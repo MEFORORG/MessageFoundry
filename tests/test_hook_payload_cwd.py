@@ -851,3 +851,205 @@ def test_lane_level_says_aloud_when_the_cwd_does_not_exist(
     text = _lane(repo, {"hook_event_name": "Stop", "cwd": gone})
     assert "[lane] COULD NOT READ THIS SESSION'S WORKTREE" in text, text
     assert "deleted-worktree, which does not exist" in text, text
+
+
+# --------------------------------------------------------------------------------------------------
+# seat-record.ps1, the Stop hook that writes the seat record through seat.ps1 -Record (BACKLOG
+# #5961). seat.ps1 took the payload `cwd` as it stood, so after a `cd` the record would land in a
+# sibling's box or in another repository's registry. It now answers through the helper's pin.
+# --------------------------------------------------------------------------------------------------
+
+SEAT_RECORD = HOOKS / "seat-record.ps1"
+
+
+def _seat_records(start: Path) -> list[dict[str, Any]]:
+    """Every seat record in the registry of the clone ``start`` belongs to."""
+    common = Path(_git(start, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    seats = common / "mefor-coord" / "seats"
+    return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(seats.rglob("*.json"))]
+
+
+def _record_stop(repo: Path, payload: dict[str, Any]) -> None:
+    """Run the Stop hook in the primary, as the app runs it.
+
+    tests/conftest.py drops MEFOR_COORD_ROOT for the whole run, so no record can reach the real
+    shared root: each fixture clone's own ``.git/mefor-coord`` is its registry."""
+    _run(SEAT_RECORD, repo, _raw(payload))
+
+
+@pytest.fixture
+def seat_clones(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    """A primary, its linked worktree, a sibling worktree, and an unrelated repository."""
+    repo, wt, sibling = _opted_in(tmp_path)
+    other = _other_repo(tmp_path)
+    _git(other, "config", "user.email", "t@example.invalid")
+    _git(other, "config", "user.name", "t")
+    _git(other, "commit", "-q", "--allow-empty", "-m", "init")
+    for clone in (repo, other):
+        (clone / ".git" / "mefor-coord").mkdir()
+    return repo, wt, sibling, other
+
+
+def test_the_seat_recorder_records_the_pinned_worktree_its_cwd_names(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """The control. Without it, a fixture that records nothing would pass the arms below."""
+    repo, wt, _, _ = seat_clones
+    seed_pin(repo, wt, "s1")
+    _record_stop(repo, _stop("s1", wt))
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+
+
+def test_after_a_cd_to_a_sibling_the_seat_recorder_records_the_pinned_worktree(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    repo, wt, sibling, _ = seat_clones
+    seed_pin(repo, wt, "s1")
+    _record_stop(repo, _stop("s1", sibling))
+    recs = _seat_records(repo)
+    assert not any(_same_dir(r["worktree"], sibling) for r in recs), recs
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+
+
+def test_after_a_cd_to_another_repository_the_seat_recorder_writes_nothing_there(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    repo, wt, _, other = seat_clones
+    seed_pin(repo, wt, "s1")
+    _record_stop(repo, _stop("s1", other))
+    assert _seat_records(other) == []
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+
+
+def test_an_unpinned_seat_recorder_writes_no_record_for_a_sibling_cwd(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """No pin says the session started in the sibling, so neither its box nor the primary's is right."""
+    repo, _, sibling, _ = seat_clones
+    _record_stop(repo, _stop("s1", sibling))
+    assert _seat_records(repo) == []
+
+
+def test_an_unpinned_seat_recorder_still_records_the_checkout_it_started_in(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """The control for the arm above: an unpinned cwd in the start checkout itself is recorded."""
+    repo, _, _, _ = seat_clones
+    _record_stop(repo, _stop("s1", repo))
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], repo), recs
+
+
+def test_a_pinned_seat_recorder_with_no_cwd_records_its_pin(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    repo, wt, _, _ = seat_clones
+    seed_pin(repo, wt, "s1")
+    _record_stop(repo, {"session_id": "s1", "hook_event_name": "Stop"})
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+    assert recs[0]["worktreeSource"].startswith("session pin"), recs
+
+
+def test_seat_ps1_says_why_it_refused_a_cwd(seat_clones: tuple[Path, Path, Path, Path]) -> None:
+    """seat-record.ps1 discards seat.ps1's stderr, so the refusal is read from seat.ps1 itself: an
+    absent record must be this refusal, not a writer that failed for some other reason."""
+    repo, _, sibling, _ = seat_clones
+    seat = ROOT / "scripts" / "coord" / "seat.ps1"
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(seat), "-Record"],
+        cwd=str(repo),
+        input=_raw(_stop("s1", sibling)),
+        capture_output=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert b"the hook input was refused, so nothing was recorded" in proc.stderr, proc.stderr
+    assert _seat_records(repo) == []
+    # A refusal is not a writer failure: fleet.ps1 counts .writer-errors.txt lines as failures, so
+    # an unpinned session must not add one on every Stop.
+    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    errors = common / "mefor-coord" / "seats" / ".writer-errors.txt"
+    assert not errors.exists() or errors.read_text(encoding="utf-8").strip() == "", errors
+
+
+def test_a_refused_seat_record_leaves_one_refusal_line_an_hour(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """seat-record.ps1 discards seat.ps1's stderr, so a refusal recorded only there left no trace,
+    and an unpinned session's record would stop refreshing in silence. Each refusal goes to
+    .writer-refusals.txt instead, one line per session key and host per hour, never to
+    .writer-errors.txt."""
+    repo, _, sibling, _ = seat_clones
+    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    seats = common / "mefor-coord" / "seats"
+    refusals = seats / ".writer-refusals.txt"
+    errors = seats / ".writer-errors.txt"
+
+    _record_stop(repo, _stop("s1", sibling))
+    assert refusals.is_file(), "a refused hook input left no .writer-refusals.txt line"
+    lines = refusals.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1, lines
+    cols = lines[0].split("\t")
+    assert cols[2] == "s1" and cols[3] == sibling.name, cols
+
+    _record_stop(repo, _stop("s1", sibling))
+    assert refusals.read_text(encoding="utf-8").splitlines() == lines, "the hour's limit failed"
+    assert not errors.exists() or errors.read_text(encoding="utf-8").strip() == "", errors
+    assert _seat_records(repo) == []
+
+    # The controls: the limit is per session key and host, and a line over an hour old, or stamped in the
+    # future by a skewed clock, does not hold it.
+    _record_stop(repo, _stop("s2", sibling))
+    assert len(refusals.read_text(encoding="utf-8").splitlines()) == 2, "another key was silenced"
+    for stamp in ("2000-01-01T00:00:00Z", "2999-01-01T00:00:00Z"):
+        refusals.write_text("\t".join([stamp, *cols[1:]]) + "\n", encoding="utf-8")
+        _record_stop(repo, _stop("s1", sibling))
+        got = refusals.read_text(encoding="utf-8").splitlines()
+        assert len(got) == 2 and got[1].split("\t")[2] == "s1", (stamp, got)
+
+
+def _record_stop_in_culture(repo: Path, payload: dict[str, Any], culture: str) -> None:
+    """Run seat.ps1 -Record, as seat-record.ps1 does, with the thread culture set first."""
+    seat = ROOT / "scripts" / "coord" / "seat.ps1"
+    lit = str(seat).replace("'", "''")
+    command = (
+        f"[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::new('{culture}'); "
+        f"& '{lit}' -Record"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=str(repo),
+        input=_raw(payload),
+        capture_output=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+
+
+@pytest.mark.parametrize("culture", ["fi-FI", "th-TH"])
+def test_the_refusal_limit_holds_under_a_culture_that_formats_time_differently(
+    seat_clones: tuple[Path, Path, Path, Path], culture: str
+) -> None:
+    """The stamp was formatted in the current culture and parsed in the invariant one. fi-FI writes
+    the time separator as '.', and th-TH counts years in the Buddhist era, so the stamp never parsed
+    and every refusal added a line. The second refusal within the hour must add none."""
+    repo, _, sibling, _ = seat_clones
+    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    refusals = common / "mefor-coord" / "seats" / ".writer-refusals.txt"
+
+    before = time.strftime("%Y", time.gmtime())
+    _record_stop_in_culture(repo, _stop("s1", sibling), culture)
+    after = time.strftime("%Y", time.gmtime())
+    lines = refusals.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1, lines
+
+    _record_stop_in_culture(repo, _stop("s1", sibling), culture)
+    assert refusals.read_text(encoding="utf-8").splitlines() == lines, (culture, "limit failed")
+    # The stamp is the invariant form the reader parses: a Gregorian year and ':' separators.
+    stamp = lines[0].split("\t")[0]
+    assert stamp[:4] in (before, after) and stamp[13] == ":", lines

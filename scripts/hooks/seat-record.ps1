@@ -36,8 +36,16 @@ try {
     # Read stdin ONCE and pass it on. The payload carries session_id, and without it seat.ps1 keys the
     # record on the literal string 'nosid' -- correct, but it collapses every unidentified session in
     # a worktree into one record, so the payload is worth forwarding carefully.
+    #
+    # Read through the shared reader where it is present; Read-CcxHookInput's header says why. The
+    # pipe below re-encodes with $OutputEncoding, UTF-8 under pwsh 7, so seat.ps1, which resolves
+    # the `cwd`, reads the path the harness wrote.
     $payload = ''
-    if ([Console]::IsInputRedirected) { $payload = [Console]::In.ReadToEnd() }
+    $hookInput = Join-Path $PSScriptRoot '_hookinput.ps1'
+    if (Test-Path -LiteralPath $hookInput -PathType Leaf) {
+        . $hookInput
+        $payload = Read-CcxHookInput
+    } elseif ([Console]::IsInputRedirected) { $payload = [Console]::In.ReadToEnd() }
 
     $seat = Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\seat.ps1'
     if (-not (Test-Path -LiteralPath $seat)) {

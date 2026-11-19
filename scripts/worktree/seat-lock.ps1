@@ -9,10 +9,9 @@
     Set-SeatWorktreeLock on the SessionStart -Prompt path, which creates the lock, and on -Declare,
     which only relabels it (Set-SeatWorktreeLock's -Mode says why). NOT on every Stop
     (-Record): that path runs the PRIMARY's seat.ps1 through the user-scope shim, so it would lock
-    trees whose own branch predates the unlock hook and never unlock them, and it follows a `cd` into
-    a sibling. Only the SessionEnd hook scripts/hooks/seat-unlock.ps1 calls
-    Remove-SeatWorktreeLock: a seat that ran -Close is often still open, and an early unlock re-opens
-    it to the GC.
+    trees whose own branch predates the unlock hook and never unlock them. Only the SessionEnd hook
+    scripts/hooks/seat-unlock.ps1 calls Remove-SeatWorktreeLock: a seat that ran -Close is often
+    still open, and an early unlock re-opens it to the GC.
     Why a lock at all, and the reason format, are in worktree-audit.ps1's header.
 
     NEITHER FUNCTION THROWS. Each returns an Action and a Detail, because both run inside hooks that
