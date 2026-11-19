@@ -69,8 +69,13 @@ def _derived_tokens(marker: str) -> str:
     )
 
 
+#: Git variables that would point a temp checkout's git calls at another repository or index.
+_GIT_REDIRECTS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE")
+
+
 def _git(*args: str, cwd: Path) -> None:
-    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_REDIRECTS}
+    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, env=env)
 
 
 def _checkout(path: Path) -> Path:
@@ -131,10 +136,9 @@ def _env(shim: Path, **over: str) -> dict[str, str]:
         "MEFOR_MIN_DETECTORS",
         "PYTHONIOENCODING",
         "PYTHONUTF8",
-        # A GIT_DIR or GIT_WORK_TREE exported by a hook running the suite would put a directory the
-        # tests treat as outside any checkout inside one.
-        "GIT_DIR",
-        "GIT_WORK_TREE",
+        # Exported by a hook running the suite, these would point the scanner's git at another
+        # repository or index, and put a directory the tests treat as outside any checkout inside one.
+        *_GIT_REDIRECTS,
     ):
         env.pop(var, None)
     env["PATH"] = str(shim) + os.pathsep + env.get("PATH", "")
@@ -361,7 +365,8 @@ def test_the_verify_step_runs_from_outside_any_git_directory(
     probe = subprocess.run(
         ["git", "rev-parse", "--git-dir"], cwd=str(elsewhere), capture_output=True, env=env
     )
-    assert probe.returncode != 0, "the test's 'outside any git directory' premise does not hold"
+    if probe.returncode == 0:
+        pytest.skip("tmp_path is inside a git checkout here, so the premise does not hold")
     proc = _run(root, "-Synthetic", env=env, cwd=elsewhere)
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
@@ -417,19 +422,21 @@ def test_a_posix_venv_interpreter_is_used(rig: tuple[Path, Path, Path], tmp_path
     assert marker.exists(), "the checkout's .venv/bin/python was not used"
 
 
-def test_a_relative_env_token_path_is_resolved_against_the_callers_directory(
+def test_a_relative_env_token_path_is_resolved_against_the_checkout(
     rig: tuple[Path, Path, Path], tmp_path: Path
 ) -> None:
-    """The scanner runs from the derived checkout, so a relative ``MEFOR_FORBIDDEN_TOKENS`` path must
-    be resolved where the operator typed it; read from the checkout, it would be taken as inline
-    token content and load nothing while the script named the file as the source."""
+    """The scanner runs from the derived checkout, in the verify step and in the pre-commit hook, so
+    a relative ``MEFOR_FORBIDDEN_TOKENS`` path names a file there. The script must name the source
+    the scanner loads, whatever directory it was invoked from, and the caller's same-named file must
+    not be what it reports."""
     root, shim, ext = rig
+    shutil.copy2(ext, root / "tok.txt")
     caller = tmp_path / "caller-rel"
     caller.mkdir()
-    shutil.copy2(ext, caller / "tok.txt")
+    (caller / "tok.txt").write_text("decoy, not a token list", encoding="utf-8")
     proc = _run(root, "-Synthetic", env=_env(shim, MEFOR_FORBIDDEN_TOKENS="tok.txt"), cwd=caller)
 
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "STRUCTURAL-ONLY" not in _loaded(proc), _loaded(proc)
     assert "SYNTHETIC" not in _loaded(proc), "the env file was not the source loaded"
-    assert str(caller / "tok.txt") in _source_line(proc), _source_line(proc)
+    assert str(root / "tok.txt") in _source_line(proc), _source_line(proc)

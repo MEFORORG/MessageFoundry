@@ -106,8 +106,6 @@ if (Test-Path -LiteralPath $local) {
 # below against the scanner's own detector counts in the SAME run rather than trusting either alone.
 $envTokens = [Environment]::GetEnvironmentVariable('MEFOR_FORBIDDEN_TOKENS')
 $envEmpty = $false
-# Set only when the variable names a file: that file's ABSOLUTE path, handed to the scanner below.
-$tokenPath = $null
 if ($null -ne $envTokens) {
     $trimmed = $envTokens.Trim()
     if (-not $trimmed) {
@@ -118,14 +116,12 @@ if ($null -ne $envTokens) {
         $source = 'NONE -- MEFOR_FORBIDDEN_TOKENS is set but EMPTY, which the scanner reads as "no source" (it does NOT fall back to the file)'
     }
     else {
-        $isFile = $false
-        try { $isFile = Test-Path -LiteralPath $trimmed -PathType Leaf } catch { $isFile = $false }
-        if ($isFile) {
-            # Resolved HERE, against the caller's directory, because the scanner runs from $repo below
-            # and would otherwise read a relative path as inline token content (BACKLOG #5467).
-            $tokenPath = (Resolve-Path -LiteralPath $trimmed).ProviderPath
-            $source = "MEFOR_FORBIDDEN_TOKENS -> $tokenPath"
-        }
+        # Probed the way the scanner probes it, with Python's Path(value).is_file() from $repo, where
+        # both the verify step below and the pre-commit hook run it (BACKLOG #5467): a relative path
+        # is relative to the checkout, and no `~` or PSDrive is expanded, as Test-Path would.
+        $tokenPath = $null
+        try { $tokenPath = [IO.Path]::GetFullPath([IO.Path]::Combine($repo, $trimmed)) } catch { $tokenPath = $null }
+        if ($tokenPath -and [IO.File]::Exists($tokenPath)) { $source = "MEFOR_FORBIDDEN_TOKENS -> $tokenPath" }
         # NEVER echo the value. A non-path value IS the token list, carried inline; naming the variable
         # is the whole diagnostic, and printing its content would publish exactly what this protects
         # into whatever log the operator happened to be capturing.
@@ -146,7 +142,10 @@ else {
 # The checkout's own venv, in this platform's layout: Scripts\python.exe on Windows, bin/python on
 # POSIX (BACKLOG #5467). Only the platform's own layout is probed, since a POSIX venv's interpreter
 # cannot be launched on Windows. Without one it falls back to whatever `python` PATH offers.
-$venvPy = Join-Path $repo $(if ($IsWindows) { '.venv/Scripts/python.exe' } else { '.venv/bin/python' })
+# [Environment]::OSVersion rather than $IsWindows, which Windows PowerShell 5.1 does not define
+# (scripts/worktree/ensure-venv.ps1 takes the same form).
+$onWindows = [Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT
+$venvPy = Join-Path $repo $(if ($onWindows) { '.venv/Scripts/python.exe' } else { '.venv/bin/python' })
 $py = if (Test-Path -LiteralPath $venvPy -PathType Leaf) { $venvPy } else { 'python' }
 Write-Host ''
 Write-Host 'Verifying the gate can see:' -ForegroundColor Cyan
@@ -156,8 +155,6 @@ Write-Host 'Verifying the gate can see:' -ForegroundColor Cyan
 # checkout's tokens -- and outside any git directory it failed outright -- which is the same
 # wrong-checkout class the $repo derivation above closes for the install (BACKLOG #1063).
 Push-Location -LiteralPath $repo
-$savedTokens = $envTokens
-if ($tokenPath) { $env:MEFOR_FORBIDDEN_TOKENS = $tokenPath }
 try {
     $out = & $py $scanner --require-tokens 2>&1
     # Captured on the very next line, before any other native call can overwrite it. The scanner's
@@ -167,7 +164,6 @@ try {
 }
 finally {
     Pop-Location
-    if ($tokenPath) { $env:MEFOR_FORBIDDEN_TOKENS = $savedTokens }
 }
 $loaded = $out | Where-Object { $_ -match 'loaded names=' } | Select-Object -First 1
 if (-not $loaded) { Write-Host ($out | Select-Object -Last 5); throw 'Scanner produced no detector-count line.' }
