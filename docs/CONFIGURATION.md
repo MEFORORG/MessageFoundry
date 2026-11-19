@@ -1450,10 +1450,21 @@ member left. At least these cases differ: after a kill that writes a line, it fo
 after a reap that is not a kill, such as closing a session whose worker had already died, no kill
 line comes before it; and when the signal itself failed, for example for want of permission, a line
 naming the process group and the system's error text, but not the inbound, comes before it. A
-failed signal to the group of a worker not yet reaped writes a similar unattributed line, which adds
-that the kill degrades to a single-process kill; a group that cannot be read, or that the worker
-does not lead, degrades the same way with no line. That single-process kill signals a running
-worker, and only reaps one that has already exited.
+worker not yet reaped whose group is found empty gets nothing more and no line. One whose group
+gets no signal for another reason takes the same group signal the already-reaped case uses next.
+That signal is sent only while no live process has the worker's pid, so it reaches the group when
+the read failed because the worker is gone. It is not proof against reuse: a pid taken by a new
+group leader between that check and the signal would have that group signalled, which needs the
+worker's group to be empty already. It reaches nothing when the system refuses the read for
+another reason, such as permission. When it also sends nothing and the group may still have
+members, as for a signal that failed or a pid reused by a process that leads no group, a
+`WARNING` naming the inbound and the pid says a kill of the worker itself is tried and a process it
+started may survive; when that signal finds the group empty, no such line is written. Each failed signal, to
+the group or by that second path, writes an unattributed line naming the process group and the
+system's error text, which says a process in it may survive and does not say what the reap does
+next. That single-process kill signals a running worker and only reaps one that has exited and not
+been reaped. For one already reaped it does nothing, unless the pid was given to another process
+the engine started, which it would then signal, or reap if that process had exited.
 **Read once at engine start — a `/config/reload` does NOT re-read it (restart to change).**
 
 **`mode` is engine-wide — there is no per-connection sandbox setting.** One policy is rendered for the

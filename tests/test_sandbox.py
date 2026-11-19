@@ -2637,9 +2637,9 @@ def test_a_worker_reaped_elsewhere_has_its_group_signalled_only_while_its_pid_is
     reaped: list[int] = []
     reaped_results: list[bool | None] = []
 
-    def _spy_unread(pid: int, **kwargs: Any) -> bool:
+    def _spy_unread(pid: int, **kwargs: Any) -> proctree.GroupKill:
         unread.append(pid)
-        return False
+        return _NOT_SENT
 
     def _spy_reaped(pid: int) -> bool | None:
         reaped.append(pid)
@@ -2683,6 +2683,243 @@ def test_a_worker_reaped_elsewhere_has_its_group_signalled_only_while_its_pid_is
     finally:
         monkeypatch.undo()
         session.close()
+
+
+# --- vault BACKLOG #5314: a failed group read does not drop to a single-process kill -----------
+
+
+_SENT, _EMPTY, _NOT_SENT = (
+    proctree.GroupKill.SENT,
+    proctree.GroupKill.EMPTY,
+    proctree.GroupKill.NOT_SENT,
+)
+
+
+def _single_kill_warnings(caplog: pytest.LogCaptureFixture) -> list[object]:
+    """The args of each single-process-kill WARNING the reap wrote, matched on a fragment of that
+    line and of no other line it writes."""
+    return [
+        r.args
+        for r in caplog.records
+        if r.name == sandbox_mod.log.name and "kill of the worker itself is tried" in r.getMessage()
+    ]
+
+
+@pytest.mark.parametrize(
+    ("state", "group", "reaped", "calls", "single"),
+    [
+        # The guarded group kill sent its signal: nothing else runs.
+        ("running", _SENT, None, ["group"], False),
+        ("zombie", _SENT, None, ["group"], False),
+        # It found the group empty: nothing is left to kill, and the reuse-safe signal, with its
+        # pid-reuse gap, is not sent.
+        ("running", _EMPTY, None, ["group"], False),
+        ("zombie", _EMPTY, None, ["group"], False),
+        # It sent nothing (the worker was reaped after the state check, or its zombie's group
+        # could not be read): the reuse-safe signal reaches the group, and no single kill.
+        ("running", _NOT_SENT, True, ["group", "reaped"], False),
+        ("zombie", _NOT_SENT, True, ["group", "reaped"], False),
+        # The reuse-safe signal found the group empty: nothing is left to kill.
+        ("zombie", _NOT_SENT, False, ["group", "reaped"], False),
+        ("running", _NOT_SENT, False, ["group", "reaped"], False),
+        # Neither sent anything and members may remain, as for a reused pid that leads no group:
+        # the single kill is the fallback, under a WARNING.
+        ("running", _NOT_SENT, None, ["group", "reaped"], True),
+        ("zombie", _NOT_SENT, None, ["group", "reaped"], True),
+        # Already reaped: only the reuse-safe signal, as before (vault BACKLOG #3135), whose own
+        # WARNING, pinned elsewhere, is not the single kill's.
+        ("reaped", None, True, ["reaped"], False),
+        ("reaped", None, None, ["reaped"], False),
+        ("reaped", None, False, ["reaped"], False),
+    ],
+)
+def test_the_posix_reap_reaches_the_group_before_any_single_kill(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    state: str,
+    group: proctree.GroupKill | None,
+    reaped: bool | None,
+    calls: list[str],
+    single: bool,
+) -> None:
+    """The POSIX reap's decision table, with the process calls replaced, so it runs on every host.
+
+    FALSIFICATION: restore ``if not proctree.kill_process_group(proc.pid): _kill_single(proc)``
+    as the last step of :func:`_reap_process_tree`, and the arms where the group kill sent nothing
+    red: the single kill runs and the reuse-safe signal is never sent. Test the guarded kill's
+    result as a bool instead of against ``NOT_SENT``, and the ``EMPTY`` arms red: the reuse-safe
+    signal is sent to a group already found empty."""
+    seen: list[str] = []
+    singles: list[object] = []
+    proc: Any = SimpleNamespace(pid=4242)
+
+    def _group(pid: int, **kwargs: Any) -> proctree.GroupKill:
+        seen.append("group")
+        assert (pid, kwargs) == (proc.pid, {})
+        assert group is not None, "the guarded group kill ran for an already-reaped worker"
+        return group
+
+    def _reaped(pid: int) -> bool | None:
+        seen.append("reaped")
+        assert pid == proc.pid
+        return reaped
+
+    monkeypatch.setattr(sandbox_mod, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(sandbox_mod, "_posix_child_state", lambda p: state)
+    monkeypatch.setattr(proctree, "kill_process_group", _group)
+    monkeypatch.setattr(proctree, "kill_reaped_leader_group", _reaped)
+    monkeypatch.setattr(sandbox_mod, "_kill_single", singles.append)
+    caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+    sandbox_mod._reap_process_tree(proc, None, "IB_T")
+    assert seen == calls
+    assert singles == ([proc] if single else [])
+    assert_capture_sees(caplog, sandbox_mod.log)  # so an empty scan below means nothing logged
+    assert _single_kill_warnings(caplog) == ([("IB_T", proc.pid)] if single else [])
+
+
+@pytest.mark.parametrize(
+    ("killpg_error", "expected", "logged"),
+    [
+        (None, _SENT, False),
+        (ProcessLookupError(3, "No such process"), _EMPTY, False),
+        (PermissionError(1, "Operation not permitted"), _NOT_SENT, True),
+    ],
+)
+def test_kill_process_group_tells_an_empty_group_from_a_failed_signal(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    killpg_error: OSError | None,
+    expected: proctree.GroupKill,
+    logged: bool,
+) -> None:
+    """``killpg`` failing with ``ESRCH`` reads as an empty group, with nothing logged; any other
+    failure reads as nothing sent, under the module's WARNING; only a sent signal is truthy, so
+    the DR hook's bool test of the result is unchanged. The process calls are replaced, so this
+    runs on every host. FALSIFICATION: drop the ``ProcessLookupError`` arm in
+    ``proctree._killpg``, and the ``ESRCH`` case returns ``NOT_SENT`` and logs, here and in
+    :func:`proctree.kill_reaped_leader_group` (which then returns ``None``, not ``False``)."""
+    sent: list[int] = []
+
+    def _killpg(pgid: int, sig: int) -> None:
+        sent.append(pgid)
+        if killpg_error is not None:
+            raise killpg_error
+
+    fake_os = SimpleNamespace(getpgid=lambda pid: pid, getpgrp=lambda: 1, killpg=_killpg)
+    monkeypatch.setattr(proctree, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(proctree, "os", fake_os)
+    monkeypatch.setattr(proctree, "signal", SimpleNamespace(SIGKILL=9))
+    caplog.set_level(logging.WARNING, logger=proctree.log.name)
+    for started_as_leader in (False, True):
+        caplog.clear()
+        sent.clear()
+        result = proctree.kill_process_group(4242, started_as_leader=started_as_leader)
+        assert result is expected
+        assert bool(result) is (expected is _SENT)
+        assert sent == [4242]
+        assert_capture_sees(caplog, proctree.log)  # so an empty scan below means nothing logged
+        lines = [r.getMessage() for r in caplog.records if r.name == proctree.log.name]
+        assert lines == (
+            [
+                "could not signal process group 4242 (Operation not permitted), so a process in it "
+                "may survive"
+            ]
+            if logged
+            else []
+        )
+    # The reuse-safe signal shares the helper, so it maps the same outcomes to True/False/None.
+    fake_os.getpgid = _no_such_pid
+    caplog.clear()
+    sent.clear()
+    reaped_result = proctree.kill_reaped_leader_group(4242)
+    assert reaped_result is {_SENT: True, _EMPTY: False, _NOT_SENT: None}[expected]
+    assert sent == [4242]
+
+
+def _no_such_pid(pid: int) -> int:
+    raise ProcessLookupError(3, "No such process")
+
+
+@pytest.mark.parametrize(
+    ("getpgid", "started_as_leader"),
+    [
+        (_no_such_pid, False),  # the group cannot be read
+        (lambda pid: pid + 1, False),  # pid leads no group of its own
+        (lambda pid: pid, True),  # the caller's own group, with started_as_leader=True
+    ],
+)
+def test_kill_process_group_refuses_before_any_signal_and_logs_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    getpgid: Callable[[int], int],
+    started_as_leader: bool,
+) -> None:
+    """Each refusal before the signal returns ``NOT_SENT``, not ``EMPTY``, and logs nothing: the
+    group may still have members, so the sandbox must go on to its next step."""
+    sent: list[int] = []
+    fake_os = SimpleNamespace(
+        getpgid=getpgid, getpgrp=lambda: 4242, killpg=lambda pgid, sig: sent.append(pgid)
+    )
+    monkeypatch.setattr(proctree, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(proctree, "os", fake_os)
+    monkeypatch.setattr(proctree, "signal", SimpleNamespace(SIGKILL=9))
+    caplog.set_level(logging.WARNING, logger=proctree.log.name)
+    assert proctree.kill_process_group(4242, started_as_leader=started_as_leader) is _NOT_SENT
+    assert sent == []
+    assert_capture_sees(caplog, proctree.log)  # so an empty scan below means nothing logged
+    assert [r for r in caplog.records if r.name == proctree.log.name] == []
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the POSIX process-group reap")
+@pytest.mark.skipif(
+    not os.path.isdir("/proc"), reason="_pid_running needs /proc to tell a zombie from a runner"
+)
+def test_a_worker_reaped_after_the_state_check_still_has_its_group_killed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A group leader that starts a grandchild, then exits and is reaped by something other than
+    ``Popen`` AFTER the reap read it as a zombie, still has its group killed: the grandchild dies.
+
+    The state check is replaced to return what it read before the reap, so the window is
+    deterministic. POSIX with ``/proc`` only, without which :func:`_pid_running` cannot tell a
+    running grandchild from a zombie, so it is NOT RUN on the Windows host this was written on; the
+    Linux CI leg runs it. FALSIFICATION: as in
+    :func:`test_the_posix_reap_reaches_the_group_before_any_single_kill`, and the grandchild
+    survives, since the single-process kill that follows sends nothing to a reaped child."""
+    pidfile = tmp_path / "grandchild.pid"
+    script = (
+        "import subprocess, sys\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"with open({str(pidfile)!r}, 'w') as f:\n"
+        "    f.write(str(p.pid))\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", script], start_new_session=True)
+    grandchild_pid: int | None = None
+    grandchild_dead = False
+    try:
+        os.waitpid(proc.pid, 0)  # the leader exited and was reaped; Popen does not know
+        grandchild_pid = int(pidfile.read_text())
+        assert proc.returncode is None
+        assert _pid_running(grandchild_pid) is True  # the control: it outlived the leader
+        monkeypatch.setattr(sandbox_mod, "_posix_child_state", lambda p: "zombie")
+        caplog.set_level(logging.WARNING, logger=sandbox_mod.log.name)
+        sandbox_mod._reap_process_tree(proc, None, "IB_T")
+        assert _wait_until_not_running(grandchild_pid, timeout=5.0) is False, (
+            "the grandchild of a worker reaped after the state check survived the reap"
+        )
+        grandchild_dead = True  # its pid may be reused now, so the cleanup below must not kill it
+        assert_capture_sees(caplog, sandbox_mod.log)  # so an empty scan below means nothing logged
+        assert _single_kill_warnings(caplog) == [], (
+            "the reap fell back to a single-process kill though the group was signalled"
+        )
+    finally:
+        if grandchild_pid is not None:
+            if not grandchild_dead:
+                _best_effort_kill_pid(grandchild_pid)
+
+        elif proc.poll() is not None:  # a leader that failed before writing the sleeper's pid
+            proctree.kill_reaped_leader_group(proc.pid)
+        proc.poll()  # already reaped: this only records it, so Popen does not warn on collection
 
 
 def test_a_fresh_worker_exited_before_its_eof_is_queued_is_respawned(
