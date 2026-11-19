@@ -104,7 +104,7 @@ try {
         $script:revParseExit = $LASTEXITCODE
     }
 } catch {
-    Write-RootRefusal "git could not be run in $here ($($_.Exception.Message))"
+    Write-RootRefusal "git could not be run, or its output could not be decoded as UTF-8, in $here ($($_.Exception.Message))"
 }
 $top = if ($revParse.Count -ge 1) { ([string]$revParse[0]).Trim() } else { '' }
 if ($revParseExit -ne 0 -or -not $top) { Write-RootRefusal "git could not name the work tree root for $here" }
