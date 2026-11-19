@@ -325,8 +325,9 @@ async def test_a_refused_record_at_the_deferred_clear_is_reported_and_grants_not
 async def test_an_outage_at_the_deferred_clear_pages_and_ends_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Vault transit Outage at the clear's write ends nothing (ADR 0217's Outage row): it is
-    paged, no seal row is written, nothing is cleared, and the caller keeps its rotated token."""
+    """A Vault transit Outage at the account record's seal ends no session (ADR 0217's Outage
+    row): it is paged, no seal row is written, nothing is cleared, and the caller keeps its rotated
+    token."""
     store = await MessageStore.open(":memory:")
     try:
         service, notifier, identity, token = await _setup(store)

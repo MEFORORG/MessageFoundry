@@ -15488,9 +15488,10 @@ class AuthService:
         commit that landed. So ``audits`` are read back (:meth:`_reauth_clear_readback`). Found,
         the reset is in: the rows found are teed off-box, and the answer is ``"cleared"``. Not
         found, or the read-back failing, the store error is re-raised: the reset's answer on the
-        account is not known, so nothing is granted. A Vault transit Outage, which is paged (ADR
-        0217's Outage row ends nothing), answers ``"refused"``: the caller writes its own row,
-        hard. A seal refusal of another kind than the account's record raises, as on the login
+        account is not known, so nothing is granted; a Vault transit Outage refusing the
+        audit-chain MAC of ``audits`` is one of those errors (``CipherError``). An Outage at the
+        account record's seal, which is paged and ends no session (ADR 0217's Outage row),
+        answers ``"refused"``: the caller writes its own row, hard. A seal refusal of another kind than the account's record raises, as on the login
         leg, and so does a defect."""
         now = time.time()
         try:

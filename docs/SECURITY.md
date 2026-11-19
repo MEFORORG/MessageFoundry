@@ -3796,17 +3796,19 @@ nothing to clear makes no such check:
   `auth.reauth` row carries `clear_denied` and `session_ended`, which says whether that revoke
   landed as far as the re-auth saw; when it did not, the rotated session may still exist, its
   token never handed back.
-- A Vault transit Outage, which is paged, clears nothing and ends nothing. The
-  re-auth then writes its `auth.reauth` row hard: refused too, the re-auth raises and its rotated
-  token is never handed back.
+- A Vault transit Outage at the account record's seal, which is paged, clears nothing and does
+  not end the rotated session. The re-auth then writes its `auth.reauth` row hard: refused too, the
+  re-auth raises and its rotated token is never handed back. An Outage at the audit-chain MAC of
+  the rows the clear appends is a raise from the clear, covered in the last bullet.
 - The `auth.reauth` row, and the `auth.login_after_failures` row when the clear ends a run of
   failures, are appended in the reset's own transaction, so the counters are not reset without
   them, and a refused append rolls the reset back.
 - A raise from the stamp onward writes an `auth.reauth` row marked `interrupted`, softly, beside
-  any row the clear already committed. When the clear itself raises, at least on a store error
-  whose commit the re-auth cannot read back, the store is first asked to end the rotated session,
-  and the row carries `clear_raised` and `session_ended`. A raise inside the re-proof itself, after the password
-  verified, writes no `auth.reauth` row.
+  any row the clear already committed. When the clear itself raises, the store is first asked to
+  end the rotated session, and the row carries `clear_raised` and `session_ended`. That covers at
+  least a store error whose commit the re-auth cannot read back, which includes a Vault transit
+  Outage refusing the audit-chain MAC of the rows the clear appends (`CipherError`). A raise
+  inside the re-proof itself, after the password verified, writes no `auth.reauth` row.
 
 **A directory step-up or enrolment leg refuses a present account that lost a role in the directory
 (BACKLOG #2240).** At least the code and passkey legs above, the two enrolment legs, the IdP
