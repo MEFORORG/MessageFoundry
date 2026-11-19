@@ -177,7 +177,7 @@ def test_role_write_refusal_reads_both_store_refusals_and_nothing_else() -> None
     fk = _role_write_refusal(
         sqlite3.IntegrityError("FOREIGN KEY constraint failed"),
         ["viewer", "custom:b", "custom:c"],
-        ["custom:c"],
+        ["viewer", "custom:c"],
     )
     assert fk is not None and fk.role_ids == ("custom:b",)
     # Controls: with every requested custom role still present, with only built-ins, with no role
@@ -186,6 +186,8 @@ def test_role_write_refusal_reads_both_store_refusals_and_nothing_else() -> None
     integrity = sqlite3.IntegrityError("UNIQUE constraint failed: audit_log.seq")
     assert _role_write_refusal(integrity, ["custom:b"], ["custom:b"]) is None
     assert _role_write_refusal(integrity, ["viewer"], []) is None
+    # A requested id that is not a custom role id is never read as a deleted custom role.
+    assert _role_write_refusal(integrity, ["retired-builtin"], []) is None
     assert _role_write_refusal(integrity, [], []) is None
     assert _role_write_refusal(integrity, ["custom:b"], None) is None
     # Control: any other failure is not a role refusal and is re-raised by the caller.

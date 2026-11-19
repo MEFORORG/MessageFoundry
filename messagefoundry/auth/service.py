@@ -2390,7 +2390,7 @@ def _is_integrity_refusal(exc: BaseException) -> bool:
 
 
 def _role_write_refusal(
-    exc: BaseException, roles: Iterable[str], existing_custom: Iterable[str] | None
+    exc: BaseException, roles: Iterable[str], existing: Iterable[str] | None
 ) -> UnknownRoleError | None:
     """The :class:`UnknownRoleError` a role write's failure means, or ``None`` when it means
     something else (BACKLOG #5968).
@@ -2404,15 +2404,15 @@ def _role_write_refusal(
 
     An integrity error names no key, and the same transaction writes other keyed rows, at least
     its audit append, so it is read as a deleted role only for the requested custom ids that
-    ``existing_custom``, the custom roles read after the failure, no longer holds. Those are the
-    ids it reports. A built-in role cannot be deleted, so with no custom id requested, or every one
-    still present, the error is something else. ``existing_custom`` is ``None`` where the caller has
-    no such read, which only an integrity error needs."""
+    ``existing``, the role ids read after the failure, no longer holds. Those are the ids it
+    reports. Only a custom role can be deleted, so with no custom id requested, or every one still
+    present, the error is something else. ``existing`` is ``None`` where the caller has no such
+    read, which only an integrity error needs."""
     if isinstance(exc, UnknownRoleError):
         return exc
-    if not _is_integrity_refusal(exc) or existing_custom is None:
+    if not _is_integrity_refusal(exc) or existing is None:
         return None
-    gone = set(roles) - {r.value for r in Role} - set(existing_custom)
+    gone = {r for r in roles if is_custom_role_id(r)} - set(existing)
     return UnknownRoleError(sorted(gone)) if gone else None
 
 
@@ -19769,7 +19769,8 @@ class AuthService:
 
         Raises :class:`UsernameTaken` when a concurrent create took ``username`` after the caller's
         own check (BACKLOG #1808), and :class:`UnknownRoleError` when a role in ``roles`` was
-        deleted after it, having removed the account it wrote (BACKLOG #5968)."""
+        deleted after it, having removed the account it wrote unless a store fault refused that
+        removal, which is logged (BACKLOG #5968)."""
         refusal = username_refusal(username)
         if refusal is not None:
             raise InvalidUsername(refusal)
@@ -19833,11 +19834,13 @@ class AuthService:
             # which rolled back. The account row committed first, holding the username with no
             # role and no `user.created` row, so it is removed: otherwise a retry under the same
             # name would be refused as taken. It holds no role, so not Administrator, which is
-            # what `delete_user` requires. A failed removal leaves the orphan the crash case above
-            # leaves, and is logged rather than masking the refusal.
+            # what `delete_user` requires. A store fault in the removal leaves the orphan the crash
+            # case above leaves, and is logged rather than masking the refusal; a defect raises.
             try:
                 await self._store.delete_user(user_id)
-            except Exception:
+            except _passkey_read_errors() as delete_exc:
+                if isinstance(delete_exc, AUDIT_WRITE_DEFECTS):
+                    raise
                 _log.exception(
                     "an account whose role write was refused could not be removed (BACKLOG #5968)"
                 )
@@ -20117,15 +20120,19 @@ class AuthService:
     async def _role_write_refusal(
         self, exc: BaseException, roles: Sequence[str]
     ) -> UnknownRoleError | None:
-        """:func:`_role_write_refusal` for a role write that raised ``exc``, re-reading the custom
-        roles only for an integrity error, the one case that needs it (BACKLOG #5968). A failed
-        re-read is logged and reads as no refusal, so the caller re-raises ``exc``."""
+        """:func:`_role_write_refusal` for a role write that raised ``exc``, re-reading the role
+        ids only for an integrity error, the one case that needs it (BACKLOG #5968). The ids come
+        from the store's role rows, so no seal is checked or reported again. A store fault in the
+        re-read is logged and reads as no refusal, so the caller re-raises ``exc``; a defect
+        (:data:`~messagefoundry.audit_write.AUDIT_WRITE_DEFECTS`) raises."""
         existing: list[str] | None = None
         if _is_integrity_refusal(exc):
             try:
-                existing = [r.id for r in await self.list_custom_roles()]
-            except Exception:
-                _log.exception("the custom roles could not be re-read after a role write failed")
+                existing = [str(row["id"]) for row in await self._store.list_roles()]
+            except _passkey_read_errors() as read_exc:
+                if isinstance(read_exc, AUDIT_WRITE_DEFECTS):
+                    raise
+                _log.exception("the role ids could not be re-read after a role write failed")
         return _role_write_refusal(exc, roles, existing)
 
     async def list_custom_roles(self) -> list[CustomRoleInfo]:
