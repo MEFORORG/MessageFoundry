@@ -8448,7 +8448,9 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
     """Is a store key configured? The at-rest gate's one test for "keyed". A local key or a DPAPI key
     file counts when ``[store].key_provider`` reads it (BACKLOG #2077), and an external provider such
     as ``vault`` counts on its own (BACKLOG #1998). The rule is
-    :func:`~messagefoundry.store.keyprovider.provider_reads_a_configured_key`.
+    :func:`~messagefoundry.store.keyprovider.provider_reads_a_configured_key`. A
+    ``MEFOR_STORE_ENCRYPTION_KEY`` of blanks only beside a retired key does not count
+    (BACKLOG #5310, #5308), so the gate refuses it.
 
     The test reads what is CONFIGURED, not what resolves: the gate runs before ``open_store`` and must
     not need the network. That is safe because a source that cannot resolve fails closed at
@@ -8465,9 +8467,14 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
     store open plaintext. The DR backup path DOES resolve it, and refuses an ignored key there
     through ``store.base._checked_active_key``. ``rotate-key`` refuses this mode before it resolves
     a key (BACKLOG #2109)."""
+    from messagefoundry.store.base import blank_active_key, retired_without_active_refusal
     from messagefoundry.store.keyprovider import provider_reads_a_configured_key
 
     store = settings.store
+    if blank_active_key(store) and retired_without_active_refusal(store) is not None:
+        # A key of blanks only beside a retired key is no key (BACKLOG #5310, #5308). Answered
+        # here, so ``serve``, which runs the gate only when this says unkeyed, refuses it too.
+        return False
     if store.cipher_provider == "vault_transit" and (
         store.encryption_key or store.encryption_key_file
     ):
@@ -8554,12 +8561,9 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
         KEYLESS_REFUSED_BY_UNREAD_KEY,
         keyless_opt_out_refusal,
     )
-    from messagefoundry.store.base import blank_active_key, retired_without_active_refusal
+    from messagefoundry.store.base import retired_without_active_refusal
     from messagefoundry.store.keyprovider import unread_key_refusal
 
-    if blank_active_key(settings.store) and retired_without_active_refusal(settings.store):
-        # A key of blanks only reads as configured below, but it is no key (BACKLOG #5310, #5308).
-        return KEYLESS_REFUSED_BY_UNREAD_KEY
     if _store_key_configured(settings):
         return None
     if (

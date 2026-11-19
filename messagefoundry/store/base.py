@@ -3759,9 +3759,10 @@ def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = 
     So does a pinned built-in provider that ignores the key the settings name (BACKLOG #2077):
     ``dpapi`` with only ``MEFOR_STORE_ENCRYPTION_KEY``, or ``env`` with only a key file.
 
-    And so does no key beside a retired one (BACKLOG #5308), under every ``cipher_provider``: that
-    raises a :class:`StoreCipherConfigError`, a ``ValueError``, with ``make_cipher``'s text, where
-    the two refusals above raise ``KeyProviderError``.
+    And so does no key, or a key of blanks only, beside a retired one (BACKLOG #5308), under every
+    ``cipher_provider``: that raises a :class:`StoreCipherConfigError`, a ``ValueError``, with
+    :func:`retired_without_active_refusal`'s text for the provider (``make_cipher``'s own under
+    ``aesgcm``), where the two refusals above raise ``KeyProviderError``.
 
     ``posture`` is the instance posture the caller holds, for an external provider's hop guard
     (vault BACKLOG #2983). ``None`` counts as enforcing there.
@@ -3845,11 +3846,13 @@ def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
         unread_key_refusal,
     )
 
-    if key and key.strip():
+    if key:
+        if not key.strip() and (retired := retired_without_active_refusal(settings)) is not None:
+            # A key of blanks only beside a retired key is no active key, as ``make_cipher`` reads
+            # it (BACKLOG #5310, #5308). With no retired key it is returned, and the cipher build
+            # refuses it as a key that does not decode, as before.
+            raise _recorded(StoreCipherConfigError(retired), retired)
         return key
-    # A key of blanks only falls through, so beside a retired key it is refused as no key, as
-    # ``make_cipher`` refuses it (BACKLOG #5310, #5308); with none it is returned below, and the
-    # cipher build refuses it as a key that does not decode, as before.
     # Each text is built from the settings alone, so it is recorded (:func:`_recorded`) and a site
     # that replaces the refusal keeps it.
     if settings.key_provider in _EXTERNAL_PROVIDERS:

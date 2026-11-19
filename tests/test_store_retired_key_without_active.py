@@ -12,13 +12,14 @@ from __future__ import annotations
 
 import pytest
 
-from messagefoundry.__main__ import _keyless_store_gate, _unread_key_text
+from messagefoundry.__main__ import _keyless_store_gate, _store_key_configured, _unread_key_text
 from messagefoundry.config.settings import (
     KEYLESS_REFUSED_BY_UNREAD_KEY,
     SecuritySettings,
     ServiceSettings,
     StoreSettings,
 )
+from messagefoundry.redaction import safe_exc
 from messagefoundry.store import crypto
 from messagefoundry.store.base import (
     StoreCipherConfigError,
@@ -244,3 +245,27 @@ def test_the_start_gate_refuses_before_the_open_whatever_the_opt_out_says() -> N
     assert _keyless_store_gate(ServiceSettings(store=StoreSettings())) != (
         KEYLESS_REFUSED_BY_UNREAD_KEY
     )
+
+
+@pytest.mark.parametrize("cipher_provider", ["aesgcm", "vault_transit"])
+def test_serve_runs_the_gate_for_a_blank_active_key_beside_a_retired_key(
+    cipher_provider: str,
+) -> None:
+    # serve consults the gate only when _store_key_configured says unkeyed, so a blank key must
+    # read as unkeyed there, or serve would skip the refusal (BACKLOG #5310, #5308).
+    store = StoreSettings(
+        cipher_provider=cipher_provider,
+        encryption_key="   ",
+        encryption_keys_retired=generate_key(),
+    )
+    assert _store_key_configured(ServiceSettings(store=store)) is False
+    # The control: with no retired key a blank key still reads as configured, left to the open.
+    blank_only = StoreSettings(cipher_provider=cipher_provider, encryption_key="   ")
+    assert _store_key_configured(ServiceSettings(store=blank_only)) is True
+
+
+def test_the_transit_refusal_survives_the_dr_backup_text_cut() -> None:
+    # The DR backup, the one runtime reader under vault_transit, renders a refusal through
+    # safe_exc, which cuts a long text; the cause and the remedy must survive.
+    rendered = safe_exc(StoreCipherConfigError(RETIRED_WITHOUT_ACTIVE_TRANSIT))
+    assert rendered.endswith(RETIRED_WITHOUT_ACTIVE_TRANSIT)
