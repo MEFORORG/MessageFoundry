@@ -344,6 +344,46 @@ async def test_a_failed_drain_outranks_every_engine_shard_crash_looping() -> Non
     assert await asyncio.wait_for(code, 5) == 3
 
 
+@pytest.mark.asyncio
+async def test_a_fatal_watcher_exit_propagates_even_when_the_drain_fails() -> None:
+    class _Fatal(BaseException):
+        pass
+
+    stuck = _Proc(terminate_error=PermissionError("refused"), kill_error=PermissionError("refused"))
+
+    async def spawn(spec: ShardSpec) -> _Proc:
+        if spec.shard == "b":
+            await stuck.waiting.wait()
+            raise _Fatal
+        return stuck
+
+    sup = Supervisor([_spec("a"), _spec("b", 1)], spawn=_spawner(spawn), terminate_grace=0.1)
+    with pytest.raises(_Fatal) as caught:
+        await asyncio.wait_for(sup.run(), 5)
+    assert isinstance(caught.value.__cause__, ShardDrainError)
+
+
+@pytest.mark.asyncio
+async def test_a_real_kill_failure_is_the_cause_ahead_of_an_abandoned_launch() -> None:
+    stuck = _Proc(terminate_error=PermissionError("refused"), kill_error=PermissionError("refused"))
+    hung = asyncio.Event()
+
+    async def spawn(spec: ShardSpec) -> _Proc:
+        if spec.shard == "b":
+            hung.set()
+            await asyncio.Event().wait()
+        return stuck
+
+    sup = Supervisor([_spec("a"), _spec("b", 1)], spawn=_spawner(spawn), terminate_grace=0.1)
+    runner = asyncio.create_task(sup.run())
+    await asyncio.wait_for(stuck.waiting.wait(), 5)
+    await asyncio.wait_for(hung.wait(), 5)
+    runner.cancel()
+    with pytest.raises(ShardDrainError, match="2 engine shard") as caught:
+        await asyncio.wait_for(runner, 5)
+    assert isinstance(caught.value.__cause__, PermissionError)
+
+
 def test_a_non_finite_terminate_grace_is_refused() -> None:
     with pytest.raises(ValueError, match="terminate_grace"):
         Supervisor([_spec("default")], terminate_grace=float("inf"))

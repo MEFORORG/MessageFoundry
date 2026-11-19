@@ -154,3 +154,9 @@ relaunched in a tight loop, each pass a full interpreter start and config load.
 
 Per-shard structured-log aggregation and graceful in-flight drain on restart remain deferred. This
 implements vault BACKLOG #2773.
+
+**Note (2026-11-18, BACKLOG #5894):** `supervise` now also returns 3, which outranks 0 and 1, when
+the shutdown drain may have left an engine shard's child running: a child the force could not end,
+or a launch abandoned at shutdown. So a non-zero exit no longer means only that every engine shard
+tripped the breaker. The `supervise` docstring in `messagefoundry/pipeline/supervisor.py` lists
+every code.

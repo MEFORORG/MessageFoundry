@@ -18,7 +18,9 @@ start is a FAST exit: each one in a row doubles the delay before the next launch
 trip the crash-loop breaker for THAT shard: it is not relaunched again, the ERROR line names it and
 its exit history, and it stays listed in :attr:`Supervisor.crash_looped`. The other shards keep
 running, so one shard's start-up failure is not a fleet outage (a crash in one supervised task stays
-isolated). Only when every shard has tripped does ``supervise`` return non-zero. The supervisor has
+isolated). Of the crash-loop outcomes, only every shard having tripped makes ``supervise`` return
+non-zero (1); a shutdown drain that may have left a child running returns 3 (:func:`supervise`
+lists every code). The supervisor has
 no store and so no alert store; the ERROR log is its alert, and its CRL reload's only sink logs
 (:func:`_supervisor_crl_alert_sink`). A child that ran for ``stable_uptime``
 resets both. Without this a start-up failure neither config load reproduces (a
@@ -288,7 +290,8 @@ async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
 
 
 class ShardDrainError(RuntimeError):
-    """The shutdown drain left at least one engine shard's child running.
+    """The shutdown drain may have left at least one engine shard's child running: a child the
+    force could not end, or a launch abandoned at shutdown, whose child may or may not exist.
 
     :func:`supervise` maps it to exit code 3, apart from the crash-loop code 1."""
 
@@ -356,10 +359,12 @@ class Supervisor:
         """Spawn every shard, then watch them until cancelled or :meth:`stop` is called.
 
         Each shard runs under its own watcher task that relaunches it on an unexpected exit (when
-        ``restart``). Every route drains all children the same way: :meth:`stop` ending the
-        watchers, a cancellation, or a watcher that raised, so no failure leaves sibling engine
-        shards running undrained. A drain that could not stop a child, or an abandoned launch, raises
-        :class:`ShardDrainError`, which outranks the other outcomes.
+        ``restart``). A cancellation, a watcher that raised, and :meth:`stop` once the watchers
+        return all drain every child the same way. A drain that may have left a child running (one
+        the force could not end, or a launch abandoned at shutdown) raises
+        :class:`ShardDrainError`, which outranks the other outcomes, except a fatal BaseException a
+        watcher raised, which propagates chained to it. Known limit: :meth:`stop` while a launch
+        hangs does not end ``run``, since only a cancellation bounds the launch.
         """
         self._stopping.clear()
         self.crash_looped.clear()
@@ -381,10 +386,15 @@ class Supervisor:
             w.cancel()
         drain, cancelled = await _finish_despite_cancel(self._drain(watchers, raised))
         if (failure := drain.exception()) is not None:
-            # A failed drain left a child running, which outranks ``raised``, so log that here.
+            if raised is not None and not isinstance(raised, (Exception, asyncio.CancelledError)):
+                # A fatal exit (SystemExit, KeyboardInterrupt) is never replaced, even by this.
+                logger.error("supervise: the drain also failed: %s", failure)
+                raise raised from failure
+            # A failed drain may have left a child running, which outranks ``raised``.
             if isinstance(raised, Exception):
                 logger.error(
-                    "supervise: an engine shard watcher failed before the drain failed: %r", raised
+                    "supervise: an engine shard watcher failed before the drain failed",
+                    exc_info=raised,
                 )
             raise failure
         if raised is None:
@@ -502,14 +512,17 @@ class Supervisor:
         clean up at all. So the spawn is let finish, the child registered and logged, and only
         then is the cancellation raised, leaving :meth:`_terminate_all` to stop the child. A spawn
         still running ``terminate_grace`` after the cancellation is cancelled and abandoned, so a
-        launch that never returns cannot keep the supervisor from stopping its siblings. Its child
-        may exist, so the drain reports it as stranded, and a process it returns later is killed."""
+        launch that never returns cannot keep a cancelled supervisor from stopping its siblings (a
+        :meth:`stop` alone does not bound it). Its child MAY remain, so the drain reports it as
+        possibly stranded, though a cancelled default spawn reaps its own child; a process the
+        launch returns later is killed."""
         launch, cancelled = await _finish_despite_cancel(
             self.spawn(spec), grace=self.terminate_grace
         )
         if not launch.done():
             logger.error(
-                "engine shard %r: the launch had not returned %gs into shutdown; abandoned",
+                "engine shard %r: the launch had not returned %gs into shutdown; abandoned. A "
+                "child may remain, though a cancelled default spawn reaps its own",
                 spec.shard,
                 self.terminate_grace,
             )
@@ -554,8 +567,9 @@ class Supervisor:
 
     def stop(self) -> None:
         """Signal a cooperative shutdown (idempotent). The watchers stop relaunching and return, so
-        the running :meth:`run` drains the children itself — no cancellation needed. Safe to call
-        from a signal handler."""
+        the running :meth:`run` drains the children itself — no cancellation needed. Known limit: a
+        watcher whose launch never returns does not return either, so ``run`` waits on it until it
+        is cancelled. Safe to call from a signal handler."""
         self._stopping.set()
 
     def _request_stop(self, child: _Child) -> None:
@@ -589,10 +603,7 @@ class Supervisor:
         to the force; a child the force could not end is raised once every child has been tried,
         so ``run`` does not end as a clean shutdown with it still running."""
         live = [c for c in self._children.values() if c.process.returncode is None]
-        stranded: list[BaseException] = [
-            RuntimeError(f"engine shard {shard!r}: launch abandoned at shutdown")
-            for shard in self._abandoned
-        ]
+        stranded: list[BaseException] = []
         for child in live:
             try:
                 self._request_stop(child)
@@ -630,9 +641,17 @@ class Supervisor:
                     )
                     logger.error("%s; leaving it", message)
                     stranded.append(RuntimeError(message))
+        # After the real failures, so the error's cause names one of those when there is one.
+        stranded.extend(
+            RuntimeError(
+                f"engine shard {shard!r}: launch abandoned at shutdown; a child may remain, though "
+                "a cancelled default spawn reaps its own"
+            )
+            for shard in self._abandoned
+        )
         if stranded:
             raise ShardDrainError(
-                f"{len(stranded)} engine shard child(ren) could not be stopped: {stranded[0]}"
+                f"{len(stranded)} engine shard child(ren) may still be running: {stranded[0]}"
             ) from stranded[0]
 
 
@@ -706,8 +725,8 @@ async def supervise(
     Installs SIGINT/SIGTERM handlers (when ``install_signal_handlers``) that trigger a clean drain.
     Runs while any engine shard is alive. Returns 0 on a clean shutdown, 1 when every engine shard
     tripped the crash-loop breaker, 2 on a config/discovery error, which includes a graph
-    ``registry_guard`` refuses (:func:`discover_shard_specs`), and 3 when the shutdown drain left an
-    engine shard's child running (:class:`ShardDrainError`), which outranks 0 and 1.
+    ``registry_guard`` refuses (:func:`discover_shard_specs`), and 3 when the shutdown drain may
+    have left an engine shard's child running (:class:`ShardDrainError`), which outranks 0 and 1.
 
     While the engine shards run, a :class:`~messagefoundry.pipeline.crl_reload.CrlReloadRunner`
     applies a replaced CRL file to this process's own TLS contexts, as an engine process's runner
@@ -887,7 +906,7 @@ async def _run_supervisor(
         )
     if drain_failure is not None:
         logger.error(
-            "supervise: the shutdown drain failed: %s; check for a stranded process", drain_failure
+            "supervise: the shutdown drain failed: %s; a process may be stranded", drain_failure
         )
         return 3
     return 1 if len(supervisor.crash_looped) == len(specs) else 0
