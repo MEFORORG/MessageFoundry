@@ -41,6 +41,7 @@ from types import ModuleType
 from typing import Any
 
 from pydantic import BaseModel
+from pydantic_core import PydanticUndefined
 
 MODELS_MODULE = "messagefoundry.api.models"
 AUTH_MODELS_MODULE = "messagefoundry.api.auth_models"
@@ -201,24 +202,51 @@ def _is_dto(obj: object) -> bool:
 
 
 def _field_annotations(dto: type) -> list[object]:
+    return [annotation for _name, annotation in _named_annotations(dto)]
+
+
+def _named_annotations(dto: type) -> list[tuple[str, object]]:
+    """``(field name, resolved annotation)`` for every rendered field of a DTO.
+
+    A Pydantic model's computed fields are included (BACKLOG #5471): the console renders one exactly
+    like a stored field, so a DTO, enum or literal reachable only through its return type is contract
+    too. A dataclass's annotations are RESOLVED with ``typing.get_type_hints``: under ``from
+    __future__ import annotations`` ``Field.type`` is a bare string, which ``typing.get_args`` sees
+    straight through, so a nested DTO, enum or literal behind it was silently missed.
+
+    The rendered-field rule (stored plus computed) matches ``_dto_fields`` in
+    ``scripts/webconsole_seam_snapshot.py``, which records the NAMES; keep the two in step.
+    """
     if isinstance(dto, type) and issubclass(dto, BaseModel):
         try:
             fields = dto.model_fields
+            computed = dto.model_computed_fields
         except Exception as exc:  # unresolved forward ref / pending model_rebuild
             raise SeamDiscoveryError(
                 f"{dto.__module__}.{dto.__name__}: model fields are unresolvable ({exc}); "
                 "the closure cannot be completed, so the surface would be under-covered"
             ) from exc
-        annotations: list[object] = [f.annotation for f in fields.values()]
-        _refuse_unresolved(dto, annotations)
-        return annotations
-    # Reached only for a dataclass DTO -- _is_dto() gates every caller, and mypy cannot carry that
-    # narrowing across the call boundary.
-    return [f.type for f in dataclasses.fields(typing.cast("Any", dto))]
+        named: list[tuple[str, object]] = [(n, f.annotation) for n, f in fields.items()]
+        named += [(n, c.return_type) for n, c in computed.items()]
+    else:
+        # Reached only for a dataclass DTO -- _is_dto() gates every caller, and mypy cannot carry
+        # that narrowing across the call boundary.
+        try:
+            # The defining module's globals are get_type_hints' default namespace for a class.
+            hints = typing.get_type_hints(dto, include_extras=True)
+        except Exception as exc:  # NameError on an unresolvable string annotation, typically
+            raise SeamDiscoveryError(
+                f"{dto.__module__}.{dto.__qualname__}: field annotations are unresolvable "
+                f"({exc}); the closure cannot be completed, so the surface would be under-covered"
+            ) from exc
+        # Fields only: get_type_hints also returns ClassVar annotations, which are not fields.
+        named = [(f.name, hints[f.name]) for f in dataclasses.fields(typing.cast("Any", dto))]
+    _refuse_unresolved(dto, [annotation for _name, annotation in named])
+    return named
 
 
 def _refuse_unresolved(dto: type, annotations: list[object]) -> None:
-    """Raise if any annotation is still a ``ForwardRef``.
+    """Raise if any annotation is still a ``ForwardRef``, a bare string, or missing.
 
     Pydantic resolves string annotations at class-build time, but NOT when the referenced class is
     defined later in the module and nobody called ``model_rebuild()``. The field's annotation then
@@ -229,18 +257,33 @@ def _refuse_unresolved(dto: type, annotations: list[object]) -> None:
     reached through such a field was NOT covered, so renaming its field moved nothing -- the exact
     silent-skip this module's docstring forbids, reproduced inside the walk it warns about. Loud,
     because a skip here is indistinguishable from full coverage at every downstream vantage point.
+
+    A bare string is the same hole in another form (BACKLOG #5471), and so is a computed field whose
+    return type Pydantic could not determine. ``Literal`` values and ``Annotated`` metadata are not
+    type positions, so a string there is data and is not refused.
     """
     for annotation in annotations:
         stack = [annotation]
         while stack:
             current = stack.pop()
-            if isinstance(current, typing.ForwardRef):
+            if isinstance(current, typing.ForwardRef | str):
                 raise SeamDiscoveryError(
                     f"{dto.__module__}.{dto.__qualname__}: field annotation {current!r} is an "
                     "UNRESOLVED ForwardRef, so the nested-model closure cannot see through it and "
                     "the contract would be silently under-covered. Define the referenced model "
                     "BEFORE this one, or call model_rebuild() on it."
                 )
+            if current is PydanticUndefined:
+                raise SeamDiscoveryError(
+                    f"{dto.__module__}.{dto.__qualname__}: a computed field has no return type, so "
+                    "the nested-model closure cannot see through it"
+                )
+            origin = typing.get_origin(current)
+            if origin is typing.Literal:
+                continue
+            if origin is typing.Annotated:
+                stack.append(typing.get_args(current)[0])
+                continue
             stack.extend(typing.get_args(current))
 
 
@@ -336,13 +379,14 @@ def literals_in_surface(dtos: set[type]) -> dict[str, tuple[str, ...]]:
     ``_SCOPE_NOTES[data.scope]``. Renaming a literal would KeyError at runtime while a field-NAME
     snapshot stayed byte-identical -- the same failure class the gate exists to catch, on the very
     field whose addition already slipped through.
+
+    Dataclass DTOs and computed fields are read too (BACKLOG #5471); this used to read Pydantic
+    stored fields only.
     """
     out: dict[str, tuple[str, ...]] = {}
     for dto in dtos:
-        if not (isinstance(dto, type) and issubclass(dto, BaseModel)):
-            continue
-        for field_name, field in dto.model_fields.items():
-            values = _literal_values(field.annotation)
+        for field_name, annotation in _named_annotations(dto):
+            values = _literal_values(annotation)
             if values:
                 out[f"{dto.__module__}.{dto.__qualname__}.{field_name}"] = values
     return out
@@ -509,28 +553,16 @@ def _with_nested_auth_service_types(service: ModuleType, names: set[str]) -> set
 
     The console reads ``outcome.elevation.token`` through ``OidcStepUp.elevation``. Without this,
     ``Elevation``'s fields would be in the seam only because another route happens to import it.
-    Stdlib dataclasses here hold their annotations as strings, so they are resolved with
-    ``typing.get_type_hints``; one that cannot be resolved fails loud rather than being skipped.
+    Stdlib dataclasses here hold their annotations as strings; :func:`_named_annotations` resolves
+    them, and one that cannot be resolved fails loud rather than being skipped.
     """
     out = set(names)
     queue = [getattr(service, n) for n in sorted(names)]
     while queue:
         cls = queue.pop()
-        if isinstance(cls, type) and issubclass(cls, BaseModel):
-            annotations = _field_annotations(cls)
-        elif isinstance(cls, type) and dataclasses.is_dataclass(cls):
-            try:
-                hints = typing.get_type_hints(cls)
-            except Exception as exc:  # NameError on an unresolvable string annotation, typically
-                raise SeamDiscoveryError(
-                    f"{cls.__module__}.{cls.__qualname__}: field annotations are "
-                    f"unresolvable ({exc}), so a nested class could be missed"
-                ) from exc
-            # Fields only: get_type_hints also returns ClassVar annotations, which are not fields.
-            annotations = [hints[f.name] for f in dataclasses.fields(cls)]
-        else:
+        if not _is_dto(cls):
             continue
-        stack: list[object] = list(annotations)
+        stack: list[object] = _field_annotations(cls)
         while stack:
             current = stack.pop()
             if isinstance(current, list):  # Callable[[X, Y], R] holds its parameters in a list
