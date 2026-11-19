@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
+"""A bearer token request that cannot be built is classified, on REST and FHIR (BACKLOG #5795, #5797).
+
+The token provider raises ``DeliveryError`` for a failed mint, but a request it cannot build or
+encode (an over-length token URL or proxy credential, a header value ``http.client`` refuses) raises
+a plain ``ValueError``. Before these rows that escaped ``send()`` and the test-connection probe
+unclassified. A delivery now gets a permanent configuration fault, so the lane stops and the queue
+is kept; a probe gets a plain ``DeliveryError``, its only failure type.
+"""
+
+from __future__ import annotations
+
+import urllib.request
+
+import pytest
+
+from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.wiring import FHIR, Rest
+from messagefoundry.transports import build_destination
+from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.fhir import FhirDestination
+from messagefoundry.transports.rest import TOKEN_REQUEST_REFUSED_CODE, RestDestination
+
+REST_URL = "https://api.example.com/ingest"
+FHIR_URL = "https://fhir.example.org/fhir"
+SECRET = "proxy-credential-value"
+SYNTHETIC_PATIENT = '{"resourceType": "Patient", "id": "synthetic-1"}'
+
+
+def _rest() -> RestDestination:
+    d = build_destination(
+        Destination(name="OB_REST", type=ConnectorType.REST, settings=Rest(url=REST_URL).settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    assert isinstance(d, RestDestination)
+    return d
+
+
+def _fhir() -> FhirDestination:
+    d = build_destination(
+        Destination(name="OB_FHIR", type=ConnectorType.FHIR, settings=FHIR(url=FHIR_URL).settings),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    assert isinstance(d, FhirDestination)
+    return d
+
+
+class _UnbuildableTokenRequest:
+    """A provider whose token request cannot be built: the ValueError quotes a credential, as an
+    http.client header check does."""
+
+    def __init__(self) -> None:
+        self.invalidated = False
+
+    def access_token(self) -> str:
+        raise ValueError(f"Invalid header value {SECRET!r}")
+
+    def invalidate(self) -> None:
+        self.invalidated = True
+
+
+class _LongToken:
+    def __init__(self) -> None:
+        self.invalidated = False
+
+    def access_token(self) -> str:
+        return "T" * 9000
+
+    def invalidate(self) -> None:
+        self.invalidated = True
+
+
+class _Opener:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def open(self, req: urllib.request.Request, timeout: float | None = None) -> object:
+        self.calls += 1
+        raise AssertionError("nothing may be sent")
+
+
+@pytest.mark.parametrize("make", [_fhir], ids=["fhir"])
+async def test_an_unbuildable_token_request_is_a_configuration_fault(make: object) -> None:
+    dest = make()  # type: ignore[operator]
+    dest._token_provider = _UnbuildableTokenRequest()
+    opener = _Opener()
+    dest._opener = opener
+    with pytest.raises(NegativeAckError) as err:
+        await dest.send(SYNTHETIC_PATIENT)
+    assert err.value.permanent is True
+    assert err.value.config_fault is True
+    assert err.value.code == TOKEN_REQUEST_REFUSED_CODE
+    assert "ValueError" in str(err.value)
+    # Raised outside the handler: the ValueError, which quotes the credential, is not chained.
+    assert err.value.__cause__ is None and err.value.__context__ is None
+    assert SECRET not in str(err.value)
+    assert opener.calls == 0
+
+
+@pytest.mark.parametrize("make", [_fhir], ids=["fhir"])
+async def test_an_unbuildable_token_request_fails_the_probe_as_a_delivery_error(
+    make: object,
+) -> None:
+    dest = make()  # type: ignore[operator]
+    dest._token_provider = _UnbuildableTokenRequest()
+    opener = _Opener()
+    dest._opener = opener
+    with pytest.raises(DeliveryError) as err:
+        await dest.test_connection()
+    assert type(err.value) is DeliveryError
+    assert err.value.__cause__ is None and err.value.__context__ is None
+    assert SECRET not in str(err.value)
+    assert opener.calls == 0

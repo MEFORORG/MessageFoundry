@@ -414,6 +414,46 @@ def auth_challenge_refused(label: str) -> NegativeAckError:
     )
 
 
+#: ``NegativeAckError.code`` of a send refused by :func:`mint_bearer`.
+TOKEN_REQUEST_REFUSED_CODE = "token-request-refused"  # nosec B105 -- a failure code, not a credential
+
+
+def _token_request_refusal(label: str, exc: ValueError) -> str:
+    # By class only: the ValueError an http.client header check raises quotes the refused value,
+    # which on the token hop can be the proxy credential.
+    return (
+        f"{label} could not send its bearer-token request ({type(exc).__name__}); "
+        "check the token endpoint and proxy settings"
+    )
+
+
+def mint_bearer(access_token: Callable[[], str], label: str) -> str:
+    """Call a bearer provider's ``access_token`` for ``label``'s delivery (BACKLOG #5795, #5797).
+
+    The provider raises ``DeliveryError`` for a failed mint, but a token request that cannot be
+    built or encoded raises a plain ``ValueError``: at least an over-length token URL or proxy
+    credential (``enforce_outbound_length_limits``) and a header value ``http.client`` refuses. That
+    is the connection's fault, the same for every queued row, so it becomes a permanent
+    configuration fault: under the default ``credential_fault_policy`` the delivery worker stops
+    the lane and keeps the queue. Raised outside the handler, so the ValueError's text is not
+    chained onto it."""
+    try:
+        return access_token()
+    except ValueError as exc:
+        text = _token_request_refusal(label, exc)
+    raise NegativeAckError(text, code=TOKEN_REQUEST_REFUSED_CODE, permanent=True, config_fault=True)
+
+
+def mint_probe_bearer(access_token: Callable[[], str], label: str) -> str:
+    """:func:`mint_bearer` for a test-connection probe, which raises only a plain
+    :class:`DeliveryError` and carries no fault marker."""
+    try:
+        return access_token()
+    except ValueError as exc:
+        text = _token_request_refusal(label, exc)
+    raise DeliveryError(text)
+
+
 class _NoRedirectHandler(NoRedirectHandler):
     """Refuse to follow HTTP redirects (ASVS 15.3.2): a 3xx could divert a PHI-bearing POST to an
     unintended host. Returning ``None`` makes urllib raise the 3xx as an ``HTTPError`` instead of
