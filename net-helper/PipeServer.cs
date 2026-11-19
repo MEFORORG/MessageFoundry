@@ -2,10 +2,13 @@
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 
 using System;
+using System.ComponentModel;
 using System.IO;
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
+using Microsoft.Win32.SafeHandles;
 
 namespace MessageFoundry.NetHelper
 {
@@ -23,6 +26,9 @@ namespace MessageFoundry.NetHelper
         // read), plus NetOps.CommandTimeout (its netsh run), plus Deadline again (its close): 20 seconds with
         // today's values. The engine-side controller owns the release deadline and must budget for that.
         private static readonly TimeSpan Deadline = TimeSpan.FromSeconds(5);
+
+        // ERROR_NO_DATA (232) as the HRESULT .NET puts on the IOException it raises for it.
+        private const int ErrorNoDataHResult = unchecked((int)0x800700E8);
 
         private static readonly SecurityIdentifier Administrators = new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null);
         private static readonly SecurityIdentifier Network = new SecurityIdentifier(WellKnownSidType.NetworkSid, null);
@@ -60,7 +66,11 @@ namespace MessageFoundry.NetHelper
                 Log.Info("listening on " + PipePath);
                 while (true)
                 {
-                    pipe.WaitForConnection();
+                    if (!Accept(pipe))
+                    {
+                        continue;
+                    }
+
                     try
                     {
                         Serve(pipe, config);
@@ -77,6 +87,43 @@ namespace MessageFoundry.NetHelper
                 }
             }
         }
+
+        // False means a caller connected and closed before this accept ran, so nobody is left to read a reply.
+        // Any bytes it wrote are discarded unread. That differs from a caller that closes after the accept, whose
+        // request is still read and applied, so only a reply tells a caller whether its request ran. A new
+        // instance takes a caller before ConnectNamedPipe runs, so a caller that arrives as the helper starts and
+        // closes at once leaves it closing, and ConnectNamedPipe fails with ERROR_NO_DATA. Left uncaught, that one
+        // early close would stop the helper. Any other failure still propagates and stops it, as before.
+        // tests/accept-dropped-caller.ps1 drives this path.
+        private static bool Accept(NamedPipeServerStream pipe)
+        {
+            try
+            {
+                pipe.WaitForConnection();
+                return true;
+            }
+            catch (IOException ex) when (ex.HResult == ErrorNoDataHResult)
+            {
+                Log.Warn("outcome=dropped reason=\"caller closed before it was accepted: " + ex.Message + "\"");
+
+                // The instance must be disconnected before it can accept again, and pipe.Disconnect refuses a
+                // pipe .NET never saw connected, so this calls DisconnectNamedPipe itself. The same instance is
+                // kept, so the pipe name is never free for another process to take.
+                if (!DisconnectNamedPipe(pipe.SafePipeHandle))
+                {
+                    var failure = new Win32Exception(Marshal.GetLastPInvokeError());
+                    throw new IOException("cannot return the pipe to listening after a caller closed early: " + failure.Message, ex);
+                }
+
+                return false;
+            }
+        }
+
+        // kernel32 is a KnownDLL, so it loads from System32 however NativeAOT binds this import.
+        [DllImport("kernel32.dll", SetLastError = true)]
+        [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool DisconnectNamedPipe(SafePipeHandle hNamedPipe);
 
         // The pipe ACL: deny network logons, allow the configured client account and Administrators to read
         // and write, and keep full control for this process's own account.
