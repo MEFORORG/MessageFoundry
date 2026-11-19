@@ -1221,33 +1221,35 @@ def test_cell_aad_spells_a_number_by_its_value_not_its_type() -> None:
     ts = 1763400000.123456
     assert cell_aad("t", "c", ts) == cell_aad("t", "c", "1763400000.123456")
     assert cell_aad("t", "c", ts) != cell_aad("t", "c", 1763400000)
-    # A str, an int and a non-integral float bind the bytes they bound before; an integral float
-    # ("1000.0" before) is the one spelling that changed.
+    # An int is its decimal text, as before.
     assert cell_aad("t", "c", 5, "x") == cell_aad("t", "c", "5", "x")
 
 
-def test_cell_aad_spells_a_subclass_by_its_value() -> None:
-    # A driver binds an int-valued Enum member as its value, so the reader gets 1, not "K.A".
-    class K(enum.IntEnum):
+def test_cell_aad_spells_a_mixin_enum_member_by_its_value() -> None:
+    # A driver binds a mixin Enum member as its value, so the reader gets 1 or "x". str() spelled
+    # these "K.A" and "S.X", which no column hands back.
+    class K(int, enum.Enum):  # noqa: UP042 - the mixin form is the one str() misspelled
         A = 1
 
-    class S(enum.StrEnum):
+    class S(str, enum.Enum):  # noqa: UP042 - the mixin form is the one str() misspelled
         X = "x"
 
+    assert str(K.A) == "K.A" and str(S.X) == "S.X"  # the control: str() would misspell both
     assert cell_aad("t", "c", K.A) == cell_aad("t", "c", 1)
     assert cell_aad("t", "c", S.X) == cell_aad("t", "c", "x")
 
 
-@pytest.mark.parametrize("bad", [None, True, False, b"x", object()])
-def test_cell_aad_refuses_a_component_str_would_collide_or_misspell(bad: object) -> None:
+@pytest.mark.parametrize("bad", [None, True, False])
+def test_cell_aad_refuses_a_component_str_would_collide(bad: object) -> None:
     # str(None) == "None" and str(True) == "True" would bind the same AAD as those strings. The
-    # refusal is a CipherError too, so a read path contains a NULL or BLOB key like any unopenable cell.
-    with pytest.raises(AADComponentError) as ei:
+    # refusal is a CipherError too, so a read path contains a NULL key like any unopenable cell.
+    with pytest.raises(AADComponentError, match=r"^t\.c: ") as ei:
         cell_aad("t", "c", bad)
     assert isinstance(ei.value, CipherError) and isinstance(ei.value, TypeError)
 
 
-def test_cell_aad_binds_a_lone_surrogate_instead_of_raising() -> None:
-    lone = "k\ud800"
-    assert cell_aad("state", "value", "ns", lone) == cell_aad("state", "value", "ns", lone)
-    assert cell_aad("state", "value", "ns", lone) != cell_aad("state", "value", "ns", "k")
+def test_cell_aad_binds_a_lone_surrogate_to_bytes_no_valid_string_spells() -> None:
+    lone = cell_aad("state", "value", "k\ud800")
+    assert lone.endswith(b"\x00\x00\x00\x04k\xed\xa0\x80")  # surrogatepass, not a lossy replace
+    for valid in ("k", "k?", "k\ufffd"):
+        assert lone != cell_aad("state", "value", valid)

@@ -327,9 +327,10 @@ _GCM_RESERVE_REFILL_AT = _GCM_RESERVE_BLOCK // 2
 # --- cell-bound AAD (ASVS 11.3.3, ADR 0019) -----------------------------------------------------------
 # The scheme tag prefixed into every cell_aad. Its own version so the AAD-construction scheme can evolve
 # additively (a future mfenc-aad/v2 would be a different bound value — a deliberate, migrated change,
-# never a silent one). NOT related to the mfenc marker version. BACKLOG #5962 changed v1's spelling of
-# an integral float key component ("1000.0" became "1000") without a bump: nothing is deployed, and a
-# cell sealed with one never opened from its float column anyway.
+# never a silent one). NOT related to the mfenc marker version. BACKLOG #5962 changed at least v1's
+# spelling of an integral float ("1000.0" became "1000") and of a mixin-Enum member ("E.A" became its
+# value) without a bump, because nothing is deployed. A cell already sealed under the old spelling of
+# either, such as a connection_event reason written with now=1000.0, no longer opens.
 _AAD_SCHEME = b"mfenc-aad/v1"
 
 
@@ -348,16 +349,15 @@ def cell_aad(table: str, column: str, *pk: object) -> bytes:
     the re-encrypt/rotation and cross-backend restore paths must reconstruct the same value. AAD length is
     irrelevant to GCM (it is hashed into the tag), so a verbose, collision-free form is free.
 
-    A component must be a ``str``, an ``int`` or a ``float`` (:func:`_aad_component` says why each
-    other type is refused and how a number is spelled). Any other value raises
-    :class:`AADComponentError`, a :class:`CipherError`, because on a read path it comes from a damaged
-    or planted row, which the caller must contain like any cell that does not open."""
-    fields = (
-        _AAD_SCHEME,
-        table.encode("utf-8"),
-        column.encode("utf-8"),
-        *(_aad_component(p) for p in pk),
-    )
+    :func:`_aad_component` says how each component is spelled. A ``None`` or ``bool`` component raises
+    :class:`AADComponentError`, a :class:`CipherError` naming the table and column, because on a read
+    path it comes from a damaged or planted row, which the caller must contain like any cell that does
+    not open."""
+    try:
+        key = [_aad_component(p) for p in pk]
+    except AADComponentError as exc:
+        raise AADComponentError(f"{table}.{column}: {exc}") from None
+    fields = (_AAD_SCHEME, table.encode("utf-8"), column.encode("utf-8"), *key)
     return b"".join(len(f).to_bytes(4, "big") + f for f in fields)
 
 
@@ -371,10 +371,11 @@ def _aad_component(value: object) -> bytes:
     other float by ``float.__repr__``, which round-trips exactly. The base types' own methods are
     called, so a subclass (an ``int``-valued Enum member, say) is spelled as the value a driver binds,
     never by its own ``__str__``. ``None`` and ``bool`` are refused: ``str()`` would bind them to the
-    same bytes as the strings ``"None"`` and ``"True"``, and no key column holds either. Any other
-    type is refused rather than ``str()``-spelled, since its text form need not match what the
-    column returns. A string is UTF-8 with ``surrogatepass``, so a lone surrogate binds bytes no
-    valid string produces instead of raising here; the backend's own write still refuses one.
+    same bytes as the strings ``"None"`` and ``"True"``, and no key column holds either. A string is
+    UTF-8 with ``surrogatepass``, so a lone surrogate binds bytes no valid string produces instead of
+    raising here; the backend's own write still refuses one. Any other type, such as a BLOB a damaged
+    SQLite row hands back, keeps its ``str()`` spelling, so a keyless open or a read whose cell is
+    NULL does not fail on it.
 
     Not covered: a float bound into a TEXT-affinity key column comes back as the text ``"1000.0"``,
     and an int past 2**53 written to a float column comes back rounded. No key column today takes
@@ -389,9 +390,7 @@ def _aad_component(value: object) -> bytes:
         if float.is_integer(value):
             return int.__repr__(int(value)).encode("ascii")
         return float.__repr__(value).encode("ascii")
-    raise AADComponentError(
-        f"cell_aad key component must be str, int or float, not {type(value).__name__}"
-    )
+    return str(value).encode("utf-8", "surrogatepass")
 
 
 def aad_cell_name(aad: bytes | None) -> tuple[str, str]:
@@ -715,11 +714,12 @@ class CipherError(Exception):
 
 
 class AADComponentError(CipherError, TypeError):
-    """A :func:`cell_aad` key component is not a ``str``, ``int`` or ``float`` (BACKLOG #5962).
+    """A :func:`cell_aad` key component is ``None`` or a ``bool`` (BACKLOG #5962).
 
     A :class:`CipherError`, so a read or rotation path that contains an unopenable cell contains a
-    row whose key column holds a NULL or a BLOB the same way. Also a ``TypeError``, because on a write
-    path it is a caller passing the wrong type. The message names the type, never the row."""
+    row whose key column holds a NULL the same way. Also a ``TypeError``, because on a write path it
+    is a caller passing the wrong type. The message names the table, the column and the refused
+    value, never the row's key."""
 
 
 class TransitSealRefused(Exception):
