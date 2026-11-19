@@ -247,13 +247,13 @@ def test_the_override_text_names_what_is_kept_and_the_engine_shard_limit(
     assert text is not None
     opening = f"keeps {kept} indefinitely" if refused else f"connections' {kept} are retained"
     assert opening in text
+    caveat = "except where a sibling engine shard purges them as stated below"
+    assert (caveat in text) is (inbound_days is not None)
     if inbound_days is None:
         assert "PHI message bodies" not in text
     shard_limit = (
-        "An inbound override is honoured only by an engine whose live graph holds that inbound "
-        "with it: on a config of more than one engine shard, each engine shard purges the shared "
-        "store with the overrides of its own inbounds alone, so a sibling engine shard purges that "
-        "inbound's bodies on the global [security].delete_message_bodies_after_days window"
+        "On a config of more than one engine shard, an inbound override keeps nothing past the "
+        "global [security].delete_message_bodies_after_days window where that window is bounded"
     )
     assert (shard_limit in text) is (inbound_days is not None)
 

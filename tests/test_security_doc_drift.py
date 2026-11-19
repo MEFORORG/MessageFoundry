@@ -3958,7 +3958,12 @@ _OVERRIDE_ARMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "- Without it, under `warn`, the gate passes the graph",
-        (_OVERRIDE_AUDITED, "with the remedy", "what the override holds is kept forever"),
+        (
+            _OVERRIDE_AUDITED,
+            "with the remedy",
+            "what the override holds is kept forever",
+            "subject to the engine-shard limit above",
+        ),
     ),
     ("- With it, the gate passes the graph", (_OVERRIDE_AUDITED,)),
 )
@@ -3967,6 +3972,9 @@ _OVERRIDE_NOTE_FACTS = (
     "each time it passes such a graph",
     "A dry-run reload counts",
     "each engine shard writes its own",
+    # BACKLOG #5967: each engine shard's retention reads its own inbounds' overrides alone.
+    "an inbound's override keeps nothing past a bounded global window",
+    "a sibling engine shard purges those bodies on the global window",
     # The body windows' line is the older rule, left alone by the 2026-11-01 ruling. The other
     # global tiers are not in this claim: an acknowledged one writes its line on either dial.
     "The startup gate for the global body windows differs: it writes its `AUDIT:` line only under "
