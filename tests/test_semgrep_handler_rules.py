@@ -183,6 +183,7 @@ _POSITIVE_CASES: tuple[tuple[str, str], ...] = (
 _NEGATIVE_CASES: tuple[tuple[str, str], ...] = (
     ("mf-handler-phi-to-log", "log.debug(msg.raw)"),
     ("mf-handler-phi-to-log", 'log.info("processed %s", msg.control_id)'),
+    ("mf-handler-ambient-os-exec", "os.fspath(msg.raw)"),  # BACKLOG #5463: the rule's ok case
     ("mf-handler-sqli-db-lookup", 'db_lookup("MPI", "select npi from p where mrn = :mrn"'),
     ("mf-handler-phi-to-log", "log.info(note)"),
     ("mf-handler-phi-to-log", "log.info(self.banner)"),

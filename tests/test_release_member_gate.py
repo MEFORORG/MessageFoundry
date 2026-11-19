@@ -50,6 +50,7 @@ from forbidden_members import (  # noqa: E402
     development_content,
     distribution,
     escapes_root,
+    filename_problem,
     forbidden,
     main,
     split_violation,
@@ -837,6 +838,233 @@ def test_the_cli_refuses_a_hyphen_named_toolkit_sdist_carrying_the_engine(
     assert "ships messagefoundry-toolkit-0.4.0/messagefoundry/__init__.py" in (
         capsys.readouterr().err
     )
+
+
+# The final review of BACKLOG #5470's repair: loosenings in the split rule's root handling and
+# filename parsing. Each CLI case below passed the gate at cecd44aefba.
+
+_TK_ROOT = "messagefoundry_toolkit-0.4.0"
+_TK_SDIST = f"{_TK_ROOT}.tar.gz"
+
+
+def _files(*names: str) -> list[tarfile.TarInfo]:
+    return [tarfile.TarInfo(n) for n in names]
+
+
+def _dot_entry() -> tarfile.TarInfo:
+    """The ``./`` directory entry GNU tar writes first."""
+    dot = tarfile.TarInfo("./")
+    dot.type = tarfile.DIRTYPE
+    return dot
+
+
+def test_a_parent_segment_is_resolved_before_the_root_is_stripped() -> None:
+    member = f"{_TK_ROOT}/../{_TK_ROOT}/messagefoundry/x.py"
+    assert split_violation(member, "messagefoundry-toolkit", _TK_ROOT) is not None
+
+
+def test_the_cli_refuses_a_root_climbing_back_into_itself(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    member = f"{_TK_ROOT}/../{_TK_ROOT}/messagefoundry/x.py"
+    sdist = _write_tar(tmp_path / "dist" / _TK_SDIST, _files(f"{_TK_ROOT}/PKG-INFO", member))
+    assert main([str(sdist)]) == 1
+    assert f"ships {member}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "stray",
+    [
+        "setup.py",  # a stray top-level file beside the root
+        "other-0.1/PKG-INFO",  # a second root: a multi-root sdist
+        f"{_TK_ROOT}/../elsewhere/x.py",  # a second top level reached through a parent segment
+    ],
+)
+def test_the_cli_refuses_an_sdist_without_exactly_one_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], stray: str
+) -> None:
+    sdist = _write_tar(
+        tmp_path / "dist" / _TK_SDIST,
+        _files(f"{_TK_ROOT}/PKG-INFO", f"{_TK_ROOT}/messagefoundry/x.py", stray),
+    )
+    assert main([str(sdist)]) == 1
+    assert "top-level entries" in capsys.readouterr().err
+
+
+def test_the_cli_refuses_an_sdist_with_no_root_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sdist = _write_tar(tmp_path / "dist" / _TK_SDIST, _files("PKG-INFO"))
+    assert main([str(sdist)]) == 1
+    assert "no top-level directory" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("spelling", [_TK_ROOT.upper(), f"{_TK_ROOT}.", f"{_TK_ROOT} "])
+def test_a_case_or_trailing_dot_spelling_of_the_root_is_the_same_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], spelling: str
+) -> None:
+    """Through the public path, so the root derivation itself is what is tested."""
+    sdist = _write_tar(
+        tmp_path / "dist" / _TK_SDIST,
+        _files(f"{spelling}/PKG-INFO", f"{_TK_ROOT}/messagefoundry/x.py"),
+    )
+    assert main([str(sdist)]) == 1
+    err = capsys.readouterr().err
+    assert f"ships {_TK_ROOT}/messagefoundry/x.py" in err
+    assert "top-level" not in err
+
+
+def test_gnu_tar_s_dot_entry_does_not_hide_the_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sdist = _write_tar(
+        tmp_path / "dist" / _TK_SDIST,
+        [_dot_entry(), *_files(f"./{_TK_ROOT}/PKG-INFO", f"./{_TK_ROOT}/messagefoundry/x.py")],
+    )
+    assert main([str(sdist)]) == 1
+    err = capsys.readouterr().err
+    assert f"ships ./{_TK_ROOT}/messagefoundry/x.py" in err
+    assert "top-level" not in err
+
+
+def test_a_clean_rooted_toolkit_sdist_with_a_dot_entry_passes(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Control for the root refusals: one root, a GNU ``./`` entry, and nothing engine-named."""
+    sdist = _write_tar(
+        tmp_path / "dist" / _TK_SDIST,
+        [
+            _dot_entry(),
+            *_files(f"./{_TK_ROOT}/PKG-INFO", f"./{_TK_ROOT}/messagefoundry_toolkit/x.py"),
+        ],
+    )
+    assert main([str(sdist)]) == 0, capsys.readouterr().err
+
+
+def test_a_zip_sdist_has_its_root_derived_and_checked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    rooted = _write_wheel(
+        tmp_path / "a" / f"{_TK_ROOT}.zip",
+        (f"{_TK_ROOT}/PKG-INFO", f"{_TK_ROOT}/messagefoundry/x.py"),
+    )
+    assert main([str(rooted)]) == 1
+    assert f"ships {_TK_ROOT}/messagefoundry/x.py" in capsys.readouterr().err
+    two_roots = _write_wheel(
+        tmp_path / "b" / f"{_TK_ROOT}.zip", (f"{_TK_ROOT}/PKG-INFO", "other-0.1/PKG-INFO")
+    )
+    assert main([str(two_roots)]) == 1
+    assert "top-level entries" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "messagefoundry_toolkit-0.4.0.dist-info/METADATA",
+        "messagefoundry_toolkit-0.4.0.data/purelib/x.py",
+        "messagefoundry-0.4.0/messagefoundry-toolkit-0.4.0/x.py",
+        "messagefoundry-toolkit/x.py",
+    ],
+)
+def test_an_engine_archive_may_not_carry_a_toolkit_entry_in_any_spelling(member: str) -> None:
+    assert split_violation(member, "messagefoundry") is not None
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "messagefoundry-dev.whl",
+        "messagefoundry-v0.4.0.tar.gz",
+        "messagefoundry-foo-1.0-py3-none-any.whl",  # read as the engine before BACKLOG #5470
+        "messagefoundryx-1.0-py3-none-any.whl",
+        "poisoned.whl",
+    ],
+)
+def test_a_filename_naming_no_known_distribution_is_refused(filename: str) -> None:
+    assert filename_problem(Path(filename)) is not None
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "messagefoundry-0.4.0-py3-none-any.whl",
+        "messagefoundry-0.4.0.tar.gz",
+        "messagefoundry_toolkit-0.4.0-py3-none-any.whl",
+        "messagefoundry_harness-0.4.0-py3-none-any.whl",
+        "messagefoundry_webconsole-0.4.0-py3-none-any.whl",
+        "unrelated-1.0-py3-none-any.whl",  # no MessageFoundry name: no split rule, as before
+    ],
+)
+def test_a_filename_naming_a_known_distribution_is_placed(filename: str) -> None:
+    assert filename_problem(Path(filename)) is None
+
+
+@pytest.mark.parametrize(
+    "filename", ["messagefoundry-dev.whl", "messagefoundry-v0.4.0-py3-none-any.whl"]
+)
+def test_the_cli_refuses_an_unparseable_filename_and_applies_both_split_rules(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], filename: str
+) -> None:
+    wheel = _write_wheel(
+        tmp_path / "dist" / filename,
+        ("messagefoundry_toolkit/__init__.py", "messagefoundry/__init__.py"),
+    )
+    assert main([str(wheel)]) == 1
+    err = capsys.readouterr().err
+    assert f"refuses {filename}: its filename has no <name>-<version> shape" in err
+    # The engine rule and the toolkit rule both still run on the members.
+    assert "ships messagefoundry_toolkit/__init__.py" in err
+    assert "ships messagefoundry/__init__.py" in err
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "messagefoundry.harness-0.4.0-py3-none-any.whl",
+        "Messagefoundry_Harness-0.4.0-py3-none-any.whl",
+    ],
+)
+def test_only_the_exact_harness_spelling_is_exempt(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], filename: str
+) -> None:
+    wheel = _write_wheel(
+        tmp_path / "harness-dist" / filename, ("harness/__init__.py", "harness/tests/test_x.py")
+    )
+    assert main([str(wheel)]) == 1
+    assert "test or development content" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "member",
+    ["messagefoundry.toml", "messagefoundry.md", "MessageFoundry.TOML", "x/messagefoundry.py"],
+)
+def test_a_toolkit_doc_or_config_file_named_for_the_engine_passes(member: str) -> None:
+    assert split_violation(member, "messagefoundry-toolkit") is None
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "messagefoundry",  # a directory entry or an extensionless file
+        "messagefoundry.toml.py",
+        "messagefoundry.md/x.py",  # a directory, whatever its suffix
+        "messagefoundry.pyi",
+        "messagefoundry-0.4.0.md",  # an engine <name>-<version> entry, whatever follows
+        f"{_TK_ROOT}/../messagefoundry.py",
+    ],
+)
+def test_a_toolkit_code_member_named_for_the_engine_is_still_refused(member: str) -> None:
+    assert split_violation(member, "messagefoundry-toolkit", _TK_ROOT) is not None
+
+
+def test_the_cli_passes_a_toolkit_sdist_with_an_engine_named_config_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sdist = _write_tar(
+        tmp_path / "dist" / _TK_SDIST,
+        _files(f"{_TK_ROOT}/PKG-INFO", f"{_TK_ROOT}/messagefoundry.toml"),
+    )
+    assert main([str(sdist)]) == 0, capsys.readouterr().err
 
 
 # --------------------------------------------------------------------------------------------------

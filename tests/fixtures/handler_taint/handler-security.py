@@ -64,6 +64,9 @@ def h_aliased(msg):
     os.system(msg.raw)
     # ruleid: mf-handler-ambient-os-exec
     osp(msg.text)
+    # A sibling os call that runs nothing, so a rule widened to every os.$F(...) fires here.
+    # ok: mf-handler-ambient-os-exec
+    os.fspath(msg.raw)
     return Send("OB", msg)  # noqa: F821
 
 

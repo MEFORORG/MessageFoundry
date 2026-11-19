@@ -13,11 +13,15 @@ script is the release-time backstop for the same class, and it asks the other qu
 
 TWO PROPERTIES MAKE THIS A DIFFERENT CHECK, NOT A SECOND COPY OF THE ALLOWLIST.
 
-1. It is a DENYLIST over the basename and the path components, so it is immune to the prefix-laundering
-   the allowlist had to be hardened against. That gate derives one archive root and strips it, because
-   ``docs/messagefoundry/security/PRIVATE.md`` inside a ``messagefoundry-0.3.0/`` root laundered itself
-   into an allowlisted path. A basename is the same string wherever the member sits, so there is no
-   prefix to launder and nothing to strip.
+1. Its first two rules are DENYLISTS over the basename and every path component, so they are immune
+   to the prefix-laundering the allowlist had to be hardened against. That gate derives one archive
+   root and strips it, because ``docs/messagefoundry/security/PRIVATE.md`` inside a
+   ``messagefoundry-0.3.0/`` root laundered itself into an allowlisted path. A basename is the same
+   string wherever the member sits, so those two rules have no prefix to launder and nothing to
+   strip. The third rule, the engine and toolkit split, is the exception: its toolkit half reads a
+   member's FIRST component, so it does derive the archive's root from the listing, as the leak gate
+   does, refuses any archive but a wheel that lacks exactly one, and tests each member both with and
+   without that root (:func:`_archive_root`, :func:`_split_candidates`).
 
 2. It covers the distributions the allowlist never reached. The allowlist runs on ``dist/*.tar.gz``
    alone. The engine WHEEL, the console wheel and the harness wheel had no member gate at all -- and
@@ -114,6 +118,27 @@ ENGINE_DISTRIBUTION = "messagefoundry"
 TOOLKIT_DISTRIBUTION = "messagefoundry-toolkit"
 TOOLKIT_PACKAGE = "messagefoundry_toolkit"
 
+#: Every distribution this repository publishes, as PEP 503 normalised names. An archive whose
+#: filename names a ``messagefoundry`` distribution outside this set is refused, and so is one whose
+#: filename has no ``<name>-<version>`` shape at all (:func:`filename_problem`): the split rule is
+#: keyed on the filename, so a name it cannot place would otherwise get no split rule, where reading
+#: up to the first hyphen used to give ``messagefoundry-dev.whl`` the engine's (BACKLOG #5470).
+KNOWN_DISTRIBUTIONS: frozenset[str] = frozenset(
+    {
+        ENGINE_DISTRIBUTION,
+        TOOLKIT_DISTRIBUTION,
+        "messagefoundry-harness",
+        "messagefoundry-webconsole",
+    }
+)
+
+#: What may follow ``messagefoundry.`` in a top-level FILE of a toolkit archive: documentation and
+#: configuration, which Python never imports. Every other suffix, and none, is refused, so a module,
+#: ``.pth``, extension module or a suffix nobody listed stays refused; only this list is let through.
+_INERT_SUFFIXES: frozenset[str] = frozenset(
+    {"md", "rst", "txt", "toml", "json", "yaml", "yml", "cfg", "ini"}
+)
+
 #: Engine paths ADR 0201 has moved into the toolkit, each as its run of path components. An engine
 #: archive carrying one as a CONSECUTIVE run is refused, wheel or sdist. A retired path stays
 #: retired, so this list only grows, one entry in the slice that retires each path.
@@ -187,18 +212,25 @@ def _members(archive: Path) -> list[tuple[str, bool]]:
     )
 
 
-def _common_root(names: Sequence[str]) -> str | None:
-    """The one top-level directory every member of a tar sits under, or ``None``.
+def _archive_root(names: Sequence[str]) -> tuple[str | None, str | None]:
+    """``(root, None)`` for the one top-level directory every member sits under, normalised, or
+    ``(None, why)`` when the listing has no such single directory.
 
     An sdist puts everything under one ``<name>-<version>/`` root whatever the version looks like,
     and the toolkit test reads the FIRST component, so the split rule tests each member without it
     too (BACKLOG #5470). Derived from the listing, as the sdist leak gate does, not guessed from a
-    version shape."""
-    firsts = {tuple(_parts(n))[:1] for n in names}
-    if len(firsts) != 1 or not any(len(_parts(n)) > 1 for n in names):
-        return None
-    (first,) = firsts
-    return first[0] if first else None
+    version shape. Each member is read as an extractor writes it: ``..`` applied, ``.`` and empty
+    components (GNU tar's ``./`` entry) dropped, and the first component normalised, so a case or
+    trailing-dot spelling of the root is the same root. A listing with two top-level entries, or
+    with no directory at all, has no root to strip, and :func:`inspect` refuses it rather than
+    silently testing every member unstripped."""
+    resolved = [r for n in names if (r := _resolve_dots(_parts(n))[0])]
+    firsts = sorted({_normalise(r[0]) for r in resolved})
+    if len(firsts) == 1 and any(len(r) > 1 for r in resolved):
+        return firsts[0], None
+    if len(firsts) > 1:
+        return None, f"it has {len(firsts)} top-level entries ({', '.join(firsts[:5])})"
+    return None, "it has no top-level directory"
 
 
 def _normalise(part: str) -> str:
@@ -358,38 +390,59 @@ def escapes_root(member: str) -> str | None:
 
 def _split_candidates(member: str, root: str | None) -> list[list[str]]:
     """Every reading of ``member`` the split rule tests, normalised: as written and with ``..``
-    applied, each also without the archive's common ``root`` when it has one (BACKLOG #5470).
-    Every reading is tested, so stripping a root cannot hide a ``<name>.data/`` tree."""
+    applied, each also without the archive's common ``root`` when it starts with it (BACKLOG
+    #5470). The root is stripped AFTER ``..`` is applied as well as before, so
+    ``<root>/../<root>/messagefoundry/x.py`` is read as the ``messagefoundry/x.py`` an extractor
+    writes. Every reading is tested, so stripping a root cannot hide a ``<name>.data/`` tree."""
+    # Resolved and stripped on the components as written: normalising first would turn ``..`` into
+    # an empty string that no longer climbs.
     raw = _parts(member)
-    readings = [raw]
-    if root is not None and raw[:1] == [root]:
-        readings.append(raw[1:])
-    readings += [_resolve_dots(parts)[0] for parts in readings]
+    readings = [raw, _resolve_dots(raw)[0]]
+    if root is not None:
+        key = _normalise(root)
+        readings += [parts[1:] for parts in readings if parts and _normalise(parts[0]) == key]
+        readings += [_resolve_dots(parts)[0] for parts in readings]
     unique = dict.fromkeys(tuple(_normalise(p) for p in parts) for parts in readings if parts)
     return [list(parts) for parts in unique]
 
 
-def _names_engine(part: str) -> bool:
-    """Whether one normalised component installs as the engine: its package or module by stem,
-    or its ``<name>-<version>.dist-info`` or sdist root by name."""
+def _canonical(name: str) -> str:
+    """``name`` with every run of ``-``, ``_`` and ``.`` read as one ``-``, the PEP 503 form."""
+    return re.sub(r"[-_.]+", "-", name)
+
+
+def _versioned_as(part: str, dist: str) -> bool:
+    """Whether one normalised component is a ``<name>-<version>`` entry for ``dist``: its
+    ``.dist-info``, ``.data`` or ``.egg-info`` directory, or its sdist root."""
     name = _name_version(part)
-    return _stem(part) == ENGINE_DISTRIBUTION or (
-        name is not None and re.sub(r"[-_.]+", "-", name) == ENGINE_DISTRIBUTION
-    )
+    return name is not None and _canonical(name) == dist
+
+
+def _names_dist(part: str, dist: str) -> bool:
+    """Whether one normalised component names ``dist``: its import name by stem, in any PEP 503
+    spelling, or any ``<name>-<version>`` entry for it."""
+    return _canonical(_stem(part)) == dist or _versioned_as(part, dist)
 
 
 def _split_rule(parts: list[str], dist: str) -> str | None:
     """Why one normalised reading breaks the split for ``dist``, or ``None``."""
     if dist == ENGINE_DISTRIBUTION:
-        if any(part.split(".", 1)[0] == TOOLKIT_PACKAGE for part in parts):
+        if any(_names_dist(part, TOOLKIT_DISTRIBUTION) for part in parts):
             return f"a path named for {TOOLKIT_PACKAGE!r} belongs to the toolkit distribution"
         for retired in RETIRED_ENGINE_PATHS:
             if _has_retired_run(parts, retired):
                 return f"{'/'.join(retired)} moved to the toolkit distribution (ADR 0201)"
     elif dist == TOOLKIT_DISTRIBUTION:
-        if _names_engine(parts[0]):
+        first = parts[0]
+        if _versioned_as(first, ENGINE_DISTRIBUTION):
+            return "the toolkit may not carry an engine <name>-<version> entry (ADR 0201)"
+        # A directory named for the engine, or a top-level file Python could import as it. A
+        # documentation or configuration file of that name is neither (_INERT_SUFFIXES).
+        if _stem(first) == ENGINE_DISTRIBUTION and (
+            len(parts) > 1 or first.partition(".")[2] not in _INERT_SUFFIXES
+        ):
             return "the toolkit may not write into the engine's package directory (ADR 0201)"
-        if parts[0].endswith(".data"):
+        if first.endswith(".data"):
             return "the toolkit ships no wheel .data tree, which installs outside its package"
     return None
 
@@ -397,11 +450,13 @@ def _split_rule(parts: list[str], dist: str) -> str | None:
 def split_violation(member: str, dist: str, root: str | None = None) -> str | None:
     """Why ``member`` breaks the engine and toolkit split for distribution ``dist``, or ``None``.
 
-    An engine archive may carry nothing named for the toolkit's import package, as a directory, a
-    module or a ``.pth`` (any component whose stem is ``messagefoundry_toolkit``), and no retired
-    engine path. A toolkit archive may carry nothing whose first component installs as the
-    engine (``messagefoundry`` by stem, or an engine ``<name>-<version>`` directory),
-    and no ``<name>.data/`` tree at all: PEP 427 installs ``purelib``, ``platlib``, ``scripts`` and
+    An engine archive may carry nothing named for the toolkit, as a directory, a module or a
+    ``.pth`` (any component whose stem is ``messagefoundry_toolkit`` in any PEP 503 spelling), or a
+    toolkit ``<name>-<version>`` entry, and no retired engine path. A toolkit archive may carry no
+    first component that installs as the engine: a ``messagefoundry`` directory, a top-level
+    ``messagefoundry`` file other than documentation or configuration (:data:`_INERT_SUFFIXES`), or
+    an engine ``<name>-<version>`` entry. Nor may it carry a ``<name>.data/`` tree at all: PEP 427
+    installs ``purelib``, ``platlib``, ``scripts`` and
     ``data`` outside the package, where each can overwrite the engine's package or its console
     script. The toolkit has no reason to ship one, so refusing the whole class is simpler than
     modelling each scheme. That is the split-package shape ADR 0201 rejects. Every other
@@ -425,21 +480,46 @@ def distribution(archive: Path) -> str:
     digit. A conforming name is written with underscores, but a hyphenated one
     (``messagefoundry-toolkit-0.4.0.tar.gz``) must not read as its first word, which named the
     engine and skipped the toolkit rule (BACKLOG #5470). A filename with no version segment yields
-    its whole stem. A name no rule names is never exempt from the test-content rule, and the split
-    rule does not run for it: that rule is keyed on the two names it was written for.
+    its whole stem, and :func:`filename_problem` refuses that archive, so such a name is only ever
+    used to report it.
     """
-    return re.sub(r"[-_.]+", "-", _declared_name(archive)).casefold()
+    return _canonical(_declared_name(archive)).casefold()
 
 
-def _declared_name(archive: Path) -> str:
-    """The name part of ``archive``'s filename as written, before normalisation."""
+def _filename_stem(archive: Path) -> str:
+    """``archive``'s filename without the archive suffix this gate reads."""
     name = archive.name
     lowered = name.lower()
     for suffix in (".tar.gz", ".tgz", ".whl", ".zip"):
         if lowered.endswith(suffix):
-            name = name[: -len(suffix)]
-            break
-    return _name_version(name) or name
+            return name[: -len(suffix)]
+    return name
+
+
+def _declared_name(archive: Path) -> str:
+    """The name part of ``archive``'s filename as written, before normalisation."""
+    stem = _filename_stem(archive)
+    return _name_version(stem) or stem
+
+
+def filename_problem(archive: Path) -> str | None:
+    """Why ``archive``'s filename cannot be placed, or ``None`` (BACKLOG #5470).
+
+    The split rule is keyed on the distribution the filename names, so a filename that names none
+    would get no split rule at all. Two shapes are refused, fail closed: a filename with no
+    ``<name>-<version>`` shape, which no wheel or sdist build writes (``messagefoundry-dev.whl``,
+    ``messagefoundry-v0.4.0.tar.gz``), and a ``messagefoundry`` name outside
+    :data:`KNOWN_DISTRIBUTIONS`, which reading up to the first hyphen once gave the engine's rule.
+    :func:`inspect` still inspects such an archive, under both split rules."""
+    if _name_version(_filename_stem(archive)) is None:
+        return (
+            "its filename has no <name>-<version> shape, so the distribution, and the engine and "
+            "toolkit split rule that applies to it, cannot be read"
+        )
+    dist = distribution(archive)
+    if dist.startswith(ENGINE_DISTRIBUTION) and dist not in KNOWN_DISTRIBUTIONS:
+        return f"its filename names {dist!r}, which is no distribution this repository publishes"
+    return None
 
 
 def inspect(archives: Iterable[Path]) -> tuple[int, list[str]]:
@@ -460,11 +540,30 @@ def inspect(archives: Iterable[Path]) -> tuple[int, list[str]]:
             )
             continue
         dist = distribution(archive)
-        # The exemption is keyed on the name as the build writes it, underscores only: a hyphenated
-        # spelling reads as the same distribution but is not exempt, so a rename only tightens.
-        tooling = dist in TEST_TOOLING_DISTRIBUTIONS and "-" not in _declared_name(archive)
+        problem = filename_problem(archive)
+        if problem is not None:
+            errors.append(f"::error::member gate refuses {archive.name}: {problem}")
+        # An unplaceable filename gets BOTH split rules, the strictest reading there is.
+        split_dists = (ENGINE_DISTRIBUTION, TOOLKIT_DISTRIBUTION) if problem else (dist,)
+        # The exemption is keyed on the exact name the build writes, all lowercase with underscores
+        # (``messagefoundry_harness``): any other spelling of the same distribution, a hyphen, a dot
+        # or a capital, is not exempt, so a rename only tightens.
+        tooling = (
+            problem is None
+            and dist in TEST_TOOLING_DISTRIBUTIONS
+            and _declared_name(archive) == dist.replace("-", "_")
+        )
         names = [name for name, _special in entries]
-        root = _common_root(names) if archive.suffix.lower() not in {".whl", ".zip"} else None
+        root: str | None = None
+        if archive.suffix.lower() != ".whl":
+            # A wheel installs at the top level and has no root. Every other archive is an sdist,
+            # zip or tar, whose one root the split rule must know to read a first component.
+            root, root_problem = _archive_root(names)
+            if root_problem is not None:
+                errors.append(
+                    f"::error::member gate refuses {archive.name}: {root_problem}, not the one "
+                    f"<name>-<version>/ root an sdist has, so no first component can be read"
+                )
         hits = [
             (name, why)
             for name, special in entries
@@ -473,7 +572,7 @@ def inspect(archives: Iterable[Path]) -> tuple[int, list[str]]:
                 or forbidden(name)
                 or escapes_root(name)
                 or (None if tooling else development_content(name))
-                or split_violation(name, dist, root)
+                or next(filter(None, (split_violation(name, d, root) for d in split_dists)), None)
             )
             is not None
         ]
