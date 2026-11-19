@@ -353,11 +353,15 @@ def cell_aad(table: str, column: str, *pk: object) -> bytes:
     :class:`AADComponentError`, a :class:`CipherError` naming the table and column, because on a read
     path it comes from a damaged or planted row, which the caller must contain like any cell that does
     not open."""
-    try:
-        key = [_aad_component(p) for p in pk]
-    except AADComponentError as exc:
-        raise AADComponentError(f"{table}.{column}: {exc}") from None
-    fields = (_AAD_SCHEME, table.encode("utf-8"), column.encode("utf-8"), *key)
+    for p in pk:
+        if p is None or isinstance(p, bool):
+            raise AADComponentError(f"{table}.{column}: cell_aad key component must not be {p!r}")
+    fields = (
+        _AAD_SCHEME,
+        table.encode("utf-8"),
+        column.encode("utf-8"),
+        *(_aad_component(p) for p in pk),
+    )
     return b"".join(len(f).to_bytes(4, "big") + f for f in fields)
 
 
@@ -370,8 +374,9 @@ def _aad_component(value: object) -> bytes:
     it, and both must bind ``1000``. An integral float is therefore spelled as its integer, and any
     other float by ``float.__repr__``, which round-trips exactly. The base types' own methods are
     called, so a subclass (an ``int``-valued Enum member, say) is spelled as the value a driver binds,
-    never by its own ``__str__``. ``None`` and ``bool`` are refused: ``str()`` would bind them to the
-    same bytes as the strings ``"None"`` and ``"True"``, and no key column holds either. A string is
+    never by its own ``__str__``. :func:`cell_aad` refuses ``None`` and ``bool``: ``str()`` would
+    bind them to the same bytes as the strings ``"None"`` and ``"True"``, and no key column holds
+    either. A string is
     UTF-8 with ``surrogatepass``, so a lone surrogate binds bytes no valid string produces instead of
     raising here; the backend's own write still refuses one. Any other type, such as a BLOB a damaged
     SQLite row hands back, keeps its ``str()`` spelling, so a keyless open or a read whose cell is
@@ -382,9 +387,7 @@ def _aad_component(value: object) -> bytes:
     either."""
     if isinstance(value, str):
         return str.encode(value, "utf-8", "surrogatepass")
-    if isinstance(value, bool) or value is None:
-        raise AADComponentError(f"cell_aad key component must not be {value!r}")
-    if isinstance(value, int):
+    if isinstance(value, int):  # cell_aad has already refused a bool
         return int.__repr__(value).encode("ascii")
     if isinstance(value, float):
         if float.is_integer(value):
