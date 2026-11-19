@@ -786,7 +786,8 @@ def test_a_refused_seat_record_leaves_one_refusal_line_an_hour(
 ) -> None:
     """seat-record.ps1 discards seat.ps1's stderr, so a refusal recorded only there left no trace,
     and an unpinned session's record would stop refreshing in silence. Each refusal goes to
-    .writer-refusals.txt instead, one line per session key per hour, never to .writer-errors.txt."""
+    .writer-refusals.txt instead, one line per session key and host per hour, never to
+    .writer-errors.txt."""
     repo, _, sibling, _ = seat_clones
     common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     seats = common / "mefor-coord" / "seats"
@@ -805,7 +806,7 @@ def test_a_refused_seat_record_leaves_one_refusal_line_an_hour(
     assert not errors.exists() or errors.read_text(encoding="utf-8").strip() == "", errors
     assert _seat_records(repo) == []
 
-    # The controls: the limit is per session key, and a line over an hour old, or stamped in the
+    # The controls: the limit is per session key and host, and a line over an hour old, or stamped in the
     # future by a skewed clock, does not hold it.
     _record_stop(repo, _stop("s2", sibling))
     assert len(refusals.read_text(encoding="utf-8").splitlines()) == 2, "another key was silenced"
@@ -814,3 +815,44 @@ def test_a_refused_seat_record_leaves_one_refusal_line_an_hour(
         _record_stop(repo, _stop("s1", sibling))
         got = refusals.read_text(encoding="utf-8").splitlines()
         assert len(got) == 2 and got[1].split("\t")[2] == "s1", (stamp, got)
+
+
+def _record_stop_in_culture(repo: Path, payload: dict[str, Any], culture: str) -> None:
+    """Run seat.ps1 -Record, as seat-record.ps1 does, with the thread culture set first."""
+    seat = ROOT / "scripts" / "coord" / "seat.ps1"
+    lit = str(seat).replace("'", "''")
+    command = (
+        f"[Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::new('{culture}'); "
+        f"& '{lit}' -Record"
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+        cwd=str(repo),
+        input=_raw(payload),
+        capture_output=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+
+
+@pytest.mark.parametrize("culture", ["fi-FI", "th-TH"])
+def test_the_refusal_limit_holds_under_a_culture_that_formats_time_differently(
+    seat_clones: tuple[Path, Path, Path, Path], culture: str
+) -> None:
+    """The stamp was formatted in the current culture and parsed in the invariant one. fi-FI writes
+    the time separator as '.', and th-TH counts years in the Buddhist era, so the stamp never parsed
+    and every refusal added a line. The second refusal within the hour must add none."""
+    repo, _, sibling, _ = seat_clones
+    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    refusals = common / "mefor-coord" / "seats" / ".writer-refusals.txt"
+
+    _record_stop_in_culture(repo, _stop("s1", sibling), culture)
+    lines = refusals.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1, lines
+
+    _record_stop_in_culture(repo, _stop("s1", sibling), culture)
+    assert refusals.read_text(encoding="utf-8").splitlines() == lines, (culture, "limit failed")
+    # The stamp is the invariant form the reader parses: a Gregorian year and ':' separators.
+    stamp = lines[0].split("\t")[0]
+    assert stamp[:4] == time.strftime("%Y", time.gmtime()) and stamp[13] == ":", lines

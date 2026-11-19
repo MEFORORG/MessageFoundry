@@ -195,21 +195,26 @@ function Write-WriterRefusal {
     param([string]$SessionKey, [string]$Cwd, [string]$Reason)
     # A refused hook input, recorded where a reader can find it. Never .writer-errors.txt (rule 2).
     # At most one line per session key and host per hour, because an unpinned session is refused on
-    # EVERY Stop and one line says as much as a hundred. A line stamped in the future (another PC's
-    # clock on a shared root) does not count, or skew would silence refusals for hours. Columns: UTC
-    # time, host, session key, the leaf of the refused cwd, and the helper's Reason as it stands,
-    # which may quote paths; no payload text beyond the cwd is written.
+    # EVERY Stop and one line says as much as a hundred. Only this host's own lines are read, so a
+    # line stamped in the future means this host's clock stepped back; it does not count, or the step
+    # would silence refusals for hours. The stamp is written and read in the invariant culture: a
+    # culture-formatted stamp (fi-FI writes '.' for ':') never parses, and the limit never holds.
+    # Columns: UTC time, host, session key, the leaf of the refused cwd with its whitespace collapsed,
+    # and the helper's Reason, collapsed the same way, which may quote paths; no payload text beyond
+    # the cwd is written.
     try {
         if (-not $script:SeatsDir) { return }
         $f = Join-Path $script:SeatsDir '.writer-refusals.txt'
         $now = [DateTime]::UtcNow
+        $inv = [Globalization.CultureInfo]::InvariantCulture
+        $stampFmt = 'yyyy-MM-ddTHH:mm:ssZ'
         $hostName = Get-CoordHost
         if (Test-Path -LiteralPath $f -PathType Leaf) {
             foreach ($l in [System.IO.File]::ReadLines($f)) {
                 $cols = $l -split "`t"
                 if ($cols.Count -lt 3 -or $cols[1] -ne $hostName -or $cols[2] -ne $SessionKey) { continue }
                 $at = [DateTime]::MinValue
-                $ok = [DateTime]::TryParseExact($cols[0], 'yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture,
+                $ok = [DateTime]::TryParseExact($cols[0], $stampFmt, $inv,
                     ([Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal), [ref]$at)
                 $age = $now - $at
                 if ($ok -and $age -ge [TimeSpan]::Zero -and $age -lt [TimeSpan]::FromHours(1)) { return }
@@ -217,10 +222,14 @@ function Write-WriterRefusal {
         }
         $leaf = ''
         $trimmed = $Cwd.TrimEnd('\', '/')
-        if ($trimmed) { $leaf = Split-Path -Leaf $trimmed }
+        if ($trimmed) { $leaf = (Split-Path -Leaf $trimmed) -replace '\s+', ' ' }
         $why = $Reason -replace '\s+', ' '
-        if ($why.Length -gt 300) { $why = $why.Substring(0, 300) }
-        $line = "{0}`t{1}`t{2}`t{3}`t{4}" -f $now.ToString('yyyy-MM-ddTHH:mm:ssZ'), $hostName, $SessionKey, $leaf, $why
+        if ($why.Length -gt 300) {
+            # Never split a surrogate pair, as the notes cap below (BACKLOG #5764).
+            $cut = if ([char]::IsHighSurrogate($why[299])) { 299 } else { 300 }
+            $why = $why.Substring(0, $cut)
+        }
+        $line = "{0}`t{1}`t{2}`t{3}`t{4}" -f $now.ToString($stampFmt, $inv), $hostName, $SessionKey, $leaf, $why
         Add-Content -LiteralPath $f -Value $line -Encoding utf8 -EA SilentlyContinue
     } catch { }
 }
@@ -1002,8 +1011,8 @@ try {
                 # NEVER goes to .writer-errors.txt, which fleet.ps1 counts as failures; an unpinned
                 # session would otherwise add one line there on every Stop (the same rule
                 # Invoke-ClearHandoff states). seat-record.ps1 discards stderr, so a refusal also
-                # goes to .writer-refusals.txt (rule 2), rate-limited per session key, or it would
-                # leave no trace at all. No .writer-alive heartbeat: it is keyed by this session's
+                # goes to .writer-refusals.txt (rule 2), rate-limited per session key and host, or it
+                # would leave no trace at all. No .writer-alive heartbeat: it is keyed by this session's
                 # box, and refused input names no box to key it by. Both files go to the registry
                 # of the checkout this hook started in, where that checkout and its registry
                 # resolve.
