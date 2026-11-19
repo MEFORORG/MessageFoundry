@@ -140,8 +140,6 @@ services:
     # through compose, before you attest, run it as
     #     MEFOR_TLS_REVOCATION_ATTESTED=0 docker compose run --rm --no-deps engine gen-key
     # since without --no-deps the revocation-attestation-check service runs first and refuses 0.
-    # --no-deps skips that check on `up` too, so never start a serving engine with
-    # `docker compose up --no-deps <engine>`: a false value would restart it forever.
     env_file:
       - path: ./secrets.env       # copy docker/secrets.env.example -> docker/secrets.env and fill it in
         required: false

@@ -1753,11 +1753,12 @@ function Set-ServiceLogonRight {
             # match matters most, because there the account may no longer translate.
             $held = @($holders | Where-Object { $_ -eq ("*" + $sid) -or $_ -eq $sid -or $_ -eq $Account })
             if (-not $held) {
-                # A lookup that could not be made, as against a domain controller that is down, is
-                # not "not this account". It is not counted as held either, since a missed grant
-                # fails the service with error 1069: the SID is added, and the warning says the
-                # row may then name the account twice. The loop stops at the first match, so later
-                # names cost no lookup.
+                # A lookup that fails with anything other than IdentityNotMappedException, a trust
+                # failure for example, is not "not this account". It is not counted as held either,
+                # since a missed grant fails the service with error 1069: the SID is added, and the
+                # warning says the row may then name the account twice. An unreachable domain is
+                # not shown to land here: LSA may report its names as not mapped. The loop stops at
+                # the first match, so later names cost no lookup.
                 $unread = @()
                 foreach ($name in @($holders | Where-Object { -not $_.StartsWith('*') })) {
                     try {
@@ -1774,8 +1775,8 @@ function Set-ServiceLogonRight {
                 if (-not $held -and $unread) {
                     Write-Warning ("Could not look up the 'Log on as a service' holder(s) " +
                         "$($unread -join ', '), so whether one of them is '$Account' is unknown. " +
-                        "The account's SID is added anyway; if one of them is '$Account', the row " +
-                        "now names it twice.")
+                        "The account's SID will be added anyway; if one of them is '$Account', the " +
+                        "row would then name it twice.")
                 }
             }
             if ($held) {

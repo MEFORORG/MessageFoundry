@@ -19,7 +19,10 @@
   account added again. A name is now matched as given, then resolved and its SID compared.
   `uninstall-service.ps1` removes such a holder the same way. It also removes the account's own
   name when that no longer resolves, as after the service is deleted; any other name that does not
-  resolve is kept. (BACKLOG #5401)
+  resolve is kept. Only a name that maps to no account now counts as another account. A lookup that
+  fails any other way, a trust failure for example, is named in a warning: the installer adds the
+  SID anyway, so the row may then name the account twice, and the uninstaller keeps the name and
+  reports the right as unproven rather than as removed or not held. (BACKLOG #5401)
 - **The service scripts read `-DataDir` literally and validate one more service name.**
   `uninstall-service.ps1` tests the data directory and reads the config directory's ACL with
   `-LiteralPath`, so a `[` in the path would no longer read an existing directory as gone and leave

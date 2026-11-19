@@ -291,6 +291,9 @@ function Get-UninstallResidueNotice {
         # What -RemoveLogonRight / -RemoveAccountAces already took back, so the notice reports the
         # host as it now IS rather than listing a residue this run just cleared.
         [switch]$LogonRightRemoved,
+        # -RemoveLogonRight ran but could not look up a holder name, so whether the account still
+        # holds the right is unknown: neither REMOVED nor "still holds" is true of it.
+        [switch]$LogonRightUnproven,
         [switch]$DataAceRemoved,
         [switch]$ConfigAceRemoved,
         [switch]$SecretsAceRemoved,
@@ -381,6 +384,11 @@ function Get-UninstallResidueNotice {
 
         if ($LogonRightRemoved) {
             $lines += "  Logon right      REMOVED - '$ServiceAccount' no longer holds 'Log on as a service'."
+        } elseif ($LogonRightUnproven) {
+            $lines += "  Logon right      UNPROVEN - a holder name of 'Log on as a service' could not be"
+            $lines += "                   looked up, so '$ServiceAccount' may still hold the right."
+            $lines += "                   Check it in secpol.msc under Local Policies, User Rights"
+            $lines += "                   Assignment."
         } else {
             # NOT "re-run this script". The registration is gone by the time these lines print, and a
             # second run exits at the "is not installed - nothing to do" guard, so the switch has to
@@ -613,9 +621,11 @@ function Remove-ServiceLogonRight {
         # A holder can be written as an account NAME rather than the '*SID' form, and the installer
         # counts such a name as held (BACKLOG #5401), so a name is this account when it is the
         # account's own name or resolves to its SID. A '*SID' token and a name that does not
-        # resolve to this SID are kept. A name whose lookup could not be made, as against a domain
-        # controller that is down, is kept too, and recorded: it may be this account, so neither
-        # "does not hold" nor a removal can be reported while one is left.
+        # resolve to this SID are kept. A name whose lookup fails with anything other than
+        # IdentityNotMappedException, a trust failure for example, is kept too, and recorded: it
+        # may be this account, so neither "does not hold" nor a removal can be reported while one
+        # is left. $script:LogonRightUnproven tells the residue notice so. An unreachable domain
+        # is not shown to land here: LSA may report its names as not mapped.
         $unread = @()
         $kept = @(foreach ($holder in $held) {
             if ($holder -eq ("*" + $Sid) -or $holder -eq $Sid) { continue }
@@ -637,6 +647,7 @@ function Remove-ServiceLogonRight {
             "$($unread -join ', '), so whether one of them is '$Account' is unknown; it was kept.")
         if ($kept.Count -eq $held.Count) {
             if ($unread) {
+                $script:LogonRightUnproven = $true
                 Write-Warning ("$unreadNote Nothing was removed, and '$Account' may still hold the " +
                     "right. Check it in secpol.msc under Local Policies, User Rights Assignment.")
                 return $false
@@ -672,6 +683,7 @@ function Remove-ServiceLogonRight {
         if ($unread) {
             # Something was removed, but a holder left in the row may still be this account, so
             # the residue notice must not say it no longer holds the right.
+            $script:LogonRightUnproven = $true
             Write-Warning ("$unreadNote The entries that are '$Account' were removed, but it may " +
                 "still hold the right. Check it in secpol.msc under Local Policies, User Rights Assignment.")
             return $false
@@ -918,6 +930,7 @@ for ($i = 0; $registrationPending -and $i -lt 10; $i++) {
 # them - so a "restore" would be inventing a state, not returning to one. The notice names those and
 # gives the command, which leaves the choice with the operator who knows the host.
 $logonRightRemoved = $false
+$script:LogonRightUnproven = $false
 $dataAceRemoved = $false
 $configAceRemoved = $false
 $secretsAceRemoved = $false
@@ -971,6 +984,7 @@ Get-UninstallResidueNotice `
     -WerImages $werImages `
     -WerLocalDumps $werLocalDumps `
     -LogonRightRemoved:$logonRightRemoved `
+    -LogonRightUnproven:$script:LogonRightUnproven `
     -DataAceRemoved:$dataAceRemoved `
     -ConfigAceRemoved:$configAceRemoved `
     -SecretsAceRemoved:$secretsAceRemoved `

@@ -3146,6 +3146,7 @@ def _logon_right_arms(
   }}
   [pscustomobject]@{{
     result = [bool]$result; outputs = $outputs; warnings = @($warnings); said = @($said)
+    unproven = [bool]$script:LogonRightUnproven
     exportCalls = $script:ExportCalls; configureCalls = $script:ConfigureCalls
     configured = $script:Configured; cfg = $script:Cfg; db = $script:Db; folder = $script:Folder
     left = @(Get-ChildItem -LiteralPath {_psq(str(parent))} -Force | ForEach-Object {{ $_.Name }})
@@ -3848,8 +3849,12 @@ def test_the_notice_and_the_removal_agree_on_the_principal(tmp_path: Path) -> No
     )
 
 
+@_windows_only
 def test_a_holder_with_a_dollar_sign_survives_the_policy_rewrite(tmp_path: Path) -> None:
     """secedit can export a holder by NAME, and a gMSA or computer account name ends in '$'.
+
+    Windows only: the name is looked up, and off Windows that lookup throws, which now reads as a
+    holder that may be this account (BACKLOG #5401) rather than as a removal.
 
     '$' is a .NET substitution metacharacter in a -replace REPLACEMENT operand, so building the
     rewritten row that way re-reads a holder as $&, $+ or $$ and feeds a mangled machine-wide
@@ -4377,8 +4382,9 @@ def test_the_uninstall_ace_removal_reads_a_bracketed_data_dir_literally(
 # controller that cannot be reached for example, read as "this holder is some other account". The
 # uninstaller then printed "does not hold" for an account that may hold the right. Only
 # IdentityNotMappedException means "no such account" now. A holder longer than any account name
-# (512 characters) makes the NTAccount constructor throw ArgumentException, which is a failure other
-# than "not mapped" on every platform, so it stands in for the unreachable domain controller here.
+# (512 characters) makes the NTAccount cast throw, which is a failure other than "not mapped" on
+# every platform. It is a stand-in for that branch, not a model of any one outage: what LSA reports
+# for a domain it cannot reach is not measured here, and may be "not mapped".
 
 _UNREADABLE = "x" * 1000
 
@@ -4386,6 +4392,7 @@ _UNREADABLE = "x" * 1000
 def test_an_unread_holder_name_is_not_reported_as_does_not_hold(tmp_path: Path) -> None:
     got = _logon_right_arms(tmp_path, holders=["*S-1-5-32-545", _UNREADABLE], sid="S-1-5-80-4001")
     assert got["result"] is False, got
+    assert got["unproven"] is True, "the residue notice is not told the right is unproven"
     assert got["configureCalls"] == 0, "the policy was rewritten although nothing was proven held"
     assert not any("does not hold" in s for s in got["said"]), got["said"]
     assert any("Could not look up" in w and "may still hold" in w for w in got["warnings"]), got[
@@ -4405,6 +4412,7 @@ def test_a_holder_name_that_maps_to_no_account_still_reads_as_does_not_hold(
     assert got["result"] is False, got
     assert any("does not hold" in s for s in got["said"]), got["said"]
     assert not got["warnings"], got["warnings"]
+    assert got["unproven"] is False, got
 
 
 def test_a_removal_beside_an_unread_holder_is_not_reported_as_removed(tmp_path: Path) -> None:
@@ -4420,6 +4428,7 @@ def test_a_removal_beside_an_unread_holder_is_not_reported_as_removed(tmp_path: 
         "configured"
     ]
     assert got["result"] is False, "a removal with an unproven holder left was reported as complete"
+    assert got["unproven"] is True, "the residue notice is not told the right is unproven"
     assert not any("removed SeServiceLogonRight" in s for s in got["said"]), got["said"]
     assert any("may still hold" in w for w in got["warnings"]), got["warnings"]
 
@@ -4435,6 +4444,8 @@ def test_the_grant_adds_the_sid_beside_an_unread_holder_and_says_so(tmp_path: Pa
     inf = ["[Unicode]", "Unicode=yes", "[Privilege Rights]", row, "[Version]"]
     inf_ps = "@(" + ", ".join(_psq(line) for line in inf) + ")"
     body = rf"""
+  # A regression to the old TEMP-based secedit files lands in the test's own folder.
+  $env:TEMP = {_psq(str(tmp_path))}
 {_workdir_seam(parent)}
   $script:Configured = ''
   function secedit {{
@@ -4459,3 +4470,15 @@ def test_the_grant_adds_the_sid_beside_an_unread_holder_and_says_so(tmp_path: Pa
     assert "Could not look up" in said, said
     assert "granted SeServiceLogonRight" in said, said
     assert f"{row},*{got['me']} |" in got["configured"], got["configured"]
+
+
+def test_an_unproven_logon_right_is_reported_as_unknown(tmp_path: Path) -> None:
+    """Neither "REMOVED" nor "still holds ... Next time, pass -RemoveLogonRight" is true when the
+    switch ran and a holder name could not be looked up (BACKLOG #5401)."""
+    facts = dict(_FULL_FACTS)
+    facts["LogonRightUnproven"] = True
+    text = _notice(tmp_path, facts)
+    assert "UNPROVEN" in text and "may still hold" in text, text
+    assert "-RemoveLogonRight" not in text and "still holds the" not in text, text
+    # POSITIVE CONTROL: without the flag the notice still offers the switch.
+    assert "-RemoveLogonRight" in _notice(tmp_path, _FULL_FACTS)
