@@ -34,6 +34,7 @@ mojibake on a stock Windows code page. Asserting on it would be testing the code
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -486,3 +487,30 @@ def test_an_inherited_git_work_tree_does_not_defeat_the_ignore_guard(
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "NOT git-ignored" not in proc.stdout + proc.stderr
     assert "CONFIGURED (synthetic)" in proc.stdout, proc.stdout
+
+
+def test_the_ignore_guard_still_refuses_an_unignored_token_file(
+    rig: tuple[Path, Path, Path],
+) -> None:
+    """The negative control for the wrapped check-ignore: a checkout that does NOT ignore the token
+    file still has it deleted and the run refused, so the wrapper cannot have made the guard pass
+    unconditionally."""
+    root, shim, _ = rig
+    (root / ".gitignore").write_text("", encoding="utf-8")
+    proc = _run(root, "-Synthetic", env=_env(shim))
+
+    assert proc.returncode != 0, proc.stdout
+    assert "NOT git-ignored" in proc.stdout + proc.stderr
+    assert not (root / "scripts" / "security" / "scan-tokens.local.txt").exists()
+
+
+def test_the_dropped_variables_mirror_the_worktree_gate_redirect_list() -> None:
+    """The script drops the location set scripts/worktree/worktree-gates.ps1 refuses; a name added
+    there must not silently stay outside this guard and the verify step."""
+    names = re.compile(r"'([A-Z_]+)'")
+    gates = (_ROOT / "scripts" / "worktree" / "worktree-gates.ps1").read_text(encoding="utf-8")
+    ours = re.search(r"\$gitRedirects = (.*)", _SETUP.read_text(encoding="utf-8"))
+    theirs = re.search(r"\$GIT_REDIRECT_NAMES = @\(([^)]*)\)", gates)
+    assert ours and theirs, "the instrument found no list to compare"
+    assert sorted(names.findall(ours.group(1))) == sorted(names.findall(theirs.group(1)))
+    assert sorted(_GIT_REDIRECTS) == sorted(names.findall(theirs.group(1)))

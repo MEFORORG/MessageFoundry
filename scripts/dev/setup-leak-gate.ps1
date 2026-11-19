@@ -140,9 +140,12 @@ if ($null -ne $envTokens) {
         $source = 'NONE -- MEFOR_FORBIDDEN_TOKENS is set but EMPTY, which the scanner reads as "no source" (it does NOT fall back to the file)'
     }
     else {
-        # Probed the way the scanner probes it, with Python's Path(value).is_file() from $repo, where
-        # both the verify step below and the pre-commit hook run it (BACKLOG #5467): a relative path
-        # is relative to the checkout, and no `~` or PSDrive is expanded, as Test-Path would.
+        # Probed APPROXIMATELY as the scanner probes it, with Python's Path(value).is_file() from $repo,
+        # where both the verify step below and the pre-commit hook run it (BACKLOG #5467): a relative
+        # path is relative to the checkout, and no `~` or PSDrive is expanded, as Test-Path would. NOT
+        # identical: a trailing separator, a drive- or root-relative Windows form, and a POSIX `..`
+        # through a symlink can resolve differently here, so in those cases the label below can
+        # disagree with what the scanner loaded. The counts line is the scanner's own answer.
         $tokenPath = $null
         try { $tokenPath = [IO.Path]::GetFullPath([IO.Path]::Combine($repo, $trimmed)) } catch { $tokenPath = $null }
         if ($tokenPath -and [IO.File]::Exists($tokenPath)) { $source = "MEFOR_FORBIDDEN_TOKENS -> $tokenPath" }
