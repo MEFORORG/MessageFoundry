@@ -273,7 +273,9 @@ def test_a_worker_failure_is_shown_not_dropped(qapp: Any, tmp_path: Any, transpo
     panel._worker = worker
     panel._on_finished()
     assert panel._results.rowCount() == 1
-    assert panel._results.item(0, 1).text() == transport
-    assert panel._results.item(0, _OK_COL).text() == "no"
-    assert panel._results.item(0, 5).text() == "ended early: RuntimeError: boom"
+    row = [panel._results.item(0, c) for c in range(panel._results.columnCount())]
+    cells = [cell.text() if cell is not None else None for cell in row]
+    assert cells[1] == transport
+    assert cells[_OK_COL] == "no"
+    assert cells[5] == "ended early: RuntimeError: boom"
     assert panel._send_btn.isEnabled()
