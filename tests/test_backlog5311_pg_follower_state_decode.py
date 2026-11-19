@@ -58,7 +58,7 @@ def _follower(cipher: Cipher, table: dict[str, list[str]]) -> PostgresStore:
 
 
 def _enc(cipher: Cipher, plaintext: str, ns: str, key: str) -> str:
-    return str(cipher.encrypt(plaintext, aad=cell_aad("state", "value", ns, key)))
+    return cipher.encrypt(plaintext, aad=cell_aad("state", "value", ns, key))
 
 
 def _assert_carries_no_marker(exc: BaseException) -> None:
@@ -77,10 +77,14 @@ async def test_a_valid_cell_converges() -> None:
     assert store._state_cache[("ns", "K0")] == MARKER
 
 
-async def test_a_cell_bound_to_another_namespace_is_refused() -> None:
-    """The decode binds the cell's own namespace and key, so a cell sealed for another place fails."""
+@pytest.mark.parametrize(("sealed_ns", "sealed_key"), [("other", "K1"), ("ns", "K0")])
+async def test_a_cell_sealed_for_another_place_is_refused(sealed_ns: str, sealed_key: str) -> None:
+    """The decode binds the cell's own namespace and key. Row K1 of ``ns`` holds a cell sealed for
+    another namespace, or for row K0 of the same namespace, and either way it is refused."""
     cipher = _keyed()
-    store = _follower(cipher, {"ns": [_enc(cipher, json.dumps(MARKER), "other", "K0")]})
+    good = _enc(cipher, json.dumps(MARKER), "ns", "K0")
+    moved = _enc(cipher, json.dumps(MARKER), sealed_ns, sealed_key)
+    store = _follower(cipher, {"ns": [good, moved]})
     with pytest.raises(CipherError):
         await store.converge_state_cache()
     assert len(store._state_cache) == 0
@@ -92,6 +96,14 @@ async def test_a_keyless_follower_raises_store_keyless_error() -> None:
     with pytest.raises(StoreKeylessError):
         await store.converge_state_cache()
     assert store._state_versions == {}  # nothing recorded, so the next tick tries again
+
+
+def test_the_marker_check_can_fail() -> None:
+    """The positive control: a bare json.loads of the corrupt text keeps the marker on ``.doc``."""
+    with pytest.raises(json.JSONDecodeError) as info:
+        json.loads(f"not json {MARKER}")
+    with pytest.raises(AssertionError):
+        _assert_carries_no_marker(info.value)
 
 
 async def test_a_corrupt_encrypted_cell_raises_without_its_plaintext() -> None:

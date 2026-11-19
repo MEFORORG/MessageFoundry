@@ -3371,7 +3371,7 @@ class PostgresStore:
 
     def _decode_state_cell(self, namespace: str, key: str, stored: str) -> Any:
         """Decrypt and decode one ``state`` cell, for both the open-time load and the follower
-        :meth:`converge_state_cache`, so the two cannot drift apart (BACKLOG #5311).
+        :meth:`converge_state_cache`, so both decode a cell the same way (BACKLOG #5311).
 
         #241 F2: with no key configured, an encrypted cell raises StoreKeylessError rather than a
         raw JSONDecodeError from feeding an mfenc: blob straight to json.loads.
