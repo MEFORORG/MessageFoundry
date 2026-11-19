@@ -125,8 +125,9 @@ probed on the loopback address of the same family, because no client can connect
 address. The tray does not read `MEFOR_*` variables set in the service's environment, which
 outrank the TOML file in `serve`; set `engine_url` in `tray.toml` when the bind comes from there.
 The probe still verifies the engine's certificate against the address it connects to, so for a
-wildcard bind that certificate must name the loopback address; when it does not, set `engine_url`
-to an address the certificate names. (BACKLOG #5936)
+wildcard bind that certificate must name the loopback address. A certificate the engine mints
+names only its bind address, and no client can connect to a wildcard one, so for a wildcard bind
+serve your own `[api].tls_cert_file` that names the address the tray probes. (BACKLOG #5936)
 
 **What "View Service Log" will open.** Windows opens a file with whatever program owns its
 extension, so a `log_path` naming a `.bat` or `.lnk` would run it. The tray therefore opens

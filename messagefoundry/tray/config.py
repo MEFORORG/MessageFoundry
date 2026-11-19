@@ -47,19 +47,22 @@ from urllib.parse import urlsplit
 from messagefoundry.api_tls_source import GENERATED_CERT_NAME, ApiTlsSource, api_tls_source
 from messagefoundry.service_status import is_safe_service_name
 
+# The engine's own [api] defaults, which a bind that names only one of host and port keeps for the
+# other (BACKLOG #5936).
+_DEFAULT_BIND_HOST = "127.0.0.1"
+_DEFAULT_BIND_PORT = 8765
 # https because the engine serves TLS by default (ADR 0172). Plain http is right only behind a
 # declared upstream terminator, and the tray learns that from the engine's settings, not by default.
-DEFAULT_ENGINE_URL = "https://127.0.0.1:8765"
+DEFAULT_ENGINE_URL = f"https://{_DEFAULT_BIND_HOST}:{_DEFAULT_BIND_PORT}"
 DEFAULT_SERVICE_NAME = "MessageFoundry"
 DEFAULT_POLL_SECONDS = 5.0
 _POLL_MIN_S = 1.0
 _POLL_MAX_S = 3600.0
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-# The engine's own [api] defaults, which a bind that names only one of host and port keeps for the
-# other (BACKLOG #5936).
-_DEFAULT_BIND_HOST = "127.0.0.1"
-_DEFAULT_BIND_PORT = 8765
+# How pydantic's lax mode reads a bool, which is how serve reads [security].local_access_only.
+_LAX_TRUE = frozenset({"1", "on", "t", "true", "y", "yes"})
+_LAX_FALSE = frozenset({"0", "off", "f", "false", "n", "no"})
 # A wildcard bind accepts on every interface of its family, but it is no address a client can
 # connect to. The loopback of the same family is one the bind accepts on (BACKLOG #5936).
 _WILDCARD_PROBE_HOSTS = {"0.0.0.0": "127.0.0.1", "::": "::1", "[::]": "::1"}  # nosec B104
@@ -321,10 +324,11 @@ def service_toml_bind(service_toml: dict[str, object] | None) -> tuple[str | Non
 
     The file sets the host through ``[security]``, as ``serve`` desugars it: ``local_access_only``
     pins loopback, and ``listen_address`` is the bind only when ``local_access_only`` is false. It
-    sets the port as ``[api].port``. A value of the wrong type or shape reads as unset, so the
-    default applies, as the tray treats every other untrusted hint. ``serve --host``/``--port`` and
+    sets the port as ``[api].port``. Each value is read as ``serve`` reads it, which accepts a
+    quoted ``"false"`` or ``"9443"``. A value ``serve`` would refuse reads as unset, so the default
+    applies, as the tray treats every other untrusted hint. ``serve --host``/``--port`` and
     ``MEFOR_*`` variables in the service's environment both outrank the file in ``serve``; this
-    reads neither (BACKLOG #5936).
+    function reads neither (BACKLOG #5936).
     """
     if not service_toml:
         return None, None
@@ -333,7 +337,7 @@ def service_toml_bind(service_toml: dict[str, object] | None) -> tuple[str | Non
     if isinstance(security, dict) and (
         "local_access_only" in security or "listen_address" in security
     ):
-        local_only = security.get("local_access_only", True)
+        local_only = _lax_bool(security.get("local_access_only", True))
         address = security.get("listen_address", _DEFAULT_BIND_HOST)
         if local_only is True:
             host = _DEFAULT_BIND_HOST
@@ -342,10 +346,36 @@ def service_toml_bind(service_toml: dict[str, object] | None) -> tuple[str | Non
     port: int | None = None
     api = service_toml.get("api")
     if isinstance(api, dict):
-        raw_port = api.get("port")
-        if isinstance(raw_port, int) and not isinstance(raw_port, bool) and 1 <= raw_port <= 65535:
+        raw_port = _lax_int(api.get("port"))
+        if raw_port is not None and 1 <= raw_port <= 65535:
             port = raw_port
     return host, port
+
+
+def _lax_bool(value: object) -> bool | None:
+    """``value`` as pydantic's lax mode reads a bool, or ``None`` where it would refuse it."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word in _LAX_TRUE:
+            return True
+        if word in _LAX_FALSE:
+            return False
+    return None
+
+
+def _lax_int(value: object) -> int | None:
+    """``value`` as pydantic's lax mode reads a whole number, or ``None`` where it would refuse it."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        return int(value.strip())
+    return None
 
 
 def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -> str | None:
@@ -502,14 +532,15 @@ def compose_config(
     if reg is not None:
         host_hint, port_hint = parse_serve_args(reg.app_parameters or "")
         file_host, file_port = service_bind
-        host_hint = host_hint or file_host
-        port_hint = port_hint or file_port
-        if host_hint is not None or port_hint is not None:
-            url_hint = build_engine_url(
-                host_hint or _DEFAULT_BIND_HOST, port_hint or _DEFAULT_BIND_PORT, tls=engine_tls
-            )
-            if url_hint is not None:
-                engine_url = url_hint
+        # Built even when nothing names a part, so the scheme still follows engine_tls: an engine
+        # behind a declared upstream terminator speaks http on the default bind too.
+        url_hint = build_engine_url(
+            host_hint or file_host or _DEFAULT_BIND_HOST,
+            port_hint or file_port or _DEFAULT_BIND_PORT,
+            tls=engine_tls,
+        )
+        if url_hint is not None:
+            engine_url = url_hint
         repo_path = (
             parse_project_root_arg(reg.app_parameters or "")
             or _clean_path_hint(reg.app_directory)

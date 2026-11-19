@@ -712,12 +712,22 @@ def test_load_config_an_operator_chain_pins_nothing(tmp_path: Path) -> None:
             ("0.0.0.0", None),
         ),
         ({"api": {"port": 9443}}, (None, 9443)),
-        # Wrong types and shapes read as unset, so the default applies.
-        ({"security": {"local_access_only": "false", "listen_address": "10.0.0.5"}}, (None, None)),
+        # Read as serve reads them: pydantic's lax mode takes these quoted and numeric spellings.
+        (
+            {"security": {"local_access_only": " FALSE ", "listen_address": "10.0.0.5"}},
+            ("10.0.0.5", None),
+        ),
+        ({"security": {"local_access_only": 0, "listen_address": "10.0.0.5"}}, ("10.0.0.5", None)),
+        ({"security": {"local_access_only": "yes"}}, ("127.0.0.1", None)),
+        ({"api": {"port": " 9443 "}}, (None, 9443)),
+        ({"api": {"port": "+9443"}}, (None, 9443)),
+        # What serve would refuse reads as unset, so the default applies.
+        ({"security": {"local_access_only": "maybe", "listen_address": "10.0.0.5"}}, (None, None)),
+        ({"security": {"local_access_only": 2, "listen_address": "10.0.0.5"}}, (None, None)),
         ({"security": {"local_access_only": False, "listen_address": "bad host"}}, (None, None)),
         ({"api": {"port": True}}, (None, None)),
         ({"api": {"port": 0}}, (None, None)),
-        ({"api": {"port": "9443"}}, (None, None)),
+        ({"api": {"port": "94x3"}}, (None, None)),
         ({"security": "x", "api": "y"}, (None, None)),
     ],
 )
@@ -733,6 +743,13 @@ def test_build_engine_url_probes_loopback_for_a_wildcard_bind() -> None:
     assert build_engine_url("::", 9100, tls=True) == "https://[::1]:9100"
     assert build_engine_url("[::]", 9100, tls=True) == "https://[::1]:9100"
     assert is_local_engine(build_engine_url("0.0.0.0", 9100) or "") is True
+
+
+def test_compose_a_declared_terminator_with_no_bind_named_is_probed_over_http() -> None:
+    """The scheme follows the engine's settings even when nothing names a host or a port."""
+    reg = ServiceRegistryInfo(app_parameters="serve --config C:\\cfg")
+    assert compose_config(None, reg, engine_tls=False).engine_url == "http://127.0.0.1:8765"
+    assert compose_config(None, reg, engine_tls=True).engine_url == DEFAULT_ENGINE_URL
 
 
 def test_compose_a_port_only_bind_keeps_the_default_host() -> None:
