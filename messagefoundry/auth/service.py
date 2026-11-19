@@ -15687,18 +15687,23 @@ class AuthService:
 
     async def _end_reauth_rotated_session(self, rotated_token: str, actor: str) -> bool:
         """Ask the store to end the session a re-auth rotated once :meth:`_clear_after_reauth`
-        answered ``"denied"`` or raised (BACKLOG #5900), and say whether the revoke landed, as far
-        as this call saw. A refused revoke is tried once more, as ``confirm_mfa_enrollment`` tries
-        its own (BACKLOG #3025). Refused twice, it is logged and answered False: the elevated
-        session may then stay live, unreachable, because the caller answers ``session_lost`` or
-        raises either way and its new token is never handed back. The caller records the answer on its ``auth.reauth``
-        row."""
+        answered ``"denied"`` or raised, or once the re-auth's hard ``auth.reauth`` row was refused
+        after a purpose grant was minted and then dropped (BACKLOG #5900), and say whether the
+        revoke landed, as far as this call saw. A refused revoke is tried once more, as
+        ``confirm_mfa_enrollment`` tries its own (BACKLOG #3025). Refused twice, it is logged and
+        answered False: the elevated session may then stay live, unreachable, because the caller
+        answers ``session_lost`` or raises either way and its new token is never handed back. The
+        caller records the answer on its ``auth.reauth`` row, or logs it when that row was
+        refused."""
         rotated = hash_token(rotated_token)
         for attempt in ("retrying", "and could not end the session it rotated"):
             ended = await write_audit_soft(
                 lambda: self._store.revoke_session(rotated),
                 log=_log,
-                message="a re-auth for %s that granted nothing had its revoke refused; %s",
+                message=(
+                    "a re-auth for %s whose rotated token is never handed back had its revoke "
+                    "refused; %s"
+                ),
                 args=(scrub_log_argument(actor), attempt),
                 errors=audit_write_errors(),
                 defects=AUDIT_WRITE_DEFECTS,

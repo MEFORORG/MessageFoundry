@@ -288,7 +288,7 @@ give, or freeze a revocation a failed seal would not**. That is the test each an
 | **Holds** | `verify` HTTP 200, `valid: true` | `True`, cached (see *The success cache*) | allow | none | none |
 | **Forged** | `verify` HTTP 200, `valid: false`; or the stored seal fails the strict well-formed parse (below), with no Transit call | `False` | deny the row (a session is ended, a user, role or map grants nothing, a write is refused) | `integrity.authority_seal_failed` | `AUTHORITY_SEAL_SUBJECT`, as today; a directory map pages under its own subject, (b) |
 | **Unverifiable** | `verify` HTTP 400, and the fixed-input key probe (`hmac` over a constant) then answers with a well-formed MAC, whatever version it names | `TransitSealUnverifiableError` | deny the row, with three limits: it never tombstones or raw-deletes a user, role, map or approval where Forged would (ending a session is allowed, since signing in replaces it); the AD maps follow (b) and (d); a write that keeps the row's stored values is refused, while an operator's explicit delete of the row, full replacement of it (a map's only with `replace_unverifiable`, (d)), or Reject of a pending approval (below), which keep none of its values, is allowed and audited | `integrity.authority_seal_unverifiable` | `authority-seal-transit-unverifiable:<kind>:<ref>:<digest suffix>` (*A ref is for reading*), capped; the two Unverifiable AD map subjects, fixed names with no ref or suffix, are exempt from the cap |
-| **Outage** | any other `verify` failure (network, timeout, 5xx, 403, malformed reply), or a 400 the probe cannot clear; except that a 400 or 403 on a seal naming a retired key, while the active key's probe works, is Unverifiable (*The key id, and a retired key*) | `TransitSealUnavailableError` | refuse the request or roll back the write; end nothing, except that (c) ends an account's sessions after a refused narrowing write; record no seal failure | none for the row; the refused request itself is audited where the audit append still works (many outages, such as a 403 on `verify` alone or a timeout, leave it working), a refused sign-in as `auth.login_refused_unavailable`, (e); a throttled ERROR log line is the record only when the append fails too | `authority-seal-transit` |
+| **Outage** (amended 2026-11-19, see below) | any other `verify` failure (network, timeout, 5xx, 403, malformed reply), or a 400 the probe cannot clear; except that a 400 or 403 on a seal naming a retired key, while the active key's probe works, is Unverifiable (*The key id, and a retired key*) | `TransitSealUnavailableError` | refuse the request or roll back the write; end nothing, except that (c) ends an account's sessions after a refused narrowing write; record no seal failure | none for the row; the refused request itself is audited where the audit append still works (many outages, such as a 403 on `verify` alone or a timeout, leave it working), a refused sign-in as `auth.login_refused_unavailable`, (e); a throttled ERROR log line is the record only when the append fails too | `authority-seal-transit` |
 
 A correction, added 2026-11-11: the Outage row's "the refused request itself is audited where the
 audit append still works" does not hold for a request the approval gate refuses on an Outage, which
@@ -298,6 +298,16 @@ writes no row; that path and two others are named in *Open audit gaps, a correct
 A correction, added 2026-11-11: the Unverifiable row's audit action and page do not hold on at
 least gaps (1), (2), (5) and (6) of *Open audit gaps, a correction added 2026-11-11*, and its
 extension, in (c).
+
+**An amendment to the Outage row, added 2026-11-19 (BACKLOG #5900, PR 3100).** On a password
+re-auth whose hard `auth.reauth` row is refused under a Vault Transit Outage, the session the
+re-auth rotated, whose token was never returned, is ended, so the user is signed out. On
+`origin/main` the original session stayed live, because the error was raised before the rotation.
+This is an exception to the Outage row's "end nothing" for that path only; the row's text is
+unchanged. The Lander decided it as the strictly safer option under the owner's standing
+instruction of 2026-10-22: it fails closed, accepts no new risk and weakens no control. The owner
+can reverse it by ruling that the Outage row's "ends nothing" governs, which would need a design
+that clears the lockout before it rotates the session.
 
 **The seal input is a fixed-length digest.** The sealer sends Transit not the row's encoding but its
 SHA-256: `seal = Transit hmac(SHA-256(label || store id || seal_bytes(kind, fields)))`, each part

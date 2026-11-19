@@ -1186,3 +1186,41 @@ async def test_an_outage_at_the_clear_and_a_refused_row_end_the_rotated_session(
         assert not service._action_step_up_grants
     finally:
         await store.close()
+
+
+async def test_a_refused_revoke_after_a_refused_row_logs_what_happened(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The refused-row path minted a purpose grant and then dropped it, so its revoke's log lines
+    say the rotated token is never handed back and that the session could not be ended, never that
+    the re-auth granted nothing."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, identity, token = await _setup(store)
+        real_audit = store.record_audit
+
+        async def outage(user_id: str, **kwargs: Any) -> None:
+            raise _outage(user_id)
+
+        async def refuse_reauth_row(action: str, **kwargs: Any) -> Any:
+            if action == "auth.reauth":
+                raise OSError("synthetic row refusal")
+            return await real_audit(action, **kwargs)
+
+        async def refuse_revoke(*args: Any, **kwargs: Any) -> None:
+            raise OSError("synthetic revoke refusal")
+
+        monkeypatch.setattr(store, "record_login_success", outage)
+        monkeypatch.setattr(service, "_user_seal_outage", lambda refused: None)
+        monkeypatch.setattr(store, "record_audit", refuse_reauth_row)
+        monkeypatch.setattr(store, "revoke_session", refuse_revoke)
+        caplog.set_level("WARNING", logger="messagefoundry.auth.service")
+        with pytest.raises(OSError, match="synthetic row refusal"):
+            await service.reauth(identity, GOOD, token=token, purpose=STEP_UP_ACTION_MFA_ENROLL)
+        text = caplog.text
+        assert "whose rotated token is never handed back had its revoke refused" in text
+        assert "whose auth.reauth row was refused could not end the session it rotated" in text
+        assert "granted nothing" not in text
+        assert not service._action_step_up_grants
+    finally:
+        await store.close()
