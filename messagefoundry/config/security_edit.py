@@ -21,6 +21,7 @@ next engine restart (``POST /config/reload`` re-runs the ``--config`` graph, not
 from __future__ import annotations
 
 import os
+import tempfile
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -66,9 +67,10 @@ def set_security(
     written. An existing file is left byte for byte and checked as it stands, so a file the engine
     would refuse is still refused; a path that is a link is refused as the replace refuses it, and
     one holding something other than a regular file is refused too. With nothing at the path, none
-    is created and nothing is checked. This module cannot tell a known ``[security]`` key from a
-    misspelled one, since it stays outside the settings import graph, so refusing a reset of an
-    unknown key is the caller's job; the ``security`` CLI does it."""
+    is created, and an empty file is checked in its place, as the replace would have checked the
+    empty file it wrote, so the environment layer is still loaded. This module cannot tell a known
+    ``[security]`` key from a misspelled one, since it stays outside the settings import graph, so
+    refusing a reset of an unknown key is the caller's job; the ``security`` CLI does it."""
     if not isinstance(updates, Mapping):
         raise SecurityEditError("security updates must be a JSON object of {key: value}")
     path = Path(service_config)
@@ -99,8 +101,9 @@ def set_security(
         if not changed:
             _check_unchanged(path, exists=original is not None, validate=validate)
             return {"op": "unchanged", "keys": [], "unchanged": unchanged}
-        # Drop a [security] table this edit emptied, so a full reset-to-defaults leaves no bare
-        # header behind. Only one it emptied: a table holding only comments is not a leftover.
+        # Drop a [security] table this edit emptied, comments and all, so a full reset-to-defaults
+        # leaves no bare header behind. An edit that removed nothing returned above, so a table
+        # that already held only comments is kept.
         if not len(sec):
             del doc["security"]
 
@@ -129,17 +132,29 @@ def _check_unchanged(path: Path, *, exists: bool, validate: Validate) -> None:
     A link is refused as the replace refuses it (vault BACKLOG #5619), and a path holding something
     other than a regular file, which the replace could not have replaced, is refused too. A file
     that is there is checked as it stands, under the edit lock the caller holds, so a file the
-    engine would refuse is never reported as left fine. With nothing at the path there is no file
-    to check, and none is created."""
+    engine would refuse is never reported as left fine. With nothing at the path, none is created:
+    an empty file is checked instead, in a private directory beside it named as the replace names
+    its candidate directory (so a killed run's leftover is removed by the next replace), as the
+    replace would have checked the empty file it wrote."""
     # The replace's own link refusal, so the two refuse a link in the same words.
     atomic_edit._refuse_a_link(path, SecurityEditError)
     if exists:
         _checked(validate)(path)
-    elif os.path.lexists(path):
+        return
+    if os.path.lexists(path):
         raise SecurityEditError(
             f"{path.name} was not changed: it is not a regular file, so it is no settings file to "
             "edit. Point --service-config at the settings TOML file"
         )
+    with atomic_edit.refused_as(path, SecurityEditError, "create its edit candidate"):
+        private = tempfile.TemporaryDirectory(
+            dir=path.parent, prefix=f".{path.name}.", suffix=atomic_edit.CANDIDATE_DIR_SUFFIX
+        )
+    with private as folder:
+        empty = Path(folder) / path.name
+        with atomic_edit.refused_as(path, SecurityEditError, "write its edit candidate"):
+            empty.write_bytes(b"")
+        _checked(validate)(empty)
 
 
 def _checked(validate: Validate) -> Validate:

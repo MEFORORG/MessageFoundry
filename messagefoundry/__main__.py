@@ -14123,24 +14123,17 @@ def _security(args: argparse.Namespace) -> int:
                 if (table, key) in _REMOVED_KEYS
             ]
             typos = [item for item in unknown if (item[0], item[1]) not in _REMOVED_KEYS]
-            detail = " ".join(
-                (
-                    [
-                        "Not a [security] key: "
-                        f"{_unknown_key_report(typos)}. Check the spelling against "
-                        "docs/CONFIGURATION.md."
-                    ]
-                    if typos
-                    else []
-                )
-                + removed
-            )
-            return _emit_error(
+            parts = [
                 "refused, nothing written: a null value resets a [security] key, and resetting a "
-                "key that is neither a [security] key nor set in the file would change nothing. "
-                + detail,
-                as_json=args.json,
-            )
+                "key that is neither a [security] key nor set in the file would change nothing."
+            ]
+            if typos:
+                parts.append(
+                    f"Not a [security] key: {_unknown_key_report(typos)}. Check the spelling "
+                    "against docs/CONFIGURATION.md."
+                )
+            parts.extend(removed)
+            return _emit_error(" ".join(parts), as_json=args.json)
         for key, value in updates.items():
             if value is None:
                 merged.pop(key, None)

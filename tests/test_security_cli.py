@@ -103,8 +103,11 @@ def test_set_security_reports_a_reset_that_finds_nothing_as_unchanged(tmp_path: 
     toml = tmp_path / "mf.toml"
     result = security_edit.set_security(toml, {"require_mfa": None}, validate=seen.append)
     assert result == {"op": "unchanged", "keys": [], "unchanged": ["require_mfa"]}
-    # Nothing changed and no file was there, so none is created and there is nothing to check.
-    assert not toml.exists() and seen == []
+    # Nothing changed and no file was there, so none is created; an empty file is checked in its
+    # place, and its private directory is gone afterwards.
+    assert not toml.exists() and len(seen) == 1
+    assert seen[0] != toml and seen[0].name == toml.name and not seen[0].parent.exists()
+    seen.clear()
     # A file that is there is checked as it stands, and not rewritten.
     toml.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
     result = security_edit.set_security(toml, {"require_mfa": False}, validate=seen.append)
@@ -174,6 +177,18 @@ def test_an_edit_that_changes_nothing_refuses_a_link(tmp_path: Path) -> None:
         pytest.skip(f"cannot create a symlink here: {exc}")
     with pytest.raises(security_edit.SecurityEditError, match="it is a link"):
         security_edit.set_security(link, {"require_mfa": False}, validate=lambda _c: None)
+
+
+def test_a_reset_that_finds_nothing_on_an_absent_file_still_names_the_environment(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no file and nothing changed, the whole-file load still runs, on an empty file, so a
+    session limit only this command's environment loosens is still named, and none is created."""
+    toml = tmp_path / "mf.toml"
+    monkeypatch.setenv(f"{_ENV_PREFIX}SECURITY_MAX_SESSION_HOURS", "99")
+    rc, res = _set(toml, {"require_mfa": None}, capsys)
+    assert rc == 0 and res["op"] == "unchanged" and not toml.exists()
+    assert "max_session_hours" in [lo["switch"] for lo in res["loosenings"]]
 
 
 def test_a_security_table_holding_only_comments_is_kept(tmp_path: Path) -> None:
