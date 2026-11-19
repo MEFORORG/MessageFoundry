@@ -13487,6 +13487,11 @@ class MessageStore:
         # threads are non-daemon, so a `close`d store could still hold threads interpreter exit has
         # to join. Wait them out so "the store is closed" means every thread it owned is gone.
         await _await_connection_worker_exit(self._db)
+        # BACKLOG #5963: release the pooled Vault sockets of a cipher that holds some (the Transit
+        # cipher). Read by name, so the store takes no import of the cipher's module.
+        release = getattr(self._cipher, "close_connections", None)
+        if callable(release):
+            release()
 
     # --- write path ----------------------------------------------------------
 

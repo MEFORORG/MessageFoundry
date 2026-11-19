@@ -158,6 +158,7 @@ def _build_client(
     revocation_attested: bool,
     posture: HopPosture | None = None,
     revocation_reason: str | None = None,
+    timeout: float | tuple[float, float] | None = None,
 ) -> Any:
     """Construct an ``hvac.Client``. Factored out so tests can substitute a fake Transit backend without
     a live Vault. ``addr`` and ``token`` are REQUIRED and always passed to hvac (BACKLOG #2851):
@@ -170,7 +171,8 @@ def _build_client(
 
     ``posture`` is the instance posture the caller was handed, or ``None``. ``None`` counts as
     enforcing, so leaving it out is the strict answer. ``revocation_reason`` is the attestation's
-    reason, for the one line an attested crossing logs."""
+    reason, for the one line an attested crossing logs. ``timeout`` is the requests timeout every
+    request takes; ``None`` leaves hvac's own default (BACKLOG #5983)."""
     # The backstop for a caller that did not read through those two functions.
     if not addr:
         raise KeyProviderError(_ADDR_UNSET)
@@ -212,6 +214,9 @@ def _build_client(
         "allow_redirects": False,
         **_vault_ca_kwargs(addr),
     }
+    if timeout is not None:
+        # Omitted when unset, so the stock construction is unchanged (BACKLOG #5983).
+        kwargs["timeout"] = timeout
     # ASVS 12.1.2 (BACKLOG #1317, ADR 0180; BACKLOG #300): hvac exposes no SSLContext, so the
     # assertion returns a factory that BUILDS this hop's context, narrows it to the approved suites
     # and asserts it, once per connection. It runs it once here, so a bad list raises ValueError at

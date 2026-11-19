@@ -98,6 +98,8 @@ from messagefoundry.store.keyprovider_vault import (
 from messagefoundry.store.row_seal import transit_mac_version
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from messagefoundry.config.settings import StoreSettings
     from messagefoundry.config.tls_policy import HopPosture
 
@@ -105,6 +107,14 @@ log = logging.getLogger(__name__)
 
 #: The `[store].cipher_provider` value that selects this cipher.
 PROVIDER_NAME = "vault_transit"
+
+#: The (connect, read) timeout, in seconds, of every Transit request this cipher sends (BACKLOG
+#: #5983). It is the engine's own bound rather than hvac's 30-second default, because the store
+#: calls the cipher on the event loop, so a Vault that stalls holds the loop for up to this long per
+#: request. requests applies the read figure to each socket read, not to the whole reply, so a reply
+#: that keeps trickling bytes is not cut off by it. A request it ends raises a requests timeout,
+#: which :func:`_transit_failure` reads as an outage that gave no verdict on the value.
+TRANSIT_REQUEST_TIMEOUT_S: tuple[float, float] = (5.0, 10.0)
 
 # Connection reuses the shared Vault wiring (a deployment runs one Vault): the address and token are read
 # through keyprovider_vault.store_vault_hop, which refuses either one unset rather
@@ -390,8 +400,23 @@ class TransitCipher(_UnmarkedPolicy):
         audit_key: str | None = None,
         *,
         allow_unmarked: bool = False,
+        client_factory: Callable[[], Any] | None = None,
     ) -> None:
-        self._client = client
+        # BACKLOG #5963: an hvac client holds one requests Session, which requests does not document
+        # as safe to share between threads, and this cipher is called both on the event loop and in
+        # worker threads (the store's asyncio.to_thread readers and the row sealer's pool). With a
+        # ``client_factory``, each thread builds and keeps its own client, and ``client`` serves the
+        # thread that constructed the cipher. Without one, every thread shares ``client``; that is
+        # for a caller that hands in one fake client, never what build_transit_cipher does.
+        self._client_factory = client_factory
+        self._shared_client = client
+        self._thread_clients = threading.local()
+        self._thread_clients.held = (0, client)
+        self._clients_lock = threading.Lock()
+        #: Every client built so far, so :meth:`close` can release their pooled sockets.
+        self._clients: list[Any] = [client]
+        #: Bumped by :meth:`close`, so a thread holding a client from before it builds a new one.
+        self._generation = 0
         self._key = key_name
         # The same unmarked-value refusal as the in-process cipher (BACKLOG #1169, ASVS 11.3.3).
         self._init_unmarked_policy(allow_unmarked)
@@ -401,6 +426,44 @@ class TransitCipher(_UnmarkedPolicy):
         # Set once Transit refused a batch, or answered one without a `reference`, and then
         # served its values alone: every later value goes alone too (BACKLOG #6706).
         self._batch_alone = False
+
+    @property
+    def _client(self) -> Any:
+        """The hvac client the calling thread uses (BACKLOG #5963), built on its first use there
+        when this cipher has a factory. Every caller reads it inside the handler that turns a
+        failed Transit request into the cipher's own error, so a build that raises is refused the
+        same way."""
+        if self._client_factory is None:
+            return self._shared_client
+        held: tuple[int, Any] | None = getattr(self._thread_clients, "held", None)
+        if held is not None and held[0] == self._generation:
+            return held[1]
+        # A build that raises propagates to the caller's own handler, as a failed request would.
+        client = self._client_factory()
+        with self._clients_lock:
+            self._clients.append(client)
+            generation = self._generation
+        self._thread_clients.held = (generation, client)
+        return client
+
+    def close_connections(self) -> None:
+        """Close the pooled Vault connections of every client this cipher has built (BACKLOG #5963).
+        The stores call it from their own ``close``. The cipher stays usable, because more than one
+        store can share it: a later call on any thread builds a fresh client when this cipher has a
+        factory, and otherwise reuses the one client, whose session opens a new connection. A client
+        whose close raises is logged by the exception's type and the rest are still closed."""
+        with self._clients_lock:
+            clients = self._clients
+            self._generation += 1
+            self._clients = [] if self._client_factory is not None else [self._shared_client]
+        for client in clients:
+            closer = getattr(getattr(client, "adapter", None), "close", None)
+            if not callable(closer):
+                continue
+            try:
+                closer()
+            except Exception as exc:  # noqa: BLE001 -- a close is best-effort; logged, not raised
+                log.warning("closing a Transit client's connections raised %s", type(exc).__name__)
 
     @property
     def transit_key_name(self) -> str:
@@ -1119,18 +1182,26 @@ def build_transit_cipher(
     # process. A token replaced afterwards, in the environment or the secrets directory, is not
     # seen until the store is opened again.
     addr, token = store_vault_hop()
+
+    def build_client() -> Any:
+        # One construction for the first client and for each thread's own (BACKLOG #5963), so every
+        # client asserts the same TLS suites, mounts the same strict reader and carries the
+        # engine's request timeout (BACKLOG #5983).
+        return _build_client(
+            addr,
+            token,
+            revocation_attested=settings.vault_revocation_attested,
+            posture=posture,
+            revocation_reason=settings.vault_revocation_attested_reason,
+            timeout=TRANSIT_REQUEST_TIMEOUT_S,
+        )
+
     # OUTSIDE the try on purpose. `_build_client` asserts this hop's TLS suites (ADR 0180) and raises
     # ValueError; the `except Exception` below would relabel that "could not reach a Vault Transit
     # key", turning a configuration refusal into what reads as a connectivity failure. Fail-closed is
     # unchanged either way: both paths propagate and the cipher provider refuses to come up.
     # lazy hvac import; fails closed naming the [vault] extra
-    client = _build_client(
-        addr,
-        token,
-        revocation_attested=settings.vault_revocation_attested,
-        posture=posture,
-        revocation_reason=settings.vault_revocation_attested_reason,
-    )
+    client = build_client()
     try:
         # Startup connectivity + key-existence + key-TYPE check: read the key metadata (no crypto, no
         # secrets). This turns a mis-provisioned Vault into a refuse-to-start rather than a first-write
@@ -1177,7 +1248,11 @@ def build_transit_cipher(
             f"(data={key_name!r}, audit={audit_key!r}, extra {_EXTRA!r}): {vault_failure_text(exc)}."
         ) from exc
     return TransitCipher(
-        client, key_name, audit_key=audit_key, allow_unmarked=settings.allow_unmarked_ciphertext
+        client,
+        key_name,
+        audit_key=audit_key,
+        allow_unmarked=settings.allow_unmarked_ciphertext,
+        client_factory=build_client,
     )
 
 

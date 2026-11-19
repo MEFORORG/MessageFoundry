@@ -2928,6 +2928,11 @@ class PostgresStore:
         except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
             log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
         await self._pool.close()
+        # BACKLOG #5963: release the pooled Vault sockets of a cipher that holds some (the Transit
+        # cipher). Read by name, so the store takes no import of the cipher's module.
+        release = getattr(self._cipher, "close_connections", None)
+        if callable(release):
+            release()
 
     async def warm_pool(self) -> None:
         # Pre-open pooled connections so a connection burst (the post-promotion delivery workers, or a

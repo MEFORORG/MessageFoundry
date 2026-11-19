@@ -5831,6 +5831,11 @@ class SqlServerStore:
             if self._pool_executor is not None:
                 self._pool_executor.shutdown(wait=False)
                 self._pool_executor = None
+        # BACKLOG #5963: release the pooled Vault sockets of a cipher that holds some (the Transit
+        # cipher). Read by name, so the store takes no import of the cipher's module.
+        release = getattr(self._cipher, "close_connections", None)
+        if callable(release):
+            release()
 
     # --- ADR 0071 B5: synchronous fused-handoff connection source ------------
     def open_sync_handoff_pool(self, stage: str, size: int) -> _SyncHandoffPool:
