@@ -15,6 +15,7 @@ route's check read it as present.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
@@ -136,6 +137,35 @@ async def test_create_user_racing_a_role_delete_is_400_and_leaves_no_account(
         retry = {"username": "newbie", "roles": ["viewer"], "email": "newbie@example.org"}
         r = await c.post("/users", headers=headers, json=retry)
         assert r.status_code == 201, r.text
+
+
+async def test_the_orphan_removal_after_a_role_write_race_is_audited(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5968: removing the roleless account a refused role write left is a user deletion,
+    so it writes the ``user.deleted`` row every other deletion writes, naming the account, the
+    acting administrator and the race as its reason."""
+    service = await _service(engine)
+    async with _client(engine, service) as c:
+        headers = await _admin_headers(service, c)
+        role_id = await _custom_role(service)
+        written: list[str] = []
+        original: Callable[..., Awaitable[Any]] = service.store.set_user_roles
+
+        async def recording(user_id: str, *args: Any, **kwargs: Any) -> Any:
+            written.append(user_id)
+            return await original(user_id, *args, **kwargs)
+
+        monkeypatch.setattr(service.store, "set_user_roles", recording)
+        _delete_first(monkeypatch, service, "set_user_roles", role_id)
+        body = {"username": "orphan", "roles": [role_id], "email": "orphan@example.org"}
+        r = await c.post("/users", headers=headers, json=body)
+        assert r.status_code == 400, r.text
+    [orphan_id] = written
+    rows = await service.store.list_audit(action="user.deleted", limit=10)
+    [row] = [row for row in rows if json.loads(row["detail"])["user_id"] == orphan_id]
+    assert row["actor"] == "adm"
+    assert "role write" in json.loads(row["detail"])["reason"]
 
 
 async def test_set_roles_racing_a_role_delete_is_400_and_writes_nothing(

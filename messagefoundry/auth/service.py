@@ -19834,15 +19834,37 @@ class AuthService:
             # which rolled back. The account row committed first, holding the username with no
             # role and no `user.created` row, so it is removed: otherwise a retry under the same
             # name would be refused as taken. It holds no role, so not Administrator, which is
-            # what `delete_user` requires. A store fault in the removal leaves the orphan the crash
-            # case above leaves, and is logged rather than masking the refusal; a defect raises.
+            # what `delete_user` requires. It is a user deletion, so it commits the `user.deleted`
+            # row `delete_user` writes, in the same transaction, with the race as its reason. A
+            # store fault in the removal leaves the orphan the crash case above leaves, and is
+            # logged rather than masking the refusal; a defect raises.
             try:
-                await self._store.delete_user(user_id)
+                await self._store.remove_unless_last_admin(
+                    user_id,
+                    AdminRemoval.DELETE,
+                    admin_role_id=Role.ADMINISTRATOR.value,
+                    audits=(
+                        AuditAppend(
+                            "user.deleted",
+                            actor=actor,
+                            detail=_json(
+                                {
+                                    "user_id": user_id,
+                                    "reason": "role write refused: a role it named was deleted "
+                                    "after the role check",
+                                }
+                            ),
+                            client=client,
+                        ),
+                    ),
+                )
             except _passkey_read_errors() as delete_exc:
                 if isinstance(delete_exc, AUDIT_WRITE_DEFECTS):
                     raise
                 _log.exception(
-                    "an account whose role write was refused could not be removed (BACKLOG #5968)"
+                    "account %s, whose role write was refused, could not be removed "
+                    "(BACKLOG #5968)",
+                    user_id,
                 )
             if role_refusal is exc:
                 raise
