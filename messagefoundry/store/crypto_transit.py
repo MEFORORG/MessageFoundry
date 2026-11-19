@@ -547,7 +547,7 @@ def _close_client(client: object, owner: int) -> None:
 class _ThreadClient:
     """One thread's own hvac client (BACKLOG #5963). :attr:`release` closes it only when it runs
     on that thread. Run on any other thread, as when the cipher is collected there, it leaves the
-    client to garbage collection. It is not run at interpreter exit."""
+    client to garbage collection. weakref's exit hook does not run it."""
 
     __slots__ = ("__weakref__", "client", "generation", "release")
 
@@ -578,8 +578,9 @@ class TransitCipher(_UnmarkedPolicy):
     ) -> None:
         # BACKLOG #5963: requests does not document its Session as thread-safe, and this cipher is
         # called on the event loop and in worker threads. With a ``client_factory`` each thread
-        # keeps its own client, ``client`` serving the thread that builds the cipher, and no thread
-        # closes another thread's client. Without one, every thread shares ``client``.
+        # keeps its own client, ``client`` serving the thread that builds the cipher, and this
+        # cipher never closes a thread's client from another thread. Without one, every thread
+        # shares ``client``.
         self._client_factory = client_factory
         self._shared_client = client
         self._thread_clients = threading.local()
@@ -603,17 +604,17 @@ class TransitCipher(_UnmarkedPolicy):
         current client of its own builds one. A build failure propagates unchanged and is not
         cached: the thread's next call builds again. The data-key paths, ``encrypt`` and
         ``decrypt`` single and batch, read it through :meth:`_thread_client` before their request's
-        handler, which turns a build failure into :func:`_build_failure`'s error. The audit-key paths read it where they
-        send their request, so a build failure there meets the handling a failed request does."""
+        handler, which turns a build failure into :func:`_build_failure`'s error. The audit-key
+        paths read it where they send their request, so a build failure there meets the handling
+        a failed request does."""
         if self._client_factory is None:
             return self._shared_client
         held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
-        if held is not None:
-            if held.generation == self._generation:
-                return held.client
-            # Stale: close it before the build, so a build that raises does not leave it open.
-            del self._thread_clients.held
-            held.release()
+        if held is not None and held.generation == self._generation:
+            return held.client
+        # Stale or absent: close a stale one before the build, so a build that raises cannot
+        # leave it open.
+        self._drop_held()
         generation = self._generation
         return self._hold(self._client_factory(), generation)
 
@@ -626,23 +627,28 @@ class TransitCipher(_UnmarkedPolicy):
             raise _build_failure(op, self._key, exc) from exc
 
     def _hold(self, client: Any, generation: int) -> Any:
-        """Keep ``client`` as the calling thread's own; only this thread closes it."""
+        """Keep ``client`` as the calling thread's own; this cipher closes it only on this thread."""
         self._thread_clients.held = _ThreadClient(client, generation)
         return client
 
-    def close_connections(self) -> None:
-        """Close the calling thread's client and mark every other thread's stale (BACKLOG #5963).
-
-        No thread closes another thread's client. Each other thread releases its own at least on
-        its next call, which builds a fresh one, or when it ends. The cipher stays usable, since
-        stores can share it. Without a factory, the one shared client is left open."""
-        if self._client_factory is None:
-            return
-        self._generation += 1
+    def _drop_held(self) -> None:
+        """Detach the calling thread's client, if any, then close it, in that order."""
         held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
         if held is not None:
             del self._thread_clients.held
             held.release()
+
+    def close_connections(self) -> None:
+        """Close the calling thread's client and mark every other thread's stale (BACKLOG #5963).
+
+        This cipher never closes a thread's client from another thread. Each other thread releases
+        its own at least on its next call, which builds a fresh one, or when it ends; until then a
+        stale client stays open. The cipher stays usable, since stores can share it. Without a
+        factory, the one shared client is left open."""
+        if self._client_factory is None:
+            return
+        self._generation += 1
+        self._drop_held()
 
     @property
     def transit_key_name(self) -> str:

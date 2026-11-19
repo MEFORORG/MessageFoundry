@@ -13477,9 +13477,9 @@ class MessageStore:
         try:
             await self._close_handles()
         finally:
-            # BACKLOG #5963: let a cipher holding Vault sockets (the Transit cipher) release them,
-            # even when a step above raised; close_connections says what it closes. Read by name,
-            # so the store takes no import of the cipher's module.
+            # BACKLOG #5963: tell a cipher holding Vault sockets (the Transit cipher) the store is
+            # closing, even when a step above raised. close_connections says what it closes, and
+            # that is not every thread's. Read by name: the store does not import the cipher.
             release = getattr(self._cipher, "close_connections", None)
             if callable(release):
                 release()

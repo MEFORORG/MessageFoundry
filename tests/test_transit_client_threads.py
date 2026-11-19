@@ -304,10 +304,10 @@ def test_a_thread_that_exits_closes_its_own_client() -> None:
     so threads that come and go do not each leave a Vault socket open."""
     cipher, built = _cipher()
     _in_thread(lambda: cipher.encrypt("synthetic"))
-    # The thread's locals are torn down as it ends, which can land just after join() returns.
+    # The ending thread tears its locals down itself, which can land just after join() returns.
+    # A teardown on this thread would close nothing, so only waiting can help here.
     deadline = time.monotonic() + 10
     while built[1].adapter.closed == 0 and time.monotonic() < deadline:
-        gc.collect()
         time.sleep(0.01)
     assert [client.adapter.closed for client in built] == [0, 1]
     cipher.close_connections()
@@ -363,6 +363,14 @@ def test_a_cipher_collected_on_another_thread_leaves_a_threads_client_open() -> 
     if failures:
         raise failures[0]
     assert opened == ["synthetic"]
+
+
+def test_weakrefs_exit_hook_does_not_release_a_thread_client() -> None:
+    """BACKLOG #5963. Mutation: leave the finalizer's ``atexit`` at its default. Red: weakref's
+    exit hook would run every live thread client's release at interpreter exit."""
+    cipher, _ = _cipher()
+    held = cipher._thread_clients.held
+    assert held.release.alive and held.release.atexit is False
 
 
 def test_a_stale_client_is_closed_even_when_its_rebuild_raises() -> None:
