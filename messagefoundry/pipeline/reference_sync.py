@@ -391,8 +391,10 @@ async def _load_database_source(
         login_timeout=_login_timeout(settings, "DATABASE reference source"),
     )
     # Every borrow from this pool carries the statement timeout, as a DATABASE connector's does
-    # (BACKLOG #5756). A non-zero value bounds an uncancelled statement's hold on the sync pass; at
-    # 0, or where the pool could not be tracked (logged at WARNING), nothing bounds it.
+    # (BACKLOG #5756). A non-zero value bounds each statement call (execute, each fetch) as the ODBC
+    # query timeout, not the pass as a whole. Nothing bounds it at least at 0, on a pool that could
+    # not be tracked, or on a driver connection with no timeout (both logged at WARNING; see
+    # _bound_statements and _apply_statement_timeout).
     _bound_statements(pool, statement_timeout)
     try:
         # What names the login, never the password, so the remembered key holds no credential.
@@ -441,8 +443,8 @@ async def _load_database_source(
             # A cancellation returns the connection only once its statement and cursor close have
             # ended (BACKLOG #2394). The pool close below stops waiting for such a held connection
             # at a bound, so once a stop cancels this sync, a statement with no time limit does not
-            # hold that stop. An uncancelled statement is bounded by statement_timeout, applied
-            # at the borrow above; at 0 it holds the pass.
+            # hold that stop. An uncancelled statement's calls are bounded by statement_timeout,
+            # applied at the borrow above, except in the cases listed there; at 0 it holds the pass.
             await _close_and_release(pool, conn, cur)
     finally:
         await _close_pool_bounded(pool, "DATABASE reference source")

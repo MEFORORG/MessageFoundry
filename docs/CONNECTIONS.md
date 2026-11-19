@@ -2660,13 +2660,13 @@ A `DatabaseRef(...)` reference sync reads a partner database too, so it gets the
   its build leg when the config has a `messagefoundry.toml`, and at each sync.
 - **The statement timeout.** `DatabaseRef(statement_timeout=…)`, whole seconds, bounds the sync's
   statement by the DATABASE connector's rule: unset is 30 s, `0` is no limit, and at least a
-  negative, fractional or boolean value, or one above `2**31 - 1`, the most pyodbc takes, is refused
+  negative, fractional or boolean value, or one above `2**31 - 1`, the largest value pyodbc takes on every platform, is refused
   when declared, an `env()` value by the build check and at each sync. A statement that runs past
   it (`HYT00`) fails that sync as
   `ReferenceStatementTimedOut`, and the last-good snapshot keeps serving; a driver that refuses the
-  value fails it as `ReferenceStatementTimeoutRefused`. The 30 s default is the store's own
-  `[store].command_timeout` default, as on the SQL Server preset, and a large set's statement can
-  need more. At `0`, an uncancelled
+  value fails it as `ReferenceStatementTimeoutRefused`. The 30 s default is the same value as
+  the `[store].command_timeout` default, not read from it, and a large set's statement can need
+  more. At `0`, an uncancelled
   statement holds the sequential sync pass, and every other set's sync behind it, until it returns.
 - **The result must fit the declared columns.** At least these refusals apply. A `key_column` or
   `value_column` the result lacks, or holds twice, as a join can, fails the sync as
@@ -4751,8 +4751,8 @@ Facts that are easy to get wrong, stated plainly first:
   `pool.acquire()`; on expiry the operation fails as a **transient** delivery error and enters the
   `RetryPolicy` path. It never waits indefinitely.
 - **The DATABASE connector bounds each statement with `statement_timeout`** (whole seconds, `0`
-  for no limit; on `Database(...)`, `DatabasePoll(...)` and `DatabaseLookup(...)`, BACKLOG
-  #5756). **Unset, the default depends on the driver family.** It is 30 s on the SQL Server
+  for no limit, at most `2**31 - 1`; on `Database(...)`, `DatabasePoll(...)` and
+  `DatabaseLookup(...)`, BACKLOG #5756). **Unset, the default depends on the driver family.** It is 30 s on the SQL Server
   preset and on a generic connection whose `odbc_driver` is Microsoft's ODBC Driver for SQL
   Server (family `msodbc`), the one family known to take the setting: the SQL Server store
   sets `[store].command_timeout` through the same pyodbc setter on that driver. It is `0`, no
