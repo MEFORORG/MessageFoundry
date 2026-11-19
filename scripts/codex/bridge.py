@@ -74,7 +74,14 @@ def repo_skill_directories(root: Path) -> tuple[Path, ...]:
             timeout=10,
             check=True,
         ).stdout.splitlines()
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError) as exc:
+        # On stderr, so source-skill's stdout stays one path line. Silence would hide the primary
+        # checkout's skills with no trace. Outside any repository this is expected.
+        detail = str(exc)
+        if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+            detail += f": {exc.stderr.strip()}"
+        message = f"git query failed, primary checkout's skills not searched: {detail}"
+        print(f"Codex bridge: warning: {message}", file=sys.stderr)
         return own
     # Only for a checkout's own top level, never a directory nested in some other repository. A bare
     # repository has no primary checkout; its common dir is not named .git.
@@ -393,8 +400,8 @@ def dispatch(root: Path, payload: dict) -> dict:
                 completed.check_returncode()
             except (OSError, ValueError, subprocess.SubprocessError, HookBlocked) as exc:
                 # A failed SessionStart hook, exit 2 included, is a non-blocking error in Claude
-                # Code: the session starts with every other hook's context. Elsewhere a failure
-                # still fails closed.
+                # Code: the session starts with every other hook's context. Elsewhere it propagates,
+                # which is not fail-closed in Codex: docs/CODEX.md states the known gap.
                 if event != "SessionStart":
                     raise
                 label = " ".join(str(part) for part in (hook["command"], *hook.get("args", [])))

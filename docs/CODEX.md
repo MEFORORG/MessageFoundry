@@ -29,9 +29,21 @@ adapter; alias matching alone cannot translate an edit payload.
 New event types appear as unmapped at startup. Unsupported handler types and
 failed commands report errors. The bridge does not silently claim they ran.
 A failed SessionStart hook, exit 2 included, is reported in `systemMessage` and
-the other hooks' context is kept, as in Claude Code; on every other event a
-failure fails closed. On Windows a timeout kills the hook's process tree; a
-descendant that escaped it gets a short drain and is then left behind.
+the other hooks' context is kept, as in Claude Code.
+
+A fault is not fail-closed; this is a known gap. On every other event, at
+least a hook that crashes or times out, unreadable settings, a bad payload or a
+missing `.venv` end the bridge or its launcher with a non-zero exit that the
+registered line delivers to Codex as 1. Codex treats an exit other than 0 or 2
+as a non-blocking error, so the tool runs: the faulting guard does not block
+it, and a deny an earlier guard of the same event returned is lost with the
+bridge's output. A hook's deliberate exit 2 leaves the registered line as 2
+when it is run directly, because `invoke.ps1` ends its process with 2 for it.
+Whether Codex's own launcher keeps that 2 is unverified; an outer
+`pwsh -Command` shell would report it as 1.
+
+On Windows a timeout kills the hook's process tree; a descendant that escaped
+it gets a short drain and is then left behind.
 A command-only hook runs in the shell its `shell` key names: `bash` (Git Bash on
 Windows, never the WSL launcher) or `powershell`. With no `shell`, it uses
 PowerShell on Windows and `sh` elsewhere. Structured `command` and `args` avoid

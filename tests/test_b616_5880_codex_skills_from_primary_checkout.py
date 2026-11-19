@@ -137,3 +137,20 @@ def test_an_inherited_git_dir_does_not_reach_the_skill_query(bridge, linked, tmp
 
 def test_outside_any_repository_only_the_root_is_searched(bridge, tmp_path):
     assert bridge.repo_skill_directories(tmp_path) == (tmp_path / ".claude/skills",)
+
+
+def test_a_failed_skill_query_is_reported_not_swallowed(bridge, tmp_path, capsys, monkeypatch):
+    def no_git(*args, **kwargs):
+        raise OSError("git not found")
+
+    monkeypatch.setattr(bridge.subprocess, "run", no_git)
+    assert bridge.repo_skill_directories(tmp_path) == (tmp_path / ".claude/skills",)
+    captured = capsys.readouterr()
+    assert "git query failed" in captured.err and "git not found" in captured.err
+    assert captured.out == ""
+
+
+def test_a_successful_skill_query_reports_nothing(bridge, linked, capsys):
+    _, worktree = linked
+    assert len(bridge.repo_skill_directories(worktree)) == 2
+    assert "git query failed" not in capsys.readouterr().err
