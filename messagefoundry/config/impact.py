@@ -23,6 +23,13 @@ in a config helper it reaches) or in the object's own definition statement are t
 data literal that merely happens to equal the old name — living in a different function — is left alone
 (BACKLOG #5620).
 
+Within a site the rewrite is also **role-scoped** (BACKLOG #5980): a literal is rewritten only where it
+is the name-bearing argument of its role — the definition's own name argument, a ``Send()`` target, a
+router's returned handler names, an inbound's ``router=`` value, a table accessor's first argument, or a
+value any of those reads through a local variable or a module binding. An equal literal anywhere else
+at the site (a field comparison, a lookup key, a sibling argument) is left alone, and its referrer is
+reported unresolved, since it still reads the old name.
+
 ``plan_rename`` is a pure computation (it reads files but writes nothing); ``apply_rename`` performs the
 writes, preserving each file's exact bytes outside the replaced spans (newline style and the original
 quote delimiter of every literal are kept). A dry-run followed by ``--apply`` on an unchanged tree
@@ -35,7 +42,7 @@ import ast
 import io
 import re
 import tokenize
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import FunctionType
@@ -43,6 +50,7 @@ from types import FunctionType
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
 from messagefoundry.config.reachability import (
+    _TABLE_ACCESSORS,
     Reference,
     ReferenceIndex,
     SourceCache,
@@ -228,20 +236,27 @@ def plan_rename(
 
     sources = SourceCache()
     index = build_reference_index(registry, sources)
-    # file -> the line spans of the object's own definition, every literal in which is rewritten.
+    # file -> the line spans of the object's own definition, scanned for literals, and the positions in
+    # them of its name argument, the only literals there that are rewritten (BACKLOG #5980).
     def_spans: dict[str, list[_Span]] = {}
+    def_positions: dict[str, set[tuple[int, int]]] = {}
     # (toml-path, key) pairs whose value == old must be rewritten (router binding / name definition).
     toml_targets: set[tuple[str, str]] = set()
 
-    def add_def_span(file: str | None, span: _Span | None) -> None:
+    def add_def_span(
+        file: str | None, span: _Span | None, positions: frozenset[tuple[int, int]]
+    ) -> None:
         if file is None or span is None:
             return
         resolved = _under_config_dir(config_dir, file)
         if resolved is not None:
             def_spans.setdefault(resolved, []).append(span)
+            def_positions.setdefault(resolved, set()).update(positions)
 
     # The object's own definition (so the name is actually changed, not only its referents).
-    _add_definition_span(registry, config_dir, target_kind, old, add_def_span, toml_targets)
+    _add_definition_span(
+        registry, config_dir, target_kind, old, sources, add_def_span, toml_targets
+    )
 
     # Every referent edge: rewrite the literal at each site the referrer reads it from (or its toml
     # binding). Keep each py referrer's sites, so a referrer we could not rewrite is surfaced, not
@@ -253,7 +268,7 @@ def plan_rename(
             continue
         sites, complete = found
         in_dir = [
-            _Site(resolved, site.span, site.allowed)
+            _Site(resolved, site.span, site.allowed, site.rewritable)
             for site in sites
             if (resolved := _under_config_dir(config_dir, site.file)) is not None
         ]
@@ -276,7 +291,7 @@ def plan_rename(
         kinds = sources.occurrences(file, old)
         for edit in _py_literal_edits(file, old, new, spans):
             pos = (edit.start_line, edit.start_col)
-            if _in_any_span(edit.start_line, file_def) or any(
+            if pos in def_positions.get(file, ()) or any(
                 site.rewrites(pos, kinds, shared_kind) for site in file_sites
             ):
                 edits.append(edit)
@@ -332,26 +347,38 @@ def _add_definition_span(
     config_dir: Path,
     target_kind: str,
     old: str,
-    add_py_span: object,
+    sources: SourceCache,
+    add_py_span: Callable[[str | None, _Span | None, frozenset[tuple[int, int]]], None],
     toml_targets: set[tuple[str, str]],
 ) -> None:
     """Scope the object's own definition (``@router("old")`` / ``outbound("old", …)`` /
-    ``DatabaseLookup("old", …)`` / a TOML ``name = "old"``). The file-backed ``code_set`` kind has no
-    ``.py`` definition — its file move is the caller's job — so nothing is added for it here."""
-    assert callable(add_py_span)
+    ``DatabaseLookup("old", …)`` / a TOML ``name = "old"``), with the position of its name argument,
+    the one literal there a rename rewrites: a sibling argument equal to the old name (an inbound's
+    ``router=`` naming a router of the same name) is another object's (BACKLOG #5980). The file-backed
+    ``code_set`` kind has no ``.py`` definition — its file move is the caller's job — so nothing is
+    added for it here."""
     if target_kind in ("router", "handler"):
         table = registry.routers if target_kind == "router" else registry.handlers
         fn = table.get(old)
         if fn is not None:
             file, span = _fn_span(fn)
-            add_py_span(file, span)
+            positions = (
+                _decorator_positions(sources, file, span, fn, old)
+                if file is not None and span is not None
+                else frozenset()
+            )
+            add_py_span(file, span, positions)
         return
     if target_kind in ("inbound", "outbound"):
         conn = (registry.inbound if target_kind == "inbound" else registry.outbound).get(old)
         if conn is None:
             return
         if conn.source_line is not None and conn.source_file:
-            add_py_span(conn.source_file, _statement_span(conn.source_file, conn.source_line))
+            add_py_span(
+                conn.source_file,
+                _statement_span(conn.source_file, conn.source_line),
+                _call_line_positions(sources, conn.source_file, conn.source_line, old),
+            )
         elif conn.source_file and _is_connections_toml(conn.source_file):
             toml_targets.add((conn.source_file, "name"))
         return
@@ -359,7 +386,12 @@ def _add_definition_span(
         # lookup/fhir_lookup/reference are code-first declarations (``DatabaseLookup("old", …)`` etc.)
         # whose spec records no source line — locate the declaring statement by parsing the modules.
         file, span = _scan_declaration_span(config_dir, _DECLARATION_FACTORIES[target_kind], old)
-        add_py_span(file, span)
+        positions = (
+            _call_line_positions(sources, file, span.start, old)
+            if file is not None and span is not None
+            else frozenset()
+        )
+        add_py_span(file, span, positions)
 
 
 @dataclass(frozen=True)
@@ -370,11 +402,17 @@ class _Site:
     referrer's own body, an inbound's statement, a non-table binding such as ``TARGET = "OB_X"``). A
     site the referrer only reaches (a helper, a module-level binding) for a table rename names its
     referent positions instead: the literals passed to that table kind's accessor, or a bare
-    ``NAME = "old"`` value, so an unrelated equal literal there (a dict key, a label) is left alone."""
+    ``NAME = "old"`` value, so an unrelated equal literal there (a dict key, a label) is left alone.
+
+    ``rewritable``, when set, narrows the rewrite to the literals in a referent role (BACKLOG #5980): a
+    site whose every equal literal is counted still rewrites only a ``Send()`` target, a returned
+    handler name and the like, so an equal literal in another role is left alone and, being still
+    counted, reports its referrer unresolved."""
 
     file: str
     span: _Span
     allowed: frozenset[tuple[int, int]] | None
+    rewritable: frozenset[tuple[int, int]] | None = None
 
     def rewrites(
         self,
@@ -383,6 +421,8 @@ class _Site:
         shared_kind: str | None,
     ) -> bool:
         """Whether the literal at ``pos`` is one of this site's referents."""
+        if self.rewritable is not None and pos not in self.rewritable:
+            return False
         if self.allowed is not None:
             return pos in self.allowed
         if not self.span.start <= pos[0] <= self.span.end:
@@ -433,6 +473,9 @@ def _referrer_sites(
         roots: list[object] = [fn]
         if ref.referrer_kind == "handler" and ref.referrer in registry.handler_accepts:
             roots.append(registry.handler_accepts[ref.referrer])
+        # A router names handlers by returning them, a handler names outbounds by Send(); a helper
+        # either reaches may hand the name back to it, so a helper's return value is a role too.
+        own_roles = _ROLE_RETURN if ref.referrer_kind == "router" else _ROLE_SEND
         sites: list[_Site] = []
         # A referrer whose own function cannot be read is unresolved. A predicate that is not a plain
         # function (a partial, a callable instance) is not: the index cannot read it either, so no
@@ -443,8 +486,14 @@ def _referrer_sites(
                 file, span = _fn_span(func)
                 if file is None or span is None:
                     complete = complete and depth > 0
-                elif depth == 0 or table_kind is None:
-                    sites.append(_Site(file, span, None))
+                elif table_kind is None:
+                    roles = own_roles if depth == 0 else own_roles | _ROLE_RETURN
+                    rewritable = _role_positions(sources, file, span, old, roles)
+                    sites.append(_Site(file, span, None, rewritable))
+                elif depth == 0:
+                    rewritable = _role_positions(sources, file, span, old, frozenset(), table_kind)
+                    rewritable |= _default_positions(sources, func, file, span, old)
+                    sites.append(_Site(file, span, None, rewritable))
                 else:
                     allowed = _accessor_positions(sources, file, span, old, table_kind)
                     allowed |= _default_positions(sources, func, file, span, old)
@@ -459,9 +508,14 @@ def _referrer_sites(
             return [], False
         if conn.source_line is not None and conn.source_file:
             span = _statement_span(conn.source_file, conn.source_line)
-            return (
-                ([_Site(conn.source_file, span, None)], True) if span is not None else ([], False)
-            )
+            if span is None:
+                return [], False
+            # The statement is a declaration, not logic: only its router= value is the referent, and
+            # the inbound's own name or a sibling argument equal to the router's is another value
+            # (BACKLOG #5980). A router= the statement does not spell leaves the site empty, which
+            # reports the inbound unresolved.
+            binding = _role_positions(sources, conn.source_file, span, old, _ROLE_ROUTER)
+            return [_Site(conn.source_file, span, binding)], True
         if conn.source_file and _is_connections_toml(conn.source_file):
             # The referent edge is the router binding; rewrite only the `router = "..."` value.
             toml_targets.add((conn.source_file, "router"))
@@ -507,6 +561,223 @@ def _default_positions(
     return out
 
 
+# --- referent roles (BACKLOG #5980) -------------------------------------------
+
+#: Role tags :func:`_role_positions` looks for: a ``Send()`` target, a function's return value (a
+#: router's handler names, or a name a helper hands back), and an inbound's ``router=`` value.
+_ROLE_SEND = frozenset({"send"})
+_ROLE_RETURN = frozenset({"return"})
+_ROLE_ROUTER = frozenset({"router"})
+
+#: Methods through which a local list or set collects names (``handlers.append("h")``).
+_COLLECTOR_METHODS = frozenset({"append", "extend", "add", "insert"})
+
+_FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+
+def _role_positions(
+    sources: SourceCache,
+    file: str,
+    span: _Span,
+    old: str,
+    roles: frozenset[str],
+    accessor: str | None = None,
+) -> frozenset[tuple[int, int]]:
+    """The positions in ``span`` of the literals equal to ``old`` that one of ``roles`` (or, with
+    ``accessor`` set, that table kind's accessor) reads as a name: written there directly, or
+    carried there by a container, a conditional, or a local variable assigned in the same function.
+    A literal in any other role, such as a comparison operand or a lookup key, is not one."""
+    parsed = sources.parse(file)
+    if parsed is None:
+        return frozenset()
+    out: set[tuple[int, int]] = set()
+    scopes: list[ast.AST] = [parsed[0]]
+    scopes.extend(n for n in ast.walk(parsed[0]) if isinstance(n, _FUNCTION_NODES))
+    for scope in scopes:
+        roots: list[ast.expr] = []
+        if isinstance(scope, ast.Lambda) and "return" in roles:
+            roots.append(scope.body)
+        for node in _own_nodes(scope):
+            roots.extend(_role_roots(node, roles, accessor))
+        if not roots:
+            continue
+        values = _local_values(scope)
+        for root in roots:
+            for const in _carried(root, values, set()):
+                if const.value == old:
+                    pos = sources.position(file, const)
+                    if span.start <= pos[0] <= span.end:
+                        out.add(pos)
+    return frozenset(out)
+
+
+def _role_roots(node: ast.AST, roles: frozenset[str], accessor: str | None) -> list[ast.expr]:
+    """The expressions ``node`` reads as a name in one of ``roles``, or as ``accessor``'s table."""
+    if isinstance(node, ast.Return):
+        return [node.value] if "return" in roles and node.value is not None else []
+    if not isinstance(node, ast.Call):
+        return []
+    out: list[ast.expr] = []
+    called = _call_name(node.func)
+    if "send" in roles and called == "Send":
+        target = _first_or_keyword(node, "to")
+        if target is not None:
+            out.append(target)
+    if "router" in roles:
+        out.extend(kw.value for kw in node.keywords if kw.arg == "router")
+    if (
+        accessor is not None
+        and called is not None
+        and _TABLE_ACCESSORS.get(called) == accessor
+        and node.args
+        and not isinstance(node.args[0], ast.Starred)
+    ):
+        out.append(node.args[0])
+    return out
+
+
+def _first_or_keyword(call: ast.Call, keyword: str) -> ast.expr | None:
+    """``call``'s first positional argument, or its ``keyword=`` value when it has none."""
+    if call.args:
+        first = call.args[0]
+        return None if isinstance(first, ast.Starred) else first
+    return next((kw.value for kw in call.keywords if kw.arg == keyword), None)
+
+
+def _own_nodes(scope: ast.AST) -> Iterator[ast.AST]:
+    """The nodes ``scope`` (a module or a function) evaluates itself: a nested function's body is its
+    own scope, while its decorators and defaults are evaluated here."""
+    if isinstance(scope, ast.Lambda):
+        stack: list[ast.AST] = [scope.body]
+    elif isinstance(scope, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef)):
+        stack = list(scope.body)
+    else:
+        return
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, _FUNCTION_NODES):
+            if not isinstance(node, ast.Lambda):
+                stack.extend(node.decorator_list)
+            stack.extend(node.args.defaults)
+            stack.extend(d for d in node.args.kw_defaults if d is not None)
+        else:
+            stack.extend(ast.iter_child_nodes(node))
+
+
+def _local_values(scope: ast.AST) -> dict[str, list[ast.expr]]:
+    """The values each local name of a function ``scope`` is given: assigned, or collected through a
+    list or set method. A module name is a binding site of its own (:func:`_module_binding_sites`)."""
+    values: dict[str, list[ast.expr]] = {}
+    if not isinstance(scope, _FUNCTION_NODES):
+        return values
+    for node in _own_nodes(scope):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    values.setdefault(target.id, []).append(node.value)
+        elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            if isinstance(node.target, ast.Name) and node.value is not None:
+                values.setdefault(node.target.id, []).append(node.value)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.attr in _COLLECTOR_METHODS
+            and node.args
+        ):
+            values.setdefault(node.func.value.id, []).append(node.args[-1])
+    return values
+
+
+def _carried(
+    expr: ast.expr, values: Mapping[str, list[ast.expr]], seen: set[str]
+) -> Iterator[ast.Constant]:
+    """The ``str`` constants ``expr``'s value carries whole: itself, an element of a list, tuple or
+    set, a branch of a conditional or a boolean operator, a dict value (never its key), or a value a
+    local name in ``values`` was given. A constant inside a comparison, a call or an f-string is not
+    carried, since the value there is not the constant."""
+    if isinstance(expr, ast.Constant):
+        if isinstance(expr.value, str):
+            yield expr
+    elif isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
+        for elt in expr.elts:
+            yield from _carried(elt, values, seen)
+    elif isinstance(expr, ast.Starred):
+        yield from _carried(expr.value, values, seen)
+    elif isinstance(expr, ast.IfExp):
+        yield from _carried(expr.body, values, seen)
+        yield from _carried(expr.orelse, values, seen)
+    elif isinstance(expr, (ast.BoolOp, ast.Dict)):
+        # A boolean operator's operands, or a dict's values: never a key.
+        for value in expr.values:
+            yield from _carried(value, values, seen)
+    elif isinstance(expr, ast.Subscript):
+        # A value read out of a local table carries that table's values.
+        yield from _carried(expr.value, values, seen)
+    elif isinstance(expr, ast.Name) and expr.id in values and expr.id not in seen:
+        seen.add(expr.id)
+        for value in values[expr.id]:
+            yield from _carried(value, values, seen)
+
+
+def _name_argument_position(
+    sources: SourceCache, file: str, call: ast.Call, old: str
+) -> tuple[int, int] | None:
+    """The position of ``call``'s name argument (its first positional, or ``name=``) when it is the
+    literal ``old``."""
+    arg = _first_or_keyword(call, "name")
+    if isinstance(arg, ast.Constant) and arg.value == old:
+        return sources.position(file, arg)
+    return None
+
+
+def _decorator_positions(
+    sources: SourceCache, file: str, span: _Span, fn: object, old: str
+) -> frozenset[tuple[int, int]]:
+    """The name argument of the ``@router("old")`` / ``@handler("old")`` call registering ``fn``, or
+    of ``router("old")(lambda ...)``. The function's body is not part of its definition."""
+    import inspect
+
+    parsed = sources.parse(file)
+    if parsed is None or not callable(fn):
+        return frozenset()
+    fn_name = getattr(inspect.unwrap(fn), "__name__", None)
+    calls: list[ast.Call] = []
+    for node in ast.walk(parsed[0]):
+        if not span.start <= getattr(node, "lineno", 0) <= span.end:
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == fn_name:
+            calls.extend(d for d in node.decorator_list if isinstance(d, ast.Call))
+        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Call):
+            calls.append(node.func)
+    return frozenset(
+        pos for call in calls if (pos := _name_argument_position(sources, file, call, old))
+    )
+
+
+def _call_line_positions(
+    sources: SourceCache, file: str, line: int, old: str
+) -> frozenset[tuple[int, int]]:
+    """The name argument of the declaring call that starts on ``line`` (``outbound("old", …)``). A
+    call nested in its arguments (``File(name=…)``) is not the declaration."""
+    parsed = sources.parse(file)
+    if parsed is None:
+        return frozenset()
+    calls = [n for n in ast.walk(parsed[0]) if isinstance(n, ast.Call) and n.lineno == line]
+    nested = {
+        id(inner)
+        for call in calls
+        for inner in ast.walk(call)
+        if inner is not call and isinstance(inner, ast.Call)
+    }
+    return frozenset(
+        pos
+        for call in calls
+        if id(call) not in nested and (pos := _name_argument_position(sources, file, call, old))
+    )
+
+
 def _module_binding_sites(
     func: FunctionType, old: str, table_kind: str | None, sources: SourceCache
 ) -> tuple[list[_Site], bool]:
@@ -537,9 +808,16 @@ def _module_binding_sites(
     for file in sorted(names_by_file):
         for stmt, stmt_names in _module_bindings(sources, file, names_by_file[file]):
             span = _Span(stmt.lineno, stmt.end_lineno or stmt.lineno)
+            rewritable: frozenset[tuple[int, int]] | None = None
             if table_kind is None:
                 allowed: set[tuple[int, int]] | None = None
                 found = any(span.start <= p[0] <= span.end for p in sources.occurrences(file, old))
+                # The bound value is the referent, not a dict key or a comparison beside it.
+                rewritable = frozenset(
+                    sources.position(file, c)
+                    for c in (_carried(stmt.value, {}, set()) if stmt.value is not None else ())
+                    if c.value == old
+                )
             else:
                 allowed = _accessor_positions(sources, file, span, old, table_kind)
                 value = stmt.value
@@ -551,7 +829,9 @@ def _module_binding_sites(
                 # the binding: A, B = "diets", "x" stays a capture of the old name.
                 continue
             bound |= {(file, name) for name in stmt_names}
-            sites.append(_Site(file, span, frozenset(allowed) if allowed is not None else None))
+            sites.append(
+                _Site(file, span, frozenset(allowed) if allowed is not None else None, rewritable)
+            )
     return sites, required <= bound
 
 
