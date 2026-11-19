@@ -734,13 +734,27 @@ says what else the step does not see.
 The removal is a plain `git -C <primary> worktree remove <path>` with **no `--force`**, so git's own
 refusal on a locked or dirty tree stays a last fence. The branch survives it. Each path is logged as it
 is decided, as `REMOVED`, `WOULD-REMOVE` (without `-Apply`), `REFUSED`, `DECLINED` (every re-check
-passed and git still refused), `FAILED` or `ORPHANED`, with its reason, then a summary line with the
-counts and the drive's free space. A refusal or a decline is data and leaves the exit code alone; a
-failure raises it to `1`, and an orphan raises it to `3` and goes into `prune-merged.ps1`'s orphan
-ledger, so later runs keep reporting it. A list that could not be read skips the step, raising the
-code to `2` on a dry run and to `1` under `-Apply`, since the prune before it may have removed
-siblings. With `-Apply` the runner refuses to run inside Claude Code. Tests:
-[`tests/test_worktree_finished_claude_removal.py`](../tests/test_worktree_finished_claude_removal.py).
+passed and git still refused), `FAILED`, `ORPHANED` or `NOT-REACHED` (the runner's
+`-StopAfterMinutes` deadline passed before that tree was started), with its reason, then a summary
+line with the counts and the drive's free space. Past that deadline before the listing run, the step
+logs one `SKIPPED` line instead and leaves the exit code alone. The installer sets the deadline inside
+the task's time limit (`-TimeLimitHours`, default 4); a task registered before either existed keeps
+its old one-hour limit and no deadline until `install-daily-prune.ps1` is run again.
+
+The exit code starts as the prune's, and each row changes it as the row arrives, before the row's
+log line is written. A refusal or a tree the deadline left leaves it alone. An orphan raises it to `3`
+and goes into `prune-merged.ps1`'s orphan ledger, so later runs keep reporting it. A `2` from the
+prune says nothing was attempted, so a `REMOVED`, `FAILED` or `DECLINED` row turns it into `1`; apart
+from that, a failure raises the code to at least `1`, and nothing lowers it. An unhandled error after
+the log path is set exits with at least `2` before the prune started or on a dry run, and at least `1`
+once an `-Apply` prune has started, never below the code the prune and the rows have set. A list that
+could not be read skips the step, raising the code to at least `2` on a dry run and at least `1` under
+`-Apply`, since the prune before it may have removed siblings. With `-Apply` the runner refuses to run
+inside Claude Code. Tests:
+[`tests/test_worktree_finished_claude_removal.py`](../tests/test_worktree_finished_claude_removal.py)
+for the step, and
+[`tests/test_worktree_install_daily_prune.py`](../tests/test_worktree_install_daily_prune.py) for the
+exit codes and the prompt variables.
 
 ## A scheduled hygiene report that deletes nothing — `hygiene-report.ps1`
 
