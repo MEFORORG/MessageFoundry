@@ -232,6 +232,9 @@ export interface RowViewModel {
   // A read-only PRAGMA note — carried so the webview greys its edit/delete controls rather than letting
   // the user discover the engine's refusal as an error toast (F6). Absent on every other row.
   pragma?: boolean;
+  // Whether the per-row Delete button is drawn: {@link isRowDeletable}, minus a control block, which
+  // waits on an engine check (BACKLOG #5944; buildRowViewModel says why). Absent means false.
+  deletable?: boolean;
   title: string;
   subtitle?: string;
   badge?: string; // e.g. "unrecognized" for a control whose test is outside the bounded grammar (§4)
@@ -445,6 +448,15 @@ function rowSubtitle(row: LensRow): string | undefined {
     const outs = row.outbounds ?? [];
     return outs.length > 0 ? outs.join(", ") : "(dynamic destination)";
   }
+  if (row.kind === "route") {
+    // The Handlers the router selects (BACKLOG #5941). A routed-nowhere return already reads
+    // "Unrouted" in its title; a dynamic one projects no names and has none to show.
+    const names = row.handlers ?? [];
+    if (row.unrouted) {
+      return undefined;
+    }
+    return names.length > 0 ? `→ ${names.join(", ")}` : "(dynamic selection)";
+  }
   if (row.kind === "diagnostic") {
     // The template (log_note) / label (checkpoint) literal — the one meaningful, editable field.
     const p = row.params ?? {};
@@ -460,11 +472,22 @@ function rowSubtitle(row: LensRow): string | undefined {
   return undefined;
 }
 
-/** The read-only param fields for a row (send rows surface their destinations as a `to` field). */
+/** The read-only param fields for a row (send rows surface their destinations as a `to` field, route
+ *  rows their Handlers as a `handlers` field, comma-separated). */
 function rowParams(row: LensRow): ParamField[] {
   if (row.kind === "send") {
     const outs = row.outbounds ?? [];
     return [{ name: "to", value: outs.length > 0 ? outs.join(", ") : "(dynamic destination)" }];
+  }
+  if (row.kind === "route") {
+    // BACKLOG #5941. A routed-nowhere return gets no field: the projection cannot tell a bare
+    // `return`, which the engine refuses to write a list into, from `return []`. A dynamic selection
+    // gets a read-only placeholder, never sent back as a name: editableParamNames omits it.
+    const names = row.handlers ?? [];
+    if (row.unrouted === true) {
+      return [];
+    }
+    return [{ name: "handlers", value: names.length > 0 ? names.join(", ") : "(dynamic selection)" }];
   }
   return paramsToFields(row.params);
 }
@@ -575,8 +598,14 @@ export function editableParamNames(row: LensRow): string[] {
   }
   // A route exposes its handler list — but only when the selection is STATIC. A dynamic return projects
   // `handlers: []` with no `unrouted`, and editing that would flatten real code to a literal list.
+  // The field shows the names comma-joined and the page posts them split on commas and trimmed, so a
+  // name holding a comma or edge whitespace would come back changed; such a list stays read-only.
   if (row.kind === "route") {
-    return (row.handlers ?? []).length > 0 || row.unrouted === true ? ["handlers"] : [];
+    const names = row.handlers ?? [];
+    if (names.some((h) => h.includes(",") || h.trim() !== h || h === "")) {
+      return [];
+    }
+    return names.length > 0 || row.unrouted === true ? ["handlers"] : [];
   }
   return [];
 }
@@ -876,6 +905,11 @@ export function buildRowViewModel(row: LensRow, index: number, lines: string[]):
   }
   if (row.kind === "control" && row.control !== undefined) {
     vm.control = row.control;
+  }
+  // A control block deletes from its header in the engine, but no trash or menu Delete is offered
+  // on it until the engine checks for a name the block binds and a later step reads (BACKLOG #5944).
+  if (isRowDeletable(row) && row.kind !== "control") {
+    vm.deletable = true;
   }
   // A control row whose test falls outside the bounded grammar keeps its structure but is flagged — it
   // is still shown, never hidden (§4 degradation ladder). recognized is only meaningful for controls.
@@ -1190,8 +1224,10 @@ export interface EditMessage {
   // render a re-typed string literal (`_render_literal` emits `6` for an int but `"6"` for a str).
   // A {@link TemplateValue} writes the argument in templated mode (ADR 0076 Amendment E, #237): the
   // engine renders the parts to an f-string and checks it reads back. Offer it only for an argument
-  // whose {@link paramWritableModes} include `templated`.
-  value: string | number | TemplateValue;
+  // whose {@link paramWritableModes} include `templated`. `null` is a cleared number field of an
+  // `X | None` param, which the engine writes as None (BACKLOG #5942). A string list is a route row's
+  // `handlers`, which the engine's set_route takes as a list (BACKLOG #5941).
+  value: string | number | null | readonly string[] | TemplateValue;
   // The row's PROJECTION-TIME source text (the row as the user saw it when the lens projected the inputs),
   // echoed back from the webview's `data-expect-src` and carried to `lens rewrite` as `expect_src` (F7).
   // Optional so a hand-built message (tests / an older payload) may omit it — then no stale check is sent.
@@ -1206,8 +1242,9 @@ export interface EditRequest {
   op: "set_params";
   // A number-kind field carries a JS number so `JSON.stringify` emits a bare `6` (an int/float literal),
   // not `"6"` (a re-typed string literal) — BACKLOG #1760. A template is `{"parts": [...]}` (#237).
-  // Every other param stays a string.
-  params: Record<string, string | number | TemplateValue>;
+  // A cleared nullable number field is `null`, rendered None (BACKLOG #5942), and a route's `handlers`
+  // a string list (BACKLOG #5941). Every other param stays a string.
+  params: Record<string, string | number | null | readonly string[] | TemplateValue>;
   // The projected row's source text from the LIVE buffer (no EOL). `lens rewrite` verifies it still
   // matches the row before splicing, so a stale coordinate (a coincidental same-shape row) is refused
   // instead of edited in the wrong place (F7). Omitted → no stale check (older/no-buffer callers).
@@ -1335,6 +1372,9 @@ function readEditCoords(m: Record<string, unknown>): EditCoords | undefined {
     typeof handler !== "string" ||
     typeof lineStart !== "number" ||
     typeof lineEnd !== "number" ||
+    // A line number is a whole number; NaN, a fraction or an infinity addresses no row (BACKLOG #5942).
+    !Number.isSafeInteger(lineStart) ||
+    !Number.isSafeInteger(lineEnd) ||
     typeof name !== "string" ||
     typeof expectSrc !== "string"
   ) {
@@ -1351,7 +1391,9 @@ export type EditMessageRead = { edit: EditMessage } | { refused: string };
  *
  * `undefined` when it is not an `edit` message, or when its coordinates are not all present: that is
  * dropped silently, as it always was. An edit whose coordinates are present but whose value is not a
- * string, a number or a well-formed template ({@link isTemplateValue}) is REFUSED with a reason, never
+ * string, a finite number, `null` with `nullable: true` (a cleared nullable number field, BACKLOG
+ * #5942), a list of strings for `handlers` (a route row, BACKLOG #5941) or a well-formed template
+ * ({@link isTemplateValue}) is REFUSED with a reason, never
  * repaired and never dropped silently: a template the webview built wrong must not become a partial
  * write. A template is copied part by part, so nothing later can change what the engine is sent.
  */
@@ -1366,9 +1408,26 @@ export function readEditMessage(m: unknown): EditMessageRead | undefined {
   const raw = m.value;
   // A template's parts, copied, or null when the value is not exactly a well-formed template.
   const parts = isTemplateValue(raw) ? readTemplateParts(raw.parts) : null;
-  let value: string | number | TemplateValue;
-  if (typeof raw === "string" || typeof raw === "number") {
+  let value: EditMessage["value"];
+  if (typeof raw === "number" && !Number.isFinite(raw)) {
+    // JSON has no infinity or NaN: JSON.stringify sends each as null, which the engine would write
+    // as None, a different argument from the one typed (BACKLOG #5942).
+    return {
+      refused: `the Steps view sent "${coords.name}" as ${String(raw)}, which is not a finite number, so nothing was written`,
+    };
+  } else if (typeof raw === "string" || typeof raw === "number") {
     value = raw;
+  } else if (raw === null && m.nullable === true) {
+    // Only a cleared number field the page marked nullable (`data-nullable`) posts null; any other
+    // null stays refused below, as it was before null could be sent at all.
+    value = null;
+  } else if (
+    coords.name === "handlers" &&
+    Array.isArray(raw) &&
+    raw.every((h): h is string => typeof h === "string")
+  ) {
+    // A route row's handler list (BACKLOG #5941), copied so nothing later can change what is sent.
+    value = [...raw];
   } else if (parts !== null) {
     value = templateValue(parts);
   } else {
@@ -2997,6 +3056,8 @@ export type OpSchema = Record<string, OpParamSchema[]>;
 export interface WidgetSpec {
   kind: "text" | "number" | "enum";
   choices?: string[]; // enum only
+  // number only: the param is an `X | None` slot, so clearing the field writes None (BACKLOG #5942).
+  nullable?: boolean;
 }
 
 /**
@@ -3022,7 +3083,7 @@ export function resolveWidget(
     return { kind: "enum", choices: param.choices };
   }
   if (param.kind === "int" || param.kind === "float") {
-    return { kind: "number" };
+    return param.nullable === true ? { kind: "number", nullable: true } : { kind: "number" };
   }
   return { kind: "text" };
 }
@@ -3092,12 +3153,18 @@ function renderLiteralInputHtml(
     // A number field posts a JS number (see stepsWebview.js) so the engine renders an int/float
     // literal, never a re-typed string literal (`_render_literal` renders `6` for an int but `"6"`
     // for a str — posting the string would silently retype the arg).
+    // `data-nullable` tells the page a cleared field means None. Without it the page refuses a
+    // cleared field rather than posting `Number("")`, which is 0 (BACKLOG #5942).
+    const nullable = widget.nullable === true ? ` data-nullable="true"` : "";
     input =
-      `<input type="number" class="edit" ${attrs} ` +
+      `<input type="number" class="edit" ${attrs}${nullable} ` +
       `value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
   } else {
+    // A route's handlers field takes comma-separated names, and `data-list` has the page post them as
+    // the list the engine's set_route takes (BACKLOG #5941). Cleared, it is put back unposted.
+    const list = row.kind === "route" && p.name === "handlers" ? ` data-list="true"` : "";
     input =
-      `<input type="text" class="edit" ${attrs} ` +
+      `<input type="text" class="edit" ${attrs}${list} ` +
       `value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
   }
   // ADR 0104 §2.3: a pickable HL7 path/segment slot gets a picker button BESIDE its input. The input is
@@ -3296,20 +3363,20 @@ function renderParamsHtml(
 }
 
 /**
- * Render the per-row STRUCTURAL affordances (move up/down, delete) — but ONLY on a recognized
- * (`action`/`lookup`/`send`) row of a writable projection (a known `handlerName`). `code` and `control`
- * rows are structurally read-only (they are not regenerable from a template), so they get NO structural
- * buttons — matching the param-edit read-only rule (ADR 0076 §5). Each button carries the row's edit
- * coordinates + its projection-time source (`data-expect-src`) for the F7 stale guard. Pure.
+ * Render the per-row STRUCTURAL affordances (move up/down, delete) of a writable projection (a known
+ * `handlerName`): move on a {@link isRowMovable} row, delete on a {@link RowViewModel.deletable} one.
+ * A `code` row gets neither. Each button carries the row's edit coordinates + its projection-time source
+ * (`data-expect-src`) for the F7 stale guard. Pure.
  *
  * NOTE: the per-row ＋ (add-step-after) button was REPLACED by the top-of-lens INSERT TOOLBAR (a native
  * <select> + green Add that inserts at the SELECTED row, ADR 0076 §5 / BACKLOG #222). Delete + move stay.
  */
 function renderRowActionsHtml(row: RowViewModel, handlerName: string): string {
   // ↑/↓ appear on any MOVABLE row (an action/lookup/send row or a whole if/for block); the client greys
-  // the ↑ on the first sibling and the ↓ on the last (a reorder never crosses a suite edge). 🗑 stays on
-  // EDITABLE rows only — deleting mutates the row and is refused on a read-only control/code row.
-  if (!handlerName || !row.movable) {
+  // the ↑ on the first sibling and the ↓ on the last (a reorder never crosses a suite edge).
+  // BACKLOG #5944: the trash keys on `deletable`, not on movability, so a Comment (deletable, not
+  // movable) gets it. A control row has no `deletable` (buildRowViewModel says why).
+  if (!handlerName || (!row.movable && !row.deletable)) {
     return "";
   }
   const coords =
@@ -3317,16 +3384,19 @@ function renderRowActionsHtml(row: RowViewModel, handlerName: string): string {
     `data-line-end="${row.lineEnd}" data-expect-src="${escapeHtml(row.expectSrc ?? "")}"`;
   const btn = (op: string, glyph: string, title: string): string =>
     `<button class="rowop" data-op="${op}" ${coords} data-tip="${escapeHtml(title)}">${glyph}</button>`;
-  const buttons = [
-    btn("moveUp", "&#8593;", "Move up one step (walks into / out of blocks)"),
-    btn("moveDown", "&#8595;", "Move down one step (walks into / out of blocks)"),
-  ];
-  if (isRowEditable(row.kind)) {
+  const buttons: string[] = [];
+  if (row.movable) {
+    buttons.push(
+      btn("moveUp", "&#8593;", "Move up one step (walks into / out of blocks)"),
+      btn("moveDown", "&#8595;", "Move down one step (walks into / out of blocks)"),
+    );
+  }
+  if (row.deletable) {
     buttons.push(btn("deleteRow", "&#128465;", "Delete this row"));
   }
   // ADR 0104 fan-out: a per-row "＋ dest" on a real send (not the `return []` filter) adds another
   // destination — appending into the accumulator, or converting a returned send up to it.
-  if (row.kind === "send" && !row.filtered) {
+  if (row.movable && row.kind === "send" && !row.filtered) {
     buttons.push(btn("addDestination", "&#65291;", "Add another destination (fan out)"));
   }
   return `<span class="row-actions">${buttons.join("")}</span>`;

@@ -1356,6 +1356,17 @@ def _purge_target_refusal(rr: RegistryRunner | None, name: str) -> HTTPException
             f"owned by engine shard {owner!r}, so stop and purge outbound {name!r} on that engine "
             "shard's API",
         )
+    # BACKLOG #5792: a cluster node that does not hold the leader lease delivers nothing, so its
+    # quiesced signal is vacuous the same way, and a stop there needs no lease. A purge on it would
+    # cancel rows of the shared store the leader is still delivering. The single-node
+    # NullCoordinator always leads. A point-in-time read, not a store fence: leadership can still
+    # change before the cancel completes.
+    if not rr.coordinator.is_leader():
+        return HTTPException(
+            409,
+            "this node does not hold the cluster lease, so stop and purge outbound "
+            f"{name!r} on the leader's API",
+        )
     # require-stopped-before-purge (after the 404, before any approval is held for a doomed purge):
     # a running/still-"stopping" outbound may have a claimed INFLIGHT row cancel_queued cannot cancel,
     # so purge must wait until the lane is paused AND fully quiesced.
@@ -7131,7 +7142,11 @@ def create_app(
         building = False  # true only across the EmailTransport build, for the cut below
         start = time.perf_counter()
         try:
-            smtp_password = resolve_connector_secret(
+            # Resolved off the event loop (BACKLOG #5793): a provider reference is a blocking call,
+            # for the vault provider an HTTP round trip, and on the loop it would stall every
+            # request the engine serves while it waits.
+            smtp_password = await asyncio.to_thread(
+                resolve_connector_secret,
                 secret_provider,
                 ref=alerts.email_password_secret,
                 literal=alerts.email_password,

@@ -23,6 +23,7 @@ import pytest
 
 from scripts.docs.asvs_tally_lint import (
     CORPUS_TOTAL,
+    EmptyScan,
     Hit,
     counted,
     idioms_for_line,
@@ -239,10 +240,224 @@ def test_the_allowlist_exempts_the_rendered_record(tmp_path: Path) -> None:
     doc = tmp_path / "docs" / "security" / "ASVS-CURRENT.md"
     doc.parent.mkdir(parents=True)
     doc.write_text("| pass | partial | fail | na |\n| 168 | 105 | 3 | 69 |\n", encoding="utf-8")
+    # A second, tally-free document, so the allowlisted run still reads one file: a run that
+    # allowlists EVERY file it found has scanned nothing, which is an error of its own (below).
+    (tmp_path / "docs" / "other.md").write_text("prose with no tally\n", encoding="utf-8")
     assert main(["docs", "--repo", str(tmp_path)]) == 1, "without the allowlist it must red"
     assert (
         main(["docs", "--repo", str(tmp_path), "--allow", "docs/security/ASVS-CURRENT.md"]) == 0
     ), "with the allowlist it must pass"
+
+
+# --------------------------------------------------------------------------------------------
+# Examining nothing is an error, never a clean run (BACKLOG #5469).
+# --------------------------------------------------------------------------------------------
+
+
+def _tree(tmp_path: Path, text: str = "prose with no tally\n") -> Path:
+    doc = tmp_path / "docs" / "d.md"
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    doc.write_text(text, encoding="utf-8")
+    return doc
+
+
+def test_a_scan_of_zero_files_is_an_error_not_a_clean_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "docs").mkdir()
+    assert main(["docs", "--repo", str(tmp_path)]) == 2, "an empty root must not pass"
+    assert "ZERO non-blank markdown files" in capsys.readouterr().out
+    # Control: the same tree with one tally-free document is a clean run, exit 0.
+    _tree(tmp_path)
+    assert main(["docs", "--repo", str(tmp_path)]) == 0
+
+
+def test_a_root_that_does_not_exist_is_an_error_not_a_clean_run(tmp_path: Path) -> None:
+    _tree(tmp_path)
+    assert main(["doc", "--repo", str(tmp_path)]) == 2, "a misspelt root must not pass"
+
+
+def test_a_misspelt_root_beside_a_good_one_is_still_an_error(tmp_path: Path) -> None:
+    _tree(tmp_path)
+    assert main(["docs", "--repo", str(tmp_path)]) == 0, "control: the good root alone passes"
+    assert main(["docs", "doc-typo", "--repo", str(tmp_path)]) == 2
+
+
+def test_a_wholly_allowlisted_scan_is_an_error_not_a_clean_run(tmp_path: Path) -> None:
+    _tree(tmp_path)
+    assert main(["docs", "--repo", str(tmp_path), "--allow", "docs/"]) == 2
+
+
+def test_a_missing_baseline_file_is_an_error_not_an_empty_baseline(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _tree(tmp_path)
+    rc = main(["docs", "--repo", str(tmp_path), "--baseline", str(tmp_path / "nope.txt")])
+    assert rc == 2
+    assert "does not exist" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("content", ["", "\n\n", "  \n"], ids=["zero-byte", "blank", "spaces"])
+def test_a_baseline_with_no_content_is_an_error(tmp_path: Path, content: str) -> None:
+    """The zero-byte case is what a refused generating run leaves behind, since the shell truncates
+    the redirect target before the program starts. Omitting --baseline is the explicit form."""
+    _tree(tmp_path)
+    base = tmp_path / "b.txt"
+    base.write_text(content, encoding="utf-8")
+    with pytest.raises(EmptyScan, match="is empty"):
+        load_baseline(base)
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 2
+    assert main(["docs", "--repo", str(tmp_path)]) == 0, "omitting --baseline still scans"
+
+
+def test_a_header_only_baseline_is_the_ratchets_end_state_and_loads(tmp_path: Path) -> None:
+    """Every tally retired leaves a `#` header and zero claims. That must stay a passing gate, or
+    following the shrink rule to its end would red a clean tree."""
+    _tree(tmp_path)
+    base = tmp_path / "b.txt"
+    base.write_text("# Grandfathered ASVS tallies\n# Format: path TAB idiom TAB token\n", "utf-8")
+    assert load_baseline(base) == {}
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 0
+    # Control: the same baseline against a tree that holds a tally fails as NEW, exit 1.
+    _tree(tmp_path, "score 212/0/0/133 here\n")
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 1
+
+
+def test_a_baseline_path_that_is_a_directory_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _tree(tmp_path)
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(tmp_path / "docs")]) == 2
+    assert "is a directory, not a file" in capsys.readouterr().out
+
+
+def test_a_malformed_baseline_is_exit_2_not_the_exit_1_of_a_finding(tmp_path: Path) -> None:
+    _tree(tmp_path)
+    base = tmp_path / "b.txt"
+    base.write_text("x\n", encoding="utf-8")
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 2
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["docs/d.md\t1", "docs/d.md\tSLASH_RUN\t212/0/0/133\textra\t1", "docs/d.md\tSLASH_RUN\t²"],
+    ids=["too-few-fields", "too-many-fields", "non-ascii-digit"],
+)
+def test_a_baseline_line_with_the_wrong_shape_is_refused(tmp_path: Path, line: str) -> None:
+    base = tmp_path / "b.txt"
+    base.write_text(line + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed baseline line"):
+        load_baseline(base)
+
+
+def test_an_unreadable_baseline_is_exit_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _tree(tmp_path)
+    base = tmp_path / "b.txt"
+    base.write_text("docs/d.md\tSLASH_RUN\t212/0/0/133\t1\n", encoding="utf-8")
+
+    def refuse(self: Path) -> bytes:
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 2
+
+
+def test_a_bom_only_baseline_is_empty_not_a_loaded_baseline(tmp_path: Path) -> None:
+    """What a PowerShell `Out-File -Encoding utf8` writes when its pipeline was empty."""
+    _tree(tmp_path)
+    base = tmp_path / "b.txt"
+    base.write_bytes(b"\xef\xbb\xbf\r\n")
+    with pytest.raises(EmptyScan, match="is empty"):
+        load_baseline(base)
+
+
+def test_the_generated_header_names_the_flags_that_reproduce_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _tree(tmp_path)
+    allow = "docs/security/ASVS-CURRENT.md"
+    main(["docs", "--repo", str(tmp_path), "--allow", allow, "--print-keys"])
+    assert f"asvs_tally_lint.py docs --allow {allow} --print-keys" in capsys.readouterr().out
+
+
+def test_a_utf16_baseline_is_refused_as_exit_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """What a Windows PowerShell 5.1 `>` redirect writes."""
+    _tree(tmp_path, "score 212/0/0/133 here\n")
+    base = tmp_path / "b.txt"
+    base.write_text("docs/d.md\tSLASH_RUN\t212/0/0/133\t1\n", encoding="utf-16")
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 2
+    assert "UTF-16" in capsys.readouterr().out
+
+
+def test_a_utf8_bom_does_not_fuse_onto_the_first_key(tmp_path: Path) -> None:
+    _tree(tmp_path, "score 212/0/0/133 here\n")
+    base = tmp_path / "b.txt"
+    base.write_text("docs/d.md\tSLASH_RUN\t212/0/0/133\t1\n", encoding="utf-8-sig")
+    assert load_baseline(base) == {"docs/d.md\tSLASH_RUN\t212/0/0/133": 1}
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 0
+
+
+def test_a_tree_of_empty_files_is_an_error_not_a_clean_run(tmp_path: Path) -> None:
+    _tree(tmp_path, "")
+    assert main(["docs", "--repo", str(tmp_path)]) == 2
+    # Control: one character of prose makes it a clean run.
+    _tree(tmp_path, "x\n")
+    assert main(["docs", "--repo", str(tmp_path)]) == 0
+
+
+def test_print_keys_stdout_loads_as_a_baseline_and_round_trips(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _tree(tmp_path, "score 212/0/0/133 here\n| Posture | 179 | 51 | 5 | 110 |\nagain 212/0/0/133\n")
+    rc = main(["docs", "--repo", str(tmp_path), "--print-keys"])
+    captured = capsys.readouterr()
+    assert rc == 1, "against no baseline every tally is NEW, so the generating run exits 1"
+    assert "SCANNED:" in captured.err and "FOUND:" in captured.err, "the inventory still prints"
+    assert "SCANNED" not in captured.out and "FOUND" not in captured.out
+    assert captured.out.startswith("# "), "the artifact describes itself"
+    assert [ln for ln in captured.out.splitlines() if not ln.startswith("#")] == [
+        "docs/d.md\tSLASH_RUN\t212/0/0/133\t2",
+        "docs/d.md\tTABLE_ROW\t179|51|5|110\t1",
+    ]
+
+    base = tmp_path / "b.txt"
+    base.write_text(captured.out, encoding="utf-8")
+    assert load_baseline(base) == {
+        "docs/d.md\tSLASH_RUN\t212/0/0/133": 2,
+        "docs/d.md\tTABLE_ROW\t179|51|5|110": 1,
+    }
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 0
+    assert "OK: no new" in capsys.readouterr().out, "the gate run still reports on stdout"
+
+
+def test_print_keys_round_trips_through_a_subprocess_stdout_file(tmp_path: Path) -> None:
+    """The documented command as a child whose stdout IS the file, then the gate run on it.
+
+    No shell is involved, so this does not measure a shell's own re-encoding of a redirect; the
+    UTF-16 case a Windows PowerShell 5.1 redirect produces is pinned separately above.
+    """
+    _tree(tmp_path, "score 212/0/0/133 here\n")
+    base = tmp_path / "b.txt"
+    lint = str(REPO_ROOT / LINT_REL)
+    with base.open("w", encoding="utf-8") as fh:
+        gen = subprocess.run(
+            [sys.executable, lint, "docs", "--repo", str(tmp_path), "--print-keys"],
+            stdout=fh,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+    assert gen.returncode == 1, gen.stderr
+    assert "SCANNED:" in gen.stderr
+    check = subprocess.run(
+        [sys.executable, lint, "docs", "--repo", str(tmp_path), "--baseline", str(base)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert check.returncode == 0, check.stdout + check.stderr
 
 
 # --------------------------------------------------------------------------------------------

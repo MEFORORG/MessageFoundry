@@ -74,6 +74,7 @@ import argparse
 import datetime
 import importlib.util
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -176,6 +177,18 @@ def cell(v: str | None) -> str:
     return s if s else "-"
 
 
+#: A cell separator is a pipe with no backslash before it. cell() writes every pipe INSIDE a cell as
+#: ``\|`` and strips the cell, so a separator is always preceded by a space or begins the line.
+_SEPARATOR = re.compile(r"(?<!\\)\|")
+
+
+def uncell(s: str) -> str:
+    r"""The inverse of cell()'s pipe escape. Every pipe cell() emits inside a cell is one it put a
+    backslash before, so each ``\|`` in its output is one escape; replacing them left to right
+    restores the original, a literal backslash-pipe included."""
+    return s.replace("\\|", "|")
+
+
 def ensure(path: str) -> None:
     d = os.path.dirname(path)
     if d and not os.path.isdir(d):
@@ -201,7 +214,13 @@ def read(path: str) -> list[dict[str, str]]:
             line = raw.decode("utf-8", "replace").strip()
             if not line.startswith("|") or line.startswith("|---"):
                 continue
-            parts = [p.strip() for p in line.strip("|").split("|")]
+            # Split on UNESCAPED pipes only. A plain split("|") broke a cell holding an escaped pipe
+            # into two, so the row had the wrong width and was dropped -- an owner item whose text
+            # held a pipe then read as never logged, or its ruling as never delivered.
+            fields = _SEPARATOR.split(line)[1:]
+            if fields and fields[-1] == "":
+                fields.pop()  # the closing separator; a hand-written row may omit it
+            parts = [uncell(p.strip()) for p in fields]
             if len(parts) == len(COLUMNS):
                 rec = dict(zip(COLUMNS, parts, strict=True))
             elif len(parts) == len(LEGACY_COLUMNS):

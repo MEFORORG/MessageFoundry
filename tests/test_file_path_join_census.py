@@ -467,11 +467,6 @@ SITES: dict[str, Site] = {
     # --- messagefoundry/ ---
     "messagefoundry/__main__.py::_cert_import": Site(3, OPERATOR, _CERT_OUT),
     "messagefoundry/__main__.py::_cert_self_signed": Site(3, OPERATOR, _CERT_OUT),
-    "messagefoundry/__main__.py::_check_env_file_present": Site(
-        1,
-        REVIEWED,
-        "The raw --env value joined under the project root to test that the value file exists.",
-    ),
     "messagefoundry/__main__.py::_emit_anchor_diagnostics": Site(
         1, REVIEWED, "The working directory and a fixed name, tested for existence."
     ),
@@ -594,17 +589,24 @@ SITES: dict[str, Site] = {
     "messagefoundry/config/environments.py::values_file_path": Site(
         1,
         GUARDED,
-        "Every caller passes [ai].environment, which the validator holds to letters, digits, `.`, "
-        "`_` and `-`.",
-        "messagefoundry/config/settings.py::_valid_environment_name",
+        "It refuses a [environments].dir with a drive, a root or a '..' part, and an environment "
+        "name outside the [ai].environment validator's alphabet, before it joins them under the "
+        "base (BACKLOG #5322). Every caller that names a value file goes through it.",
+        "messagefoundry/config/environments.py::_leaves_base",
+        called=True,
     ),
     "messagefoundry/config/environments.py::resolve_values_base_dir": Site(
         1, OPERATOR, "The operator's [environments].base_dir under the working directory."
     ),
     "messagefoundry/config/fingerprint.py::_git_head": Site(
         7,
-        OPERATOR,
-        "Reads the git metadata of the operator's own config checkout; read only, to a commit hash.",
+        GUARDED,
+        "Reads the git metadata of the operator's own config checkout, read only, to an object id. "
+        "The symbolic ref HEAD names is joined only once _confined_ref holds it, lexically, under "
+        "refs/ of the root it joins (vault BACKLOG #5325). The other joins are fixed names, or the "
+        "checkout's own .git and commondir pointers, which are not confined.",
+        "messagefoundry/config/fingerprint.py::_confined_ref",
+        called=True,
     ),
     "messagefoundry/config/impact.py::_validate_new_name": Site(1, OPERATOR, _CODESETS),
     "messagefoundry/config/snapshot.py::ConfigSnapshot._folder_of": Site(
@@ -886,7 +888,10 @@ SITES: dict[str, Site] = {
         "#5221).",
     ),
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
-        1, OPERATOR, "A shard tag from the operator's config on the operator's --db path."
+        1,
+        OPERATOR,
+        "An engine shard tag from the operator's config on the base store path, --db or the merged "
+        "[store].path (BACKLOG #5817).",
     ),
     "messagefoundry_toolkit/scaffold.py::<module>": Site(1, INTERNAL, "Package resource literal."),
     "messagefoundry_toolkit/scaffold.py::scaffold": Site(

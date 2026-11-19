@@ -332,7 +332,7 @@ query($owner: String!, $name: String!, $cursor: String) {
             pageInfo { hasNextPage }
             nodes {
               __typename
-              ... on CheckRun { name status conclusion startedAt }
+              ... on CheckRun { name status conclusion startedAt completedAt }
               ... on StatusContext { context state createdAt }
             }
           }
