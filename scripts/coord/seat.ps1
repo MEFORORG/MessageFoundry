@@ -938,20 +938,12 @@ try {
         if (-not $wtHint) {
             if ($hookIn.Reason) {
                 # Rule 1 again: input this cannot vouch for names no worktree, so NO RECORD, and exit
-                # 0 because this is the Stop path. Rule 2 still holds: seat-record.ps1 discards
-                # stderr, so the refusal goes to the registry of the checkout this hook started in,
-                # the same clone's, where that checkout and its registry resolve.
-                $why = "the hook input was refused, so nothing was recorded: $($hookIn.Reason)"
-                [System.Console]::Error.WriteLine("seat.ps1: $why")
-                $startWt = Resolve-Worktree -Hint $null
-                if ($startWt) {
-                    $startRes = Resolve-CoordSharedRoot -From $startWt -LocalRoot (Get-CoordLocalRoot -From $startWt)
-                    if (-not $startRes.Error) {
-                        $script:SeatsDir = Join-Path $startRes.Path 'seats'
-                        $null = New-Item -ItemType Directory -Force -Path $script:SeatsDir -EA SilentlyContinue
-                        Write-WriterError -Stage 'hook-input' -Message $why
-                    }
-                }
+                # 0 because this is the Stop path. A refusal is not a writer failure, so it goes to
+                # stderr only and NEVER to .writer-errors.txt, which fleet.ps1 counts as failures;
+                # an unpinned session would otherwise add one line there on every Stop (the same
+                # rule Invoke-ClearHandoff states). No .writer-alive heartbeat either: it is keyed
+                # by this session's box, and refused input names no box to key it by.
+                [System.Console]::Error.WriteLine("seat.ps1: the hook input was refused, so nothing was recorded: $($hookIn.Reason)")
                 exit 0
             }
             $wtHint = $hookIn.Dir
