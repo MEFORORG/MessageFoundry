@@ -1766,8 +1766,9 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
 ) -> None:
     # PR 2804 seventh hold, finding 1: --db overrides [store].path, so "the same arguments" would
     # point a new store's re-run, and its service, back at the old store. A new SQLite store's --db
-    # names the new path, on the re-run and wherever the service passes one (eighth hold: at least
-    # install-service.ps1 and supervise always do); a server store is named by
+    # names the new path, on the re-run and wherever the service passes one (eighth hold:
+    # install-service.ps1 always does, and a supervise does when started with --db, BACKLOG
+    # #5817); a server store is named by
     # [store].server/database, here and for the service. With the store kept, the re-run keeps
     # every argument, --db and --service-config among them.
     settings = _settings(tmp_path).model_copy(update={"backend": backend})
@@ -1797,8 +1798,9 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
         "[store].path, which does not name a server store)"
     )
     server = backend is not StoreBackend.SQLITE
-    # PR 2804 eighth hold: at least install-service.ps1 and supervise always pass --db, so it is
-    # named, not left out, and the service's own commands are named concretely.
+    # PR 2804 eighth hold: install-service.ps1 always passes --db, and a supervise started with
+    # one passes it on (BACKLOG #5817), so it is named, not left out, and the service's own
+    # commands are named concretely.
     assert "leave it out" not in step and "take it off" not in step, step
     named = "--db, which overrides [store].path, naming that new SQLite path" in step
     assert named is (new_store and not server), step
@@ -1832,7 +1834,7 @@ def test_the_service_commands_the_fallback_names_exist() -> None:
 
     (spec,) = build_shard_specs(["a"], config="c", db_base=supervise.db, base_port=8765)
     argv = list(spec.argv)
-    assert argv[argv.index("--db") + 1] == "new.db", argv
+    assert "--db=new.db" in argv, argv  # one token (BACKLOG #5817)
     step = custody_host.keep_the_key_step(
         StoreSettings(key_provider="host", cipher_provider="aesgcm"), new_store=True
     )

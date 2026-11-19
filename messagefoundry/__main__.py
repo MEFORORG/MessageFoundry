@@ -5538,17 +5538,16 @@ def _supervise(args: argparse.Namespace) -> int:
     # Each engine shard's store path is derived from the merged [store].path, from --db or the
     # settings (BACKLOG #5817). The load already refused a SQLite path no anchor can place
     # (BACKLOG #5926): the raw --db went in unanchored, so the load tested the value itself.
-    from messagefoundry.config.settings import store_path_names_a_directory
+    from messagefoundry.pipeline.supervisor import base_names_no_stem
 
     db_base = anchor_under_root(settings.store.path, root, cwd=cwd)
     assert db_base is not None  # [store].path is a str, never None
-    if store_path_names_a_directory(settings.store.path) and not store_path_names_a_directory(
-        db_base
-    ):
-        # Joining under the root drops a trailing separator ("state/" becomes "<root>/state"), and
-        # "" becomes the root itself. Keep the directory shape, so the supervisor's derivation of
-        # several engine shards' names refuses it as it would the value written.
-        db_base += "/"  # a separator on every platform
+    if base_names_no_stem(settings.store.path) and not base_names_no_stem(db_base):
+        # Joining "" or "." under the root gives the root itself, whose own name would become
+        # each engine shard's stem (<root>_a, beside the root). A trailing "." names the same
+        # directory, so the supervisor still refuses several engine shards, as it would the value
+        # written, and one engine shard's --db still names the root.
+        db_base += "/."
     # BACKLOG #5817: [api].port has no range check at load, and every engine shard's port counts
     # up from it, so a value no socket takes is refused here, before the TLS renewal below writes
     # anything. How many engine shards the graph has is known only once the supervisor loads it,

@@ -248,20 +248,58 @@ def test_supervise_takes_store_path_and_api_port_from_settings_without_flags(
     assert captured == {"db_base": str(root / db_name), "base_port": port}
 
 
-@pytest.mark.parametrize("db_base", ["", ".", "..", "state/", "data/..", "C:/srv/repo/"])
-def test_build_shard_specs_refuses_a_directory_base_for_several_engine_shards(
+@pytest.mark.parametrize("db_base", ["", ".", "..", "data/..", "data/.", "C:/srv/repo/."])
+def test_build_shard_specs_refuses_a_base_with_no_stem_for_several_engine_shards(
     db_base: str,
 ) -> None:
-    """A server store's [store].path may name a directory, which has no stem for each engine
-    shard's ``<stem>_<shard>`` name. With --db no longer defaulted (BACKLOG #5817) that path is the
-    base, so several engine shards are refused; one keeps the bare base, as a plain `serve` does."""
+    """A server store's [store].path may name a directory. With --db no longer defaulted (BACKLOG
+    #5817) that path is the base, and "" or a last part of "." or ".." has no stem for each engine
+    shard's ``<stem>_<shard>`` name, so several engine shards are refused; one keeps the bare
+    base, as a plain `serve` does."""
     with pytest.raises(ValueError, match="names a directory"):
         build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
     (single,) = build_shard_specs(["a"], config="c", db_base=db_base, base_port=8765)
     assert single.db_path == db_base
-    # A file base still derives each name from its stem.
-    specs = build_shard_specs(["a", "b"], config="c", db_base="site.db", base_port=8765)
-    assert [Path(s.db_path).name for s in specs] == ["site_a.db", "site_b.db"]
+
+
+@pytest.mark.parametrize(
+    ("db_base", "names"),
+    [
+        pytest.param("site.db", ["site_a.db", "site_b.db"], id="file"),
+        pytest.param("state/", ["state_a", "state_b"], id="trailing-separator"),
+        pytest.param("C:/mefor/state/", ["state_a", "state_b"], id="absolute-trailing-separator"),
+    ],
+)
+def test_build_shard_specs_derives_names_from_a_base_with_a_stem(
+    db_base: str, names: list[str]
+) -> None:
+    """A trailing separator after a real name is not refused: the name before it is the stem, as
+    on origin/main before BACKLOG #5817."""
+    specs = build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
+    assert [Path(s.db_path).name for s in specs] == names
+
+
+def test_each_engine_shard_gets_its_store_path_as_one_argv_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A [store].path such as "-x.db" now reaches each engine shard from the settings (BACKLOG
+    #5817). As its own token after --db, argparse would take it for an option; as --db=<path> the
+    engine shard's own parser reads it as the store path."""
+    from messagefoundry import __main__ as cli
+
+    monkeypatch.delenv("MEFOR_STORE_PATH", raising=False)
+    monkeypatch.delenv("MEFOR_API_PORT", raising=False)
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text('[store]\npath = "-x.db"\n', encoding="utf-8")
+    captured = _supervise_captured(tmp_path, monkeypatch, ["--service-config", str(svc)])
+    db_base = str(captured["db_base"])
+    assert db_base == "-x.db"
+    for shards in (["a"], ["a", "b"]):
+        for spec in build_shard_specs(shards, config="c", db_base=db_base, base_port=8765):
+            serve_argv = list(spec.argv)[list(spec.argv).index("serve") :]
+            args = cli._build_parser()[0].parse_args(serve_argv)
+            assert args.db == spec.db_path, serve_argv
+            assert args.port == spec.port
 
 
 def test_supervise_refuses_an_api_port_no_socket_takes_before_the_tls_renewal(
@@ -294,11 +332,10 @@ class _AtTheRenewal(Exception):
 def test_supervise_keeps_a_directory_shaped_store_path_through_the_root_join(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
 ) -> None:
-    """Joining under --project-root drops a trailing separator, and "" becomes the root itself,
-    which would turn a directory into a file stem; the supervisor keeps the shape, so several
-    engine shards are refused (BACKLOG #5817)."""
+    """Joining "" or "." under --project-root gives the root itself, whose name would become each
+    engine shard's stem; the supervisor keeps it stemless, so several engine shards are refused
+    (BACKLOG #5817). "state/" keeps deriving from "state", as before."""
     from messagefoundry import __main__ as cli
-    from messagefoundry.config.settings import store_path_names_a_directory
     from messagefoundry.store.crypto import generate_key
     from tests._phi_gate_provisions import (
         make_syslog_ca_and_crl,
@@ -331,7 +368,14 @@ def test_supervise_keeps_a_directory_shaped_store_path_through_the_root_join(
     with pytest.raises(_AtTheRenewal):
         cli._supervise(args)
     (db_base,) = seen
-    assert store_path_names_a_directory(db_base), db_base
+    if path == "state/":
+        # A real name before the separator: derived from, as on origin/main, under the root.
+        specs = build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
+        assert [Path(s.db_path) for s in specs] == [root / "state_a", root / "state_b"]
+        return
+    # "" and "." join to the root itself; the base still names no stem, so several engine
+    # shards are refused, and one engine shard's --db still names the root.
+    assert Path(db_base) == root, db_base
     with pytest.raises(ValueError, match="names a directory"):
         build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
 

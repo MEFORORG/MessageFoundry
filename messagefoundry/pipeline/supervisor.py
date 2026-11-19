@@ -46,6 +46,7 @@ import asyncio
 import logging
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -56,7 +57,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from messagefoundry.childenv import engine_environment, python_child_argv
-from messagefoundry.config.settings import StoreBackend, store_path_names_a_directory
+from messagefoundry.config.settings import StoreBackend
 from messagefoundry.config.wiring import Registry, load_config
 from messagefoundry.controlchars import scrub_control_chars
 from messagefoundry.pipeline import _config_preflight
@@ -99,6 +100,18 @@ class ShardSpec:
     argv: tuple[str, ...]
 
 
+def base_names_no_stem(db_base: str) -> bool:
+    """Whether ``db_base``, as written, is empty or ends in a ``.`` or ``..`` part, so it has no
+    stem for each engine shard's ``<stem>_<shard>`` name (BACKLOG #5817). On Windows a backslash
+    also separates parts. A trailing separator after a real name is not one of these: pathlib
+    drops it, and the name before it is the stem."""
+    if db_base == "":
+        return True
+    parts = re.split(r"[\\/]", db_base) if os.name == "nt" else db_base.split("/")
+    last = next((part for part in reversed(parts) if part), "")
+    return last in ("", ".", "..")
+
+
 def _shard_db_path(db_base: str, shard: str, *, single: bool) -> str:
     """Per-shard SQLite file: ``<stem>_<shard><suffix>`` (e.g. ``mefor_a.db``).
 
@@ -107,10 +120,11 @@ def _shard_db_path(db_base: str, shard: str, *, single: bool) -> str:
     """
     if single:
         return db_base
-    if store_path_names_a_directory(db_base):
+    if base_names_no_stem(db_base):
         # A server store's [store].path may name a directory, and with --db no longer defaulted
-        # that path is the base (BACKLOG #5817). It has no stem to derive each engine shard's name
-        # from, so several engine shards are refused rather than named beside it.
+        # that path is the base (BACKLOG #5817). "" or a last part of "." or ".." has no stem to
+        # derive each engine shard's name from, so several engine shards are refused. A trailing
+        # separator after a real name ("state/") still derives from that name, as it always did.
         raise ValueError(
             "--db or [store].path names a directory (value withheld); several engine shards each "
             "derive their file name from it, so name a file, e.g. 'messagefoundry.db'"
@@ -161,8 +175,9 @@ def build_shard_specs(
             config,
             "--shard",
             shard,
-            "--db",
-            db_path,
+            # One token: a store path from [store].path or MEFOR_STORE_PATH may start with "-",
+            # which as a separate token argparse would take for an option (BACKLOG #5817).
+            f"--db={db_path}",
             "--port",
             str(port),
         ]
