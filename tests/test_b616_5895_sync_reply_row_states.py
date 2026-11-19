@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The sync-reply resolver settles a turn on the awaited outbound's row SET, and only once the
-message itself is terminal (ADR 0154 D3, amended 2026-11-18, BACKLOG #5895).
+"""The sync-reply resolver settles a turn on the awaited outbound's row SET, and only once nothing
+upstream can add a row: the message is terminal, or no ingress or routed row is unsettled (ADR 0154
+D3, amended 2026-11-18, BACKLOG #5895).
+
+``_flowing`` leaves ``upstream_in_flight`` at its default of ``True``, so a test named "while the
+message is still routed" is a routed message WITH upstream work in flight; ``_settled_upstream``
+builds the other case.
 
 Driven through the resolver suite's store double so each state is deterministic:
 
@@ -41,22 +46,32 @@ async def _outcome(*states: Any, timeout: float = _SHORT) -> ReplyOutcome:
     return (await _resolver(_Store(list(states)), timeout=timeout)("m1")).outcome
 
 
-# --- ROUTED: no row set settles the turn -----------------------------------------------------------
+# --- ROUTED with upstream in flight: no row set settles the turn before the deadline ------------
 
 
-async def test_dead_beside_done_waits_while_the_message_is_still_routed() -> None:
-    # origin/main failed this at once with 502. A sibling handler upstream may still emit a row that
-    # captures the reply, so the turn waits for the finalizer instead.
-    assert await _outcome(_flowing(row_states=("dead", "done"))) is ReplyOutcome.TIMEOUT
+async def _waited(rows: tuple[str, ...]) -> tuple[ReplyOutcome, int]:
+    reply = await _resolver(_Store([_flowing(row_states=rows)]), timeout=_SHORT)("m1")
+    return reply.outcome, reply.waited_ms
 
 
-async def test_every_row_failed_waits_while_the_message_is_still_routed() -> None:
+async def test_dead_beside_done_waits_while_upstream_is_in_flight() -> None:
+    # A sibling handler upstream may still emit a row that captures the reply, so the turn waits.
+    # At the deadline the settled set answers rather than "timeout", which D8 keeps for a partner
+    # that did not answer.
+    outcome, waited_ms = await _waited(("dead", "done"))
+    assert outcome is ReplyOutcome.EMPTY
+    assert waited_ms >= int(_SHORT * 1000) - 20, "it answered before the deadline"
+
+
+async def test_every_row_failed_waits_while_upstream_is_in_flight() -> None:
     for rows in (("dead",), ("cancelled",), ("dead", "cancelled")):
-        assert await _outcome(_flowing(row_states=rows)) is ReplyOutcome.TIMEOUT, rows
+        outcome, waited_ms = await _waited(rows)
+        assert outcome is ReplyOutcome.FAILED, rows
+        assert waited_ms >= int(_SHORT * 1000) - 20, rows
 
 
-async def test_a_done_row_with_no_reply_waits_while_the_message_is_still_routed() -> None:
-    assert await _outcome(_flowing(row_states=("done",))) is ReplyOutcome.TIMEOUT
+async def test_a_live_row_at_the_deadline_is_still_a_timeout() -> None:
+    assert (await _waited(("dead", "pending")))[0] is ReplyOutcome.TIMEOUT
 
 
 async def test_a_sibling_capture_after_a_settled_set_is_returned() -> None:
@@ -105,7 +120,9 @@ async def test_nothing_upstream_settles_a_routed_message_at_once() -> None:
         (("dead",), ReplyOutcome.FAILED),
         (("dead", "cancelled"), ReplyOutcome.FAILED),
         (("dead", "done"), ReplyOutcome.EMPTY),
-        ((), ReplyOutcome.NO_ROUTE),
+        # No row while ROUTED: a dead routed row also leaves nothing upstream, and that is not
+        # "nothing routed", so no_route still waits for the terminal status.
+        ((), ReplyOutcome.TIMEOUT),
         (("dead", "pending"), ReplyOutcome.TIMEOUT),
     )
     for rows, expected in cases:

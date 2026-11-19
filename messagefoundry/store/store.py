@@ -1359,7 +1359,8 @@ class ClaimedHeads:
 
 
 #: Counts a message's unsettled ``ingress``/``routed`` rows (ADR 0154 D3, amended 2026-11-18). Plain
-#: ``COUNT`` so the one statement serves all three backends; a message has few rows.
+#: ``COUNT`` so SQLite and SQL Server share it; ``postgres.py`` keeps its ``$n`` twin inline, so a
+#: change here changes that copy too. A message has few rows.
 _UPSTREAM_IN_FLIGHT_SQL: Final = (
     "SELECT COUNT(*) AS n FROM queue WHERE message_id=? AND stage IN (?,?)"
     " AND status NOT IN (?,?,?)"
@@ -1371,9 +1372,7 @@ def _upstream_in_flight_params(message_id: str) -> tuple[str, ...]:
         message_id,
         Stage.INGRESS.value,
         Stage.ROUTED.value,
-        OutboxStatus.DONE.value,
-        OutboxStatus.DEAD.value,
-        OutboxStatus.CANCELLED.value,
+        *_RESOLVED_STATUSES,
     )
 
 
@@ -16633,7 +16632,7 @@ class MessageStore:
         Deliberately **not** built on :meth:`outbox_for`. That is a ``SELECT *`` fed through
         ``_decode_row``, so it decrypts ``last_error`` and pulls the payload ciphertext on **every
         tick** — a cost a poll loop cannot carry, and PHI this path has no business touching.
-        Modelled on :meth:`pending_depth` instead: three narrow indexed reads sharing one pooled
+        Modelled on :meth:`pending_depth` instead: four narrow indexed reads sharing one pooled
         connection, decoding nothing.
 
         See :class:`ReplyWaitState` for why the message's own status is returned alongside the row

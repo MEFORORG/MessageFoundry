@@ -245,24 +245,26 @@ class SyncReplyResolverImpl:
                     # destination_name, so the row set alone cannot rule that out. An unrelated
                     # outbound still retrying does not hold the turn: only upstream work can add a
                     # row here.
-                    if state.message_is_terminal or not state.upstream_in_flight:
-                        rows = state.row_states
-                        if not rows:
-                            # Nothing was routed here at all. Never on the absence of rows alone:
-                            # that is the 502-for-a-message-we-then-delivered defect.
+                    rows = state.row_states
+                    if not rows:
+                        if state.message_is_terminal:
+                            # Nothing was routed here at all. Only on the message's own terminal
+                            # status: an upstream row settled by a failure (a dead routed row) is
+                            # not "nothing routed", and the absence of rows alone is the
+                            # 502-for-a-message-we-then-delivered defect.
                             return self._done(ReplyOutcome.NO_ROUTE, elapsed_ms())
-                        if all(s in _SETTLED_ROW_STATES for s in rows):
-                            if OutboxStatus.DONE.value in rows:
-                                # Delivered, but no reply was captured (a plain mark_done, as
-                                # shadow or simulate mode performs). That is "delivered, no
-                                # reply", never delivery_failed, which would invite a resend.
-                                return self._done(ReplyOutcome.EMPTY, elapsed_ms())
-                            return self._done(ReplyOutcome.FAILED, elapsed_ms())
+                    elif state.message_is_terminal or not state.upstream_in_flight:
+                        settled = self._settled(rows, elapsed_ms())
+                        if settled is not None:
+                            return settled
                         # A live row: keep waiting for it to settle.
 
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        return self._done(ReplyOutcome.TIMEOUT, elapsed_ms())
+                        # Out of budget: a settled row set still says more than "timeout", which
+                        # D8 reserves for a partner that did not answer.
+                        settled = self._settled(rows, elapsed_ms()) if rows else None
+                        return settled or self._done(ReplyOutcome.TIMEOUT, elapsed_ms())
 
                     await waiter.hint(min(poll_period(self._rendezvous.waiters), remaining))
                     if waiter.drain_reason is not None:
@@ -328,6 +330,17 @@ class SyncReplyResolverImpl:
             if str(name).strip().lower() == "content-type":
                 return str(value)
         return None
+
+    def _settled(self, rows: tuple[str, ...], waited_ms: int) -> InboundReply | None:
+        """Map a fully settled ``reply_from`` row set with no capture, or ``None`` while one is live."""
+        if not all(s in _SETTLED_ROW_STATES for s in rows):
+            return None
+        if OutboxStatus.DONE.value in rows:
+            # Delivered, but no reply was captured (a plain mark_done, as shadow or simulate mode
+            # performs). That is "delivered, no reply", never delivery_failed, which would invite a
+            # resend.
+            return self._done(ReplyOutcome.EMPTY, waited_ms)
+        return self._done(ReplyOutcome.FAILED, waited_ms)
 
     def _done(
         self, outcome: ReplyOutcome, waited_ms: int, *, response_seq: int | None = None

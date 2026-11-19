@@ -461,8 +461,9 @@ outbound, so an unrelated outbound still retrying never holds the turn.
 |---|---|
 | a qualifying `response` row is committed | **one** `correlate_response(message_id)` read; filter `kind == "response"` **and** `destination_name == reply_from`; take `max(response_seq)`; `purged` if no row survives the filter or its body is null (retention); else map the captured row's **`outcome`** field: `accepted` → `reply`, `no_reply` → `empty`, `rejected`/`unparseable` → `rejected` |
 | no qualifying `response` row, and upstream is **not** settled | **keep waiting**, whatever the `reply_from` rows read: a sibling handler may not have transformed yet, and its row may still capture the reply |
-| no qualifying `response` row, upstream settled, and no `reply_from` row | **fail immediately** (`no_route`) |
-| as above, but every `reply_from` row is **`dead`** or **`cancelled`** | **fail immediately** (`failed`) |
+| no qualifying `response` row, no `reply_from` row, and the message is **terminal** | **fail immediately** (`no_route`) |
+| no qualifying `response` row, no `reply_from` row, the message not terminal | keep waiting: an upstream row settled by a failure, such as a dead routed row, is not "nothing routed" |
+| no qualifying `response` row, upstream settled, and every `reply_from` row is **`dead`** or **`cancelled`** | **fail immediately** (`failed`) |
 | as above, but every `reply_from` row is settled (`done`, `dead` or `cancelled`) and at least one is `done` | **answer immediately** (`empty`): delivered, with no reply captured (a plain `mark_done`, as shadow mode performs) |
 | as above, but a `reply_from` row is `pending`, `inflight` or any other state | keep waiting |
 
@@ -493,6 +494,9 @@ successfully and captured exactly the reply the caller was owed. The store's own
 verbatim: *"a sibling handler's routed/outbound rows may still be in flight, so per-handoff disposition math
 would be order-dependent and wrong"* — the finalizer is the single disposition authority. **The wait loop
 must not do disposition math on a partial row picture.** It now asks the message's own status instead.
+*(Note 2026-11-18, BACKLOG #5895: "the last row" here is revision 1's "no `reply_from` row yet"
+row, now the table's "upstream is not settled" row. The gate is no longer the message status alone
+but upstream settledness; see [Amendment 2026-11-18, sync-reply row set](#amendment-2026-11-18-a-sync-reply-turn-settles-on-the-row-set-once-nothing-upstream-can-add-a-row).)*
 
 `cancelled` is the fifth outbox status, reachable by an operator running `cancel_queued` on the lane while a
 caller is blocked. Revision 1's four-status table matched none of its branches, so the caller burned the full
@@ -1813,6 +1817,11 @@ unrelated outbound's retries.
   a `502 delivery_failed` for a delivered message invites the caller to send it again. That holds
   when another row to the outbound is `dead` too; the dead row stays on the operator's replay path.
 - A live row keeps the turn waiting.
+- `no_route` still needs a terminal message, as before: with no `reply_from` row, a dead routed row
+  also leaves nothing upstream, and that is not "nothing routed".
+- When `reply_timeout` expires with every `reply_from` row settled but a sibling still upstream, the
+  turn answers that settled set (`failed` or `empty`), not `timeout`, which D8 keeps for a partner
+  that did not answer.
 
 One case moves from a fast `502` to waiting: a `dead` row while a sibling handler's work is still
 upstream. That wait is the point of the change, since the sibling's row may still capture the

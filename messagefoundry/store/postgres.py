@@ -7527,10 +7527,11 @@ class PostgresStore:
     async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
         """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3).
 
-        Three narrow indexed reads, decoding nothing — see :class:`ReplyWaitState` for why the
+        Four narrow indexed reads, decoding nothing — see :class:`ReplyWaitState` for why the
         message's own status is returned alongside the destination's row states."""
         message_row = await self._fetchone("SELECT status FROM messages WHERE id=$1", message_id)
-        # Read BEFORE the rows: see ReplyWaitState.upstream_in_flight.
+        # Read BEFORE the rows: see ReplyWaitState.upstream_in_flight. The $n twin of
+        # store._UPSTREAM_IN_FLIGHT_SQL; change both together.
         upstream_row = await self._fetchone(
             "SELECT COUNT(*) AS n FROM queue WHERE message_id=$1 AND stage IN ($2,$3)"
             " AND status NOT IN ($4,$5,$6)",
