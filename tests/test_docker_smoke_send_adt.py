@@ -15,6 +15,8 @@ from types import ModuleType
 
 import pytest
 
+from messagefoundry.parsing.peek import Peek
+
 _SCRIPT = Path(__file__).resolve().parents[1] / "docker" / "smoke" / "send_adt.py"
 
 
@@ -27,6 +29,12 @@ def _load() -> ModuleType:
 
 
 send_adt = _load()
+
+
+def test_the_sender_reads_the_ack_through_the_engines_peek() -> None:
+    """The script parses the ACK with the engine's own Peek, so this stays an engine test: the
+    direct import above is what the tooling partition reads (tests/test_tooling_partition.py)."""
+    assert send_adt.Peek is Peek
 
 
 def _ack(msa: str) -> str:
