@@ -449,7 +449,7 @@ async def test_the_scan_never_logs_a_decrypted_body(
         root,
         fid,
         key,
-        json.dumps({"file_id": fid, "uploaded_at": 1.0e9, "size": "MRN123-NOT-AN-INT"}),
+        json.dumps({"file_id": fid, "uploaded_at": 1.8e9, "size": "MRN123-NOT-AN-INT"}),
     )
 
     with caplog.at_level(logging.WARNING, logger="messagefoundry.uploads"):
@@ -482,7 +482,7 @@ async def test_a_planted_plaintext_sidecar_is_refused_until_resealed(tmp_path: P
                 "uploader": "attacker",
                 "uploader_id": "attacker-id",
                 "size": 3,
-                "uploaded_at": 1.0,
+                "uploaded_at": 1.8e9,
             }
         ),
         encoding="utf-8",
