@@ -2699,11 +2699,15 @@ def test_a_worker_reaped_elsewhere_has_its_group_signalled_only_while_its_pid_is
         ("zombie", False, True, ["group", "reaped"], False),
         # The group is empty: nothing is left to kill.
         ("zombie", False, False, ["group", "reaped"], False),
+        ("running", False, False, ["group", "reaped"], False),
         # Neither sent anything and members may remain, as for a live pid that left its group:
         # the single kill is the fallback, under a WARNING.
         ("running", False, None, ["group", "reaped"], True),
-        # Already reaped: only the reuse-safe signal, as before (vault BACKLOG #3135).
+        ("zombie", False, None, ["group", "reaped"], True),
+        # Already reaped: only the reuse-safe signal, as before (vault BACKLOG #3135), whose own
+        # WARNING, pinned elsewhere, is not the single kill's.
         ("reaped", None, True, ["reaped"], False),
+        ("reaped", None, None, ["reaped"], False),
     ],
 )
 def test_the_posix_reap_reaches_the_group_before_any_single_kill(
@@ -2744,6 +2748,7 @@ def test_the_posix_reap_reaches_the_group_before_any_single_kill(
     sandbox_mod._reap_process_tree(proc, None, "IB_T")
     assert seen == calls
     assert singles == ([proc] if single else [])
+    assert_capture_sees(caplog, sandbox_mod.log)  # so an empty scan below means nothing logged
     warned = [
         r.args
         for r in caplog.records
@@ -2752,9 +2757,9 @@ def test_the_posix_reap_reaches_the_group_before_any_single_kill(
     assert warned == ([("IB_T", proc.pid)] if single else [])
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the POSIX process-group reap")
 @pytest.mark.skipif(
-    not os.path.isdir("/proc"),
-    reason="the POSIX process-group reap, read through /proc to tell a zombie from a runner",
+    not os.path.isdir("/proc"), reason="_pid_running needs /proc to tell a zombie from a runner"
 )
 def test_a_worker_reaped_after_the_state_check_still_has_its_group_killed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2763,8 +2768,8 @@ def test_a_worker_reaped_after_the_state_check_still_has_its_group_killed(
     ``Popen`` AFTER the reap read it as a zombie, still has its group killed: the grandchild dies.
 
     The state check is replaced to return what it read before the reap, so the window is
-    deterministic. It needs ``/proc``, without which :func:`_pid_running` cannot tell a running
-    grandchild from a dead one, so it is NOT RUN on the Windows host this was written on; the
+    deterministic. POSIX with ``/proc`` only, without which :func:`_pid_running` cannot tell a
+    running grandchild from a zombie, so it is NOT RUN on the Windows host this was written on; the
     Linux CI leg runs it. FALSIFICATION: as in the test above, and the grandchild survives, since
     the single-process kill that follows sends nothing to a reaped child."""
     pidfile = tmp_path / "grandchild.pid"
@@ -2789,6 +2794,8 @@ def test_a_worker_reaped_after_the_state_check_still_has_its_group_killed(
     finally:
         if grandchild_pid is not None:
             _best_effort_kill_pid(grandchild_pid)
+        elif proc.poll() is not None:  # a leader that failed before writing the sleeper's pid
+            proctree.kill_reaped_leader_group(proc.pid)
         proc.poll()  # already reaped: this only records it, so Popen does not warn on collection
 
 

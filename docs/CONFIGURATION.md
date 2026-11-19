@@ -1450,10 +1450,14 @@ member left. At least these cases differ: after a kill that writes a line, it fo
 after a reap that is not a kill, such as closing a session whose worker had already died, no kill
 line comes before it; and when the signal itself failed, for example for want of permission, a line
 naming the process group and the system's error text, but not the inbound, comes before it. A
-failed signal to the group of a worker not yet reaped writes a similar unattributed line, which adds
-that the kill degrades to a single-process kill; a group that cannot be read, or that the worker
-does not lead, degrades the same way with no line. That single-process kill signals a running
-worker, and only reaps one that has already exited.
+worker not yet reaped whose group gets no signal takes the same reuse-safe group signal next, so a
+group that cannot be read because the worker is gone is still reached. When that also sends
+nothing, as for a worker that does not lead its group or a signal that failed, a second `WARNING`
+naming the inbound and the pid says the worker gets a single-process kill and a process it started
+may survive. A failed signal writes a similar unattributed line before it, which adds that the kill
+degrades to a single-process kill; that line can also be written when the group emptied in the
+meantime and no single-process kill follows. That single-process kill signals a running worker, and
+only reaps one that has already exited.
 **Read once at engine start — a `/config/reload` does NOT re-read it (restart to change).**
 
 **`mode` is engine-wide — there is no per-connection sandbox setting.** One policy is rendered for the
