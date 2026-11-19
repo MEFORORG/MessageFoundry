@@ -3307,40 +3307,52 @@ class RestDestination(DestinationConnector):
         # BACKLOG #2196: the hop re-check _post runs, before the bearer is minted below.
         assert_probe_hop(self._hop_guard, self.url, connector="REST")
         headers = self._headers
-        if self._token_provider is not None:
-            # Acquire a real SMART token so reachability reflects the actual credentials (a token-
-            # endpoint failure raises DeliveryError, surfaced as unreachable).
-            headers = {
-                **self._headers,
-                "Authorization": f"Bearer {self._token_provider.access_token()}",
-            }
-        req = (
-            self._ech_request(None, dict(headers), "HEAD")
-            if self._ech_sidecar is not None
-            else urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s)
-                self.url, headers=headers, method="HEAD"
-            )
-        )
-        # ASVS 4.2.5: this probe MINTS a real bearer above (so reachability reflects the actual
-        # credentials), and that token is the one value the construction gate could not see -- the URL
-        # and the static headers were already bounded there. Gated here so an operator's "test
-        # connection" fails with the real reason rather than an opaque wire error. The SOAP probe
-        # mints and gates the same way (BACKLOG #5526).
         try:
-            enforce_send_time_length_limits(
-                req.full_url,
-                headers,
-                connector=f"REST {_redact_url(self.url)} probe",
-                minted_credential_names=(
-                    frozenset({"Authorization"})
-                    if self._token_provider is not None
-                    else frozenset()
-                ),
-            )
+            if self._token_provider is not None:
+                # Acquire a real SMART token so reachability reflects the actual credentials (a
+                # token-endpoint failure raises DeliveryError, surfaced as unreachable).
+                bearer = mint_probe_bearer(
+                    self._token_provider.access_token, f"REST {_redact_url(self.url)} probe"
+                )
+                headers = {**self._headers, "Authorization": f"Bearer {bearer}"}
+            try:
+                req = (
+                    self._ech_request(None, dict(headers), "HEAD")
+                    if self._ech_sidecar is not None
+                    else urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s)
+                        self.url, headers=headers, method="HEAD"
+                    )
+                )
+            except ValueError as exc:
+                raise DeliveryError(
+                    f"REST {_redact_url(self.url)} rejected an invalid request value"
+                ) from exc
+            # ASVS 4.2.5: this probe MINTS a real bearer above (so reachability reflects the actual
+            # credentials), and that token is the one value the construction gate could not see --
+            # the URL and the static headers were already bounded there. Gated here so an
+            # operator's "test connection" fails with the real reason rather than an opaque wire
+            # error. The SOAP probe mints and gates the same way (BACKLOG #5526).
+            try:
+                enforce_send_time_length_limits(
+                    req.full_url,
+                    headers,
+                    connector=f"REST {_redact_url(self.url)} probe",
+                    minted_credential_names=(
+                        frozenset({"Authorization"})
+                        if self._token_provider is not None
+                        else frozenset()
+                    ),
+                )
+            except NegativeAckError as exc:
+                if exc.credential_fault and self._token_provider is not None:
+                    self._token_provider.invalidate()
+                raise
         except NegativeAckError as exc:
-            if exc.credential_fault and self._token_provider is not None:
-                self._token_provider.invalidate()
-            raise
+            # BACKLOG #5797: a probe raises only a plain DeliveryError, with no fault marker (the
+            # HttpAuthError arm below says the same), so a NegativeAckError raised before the open
+            # (at least the length gate's, and a refused Digest challenge on the token hop) is
+            # retyped here, keeping its text.
+            raise DeliveryError(str(exc)) from exc
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: the probe body is discarded, but an unbounded drain would let a
@@ -3396,19 +3408,31 @@ class RestDestination(DestinationConnector):
             if self._token_provider is not None:
                 # ADR 0024: a fresh SMART bearer per request, acquired off-loop past the queue boundary
                 # (a retry re-mints — re-run purity holds). Overrides any static bearer_token.
-                headers["Authorization"] = f"Bearer {self._token_provider.access_token()}"
+                # BACKLOG #5797: a token request that cannot be built is a configuration fault.
+                bearer = mint_bearer(
+                    self._token_provider.access_token, f"REST {_redact_url(self.url)}"
+                )
+                headers["Authorization"] = f"Bearer {bearer}"
             if self._signer is not None:
                 # ASVS 4.1.5 (ADR 0018): mint a detached JWS over the exact body bytes and carry it in a
                 # per-request header. Minted here in send()'s off-loop worker, past the queue boundary, so
                 # a retry re-mints it (re-run purity holds, like the WS-Security nonce — ADR 0015).
                 headers.update(self._signer.signature_headers(data))
-        req = (
-            self._ech_request(data, headers, self.method)
-            if self._ech_sidecar is not None
-            else urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s)
-                self.url, data=data, headers=headers, method=self.method
+        try:
+            req = (
+                self._ech_request(data, headers, self.method)
+                if self._ech_sidecar is not None
+                else urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s)
+                    self.url, data=data, headers=headers, method=self.method
+                )
             )
-        )
+        except ValueError as exc:
+            # BACKLOG #5797: classified as the open's ValueError arm below classifies it.
+            raise NegativeAckError(
+                f"REST {_redact_url(self.url)} rejected an invalid request value",
+                code="bad-request-value",
+                permanent=True,
+            ) from exc
         # ASVS 4.2.5: bound what ACTUALLY ships. The construction gate saw only the static config; the
         # per-message headers, the SMART bearer and the JWS headers above are all added after it.
         # Measured on req.full_url rather than self.url because _ech_request re-addresses the request

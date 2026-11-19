@@ -81,7 +81,7 @@ class _Opener:
         raise AssertionError("nothing may be sent")
 
 
-@pytest.mark.parametrize("make", [_fhir], ids=["fhir"])
+@pytest.mark.parametrize("make", [_rest, _fhir], ids=["rest", "fhir"])
 async def test_an_unbuildable_token_request_is_a_configuration_fault(make: object) -> None:
     dest = make()  # type: ignore[operator]
     dest._token_provider = _UnbuildableTokenRequest()
@@ -99,7 +99,7 @@ async def test_an_unbuildable_token_request_is_a_configuration_fault(make: objec
     assert opener.calls == 0
 
 
-@pytest.mark.parametrize("make", [_fhir], ids=["fhir"])
+@pytest.mark.parametrize("make", [_rest, _fhir], ids=["rest", "fhir"])
 async def test_an_unbuildable_token_request_fails_the_probe_as_a_delivery_error(
     make: object,
 ) -> None:
@@ -112,4 +112,21 @@ async def test_an_unbuildable_token_request_fails_the_probe_as_a_delivery_error(
     assert type(err.value) is DeliveryError
     assert err.value.__cause__ is None and err.value.__context__ is None
     assert SECRET not in str(err.value)
+    assert opener.calls == 0
+
+
+async def test_the_rest_probe_retypes_the_length_gate_refusal() -> None:
+    """BACKLOG #5797: the probe's send-time length gate raises NegativeAckError; the probe raises
+    only a plain DeliveryError, and still drops the over-length cached token."""
+    dest = _rest()
+    provider = _LongToken()
+    dest._token_provider = provider
+    opener = _Opener()
+    dest._opener = opener  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as err:
+        await dest.test_connection()
+    assert type(err.value) is DeliveryError
+    assert isinstance(err.value.__cause__, NegativeAckError)
+    assert provider.invalidated is True
+    assert "T" * 20 not in str(err.value)
     assert opener.calls == 0
