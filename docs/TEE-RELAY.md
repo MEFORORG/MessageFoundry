@@ -117,10 +117,12 @@ fail-closed), `--connect-timeout` / `--send-timeout`, `--max-frame-bytes` (frame
 `--stop-grace` (default 30 seconds). On shutdown the relay stops ACKing new messages, then gives
 messages it has already ACKed up to the grace to finish their Corepoint and MEFOR legs, then gives
 the MEFOR shadow queue up to the grace again to drain. It cancels whatever is left at each deadline
-and logs it. A message cut off while it is being forwarded to Corepoint is logged as a
-`transport_error` row, so `naks` lists it. A message cut off at any other point after its ACK
-(a store write, or a MEFOR copy dropped at the queue deadline) appears only in the log. Keep twice
-the grace inside your service manager's stop timeout.
+and logs it. An Epic message cut off after its ACK but before its Corepoint row is written is
+logged by control id and still gets a Corepoint row: a `transport_error` row (so `naks` lists it)
+while the forward is unfinished, or the forward's real outcome once it finished (a cut-off during
+that row's own write can leave the outcome recorded twice). A MEFOR copy dropped at the queue
+deadline, or a Corepoint-copy message cut off after its ACK, appears only in the log, by count.
+Keep twice the grace inside your service manager's stop timeout.
 
 ## The SQLite log
 

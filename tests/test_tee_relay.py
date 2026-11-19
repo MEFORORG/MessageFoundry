@@ -854,6 +854,31 @@ async def test_stop_during_start_closes_listeners_bound_after_it(
         await mefor.stop()
 
 
+async def test_start_is_refused_after_a_failed_start(tmp_path: Path) -> None:
+    # A start() that failed after opening the store leaves it to stop(), whose teardown is
+    # memoized; a second start() would open a store and listeners no later stop() closes.
+    taken = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+    busy: Endpoint = taken.sockets[0].getsockname()[:2]
+    relay = TeeRelay(
+        RelayConfig(
+            listen_epic=busy,
+            corepoint=("127.0.0.1", 1),
+            mefor=("127.0.0.1", 2),
+            db_path=str(tmp_path / "tee.db"),
+        )
+    )
+    try:
+        with pytest.raises(OSError):
+            await relay.start()
+        await relay.stop()
+        with pytest.raises(RuntimeError, match="already started"):
+            await relay.start()
+    finally:
+        await relay.stop()
+        taken.close()
+        await taken.wait_closed()
+
+
 async def _cut_off_legs(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,

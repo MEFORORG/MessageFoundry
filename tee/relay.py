@@ -226,9 +226,10 @@ class TeeRelay:
 
     # -- lifecycle -----------------------------------------------------------
     async def start(self) -> None:
-        if self._epic_server is not None or (
-            self._start_done is not None and not self._start_done.is_set()
-        ):
+        # A start() that is running, or that ran at all, refuses: one that failed after opening the
+        # store leaves it to stop(), whose teardown is memoized, so a second start() would open a
+        # store and listeners that no later stop() closes.
+        if self._start_done is not None or self._epic_server is not None:
             raise RuntimeError("relay already started")
         cfg = self.config
         # A stop() before start() had nothing to tear down; its flag must not make this start()'s
