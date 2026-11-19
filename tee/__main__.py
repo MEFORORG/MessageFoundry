@@ -215,6 +215,13 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--corepoint-retry-delay", type=float, default=1.0)
     run.add_argument("--mefor-queue-max", type=int, default=1000)
     run.add_argument(
+        "--stop-grace",
+        type=float,
+        default=30.0,
+        help="seconds a shutdown lets in-flight messages finish, then the MEFOR queue drain,"
+        " before cancelling what is left",
+    )
+    run.add_argument(
         "--capture-bodies",
         action="store_true",
         help="persist full message bodies for ALL feeds to the DB (test data only — off by default)",
@@ -420,6 +427,7 @@ async def _run(args: argparse.Namespace) -> int:
         corepoint_attempts=args.corepoint_attempts,
         corepoint_retry_delay=args.corepoint_retry_delay,
         mefor_queue_max=args.mefor_queue_max,
+        stop_grace=args.stop_grace,
         capture_bodies=args.capture_bodies,
         capture_corepoint_copy=args.capture_corepoint_copy,
     )

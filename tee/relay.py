@@ -64,7 +64,8 @@ class RelayConfig:
         1000  # bounded shadow buffer; oldest copies dropped (with a log) when full
     )
     capture_bodies: bool = False  # off by default; when on, the DB holds PHI bodies for ALL feeds
-    # How long stop() lets in-flight listener handlers finish before cancelling them.
+    # How long stop() lets in-flight listener handlers finish, and then how long it lets the MEFOR
+    # worker drain its queue, before cancelling what is left (so stop() takes at most twice this).
     stop_grace: float = 30.0
     capture_corepoint_copy: bool = (
         # Capture ONLY the Corepoint-copy feed (Corepoint's *output*) — the minimal-PHI posture for a
@@ -162,14 +163,12 @@ class TeeRelay:
         self._shutdown = asyncio.Event()
         self._epic_server: asyncio.Server | None = None
         self._copy_server: asyncio.Server | None = None
-        self._epic_writers: set[asyncio.StreamWriter] = set()
-        self._copy_writers: set[asyncio.StreamWriter] = set()
         # Every live listener handler (both listeners), so stop() can let an in-flight message
         # finish its store writes and MEFOR enqueue before the worker and the store go away.
         self._handler_tasks: set[asyncio.Task[object]] = set()
         self._mefor_queue: asyncio.Queue[_MeforItem | _WorkerStop] = asyncio.Queue()
         self._mefor_worker: asyncio.Task[None] | None = None
-        self._mefor_closing = False  # set by stop() just before it queues the worker's sentinel
+        self._stop_task: asyncio.Future[None] | None = None
 
     # -- properties ----------------------------------------------------------
     @property
@@ -244,62 +243,81 @@ class TeeRelay:
             await self.stop()
 
     async def stop(self) -> None:
+        """Tear the relay down. Runs once: a concurrent or repeated call (``serve_forever``'s own
+        ``finally`` among them) waits for the same teardown rather than starting a second one."""
+        if self._stop_task is None:
+            self._stop_task = asyncio.ensure_future(self._stop())
+        await asyncio.shield(self._stop_task)
+
+    async def _stop(self) -> None:
         self._shutdown.set()
-        if self._epic_server is not None:
-            self._epic_server.close()
-        if self._copy_server is not None:
-            self._copy_server.close()
-        # Closing a server does not close its accepted connections, so close both listeners'
-        # connections ourselves; a handler then reads EOF and leaves its loop. A handler already
-        # past its ACK keeps going until its store writes and its MEFOR enqueue are done, and the
-        # drain below waits for that: closing the store under it would leave an ACKed message with
-        # no record, and an enqueue racing the stop sentinel could displace it and hang the worker.
-        for writer in [*self._epic_writers, *self._copy_writers]:
-            writer.close()
-            with suppress(OSError):
-                await writer.wait_closed()
-        await self._drain_handlers()
+        await self._drain_listeners()
         if self._mefor_worker is not None:
-            # Stop the shadow worker by queueing a sentinel so it returns cleanly from its
-            # Queue.get(), rather than cancel()-ing a task parked in get() — which intermittently
-            # deadlocks on CPython 3.11 (BACKLOG #17, see _WorkerStop). put_nowait succeeds whenever
-            # the worker is actually parked in get() (an empty queue is never full); the QueueFull
-            # fallback only fires when the queue is non-empty, i.e. the worker is NOT in get(), so
-            # cancel() is safe there. No handler is left to enqueue after this point (they were
-            # drained above, and _enqueue_mefor refuses once _mefor_closing is set), so nothing
-            # can displace the sentinel.
-            self._mefor_closing = True
-            try:
-                self._mefor_queue.put_nowait(_WORKER_STOP)
-            except asyncio.QueueFull:
-                self._mefor_worker.cancel()
-            with suppress(asyncio.CancelledError):
-                await self._mefor_worker
+            await self._drain_mefor_worker(self._mefor_worker)
         if self.store is not None:
             await self.store.close()
 
-    async def _drain_handlers(self) -> None:
-        """Wait for every live listener handler to finish, bounded by ``stop_grace``.
+    async def _drain_listeners(self) -> None:
+        """Close both listeners and wait, bounded by ``stop_grace``, for every handler to finish.
 
-        A handler whose peer was closed exits at its next read; one mid-forward finishes that
-        message first. Any still running after the grace period is cancelled, so a wedged peer can
-        delay stop() but never hang it."""
-        # A connection accepted just before the servers closed may have a handler task that has
-        # not run yet; yield once so it registers (and sees the shutdown flag) before we snapshot.
-        await asyncio.sleep(0)
-        pending = set(self._handler_tasks)
-        if not pending:
-            return
-        _done, stragglers = await asyncio.wait(pending, timeout=self.config.stop_grace)
-        if stragglers:
+        Closing a server does not close its accepted connections, so ``close_clients`` closes them;
+        a handler then reads EOF and leaves its loop. A handler already past its ACK keeps going
+        until its store writes and its MEFOR enqueue are done: closing the store under it would
+        leave an ACKed message with no record, and an enqueue after the worker's stop sentinel
+        could evict the sentinel. Whatever is still running at the deadline has its connection
+        aborted (a peer that stopped reading would otherwise hold a close open forever) and is
+        cancelled, so a wedged peer can delay stop() but never hang it."""
+        servers = [s for s in (self._epic_server, self._copy_server) if s is not None]
+        for server in servers:
+            server.close()
+            server.close_clients()
+        grace = self.config.stop_grace
+        try:
+            async with asyncio.timeout(grace):
+                # wait_closed returns once every connection is gone, by which point each of their
+                # handlers has run its first step and registered in _handler_tasks.
+                for server in servers:
+                    await server.wait_closed()
+                if self._handler_tasks:
+                    await asyncio.wait(set(self._handler_tasks))
+        except TimeoutError:
+            stragglers = set(self._handler_tasks)
             logger.warning(
-                "%d listener handler(s) still running after %.1fs; cancelling",
+                "%d listener handler(s) still running after %.1fs; aborting their connections"
+                " and cancelling",
                 len(stragglers),
-                self.config.stop_grace,
+                grace,
             )
+            for server in servers:
+                server.abort_clients()
             for task in stragglers:
                 task.cancel()
             await asyncio.gather(*stragglers, return_exceptions=True)
+
+    async def _drain_mefor_worker(self, worker: asyncio.Task[None]) -> None:
+        """Let the shadow worker forward what is queued, then stop it, bounded by ``stop_grace``.
+
+        The worker stops on a queued sentinel rather than a cancel() of a task parked in
+        Queue.get(), which intermittently deadlocks on CPython 3.11 (BACKLOG #17, see _WorkerStop).
+        No listener handler is left to enqueue by now, so a blocking put cannot be raced and
+        nothing can displace the sentinel. A worker still busy at the deadline (MEFOR slow or
+        down) is cancelled, which is safe because it is then not parked in an empty get()."""
+        grace = self.config.stop_grace
+        try:
+            async with asyncio.timeout(grace):
+                await self._mefor_queue.put(_WORKER_STOP)
+                await asyncio.wait({worker})
+        except TimeoutError:
+            pending = self._mefor_queue.qsize()
+            logger.warning(
+                "MEFOR shadow worker still draining after %.1fs; cancelling it and dropping up to"
+                " %d queued copies",
+                grace,
+                pending,
+            )
+            worker.cancel()
+        with suppress(asyncio.CancelledError):
+            await worker
 
     def _register_handler(self) -> None:
         """Record the running listener handler so stop() can wait for it."""
@@ -322,10 +340,7 @@ class TeeRelay:
         )
         if self._epic_server is not None:
             self._epic_server.close()
-        for writer in list(self._epic_writers):
-            writer.close()
-            with suppress(OSError):
-                await writer.wait_closed()
+            self._epic_server.close_clients()
 
     # -- Listener A: Epic -> (Corepoint + MEFOR) -----------------------------
     async def _handle_epic(
@@ -333,12 +348,14 @@ class TeeRelay:
     ) -> None:
         peer = writer.get_extra_info("peername")
         self._register_handler()
-        self._epic_writers.add(writer)
         try:
+            if self._shutdown.is_set():  # accepted as stop() began: serve nothing
+                return
             async for message in self._iter_frames(reader):
-                # Stop before the ACK once shutting down: an un-ACKed message is resent by Epic,
-                # whereas one ACKed now would race the store's close.
-                if self._tripped.is_set() or self._shutdown.is_set():
+                if self._tripped.is_set():
+                    break
+                if self._shutdown.is_set():
+                    _log_unacked_at_stop(message)
                     break
                 try:
                     await self._process_epic_message(message, writer)
@@ -350,7 +367,6 @@ class TeeRelay:
         except mllp.FrameError as exc:
             logger.warning("Epic connection %s framing error: %s; closing", peer, exc)
         finally:
-            self._epic_writers.discard(writer)
             writer.close()
             with suppress(OSError):
                 await writer.wait_closed()
@@ -374,6 +390,26 @@ class TeeRelay:
         # 2. Production leg: Corepoint (a transport failure trips fail-closed; a NAK is only logged).
         try:
             outcome, code, detail = await self._forward_corepoint(message)
+        except asyncio.CancelledError:
+            # stop() ran out of grace with this message ACKed but its forward unfinished: record it
+            # (as a transport error, so `naks` lists it) rather than leave an ACK with no row.
+            logger.warning(
+                "relay stop cut off an ACKed message mid-forward; Corepoint delivery unknown"
+                " control_id=%s",
+                control_id,
+            )
+            with suppress(Exception):
+                await store.record_leg(
+                    direction="epic_to_corepoint",
+                    leg="corepoint",
+                    control_id=control_id,
+                    message_type=message_type,
+                    size_bytes=size,
+                    outcome="transport_error",
+                    ack_code=None,
+                    detail="cancelled by relay stop after the ACK; delivery unknown",
+                )
+            raise
         except ForwardError as exc:
             await store.record_leg(
                 direction="epic_to_corepoint",
@@ -442,10 +478,12 @@ class TeeRelay:
     ) -> None:
         peer = writer.get_extra_info("peername")
         self._register_handler()
-        self._copy_writers.add(writer)
         try:
+            if self._shutdown.is_set():  # accepted as stop() began: serve nothing
+                return
             async for message in self._iter_frames(reader):
-                if self._shutdown.is_set():  # see _handle_epic: never ACK into a closing relay
+                if self._shutdown.is_set():
+                    _log_unacked_at_stop(message)
                     break
                 try:
                     if not await self._process_copy_message(message, writer):
@@ -458,7 +496,6 @@ class TeeRelay:
         except mllp.FrameError as exc:
             logger.warning("Copy connection %s framing error: %s; closing", peer, exc)
         finally:
-            self._copy_writers.discard(writer)
             writer.close()
             with suppress(OSError):
                 await writer.wait_closed()
@@ -484,14 +521,7 @@ class TeeRelay:
 
         Best-effort and non-blocking (uses ``put_nowait``) so a slow MEFOR never back-pressures the
         production path. A drop is **always** logged — including the rare race where a concurrent
-        enqueuer takes the slot we freed, in which case we drop *this* item instead.
-
-        Refused once stop() is about to queue the worker's stop sentinel: the drop-oldest path below
-        could otherwise evict that sentinel and leave stop() waiting on a worker that never exits.
-        A handler draining during stop() still enqueues normally, ahead of the sentinel."""
-        if self._mefor_closing:
-            logger.warning("MEFOR shadow leg stopping; dropped copy control_id=%s", item.control_id)
-            return
+        enqueuer takes the slot we freed, in which case we drop *this* item instead."""
         try:
             self._mefor_queue.put_nowait(item)
             return
@@ -578,6 +608,14 @@ class TeeRelay:
                 raise _ConnectionClosed
             for message in decoder.feed(chunk):
                 yield message
+
+
+def _log_unacked_at_stop(message: bytes) -> None:
+    """Log a frame read during stop() and left un-ACKed, so its sender resends it."""
+    logger.info(
+        "relay stopping; left a received message un-ACKed for resend control_id=%s",
+        mllp.peek_fields(message)[0],
+    )
 
 
 class _ConnectionClosed(Exception):
