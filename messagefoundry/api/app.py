@@ -1317,7 +1317,8 @@ def _purge_target_refusal(rr: RegistryRunner | None, name: str) -> HTTPException
     # BACKLOG #5792: a cluster node that does not hold the leader lease delivers nothing, so its
     # quiesced signal is vacuous the same way, and a stop there needs no lease. A purge on it would
     # cancel rows of the shared store the leader is still delivering. The single-node
-    # NullCoordinator always leads.
+    # NullCoordinator always leads. A point-in-time read, not a store fence: leadership can still
+    # change before the cancel completes.
     if not rr.coordinator.is_leader():
         return HTTPException(
             409,
