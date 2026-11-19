@@ -160,9 +160,37 @@ class _Part:
         )
 
 
-def _after_line_feed(found: int) -> int:
-    """The offset of a delimiter :func:`_locate_parts` found with its line feed in front, or -1."""
-    return -1 if found == -1 else found + 1
+#: What may follow a boundary on its delimiter line (RFC 2046): the close marker ``--``, or
+#: optional transport padding (spaces and tabs) and the line break. The end of the body is admitted
+#: too, so a body cut short right after a delimiter is refused as unclosed, not read as content.
+_DELIMITER_TAIL = re.compile(rb"--|[ \t]*\r?\n|[ \t]*\Z")
+
+
+def _next_delimiter(body: bytes, delim: bytes, start: int) -> int:
+    """The offset of the first delimiter line at or after ``start``, or -1 (BACKLOG #5787).
+
+    RFC 2046 puts a delimiter on a line of its own, so one is found only at the very start of the
+    body or after a line feed (a CRLF, or the bare LF a non-conforming client sends), and followed
+    by what :data:`_DELIMITER_TAIL` admits. The boundary text anywhere else is part content, not a
+    split point. A content line that only starts with the boundary costs a ``find``, so more than
+    ``_MAX_PARTS`` of them in a row are refused, as more parts would be: the walk stays bounded."""
+    if start == 0 and body.startswith(delim) and _DELIMITER_TAIL.match(body, len(delim)):
+        return 0
+    line_delim = b"\n" + delim
+    skipped = 0
+    found = body.find(line_delim, start)
+    while found != -1:
+        pos = found + 1
+        if _DELIMITER_TAIL.match(body, pos + len(delim)):
+            return pos
+        skipped += 1
+        if skipped > _MAX_PARTS:
+            raise MultipartError(
+                f"multipart body has more than {_MAX_PARTS} lines in a row that start with the "
+                "boundary but are not delimiters"
+            )
+        found = body.find(line_delim, pos)
+    return -1
 
 
 def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int) -> list[_Part]:
@@ -181,23 +209,21 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     if boundary is None:
         raise MultipartError("Content-Type is not multipart/form-data with a boundary")
     delim = b"--" + boundary
-    # BACKLOG #5787: RFC 2046 puts a delimiter at the start of a line, so one is found only there:
-    # at the very start of the body or after a line feed (a CRLF, or the bare LF a non-conforming
-    # client sends). The boundary text later in a line is part content, not a split point.
-    line_delim = b"\n" + delim
     # (header start, header end, content start, content end) for each part with a header block.
     spans: list[tuple[int, int, int, int]] = []
     count = 0
     closed = False
     # Anything before the first delimiter is the ignorable preamble; the closing "--boundary--" is
     # the first later delimiter followed by b"--", and anything after it is the ignorable epilogue.
-    pos = 0 if body.startswith(delim) else _after_line_feed(body.find(line_delim))
+    pos = _next_delimiter(body, delim, 0)
+    if pos == -1:
+        raise MultipartError("multipart body has no boundary delimiter matching its Content-Type")
     while pos != -1:
         start = pos + len(delim)
         if body.startswith(b"--", start):
             closed = True
             break
-        nxt = _after_line_feed(body.find(line_delim, start))
+        nxt = _next_delimiter(body, delim, start)
         end = len(body) if nxt == -1 else nxt
         # After each delimiter comes CRLF, then the part's header block.
         if body.startswith(b"\r\n", start, end):

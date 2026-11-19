@@ -131,7 +131,6 @@ from messagefoundry.transports.rest import (
     http_credentials_sent,
     http_family_trust_anchor,
     mint_bearer,
-    mint_probe_bearer,
     normalize_header_allowlist,
     outbound_headers_from_metadata,
     refuse_cleartext_credentials,
@@ -1571,8 +1570,10 @@ class FhirDestination(DestinationConnector):
         if self._token_provider is not None:
             # Acquire a real SMART token so reachability reflects the actual credentials. BACKLOG
             # #5795: a token request that cannot be built is a classified DeliveryError.
-            bearer = mint_probe_bearer(
-                self._token_provider.access_token, f"FHIR {_redact_url(self.base_url)} probe"
+            bearer = mint_bearer(
+                self._token_provider.access_token,
+                f"FHIR {_redact_url(self.base_url)} probe",
+                probe=True,
             )
             headers = {**self._headers, "Authorization": f"Bearer {bearer}"}
         try:

@@ -130,3 +130,41 @@ async def test_the_rest_probe_retypes_the_length_gate_refusal() -> None:
     assert provider.invalidated is True
     assert "T" * 20 not in str(err.value)
     assert opener.calls == 0
+
+
+class _RefusingRequest:
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        raise ValueError("unknown url type")
+
+
+async def test_a_rest_request_urllib_cannot_build_is_a_configuration_fault(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5797: building the delivery Request sat outside the classifying try. What urllib
+    can refuse there is the configured URL, the same for every queued row."""
+    dest = _rest()
+    opener = _Opener()
+    dest._opener = opener  # type: ignore[assignment]
+    monkeypatch.setattr(urllib.request, "Request", _RefusingRequest)
+    with pytest.raises(NegativeAckError) as err:
+        await dest.send(SYNTHETIC_PATIENT)
+    assert (err.value.code, err.value.permanent, err.value.config_fault) == (
+        "bad-request-value",
+        True,
+        True,
+    )
+    assert opener.calls == 0
+
+
+@pytest.mark.parametrize("make", [_rest, _fhir], ids=["rest", "fhir"])
+async def test_a_probe_request_urllib_cannot_build_is_a_delivery_error(
+    make: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dest = make()  # type: ignore[operator]
+    opener = _Opener()
+    dest._opener = opener
+    monkeypatch.setattr(urllib.request, "Request", _RefusingRequest)
+    with pytest.raises(DeliveryError, match="rejected an invalid request value") as err:
+        await dest.test_connection()
+    assert type(err.value) is DeliveryError
+    assert opener.calls == 0

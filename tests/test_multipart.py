@@ -494,9 +494,37 @@ def test_a_body_cut_short_of_its_closing_delimiter_is_refused(tail: bytes) -> No
     assert type(caught.value) is MultipartError  # 400, not 413
 
 
-def test_a_body_with_no_delimiter_at_all_is_refused() -> None:
-    with pytest.raises(MultipartError, match="no closing boundary delimiter"):
-        parse_multipart_form(f"multipart/form-data; boundary={_B}", b"", max_file_bytes=1024)
+@pytest.mark.parametrize(
+    "body",
+    [b"", _body([_FILE_PART]).replace(_B.encode(), b"OtherBoundary")],
+    ids=["empty", "other"],
+)
+def test_a_body_with_no_matching_delimiter_is_refused_naming_the_boundary(body: bytes) -> None:
+    """A body with no delimiter for the Content-Type's boundary is refused for that, not as a
+    truncated upload, which would send the operator after the network rather than the client."""
+    with pytest.raises(MultipartError, match="no boundary delimiter matching its Content-Type"):
+        parse_multipart_form(f"multipart/form-data; boundary={_B}", body, max_file_bytes=1024)
+
+
+def test_a_line_that_only_starts_with_the_boundary_is_content() -> None:
+    """BACKLOG #5787: a delimiter is the boundary alone on its line, or the close marker. A content
+    line that merely starts with the boundary text used to split the file part, cutting it short
+    while the body still closed, so the cut file was kept as if whole."""
+    content = f"line1\r\n--{_B}x more\r\n--{_B}\tpadded-not\r\nend".encode()
+    body = _body([_FILE_PART_HEAD + content])
+    file = parse_single_file_upload(
+        f"multipart/form-data; boundary={_B}", body, max_file_bytes=1024
+    )
+    assert file.data == content
+
+
+def test_transport_padding_after_a_delimiter_still_delimits() -> None:
+    """Control: RFC 2046 lets spaces or tabs follow the boundary on its line."""
+    body = f"--{_B} \t\r\n".encode() + _FILE_PART + f"\r\n--{_B}--\r\n".encode()
+    file = parse_single_file_upload(
+        f"multipart/form-data; boundary={_B}", body, max_file_bytes=1024
+    )
+    assert file.filename == "a.hl7"
 
 
 def test_boundary_text_inside_a_line_is_content_not_a_split() -> None:
@@ -705,3 +733,15 @@ def test_a_text_field_at_the_cap_still_parses() -> None:
         max_file_bytes=1024,
     )
     assert form.fields["note"] == value.decode()
+
+
+def test_many_lines_that_only_start_with_the_boundary_are_refused() -> None:
+    """Each such content line costs a find, so the walk refuses a run longer than the part cap
+    rather than walking a body full of them; a run at the cap is still content."""
+    ct = f"multipart/form-data; boundary={_B}"
+    lines = f"\r\n--{_B}x".encode()
+    at_cap = _body([_FILE_PART_HEAD + b"a" + lines * multipart._MAX_PARTS])
+    assert parse_single_file_upload(ct, at_cap, max_file_bytes=4096).data.startswith(b"a\r\n")
+    over = _body([_FILE_PART_HEAD + b"a" + lines * (multipart._MAX_PARTS + 1)])
+    with pytest.raises(MultipartError, match="lines in a row that start with the boundary"):
+        parse_single_file_upload(ct, over, max_file_bytes=4096)

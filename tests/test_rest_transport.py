@@ -185,7 +185,7 @@ def test_rest_bearer_token_beside_basic_is_refused() -> None:
 def test_rest_timeout_that_is_not_positive_is_refused_at_construction(timeout: object) -> None:
     """BACKLOG #5796: float_setting passes zero and negatives through, and either built a
     destination that failed every send."""
-    with pytest.raises(ValueError, match="'timeout_seconds' must be greater than zero"):
+    with pytest.raises(ValueError, match="timeout_seconds must be a number of seconds above zero"):
         _dest(timeout_seconds=timeout)
 
 

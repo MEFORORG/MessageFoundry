@@ -88,8 +88,8 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     ReplyBodyDropped,
     encode_wire_body,
-    float_setting,
     insecure_hop_refused,
+    positive_seconds,
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
@@ -418,40 +418,30 @@ def auth_challenge_refused(label: str) -> NegativeAckError:
 TOKEN_REQUEST_REFUSED_CODE = "token-request-refused"  # nosec B105 -- a failure code, not a credential
 
 
-def _token_request_refusal(label: str, exc: ValueError) -> str:
-    # By class only: the ValueError an http.client header check raises quotes the refused value,
-    # which on the token hop can be the proxy credential.
-    return (
-        f"{label} could not send its bearer-token request ({type(exc).__name__}); "
-        "check the token endpoint and proxy settings"
-    )
+def mint_bearer(access_token: Callable[[], str], label: str, *, probe: bool = False) -> str:
+    """Call a bearer provider's ``access_token`` for ``label``'s hop (BACKLOG #5795, #5797).
 
-
-def mint_bearer(access_token: Callable[[], str], label: str) -> str:
-    """Call a bearer provider's ``access_token`` for ``label``'s delivery (BACKLOG #5795, #5797).
-
-    The provider raises ``DeliveryError`` for a failed mint, but a token request that cannot be
-    built or encoded raises a plain ``ValueError``: at least an over-length token URL or proxy
-    credential (``enforce_outbound_length_limits``) and a header value ``http.client`` refuses. That
-    is the connection's fault, the same for every queued row, so it becomes a permanent
+    The provider raises ``DeliveryError`` for a failed mint, but a token request it cannot build or
+    send raises a plain ``ValueError``: at least an over-length token URL or proxy credential
+    (``enforce_outbound_length_limits``) and a header value ``http.client`` refuses. That is the
+    connection's fault, the same for every queued row, so for a delivery it becomes a permanent
     configuration fault: under the default ``credential_fault_policy`` the delivery worker stops
-    the lane and keeps the queue. Raised outside the handler, so the ValueError's text is not
-    chained onto it."""
+    the lane and keeps the queue. A ``probe`` raises a plain :class:`DeliveryError` instead, the
+    only failure type a test-connection probe raises.
+
+    Named by class only, and raised outside the handler so nothing chains the ValueError: an
+    ``http.client`` header refusal quotes the value, which on the token hop can be the proxy
+    credential."""
     try:
         return access_token()
     except ValueError as exc:
-        text = _token_request_refusal(label, exc)
+        text = (
+            f"{label} could not build or send its bearer-token request "
+            f"({type(exc).__name__}); check the connection's token settings"
+        )
+    if probe:
+        raise DeliveryError(text)
     raise NegativeAckError(text, code=TOKEN_REQUEST_REFUSED_CODE, permanent=True, config_fault=True)
-
-
-def mint_probe_bearer(access_token: Callable[[], str], label: str) -> str:
-    """:func:`mint_bearer` for a test-connection probe, which raises only a plain
-    :class:`DeliveryError` and carries no fault marker."""
-    try:
-        return access_token()
-    except ValueError as exc:
-        text = _token_request_refusal(label, exc)
-    raise DeliveryError(text)
 
 
 class _NoRedirectHandler(NoRedirectHandler):
@@ -2971,14 +2961,11 @@ class RestDestination(DestinationConnector):
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("REST", config.name)
         self.method: str = str(s.get("method", "POST")).upper()
-        self.timeout: float = float_setting(
+        # BACKLOG #5796: positive, because urllib reads a zero timeout as a non-blocking socket and
+        # refuses a negative one, so either would build and then fail every send.
+        self.timeout: float = positive_seconds(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="REST destination"
         )
-        # BACKLOG #5796: float_setting returns zero and negatives as they are. urllib reads a zero
-        # timeout as a non-blocking socket and refuses a negative one, so either would build and
-        # then fail every send.
-        if self.timeout <= 0:
-            raise ValueError("REST destination 'timeout_seconds' must be greater than zero")
         encoding = s.get("encoding", "utf-8")
         # BACKLOG #5796: "".encode is the probe the config-load encoding checks use, the same call
         # the send makes, so a non-text codec such as base64 is refused too. Checked here as well,
@@ -3330,8 +3317,10 @@ class RestDestination(DestinationConnector):
             if self._token_provider is not None:
                 # Acquire a real SMART token so reachability reflects the actual credentials (a
                 # token-endpoint failure raises DeliveryError, surfaced as unreachable).
-                bearer = mint_probe_bearer(
-                    self._token_provider.access_token, f"REST {_redact_url(self.url)} probe"
+                bearer = mint_bearer(
+                    self._token_provider.access_token,
+                    f"REST {_redact_url(self.url)} probe",
+                    probe=True,
                 )
                 headers = {**self._headers, "Authorization": f"Bearer {bearer}"}
             try:
@@ -3351,22 +3340,19 @@ class RestDestination(DestinationConnector):
             # the URL and the static headers were already bounded there. Gated here so an
             # operator's "test connection" fails with the real reason rather than an opaque wire
             # error. The SOAP probe mints and gates the same way (BACKLOG #5526).
-            try:
-                enforce_send_time_length_limits(
-                    req.full_url,
-                    headers,
-                    connector=f"REST {_redact_url(self.url)} probe",
-                    minted_credential_names=(
-                        frozenset({"Authorization"})
-                        if self._token_provider is not None
-                        else frozenset()
-                    ),
-                )
-            except NegativeAckError as exc:
-                if exc.credential_fault and self._token_provider is not None:
-                    self._token_provider.invalidate()
-                raise
+            enforce_send_time_length_limits(
+                req.full_url,
+                headers,
+                connector=f"REST {_redact_url(self.url)} probe",
+                minted_credential_names=(
+                    frozenset({"Authorization"})
+                    if self._token_provider is not None
+                    else frozenset()
+                ),
+            )
         except NegativeAckError as exc:
+            if exc.credential_fault and self._token_provider is not None:
+                self._token_provider.invalidate()
             # BACKLOG #5797: a probe raises only a plain DeliveryError, with no fault marker (the
             # HttpAuthError arm below says the same), so a NegativeAckError raised before the open
             # (at least the length gate's, and a refused Digest challenge on the token hop) is
@@ -3446,11 +3432,14 @@ class RestDestination(DestinationConnector):
                 )
             )
         except ValueError as exc:
-            # BACKLOG #5797: classified as the open's ValueError arm below classifies it.
+            # BACKLOG #5797: the open's ValueError arm below, but a configuration fault: urllib
+            # checks no header here, so what it can refuse is the configured URL (or the ECH
+            # sidecar's), the same for every queued row.
             raise NegativeAckError(
                 f"REST {_redact_url(self.url)} rejected an invalid request value",
                 code="bad-request-value",
                 permanent=True,
+                config_fault=True,
             ) from exc
         # ASVS 4.2.5: bound what ACTUALLY ships. The construction gate saw only the static config; the
         # per-message headers, the SMART bearer and the JWS headers above are all added after it.
