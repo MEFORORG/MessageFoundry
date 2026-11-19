@@ -91,8 +91,10 @@ def test_the_key_import_sits_inside_the_try_whose_finally_deletes_it() -> None:
     assert 0 <= try_at < import_at, "the certificate import must sit inside the try block"
     finally_block = script[script.index("} finally {", import_at) :]
     assert "$store.Remove($cert)" in finally_block
-    assert ".Key.Delete()" in finally_block, "the finally block must delete a CNG key"
+    delete_at = finally_block.index(".Key.Delete()")
     assert "PersistKeyInCsp = $false" in finally_block, "the finally block must delete a CSP key"
+    # The key goes first: a store call that throws must not stop the key from being deleted.
+    assert delete_at < finally_block.index("$store.Remove($cert)")
 
 
 _VERIFY_START = "$signature = Get-AuthenticodeSignature"

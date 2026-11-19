@@ -200,6 +200,7 @@ jobs:
           $cert = $null
           $store = $null
           $thumbprint = $null
+          $opened = $false
           $failure = $null
           try {
             $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($pfx, $pfxPassword, $flags)
@@ -208,6 +209,7 @@ jobs:
             # so the password never appears on a command line.
             $store = [System.Security.Cryptography.X509Certificates.X509Store]::new('My', 'CurrentUser')
             $store.Open('ReadWrite')
+            $opened = $true
             $store.Add($cert)
             # /tr and /td ask for an RFC 3161 timestamp, so the signature stays valid after the certificate expires.
             & $signtool.FullName sign /sha1 $thumbprint /s My /fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256 $exe
@@ -216,16 +218,19 @@ jobs:
             $failure = $_
             throw
           } finally {
-            try {
-              if ($store) {
-                if ($cert) { $store.Remove($cert) }
-                $store.Close()
-              }
-              if ($cert) {
+            # Each cleanup action is tried on its own, the key first, so one that throws cannot leave the
+            # others undone. Failures are collected and reported once all have run.
+            $cleanup = [System.Collections.Generic.List[string]]::new()
+            if ($cert) {
+              try {
                 # Removing the certificate from the store leaves the persisted private key behind, so the
-                # key is deleted through its own handle. A key type this cannot delete fails the step.
+                # key is deleted through its own handle. A certificate with no RSA or ECDSA key, or a key
+                # type this cannot delete, fails the step rather than leave a key behind unreported.
                 $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
                 $ecdsa = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($cert)
+                if ($null -eq $rsa -and $null -eq $ecdsa) {
+                  throw 'the imported certificate has no RSA or ECDSA private key this step can delete'
+                }
                 foreach ($key in @($rsa, $ecdsa)) {
                   if ($null -eq $key) { continue }
                   if ($key -is [System.Security.Cryptography.RSACng] -or $key -is [System.Security.Cryptography.ECDsaCng]) {
@@ -237,12 +242,22 @@ jobs:
                     throw "the imported private key is a $($key.GetType().FullName), which this step cannot delete"
                   }
                 }
-                $cert.Dispose()
-              }
-            } catch {
-              # A throw here would replace a signing failure already in flight, so that case reports the
-              # cleanup failure beside it and lets the first error end the step. Alone, it fails the step.
-              if ($failure) { Write-Host "::error title=signing key cleanup failed::$($_.Exception.Message)" } else { throw }
+              } catch { $cleanup.Add("deleting the private key: $($_.Exception.Message)") }
+            }
+            if ($opened -and $cert) {
+              try { $store.Remove($cert) } catch { $cleanup.Add("removing the certificate from the store: $($_.Exception.Message)") }
+            }
+            if ($store) {
+              try { $store.Close() } catch { $cleanup.Add("closing the store: $($_.Exception.Message)") }
+            }
+            if ($cert) { $cert.Dispose() }
+            if ($cleanup.Count -gt 0) {
+              # Workflow-command escaping, so a multi-line exception message stays inside the annotation.
+              $message = ($cleanup -join '; ') -replace '%', '%25' -replace "`r", '%0D' -replace "`n", '%0A'
+              Write-Host "::error title=signing key cleanup failed::$message"
+              # A throw here would replace a signing failure already in flight, so that case lets the first
+              # error end the step with this one reported beside it. Alone, a cleanup failure fails the step.
+              if (-not $failure) { throw "signing key cleanup failed: $($cleanup -join '; ')" }
             }
           }
 
