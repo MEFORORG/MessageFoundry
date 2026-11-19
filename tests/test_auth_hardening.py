@@ -36,11 +36,16 @@ from messagefoundry.api.app import _session_reaper
 from messagefoundry.auth import Role, hash_password
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError
-from messagefoundry.auth.service import AuthService, LastAdministratorRefused, _opened_totp_state
+from messagefoundry.auth.service import (
+    AuthService,
+    LastAdministratorRefused,
+    _opened_totp_state,
+    _OpenedTotp,
+)
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, VerifiedUser
 from tests._admin_account import ADMIN_USERNAME, create_admin, create_local_user_chosen
 
 PW = "a-strong-test-passphrase"  # ≥15, no app/vendor terms — satisfies the ASVS policy (WP-3)
@@ -56,6 +61,13 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
     )
     yield eng
     await eng.stop()
+
+
+async def _opened(service: AuthService, user: VerifiedUser) -> _OpenedTotp:
+    """``user``'s TOTP cell, opened once as ``verify_mfa`` opens it for its check (BACKLOG #5781)."""
+    opened = await service._opened_totp_enrolment(user)
+    assert opened is not None
+    return opened
 
 
 async def _service(engine: Engine, settings: AuthSettings | None = None) -> AuthService:
@@ -763,7 +775,9 @@ async def test_recovery_code_verify_cost_does_not_vary_with_the_code(
     verified = await service._load_user(user.id)
     assert verified is not None
     calls["n"] = 0
-    ok = await service._verify_second_factor(verified, presented)
+    ok = await service._verify_second_factor(
+        verified, presented, opened=await _opened(service, verified)
+    )
 
     assert ok is (present != "wrong"), why
     assert calls["n"] == slots, (
@@ -821,12 +835,18 @@ async def test_a_failed_totp_attempt_costs_the_recovery_walk_whatever_the_reason
     verified = await service._load_user(user.id)  # the checked record, after the enrolment
     assert verified is not None
     if present == "replayed":
-        assert await service._verify_second_factor(verified, code, arrived=arrived) is True
+        opened = await _opened(service, verified)
+        assert (
+            await service._verify_second_factor(verified, code, opened=opened, arrived=arrived)
+            is True
+        )
     elif present == "wrong":
         code = f"{(int(code) + 1) % 1_000_000:06d}"
 
     used.clear()
-    ok = await service._verify_second_factor(verified, code, arrived=arrived)
+    ok = await service._verify_second_factor(
+        verified, code, opened=await _opened(service, verified), arrived=arrived
+    )
 
     assert ok is expect_ok
     expected = [] if expect_ok else walk

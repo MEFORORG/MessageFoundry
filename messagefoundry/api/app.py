@@ -7142,7 +7142,11 @@ def create_app(
         building = False  # true only across the EmailTransport build, for the cut below
         start = time.perf_counter()
         try:
-            smtp_password = resolve_connector_secret(
+            # Resolved off the event loop (BACKLOG #5793): a provider reference is a blocking call,
+            # for the vault provider an HTTP round trip, and on the loop it would stall every
+            # request the engine serves while it waits.
+            smtp_password = await asyncio.to_thread(
+                resolve_connector_secret,
                 secret_provider,
                 ref=alerts.email_password_secret,
                 literal=alerts.email_password,

@@ -1371,8 +1371,9 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
     secret, so the row holds a factor again but not the one the code proved; it is audited
     ``factor_replaced``, apart from a plain disable. ``factor-restamped`` enrols the SAME secret
     again under a new stamp, so only the stamp tells the enrolments apart. ``secret-unopenable``
-    makes the fresh row's secret fail to open once the code is spent: refused and audited
-    ``factor_unverified``, never raised."""
+    does the same and then makes the fresh row's secret fail to open once the code is spent: the
+    moved stamp makes the after-check comparison open the cell (BACKLOG #5781: an unmoved row is
+    not opened again), so it is refused and audited ``factor_unverified``, never raised."""
     if account == "directory":
         e = await _enrolled_directory_session(store, monkeypatch)
         service, token, user_id, code = e.service, e.token, e.user_id, totp.totp(e.secret, now=_T1)
@@ -1410,13 +1411,7 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
             await store.revoke_session(hash_token(token))
         elif change == "disable":
             await store.set_user_disabled(user_id, disabled=True)
-        elif change == "secret-unopenable":
-
-            def _refuse(*_args: object) -> str | None:
-                raise CipherError("synthetic: the cell does not open")
-
-            monkeypatch.setattr(store, "open_totp_secret", _refuse)
-        elif change == "factor-restamped":
+        elif change in ("factor-restamped", "secret-unopenable"):
             before = await store.get_user(user_id)
             assert before is not None and before.totp_enrolled_at is not None
             await store.disable_totp(user_id)
@@ -1428,6 +1423,12 @@ async def test_what_lands_during_the_code_check_stops_the_factor_write(
                 expected_secret_cell=cell,
                 now=before.totp_enrolled_at + 1.0,
             )
+            if change == "secret-unopenable":
+
+                def _refuse(*_args: object) -> str | None:
+                    raise CipherError("synthetic: the cell does not open")
+
+                monkeypatch.setattr(store, "open_totp_secret", _refuse)
         else:
             before = await store.get_user(user_id)
             assert before is not None

@@ -3081,6 +3081,19 @@ class _CodeMatch:
     matched: bool = False
 
 
+@dataclass(frozen=True)
+class _OpenedTotp:
+    """One open of an account's TOTP cell (BACKLOG #5781), from
+    :meth:`AuthService._opened_totp_enrolment`: the checked record whose cell was opened, its
+    :data:`_TotpEnrolment` reading, and the opened secret. :meth:`AuthService._verify_second_factor` checks a code against ``secret`` only for the
+    record named ``holder``, so the secret it checks is still the one that record's seal covered
+    (BACKLOG #3510). The secret is kept out of the repr."""
+
+    holder: VerifiedUser
+    enrolment: _TotpEnrolment
+    secret: str | None = field(repr=False)
+
+
 def _log_totp_undecryptable(username: str) -> None:
     """Log an account whose TOTP cell does not open under this store key, naming the account and
     never the value."""
@@ -13599,29 +13612,47 @@ class AuthService:
             _log_totp_refused(user.username)
         return secret
 
-    async def _totp_enrolment(self, user: VerifiedUser) -> _TotpEnrolment | None:
-        """``user``'s TOTP enrolment as :meth:`verify_mfa` compares it across a code check (BACKLOG
-        #3068): the enrolment stamp and a digest of the opened secret, so the plaintext is not held
-        across the check. ``None`` when the cell does not open, logged by
-        :func:`_log_totp_undecryptable`."""
+    async def _opened_totp_enrolment(self, user: VerifiedUser) -> _OpenedTotp | None:
+        """From ONE open of ``user``'s TOTP cell, the one its seal covered: the enrolment reading
+        (the enrolment stamp and a digest of the opened secret) and the opened secret itself. ``None``
+        when the cell does not open, logged by :func:`_log_totp_undecryptable`. :meth:`verify_mfa`
+        compares the reading after its code check, and checks the code against the secret, so the
+        check opens no cell of its own (BACKLOG #5781)."""
         try:
             secret = await self._totp_secret(user)
         except CipherError:
             _log_totp_undecryptable(user.username)
             return None
-        return user.totp_enrolled_at, None if secret is None else hash_token(secret)
+        enrolment = (user.totp_enrolled_at, None if secret is None else hash_token(secret))
+        return _OpenedTotp(user, enrolment, secret)
+
+    async def _totp_enrolment(self, user: VerifiedUser) -> _TotpEnrolment | None:
+        """The enrolment reading of :meth:`_opened_totp_enrolment` alone (BACKLOG #3068): the
+        enrolment stamp and a digest of the opened secret, so no plaintext is kept. ``None`` when
+        the cell does not open, logged by :func:`_log_totp_undecryptable`. :meth:`verify_mfa`'s
+        after-check comparison reads a moved row's enrolment through it."""
+        opened = await self._opened_totp_enrolment(user)
+        return None if opened is None else opened.enrolment
 
     async def _totp_enrolment_moved(
-        self, verified: _TotpEnrolment, current: VerifiedUser
+        self, verified: _TotpEnrolment, current: VerifiedUser, *, checked: VerifiedUser
     ) -> _TotpMoved | None:
         """Why the TOTP factor :meth:`verify_mfa` checked a code against is no longer the one row
         ``current`` holds, or ``None`` when it still is: ``"factor_removed"`` (turned off),
         ``"factor_unverified"`` (``current``'s cell does not open, checked first, so an
         unopenable cell is never read as a change) or ``"factor_replaced"`` (enrolled again, told
         apart by the stamp or the opened secret). ``verified`` is the reading taken before the
-        check, which :meth:`verify_mfa` requires to have opened. BACKLOG #3068, #3780."""
+        check, from ``checked``'s cell, which :meth:`verify_mfa` requires to have opened.
+        BACKLOG #3068, #3780.
+
+        A ``current`` that stores the very columns ``checked`` stored, on, the same stamp and the
+        same cell, holds the enrolment ``verified`` read, so its cell is not opened again (BACKLOG
+        #5781): under a Transit cipher each open is a round trip. A cell a store-key rotation
+        re-encrypted differs, so it is still opened and compared by its secret."""
         if not current.totp_enabled:
             return "factor_removed"
+        if _same_totp_columns(checked, current):
+            return None
         enrolment_now = await self._totp_enrolment(current)
         if enrolment_now is None:
             return "factor_unverified"
@@ -17495,12 +17526,16 @@ class AuthService:
             # ``replace_totp_enrolment``'s compare-and-set relies on, and the opened secret is
             # compared too, so two enrolments sharing a stamp still differ. Neither moves under a
             # store-key rotation, which re-encrypts the cell, so a rotation refuses nothing.
-            verified_enrolment = await self._totp_enrolment(user)
-            if verified_enrolment is None:
-                # The cell did not open (logged by _totp_enrolment), so nothing after the check
-                # could tell whether the code proved the factor the row holds then. Refused before
-                # the check, so no code is spent and nothing is charged, even where a later open
-                # would succeed (BACKLOG #3929 review): a recovery code spent here was lost.
+            # The ONE open of the cell for this request (BACKLOG #5781): the code is checked
+            # against the secret it opened, and the after-check comparisons open a cell only when
+            # the row's TOTP columns moved from ``checked``'s.
+            checked = user
+            opened = await self._opened_totp_enrolment(checked)
+            if opened is None:
+                # The cell did not open (logged by _opened_totp_enrolment), so nothing after the
+                # check could tell whether the code proved the factor the row holds then. Refused
+                # before the check, so no code is spent and nothing is charged, even where a later
+                # open would succeed (BACKLOG #3929 review): a recovery code spent here was lost.
                 await self._audit(
                     "auth.mfa_failed",
                     actor=user.username,
@@ -17508,16 +17543,16 @@ class AuthService:
                     client=client,
                 )
                 return Elevation()
+            verified_enrolment = opened.enrolment
             match = _CodeMatch()
             try:
                 proved = await self._verify_second_factor(
-                    user, code, client=client, arrived=arrived, match=match
+                    user, code, opened=opened, client=client, arrived=arrived, match=match
                 )
             except CipherError:
-                # The cell opened above but not for the check. The check raises at its TOTP
-                # decrypt, before any recovery code is read, so nothing is spent and nothing is
-                # charged. Refused with the reason the after-side gives, rather than raised past
-                # the "never raises" contract.
+                # The check opens no cell: it is handed the secret opened above. A CipherError from
+                # its own store calls is refused with the reason the after-side gives, rather than
+                # raised past the "never raises" contract.
                 await self._audit(
                     "auth.mfa_failed",
                     actor=user.username,
@@ -17525,6 +17560,7 @@ class AuthService:
                     client=client,
                 )
                 return Elevation()
+            del opened  # the plaintext is not held past the check it was opened for
             if proved:
                 # BACKLOG #3068: the verify awaited (a recovery-code walk is argon2 work off the
                 # loop), and a revocation or a disable needs no queue to land. So the session, the
@@ -17544,11 +17580,16 @@ class AuthService:
                 # (``factor_replaced``). An administrator's replace revokes the sessions with it,
                 # so it answers ``session_lost`` above. Either way the code proved a factor the row
                 # no longer holds. It is spent by now, so the refusal is audited with its reason.
-                # A cell that no longer opens proves nothing either way; the proof is spent, so it
-                # is refused and audited too rather than raised past the "never raises" contract.
-                refusal = await self._totp_enrolment_moved(verified_enrolment, fresh)
-                # BACKLOG #3929: each comparison opens the cell in a worker thread, so a revocation,
-                # a disable or a lock can land during it. The holder is read again after each one
+                # A moved cell that no longer opens proves nothing either way; the proof is spent,
+                # so it is refused and audited too rather than raised past the "never raises"
+                # contract.
+                refusal = await self._totp_enrolment_moved(
+                    verified_enrolment, fresh, checked=checked
+                )
+                # BACKLOG #3929: a comparison that opens the cell opens it in a worker thread, so a
+                # revocation, a disable or a lock can land during it (BACKLOG #5781: one whose row
+                # still stores ``checked``'s TOTP columns opens nothing). The holder is read again
+                # after each one
                 # until a read finds the stored enrolment the comparison judged, so the last read
                 # before the write is a store read, and the write is for the enrolment compared.
                 while refusal is None:
@@ -17565,7 +17606,9 @@ class AuthService:
                     fresh = settled
                     if unmoved:
                         break
-                    refusal = await self._totp_enrolment_moved(verified_enrolment, fresh)
+                    refusal = await self._totp_enrolment_moved(
+                        verified_enrolment, fresh, checked=checked
+                    )
                 if refusal is not None:
                     await self._audit(
                         "auth.mfa_failed",
@@ -17662,7 +17705,9 @@ class AuthService:
                     )
                     if isinstance(held, Elevation):
                         return held
-                    change = await self._totp_enrolment_moved(verified_enrolment, held)
+                    change = await self._totp_enrolment_moved(
+                        verified_enrolment, held, checked=checked
+                    )
                 except Exception:  # noqa: BLE001 - any re-read failure is charged, never raised
                     _log.exception("verify_mfa: the factor re-read after a failed spend raised")
                 else:
@@ -18170,6 +18215,7 @@ class AuthService:
         user: VerifiedUser,
         code: str,
         *,
+        opened: _OpenedTotp,
         client: str | None = None,
         arrived: float | None = None,
         match: _CodeMatch | None = None,
@@ -18179,15 +18225,22 @@ class AuthService:
         replay still pays the recovery-code walk (ADR 0170). Recovery codes are argon2id-hashed and
         single-use. Codes never collide (TOTP is 6 digits; recovery codes are dashed alphanumerics).
 
+        ``opened`` is the caller's one open of ``user``'s TOTP cell, the one its seal covered
+        (:meth:`_opened_totp_enrolment`), so this check opens no cell of its own (BACKLOG #5781).
+        An ``opened`` whose holder is not ``user`` raises ``ValueError``: its secret is not one
+        ``user``'s seal covered (BACKLOG #3510).
+
         ``client`` is the caller's address, carried onto the recovery-code audit row and notice
         (BACKLOG #1139) so the holder can tell their own use from someone else's. ``match``, when
         given, is marked when the code matched a factor, so :meth:`verify_mfa` can tell a code that
         only failed its spend from a wrong one (BACKLOG #3780 item 1)."""
+        if opened.holder is not user:
+            raise ValueError("the opened TOTP cell is not this account's checked record")
         code = code.strip()
         if not code:
             return False
         totp_refused = False
-        secret = await self._totp_secret(user)
+        secret = opened.secret
         if secret:
             # Clock-skew window is operator-configurable (BACKLOG #187; ASVS 6.5.5). Default
             # totp_skew_steps=0 accepts only the current 30 s step (strict, tightest replay window);
