@@ -157,9 +157,9 @@ transport = "mllp"
   A connector reads its `port` one way too: a whole number from 0 to 65535, as a number or in
   digits. A bool, a fraction or anything else is refused when the connector is built (BACKLOG
   #1650). That read sees what a `cast` left, so `cast = "int"` has already read `true` as 1 and cut
-  a fraction. Every host-and-port `[egress]` list that pins a port, `allowed_mllp` and `allowed_db`
-  among them, compares the port as a number before the connector is built, so the text `"06661"`
-  matches a pin of `6661` (BACKLOG #5915).
+  a fraction. At least `allowed_mllp` and `allowed_db`, among the host-and-port `[egress]` lists
+  that pin a port, compare the port as a number before the connector is built, so the text
+  `"06661"` matches a pin of `6661` (BACKLOG #5915).
   **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a
   cap documents `None`/`0` as "disabled" or "unlimited", `"0"` and an empty value disable it too. On
   those caps, and on the pacing rates and bursts, a negative or `nan` is refused at load in either

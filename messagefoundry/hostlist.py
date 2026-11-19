@@ -120,9 +120,9 @@ def _is_host_name(text: str) -> bool:
 
 
 def allow_entry_problem(entry: str) -> str | None:
-    """Why ``entry`` can never match a host, or ``None`` when :func:`parse_allow_entry` reads it,
-    its host is an IP address or holds only what :func:`_is_host_name` admits, and any port it
-    names is a number from 1 to 65535.
+    """Why ``entry`` is refused when the settings load, or ``None`` when :func:`parse_allow_entry`
+    reads it, its host is an IP address or holds only what :func:`_is_host_name` admits, and any
+    port it names is a number from 1 to 65535.
 
     The reason never quotes the entry: an operator who pasted a URL, credential and all, would
     otherwise find it in the error."""

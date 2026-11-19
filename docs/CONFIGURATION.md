@@ -1693,17 +1693,17 @@ transport's list is set, an outbound of that transport not on it is **refused at
 (an IPv6 literal, any port) or `[v6]:port`, such as `[2001:db8::10]:6661`. An IP literal compares as
 an address, so `[0:0:0:0:0:0:0:1]` names `::1`; a name compares without regard to case. Nothing
 looser matches: an IPv4-mapped IPv6 address does not name its IPv4 address, and `127.1` is a name,
-not `127.0.0.1`. An entry matches nothing at least when it is unbracketed and holds more than one
-colon (write `::1` as `[::1]`), when its brackets hold anything but an IPv6 literal, when a colon
-has no port after it, when its port is not a number from 1 to 65535, when it carries a `%` zone id,
-when it is a URL or holds a `/` or `@`, or when its host holds anything but letters, combining
-marks, digits, `.`, `-` and `_`, such as a `*` pattern. The lists named here refuse such an entry at
-config load, naming the list and the entry's position (BACKLOG #5915). A blank entry in a TOML list
-is refused the same way. The comma-separated environment form of the `[egress]` lists drops blank
-items instead, as it always has, so a variable holding only commas or spaces leaves its list unset.
-A host being checked that carries a `%` zone id matches no entry either, so while its list is set a
-zoned IPv6 destination is refused whatever the entries say. The host being checked must name an IPv6
-literal bare, as `::1`, at least in a connection's `host` setting and in `[logging].forward_host`: a
+not `127.0.0.1`. The lists named here refuse an entry when the settings load, naming the list and
+the entry's position (BACKLOG #5915), at least when it is unbracketed and holds more than one colon
+(write `::1` as `[::1]`), when its brackets hold anything but an IPv6 literal, when a colon has no
+port after it, when its port is not a number from 1 to 65535, when it carries a `%` zone id, when it
+is a URL or holds a `/` or `@`, or when its host holds anything but letters, combining marks,
+digits, `.`, `-` and `_`, such as a `*` pattern. A blank entry in a TOML list is refused the same
+way. The comma-separated environment form of the `[egress]` lists drops blank items instead, as it
+always has, so a variable holding only commas or spaces leaves its list unset. A host being checked
+that carries a `%` zone id matches no entry either, so while its list is set a zoned IPv6
+destination is refused whatever the entries say. The host being checked must name an IPv6 literal
+bare, as `::1`, at least in a connection's `host` setting and in `[logging].forward_host`: a
 bracketed `[::1]` there matches no entry. A URL brackets its IPv6 host, and that is read correctly.
 
 **How a pinned port is matched.** Ports compare as numbers on both sides, so a port that reaches the
