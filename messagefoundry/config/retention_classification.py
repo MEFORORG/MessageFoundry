@@ -539,8 +539,7 @@ def keep_forever_overrides(registry: Registry) -> tuple[str, ...]:
     an outbound sets ``dead_letter_days``. ``None`` inherits the global window and a positive number
     bounds it. ``0`` asks to keep that connection's PHI forever, whatever the global window says, so
     it is the same choice as a global ``0`` made for one connection. Which rows each kind keeps,
-    which it does not, and how a ``serve --shard`` process that does not hold an inbound purges
-    that inbound override's bodies on the global window anyway, is stated on
+    which it does not, and the engine shard limit on an inbound override, are stated on
     :func:`_override_scope`. The global windows live in the service settings, where
     :func:`unbounded_windows` reads them; these live in the graph, so the start gate cannot see them
     and a registry guard must (vault BACKLOG #2368).
@@ -570,6 +569,23 @@ def _window_setting(field: str) -> str:
     return next(w.setting for w in PHI_RETENTION_WINDOWS if w.field == field)
 
 
+def _engine_shard_limit() -> str:
+    """The engine shard limit on an inbound override, the one statement of it (BACKLOG #5967).
+
+    Each ``serve --shard`` process's retention reads its override maps from its own registry
+    (:meth:`~messagefoundry.pipeline.retention.RetentionRunner._resolve_overrides`), and
+    :func:`~messagefoundry.pipeline.sharding.filter_registry_for_shard` leaves only that process's
+    inbounds in it. Plain ``serve`` does not filter its registry."""
+    return (
+        "The engine shard limit: where a serve --shard process that does not hold an inbound "
+        "runs retention against the same store, that inbound's override does not keep its "
+        "message bodies past that process's global "
+        f"{_window_setting('messages_days')} window; no messages_days value on that inbound "
+        "changes this. Plain serve, and the serve --shard process that holds the inbound, apply "
+        "the override."
+    )
+
+
 def _override_scope(kept: tuple[str, ...]) -> str:
     """What each kind of override in ``kept`` keeps and does not keep, so the refusal and the
     ``AUDIT:`` line promise no more than the store does (BACKLOG #5967).
@@ -578,35 +594,15 @@ def _override_scope(kept: tuple[str, ...]) -> str:
     ``messages_days`` is the cutoff of ``purge_message_bodies``, keyed on the receiving inbound, and
     an outbound's ``dead_letter_days`` the cutoff of ``purge_dead_letters``, keyed on the dead
     row's outbound. Read their docstrings for what each blanks. The lists in the text say "at
-    least", because a closed list here would go false when a purge gains a tier.
-
-    Each engine shard runs its own retention over the one shared store, with the override maps
-    :meth:`~messagefoundry.pipeline.retention.RetentionRunner._resolve_overrides` reads from its own
-    registry. :func:`~messagefoundry.pipeline.sharding.filter_registry_for_shard` keeps only that
-    engine shard's inbounds and every outbound. So an inbound's hold is honoured by plain ``serve``,
-    which does not filter its registry, and by the ``serve --shard`` process that holds that
-    inbound; a ``serve --shard`` process that does not hold it, running retention against the same
-    store, purges that inbound's bodies on the global window. The text keys on that process, not on
-    how many engine shards the config names or how many processes run: a lone ``serve --shard``
-    that holds the inbound keeps its bodies. An outbound's hold is in every engine shard's
-    registry."""
+    least", because a closed list here would go false when a purge gains a tier. Where ``kept``
+    holds an inbound override, the text opens with :func:`_engine_shard_limit`."""
     dead_global = _window_setting("dead_letter_days")
-    body_global = _window_setting("messages_days")
     inbound, outbound = _override_kinds(kept)
     parts = []
     if inbound:
         parts.append(
-            "Where a serve --shard process that does not hold that inbound runs retention against "
-            f"the same store, an inbound override keeps nothing past the global {body_global} "
-            "window where that window is bounded: each serve --shard process purges the shared "
-            "store with the inbound overrides of its own registry, which holds no other engine "
-            "shard's inbounds, so that process purges at least what is listed next for that "
-            "inbound's messages on the global window. Setting "
-            f"{BODY_ACKNOWLEDGEMENT_SETTING} does not stop that purge, but it lifts the default "
-            f"bound of an unset {body_global}, so with that window unset the global window is "
-            "unbounded and that process purges none of those rows on it. Otherwise, under plain serve or the "
-            "serve --shard process that holds that inbound, it keeps forever, "
-            "while that inbound stays in the live graph with it, at least what the purge of "
+            f"{_engine_shard_limit()} Where it applies, an inbound override keeps forever, while "
+            "that inbound stays in the live graph with it, at least what the purge of "
             "message bodies holds for the messages that inbound "
             "received: each stored body, though the inbound's own prune_documents_after, where "
             "set, still strips embedded documents from it; its delivered and cancelled outbound "
@@ -622,44 +618,17 @@ def _override_scope(kept: tuple[str, ...]) -> str:
             "it, at least that outbound's own dead-lettered rows, with their payloads, error text "
             "and any streaming attachment they still hold. It does not keep what the purge of "
             "message bodies holds for those messages, at least the stored body, the delivered and "
-            "cancelled payloads, the event detail and the replies that outbound captured: those "
-            "are purged on the body window of the inbound that received the message, which is "
-            f"that inbound's own override or else the global {body_global}, where that window is "
-            "bounded. Where a serve --shard process that does not hold that inbound runs "
-            "retention against the same store, it purges them on the global window, where that "
-            "window is bounded."
+            "cancelled payloads, the event detail and the replies that outbound captured."
         )
     return " ".join(parts)
 
 
-def _keep_forever_remedy(kept: tuple[str, ...]) -> str:
+def _keep_forever_remedy() -> str:
     """What an operator does about a keep-forever override. The refusal and the ``AUDIT:`` line
-    under ``enforcement = warn`` both end with it, so the two give the same advice.
-
-    Where ``kept`` holds an inbound override, the advice to give the global body window explicit
-    days does not keep that inbound's bodies wherever a ``serve --shard`` process that does not
-    hold it runs retention against the same store: those days bound the window that process purges
-    them on (:func:`_override_scope`). The sentences after that advice say so, keyed on that
-    process, and name a configuration that keeps them there and what it costs."""
+    under ``enforcement = warn`` both end with it, so the two give the same advice."""
     # Only the auto-bounded windows lose a default. Naming them keeps an operator from setting a
     # window on a tier where a window is the wrong answer, such as transform state.
     auto_bounded = ", ".join(w.setting for w in auto_bounded_windows())
-    inbound, _ = _override_kinds(kept)
-    body_global = _window_setting("messages_days")
-    engine_shards = (
-        " Those explicit days do not keep an inbound override's bodies where a serve --shard "
-        "process that does not hold that inbound runs retention against the same store: they "
-        f"bound the global {body_global} window, and that process purges the bodies on it. No "
-        "setting on that inbound changes this. One configuration that keeps them there leaves "
-        f"{body_global} unbounded, unset with the switch set or 0, and gives every other inbound "
-        "a positive messages_days of its own, which the serve --shard process holding that "
-        "inbound applies. With the global window unbounded, at least every inbound that has no "
-        "positive override of its own, and the stored messages of an inbound no longer in the "
-        "graph, keep their bodies forever. Plain serve, which runs no such process, keeps the "
-        "override as written"
-        if inbound
-        else ""
-    )
     return (
         "Set each override to a positive number of days, or remove it to inherit the global "
         "window where that window is bounded; or, to deliberately retain forever, set "
@@ -668,8 +637,8 @@ def _keep_forever_remedy(kept: tuple[str, ...]) -> str:
         "AUDIT line naming these connections for each graph its guard passes. That switch covers "
         "the whole instance: it also turns off the default bound on each of these windows that "
         f"is unset: {auto_bounded}. Set each of them to an explicit number of days first, or it "
-        f"keeps its PHI forever too.{engine_shards}{'.' if engine_shards else ''} The start gate "
-        "writes an AUDIT line for such a window at 0 only under enforcement = enforce"
+        "keeps its PHI forever too. The start gate writes an AUDIT line for one of those global "
+        "windows at 0 only under enforcement = enforce"
     )
 
 
@@ -693,18 +662,11 @@ def _kept_phi(kept: tuple[str, ...]) -> str:
 
 def _engine_shard_caveat(kept: tuple[str, ...]) -> str:
     """The clause that follows "indefinitely" in the opening sentence where ``kept`` holds an
-    inbound override, whose bodies another engine shard may purge anyway (:func:`_override_scope`);
-    empty otherwise. It names an inbound override's bodies alone, so in a graph that also holds an
-    outbound override it does not reach that outbound's dead rows. The scope text follows it in the
-    same line, hence "as stated after this". It carries no trailing comma, so each caller
-    punctuates its own sentence."""
+    inbound override, pointing at :func:`_engine_shard_limit`, which the scope text after it
+    states; empty otherwise. It carries no trailing comma, so each caller punctuates its own
+    sentence."""
     inbound, _ = _override_kinds(kept)
-    return (
-        ", except an inbound override's message bodies where another engine shard purges them, "
-        "as stated after this"
-        if inbound
-        else ""
-    )
+    return ", subject to the engine shard limit stated after this" if inbound else ""
 
 
 def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None) -> str:
@@ -719,7 +681,7 @@ def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None
         f"a per-connection retention override keeps {_kept_phi(kept)} indefinitely"
         f"{caveat}{',' if caveat else ''} on a PHI instance{where}: {'; '.join(kept)} "
         "(unbounded PHI at rest, ASVS 14.2.4/14.2.7). "
-        f"{_override_scope(kept)} {_keep_forever_remedy(kept)}"
+        f"{_override_scope(kept)} {_keep_forever_remedy()}"
     )
 
 
@@ -786,7 +748,7 @@ def judge_keep_forever_overrides(
         basis="[security].enforcement = warn, no acknowledgement",
         status="not acknowledged; enforcement = enforce would refuse this graph",
     )
-    return OverrideVerdict(refusal=None, report=f"{report} {_keep_forever_remedy(kept)}.")
+    return OverrideVerdict(refusal=None, report=f"{report} {_keep_forever_remedy()}.")
 
 
 def make_retention_override_guard(

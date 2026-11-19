@@ -1327,12 +1327,12 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > **Under `enforce`, an override of `0` needs the same acknowledgement as a global `0`** (BACKLOG
 > #2368). Subject to the engine shard limit next, it keeps forever what that override's purge
 > holds, whatever the global window says, and not every row about its messages; the refusal and the
-> `AUDIT:` line state which (BACKLOG #5967). The engine shard limit binds an inbound's override alone. Each
-> `serve --shard` process purges the shared store with only its own inbounds' overrides, so where a
-> `serve --shard` process that does not hold that inbound runs retention against the same store, it
-> purges that inbound's message bodies on the global window, and where that window is bounded the
-> override keeps nothing past it. Plain `serve`, and the `serve --shard` process that holds the inbound, honour
-> the override. The
+> `AUDIT:` line state which (BACKLOG #5967). **The engine shard limit:** where a `serve --shard`
+> process that does not hold an inbound runs retention against the same store, that inbound's
+> override does not keep its message bodies past that process's global body window; no
+> `messages_days` value on that inbound changes this. Plain `serve`, and the `serve --shard` process
+> that holds the inbound, apply the override. Changing that behaviour is its own backlog row, on
+> retention under engine shards. The
 > overrides live in the graph, so `serve` checks them when it loads the graph, at least at startup
 > and on every config reload:
 >
@@ -1352,16 +1352,7 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > **That switch is not scoped to one connection.** It also turns off the 30-day default for each
 > unset window that carries one (those named in the posture paragraph above), and it acknowledges
 > every connection's `0`, including one added by a later reload. Before you set it for one feed, set
-> each of those windows to an explicit number of days. **Those explicit days do not keep an inbound
-> override's bodies where a `serve --shard` process that does not hold that inbound runs retention
-> against the same store:** they bound the global body window, and that process purges the bodies
-> on it (the engine shard limit above). No setting on that inbound changes this. One configuration
-> that keeps them there leaves `[security].delete_message_bodies_after_days` unbounded, unset with
-> the switch set or `0`, and gives every other inbound a positive `messages_days` of its own, which
-> the `serve --shard` process holding that inbound applies. With the global window unbounded, at
-> least every inbound that has no positive override of its own, and the stored messages of an
-> inbound no longer in the graph, keep their bodies forever. Plain `serve`, which runs no such
-> process, keeps the override as written.
+> each of those windows to an explicit number of days.
 >
 > The acknowledgement is read once, at startup. `messagefoundry connection upsert` and `remove` refuse
 > an edit an enforcing engine would refuse. `messagefoundry check` reads the same decision as a

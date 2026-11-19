@@ -3973,25 +3973,28 @@ _OVERRIDE_NOTE_FACTS = (
     "A dry-run reload counts",
     "each engine shard writes its own",
     # BACKLOG #5967: each engine shard process's retention reads its own inbounds' overrides
-    # alone. The limit binds an inbound's override only, and only where a `serve --shard` process
-    # that does not hold that inbound runs: plain `serve`, and the process that holds it, honour it.
+    # alone, so the limit is keyed on a `serve --shard` process that does not hold the inbound. The
+    # note states it once, in the words the refusal and the AUDIT line use.
     "Subject to the engine shard limit next, it keeps forever what that override's purge holds",
-    "The engine shard limit binds an inbound's override alone.",
-    # BACKLOG #5967: the switch-plus-explicit-days remedy bounds the window a sibling purges on.
-    "**Those explicit days do not keep an inbound override's bodies where a `serve --shard` process "
-    "that does not hold that inbound runs retention against the same store:**",
-    "No setting on that inbound changes this.",
-    "at least every inbound that has no positive override of its own, and the stored messages of "
-    "an inbound no longer in the graph, keep their bodies forever.",
-    "Plain `serve`, which runs no such process, keeps the override as written.",
-    "where a `serve --shard` process that does not hold that inbound runs retention against the "
-    "same store, it purges that inbound's message bodies on the global window, and where that "
-    "window is bounded the override keeps nothing past it.",
-    "Plain `serve`, and the `serve --shard` process that holds the inbound, honour the override.",
+    "**The engine shard limit:** where a `serve --shard` process that does not hold an inbound "
+    "runs retention against the same store, that inbound's override does not keep its message "
+    "bodies past that process's global body window; no `messages_days` value on that inbound "
+    "changes this. Plain `serve`, and the `serve --shard` process that holds the inbound, apply "
+    "the override.",
     # The body windows' line is the older rule, left alone by the 2026-11-01 ruling. The other
     # global tiers are not in this claim: an acknowledged one writes its line on either dial.
     "The startup gate for the global body windows differs: it writes its `AUDIT:` line only under "
     "`enforce`.",
+)
+#: BACKLOG #5967: a configuration once recommended for keeping an inbound's bodies under engine
+#: shards, removed because it also kept other tiers forever and failed with the holding engine
+#: shard down. None of these may come back into the note.
+_OVERRIDE_NOTE_REMOVED = (
+    "One configuration that keeps them",
+    "gives every other inbound a positive `messages_days`",
+    "With the global window unbounded",
+    "Those explicit days do not keep",
+    "keeps the override as written",
 )
 _LOOSENING_DOC = _ROOT / "docs" / "SECURITY-LOOSENING.md"
 _PHI_DOC = _ROOT / "docs" / "PHI.md"
@@ -4038,6 +4041,7 @@ def _override_note_findings(doc: str) -> list[str]:
         findings += [f"bullet {opening!r} no longer says {p!r}" for p in phrases if p not in bullet]
     whole = " ".join(entries)
     findings += [f"the note no longer says {p!r}" for p in _OVERRIDE_NOTE_FACTS if p not in whole]
+    findings += [f"the note says the removed {p!r}" for p in _OVERRIDE_NOTE_REMOVED if p in whole]
     return findings
 
 

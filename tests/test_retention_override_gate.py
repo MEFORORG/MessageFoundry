@@ -235,9 +235,9 @@ def test_the_override_text_names_what_is_kept_and_the_engine_shard_limit(
     kept: str,
 ) -> None:
     """BACKLOG #5967: the opening sentence names what the overrides keep, so an outbound-only
-    override is not said to keep message bodies, and an inbound override's scope says a sibling
-    engine shard purges its bodies on the global window. Red on a text that says "PHI message
-    bodies" for every override, or promises an inbound's hold on every engine shard."""
+    override is not said to keep message bodies, and an inbound override's text states the engine
+    shard limit once. Red on a text that says "PHI message bodies" for every override, or promises
+    an inbound's hold on every engine shard."""
     registry = _graph(tmp_path / "cfg", inbound_days=inbound_days, outbound_days=outbound_days)
     verdict = judge_keep_forever_overrides(
         registry, acknowledged=acknowledged, enforcing=enforcing, env_name="prod"
@@ -247,40 +247,29 @@ def test_the_override_text_names_what_is_kept_and_the_engine_shard_limit(
     assert text is not None
     opening = f"keeps {kept} indefinitely" if refused else f"connections' {kept} are retained"
     assert opening in text
-    # The caveat names the inbound overrides' bodies alone, so in the mixed case its "them" cannot
-    # be read as covering the outbound's dead rows, and it leaves no comma before "(status)".
-    caveat = (
-        "except an inbound override's message bodies where another engine shard purges them, "
-        "as stated after this"
-    )
+    # The caveat only points at the limit, and it leaves no comma before "(status)".
+    caveat = ", subject to the engine shard limit stated after this"
     assert (caveat in text) is (inbound_days is not None)
     assert "this, (" not in text and ",," not in text
     if inbound_days is None:
         assert "PHI message bodies" not in text
     # The limit is keyed on a `serve --shard` process that does NOT hold the inbound: plain `serve`
-    # and the `serve --shard` process that holds it honour the override, a lone one included.
+    # and the `serve --shard` process that holds it apply the override. It is stated once.
     shard_limit = (
-        "Where a serve --shard process that does not hold that inbound runs retention against the "
-        "same store, an inbound override keeps nothing past the global "
-        "[security].delete_message_bodies_after_days window where that window is bounded"
+        "The engine shard limit: where a serve --shard process that does not hold an inbound runs "
+        "retention against the same store, that inbound's override does not keep its message "
+        "bodies past that process's global [security].delete_message_bodies_after_days window; no "
+        "messages_days value on that inbound changes this. Plain serve, and the serve --shard "
+        "process that holds the inbound, apply the override."
     )
-    assert (shard_limit in text) is (inbound_days is not None)
-    # The acknowledgement does not stop the sibling purge, but it lifts an unset window's default
-    # bound, which then purges nothing; the text says what the switch changes.
-    switch = (
-        "Setting [security].allow_keeping_phi_indefinitely does not stop that purge, but it lifts "
-        "the default bound of an unset [security].delete_message_bodies_after_days"
-    )
-    assert (switch in text) is (inbound_days is not None)
+    assert text.count(shard_limit) == (1 if inbound_days is not None else 0)
+    assert text.count("serve --shard") == (2 if inbound_days is not None else 0)
     assert (
-        "Otherwise, under plain serve or the serve --shard process that holds that inbound, it "
-        "keeps forever" in text
+        "Where it applies, an inbound override keeps forever, while that inbound stays in the live "
+        "graph" in text
     ) is (inbound_days is not None)
     if outbound_days is not None:
-        assert (
-            "which is that inbound's own override or else the global "
-            "[security].delete_message_bodies_after_days, where that window is bounded" in text
-        )
+        assert "the replies that outbound captured." in text
 
 
 def test_the_remedy_does_not_offer_an_unbounded_global_window_as_a_bound(tmp_path: Path) -> None:
@@ -313,45 +302,43 @@ def test_the_remedy_says_what_the_switch_needs_and_what_it_leaves_unrecorded(
     assert "an engine writes an AUDIT line naming these connections" in remedy
     # The imperative carries its own reason, or a reader on enforce has none to bound a window.
     assert "Set each of them to an explicit number of days first, or" in remedy
-    assert "AUDIT line for such a window at 0 only under enforcement = enforce" in remedy
+    # "Those global windows" names the auto-bounded windows just listed, not the override.
+    assert (
+        "The start gate writes an AUDIT line for one of those global windows at 0 only under "
+        "enforcement = enforce" in remedy
+    )
 
 
 @pytest.mark.parametrize(("inbound_days", "outbound_days"), [(0, None), (None, 0), (0, 0)])
-@pytest.mark.parametrize("enforcing", [True, False])
-def test_the_remedy_says_explicit_days_do_not_keep_an_inbound_under_engine_shards(
-    tmp_path: Path, enforcing: bool, inbound_days: int | None, outbound_days: int | None
+@pytest.mark.parametrize(
+    ("acknowledged", "enforcing"), [(True, True), (False, True), (False, False)]
+)
+def test_the_override_text_recommends_no_configuration_for_engine_shards(
+    tmp_path: Path,
+    acknowledged: bool,
+    enforcing: bool,
+    inbound_days: int | None,
+    outbound_days: int | None,
 ) -> None:
-    """BACKLOG #5967: the remedy's advice to bound the global windows first gives a sibling
-    serve --shard process the bounded window it purges an inbound override's bodies on. Red on a
-    remedy that offers the switch plus explicit days as a way to keep an inbound's bodies under
-    engine shards without saying so, and on one that adds the caveat for an outbound alone."""
+    """BACKLOG #5967: a recommended configuration for keeping an inbound's bodies under engine
+    shards (an unbounded global window plus a positive override on every other inbound) was
+    removed, because it also kept other tiers forever and failed when the holding engine shard was
+    down. Red if any arm offers it again, or the switch's effect on that purge."""
     registry = _graph(tmp_path / "cfg", inbound_days=inbound_days, outbound_days=outbound_days)
     verdict = judge_keep_forever_overrides(
-        registry, acknowledged=False, enforcing=enforcing, env_name="prod"
+        registry, acknowledged=acknowledged, enforcing=enforcing, env_name="prod"
     )
-    remedy = verdict.refusal if enforcing else verdict.report
-    assert remedy is not None
-    named = inbound_days is not None
-    # Keyed on the process, never on "engine shards" alone: a lone serve --shard holding the
-    # inbound keeps its bodies with explicit days.
-    caveat = (
-        "Those explicit days do not keep an inbound override's bodies where a serve --shard "
-        "process that does not hold that inbound runs retention against the same store: they "
-        "bound the global [security].delete_message_bodies_after_days window, and that process "
-        "purges the bodies on it. No setting on that inbound changes this."
-    )
-    assert (caveat in remedy) is named
-    # The configuration that keeps them, and its cost, stated with it.
-    assert ("gives every other inbound a positive messages_days of its own" in remedy) is named
-    cost = (
-        "With the global window unbounded, at least every inbound that has no positive override "
-        "of its own, and the stored messages of an inbound no longer in the graph, keep their "
-        "bodies forever."
-    )
-    assert (cost in remedy) is named
-    assert ("Plain serve, which runs no such process, keeps the override as written" in remedy) is (
-        named
-    )
+    text = verdict.refusal if enforcing and not acknowledged else verdict.report
+    assert text is not None
+    for removed in (
+        "One configuration that keeps them",
+        "gives every other inbound a positive messages_days",
+        "With the global window unbounded",
+        "Those explicit days do not keep",
+        "keeps the override as written",
+        "does not stop that purge",
+    ):
+        assert removed not in text
 
 
 @pytest.mark.parametrize(
