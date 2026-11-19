@@ -8,7 +8,8 @@ keyless follower of an encrypted store then raised a bare ``JSONDecodeError`` ra
 decrypted plaintext. It now decodes through ``decrypt_json_cell``, as the open-time load does.
 
 Checked WITHOUT a database, so it runs everywhere: ``_fetchall`` is faked, and only the follower
-read-through runs. The values are synthetic.
+read-through runs. The keyed cipher writes the cell-bound ``mfenc:v4`` form, the production default,
+so a cell decoded under the wrong associated data is refused. The values are synthetic.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from typing import Any
 import pytest
 
 from messagefoundry.store.crypto import (
+    Cipher,
     CipherError,
     IdentityCipher,
     StoreKeylessError,
@@ -33,29 +35,35 @@ from tests._content_free import assert_chain_severed
 MARKER = "synthetic-mrn-marker"
 
 
-def _follower(cipher: Any, stored: list[str]) -> PostgresStore:
-    """A bare follower whose shared ``state`` table holds ``stored`` under namespace ``ns``."""
+def _keyed() -> Cipher:
+    return make_cipher(generate_key(), write_v2=True)
+
+
+def _follower(cipher: Cipher, table: dict[str, list[str]]) -> PostgresStore:
+    """A bare follower whose shared ``state`` table holds ``table``: namespace -> stored values,
+    keyed ``K0``, ``K1``, ... Every namespace is at version 1, which this handle has not seen."""
     store = object.__new__(PostgresStore)
     store._cipher = cipher
     store._state_cache = new_state_cache()
     store._state_versions = {}
 
-    async def fake_fetchall(sql: str, *_params: Any) -> list[dict[str, Any]]:
+    async def fake_fetchall(sql: str, *params: Any) -> list[dict[str, Any]]:
         if "FROM state_version" in sql:
-            return [{"namespace": "ns", "version": 1}]
+            return [{"namespace": ns, "version": 1} for ns in table]
         assert "WHERE namespace" in sql, sql
-        return [{"key": f"K{i}", "value": v} for i, v in enumerate(stored)]
+        return [{"key": f"K{i}", "value": v} for i, v in enumerate(table[params[0]])]
 
     store._fetchall = fake_fetchall  # type: ignore[method-assign]
     return store
 
 
-def _enc(cipher: Any, plaintext: str, key: str) -> str:
-    return str(cipher.encrypt(plaintext, aad=cell_aad("state", "value", "ns", key)))
+def _enc(cipher: Cipher, plaintext: str, ns: str, key: str) -> str:
+    return str(cipher.encrypt(plaintext, aad=cell_aad("state", "value", ns, key)))
 
 
-def _assert_carries_no_secret(exc: BaseException) -> None:
-    """The raised error does not hold the plaintext, and nothing is chained to it that could."""
+def _assert_carries_no_marker(exc: BaseException) -> None:
+    """The raised error's message, repr and ``.doc`` do not hold the plaintext, and nothing is
+    chained to it that could. Its traceback's frame locals are out of scope here."""
     assert MARKER not in f"{exc} | {exc!r}"
     assert MARKER not in str(getattr(exc, "doc", ""))
     assert_chain_severed(exc)
@@ -63,34 +71,60 @@ def _assert_carries_no_secret(exc: BaseException) -> None:
 
 async def test_a_valid_cell_converges() -> None:
     """The control: a well-formed encrypted cell decodes and lands in the cache."""
-    cipher = make_cipher(generate_key())
-    store = _follower(cipher, [_enc(cipher, json.dumps(MARKER), "K0")])
+    cipher = _keyed()
+    store = _follower(cipher, {"ns": [_enc(cipher, json.dumps(MARKER), "ns", "K0")]})
     assert await store.converge_state_cache() == ["ns"]
     assert store._state_cache[("ns", "K0")] == MARKER
 
 
+async def test_a_cell_bound_to_another_namespace_is_refused() -> None:
+    """The decode binds the cell's own namespace and key, so a cell sealed for another place fails."""
+    cipher = _keyed()
+    store = _follower(cipher, {"ns": [_enc(cipher, json.dumps(MARKER), "other", "K0")]})
+    with pytest.raises(CipherError):
+        await store.converge_state_cache()
+    assert len(store._state_cache) == 0
+
+
 async def test_a_keyless_follower_raises_store_keyless_error() -> None:
-    writer = make_cipher(generate_key())
-    store = _follower(make_cipher(None), [_enc(writer, json.dumps(MARKER), "K0")])
+    writer = _keyed()
+    store = _follower(make_cipher(None), {"ns": [_enc(writer, json.dumps(MARKER), "ns", "K0")]})
     with pytest.raises(StoreKeylessError):
         await store.converge_state_cache()
     assert store._state_versions == {}  # nothing recorded, so the next tick tries again
 
 
 async def test_a_corrupt_encrypted_cell_raises_without_its_plaintext() -> None:
-    cipher = make_cipher(generate_key())
+    cipher = _keyed()
     # Decrypts under the configured key, but the plaintext is not JSON.
-    store = _follower(cipher, [_enc(cipher, f"not json {MARKER}", "K0")])
+    store = _follower(cipher, {"ns": [_enc(cipher, f"not json {MARKER}", "ns", "K0")]})
     with pytest.raises(CipherError) as info:
         await store.converge_state_cache()
     assert "corrupt" in str(info.value)
-    _assert_carries_no_secret(info.value)
+    _assert_carries_no_marker(info.value)
     assert len(store._state_cache) == 0
 
 
 async def test_a_malformed_legacy_plaintext_cell_raises_a_body_free_error() -> None:
-    store = _follower(IdentityCipher(), [f"{{not json {MARKER}"])
+    store = _follower(IdentityCipher(), {"ns": [f"{{not json {MARKER}"]})
     with pytest.raises(json.JSONDecodeError) as info:
         await store.converge_state_cache()
     assert info.value.doc == ""
-    _assert_carries_no_secret(info.value)
+    _assert_carries_no_marker(info.value)
+
+
+async def test_a_corrupt_later_namespace_leaves_an_earlier_good_one_untouched() -> None:
+    """Every changed namespace decodes before any cache write or version record, so a failure in
+    the second leaves the first neither reseeded nor recorded."""
+    cipher = _keyed()
+    store = _follower(
+        cipher,
+        {
+            "good": [_enc(cipher, json.dumps(MARKER), "good", "K0")],
+            "bad": [_enc(cipher, "not json", "bad", "K0")],
+        },
+    )
+    with pytest.raises(CipherError):
+        await store.converge_state_cache()
+    assert len(store._state_cache) == 0
+    assert store._state_versions == {}

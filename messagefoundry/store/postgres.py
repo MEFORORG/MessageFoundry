@@ -3373,10 +3373,10 @@ class PostgresStore:
         """Decrypt and decode one ``state`` cell, for both the open-time load and the follower
         :meth:`converge_state_cache`, so the two cannot drift apart (BACKLOG #5311).
 
-        #241 F2: a keyless open of an encrypted store fails closed with StoreKeylessError rather
-        than a raw JSONDecodeError from feeding an mfenc: blob straight to json.loads. A corrupt
-        cell raises an error that carries neither the decrypted text nor a chained JSONDecodeError
-        quoting it (see :func:`decrypt_json_cell`)."""
+        #241 F2: with no key configured, an encrypted cell raises StoreKeylessError rather than a
+        raw JSONDecodeError from feeding an mfenc: blob straight to json.loads.
+        :func:`decrypt_json_cell` states what else it refuses and what its error's message and
+        chain leave out; the traceback's frame locals still hold the decrypted text."""
         return decrypt_json_cell(
             self._cipher,
             stored,
@@ -3418,7 +3418,7 @@ class PostgresStore:
                 entry = cache[r["name"]] = new_reference_set(r["name"])
             versions[r["name"]] = r["version"]
             if r["key"] is not None:  # NULL key = the LEFT-JOIN miss of an empty snapshot
-                # #241 F2: fail closed on a keyless open of an encrypted store (see _load_state_cache).
+                # #241 F2: fail closed on a keyless open of an encrypted store (see _decode_state_cell).
                 entry[r["key"]] = decrypt_json_cell(
                     self._cipher,
                     r["value"],
