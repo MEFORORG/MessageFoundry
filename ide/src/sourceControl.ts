@@ -302,8 +302,9 @@ function isUncSpelling(p: string): boolean {
  * `core.hooksPath` or from git's answer, so when it is SPELLED as a UNC share it is compared by
  * spelling alone, with no file-system call on it: a value written as a share is not opened. A
  * workspace on a mapped drive still matches its UNC spelling, through the real path of `ours`.
- * Open limit: a `theirs` spelled locally that reaches a share through a link is still followed when
- * its real path is read; setup runs only in a trusted window, where the repository's code runs.
+ * Open limits: a `theirs` spelled locally that reaches a share is still opened when its real path is
+ * read, at least through a link or a mapped drive letter, though no longer on the extension host's
+ * own thread. Setup runs only in a trusted window, where the repository's code runs.
  */
 async function sameDir(ours: string, theirs: string): Promise<boolean> {
   const fold = (p: string): string => (process.platform === "win32" ? p.toLowerCase() : p);

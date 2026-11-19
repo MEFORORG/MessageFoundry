@@ -238,6 +238,7 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
 
     // Nothing statted at all, so not the configured path either.
     assert.deepStrictEqual(run.statted, [], "Restart touched the filesystem before its trust check");
+    assert.deepStrictEqual(run.resolved, [], "Restart read a real path before its trust check");
     assert.deepStrictEqual(notices, [TRUST_REFUSAL]);
     assert.strictEqual(run.stopped, false, "a refused Restart must not stop the engine");
     assert.strictEqual(run.started, false);
@@ -247,6 +248,7 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     const run = await restart(REMOTE);
 
     assert.deepStrictEqual(run.statted, [], "Restart touched the filesystem before its target check");
+    assert.deepStrictEqual(run.resolved, [], "Restart read a real path before its target check");
     assert.deepStrictEqual(notices, [REMOTE_REFUSAL]);
     assert.strictEqual(run.stopped, false);
     assert.strictEqual(run.started, false);

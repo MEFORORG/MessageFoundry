@@ -65,13 +65,20 @@ suite("b532r: a workspace may only lower ai.contextCharLimit (BACKLOG #5404 item
     assert.ok(!/\.get\s*</.test(fn) && !fn.includes(".get("), fn);
   });
 
+  const pkg = (): {
+    capabilities: { untrustedWorkspaces: { restrictedConfigurations: string[] } };
+    contributes: { configuration: { properties: Record<string, { default?: unknown }> } };
+  } => JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8"));
+
   test("the setting stays out of restrictedConfigurations, which would drop a tightening value", () => {
-    const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, "package.json"), "utf8")) as {
-      capabilities: { untrustedWorkspaces: { restrictedConfigurations: string[] } };
-    };
     assert.ok(
-      !pkg.capabilities.untrustedWorkspaces.restrictedConfigurations.includes("messagefoundry.ai.contextCharLimit"),
+      !pkg().capabilities.untrustedWorkspaces.restrictedConfigurations.includes("messagefoundry.ai.contextCharLimit"),
     );
+  });
+
+  test("the fallback default is the manifest's default", () => {
+    const prop = pkg().contributes.configuration.properties["messagefoundry.ai.contextCharLimit"];
+    assert.strictEqual(prop.default, DEFAULT_CONTEXT_CHAR_LIMIT);
   });
 });
 
@@ -87,7 +94,8 @@ suite("b532r: writers check the real path of a path setting (BACKLOG #5404 item 
     // The spelling test runs first, with no I/O, so a path spelled outside the folder is never opened.
     assert.ok(escapes.indexOf("committedRelativePath(ws, value)") < escapes.indexOf("resolveInsideWorkspace"), escapes);
     // A `..` component is refused before the real-path read, which collapses it by spelling.
-    assert.ok(escapes.includes('value.split(/[\\\\/]/).includes("..")'), escapes);
+    assert.ok(escapes.includes('process.platform === "win32" ? /[\\\\/]/ : /[/]/'), escapes);
+    assert.ok(escapes.includes('value.split(separator).includes("..")'), escapes);
     assert.ok(escapes.indexOf('includes("..")') < escapes.indexOf("resolveInsideWorkspace"), escapes);
     assert.ok(escapes.includes("resolveInsideWorkspace(ws, value) === undefined"), escapes);
     // writerPathSetting and writerConfigTarget both go through writerSetting.

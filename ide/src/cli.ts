@@ -150,17 +150,19 @@ export function writerCheckSetting(key: PathSettingKey): ContainedPathSetting {
  * land outside the folder although its spelling is `x`.
  *
  * Open limits. The check reads the named path only: a link BELOW it, such as a linked `codesets`
- * folder under `configDir`, is not caught here. The real-path reads are synchronous, as every
- * writer's caller is, so a workspace on a slow share stalls the extension host for each writer
- * command, and a link inside the folder is followed wherever it leads while its real path is read.
- * Only a trusted window runs the check (see {@link writerSetting}), where the repository's own code
- * already runs.
+ * folder under `configDir`, is not caught here. The real-path reads are synchronous, because
+ * {@link writerPathSetting} answers synchronously to its many callers, so a workspace on a slow share
+ * stalls the extension host for each writer command, and a link inside the folder is followed
+ * wherever it leads while its real path is read. Only a trusted window runs the check (see {@link
+ * writerSetting}), where the repository's own code already runs.
  */
 function escapesByLink(ws: string | undefined, value: string): boolean {
   if (ws === undefined || committedRelativePath(ws, value) === undefined) {
     return false;
   }
-  if (value.split(/[\\/]/).includes("..")) {
+  // A backslash separates components on Windows only; on POSIX it is part of a name.
+  const separator = process.platform === "win32" ? /[\\/]/ : /[/]/;
+  if (value.split(separator).includes("..")) {
     return true;
   }
   return resolveInsideWorkspace(ws, value) === undefined;
@@ -170,10 +172,10 @@ function escapesByLink(ws: string | undefined, value: string): boolean {
  *  value or the link's target (docs/REVIEW-STANDARDS.md R12). */
 export function linkEscapeRefusal(key: PathSettingKey): string {
   return (
-    `MessageFoundry: messagefoundry.${key} names a path inside the workspace folder that a symbolic link ` +
-    "or junction leads out of, that climbs with '..', or whose real path cannot be read, so nothing was " +
-    "written or started. Remove the link or the '..', or name the folder the link leads to with an " +
-    "absolute path in user settings."
+    `MessageFoundry: nothing was written or started. messagefoundry.${key} names a path inside the ` +
+    "workspace folder that may lead out of it. At least one of these holds: a symbolic link or junction " +
+    "on the path leads out, the path climbs with '..', or its real path cannot be read. Remove the link " +
+    "or the '..'. To use the folder a link leads to, name it with an absolute path in user settings."
   );
 }
 
