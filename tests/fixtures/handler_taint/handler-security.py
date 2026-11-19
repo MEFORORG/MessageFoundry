@@ -59,6 +59,8 @@ def h_aliased(msg):
     pk(msg.raw)
     # ruleid: mf-handler-ambient-eval-exec
     eval(msg.text)
+    # ruleid: mf-handler-ambient-os-exec
+    os.system(msg.raw)
     return Send("OB", msg)  # noqa: F821
 
 
