@@ -389,6 +389,17 @@ def _transit_failure(op: str, key: str, exc: Exception) -> CipherError:
     return UnauthenticatedCipherError(refused) if unauthenticated else CipherError(refused)
 
 
+def _batch_build_failure(op: str, key: str, exc: Exception) -> CipherError:
+    """The error each value of a batch gets when the calling thread's client could not be built
+    (BACKLOG #5963): the one a single ``encrypt`` or ``decrypt`` gives that failure, with ``exc`` as
+    its cause. The batch paths read the client before their request's handler, because that handler
+    reads any failure it does not call an outage as Transit refusing the batch, and that turns
+    batching off for the whole cipher although Transit was never asked."""
+    error = _transit_failure(op, key, exc)
+    error.__cause__ = exc
+    return error
+
+
 def _close_client(client: object) -> None:
     """Close an hvac client's pooled connections, best-effort: a close that raises is logged by
     the exception's type alone (BACKLOG #5963). A client with no adapter to close is left alone."""
@@ -671,11 +682,17 @@ class TransitCipher(_UnmarkedPolicy):
         """One batch request of :meth:`decrypt_many`, every value ``mfenc:v3``: the results in
         its order."""
         sent = [(stored[len(_V3_PREFIX) :], aad) for stored, aad in batch]
+        try:
+            client = self._client
+        except Exception as exc:
+            # Outside the batch handler: a thread whose client could not be built never asked
+            # Transit, so it must not read as Transit refusing the batch (see _batch_build_failure).
+            return [_batch_build_failure("decrypt", self._key, exc) for _ in batch]
         response: Any = None
         failed = unavailable = bad_request = False
         failure_type = ""
         try:
-            response = self._client.secrets.transit.decrypt_data(
+            response = client.secrets.transit.decrypt_data(
                 name=self._key, batch_input=self._batch_input("ciphertext", sent)
             )
         except Exception as exc:
@@ -750,11 +767,16 @@ class TransitCipher(_UnmarkedPolicy):
             (base64.b64encode(plaintext.encode("utf-8")).decode("ascii"), aad)
             for plaintext, aad in batch
         ]
+        try:
+            client = self._client
+        except Exception as exc:
+            # Raised as encrypt would raise it, outside the batch handler (see _batch_build_failure).
+            raise _batch_build_failure("encrypt", self._key, exc) from exc
         response: Any = None
         failed = unavailable = bad_request = False
         failure_type = ""
         try:
-            response = self._client.secrets.transit.encrypt_data(
+            response = client.secrets.transit.encrypt_data(
                 name=self._key, batch_input=self._batch_input("plaintext", sent)
             )
         except Exception as exc:

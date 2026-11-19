@@ -305,6 +305,37 @@ def test_a_thread_client_build_refusal_is_a_refusal_not_an_outage() -> None:
     assert str(failures[0].__cause__) == "synthetic TLS-suite refusal"
 
 
+@_vault_extra
+def test_a_build_refusal_on_a_batch_leaves_batching_on() -> None:
+    """Mutation: read the thread's client inside the batch request's handler. Red: a build refusal
+    reads as Transit refusing the batch, and the cipher sends every later value alone although
+    Transit was never asked."""
+
+    def refuse() -> Any:
+        raise ValueError("synthetic TLS-suite refusal")
+
+    cipher = TransitCipher(_FakeClient(_FakeTransit()), _KEY_NAME, client_factory=refuse)
+    stored = [f"mfenc:v3:vault:v1:c3ludGhldGlj{n}" for n in range(2)]
+    opened: list[list[str | CipherError]] = []
+    raised: list[BaseException] = []
+
+    def batches() -> None:
+        opened.append(cipher.decrypt_many([(value, None) for value in stored]))
+        try:
+            cipher.encrypt_many([("synthetic one", None), ("synthetic two", None)])
+        except CipherError as exc:
+            raised.append(exc)
+
+    _in_thread(batches)
+    assert not cipher._batch_alone
+    assert len(opened[0]) == 2
+    for result in opened[0]:
+        assert isinstance(result, CipherError) and not isinstance(result, CipherUnavailableError)
+        assert isinstance(result.__cause__, ValueError)
+    assert len(raised) == 1 and not isinstance(raised[0], CipherUnavailableError)
+    assert isinstance(raised[0].__cause__, ValueError)
+
+
 async def test_closing_the_sqlite_store_releases_the_transit_clients(tmp_path: Path) -> None:
     """Mutation: drop the close_connections call from MessageStore.close. Red: no client is
     closed."""
