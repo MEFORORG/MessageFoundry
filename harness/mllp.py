@@ -174,14 +174,18 @@ class SendWorker(QObject):
                     self._sock.shutdown(socket.SHUT_RDWR)
 
     def run(self) -> None:
-        delay = 1.0 / self._rate if self._rate > 0 else 0.0
-        for item in self._items:
-            if self._stop.is_set():
-                break
-            self.result.emit(self._send_one(item))
-            if delay and self._stop.wait(delay):
-                break
-        self.finished.emit()
+        # The items may be generated lazily on this thread, so a generator fault ends the batch
+        # here; finished is emitted whatever happens, or the tab would wait on it for good.
+        try:
+            delay = 1.0 / self._rate if self._rate > 0 else 0.0
+            for item in self._items:
+                if self._stop.is_set():
+                    break
+                self.result.emit(self._send_one(item))
+                if delay and self._stop.wait(delay):
+                    break
+        finally:
+            self.finished.emit()
 
     def _connect(self) -> socket.socket:
         """``socket.create_connection`` with the same timeout, but each dial is a non-blocking
@@ -243,7 +247,12 @@ class SendWorker(QObject):
             with self._connect() as sock:
                 with self._lock:
                     self._sock = sock  # publish so stop() can interrupt a blocking recv
+                    # A stop() that ran between the dial and the publish found no socket to shut
+                    # down; read its flag under the same lock so it is not missed.
+                    stopped = self._stop.is_set()
                 try:
+                    if stopped:
+                        raise ConnectionAbortedError("stopped before sending")
                     sock.settimeout(self._timeout)
                     sock.sendall(wire)
                     if not self._expect_ack:
@@ -253,7 +262,7 @@ class SendWorker(QObject):
                     decoder = MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES)
                     ack = b""
                     while not ack:
-                        chunk = sock.recv(4096)
+                        chunk = self._recv(sock)
                         if not chunk:
                             raise ConnectionError("peer closed before sending an ACK")
                         for message in decoder.feed(chunk):
@@ -271,6 +280,25 @@ class SendWorker(QObject):
         except OSError as exc:
             latency = (time.monotonic() - start) * 1000.0
             return SendResult(item, False, "-", latency, str(exc))
+
+    def _recv(self, sock: socket.socket) -> bytes:
+        """``sock.recv(4096)`` under the worker's timeout, waited in :data:`_STOP_POLL_S` slices so
+        :meth:`stop` is seen. Shutting the socket down does not wake a blocked receive on every
+        platform while the peer stays silent; Windows is one where it does not."""
+        deadline = time.monotonic() + self._timeout
+        while True:
+            if self._stop.is_set():
+                raise ConnectionAbortedError("stopped while waiting for an ACK")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out")
+            sock.settimeout(min(_STOP_POLL_S, remaining))
+            try:
+                return sock.recv(4096)
+            except TimeoutError:
+                continue
+            finally:
+                sock.settimeout(self._timeout)
 
     def _read_no_ack(self, item: SendItem, sock: socket.socket, start: float) -> SendResult:
         """Fire-and-forget: confirm no ACK arrives in a short window (a NONE-ack inbound sends
