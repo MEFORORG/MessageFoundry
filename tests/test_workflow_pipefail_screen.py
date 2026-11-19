@@ -776,12 +776,6 @@ _GRANDFATHERED: frozenset[tuple[str, str, str]] = frozenset(
             "Smoke-check the console wheel (clean venv, install, then the console's OWN "
             "__version__ == tag)",
         ),
-        # Renamed for BACKLOG #5475, when the download and checksum left the score step.
-        (
-            "security.yml",
-            "sbom",
-            "Install sbomqs (checksum-verified; a failed check fails the job)",
-        ),
         ("security.yml", "trivy", "Install Trivy (pinned)"),
         ("zizmor.yml", "zizmor", "Lint workflow syntax (actionlint, pinned)"),
     }

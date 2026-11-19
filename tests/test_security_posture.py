@@ -520,10 +520,12 @@ def _job_if_runs(expression: str, context: dict[str, str]) -> bool:
     a name ``_PR_EVENT_CONTEXTS`` does not seed (``github.actor``, ``github.event.*``) could pass
     unseen. An absent ``if:`` is GitHub's implicit ``success()``, which runs.
     """
-    from tests.test_asvs_anchor_report import _if_body
     from tests.test_dependabot_automerge_guardrails import _evaluate_expression
 
-    return _evaluate_expression(_if_body(expression) or "success()", context, _IF_FUNCTIONS)
+    body = expression.strip()
+    if body.startswith("${{") and body.endswith("}}"):
+        body = body[3:-2].strip()
+    return _evaluate_expression(body or "success()", context, _IF_FUNCTIONS)
 
 
 def test_step_advisory_security_jobs_cannot_run_on_a_pull_request() -> None:
@@ -559,6 +561,8 @@ def test_step_advisory_security_jobs_cannot_run_on_a_pull_request() -> None:
         "github.base_ref != ''",
         "startsWith(github.ref, 'refs/pull/')",
         "contains(github.event_name, 'pull')",
+        "contains(github.event_name || '', 'pull')",
+        "github.EVENT_NAME == 'pull_request'",
     ],
 )
 def test_the_job_if_evaluation_reads_each_loosening_as_a_run(loosening: str) -> None:
@@ -1246,32 +1250,99 @@ def _shell_lines(step: dict) -> str:
 
 
 def _sbomqs_split_offences(job: dict, soft_step: str) -> list[str]:
-    """Why ``job``'s sbomqs checksum could end green; empty when it cannot."""
+    """Why ``job``'s sbomqs checksum could end green, or never run; empty when a failed check fails
+    the job. The same rules as tests/test_release_pipeline.py's release twin, except two this job
+    needs: its install step may run on ``always()`` (so the IDE SBOM is still scored after a failed
+    Python one), and it may name ``shell: bash``, which keeps errexit (GitHub runs it as ``bash -e``).
+    """
+    from tests._verify_softeners import verification_softeners
+
     steps = [s for s in job.get("steps") or [] if isinstance(s, dict)]
-    verifying = [s for s in steps if "sha256sum -c" in _shell_lines(s)]
+    verifying = [i for i, s in enumerate(steps) if "sha256sum -c" in _shell_lines(s)]
+    scores = [i for i, s in enumerate(steps) if s.get("name") == soft_step]
+    if len(verifying) != 1 or len(scores) != 1:
+        return [
+            f"expected one `sha256sum -c` step and one {soft_step!r}, found {verifying}, {scores}"
+        ]
+    install, score = steps[verifying[0]], steps[scores[0]]
+    name = install.get("name") or "<unnamed step>"
+    body = _shell_lines(install)
     offences: list[str] = []
-    if not verifying:
-        offences.append("no step runs `sha256sum -c`, so nothing checks the sbomqs download")
-    for step in verifying:
-        name = step.get("name") or "<unnamed step>"
-        if step.get("continue-on-error") not in (None, False):
-            offences.append(f"the checksum step {name!r} carries continue-on-error")
-    for step in steps:
-        if step.get("name") == soft_step and re.search(
-            r"sha256sum -c|releases/download|curl ", _shell_lines(step)
-        ):
-            offences.append(f"the softened step {soft_step!r} downloads or verifies sbomqs")
+    if install is score or re.search(r"sha256sum -c|releases/download|curl ", _shell_lines(score)):
+        offences.append(f"the softened step {soft_step!r} downloads or verifies sbomqs")
+    if install.get("continue-on-error") not in (None, False):
+        offences.append(f"the checksum step {name!r} carries continue-on-error")
+    if str(install.get("if") or "always()").strip() != "always()":
+        offences.append(f"the checksum step {name!r} can be skipped: if: {install.get('if')!r}")
+    if install.get("shell") not in (None, "bash"):
+        offences.append(f"the checksum step {name!r} runs under shell {install.get('shell')!r}")
+    if "||" in body:
+        offences.append(f"the checksum step {name!r} carries a `||` fallback")
+    offences.extend(
+        f"the checksum step {name!r} lets a failed check carry on: {reason}"
+        for reason in verification_softeners(body)
+    )
+    if verifying[0] > scores[0]:
+        offences.append("the sbomqs score runs before the step that verifies sbomqs")
     return offences
 
 
 def test_a_failed_sbomqs_checksum_fails_the_sbom_job() -> None:
     """RED when: an SBOM job's sbomqs download or ``sha256sum -c`` runs inside its softened score
-    step, or in a step of its own that is softened. Either way a failed pin check ends green."""
+    step, or in a step of its own that is softened, skippable, or swallows a failed check. Each way
+    a failed pin check ends green."""
     soft = {key: step for wf, key, _, step in _STEP_ADVISORY_JOBS if wf == _SECURITY}
     jobs = jobs_of(_SECURITY)
     for key in _SBOMQS_SPLIT_JOBS:
         offences = _sbomqs_split_offences(jobs[key], soft[key])
         assert not offences, f"security.yml:{key}: {offences}"
+
+
+def _edit_verify_step(edit: Callable[[dict], dict]) -> Callable[[list[dict], dict], list[dict]]:
+    def mutate(steps: list[dict], verify: dict) -> list[dict]:
+        return [edit(dict(s)) if s is verify else s for s in steps]
+
+    return mutate
+
+
+def _swap_verify_and_score(steps: list[dict], verify: dict) -> list[dict]:
+    at = steps.index(verify)
+    out = list(steps)
+    out[at], out[at + 1] = out[at + 1], out[at]
+    return out
+
+
+@pytest.mark.parametrize("key", _SBOMQS_SPLIT_JOBS)
+@pytest.mark.parametrize(
+    ("mutate", "needle"),
+    [
+        (_edit_verify_step(lambda s: {**s, "continue-on-error": True}), "continue-on-error"),
+        (_edit_verify_step(lambda s: {**s, "if": "false"}), "can be skipped"),
+        (
+            _edit_verify_step(
+                lambda s: {**s, "run": s["run"].replace("sha256sum -c -", "sha256sum -c - || true")}
+            ),
+            "fallback",
+        ),
+        (
+            _edit_verify_step(lambda s: {**s, "run": "set +e\n" + s["run"]}),
+            "carry on",
+        ),
+        (_swap_verify_and_score, "runs before"),
+    ],
+    ids=["softened", "skippable", "or-true", "errexit-off", "reordered"],
+)
+def test_the_sbomqs_split_check_reds_on_each_loosening(
+    key: str, mutate: Callable[[list[dict], dict], list[dict]], needle: str
+) -> None:
+    """The controls: each loosening of the checksum step is reported."""
+    soft = {k: step for wf, k, _, step in _STEP_ADVISORY_JOBS if wf == _SECURITY}[key]
+    job = jobs_of(_SECURITY)[key]
+    steps = [s for s in job["steps"] if isinstance(s, dict)]
+    verify = next(s for s in steps if "sha256sum -c" in _shell_lines(s))
+    assert steps[steps.index(verify) + 1].get("name") == soft, "the score no longer follows"
+    offences = _sbomqs_split_offences({**job, "steps": mutate(steps, verify)}, soft)
+    assert any(needle in o for o in offences), offences
 
 
 @pytest.mark.parametrize("key", _SBOMQS_SPLIT_JOBS)
@@ -1285,8 +1356,9 @@ def test_the_sbomqs_split_check_reds_on_the_merged_shape(key: str) -> None:
     score = next(s for s in steps if s.get("name") == soft)
     merged = {**score, "run": f"{verify['run']}\n{score['run']}"}
     folded = {**job, "steps": [merged if s is score else s for s in steps if s is not verify]}
-    assert any("downloads or verifies" in o for o in _sbomqs_split_offences(folded, soft))
-    assert any("carries continue-on-error" in o for o in _sbomqs_split_offences(folded, soft))
+    offences = _sbomqs_split_offences(folded, soft)
+    assert any("downloads or verifies" in o for o in offences), offences
+    assert any("carries continue-on-error" in o for o in offences), offences
 
 
 # --- trivy: run the scan step and its reporter against each other, verbatim ----------------------

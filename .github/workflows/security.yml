@@ -658,11 +658,16 @@ jobs:
         if: always()
         run: |
           # Pinned + checksum-verified against the release's own goreleaser checksums.txt. ADR 0149.
+          # pipefail: the verify line below is a pipe, so a failing grep must fail it by design, not
+          # only because `sha256sum -c -` refuses empty input (the gitleaks install says why).
+          # --retry covers a transient network error, which now fails this blocking step; a
+          # checksum mismatch is not a curl error and is never retried.
+          set -o pipefail
           VER=2.0.11
           asset="sbomqs_${VER}_Linux_x86_64.tar.gz"
           base="https://github.com/interlynk-io/sbomqs/releases/download/v${VER}"
-          curl -sSfL "${base}/${asset}" -o "${asset}"
-          curl -sSfL "${base}/checksums.txt" -o sbomqs-checksums.txt
+          curl -sSfL --retry 3 --retry-all-errors "${base}/${asset}" -o "${asset}"
+          curl -sSfL --retry 3 --retry-all-errors "${base}/checksums.txt" -o sbomqs-checksums.txt
           grep " ${asset}$" sbomqs-checksums.txt | sha256sum -c -
           tar -xzf "${asset}" sbomqs
           sudo install -m 0755 sbomqs /usr/local/bin/sbomqs
