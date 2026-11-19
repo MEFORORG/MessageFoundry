@@ -8,7 +8,7 @@
   `docker/k8s/ha-postgres.yaml`, now take the value from a ConfigMap you create,
   `mefor-revocation-attestation`, key `attested`, with no default: until it exists the kubelet
   refuses the container with `CreateContainerConfigError` instead of the pod crash-looping.
-  Kubernetes has no check of the value itself, so a value such as `0` there still crash-loops. See
+  Neither manifest checks the value itself, so a value such as `0` there still crash-loops. See
   docs/CLOUD-DEPLOYMENT.md, section 7. (BACKLOG #5400)
 - **`install-service.ps1` now counts a "Log on as a service" holder written as an account name.**
   It compared the exported `SeServiceLogonRight` holders with the account's SID only, so a row that

@@ -553,9 +553,10 @@ function Remove-ServiceLogonRight {
       Take SeServiceLogonRight back off $Sid, mirroring install-service.ps1's Set-ServiceLogonRight
       in reverse: export USER_RIGHTS, drop the SID from the row, re-import.
 
-      IT TAKES A SID, NOT A NAME, and the caller resolves it BEFORE the registration is removed. A
+      IT TAKES THE ACCOUNT'S SID, which the caller resolves BEFORE the registration is removed. A
       per-service virtual account is named by the service; with the service gone the name no longer
-      translates, and a resolve attempted here would fail on exactly the default install.
+      translates, so resolving $Account here would fail on exactly the default install. $Account is
+      only compared as text with holder names; other holder names are resolved, as below.
 
       EXACT TOKEN MATCHING, for the reason the installer's grant states: a SID that is a string
       prefix of another (RID 110 against 1100) would make a substring test drop the wrong account's
@@ -672,8 +673,8 @@ function Remove-AccountAce {
         [Parameter(Mandatory)][string]$Principal,
         [Parameter(Mandatory)][string]$What
     )
-    # -LiteralPath: a '[' or ']' in -DataDir is part of the name, not a wildcard range (BACKLOG
-    # #5402). A Windows name cannot hold '*' or '?', so the brackets are the case this covers.
+    # -LiteralPath: a character PowerShell would read as wildcard syntax, at least '[', ']' and the
+    # backtick escape, is part of the -DataDir name, not a pattern (BACKLOG #5402).
     if (-not (Test-Path -LiteralPath $Path)) {
         Write-Host "  ACEs   : $What '$Path' is gone; nothing to remove."
         return $false

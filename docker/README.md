@@ -146,8 +146,8 @@ against one case that matters, described under
   revocation ([SECURITY.md, API revocation gate](../docs/SECURITY.md#api-revocation-gate)):
   `kubectl create configmap mefor-revocation-attestation --from-literal=attested=1`. The value must
   read as true (`1`, `true`, `yes` or `on`). A value such as `0` passes the kubelet, and the engine
-  then exits 2 and the pod crash-loops: only `compose.yaml` checks the value before an engine starts,
-  with its `revocation-attestation-check` service.
+  then exits 2 and the pod crash-loops: neither manifest checks the value before the engine starts,
+  as `compose.yaml` does with its `revocation-attestation-check` service.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
   Postgres-backed `replicas: 3` Deployment with `[cluster].enabled`, a PodDisruptionBudget, and
   lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)
@@ -166,9 +166,11 @@ against one case that matters, described under
   `compose.yaml` passes it by compose substitution with no default, so `docker compose` refuses to
   start until you export it or put it in a `.env` beside `compose.yaml` (an `env_file:` does not
   feed substitution, and passing `--env-file` reads the named file instead of that `.env`, so keep
-  this value and the Postgres password in the same place). A value that does not read as true, such
-  as `0`, is refused by the `revocation-attestation-check` service before any engine starts. Set it
-  only if your PKI enforces revocation; the file never sets it for you.
+  every substituted value, at least this one and the Postgres password, in the file substitution
+  reads; the `ha` engines still read their own store password from `secrets.env`). A value that does
+  not read as true, such as `0`, is refused by the `revocation-attestation-check` service before any
+  engine starts, and `docker compose logs revocation-attestation-check` shows why. Set it only if
+  your PKI enforces revocation; the file never sets it for you.
 - **(B) Reverse-proxy / same-pod sidecar — k8s-preferred.** Engine stays on loopback behind the
   sidecar, declared with `tls_terminated_upstream=true` + `trusted_proxies=[…]` +
   `plaintext_upstream_hop_acknowledged=true`, because with no `tls_cert_file` that hop is

@@ -376,8 +376,8 @@ TLS-terminating collector).
    `kubectl create configmap mefor-revocation-attestation --from-literal=attested=1`.
    The value must read as true to the engine (`1`, `true`, `yes` or `on`, in any case). A value that
    does not, such as `0`, passes the kubelet and the engine then exits 2 at the revocation gate, so
-   the pod crash-loops. Kubernetes has no check for this; only `docker/compose.yaml` runs one, its
-   `revocation-attestation-check` service.
+   the pod crash-loops. Neither Kubernetes manifest checks the value before the engine starts;
+   `docker/compose.yaml` does, with its `revocation-attestation-check` service.
 5. **Apply** [`docker/k8s/ha-postgres.yaml`](../docker/k8s/ha-postgres.yaml) with all three `image:` fields
    (`tls-dir`, `copy-tls` and `engine`) set to your baked image and `MEFOR_STORE_SERVER` set to the managed-PG endpoint.
 6. **Stand up the L4 NLB** (one listener per MLLP port, primary-only TCP-connect health check at a ~10s
