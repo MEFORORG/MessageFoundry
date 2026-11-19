@@ -87,12 +87,12 @@ worker and never able to break alerting or delivery. The restart itself is `rest
 `restart_outbound`, which already return fast (a cooperative stop that does not await an in-flight drain),
 so the task cannot hang a lane.
 
-### §4 — Throttled with the notification; independent of transport suppression
+### §4 — Throttled per cooldown; independent of transport suppression
 
-The action fires on the **same throttle gate** as the notification — at most once per `realert_seconds`
-(or the rule's `cooldown_seconds`) per `(event_type, connection)` — so a flapping lane cannot trigger a
-restart storm. It is **independent of transport suppression**: a rule may set `transports=[]` to
-auto-remediate **quietly** (restart, no page) or fire alongside a page. The control action requires the
+The action fires at most once per `realert_seconds` (or the rule's `cooldown_seconds`) per
+`(event_type, connection)`, on a throttle of its own (amended below, owner ruling 2026-11-19), so a
+flapping lane cannot trigger a restart storm. It is **independent of transport suppression**: a rule
+may set `transports=[]` to auto-remediate **quietly** (restart, no page) or fire alongside a page. The control action requires the
 **notifier** to be active (≥1 transport configured), since it is a notifier outcome; a deployment that
 wants transportless remediation configures at least one transport (documented; a transportless-notifier
 mode is a possible follow-up).
@@ -104,6 +104,18 @@ is in flight, so a later stop is a new incident that pages and acts at once. No 
 raises it, so a loop of rule restarts, including two rules restarting each other's inbound, keeps the
 bound above. An operator's resolve by hand does not end the window. `AlertSink.connection_started`
 lists the operator starts that still raise nothing, so leave the window standing.
+
+**Amendment (owner ruling 2026-11-19, PR 3069).** The control action runs on its own throttle, apart
+from the notification's. The sink records when it dispatched a control task for an
+`(event_type, connection)`, and decides the next control action from that time alone, whether or not
+the notification for the same emit is throttled. So the restart still fires at most once per
+connection per cooldown, for each event type. It is recorded only when a control task is scheduled:
+an emit whose action is skipped (for example: no control callback wired, the engine shutting down,
+or an event that is not about a connection) records nothing. A restart can therefore fire on a throttled alert
+when an earlier alert in the window ran no restart. The notification throttle is unchanged, and a
+`connection_error` of kind `config_fault` keeps its own notification throttle (ADR 0095 Amendment
+B.2) while sharing the `connection_error` control throttle with the transport kind. The
+`connection_started` clear above ends both windows, and a failed resolve restores both.
 
 ## Options considered
 
@@ -121,7 +133,7 @@ lists the operator starts that still raise nothing, so leave the window standing
 
 **Positive** — the common "just restart the wedged lane" case is auto-remediated at alert latency with a
 human still paged (or deliberately quiet); additive, off by default, no new dependency, no layering
-change. Reuses the existing throttle so it can't storm.
+change. Throttled per cooldown so it can't storm.
 
 **Negative / residual** — auto-restarting a lane wedged on a *persistent* fault will restart-loop it (once
 per cooldown) until an operator intervenes — the same class of caveat as retry-forever; an operator scopes
