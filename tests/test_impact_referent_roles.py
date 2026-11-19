@@ -1239,3 +1239,59 @@ def test_codeset_rename_with_an_unresolved_referrer_moves_nothing(tmp_path: Path
     assert (config_dir / "codesets" / "diets.csv").is_file()
     assert not (config_dir / "codesets" / "meals.csv").exists()
     assert _mod(config_dir) == before
+
+
+def test_a_definition_constant_read_through_a_re_export_is_refused(tmp_path: Path) -> None:
+    """``feeds.py`` reads the constant through ``_reexport``, never importing ``_consts`` itself,
+    and names an inbound with it: rewriting it for the outbound would rename the inbound too."""
+    d = tmp_path / "config"
+    d.mkdir()
+    files = {
+        "_consts.py": "from messagefoundry import MLLP, outbound\n"
+        "\n"
+        'OB = "X_FEED"\n'
+        'outbound(OB, MLLP(host="127.0.0.1", port=7029))\n',
+        "_reexport.py": "from _consts import OB  # noqa: F401\n",
+        "feeds.py": _HEAD + "from _reexport import OB\n"
+        "\n"
+        'inbound(OB, MLLP(port=2869), router="r_x")\n'
+        "\n"
+        '@router("r_x")\n'
+        "def r_x(msg):\n"
+        '    return ["h_x"]\n'
+        "\n"
+        '@handler("h_x")\n'
+        "def h_x(msg):\n"
+        '    return Send("X_FEED", msg)\n',
+    }
+    for name, text in files.items():
+        (d / name).write_text(text, encoding="utf-8", newline="")
+    registry = load_config(d)
+    assert "X_FEED" in registry.inbound and "X_FEED" in registry.outbound
+    with pytest.raises(WiringError, match="other code reads it too"):
+        plan_rename(registry, d, "outbound", "X_FEED", "X_NEW")
+
+
+def test_a_table_accessor_bound_and_read_at_module_level_is_renamed(tmp_path: Path) -> None:
+    """``DIET`` holds the code set itself, so a module-level read of it reads the renamed table
+    as before: the accessor's argument is rewritten, whoever reads the binding."""
+    config_dir = _write_config(
+        tmp_path,
+        'DIET = code_set("diets")\n'
+        "_ALIAS = DIET\n"
+        'inbound("IB_D", MLLP(port=2870), router="r_d")\n'
+        'outbound("OB_D", MLLP(host="127.0.0.1", port=7030))\n'
+        "\n"
+        '@router("r_d")\n'
+        "def r_d(msg):\n"
+        '    return ["h_d"]\n'
+        "\n"
+        '@handler("h_d")\n'
+        "def h_d(msg):\n"
+        '    label = DIET.get("A")\n'
+        '    return Send("OB_D", msg)\n',
+        codesets=("diets",),
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "code_set", "diets", "meals")
+    assert plan.unresolved == ()
+    assert [(e.line, e.new_literal) for e in plan.edits] == [(3, '"meals"')]

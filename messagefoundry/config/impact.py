@@ -300,6 +300,9 @@ def plan_rename(
     )
     ref_sites = [site for _ref, sites, _complete in referrers for site in sites]
     edits: list[LiteralEdit] = []
+    # The config modules, listed once on the first module-binding literal: ``None`` inside it when
+    # the listing failed, so no binding literal is rewritten.
+    listed: list[tuple[str, ...] | None] = []
     files = set(def_spans) | {site.file for site in ref_sites}
     bom_files = frozenset(file for file in files if _has_bom(file))
     for file in sorted(files):
@@ -315,9 +318,13 @@ def plan_rename(
             ):
                 continue
             # A literal a module binding holds changes every read of that name, so each read must
-            # be one this rename means to change. A definition's own literal argument is not
-            # bound; its constant is checked against the declaring argument that reads it.
-            if is_def and (file, pos) not in def_readers:
+            # be one this rename means to change. Two literals no reader sees as a string are
+            # exempt: a definition's own name argument, and a table accessor's argument
+            # (``DIET = code_set("diets")`` still reads the same, renamed table). A definition's
+            # constant is checked against the declaring argument that reads it.
+            if (is_def and (file, pos) not in def_readers) or (
+                target_kind in _TABLE_KINDS and kinds.get(pos) == target_kind
+            ):
                 edits.append(edit)
                 continue
             covering = [
@@ -327,7 +334,9 @@ def plan_rename(
                 for site in sites
             ]
             declaring = def_readers.get((file, pos), frozenset())
-            if _binding_read_only_by_referents(sources, config_dir, file, pos, declaring, covering):
+            if not listed:
+                listed.append(_config_modules(config_dir))
+            if _binding_read_only_by_referents(sources, listed[0], file, pos, declaring, covering):
                 edits.append(edit)
     for toml_path, key in toml_targets:
         toml_edits = _toml_value_edits(toml_path, key, old, new)
@@ -1357,7 +1366,7 @@ def _module_binding_sites(
 
 def _binding_read_only_by_referents(
     sources: SourceCache,
-    config_dir: Path,
+    modules: tuple[str, ...] | None,
     file: str,
     pos: _Pos,
     declaring: frozenset[_Pos],
@@ -1382,14 +1391,9 @@ def _binding_read_only_by_referents(
             names |= stmt_names
     if not names:
         return True
-    if len(declaring) > 1:
+    if len(declaring) > 1 or modules is None:
         return False
-    try:
-        readers = _name_readers(sources, config_dir, file, names)
-    except OSError as exc:
-        _log.debug("rename could not list %s for readers: %s", config_dir, type(exc).__name__)
-        return False
-    for reader_file, node in readers:
+    for reader_file, node in _name_readers(sources, modules, file, names):
         if reader_file == file and sources.position(file, node) in declaring:
             continue
         if not _in_covered_body(sources, reader_file, node, covering):
@@ -1397,13 +1401,29 @@ def _binding_read_only_by_referents(
     return True
 
 
+def _config_modules(config_dir: Path) -> tuple[str, ...] | None:
+    """Every ``.py`` under ``config_dir`` (subdirectories too, since a helper package is importable
+    from a config module), dot-named parts excluded, as resolved paths; ``None`` when the directory
+    cannot be walked, so no reader can be ruled out."""
+    root = config_dir.resolve()
+    try:
+        return tuple(
+            str(path)
+            for path in sorted(root.rglob("*.py"))
+            if not any(part.startswith(".") for part in path.relative_to(root).parts)
+        )
+    except OSError as exc:
+        _log.debug("rename could not list %s for readers: %s", config_dir, type(exc).__name__)
+        return None
+
+
 def _name_readers(
-    sources: SourceCache, config_dir: Path, file: str, names: set[str]
+    sources: SourceCache, modules: tuple[str, ...], file: str, names: set[str]
 ) -> list[tuple[str, ast.expr]]:
-    """Every read of one of ``names``, bound at module scope in ``file``, across the config dir:
-    in ``file`` itself, and in any other config ``.py`` module that imports ``file``'s module (by
-    a bare name or as an attribute, whatever the import's spelling). A module that cannot be
-    parsed cannot have been run, so it is skipped. Raises the ``OSError`` of a failed listing."""
+    """Every read of one of ``names``, bound at module scope in ``file``: in ``file`` itself, and in
+    any other of ``modules`` that imports any config module, by any spelling, since a name can
+    reach it through a re-export as well as from ``file``'s own module. A module that cannot be
+    parsed cannot have been run, so it is skipped."""
     out: list[tuple[str, ast.expr]] = []
     parsed = sources.parse(file)
     if parsed is not None:
@@ -1412,30 +1432,27 @@ def _name_readers(
             for node in ast.walk(parsed[0])
             if isinstance(node, ast.Name) and node.id in names and isinstance(node.ctx, ast.Load)
         )
-    stem = Path(file).stem
-    root = config_dir.resolve()
-    for path in sorted(root.rglob("*.py")):
-        other = str(path)
-        if other == file or any(part.startswith(".") for part in path.relative_to(root).parts):
-            continue
-        other_parsed = sources.parse(other)
+    stems = {Path(module).stem for module in modules}
+    for other in modules:
+        other_parsed = sources.parse(other) if other != file else None
         if other_parsed is None:
             continue
         tree = other_parsed[0]
         imports = any(
-            (isinstance(node, ast.ImportFrom) and stem in (node.module or "").split("."))
-            or any(stem in a.name.split(".") for a in node.names)
+            stems.intersection(
+                ((node.module or "").split(".") if isinstance(node, ast.ImportFrom) else [])
+                + [part for a in node.names for part in a.name.split(".")]
+            )
             for node in ast.walk(tree)
             if isinstance(node, (ast.Import, ast.ImportFrom))
         )
-        if not imports:
-            continue
-        out.extend(
-            (other, node)
-            for node in ast.walk(tree)
-            if (isinstance(node, ast.Name) and node.id in names)
-            or (isinstance(node, ast.Attribute) and node.attr in names)
-        )
+        if imports:
+            out.extend(
+                (other, node)
+                for node in ast.walk(tree)
+                if (isinstance(node, ast.Name) and node.id in names)
+                or (isinstance(node, ast.Attribute) and node.attr in names)
+            )
     return out
 
 
