@@ -187,31 +187,96 @@ jobs:
             Select-Object -Last 1
           if (-not $signtool) { throw 'signtool.exe was not found in the Windows SDK' }
 
+          # PersistKeySet, not EphemeralKeySet: signtool is another process and reaches the key through the
+          # certificate store, which an ephemeral key never enters. So the key is written to this user's key
+          # store, and the finally block below deletes it again (BACKLOG #5478). Everything from the import on
+          # sits inside that try, so a failure at any point, the import included, still removes what it made.
           $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]'PersistKeySet, UserKeySet'
           $pfx = [System.Convert]::FromBase64String($env:SIGNING_PFX_BASE64)
-          $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($pfx, $env:SIGNING_PFX_PASSWORD, $flags)
+          $pfxPassword = $env:SIGNING_PFX_PASSWORD
           # signtool needs neither secret, so both leave this process's environment before it starts.
           Remove-Item Env:SIGNING_PFX_BASE64, Env:SIGNING_PFX_PASSWORD
 
-          # The certificate sits in the user store only while signtool runs, and is selected by thumbprint,
-          # so the password never appears on a command line.
-          $store = [System.Security.Cryptography.X509Certificates.X509Store]::new('My', 'CurrentUser')
-          $store.Open('ReadWrite')
+          $cert = $null
+          $store = $null
+          $thumbprint = $null
+          $failure = $null
           try {
+            $cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new($pfx, $pfxPassword, $flags)
+            $thumbprint = $cert.Thumbprint
+            # The certificate sits in the user store only while signtool runs, and is selected by thumbprint,
+            # so the password never appears on a command line.
+            $store = [System.Security.Cryptography.X509Certificates.X509Store]::new('My', 'CurrentUser')
+            $store.Open('ReadWrite')
             $store.Add($cert)
             # /tr and /td ask for an RFC 3161 timestamp, so the signature stays valid after the certificate expires.
-            & $signtool.FullName sign /sha1 $cert.Thumbprint /s My /fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256 $exe
+            & $signtool.FullName sign /sha1 $thumbprint /s My /fd SHA256 /tr $env:TIMESTAMP_URL /td SHA256 $exe
             if ($LASTEXITCODE -ne 0) { throw "signtool sign failed with exit code $LASTEXITCODE" }
+          } catch {
+            $failure = $_
+            throw
           } finally {
-            $store.Remove($cert)
-            $store.Close()
+            try {
+              if ($store) {
+                if ($cert) { $store.Remove($cert) }
+                $store.Close()
+              }
+              if ($cert) {
+                # Removing the certificate from the store leaves the persisted private key behind, so the
+                # key is deleted through its own handle. A key type this cannot delete fails the step.
+                $rsa = [System.Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPrivateKey($cert)
+                $ecdsa = [System.Security.Cryptography.X509Certificates.ECDsaCertificateExtensions]::GetECDsaPrivateKey($cert)
+                foreach ($key in @($rsa, $ecdsa)) {
+                  if ($null -eq $key) { continue }
+                  if ($key -is [System.Security.Cryptography.RSACng] -or $key -is [System.Security.Cryptography.ECDsaCng]) {
+                    $key.Key.Delete()
+                  } elseif ($key -is [System.Security.Cryptography.RSACryptoServiceProvider]) {
+                    $key.PersistKeyInCsp = $false
+                    $key.Dispose()
+                  } else {
+                    throw "the imported private key is a $($key.GetType().FullName), which this step cannot delete"
+                  }
+                }
+                $cert.Dispose()
+              }
+            } catch {
+              # A throw here would replace a signing failure already in flight, so that case reports the
+              # cleanup failure beside it and lets the first error end the step. Alone, it fails the step.
+              if ($failure) { Write-Host "::error title=signing key cleanup failed::$($_.Exception.Message)" } else { throw }
+            }
           }
 
           # Checked without chain trust: a certificate from an internal CA is not trusted by this runner, and
-          # whether to trust it is the deploying site's decision. Signed and timestamped is what is asserted.
+          # whether to trust it is the deploying site's decision. What is asserted (BACKLOG #5478): the binary
+          # is signed and timestamped, the signer is the certificate imported above, and the signature itself
+          # verifies. Status Valid passes. UnknownError is what an untrusted root reports, so it passes only
+          # when the signer's chain builds for code signing with the unknown-CA fault alone ignored. Every
+          # other status fails, at least NotSigned, HashMismatch, NotTrusted (explicitly distrusted),
+          # Incompatible and NotSupportedFileFormat. Revocation is not checked here, as Valid does not either.
           $signature = Get-AuthenticodeSignature -FilePath $exe
           if (-not $signature.SignerCertificate -or -not $signature.TimeStamperCertificate) {
             throw 'the binary is not both signed and timestamped'
+          }
+          if ($signature.SignerCertificate.Thumbprint -ne $thumbprint) {
+            throw "the binary is signed by $($signature.SignerCertificate.Thumbprint), not by the imported certificate $thumbprint"
+          }
+          if ($signature.Status -ne 'Valid') {
+            if ($signature.Status -ne 'UnknownError') {
+              throw "the signature's status is $($signature.Status): $($signature.StatusMessage)"
+            }
+            $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
+            try {
+              $chain.ChainPolicy.RevocationMode = 'NoCheck'
+              $chain.ChainPolicy.VerificationFlags = 'AllowUnknownCertificateAuthority'
+              # 1.3.6.1.5.5.7.3.3 is the code-signing extended key usage.
+              $null = $chain.ChainPolicy.ApplicationPolicy.Add([System.Security.Cryptography.Oid]::new('1.3.6.1.5.5.7.3.3'))
+              if (-not $chain.Build($signature.SignerCertificate)) {
+                $faults = ($chain.ChainStatus | ForEach-Object { $_.Status }) -join ', '
+                throw "the signature's status is UnknownError ($($signature.StatusMessage)), and the signer's chain fails for more than an unknown CA: $faults"
+              }
+            } finally {
+              $chain.Dispose()
+            }
           }
           Write-Host "signed by $($signature.SignerCertificate.Subject); timestamped by $($signature.TimeStamperCertificate.Subject)"
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash
