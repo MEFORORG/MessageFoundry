@@ -6120,7 +6120,8 @@ def _dryrun(args: argparse.Namespace) -> int:
         return _emit_error(str(exc), as_json=args.json)
 
     # #230 P4 (ADR 0104): preview under the engine's copy-on-Send posture, resolved from the service
-    # settings serve would load — the library defaults stay False, but the CLI mirrors the live engine.
+    # settings serve would load, so a site's [pipeline] value reaches the preview; the library default,
+    # True, is the PipelineSettings default and applies only where nothing is passed (BACKLOG #5794).
     snapshot_on_send = _snapshot_on_send_setting(service_config)
 
     show_phi: bool = args.show_phi

@@ -5644,9 +5644,10 @@ class Send:
         # (a divergent fan-out: set(); Send(); set(); Send()) does not leak into an already-constructed
         # Send. The flag is read from a run-scoped ContextVar — never a constructor argument — so this is
         # a single choke point the fused path (which calls transform_one WITHOUT run_context=) cannot
-        # bypass. Flag OFF (the default, and any Send built outside a transform run — tests, dry-run) =>
-        # the ContextVar default False => a no-op => Send stores the caller's exact reference =>
-        # byte-identical to pre-ADR-0104. Frozen dataclass, so rebind via object.__setattr__.
+        # bypass. Flag OFF (a run started with snapshot_on_send=False — the engine, dry-run and their
+        # entry points default it ON, BACKLOG #5794 — and any Send built outside a transform run, such
+        # as a test's, where the ContextVar default False applies) => a no-op => Send stores the
+        # caller's exact reference => byte-identical to pre-ADR-0104. Frozen dataclass, so rebind via object.__setattr__.
         if snapshot_on_send_active():
             snap = snapshot_payload(self.message)
             if snap is not self.message:  # a str is returned as-is -> nothing to rebind

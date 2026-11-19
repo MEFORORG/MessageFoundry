@@ -90,6 +90,7 @@ from messagefoundry.config.models import (
     StallThreshold,
     _check_flag_with_reason,
     _check_hop_attestation,
+    infinite_age_is_off,
 )
 from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
 from messagefoundry.config.tls_policy import (
@@ -2529,12 +2530,20 @@ class DeliverySettings(_Section):
     internal_error: InternalErrorPolicy = InternalErrorPolicy.CONTINUE
     # queue_buildup alert thresholds for every outbound. Mirror BuildupThreshold (a test guards the
     # sync); buildup_max_depth unset = depth dimension off; per-connection buildup= overrides.
-    buildup_max_depth: int | None = None
-    buildup_max_oldest_seconds: float | None = 300.0
+    buildup_max_depth: int | None = Field(default=None, ge=1)
+    buildup_max_oldest_seconds: float | None = Field(default=300.0, gt=0)
     # message_stall alert threshold (Corepoint "Max Message Stall") for every outbound. Mirror
     # StallThreshold (a test guards the sync); None (the default) = the stall alert is OFF — deny-by-
     # default, opt-in because it overlaps queue_buildup's age dimension. Per-connection stall= overrides.
-    stall_max_oldest_seconds: float | None = None
+    stall_max_oldest_seconds: float | None = Field(default=None, gt=0)
+
+    # BACKLOG #5778: `inf` (TOML has no null) is the age keys' spelling of off, read as None as the
+    # models they feed read it, so these fields hold None rather than inf.
+    @field_validator("buildup_max_oldest_seconds", "stall_max_oldest_seconds", mode="after")
+    @classmethod
+    def _inf_age_is_off(cls, value: float | None) -> float | None:
+        return infinite_age_is_off(value)
+
     # saturation alert threshold (#93, ADR 0014 amendment): fire when a lane's backlog is RISING
     # SUSTAINED over this many samples (the DERIVATIVE signal, distinct from buildup/stall's absolute
     # ceilings). None (the default) = OFF — deny-by-default, opt-in because it overlaps queue_buildup's

@@ -193,6 +193,23 @@ def test_model_validation() -> None:
         )  # weekday out of range
 
 
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        (time(8, tzinfo=UTC), time(17)),
+        (time(8), time(17, tzinfo=UTC)),
+        ("08:00:00+02:00", "17:00:00+02:00"),
+    ],
+)
+def test_model_refuses_offset_bearing_times(start: time | str, end: time | str) -> None:
+    # BACKLOG #5779: an aware start/end used to load, then contains() compared it with a naive local
+    # time and raised TypeError at every schedule tick. It is now refused at load.
+    with pytest.raises(ValueError, match="no tzinfo or UTC offset"):
+        ActiveWindow.model_validate(
+            {"days": frozenset({MON}), "start": start, "end": end, "timezone": "UTC"}
+        )
+
+
 # === runner scheduler ========================================================
 
 

@@ -2001,8 +2001,9 @@ class RegistryRunner:
         schedule_clock: Callable[[], datetime] | None = None,
         fuse_thread_hops: bool = False,  # ADR 0071 B5: SQL-Server-only thread-hop fusion (default-OFF)
         pooled_fusing_workers: int = 8,
-        batch_handoff_statements: bool = False,  # ADR 0075: SQL-Server-only per-hop batching (default-OFF)
-        snapshot_on_send: bool = False,  # ADR 0104: copy-on-Send at Send construction (default-OFF)
+        # Both default as PipelineSettings does (BACKLOG #5794).
+        batch_handoff_statements: bool = True,  # ADR 0075: SQL-Server-only per-hop batching (default-ON)
+        snapshot_on_send: bool = True,  # ADR 0104: copy-on-Send at Send construction (default-ON)
         sandbox_policy: SandboxPolicy
         | None = None,  # ADR 0087 #197: opt-in subprocess isolation (default-OFF)
         sandbox_config_source: tuple[str | None, str | None] | None = None,
@@ -2433,7 +2434,7 @@ class RegistryRunner:
         # (the only backend that ships the batched handoff forms) — else the async path (fail-closed,
         # byte-identical). Independent of claim_mode: batching works on the plain async handoff too.
         self._batch_handoff_statements = batch_handoff_statements
-        # ADR 0104 copy-on-Send (default-OFF); every transform-phase RunContext this runner builds carries
+        # ADR 0104 copy-on-Send (default-ON); every transform-phase RunContext this runner builds carries
         # it, so Send.__post_init__ snapshots on the split, inline, and fused paths alike. Read ONCE here —
         # a /config/reload never re-reads it (restart to change, exactly like fuse_thread_hops).
         self._snapshot_on_send = snapshot_on_send

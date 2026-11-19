@@ -12580,8 +12580,10 @@ def create_managed_app(
     schedule_tick_seconds: float = 30.0,  # #147 (ADR 0095): active-window scheduler tick
     fuse_thread_hops: bool = False,  # ADR 0071 B5: SQL-Server-only thread-hop fusion (default-OFF)
     pooled_fusing_workers: int = 8,
-    batch_handoff_statements: bool = False,  # ADR 0075: SQL-Server-only per-hop batching (default-OFF)
-    snapshot_on_send: bool = False,  # ADR 0104: copy-on-Send at Send construction (default-OFF)
+    # Both default as PipelineSettings does, so an embedder on keyword defaults runs as serve does
+    # (BACKLOG #5794).
+    batch_handoff_statements: bool = True,  # ADR 0075: SQL-Server-only per-hop batching (default-ON)
+    snapshot_on_send: bool = True,  # ADR 0104: copy-on-Send at Send construction (default-ON)
     connection_events: bool = True,
     response_sent_default: bool = True,
     message_events: str = "all",  # #63 [diagnostics].message_events verbosity → open_store
