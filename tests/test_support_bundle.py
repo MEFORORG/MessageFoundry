@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import zipfile
 from pathlib import Path
 from typing import Any
@@ -78,6 +79,44 @@ def test_manifest_phi_contract_does_not_claim_the_bundle_secret_free(tmp_path: P
     assert "username" in contract
     assert "at least" in contract  # a residual is a floor, not an enumeration (SDS-3.6)
     assert "not as secret-free or phi-free" in contract.lower()
+
+
+def test_cli_help_and_build_docstring_state_the_phi_contract_residual(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5385 item 1: the support-bundle help and ``build_bundle``'s docstring must match the
+    manifest's ``phi_contract``. The help named a username as the residual and omitted the
+    DEBUG-logged body the contract names; the docstring said the function reads no "secret value"
+    into the bundle, which the best-effort tail does not meet. The help is read from
+    ``support-bundle --help``, what an operator runs, and each residual term it names must be one
+    the contract names, so the two cannot drift apart unnoticed."""
+    from messagefoundry.__main__ import main
+
+    with pytest.raises(SystemExit) as exc:
+        main(["support-bundle", "--help"])
+    assert exc.value.code == 0
+    # argparse wraps at a hyphen too, so a wrapped "single-token" is joined back before matching.
+    help_text = re.sub(r"-\s+", "-", " ".join(capsys.readouterr().out.split())).lower()
+    out = tmp_path / "bundle.zip"
+    build_bundle(out, config_dir=None, settings=None)
+    contract = json.loads(_members(out)["manifest.json"])["phi_contract"].lower()
+    for term in (
+        "best-effort",
+        "at least",
+        "single-token identifier",
+        "operator username",
+        "debug",
+        "message body",
+        "not as secret-free or phi-free",
+    ):
+        assert term in help_text, term
+        assert term in contract, term
+    assert "phi_contract" in help_text
+
+    doc = " ".join((build_bundle.__doc__ or "").split()).lower()
+    assert "nor any secret value" not in doc
+    assert "neither secret-free nor phi-free" in doc
+    assert "phi_contract" in doc
 
 
 def test_status_snapshot_uses_real_models() -> None:
