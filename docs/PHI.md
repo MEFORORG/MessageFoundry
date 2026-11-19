@@ -818,7 +818,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    range, so the prior key can never open another. `rotate-key` under it re-seals the data and then
    refuses at the audit step, and leaves you worse off. A skip clears when you fix its cause, or
    remove that upload's two files, and re-run: the roll is then a verified no-op and the stamp
-   follows. A new key is only for leaving this key, and clears no skip. Keep the prior key in
+   follows. For a skip whose sidecar every reader refuses, as below, remove that upload's files
+   only deliberately: the sidecar may hold a value under the prior key, so keep that key until the
+   sidecar is fixed or so removed. `rotate-key` gives its advice to remove an upload's two files
+   only for its other skips. A new key is only for leaving this key, and clears no skip. Keep the prior key in
    `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` until a run completes, because a skipped upload may still be
    under it. **To read the chain,** run `messagefoundry audit-verify` with the new key active and the
    prior key retired. If it warns that the audit chain's current range is keyed under a retired
@@ -929,7 +932,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    that holds nothing apart from `skipped`, as `damaged`, so it does not hold the rotation open.
    The command's output does not report that count, and the log names each such upload. The
    startup count agrees with `rotate-key` over each of these kinds: it counts none of their
-   sidecars, and counts the plaintext body under one only where `rotate-key` would seal it.
+   sidecars, and counts the plaintext body under one where `rotate-key` would seal it. It also
+   counts at least a body whose first bytes it reads but whose whole read then fails for a cause
+   other than decoding, which `rotate-key` skips, so the startup count can exceed what that run
+   seals.
    **A part the filesystem refuses the engine is not damaged (BACKLOG #5388).** At least a
    permission or an ACL the engine lacks, and on Windows a file another program holds open, are
    answered on a by-id read where a damaged file's 423 would be, with a 423 whose own text says
