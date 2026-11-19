@@ -74,7 +74,13 @@ function Get-ClaimHostToken {
     # stranded/, which is visible in -Status and is never a double delivery, because the sweep only
     # ever moves claiming/ -> stranded/ and NEVER back to inbox/. Do not "improve" the sweep into a
     # re-queue; that is what would turn this collision into a delivered-twice bug.
-    $n = ([string]$env:COMPUTERNAME).ToLowerInvariant()
+    #
+    # THE ONE HOST RULE (Get-BoxKeyHost -> coord-root.ps1's Get-CoordHost, [Environment]::MachineName),
+    # NEVER $env:COMPUTERNAME. The variable is inherited and overwritable, so two machines with it unset
+    # (every machine hashes "") or set alike would share a token, and a LIVE remote claim would be read
+    # against this machine's process table, judged dead, and swept to stranded/. On an ordinary Windows
+    # host the two read the same name, so existing tokens keep their value.
+    $n = (Get-BoxKeyHost).ToLowerInvariant()
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try { $b = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($n)) }
     finally { $sha.Dispose() }
