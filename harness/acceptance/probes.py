@@ -15,7 +15,6 @@ rules admitting external traffic, service-account ACLs, a real interactive deskt
 from __future__ import annotations
 
 import os
-import socket
 import sys
 import tempfile
 from collections.abc import Callable
@@ -127,24 +126,15 @@ def probe_postgres_client() -> ProbeResult:
     return ProbeResult(Status.PASS, f"asyncpg {getattr(asyncpg, '__version__', '?')}")
 
 
-def _bindable(port: int) -> bool:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        s.bind(("127.0.0.1", port))
-        return True
-    except OSError:
-        return False
-    finally:
-        s.close()
-
-
 def probe_firewall_ports() -> ProbeResult:
-    """A5 — MANUAL: external firewall rules can't be introspected; report local bindability."""
-    parts = [
-        f"{name} {port}: {'free' if _bindable(port) else 'in use'}"
-        for name, port in _DEFAULT_PORTS.items()
-    ]
+    """A5 — MANUAL: external firewall rules can't be introspected; report local bindability.
+
+    Each port's state is the verifier's own ``host.ports`` probe, so the two read a port the same
+    way. The copy this replaced bound 127.0.0.1 with ``SO_REUSEADDR`` and so would have read a held
+    port as free on Windows (BACKLOG #5389)."""
+    from messagefoundry.verify.checks import port_state
+
+    parts = [f"{name} {port}: {port_state(port)}" for name, port in _DEFAULT_PORTS.items()]
     return ProbeResult(
         Status.MANUAL,
         "confirm inbound firewall rules admit these ports from partner hosts",

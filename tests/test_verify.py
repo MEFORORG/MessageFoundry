@@ -249,8 +249,26 @@ def test_listener_ports_skips_ipv6_when_its_family_is_not_enabled(
 def test_listener_ports_does_not_skip_ipv4_on_a_family_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Not skipped, so not free; and not a held port either, so not "in use" (BACKLOG #5389 item 2).
     _refuse_bind(monkeypatch, socket.AF_INET, OSError(errno.EADDRNOTAVAIL, "not available"))
+    assert _evidence_for(2575) == "could not be probed (not available)"
+
+
+@pytest.mark.parametrize("family", [socket.AF_INET, socket.AF_INET6], ids=["ipv4", "ipv6"])
+def test_listener_ports_reads_only_address_in_use_as_in_use(
+    monkeypatch: pytest.MonkeyPatch, family: socket.AddressFamily
+) -> None:
+    _refuse_bind(monkeypatch, family, OSError(errno.EADDRINUSE, "in use"))
     assert _evidence_for(2575) == "in use/bound"
+
+
+@pytest.mark.parametrize("family", [socket.AF_INET, socket.AF_INET6], ids=["ipv4", "ipv6"])
+def test_listener_ports_reads_another_bind_error_as_not_probed(
+    monkeypatch: pytest.MonkeyPatch, family: socket.AddressFamily
+) -> None:
+    # BACKLOG #5389 item 2: any bind error but the family errnos used to read "in use/bound".
+    _refuse_bind(monkeypatch, family, OSError(errno.EINVAL, "invalid argument"))
+    assert _evidence_for(2575) == "could not be probed (invalid argument)"
 
 
 def test_listener_ports_reads_a_failed_socket_call_as_not_probed(

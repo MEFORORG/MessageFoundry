@@ -370,7 +370,7 @@ def check_postgres_driver() -> CheckResult:
 _FAMILY_NOT_ENABLED = frozenset({errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT})
 
 
-def _port_state(port: object) -> str:
+def port_state(port: object) -> str:
     """Report whether a listener could take ``port``: ``free``, ``in use/bound``, ``not bindable by
     this user``, ``could not be probed``, or ``invalid port``.
 
@@ -387,6 +387,10 @@ def _port_state(port: object) -> str:
     On Linux ``SO_REUSEADDR`` only reuses a TIME_WAIT port, as the engine's own listener does, and a
     listening socket still refuses it. Elsewhere (BSD, macOS) it lets a wildcard bind succeed beside
     a listener on one address, so the probe sets neither, and a TIME_WAIT port may read held there.
+
+    Only ``EADDRINUSE`` reads as in use. Any other bind error, at least an IPv4 family error, is
+    ``could not be probed``, so a probe that failed for another reason does not read as a held port
+    (BACKLOG #5389). The harness A5 probe calls this function too, so the two cannot drift apart.
 
     The answer is for the account running verify, which may not be the service account. A free
     result says nothing about an external firewall.
@@ -428,7 +432,9 @@ def _port_state(port: object) -> str:
             if ipv6 and exc.errno in _FAMILY_NOT_ENABLED:
                 _log.debug("port probe skipped IPv6, its family is not enabled: %s", exc)
                 continue
-            return "in use/bound"
+            if exc.errno == errno.EADDRINUSE:  # WSAEADDRINUSE on Windows, where the two are equal
+                return "in use/bound"
+            return f"could not be probed ({exc.strerror or exc})"
         finally:
             s.close()
     return "free"
@@ -439,7 +445,7 @@ def check_listener_ports(ports: Mapping[str, object]) -> CheckResult:
 
     Bindability is the residual this row can measure: a port that reads free here may still be
     blocked by a host or network firewall, which is why the row stays MANUAL."""
-    parts = [f"{name} {port}: {_port_state(port)}" for name, port in ports.items()]
+    parts = [f"{name} {port}: {port_state(port)}" for name, port in ports.items()]
     return CheckResult(
         "host.ports",
         "Listener ports / firewall",
