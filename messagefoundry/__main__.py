@@ -568,11 +568,14 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         # username a credential. A blanket claim resting on a member that does not meet it is the
         # false-premise shape CLAUDE.md section 11 forbids, so the claim was repaired rather than the
         # control -- see BACKLOG #1475 and the exclusion table in
-        # tests/test_log_redaction_secret_domain.py for why the username class stays out.
+        # tests/test_log_redaction_secret_domain.py for why the username class stays out. The help
+        # states the same residual as the manifest's phi_contract (BACKLOG #5385), which is the record.
         help="write a support zip to hand to support (#49): a secret-free config summary "
         "(counts/names only) + a PHI-free /status snapshot + a REDACTED app-log tail. The tail's "
-        "redaction is BEST-EFFORT: a single-token identifier can survive it, an operator username "
-        "included",
+        "redaction is BEST-EFFORT, and values survive it: at least a single-token identifier such "
+        "as an operator username and, on a non-production instance logging at DEBUG, a message body "
+        "the log recorded in a shape the redaction does not read. Handle the zip as a copy of the "
+        "app log, not as secret-free or PHI-free; manifest.json's phi_contract is the record",
     )
     support_bundle.add_argument(
         "--out", required=True, help="path to write the support-bundle .zip"

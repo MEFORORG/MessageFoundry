@@ -361,8 +361,10 @@ def build_bundle(
     is already broken.
 
     Returns a :class:`BundleResult` (the path + member names). The caller is responsible for picking a
-    PHI-safe destination; this function never reads ``.env`` / ``*.db`` content into the bundle nor any
-    secret value."""
+    PHI-safe destination. This function never copies ``.env`` / ``*.db`` content into the bundle, but
+    the bundle is not secret-free: the app-log tail is only best-effort redacted, so at least a value
+    the redaction does not read survives it. The manifest's ``phi_contract`` states that residual and
+    is the record (BACKLOG #5385)."""
     now = time.time() if now is None else now
     members: dict[str, str] = {}
 

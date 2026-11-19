@@ -80,6 +80,31 @@ def test_manifest_phi_contract_does_not_claim_the_bundle_secret_free(tmp_path: P
     assert "not as secret-free or phi-free" in contract.lower()
 
 
+def test_cli_help_and_build_docstring_state_the_phi_contract_residual() -> None:
+    """BACKLOG #5385 item 1: the support-bundle help and ``build_bundle``'s docstring are other records
+    of the manifest's ``phi_contract``. The help used to omit the DEBUG-body residual, and the docstring
+    said the function reads no "secret value" into the bundle, which the best-effort tail does not
+    meet. Both now name what survives the redaction and claim no secret-free bundle."""
+    import argparse
+
+    from messagefoundry.__main__ import _build_parser
+
+    parser, _ = _build_parser()
+    sub = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))
+    entry = next(c for c in sub._choices_actions if c.dest == "support-bundle")
+    help_text = " ".join((entry.help or "").split()).lower()
+    assert "best-effort" in help_text
+    assert "debug" in help_text
+    assert "message body" in help_text
+    assert "at least" in help_text
+    assert "not as secret-free or phi-free" in help_text
+
+    doc = " ".join((build_bundle.__doc__ or "").split()).lower()
+    assert "nor any secret value" not in doc
+    assert "not secret-free" in doc
+    assert "phi_contract" in doc
+
+
 def test_status_snapshot_uses_real_models() -> None:
     # No settings -> engine info from __version__, db None. Built from the REAL status models.
     snap = status_snapshot(None)
