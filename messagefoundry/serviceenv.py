@@ -488,33 +488,42 @@ def _read_string(
 
 
 def _continues_string(entry: str) -> bool:
-    """Whether the registry string ``entry`` may be read as the rest of an empty value the string
-    above it ends on (:func:`_variables`). It may when it holds a non-blank line, no name the
-    refusal is about starts it under the whole-string reading, as one starts
-    ``MEFOR_VALUE_A<LF>X=1``, and its first non-blank line starts no variable under
-    :func:`_line_start`, the rule :func:`_read_string` applies to a later line of one string.
+    """Whether the registry string ``entry`` may continue an empty value the string above it
+    ends on (:func:`_variables`).
 
-    NSSM reads each item as its own variable, so at an item's start that rule is narrowed to
-    what could be key material: a first line holding an equals sign continues the value only
-    when its name is standard base64 text or holds a store-key-sized run
-    (:data:`_KEY_SHAPED_RUN`). So a padded base64 secret, one ``=`` of padding or two, continues
-    it, an error toward refusing, while ``HTTP_PROXY=``, ``MEFOR_SECRETS_DIRECTORY=`` and
-    Windows' own empty-named ``=C:=C:\\x`` entries end it, as the same lines below the value in
-    one string would not. A name of base64 letters alone, such as ``PATH`` set to nothing, still
-    continues it. Only the first non-blank line decides: the item's later lines are read when
-    the strings are joined, as later lines of one string."""
+    It may not when it holds no non-blank line. It may not when a name the refusal is about
+    starts it under the whole-string reading, as one starts ``MEFOR_VALUE_A<LF>X=1``. Otherwise
+    its first non-blank line decides. A first line with no equals sign continues the value.
+
+    NSSM reads each item as its own variable. So a first line with an equals sign continues the
+    value in three cases only. Its name is the text before its first equals sign, stripped, and
+    its value the text after it:
+
+    * the name holds a store-key-sized run (:data:`_KEY_SHAPED_RUN`), whatever the value;
+    * the name is standard base64 text, and the value holds only whitespace and equals signs;
+    * the name is not blank, and the value holds an equals sign and only spaces and tabs beside.
+
+    So ``abc==`` continues it in any alphabet. ``abc=`` continues it only under the first two
+    cases, so ``ab-c_dE=`` ends it. ``PATH=`` continues it too. ``HTTP_PROXY=`` and Windows'
+    own empty-named ``=C:=C:\\x`` entries end it. ``MEFOR_SECRETS_DIRECTORY=`` ends it, since
+    the refusal is about that name. In the three cases :func:`_line_start` reads the first line as
+    starting no variable. So when the strings are joined, the line and the item's later lines
+    are read as later lines of one string."""
     first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), None)
     if first is None:
         return False
     whole, whole_equals, _value = entry.partition("=")
     if whole_equals and _refused_name(whole.strip().upper()):
         return False
-    written, equals, _rest = first.partition("=")
+    written, equals, rest = first.partition("=")
     if not equals:
         return True
     name = written.strip()
     could_be_key = _BASE64_TEXT.fullmatch(name) is not None or _holds_key_run(name)
-    return could_be_key and _line_start(first) is None
+    # A padded secret outside the standard alphabet, such as base64url, reads as a name set to
+    # padding alone. An earlier rule continued on it, so a split padded secret still refuses.
+    padding = bool(name) and bool(rest.strip()) and not rest.strip("= \t")
+    return (could_be_key and _line_start(first) is None) or padding
 
 
 def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:

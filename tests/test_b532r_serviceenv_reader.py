@@ -387,9 +387,7 @@ def test_the_next_item_is_read_as_the_same_lines_below_the_key_in_one_string(
     assert split.unplain_value_names == one_string.unplain_value_names, follower
 
 
-@pytest.mark.parametrize(
-    "item", ["=C:=C:\\x", "MEFOR_SECRETS_DIRECTORY=", "HTTP_PROXY=", "ProgramFiles(x86)= ="]
-)
+@pytest.mark.parametrize("item", ["=C:=C:\\x", "MEFOR_SECRETS_DIRECTORY=", "HTTP_PROXY="])
 def test_the_first_line_shapes_the_readings_differ_on(item: str) -> None:
     """Below the key in one string each line belongs to the key's value, so it refuses; as the
     next item each ends the value above, since NSSM reads the item as its own variable and its
@@ -400,9 +398,47 @@ def test_the_first_line_shapes_the_readings_differ_on(item: str) -> None:
 
 
 def test_an_item_that_sets_the_secrets_directory_is_not_taken_into_the_value_above() -> None:
-    posture = _read(["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=\nC:\\s"])
+    posture_items = ["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=\nC:\\s"]
+    posture = _read(posture_items)
     assert posture.listed == ("MEFOR_SECRETS_DIRECTORY",)
-    assert "The service's lists set no" not in str(service_env_refusal(posture))
+    # A secret of its own makes the refusal speak; the remedy then reads the directory as set.
+    # Without the directory item, the same refusal says the lists set none: the control.
+    secret = "MEFOR_AUTH_OIDC_CLIENT_SECRET=synthetic"
+    refusal = service_env_refusal(_read([*posture_items, secret]))
+    assert refusal is not None
+    assert "The service's lists set no" not in refusal
+    control = service_env_refusal(_read(["MEFOR_STORE_PASSWORD=", secret]))
+    assert control is not None and "The service's lists set no" in control
+
+
+#: A padded secret outside the standard base64 alphabet, split from its name into the next item.
+#: Each reads as a name set to equals signs alone. The item rule of 3085e1d5c55 took that as the
+#: empty value's continuation; the one of 99cc2f7c260 did not.
+_PADDED_OUTSIDE_STANDARD = (
+    "ab-c_dEf==",  # base64url with two ``=`` of padding
+    "abc.def==",  # a dot, in no base64 alphabet
+    base64.urlsafe_b64encode(b"\xfb\xff\xfe-tok-0017x").decode(),  # base64url with ``-`` and ``_``
+    "ProgramFiles(x86)= =",  # a name with a blank inside its padding
+)
+
+
+@pytest.mark.parametrize("item", _PADDED_OUTSIDE_STANDARD)
+@pytest.mark.parametrize("name", ["MEFOR_AUTH_OIDC_CLIENT_SECRET", KEY_CLASS_NAMES[0]])
+def test_a_padded_secret_outside_standard_base64_split_into_the_next_item_refuses(
+    name: str, item: str
+) -> None:
+    posture = _read([f"{name}=", item])
+    assert posture.listed == (name,)
+    assert service_env_refusal(posture) is not None
+    # The same line below the name in one string already refused, so the readings agree.
+    one_string = _read([f"MEFOR_AI_ENVIRONMENT=prod\n{name}=\n{item}"])
+    assert one_string.listed == posture.listed
+
+
+def test_the_base64url_stand_in_is_outside_the_standard_alphabet() -> None:
+    url = _PADDED_OUTSIDE_STANDARD[2]
+    assert url.endswith("==") and "-" in url and "_" in url
+    assert not serviceenv._BASE64_TEXT.fullmatch(url.rstrip("="))
 
 
 def test_a_key_shaped_item_with_an_ordinary_later_line_continues_the_empty_key() -> None:
