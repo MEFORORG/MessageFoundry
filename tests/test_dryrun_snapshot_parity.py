@@ -206,10 +206,12 @@ def _probe_registry() -> Registry:
 
 def test_trace_dry_run_passes_snapshot_on_send_through() -> None:
     # snapshot_on_send=True must reach the run context the traced dry_run activates (the same
-    # ContextVar the engine's copy-on-Send keys on) — and the library default must stay False
-    # (ADR 0104 §8.1: a preview that doesn't opt in does not snapshot).
+    # ContextVar the engine's copy-on-Send keys on), False must turn it off, and the library default
+    # is True, as the engine's is (BACKLOG #5794, ADR 0104 §8.1 as amended).
     reg = _probe_registry()
     on = trace_dry_run(reg, ADT_A01, show_phi=True, snapshot_on_send=True)
-    off = trace_dry_run(reg, ADT_A01, show_phi=True)
+    off = trace_dry_run(reg, ADT_A01, show_phi=True, snapshot_on_send=False)
+    default = trace_dry_run(reg, ADT_A01, show_phi=True)
+    assert _handler_writes(default)["MSH-6"] == "SNAP"
     assert _handler_writes(on)["MSH-6"] == "SNAP"
     assert _handler_writes(off)["MSH-6"] == "NOSNAP"

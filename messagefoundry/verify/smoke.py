@@ -172,7 +172,7 @@ def smoke_self(
     config_dir: str,
     *,
     inbound: str | None = None,
-    snapshot_on_send: bool = False,
+    snapshot_on_send: bool = True,
     graph: Callable[[], Registry] | None = None,
 ) -> CheckResult:
     """Route a synthetic message through the box's config with no side effects (``dry_run``).
@@ -182,10 +182,10 @@ def smoke_self(
     config modules are not run a second time; without it the smoke loads the graph itself.
 
     ``snapshot_on_send`` (ADR 0104) selects the copy-on-Send posture the preview reproduces, matching
-    the live engine's ``[pipeline].snapshot_on_send``. It keeps the library default ``False`` here so a
-    caller that resolves no service settings previews the pre-ADR-0104 behaviour; the verify runner
-    passes the resolved setting (``True`` on a default engine) so the smoke mirrors what actually ships
-    — see :func:`messagefoundry.verify.runner.run_verify`."""
+    the live engine's ``[pipeline].snapshot_on_send``. It defaults ``True``, as the engine and
+    ``[pipeline]`` do (BACKLOG #5794), so a caller that resolves no service settings previews what a
+    default engine delivers; the verify runner passes the resolved setting so the smoke mirrors what
+    the site configured — see :func:`messagefoundry.verify.runner.run_verify`."""
     from pathlib import Path
 
     # One source for the pair, as the classifiers below already do. The id is the grouping and

@@ -490,7 +490,7 @@ def trace_dry_run(
     *,
     inbound: str | None = None,
     show_phi: bool = False,
-    snapshot_on_send: bool = False,
+    snapshot_on_send: bool = True,
 ) -> dict[str, Any]:
     """Dry-run ``raw`` against ``registry`` with the execution tracer installed; return the trace JSON.
 
