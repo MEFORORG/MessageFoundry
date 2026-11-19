@@ -1503,13 +1503,14 @@ def test_an_empty_user_dsn_hides_an_equals_sign_and_states_its_residual() -> Non
     assert "pw;Semi_Sec-83" in scrub_credentials("redis://:pw;Semi_Sec-83@host")
     assert "pw|Pipe_Sec-84" in scrub_credentials("redis://:pw|Pipe_Sec-84@host")
     assert "Lead_At-74" in scrub_credentials("store dsn postgres://svc:@Lead_At-74@db.invalid/m")
-    # Round 4 review: a placeholder the PHI pass wrote first, a percent-encoded password, and a line
-    # where the union keeps the reading before whole, which runs no widened pass.
+    # Round 4 review: a placeholder the PHI pass wrote first, and a percent-encoded password.
     chained = scrub_credentials(redact_untrusted("connect redis://:Zq7-19800505-Kv9x@host failed"))
     assert "Zq7-" in chained and "-Kv9x" in chained, chained
     assert "p%40Kv9x" in scrub_credentials("redis://:p%40Kv9x@host")
+    # No longer a residual (BACKLOG #5386, added item 2): a line where the union keeps the reading
+    # before whole runs the widened pass too. tests/test_b532r_redaction_dsn.py holds the branch.
     kept_before = "connect redis://:Zq-Pw_1@h failed; userPwd='a;PWD=b c'"
-    assert "Zq-Pw_1" in scrub_credentials(kept_before)
+    assert "Zq-Pw_1" not in scrub_credentials(kept_before)
     assert "Zq-Pw_1" not in scrub_credentials("connect redis://:Zq-Pw_1@h failed")
 
 

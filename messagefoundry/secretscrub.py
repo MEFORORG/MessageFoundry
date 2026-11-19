@@ -1318,9 +1318,9 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # password running to the value's "@", took the ``PWD=`` label the label pass needed, and printed
 # the value that label hid (code review, round 4). After the label passes a value they read is a
 # placeholder, which the run after the password stops at; and every pass before this one is the
-# code ``origin/main`` ran, so on one call this pass only hides more. It does not run at all on a
-# line where :func:`_union` keeps the reading before whole, because that reading is kept as
-# ``origin/main``'s, which had no such pass; :func:`_run` names those lines and says why.
+# code ``origin/main`` ran, so on one call this pass only hides more. It runs on both of
+# :func:`_union`'s readings, so also on a line where the union keeps the reading before whole;
+# :func:`_run` names those lines.
 #
 # THE USER MAY BE EMPTY, AND THE PASSWORD MAY HOLD AN "@". The user was
 # ``[^\s:/@]+``, so ``postgres://:<pw>@host`` -- a DSN that sets only a password -- did not match and
@@ -1382,7 +1382,8 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # not as a repeated "@"-led group, so no quantifier nests under another. The static ReDoS gate in
 # ``tests/test_security_static.py`` DOES NOT SCAN this pattern: it splices ``_DSN_RUN_STOP`` below,
 # so that gate lists it among the patterns it cannot resolve, and the shape is held by inspection,
-# stated there.
+# stated there. The growth is held by a stopwatch, against a backtracking control, in
+# ``tests/test_b532r_redaction_dsn.py``.
 #
 # NO SEGMENT CROSSES A LABEL ANOTHER PASS HIDES A VALUE UNDER (code review, rounds 5 and 9). A
 # character of either first segment, or of the run after it, is taken only where no
@@ -2221,18 +2222,18 @@ def _run(
     pre-camelCase reading otherwise. Its last argument names the group a replacement writes back
     masked at its end, which only the tracing reads.
 
-    ``wide`` False leaves out the widened DSN pass (BACKLOG #5386). :func:`_union`'s reading before
-    does, because that reading is kept as the code ``origin/main`` ran, which had no widened pass:
-    it is the reference the union holds the shipped reading to, and it is left as it was rather than
-    widened in this change. Widening it is a separate follow-up. The hazard first given as the reason,
-    the widened run crossing a camelCase label only the shipped reading reads, no longer applies:
-    since every segment of the widened match stops at a label word (``_DSN_RUN_STOP``), on
-    ``redis://:pw@h?accessToken=Tail@Sec`` and ``redis://:pw@h;userPassword=Tail@Sec`` the reading
-    before, widened or not, differs only in ``pw``, which the widened pass hides, and leaves the
-    label and its value the same. So where :func:`_union` returns that reading whole, on a line where the
-    shipped one would hide a member key's ";" and on an untraceable one, the widened pass does not
-    run, and a password-only DSN, or the tail of a password holding an "@", prints there as it did
-    before #5386. The support bundle's own last pass still reads it."""
+    ``wide`` False leaves out the widened DSN pass (BACKLOG #5386). Nothing in this module passes
+    it any more. :func:`_union` runs its reading before with the widened pass, so the pass also
+    runs where the union returns that reading whole: on a line where the shipped reading would hide
+    a member key's ";", and on an untraceable one. Until BACKLOG #5386's added item 2, a
+    password-only DSN, or the tail of a password holding an "@", printed on those lines. The
+    widened pattern holds no camelCase fragment, so :func:`_pre_camel` leaves it as it is and both
+    readings apply the same pattern. The hazard once given for leaving it out, its run crossing a
+    camelCase label only the shipped reading reads, does not arise: every segment of the widened
+    match stops at a label word (``_DSN_RUN_STOP``), and on ``redis://:pw@h?accessToken=Tail@Sec``
+    and ``redis://:pw@h;userPassword=Tail@Sec`` the two readings differ only in ``pw``, which the
+    pass hides. The flag stays for a test that rebuilds the reading as it stood before BACKLOG
+    #5545, which had no widened pass."""
     apply = _plain_sub if sub is None else sub
     if _admits(folded, _ENV_HINT):
         text = apply(_MEFOR_SECRET, lambda m: _keep_label(m, placeholder), text, _BRACED)
@@ -2455,13 +2456,13 @@ def _union(text: str, placeholder: str, folded: str | None) -> str:
     before = _Trace(len(text), _pre_camel)
     shipped = _Trace(len(text), lambda pattern: pattern)
     try:
-        old = _run(text, placeholder, folded, before.sub, wide=False)
+        old = _run(text, placeholder, folded, before.sub)
         if old is text:
             # The reading before hid nothing, so the shipped one alone needs no trace.
             return _run(text, placeholder, folded)
         new = _run(text, placeholder, folded, shipped.sub)
     except _Untraceable:
-        return _run(text, placeholder, folded, _pre_camel_sub, wide=False)
+        return _run(text, placeholder, folded, _pre_camel_sub)
     # What the reading before did with each character of the line: printed it, masked it, or hid it.
     state = bytearray(len(text))  # _HIDDEN
     old_masks: dict[int, str] = {}
