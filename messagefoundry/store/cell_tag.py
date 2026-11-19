@@ -28,9 +28,10 @@ drift. An unmarked value the cipher refuses raises :class:`UnmarkedCellError`: d
 contained, with the cipher's own refusal as its alert (BACKLOG #5650).
 
 **A list-shaped read withholds a cell only for a key the store does not hold** (BACKLOG #5970,
-owner ruling 2026-11-19): a key not supplied, a retired key version or an unknown one
-(:func:`refused_for_key`, which names the marker rewrites it cannot tell from those). Every other
-cipher error fails the read, as it did before #5970.
+owner ruling 2026-11-19): in-process, a key not supplied, a retired key version or an unknown
+one; under Vault Transit, only a retired or unknown key VERSION, never a configured key Transit
+does not find (:func:`refused_for_key`, which names the marker rewrites it cannot tell from
+those). Every other cipher error fails the read, as it did before #5970.
 
 **The store id.** No store id is minted yet, so every tag carries
 :data:`~messagefoundry.store.crypto.NO_STORE_ID`, as the queue tag does.
@@ -38,6 +39,7 @@ cipher error fails the read, as it did before #5970.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import inspect
 import json
@@ -564,8 +566,10 @@ def _transit_refused_for_key(cause: BaseException | None) -> bool:
     or one it has no entry for. Every other 400 is ``False``, at least invalid or truncated
     ciphertext, bad base64, a version number that does not decode, a missing prefix, the
     configured key not found, and a body too long to read. The reply is read by the Transit
-    cipher's own bounded reader. A memory or stack fault reading it is logged and read as
-    ``False``; anything else it raises propagates, which fails the read too."""
+    cipher's own bounded reader. A memory or stack fault reading it reads as ``False``, and is
+    logged by class where the warning can still be written; a second such fault while logging is
+    suppressed, so the warning is lost but the read still fails. Anything else the reader raises
+    propagates in place of the cipher's error, which fails the read too."""
     from messagefoundry.store.crypto_transit import (  # noqa: PLC0415 -- Transit only
         _READ_FAULTS,
         _reply_errors,
@@ -577,10 +581,10 @@ def _transit_refused_for_key(cause: BaseException | None) -> bool:
     try:
         errors, oversize = _reply_errors(cause, bound_parsed=True)
     except _READ_FAULTS as fault:
-        _log.warning(
-            "reading a Transit decrypt 400 raised %s; not read as a key refusal",
-            type(fault).__name__,
-        )
+        kind = type(fault).__name__
+        # Short of memory or stack, logging can fault again; the read still fails either way.
+        with contextlib.suppress(*_READ_FAULTS):
+            _log.warning("reading a Transit decrypt 400 raised %s; not read as a key refusal", kind)
         return False
     if oversize is not None or not isinstance(errors, list) or not errors:
         return False
@@ -592,9 +596,10 @@ def _transit_refused_for_key(cause: BaseException | None) -> bool:
 
 def refused_for_key(cipher: Cipher, exc: CipherError, stored: str | None) -> bool:
     """Whether ``exc``, from opening ``stored``, is the cipher refusing that cell only because it
-    does not hold the key the cell names: a key not supplied, a retired key version, or an unknown
-    one (BACKLOG #5970). Only such a cell may a list-shaped read withhold (owner ruling
-    2026-11-19); every other refusal fails the read.
+    does not hold the key the cell names (BACKLOG #5970): in-process, a key not supplied, a
+    retired key version, or an unknown one; under Transit, a retired or unknown key version only.
+    Only such a cell may a list-shaped read withhold (owner ruling 2026-11-19); every other
+    refusal fails the read.
 
     Under Transit only a retired or unknown key VERSION counts; a configured key Transit does not
     find is a fault of the whole store, so it fails the read.
@@ -657,9 +662,10 @@ def withhold_refused_cell(cipher: Cipher, table: str, exc: CipherError, stored: 
 
 def open_listed_cell(cipher: Cipher, stored: str | None, aad: bytes, *, table: str) -> str | None:
     """Open one cell of a table this module does not tag, for a list-shaped read, or ``None`` when
-    the cipher refuses it only because it does not hold the key the cell names: a key not
-    supplied, a retired key version or an unknown one (:func:`refused_for_key`, BACKLOG #5970).
-    So one such cell withholds that cell rather than failing the page.
+    the cipher refuses it only because it does not hold the key the cell names: in-process, a key
+    not supplied, a retired key version or an unknown one; under Transit, a retired or unknown key
+    version only (:func:`refused_for_key`, BACKLOG #5970). So one such cell withholds that cell
+    rather than failing the page.
 
     Every other refusal raises the cipher's own error, failing the read as it did before #5970
     (owner ruling 2026-11-19): at least an outage, a tag that failed under a key the store holds

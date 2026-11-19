@@ -1295,6 +1295,49 @@ def test_a_transit_refusal_that_names_the_key_beside_another_reason_fails_loudly
 _V3 = "mfenc:v3:vault:v1:AAAA"
 
 
+@pytest.mark.parametrize("fault", [MemoryError, RecursionError])
+@pytest.mark.parametrize("log_faults", [False, True])
+def test_a_memory_fault_reading_a_transit_400_fails_the_list_read(
+    monkeypatch: pytest.MonkeyPatch, fault: type[BaseException], log_faults: bool
+) -> None:
+    """A memory or stack fault while the 400 is read is not a key refusal, so the list read fails
+    with the cipher's own error. A second such fault while logging that is suppressed, and the
+    read still fails with the cipher's error, never the fault."""
+    pytest.importorskip("hvac")
+    from messagefoundry.store import cell_tag, crypto_transit
+
+    cipher = _transit_refusing("no such key version")
+    aad = cell_aad("connection_event", "reason", "IB_A", 1.0, "closed")
+
+    def faulting(*_a: Any, **_kw: Any) -> Any:
+        raise fault
+
+    monkeypatch.setattr(crypto_transit, "_reply_errors", faulting)
+    if log_faults:
+        monkeypatch.setattr(cell_tag._log, "warning", faulting)
+    with pytest.raises(CipherError) as refused:
+        open_listed_cell(cipher, _V3, aad, table="connection_event")
+    assert not isinstance(refused.value, CellTagError)
+
+
+def test_another_fault_reading_a_transit_400_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only a memory or stack fault is caught while the 400 is read; any other propagates, so the
+    list read fails with it rather than withholding the cell."""
+    pytest.importorskip("hvac")
+    from messagefoundry.store import crypto_transit
+
+    cipher = _transit_refusing("no such key version")
+    aad = cell_aad("connection_event", "reason", "IB_A", 1.0, "closed")
+    assert open_listed_cell(cipher, _V3, aad, table="connection_event") is None  # control
+
+    def faulting(*_a: Any, **_kw: Any) -> Any:
+        raise TypeError("synthetic reader fault")
+
+    monkeypatch.setattr(crypto_transit, "_reply_errors", faulting)
+    with pytest.raises(TypeError, match="synthetic reader fault"):
+        open_listed_cell(cipher, _V3, aad, table="connection_event")
+
+
 def _with_cause(error: CipherError, cause: BaseException) -> CipherError:
     error.__cause__ = cause
     return error
