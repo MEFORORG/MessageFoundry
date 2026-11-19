@@ -1045,14 +1045,30 @@ async def run_batch_engine(
 # --- the DRIVER half ---------------------------------------------------------
 
 
+# What a band may spend beyond its own hold and drain windows: signing in, binding its sinks, the
+# engine reads that bracket the hold, and writing its report. A child still running past
+# hold + drain + this is hung, and is killed so it cannot hang the driver (BACKLOG #5304).
+_REMOTE_PROC_SLACK = 300.0
+
+
+def _remote_proc_timeout(hold_seconds: float, drain_timeout: float) -> float:
+    """The wall-clock bound on one ``connscale-remote`` band: its hold, its drain, and the slack."""
+    return hold_seconds + drain_timeout + _REMOTE_PROC_SLACK
+
+
 # Module-level so a structural test can monkeypatch the subprocess spawn (no real connscale-remote runs).
-async def _run_remote_proc(argv: list[str], report_path: Path, cwd: Path) -> dict[str, Any]:
+async def _run_remote_proc(
+    argv: list[str], report_path: Path, cwd: Path, *, timeout: float
+) -> dict[str, Any]:
     """Spawn one ``connscale-remote`` process, wait for it, and return its JSON report. Real work — the
     tests replace this seam with a synthetic report per band so the fleet drive runs offline.
 
     Any file already at ``report_path`` is removed before the spawn (BACKLOG #5304), so only a report
     THIS child wrote can be read: a child that fails before writing would otherwise hand back the band
-    report an earlier run left at the same path."""
+    report an earlier run left at the same path.
+
+    A child still running after ``timeout`` seconds is killed and the band fails, and so is one left
+    running when this wait is cancelled: an unbounded wait let one hung child hang the whole driver."""
     report_path.unlink(missing_ok=True)
     proc = await asyncio.create_subprocess_exec(
         *argv,
@@ -1060,7 +1076,17 @@ async def _run_remote_proc(argv: list[str], report_path: Path, cwd: Path) -> dic
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, said = await proc.communicate()
+    try:
+        _, said = await asyncio.wait_for(proc.communicate(), timeout)
+    except TimeoutError:
+        raise ConnScaleError(
+            f"connscale-remote was still running after {timeout:g}s and was killed"
+        ) from None
+    finally:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            await proc.wait()
     if not report_path.exists():
         # The process writes its report only when it ran. One that could not start (a band layout
         # it refused, a sign-in the engine refused) says why on stderr and writes nothing, and that
@@ -1152,7 +1178,14 @@ async def _drive_cell_fleet(
             drain_timeout=drain_timeout,
             report_path=report_path,
         )
-        tasks.append(_run_remote_proc(argv, report_path, cwd))
+        tasks.append(
+            _run_remote_proc(
+                argv,
+                report_path,
+                cwd,
+                timeout=_remote_proc_timeout(hold_seconds, drain_timeout),
+            )
+        )
     # return_exceptions=True so a crashed band is COLLECTED (never left un-retrieved) and every sibling
     # still completes — then fail the whole cell explicitly if ANY band raised, so the caller records a
     # failed/loss cell instead of the cell silently going absent from the verdict.

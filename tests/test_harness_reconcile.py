@@ -1814,7 +1814,9 @@ async def test_a_crashed_band_carries_its_siblings_reports(
     # Item 7, the driver half: the error a crashed band raises keeps what the other bands wrote.
     calls = 0
 
-    async def one_crashes(argv: list[str], report_path: Path, cwd: Path) -> dict[str, object]:
+    async def one_crashes(
+        argv: list[str], report_path: Path, cwd: Path, *, timeout: float
+    ) -> dict[str, object]:
         nonlocal calls
         calls += 1
         if calls == 1:
