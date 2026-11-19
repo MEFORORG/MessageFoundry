@@ -23,6 +23,7 @@ import pytest
 from messagefoundry.config.settings import BackupSettings, StoreSettings
 from messagefoundry.pipeline import dr_backup
 from messagefoundry.pipeline.dr_backup import BackupError, BackupRunner
+from messagefoundry.redaction import safe_exc
 
 _NOT_A_DATABASE = b"this is not a sqlite database, just synthetic bytes " * 200
 
@@ -110,18 +111,29 @@ def test_a_count_that_will_not_decode_is_a_fail(
     assert "with text" not in result.reason
 
 
-def test_an_integrity_failure_is_reported_even_when_the_count_fails(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_an_integrity_failure_stays_the_verdict_when_the_count_hits_a_snapshot_fault(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """A coded SQLITE_CORRUPT from the count is a snapshot fault, so it reaches the arm that keeps
+    the failed integrity_check as the verdict and logs the count's error."""
+
     def _count_raises(_path: Path) -> dict[str, int]:
-        raise sqlite3.DatabaseError("database disk image is malformed")
+        raise _coded(
+            sqlite3.DatabaseError, "database disk image is malformed", sqlite3.SQLITE_CORRUPT
+        )
 
     monkeypatch.setattr(dr_backup, "_integrity_check", lambda _p: (False, "page 2 is never used"))
     monkeypatch.setattr(dr_backup, "_count_tables", _count_raises)
-    result = _verify(_good_db_archive(tmp_path), tmp_path)
+    with caplog.at_level("WARNING", logger=dr_backup.log.name):
+        result = _verify(_good_db_archive(tmp_path), tmp_path)
     assert result.status == "FAIL"
     assert result.integrity_ok is False
     assert result.reason == "integrity_check failed: page 2 is never used"
+    assert any(
+        "snapshot row count failed after a failed integrity_check" in r.getMessage()
+        and "database disk image is malformed" in r.getMessage()
+        for r in caplog.records
+    )
 
 
 def test_a_volume_fault_in_a_backups_verify_raises_so_nothing_is_quarantined(
@@ -283,13 +295,49 @@ async def test_a_volume_fault_in_a_backups_verify_fails_the_run_naming_the_archi
             secure=False,
         )
     assert caught.value.kind == "write"
-    # The archive's location leads, and the directory the verify's teardown left, which may hold
-    # decrypted bytes, is named after it rather than dropped.
-    assert str(caught.value).startswith("archive written but not verified, left at a.mfbak.part: ")
-    assert str(caught.value).endswith(
-        "disk I/O error; staging directory mefor-verify-x could not be removed"
+    # The directory the verify's teardown left, which may hold decrypted bytes, leads; the
+    # archive's location follows it.
+    assert str(caught.value) == (
+        "staging directory mefor-verify-x could not be removed; "
+        "archive written but not verified, left at a.mfbak.part: OperationalError: disk I/O error"
     )
     assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
+
+
+async def test_the_leftover_plaintext_path_survives_the_failure_records_cut(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure record keeps 200 characters of ``safe_exc``; with a long ``.part`` name the
+    message passes that, and the verify staging directory's path must be in what is kept."""
+    leftover = "staging directory mefor-verify-leftover7 could not be removed"
+
+    def _faulted_verify(**_kw: object) -> object:
+        exc = _coded(sqlite3.OperationalError, "disk I/O error", sqlite3.SQLITE_IOERR)
+        exc.add_note(leftover)
+        raise exc
+
+    monkeypatch.setattr(dr_backup, "_verify_archive_blocking", _faulted_verify)
+    runner = BackupRunner(
+        cast(Any, None),
+        BackupSettings(enabled=True, destination=str(tmp_path / "dest"), verify_after_backup=True),
+        store_settings=StoreSettings(path=str(tmp_path / "msg.db")),
+        config_dir=None,
+        instance="dev",
+    )
+    name = "b" * 160 + ".mfbak"
+    with pytest.raises(BackupError) as caught:
+        await runner._verify_and_publish(
+            tmp_path / f"{name}.part",
+            tmp_path / name,
+            key=None,
+            staging_root=tmp_path,
+            secure=False,
+        )
+    assert len(str(caught.value)) > 200
+    kept = safe_exc(caught.value)
+    # Positive control: the cut applied, so the tail of the message did not survive it.
+    assert "disk I/O error" not in kept
+    assert leftover in kept
 
 
 def _schema_format_5(tmp_path: Path) -> bytes:
