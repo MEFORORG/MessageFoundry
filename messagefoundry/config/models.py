@@ -649,6 +649,19 @@ class ActiveWindow(BaseModel):
             raise ValueError(f"unknown IANA timezone {tz!r}: {exc}") from exc
         return tz
 
+    @field_validator("start", "end")
+    @classmethod
+    def _check_naive(cls, value: time) -> time:
+        # The window's zone is ``timezone``; an offset on the time itself would be a second, conflicting
+        # zone, and :meth:`contains` compares naive local times, so an aware value would raise
+        # TypeError at every schedule tick rather than at load (BACKLOG #5779).
+        if value.tzinfo is not None:
+            raise ValueError(
+                f"active-window start/end must be a wall-clock time with no UTC offset; got "
+                f"{value.isoformat()!r} (set the window's zone with `timezone`)"
+            )
+        return value
+
     @model_validator(mode="after")
     def _check_span(self) -> ActiveWindow:
         if self.start == self.end:
