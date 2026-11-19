@@ -69,7 +69,8 @@ def _writer(msg: Message, src: str) -> Callable[[str, str], None]:
     is. A component write would escape it, escape sequences included, a second time (BACKLOG
     #5821), so a component or subcomponent destination gets it as one leaf's raw text instead
     (:func:`_as_one_leaf`), spliced into the field. Either way, a
-    component or subcomponent of field 1 or 2 of ``MSH``, ``BHS`` or ``FHS`` is refused."""
+    component or subcomponent of field 1 or 2 of ``MSH``, ``BHS`` or ``FHS`` is refused, and a
+    whole-field write there that would change a delimiter is refused by :meth:`Message.set`."""
     from_leaf = parse_path(src)[2] is not None
 
     def write(dst: str, value: str) -> None:
@@ -102,7 +103,7 @@ def copy_field(msg: Message, src: str, dst: str) -> None:
     reads back as ``A^B``. An escape sequence holding a raw control character that decodes to a CR
     or LF, which no component carries, reads back as sent instead. A component or subcomponent
     ``dst`` in field 1 or 2 of ``MSH``, ``BHS`` or ``FHS`` raises :class:`ValueError`, whatever
-    ``src`` is."""
+    ``src`` is, and so does a whole-field one there that would change a delimiter."""
     _writer(msg, src)(dst, msg.field(src) or "")
 
 
@@ -119,7 +120,8 @@ def append_to_field(msg: Message, path: str, suffix: str) -> None:
     escape sequences are kept as sent rather than decoded and written back (BACKLOG #5928). On a
     whole-field path ``suffix`` is appended to the raw text, as the structure a whole-field
     :meth:`Message.set` takes. A component or subcomponent path raises :class:`ValueError` on field
-    1 or 2 of ``MSH``, ``BHS`` or ``FHS``."""
+    1 or 2 of ``MSH``, ``BHS`` or ``FHS``, and so does a whole-field path there whose result would
+    change a delimiter."""
     seg, fld, comp, _sub = parse_path(path)
     if comp is not None:
         _refuse_delimiter_field(seg, fld, path)
@@ -562,8 +564,8 @@ def copy_segment(
     Reads the ``occurrence``-th (1-based) ``segment_id`` from the message and re-adds an identical
     segment. The copy is appended by default, or inserted at 1-based ``index`` among segments (``1`` =
     just after MSH). Raises :class:`KeyError` if the source segment/occurrence is absent, and
-    :class:`ValueError` (from :meth:`Message.add_segment`) for an ``MSH`` copy or an out-of-range
-    ``index``."""
+    :class:`ValueError` (from :meth:`Message.add_segment`) for an ``MSH``, ``BHS`` or ``FHS`` copy
+    or an out-of-range ``index``."""
     line = _segment_line(msg, segment_id, occurrence)
     if line is None:
         where = segment_id + (f" occurrence {occurrence}" if occurrence > 1 else "")
@@ -623,7 +625,7 @@ def _seps(msg: Message) -> _Seps:
 
 
 def _refuse_delimiter_field(seg: str, fld: int, path: str) -> None:
-    if seg in ("MSH", "BHS", "FHS") and fld in (1, 2):
+    if _builtin_hl7.is_delimiter_field(seg, fld):
         raise ValueError(f"cannot transform {path}: fields 1 and 2 hold the delimiters themselves")
 
 

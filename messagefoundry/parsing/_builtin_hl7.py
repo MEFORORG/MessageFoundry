@@ -70,6 +70,8 @@ __all__ = [
     "encode_with_separators",
     "segment_ids",
     "separators",
+    "HEADER_IDS",
+    "is_delimiter_field",
     "unescape",
     "unescape_separators",
     "escape_leaf",
@@ -141,6 +143,10 @@ class ParsedMessage(TypedDict):
 # Parse
 # ---------------------------------------------------------------------------
 
+
+#: The header segments whose fields 1 and 2 hold the delimiters themselves (MSH-1/MSH-2,
+#: BHS-1/BHS-2, FHS-1/FHS-2), numbered by the hidden offset :func:`_parse_msh` describes.
+HEADER_IDS = ("MSH", "BHS", "FHS")
 
 #: How much of a header line :func:`_extract_separators` reads: the id, MSH-1 and four encoding
 #: characters. :func:`_first_line_head` cuts the pre-parse read to the same width.
@@ -216,7 +222,7 @@ def parse(norm: str) -> ParsedMessage:
     """
     strmsg = norm.strip()
     lines = strmsg.split("\r")
-    if lines[0][:3] not in ("MSH", "FHS", "BHS"):
+    if lines[0][:3] not in HEADER_IDS:
         raise HL7ParseError("message does not start with an MSH segment or an FHS/BHS batch header")
     # A header too short to hold MSH-1 and one encoding character ("MSH", "MSH|") cannot be read at
     # all. That is bad input, not a parser fault, so it is the same contract error (BACKLOG #1601).
@@ -232,7 +238,7 @@ def parse(norm: str) -> ParsedMessage:
             # The first segment is MSH/BHS/FHS; split it eagerly off its own separators.
             segments.append(_parse_msh(line, seps))
             continue
-        if line[:3] in ("MSH", "BHS", "FHS"):
+        if line[:3] in HEADER_IDS:
             # A further header-style line (e.g. a stray MSH) also splits eagerly.
             if len(line) < 4:
                 raise HL7ParseError(_SHORT_HEADER)
@@ -478,7 +484,7 @@ def extract_field(
     # never split — python-hl7 returns their value **raw** (un-unescaped) for a comp=1/sub=1 read, and
     # raises ``IndexError`` for any deeper index (the path runs past the leaf). Handle before the split
     # logic so MSH-2's ``^~\&`` is not mistaken for component structure.
-    if seg_id in ("MSH", "BHS", "FHS") and fld in (1, 2):  # noqa: SIM102
+    if is_delimiter_field(seg_id, fld):  # noqa: SIM102
         if fld < len(fields):
             if comp_num == 1 and sub_num == 1:
                 return _field_text(fields[fld]) or None
@@ -588,6 +594,11 @@ def count_segments(msg: ParsedMessage, seg_id: str) -> int:
         for i, seg in enumerate(msg["segments"])
         if seg["id"] == seg_id and not _is_fieldless(msg, i)
     )
+
+
+def is_delimiter_field(seg_id: str, fld: int) -> bool:
+    """Whether ``seg_id``-``fld`` is a header's field separator or encoding characters."""
+    return seg_id in HEADER_IDS and fld in (1, 2)
 
 
 def separators(msg: ParsedMessage) -> tuple[str, str, str, str, str]:
@@ -1098,7 +1109,7 @@ def _encode_segment(
 
     field_sep = seps[0]
     texts = [_field_text(f) if not isinstance(f, str) else f for f in fields]
-    if seg["id"] in ("MSH", "BHS", "FHS") and len(texts) >= 3:
+    if seg["id"] in HEADER_IDS and len(texts) >= 3:
         return _join_header(texts, field_sep)
     return field_sep.join(texts)
 
@@ -1149,7 +1160,7 @@ def _encode_segment_raw_separators(
     seg = msg["segments"][seg_index]
     seg_id = seg["id"]
     field_sep = seps[0]
-    if seg_id in ("MSH", "BHS", "FHS"):
+    if seg_id in HEADER_IDS:
         # Header segments are always split eagerly (never lazy); MSH-1/MSH-2 stay raw, fields 3+ convert.
         fields = seg["fields"]
         texts = [_field_text(f) if not isinstance(f, str) else f for f in fields]
