@@ -1131,7 +1131,10 @@ async def test_engine_clustered_spawns_convergence_and_seeds_applied(tmp_path: P
     try:
         await eng.start()
         assert eng._config_convergence is not None  # spawned in clustered mode
-        assert eng._state_convergence is not None  # Track B Step 6b: also spawned in clustered mode
+        # BACKLOG #5984: NOT spawned over this SQLite store, whose converge_state_cache is a no-op; the
+        # engine warns instead of announcing a convergence nothing performs
+        # (tests/test_backlog5984_state_convergence.py covers the converging profile).
+        assert eng._state_convergence is None
         assert eng._applied_config_version == 4  # seeded → fresh node does not self-reload
     finally:
         await eng.stop()

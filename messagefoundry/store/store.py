@@ -11479,6 +11479,10 @@ class MessageStore:
     # can't, failing closed rather than silently dropping captures.
     supports_response_capture = True
 
+    # Single-writer: converge_state_cache is a no-op, so the engine runs no convergence loop over this
+    # backend (BACKLOG #5984).
+    converges_transform_state = False
+
     # This backend implements pass-through (PT) re-ingress — the foundational slice of the
     # `pt_deliveries` branch of transform_handoff (ConnectorType.PT, ADR 0013 generalized) lands here.
     # The engine ALLOW-LISTS PT to this backend only: a graph with a PT inbound on any backend whose
@@ -14464,6 +14468,10 @@ class MessageStore:
     def enable_state_convergence(self) -> None:
         """No-op on SQLite (Track B Step 6b): there is no cross-node convergence on this backend, so there
         is no per-namespace version to bump. Present for ``Store`` protocol completeness."""
+        return None
+
+    async def reload_state_cache(self) -> None:
+        """No-op on SQLite (BACKLOG #5984): this handle is the sole writer, so its cache is current."""
         return None
 
     async def _apply_state_op(

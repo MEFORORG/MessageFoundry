@@ -12,8 +12,12 @@ convergence Step 6 ships (:class:`~messagefoundry.pipeline.reference_sync.Refere
 :class:`StateConvergenceRunner` is the engine-owned background loop on every clustered node that, each
 interval, calls a converge callable (``store.converge_state_cache``) which read-throughs any namespace
 whose shared per-namespace version is newer than the one this node reflects, and logs the refreshed
-namespace **names** (never keys/values — those may be PHI). The engine only spawns it in clustered mode
-(``coordinator.is_clustered()``), so single-node / SQLite never pays for it.
+namespace **names** (never keys/values — those may be PHI). The engine spawns it only where another
+process shares the store, in clustered mode (``coordinator.is_clustered()``) or on an engine shard of a
+multi-shard config, and only over a backend whose ``converge_state_cache`` really converges
+(``store.converges_transform_state``, Postgres alone today). Over SQL Server the converge is a no-op, so
+the engine warns instead of starting a loop whose start line would announce a convergence nothing
+performs (BACKLOG #5984). A lone process never pays for it.
 
 It mirrors :class:`~messagefoundry.pipeline.config_convergence.ConfigConvergenceRunner`'s shape
 (``start``/``stop``/``_run``/``_sleep``/``converge_once``, supervised + cooperatively cancellable) and
@@ -77,7 +81,7 @@ class StateConvergenceRunner:
         self._stop.clear()
         self._task = asyncio.create_task(self._run())
         log.info(
-            "cluster transform-state convergence enabled: read-through every %gs",
+            "transform-state convergence enabled: read-through every %gs",
             self._interval_seconds,
         )
 

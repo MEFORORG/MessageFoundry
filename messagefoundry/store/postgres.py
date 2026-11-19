@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -64,6 +65,7 @@ from collections.abc import (
     Callable,
     Collection,
     Iterable,
+    Iterator,
     Mapping,
     MutableMapping,
     Sequence,
@@ -73,7 +75,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from time import perf_counter
 from types import MappingProxyType
-from typing import Any, Final, assert_never
+from typing import Any, ClassVar, Final, assert_never
 from uuid import uuid4
 
 from messagefoundry.config.models import RetryPolicy
@@ -2068,6 +2070,11 @@ class PostgresStore:
     # complete_with_response), with the same single-transaction atomicity as SQLite.
     supports_response_capture = True
 
+    # The per-namespace state_version bump makes converge_state_cache a real read-through of another
+    # process's transform-state writes (Track B Step 6b), so the engine runs the convergence loop over
+    # this backend in a cluster AND across engine shards on one node (BACKLOG #5984).
+    converges_transform_state = True
+
     # Pass-through (PT) re-ingress (the `pt_deliveries` branch of transform_handoff, ADR 0013
     # generalized) is implemented at full SQLite parity: the atomic PT-child + parent-marker branch runs
     # inside transform_handoff's transaction (see _insert_passthrough_child_pg / _insert_passthrough_
@@ -2196,9 +2203,10 @@ class PostgresStore:
         # FOLLOWER must re-read (read-through), mirroring _reference_versions for reference sets. Seeded at
         # open (_load_state_cache) and advanced on every gated transform_handoff/purge_state bump.
         self._state_versions: dict[str, int] = {}
-        # Gates the in-txn state-version bump. The engine flips it on (enable_state_convergence) only when
-        # clustered, BEFORE workers start; single-node never turns it on, so no state_version rows are ever
-        # written and the backend stays byte-identical.
+        # Gates the in-txn state-version bump. The engine flips it on (enable_state_convergence) only where
+        # another process shares the store (a cluster, or engine shards), BEFORE workers start; a lone
+        # process never turns it on, so no state_version rows are ever written and the backend stays
+        # byte-identical.
         self._cluster_state_convergence: bool = False
         # H1 fencing token: the leader epoch this node currently holds + the leader_lease row to validate
         # it against, both pushed by the engine on promotion via set_leader_epoch() (the store NEVER
@@ -3375,7 +3383,14 @@ class PostgresStore:
 
         Also seeds :attr:`_state_versions` from ``state_version`` (Track B Step 6b): a fresh clustered node
         loads the WHOLE ``state`` table here (so it starts fully converged), and recording the per-namespace
-        versions means its first convergence tick won't needlessly re-read every namespace it already holds."""
+        versions means its first convergence tick won't needlessly re-read every namespace it already holds.
+
+        The versions are read BEFORE the rows, the read-skew-safe order :meth:`converge_state_cache`
+        uses: a sibling's write landing between the two reads then leaves the recorded version below
+        the shared one, so the first tick re-reads it, rather than above the rows loaded, which would
+        skip it for the life of the process (BACKLOG #5984)."""
+        vrows = await self._fetchall("SELECT namespace, version FROM state_version")
+        versions = {r["namespace"]: int(r["version"]) for r in vrows}
         rows = await self._fetchall("SELECT namespace, key, value FROM state")
         cache = new_state_cache()  # sealed (BACKLOG #1174); the decrypt below still fails closed
         for r in rows:
@@ -3383,8 +3398,7 @@ class PostgresStore:
                 r["namespace"], r["key"], r["value"]
             )
         self._state_cache = cache
-        vrows = await self._fetchall("SELECT namespace, version FROM state_version")
-        self._state_versions = {r["namespace"]: int(r["version"]) for r in vrows}
+        self._state_versions = versions
 
     def _decode_state_cell(self, namespace: str, key: str, stored: str) -> Any:
         """Decrypt and decode one ``state`` cell, for both the open-time load and the follower
@@ -3465,10 +3479,72 @@ class PostgresStore:
         return refreshed
 
     def enable_state_convergence(self) -> None:
-        """Turn on per-namespace state-version bumping (Track B Step 6b). The engine calls this in a
-        cluster (is_clustered()) BEFORE workers start, so a sibling's converge_state_cache sees every
-        write. Single-node never calls it → no state_version writes → byte-identical."""
+        """Turn on per-namespace state-version bumping (Track B Step 6b). The engine calls this whenever
+        another process shares the store, in a cluster (is_clustered()) or on an engine shard of a
+        multi-shard config (BACKLOG #5984), BEFORE workers start, so a sibling's converge_state_cache
+        sees every write. A lone process never calls it → no state_version writes → byte-identical."""
         self._cluster_state_convergence = True
+
+    async def reload_state_cache(self) -> None:
+        """No-op on Postgres (BACKLOG #5984): a sibling's writes already reach this handle through
+        :meth:`converge_state_cache`, whose runner is live before any promotion, and a whole-cache
+        reload racing that runner could only regress it."""
+        return None
+
+    def _record_own_state_bumps(self, bumped: list[tuple[str, int]]) -> None:
+        """Record the versions this handle's own committed write bumped each namespace to.
+
+        Only a CONTIGUOUS bump (the held version was ``ver - 1``) proves this handle reflects ``ver``:
+        a gap means another process bumped in between, and recording ``ver`` would make the next
+        converge skip that sibling's write for good (BACKLOG #5984; engine shards write the same
+        namespaces at once). Any other record, a gap or a late record at or below the held version,
+        sets a fresh stale mark (:meth:`_new_stale_mark`).
+
+        A stale mark matches no shared version, so the next converge re-reads the namespace, and it
+        matches no value held before, so a converge in flight whose captured ``seen`` it replaced
+        merges rather than reseeds. Recording ``ver - 1`` on a gap could do neither reliably: two
+        transform workers in this process recording out of order could land it back on that ``seen``,
+        and that pass would reseed destructively and drop the later write's just-published key for a
+        tick. A late record also must not leave the held version alone: the write published its
+        value just before, possibly over a newer sibling value a converge already read, so the
+        namespace has to be re-read."""
+        for ns, ver in bumped:
+            held = self._state_versions.get(ns, 0)
+            self._state_versions[ns] = ver if held == ver - 1 else self._new_stale_mark()
+
+    # Process-wide source of stale marks: negative, so never a shared version (those start at 1), and
+    # each drawn once. Only the event loop draws from it.
+    _stale_marks: ClassVar[Iterator[int]] = itertools.count(-1, -1)
+
+    def _new_stale_mark(self) -> int:
+        """A held-version value that equals no shared version and no value this handle held before, so
+        the namespace is re-read on the next converge and an in-flight converge sees it change."""
+        return next(self._stale_marks)
+
+    async def _bump_state_versions(
+        self, conn: Any, namespaces: Iterable[str], now: float
+    ) -> list[tuple[str, int]]:
+        """Bump each distinct namespace's ``state_version`` row in ``conn``'s transaction, in sorted
+        order, and return the versions bumped to.
+
+        Every path that locks these rows takes them in one global order, so two engine shards (or two
+        cluster nodes) bumping overlapping namespaces cannot deadlock on the ``state_version`` rows,
+        as a first-appearance order could (BACKLOG #5984). The ``state`` rows a write or purge locks
+        before this are not ordered here."""
+        bumped: list[tuple[str, int]] = []
+        for ns in sorted(set(namespaces)):
+            row = await conn.fetchrow(
+                "INSERT INTO state_version (namespace, version, updated_at) "
+                "VALUES ($1, 1, $2) "
+                "ON CONFLICT (namespace) DO UPDATE SET "
+                "version = state_version.version + 1, updated_at = excluded.updated_at "
+                "RETURNING version",
+                ns,
+                now,
+            )
+            assert row is not None, "state_version upsert returned no row"
+            bumped.append((ns, int(row["version"])))
+        return bumped
 
     async def converge_state_cache(self) -> list[str]:
         """Pull any newer shared transform-state writes into this node's local cache (Track B Step 6b).
@@ -3517,11 +3593,17 @@ class PostgresStore:
                 # window, advancing the DB version past `version`. A destructive reseed from the stale
                 # `fresh` would drop that just-committed local key; merge non-destructively instead
                 # (setdefault keeps any newer local value) so the sibling rows we read still land. We
-                # deliberately record `version` (< the DB version the local write bumped to) so the next
-                # tick does a clean reseed that reconciles any sibling deletes this merge could not see.
+                # deliberately record a stale mark, so the next tick does a clean reseed that
+                # reconciles any sibling update or delete this merge kept a stale local value over.
+                # Recording `version` was safe only while the local write always landed after the
+                # scan; with engine shards writing at once it can land before it, and the scanned
+                # version is then the shared one. `version - 1` is no better: a later own bump to
+                # `version` would read as contiguous and raise the held version to the shared one
+                # with the stale value still cached (BACKLOG #5984).
                 for k, v in fresh.items():
                     if (ns, k) not in self._state_cache:  # setdefault would decrypt the kept value
                         self._state_cache[(ns, k)] = v
+                version = self._new_stale_mark()
             self._state_versions[ns] = version
             refreshed.append(ns)
         return refreshed
@@ -5008,18 +5090,9 @@ class PostgresStore:
                 # here, so the bump never double-applies.
                 bumped: list[tuple[str, int]] = []
                 if self._cluster_state_convergence and state_ops:
-                    for ns in dict.fromkeys(n for n, _, _ in state_ops):  # distinct, order-stable
-                        row = await conn.fetchrow(
-                            "INSERT INTO state_version (namespace, version, updated_at) "
-                            "VALUES ($1, 1, $2) "
-                            "ON CONFLICT (namespace) DO UPDATE SET "
-                            "version = state_version.version + 1, updated_at = excluded.updated_at "
-                            "RETURNING version",
-                            ns,
-                            now,
-                        )
-                        assert row is not None, "state_version upsert returned no row"
-                        bumped.append((ns, int(row["version"])))
+                    bumped = await self._bump_state_versions(
+                        conn, (n for n, _, _ in state_ops), now
+                    )
                 total_targets = len(deliveries) + len(pt_deliveries)
                 await self._event(
                     conn,
@@ -5045,8 +5118,7 @@ class PostgresStore:
             self._state_cache[ck] = cv
         # The writer records its own new per-namespace versions so its own converge_state_cache() skips
         # re-reading the namespaces it just wrote (Track B Step 6b).
-        for ns, ver in bumped:
-            self._state_versions[ns] = ver
+        self._record_own_state_bumps(bumped)
         return True
 
     # --- transform-state / reference views (ADR 0005 / 0006) -----------------
@@ -12329,26 +12401,14 @@ class PostgresStore:
             purged_keys = [(r["namespace"], r["key"]) for r in rows]
             bumped: list[tuple[str, int]] = []
             if self._cluster_state_convergence:
-                for ns in dict.fromkeys(n for n, _ in purged_keys):  # distinct, order-stable
-                    vrow = await conn.fetchrow(
-                        "INSERT INTO state_version (namespace, version, updated_at) "
-                        "VALUES ($1, 1, $2) "
-                        "ON CONFLICT (namespace) DO UPDATE SET "
-                        "version = state_version.version + 1, updated_at = excluded.updated_at "
-                        "RETURNING version",
-                        ns,
-                        now,
-                    )
-                    assert vrow is not None, "state_version upsert returned no row"
-                    bumped.append((ns, int(vrow["version"])))
+                bumped = await self._bump_state_versions(conn, (n for n, _ in purged_keys), now)
         # Commit succeeded → evict the purged keys from the read-through cache.
         for ck in purged_keys:
             # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
             if ck in self._state_cache:
                 del self._state_cache[ck]
         # Record this node's new per-namespace versions so its own converge skips re-reading them.
-        for ns, ver in bumped:
-            self._state_versions[ns] = ver
+        self._record_own_state_bumps(bumped)
         return len(purged_keys)
 
     async def wal_checkpoint(self) -> None:
