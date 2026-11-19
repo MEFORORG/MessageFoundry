@@ -155,7 +155,8 @@ def test_setstate_bounds_each_field_and_the_pair_in_utf16_units() -> None:
     with pytest.raises(StateKeyError, match="key is 258 UTF-16 code units"):
         SetState("ns", astral * 129, 1)
     # A lone surrogate is refused as a key fault, not raised as a bare UnicodeEncodeError, and at
-    # construction rather than inside the handoff's cell_aad encode.
+    # construction rather than inside the handoff, where the backend's bind of the key would raise
+    # it as a store error. cell_aad binds a lone surrogate via surrogatepass (BACKLOG #5962).
     for lone in (chr(0xD800), chr(0xDFFF), "MRN-" + chr(0xDC80)):
         with pytest.raises(StateKeyError, match="lone surrogate") as exc:
             SetState("ns", lone, 1)

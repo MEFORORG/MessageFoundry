@@ -504,7 +504,8 @@ Design + build:
   text, so a SQLite `INTEGER` id and a Postgres/SQL Server `BIGINT` for the same logical row yield
   identical AAD — a cross-backend backup/restore of a v2 value stays decryptable). Since BACKLOG #5962
   a number is spelled by its value, so an integral float binds the same bytes as the int, and `None`
-  or a `bool` component is refused; the cell_aad docstring holds the full spelling.
+  or a `bool` component is refused; the `_aad_component` docstring in the same file holds the full
+  spelling.
 - **v1 stays FROZEN (CRYPTO-1).** AAD rides ONLY the additive `mfenc:v2` writer; `decrypt` dispatches AAD
   by marker version (v1 → `None`, v2 → the caller's `aad`), so legacy v1 rows still read (**dual-read**)
   and `messagefoundry rotate-key` upgrades a row v1 → cell-bound v2 in place under `[store].aad_bind`.

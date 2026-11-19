@@ -326,11 +326,12 @@ _GCM_RESERVE_REFILL_AT = _GCM_RESERVE_BLOCK // 2
 
 # --- cell-bound AAD (ASVS 11.3.3, ADR 0019) -----------------------------------------------------------
 # The scheme tag prefixed into every cell_aad. Its own version so the AAD-construction scheme can evolve
-# additively (a future mfenc-aad/v2 would be a different bound value — a deliberate, migrated change,
-# never a silent one). NOT related to the mfenc marker version. BACKLOG #5962 changed at least v1's
-# spelling of an integral float ("1000.0" became "1000") and of a mixin-Enum member ("E.A" became its
-# value) without a bump, because nothing is deployed. A cell already sealed under the old spelling of
-# either, such as a connection_event reason written with now=1000.0, no longer opens.
+# additively: a change to the bound value is meant to take a new tag (a future mfenc-aad/v2) and a
+# migration, so it is deliberate. NOT related to the mfenc marker version. BACKLOG #5962 is the
+# recorded exception: it changed at least v1's spelling of an integral float ("1000.0" became "1000")
+# and of a mixin-Enum member ("E.A" became its value) under the same tag, with no migration, because
+# nothing is deployed. A cell sealed under the old spelling of either, such as a connection_event
+# reason written with now=1000.0, would no longer open.
 _AAD_SCHEME = b"mfenc-aad/v1"
 
 
@@ -382,9 +383,11 @@ def _aad_component(value: object) -> bytes:
     SQLite row hands back, keeps its ``str()`` spelling, so a keyless open or a read whose cell is
     NULL does not fail on it.
 
-    Not covered: a float bound into a TEXT-affinity key column comes back as the text ``"1000.0"``,
-    and an int past 2**53 written to a float column comes back rounded. No key column today takes
-    either."""
+    Not covered, at least: a float bound into a TEXT-affinity key column comes back as the text
+    ``"1000.0"``; an int past 2**53 written to a float column comes back rounded; and a ``Decimal``
+    a NUMERIC or DECIMAL column hands back keeps its ``str()`` spelling, so ``Decimal("1000.0")``
+    binds ``1000.0``, not the ``1000`` an int or integral float binds. No key column today takes
+    the first two."""
     if isinstance(value, str):
         return str.encode(value, "utf-8", "surrogatepass")
     if isinstance(value, int):  # cell_aad has already refused a bool
