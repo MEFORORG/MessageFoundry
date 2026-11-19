@@ -604,9 +604,20 @@ class FileDestination(DestinationConnector):
         try:
             await self._run_fs(self._write, payload)
         except OSError as exc:
-            # Raised before a name was rendered, so the only path it can quote is the configured
-            # directory. A failure after it comes back from _write already as a DeliveryError.
-            raise DeliveryError(f"file write failed: {exc}") from exc
+            # The text goes at least to last_error and the alert reason, so it keeps the type, errno
+            # and OS text, never the raw OS message, as _write does (BACKLOG #5302). A credential
+            # logon error carries fixed words and a Win32 code, so its message is kept.
+            fixed_message = isinstance(exc, wincred.CredentialLogonError)
+            reason = (
+                _describe_os_error(exc)
+                if exc.errno is not None or fixed_message
+                else type(exc).__name__
+            )
+        else:
+            return
+        # Raised outside the handler, so the OS error is neither __cause__ nor __context__. The
+        # configured directory goes last, so the store's length bound cuts it before the reason.
+        raise DeliveryError(f"file write failed: {reason} (directory {self.directory})")
 
     async def validate_startup(self) -> None:
         """Opt-in at-start directory validation (#114) — the outbound mirror of
@@ -662,9 +673,12 @@ class FileDestination(DestinationConnector):
         already probed ``is_dir()`` on its ``FileExistsError`` branch, which is the common one."""
         if self.validate_directory:
             if not self.directory.is_dir():
+                # An errno, so send reports the words; it names the directory itself.
                 raise FileNotFoundError(
-                    f"destination directory {self.directory} does not exist and validate_directory is "
-                    "on, so it is never created on write"
+                    errno.ENOENT,
+                    "destination directory does not exist and validate_directory is on, so it is "
+                    "never created on write",
+                    str(self.directory),
                 )
             return
         try:

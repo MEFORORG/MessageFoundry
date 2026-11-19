@@ -32,6 +32,7 @@ from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore
+from messagefoundry.transports import wincred
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
@@ -192,3 +193,69 @@ async def test_an_error_with_no_errno_keeps_only_what_names_no_file(
     with pytest.raises(DeliveryError) as caught:
         await _file_destination(tmp_path / "out").send(BODY)
     assert kept in str(caught.value) and MRN not in _traceback(caught.value)
+
+
+async def test_send_reports_an_error_before_the_name_by_errno_and_directory(tmp_path: Path) -> None:
+    # BACKLOG #5302: a regular file sits at the configured directory, so making it fails before a
+    # name is rendered. send's own arm reports it by type, errno and the configured directory.
+    out = tmp_path / "out"
+    out.write_text("not a directory", encoding="utf-8")
+    with pytest.raises(DeliveryError) as raised:
+        await _file_destination(out).send(BODY)
+    text = str(raised.value)
+    assert text.startswith(f"file write failed: FileExistsError: [Errno {errno.EEXIST}]")
+    assert text.endswith(f"(directory {out})")
+    # The raw OS error is not chained, so a traceback of the delivery error cannot print it.
+    assert raised.value.__cause__ is None and raised.value.__context__ is None
+
+
+async def test_send_reports_a_missing_validated_directory_in_words(tmp_path: Path) -> None:
+    out = tmp_path / "out"
+    dest = _file_destination(out)
+    dest.validate_directory = True
+    with pytest.raises(DeliveryError) as raised:
+        await dest.send(BODY)
+    assert str(raised.value) == (
+        f"file write failed: FileNotFoundError: [Errno {errno.ENOENT}] destination directory does "
+        f"not exist and validate_directory is on, so it is never created on write (directory {out})"
+    )
+
+
+@pytest.mark.parametrize(
+    ("raised", "kept"),
+    [
+        (
+            PermissionError(errno.EACCES, os.strerror(errno.EACCES), f"out/{MRN}_SYNTHETIC.hl7"),
+            f"PermissionError: [Errno {errno.EACCES}] {os.strerror(errno.EACCES)} (directory",
+        ),
+        (
+            OSError(f"share refused out/{MRN}_SYNTHETIC-1.hl7"),
+            "file write failed: OSError (directory",
+        ),
+        (
+            wincred.CredentialLogonError(
+                "alternate Windows credential logon failed (win32 error 5)"
+            ),
+            "CredentialLogonError: alternate Windows credential logon failed (win32 error 5)",
+        ),
+    ],
+    ids=["errno", "message-only", "credential-logon"],
+)
+async def test_send_never_carries_a_raw_os_error_text(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: OSError, kept: str
+) -> None:
+    # BACKLOG #5302: whatever path an OS error reaching send's arm quotes, only its type, errno and
+    # OS text reach the delivery error, its traceback and the stored text. A message-only error
+    # keeps its type alone, except a credential logon error, whose words are fixed.
+    dest = _file_destination(tmp_path / "out")
+
+    def refuse(payload: str) -> None:
+        raise raised
+
+    monkeypatch.setattr(dest, "_write", refuse)
+    with pytest.raises(DeliveryError) as caught:
+        await dest.send(BODY)
+    text = str(caught.value)
+    assert kept in text and text.endswith(f"(directory {tmp_path / 'out'})")
+    assert MRN not in text and MRN not in _traceback(caught.value)
+    assert MRN not in safe_exc(caught.value)
