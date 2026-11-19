@@ -85,8 +85,8 @@ $ErrorActionPreference = 'Stop'
 # Set here so the trap below never reads a caller's variable of the same name.
 $log = $null
 $code = $null
+$childExit = $null
 $pruneStarted = $false
-$savedPromptEnv = $null
 # In UTC: Task Scheduler's limit counts elapsed time, and a local clock repeats an hour at the DST
 # fall-back, which would put this deadline an hour past the kill.
 $deadline = if ($PSBoundParameters.ContainsKey('StopAfterMinutes')) { [DateTime]::UtcNow.AddMinutes($StopAfterMinutes) } else { $null }
@@ -139,8 +139,6 @@ function Exit-Run([int]$Code) {
         Sort-Object LastWriteTime -Descending |
         Select-Object -Skip $KeepLogs |
         Remove-Item -Force -ErrorAction SilentlyContinue
-    # A hand run with `&` shares this process, so the operator's shell gets its prompts back.
-    if ($savedPromptEnv) { foreach ($k in $savedPromptEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $savedPromptEnv[$k]) } }
     exit $Code
 }
 
@@ -193,17 +191,55 @@ if (-not $RepoRoot) {
 
 $pruneArgs = @('-RepoRoot', $RepoRoot)
 if ($Apply) { $pruneArgs += '-Apply' }
-if ($PSBoundParameters.ContainsKey('IdleHours')) { $pruneArgs += @('-IdleHours', $IdleHours) }
+if ($PSBoundParameters.ContainsKey('IdleHours')) { $pruneArgs += @('-IdleHours', [string]$IdleHours) }
 
+# Runs prune-merged.ps1 in a child pwsh and emits each line it prints, as it prints it, as
+# @{ Err = <from stderr>; Text }; the child's exit code is left in $script:childExit.
+#
 # A scheduled task has nobody to answer an HTTPS credential prompt, in a terminal or in Git Credential
-# Manager's window, so make prune-merged.ps1's `git fetch` (and every git it starts, which inherit this)
-# fail instead of waiting until the task's time limit kills the run. hygiene-report.ps1 sets the same
-# two. An SSH origin's passphrase or host-key prompt is not covered. The 2026-11-17 log stops right
-# after "Fetching origin (--prune)...", which a fetch waiting on a prompt would explain; that is not
-# established. Exit-Run restores both.
-$savedPromptEnv = @{ GIT_TERMINAL_PROMPT = $env:GIT_TERMINAL_PROMPT; GCM_INTERACTIVE = $env:GCM_INTERACTIVE }
-$env:GIT_TERMINAL_PROMPT = '0'
-$env:GCM_INTERACTIVE = 'never'
+# Manager's window, so the child's `git fetch` (and every git it starts, which inherit the child's
+# environment) must fail instead of waiting until the task's time limit kills the run. The two
+# variables are set on the CHILD's environment only, as claim.ps1 and enter-check.ps1 do: set in this
+# process, a hand run with `&` stopped by Ctrl+C would leave them set in the operator's shell.
+# hygiene-report.ps1 sets the same two. An SSH origin's passphrase or host-key prompt is not covered.
+# The 2026-11-17 log stops right after "Fetching origin (--prune)...", which a fetch waiting on a
+# prompt would explain; that is not established.
+function Invoke-PruneChild([string[]]$ChildArgs) {
+    $psi = [System.Diagnostics.ProcessStartInfo]::new((Get-Process -Id $PID).Path)
+    foreach ($a in @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $prune) + $ChildArgs) { $psi.ArgumentList.Add($a) }
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    # How PowerShell decodes a native command's output, so the log reads as it did under `&`.
+    $psi.StandardOutputEncoding = [Console]::OutputEncoding
+    $psi.StandardErrorEncoding = [Console]::OutputEncoding
+    $psi.Environment['GIT_TERMINAL_PROMPT'] = '0'
+    $psi.Environment['GCM_INTERACTIVE'] = 'never'
+    $p = [System.Diagnostics.Process]::Start($psi)
+    try {
+        # Both streams read at once, line by line, so neither pipe fills and blocks the child, and the
+        # log keeps the order the lines arrived in. The wait is bounded so a Ctrl+C is seen.
+        $reads = @($p.StandardOutput.ReadLineAsync(), $p.StandardError.ReadLineAsync())
+        while ($null -ne $reads[0] -or $null -ne $reads[1]) {
+            $live = [System.Threading.Tasks.Task[]]@($reads | Where-Object { $null -ne $_ })
+            if ([System.Threading.Tasks.Task]::WaitAny($live, 250) -lt 0) { continue }
+            foreach ($i in 0, 1) {
+                if ($null -eq $reads[$i] -or -not $reads[$i].IsCompleted) { continue }
+                $text = $reads[$i].GetAwaiter().GetResult()
+                if ($null -eq $text) { $reads[$i] = $null; continue }
+                [pscustomobject]@{ Err = ($i -eq 1); Text = $text }
+                $reads[$i] = if ($i -eq 0) { $p.StandardOutput.ReadLineAsync() } else { $p.StandardError.ReadLineAsync() }
+            }
+        }
+        $p.WaitForExit()
+        $script:childExit = $p.ExitCode
+    }
+    finally {
+        # Only when this run is stopped part way (Ctrl+C, a stop request): the child must not outlive it.
+        if (-not $p.HasExited) { try { $p.Kill($true) } catch [System.InvalidOperationException] { } }
+        $p.Dispose()
+    }
+}
 
 $deadlineText = if ($deadline) { " stopAfter=$($deadline.ToLocalTime().ToString('HH:mm:ss'))" } else { '' }
 "=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode repo=$RepoRoot$deadlineText ===" | Add-Content -LiteralPath $log
@@ -211,9 +247,8 @@ $deadlineText = if ($deadline) { " stopAfter=$($deadline.ToLocalTime().ToString(
 # table. A log that ends after the first marker, with no exit marker, was stopped inside that run.
 "--- prune-merged.ps1 running ---" | Add-Content -LiteralPath $log
 $pruneStarted = $true
-& (Get-Process -Id $PID).Path -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $prune @pruneArgs *>&1 |
-    Add-Content -LiteralPath $log
-$code = $LASTEXITCODE
+Invoke-PruneChild $pruneArgs | ForEach-Object { $_.Text } | Add-Content -LiteralPath $log
+$code = $childExit
 "--- prune-merged.ps1 exit $code at $(Get-Date -Format 'HH:mm:ss') ---" | Add-Content -LiteralPath $log
 
 if ($RemoveFinishedClaudeWorktrees) { "--- finished .claude/worktrees: mode=$mode ---" | Add-Content -LiteralPath $log }
@@ -227,13 +262,13 @@ elseif ($RemoveFinishedClaudeWorktrees) {
     # A FRESH list, from a second prune-merged.ps1 run in this invocation, after the prune above. Always
     # a dry run (-Json without -Apply) and -SkipGh: the report-only set does not read merge signals.
     $listArgs = @('-RepoRoot', $RepoRoot, '-Json', '-SkipGh')
-    if ($PSBoundParameters.ContainsKey('IdleHours')) { $listArgs += @('-IdleHours', $IdleHours) }
-    $raw = @(& (Get-Process -Id $PID).Path -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $prune @listArgs 2>&1)
-    $listExit = $LASTEXITCODE
-    $stderrLines = @($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "  stderr: $_" })
+    if ($PSBoundParameters.ContainsKey('IdleHours')) { $listArgs += @('-IdleHours', [string]$IdleHours) }
+    $raw = @(Invoke-PruneChild $listArgs)
+    $listExit = $childExit
+    $stderrLines = @($raw | Where-Object { $_.Err } | ForEach-Object { "  stderr: $($_.Text)" })
     if ($stderrLines.Count -gt 0) { $stderrLines | Add-Content -LiteralPath $log }
     $listing = $null
-    try { $listing = (@($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n") | ConvertFrom-Json -ErrorAction Stop }
+    try { $listing = (@($raw | Where-Object { -not $_.Err } | ForEach-Object { $_.Text }) -join "`n") | ConvertFrom-Json -ErrorAction Stop }
     catch { "  could not parse the listing run's JSON (exit $listExit): $($_.Exception.Message)" | Add-Content -LiteralPath $log }
 
     if ($null -eq $listing -or $null -eq $listing.fence -or $null -eq $listing.fence.idleHours) {

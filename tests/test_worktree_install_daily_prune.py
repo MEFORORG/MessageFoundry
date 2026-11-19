@@ -341,14 +341,15 @@ PRUNE_STUB = (
 )
 
 
-def run_copied_runner(
-    tmp_path: Path, *args: str
-) -> tuple[subprocess.CompletedProcess[str], str | None]:
-    """Run a copy of the runner outside any repository, beside ``PRUNE_STUB``.
+def copy_runner(
+    tmp_path: Path, prune_stub: str = PRUNE_STUB, extra: dict[str, str] | None = None
+) -> tuple[Path, Path, dict[str, str]]:
+    """Copy the runner outside any repository, beside ``prune_stub`` as its prune-merged.ps1.
 
-    Only the coord files the runner dot-sources without -RemoveFinishedClaudeWorktrees are copied.
-    Returns the process and the log text (None when no log was written). Nothing here reaches the real
-    repository: git discovery stops at ``tmp_path`` and no GIT_* variable is inherited.
+    Only the coord files the runner dot-sources without -RemoveFinishedClaudeWorktrees are copied;
+    ``extra`` writes further files beside the runner. Returns the runner's path, the log directory and
+    the environment to run it under. Nothing here reaches the real repository: git discovery stops at
+    ``tmp_path`` and no GIT_* variable is inherited.
     """
     scripts = tmp_path / "copy" / "scripts"
     (scripts / "coord").mkdir(parents=True)
@@ -356,22 +357,36 @@ def run_copied_runner(
         shutil.copy2(ROOT / "scripts" / "coord" / name, scripts / "coord" / name)
     (scripts / "worktree").mkdir()
     shutil.copy2(RUNNER, scripts / "worktree" / RUNNER.name)
-    (scripts / "worktree" / PRUNE.name).write_text(PRUNE_STUB, encoding="utf-8")
-    log_dir = tmp_path / "logs"
+    (scripts / "worktree" / PRUNE.name).write_text(prune_stub, encoding="utf-8")
+    for name, text in (extra or {}).items():
+        (scripts / "worktree" / name).write_text(text, encoding="utf-8")
     env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "GCM_"))}
     env.pop("CLAUDECODE", None)
     env["GIT_CEILING_DIRECTORIES"] = str(tmp_path)
+    return scripts / "worktree" / RUNNER.name, tmp_path / "logs", env
+
+
+def read_log(log_dir: Path) -> str | None:
+    logs = list(log_dir.glob("prune-*.log"))
+    return logs[0].read_text(encoding="utf-8") if logs else None
+
+
+def run_copied_runner(
+    tmp_path: Path,
+    *args: str,
+    prune_stub: str = PRUNE_STUB,
+    extra: dict[str, str] | None = None,
+    env_extra: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], str | None]:
+    """Run a copy of the runner (see ``copy_runner``).
+
+    Returns the process and the log text (None when no log was written).
+    """
+    runner, log_dir, env = copy_runner(tmp_path, prune_stub, extra)
+    env.update(env_extra or {})
     proc = subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(scripts / "worktree" / RUNNER.name),
-            "-LogDir",
-            str(log_dir),
-            *args,
-        ],
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(runner), "-LogDir", str(log_dir)]
+        + list(args),
         capture_output=True,
         text=True,
         timeout=120,
@@ -379,8 +394,7 @@ def run_copied_runner(
         cwd=tmp_path,
         check=False,
     )
-    logs = list(log_dir.glob("prune-*.log"))
-    return proc, (logs[0].read_text(encoding="utf-8") if logs else None)
+    return proc, read_log(log_dir)
 
 
 @requires_windows
@@ -419,3 +433,59 @@ def test_the_prune_run_cannot_wait_on_a_credential_prompt_and_is_bracketed(
         text
     )
     assert re.match(r"=== exit 0 \(OK\) at \d\d:\d\d:\d\d ===$", lines[-1]), text
+
+
+# A stub that reports what it inherited into the file $env:T_STARTED names, then waits long enough to
+# be stopped part way. A file, not the log: the runner's log holds the stub's lines until it returns.
+SLOW_PRUNE_STUB = (
+    "param([string]$RepoRoot, [switch]$Apply, [double]$IdleHours)\n"
+    '"stub prompt=$env:GIT_TERMINAL_PROMPT gcm=$env:GCM_INTERACTIVE" | Set-Content $env:T_STARTED\n'
+    "Start-Sleep -Seconds 30\n"
+    "exit 0\n"
+)
+
+
+@requires_windows
+def test_a_hand_run_stopped_part_way_leaves_the_shells_prompt_variables_alone(
+    tmp_path: Path,
+) -> None:
+    """The prompt variables go on the child only, so a Ctrl+C cannot leave them in the operator's shell.
+
+    A hand run with ``&`` shares the caller's process. Here one pwsh stands in for that shell: the
+    runner runs in a second runspace of it and is stopped, as Ctrl+C stops it, while the stub
+    prune-merged.ps1 is still running. Set in the runner's own process and restored only on its way
+    out, both variables stayed set; now neither is touched, and the child still saw both.
+    """
+    runner, log_dir, env = copy_runner(tmp_path, SLOW_PRUNE_STUB)
+    started = tmp_path / "stub-started.txt"
+    env.update(
+        {
+            "T_RUNNER": str(runner),
+            "T_LOGDIR": str(log_dir),
+            "T_REPO": str(tmp_path),
+            "T_STARTED": str(started),
+        }
+    )
+    script = (
+        "$ps = [powershell]::Create().AddScript("
+        "'& $env:T_RUNNER -LogDir $env:T_LOGDIR -RepoRoot $env:T_REPO'); "
+        "$null = $ps.BeginInvoke(); $sw = [Diagnostics.Stopwatch]::StartNew(); "
+        "while ($sw.Elapsed.TotalSeconds -lt 60 -and -not (Test-Path -LiteralPath $env:T_STARTED)) "
+        "{ Start-Sleep -Milliseconds 100 }; "
+        "$ps.Stop(); "
+        '"state=$($ps.InvocationStateInfo.State) '
+        'after prompt=[$env:GIT_TERMINAL_PROMPT] gcm=[$env:GCM_INTERACTIVE]"'
+    )
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        cwd=tmp_path,
+        check=False,
+    )
+    assert started.is_file(), proc.stdout + proc.stderr
+    assert started.read_text(encoding="utf-8").strip() == "stub prompt=0 gcm=never"
+    assert "state=Stopped " in proc.stdout, f"the run must be stopped part way: {proc.stdout}"
+    assert "after prompt=[] gcm=[]" in proc.stdout, proc.stdout + proc.stderr
