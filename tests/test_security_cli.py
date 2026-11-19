@@ -123,8 +123,9 @@ def test_set_security_reports_a_reset_that_finds_nothing_as_unchanged(tmp_path: 
         "unchanged": ["require_mfa"],
         "rewritten": True,
         "detail": "no key changed; file rewritten by the validated replace every set uses, which "
-        "restricts it to its owner and, where another account owns it on Windows, the editing "
-        "account, and logs a warning where it cannot",
+        "restricts it, on POSIX to its owner afterwards (the editing account unless root keeps the "
+        "previous owner), on Windows to the editing account or, where another account owned it, to "
+        "that account and the editing account, and logs a warning where it cannot",
     }
     assert len(seen) == 1 and seen[0] != toml and seen[0].name == toml.name
     # A value equal in Python but of another type is a change, not the value the file holds.
@@ -252,6 +253,24 @@ def test_null_reset_in_a_missing_folder_exits_0_and_creates_nothing(
     rc, res = _set(toml, {"require_mfa": None}, capsys)
     assert rc == 0 and res["rewritten"] is False
     assert list(tmp_path.iterdir()) == []
+
+
+def test_null_reset_where_the_stat_is_refused_is_not_reported_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5327: a failed stat is not "nothing there". Where the editors' shared stat gate
+    refuses the path, as for a file behind an unreachable share, the reset is refused rather than
+    reported as finding no file."""
+    from messagefoundry.config import atomic_edit, security_edit
+
+    def refuse(path: Path, *, refused_error: object) -> bool:
+        raise security_edit.SecurityEditError(f"could not stat {path.name}")
+
+    monkeypatch.setattr(atomic_edit, "is_file", refuse)
+    with pytest.raises(security_edit.SecurityEditError, match="could not stat"):
+        security_edit.set_security(
+            tmp_path / "mf.toml", {"require_mfa": None}, validate=lambda _c: None
+        )
 
 
 def test_null_reset_of_an_absent_known_key_reports_nothing_changed(

@@ -66,8 +66,10 @@ def set_security(
     value the file already holds. When no key changed, ``op`` is ``"unchanged"``. An existing file
     still goes through the same validated replace, so a file the engine would refuse, or a link, is
     refused as it is for any edit, and the file is rewritten by that replace, which restricts it
-    as for every set: to its owner and, where another account owns it on Windows, the editing
-    account, logging a warning where it cannot. ``rewritten`` says so, and ``detail`` says it in
+    as for every set (:func:`atomic_edit.replace_validated`): on POSIX to its owner afterwards,
+    the editing account unless root keeps the previous owner; on Windows to the editing account
+    or, where another account owned it, to that account and the editing account; logging a
+    warning where it cannot. ``rewritten`` says so, and ``detail`` says it in
     words when no key changed. With nothing at the path and only resets asked, no edit lock is
     taken and nothing is created or checked, so a missing folder is no error: ``rewritten`` is
     false. This
@@ -77,7 +79,7 @@ def set_security(
     if not isinstance(updates, Mapping):
         raise SecurityEditError("security updates must be a JSON object of {key: value}")
     path = Path(service_config)
-    if all(value is None for value in updates.values()) and not os.path.lexists(path):
+    if all(value is None for value in updates.values()) and _nothing_at(path):
         # Only resets, and no file to reset them in: nothing can change, so take no lock, whose
         # file would be the edit's only trace and whose folder may not exist. Anything at the
         # path, a directory or a link among them, goes on to the replace, which fails on it.
@@ -107,7 +109,7 @@ def set_security(
             else:
                 sec[key] = value
                 changed.append(key)
-        if not changed and not os.path.lexists(path):
+        if not changed and _nothing_at(path):
             # The file went between the check above and the lock: still nothing to reset, and a
             # 0-byte file would be the edit's only effect.
             return _absent_result(path, unchanged)
@@ -128,12 +130,22 @@ def set_security(
         # The replace does not report whether its restriction took, so this names the step
         # rather than claim its outcome.
         "detail": "no key changed; file rewritten by the validated replace every set uses, which "
-        "restricts it to its owner and, where another account owns it on Windows, the editing "
-        "account, and logs a warning where it cannot",
+        "restricts it, on POSIX to its owner afterwards (the editing account unless root keeps the "
+        "previous owner), on Windows to the editing account or, where another account owned it, to "
+        "that account and the editing account, and logs a warning where it cannot",
     }
 
 
 # --- internals ---------------------------------------------------------------
+
+
+def _nothing_at(path: Path) -> bool:
+    """Whether nothing at all is at ``path``. ``os.path.lexists`` alone reads every failed lstat
+    as absent, so a file behind an unreachable share would be reported as missing; the editors'
+    shared stat gate refuses that case instead."""
+    return not os.path.lexists(path) and not atomic_edit.is_file(
+        path, refused_error=SecurityEditError
+    )
 
 
 def _absent_result(path: Path, unchanged: list[str]) -> dict[str, Any]:
