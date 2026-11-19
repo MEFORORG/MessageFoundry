@@ -966,8 +966,9 @@ HOST_PROBE = r"""
 param([Parameter(Mandatory)][string]$ClaimLib)
 $ErrorActionPreference = 'Stop'
 . $ClaimLib
-# Get-ClaimHostToken caches nothing, so one process can try every override in turn.
-$rows = foreach ($case in @('unset', 'empty', 'other')) {
+# 'other' FIRST: it is the case an env-first rule would fail, so a cache filled by an earlier case
+# could never hide it. Get-ClaimHostToken caches nothing today, so the rest run in the same process.
+$rows = foreach ($case in @('other', 'unset', 'empty')) {
     switch ($case) {
         'unset' { Remove-Item Env:COMPUTERNAME -ErrorAction SilentlyContinue }
         'empty' { $env:COMPUTERNAME = '' }
@@ -998,7 +999,7 @@ def test_the_claim_host_token_ignores_an_overridden_computername(tmp_path: Path)
     assert proc.returncode == 0, proc.stderr
     r = json.loads(proc.stdout)
     want = hashlib.sha256(r["machine"].lower().encode("utf-8")).hexdigest()[:4]
-    assert [row["case"] for row in r["rows"]] == ["unset", "empty", "other"], r
+    assert [row["case"] for row in r["rows"]] == ["other", "unset", "empty"], r
     for row in r["rows"]:
         # The variable really differed from the machine name, or this case measures nothing.
         assert row["computername"].lower() != r["machine"].lower(), row
