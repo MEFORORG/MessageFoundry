@@ -1034,6 +1034,36 @@ async def test_a_cipher_refused_message_refusal_carries_no_chain(
     _assert_bare(caught.value)
 
 
+@pytest.mark.parametrize("stage", ["scope re-read", "audit"])
+async def test_a_fault_after_a_cipher_refusal_carries_no_chain(stage: str) -> None:
+    """BACKLOG #5969: the scope re-read and the audit run after the handler, so a fault in either
+    carries neither the cipher's error nor its planted text on its chain."""
+    reads: list[str] = []
+
+    async def _get_message(_message_id: str) -> dict[str, Any] | None:
+        raise CipherError(_PLANTED)
+
+    async def _channel(_message_id: str) -> str:
+        reads.append(_message_id)
+        if stage == "scope re-read" and len(reads) > 1:
+            raise RuntimeError("synthetic scope fault")
+        return "IB_A" if len(reads) == 1 else "IB_B"
+
+    async def _record_audit(*_: object, **__: object) -> None:
+        raise RuntimeError("synthetic audit fault")
+
+    engine: Any = SimpleNamespace(
+        store=SimpleNamespace(
+            get_message=_get_message, message_channel_id=_channel, record_audit=_record_audit
+        )
+    )
+    identity: Any = SimpleNamespace(username="u", can_access_channel=lambda c: c == "IB_A")
+    request = Request({"type": "http", "client": ("127.0.0.1", 1), "headers": []})
+    with pytest.raises(RuntimeError, match="synthetic") as caught:
+        await read_scoped_message(engine, identity, "m-1", request, refuse_integrity=True)
+    _assert_bare(caught.value)
+
+
 # ---- store/store.py WebAuthnCredential.from_mapping: a malformed passkey row (BACKLOG #3937) ------
 
 

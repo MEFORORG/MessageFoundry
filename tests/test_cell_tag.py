@@ -1130,6 +1130,23 @@ def test_a_list_read_withholds_a_cell_the_cipher_refuses() -> None:
     assert row == {"error": None, "summary": None} and failures == []
 
 
+def test_a_list_read_still_refuses_a_tag_failure_under_a_held_key() -> None:
+    """BACKLOG #5970 withholds a key or format refusal only. A cell sealed under the store's own
+    key for another cell, a substitution, fails its tag: on a table with no tag-failed audit or
+    alert the cipher's error still fails the read, as before #5970, and is never withheld. An
+    unmarked value, which the cipher alerts on itself, is withheld (control)."""
+    cipher = make_cipher(generate_key(), write_v2=True)
+    aad = cell_aad("connection_event", "reason", "IB_A", 1.0, "closed")
+    moved = cipher.encrypt(
+        "SYNTH", aad=cell_aad("connection_event", "reason", "IB_B", 2.0, "closed")
+    )
+    for table in ("queue", "connection_event", "alert_instance"):
+        with pytest.raises(UnauthenticatedCipherError) as refused:
+            open_listed_cell(cipher, moved, aad, table=table)
+        assert not isinstance(refused.value, CellTagError)
+    assert open_listed_cell(cipher, "SYNTH-UNMARKED", aad, table="connection_event") is None
+
+
 async def test_get_message_opens_its_cells_off_the_event_loop(tmp_path: pathlib.Path) -> None:
     """BACKLOG #5981: under vault_transit each open is a blocking Vault call, so ``get_message``
     opens its four cells in a worker thread, never on the loop's own thread."""

@@ -199,6 +199,8 @@ async def assert_cell_tag_contract(store: Any, raw: RawSql, fetch: RawFetch) -> 
 
     # --- a cell under a key the store does not hold is withheld from a list --------------------
     await _assert_foreign_key_cells(store, raw)
+    # --- a substituted cell under a held key still fails a list read loudly --------------------
+    await _assert_substituted_listed_cells(store, raw, fetch)
 
 
 async def _assert_foreign_key_cells(store: Any, raw: RawSql) -> None:
@@ -273,6 +275,80 @@ async def _assert_foreign_key_cells(store: Any, raw: RawSql) -> None:
     }
     assert alerts[planted].reason is None
     assert alerts[kept].reason == "SYNTH-ALERT"  # control
+
+
+async def _assert_list_fails(read: Awaitable[object]) -> None:
+    """The list read raises the cipher's own error, neither a tag error nor a withheld cell."""
+    try:
+        await read
+    except CellTagError as exc:
+        raise AssertionError(
+            "a substituted cell on an untagged table read as a CellTagError"
+        ) from exc
+    except CipherError:
+        return
+    raise AssertionError("a substituted cell under a held key was withheld, not refused")
+
+
+async def _assert_substituted_listed_cells(store: Any, raw: RawSql, fetch: RawFetch) -> None:
+    """BACKLOG #5970 withholds only a key or format refusal. A cell copied from a sibling row,
+    sealed under a key the store holds but for the sibling's cell, fails its tag: on the queue,
+    connection_event and alert_instance tables, which have no tag-failed audit or alert, the list
+    read still fails with the cipher's error, so the tamper is not hidden as a withheld cell. Each
+    planted cell is put back after, so later lists on the same store still read."""
+    ch, out = f"IB_CT_S_{_RUN}", f"OB_CT_S_{_RUN}"
+    for _ in range(2):
+        await store.enqueue_message(channel_id=ch, raw=_RAW, deliveries=[(out, "B")])
+        item = await store.claim_next_fifo(out)
+        assert item is not None
+        await store.dead_letter_now(item.id, "synthetic permanent reject")
+    a, b = [
+        r["outbox_id"] for r in await store.list_dead(destination_name=out, allowed_channels=None)
+    ]
+    rows = {
+        r["id"]: r["last_error"]
+        for r in await fetch("SELECT id, last_error FROM queue WHERE id IN (?, ?)", (a, b))
+    }
+    await raw("UPDATE queue SET last_error=? WHERE id=?", (rows[b], a))
+    await _assert_list_fails(store.list_dead(destination_name=out, allowed_channels=None))
+    await raw("UPDATE queue SET last_error=? WHERE id=?", (rows[a], a))
+    assert len(await store.list_dead(destination_name=out, allowed_channels=None)) == 2  # control
+
+    planted, kept = f"IB_CT_T_{_RUN}", f"IB_CT_U_{_RUN}"
+    for conn in (planted, kept):
+        await store.record_connection_event(
+            connection=conn, transport="mllp", direction="in", kind="closed", reason="SYNTH-REASON"
+        )
+        await store.upsert_alert_instance(
+            event_type="connection_error", connection=conn, severity="warning", reason="SYNTH-ALERT"
+        )
+    for table in ("connection_event", "alert_instance"):
+        sealed = {
+            r["connection"]: r["reason"]
+            for r in await fetch(
+                f"SELECT connection, reason FROM {table} WHERE connection IN (?, ?)",  # noqa: S608
+                (planted, kept),
+            )
+        }
+        await raw(
+            f"UPDATE {table} SET reason=? WHERE connection=?",  # noqa: S608
+            (sealed[kept], planted),
+        )
+        await _assert_list_fails(
+            store.list_connection_events(connection=planted, allowed_channels=None)
+            if table == "connection_event"
+            else store.list_active_alert_instances(allowed_channels=None)
+        )
+        await raw(
+            f"UPDATE {table} SET reason=? WHERE connection=?",  # noqa: S608
+            (sealed[planted], planted),
+        )
+    [event] = await store.list_connection_events(connection=planted, allowed_channels=None)
+    assert event.reason == "SYNTH-REASON"  # control: the put-back cell opens
+    assert any(
+        a.connection == planted and a.reason == "SYNTH-ALERT"
+        for a in await store.list_active_alert_instances(allowed_channels=None)
+    )
 
 
 async def _routed(store: Any, fetch: RawFetch, channel_id: str) -> tuple[str, str]:

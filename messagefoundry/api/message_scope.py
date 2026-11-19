@@ -109,8 +109,9 @@ async def read_scoped_message(
     *,
     refuse_integrity: bool = False,
 ) -> dict[str, Any] | None:
-    """The message row, or ``None`` when it does not exist, sits outside the caller's channels, or
-    its cells cannot be opened.
+    """The message row, or ``None`` when it does not exist or sits outside the caller's channels.
+    An in-scope row whose cells cannot be opened is ``None`` only for a failed tag and a caller
+    that skips; every other refusal raises, as below.
 
     The channel scope is checked on the row's plaintext ``channel_id`` BEFORE any cell is opened
     (BACKLOG #5969, #5981), so an out-of-scope message decrypts nothing, and whatever its cells
@@ -132,19 +133,31 @@ async def read_scoped_message(
     if not identity.can_access_channel(channel_id):
         await audit_channel_denied(engine, identity, channel_id, client_ip(request))
         return None
-    refusal: Exception | None = None
+    row: dict[str, Any] | None = None
+    tag_refused = False
+    tag_channel: str | None = None
+    # (gave no verdict, error class name) of a plain cipher refusal.
+    cipher_refused: tuple[bool, str] | None = None
     try:
         row = await engine.store.get_message(message_id)
     except CellTagError as err:
+        tag_refused, tag_channel = True, err.channel_id
+    except CipherError as exc:
+        cipher_refused = (gave_no_verdict(exc), type(exc).__name__)
+    # Everything below runs after the handlers (BACKLOG #1796), so neither a refusal nor a fault in
+    # the scope read or the audit chains the cipher's error. Inside a handler, even with
+    # `from None`, __context__ would keep that error and, through its traceback, the store frame
+    # holding the cells it had already opened.
+    if tag_refused:
         # The tag is built from the channel the store read, which may not be the one checked above
         # if the row changed between the two reads; out of scope it is the uniform refusal.
-        if not identity.can_access_channel(err.channel_id):
-            await audit_channel_denied(engine, identity, err.channel_id, client_ip(request))
+        if not identity.can_access_channel(tag_channel):
+            await audit_channel_denied(engine, identity, tag_channel, client_ip(request))
             return None
         if not refuse_integrity:
             return None
-        refusal = HTTPException(423, _INTEGRITY_REFUSED)
-    except CipherError as exc:
+        raise HTTPException(423, _INTEGRITY_REFUSED)
+    if cipher_refused is not None:
         # A plain cipher error names no channel, so the scope is read again: a row that changed
         # channel between the two reads is the uniform refusal, never a 423 or 503 that would say
         # it exists.
@@ -154,28 +167,22 @@ async def read_scoped_message(
         if not identity.can_access_channel(now_in):
             await audit_channel_denied(engine, identity, now_in, client_ip(request))
             return None
-        no_verdict = gave_no_verdict(exc)
+        no_verdict, error_class = cipher_refused
         # The class name only: the cipher's text can echo fields cut from the stored value.
-        cause = f"message {message_id} could not be opened: {type(exc).__name__}"
+        cause = f"message {message_id} could not be opened: {error_class}"
         _log.warning("%s", cause)
         if not refuse_integrity:
             # The export stream does not skip such a row: an export that leaves out rows nothing
             # records would read as complete, so it records a stop instead. A fresh error, so no
             # frame holding opened cells rides on it.
-            refusal = CipherUnavailableError(cause) if no_verdict else CipherError(cause)
-        elif no_verdict:
-            refusal = HTTPException(
+            raise CipherUnavailableError(cause) if no_verdict else CipherError(cause)
+        if no_verdict:
+            raise HTTPException(
                 503,
                 _KEY_SERVICE_UNAVAILABLE,
                 headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
             )
-        else:
-            refusal = HTTPException(423, _KEYS_REFUSED)
-    if refusal is not None:
-        # Raised after the handler, so the refusal chains nothing (BACKLOG #1796). Inside it, even
-        # with `from None`, __context__ would keep the cipher's error and, through its traceback,
-        # the store frame holding the cells it had already opened.
-        raise refusal
+        raise HTTPException(423, _KEYS_REFUSED)
     if row is None:
         return None
     # Checked again on the row itself. It differs from the check above only if the row changed

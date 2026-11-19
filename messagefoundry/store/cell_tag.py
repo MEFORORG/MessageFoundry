@@ -553,14 +553,25 @@ def withhold_refused_cell(table: str, exc: CipherError) -> None:
 
 
 def open_listed_cell(cipher: Cipher, stored: str | None, aad: bytes, *, table: str) -> str | None:
-    """Open one cell for a list-shaped read, or ``None`` when the cipher refuses it (BACKLOG
-    #5970), so one unreadable cell withholds that cell rather than failing the page. An outage
-    (:func:`~messagefoundry.store.crypto.gave_no_verdict`) still raises, as a store-wide fault."""
+    """Open one cell of a table this module does not tag, for a list-shaped read, or ``None`` when
+    the cipher refuses it for a key or format reason (BACKLOG #5970), so one unreadable cell
+    withholds that cell rather than failing the page.
+
+    Two failures still raise the cipher's own error, failing the read as it did before #5970: an
+    outage (:func:`~messagefoundry.store.crypto.gave_no_verdict`), a store-wide fault, and an
+    integrity failure no alert has reported, which is at least a tag that failed under a key this
+    process holds (a substituted or tampered cell) and a corrupt cell under such a key. These
+    tables have no tag-failed audit row or ``integrity_drift`` alert, so the failed read is the
+    only signal, and withholding it would hide the tamper. An unmarked value the cipher refused is
+    withheld: the cipher raised its own alert when it refused it."""
     if stored is None:
         return None
     try:
         return cipher.decrypt(stored, aad=aad)
     except CipherError as exc:
+        kind = _tag_failure_kind(cipher, stored, exc)
+        if kind is not None and not kind.cipher_alerted:
+            raise
         withhold_refused_cell(table, exc)
         return None
 

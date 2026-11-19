@@ -921,9 +921,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/api/app.py": frozenset(
         {"messagefoundry.config.tls_policy", "messagefoundry.store.crypto"}
     ),
-    # BACKLOG #5969: the by-id message read imports CipherError and gave_no_verdict from
-    # store.crypto only to answer a cell the store's keys refused (423) apart from a key service
-    # that gave no verdict (503). Calls no crypto itself.
+    # BACKLOG #5969: the by-id message read imports at least CipherError, CipherUnavailableError
+    # and gave_no_verdict from store.crypto, to answer a cell the store's keys refused (423) apart
+    # from a key service that gave no verdict (503), and to raise a fresh one of those errors to
+    # the export stream. It opens no cell and calls no cipher itself.
     "messagefoundry/api/message_scope.py": frozenset({"messagefoundry.store.crypto"}),
     "messagefoundry/api/security.py": frozenset({"messagefoundry.config.tls_policy"}),
     # reach the seam to parse and bound it rather than to open a connection.
@@ -985,8 +986,10 @@ INVENTORY: dict[str, frozenset[str]] = {
 #: that no call-pattern instrument can see.
 IMPORT_ONLY: dict[str, str] = {
     "messagefoundry/api/message_scope.py": (
-        "names store.crypto's CipherError and gave_no_verdict only to classify a refused read of "
-        "a message's cells, calling no cipher; the cells are opened in the store backends"
+        "names at least store.crypto's CipherError, CipherUnavailableError and gave_no_verdict, "
+        "to classify a refused read of a message's cells and to construct and raise a fresh "
+        "CipherError or CipherUnavailableError for the export stream; it calls no cipher, and "
+        "the cells are opened in the store backends"
     ),
     "messagefoundry/tls_handshake_failures.py": (
         "subclasses ssl.SSLObject to observe a failed handshake and re-raise it, and sets a "
