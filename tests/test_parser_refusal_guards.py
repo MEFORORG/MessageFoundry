@@ -286,7 +286,7 @@ def test_lens_paste_refuses_a_refused_block_with_lens_rewrite_error(case: str) -
 def test_impact_declaration_scan_skips_a_refused_module(tmp_path: Path, case: str) -> None:
     _write_module(tmp_path, "a_refused.py", case)
     (tmp_path / "b_decl.py").write_text("Reference('OLD', {})\n", encoding="utf-8")
-    file, span = _scan_declaration_span(tmp_path, frozenset({"Reference"}), "OLD")
+    file, span, _name_arg = _scan_declaration_span(tmp_path, frozenset({"Reference"}), "OLD")
     assert file is not None and file.endswith("b_decl.py")
     assert span is not None and span.start == 1
 

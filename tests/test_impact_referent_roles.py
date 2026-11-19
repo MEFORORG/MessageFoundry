@@ -220,6 +220,16 @@ _FANOUT_HEAD = (
     "def _out(dest, msg):\n"
     "    return Send(dest, msg)\n"
     "\n"
+    "def _or_alt(dest, msg):\n"
+    '    dest = dest or "OB_ALT"\n'
+    "    return Send(dest, msg)\n"
+    "\n"
+    "def _b(x):\n"
+    "    return x\n"
+    "\n"
+    "def _a(x):\n"
+    "    return _b(x)\n"
+    "\n"
     '@router("r_f")\n'
     "def r_f(msg):\n"
     '    return ["h_f"]\n'
@@ -238,6 +248,8 @@ _FANOUT_HEAD = (
         '    a, b = "OB_OLD", "OB_ALT"\n    return [Send(a, msg), Send(b, msg)]\n',
         '    return _out("OB_OLD", msg)\n',
         '    return _out(dest="OB_OLD", msg=msg)\n',
+        '    return _or_alt("OB_OLD", msg)\n',
+        '    return Send(_a("OB_OLD"), msg)\n',
     ],
 )
 def test_fan_out_send_forms_are_rewritten(tmp_path: Path, body: str) -> None:
@@ -275,6 +287,7 @@ _ROUTER_FORMS_HEAD = (
         '    routes = {"ADT": "h_old"}\n    return [routes.get(str(msg), "h_x")]\n',
         '    return list({"h_old"})\n',
         '    base = ["h_x"]\n    return base + ["h_old"]\n',
+        '    return [h for h in ("h_old", "h_x") if msg]\n',
     ],
 )
 def test_router_return_forms_are_rewritten(tmp_path: Path, body: str) -> None:
@@ -412,3 +425,88 @@ def test_a_stacked_decorator_argument_equal_to_the_name_is_left(tmp_path: Path) 
     apply_rename(plan)
     assert '@handler("h_new")\n@tag("h_old")' in _mod(config_dir)
     load_config(config_dir)
+
+
+_LEFT_HEAD = (
+    'inbound("IB_N", MLLP(port=2815), router="r_n")\n'
+    'outbound("OB_OLD", MLLP(host="127.0.0.1", port=6967))\n'
+    'outbound("TEST_OB_OLD", MLLP(host="127.0.0.1", port=6968))\n'
+    'LABELS = {"OB_OLD": "x"}\n'
+    "\n"
+    "def get(dest, msg):\n"
+    "    return Send(dest, msg)\n"
+    "\n"
+    '@router("r_n")\n'
+    "def r_n(msg):\n"
+    '    return ["h_n"]\n'
+    "\n"
+    '@handler("h_n")\n'
+    "def h_n(msg):\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("body", "kept"),
+    [
+        # A method named like a config helper is not that helper.
+        ('    tag = LABELS.get("OB_OLD")\n    return get("OB_OLD", msg)\n', 'LABELS.get("OB_OLD")'),
+        # A fragment of a target being built is not the target.
+        (
+            '    env = "TEST_"\n    dest = "OB_OLD"\n    return Send(env + dest, msg)\n',
+            'dest = "OB_OLD"',
+        ),
+    ],
+)
+def test_a_literal_that_only_resembles_a_role_is_left(tmp_path: Path, body: str, kept: str) -> None:
+    config_dir = _write_config(tmp_path, _LEFT_HEAD + body)
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    apply_rename(plan)
+    assert kept in _mod(config_dir)
+    assert plan.unresolved == (Reference("handler", "h_n", "outbound", "OB_OLD"),)
+
+
+def test_an_aliased_send_and_a_same_named_handler_are_handled(tmp_path: Path) -> None:
+    config_dir = _write_config(
+        tmp_path,
+        "from messagefoundry import Send as S\n"
+        "\n"
+        'inbound("IB_E", MLLP(port=2816), router="r_e")\n'
+        'outbound("EPIC", MLLP(host="127.0.0.1", port=6969))\n'
+        "\n"
+        '@router("r_e")\n'
+        "def r_e(msg):\n"
+        '    return ["EPIC"]\n'
+        "\n"
+        '@handler("EPIC")\n'
+        "def epic(msg):\n"
+        '    return S("EPIC", msg)\n',
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "EPIC", "OB_EPIC")
+    # The handler's own decorator names the handler; it is neither rewritten nor counted.
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    text = _mod(config_dir)
+    assert 'return S("OB_EPIC", msg)' in text
+    assert '@handler("EPIC")' in text
+    load_config(config_dir)
+
+
+def test_an_accepts_lambda_is_scanned_not_a_lambda_in_the_body(tmp_path: Path) -> None:
+    config_dir = _write_config(
+        tmp_path,
+        'inbound("IB_P", MLLP(port=2817), router="r_p")\n'
+        'outbound("OB_P", MLLP(host="127.0.0.1", port=6970))\n'
+        "\n"
+        '@router("r_p")\n'
+        "def r_p(msg):\n"
+        '    return ["h_p"]\n'
+        "\n"
+        '@handler("h_p", accepts=lambda m: code_set("diets").get("A") is not None)\n'
+        "def h_p(msg):\n"
+        "    key = lambda m: m\n"
+        '    return Send("OB_P", key(msg))\n',
+        codesets=("diets",),
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "code_set", "diets", "meals")
+    assert plan.unresolved == ()
+    assert [e.new_literal for e in plan.edits] == ['"meals"']
