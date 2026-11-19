@@ -315,7 +315,11 @@ def test_the_resync_checkout_persists_no_credential() -> None:
 
 
 def test_only_the_push_step_receives_the_app_token() -> None:
-    """RED when: any step but the push can read the minted contents-write token (BACKLOG #5477)."""
+    """RED when: a step other than the push names the minted token's output (BACKLOG #5477).
+
+    This pins the expression reference only. That the token is not live while uv and the repository
+    script run is the mint step's position, pinned by the test below.
+    """
     readers = [
         str(s.get("name") or s.get("uses"))
         for s in _resync_steps()
@@ -346,3 +350,22 @@ def test_the_resync_installs_the_uv_the_gate_pins() -> None:
     assert str(with_.get("version", "")) == gate_pins.pop(), (
         f"setup-uv installs uv {with_.get('version')!r}, not the uv security.yml's DEP-1 step pins"
     )
+
+
+def test_the_app_token_is_minted_after_the_steps_that_run_on_the_pr_tree() -> None:
+    """RED when: the contents-write token is minted before uv or the repository script runs.
+
+    Once minted, the token lives on the runner until the job ends, readable by any later step on
+    the same machine, so the steps that run on the Dependabot-changed tree must all come first.
+    """
+    steps = _resync_steps()
+    position = {str(s.get("id") or s.get("name")): i for i, s in enumerate(steps)}
+    mint = position["app-token"]
+    uv_steps = [
+        i
+        for i, s in enumerate(steps)
+        if any(line.lstrip().startswith("uv ") for line in str(s.get("run", "")).splitlines())
+    ]
+    assert uv_steps, "no step runs uv; the ordering assertion would pass over nothing"
+    assert mint > max(uv_steps), "the App token is minted before a step that runs uv"
+    assert mint > position["closure"], "the App token is minted before the repository script runs"

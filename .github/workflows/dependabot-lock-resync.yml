@@ -104,15 +104,6 @@ jobs:
             echo "::warning title=lock-resync skipped (misconfiguration)::This run WAS triggered by dependabot[bot], yet LOCK_RESYNC_APP_ID is empty. The App credentials must live under Settings > Secrets and variables > *Dependabot* (not Actions) for a Dependabot-triggered run to read them. Skipping the re-export; DEP-1 lock sync is still enforced by the pip-audit job in security.yml."
           fi
 
-      - name: Mint a scoped GitHub App token
-        id: app-token
-        if: steps.creds.outputs.present == 'true'
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: ${{ secrets.LOCK_RESYNC_APP_ID }}
-          private-key: ${{ secrets.LOCK_RESYNC_APP_PRIVATE_KEY }}
-          permission-contents: write
-
       - name: Check out the PR head
         if: steps.creds.outputs.present == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -123,8 +114,8 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           # NO CREDENTIAL IN THE CHECKOUT (BACKLOG #5477). The fetch uses the run's read-only token,
           # and nothing is persisted into .git/config, so uv and the repository script below run on a
-          # Dependabot-changed tree with no write credential on disk to read. The App token reaches the
-          # push step alone, through that step's environment.
+          # Dependabot-changed tree with no write credential on disk to read. The App token is minted
+          # only after those steps, and reaches the push step through that step's environment.
           persist-credentials: false
 
       - name: Set up uv
@@ -185,17 +176,34 @@ jobs:
           set -euo pipefail
           python3 scripts/security/runtime_closure.py
 
+      # MINTED HERE, AFTER uv AND THE REPOSITORY SCRIPT HAVE RUN (BACKLOG #5477), so no step that runs
+      # on the Dependabot-changed tree executes while a contents-write token exists on this runner.
+      - name: Mint a scoped GitHub App token
+        id: app-token
+        if: steps.creds.outputs.present == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.LOCK_RESYNC_APP_ID }}
+          private-key: ${{ secrets.LOCK_RESYNC_APP_PRIVATE_KEY }}
+          permission-contents: write
+
       - name: Commit and push the resynced locks
         if: steps.creds.outputs.present == 'true'
         env:
           # Pass the PR head ref through the environment, NOT inline ${{ }} in the run block, so a branch
           # name containing shell metacharacters can never be evaluated as code (template injection).
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          # The App token reaches THIS step only (BACKLOG #5477): the checkout persists no credential,
-          # so the steps that run uv and the repository script never have it on disk.
+          # The only step that reads the App token (BACKLOG #5477), which is minted just above.
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
+          # Earlier steps ran uv and a repository script on the Dependabot-changed tree, as the same
+          # user, so they could have written .git/hooks or a core.fsmonitor command. Both are turned
+          # off for every git command below, through git's environment config, which outranks
+          # .git/config, because this step holds the token while git runs.
+          export GIT_CONFIG_COUNT=2
+          export GIT_CONFIG_KEY_0='core.hooksPath' GIT_CONFIG_VALUE_0='/dev/null'
+          export GIT_CONFIG_KEY_1='core.fsmonitor' GIT_CONFIG_VALUE_1='false'
           git config user.name 'dependabot[bot]'
           git config user.email '49699333+dependabot[bot]@users.noreply.github.com'
           if git diff --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock security/runtime-closure-core.txt security/runtime-closure-sqlserver.txt security/runtime-closure-harness.txt; then
@@ -207,16 +215,16 @@ jobs:
           # Push with the App token (NOT GITHUB_TOKEN). An App-token push emits a synchronize event so
           # the required checks (DEP-1, ci.yml) re-run on the new commit; a GITHUB_TOKEN push would
           # leave them pending and the PR unmergeable.
-          # The credential goes in as an http.extraheader through git's GIT_CONFIG_* environment, set
+          # The credential goes in as an http.extraheader through a third GIT_CONFIG_* entry, set
           # on the push command alone: never on a command line or in the process table, and never
           # written to .git/config. printf is a shell builtin and base64 reads stdin, so the token is
           # in no argv. The encoded form is masked too, since the runner masks only the raw token.
           auth="$(printf 'x-access-token:%s' "${APP_TOKEN}" | base64 -w0)"
           echo "::add-mask::${auth}"
           # Fully qualified: the checkout is a detached SHA, so HEAD has no branch to infer a name from.
-          GIT_CONFIG_COUNT=1 \
-          GIT_CONFIG_KEY_0='http.https://github.com/.extraheader' \
-          GIT_CONFIG_VALUE_0="AUTHORIZATION: basic ${auth}" \
+          GIT_CONFIG_COUNT=3 \
+          GIT_CONFIG_KEY_2='http.https://github.com/.extraheader' \
+          GIT_CONFIG_VALUE_2="AUTHORIZATION: basic ${auth}" \
             git push origin "HEAD:refs/heads/${HEAD_REF}"
 
       - name: Fail if the closure inventory could not be regenerated
