@@ -488,6 +488,26 @@ def _dense_lines(count: int, seed: int) -> list[str]:
     return lines
 
 
+#: DSN lines for the differential, each beside a label of the corpus, built in order so the seeded
+#: lines above stay as they were. The widened DSN pass (BACKLOG #5386) reads the first and third
+#: heads' passwords whole, and the label after is what it must not take. The heads holding ";w"
+#: it reads only up to that ";", or not at all, a pinned residual: there the lines measure that a
+#: DSN with a ";" in it, the last two as a camelCase label's value, keeps that ";" for the readings
+#: after (code review of #5386).
+_DSN_LINES = tuple(
+    f"connect {head}{sep}{label}{assign}vq2"
+    for head in (
+        "redis://:vq0@h",
+        "postgres://svc:vq0@vq1;w@h:5432",
+        "redis://:vq0%40vq1@h",
+        "accessToken=redis://:vq0;w@h",
+        "clientSecret=redis://:vq0@vq1;w@h",
+    )
+    for sep in (" failed ", ";", "?", "&")
+    for label in _DENSE_LABELS
+    for assign in ("=", "='vq3;PWD='")
+)
+
 _ATOM = re.compile(r"vq\d+(?!\d)")
 
 
@@ -497,7 +517,8 @@ def _prints(atom: str, text: str) -> bool:
 
 def _scrub_before(text: str, *, placeholder: str = CREDENTIAL_PLACEHOLDER) -> str:
     """``scrub_credentials`` as it read before BACKLOG #5545: every pattern through ``_pre_camel``,
-    and no widened DSN pass (BACKLOG #5386), as ``_union`` runs its reading before."""
+    and no widened DSN pass, which BACKLOG #5386 added later. It is not ``_union``'s reading before
+    as that runs now; ``secretscrub._run``'s docstring says where the union runs the widened pass."""
     folded = secretscrub._gate_fold(text)
     if not secretscrub._admits(folded, secretscrub._ANY_HINT):
         return text
@@ -553,8 +574,11 @@ def test_the_camelcase_reading_prints_no_atom_the_reading_before_it_hid(
     """THE GUARANTEE, measured: over 2,000 seeded lines dense with every label kind, no surface prints
     an atom the reading before BACKLOG #5545 hid. ``_pre_camel`` of each shipped pattern is that
     reading; measured 2026-11-10, its source equals ``origin/main``'s at ``0d240bad62`` for all seven
-    patterns ``_run`` applies. The reverse count must be above zero, or the two never differed."""
-    newly, hidden_now = _newly_printed(monkeypatch, _dense_lines(2000, 5545))
+    patterns ``_run`` applied then. ``_WIDE_DSN_PASSWORD``, added since by BACKLOG #5386, is an eighth,
+    which ``_scrub_before`` leaves out. The corpus ends with :data:`_DSN_LINES`, so a line the
+    widened pass reads is measured too. The reverse count must be above zero, or the two never
+    differed."""
+    newly, hidden_now = _newly_printed(monkeypatch, _dense_lines(2000, 5545) + list(_DSN_LINES))
     assert not newly, f"{len(newly)} newly printed, first: {newly[:3]}"
     assert hidden_now > 0
 

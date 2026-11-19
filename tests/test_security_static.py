@@ -686,16 +686,22 @@ _UNSCANNABLE_RE_PATTERNS = {
     # Two more since BACKLOG #5545's union. ``_CAMEL_PROBE`` compiles ``_CAMEL_START``'s builder
     # with a separator after the label word, which holds no repetition outside a lookaround and the
     # possessive ``\s*+``. ``_pre_camel`` compiles each shipped pattern with its
-    # camelCase fragments swapped back for what ``origin/main`` held there, so it compiles exactly the
-    # patterns this file scanned before #5545; ``tests/test_secretscrub_camelcase_label.py`` holds
-    # each to carrying none of those fragments.
+    # camelCase fragments swapped back for what ``origin/main`` held there before #5545. That is the
+    # shipped pattern with each fragment replaced by text this file scanned then, not the whole of a
+    # pattern scanned then: a pattern changed since #5545 comes back with its later change, and one
+    # added since, such as ``_WIDE_DSN_PASSWORD``, holds no fragment and comes back as it ships.
+    # ``tests/test_secretscrub_camelcase_label.py`` holds each label pattern to carrying none of
+    # those fragments.
     #
     # Since the round-5 review of BACKLOG #5386 ``_WIDE_DSN_PASSWORD`` splices ``_DSN_RUN_STOP``, a
     # negative lookahead over an alternation of ``_CREDENTIAL_QUERY_KEYS`` and the label words, built
     # by ``_alternation`` so it stays derived from them. The lookahead holds no repetition. Each
-    # repeated group is that lookahead and ONE character class, so no quantifier nests under
-    # another: the empty user's segment is possessive, and the run after it backs off one
-    # character at a time to its last "@", as the literal form it replaced did. Since round 9 the
+    # repeated group is that lookahead and ONE character, so no quantifier nests under another:
+    # the empty user's segment is possessive, and the run after it backs off one character at a
+    # time to its last "@", as the literal form it replaced did. Since BACKLOG #5386's added item 3
+    # the empty user's character is a class OR a single "%" the class excludes, behind a
+    # fixed-width lookahead, so the two alternatives start on disjoint characters.
+    # ``tests/test_b532r_redaction_dsn.py`` holds the growth with a stopwatch. Since round 9 the
     # user's first segment is ``_DSN_USER_FIRST_SEGMENT``, an atomic group of three alternatives
     # that start on disjoint characters: a bracketed word, an angled word, or a possessive run of
     # that lookahead and one class holding neither bracket nor angle.
@@ -705,7 +711,7 @@ _UNSCANNABLE_RE_PATTERNS = {
         "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_NO_SPACE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]++[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _ODBC_BRACED + '|' + _KV_QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _KEY_LABEL_ALTERNATION + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_KEY_VALUE + ')'",
-        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*):(?:(?<=//:)(?:' + _DSN_RUN_STOP + '[^\\\\s/@?#&=;,()|^~{}<>\\\\[\\\\]%\\\\x27\\\\x22])*+|(?<!//:)' + _DSN_USER_FIRST_SEGMENT + ')(?:' + _DSN_RUN_STOP + '[^\\\\s/;?#&,()|^~{}<>\\\\[\\\\]%\\\\x27\\\\x22])*@'",
+        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*):(?:(?<=//:)(?:' + _DSN_RUN_STOP + '(?:[^\\\\s/@?#&=;,()|^~{}<>\\\\[\\\\]%\\\\x27\\\\x22]|%(?!7c|7e|5e|26|2c|3b|3f|23|27|22|28|29)))*+|(?<!//:)' + _DSN_USER_FIRST_SEGMENT + ')(?:' + _DSN_RUN_STOP + '[^\\\\s/;?#&,()|^~{}<>\\\\[\\\\]%\\\\x27\\\\x22])*@'",
         "_camel_start('\\\\b[\\'\\\\\"]?\\\\s*+[:=]')",
         "source",
     ),
