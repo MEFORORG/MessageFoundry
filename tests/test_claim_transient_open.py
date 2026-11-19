@@ -389,20 +389,26 @@ async def test_a_corrupt_cell_under_a_held_key_is_dead_lettered_and_reported(
         ((sealed,),) = _side(db, f"SELECT payload FROM queue WHERE rowid={head}", (_DEST,))
         corrupt = str(sealed).rsplit(":", 1)[0] + ":AAAAA"
         _side(db, f"UPDATE queue SET payload=? WHERE rowid={head}", (corrupt, _DEST))
-        assert all(i.payload != "B1" for i in await claim(store))
+        # B1's ciphertext is destroyed, so only B2 can leak. A claim that delivers past the dead
+        # head opens B2 in the same claim; a FIFO claim stops at the dead head, so the next opens it.
+        opened = [i.payload for i in await claim(store)]
+        if not opened:
+            opened = [i.payload for i in await claim(store)]
+        assert opened == ["B2"]
         assert _rows(db)[0][0] == "dead"
         assert _audited(db) == 1
         (detail,) = _side(
             db, "SELECT detail FROM audit_log WHERE action=?", (QUEUE_TAG_FAILED_ACTION,)
         )
-        assert json.loads(detail[0])["cause"] == "corrupt"
-        assert len(alerts) == 1 and "is corrupt" in alerts[0] and "B1" not in alerts[0]
+        assert json.loads(detail[0])["cause"] == "corrupt" and "B2" not in detail[0]
+        assert len(alerts) == 1 and "is corrupt" in alerts[0] and "B2" not in alerts[0]
         warned = [
             r
             for r in caplog.records
             if r.name == "messagefoundry.store.queue_tag" and "is corrupt" in r.getMessage()
         ]
-        assert len(warned) == 1 and "B1" not in warned[0].getMessage()
+        assert len(warned) == 1
+        assert not any("B2" in r.getMessage() for r in caplog.records)
         # Every WARNING the corrupt cell left, the store's dead-letter line included, carries no
         # exception object and no traceback.
         corrupt_lines = [r for r in caplog.records if "is corrupt" in r.getMessage()]

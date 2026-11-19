@@ -20,6 +20,12 @@ from typing import Any
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
+from messagefoundry.pipeline.alerts import (
+    QUEUE_CORRUPT_SUBJECT,
+    QUEUE_TAG_SUBJECT,
+    alert_cell_tag_failure,
+)
 from messagefoundry.store.crypto import (
     AesGcmCipher,
     UnauthenticatedCipherError,
@@ -27,6 +33,8 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 from messagefoundry.store.queue_tag import (
+    QUEUE_CORRUPT_ALERT_TABLE,
+    QUEUE_TAG_CAUSES,
     CorruptQueueCellError,
     QueueTagError,
     alert_queue_tag_failure,
@@ -186,3 +194,103 @@ def test_a_real_transit_cipher_verdict_stays_drift() -> None:
     transit.error = InvalidRequest(errors=[verdicts[0]])
     with pytest.raises(CorruptQueueCellError):
         open_queue_cell(naming, row)
+
+    # Neither of the drift verdicts above claims more than the cipher said: only the AEAD failure
+    # names the tag; the other cannot say whether the cell is corrupt or moved.
+    for text, cause in zip(verdicts, ("unknown", "tag"), strict=True):
+        transit.error = InvalidRequest(errors=[text])
+        with pytest.raises(QueueTagError) as refused:
+            open_queue_cell(cipher, row)
+        assert refused.value.cause == cause, text
+
+
+def test_each_refusal_names_only_the_cause_the_code_knows() -> None:
+    """The audit detail's ``cause`` and the alert's words say what the raise site knows, never
+    ``tag`` for a refusal no tag check made (BACKLOG #5884)."""
+    cipher, _key_b64, seen = _cipher_and_hook()
+    row = _row()
+    sealed = cipher.encrypt("SYNTH-BODY", aad=queue_row_aad(row))
+    ref_row = _row(body_ref="a" * 64)
+    sealed_ref = cipher.encrypt("a" * 64, aad=queue_row_aad(ref_row))
+    keyless = make_cipher(None)
+    cases: list[tuple[Any, dict[str, Any], str]] = [
+        (cipher, {**row, "channel_id": "IB_B", "payload": sealed}, "tag"),
+        (cipher, {**row, "payload": ""}, "blank"),
+        (cipher, {**ref_row, "body_ref": "b" * 64, "payload": sealed_ref}, "ref"),
+        (keyless, {**ref_row, "body_ref": "b" * 64, "payload": "a" * 64}, "ref-unsealed"),
+    ]
+    for case_cipher, case_row, expected in cases:
+        with pytest.raises(QueueTagError) as refused:
+            open_queue_cell(case_cipher, case_row)
+        assert refused.value.cause == expected, expected
+        sink = _Sink()
+        seen.clear()
+        asyncio.run(report_queue_tag_failure(sink, cipher, case_row, error=refused.value))
+        assert json.loads(sink.details[0])["cause"] == expected
+        words = QUEUE_TAG_CAUSES[refused.value.cause]
+        assert seen == [f"a outbound queue row {words} and was dead-lettered (row row-5884)"]
+        if expected != "tag":
+            assert "integrity tag" not in seen[0]
+    # A QueueTagError raised with no cause claims nothing it does not know.
+    assert QueueTagError("t").cause == "unknown"
+    assert CorruptQueueCellError("t").cause == "corrupt"
+
+
+async def test_a_corrupt_alert_does_not_mute_a_drift_alert() -> None:
+    """A corrupt cell's alert has its own subject, so the notifier's per-subject cooldown it
+    starts never holds back a drift page raised at once after it (BACKLOG #5884)."""
+    assert QUEUE_CORRUPT_ALERT_TABLE == QUEUE_CORRUPT_SUBJECT != QUEUE_TAG_SUBJECT
+
+    class _Transport:
+        name = "webhook"
+
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def send(self, event: dict[str, Any], **_kw: Any) -> None:
+            self.events.append(event)
+
+    async def _pages(errors: list[QueueTagError]) -> list[str]:
+        transport = _Transport()
+        sink = NotifierAlertSink([transport], realert_seconds=3600.0)
+        cipher, _key_b64, _seen = _cipher_and_hook()
+        cipher.set_tag_failure_hook(
+            lambda table, reason: alert_cell_tag_failure(sink, table, reason)
+        )
+        for error in errors:
+            alert_queue_tag_failure(cipher, _row(), error=error, outcome="was dead-lettered")
+        sink.start()
+        await asyncio.sleep(0)
+        await sink.aclose()
+        return [str(event["connection"]) for event in transport.events]
+
+    drift = QueueTagError("t", cause="tag")
+    pages = await _pages([CorruptQueueCellError("c"), drift])
+    assert pages == [QUEUE_CORRUPT_SUBJECT, QUEUE_TAG_SUBJECT]
+    # Control: the cooldown is real, so a second drift page inside it is held back.
+    assert await _pages([drift, drift]) == [QUEUE_TAG_SUBJECT]
+
+
+def test_a_failed_audit_write_logs_no_exception_object(caplog: pytest.LogCaptureFixture) -> None:
+    """The audit write's failure is logged by class and code only, with no ``exc_info``: through
+    ``__context__`` the error can reach the claim frame and its opened bodies (BACKLOG #5884)."""
+    caplog.set_level(logging.DEBUG, logger="messagefoundry.store.queue_tag")
+    cipher, _key_b64, seen = _cipher_and_hook()
+
+    class _FailingSink:
+        async def record_audit(self, action: str, **_kw: Any) -> None:
+            try:
+                raise ValueError("SYNTH-OPENED-BODY")  # stands in for a claim frame's plaintext
+            except ValueError:
+                raise RuntimeError("driver said SYNTH-DRIVER-TEXT")  # noqa: B904 -- keeps context
+
+    error = CorruptQueueCellError("c")
+    asyncio.run(report_queue_tag_failure(_FailingSink(), cipher, _row(), error=error))
+    assert len(seen) == 1  # the alert still fires
+    failed = [r for r in caplog.records if "could not be written" in r.getMessage()]
+    assert len(failed) == 1 and "RuntimeError" in failed[0].getMessage()
+    assert failed[0].levelno == logging.ERROR
+    for record in caplog.records:
+        assert record.exc_info is None
+        assert "SYNTH" not in record.getMessage()
+        assert not any(isinstance(arg, BaseException) for arg in record.args or ())
