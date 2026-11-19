@@ -15900,19 +15900,37 @@ class AuthService:
                     rotated_token = elevation.token
                     try:
                         clear = await self._clear_after_reauth(proof.user, audits)
-                    except Exception:
+                    except BaseException as exc:
                         # The clear's outcome on the account is not known, at least for a store
-                        # error its read-back did not settle, so nothing is granted. The rotated
-                        # session is ended as on the denied path below, rather than left live
-                        # with its token never handed back; the row the ``finally`` writes says
-                        # whether that revoke landed.
+                        # error its read-back did not settle or a cancellation, so nothing is
+                        # granted. The rotated session is ended as on the denied path below, run
+                        # to completion through a cancel, rather than left live with its token
+                        # never handed back; the row the ``finally`` writes says whether that
+                        # revoke landed. A revoke that fails never replaces ``exc``.
                         clear_raised = True
                         lost = True
                         elevation = Elevation(session_lost=True)
                         clear_denied_session_ended = False
-                        clear_denied_session_ended = await self._end_reauth_rotated_session(
-                            rotated_token, identity.username
-                        )
+                        ended: list[bool] = []
+                        cause = type(exc).__name__
+
+                        async def end_rotated() -> None:
+                            try:
+                                ended.append(
+                                    await self._end_reauth_rotated_session(
+                                        rotated_token, identity.username
+                                    )
+                                )
+                            except Exception as revoke_exc:  # noqa: BLE001 -- exc stands
+                                _log.warning(
+                                    "a re-auth whose lockout clear raised (%s) could not end the "
+                                    "session it rotated (%s)",
+                                    cause,
+                                    type(revoke_exc).__name__,
+                                )
+
+                        await _write_through_cancellation([end_rotated])
+                        clear_denied_session_ended = bool(ended and ended[0])
                         raise
                     cleared = row_written = clear == "cleared"
                     if cleared and flag:

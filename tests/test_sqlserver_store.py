@@ -7902,3 +7902,90 @@ async def test_mark_failed_at_its_cap_leaves_a_done_row_done(store) -> None:
     assert outcome == FailOutcome()
     outbox = await store.outbox_for(mid)
     assert outbox[0]["status"] == OutboxStatus.DONE.value
+
+
+class _AuditLockProbeSealer:
+    """Delegates to ``inner``, recording at each seal and verify whether the store's process-wide
+    ``_audit_lock`` was held: the conditional login reset's Vault transit round trips must never
+    hold it (BACKLOG #5900)."""
+
+    def __init__(self, store: Any, inner: Any) -> None:
+        self._store = store
+        self._inner = inner
+        self.calls: list[tuple[str, bool]] = []
+
+    async def seal_async(self, kind: str, fields: Any) -> str:
+        self.calls.append(("seal", self._store._audit_lock.locked()))
+        return str(await self._inner.seal_async(kind, fields))
+
+    async def verify_held_async(self, kind: str, fields: Any, stored: Any) -> bool:
+        self.calls.append(("verify", self._store._audit_lock.locked()))
+        return bool(await self._inner.verify_held_async(kind, fields, stored))
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+async def _conditional_reset_user(store: Any) -> tuple[object, ...]:
+    from messagefoundry.store.row_seal import RowSealer
+    from messagefoundry.store.store import full_authentication_snapshot
+
+    store._row_sealer = RowSealer(bytes(32))
+    await store.create_user(
+        user_id="u-carol",
+        username="carol",
+        auth_provider="local",
+        password_generated=False,
+        audits=(),
+    )
+    await store.record_login_failure("u-carol", failed_attempts=3, locked_until=None)
+    user = await store.get_user("u-carol")
+    assert user is not None
+    return full_authentication_snapshot(user)
+
+
+async def test_conditional_login_reset_holds_no_audit_lock_across_transit(store) -> None:
+    """BACKLOG #5900: the reset's verify and seal, each a Vault round trip under a Transit sealer,
+    run before ``_audit_lock`` is taken, so they never hold every audit write in the process."""
+    from messagefoundry.store.store import AuditAppend
+
+    expected = await _conditional_reset_user(store)
+    probe = _AuditLockProbeSealer(store, store._row_sealer)
+    store._row_sealer = probe
+    answer = await store.record_login_success(
+        "u-carol", expected=expected, audits=[AuditAppend("auth.reauth", actor="carol")]
+    )
+    assert answer == "written"
+    assert {name for name, _ in probe.calls} == {"seal", "verify"}
+    assert not any(held for _, held in probe.calls), probe.calls
+    user = await store.get_user("u-carol")
+    assert user is not None and user.failed_attempts == 0
+
+
+async def test_conditional_login_reset_reverifies_a_row_changed_under_it(store) -> None:
+    """BACKLOG #5900: a row rewritten without a seal between the reset's seal work and its lock is
+    never decided on unverified: the seal work is redone, and the forged row raises."""
+    from messagefoundry.store.row_seal import RowSealError
+    from messagefoundry.store.store import AuditAppend
+
+    expected = await _conditional_reset_user(store)
+    real = store._preseal_user
+    done: list[bool] = []
+
+    async def preseal_then_forge(user_id: str, change: Any) -> Any:
+        out = await real(user_id, change)
+        if not done:
+            done.append(True)
+            async with store._pool.acquire() as conn:
+                cur = await conn.cursor()
+                await cur.execute("UPDATE users SET failed_attempts=9 WHERE id=?", (user_id,))
+                await conn.commit()
+                await cur.close()
+        return out
+
+    store._preseal_user = preseal_then_forge
+    with pytest.raises(RowSealError):
+        await store.record_login_success(
+            "u-carol", expected=expected, audits=[AuditAppend("auth.reauth", actor="carol")]
+        )
+    assert not await store.list_audit(action="auth.reauth")

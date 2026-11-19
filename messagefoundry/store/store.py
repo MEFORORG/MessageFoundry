@@ -10387,6 +10387,11 @@ def full_authentication_snapshot(user: UserRecord | UserRow) -> tuple[object, ..
     return tuple(values[col] for col in FULL_AUTHENTICATION_GUARD)
 
 
+class _PresealStaleError(Exception):
+    """``MessageStore._write_user`` found the row changed since its ``presealed`` seal work
+    (BACKLOG #5900): it wrote nothing, and the caller redoes that work."""
+
+
 @dataclass(frozen=True)
 class _PresealedUserWrite:
     """A user write whose seal work is already done (BACKLOG #5900): ``read``, the record as read
@@ -19687,7 +19692,8 @@ class MessageStore:
 
         With ``presealed`` (:meth:`_preseal_user`) it makes no Transit call: ``change`` still
         decides on the row read here, and the write is the presealed one, made only when that row
-        is exactly the record it was sealed from, else nothing is written. Without it, it raises
+        is exactly the record it was sealed from; any other row raises :class:`_PresealStaleError`
+        before ``change`` sees it, writing nothing. Without it, it raises
         :class:`RowSealError` (Forged) or, under a Transit sealer, its sibling
         :class:`RowSealUnverifiableError` or :class:`TransitSealUnavailableError` (Outage), and
         writes nothing, when the record it read does not verify or cannot be checked:
@@ -19699,14 +19705,15 @@ class MessageStore:
             return None
         if presealed is None:
             await require_user_seal_for_write(self._row_sealer, current)
+        elif current != presealed.read:
+            # Changed since the seal work: nobody verified this row, so ``change`` never decides on
+            # it, and the presealed record would undo the change. The caller redoes the seal work,
+            # which verifies the row as it now is, outside the lock.
+            raise _PresealStaleError
         changed = change(current)
         if changed is None:
             return None
         if presealed is not None:
-            # The row the seal work verified and sealed from, or nothing: a row changed since was
-            # verified by nobody, and the presealed record would undo the change.
-            if current != presealed.read:
-                return None
             updated = presealed.updated
         else:
             if changed.roles != current.roles:
@@ -20645,13 +20652,13 @@ class MessageStore:
         when the reset is written, so a refused append rolls the reset back; a reset that writes
         nothing appends nothing.
 
-        The conditional form does its seal work, the verify of the row it read and the seal of the
-        reset, before it takes any lock, because under a Transit sealer each is a Vault round trip
-        that every other writer, ingress included, would otherwise wait behind. It then re-reads
-        the row under ``BEGIN IMMEDIATE``, so no writer in another process can commit between that
-        re-read and the write, and writes only when the row is exactly the one it sealed from.
-        A row changed in between that no longer holds ``expected`` writes nothing and answers from
-        the row the re-read found. One that still holds it redoes the seal work, up to
+        The conditional form does the user row's seal work, the verify of the row it read and the
+        seal of the reset, before it takes any lock, because under a Transit sealer each is a Vault
+        round trip. The audit-chain MAC of each row in ``audits`` is still computed under the lock,
+        as every audit append's is. It then re-reads the row under ``BEGIN IMMEDIATE``, so no
+        writer in another process can commit between that re-read and the write, and writes only
+        when the row is exactly the one it sealed from. A row changed in between redoes the seal
+        work, which verifies the row as it now is and decides on it, up to
         :data:`_PRESEAL_ATTEMPTS` times, then answers ``"account_changed"``, as a lost compare on
         the seal does. The plain form stays a short writer, as every login leg
         has always called it."""
@@ -20673,16 +20680,20 @@ class MessageStore:
             # A fresh decision for the row read under the lock, so its answer is that row's alone.
             write = FullAuthenticationWrite(now, expected)
             appended: list[AppendedAuditRow] = []
-            async with _writer_txn(self._db, self._lock, immediate=True):
-                written = await self._write_user(user_id, write, presealed=presealed)
-                if written is None:
-                    await self._db.rollback()
-                    if write.accepted:
-                        continue
-                    return write.answer(None)
-                if audits:
-                    appended = await self._append_audits(audits, now=now)
-                await self._commit()
+            try:
+                async with _writer_txn(self._db, self._lock, immediate=True):
+                    written = await self._write_user(user_id, write, presealed=presealed)
+                    if written is None:
+                        await self._db.rollback()
+                        if write.accepted:
+                            continue
+                        return write.answer(None)
+                    if audits:
+                        appended = await self._append_audits(audits, now=now)
+                    await self._commit()
+            except _PresealStaleError:
+                # Rolled back by the writer transaction's unwind; redo the seal work.
+                continue
             if appended:
                 tee_audits(audits, appended, ts=now)
             return "written"

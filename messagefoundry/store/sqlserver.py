@@ -218,6 +218,7 @@ from messagefoundry.store.session_lineage import revoke_through_lineage
 from messagefoundry.store.store import (
     _ACTIVE_ALERT_STATUS_SQL,
     _ALERT_SEVERITY_RANK_SQL,
+    _PRESEAL_ATTEMPTS,
     _RESOLVED_STATUSES,
     _SESSION_CAP_ORDER_SQL,
     _SESSION_CAP_RANK_NOT_AHEAD_SQL,
@@ -326,6 +327,8 @@ from messagefoundry.store.store import (
     _connection_event_where,
     _dead_target_pairs,
     _opt_float,
+    _PresealedUserWrite,
+    _PresealStaleError,
     _qmark_cutoff_case,
     _security_events_where,
     _session_cap_groups,
@@ -15120,13 +15123,18 @@ class SqlServerStore:
         grants = [RoleGrant.from_mapping(g) for g in await self._fetch_dicts(cur)]
         return UserAuthzRecord.of(UserRow.from_mapping(rows[0]), grants)
 
-    async def _write_user(
-        self, cur: Any, user_id: str, change: UserChange
-    ) -> UserAuthzRecord | None:
-        """The one writer of a user's sealed record (BACKLOG #2592); store.py's
-        ``MessageStore._write_user`` states the contract. Call it on ``cur`` inside an open
-        transaction. The write reports through ``OUTPUT`` (BACKLOG #2283)."""
-        current = await self._read_user_record(cur, user_id)
+    async def _preseal_user(self, user_id: str, change: UserChange) -> _PresealedUserWrite | None:
+        """store.py's ``MessageStore._preseal_user`` (BACKLOG #5900): the read, unlocked, in a
+        transaction ended before the seal work, then the verify, ``change`` and the seal, holding
+        no lock, so neither the row lock nor ``_audit_lock`` waits on Vault transit."""
+        async with self._acquire() as conn:
+            try:
+                async with self._cursor(conn) as cur:
+                    current = await self._read_user_record(cur, user_id, lock=False)
+                await conn.rollback()
+            except Exception:
+                await self._rollback_or_discard(conn)
+                raise
         if current is None:
             return None
         await require_user_seal_for_write(self._row_sealer, current)
@@ -15134,10 +15142,38 @@ class SqlServerStore:
         if changed is None:
             return None
         if changed.roles != current.roles:
-            await cur.execute("SELECT id FROM roles")
-            present = [str(r[0]) for r in await cur.fetchall()]
-            changed = existing_roles_only(current, changed, present)
-        updated = await seal_user_async(self._row_sealer, changed)
+            raise ValueError("a presealed user write may not change the account's role rows")
+        return _PresealedUserWrite(current, await seal_user_async(self._row_sealer, changed))
+
+    async def _write_user(
+        self,
+        cur: Any,
+        user_id: str,
+        change: UserChange,
+        *,
+        presealed: _PresealedUserWrite | None = None,
+    ) -> UserAuthzRecord | None:
+        """The one writer of a user's sealed record (BACKLOG #2592); store.py's
+        ``MessageStore._write_user`` states the contract, ``presealed`` included. Call it on
+        ``cur`` inside an open transaction. The write reports through ``OUTPUT`` (BACKLOG #2283)."""
+        current = await self._read_user_record(cur, user_id)
+        if current is None:
+            return None
+        if presealed is None:
+            await require_user_seal_for_write(self._row_sealer, current)
+        elif current != presealed.read:
+            raise _PresealStaleError
+        changed = change(current)
+        if changed is None:
+            return None
+        if presealed is not None:
+            updated = presealed.updated
+        else:
+            if changed.roles != current.roles:
+                await cur.execute("SELECT id FROM roles")
+                present = [str(r[0]) for r in await cur.fetchall()]
+                changed = existing_roles_only(current, changed, present)
+            updated = await seal_user_async(self._row_sealer, changed)
         await cur.execute(_MSSQL_USER_RESEAL, user_reseal_params(updated, current))
         if not await cur.fetchall():
             return None
@@ -16065,30 +16101,49 @@ class SqlServerStore:
         expected: tuple[object, ...] | None = None,
         audits: Sequence[AuditAppend],
     ) -> LoginSuccessAnswer:
-        """See the SQLite twin (BACKLOG #5900): the compare with ``expected`` reads the row
-        ``_write_user`` holds under ``UPDLOCK``, and ``audits`` share the reset's transaction. This
-        leg is CI-only, so a divergence from the SQLite and Postgres bodies surfaces first in CI.
-        Same lock order as ``clear_lockout``: the in-process gate, then the connection."""
+        """See the SQLite twin (BACKLOG #5900): the user row's seal work runs before
+        ``_audit_lock`` and the transaction (:meth:`_preseal_user`); the compare with ``expected``
+        then reads the row ``_write_user`` holds under ``UPDLOCK``, a changed row redoing the seal
+        work, and ``audits`` share the reset's transaction. Their audit-chain MAC is still computed
+        under ``_audit_lock``, as every audit append's is. This leg is CI-only, so a divergence
+        from the SQLite and Postgres bodies surfaces first in CI. Same lock order as
+        ``clear_lockout``: the in-process gate, then the connection."""
         now = time.time() if now is None else now
         write = FullAuthenticationWrite(now, expected)
         if not audits:
             return write.answer(await self._write_user_txn(user_id, write))
-        appended: list[AppendedAuditRow] = []
-        async with self._audit_lock:  # noqa: SIM117
-            async with self._acquire() as conn:
-                try:
-                    async with self._cursor(conn) as cur:
-                        written = await self._write_user(cur, user_id, write)
-                        if written is not None:
-                            appended = await self._append_audits(cur, audits, now=now)
-                        await self._commit(conn)
-                except Exception:
-                    # BACKLOG #1940: see _rollback_or_discard, as clear_lockout does.
-                    await self._rollback_or_discard(conn)
-                    raise
-        if appended:
-            tee_audits(audits, appended, ts=now)
-        return write.answer(written)
+        for _ in range(_PRESEAL_ATTEMPTS):
+            write = FullAuthenticationWrite(now, expected)
+            presealed = await self._preseal_user(user_id, write)
+            if presealed is None:
+                return write.answer(None)
+            write = FullAuthenticationWrite(now, expected)
+            appended: list[AppendedAuditRow] = []
+            try:
+                async with self._audit_lock:  # noqa: SIM117
+                    async with self._acquire() as conn:
+                        try:
+                            async with self._cursor(conn) as cur:
+                                written = await self._write_user(
+                                    cur, user_id, write, presealed=presealed
+                                )
+                                if written is not None:
+                                    appended = await self._append_audits(cur, audits, now=now)
+                                await self._commit(conn)
+                        except Exception:
+                            # BACKLOG #1940: see _rollback_or_discard, as clear_lockout does.
+                            await self._rollback_or_discard(conn)
+                            raise
+            except _PresealStaleError:
+                continue
+            if written is None:
+                if write.accepted:
+                    continue
+                return write.answer(None)
+            if appended:
+                tee_audits(audits, appended, ts=now)
+            return "written"
+        return "account_changed"
 
     async def clear_lockout(
         self,

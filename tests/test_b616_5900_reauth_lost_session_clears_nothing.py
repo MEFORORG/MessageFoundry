@@ -958,8 +958,8 @@ async def _conditional_reset_store(
 
 async def test_the_conditional_reset_holds_no_lock_across_its_transit_work(tmp_path: Any) -> None:
     """The seal verify and the new seal, each a Vault round trip under a Transit sealer, run with
-    neither the writer lock nor a writer transaction held, so a hung Transit stalls no ingress
-    commit. The reset still lands with its row."""
+    neither the writer lock nor a writer transaction held, so a hung Transit at the user seal
+    stalls no ingress commit. The reset still lands with its row."""
     store, expected = await _conditional_reset_store(tmp_path)
     try:
         probe = _LockProbeSealer(store, None)
@@ -1086,5 +1086,72 @@ async def test_a_refused_revoke_on_the_raise_path_is_logged_and_recorded(
         assert "and could not end the session it rotated" in caplog.text
         row = json.loads((await store.list_audit(action="auth.reauth"))[0]["detail"])
         assert row["session_lost"] is True and row["session_ended"] is False
+    finally:
+        await store.close()
+
+
+async def _forge_after_preseal(store: MessageStore) -> None:
+    """Rewrite a lockout column of ``u-bob`` with no seal, once, between the reset's seal work and
+    its lock: a row changed outside the store, so its seal no longer holds."""
+    real = store._preseal_user
+    done: list[bool] = []
+
+    async def preseal_then_forge(user_id: str, change: Any) -> Any:
+        out = await real(user_id, change)
+        if not done:
+            done.append(True)
+            async with store._lock:
+                await store._db.execute("UPDATE users SET failed_attempts=9 WHERE id=?", (user_id,))
+                await store._db.commit()
+        return out
+
+    store._preseal_user = preseal_then_forge  # type: ignore[method-assign]
+
+
+async def test_a_row_forged_between_the_seal_work_and_the_lock_is_reported_and_denied(
+    tmp_path: Any,
+) -> None:
+    """The locked re-read finds a row other than the one the seal work verified. Nothing decides on
+    that unverified row: the seal work is redone, which verifies it, so a forged row raises its seal
+    failure, which is reported, and the re-auth is denied with nothing granted."""
+    store = await MessageStore.open(str(tmp_path / "forged.db"))
+    store._row_sealer = RowSealer(bytes(32))
+    try:
+        service, notifier, identity, token = await _setup(store)
+        await _forge_after_preseal(store)
+        out = await service.reauth(identity, GOOD, token=token, purpose=STEP_UP_ACTION_MFA_ENROLL)
+        assert out.session_lost and not out.ok and out.token is None
+        assert not service._action_step_up_grants
+        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+        assert await store.list_sessions("u-bob") == [], "the rotated session was left live"
+        assert not [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
+    finally:
+        await store.close()
+
+
+async def test_a_cancel_during_the_clear_ends_the_rotated_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancellation that lands while the clear runs grants nothing, so the rotated session is
+    ended, run to completion through the cancel, and the cancellation propagates."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, identity, token = await _setup(store)
+        entered = asyncio.Event()
+
+        async def hangs(user_id: str, **kwargs: Any) -> None:
+            entered.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(store, "record_login_success", hangs)
+        task = asyncio.ensure_future(service.reauth(identity, GOOD, token=token))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert await store.list_sessions("u-bob") == [], "the rotated session was left live"
+        rows = [json.loads(r["detail"]) for r in await store.list_audit(action="auth.reauth")]
+        assert rows[0]["interrupted"] is True and rows[0]["session_lost"] is True
+        assert rows[0]["clear_raised"] is True and rows[0]["session_ended"] is True
     finally:
         await store.close()
