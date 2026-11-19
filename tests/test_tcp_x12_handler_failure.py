@@ -165,8 +165,17 @@ async def test_no_reply_a_stop_ends_the_hold_and_names_the_loss(
     last = [r for r in caplog.records if "one last attempt" in r.getMessage()]
     assert len(last) == 1 and "(attempt 2)" in last[0].getMessage()
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert len(errors) == 1
-    assert "nor is any frame behind it" in errors[0] and "listener is stopping" in errors[0]
+    hold = [e for e in errors if "not handed to the pipeline" not in e]
+    assert len(hold) == 1
+    assert "nor is any frame behind it" in hold[0] and "listener is stopping" in hold[0]
+    if transport == "X12":
+        # BACKLOG #5971: the X12 close also counts the frame behind it, at ERROR, since this
+        # inbound's sender never resends.
+        counted = [e for e in errors if "not handed to the pipeline" in e]
+        assert len(counted) == 1 and "closed with 1 complete interchange(s)" in counted[0]
+        assert "does not resend, so they are lost" in counted[0]
+    else:
+        assert errors == hold
 
 
 class _Blocking:
@@ -400,25 +409,93 @@ async def test_x12_a_clean_read_reports_nothing_unhandled(caplog: pytest.LogCapt
     assert _unhandled_lines(caplog) == []
 
 
-async def test_x12_a_reply_that_will_not_encode_is_a_handler_error_not_a_framing_error(
+async def test_x12_a_reply_its_charset_cannot_hold_is_replaced_and_sent(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     # The engine's own reply is the fault here, not the partner's bytes. In the shipped code it
-    # fell to the last-resort arm and would have read as `framing_error`.
+    # fell to the last-resort arm and would have read as `framing_error`, closing unanswered, so a
+    # sender waiting for the reply would resend an interchange already stored. The shared reply
+    # policy (BACKLOG #5799) replaces the character and sends, as MLLP and raw TCP do.
     source = _replying(lambda: _x12(encoding="ascii"))
     seen: list[bytes] = []
 
-    async def unencodable_reply(raw: bytes) -> str:
+    async def narrow_reply(raw: bytes) -> str:
         seen.append(raw)
-        return "synthetic reply ’"
+        return "synthetic reply \u2019"
 
     writer = _Peer()
     with caplog.at_level(logging.WARNING):
-        events = await _drive(source, _ThenEof(EDI * 2), writer, handler=unencodable_reply)
+        events = await _drive(source, _ThenEof(EDI * 2), writer, handler=narrow_reply)
+    assert seen == [EDI] * 2
+    assert writer.written == [b"synthetic reply ?"] * 2
+    assert _kinds(events) == ["established", "closed"]
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+async def test_x12_a_reply_the_policy_still_refuses_is_a_handler_error_not_a_framing_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # An MSH-led reply whose own delimiter is the replacement "?" cannot be replaced safely, so the
+    # shared policy refuses it. That is still the engine's fault: `handler_error`, and the read's
+    # remainder is counted.
+    source = _replying(lambda: _x12(encoding="ascii"))
+    seen: list[bytes] = []
+
+    async def refused_reply(raw: bytes) -> str:
+        seen.append(raw)
+        return "MSH?^~\\&?SYNTH\u2019\r"
+
+    writer = _Peer()
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(source, _ThenEof(EDI * 2), writer, handler=refused_reply)
     assert seen == [EDI], "the first interchange is recorded; the close stops the second"
     assert _kinds(events) == ["established", "handler_error"]
     assert not writer.written and writer.closed
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert len(errors) == 1 and "does not encode as ascii" in errors[0]
+    assert len(errors) == 1 and "could not be encoded" in errors[0]
+    assert "SYNTH" not in errors[0], "the reply is never logged"
     lines = _unhandled_lines(caplog)
     assert len(lines) == 1 and "closed with 1 complete interchange(s)" in lines[0]
+    assert "sender resends" in lines[0]
+
+
+async def test_x12_a_cancel_mid_read_counts_the_remainder(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The stop path: stop() cancels a client task past its grace. The interchanges behind the one
+    # in hand are counted on the cancel too, at ERROR on a no-reply inbound, whose sender never
+    # resends.
+    source = _no_reply(_x12)
+    handler = _Blocking()
+    events: list[Event] = []
+    source.on_connection_event = _sink(events)  # type: ignore[assignment]
+    source._handler = handler
+    with caplog.at_level(logging.WARNING):
+        client = asyncio.create_task(source._on_client(_ThenEof(EDI * 3), _Peer()))  # type: ignore[arg-type]
+        await asyncio.wait_for(handler.blocked.wait(), timeout=2.0)
+        client.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(client, timeout=2.0)
+    lines = [r for r in caplog.records if "not handed to the pipeline" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelno == logging.ERROR
+    assert "closed with 2 complete interchange(s)" in lines[0].getMessage()
+
+
+async def test_x12_an_over_cap_interchange_in_the_remainder_is_named(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The decoder discards the rest of its buffer at an over-cap interchange, so the count cannot
+    # see past it; the line says so rather than reading as a complete count.
+    source = _replying(lambda: _x12(max_interchange_bytes=len(EDI) + 16))
+    big = EDI.replace(b"~IEA", b"~" + b"X" * 64 + b"~IEA", 1)
+    assert len(big) > len(EDI) + 16
+    seen: list[bytes] = []
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(
+            source, _ThenEof(EDI + EDI + big + EDI), _Peer(), handler=_failing_for(99, seen)
+        )
+    assert seen == [EDI]
+    assert _kinds(events) == ["established", "handler_error"]
+    lines = _unhandled_lines(caplog)
+    assert len(lines) == 1 and "closed with 1 complete interchange(s)" in lines[0]
+    assert "over-cap interchange that discarded the rest of the read" in lines[0]

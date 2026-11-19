@@ -67,7 +67,7 @@ from messagefoundry.transports.base import (
     register_source,
     wait_for_intake,
 )
-from messagefoundry.transports.framing import declared_encoding
+from messagefoundry.transports.framing import declared_encoding, encode_reply
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_CONNECTIONS_PER_HOST,
@@ -864,8 +864,7 @@ class X12Source(SourceConnector):
             )
             raise
 
-    @staticmethod
-    def _report_unhandled(frames: Iterator[bytes], peer: object) -> None:
+    def _report_unhandled(self, frames: Iterator[bytes], peer: object) -> None:
         """Count, and log, the complete interchanges of the last read that a close leaves unhandled
         (BACKLOG #5971).
 
@@ -873,27 +872,40 @@ class X12Source(SourceConnector):
         way through them (a handler fault, a failed reply, a stop or a reset), the rest were taken
         off the socket but never handed to the pipeline, so nothing records them. Draining the
         decoder's generator only reassembles bytes already in memory; it does no I/O and hands
-        nothing on. The count is the record: no frame content is logged.
+        nothing on. The count is the record: no frame content is logged. A sender waiting for a
+        reply resends on the close; one that waits for none never does (``hold_and_retry``), so for
+        it the loss is final and is logged at ERROR.
         """
         left = 0
+        over_cap = False
         try:
             for _ in frames:
                 left += 1
         except X12FrameError:
-            pass  # an over-cap remainder ends the count; it is not a complete interchange
+            # The decoder discards its whole buffer at an over-cap interchange, so anything behind
+            # it in the read is gone uncounted.
+            over_cap = True
         except Exception as exc:  # noqa: BLE001 -- this runs in a finally, maybe on a cancel
             # Nothing raised here may replace the exception the close is already handling.
             logger.warning(
                 "X12 count of unhandled interchanges from %s cut short: %s", peer, safe_exc(exc)
             )
-        if left:
-            logger.warning(
-                "X12 connection from %s closed with %d complete interchange(s) from its last read "
-                "not handed to the pipeline; they are not recorded, and only a resend by the "
-                "sender delivers them",
-                peer,
-                left,
-            )
+        if not left and not over_cap:
+            return
+        resends = owes_hl7_reply(self.ack_mode, self.content_type)
+        logger.log(
+            logging.WARNING if resends else logging.ERROR,
+            "X12 connection from %s closed with %d complete interchange(s) from its last read not "
+            "handed to the pipeline%s; they are not recorded, %s",
+            peer,
+            left,
+            ", then an over-cap interchange that discarded the rest of the read"
+            if over_cap
+            else "",
+            "and the sender resends what it sent unanswered"
+            if resends
+            else "and this inbound's sender does not resend, so they are lost",
+        )
 
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
@@ -985,22 +997,30 @@ class X12Source(SourceConnector):
                                     break  # handler_error is recorded; close
                                 failed = False
                             if reply is not None:
+                                # BACKLOG #5971: the reply is the engine's, so a charset that cannot
+                                # hold it is the engine's fault. The shared policy replaces what it
+                                # can (BACKLOG #5799); what it still refuses is `handler_error`,
+                                # never `framing_error`. The interchange is already recorded. The
+                                # event is sent outside the except clause, so nothing chains the
+                                # encode error, whose `object` is the whole reply.
+                                reply_fault: str | None = None
+                                wire = b""
                                 try:
-                                    wire = reply.encode(self.encoding)
-                                except UnicodeEncodeError as exc:
-                                    # BACKLOG #5971: the engine's own reply will not encode in the
-                                    # declared charset. The interchange is recorded; the fault is
-                                    # the engine's, so it is `handler_error`, not `framing_error`.
+                                    wire = encode_reply(
+                                        reply, self.encoding, connection=self._pacing_name
+                                    )
+                                except (LookupError, UnicodeError) as exc:
+                                    reply_fault = safe_exc(exc)
+                                if reply_fault is not None:
                                     logger.error(
-                                        "X12 reply to %s does not encode as %s: %s; the "
-                                        "interchange is recorded, closing the connection",
+                                        "X12 reply to %s could not be encoded: %s; the interchange "
+                                        "is recorded, closing the connection",
                                         peer,
-                                        self.encoding,
-                                        safe_exc(exc),
+                                        reply_fault,
                                     )
                                     failed = True
                                     await self._emit_event(
-                                        "handler_error", peer_host=peer_host, reason=safe_exc(exc)
+                                        "handler_error", peer_host=peer_host, reason=reply_fault
                                     )
                                     break
                                 writer.write(wire)  # verbatim reply

@@ -168,6 +168,19 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
     connection for each, since a narrow charset meets the same characters message after message.
     The charset setting and the reply are never logged: the setting is configuration that may hold
     anything, and the reply echoes the message."""
+    body = encode_reply(reply, encoding, connection=connection)
+    if codec.start in body or codec.end in body:
+        logger.warning(
+            "reply held a frame start or end byte; each was replaced by a space before framing"
+        )
+    # The replacement is the leaf's rule, shared with the test harness's ACK writers.
+    return codec.frame(codec.neutralise(body))
+
+
+def encode_reply(reply: str, encoding: str, *, connection: str = "") -> bytes:
+    """The charset half of :func:`frame_reply`, with no framing, for a listener that writes its
+    reply verbatim (the X12 listener, BACKLOG #5971). The fallbacks and what still raises are as
+    :func:`frame_reply` states."""
     unencodable = False
     try:
         body = reply.encode(encoding)
@@ -187,12 +200,7 @@ def frame_reply(codec: FrameCodec, reply: str, encoding: str, *, connection: str
         body = reply.encode("utf-8")
     if unencodable:
         body = _encode_replacing(reply, encoding, connection)
-    if codec.start in body or codec.end in body:
-        logger.warning(
-            "reply held a frame start or end byte; each was replaced by a space before framing"
-        )
-    # The replacement is the leaf's rule, shared with the test harness's ACK writers.
-    return codec.frame(codec.neutralise(body))
+    return body
 
 
 def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:
