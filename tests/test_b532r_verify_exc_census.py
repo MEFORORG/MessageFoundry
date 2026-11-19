@@ -38,14 +38,14 @@ _SCRUBS = frozenset(
         "safe_detail_text",
         "safe_exc_text",
         "safe_exc_detail",
-        "safe_exc",
         "scrubbed_exc",
         "_not_probed",
     }
 )
-#: Calls that render an exception's text with no PHI or credential pass, at least these.
+#: Calls that render an exception's text with no credential pass, at least these. ``safe_exc`` is a
+#: PHI pass only, so a credential in the text prints through it.
 _RAW_CALLS = frozenset(
-    {"str", "repr", "codec_safe_str", "codec_safe_line", "settings_error_detail"}
+    {"str", "repr", "codec_safe_str", "codec_safe_line", "settings_error_detail", "safe_exc"}
 )
 _LOGGERS = frozenset({"_log", "log", "logger", "_logger"})
 #: Nodes a value passes through on its way to the call that receives it.
@@ -128,6 +128,9 @@ def f():
         g = codec_safe_line(exc)
         h = rows.error(f"{exc}")
         i = safe_exc_text(x, before=y).join([f"{exc}"])
+        j = safe_exc(exc)
+        k = f"x {safe_exc(exc, limit=9)}"
+        ok5 = safe_detail_text(safe_exc(exc))
         ok1 = safe_exc_text(exc)
         ok2 = f"{safe_detail_text(codec_safe_str(exc))}"
         ok3 = type(exc).__name__
@@ -136,7 +139,8 @@ def f():
         raise ValueError(f"wrapped {exc}") from exc
 """
     found = _raw_uses(ast.parse(planted))
-    assert len(found) == 8, found
+    assert len(found) == 10, found
+    assert sum("safe_exc(exc" in f for f in found) == 2, found
 
 
 def test_the_walk_covers_the_files_it_names() -> None:

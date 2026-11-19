@@ -83,13 +83,14 @@ def test_the_harness_probes_load_no_engine_runtime_package() -> None:
     import subprocess
     from pathlib import Path
 
-    out = subprocess.run(
+    proc = subprocess.run(
         [sys.executable, "-c", _ISOLATION_PROBE],
         cwd=Path(__file__).resolve().parents[1],
         capture_output=True,
         text=True,
         timeout=120,
-        check=True,
-    ).stdout
+    )
+    assert proc.returncode == 0, f"isolation probe exited {proc.returncode}:\n{proc.stderr}"
+    out = proc.stdout
     assert "LEAF=True" in out, out  # positive control: the probes did reach the leaf
     assert "LOADED=\n" in out, out

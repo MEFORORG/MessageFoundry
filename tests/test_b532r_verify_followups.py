@@ -266,3 +266,38 @@ def test_the_harness_scrub_withholds_the_text_when_it_cannot_run(
         assert text.startswith("RuntimeError (detail withheld"), text
         assert "x: " not in text, text
         assert _PLANTED not in text, text
+
+
+def test_the_typed_harness_scrub_scans_before_and_keeps_the_probe_key() -> None:
+    # The typed path once added ``before`` unscrubbed, so a credential the caller built into it
+    # printed. The probe key the operator needs must survive the scan.
+    text = probes.scrubbed_exc(
+        RuntimeError(_LEAKY), before=f"probe 'db_driver' raised at password={_PLANTED} ", typed=True
+    )
+    assert _PLANTED not in text, text
+    assert text.startswith("probe 'db_driver' raised"), text
+    assert "RuntimeError" in text, text
+
+
+def test_run_probe_names_the_key_and_scrubs_the_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom() -> probes.ProbeResult:
+        raise RuntimeError(_LEAKY)
+
+    monkeypatch.setitem(probes.PROBES, "console_gui", boom)
+    result = probes.run_probe("console_gui")
+    assert result.detail.startswith("probe 'console_gui' raised RuntimeError"), result.detail
+    assert _PLANTED not in result.detail, result.detail
+
+
+def test_the_typed_harness_scrub_withholds_before_when_the_line_scrub_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry import verify_leaf
+
+    def broken(*args: object, **kwargs: object) -> str:
+        raise SyntaxError("an interpreter too old for the engine")
+
+    monkeypatch.setattr(verify_leaf, "safe_detail_text", broken)
+    text = probes.scrubbed_exc(RuntimeError("x"), before=f"password={_PLANTED} ", typed=True)
+    assert text.startswith("RuntimeError (detail withheld"), text
+    assert _PLANTED not in text, text

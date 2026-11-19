@@ -32,19 +32,28 @@ _DEFAULT_PORTS: dict[str, int] = {"MLLP": 2575, "DICOM": 11112, "API": 8765}
 
 def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -> str:
     """``exc`` for a report row, through the verifier's detail scrub (BACKLOG #5395): ``before`` and
-    the text as :func:`messagefoundry.verify_leaf.safe_exc_text`, or, with ``typed``, the type name
-    then the text as ``safe_exc_detail``. A report row leaves the box, and driver or OS text can
-    quote a DSN, a credential or a path.
+    the text as :func:`messagefoundry.verify_leaf.safe_exc_text`, or, with ``typed``, ``before``
+    then the type name and text as ``safe_exc_detail`` renders them, that whole line through
+    ``safe_detail_text`` once more so ``before`` is scanned with the text on this path too. A report
+    row leaves the box, and driver or OS text can quote a DSN, a credential or a path, and so can
+    ``before``, which can name a path or a key the caller built.
 
     The scrub is imported here, at call time, and a failure to load or run it withholds both
-    ``before`` and the text rather than printing either raw, since ``before`` was to be scrubbed
-    with the text, and names the failure's type instead. A1 exists to report an interpreter the engine cannot run on, and
-    there the engine's modules may not even parse, so this must not take the runner down either."""
+    ``before`` and the text rather than printing either raw, and names the failure's type instead.
+    That row then names no probe key or path the caller put in ``before``. A1 exists to report an
+    interpreter the engine cannot run on, and there the engine's modules may not even parse, so this
+    must not take the runner down either."""
     try:
-        from messagefoundry.verify_leaf import DRIVER_DETAIL_LIMIT, safe_exc_detail, safe_exc_text
+        from messagefoundry.verify_leaf import (
+            DRIVER_DETAIL_LIMIT,
+            safe_detail_text,
+            safe_exc_detail,
+            safe_exc_text,
+        )
 
         if typed:
-            return before + safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)
+            detail = safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)
+            return safe_detail_text(before + detail, limit=DRIVER_DETAIL_LIMIT)
         return safe_exc_text(exc, before=before)
     except Exception as scrub_failure:  # SyntaxError or ImportError on such an interpreter
         return (
