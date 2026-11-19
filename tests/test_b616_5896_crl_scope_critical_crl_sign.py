@@ -494,8 +494,7 @@ def test_the_ca_file_scan_passes_an_out_of_scope_crl_beside_a_usable_one(
     tmp_path: Path, shape: str
 ) -> None:
     """Finding 2 of engine PR 3099, the Lander's hold. A CA file holds its CA, a usable CRL and a
-    reason-scoped or indirect CRL from the same issuer. Nothing judges a CA file's CRLs at start,
-    so a start loads it and OpenSSL judges peers by the usable CRL. The scan must not call it a
+    reason-scoped or indirect CRL from the same issuer. The scan must not call it a
     file to replace before restarting, which is what it said once ``judge_every_crl`` refused the
     out-of-scope CRL for every caller. The same bytes in a CRL setting still refuse that start."""
     pki = _Pki(tmp_path)

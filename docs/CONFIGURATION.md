@@ -2719,8 +2719,8 @@ connection's own `tls_ca_file`, whole, CRL blocks included. So does the syslog f
 CRLs are checked too, and past `nextUpdate` one refuses every peer under its issuer, except on a hop
 that sets `tls_allow_expired`, as **CRL files** above says. The expiry scan watches
 each one in a row labelled `held-crl:` and the CA file's path. The reload does not apply a changed CA
-file, so a refreshed CRL inside one needs a restart, and the expiry alert's `detail` says so. A start does
-not judge a CA file's CRL, so the scan judges it first (BACKLOG #3176). It checks each CRL's
+file, so a refreshed CRL inside one needs a restart, and the expiry alert's `detail` says so. The scan
+judges the CA file's CRL (BACKLOG #3176). It checks each CRL's
 signature against the CA the file lists for its issuer. In at least these cases `detail` says to fix the CRL in the CA file before restarting.
 The CRL is expired, not yet in effect, a delta CRL, unreadable, or proven badly signed. For a CRL
 not yet in effect, `detail` offers a wait too. The hop's copy of that issuer's CRL may lapse before

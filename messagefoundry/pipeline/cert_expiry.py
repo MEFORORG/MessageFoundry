@@ -920,7 +920,7 @@ def _judge_crl(
     account: _HeldCopyAccount | None = None
     try:
         copies = held.copies(cert.path)
-        # BACKLOG #3512: whether a CRL setting names this file, for the wording alone: a start
+        # BACKLOG #3512: whether a CRL setting names this file: a start
         # judges that setting, so the CA-file step says "before restarting" rather than ordering a
         # restart. Any row but a held-crl one is a CRL setting, and so is a held copy from one,
         # stale or not: a store hop records none. Whether a restart waits for the reload is a
@@ -974,9 +974,7 @@ def _judge_crl(
                 )
                 is not None
             ):
-                # BACKLOG #3176: nothing judges a CA file's CRL at start, so a restart would load
-                # this one, which refuses peers under its issuer or, unconfirmed, might (#3512).
-                # Fix or check it first.
+                # BACKLOG #3176: fix or check it first.
                 why, remedy = unsafe
                 if not bundle_only:
                     # BACKLOG #3512: a stale copy from a CRL setting is what the reload judges
