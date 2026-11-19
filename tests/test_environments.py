@@ -625,6 +625,27 @@ def test_values_file_path_refuses_an_environment_the_validator_would_refuse(
 
 
 @pytest.mark.parametrize(
+    "environment", ["NUL", "nul", "CON", "COM1", "LPT9", "AUX", "PRN", "NUL.x"]
+)
+def test_values_file_path_refuses_a_reserved_environment_name(
+    tmp_path: Path, environment: str
+) -> None:
+    """A reserved name passes the alphabet. Windows 11 opens ``NUL.toml`` as a file (measured), but
+    older releases were not measured, so the name is refused on every host."""
+    with pytest.raises(ValueError, match="must not be a Windows reserved name") as caught:
+        values_file_path(tmp_path, "environments", environment)
+    assert "(value withheld)" in str(caught.value)
+
+
+@pytest.mark.parametrize("dir_name", ["NUL", "envs/nul", "COM1\\sub", "CON.d"])
+def test_values_file_path_refuses_a_reserved_dir_part(tmp_path: Path, dir_name: str) -> None:
+    """A bare ``NUL`` folder part names the device, not a folder (measured on Windows 11)."""
+    with pytest.raises(ValueError, match="must not hold a Windows reserved name") as caught:
+        values_file_path(tmp_path, dir_name, "dev")
+    assert "(value withheld)" in str(caught.value)
+
+
+@pytest.mark.parametrize(
     ("dir_name", "environment", "parts"),
     [
         ("environments", "dev", ("environments", "dev.toml")),

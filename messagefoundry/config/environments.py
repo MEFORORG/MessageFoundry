@@ -219,10 +219,14 @@ def values_file_path(base_dir: str | Path, dir_name: str, environment: str) -> P
     holding a link on the way, of the object the chain ends at and of that object's folder, but
     nothing checks that the end lies under ``base_dir``.
 
-    Nor does it refuse a Windows reserved device name such as ``NUL``, which the alphabet admits.
-    The file name always carries ``.toml``, and on Windows 11 (measured on build 26300) ``NUL.toml``
-    is an ordinary file name: it is created, listed and read as a regular file in its folder. Older
-    Windows releases were not measured."""
+    It also raises when a part of ``dir_name``, or the file name ``<env>.toml``, is one
+    :func:`ntpath.isreserved` calls reserved, such as ``NUL`` or ``COM1.toml``, read under the
+    Windows rules on every host. On Windows 11 (measured on build 26300) ``NUL.toml`` is an ordinary
+    file name, but a bare ``NUL`` folder part named the device rather than a folder, and older Windows releases, Windows Server
+    among them, were not measured; refusing every such name leaves no release where the path could
+    open a device."""
+    import ntpath
+
     # Imported here, so importing this module does not load the settings model.
     from messagefoundry.config.settings import _ENV_NAME_ALLOWED
 
@@ -232,13 +236,24 @@ def values_file_path(base_dir: str | Path, dir_name: str, environment: str) -> P
             "no leading slash or backslash, and no part of only dots or spaces such as '..' "
             "(value withheld)"
         )
+    if any(ntpath.isreserved(part) for part in PureWindowsPath(dir_name).parts):
+        raise ValueError(
+            "[environments].dir must not hold a Windows reserved name such as NUL or COM1 "
+            "(value withheld)"
+        )
     # The validator's own alphabet has no separator and no ':', so the file name is one plain part.
     if not environment or not set(environment) <= _ENV_NAME_ALLOWED:
         raise ValueError(
             "the environment name must be a non-empty name of letters, digits, '.', '_' or '-' "
             "(value withheld)"
         )
-    return Path(base_dir) / dir_name / f"{environment}.toml"
+    file_name = f"{environment}.toml"
+    if ntpath.isreserved(file_name):
+        raise ValueError(
+            "the environment name must not be a Windows reserved name such as NUL or COM1 "
+            "(value withheld)"
+        )
+    return Path(base_dir) / dir_name / file_name
 
 
 def load_environment_values(
