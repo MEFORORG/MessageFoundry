@@ -2195,7 +2195,12 @@ def test_a_dns_name_beside_an_rfc822_name_binds_no_other_mailbox_at_that_domain(
     DirectDestination(_dest(pki, recipient_cert=path))
     refusal = _refusal(pki, recipient_cert=path, recipients=["other@hisp.example"])
     assert "does not name recipient address 1 of 1" in refusal
-    assert "on a cert that names no rfc822Name" in refusal
+    assert "bound to those mailboxes alone" in refusal
+    # Negative control: a cert carrying no dNSName for the domain gets no such explanation.
+    plain = _recipient(pki, tmp_path, "no_dns_name", addresses=("recipient@hisp.example",))
+    refusal = _refusal(pki, recipient_cert=plain, recipients=["other@hisp.example"])
+    assert "does not name recipient address 1 of 1" in refusal
+    assert "bound to those mailboxes alone" not in refusal
 
 
 def test_every_recipient_must_be_named_and_the_refusal_gives_the_position(
