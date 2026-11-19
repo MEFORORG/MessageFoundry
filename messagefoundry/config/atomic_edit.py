@@ -396,14 +396,9 @@ def replace_validated(
     # Here, not at module top, so importing the config layer does not import the auth package.
     from messagefoundry.restricted_file import replace_generated
 
-    _refuse_a_link(path, refused_error)
+    refuse_a_link(path, refused_error)
     live = _live_security(path)
-    _remove_stale_candidates(path)
-    with refused_as(path, refused_error, "create its edit candidate"):
-        private = Path(
-            tempfile.mkdtemp(dir=path.parent, prefix=f".{path.name}.", suffix=CANDIDATE_DIR_SUFFIX)
-        )
-    try:
+    with candidate_dir(path, refused_error) as private:
         candidate = private / path.name
         with refused_as(path, refused_error, "write its edit candidate"):
             fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_BINARY, 0o600)
@@ -431,9 +426,23 @@ def replace_validated(
         validate(candidate)
         with refused_as(path, refused_error, "replace it with the validated edit"):
             replace_generated(candidate, path)
-    finally:
-        _remove_private_dir(private)
     _fsync_dir(path.parent)
+    restrict_to_owner(path, live=live)
+
+
+def restrict_to_owner(path: Path, *, live: _LiveSecurity | None = None) -> None:
+    """Restrict ``path`` to its owner, the step :func:`replace_validated` ends with.
+
+    ``live`` is whose the file must stay, read before :func:`replace_validated` renamed its
+    candidate into place. With none, ``path`` is a file left where it is, such as one an edit
+    that changed nothing kept byte for byte (BACKLOG #5327), and its owner is read from it now:
+    its bytes are not rewritten, and it is narrowed exactly as a replaced file would be, so an
+    edit that changes nothing still leaves the file owner-only. On POSIX that is mode 0600 with
+    the owner unchanged; on Windows it is the owner-and-editor list for a file another account
+    owns and the editing account's own list otherwise (the module docstring says why each).
+    Best-effort as the replace's own step is: a failure is logged, not raised."""
+    if live is None:
+        live = _live_security(path)
     if live.windows_owner is not None and _restrict_to_owner_and_editor(path, live.windows_owner):
         return
     # When the owner-and-editor list write fails, the fallback writes the same list again: the live
@@ -442,6 +451,24 @@ def replace_validated(
     if sys.platform == "win32" and _restrict_to_editor(path, owner=live.windows_owner):
         return
     _secure_file(path)
+
+
+@contextlib.contextmanager
+def candidate_dir(path: Path, refused_error: Callable[[str], Exception] | None) -> Iterator[Path]:
+    """A private directory beside ``path`` to build an edit candidate in, removed on exit.
+
+    A stale one a killed editor of ``path`` left behind is removed first, and a refusal creating it
+    is raised as ``refused_error(message)`` (:func:`refused_as`). Its removal logs rather than raises,
+    so a cleanup fault never hides the edit's own outcome."""
+    _remove_stale_candidates(path)
+    with refused_as(path, refused_error, "create its edit candidate"):
+        private = Path(
+            tempfile.mkdtemp(dir=path.parent, prefix=f".{path.name}.", suffix=CANDIDATE_DIR_SUFFIX)
+        )
+    try:
+        yield private
+    finally:
+        _remove_private_dir(private)
 
 
 @dataclass(frozen=True)
@@ -491,7 +518,7 @@ def _give_candidate_the_owner(
         ) from exc
 
 
-def _refuse_a_link(path: Path, refused_error: Callable[[str], Exception] | None) -> None:
+def refuse_a_link(path: Path, refused_error: Callable[[str], Exception] | None) -> None:
     """Refuse an edit of ``path`` when ``path`` itself is a link: ``os.replace`` replaces the link,
     not its target, so the edit would land in a detached regular file and leave the target as it
     was (vault BACKLOG #5619). A folder above it that is a link is followed, as every reader does."""
@@ -669,7 +696,11 @@ def _restrict_to_owner_and_editor(path: Path, owner: str) -> bool:
     from messagefoundry.store.store import _current_user_sid, _set_security_from_sddl
 
     editor = _current_user_sid()
-    sddl = f"O:{owner}" + _owner_and_editor_list(owner, editor, editor_writes=False)
+    # A file left in place that ``owner`` already owns needs no hand-back (restrict_to_owner): naming
+    # another account as the owner again would be refused without the restore privilege, and the
+    # warning below would then claim a hand-back that was never needed.
+    give_back = "" if _owner_of(path) == owner else f"O:{owner}"
+    sddl = give_back + _owner_and_editor_list(owner, editor, editor_writes=False)
     result = _set_security_from_sddl(path, sddl, protected=True)
     if result.failure is not None:
         _log.warning("could not restrict %s to its owner after the edit: %s", path, result.failure)

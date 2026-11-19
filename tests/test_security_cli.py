@@ -1160,3 +1160,118 @@ def test_cli_set_reports_a_malformed_edit_as_json_on_stdout_in_a_real_subprocess
     assert proc.stdout.strip(), f"stdout was empty; stderr={proc.stderr}"
     assert json.loads(proc.stdout)["error"].startswith("invalid security update JSON:")
     assert "Traceback" not in proc.stderr, "a raw traceback reached the operator"
+
+
+# --- BACKLOG #5327: an edit that changes nothing still restricts the file to its owner ----------
+
+
+def _unchanged_set(toml: Path) -> None:
+    from messagefoundry.config import security_edit
+
+    result = security_edit.set_security(toml, {"require_mfa": False}, validate=lambda _c: None)
+    assert result["op"] == "unchanged"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_an_edit_that_changes_nothing_still_narrows_a_loose_file_on_posix(tmp_path: Path) -> None:
+    """The replace re-restricts the settings file to its owner on every set, so skipping the write
+    must not skip that: a file left at 0644 is narrowed to 0600, and its bytes are not touched."""
+    import os
+    import stat
+
+    toml = tmp_path / "mf.toml"
+    toml.write_bytes(b"[security]\r\nrequire_mfa = false\n")
+    os.chmod(toml, 0o644)
+    before = toml.read_bytes()
+    _unchanged_set(toml)
+    assert stat.S_IMODE(toml.stat().st_mode) == 0o600
+    assert toml.read_bytes() == before
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX permission bits")
+def test_an_edit_that_changes_nothing_but_is_refused_keeps_the_mode_on_posix(
+    tmp_path: Path,
+) -> None:
+    """The control: a refused replace never touches the live file, so neither does a refused
+    edit that changes nothing."""
+    import os
+    import stat
+
+    from messagefoundry.config import security_edit
+
+    def refuse(_candidate: Path) -> None:
+        raise ValueError("refused")
+
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
+    os.chmod(toml, 0o644)
+    with pytest.raises(security_edit.SecurityEditError):
+        security_edit.set_security(toml, {"require_mfa": False}, validate=refuse)
+    assert stat.S_IMODE(toml.stat().st_mode) == 0o644
+
+
+def _own_file_in_a_loose_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, str]:
+    """A settings file that inherits a list granting this account and SYSTEM, and its real owner,
+    which the token seam then reports as the editing account."""
+    import messagefoundry.store.store as store_mod
+    from messagefoundry.auth.anchor_path import SYSTEM_SID
+    from messagefoundry.config import atomic_edit
+    from tests._win_acl import folder_granting
+
+    token = store_mod._current_user_sid()
+    assert token is not None
+    toml = folder_granting(tmp_path / "config", token, SYSTEM_SID) / "mf.toml"
+    toml.write_bytes(b"[security]\r\nrequire_mfa = false\n")
+    owner = atomic_edit._owner_of(toml)
+    assert owner is not None
+    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: owner)
+    return toml, owner
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a Windows access list")
+def test_an_edit_that_changes_nothing_still_narrows_a_loose_file_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The Windows half: a file whose inherited list also grants SYSTEM is left with its owner's
+    entry alone, as the replace leaves the file it writes, and its bytes are not touched."""
+    from tests._win_acl import assert_owner_only
+
+    toml, owner = _own_file_in_a_loose_folder(tmp_path, monkeypatch)
+    before = toml.read_bytes()
+    _unchanged_set(toml)
+    assert_owner_only(toml, owner)
+    assert toml.read_bytes() == before
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a Windows access list")
+def test_an_edit_that_changes_nothing_keeps_a_foreign_owners_grant_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file another account owns is narrowed to that account and the editor at read only, as
+    the replace narrows it, and the owner is not handed back again since it never left."""
+    import messagefoundry.restricted_file as restricted_mod
+    import messagefoundry.store.store as store_mod
+    from messagefoundry.config import atomic_edit
+    from tests._win_acl import protected_entries
+
+    editor = "S-1-5-21-1000000001-1000000002-1000000003-4242"
+    toml, owner = _own_file_in_a_loose_folder(tmp_path, monkeypatch)
+    monkeypatch.setattr(store_mod, "_current_user_sid", lambda: editor)
+    monkeypatch.setattr(restricted_mod, "administrators_enabled", lambda: False)
+    written: list[str] = []
+    real_write = store_mod._set_security_from_sddl
+
+    def _record(path: Path, sddl: str, *, protected: bool) -> object:
+        written.append(sddl)
+        return real_write(path, sddl, protected=protected)
+
+    monkeypatch.setattr(store_mod, "_set_security_from_sddl", _record)
+    before = toml.read_bytes()
+    _unchanged_set(toml)
+    _, file_owner, entries = protected_entries(toml)
+    assert (file_owner, [sid for *_, sid in entries]) == (owner, [owner, editor])
+    assert written and not any(sddl.startswith("O:") for sddl in written), written
+    assert toml.read_bytes() == before
+    assert atomic_edit._owner_of(toml) == owner
