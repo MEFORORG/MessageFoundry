@@ -348,6 +348,19 @@ def test_metadata_is_masked_whole_on_both_models(blob: str) -> None:
     assert summary == "MRN ****0001 · D**, J**"  # the control: summary still keeps its shape
 
 
+def test_error_text_is_masked_whole_even_if_its_name_is_grammar_masked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Error text keeps the whole mask it had before BACKLOG #5786 split out GRAMMAR_MASKED: a name
+    in both sets is free text, so it never goes through the summary grammar."""
+    import messagefoundry.api.field_authz as field_authz
+
+    monkeypatch.setattr(field_authz, "GRAMMAR_MASKED", frozenset({"summary", "error"}))
+    holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
+    masked = redact_unauthorized(_summary(error="DOE, JANE MRN 100001"), holder)
+    assert masked.error == "****"
+
+
 def test_the_reveal_set_on_the_detail_route_covers_every_masked_property() -> None:
     """Every reveal call site must reveal every masked property, or a field silently stays masked.
 

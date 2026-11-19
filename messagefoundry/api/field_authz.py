@@ -289,7 +289,9 @@ def redact_unauthorized(  # noqa: UP047
     for prop in allowed & ((MASKED_UNTIL_REVEALED | error_text) - revealed):
         value = getattr(model, prop, None)
         if isinstance(value, str) and value:
-            withheld[prop] = mask_for_display(value) if prop in GRAMMAR_MASKED else _MASK
+            # Error text is masked whole even if a name is also in GRAMMAR_MASKED (BACKLOG #2436).
+            grammar = prop in GRAMMAR_MASKED and prop not in error_text
+            withheld[prop] = mask_for_display(value) if grammar else _MASK
             masked.add(prop)
     out = model.model_copy(update=withheld)
     if isinstance(out, PhiGatedModel):
