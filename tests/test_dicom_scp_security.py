@@ -197,24 +197,31 @@ def test_nonloopback_scp_with_source_ip_allowlist_ok() -> None:
 # Vault BACKLOG #2622 item 2: the allow-list is weighed, not counted. Each refused list is set, so
 # a presence test passes it; each is wider than the floor somewhere, so it restricts nobody it can
 # be shown to. RED on the code before #2622, which built every one of these.
+# Each case with the reason allowlist_shortfall returns for it, written out rather than computed,
+# so a regressed shortfall fails the test instead of agreeing with itself.
+_V4_WIDE = "an IPv4 entry is wider than /8"
+_V6_WIDE = "an IPv6 entry is wider than /32"
 _TOO_WIDE = (
-    ["0.0.0.0/0"],
-    ["::/0"],
-    ["10.0.0.0/7"],
-    ["2001:db8::/31"],
-    ["10.0.0.0/8", "0.0.0.0/0"],  # ONE wide entry defeats the list
+    (["0.0.0.0/0"], _V4_WIDE),
+    (["::/0"], _V6_WIDE),
+    (["10.0.0.0/7"], _V4_WIDE),
+    (["2001:db8::/31"], _V6_WIDE),
+    (["10.0.0.0/8", "0.0.0.0/0"], _V4_WIDE),  # ONE wide entry defeats the list
 )
 # The controls, one prefix inside each floor, so the refusal is the floor and not the presence.
 _NARROW_ENOUGH = (["10.0.0.0/8"], ["2001:db8::/32"], ["192.0.2.7"], ["10.0.0.0/8", "2001:db8::/48"])
 
 
-@pytest.mark.parametrize("allowlist", _TOO_WIDE)
-def test_nonloopback_scp_with_a_too_wide_allowlist_fails_closed(allowlist: list[str]) -> None:
+@pytest.mark.parametrize(("allowlist", "reason"), _TOO_WIDE)
+def test_nonloopback_scp_with_a_too_wide_allowlist_fails_closed(
+    allowlist: list[str], reason: str
+) -> None:
     with pytest.raises(ValueError) as exc:
         _scp("0.0.0.0", source_ip_allowlist=allowlist)
     msg = str(exc.value)
-    # It says why the list the operator did set does not count, with the floors it is held to.
-    assert "wider than /8 (IPv4) or /32 (IPv6)" in msg
+    # It names the part the list failed. The rule text is quoted in every refusal, so only the
+    # shortfall's own reason can tell a regressed shortfall from a working one.
+    assert f"does not count as a peer control: {reason}." in msg
     assert "Narrow every entry" in msg
 
 
@@ -237,7 +244,7 @@ def test_a_too_wide_allowlist_still_passes_with_mtls(tmp_path: Path) -> None:
     )  # no raise
 
 
-@pytest.mark.parametrize("allowlist", [*_TOO_WIDE, *_NARROW_ENOUGH])
+@pytest.mark.parametrize("allowlist", [*(case for case, _ in _TOO_WIDE), *_NARROW_ENOUGH])
 def test_the_dicom_and_http_gates_weigh_an_allowlist_the_same(allowlist: list[str]) -> None:
     # One rule for both listeners: an allow-list the HTTP intake gate refuses, the SCP refuses.
     from messagefoundry.pipeline.wiring_runner import _has_effective_peer_control

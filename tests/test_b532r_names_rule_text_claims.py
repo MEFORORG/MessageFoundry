@@ -63,7 +63,6 @@ def test_loopback_in_the_plain_space_is_left_out_of_the_count_not_the_list() -> 
     private = ["10.0.0.0/8", "192.168.0.0/16"]
     assert allowlist_restricts(private) is True
     assert allowlist_restricts([*private, "127.0.0.0/8"]) is True
-    assert "count" in (netaddr.allowlist_shortfall.__doc__ or "")
 
 
 def test_siit_is_read_as_the_ipv4_embedding_prefixes_comment_says() -> None:

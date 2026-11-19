@@ -444,8 +444,8 @@ the management API, and it does not inherit the API's auth: harden it deliberate
   refuses a peer outside `source_ip_allowlist` on every connection. With `intake_auth = none`, the
   default, a `source_ip_allowlist` counts only when it meets the allow-list rule. The rule judges
   each entry against a prefix floor, judges an IPv6 entry by the IPv4 addresses it can carry, and
-  judges the whole list against a cap on the IPv4 addresses its entries together admit, counted as
-  the rule says (vault BACKLOG #2622, #5393). It is stated once, as `ALLOWLIST_RULE_TEXT` in
+  judges the whole list against a cap that caps the IPv4 address count that
+  `ALLOWLIST_RULE_TEXT` in netaddr.py defines, which is not every address the list admits (vault BACKLOG #2622, #5393). It is stated once, as `ALLOWLIST_RULE_TEXT` in
   [netaddr.py](../messagefoundry/netaddr.py), and a refusal quotes it and, when a list is set,
   names the part the list failed. So `0.0.0.0/0` does not count, and neither does a list of
   entries that each meet the floor but together pass the cap.
