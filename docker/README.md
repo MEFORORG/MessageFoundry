@@ -141,6 +141,10 @@ against one case that matters, described under
   and read topology A below for the revocation attestation `docker compose` requires.
 - **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
   — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set all three `image:` fields (`tls-dir`, `copy-tls` and `engine`) to your config-baked image.
+  An enforcing start needs more than the bind, and the manifest's block *what an enforcing start
+  needs* sets at least the alert channel, verified-TLS log forwarding and the retention bounds, with
+  `REPLACE` values for you to fill in. Bake the syslog CA and CRL it names under `/config/pki/`, and
+  add the Secret's `tls-revocation-attested` key, without which the pod does not start.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
   Postgres-backed `replicas: 3` Deployment with `[cluster].enabled`, a PodDisruptionBudget, and
   lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)
