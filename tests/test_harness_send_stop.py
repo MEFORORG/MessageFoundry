@@ -58,7 +58,12 @@ def unreachable(monkeypatch: pytest.MonkeyPatch) -> list[_NeverConnects]:
         return sock
 
     monkeypatch.setattr(mllp, "_open_socket", open_socket)
-    monkeypatch.setattr(mllp, "_dial_settled", lambda _sock, wait_s: time.sleep(wait_s) or False)
+
+    def never_settles(_sock: object, wait_s: float) -> bool:
+        time.sleep(wait_s)
+        return False
+
+    monkeypatch.setattr(mllp, "_dial_settled", never_settles)
     return opened
 
 
