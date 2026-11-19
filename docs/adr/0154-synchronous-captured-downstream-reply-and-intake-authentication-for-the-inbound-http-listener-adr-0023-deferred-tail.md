@@ -1819,9 +1819,6 @@ unrelated outbound's retries.
 - A live row keeps the turn waiting.
 - `no_route` still needs a terminal message, as before: with no `reply_from` row, a dead routed row
   also leaves nothing upstream, and that is not "nothing routed".
-- When `reply_timeout` expires with every `reply_from` row settled but a sibling still upstream, the
-  turn answers that settled set (`failed` or `empty`), not `timeout`, which D8 keeps for a partner
-  that did not answer.
 
 One case moves from a fast `502` to waiting: a `dead` row while a sibling handler's work is still
 upstream. That wait is the point of the change, since the sibling's row may still capture the

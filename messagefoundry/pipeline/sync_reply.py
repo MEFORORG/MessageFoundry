@@ -261,10 +261,7 @@ class SyncReplyResolverImpl:
 
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        # Out of budget: a settled row set still says more than "timeout", which
-                        # D8 reserves for a partner that did not answer.
-                        settled = self._settled(rows, elapsed_ms()) if rows else None
-                        return settled or self._done(ReplyOutcome.TIMEOUT, elapsed_ms())
+                        return self._done(ReplyOutcome.TIMEOUT, elapsed_ms())
 
                     await waiter.hint(min(poll_period(self._rendezvous.waiters), remaining))
                     if waiter.drain_reason is not None:

@@ -55,19 +55,14 @@ async def _waited(rows: tuple[str, ...]) -> tuple[ReplyOutcome, int]:
 
 
 async def test_dead_beside_done_waits_while_upstream_is_in_flight() -> None:
-    # A sibling handler upstream may still emit a row that captures the reply, so the turn waits.
-    # At the deadline the settled set answers rather than "timeout", which D8 keeps for a partner
-    # that did not answer.
-    outcome, waited_ms = await _waited(("dead", "done"))
-    assert outcome is ReplyOutcome.EMPTY
-    assert waited_ms >= int(_SHORT * 1000) - 20, "it answered before the deadline"
+    # A sibling handler upstream may still emit a row that captures the reply, so the turn waits,
+    # and the deadline answers "timeout": the sibling may yet deliver.
+    assert (await _waited(("dead", "done")))[0] is ReplyOutcome.TIMEOUT
 
 
 async def test_every_row_failed_waits_while_upstream_is_in_flight() -> None:
     for rows in (("dead",), ("cancelled",), ("dead", "cancelled")):
-        outcome, waited_ms = await _waited(rows)
-        assert outcome is ReplyOutcome.FAILED, rows
-        assert waited_ms >= int(_SHORT * 1000) - 20, rows
+        assert (await _waited(rows))[0] is ReplyOutcome.TIMEOUT, rows
 
 
 async def test_a_live_row_at_the_deadline_is_still_a_timeout() -> None:
@@ -126,7 +121,14 @@ async def test_nothing_upstream_settles_a_routed_message_at_once() -> None:
         (("dead", "pending"), ReplyOutcome.TIMEOUT),
     )
     for rows, expected in cases:
-        assert await _outcome(_settled_upstream(row_states=rows)) is expected, rows
+        waits = expected is ReplyOutcome.TIMEOUT
+        # A settled answer gets a long budget, so answering at the deadline instead of at once fails.
+        budget = _SHORT if waits else 30.0
+        store = _Store([_settled_upstream(row_states=rows)])
+        reply = await _resolver(store, timeout=budget)("m1")
+        assert reply.outcome is expected, rows
+        if not waits:
+            assert reply.waited_ms < 5000, rows
 
 
 # --- terminal: the settled set decides --------------------------------------------------------------
