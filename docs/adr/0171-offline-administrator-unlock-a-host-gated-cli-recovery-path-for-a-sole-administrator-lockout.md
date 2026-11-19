@@ -393,7 +393,8 @@ This amends Amendment B's *The audit row commits WITH the swap, which is stricte
   one refused, exit 1. Both refusals write nothing.
 - Exit codes follow Amendment C. A refusal of the open, `StoreKeylessError`, `CipherError`, a
   driver error or a store that cannot be reached among them, exits 2. The same classes raised by
-  the read or the write after the open are a refused write, exit 1, which names the error's class, never its text.
+  the read or the write after the open are a refused write, exit 1; the refusal the command prints
+  names the error's class, never its text.
 
 Amended 2026-11-18 (BACKLOG #5633): admin-unlock's Unverifiable refusal also prints the stored
 and probe key versions, and an engine-defined refusal class at the store open prints whole.
