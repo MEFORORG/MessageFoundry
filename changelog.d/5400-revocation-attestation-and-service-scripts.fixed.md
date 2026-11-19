@@ -14,8 +14,9 @@
   It compared the exported `SeServiceLogonRight` holders with the account's SID only, so a row that
   named the account would have read as missing and the policy would have been re-imported with the
   account added again. A name is now matched as given, then resolved and its SID compared.
-  `uninstall-service.ps1` removes such a holder the same way, and a name that does not resolve is
-  kept. (BACKLOG #5401)
+  `uninstall-service.ps1` removes such a holder the same way. It also removes the account's own
+  name when that no longer resolves, as after the service is deleted; any other name that does not
+  resolve is kept. (BACKLOG #5401)
 - **The service scripts read `-DataDir` literally and validate one more service name.**
   `uninstall-service.ps1` tests the data directory and reads the config directory's ACL with
   `-LiteralPath`, so a `[` in the path would no longer read an existing directory as gone and leave

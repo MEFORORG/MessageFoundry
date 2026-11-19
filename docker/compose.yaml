@@ -136,7 +136,10 @@ services:
 
     # Secrets via env_file (gitignored). Each line: MEFOR_STORE_ENCRYPTION_KEY=..., MEFOR_API_TLS_KEY_PASSWORD=...
     # Plain env is visible in `docker inspect` + image-less but on the host — for stricter handling use a
-    # secrets manager or the k8s manifests (secretKeyRef). Mint the store key with `messagefoundry gen-key`.
+    # secrets manager or the k8s manifests (secretKeyRef). Mint the store key with `messagefoundry gen-key`;
+    # through compose, before you attest, run it as
+    #     MEFOR_TLS_REVOCATION_ATTESTED=0 docker compose run --rm --no-deps engine gen-key
+    # since without --no-deps the revocation-attestation-check service runs first and refuses 0.
     env_file:
       - path: ./secrets.env       # copy docker/secrets.env.example -> docker/secrets.env and fill it in
         required: false

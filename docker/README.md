@@ -165,7 +165,10 @@ against one case that matters, described under
   [SECURITY.md, API revocation gate](../docs/SECURITY.md#api-revocation-gate) states.
   `compose.yaml` passes it by compose substitution with no default, so `docker compose` refuses to
   start until you export it or put it in a `.env` beside `compose.yaml` (an `env_file:` does not
-  feed substitution). Set it only if your PKI enforces revocation; the file never sets it for you.
+  feed substitution, and passing `--env-file` reads the named file instead of that `.env`, so keep
+  this value and the Postgres password in the same place). A value that does not read as true, such
+  as `0`, is refused by the `revocation-attestation-check` service before any engine starts. Set it
+  only if your PKI enforces revocation; the file never sets it for you.
 - **(B) Reverse-proxy / same-pod sidecar — k8s-preferred.** Engine stays on loopback behind the
   sidecar, declared with `tls_terminated_upstream=true` + `trusted_proxies=[…]` +
   `plaintext_upstream_hop_acknowledged=true`, because with no `tls_cert_file` that hop is
