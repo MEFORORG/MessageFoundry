@@ -88,7 +88,8 @@ def test_an_empty_store_key_item_above_an_ordinary_item_does_not_refuse(key: str
         "=C:=C:\\x",
         "HTTP_PROXY=",  # an ordinary variable set to nothing still ends the value above
         "MEFOR_SECRETS_DIRECTORY=",
-        "MIIBshort==",  # padded base64 that is not a store key
+        "foo\nPATH=C:\\x",  # a later line of the item sets an ordinary variable
+        "A" * 42 + "_B=1",  # a base64 run one short of a key's, so this is a name
     )
     for follower in followers:
         posture = _read([f"{key}=", follower])
@@ -101,6 +102,33 @@ def test_a_quoted_or_comma_led_key_item_continues_the_empty_key(item: str) -> No
     key = KEY_CLASS_NAMES[1]
     assert _read([f"{key}=", item]).listed_keys == (key,)
     assert _read([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\n{item}"]).listed_keys == (key,)
+
+
+@pytest.mark.parametrize("name", ["MEFOR_STORE_PASSWORD", "MEFOR_AUTH_OIDC_CLIENT_SECRET"])
+def test_a_padded_secret_split_into_the_next_item_refuses(name: str) -> None:
+    """A padded base64 secret reads as ``NAME==``-shaped text, as it does on the next line of one
+    string, where it already refused."""
+    padded = base64.b64encode(b"synthetic-tok-16").decode()
+    assert padded.endswith("==")
+    assert _read([f"{name}=", padded]).listed_directory_names == (name,)
+    assert _read([f"MEFOR_AI_ENVIRONMENT=prod\n{name}=\n{padded}"]).listed_directory_names == (
+        name,
+    )
+
+
+def test_a_name_whose_equals_sign_is_on_the_next_line_takes_the_next_item() -> None:
+    key = KEY_CLASS_NAMES[0]
+    assert _read([f"{key}\n=", _KEY_B64]).listed_keys == (key,)
+
+
+def test_a_later_empty_key_whose_key_is_the_next_item_is_counted_once() -> None:
+    """The joined strings read as the one string they would be, so the broken ``MEFOR_VALUE_A``
+    name above the key is counted once, under the key, and is not called empty."""
+    key = KEY_CLASS_NAMES[0]
+    split = _read([f"MEFOR_VALUE_A\n{key}=", _KEY_B64])
+    whole = _read([f"MEFOR_VALUE_A\n{key}={_KEY_B64}"])
+    assert split.listed == whole.listed == (key,)
+    assert split.empty_value_names == whole.empty_value_names == ()
 
 
 def test_the_refusal_says_to_remove_the_strings_a_value_runs_on_into() -> None:
@@ -285,11 +313,15 @@ def test_a_line_whose_value_is_only_equals_signs_and_blanks_continues_the_value(
 # --- item 11: no wording that goes stale on merge --------------------------------------------------
 
 
-_STALE_BASELINE = re.compile(r"``main``|\bthe head\b", re.IGNORECASE)
+#: ``main`` as a baseline, and "the head" as a version: what goes stale on merge, and not "the
+#: head of a list", which does not.
+_STALE_BASELINE = re.compile(r"``main``|\b(?:at|on|than) main\b|\bthe head\b(?! of\b)", re.I)
 
 
 def test_the_module_names_no_branch_or_head_as_its_baseline() -> None:
-    # The positive control: the pattern finds the wording it is for.
+    # The positive control: the pattern finds the wording it is for, and only that.
     assert _STALE_BASELINE.search("as ``main`` read it")
     assert _STALE_BASELINE.search("The head read the rest")
+    assert _STALE_BASELINE.search("refused as on main")
+    assert not _STALE_BASELINE.search("the head of the walk")
     assert not _STALE_BASELINE.search(inspect.getsource(serviceenv))
