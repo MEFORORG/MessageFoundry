@@ -447,7 +447,12 @@ def test_a_backlog_named_file_with_no_item_refuses_rather_than_reporting_no_item
     assert "NO-ITEM" not in proc.stdout, combined
 
     backlog(repo, f"## 26. A real item\n\n> {SHIPPED} SHIPPED\n")
-    assert set(verdicts(repo)) == {"26"}
+    proc = adjudicate(repo, "-Json")
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout)
+    assert {c["key"] for c in report["claims"]} == {"26"}
+    # The proposals file matches BACKLOG by name but holds no item, so it is not a source.
+    assert report["sources"]["backlog"] == ["docs/BACKLOG.md"], report["sources"]
 
 
 def test_the_script_carries_no_control_characters() -> None:

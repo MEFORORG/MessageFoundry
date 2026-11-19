@@ -177,19 +177,25 @@ if (-not $backlogFiles.Count) {
 # in their names. Counting files therefore passed on a namespace that holds nothing, and every
 # numeric key then read NO-ITEM -- the same never-looked report the check above refuses. So a file
 # joins the corpus only if it holds an item heading, in the shape Get-ItemBlock matches, and a
-# corpus left empty refuses. A stub is then never listed as a source either.
+# corpus left empty refuses. A stub is then never listed as a source either. A file that could not
+# be READ refuses too: dropping it silently would turn its items into NO-ITEM the same way.
 $itemHeading = '(?m)^##\s+\d+\.\s'
 $corpus = @{}
 foreach ($bf in $backlogFiles) {
+    $global:LASTEXITCODE = -1
     $text = (& git -C $repo show "${mainRef}:$bf" 2>$null) -join "`n"
+    if ($LASTEXITCODE -ne 0) {
+        throw "could not read ${mainRef}:$bf (git show exited $LASTEXITCODE): cannot adjudicate any key against a namespace that was only partly read"
+    }
     if ($text -match $itemHeading) { $corpus[$bf] = $text }
 }
 if (-not $corpus.Count) {
-    throw ("no backlog item heading found in the $($backlogFiles.Count) backlog-named file(s) on ${mainRef}, " +
-        "so there is no ledger here to adjudicate any key against. The ledger lives in the " +
-        "maintainer-internal repository (the vault) since 2026-09-13, and docs/BACKLOG.md here is a " +
-        "stub. Refusing rather than report every key NO-ITEM.")
+    throw ("no backlog item heading found in the backlog-named file(s) on ${mainRef} " +
+        "($($backlogFiles -join ', ')), so there is no ledger here to adjudicate any key against. " +
+        "The ledger lives in the maintainer-internal repository (the vault) since 2026-09-13, and " +
+        "docs/BACKLOG.md here is a stub. Refusing rather than report every key NO-ITEM.")
 }
+$corpusFiles = @($corpus.Keys | Sort-Object)
 
 # The status vocabulary is backlog_status_check.py's, not this file's. Held as codepoints so the
 # source stays readable on a console that cannot render them.
@@ -216,7 +222,7 @@ function Get-ItemBlock([string]$ItemKey) {
     # item; anything else belongs to a different namespace and must not be pattern-matched into this
     # one.
     if ($ItemKey -notmatch '^\d+$') { return $null }
-    foreach ($f in ($corpus.Keys | Sort-Object)) {
+    foreach ($f in $corpusFiles) {
         $text = $corpus[$f]
         $m = [regex]::Match($text, '(?m)^##\s+' + [regex]::Escape($ItemKey) + '\.\s')
         if (-not $m.Success) { continue }
@@ -423,7 +429,7 @@ if ($Json) {
         scanned   = $true
         reference = $mainRef
         applied   = $false
-        sources   = [pscustomobject]@{ claims = $claimsDir; backlog = @($corpus.Keys | Sort-Object) }
+        sources   = [pscustomobject]@{ claims = $claimsDir; backlog = $corpusFiles }
         counts    = [pscustomobject]@{
             total      = $rows.Count
             superseded = @($rows | Where-Object verdict -eq 'SUPERSEDED').Count
@@ -446,7 +452,7 @@ if (-not $mainIsRemote) {
 
 Write-Host "CLAIM ADJUDICATION -- per key, against the durable protection on $mainRef" -ForegroundColor Cyan
 Write-Host "  claims  : $claimsDir"
-Write-Host "  backlog : $(($corpus.Keys | Sort-Object) -join ', ')"
+Write-Host "  backlog : $($corpusFiles -join ', ')"
 Write-Host "  writes  : NONE. This tool has no -Apply. The release lines below are for you to run."
 Write-Host ""
 
