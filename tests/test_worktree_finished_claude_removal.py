@@ -503,10 +503,10 @@ def test_runner_past_its_deadline_skips_the_step_and_still_writes_its_exit_line(
 ) -> None:
     """The task's time limit kills the run with nothing written (2026-11-18), so the runner stops first.
 
-    A deadline already gone when the step starts: the listing run is not started, no tree is touched,
-    and the exit line is still written.
+    A deadline already gone when the run reaches its first prune-merged.ps1 run: neither that run nor
+    the listing run is started, no tree is touched, and the exit line is still written, with 4, STOPPED.
     """
-    _, log = run_logged(
+    code, log = run_logged(
         fx,
         tmp_path / "logs-deadline",
         "-Apply",
@@ -518,8 +518,12 @@ def test_runner_past_its_deadline_skips_the_step_and_still_writes_its_exit_line(
         assert fx.tree(name).is_dir(), f"{name} was removed past the deadline: {log}"
     assert "SKIPPED, the run's deadline (stopAfter=" in log, log
     assert "listed finished:" not in log, "the listing run must not start past the deadline"
-    assert "--- prune-merged.ps1 exit " in log
-    assert re.search(r"^=== exit \d \(.*\) at \d\d:\d\d:\d\d ===$", log.splitlines()[-1]), log
+    assert "--- prune-merged.ps1 NOT STARTED, the run's deadline (stopAfter=" in log, log
+    assert "--- prune-merged.ps1 running ---" not in log, log
+    assert re.search(r"^=== exit 4 \(STOPPED .*\) at \d\d:\d\d:\d\d ===$", log.splitlines()[-1]), (
+        log
+    )
+    assert code == 4, log
 
 
 def test_the_helper_past_its_stop_time_attempts_no_path_and_says_so(fx: Fx) -> None:
