@@ -58,13 +58,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     confirm pages also read cluster state through the ``monitoring:read`` handlers, so they assert that
     permission as well and fail closed on either."""
     core = deps.core
+    # Whether the current run of failed membership reads has been logged at WARNING. The live
+    # fragment polls every few seconds per open tab, so an outage logs one warning, not one per poll,
+    # and a read that succeeds again starts a new run.
+    outage_logged = False
 
     async def _state(
         engine: Any, identity: Identity
     ) -> tuple[ClusterStatus, ClusterNodeList | None]:
         """The in-memory status, and the membership and lease rows, or ``None`` for the rows when
         their store read raised (BACKLOG #5932). That read is the only one here that touches the
-        store, so a store timeout or outage degrades these pages instead of answering ``500``."""
+        store, so a store timeout or outage degrades these pages instead of answering an error body."""
+        nonlocal outage_logged
         cluster = await core.cluster_status(engine=engine, _user=identity)
         try:
             nodes = await core.cluster_nodes(engine=engine, _user=identity)
@@ -74,12 +79,15 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             # As broad as the JSON stepdown handler's membership read, for its reason: the store's
             # driver exceptions are not importable here without the optional extras.
             # CancelledError is not an Exception, so a request deadline still unwinds.
-            _log.warning(
+            _log.log(
+                logging.DEBUG if outage_logged else logging.WARNING,
                 "cluster page: node %s could not read cluster membership: %s",
                 cluster.node_id,
                 safe_exc(exc),
             )
+            outage_logged = True
             return cluster, None
+        outage_logged = False
         return cluster, nodes
 
     @app.get("/ui/cluster", response_class=HTMLResponse)
@@ -90,7 +98,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> HTMLResponse:
         cluster, nodes = await _state(engine, identity)
         if nodes is None:
-            return HTMLResponse(pages.high_availability_unreadable(cluster), status_code=503)
+            return HTMLResponse(
+                pages.high_availability_unreadable(cluster, notice=m), status_code=503
+            )
         can_control = identity.has(Permission.CLUSTER_CONTROL)
         return HTMLResponse(
             pages.high_availability(cluster, nodes, can_control=can_control, notice=m)

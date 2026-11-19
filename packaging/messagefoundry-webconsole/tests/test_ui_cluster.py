@@ -498,6 +498,7 @@ class _Coordinator(NullCoordinator):
         self._raises = raises
         # Set by a test after sign-in, since _console reads the page once to prove the session.
         self.members_raise: Exception | None = None
+        self.lease_raise: Exception | None = None
         self.step_down_calls = 0
 
     def is_clustered(self) -> bool:
@@ -515,6 +516,8 @@ class _Coordinator(NullCoordinator):
         return self._members
 
     async def leadership_lease(self) -> tuple[str | None, float | None]:
+        if self.lease_raise is not None:
+            raise self.lease_raise
         return ("node-a", 1_700_000_030.0) if self._clustered else (self.node_id, None)
 
     async def step_down_leadership(
@@ -818,3 +821,34 @@ async def test_a_store_failure_degrades_the_pages_instead_of_a_500(
         coord.members_raise = None
         assert (await c.get("/ui/cluster")).status_code == 200
     assert coord.step_down_calls == 0
+
+
+_LOGGER = "messagefoundry_webconsole.routes.cluster"
+
+
+async def test_a_failed_lease_read_degrades_and_keeps_the_notice(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5932, the second store read: membership answers and the lease read then fails. The
+    post-stepdown notice still shows, since the stepdown it reports already ran, and an outage
+    logs one warning however often the page polls."""
+    coord = _Coordinator()
+    async with _console(tmp_path, coord) as (_engine, c):
+        coord.lease_raise = ConnectionError("store unreachable")
+        with caplog.at_level("DEBUG", logger=_LOGGER):
+            page_ = await c.get("/ui/cluster", params={"m": "drained"})
+            for _ in range(3):
+                assert (await c.get("/ui/cluster/live")).status_code == 200
+        assert page_.status_code == 503
+        assert "could not read cluster membership" in page_.text
+        assert "Leadership lease released with force" in page_.text
+        warnings = [r for r in caplog.records if r.name == _LOGGER and r.levelname == "WARNING"]
+        assert len(warnings) == 1
+        # The store answers again, so the next failure is a new outage and warns again.
+        coord.lease_raise = None
+        assert (await c.get("/ui/cluster")).status_code == 200
+        coord.lease_raise = ConnectionError("store unreachable")
+        caplog.clear()
+        with caplog.at_level("DEBUG", logger=_LOGGER):
+            assert (await c.get("/ui/cluster/live")).status_code == 200
+        assert [r.levelname for r in caplog.records if r.name == _LOGGER] == ["WARNING"]

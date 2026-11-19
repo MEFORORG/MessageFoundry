@@ -412,6 +412,11 @@ _UNREADABLE = (
     "page shows only this node's own status, and no stepdown can be started from it. Retry, and if "
     "it repeats, check the store connection."
 )
+_UNREADABLE_CONFIRM = (
+    "This node could not read cluster membership or the leadership lease from the store, so this "
+    "page cannot say what a stepdown would do, and offers none. Retry, and if it repeats, check the "
+    "store connection."
+)
 
 
 def _unreadable_body(cluster: ClusterStatus) -> Markup:
@@ -444,8 +449,10 @@ def high_availability_unreadable_fragment(cluster: ClusterStatus) -> Markup:
     return _unreadable_body(cluster)
 
 
-def high_availability_unreadable(cluster: ClusterStatus) -> Markup:
-    """The High Availability page when the membership read raised (BACKLOG #5932)."""
+def high_availability_unreadable(cluster: ClusterStatus, *, notice: str = "") -> Markup:
+    """The High Availability page when the membership read raised (BACKLOG #5932). It keeps the
+    post-stepdown notice, since the stepdown it reports already ran whatever this read did."""
+    message = _NOTICES.get(notice)
     live = el(
         "div",
         _unreadable_body(cluster),
@@ -456,6 +463,7 @@ def high_availability_unreadable(cluster: ClusterStatus) -> Markup:
     return page(
         "High Availability",
         el("h1", "High Availability"),
+        el("p", message, class_="banner") if message else Markup(""),
         el("p", _INTRO, class_="muted"),
         live,
         active="cluster",
@@ -469,7 +477,7 @@ def stepdown_confirm_unreadable(*, force: bool) -> Markup:
     body = el(
         "div",
         el("h1", title),
-        el("p", _UNREADABLE),
+        el("p", _UNREADABLE_CONFIRM),
         el("p", el("a", "Back to High Availability", href=_PAGE)),
         class_="card detail-card",
     )
