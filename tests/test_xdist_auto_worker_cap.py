@@ -1,14 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Pin the cap on the worker count ``pytest -n auto`` starts (``tests/_xdist_worker_cap.py``).
+"""Pin the cap on the worker count ``pytest -n auto`` starts, and both conftests that register it.
 
-One ``-n auto`` run takes at most ``MAX_AUTO_WORKERS`` workers, a smaller machine keeps its own
-count, and ``PYTEST_XDIST_AUTO_NUM_WORKERS`` still sizes one run. The cap does nothing unless a
-conftest pytest loads early registers it, so both registrations are pinned too.
-
-The repo-root conftest is reached through this run's plugin manager, never imported: pytest
-registers it under the bare name ``conftest``, which ``tests/test_conftest_name_collision_guard.py``
-keeps unimported.
+The module under test, ``tests/_xdist_worker_cap.py``, says why there are two registrations.
 """
 
 from __future__ import annotations
@@ -24,10 +18,6 @@ from tests import _xdist_worker_cap as cap
 _ROOT = Path(__file__).resolve().parents[1]
 _ROOT_CONFTEST = _ROOT / "conftest.py"
 _CONSOLE_CONFTEST = _ROOT / "packaging" / "messagefoundry-webconsole" / "tests" / "conftest.py"
-
-
-def test_the_cap_is_eight() -> None:
-    assert cap.MAX_AUTO_WORKERS == 8
 
 
 @pytest.mark.parametrize(
@@ -49,7 +39,11 @@ def test_an_override_xdist_ignored_does_not_lift_the_cap() -> None:
 
 
 def test_the_root_conftest_registers_the_cap_in_this_run(pytestconfig: pytest.Config) -> None:
-    """The premise: the root conftest is a loaded plugin and binds the shared hook."""
+    """The premise: the root conftest is a loaded plugin and binds the shared hook.
+
+    Reached through the plugin manager, never imported, because pytest registers it under the bare
+    name ``conftest``. Unlike the hook-chain test below, this holds even where xdist is inactive.
+    """
     for plugin in pytestconfig.pluginmanager.get_plugins():
         location = getattr(plugin, "__file__", None)
         if location and Path(location).resolve() == _ROOT_CONFTEST:
@@ -91,18 +85,19 @@ def cpu_count(
     return set_count
 
 
-@pytest.mark.parametrize(("cpus", "expected"), [(32, 8), (4, 4)])
+@pytest.mark.parametrize(
+    ("cpus", "override", "expected"), [(32, None, 8), (4, None, 4), (32, "24", 24)]
+)
 def test_the_real_hook_chain_caps_xdists_count(
-    pytestconfig: pytest.Config, cpu_count: Callable[[int], None], cpus: int, expected: int
+    pytestconfig: pytest.Config,
+    cpu_count: Callable[[int], None],
+    monkeypatch: pytest.MonkeyPatch,
+    cpus: int,
+    override: str | None,
+    expected: int,
 ) -> None:
     """Drive the registered hook chain: xdist's implementation computes, the wrapper bounds it."""
     cpu_count(cpus)
+    if override is not None:
+        monkeypatch.setenv(cap.AUTO_WORKERS_ENV, override)
     assert pytestconfig.hook.pytest_xdist_auto_num_workers(config=pytestconfig) == expected
-
-
-def test_the_env_override_still_wins_through_the_real_hook_chain(
-    pytestconfig: pytest.Config, cpu_count: Callable[[int], None], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    cpu_count(32)
-    monkeypatch.setenv(cap.AUTO_WORKERS_ENV, "24")
-    assert pytestconfig.hook.pytest_xdist_auto_num_workers(config=pytestconfig) == 24

@@ -45,14 +45,11 @@ def capped_auto_workers(computed: int, env_value: str | None) -> int:
     xdist ignores a non-integer value with a warning and falls back to its CPU count, so the cap
     still applies then.
     """
-    if env_value:
-        try:
-            int(env_value)
-        except ValueError:
-            pass
-        else:
-            return computed
-    return min(MAX_AUTO_WORKERS, computed)
+    try:
+        int(env_value or "")
+    except ValueError:
+        return min(MAX_AUTO_WORKERS, computed)
+    return computed
 
 
 # A wrapper, so xdist still computes the count (its env override, then psutil's physical cores, or
