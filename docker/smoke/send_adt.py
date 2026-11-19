@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Self-contained MLLP sender for the container smoke: frame one SYNTHETIC ADT^A01 and assert AA.
+"""Self-contained MLLP sender for the container smoke: frame one SYNTHETIC ADT^A01 and assert AA or CA.
 
 Uses only the installed engine package (no samples/ mount needed) and a hard-coded synthetic message
 (no PHI). Exits 0 on a positive ACK (MSA-1 exactly AA or CA), non-zero otherwise — so the CI smoke can
@@ -14,6 +14,7 @@ import contextlib
 import sys
 
 from messagefoundry.mllpcodec import MLLPDecoder, frame
+from messagefoundry.parsing.peek import HL7PeekError, Peek
 
 # Synthetic ADT^A01 (no PHI). \r segment terminators, as HL7 requires.
 ADT_A01 = (
@@ -57,19 +58,20 @@ _POSITIVE_ACK_CODES = frozenset({"AA", "CA"})
 
 
 def ack_exit_code(ack: str) -> int:
-    """0 when the ACK's first MSA segment carries MSA-1 exactly AA or CA, 1 for anything else.
+    """0 when the ACK's MSA-1 is exactly AA or CA, 1 for anything else.
 
-    Fails closed: AE, AR, CE, CR, an empty or unknown code, and an ACK with no MSA segment all exit 1.
+    Read through the engine's own separator-aware Peek, as its MLLP client reads an ACK. Fails
+    closed: AE, AR, CE, CR, an empty or unknown code, a missing MSA-1 and an unparseable ACK all
+    exit 1.
     """
-    for seg in ack.split("\r"):
-        if seg.startswith("MSA|"):
-            fields = seg.split("|")
-            code = fields[1] if len(fields) > 1 else ""
-            if code in _POSITIVE_ACK_CODES:
-                return 0
-            print(f"MSA-1 {code!r} is not AA or CA", file=sys.stderr)
-            return 1
-    print("no MSA segment in ACK", file=sys.stderr)
+    try:
+        code = Peek.parse(ack).field("MSA-1")
+    except HL7PeekError as exc:
+        print(f"unparseable ACK: {exc}", file=sys.stderr)
+        return 1
+    if code in _POSITIVE_ACK_CODES:
+        return 0
+    print(f"MSA-1 {code!r} is not AA or CA", file=sys.stderr)
     return 1
 
 
