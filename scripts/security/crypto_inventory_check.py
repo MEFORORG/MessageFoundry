@@ -582,7 +582,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     # preset's criteria (bound to its owner) are sealed under, and opens those cells through the store
     # cipher seam. No key of its own. BACKLOG #5970: to tell a Transit decrypt 400 that names the
     # key version (retired or unknown) from any other, it reads the reply with
-    # crypto_transit's bounded reader and version texts and keyprovider_vault's 400 test; it makes
+    # crypto_transit's bounded reader and its fault set and keyprovider_vault's 400 test; it makes
     # no Transit call of its own.
     "messagefoundry/store/cell_tag.py": frozenset(
         {

@@ -538,17 +538,23 @@ def _first_in_interval(memo: _Memo, err: CellTagError, key: _Key | None = None) 
     return True
 
 
-#: The texts, lower-cased and matched whole, that a Transit data-key ``decrypt`` 400 names a
-#: retired key version with (BACKLOG #5970), beside the audit walk's
-#: :data:`~messagefoundry.store.crypto_transit._VERSION_REFUSAL_TEXTS`, which also cover
-#: ``decrypt``'s ``invalid ciphertext: version is too new`` and ``no such key version``. Read on
-#: 2026-11-19 from Vault ``main``'s ``sdk/helper/keysutil/policy.go`` (``ErrTooOld``); OpenBao was
-#: not read. Wording a release changes stops matching, so that refusal fails the read loudly, the
-#: side the owner's ruling keeps. ``encryption key not found`` is deliberately absent: Transit
-#: answers it when the store's configured key is missing, a fault of the whole store rather than
-#: of a cell's key version, so a list read raises on it (owner ruling 2026-11-19).
+#: The texts, lower-cased and matched WHOLE, never as a substring, that a Transit data-key
+#: ``decrypt`` 400 names a retired or unknown key version with (BACKLOG #5970). Read on 2026-11-19
+#: from Vault ``main``'s ``sdk/helper/keysutil/policy.go`` (``ErrTooOld``, ``DecryptWithOptions``,
+#: ``safeGetKeyEntry``); OpenBao was not read. Decrypt-only on purpose: the audit walk's
+#: :data:`~messagefoundry.store.crypto_transit._VERSION_REFUSAL_TEXTS` holds HMAC wording and is
+#: matched as a substring, so a missing-key or malformed-cell reason that merely mentions a
+#: version would read as one. Wording a release changes stops matching, so that refusal fails the
+#: read loudly, the side the owner's ruling keeps. ``encryption key not found`` is deliberately
+#: absent: Transit answers it when the store's configured key is missing, a fault of the whole
+#: store rather than of a cell's key version, so a list read raises on it (owner ruling
+#: 2026-11-19).
 _TRANSIT_KEY_REFUSAL_TEXTS: Final = frozenset(
-    {"ciphertext or signature version is disallowed by policy (too old)"}
+    {
+        "ciphertext or signature version is disallowed by policy (too old)",
+        "invalid ciphertext: version is too new",
+        "no such key version",
+    }
 )
 
 
@@ -562,7 +568,6 @@ def _transit_refused_for_key(cause: BaseException | None) -> bool:
     ``False``; anything else it raises propagates, which fails the read too."""
     from messagefoundry.store.crypto_transit import (  # noqa: PLC0415 -- Transit only
         _READ_FAULTS,
-        _VERSION_REFUSAL_TEXTS,
         _reply_errors,
     )
     from messagefoundry.store.keyprovider_vault import is_vault_bad_request  # noqa: PLC0415
@@ -579,15 +584,10 @@ def _transit_refused_for_key(cause: BaseException | None) -> bool:
         return False
     if oversize is not None or not isinstance(errors, list) or not errors:
         return False
-    for entry in errors:
-        if not isinstance(entry, str):
-            return False
-        text = entry.strip().lower()
-        if text not in _TRANSIT_KEY_REFUSAL_TEXTS and not any(
-            known in text for known in _VERSION_REFUSAL_TEXTS
-        ):
-            return False
-    return True
+    return all(
+        isinstance(entry, str) and entry.strip().lower() in _TRANSIT_KEY_REFUSAL_TEXTS
+        for entry in errors
+    )
 
 
 def refused_for_key(cipher: Cipher, exc: CipherError, stored: str | None) -> bool:

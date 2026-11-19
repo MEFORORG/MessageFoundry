@@ -1208,6 +1208,9 @@ _TRANSIT_KEY_REFUSALS = (
 #: key version.
 _TRANSIT_LOUD_REFUSALS = (
     "encryption key not found",
+    # A reason that only mentions a version is not one: matched whole, never as a substring.
+    "encryption key not found (no such key version)",
+    "no hmac key exists for that key version",
     "invalid ciphertext: no prefix",
     "invalid ciphertext: wrong number of fields",
     "invalid ciphertext: version number could not be decoded",
