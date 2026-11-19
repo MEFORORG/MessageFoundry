@@ -121,27 +121,6 @@ def test_graph_references_env_false_for_zero_env_graph(tmp_path: Path) -> None:
     assert referenced_env_keys_in_graph(reg) == []
 
 
-def test_graph_references_env_skips_not_deployed_connection(tmp_path: Path) -> None:
-    # BACKLOG #5775: a deployed=False connection's env() values are never resolved (ADR 0111), so a
-    # reference it alone carries must not turn a zero-env deployment into one that needs a value file.
-    body = (
-        _NO_ENV_GRAPH
-        + '    outbound("OB_OFF", MLLP(host=env("off_host"), port=6001), deployed=False)\n'
-    )
-    body = body.replace(
-        "from messagefoundry import inbound, outbound, MLLP, router, handler, Send",
-        "from messagefoundry import inbound, outbound, MLLP, router, handler, Send, env",
-    )
-    reg = load_config(_config_dir(tmp_path, body))
-    assert "OB_OFF" in reg.outbound
-    assert graph_references_env(reg) is False
-    assert referenced_env_keys_in_graph(reg) == []
-    # Positive control: the same connection, deployed, is counted.
-    on = load_config(_config_dir(tmp_path, body.replace(", deployed=False", ""), name="config_on"))
-    assert graph_references_env(on) is True
-    assert referenced_env_keys_in_graph(on) == ["off_host"]
-
-
 # --- AC-3: scoped fail-loud through the offline `validate` subcommand ----------------------------
 
 

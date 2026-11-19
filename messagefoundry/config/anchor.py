@@ -170,13 +170,9 @@ def _iter_settings_values(registry: Registry) -> Iterable[Any]:
     (``db_lookup`` / ``fhir_lookup``), and each reference set's source settings all carry ``env()``
     references as dict values (see the ``env()`` examples in ``wiring.py``). Routers/Handlers author
     *logic*, not transport settings, so they hold no ``EnvRef`` — they are not scanned.
-
-    A ``deployed=False`` connection (#233, ADR 0111) is skipped: its ``env()`` values are never
-    resolved, so a reference it alone carries does not make the graph need a value file.
     """
-    for _kind, _name, settings, deployed in registry.settings_carriers():
-        if deployed:
-            yield from _mapping_values(settings)
+    for _kind, _name, settings, _deployed in registry.settings_carriers():
+        yield from _mapping_values(settings)
 
 
 def _mapping_values(settings: Mapping[str, Any]) -> Iterable[Any]:
@@ -190,8 +186,7 @@ def _mapping_values(settings: Mapping[str, Any]) -> Iterable[Any]:
 
 
 def referenced_env_keys_in_graph(registry: Registry) -> list[str]:
-    """The sorted, de-duplicated ``env()`` keys the loaded graph references, leaving out a
-    ``deployed=False`` connection's (see :func:`_iter_settings_values`).
+    """The sorted, de-duplicated ``env()`` keys the whole loaded graph references.
 
     The graph-wide analogue of :func:`messagefoundry.config.wiring.referenced_env_keys` (which is
     per-settings-dict). Empty ⇒ a zero-``env()`` deployment — the case ADR 0050 AC-3 must never
@@ -201,8 +196,7 @@ def referenced_env_keys_in_graph(registry: Registry) -> list[str]:
 
 
 def graph_references_env(registry: Registry) -> bool:
-    """Whether the loaded graph contains at least one ``env()`` reference outside a
-    ``deployed=False`` connection (ADR 0050 §2 / AC-3 gate).
+    """Whether the loaded graph contains at least one ``env()`` reference (ADR 0050 §2 / AC-3 gate).
 
     This is the precondition that — together with an *explicit* project root and an absent
     ``<env>.toml`` — turns a missing value file into a hard startup failure. A graph with **zero**
