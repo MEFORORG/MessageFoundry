@@ -1352,7 +1352,13 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > **That switch is not scoped to one connection.** It also turns off the 30-day default for each
 > unset window that carries one (those named in the posture paragraph above), and it acknowledges
 > every connection's `0`, including one added by a later reload. Before you set it for one feed, set
-> each of those windows to an explicit number of days.
+> each of those windows to an explicit number of days. **Under engine shards that does not keep an
+> inbound override's bodies:** the explicit number of days bounds the global body window, and a
+> `serve --shard` process that does not hold that inbound purges its bodies on it (the engine shard
+> limit above). No per-connection setting keeps one inbound's bodies past a bounded global window
+> there. Only an unbounded `[security].delete_message_bodies_after_days`, unset with the switch set
+> or `0`, keeps them, and it keeps every inbound's bodies from that purge too. Plain `serve`, which
+> runs no such process, keeps the override as written.
 >
 > The acknowledgement is read once, at startup. `messagefoundry connection upsert` and `remove` refuse
 > an edit an enforcing engine would refuse. `messagefoundry check` reads the same decision as a

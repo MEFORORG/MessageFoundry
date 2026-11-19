@@ -632,12 +632,31 @@ def _override_scope(kept: tuple[str, ...]) -> str:
     return " ".join(parts)
 
 
-def _keep_forever_remedy() -> str:
+def _keep_forever_remedy(kept: tuple[str, ...]) -> str:
     """What an operator does about a keep-forever override. The refusal and the ``AUDIT:`` line
-    under ``enforcement = warn`` both end with it, so the two give the same advice."""
+    under ``enforcement = warn`` both end with it, so the two give the same advice.
+
+    Where ``kept`` holds an inbound override, the advice to set the global body window to explicit
+    days is not enough under engine shards: that bounded window is the one a ``serve --shard``
+    process that does not hold the inbound purges its bodies on (:func:`_override_scope`). The
+    last sentence says so, and names what does keep them: an unbounded global window, which keeps
+    every inbound's bodies from that purge, or plain ``serve``."""
     # Only the auto-bounded windows lose a default. Naming them keeps an operator from setting a
     # window on a tier where a window is the wrong answer, such as transform state.
     auto_bounded = ", ".join(w.setting for w in auto_bounded_windows())
+    inbound, _ = _override_kinds(kept)
+    body_global = _window_setting("messages_days")
+    engine_shards = (
+        ". Under engine shards that does not keep an inbound override's bodies: a serve --shard "
+        "process that does not hold that inbound purges them on the global "
+        f"{body_global} window, and an explicit number of days bounds that window. No per-"
+        "connection setting keeps one inbound's bodies past a bounded global window there. Only "
+        f"an unbounded {body_global}, unset with the switch set or 0, keeps them, and it keeps "
+        "every inbound's bodies from that purge too; plain serve, which runs no such process, "
+        "keeps the override as written"
+        if inbound
+        else ""
+    )
     return (
         "Set each override to a positive number of days, or remove it to inherit the global "
         "window where that window is bounded; or, to deliberately retain forever, set "
@@ -647,7 +666,7 @@ def _keep_forever_remedy() -> str:
         "the whole instance: it also turns off the default bound on each of these windows that "
         f"is unset: {auto_bounded}. Set each of them to an explicit number of days first, or it "
         "keeps its PHI forever too. The start gate writes an AUDIT line for such a window at 0 "
-        "only under enforcement = enforce"
+        f"only under enforcement = enforce{engine_shards}"
     )
 
 
@@ -697,7 +716,7 @@ def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None
         f"a per-connection retention override keeps {_kept_phi(kept)} indefinitely"
         f"{caveat}{',' if caveat else ''} on a PHI instance{where}: {'; '.join(kept)} "
         "(unbounded PHI at rest, ASVS 14.2.4/14.2.7). "
-        f"{_override_scope(kept)} {_keep_forever_remedy()}"
+        f"{_override_scope(kept)} {_keep_forever_remedy(kept)}"
     )
 
 
@@ -764,7 +783,7 @@ def judge_keep_forever_overrides(
         basis="[security].enforcement = warn, no acknowledgement",
         status="not acknowledged; enforcement = enforce would refuse this graph",
     )
-    return OverrideVerdict(refusal=None, report=f"{report} {_keep_forever_remedy()}.")
+    return OverrideVerdict(refusal=None, report=f"{report} {_keep_forever_remedy(kept)}.")
 
 
 def make_retention_override_guard(

@@ -316,6 +316,34 @@ def test_the_remedy_says_what_the_switch_needs_and_what_it_leaves_unrecorded(
     assert "AUDIT line for such a window at 0 only under enforcement = enforce" in remedy
 
 
+@pytest.mark.parametrize(("inbound_days", "outbound_days"), [(0, None), (None, 0), (0, 0)])
+@pytest.mark.parametrize("enforcing", [True, False])
+def test_the_remedy_says_explicit_days_do_not_keep_an_inbound_under_engine_shards(
+    tmp_path: Path, enforcing: bool, inbound_days: int | None, outbound_days: int | None
+) -> None:
+    """BACKLOG #5967: the remedy's advice to bound the global windows first gives a sibling
+    serve --shard process the bounded window it purges an inbound override's bodies on. Red on a
+    remedy that offers the switch plus explicit days as a way to keep an inbound's bodies under
+    engine shards without saying so, and on one that adds the caveat for an outbound alone."""
+    registry = _graph(tmp_path / "cfg", inbound_days=inbound_days, outbound_days=outbound_days)
+    verdict = judge_keep_forever_overrides(
+        registry, acknowledged=False, enforcing=enforcing, env_name="prod"
+    )
+    remedy = verdict.refusal if enforcing else verdict.report
+    assert remedy is not None
+    caveat = (
+        "Under engine shards that does not keep an inbound override's bodies: a serve --shard "
+        "process that does not hold that inbound purges them on the global "
+        "[security].delete_message_bodies_after_days window, and an explicit number of days "
+        "bounds that window. No per-connection setting keeps one inbound's bodies past a bounded "
+        "global window there."
+    )
+    assert (caveat in remedy) is (inbound_days is not None)
+    assert ("plain serve, which runs no such process, keeps the override as written" in remedy) is (
+        inbound_days is not None
+    )
+
+
 @pytest.mark.parametrize(
     ("authored", "early_names_body", "folded_days"),
     [
