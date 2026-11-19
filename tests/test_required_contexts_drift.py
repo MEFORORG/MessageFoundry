@@ -14,6 +14,8 @@ from typing import Any
 
 import pytest
 
+from scripts.ci.required_contexts import branch_protection_contexts
+
 _REPO = Path(__file__).resolve().parents[1]
 _SCRIPT = _REPO / "scripts" / "ci" / "check_required_contexts_drift.py"
 _CANONICAL = _REPO / ".github" / "required-contexts.txt"
@@ -252,20 +254,13 @@ def test_the_job_that_runs_this_checker_is_not_a_required_context() -> None:
     )
 
 
-def _reader() -> Any:
-    sys.path.insert(0, str(_REPO))
-    from scripts.ci.required_contexts import branch_protection_contexts
-
-    return branch_protection_contexts
-
-
 def _branch(**rsc: Any) -> dict[str, Any]:
     return {"protected": True, "protection": {"required_status_checks": rsc}}
 
 
 def test_the_reader_unions_contexts_and_checks() -> None:
     """BACKLOG #5465: a context carried only under ``checks`` is still required."""
-    read = _reader()
+    read = branch_protection_contexts
     assert read(_branch(contexts=[], checks=[{"context": "cla", "app_id": 1}])) == ["cla"]
     assert read(
         _branch(contexts=["CI gate"], checks=[{"context": "CI gate"}, {"context": "cla"}])
@@ -297,7 +292,7 @@ def test_the_reader_unions_contexts_and_checks() -> None:
 )
 def test_an_empty_or_unenforced_required_set_is_refused(payload: dict[str, Any], why: str) -> None:
     """BACKLOG #5465: each of these read as "nothing required" before; now each refuses."""
-    read = _reader()
+    read = branch_protection_contexts
     with pytest.raises(RuntimeError, match=why):
         read(payload)
     # A caller that unions with the rulesets and refuses an empty combined set opts in to [].
@@ -305,15 +300,29 @@ def test_an_empty_or_unenforced_required_set_is_refused(payload: dict[str, Any],
 
 
 def test_a_payload_with_neither_list_refuses_even_when_empty_is_allowed() -> None:
-    read = _reader()
+    read = branch_protection_contexts
     with pytest.raises(RuntimeError, match="not an empty required set"):
         read({"protection": {}}, allow_empty=True)
-    with pytest.raises(RuntimeError, match="names no context"):
-        read(_branch(contexts=[], checks=[{"app_id": 1}]))
+    for bad in (
+        _branch(contexts=[], checks=[{"app_id": 1}]),
+        _branch(contexts=[""]),
+        _branch(contexts=[None]),
+        _branch(contexts=["CI gate"], checks=["CI gate"]),
+    ):
+        with pytest.raises(RuntimeError, match="names no context"):
+            read(bad, allow_empty=True)
+
+
+def test_an_unprotected_branch_with_no_status_checks_block_reads_empty_when_allowed() -> None:
+    """GitHub may omit required_status_checks entirely for an unprotected branch."""
+    payload = {"protected": False, "protection": {"enabled": False}}
+    assert branch_protection_contexts(payload, allow_empty=True) == []
+    with pytest.raises(RuntimeError, match="not protected"):
+        branch_protection_contexts(payload)
 
 
 def test_the_frozen_live_payload_still_reads(payload: dict[str, Any]) -> None:
     """The positive control on the real shape: enforced, both lists populated, nothing refused."""
     rsc = payload["protection"]["required_status_checks"]
     expected = {*rsc["contexts"], *(c["context"] for c in rsc["checks"])}
-    assert set(_reader()(payload)) == expected
+    assert set(branch_protection_contexts(payload)) == expected

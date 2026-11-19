@@ -2,10 +2,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Read the required status-check contexts: from the checked-in file and from the server.
 
-ONE READER, stdlib only. Three callers need it and two of them run where PyYAML and pytest are not
-installed: ``scripts/release/tag_provenance.py`` on the release runner, and
+ONE READER, stdlib only. At least four callers need it and two of them run where PyYAML and pytest
+are not installed: ``scripts/release/tag_provenance.py`` on the release runner, and
 ``scripts/ci/check_required_contexts_drift.py`` on the scanner-lock job.
-``tests/_workflow_contexts.py`` uses the same file parser. Before vault BACKLOG #2631 each had its
+``scripts/coord/pr_state.py`` loads it by path and passes ``allow_empty=True`` (see
+``branch_protection_contexts``), and ``tests/_workflow_contexts.py`` uses the same file parser. Before vault BACKLOG #2631 each had its
 own copy, and two of them disagreed on what an absent server list means. Here an absent list
 RAISES: an unprotected branch, or a changed API shape, is not an empty required set. By default an
 empty one raises too (``branch_protection_contexts``).
@@ -67,24 +68,28 @@ def branch_protection_contexts(payload: Any, *, allow_empty: bool = False) -> li
     """
     if not isinstance(payload, dict):
         raise RuntimeError(f"the branch payload is a {type(payload).__name__}, not an object")
+    unprotected = payload.get("protected") is False
+    if unprotected and allow_empty:
+        return []
     protection = payload.get("protection") or {}
     checks = protection.get("required_status_checks") or {}
     contexts = checks.get("contexts")
     check_list = checks.get("checks")
-    if contexts is None and check_list is None:
+    if contexts is None and check_list is None and not unprotected:
         raise RuntimeError(
             "the branch payload carried no required_status_checks.contexts or .checks -- the API "
             "shape changed, or this branch is unprotected. Either way it is not an empty required set."
         )
     if not isinstance(contexts, list | None) or not isinstance(check_list, list | None):
         raise RuntimeError("required_status_checks.contexts or .checks is not a list")
-    found: list[str] = [str(c) for c in contexts or []]
-    for check in check_list or []:
-        if not isinstance(check, dict) or not check.get("context"):
-            raise RuntimeError(f"a required_status_checks.checks entry names no context: {check!r}")
-        found.append(str(check["context"]))
+    found = [
+        *(contexts or []),
+        *(c.get("context") if isinstance(c, dict) else None for c in check_list or []),
+    ]
+    if not all(isinstance(c, str) and c for c in found):
+        raise RuntimeError(f"a required_status_checks entry names no context: {found!r}")
     unique = list(dict.fromkeys(found))
-    if payload.get("protected") is False:
+    if unprotected:
         why_empty = "the branch is not protected"
     elif checks.get("enforcement_level") == "off":
         why_empty = "required_status_checks.enforcement_level is off"
