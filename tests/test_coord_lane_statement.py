@@ -544,3 +544,82 @@ def test_a_non_ascii_path_keys_on_the_root_git_names(tmp_path: Path) -> None:
     assert proc.returncode == 0, proc.stdout + proc.stderr
     rec = json.loads(_lane_record(root).read_text(encoding="utf-8-sig"))
     assert Path(rec["worktree"]) == Path(_toplevel(root)), rec
+
+
+# BACKLOG #5486: A HOST WITH NO CONSOLE MAY REFUSE THE [Console]::OutputEncoding SETTER. Invoke-GitUtf8
+# set it unguarded, so the refusal reached the lane-level hook's catch and it printed "[lane] SKIPPED"
+# on every Stop. A stub stands in for System.Console: the `Console` type accelerator is pointed at a
+# class whose OutputEncoding setter throws and counts its calls, and whose other members forward to
+# the real console. The count is the control: a run where the setter was never reached proves nothing.
+
+_LANE_ROOT = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "lane-root.ps1"
+
+_THROWING_CONSOLE = r"""
+Add-Type -TypeDefinition @'
+public static class MeforThrowingConsole {
+    public static int SetAttempts;
+    public static System.Text.Encoding OutputEncoding {
+        get { return System.Console.OutputEncoding; }
+        set { SetAttempts++; throw new System.IO.IOException("The handle is invalid."); }
+    }
+    public static System.IO.TextWriter Out { get { return System.Console.Out; } }
+    public static System.IO.TextWriter Error { get { return System.Console.Error; } }
+    public static bool IsInputRedirected { get { return System.Console.IsInputRedirected; } }
+    public static System.IO.Stream OpenStandardInput() { return System.Console.OpenStandardInput(); }
+}
+'@
+[psobject].Assembly.GetType('System.Management.Automation.TypeAccelerators')::Add('Console', [MeforThrowingConsole])
+"""
+
+
+def _under_throwing_setter(
+    cwd: Path, body: str, stdin: str | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run ``body`` in a pwsh whose ``[Console]`` is the throwing stub, then print the setter count."""
+    script = (
+        _THROWING_CONSOLE
+        + body
+        + '\n[System.Console]::Error.WriteLine("SETATTEMPTS=$([MeforThrowingConsole]::SetAttempts)")\n'
+    )
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=cwd,
+        env=_env(),
+        timeout=45,
+    )
+
+
+def _set_attempts(proc: subprocess.CompletedProcess[str]) -> int:
+    lines = [ln for ln in proc.stderr.splitlines() if ln.startswith("SETATTEMPTS=")]
+    assert lines, proc.stdout + proc.stderr
+    return int(lines[-1].split("=", 1)[1])
+
+
+def test_invoke_git_utf8_runs_the_action_when_the_encoding_setter_throws(repo: Path) -> None:
+    """The action's output comes back and nothing is thrown, though the setter refused."""
+    body = (
+        f". '{_LANE_ROOT}'\n"
+        "try { $r = Invoke-GitUtf8 { 'ACTION-RAN' }; [System.Console]::Out.WriteLine(\"RESULT=$r\") }\n"
+        'catch { [System.Console]::Out.WriteLine("THREW=$($_.Exception.Message)") }\n'
+    )
+    proc = _under_throwing_setter(repo, body)
+    assert _set_attempts(proc) >= 1, proc.stdout + proc.stderr
+    assert "RESULT=ACTION-RAN" in proc.stdout, proc.stdout + proc.stderr
+    assert "THREW=" not in proc.stdout, proc.stdout
+
+
+def test_the_hook_does_not_skip_when_the_encoding_setter_throws(tmp_path: Path) -> None:
+    """The hook still resolves the root and nags for the unstated lane, with no SKIPPED line. The
+    tree is named as a builder lane, the population the hook answers for."""
+    repo = _init_repo(tmp_path / "builder-no-console")
+    proc = _under_throwing_setter(
+        repo, f"& '{_HOOK}'\n", stdin=json.dumps({"hook_event_name": "Stop"})
+    )
+    assert _set_attempts(proc) >= 1, proc.stdout + proc.stderr
+    assert "SKIPPED" not in proc.stdout, proc.stdout
+    assert _UNSTATED in proc.stdout, proc.stdout + proc.stderr

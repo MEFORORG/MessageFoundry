@@ -15,13 +15,22 @@
 # which is an OEM code page on a stock console, so a non-ASCII path segment would come back mangled
 # and key a box nobody reads. Every git call that reads a path (here and in Resolve-CoordSharedRoot,
 # which reads --git-common-dir) runs inside this; the caller's encoding is put back afterwards.
+# A host with no console attached may refuse the setter (as alloc.ps1 and worktree/remove.ps1 note).
+# The action then runs in the encoding it already has, rather than the refusal reaching the caller:
+# the lane-level hook would otherwise read it as an unresolved root and print SKIPPED on every Stop
+# (BACKLOG #5486). Only an encoding that was actually switched is put back.
 function Invoke-GitUtf8([scriptblock]$Action) {
-    $saved = [Console]::OutputEncoding
+    $saved = $null
+    $switched = $false
     try {
+        $saved = [Console]::OutputEncoding
         [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        $switched = $true
+    } catch { }
+    try {
         & $Action
     } finally {
-        [Console]::OutputEncoding = $saved
+        if ($switched) { try { [Console]::OutputEncoding = $saved } catch { } }
     }
 }
 
