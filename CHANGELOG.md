@@ -23,15 +23,6 @@ All notable changes to MessageFoundry are documented here. The format follows
   external provider. (`BACKLOG #2595`)
 
 ### Changed
-- **On a SQL Server cluster the renew clamp is checked against both of the lease claim's
-  windows.** There the claim's wait for a pooled connection and its statement each get their own
-  window, so a clamp inside the detection margin could still let a renew land past it. A
-  `lease_renew_timeout_seconds` you set whose two windows reach the margin is now refused at load,
-  where it used to load with a start-up warning; a derived one is stepped down to the largest
-  whole number of seconds that fits; a fence/TTL pair that no clamp of at least 1 s fits is
-  refused. The shipped failover profiles' TTLs are now 8.0 and 6.0 so that they load on SQL
-  Server. See the `lease_renew_timeout_seconds` row of [CONFIGURATION.md](docs/CONFIGURATION.md).
-  (`BACKLOG #5979`)
 - **A `[dr]` takeover or release hook now gets an allowlisted environment.** It used to get the
   engine's whole environment less the engine's own `MEFOR_*` names, so a secret kept under any
   other name reached it. Now a variable reaches a hook only if it is one a shell needs to start or

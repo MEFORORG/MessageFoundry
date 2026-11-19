@@ -1008,7 +1008,17 @@ def test_a_tight_pair_whose_derived_clamp_cannot_fit_is_refused_on_sqlserver(
     assert "margin (1.2 s)" in text
     # Derived, so the message never tells the operator to lower a value they did not write.
     assert "Lower lease_renew_timeout_seconds" not in text
+    _assert_names_the_fix_and_the_acquire_timeout_scope(text)
     assert _load(tmp_path, _POSTGRES + timings).cluster.lease_renew_timeout_seconds == 1.0
+
+
+def _assert_names_the_fix_and_the_acquire_timeout_scope(text: str) -> None:
+    """The fix the refusal leads with is the fence/TTL gap. [store].acquire_timeout is named only
+    with its engine-wide scope, so an operator does not shorten every pooled borrow to pass a
+    [cluster] check (BACKLOG #5979)."""
+    assert "Widen the gap between leader_fence_timeout_seconds and leader_lease_ttl_seconds" in text
+    assert "or shorten [store].acquire_timeout" not in text
+    assert "bounds every pooled-connection borrow in the engine, not only this claim" in text
 
 
 def test_a_set_clamp_at_a_margin_no_clamp_fits_names_widening_alone(tmp_path: Path) -> None:
@@ -1023,6 +1033,7 @@ def test_a_set_clamp_at_a_margin_no_clamp_fits_names_widening_alone(tmp_path: Pa
     text = str(caught.value)
     assert "even a 1 s clamp, the SQL Server floor, runs for 2 s" in text
     assert "Lower lease_renew_timeout_seconds" not in text
+    _assert_names_the_fix_and_the_acquire_timeout_scope(text)
 
 
 @pytest.mark.parametrize(

@@ -40,7 +40,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from _failover_load_support import failover_test_profile
+from _failover_load_support import FAILOVER_TEST_TTL, failover_test_profile
 from pydantic import ValidationError
 
 from harness.load.failover import FailoverPorts, _node_env
@@ -320,10 +320,20 @@ def _failover_timings() -> dict[str, Failover]:
     # not a census.
     assert declares == set(found), (declares, set(found))
 
-    ci = failover_test_profile()
-    assert ci.failover is not None
-    found["tests/_failover_load_support.py"] = ci.failover
+    for backend in FAILOVER_TEST_TTL:
+        ci = failover_test_profile(backend)
+        assert ci.failover is not None
+        found[f"tests/_failover_load_support.py:{backend}"] = ci.failover
     return found
+
+
+def _backend_of(source: str) -> str:
+    """The server backend a shipped failover configuration runs on. ``benchmark.yml`` runs the
+    ``failover-sqlserver`` profile on SQL Server and ``failover`` on Postgres, and each gated test
+    picks the CI profile by backend (BACKLOG #5979)."""
+    if source.startswith("tests/"):
+        return source.rsplit(":", 1)[1]
+    return "sqlserver" if "sqlserver" in source else "postgres"
 
 
 def test_the_census_of_shipped_failover_configurations_is_not_empty() -> None:
@@ -331,14 +341,15 @@ def test_the_census_of_shipped_failover_configurations_is_not_empty() -> None:
     vacuously green, and a zero is a fact about the pattern, not about the repository."""
     timings = _failover_timings()
     assert "failover.toml" in timings
-    assert "tests/_failover_load_support.py" in timings
+    assert "failover-sqlserver.toml" in timings
+    assert "tests/_failover_load_support.py:postgres" in timings
+    assert "tests/_failover_load_support.py:sqlserver" in timings
     assert len(timings) >= 2
 
 
-@pytest.mark.parametrize("store", [_PG, _MSSQL], ids=["postgres", "sqlserver"])
 @pytest.mark.parametrize("source", sorted(_failover_timings()))
 def test_a_shipped_failover_configuration_loads_through_the_real_node_env(
-    source: str, store: str, tmp_path: Path
+    source: str, tmp_path: Path
 ) -> None:
     """Drive the REAL settings path with the REAL exported environment, not a hand-built object.
 
@@ -362,15 +373,16 @@ def test_a_shipped_failover_configuration_loads_through_the_real_node_env(
         api_b=2801,
     )
     env = _node_env({}, node_id="fo-a", ports=ports, fo=fo, sink_host="127.0.0.1")
-    # Both server backends, because the harness runs these profiles on both, and SQL Server refuses
-    # a pair whose claim windows reach the margin (BACKLOG #5979).
+    # The backend each configuration runs on, because SQL Server refuses a pair whose claim windows
+    # reach the margin (BACKLOG #5979) and Postgres keeps its tighter timings.
+    store = _MSSQL if _backend_of(source) == "sqlserver" else _PG
     cfg = _write(tmp_path / "messagefoundry.toml", store)
 
     s = load_settings(config_path=cfg, environ=env)
 
     assert s.cluster.enabled
-    # Aim check on the backend: an exported MEFOR_STORE_BACKEND would override the TOML and leave
-    # the sqlserver case loading Postgres, which never runs the SQL Server refusal.
+    # Aim check on the backend: the config must load the backend this case names, or the sqlserver
+    # case would never run the SQL Server refusal.
     expected = StoreBackend.SQLSERVER if store == _MSSQL else StoreBackend.POSTGRES
     assert s.store.backend == expected
     assert s.cluster.leader_fence_timeout_seconds == fo.leader_fence_timeout_seconds
@@ -381,6 +393,32 @@ def test_a_shipped_failover_configuration_loads_through_the_real_node_env(
     clamp = s.cluster.lease_renew_timeout_seconds
     assert clamp is not None
     assert 0 < clamp < margin, (source, clamp, margin)
+
+
+def test_the_postgres_failover_timings_are_not_loosened_for_sql_server() -> None:
+    """BACKLOG #5979 widened the SQL Server failover TTLs so they load there. The recovery bound is
+    a multiple of the TTL, so a wider Postgres TTL would loosen the Postgres failover gate. These
+    are the Postgres values on main before #5979, pinned."""
+    timings = _failover_timings()
+    assert timings["failover.toml"].leader_fence_timeout_seconds == 4.0
+    assert timings["failover.toml"].leader_lease_ttl_seconds == 6.0
+    assert timings["tests/_failover_load_support.py:postgres"].leader_lease_ttl_seconds == 5.0
+    assert Failover().leader_lease_ttl_seconds == 6.0
+
+
+def test_sql_server_refuses_the_postgres_failover_timings(tmp_path: Path) -> None:
+    """The control for the split: the Postgres profile's 4.0 / 6.0 is refused on SQL Server, which
+    is why that leg runs its own profile."""
+    fo = _failover_timings()["failover.toml"]
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        _MSSQL
+        + "[cluster]\nenabled = true\nheartbeat_seconds = 2.0\n"
+        + f"leader_fence_timeout_seconds = {fo.leader_fence_timeout_seconds}\n"
+        + f"leader_lease_ttl_seconds = {fo.leader_lease_ttl_seconds}\n",
+    )
+    with pytest.raises(ValidationError, match="no clamp of at least 1 s"):
+        load_settings(config_path=cfg, environ={})
 
 
 # --- the clamp reaches the statement ----------------------------------------

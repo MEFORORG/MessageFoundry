@@ -28,15 +28,14 @@ types = ["ADT"]
 
 # Tuned-short lease timings (heartbeat < fence < ttl) so a CI crash-failover completes in seconds; the
 # recovery SLO is relative to the TTL, so it stays valid if these are retuned for a slower network.
-# The TTL is 8.0, not 6.0, because SQL Server refuses a pair whose lease claim's pool wait plus its
-# statement reaches the detection margin (BACKLOG #5979): 4.0 / 6.0 left 1.2 s against 1 + 1 s at the
-# derived clamp; 4.0 / 8.0 leaves 3.2 s against 1.6 + 1 s, with room to retune.
+# These are the Postgres timings. SQL Server refuses 4.0 / 6.0 at config load (BACKLOG #5979), so the
+# SQL Server leg runs failover-sqlserver.toml, which differs only in its TTL.
 [load.failover]
 kill_at_fraction = 0.5
 heartbeat_seconds = 2.0
 leader_fence_timeout_seconds = 4.0
-leader_lease_ttl_seconds = 8.0
-recovery_ttl_multiple = 2.0   # functional recovery must be at most 16 s (2 x the 8 s TTL)
+leader_lease_ttl_seconds = 6.0
+recovery_ttl_multiple = 2.0   # functional recovery must be ≤ 12 s (2 × the 6 s TTL)
 max_dup_rate = 0.10           # at-least-once re-deliveries are expected across a crash — bounded, not zero
 
 [[load.phase]]

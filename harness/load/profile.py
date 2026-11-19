@@ -154,7 +154,7 @@ class Failover:
     kill_at_fraction: float = 0.5  # fraction into the measured phase to kill the primary
     heartbeat_seconds: float = 2.0
     leader_fence_timeout_seconds: float = 4.0
-    leader_lease_ttl_seconds: float = 8.0  # loads on SQL Server too (BACKLOG #5979)
+    leader_lease_ttl_seconds: float = 6.0
     recovery_ttl_multiple: float = 2.0  # functional recovery must be ≤ this × the lease TTL
     max_promotion_seconds: float | None = (
         None  # optional absolute cap on promotion (None = unchecked)
@@ -347,7 +347,7 @@ def _failover_from(raw: Any, where: str) -> Failover | None:
             raw, "leader_fence_timeout_seconds", where, default=4.0, minimum=0.05
         ),
         leader_lease_ttl_seconds=_opt_float(
-            raw, "leader_lease_ttl_seconds", where, default=8.0, minimum=0.05
+            raw, "leader_lease_ttl_seconds", where, default=6.0, minimum=0.05
         ),
         recovery_ttl_multiple=_opt_float(
             raw, "recovery_ttl_multiple", where, default=2.0, minimum=0.0, maximum=100.0

@@ -88,7 +88,7 @@ def test_failover_defaults_when_table_minimal() -> None:
     assert fo is not None
     assert fo.kill_at_fraction == 0.3
     assert fo.heartbeat_seconds == 2.0  # default
-    assert fo.leader_lease_ttl_seconds == 8.0  # default
+    assert fo.leader_lease_ttl_seconds == 6.0  # default
     assert fo.recovery_ttl_multiple == 2.0  # default
     assert fo.max_promotion_seconds is None
 
