@@ -91,6 +91,76 @@ export function committedRelativePath(ws: string, value: string): string | undef
   return rel === "" ? "." : rel.split(path.sep).join("/");
 }
 
+/**
+ * Whether `rel`, a path relative to a folder with its `.` and `..` components already collapsed, has
+ * a folder or file name that ends in a dot or a space, when `win32` (by default, on Windows). Node
+ * reads such a name as written, while a Win32 open, the CLI's among them, goes through Windows path
+ * normalization, which can drop the ending and open another entry: a check Node makes on `cfg.` then
+ * says nothing of the `cfg` the CLI opens. Either separator splits `rel`, since Windows takes both.
+ * Spelling only, with no I/O. Shared by {@link escapesByLink} and securityConfigTarget.
+ */
+export function hasTrailingDotOrSpaceName(rel: string, win32: boolean = path.sep === "\\"): boolean {
+  return win32 && rel.split(/[\\/]/).some((part) => part.endsWith(".") || part.endsWith(" "));
+}
+
+/**
+ * Whether a writer must refuse `value`, a path setting's value, because though its spelling lies
+ * inside the workspace folder `ws`, the file the CLI or the writer would open may not (BACKLOG #5404
+ * item 1). {@link containedPathSetting} compares spellings only, so without this a writer would follow
+ * a symlink or junction inside the folder out of it, a dangling one included, or act on a path whose
+ * real path cannot be read. The repository supplies the link whichever scope named the path, so the
+ * manifest default and a relative user value are checked too. A value spelled outside the folder can
+ * only be the operator's own user value, theirs to point anywhere, so it is not checked, and the
+ * spelling test runs first, with no I/O.
+ *
+ * Two spellings are refused outright, before any I/O. A `..` component: the real-path check collapses
+ * `..` by spelling, but on POSIX the CLI's kernel follows a link before it applies the `..` after it,
+ * so `link/../x` could land outside the folder although its spelling is `x`. And, on Windows, a
+ * folder or file name ending in a dot or a space ({@link hasTrailingDotOrSpaceName}): Node finds no
+ * `cfg.` and so reads it as a missing path inside the folder, while the CLI's open drops the dot and
+ * follows a `cfg` link out of it.
+ *
+ * Open limits. The check reads the named path only: a link BELOW it, such as a linked `codesets`
+ * folder under `configDir`, is not caught here. The real-path reads are synchronous, because cli.ts
+ * `writerPathSetting` answers synchronously to its many callers, so a workspace on a slow share stalls
+ * the extension host for each writer command, and a link inside the folder is followed wherever it
+ * leads while its real path is read. Only a trusted window runs the check (cli.ts `writerSetting`),
+ * where the repository's own code already runs.
+ */
+export function escapesByLink(ws: string | undefined, value: string, win32: boolean = path.sep === "\\"): boolean {
+  if (ws === undefined) {
+    return false;
+  }
+  const rel = committedRelativePath(ws, value);
+  if (rel === undefined) {
+    return false;
+  }
+  // A backslash separates components on Windows only; on POSIX it is part of a name.
+  if (value.split(win32 ? /[\\/]/ : /[/]/).includes("..")) {
+    return true;
+  }
+  if (rel !== "." && hasTrailingDotOrSpaceName(rel, win32)) {
+    return true;
+  }
+  return resolveInsideWorkspace(ws, value) === undefined;
+}
+
+/**
+ * The refusal a writer shows when {@link escapesByLink} holds. It names the setting, never the value
+ * or the link's target (docs/REVIEW-STANDARDS.md R12). The remedy works for every writer: an absolute
+ * path in user settings would not, since at least the New Route wizard writes only inside the
+ * workspace folder and version-control setup commits no hook for a folder outside it.
+ */
+export function linkEscapeRefusal(key: string): string {
+  return (
+    `MessageFoundry: nothing was written or started. messagefoundry.${key} names a path inside the ` +
+    "workspace folder that may lead out of it, or that Windows may open as another name. At least one of " +
+    "these holds: a symbolic link or junction on the path leads out, the path climbs with '..', a folder " +
+    "or file name on it ends in a dot or a space, or its real path cannot be read. Remove the link or the " +
+    "'..', or the trailing dot or space, so the setting names a plain folder or file inside the workspace folder."
+  );
+}
+
 function isWithin(root: string, target: string): boolean {
   const rel = path.relative(root, target);
   return !(path.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${path.sep}`));
@@ -129,7 +199,7 @@ export interface PathSettingScopes {
  * Open limit: this compares spellings only, with no file-system call, because every CLI call reads
  * these settings. It does not catch a link or junction inside the folder that leads out of it, or a
  * Windows name ending in a dot or a space. A writer that needs those checks makes them itself
- * ({@link resolveInsideWorkspace}, securityConfigTarget).
+ * ({@link escapesByLink}, {@link resolveInsideWorkspace}, securityConfigTarget).
  */
 export function containedPathSetting(
   seen: PathSettingScopes | undefined,

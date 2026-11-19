@@ -98,7 +98,8 @@ export function capCode(code: string, limit: number): CappedCode {
   const kept = lastNl > 0 ? hard.slice(0, lastNl) : hard; // back off to a whole-line boundary
   const marker =
     `\n# … (truncated: ${kept.length} of ${totalChars} chars sent; ` +
-    `raise messagefoundry.ai.contextCharLimit to include more)`;
+    `raise messagefoundry.ai.contextCharLimit in user settings, and remove any lower workspace value, ` +
+    `to include more)`;
   return { text: kept + marker, truncated: true, shownChars: kept.length, totalChars };
 }
 
@@ -128,8 +129,9 @@ export function registerChat(context: vscode.ExtensionContext, graph: GraphProvi
     // DATA-SCOPE CAP: in MVP only code_only context is ever attached (the config graph *names* above
     // and the active editor *code* below). Nothing above code_only — message bodies / patient data —
     // may be attached here regardless of mode/provider until later phases build that path. The size
-    // cap (messagefoundry.ai.contextCharLimit, default 8000) additionally bounds how much of the
-    // user's own code egresses; oversized files are cut on a line boundary and marked.
+    // cap (messagefoundry.ai.contextCharLimit, default 8000; a workspace value may only lower it,
+    // BACKLOG #5404 item 2) additionally bounds how much of the user's own code egresses; oversized
+    // files are cut on a line boundary and marked.
     const limit = aiContextCharLimit();
     const capped = capCode(activeCode(), limit);
     if (capped.shownChars > 0) {
@@ -142,7 +144,8 @@ export function registerChat(context: vscode.ExtensionContext, graph: GraphProvi
         `_Sent the first ${capped.shownChars.toLocaleString()} of ` +
           `${capped.totalChars.toLocaleString()} characters of the active file (limit ` +
           `${limit.toLocaleString()}). Select a region, or raise ` +
-          "`messagefoundry.ai.contextCharLimit`, to include more._\n\n",
+          "`messagefoundry.ai.contextCharLimit` in user settings, to include more. A workspace value " +
+          "can only lower the limit, so remove any lower one there too._\n\n",
       );
     }
     const task = request.command ? COMMAND_TASKS[request.command] : undefined;

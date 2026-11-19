@@ -7,7 +7,7 @@
 import * as path from "node:path";
 
 import type { Field, FieldType } from "./securityEditorWebview";
-import type { ContainedPathSetting, PathSettingScopes } from "./workspaceContainment";
+import { hasTrailingDotOrSpaceName, type ContainedPathSetting, type PathSettingScopes } from "./workspaceContainment";
 
 /**
  * The value and scope {@link securityConfigTarget} judges for `messagefoundry.serviceConfig`, from
@@ -146,7 +146,7 @@ export function securityConfigTarget(
     }
     return { ok: true, path: target };
   }
-  if (path.sep === "\\" && rel.split(path.sep).some((part) => part.endsWith(".") || part.endsWith(" "))) {
+  if (hasTrailingDotOrSpaceName(rel)) {
     return {
       ok: false,
       problem:

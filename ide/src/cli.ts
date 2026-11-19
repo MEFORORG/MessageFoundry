@@ -22,10 +22,10 @@ import { cliArgv } from "./engineControlModel";
 import { LENS_CONTRACT, isUnknownArgumentError, looksLikeUnknownArgument } from "./stepsModel";
 import type { LensParseResult, OpSchema } from "./stepsModel";
 import {
-  committedRelativePath,
   containedPathSetting,
   droppedNotice,
-  resolveInsideWorkspace,
+  escapesByLink,
+  linkEscapeRefusal,
   writerRefusal,
   type ContainedPathSetting,
 } from "./workspaceContainment";
@@ -136,54 +136,11 @@ export function writerCheckSetting(key: PathSettingKey): ContainedPathSetting {
 }
 
 /**
- * Whether a writer must refuse `value` because, though its spelling lies inside the workspace folder
- * `ws`, its real path does not (BACKLOG #5404 item 1): a symlink or junction inside the folder that
- * leads out of it, a dangling one, or a path whose real path cannot be read. {@link
- * containedPathSetting} compares spellings only, so without this a writer would follow such a link
- * out of the folder. The repository supplies the link whichever scope named the path, so the
- * manifest default and a relative user value are checked too. A value spelled outside the folder can
- * only be the operator's own user value, theirs to point anywhere, so it is not checked, and the
- * spelling test runs first, with no I/O.
- *
- * A value with a `..` component is refused outright: the check collapses `..` by spelling, but on
- * POSIX the CLI's kernel follows a link before it applies the `..` after it, so `link/../x` could
- * land outside the folder although its spelling is `x`.
- *
- * Open limits. The check reads the named path only: a link BELOW it, such as a linked `codesets`
- * folder under `configDir`, is not caught here. The real-path reads are synchronous, because
- * {@link writerPathSetting} answers synchronously to its many callers, so a workspace on a slow share
- * stalls the extension host for each writer command, and a link inside the folder is followed
- * wherever it leads while its real path is read. Only a trusted window runs the check (see {@link
- * writerSetting}), where the repository's own code already runs.
- */
-function escapesByLink(ws: string | undefined, value: string): boolean {
-  if (ws === undefined || committedRelativePath(ws, value) === undefined) {
-    return false;
-  }
-  // A backslash separates components on Windows only; on POSIX it is part of a name.
-  const separator = process.platform === "win32" ? /[\\/]/ : /[/]/;
-  if (value.split(separator).includes("..")) {
-    return true;
-  }
-  return resolveInsideWorkspace(ws, value) === undefined;
-}
-
-/** The refusal a writer shows when {@link escapesByLink} holds. It names the setting, never the
- *  value or the link's target (docs/REVIEW-STANDARDS.md R12). */
-export function linkEscapeRefusal(key: PathSettingKey): string {
-  return (
-    `MessageFoundry: nothing was written or started. messagefoundry.${key} names a path inside the ` +
-    "workspace folder that may lead out of it. At least one of these holds: a symbolic link or junction " +
-    "on the path leads out, the path climbs with '..', or its real path cannot be read. Remove the link " +
-    "or the '..'. To use the folder a link leads to, name it with an absolute path in user settings."
-  );
-}
-
-/**
  * {@link writerPathSetting}'s reading with its scope, or undefined after the refusal is shown. The
- * link check runs only in a trusted window, so an untrusted one touches no file before its own trust
- * refusal: there the writer's CLI call is refused by the exec gate ({@link isExecGated}), and the
- * writers that write without the CLI refuse an untrusted window themselves.
+ * link check ({@link escapesByLink}, BACKLOG #5404 item 1) runs only in a trusted window, so an
+ * untrusted one touches no file before its own trust refusal: there the writer's CLI call is refused
+ * by the exec gate ({@link isExecGated}), and the writers that write without the CLI refuse an
+ * untrusted window themselves.
  */
 function writerSetting(key: PathSettingKey): ContainedPathSetting | undefined {
   const s = writerCheckSetting(key);

@@ -10,7 +10,13 @@ import * as path from "path";
 
 import { DEFAULT_CONTEXT_CHAR_LIMIT, contextCharLimitOf } from "../../aiPolicyModel";
 import { INTERPRETER_OPTIONS } from "../../engineControlModel";
-import { committedRelativePath, containedPathSetting, resolveInsideWorkspace } from "../../workspaceContainment";
+import {
+  containedPathSetting,
+  escapesByLink,
+  hasTrailingDotOrSpaceName,
+  linkEscapeRefusal,
+  resolveInsideWorkspace,
+} from "../../workspaceContainment";
 
 const SRC = path.join(__dirname, "..", "..", "..", "src");
 const ROOT = path.join(SRC, "..");
@@ -76,6 +82,15 @@ suite("b532r: a workspace may only lower ai.contextCharLimit (BACKLOG #5404 item
     );
   });
 
+  test("the chat's advice to raise the limit names user settings and the workspace's lower-only rule", () => {
+    const fn = body(code("chat.ts"), "export function capCode(");
+    assert.ok(fn.includes("raise messagefoundry.ai.contextCharLimit in user settings"), fn);
+    assert.ok(fn.includes("remove any lower workspace value"), fn);
+    const handler = body(code("chat.ts"), "export function registerChat(");
+    assert.ok(handler.includes("`messagefoundry.ai.contextCharLimit` in user settings"), handler);
+    assert.ok(handler.includes("can only lower the limit"), handler);
+  });
+
   test("the fallback default is the manifest's default", () => {
     const prop = pkg().contributes.configuration.properties["messagefoundry.ai.contextCharLimit"];
     assert.strictEqual(prop.default, DEFAULT_CONTEXT_CHAR_LIMIT);
@@ -83,51 +98,116 @@ suite("b532r: a workspace may only lower ai.contextCharLimit (BACKLOG #5404 item
 });
 
 suite("b532r: writers check the real path of a path setting (BACKLOG #5404 item 1)", () => {
-  test("writerSetting refuses a link escape after the spelling check", () => {
+  test("writerSetting refuses a link escape after the spelling check, in a trusted window only", () => {
     const cli = code("cli.ts");
     const writer = body(cli, "function writerSetting(");
     // Only a trusted window reads a real path, so an untrusted one touches no file before its refusal.
     assert.ok(writer.includes("if (!isExecGated() && escapesByLink(workspaceDir(), s.value))"), writer);
     assert.ok(writer.includes("linkEscapeRefusal(key)"), writer);
     assert.ok(writer.indexOf("s.dropped !== false") < writer.indexOf("escapesByLink"), writer);
-    const escapes = body(cli, "function escapesByLink(");
-    // The spelling test runs first, with no I/O, so a path spelled outside the folder is never opened.
-    assert.ok(escapes.indexOf("committedRelativePath(ws, value)") < escapes.indexOf("resolveInsideWorkspace"), escapes);
-    // A `..` component is refused before the real-path read, which collapses it by spelling.
-    assert.ok(escapes.includes('process.platform === "win32" ? /[\\\\/]/ : /[/]/'), escapes);
-    assert.ok(escapes.includes('value.split(separator).includes("..")'), escapes);
-    assert.ok(escapes.indexOf('includes("..")') < escapes.indexOf("resolveInsideWorkspace"), escapes);
-    assert.ok(escapes.includes("resolveInsideWorkspace(ws, value) === undefined"), escapes);
+    // The predicate is the shared one, driven below; cli.ts keeps no copy of it.
+    assert.ok(!cli.includes("function escapesByLink("), "cli.ts defines its own escapesByLink");
     // writerPathSetting and writerConfigTarget both go through writerSetting.
     assert.ok(body(cli, "export function writerPathSetting(").includes("writerSetting(key)"));
     assert.ok(body(cli, "export function writerConfigTarget(").includes('writerSetting("serviceConfig")'));
   });
 
-  test("a junction inside the folder passes the spelling check and fails the real-path one", function () {
+  /** A temporary workspace folder `ws` beside a folder `outside`, removed after `fn`. */
+  function withWorkspace(fn: (ws: string, outside: string) => void): void {
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "b532r-ide-"));
     try {
       const ws = path.join(base, "ws");
       const outside = path.join(base, "outside");
       fs.mkdirSync(ws);
       fs.mkdirSync(outside);
-      try {
-        fs.symlinkSync(outside, path.join(ws, "cfg"), "junction");
-      } catch {
-        this.skip(); // a platform where no link can be made here
-      }
-      // Control: the reader's containment, which compares spellings, accepts the link.
-      assert.strictEqual(containedPathSetting({ workspaceValue: "cfg" }, ws, "d").dropped, false);
-      assert.notStrictEqual(committedRelativePath(ws, "cfg"), undefined);
-      // The check escapesByLink makes refuses it, and a missing file under it too.
-      assert.strictEqual(resolveInsideWorkspace(ws, "cfg"), undefined);
-      assert.strictEqual(resolveInsideWorkspace(ws, "cfg/new.toml"), undefined);
-      // A plain folder and a missing file inside the folder still pass.
-      fs.mkdirSync(path.join(ws, "plain"));
-      assert.strictEqual(resolveInsideWorkspace(ws, "plain"), path.join(ws, "plain"));
-      assert.strictEqual(resolveInsideWorkspace(ws, "messagefoundry.toml"), path.join(ws, "messagefoundry.toml"));
+      fn(ws, outside);
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }
+  }
+
+  /** Links `at` to `target` as a junction (a directory symlink off Windows), or skips the test. */
+  function link(ctx: Mocha.Context, target: string, at: string): void {
+    try {
+      fs.symlinkSync(target, at, "junction");
+    } catch {
+      ctx.skip(); // a platform where no link can be made here
+    }
+  }
+
+  test("a junction inside the folder passes the spelling check and is refused", function () {
+    withWorkspace((ws, outside) => {
+      link(this, outside, path.join(ws, "cfg"));
+      // Control: the reader's containment, which compares spellings, accepts the link.
+      assert.strictEqual(containedPathSetting({ workspaceValue: "cfg" }, ws, "d").dropped, false);
+      assert.strictEqual(escapesByLink(ws, "cfg"), true);
+      assert.strictEqual(escapesByLink(ws, "cfg/new.toml"), true);
+      // A plain folder, a missing file inside the folder and the folder itself still pass.
+      fs.mkdirSync(path.join(ws, "plain"));
+      assert.strictEqual(escapesByLink(ws, "plain"), false);
+      assert.strictEqual(escapesByLink(ws, "plain/new.toml"), false);
+      assert.strictEqual(escapesByLink(ws, "messagefoundry.toml"), false);
+      assert.strictEqual(escapesByLink(ws, "."), false);
+    });
+  });
+
+  test("on Windows a name ending in a dot or a space is refused, a link beside it or not", function () {
+    withWorkspace((ws, outside) => {
+      link(this, outside, path.join(ws, "cfg"));
+      if (process.platform === "win32") {
+        // THE CONTROL: Node reads `cfg.` as written, finds nothing and walks up to the folder, so the
+        // real-path check alone passes the name the CLI's Win32 open would follow through `cfg`.
+        assert.notStrictEqual(resolveInsideWorkspace(ws, "cfg."), undefined);
+      }
+      for (const v of ["cfg.", "cfg ", "cfg./new.toml", "messagefoundry.toml.", "messagefoundry.toml ", "a. /b"]) {
+        assert.strictEqual(escapesByLink(ws, v, true), true, JSON.stringify(v));
+      }
+      // Off Windows the dot and the space are part of the name, which the real-path check judges.
+      assert.strictEqual(escapesByLink(ws, "messagefoundry.toml.", false), false);
+      // The same names with nothing trailing pass, and `.` itself is the folder.
+      assert.strictEqual(escapesByLink(ws, "messagefoundry.toml", true), false);
+      assert.strictEqual(escapesByLink(ws, "./messagefoundry.toml", true), false);
+      assert.strictEqual(escapesByLink(ws, ".", true), false);
+    });
+  });
+
+  test("a '..' component is refused before any real-path read; '..conf' is a name", () => {
+    withWorkspace((ws) => {
+      fs.mkdirSync(path.join(ws, "plain"));
+      // Control: the real-path check collapses it by spelling and passes it.
+      assert.notStrictEqual(resolveInsideWorkspace(ws, "plain/../x"), undefined);
+      assert.strictEqual(escapesByLink(ws, "plain/../x"), true);
+      assert.strictEqual(escapesByLink(ws, "plain\\..\\x", true), true);
+      assert.strictEqual(escapesByLink(ws, "..conf"), false);
+    });
+  });
+
+  test("a value spelled outside the folder, or no folder open, is not checked", function () {
+    // The operator's own user value may point anywhere; a link outside the folder is theirs.
+    withWorkspace((ws, outside) => {
+      link(this, outside, path.join(path.dirname(ws), "away"));
+      assert.strictEqual(escapesByLink(ws, path.join(path.dirname(ws), "away")), false);
+      assert.strictEqual(escapesByLink(ws, "../away"), false);
+      assert.strictEqual(escapesByLink(undefined, "cfg"), false);
+    });
+  });
+
+  test("hasTrailingDotOrSpaceName reads every component, on Windows only", () => {
+    assert.strictEqual(hasTrailingDotOrSpaceName("a.\\b", true), true);
+    assert.strictEqual(hasTrailingDotOrSpaceName("a/b ", true), true);
+    assert.strictEqual(hasTrailingDotOrSpaceName("a/.b/c.toml", true), false);
+    assert.strictEqual(hasTrailingDotOrSpaceName("a./b", false), false);
+  });
+
+  test("the refusal's remedy names a fix every writer accepts", () => {
+    const text = linkEscapeRefusal("configDir");
+    assert.ok(text.includes("messagefoundry.configDir"), text);
+    assert.ok(text.includes("ends in a dot or a space"), text);
+    assert.ok(text.includes("inside the workspace folder."), text);
+    // The New Route wizard refuses an absolute path outside the folder, and version-control setup
+    // commits no hook for one, so the remedy must not send the operator there.
+    assert.ok(!/absolute/i.test(text), text);
+    assert.ok(!/user settings/i.test(text), text);
   });
 });
 
