@@ -43,9 +43,10 @@ def test_every_other_code_fails(code: str) -> None:
     assert send_adt.ack_exit_code(_ack(f"MSA|{code}|SMOKE0001")) == 1
 
 
-def test_missing_msa_segment_fails() -> None:
+def test_missing_msa_segment_fails(capsys: pytest.CaptureFixture[str]) -> None:
     ack = "MSH|^~\\&|MEFOR|MEFOR|SMOKE_APP|SMOKE_FAC|20260101000000||ACK^A01|A1|P|2.5.1\r"
     assert send_adt.ack_exit_code(ack) == 1
+    assert "no MSA-1 in ACK" in capsys.readouterr().err
 
 
 def test_unparseable_ack_fails() -> None:

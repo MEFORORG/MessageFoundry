@@ -71,6 +71,9 @@ def ack_exit_code(ack: str) -> int:
         return 1
     if code in _POSITIVE_ACK_CODES:
         return 0
+    if code is None:
+        print("no MSA-1 in ACK", file=sys.stderr)
+        return 1
     print(f"MSA-1 {code!r} is not AA or CA", file=sys.stderr)
     return 1
 

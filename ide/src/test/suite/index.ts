@@ -35,8 +35,10 @@ export async function run(): Promise<void> {
 
   await new Promise<void>((resolve, reject) => {
     try {
-      mocha.run((failures) => {
-        if (failures > 0) {
+      const runner = mocha.run((failures) => {
+        if (runner.total === 0) {
+          reject(new Error("the compiled test files registered no test; refusing to report an empty run as passing"));
+        } else if (failures > 0) {
           reject(new Error(`${failures} test(s) failed.`));
         } else {
           resolve();

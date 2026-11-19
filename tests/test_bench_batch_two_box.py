@@ -679,7 +679,7 @@ async def test_a_failed_remote_process_never_reads_an_earlier_runs_report(tmp_pa
     with pytest.raises(ConnScaleError, match="exited 2 and wrote no report.*refused"):
         await bb._run_remote_proc([sys.executable, "-c", child], report, tmp_path)
     assert not report.exists()
-    # CONTROL: a child that writes its own report over the stale one is read, not refused.
+    # CONTROL: with a stale report planted again, a child that writes its own is read, not refused.
     report.write_text('{"sent": 99, "stale": true}', encoding="utf-8")
     writer = f"open({str(report)!r}, 'w').write('{{\"sent\": 3}}')"
     assert await bb._run_remote_proc([sys.executable, "-c", writer], report, tmp_path) == {
