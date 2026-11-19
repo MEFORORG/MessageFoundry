@@ -4,9 +4,9 @@
 
 Two conftests register the hook below, because neither is loaded for every invocation:
 
-* ``tests/conftest.py``, for runs that collect anything under ``tests/``: no arguments (pytest
-  uses ``testpaths``), a ``tests/...`` argument, or ``.``, where pytest also loads the conftest of
-  each ``test*`` directory below the argument;
+* ``tests/conftest.py``, for runs whose arguments reach it before collection: no arguments (pytest
+  uses ``testpaths``), a ``tests/...`` argument, or ``.``, because pytest also loads the conftest of
+  each ``test*`` directory DIRECTLY under an argument;
 * ``packaging/messagefoundry-webconsole/tests/conftest.py``, because a run that names only that
   tree takes the web console's own ``pyproject.toml`` as its config file and rootdir, and then never
   loads ``tests/conftest.py``.
@@ -23,9 +23,11 @@ in ``tests/conftest.py`` and changes where ``messagefoundry_webconsole`` is impo
 Both import it package-qualified, the house idiom ``tests/test_conftest_name_collision_guard.py``
 describes; the web console suite already reaches ``tests/_deadline_capture.py`` the same way.
 
-At least these runs stay uncapped: ``--noconftest``, a run whose arguments reach neither
-conftest, and a ``-c`` naming a config whose rootdir loads neither. The cap is per run, not per
-machine: seven concurrent runs can still start seven times ``MAX_AUTO_WORKERS``.
+At least these runs stay uncapped: ``pytest -n auto packaging`` from the repository root, and
+``pytest -n auto`` from ``packaging/`` (both root-configured; they collect the console suite, whose
+conftest loads only during collection, after xdist has sized the run; measured 16 workers),
+``--noconftest``, and a ``-c`` naming a config whose rootdir loads neither conftest. The cap is per
+run, not per machine: seven concurrent runs can still start seven times ``MAX_AUTO_WORKERS``.
 
 WHY NOT xdist's ``--maxprocesses`` IN ``addopts``. It would cap without code, but it also caps an
 explicit ``-n N``, which this cap deliberately leaves alone, and a run under ``-p no:xdist`` (the web

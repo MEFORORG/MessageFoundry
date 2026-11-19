@@ -926,7 +926,8 @@ Manager's watch reached the cloud session 29 seconds after its question.
   hash-locked `requirements.lock` (exported from `uv.lock`; CI checks it stays in sync and audits
   it — DEP-1). No ad-hoc installs — add deps to `pyproject.toml`, then re-run `uv lock`/`uv export`.
 - Run tests in parallel with `pytest -n auto`, which [`tests/_xdist_worker_cap.py`](tests/_xdist_worker_cap.py)
-  caps so concurrent sessions on one machine do not each take every core. Lower one run
+  caps per run on a machine with more cores than the cap; it does not limit concurrent runs, and
+  that file lists the invocations it misses. Lower one run
   with `PYTEST_XDIST_AUTO_NUM_WORKERS=<n>`; it bypasses the cap, so neither it nor an explicit `-n`
   should go above it.
 

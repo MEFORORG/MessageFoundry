@@ -59,12 +59,21 @@ def _binds_the_cap(source: str) -> bool:
     Bare, not guarded: the console suite already needs ``tests/`` importable, so a guard would only
     let a fault drop the cap silently.
     """
-    return any(
-        isinstance(node, ast.ImportFrom)
-        and node.module == "tests._xdist_worker_cap"
-        and any(a.name == "pytest_xdist_auto_num_workers" and a.asname is None for a in node.names)
-        for node in ast.parse(source).body
-    )
+    name = "pytest_xdist_auto_num_workers"
+    bound = False
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.ImportFrom) and any(
+            a.asname is None and a.name == name for a in node.names
+        ):
+            bound = node.module == "tests._xdist_worker_cap"
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
+            bound = False
+        elif isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.Delete)):
+            # pluggy registers what the name holds last, so a later rebinding drops the cap.
+            targets = node.targets if isinstance(node, (ast.Assign, ast.Delete)) else [node.target]
+            if any(isinstance(t, ast.Name) and t.id == name for t in targets):
+                bound = False
+    return bound
 
 
 def test_the_console_conftest_registers_the_cap_too() -> None:
@@ -89,6 +98,12 @@ def test_the_console_conftest_registers_the_cap_too() -> None:
         "except ModuleNotFoundError:\n    pass\n",
         "try:\n    from tests._xdist_worker_cap import pytest_xdist_auto_num_workers\n"
         "except ModuleNotFoundError:\n    raise\nexcept ImportError:\n    pass\n",
+        "from tests._xdist_worker_cap import pytest_xdist_auto_num_workers\n"
+        "pytest_xdist_auto_num_workers = None\n",
+        "from tests._xdist_worker_cap import pytest_xdist_auto_num_workers\n"
+        "del pytest_xdist_auto_num_workers\n",
+        "from tests._xdist_worker_cap import pytest_xdist_auto_num_workers\n"
+        "def pytest_xdist_auto_num_workers(config):\n    return 64\n",
     ],
     ids=[
         "absent",
@@ -97,6 +112,9 @@ def test_the_console_conftest_registers_the_cap_too() -> None:
         "renamed",
         "swallows-a-missing-module",
         "two-handlers",
+        "rebound",
+        "deleted",
+        "redefined",
     ],
 )
 def test_the_console_binding_check_goes_red_without_the_binding(source: str) -> None:
