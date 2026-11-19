@@ -698,6 +698,13 @@ STUB = (
 )
 
 
+def _names_path(text: str, path: Path) -> bool:
+    """Whether ``text`` names ``path`` as git prints it (forward slashes). Whitespace is dropped from
+    both, because pwsh's error view word-wraps a thrown message at the console width."""
+    want = re.sub(r"\s+", "", str(path.resolve()).replace("\\", "/")).lower()
+    return want in re.sub(r"\s+", "", _flat(text)).replace("|", "").lower()
+
+
 @pytest.fixture
 def vault(tmp_path: Path) -> Path:
     """A ledger repository of its own, with an origin/main the tool must read rather than local main.
@@ -761,8 +768,18 @@ def test_ledger_repo_verdicts_come_from_the_ledger_repository(
     assert ledger["reference"] == "origin/main"
     assert ledger["sha"] == git(vault, "rev-parse", "origin/main").strip()
 
-    text = adjudicate(repo, "-LedgerRepo", str(vault)).stdout
-    assert ledger["sha"] in text, text
+
+def test_ledger_repo_text_report_names_the_checkout_and_the_pinned_sha(
+    repo: Path, vault: Path, tmp_path: Path
+) -> None:
+    """MUST TRIP on origin/main, which has no -LedgerRepo. The human report, not only -Json, says
+    which ledger it read. A test of its own, so each stays inside the per-test watchdog."""
+    backlog(repo, STUB)
+    write_claim(repo, "60", tmp_path / "gone", "seat")
+    proc = adjudicate(repo, "-LedgerRepo", str(vault))
+    assert proc.returncode == 0, proc.stderr
+    assert git(vault, "rev-parse", "origin/main").strip() in proc.stdout, proc.stdout
+    assert _names_path(proc.stdout, vault), proc.stdout
 
 
 def test_ledger_repo_is_pinned_to_origin_main_not_local_main(
@@ -796,18 +813,61 @@ def test_a_ledger_repo_that_is_not_a_git_repository_refuses(repo: Path, tmp_path
     assert '"claims"' not in proc.stdout, combined
 
 
-def test_a_ledger_repo_whose_ref_does_not_resolve_refuses(repo: Path, tmp_path: Path) -> None:
-    """A repository with no commit has neither origin/main nor main. The refusal carries git's words."""
+def test_a_ledger_checkout_without_origin_main_refuses_rather_than_read_local_main(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST TRIP on origin/main. The checkout's LOCAL main carries a CLOSED banner nobody published.
+    Reading it would release the claim on protection that does not travel -- the costly direction --
+    so the ledger gets no local-main fallback and the refusal carries git's own words."""
     backlog(repo, STUB)
+    unmerged_branch(repo, "seat")
     write_claim(repo, "60", tmp_path / "gone", "seat")
-    empty = tmp_path / "empty-vault"
-    subprocess.run(["git", "init", "-q", "-b", "main", str(empty)], check=True, capture_output=True)
-    proc = adjudicate(repo, "-Json", "-LedgerRepo", str(empty))
+    local = tmp_path / "local-only-vault"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(local)], check=True, capture_output=True)
+    git(local, "config", "user.email", "t@example.invalid")
+    git(local, "config", "user.name", "t")
+    (local / "docs").mkdir()
+    (local / "docs" / "BACKLOG.md").write_text(
+        f"# Backlog\n\n## 60. Shipped thing\n\n> {SHIPPED} SHIPPED\n\nbody\n", encoding="utf-8"
+    )
+    git(local, "add", "-A")
+    git(local, "commit", "-qm", "local only")
+    proc = adjudicate(repo, "-Json", "-LedgerRepo", str(local))
     combined = _flat(proc.stderr + proc.stdout)
     assert proc.returncode != 0, combined
     assert "git rev-parse exited" in combined, combined
-    assert "origin/main or main" in combined, combined
-    assert '"claims"' not in proc.stdout, combined
+    assert "origin/main in" in combined, combined
+    assert "SUPERSEDED" not in proc.stdout, combined
+
+
+def test_the_blocking_roll_up_strips_a_banner_state_holding_a_space(
+    repo: Path, tmp_path: Path
+) -> None:
+    """MUST TRIP on origin/main: `OPEN/in progress` holds a space, so the roll-up's strip of the
+    "item reads <state> on <ref> and" lead never matched and the whole sentence printed."""
+    backlog(repo, f"## 67. In progress\n\n> {IN_PROGRESS} in progress\n\nbody\n")
+    unmerged_branch(repo, "seat")
+    write_claim(repo, "67", tmp_path / "gone", "seat")
+    proc = adjudicate(repo)
+    assert proc.returncode == 0, proc.stderr
+    assert "'seat' carries 1 commit(s)" in proc.stdout, proc.stdout
+    assert "item reads" not in proc.stdout, proc.stdout
+
+
+def test_an_archive_file_without_backlog_in_its_name_is_still_read(
+    repo: Path, vault: Path, tmp_path: Path
+) -> None:
+    """A guard on the narrowing, not a trip on origin/main (which read it too): every .md file under
+    docs/archive/backlog/ belongs to the namespace, so its CLOSED items are never silently NO-ITEM."""
+    backlog(repo, STUB)
+    unmerged_branch(repo, "seat")
+    write_claim(repo, "66", tmp_path / "gone", "seat")
+    _publish(
+        vault,
+        "docs/archive/backlog/closed-2026-12.md",
+        f"# Closed\n\n## 66. Archived later\n\n> {RETIRED} retired\n\nbody\n",
+    )
+    assert verdicts(repo, "-LedgerRepo", str(vault))["66"] == "SUPERSEDED"
 
 
 def test_a_ledger_repo_with_no_item_heading_refuses(
@@ -823,7 +883,7 @@ def test_a_ledger_repo_with_no_item_heading_refuses(
     combined = _flat(proc.stderr + proc.stdout)
     assert proc.returncode != 0, combined
     assert "no backlog item heading found" in combined, combined
-    assert vault.name in combined, combined
+    assert _names_path(proc.stderr + proc.stdout, vault), combined
     assert '"claims"' not in proc.stdout, combined
 
 

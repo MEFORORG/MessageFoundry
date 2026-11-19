@@ -161,13 +161,6 @@ if (-not (Test-Path -LiteralPath $claimsDir)) {
     exit 0
 }
 
-# origin/main is the reference, never local main: measured 2026-08-16, local main was 24 commits
-# behind on this clone. Here the staleness bites in a specific way -- a banner that has landed but
-# not been fetched reads as ABSENT, which holds a claim that is safe to release.
-#
-# RESOLVED TO ONE SHA, ONCE. Every later read -- the ls-tree, each git show, the citation log and the
-# ahead count -- takes $mainSha, never the name, so a fetch landing mid-run cannot hand one read an
-# older tree and the next a newer one. $mainRef stays the name, for the prose.
 # ONE WRAPPER FOR THE NAMESPACE READS, so the exit check and the stderr carry cannot be dropped from
 # one of them. Both preferences are pinned in the function's own scope: under the script's "Stop",
 # with $PSNativeCommandUseErrorActionPreference true, git's first stderr line or its exit code throws
@@ -192,38 +185,52 @@ function Invoke-NamespaceGit([string]$In, [string[]]$GitArgs, [string]$What, [st
     @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
 }
 
-# The reference of repository $In, pinned: origin/main, else local main. The last attempt runs through
-# the wrapper, so a ref that does not resolve refuses with git's own words.
-function Resolve-PinnedMain([string]$In) {
+# origin/main is the reference, never local main: measured 2026-08-16, local main was 24 commits
+# behind on this clone. Here the staleness bites in a specific way -- a banner that has landed but
+# not been fetched reads as ABSENT, which holds a claim that is safe to release.
+#
+# RESOLVED TO ONE SHA, ONCE, per repository. Every later read takes the SHA, never the name, so a
+# fetch landing mid-run cannot hand one read an older tree and the next a newer one. The name stays
+# for the prose. The refs are spelled in full, because git resolves a bare `origin/main` to a tag or a
+# local branch of that name before the remote-tracking ref, and the ambiguity warning is on stderr.
+#
+# $AllowLocal is this repository's long-standing fallback to local main where origin/main is absent.
+# The ledger checkout gets NO fallback (BACKLOG #5480): there a local-only commit could carry a CLOSED
+# banner nobody published, and reading it would RELEASE a claim on protection that does not travel --
+# the costly direction, not the harmless one. So a ledger checkout without origin/main refuses, with
+# git's own words, through the wrapper.
+function Resolve-PinnedMain([string]$In, [switch]$AllowLocal) {
     $ref = "origin/main"
-    $sha = "$(& git -C $In rev-parse --verify --quiet $ref 2>$null)".Trim()
-    if (-not $sha) {
+    if ($AllowLocal) {
+        $sha = "$(& git -C $In rev-parse --verify --quiet refs/remotes/origin/main 2>$null)".Trim()
+        if ($sha) { return [pscustomobject]@{ Ref = $ref; Sha = $sha; IsRemote = $true } }
         $ref = "main"
-        $sha = (@(Invoke-NamespaceGit $In @('rev-parse', '--verify', $ref) "origin/main or main in $In" "not read") -join '').Trim()
     }
+    $full = if ($ref -eq "main") { "refs/heads/main" } else { "refs/remotes/origin/main" }
+    $sha = (@(Invoke-NamespaceGit $In @('rev-parse', '--verify', "$full^{commit}") "$ref in $In" "not read") -join '').Trim()
     [pscustomobject]@{ Ref = $ref; Sha = $sha; IsRemote = ($ref -eq "origin/main") }
 }
 
-$pinned = Resolve-PinnedMain $repo
+# This repository's reference: the citation log and the ahead counts, and the namespace when no
+# -LedgerRepo is given.
+$pinned = Resolve-PinnedMain $repo -AllowLocal
 $mainRef = $pinned.Ref; $mainSha = $pinned.Sha; $mainIsRemote = $pinned.IsRemote
 
 # ---------------------------------------------------------------------------------------------
 # WHICH REPOSITORY HOLDS THE LEDGER (BACKLOG #5480).
 #
 # With -LedgerRepo every namespace read -- the rev-parse, the ls-tree and each git show -- runs in
-# that checkout, against ITS origin/main resolved to one SHA here, for the reason $mainSha is: a fetch
-# landing mid-run must not hand one read an older tree and the next a newer one. Local main is the
-# fallback only where origin/main is absent, as above. The claims, the ahead counts and the citations
-# stay this repository's: the branches and the landed commits live here, not in the ledger's history.
-# Without -LedgerRepo the namespace is read here, which refuses below on the stub.
+# that checkout, against ITS origin/main resolved once to a SHA. The claims, the ahead counts and the
+# citations stay this repository's: the branches and the landed commits live here, not in the
+# ledger's history. Without -LedgerRepo the namespace is read here, which refuses below on the stub.
 # ---------------------------------------------------------------------------------------------
 if ($LedgerRepo) {
     $ledgerPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LedgerRepo)
     $ledgerRoot = (@(Invoke-NamespaceGit $ledgerPath @('rev-parse', '--path-format=absolute', '--show-toplevel') "-LedgerRepo $ledgerPath as a git repository" "not read") -join '').Trim()
     $ledgerPinned = Resolve-PinnedMain $ledgerRoot
-    # One token, so the why-strings below keep the shape the BLOCKING roll-up strips.
+    # One token, so the BLOCKING roll-up's strip of the why-string's lead stays anchored.
     $ledgerAt = "ledger:$($ledgerPinned.Ref)@$($ledgerPinned.Sha.Substring(0, [Math]::Min(12, $ledgerPinned.Sha.Length)))"
-    $remedy = ""
+    $remedy = " Check that -LedgerRepo names a checkout of the ledger repository (the vault)."
 }
 else {
     $ledgerRoot = $repo; $ledgerPinned = $pinned; $ledgerAt = $mainRef
@@ -245,15 +252,15 @@ $ledgerRef = $ledgerPinned.Ref; $ledgerSha = $ledgerPinned.Sha
 # BACKLOG in their names and `## N.` headings of their own (measured 2026-11-19 on the vault's
 # origin/main: two such files, under docs/releases/ and docs/security/handoff/). Matching the word
 # anywhere under docs/ let those headings join the namespace as items, so a key the ledger lacks
-# would take a plan step's text as its banner. scripts/coord/owed_ledger_acts.py's LEDGER_SOURCES
-# names the same pair.
+# would take a plan step's text as its banner. Every .md file under docs/archive/backlog/ is read,
+# whatever its name: dropping an archive file would turn its CLOSED items into NO-ITEM silently.
 # ---------------------------------------------------------------------------------------------
 #
 # `-z` because without it git QUOTES a path holding a non-ASCII byte or a control character, and a
 # quoted name is not a path git show can read. pwsh splits native output on newlines, so rejoin on
 # newline before splitting on NUL. A FAILED ls-tree REFUSES, for the reason a failed git show does.
 $treeNames = (@(Invoke-NamespaceGit $ledgerRoot @('ls-tree', '-r', '-z', '--name-only', $ledgerSha, '--', 'docs/BACKLOG.md', 'docs/archive/backlog/') "the tree of $ledgerRef ($ledgerSha) in $ledgerRoot" "not read") -join "`n") -split "`0"
-$backlogFiles = @($treeNames | Where-Object { $_ -cmatch 'BACKLOG' -and $_ -like '*.md' })
+$backlogFiles = @($treeNames | Where-Object { $_ -like '*.md' })
 if (-not $backlogFiles.Count) {
     throw "no backlog file found on $ledgerRef ($ledgerSha) in ${ledgerRoot}: cannot adjudicate any key against a namespace that was not read.$remedy"
 }
@@ -531,11 +538,8 @@ if ($Json) {
     exit 0
 }
 
-$localMain = @()
-if (-not $mainIsRemote) { $localMain += "on this clone" }
-if ($LedgerRepo -and -not $ledgerPinned.IsRemote) { $localMain += "in the ledger checkout" }
-foreach ($where in $localMain) {
-    Write-Host "WARNING: origin/main is not present $where; every verdict below that rests on it was taken against LOCAL main." -ForegroundColor Yellow
+if (-not $mainIsRemote) {
+    Write-Host "WARNING: origin/main is not present on this clone; every verdict below that rests on it was taken against LOCAL main." -ForegroundColor Yellow
     Write-Host "         A banner that has landed but not been fetched reads as absent, which HOLDS releasable claims." -ForegroundColor Yellow
     Write-Host ""
 }
@@ -581,7 +585,7 @@ if ($blk.Count) {
         $plural = if ($grp.Count -eq 1) { "" } else { "s" }
         Write-Host ("  {0}" -f $grp.Name) -ForegroundColor Yellow
         Write-Host ("      {0} key{1}: {2}" -f $grp.Count, $plural, $keys)
-        Write-Host ("      {0}" -f ($grp.Group[0].why -replace '^item reads \S+ on \S+ and ', ''))
+        Write-Host ("      {0}" -f ($grp.Group[0].why -replace '^item reads .+? on \S+ and ', ''))
         Write-Host ("      one decision for the branch -- land it, or abandon it and release all {0}." -f $grp.Count)
         Write-Host ""
     }
