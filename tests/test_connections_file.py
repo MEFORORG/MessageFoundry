@@ -305,9 +305,14 @@ def test_seconds_key_refuses_a_non_finite_or_overflowing_value(
 def test_seconds_key_still_takes_a_finite_number(
     tmp_path: Path, key: str, value: str, expected: float
 ) -> None:
-    """The control: a finite number, and an int widened to a float, still load."""
+    """The control: a finite number still loads. The two connection-level keys keep the float
+    finite_seconds returns, so an int is widened there; send_min_interval_seconds is a transport
+    setting, kept as written and read with float() when the lane starts."""
     toml, read_back = _SECONDS_CASES[key]
-    assert read_back(load_config(_config(tmp_path, toml.format(value=value)))) == expected
+    loaded = read_back(load_config(_config(tmp_path, toml.format(value=value))))
+    assert loaded == expected
+    if key != "send_min_interval_seconds":
+        assert type(loaded) is float
 
 
 def test_negative_strict_timeout_still_disables_the_backstop(tmp_path: Path) -> None:
