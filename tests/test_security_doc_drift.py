@@ -44,6 +44,7 @@ from messagefoundry.auth.permissions import (
 )
 from messagefoundry.config.retention_classification import (
     BODY_ACKNOWLEDGEMENT_SETTING,
+    ENGINE_SHARD_LIMIT,
     RetentionGateLine,
     evaluate_retention_gate,
 )
@@ -1796,6 +1797,14 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
         "reads finding strings about prose. Each plant mutates a document and the verdict is "
         "_override_note_findings' or _gate_audit_prose_findings' text read, a prose claim; the "
         "code each claim describes is driven in the two tests beside it (vault BACKLOG #2368)"
+    ),
+    (
+        "test_security_doc_drift.py",
+        "test_the_override_note_states_the_engine_shard_limit_the_refusal_states",
+    ): (
+        "compares CONFIGURATION.md prose to the refusal's ENGINE_SHARD_LIMIT string, a prose "
+        "claim; tests/test_per_connection_retention.py drives the purge it describes (BACKLOG "
+        "#5967)"
     ),
     ("test_security_doc_rate_limits.py", "_config_section"): "slices CONFIGURATION.md prose",
     ("test_security_doc_rate_limits.py", "test_ui_refusal_reader_can_fail"): (
@@ -3958,7 +3967,12 @@ _OVERRIDE_ARMS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     (
         "- Without it, under `warn`, the gate passes the graph",
-        (_OVERRIDE_AUDITED, "with the remedy", "those bodies are kept forever"),
+        (
+            _OVERRIDE_AUDITED,
+            "with the remedy",
+            "what the override holds is kept forever",
+            "subject to the engine shard limit above",
+        ),
     ),
     ("- With it, the gate passes the graph", (_OVERRIDE_AUDITED,)),
 )
@@ -3967,10 +3981,21 @@ _OVERRIDE_NOTE_FACTS = (
     "each time it passes such a graph",
     "A dry-run reload counts",
     "each engine shard writes its own",
+    # BACKLOG #5967: the limit itself is checked against ENGINE_SHARD_LIMIT, the refusal's own
+    # sentence, by test_the_override_note_states_the_engine_shard_limit_the_refusal_states.
+    "Subject to the engine shard limit next, it keeps forever what that override's purge holds",
     # The body windows' line is the older rule, left alone by the 2026-11-01 ruling. The other
     # global tiers are not in this claim: an acknowledged one writes its line on either dial.
     "The startup gate for the global body windows differs: it writes its `AUDIT:` line only under "
     "`enforce`.",
+)
+#: BACKLOG #5967: a configuration once recommended for keeping an inbound's bodies under engine
+#: shards, removed because it also kept other tiers forever and failed with the holding engine
+#: shard down. None of these may come back into the note.
+_OVERRIDE_NOTE_REMOVED = (
+    "One configuration that keeps them",
+    "gives every other inbound a positive `messages_days`",
+    "keeps the override as written",
 )
 _LOOSENING_DOC = _ROOT / "docs" / "SECURITY-LOOSENING.md"
 _PHI_DOC = _ROOT / "docs" / "PHI.md"
@@ -3998,11 +4023,23 @@ _RETIRED_RETENTION_CLAIMS: tuple[tuple[Path, str], ...] = (
 )
 
 
+def test_the_override_note_states_the_engine_shard_limit_the_refusal_states() -> None:
+    """BACKLOG #5967 (SDS-3.5): the note restates ENGINE_SHARD_LIMIT, the refusal's own sentence,
+    word for word once its markup is dropped, so the two cannot drift apart. Red on either copy
+    changing alone."""
+    quoted = blockquote_lines(_CONFIG_DOC.read_text(encoding="utf-8"), _OVERRIDE_NOTE)
+    note = " ".join(line.removeprefix(">").strip() for line in quoted)
+    plain = note.replace("**", "").replace("`", "")
+    assert ENGINE_SHARD_LIMIT.startswith("The engine shard limit: ")
+    assert plain.count(ENGINE_SHARD_LIMIT) == 1
+
+
 def _override_note_findings(doc: str) -> list[str]:
     """What the *Per-connection overrides* note in CONFIGURATION.md no longer says.
 
-    Reads prose, and only checks that at least these phrases are PRESENT. A contradicting sentence
-    added beside them is not caught."""
+    Reads prose. It checks that at least these phrases are PRESENT, and that the removed phrases of
+    :data:`_OVERRIDE_NOTE_REMOVED` are absent. Any other contradicting sentence added beside them is
+    not caught."""
     quoted = blockquote_lines(doc, _OVERRIDE_NOTE)
     text = "\n".join(line.removeprefix(">").strip() for line in quoted)
     # A wrapped line joins the one above it, so a phrase is found wherever the doc wraps it.
@@ -4017,6 +4054,7 @@ def _override_note_findings(doc: str) -> list[str]:
         findings += [f"bullet {opening!r} no longer says {p!r}" for p in phrases if p not in bullet]
     whole = " ".join(entries)
     findings += [f"the note no longer says {p!r}" for p in _OVERRIDE_NOTE_FACTS if p not in whole]
+    findings += [f"the note says the removed {p!r}" for p in _OVERRIDE_NOTE_REMOVED if p in whole]
     return findings
 
 
@@ -4202,7 +4240,7 @@ def test_the_override_prose_readers_detect_a_planted_violation() -> None:
             "Without it, under `warn`",
         ),
         # A warn arm that reads as if nothing is lost.
-        "bodies-not-kept": ("and those bodies are kept forever", "", "kept forever"),
+        "bodies-not-kept": ("and what the override holds is kept forever", "", "kept forever"),
         "acknowledged-arm-unaudited": (
             "the gate passes the graph and logs a WARNING-level `AUDIT:` line naming each "
             "connection.\n",
@@ -4217,6 +4255,13 @@ def test_the_override_prose_readers_detect_a_planted_violation() -> None:
             "expected 3 bullets",
         ),
         "dry-run-dropped": ("A dry-run reload counts, and", "And", "A dry-run reload counts"),
+        # BACKLOG #5967: the removed engine shard recommendation, put back where it stood.
+        "removed-recommendation-back": (
+            "each of those windows to an explicit number of days.",
+            "each of those windows to an explicit number of days. One configuration that keeps them "
+            "there gives every other inbound a positive `messages_days`.",
+            "the removed",
+        ),
         # The claim this row corrected: the global gate audits on either dial.
         "global-gate-unconditional": (
             "its `AUDIT:` line only under `enforce`.",

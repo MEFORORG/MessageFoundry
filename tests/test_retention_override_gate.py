@@ -24,6 +24,7 @@ import pytest
 from messagefoundry.__main__ import _chain_registry_guards, main
 from messagefoundry.checks import CheckReport, CheckResult, run_checks
 from messagefoundry.config.retention_classification import (
+    ENGINE_SHARD_LIMIT,
     auto_bounded_windows,
     judge_keep_forever_overrides,
     keep_forever_overrides,
@@ -173,6 +174,109 @@ def test_the_audit_line_names_no_environment_when_none_is_active(
     assert verdict.report is not None and "(environment" not in verdict.report
 
 
+@pytest.mark.parametrize(
+    ("inbound_days", "outbound_days", "inbound_named", "outbound_named"),
+    [(0, None, True, False), (None, 0, False, True), (0, 0, True, True)],
+)
+@pytest.mark.parametrize(
+    ("acknowledged", "enforcing"), [(True, True), (False, True), (False, False)]
+)
+def test_the_override_text_states_what_the_purge_keeps(
+    tmp_path: Path,
+    acknowledged: bool,
+    enforcing: bool,
+    inbound_days: int | None,
+    outbound_days: int | None,
+    inbound_named: bool,
+    outbound_named: bool,
+) -> None:
+    """BACKLOG #5967: an inbound ``messages_days = 0`` does not keep its dead-lettered rows, which
+    the dead-letter purge keys on the row's outbound, and an outbound ``dead_letter_days = 0`` does
+    not keep its captured replies, which the body purge keys on the receiving inbound. The refusal
+    and the AUDIT line of each arm (acknowledged, enforced refusal, warn) say so, for the kinds of
+    override the graph holds and no other. ``tests/test_per_connection_retention.py`` pins the store
+    behaviour these words describe."""
+    registry = _graph(tmp_path / "cfg", inbound_days=inbound_days, outbound_days=outbound_days)
+    verdict = judge_keep_forever_overrides(
+        registry, acknowledged=acknowledged, enforcing=enforcing, env_name="prod"
+    )
+    text = verdict.refusal if enforcing and not acknowledged else verdict.report
+    assert text is not None
+    inbound_scope = (
+        "It does not keep their dead-lettered rows at any stage, or a streaming attachment the "
+        "purge of the last of those rows releases: a dead row that names no outbound is purged on "
+        "the global [retention].dead_letter_days window"
+    )
+    outbound_scope = (
+        "It does not keep what the purge of message bodies holds for those messages, at least the "
+        "stored body, the delivered and cancelled payloads, the event detail and the replies that "
+        "outbound captured"
+    )
+    assert (inbound_scope in text) is inbound_named
+    assert (outbound_scope in text) is outbound_named
+
+
+@pytest.mark.parametrize(
+    ("inbound_days", "outbound_days", "kept"),
+    [
+        (0, None, "PHI message bodies"),
+        (None, 0, "dead-lettered PHI rows"),
+        (0, 0, "PHI message bodies and dead-lettered PHI rows"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("acknowledged", "enforcing"), [(True, True), (False, True), (False, False)]
+)
+def test_the_override_text_names_what_is_kept_and_the_engine_shard_limit(
+    tmp_path: Path,
+    acknowledged: bool,
+    enforcing: bool,
+    inbound_days: int | None,
+    outbound_days: int | None,
+    kept: str,
+) -> None:
+    """BACKLOG #5967: the opening sentence names what the overrides keep, so an outbound-only
+    override is not said to keep message bodies, and an inbound override's text states the engine
+    shard limit once. Red on a text that says "PHI message bodies" for every override, or promises
+    an inbound's hold on every engine shard."""
+    registry = _graph(tmp_path / "cfg", inbound_days=inbound_days, outbound_days=outbound_days)
+    verdict = judge_keep_forever_overrides(
+        registry, acknowledged=acknowledged, enforcing=enforcing, env_name="prod"
+    )
+    refused = enforcing and not acknowledged
+    text = verdict.refusal if refused else verdict.report
+    assert text is not None
+    opening = f"keeps {kept} indefinitely" if refused else f"connections' {kept} are retained"
+    assert opening in text
+    # The caveat only points at the limit, and it leaves no comma before "(status)".
+    caveat = ", subject, for an inbound override, to the engine shard limit stated after this"
+    assert (caveat in text) is (inbound_days is not None)
+    assert "this, (" not in text and ",," not in text
+    if inbound_days is None:
+        assert "PHI message bodies" not in text
+    # The limit is keyed on a `serve --shard` process that does NOT hold the inbound, and it covers
+    # all the body purge holds, not the stored body alone. It is stated once.
+    shard_limit = (
+        "The engine shard limit: where a serve --shard process that does not hold an inbound runs "
+        "retention against the same store, that inbound's override keeps none of what the purge "
+        "of message bodies holds for that inbound's messages past that process's global "
+        "[security].delete_message_bodies_after_days window, where that window is bounded; no "
+        "messages_days value on that inbound changes this."
+    )
+    assert shard_limit == ENGINE_SHARD_LIMIT
+    assert text.count(shard_limit) == (1 if inbound_days is not None else 0)
+    assert text.count("serve --shard") == (1 if inbound_days is not None else 0)
+    # Keep-forever is made subject to the limit, never to the holding process applying it.
+    assert (
+        "Subject to that limit, an inbound override keeps forever, while that inbound stays in the "
+        "live graph" in text
+    ) is (inbound_days is not None)
+    assert "holds the inbound, apply the override" not in text
+    assert "honour the override" not in text
+    if outbound_days is not None:
+        assert "the replies that outbound captured: that purge reads no outbound override." in text
+
+
 def test_the_remedy_does_not_offer_an_unbounded_global_window_as_a_bound(tmp_path: Path) -> None:
     # Under warn a global 0 passes the start gate. Inheriting it keeps the bodies forever with the
     # line gone, so removing the override is the remedy only where the global window is bounded.
@@ -203,7 +307,41 @@ def test_the_remedy_says_what_the_switch_needs_and_what_it_leaves_unrecorded(
     assert "an engine writes an AUDIT line naming these connections" in remedy
     # The imperative carries its own reason, or a reader on enforce has none to bound a window.
     assert "Set each of them to an explicit number of days first, or" in remedy
-    assert "AUDIT line for such a window at 0 only under enforcement = enforce" in remedy
+    # "Those global windows" names the auto-bounded windows just listed, not the override.
+    assert (
+        "The start gate writes an AUDIT line for one of those global windows at 0 only under "
+        "enforcement = enforce" in remedy
+    )
+
+
+@pytest.mark.parametrize(("inbound_days", "outbound_days"), [(0, None), (None, 0), (0, 0)])
+@pytest.mark.parametrize(
+    ("acknowledged", "enforcing"), [(True, True), (False, True), (False, False)]
+)
+def test_the_override_text_recommends_no_configuration_for_engine_shards(
+    tmp_path: Path,
+    acknowledged: bool,
+    enforcing: bool,
+    inbound_days: int | None,
+    outbound_days: int | None,
+) -> None:
+    """BACKLOG #5967: a recommended configuration for keeping an inbound's bodies under engine
+    shards (an unbounded global window plus a positive override on every other inbound) was
+    removed, because it also kept other tiers forever and failed when the holding engine shard was
+    down. Red if any arm offers it again."""
+    registry = _graph(tmp_path / "cfg", inbound_days=inbound_days, outbound_days=outbound_days)
+    verdict = judge_keep_forever_overrides(
+        registry, acknowledged=acknowledged, enforcing=enforcing, env_name="prod"
+    )
+    text = verdict.refusal if enforcing and not acknowledged else verdict.report
+    assert text is not None
+    for removed in (
+        "One configuration that keeps them",
+        "gives every other inbound a positive messages_days",
+        "keeps the override as written",
+        "to deliberately retain forever",
+    ):
+        assert removed not in text
 
 
 @pytest.mark.parametrize(
