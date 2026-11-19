@@ -170,9 +170,7 @@ def list_connections(config_dir: str | Path) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for direction in ("inbound", "outbound"):
         for table in doc.get(direction, []):
-            plain = table.unwrap()
-            where = f"{direction} connection {plain.get('name')!r}"
-            entry = {key: _jsonable(value, where) for key, value in plain.items()}
+            entry = {key: _jsonable(value) for key, value in table.unwrap().items()}
             entry["direction"] = direction
             out.append(entry)
     return out
@@ -202,23 +200,22 @@ def _is_tag_shaped(value: Any) -> bool:
     return isinstance(value, dict) and len(value) == 1 and NON_FINITE_TAG in value
 
 
-def _jsonable(value: Any, where: str = "connection") -> Any:
+def _jsonable(value: Any) -> Any:
     """Canonicalize a TOML-unwrapped value for the list boundary: ``datetime``/``date``/``time``
     become ISO-8601 strings (``HH:MM:SS`` for a time), a non-finite float becomes the tag
     ``{"$toml": "inf"}`` (``-inf``, ``nan``, ``-nan``), containers recurse, and everything else
     passes verbatim, so the result is standard JSON with no bare ``Infinity`` or ``NaN`` token.
 
-    A table whose only key is ``$toml`` is reserved for the tag: upsert reads it as one, or refuses
-    it, so it is refused here rather than listed ambiguously."""
+    A hand-written table whose only key is ``$toml`` is listed under an escape, wrapped once more:
+    ``{"$toml": v}`` becomes ``{"$toml": {"$toml": v'}}``. The tag's value is always a string and
+    the escape's always a table, so neither can be read as the other, and :func:`_decode_tags`
+    unwraps the escape back to the same table."""
     if _is_tag_shaped(value):
-        raise WiringError(
-            f"{where}: a table whose only key is {NON_FINITE_TAG!r} is reserved for the "
-            "non-finite number tag and cannot be listed; rename the key"
-        )
+        return {NON_FINITE_TAG: {NON_FINITE_TAG: _jsonable(value[NON_FINITE_TAG])}}
     if isinstance(value, dict):
-        return {key: _jsonable(item, where) for key, item in value.items()}
+        return {key: _jsonable(item) for key, item in value.items()}
     if isinstance(value, list):
-        return [_jsonable(item, where) for item in value]
+        return [_jsonable(item) for item in value]
     if isinstance(value, (datetime, date, time)):
         return value.isoformat()
     if isinstance(value, float) and not math.isfinite(value):
@@ -228,16 +225,19 @@ def _jsonable(value: Any, where: str = "connection") -> Any:
 
 def _decode_tags(value: Any) -> Any:
     """``value`` with each exact non-finite tag (one key, ``$toml``, one of the four spellings)
-    decoded to its float, at any depth. Nothing else is decoded: a plain ``"inf"`` string stays a
-    string, and the read schema refuses it in a float field as it always has. Any other one-key
-    ``$toml`` table is refused, since ``connection list`` could not list it back."""
+    decoded to its float, and each escape :func:`_jsonable` writes for a hand-written ``$toml``
+    table unwrapped back to that table, at any depth. A plain string is never decoded as a tag. Any
+    other one-key ``$toml`` table is refused, since it is neither."""
     if _is_tag_shaped(value):
-        spelling = value[NON_FINITE_TAG]
-        if isinstance(spelling, str) and spelling in _NON_FINITE:
-            return _NON_FINITE[spelling]
+        inner = value[NON_FINITE_TAG]
+        if isinstance(inner, str) and inner in _NON_FINITE:
+            return _NON_FINITE[inner]
+        if _is_tag_shaped(inner):
+            return {NON_FINITE_TAG: _decode_tags(inner[NON_FINITE_TAG])}
         raise WiringError(
-            f"a table whose only key is {NON_FINITE_TAG!r} is the non-finite number tag, and its "
-            f"value must be one of {', '.join(_NON_FINITE)}"
+            f"a table whose only key is {NON_FINITE_TAG!r} is the non-finite number tag, with a "
+            f"value of {', '.join(_NON_FINITE)}, or the escape of a hand-written "
+            f"{NON_FINITE_TAG!r} table: {{{NON_FINITE_TAG!r}: {{{NON_FINITE_TAG!r}: <value>}}}}"
         )
     if isinstance(value, dict):
         return {key: _decode_tags(item) for key, item in value.items()}

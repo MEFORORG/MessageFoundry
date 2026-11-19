@@ -720,19 +720,53 @@ def test_a_clone_of_a_hand_written_non_finite_strict_timeout_is_refused(
     assert (cfg / "connections.toml").read_bytes() == before
 
 
-@pytest.mark.parametrize("body", ['"$toml" = "inf"', '"$toml" = "anything"'])
-def test_a_table_shaped_like_the_tag_is_refused_on_list(
-    body: str, cfg: Path, capsys: pytest.CaptureFixture[str]
+_HAND_WRITTEN_TAG_TABLES = {
+    "string inf": ('"$toml" = "inf"', {NON_FINITE_TAG: {NON_FINITE_TAG: "inf"}}),
+    "other string": ('"$toml" = "hello"', {NON_FINITE_TAG: {NON_FINITE_TAG: "hello"}}),
+    "float inf": (
+        '"$toml" = inf',
+        {NON_FINITE_TAG: {NON_FINITE_TAG: {NON_FINITE_TAG: "inf"}}},
+    ),
+    "nested": (
+        '"$toml" = { "$toml" = "nan" }',
+        {NON_FINITE_TAG: {NON_FINITE_TAG: {NON_FINITE_TAG: {NON_FINITE_TAG: "nan"}}}},
+    ),
+    "array": (
+        '"$toml" = [1, inf]',
+        {NON_FINITE_TAG: {NON_FINITE_TAG: [1, {NON_FINITE_TAG: "inf"}]}},
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_HAND_WRITTEN_TAG_TABLES))
+def test_a_hand_written_tag_shaped_table_lists_escaped_and_round_trips(
+    case: str, cfg: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A real table whose only key is `$toml` would list as a tag and come back as a float, so
-    `connection list` refuses it, naming the connection, rather than list it ambiguously."""
-    (cfg / "connections.toml").write_text(
-        _base(inbound_extra=f"metadata = {{ t = {{ {body} }} }}\n"), encoding="utf-8"
-    )
-    rc = main(["connection", "list", "--config", str(cfg), "--json"])
-    out = capsys.readouterr().out
-    assert rc == 1
-    assert "$toml" in out and "'IB'" in out
+    """A hand-written table whose only key is `$toml` loads on main, so `connection list` must
+    still list the whole file. It lists that table under the escape {"$toml": {"$toml": v}}, which
+    cannot be read as the non-finite tag (whose value is always a string), and upsert unwraps it:
+    a no-op save is byte-identical, and a clone carries the same table."""
+    body, escaped = _HAND_WRITTEN_TAG_TABLES[case]
+    before = _base(inbound_extra=f"metadata = {{ t = {{ {body} }} }}  # hand\n").encode("utf-8")
+    (cfg / "connections.toml").write_bytes(before)
+    svc = _svc(cfg, _EPIC_EGRESS)
+    listed = _listed(cfg, capsys)
+    assert set(listed) == {"IB", "OB"}
+    assert listed["IB"]["metadata"]["t"] == escaped
+    for entry in listed.values():
+        rc, out = _upsert(cfg, entry, capsys, svc=svc)
+        assert rc == 0, out
+    assert (cfg / "connections.toml").read_bytes() == before
+    source = _tables(cfg)["IB"]
+    entry = listed["IB"]
+    entry["name"] = "IB2"
+    entry["settings"]["port"] = 2610
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 0, out
+    clone = _tables(cfg)["IB2"]
+    assert isinstance(source, dict) and isinstance(clone, dict)
+    assert clone["metadata"] == source["metadata"]
+    load_config(cfg)
 
 
 @pytest.mark.parametrize("value", ["bogus", ["inf"], {}, 5])
