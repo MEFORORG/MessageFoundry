@@ -2495,7 +2495,8 @@ def _start_logging_gates(
         if _egress_gap is not None:
             print(
                 f"error: {_egress_gap}; refusing to start. List the collector in "
-                "[egress].allowed_syslog as 'host' (any port) or 'host:port'.",
+                "[egress].allowed_syslog as 'host' or '[v6]' (any port), or 'host:port' or "
+                "'[v6]:port', and give an IPv6 forward_host unbracketed.",
                 file=sys.stderr,
             )
             return 2

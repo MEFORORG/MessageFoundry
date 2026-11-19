@@ -151,7 +151,8 @@ def test_posture_helper_hands_the_audit_back_instead_of_logging_it(
     settings = load_settings(
         environ={
             "MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND": "false",
-            "MEFOR_EGRESS_ALLOWED_MLLP": '["10.0.0.5"]',
+            # Comma-separated: a JSON list here is one entry, refused at load (BACKLOG #5915).
+            "MEFOR_EGRESS_ALLOWED_MLLP": "10.0.0.5",
         },
         default_file=False,
     )

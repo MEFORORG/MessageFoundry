@@ -15,7 +15,6 @@ finally reaches, and it does not see a native driver that dials on its own.
 
 from __future__ import annotations
 
-import ipaddress
 import logging
 import urllib.parse
 from collections.abc import Mapping
@@ -29,9 +28,10 @@ from messagefoundry.config.settings import (
     pinned_host_port,
 )
 from messagefoundry.config.wiring import WiringError, resolve_env_settings
+from messagefoundry.hostlist import canonical_host, parse_allow_entry, port_number, port_or_zero
 from messagefoundry.secretscrub import credential_query_params
 from messagefoundry.transports.base import _ECH_ROUTING_DESTINATIONS
-from messagefoundry.transports.db_endpoint import database_dial_endpoint, port_or_zero
+from messagefoundry.transports.db_endpoint import database_dial_endpoint
 from messagefoundry.transports.email import envelope_address_problem, envelope_recipients
 from messagefoundry.transports.proxy_address import (
     _UNCACHED_URLSPLIT,
@@ -881,78 +881,28 @@ def syslog_forward_refusal(host: str, port: int, egress: EgressSettings) -> str 
 
 def host_port_allowed(host: str, port: object, allowed: list[str]) -> bool:
     """True if an entry in ``allowed`` names ``host`` and either names no port or names ``port``.
-    A ``port`` of ``None`` matches only an entry that names no port, never one spelled ``None``."""
+
+    Ports compare as numbers (:func:`~messagefoundry.hostlist.port_number`), so a port that arrives
+    as text, such as an uncast ``env()`` value, matches the entry for the port its connector dials:
+    ``06661`` matches ``host:6661``. A ``port`` that is not a port, ``None`` included, matches only
+    an entry that names no port, never one spelled ``None``."""
+    number = port_number(port)
     return any(
-        not allow_port or (port is not None and str(port) == allow_port)
+        not allow_port or (number is not None and port_or_zero(allow_port) == number)
         for allow_port in _allowed_ports_for(host, allowed)
     )
 
 
-#: A host as the allowlist compares it: an IP literal as an address, a name lowercased.
-_CanonicalHost = ipaddress.IPv4Address | ipaddress.IPv6Address | str
-
-
-def _canonical_host(text: str) -> _CanonicalHost | None:
-    """``text``, a host as a connection names it, in the form the allowlist compares, or ``None``
-    when no entry may match it (BACKLOG #5915).
-
-    An IP literal compares as its address, so ``0:0:0:0:0:0:0:1`` is ``::1``. Anything else
-    holding a ``:``, a bracketed ``[::1]`` included, matches no entry: no entry's host is such a
-    name, and reading it as an address would be a guess about how its connector dials it. A name
-    compares lowercased. Canonical equivalence only,
-    never looser: an IPv4-mapped IPv6 address is not the IPv4 address, a trailing-dot name is not
-    the dotless one, and shorthand IPv4 such as ``127.1`` is a name, since :mod:`ipaddress` reads
-    only the dotted quad. A ``%`` zone id gets ``None``. :mod:`ipaddress` compares the zone, but a
-    URL's zone is compared as written and dialled decoded: ``urlsplit`` reads ``[::1%31]`` as the
-    host ``::1%31``, which an entry ``[::1%31]`` names, and ``urllib.request`` decodes it to
-    ``::11`` before it dials, so the entry would admit a host it does not name."""
-    if not text or "%" in text:
-        return None
-    try:
-        return ipaddress.ip_address(text)
-    except ValueError:
-        return None if ":" in text else text.lower()
-
-
-def _parse_allow_entry(entry: str) -> tuple[_CanonicalHost, str] | None:
-    """``entry`` read as ``(host, port text)``, the port text ``""`` where it names none, or
-    ``None`` for an entry that matches nothing (BACKLOG #5915).
-
-    ``host``, ``host:port``, ``[v6]`` and ``[v6]:port`` are read. Brackets hold an IPv6 literal and
-    nothing else. An unbracketed entry holding more than one ``:``, such as ``::1`` or
-    ``fe80::1:443``, is ambiguous, so it matches nothing: the last group is never read as a port,
-    and the entry is not read as a host with no port. A ``:`` with no port after it, such as
-    ``[::1]:`` or ``db:`` (an ``env()`` that expanded to nothing), matches nothing too, rather
-    than any port. The host is read by :func:`_canonical_host`."""
-    text = entry.strip()
-    if text.startswith("["):
-        close = text.find("]")
-        if close == -1:
-            return None
-        inner, rest = text[1:close], text[close + 1 :]
-        if (rest and not rest.startswith(":")) or ":" not in inner:
-            return None
-        host, sep, port = inner, rest[:1], rest[1:]
-    elif text.count(":") > 1:
-        return None
-    else:
-        host, sep, port = text.partition(":")
-    port = port.strip()
-    canonical = _canonical_host(host.strip())
-    if canonical is None or (sep and not port):
-        return None
-    return canonical, port
-
-
 def _allowed_ports_for(host: str, allowed: list[str]) -> list[str]:
     """The port text of each entry in ``allowed`` whose host is ``host``, ``""`` for an entry that
-    names no port. Hosts compare in :func:`_canonical_host`'s form and entries are read by
-    :func:`_parse_allow_entry`. The one parse :func:`host_port_allowed`, the DATABASE check and
+    names no port. Hosts compare in :func:`~messagefoundry.hostlist.canonical_host`'s form and
+    entries are read by :func:`~messagefoundry.hostlist.parse_allow_entry`. The one parse
+    :func:`host_port_allowed`, the DATABASE check and
     ``transports.ai_broker.endpoint_host_allowed`` share."""
-    canonical = _canonical_host(host)
+    canonical = canonical_host(host)
     if canonical is None:
         return []
-    parsed = (_parse_allow_entry(entry) for entry in allowed)
+    parsed = (parse_allow_entry(entry) for entry in allowed)
     return [entry[1] for entry in parsed if entry is not None and entry[0] == canonical]
 
 
@@ -978,7 +928,16 @@ def _database_refusal(
     endpoint = database_dial_endpoint(settings, dialect=dialect)
     host, port = endpoint.host, endpoint.port
     # Unverified driver reads fail closed; docs/CONNECTIONS.md says why (BACKLOG #5915).
-    pins = [] if ":" in host else _allowed_ports_for(host, allowed)
+    if ":" in host:
+        # Refused as unlisted, saying why, since an entry naming the address looks like it lists it.
+        # The server text is not quoted: a ':' is where a pasted "user:password@host" lands.
+        where = "the PORT keyword in odbc_params" if dialect == "generic" else "the port setting"
+        return (
+            "the server setting is not in the [egress].allowed_db allowlist: a server holding a "
+            f"':' is never listed, so give a port in {where}, not in server, and name an IPv6 "
+            "server by host name"
+        )
+    pins = _allowed_ports_for(host, allowed)
     if not pins:
         return f"server {host!r} is not in the [egress].allowed_db allowlist"
     if endpoint.conflict is not None:
@@ -1016,7 +975,10 @@ def _dir_egress_allowed(directory: str, allowed: list[str]) -> bool:
 
 def http_egress_allowed(url: str, allowed: list[str]) -> bool:
     """True if ``url``'s host (and port, when an allow entry pins one) is on the allowlist — the same
-    ``host`` / ``host:port`` matching as MLLP.
+    entry matching as MLLP. An ``http`` or ``https`` URL that names no port is matched at the port
+    urllib dials for it, 80 or 443 (:func:`http_dial_port`), so ``host:443`` admits
+    ``https://host/``; a URL in any other scheme that names no port matches only an entry naming
+    none.
 
     A port ``urlsplit`` cannot read is NOT allowed, and this never raises (BACKLOG #1793). The
     ``ValueError`` from ``.port`` quotes the port text, and a password holding an unencoded ``/``,
@@ -1028,4 +990,7 @@ def http_egress_allowed(url: str, allowed: list[str]) -> bool:
         port = parts.port
     except ValueError:
         return False
+    if port is None:
+        # urlsplit lowercases the scheme, so the table is read as http_dial_port reads it.
+        port = _HTTP_DEFAULT_PORTS.get(parts.scheme)
     return host_port_allowed(parts.hostname or "", port, allowed)
