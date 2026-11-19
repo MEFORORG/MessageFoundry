@@ -1242,9 +1242,9 @@ def DatabaseRef(
     ``statement_timeout`` (whole seconds, ``0`` for no limit) bounds each statement call of the sync
     (the execute, each fetch), not the statement or the pass, by the DATABASE connector's rule:
     unset is :data:`~messagefoundry.config.models.DEFAULT_DB_STATEMENT_TIMEOUT`. A call that runs
-    past it fails that sync, and the last-good snapshot stays. Nothing bounds a call at least at
-    ``0``, on an untracked pool, or on a driver connection with no timeout (docs/CONNECTIONS.md,
-    *The statement timeout*). Checked when declared, like ``max_rows``.
+    past it fails that sync, the last-good snapshot stays, and a set never synced stays unloaded.
+    Some cases leave a call unbounded, at least ``0``; docs/CONNECTIONS.md, *The statement
+    timeout*, lists them. Checked when declared, like ``max_rows``.
 
     A result that does not fit ``key_column`` and ``value_column`` fails the sync too, rather than
     replacing the last-good snapshot. At least these do: a named column the result lacks or holds

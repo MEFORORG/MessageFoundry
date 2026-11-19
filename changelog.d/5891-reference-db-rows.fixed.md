@@ -2,10 +2,11 @@
   columns.** `DatabaseRef(statement_timeout=...)`, whole seconds, `0` for no limit, defaults to 30
   as the DATABASE connector's SQL Server preset does, and bounds each statement call, the execute
   and each fetch, not the pass. A call that runs past a non-zero value fails that sync as
-  `ReferenceStatementTimedOut` at least on `HYT00`; the last-good snapshot keeps serving, and a set
-  that never synced stays unloaded. Nothing bounds a call at least at `0`, on an untracked pool, or
-  on a driver connection with no timeout, and there an uncancelled statement holds the sync pass
-  until it returns. The 30 s default is the same value as the `[store].command_timeout` default, not read
+  `ReferenceStatementTimedOut` at least on `HYT00`, the one state read as this timeout; the
+  last-good snapshot keeps serving, and a set that never synced stays unloaded. Nothing bounds a
+  call in at least these cases: at `0`, on a pool the engine could not track, or on a driver
+  connection that carries no timeout, the last two logged at WARNING. In those cases an
+  uncancelled statement holds the sync pass until it returns. The 30 s default is the same value as the `[store].command_timeout` default, not read
   from it, and a large set's statement can need more. A result that did not fit its columns used to
   replace the last-good snapshot: a missing `value_column` gave `None` values, a NULL key a
   `"None"` key, two rows with one key whichever came last, and a column the result held twice, as a
