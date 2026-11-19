@@ -481,6 +481,7 @@ def test_the_intake_numbers_the_doc_quotes_match_the_code() -> None:
     The budget numbers are stated once, in this section's row; Table B names the settings and links
     to CONNECTIONS.md for the values rather than restating them (SDS-3.5).
     """
+    from messagefoundry import netaddr
     from messagefoundry.pipeline.wiring_runner import (
         _INTAKE_ALLOWLIST_MIN_PREFIX_V4,
         _INTAKE_ALLOWLIST_MIN_PREFIX_V6,
@@ -505,10 +506,13 @@ def test_the_intake_numbers_the_doc_quotes_match_the_code() -> None:
     for quoted in (
         "(default `x-api-key`)",
         "`Retry-After: 60`",
-        "wider than a /8 (IPv4) or a /32 (IPv6)",
+        # The allow-list rule is stated once in code, so the row links to it rather than quoting
+        # the floors (vault BACKLOG #5393).
+        "`ALLOWLIST_RULE_TEXT` in [netaddr.py](../messagefoundry/netaddr.py)",
         'unless `intake_auth_health = "allow"`',
     ):
         assert quoted in table_b, f"the Table B HTTP rows no longer quote {quoted!r}"
+    assert netaddr.ALLOWLIST_RULE_TEXT, "the rule the Table B HTTP row links to is gone"
 
 
 def test_the_one_switch_that_flattens_three_pathways_is_named_in_each_row() -> None:

@@ -15987,6 +15987,11 @@ def check_http_tls_exposure(
 _INTAKE_ALLOWLIST_MIN_PREFIX_V4 = ALLOWLIST_MIN_PREFIX_V4
 _INTAKE_ALLOWLIST_MIN_PREFIX_V6 = ALLOWLIST_MIN_PREFIX_V6
 
+#: The ``intake_auth`` modes :func:`_has_effective_peer_control` judges without the allow-list. It
+#: weighs the list for any other value, ``none`` or one ``Http()`` would have refused, so
+#: :func:`check_http_intake_auth` names the list's shortfall for exactly those.
+_INTAKE_MODES_JUDGED_ALONE = frozenset({"api_key", "bearer", "mtls_subject"})
+
 
 def _has_effective_peer_control(settings: Mapping[str, Any]) -> bool:
     """Whether this HTTP listener actually requires a peer to be someone in particular.
@@ -15999,13 +16004,12 @@ def _has_effective_peer_control(settings: Mapping[str, Any]) -> bool:
     softer landing for having a control that does not work.
     """
     mode = str(settings.get("intake_auth") or "none")
-    if mode in ("api_key", "bearer"):
-        return bool(settings.get("intake_api_key"))
+    if mode not in _INTAKE_MODES_JUDGED_ALONE:
+        return allowlist_restricts(settings.get("source_ip_allowlist"))
     if mode == "mtls_subject":
         # The subject list is what tls_ca_file alone does not give you.
         return bool(settings.get("tls_ca_file")) and bool(settings.get("intake_client_subjects"))
-
-    return allowlist_restricts(settings.get("source_ip_allowlist"))
+    return bool(settings.get("intake_api_key"))  # api_key or bearer
 
 
 def check_http_sync_reply(
@@ -16164,11 +16168,11 @@ def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | N
     if _has_effective_peer_control(source.settings):
         return
 
-    # The list is weighed only when intake_auth names no mode (_has_effective_peer_control), so
-    # only then is its shortfall the reason for this refusal.
+    # The list is weighed only when intake_auth names no mode the gate judges alone
+    # (_has_effective_peer_control), so only then is its shortfall the reason for this refusal.
     allowlist = source.settings.get("source_ip_allowlist")
-    no_mode = str(source.settings.get("intake_auth") or "none") == "none"
-    shortfall = allowlist_shortfall(allowlist) if allowlist and no_mode else None
+    weighed = str(source.settings.get("intake_auth") or "none") not in _INTAKE_MODES_JUDGED_ALONE
+    shortfall = allowlist_shortfall(allowlist) if allowlist and weighed else None
     detail = (
         f"inbound connection {name!r} binds non-loopback host {host!r} with no effective peer "
         "control: anyone who can reach the socket can submit a message. "

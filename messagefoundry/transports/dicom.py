@@ -1971,8 +1971,9 @@ class DicomScpSource(SourceConnector):
         # PAIRED with a control that can actually be verified.
         #
         # The allow-list is weighed, not counted (vault BACKLOG #2622 item 2): ["0.0.0.0/0"] parses
-        # and restricts nobody, so it is held to the same prefix floors as the HTTP intake gate, by
-        # the same function (netaddr.allowlist_restricts).
+        # and restricts nobody, so it is held to the same allow-list rule as the HTTP intake gate, by
+        # the same function (netaddr.allowlist_restricts). The rule is stated once, as
+        # netaddr.ALLOWLIST_RULE_TEXT: per-entry floors and a whole-list cap (vault BACKLOG #5393).
         #
         # NOT BUILT HERE, dated 2026-10-06: mTLS is still counted by presence. tls + tls_ca_file
         # accepts any certificate that CA signed and binds no client subject, which the HTTP gate

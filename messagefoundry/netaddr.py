@@ -117,8 +117,9 @@ IPV4_EMBEDDING_PREFIXES: Final = tuple(
 
 #: IPv4 space a remote peer's packet cannot carry as its source: loopback, which a host drops as a
 #: martian when it arrives on another interface, and multicast, never a unicast source. The
-#: whole-list count in :func:`allowlist_shortfall` leaves it out, so listing ``127.0.0.0/8`` beside
-#: the private ranges does not use up the cap. "This network" (``0.0.0.0/8``) and the reserved
+#: whole-list count in :func:`allowlist_shortfall` leaves it out of the plain IPv4 space only, so
+#: listing ``127.0.0.0/8`` beside the private ranges does not use up the cap. The same blocks
+#: reached through another range of :data:`IPV4_EMBEDDINGS`, NAT64 for one, are counted. "This network" (``0.0.0.0/8``) and the reserved
 #: class E block are counted: at least Linux can be set to use them as unicast addresses.
 _NOT_A_PEER_V4: Final = (
     ipaddress.IPv4Network("127.0.0.0/8"),
@@ -292,9 +293,9 @@ ALLOWLIST_RULE_TEXT: Final = (
     f"least a /{_LATE_IPV4_START + ALLOWLIST_MIN_PREFIX_V4} inside a prefix whose IPv4 address "
     f"starts at bit {_LATE_IPV4_START}, at least {', '.join(_RULE_TEXT_LATE_RANGES[:-1])} and "
     f"{_RULE_TEXT_LATE_RANGES[-1]}; and the entries together admit at most "
-    f"{ALLOWLIST_MAX_IPV4_ADDRESSES:,} IPv4 addresses a remote peer can hold, two "
-    f"/{ALLOWLIST_MIN_PREFIX_V4} networks' worth, an IPv6 entry inside such a prefix counting the "
-    "IPv4 addresses it can carry"
+    f"{ALLOWLIST_MAX_IPV4_ADDRESSES:,} IPv4 addresses, two /{ALLOWLIST_MIN_PREFIX_V4} networks' "
+    "worth, an IPv6 entry inside such a prefix counting the IPv4 addresses it can carry, and "
+    "loopback and multicast not counted where a plain IPv4 or IPv4-mapped entry lists them"
 )
 
 
@@ -307,7 +308,8 @@ def _embedded_ipv4(net: ipaddress.IPv6Network, ipv4_start: int) -> ipaddress.IPv
 
 
 def _peer_addresses(blocks: list[ipaddress.IPv4Network]) -> int:
-    """How many addresses in ``blocks``, already collapsed so disjoint, a remote peer can hold."""
+    """How many addresses in ``blocks``, already collapsed so disjoint, lie outside
+    :data:`_NOT_A_PEER_V4`."""
     total = 0
     for block in blocks:
         total += block.num_addresses
@@ -399,7 +401,7 @@ def allowlist_shortfall(allowlist: Any) -> str | None:
         total += _peer_addresses(blocks) if key is None else sum(b.num_addresses for b in blocks)
     if total > ALLOWLIST_MAX_IPV4_ADDRESSES:
         return (
-            f"the entries together admit {total:,} IPv4 addresses a remote peer can hold, more "
-            f"than {ALLOWLIST_MAX_IPV4_ADDRESSES:,}"
+            f"the entries together count {total:,} IPv4 addresses toward the cap, more than "
+            f"{ALLOWLIST_MAX_IPV4_ADDRESSES:,}"
         )
     return None

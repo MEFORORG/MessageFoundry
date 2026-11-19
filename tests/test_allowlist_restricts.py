@@ -180,9 +180,7 @@ def test_a_list_within_the_ipv4_cap_restricts(allowlist: list[str]) -> None:
 )
 def test_entries_that_together_pass_the_ipv4_cap_do_not_restrict(allowlist: list[str]) -> None:
     assert allowlist_restricts(allowlist) is False
-    assert "IPv4 addresses a remote peer can hold, more than" in (
-        allowlist_shortfall(allowlist) or ""
-    )
+    assert "IPv4 addresses toward the cap, more than" in (allowlist_shortfall(allowlist) or "")
 
 
 def test_a_sets_reason_does_not_follow_its_hash_order() -> None:
@@ -220,6 +218,24 @@ def test_the_http_gate_names_no_allowlist_shortfall_when_a_mode_is_set() -> None
     with pytest.raises(WiringError) as exc:
         check_http_intake_auth(source, "IB_HTTP", posture=HopPosture(enforcing=True))
     assert "does not count:" not in str(exc.value)
+
+
+def test_the_http_gate_names_the_shortfall_for_an_unknown_mode() -> None:
+    # An intake_auth value the gate does not judge alone falls through to the list, as "none"
+    # does, so the list's shortfall is the reason and is named. Http() refuses such a value; a
+    # Source built directly can still carry one.
+    source = Source(
+        type=ConnectorType.HTTP,
+        settings={
+            "host": "0.0.0.0",
+            "port": 8080,
+            "intake_auth": "basic",
+            "source_ip_allowlist": ["0.0.0.0/0"],
+        },
+    )
+    with pytest.raises(WiringError) as exc:
+        check_http_intake_auth(source, "IB_HTTP", posture=HopPosture(enforcing=True))
+    assert f"does not count: {allowlist_shortfall(['0.0.0.0/0'])}." in str(exc.value)
 
 
 def test_the_cap_is_twice_the_ipv4_floor() -> None:
