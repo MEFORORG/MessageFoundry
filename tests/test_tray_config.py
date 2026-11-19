@@ -852,29 +852,93 @@ def test_load_config_reads_the_bind_from_the_service_toml(tmp_path: Path) -> Non
     assert cfg.monitor_only is False
 
 
-def test_load_config_a_lan_bind_from_the_service_toml_keeps_service_control(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("service_toml", "app_parameters"),
+    [
+        # The installer's form: install-service.ps1 always writes --host and --port.
+        ("", "serve --config C:\\cfg --host 10.0.0.5 --port 8765"),
+        # --host with no --port, which keeps the engine's default port.
+        ("", "serve --config C:\\cfg --host 10.0.0.5"),
+        # The same bind written in the engine's settings file instead.
+        (
+            '[security]\nlocal_access_only = false\nlisten_address = "10.0.0.5"\n',
+            "serve --config C:\\cfg",
+        ),
+    ],
+)
+def test_a_lan_bind_is_monitor_only_wherever_it_was_written(
+    tmp_path: Path, service_toml: str, app_parameters: str
 ) -> None:
-    """The local service bound to a LAN address is still the service on this machine."""
+    """The control decision follows what the bind is, never where it was written (ADR 0113 AC-7).
+
+    A LAN bind is a non-loopback host, so it is monitor-only whether ``serve --host`` or
+    ``[security].listen_address`` names it: monitor-only keys on locality alone.
+    """
     (tmp_path / "messagefoundry.toml").write_text(
-        '[security]\nlocal_access_only = false\nlisten_address = "10.0.0.5"\n'
-        '[api]\ntls_cert_file = "engine.pem"\n',
-        encoding="utf-8",
+        service_toml + '[api]\ntls_cert_file = "engine.pem"\n', encoding="utf-8"
     )
     reader = _FakeReader(
-        ServiceRegistryInfo(app_directory=str(tmp_path), app_parameters="serve --config C:\\cfg")
+        ServiceRegistryInfo(app_directory=str(tmp_path), app_parameters=app_parameters)
     )
     cfg = load_config(tmp_path, reader)
     assert cfg.engine_url == "https://10.0.0.5:8765"
-    assert cfg.monitor_only is False
+    assert cfg.monitor_only is True
 
 
-def test_a_host_from_the_command_line_or_tray_toml_keeps_the_locality_rule() -> None:
-    """``serve --host`` and an operator's engine_url are not read as the local service."""
-    reg = ServiceRegistryInfo(app_parameters="serve --host 10.0.0.5 --port 9100")
-    assert compose_config(None, reg).monitor_only is True
+def test_a_remote_tray_toml_engine_url_is_monitor_only() -> None:
+    """An operator's non-loopback ``engine_url`` degrades the tray whatever the service binds."""
     reg = ServiceRegistryInfo(app_parameters="serve")
     cfg = compose_config(
         {"engine_url": "https://10.0.0.5:7000"}, reg, service_bind=("10.0.0.5", None)
     )
     assert cfg.monitor_only is True
+
+
+def test_a_relative_service_config_anchors_under_the_project_root(tmp_path: Path) -> None:
+    """``serve`` resolves a relative ``--service-config`` under ``--project-root`` (ADR 0050).
+
+    The tray reads the bind from that file, so it must read the file the engine loaded, not one
+    of the same name under the service's working directory.
+    """
+    install = tmp_path / "install"
+    repo = tmp_path / "repo"
+    reg = ServiceRegistryInfo(
+        app_directory=str(install),
+        app_parameters=f"serve --project-root {repo} --service-config conf/mf.toml",
+    )
+    assert service_toml_path(reg) == repo / "conf" / "mf.toml"
+    # A relative --project-root is itself taken against the working directory, as serve takes it.
+    reg = ServiceRegistryInfo(
+        app_directory=str(install),
+        app_parameters="serve --project-root estate --service-config mf.toml",
+    )
+    assert service_toml_path(reg) == install / "estate" / "mf.toml"
+    # An absolute --service-config ignores the root, as serve's anchor does.
+    absolute = tmp_path / "elsewhere" / "mf.toml"
+    reg = ServiceRegistryInfo(
+        app_directory=str(install),
+        app_parameters=f"serve --project-root {repo} --service-config {absolute}",
+    )
+    assert service_toml_path(reg) == absolute
+    # With no --service-config, serve reads messagefoundry.toml in its working directory.
+    reg = ServiceRegistryInfo(
+        app_directory=str(install), app_parameters=f"serve --project-root {repo}"
+    )
+    assert service_toml_path(reg) == install / "messagefoundry.toml"
+
+
+def test_load_config_reads_the_bind_from_the_file_under_the_project_root(tmp_path: Path) -> None:
+    """The bind comes from the settings file serve loads, not a same-named one in AppDirectory."""
+    install = tmp_path / "install"
+    repo = tmp_path / "repo"
+    install.mkdir()
+    repo.mkdir()
+    (install / "mf.toml").write_text("[api]\nport = 7001\n", encoding="utf-8")
+    (repo / "mf.toml").write_text("[api]\nport = 7002\n", encoding="utf-8")
+    reader = _FakeReader(
+        ServiceRegistryInfo(
+            app_directory=str(install),
+            app_parameters=f"serve --project-root {repo} --service-config mf.toml",
+        )
+    )
+    assert load_config(tmp_path, reader).engine_url == "https://127.0.0.1:7002"

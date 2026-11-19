@@ -325,7 +325,8 @@ trust, which cannot verify an internal-CA or operator-installed engine cert.
   IPv6 literal, so `serve --host ::1` no longer yields the unparseable `http://::1:8765`).
 - **Discovery learns the scheme.** There is no `serve` TLS *flag* to sniff — TLS is configured in the engine's
   service-settings TOML — so `load_config` now also reads that file, resolved exactly as `serve` resolves it
-  (`--service-config`, relative paths against NSSM `AppDirectory`; else `<AppDirectory>/messagefoundry.toml`), and
+  (`--service-config`, relative paths under `--project-root` when given, else against NSSM `AppDirectory`; else
+  `<AppDirectory>/messagefoundry.toml`), and
   takes **one boolean** from it: is `[api].tls_cert_file` set. Read-only, **fail-soft** (any missing/malformed
   file → "no TLS hint", never an exception into tray startup), and deliberately narrow — no hosts, paths, or
   secrets are lifted out of an operator file reached via an untrusted registry hint. An explicit `engine_url` in

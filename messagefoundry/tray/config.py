@@ -85,22 +85,16 @@ class TrayConfig:
     log_path: str | None = None
     #: A PEM the probe pins as its ONLY trust anchor, or ``None`` for the OS trust store.
     engine_cacert: str | None = None
-    #: True when the host in ``engine_url`` came from the local service's own settings file or the
-    #: engine default, not from ``serve --host`` or ``tray.toml``. That engine is the service on
-    #: this machine whatever address it binds (BACKLOG #5936).
-    host_from_local_service: bool = False
 
     @property
     def monitor_only(self) -> bool:
         """A **remote** engine → monitor-only (service control + Open-Repo disabled).
 
-        Keyed on locality: a loopback engine is controllable whether it serves http or https (see
-        the module docstring). A host the tray read from the local service's own settings file is
-        controllable too, whatever address it binds, since that service runs here. Otherwise only
-        a non-loopback host degrades the tray, because only then are "start the local service"
-        and "open the local repo" meaningless.
+        Keyed on locality alone: a loopback engine is controllable whether it serves http or
+        https (see the module docstring). Only a non-loopback host degrades the tray, because
+        only then are "start the local service" and "open the local repo" meaningless.
         """
-        return not (self.host_from_local_service or is_local_engine(self.engine_url))
+        return not is_local_engine(self.engine_url)
 
 
 @dataclass(frozen=True)
@@ -553,7 +547,6 @@ def compose_config(
     repo_path: str | None = None
     poll_seconds = DEFAULT_POLL_SECONDS
     log_path: str | None = None
-    host_from_local_service = False
 
     # Registry hints (untrusted; validated).
     if reg is not None:
@@ -568,9 +561,6 @@ def compose_config(
         )
         if url_hint is not None:
             engine_url = url_hint
-            # The settings file or the default named the host, not `serve --host`: this is the
-            # local service, whatever it binds, so service control stays on (BACKLOG #5936).
-            host_from_local_service = host_hint is None
         repo_path = (
             parse_project_root_arg(reg.app_parameters or "")
             or _clean_path_hint(reg.app_directory)
@@ -584,7 +574,6 @@ def compose_config(
         if isinstance(raw_url, str) and raw_url:
             engine_url = raw_url
             cacert = None
-            host_from_local_service = False
         raw_cacert = _clean_path_hint(toml_data.get("engine_cacert"))
         if raw_cacert is not None and Path(raw_cacert).is_absolute():
             cacert = raw_cacert
@@ -604,7 +593,6 @@ def compose_config(
         poll_seconds=poll_seconds,
         log_path=log_path,
         engine_cacert=cacert,
-        host_from_local_service=host_from_local_service,
     )
 
 
@@ -630,19 +618,33 @@ def _read_toml(path: Path) -> dict[str, object] | None:
 def service_toml_path(reg: ServiceRegistryInfo | None) -> Path | None:
     """Where the engine service's settings TOML lives, per its NSSM registry entry — or ``None``.
 
-    Mirrors ``serve``'s own resolution: an explicit ``--service-config`` (relative paths resolve
-    against the service's working directory, which NSSM records as ``AppDirectory``), else
-    ``<AppDirectory>/messagefoundry.toml``. Both inputs are untrusted registry strings, already
-    length/NUL-validated by :func:`_clean_path_hint`; the result is only ever *read*.
+    Mirrors ``serve``'s own resolution (ADR 0050): an explicit ``--service-config``, where a
+    relative path resolves under ``--project-root`` when one is given and otherwise against the
+    service's working directory, which NSSM records as ``AppDirectory``; else
+    ``<AppDirectory>/messagefoundry.toml``. A relative ``--project-root`` is itself taken against
+    ``AppDirectory``; a rooted but not absolute one (a Windows drive-relative ``\\repo``) answers
+    ``None`` rather than guess its drive. Under a root, a drive-relative ``--service-config`` keeps
+    its tail under the root, as ``serve``'s anchor does. The inputs are untrusted registry strings,
+    already length/NUL-validated by :func:`_clean_path_hint`; the result is only ever *read*.
     """
     if reg is None:
         return None
     base = _clean_path_hint(reg.app_directory)
-    explicit = parse_service_config_arg(reg.app_parameters or "")
+    params = reg.app_parameters or ""
+    explicit = parse_service_config_arg(params)
     if explicit is not None:
         candidate = Path(explicit)
         if candidate.is_absolute():
             return candidate
+        root = parse_project_root_arg(params)
+        if root is not None:
+            anchor = Path(root)
+            if not anchor.is_absolute():
+                if anchor.anchor or not base:
+                    return None
+                anchor = Path(base) / anchor
+            # Drop a drive-relative leading separator so the tail stays under the root.
+            return anchor.joinpath(*candidate.parts[1:] if candidate.anchor else candidate.parts)
         return Path(base) / candidate if base else None
     return Path(base) / _DEFAULT_SERVICE_TOML if base else None
 
