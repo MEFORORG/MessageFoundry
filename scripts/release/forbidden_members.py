@@ -44,6 +44,7 @@ and the zero-member control below is what keeps a failed listing from reading as
 from __future__ import annotations
 
 import argparse
+import posixpath
 import re
 import sys
 import tarfile
@@ -143,8 +144,15 @@ class InspectionError(RuntimeError):
     """An archive could not be inspected, so nothing about it has been proved."""
 
 
-def _members(archive: Path) -> list[str]:
-    """Every member name in ``archive``, or raise :class:`InspectionError`.
+def _members(archive: Path) -> list[tuple[str, str]]:
+    """Every ``(path, shown)`` pair to test in ``archive``, or raise :class:`InspectionError`.
+
+    ``path`` is what the rules read and ``shown`` is how the error line names it. A member is one
+    pair, its name both times. A tar link member adds a pair for its TARGET too (BACKLOG #5470):
+    ``getnames()`` alone never read a link's ``linkname``, so a toolkit sdist could carry an
+    innocently named link whose extraction exposes an engine path. A hard link's target is an
+    archive path; a symbolic link's is relative to the link's own directory, so it is joined there
+    and also tested as written.
 
     RAISING RATHER THAN RETURNING EMPTY IS THE POINT. "No forbidden member" and "the listing failed"
     are the same empty set, and a gate that cannot tell them apart reports a clean archive when it read
@@ -155,12 +163,12 @@ def _members(archive: Path) -> list[str]:
     try:
         if archive.suffix.lower() in {".whl", ".zip"}:
             with zipfile.ZipFile(archive) as zf:
-                return zf.namelist()
+                return [(name, name) for name in zf.namelist()]
         if suffixes[-2:] == [".tar", ".gz"] or archive.suffix.lower() == ".tgz":
             # `r:gz` and not `r:*`: the mode must be the one the filename promised, so a `.tar.gz`
             # that is secretly an uncompressed tar fails here rather than being read anyway.
             with tarfile.open(archive, "r:gz") as tf:
-                return tf.getnames()
+                return [pair for info in tf.getmembers() for pair in _tar_entries(info)]
     # `EOFError` IS NOT AN `OSError`, and a truncated archive is exactly what raises it: a `.tar.gz`
     # cut mid-stream gives "Compressed file ended before the end-of-stream marker was reached" from
     # gzip, which an `OSError` clause walks straight past. Measured against a 40-byte truncation of a
@@ -174,6 +182,17 @@ def _members(archive: Path) -> list[str]:
         f"{archive} has no extension this gate can read (.whl, .zip, .tar.gz, .tgz), "
         f"so it would be published uninspected"
     )
+
+
+def _tar_entries(info: tarfile.TarInfo) -> list[tuple[str, str]]:
+    """The ``(path, shown)`` pairs one tar member contributes: itself, and any link target."""
+    entries = [(info.name, info.name)]
+    if info.issym() or info.islnk():
+        targets = [info.linkname]
+        if info.issym():
+            targets.append(posixpath.join(posixpath.dirname(info.name), info.linkname))
+        entries.extend((t, f"{info.name} (a link to {t})") for t in dict.fromkeys(targets))
+    return entries
 
 
 def _normalise(part: str) -> str:
@@ -204,11 +223,14 @@ def _normalise(part: str) -> str:
 
 
 def _parts(member: str) -> list[str]:
-    """``member``'s path components, split on BOTH ``/`` and ``\\``, empty ones dropped.
+    """``member``'s path components, split on BOTH ``/`` and ``\\``, empty and ``.`` ones dropped.
 
     ONE copy for every rule below, so an evasion closed in the split is closed for all of them.
-    :func:`forbidden` says why both separators count and why empty components drop out."""
-    return [p for p in member.replace("\\", "/").split("/") if p]
+    :func:`forbidden` says why both separators count and why empty components drop out. A ``.``
+    component names the directory it sits in, so ``./messagefoundry/x.py`` is ``messagefoundry/x.py``
+    to an extractor, and keeping it hid that from a rule that reads the first component or a
+    consecutive run (BACKLOG #5470). Dropping one never removes a component a rule could match."""
+    return [p for p in member.replace("\\", "/").split("/") if p and p != "."]
 
 
 def forbidden(member: str) -> str | None:
@@ -284,21 +306,50 @@ def _has_retired_run(parts: list[str], retired: tuple[str, ...]) -> bool:
     return False
 
 
-def split_violation(member: str, dist: str) -> str | None:
-    """Why ``member`` breaks the engine and toolkit split for distribution ``dist``, or ``None``.
+def _name_version(stem: str) -> str | None:
+    """The name half of a ``<name>-<version>`` string, or ``None`` if it has no such shape.
 
-    An engine archive may carry nothing named for the toolkit's import package, as a directory, a
-    module or a ``.pth`` (any component whose stem is ``messagefoundry_toolkit``), and no retired
-    engine path. A toolkit archive may carry nothing whose first component is ``messagefoundry``,
-    and no ``<name>.data/`` tree at all: PEP 427 installs ``purelib``, ``platlib``, ``scripts`` and
-    ``data`` outside the package, where each can overwrite the engine's package or its console
-    script. The toolkit has no reason to ship one, so refusing the whole class is simpler than
-    modelling each scheme. That is the split-package shape ADR 0201 rejects. Every other
-    distribution passes. Split and normalised exactly as :func:`forbidden` is.
-    """
-    parts = [_normalise(p) for p in _parts(member)]
-    if not parts:
-        return None
+    The version is the first hyphen-separated segment, after the first, that starts with a digit,
+    which is where the wheel and sdist rules end a name. Splitting at the first hyphen instead
+    read ``messagefoundry-toolkit-0.4.0.tar.gz`` as the engine (BACKLOG #5470)."""
+    segments = stem.split("-")
+    for i in range(1, len(segments)):
+        if segments[i][:1].isdigit():
+            return "-".join(segments[:i])
+    return None
+
+
+def _resolve_dots(parts: list[str]) -> list[str]:
+    """``parts`` with each ``..`` applied to the component before it, as an extractor would."""
+    resolved: list[str] = []
+    for part in parts:
+        if part == "..":
+            if resolved:
+                resolved.pop()
+        else:
+            resolved.append(part)
+    return resolved
+
+
+def _split_candidates(member: str) -> list[list[str]]:
+    """Every reading of ``member`` the split rule tests, normalised: as written, with ``..``
+    applied, and each of those without a leading sdist ``<name>-<version>/`` root (BACKLOG #5470).
+
+    The toolkit test reads the FIRST component, so a root such as ``messagefoundry_toolkit-0.4.0/``
+    in front of ``messagefoundry/`` hid the engine package from it. Every reading is tested, never
+    just the stripped one, so stripping a root cannot hide a ``<name>.data/`` tree either."""
+    raw = _parts(member)
+    readings = [raw, _resolve_dots(raw)] if ".." in raw else [raw]
+    for parts in list(readings):
+        if len(parts) > 1 and _name_version(parts[0]) is not None:
+            readings.append(parts[1:])
+            readings.append(_resolve_dots(parts[1:]))
+    unique = dict.fromkeys(tuple(_normalise(p) for p in parts) for parts in readings if parts)
+    return [list(parts) for parts in unique]
+
+
+def _split_rule(parts: list[str], dist: str) -> str | None:
+    """Why one normalised reading breaks the split for ``dist``, or ``None``."""
     if dist == ENGINE_DISTRIBUTION:
         if any(part.split(".", 1)[0] == TOOLKIT_PACKAGE for part in parts):
             return f"a path named for {TOOLKIT_PACKAGE!r} belongs to the toolkit distribution"
@@ -313,13 +364,35 @@ def split_violation(member: str, dist: str) -> str | None:
     return None
 
 
+def split_violation(member: str, dist: str) -> str | None:
+    """Why ``member`` breaks the engine and toolkit split for distribution ``dist``, or ``None``.
+
+    An engine archive may carry nothing named for the toolkit's import package, as a directory, a
+    module or a ``.pth`` (any component whose stem is ``messagefoundry_toolkit``), and no retired
+    engine path. A toolkit archive may carry nothing whose first component is ``messagefoundry``,
+    and no ``<name>.data/`` tree at all: PEP 427 installs ``purelib``, ``platlib``, ``scripts`` and
+    ``data`` outside the package, where each can overwrite the engine's package or its console
+    script. The toolkit has no reason to ship one, so refusing the whole class is simpler than
+    modelling each scheme. That is the split-package shape ADR 0201 rejects. Every other
+    distribution passes. Split and normalised exactly as :func:`forbidden` is, and tested in every
+    reading :func:`_split_candidates` names.
+    """
+    for parts in _split_candidates(member):
+        why = _split_rule(parts, dist)
+        if why is not None:
+            return why
+    return None
+
+
 def distribution(archive: Path) -> str:
     """The PEP 503 normalised distribution name an archive's filename declares.
 
     Both a wheel (``name-version-...whl``) and an sdist (``name-version.tar.gz``) put the name first
-    and end it at the first hyphen, since the name itself is written with underscores. A filename
-    that follows neither shape yields whatever precedes its first hyphen, which matches no exempt
-    distribution, so the result is the strict path.
+    and end it where the version begins: the first hyphen-separated segment that starts with a
+    digit. A conforming name is written with underscores, but a hyphenated one
+    (``messagefoundry-toolkit-0.4.0.tar.gz``) must not read as its first word, which named the
+    engine and skipped the toolkit rule (BACKLOG #5470). A filename with no version segment yields
+    its whole stem, which matches no distribution a rule names, so the result is the strict path.
     """
     name = archive.name
     lowered = name.lower()
@@ -327,7 +400,7 @@ def distribution(archive: Path) -> str:
         if lowered.endswith(suffix):
             name = name[: -len(suffix)]
             break
-    return re.sub(r"[-_.]+", "-", name.split("-", 1)[0]).casefold()
+    return re.sub(r"[-_.]+", "-", _name_version(name) or name).casefold()
 
 
 def inspect(archives: Iterable[Path]) -> tuple[int, list[str]]:
@@ -336,13 +409,13 @@ def inspect(archives: Iterable[Path]) -> tuple[int, list[str]]:
     total = 0
     for archive in archives:
         try:
-            names = _members(archive)
+            entries = _members(archive)
         except InspectionError as exc:
             errors.append(f"::error::member gate {exc}, so nothing was inspected")
             continue
         # A ZERO-MEMBER LISTING IS NOT A CLEAN ARCHIVE, it is no evidence at all -- the same control
         # the sdist leak gate applies to its own `tar` output, for the same reason.
-        if not names:
+        if not entries:
             errors.append(
                 f"::error::member gate listed {archive} and got ZERO members, so nothing was inspected"
             )
@@ -350,19 +423,19 @@ def inspect(archives: Iterable[Path]) -> tuple[int, list[str]]:
         dist = distribution(archive)
         tooling = dist in TEST_TOOLING_DISTRIBUTIONS
         hits = [
-            (name, why)
-            for name in names
+            (shown, why)
+            for path, shown in entries
             if (
-                why := forbidden(name)
-                or (None if tooling else development_content(name))
-                or split_violation(name, dist)
+                why := forbidden(path)
+                or (None if tooling else development_content(path))
+                or split_violation(path, dist)
             )
             is not None
         ]
-        errors.extend(f"::error::{archive.name} ships {name} -- {why}" for name, why in hits)
-        total += len(names)
+        errors.extend(f"::error::{archive.name} ships {shown} -- {why}" for shown, why in hits)
+        total += len(entries)
         verdict = f"{len(hits)} forbidden" if hits else "none forbidden"
-        print(f"member gate: inspected {len(names)} members in {archive.name}, {verdict}")
+        print(f"member gate: inspected {len(entries)} members in {archive.name}, {verdict}")
         if tooling:
             # Said in the log every time, so the exemption is visible where the verdict is read.
             print(

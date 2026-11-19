@@ -605,6 +605,143 @@ def test_the_cli_passes_a_clean_toolkit_wheel(
     assert "inspected 4 members" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "messagefoundry-toolkit-0.4.0.tar.gz",  # a hyphenated sdist name read as the engine
+        "messagefoundry-toolkit-0.4.0-py3-none-any.whl",
+        "messagefoundry_toolkit-0.4.0.tar.gz",
+        "Messagefoundry.Toolkit-0.4.0rc1.tgz",
+    ],
+)
+def test_distribution_reads_a_hyphenated_toolkit_filename_as_the_toolkit(filename: str) -> None:
+    # BACKLOG #5470: splitting at the first hyphen named the engine, so the toolkit rule never ran.
+    assert distribution(Path(filename)) == "messagefoundry-toolkit"
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        # BACKLOG #5470: an sdist name-version root in front of the engine package.
+        "messagefoundry_toolkit-0.4.0/messagefoundry/__init__.py",
+        "messagefoundry-toolkit-0.4.0/messagefoundry/generators/adt.py",
+        "messagefoundry-0.4.0/messagefoundry/x.py",
+        # A leading or embedded dot segment.
+        "./messagefoundry/__init__.py",
+        "././messagefoundry/x.py",
+        "messagefoundry_toolkit-0.4.0/./messagefoundry/x.py",
+        # A parent segment an extractor resolves back to the engine package.
+        "messagefoundry_toolkit/../messagefoundry/x.py",
+        "messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/../messagefoundry/x.py",
+        # The root is stripped for the engine test, never for the .data test.
+        "messagefoundry_toolkit-0.4.0.data/purelib/x.py",
+        "./messagefoundry_toolkit-0.4.0.data/scripts/messagefoundry",
+    ],
+)
+def test_a_prefixed_or_dotted_engine_member_in_a_toolkit_archive_is_refused(member: str) -> None:
+    assert split_violation(member, "messagefoundry-toolkit") is not None
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/__init__.py",
+        "messagefoundry_toolkit-0.4.0/PKG-INFO",
+        "./messagefoundry_toolkit/adr_analyze.py",
+        "messagefoundry_toolkit-0.4.0.dist-info/METADATA",
+        "messagefoundry_toolkit-0.4.0.dist-info/licenses/LICENSE",
+        "messagefoundry_toolkit/templates/messagefoundry.toml",  # a near name, deeper
+    ],
+)
+def test_the_toolkit_s_own_prefixed_members_still_pass(member: str) -> None:
+    assert split_violation(member, "messagefoundry-toolkit") is None
+
+
+def test_a_dot_segment_does_not_hide_a_retired_engine_path() -> None:
+    assert split_violation("messagefoundry/./anon/__init__.py", "messagefoundry") is not None
+    assert split_violation("messagefoundry/x/../hl7schema.py", "messagefoundry") is not None
+
+
+def _write_tar(path: Path, entries: Sequence[tarfile.TarInfo]) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tarfile.open(path, "w:gz") as tf:
+        for info in entries:
+            payload = b"fixture\n" if info.isfile() else b""
+            info.size = len(payload)
+            tf.addfile(info, io.BytesIO(payload) if payload else None)
+    return path
+
+
+def _link(name: str, target: str, kind: bytes) -> tarfile.TarInfo:
+    info = tarfile.TarInfo(name)
+    info.type = kind
+    info.linkname = target
+    return info
+
+
+@pytest.mark.parametrize(
+    ("kind", "target", "shown"),
+    [
+        (tarfile.SYMTYPE, "../messagefoundry/__init__.py", "messagefoundry/__init__.py"),
+        (tarfile.SYMTYPE, "/tmp/x/CLAUDE.md", "CLAUDE.md"),
+        (
+            tarfile.LNKTYPE,
+            "messagefoundry_toolkit-0.4.0/messagefoundry/__init__.py",
+            "messagefoundry/__init__.py",
+        ),
+    ],
+)
+def test_the_cli_refuses_a_tar_link_whose_target_is_forbidden(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], kind: bytes, target: str, shown: str
+) -> None:
+    # BACKLOG #5470: getnames() never read a link's target, so an innocent link name passed.
+    sdist = _write_tar(
+        tmp_path / "dist" / "messagefoundry_toolkit-0.4.0.tar.gz",
+        [
+            tarfile.TarInfo("messagefoundry_toolkit-0.4.0/PKG-INFO"),
+            _link("messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/helper.py", target, kind),
+        ],
+    )
+    assert main([str(sdist)]) == 1
+    err = capsys.readouterr().err
+    assert "messagefoundry_toolkit/helper.py (a link to" in err and shown in err
+
+
+def test_the_cli_passes_a_tar_link_whose_target_is_clean(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Control for the refusal above: a link inside the toolkit's own tree passes."""
+    sdist = _write_tar(
+        tmp_path / "dist" / "messagefoundry_toolkit-0.4.0.tar.gz",
+        [
+            tarfile.TarInfo("messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/real.py"),
+            _link(
+                "messagefoundry_toolkit-0.4.0/messagefoundry_toolkit/alias.py",
+                "real.py",
+                tarfile.SYMTYPE,
+            ),
+        ],
+    )
+    assert main([str(sdist)]) == 0
+    capsys.readouterr()
+
+
+def test_the_cli_refuses_a_hyphen_named_toolkit_sdist_carrying_the_engine(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sdist = _write_tar(
+        tmp_path / "dist" / "messagefoundry-toolkit-0.4.0.tar.gz",
+        [
+            tarfile.TarInfo("messagefoundry-toolkit-0.4.0/PKG-INFO"),
+            tarfile.TarInfo("messagefoundry-toolkit-0.4.0/messagefoundry/__init__.py"),
+        ],
+    )
+    assert main([str(sdist)]) == 1
+    assert "ships messagefoundry-toolkit-0.4.0/messagefoundry/__init__.py" in (
+        capsys.readouterr().err
+    )
+
+
 # --------------------------------------------------------------------------------------------------
 # The wiring. A gate no publishing job calls is the gap that was reported.
 # --------------------------------------------------------------------------------------------------
