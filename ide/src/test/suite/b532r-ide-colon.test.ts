@@ -76,6 +76,7 @@ suite("b532r: a name holding a colon is refused on Windows (BACKLOG #5404 item 1
       // THE CONTROL: the real-path check alone passes the name.
       assert.notStrictEqual(resolveInsideWorkspace(ws, "cfg:x"), undefined);
       assert.strictEqual(escapesByLink(ws, "cfg:x"), true);
+      assert.notStrictEqual(resolveInsideWorkspace(ws, "cfg:x/new.toml"), undefined);
       assert.strictEqual(escapesByLink(ws, "cfg:x/new.toml"), true);
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
@@ -105,6 +106,10 @@ suite("b532r: a name holding a colon is refused on Windows (BACKLOG #5404 item 1
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "b532r-ide-colon-"));
     try {
       assert.strictEqual(escapesByLink(base, path.join(base, "messagefoundry.toml")), false);
+      // THE CONTROL: the same absolute spelling with a colon in a name is refused.
+      assert.strictEqual(escapesByLink(base, path.join(base, "messagefoundry.toml:s")), true);
+      // A one-letter name holding a colon, spelled so Node keeps it inside the folder, is refused too.
+      assert.strictEqual(escapesByLink(base, ".\\x:y"), true);
     } finally {
       fs.rmSync(base, { recursive: true, force: true });
     }
@@ -117,6 +122,8 @@ suite("b532r: a name holding a colon is refused on Windows (BACKLOG #5404 item 1
     assert.strictEqual(hasColonInName("a/b/c.toml", true), false);
     assert.strictEqual(hasColonInName(".", true), false);
     assert.strictEqual(hasColonInName("a:b", false), false);
+    // A leading `x:` in a relative path is a one-letter name holding a colon, not a drive.
+    assert.strictEqual(hasColonInName("x:y", true), true);
   });
 
   test("securityConfigTarget refuses a colon in a name inside the folder before any file-system call", function () {

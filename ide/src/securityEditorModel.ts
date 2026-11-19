@@ -103,8 +103,8 @@ function noLinkBelow(root: string, rel: string, fsx: LinkFs): boolean {
  *    and space from the file name and one trailing dot from a folder name, and kept a folder name's
  *    trailing space. The check refuses every such name, the ones kept as written included. A
  *    folder or file name below the workspace folder that holds a colon is refused there too, before
- *    any file-system call: a Win32 open reads `name:stream` as an NTFS stream on the entry `name`,
- *    which may be a link out of the folder, while Node reads the whole name as missing. Then
+ *    any file-system call, since a Win32 open reads it as a stream on another entry, which may be a
+ *    link out of the folder ({@link hasColonInName} says why the link walk cannot be relied on). Then
  *    every existing path below the workspace folder, down to the target, must lstat as not a link,
  *    a dangling one included; the walk stops at the first that does not exist. The deepest
  *    existing one must then realpath to the folder's own realpath joined with the same parts,

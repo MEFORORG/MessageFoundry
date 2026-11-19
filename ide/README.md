@@ -229,7 +229,7 @@ and uses your user value or the default instead, until you trust the workspace (
   workspace folder. The check reads the named path only, so a link below it is still followed, such
   as a linked folder under `configDir`. The security editor does not run this check. It makes its
   own: it collapses a `..` rather than refusing it, and it refuses a link anywhere on the named
-  path. On Windows it also refuses a name that ends in a dot or a space or holds a colon.
+  path below the workspace folder. On Windows it also refuses a name that ends in a dot or a space or holds a colon.
   The New Route wizard makes its own link check as well.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. The security

@@ -109,7 +109,9 @@ export function hasTrailingDotOrSpaceName(rel: string, win32: boolean = path.sep
 
 /**
  * Whether `rel`, a path relative to a folder, has a folder or file name holding a colon, when `win32`
- * (by default, on Windows). `rel` is relative, so it carries no drive letter. A Win32 open reads
+ * (by default, on Windows). Both callers pass the part below the workspace folder, so the drive is
+ * not in it. Pass no absolute path: its drive colon would count, and a leading `x:` in `rel` is a
+ * one-letter name, not a drive, so it is not skipped. A Win32 open reads
  * `name:stream` as an NTFS alternate data stream on the entry `name`. With `cfg` a junction out of
  * the folder, Python's open of `cfg:x` wrote a stream on the folder outside (measured in review, 2026-11-19),
  * while Node's real-path read finds no such entry and the real-path check passes the name. Behind a
@@ -134,7 +136,7 @@ export type PathSettingKey = "configDir" | "serviceConfig" | "messageSetsDir";
  * only be the operator's own user value, theirs to point anywhere, so it is not checked, and the
  * spelling test runs first, with no I/O.
  *
- * Two spellings are refused outright, before any I/O. A `..` component: the real-path check collapses
+ * At least these spellings are refused outright, before any I/O. A `..` component: the real-path check collapses
  * `..` by spelling, but on POSIX the CLI's kernel follows a link before it applies the `..` after it,
  * so `link/../x` could land outside the folder although its spelling is `x`. And, on Windows, a name
  * {@link hasTrailingDotOrSpaceName} or {@link hasColonInName} names, which the real-path check can
@@ -183,8 +185,9 @@ export function linkEscapeRefusal(key: PathSettingKey, fallback?: string): strin
     `MessageFoundry: nothing was written or started. ${subject} inside the workspace folder that may ` +
     "lead out of it, or that Windows may open as another name. At least one of these holds: a symbolic " +
     "link or junction on the path leads out, the path climbs with '..', a folder or file name on it " +
-    "ends in a dot or a space or holds a colon, or its real path cannot be read. Remove the link or the " +
-    "'..', rename the folder or file, or make the workspace folder readable, so the path is a plain " +
+    "ends in a dot or a space or holds a colon, or its real path cannot be read. Remove the link, the " +
+    "'..' or the colon, rename the folder or file, correct the setting value, or make the workspace " +
+    "folder readable, so the path is a plain " +
     "folder or file inside the workspace folder. Commands other than New Route and the commit hook " +
     "also take the target of a link, named with an absolute path in user settings, once any value " +
     "for the setting in workspace settings is removed, since a workspace value wins over a user value."

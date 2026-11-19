@@ -284,6 +284,7 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
       assert.ok(notices[0].includes("holds a colon"), notices[0]);
       assert.deepStrictEqual(run.statted, [], "the colon refusal came after a file-system call");
       // configDir is checked first and is read; the serviceConfig value never is.
+      assert.ok(run.resolved.length > 0, "the configDir link check did not run, so the spy is unwired");
       assert.ok(
         run.resolved.every((p) => !p.includes("command")),
         `the colon refusal came after a real-path read: ${JSON.stringify(run.resolved)}`,
@@ -295,9 +296,10 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     assert.strictEqual(run.started, false);
   });
 
-  test("a command-link value the link check does not read reaches the no-file refusal, and is not echoed", async () => {
-    // A user value outside the folder on Windows, and a plain name inside it elsewhere: neither is
-    // stopped by the colon refusal, so the no-file refusal's own no-echo is still driven on both legs.
+  test("a command-link value the colon refusal does not stop reaches the no-file refusal, and is not echoed", async () => {
+    // A user value outside the folder on Windows, which the link check does not read, and a plain
+    // name inside it elsewhere, which it reads and passes: neither is stopped by the colon refusal,
+    // so the no-file refusal's own no-echo is still driven on both legs.
     stubSetting = "\\\\attacker.invalid\\share\\[x](command:foo)";
     const run = await restart(LOOPBACK);
 
