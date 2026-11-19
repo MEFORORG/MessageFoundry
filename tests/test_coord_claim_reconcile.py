@@ -221,6 +221,64 @@ def test_apply_releases_only_the_releasable_and_records_each_one(
     assert records[0]["prior_branch"] == "landed"
 
 
+def test_a_claim_whose_key_names_another_file_is_never_released(repo: Path, tmp_path: Path) -> None:
+    """BACKLOG #5482: -Release deletes the file the KEY names, so the key must name this file.
+
+    ``k-a.json`` carries the key ``k-b`` and judges releasable; ``k-b.json`` is a real claim guarding
+    unmerged work. Releasing ``k-a.json`` by its key would delete ``k-b.json`` instead.
+    """
+    landed_branch(repo, "landed")
+    unmerged_branch(repo, "unmerged")
+    guarded = write_claim(repo, "k-b", tmp_path / "vanished", "unmerged")
+    stray = write_claim(repo, "k-a", tmp_path / "vanished", "landed")
+    claim = json.loads(stray.read_bytes())
+    claim["key"] = "k-b"
+    stray.write_bytes(json.dumps(claim).encode("utf-8"))
+
+    proc = reconcile(repo, "-Json", "-Apply")
+    assert proc.returncode == 0, proc.stderr
+    out = {c["key"]: c for c in json.loads(proc.stdout)["claims"]}
+    assert guarded.exists(), "the claim the stray key names must survive"
+    assert stray.exists(), "a mismatched claim is reported, never released"
+    assert out["k-a"]["verdict"] == "KEY-MISMATCH", out
+    assert "outcome" not in out["k-a"], out
+    assert out["k-b"]["verdict"] == "HOLD", out
+
+
+def test_a_date_shaped_key_is_released_under_its_own_spelling(repo: Path, tmp_path: Path) -> None:
+    """BACKLOG #5482: ConvertFrom-Json would read an ISO-shaped key as a [datetime].
+
+    Through [string] it came back as local short text, which -Release folds to a file that does not
+    exist; claim.ps1 exits 0 on that, so the row read "released" while the claim stayed.
+    """
+    landed_branch(repo, "landed")
+    key = "2026-08-01T00:00:00"
+    p = write_claim(
+        repo, "2026-08-01t00-00-00", tmp_path / "vanished", "landed"
+    )  # claim.ps1's name
+    claim = json.loads(p.read_bytes())
+    claim["key"] = key
+    p.write_bytes(json.dumps(claim).encode("utf-8"))
+
+    proc = reconcile(repo, "-Json", "-Apply")
+    assert proc.returncode == 0, proc.stderr
+    row = json.loads(proc.stdout)["claims"][0]
+    assert row["key"] == key, row
+    assert not p.exists(), row
+    assert row["outcome"] == "released", row
+
+
+def _ps_function(path: Path, name: str) -> str:
+    text = path.read_text(encoding="utf-8")
+    start = text.index(f"function {name}(")
+    return text[start : text.index("\n}\n", start) + 2]
+
+
+def test_the_key_file_fold_is_claim_ps1s_own() -> None:
+    """The copy in claim-reconcile.ps1 must fold a key exactly as claim.ps1 -Release does."""
+    assert _ps_function(RECONCILE, "ConvertTo-KeyFile") == _ps_function(CLAIM, "ConvertTo-KeyFile")
+
+
 def _gh_stub(tmp_path: Path, payload: str) -> Path:
     """Stand-in for `gh`. Ignores its arguments and prints one canned JSON document."""
     stub = tmp_path / "gh-stub.ps1"

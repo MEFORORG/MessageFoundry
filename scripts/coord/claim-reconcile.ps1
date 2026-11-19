@@ -171,6 +171,13 @@ if ($env:CLAUDE_CODE_REMOTE -eq 'true') {
 
 $ErrorActionPreference = "Stop"
 
+# Every claim file is parsed with -DateKind String (BACKLOG #5482), which arrived in pwsh 7.5. Without
+# it the parse fails on 7.4 and every claim would read UNREADABLE, so refuse instead (seat.ps1 does too).
+if ($PSVersionTable.PSVersion -lt [version]'7.5') {
+    [Console]::Error.WriteLine("claim-reconcile.ps1: REFUSED -- needs pwsh 7.5 or later for ConvertFrom-Json -DateKind; this is $($PSVersionTable.PSVersion). Nothing was scanned or released.")
+    exit 2
+}
+
 # -ClaimsDir exists to AUDIT a reconstructed copy, and a release always lands in the LIVE registry,
 # because claim.ps1 resolves its own. Together they would judge one file and delete another.
 if ($Apply -and $ClaimsDir) {
@@ -204,6 +211,20 @@ else {
     $claimsDir = $resolved.Path
 }
 $claimTool = Join-Path $PSScriptRoot "claim.ps1"
+
+# A COPY of claim.ps1's ConvertTo-KeyFile, which cannot be dot-sourced because it runs on load.
+# tests/test_coord_claim_reconcile.py holds the two bodies equal. claim.ps1 -Release <key> deletes
+# the file this names, so a claim whose key does not fold to its own file name is never released.
+function ConvertTo-KeyFile([string]$Key) {
+    $safe = ($Key.Trim().ToLowerInvariant() -replace '[^a-z0-9._-]+', '-').Trim('-')
+    if (-not $safe) { throw "Key '$Key' reduces to nothing usable -- pick something with letters or digits." }
+    $safe
+}
+
+# The file a claim's key names, or "" when the key reduces to nothing.
+function Get-KeyFileName([string]$Key) {
+    try { return (ConvertTo-KeyFile $Key) } catch { return "" }
+}
 
 function ConvertTo-Norm([string]$Path) {
     if (-not $Path) { return "" }
@@ -499,8 +520,11 @@ function Get-PresentHolderVerdict {
 function Test-StillReleasable([object]$Row) {
     $file = $Row.claimFile
     if (-not (Test-Path -LiteralPath $file)) { return "the claim file is gone" }
-    try { $c = Read-CoordText $file | ConvertFrom-Json -EA Stop }
+    try { $c = Read-CoordText $file | ConvertFrom-Json -DateKind String -EA Stop }
     catch { return "the claim file no longer parses" }
+    if ((Get-KeyFileName ([string]$c.key)) -ne [IO.Path]::GetFileNameWithoutExtension($file)) {
+        return "the claim file's key no longer names that file"
+    }
     if ((ConvertTo-Norm ([string]$c.worktree)) -ne $Row.holder) { return "the claim is now held by another worktree" }
     if (-not (Test-CoordRecordIsHere $c)) { return "the claim is now held on $(Get-CoordRecordHost $c)" }
     $fresh = Read-WorktreeRegistry
@@ -515,10 +539,15 @@ function Test-StillReleasable([object]$Row) {
 
 $rows = @()
 $script:prByKey = @{}
+$script:fileByKey = @{}
 foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue | Sort-Object Name)) {
     $verdict = "UNKNOWN"; $why = ""; $key = $f.BaseName; $holder = ""; $branch = ""
 
-    try { $c = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop }
+    # -DateKind String (BACKLOG #5482): the default coerces any ISO-8601-shaped string into a
+    # [datetime], and a key is free text, so a key like "2026-08-01T00:00:00" would come back through
+    # [string] as "08/01/2026 00:00:00" -- a key nobody typed, which -Release folds to a file that does
+    # not exist. claim.ps1 records the same trap beside its own -Take.
+    try { $c = Read-CoordText $f.FullName | ConvertFrom-Json -DateKind String -EA Stop }
     catch {
         # An unreadable claim belongs to the registry, not to any worktree. It is reported and never
         # released: we could not read whose it is, and claim_check.py reads a malformed claim as
@@ -531,6 +560,18 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
     $holder = ConvertTo-Norm ([string]$c.worktree)
     $branch = [string]$c.branch
     $note = [string]$c.note
+
+    # The release goes through `claim.ps1 -Release <key>`, which deletes the file the KEY names, not
+    # this one (BACKLOG #5482). A key that folds to another file name would release a different
+    # claim, or nothing while reading as released. Judged here, it is reported and never released.
+    $keyFile = Get-KeyFileName $key
+    if ($keyFile -ne $f.BaseName) {
+        $names = if ($keyFile) { "'$keyFile.json'" } else { "no file at all" }
+        $rows += [pscustomobject]@{ key = $f.BaseName; holder = $holder; branch = $branch; note = $note; verdict = "KEY-MISMATCH"
+            why = "the file is '$($f.Name)' but its key reads '$key', which names $names -- a release by that key would act on another file" }
+        continue
+    }
+    $script:fileByKey[$key] = $f.FullName
 
     if (-not $holder) {
         $rows += [pscustomobject]@{ key = $key; holder = ""; branch = $branch; note = $note; verdict = "UNKNOWN"; why = "claim names no worktree" }
@@ -741,14 +782,18 @@ if ($Apply) {
         # The ledger writer stays in one place. A gone holder's release needs -Force, because it is
         # held by a worktree that is not this one, which is the condition that defines that set.
         & pwsh -NoProfile -File $claimTool @releaseArgs | Out-Null
-        $outcome = if ($LASTEXITCODE -eq 0) { "released" } else { "release FAILED -- claim untouched" }
+        # claim.ps1 exits 0 on "no claim -- nothing to release" too, so an exit code alone can report
+        # a release that did not happen. Released means the file this row judged is gone.
+        $outcome = if ($LASTEXITCODE -ne 0) { "release FAILED -- claim untouched" }
+        elseif (Test-Path -LiteralPath $script:fileByKey[$r.key]) { "release FAILED -- the claim file is still there" }
+        else { "released" }
         $r | Add-Member -NotePropertyName outcome -NotePropertyValue $outcome -Force
     }
 }
 
 $releasable = @($rows | Where-Object { $_.verdict -eq "RELEASABLE" })
 $hold = @($rows | Where-Object { $_.verdict -eq "HOLD" })
-$unknown = @($rows | Where-Object { $_.verdict -in @("STRANDED-UNKNOWN", "STRANDED-REGISTERED", "UNKNOWN", "UNREADABLE", "NOTE-POINTS-ELSEWHERE", "MERGED-HELD", "ELSEWHERE") })
+$unknown = @($rows | Where-Object { $_.verdict -in @("STRANDED-UNKNOWN", "STRANDED-REGISTERED", "UNKNOWN", "UNREADABLE", "KEY-MISMATCH", "NOTE-POINTS-ELSEWHERE", "MERGED-HELD", "ELSEWHERE") })
 
 if ($Json) {
     [pscustomobject]@{
