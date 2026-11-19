@@ -76,17 +76,35 @@ if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
 . $coordRootScript
 $thisHost = Get-CoordHost
 
-# The lane file and the claim hash are keyed on the WORK TREE ROOT, which is how the readers name the
-# tree; the current directory keyed a subdirectory run on a box nobody reads (BACKLOG #5486). Read
-# before the root is resolved, so a directory with no work tree (a .git directory) refuses first.
-# Interpolated, not cast: no output casts to $null, and .Trim() on that throws.
-$top = "$(& git rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
-if ($LASTEXITCODE -ne 0 -or -not $top) {
-    [Console]::Error.WriteLine("lane.ps1: REFUSED -- git could not name the work tree root for $((Get-Location).Path), so the lane cannot be keyed and nothing was read or written.")
+# The lane file and the claim hash are keyed on the WORK TREE ROOT; the current directory keyed a
+# subdirectory run on a box nobody reads (BACKLOG #5486). Read before the root is resolved, so a
+# directory with no work tree (a .git directory) refuses before anything is read or written.
+$here = (Get-Location).Path
+function Write-RootRefusal([string]$Why) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- $Why, so the lane cannot be keyed and nothing was read or written.")
     exit 2
 }
-# GetFullPath puts the separators in this platform's form, as (Get-Location).Path gave them.
-$worktree = [System.IO.Path]::GetFullPath($top)
+try { $revParse = @(& git rev-parse --path-format=absolute --show-toplevel --show-prefix 2>$null) }
+catch { Write-RootRefusal "git could not be run in $here ($($_.Exception.Message))" }
+$top = if ($revParse.Count -ge 1) { ([string]$revParse[0]).Trim() } else { '' }
+if ($LASTEXITCODE -ne 0 -or -not $top) { Write-RootRefusal "git could not name the work tree root for $here" }
+$prefix = if ($revParse.Count -ge 2) { ([string]$revParse[1]).Trim().TrimEnd('/') } else { '' }
+# A directory the tree ignores is not part of the tree's work: it is the shape of a removed worktree
+# under the primary checkout (.claude/worktrees/<name> with no .git left), which git walks up to the
+# primary from. Keying it there would overwrite the primary's level.
+if ($prefix) {
+    & git check-ignore -q -- . 2>$null
+    if ($LASTEXITCODE -eq 0) { Write-RootRefusal "$here is ignored by the work tree at $top (a removed worktree reads this way)" }
+}
+# The root as the caller's own path names it, by walking up the prefix's depth, so a tree reached
+# through a junction or a subst drive keys where the readers, which read Get-Location, key it. git's
+# --show-toplevel is the resolved path. It is used only where the walk does not retrace the prefix.
+$worktree = $here
+foreach ($seg in @(if ($prefix) { $prefix -split '/' })) {
+    if ((Split-Path -Leaf $worktree) -ne $seg) { $worktree = $null; break }
+    $worktree = Split-Path -Parent $worktree
+}
+if (-not $worktree) { $worktree = [System.IO.Path]::GetFullPath($top) }
 
 # Both kinds this writes or reads are fleet-wide, so both are resolved before anything is written,
 # and an error refuses rather than writing a level into a local copy nobody else reads.

@@ -377,3 +377,39 @@ def test_a_directory_with_no_work_tree_refuses_and_writes_nothing(repo: Path) ->
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "REFUSED" in proc.stderr and "work tree root" in proc.stderr, proc.stderr
     assert not (repo / ".git" / "mefor-coord" / "lanes").exists()
+
+
+def test_a_directory_the_tree_ignores_refuses_and_writes_nothing(repo: Path) -> None:
+    """A removed worktree under the primary (.claude/worktrees/<name>, its .git gone) has git walk up
+    to the primary, so keying on that root would overwrite the primary's level. The directory is
+    ignored by the tree, so it refuses. The control is the tracked subdirectory test above."""
+    (repo / ".gitignore").write_text(".claude/worktrees/\n", encoding="utf-8")
+    stale = repo / ".claude" / "worktrees" / "gone"
+    stale.mkdir(parents=True)
+    proc = _pwsh(stale, "-Free", "1", "-InFlight", "0")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "REFUSED" in proc.stderr and "ignored" in proc.stderr, proc.stderr
+    assert not (repo / ".git" / "mefor-coord" / "lanes").exists()
+
+
+def test_a_tree_reached_through_a_junction_keys_on_the_path_the_caller_used(
+    repo: Path, tmp_path: Path
+) -> None:
+    """The readers key on Get-Location, so the root is the caller's own path walked up, not git's
+    resolved one. From a junction's subdirectory, the record names the junction."""
+    if os.name != "nt":
+        pytest.skip("a directory junction is a Windows mount point")
+    link = tmp_path.parent / f"{tmp_path.name}-junction"
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(repo)], check=True, capture_output=True
+    )
+    try:
+        sub = link / "sub"
+        sub.mkdir()
+        proc = _pwsh(sub, "-Free", "1", "-InFlight", "0")
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        rec = json.loads(_lane_record(repo).read_text(encoding="utf-8-sig"))
+        assert rec["worktree"].lower() == str(link).lower(), rec
+    finally:
+        # rmdir removes the junction itself and leaves its target alone.
+        os.rmdir(link)
