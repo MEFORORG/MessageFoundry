@@ -237,16 +237,16 @@ def test_null_reset_of_an_unknown_key_the_file_carries_removes_it(
     assert "require_mfx" not in toml.read_text(encoding="utf-8")
 
 
-def test_null_reset_in_a_missing_folder_exits_0_and_creates_nothing(
+def test_null_reset_in_a_missing_folder_is_refused_and_creates_nothing(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """BACKLOG #5327: a reset that finds nothing where neither the file nor its folder exists
-    exits 0, as `security show` does there, and creates nothing, the edit lock's file included."""
+    """BACKLOG #5327: a reset whose folder does not exist is a mistyped path, so it exits non-zero
+    and creates nothing rather than read as a successful reset. An absent file in a folder that
+    exists still exits 0 and creates nothing, the edit lock's file included."""
     toml = tmp_path / "missing" / "mf.toml"
-    rc, res = _set(toml, {"require_mfa": None}, capsys)
-    assert rc == 0
-    assert res["op"] == "unchanged" and res["rewritten"] is False
-    assert res["unchanged"] == ["require_mfa"]
+    rc, err = _set(toml, {"require_mfa": None}, capsys)
+    assert rc != 0
+    assert "does not exist" in err["error"] and "missing" in err["error"]
     assert list(tmp_path.iterdir()) == []
     # In a folder that exists, no lock file is left beside the absent settings file.
     toml = tmp_path / "mf.toml"

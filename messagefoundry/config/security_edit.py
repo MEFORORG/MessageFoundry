@@ -70,20 +70,29 @@ def set_security(
     the editing account unless root keeps the previous owner; on Windows to the editing account
     or, where another account owned it, to that account and the editing account; logging a
     warning where it cannot. ``rewritten`` says so, and ``detail`` says it in
-    words when no key changed. With nothing at the path and only resets asked, no edit lock is
-    taken and nothing is created or checked, so a missing folder is no error: ``rewritten`` is
-    false. This
+    words when no key changed. With only resets asked and no file at the path in a folder that
+    exists, nothing is created or checked and ``rewritten`` is false. No edit lock is taken when
+    the file is absent at the first check; if it is deleted between that check and the lock, the
+    lock is taken and its lock file left as any edit leaves it. A missing folder, or a missing
+    drive, is refused, so a mistyped path does not read as a successful reset. This
     module cannot tell a known ``[security]`` key from a misspelled one, since it stays outside the
     settings import graph, so refusing a reset of an unknown key is the caller's job; the
     ``security`` CLI does it."""
     if not isinstance(updates, Mapping):
         raise SecurityEditError("security updates must be a JSON object of {key: value}")
     path = Path(service_config)
-    if all(value is None for value in updates.values()) and _nothing_at(path):
-        # Only resets, and no file to reset them in: nothing can change, so take no lock, whose
-        # file would be the edit's only trace and whose folder may not exist. Anything at the
-        # path, a directory or a link among them, goes on to the replace, which fails on it.
-        return _absent_result(path, list(updates))
+    if all(value is None for value in updates.values()):
+        if not os.path.lexists(path.parent):
+            # A mistyped path must not read as a successful reset.
+            raise SecurityEditError(
+                f"refused, nothing written: the folder {path.parent} does not exist, so there is "
+                "no settings file to reset; check the --service-config path"
+            )
+        if _nothing_at(path):
+            # Only resets, and no file to reset them in: nothing can change, so take no lock,
+            # whose file would be the edit's only trace. Anything at the path, a directory or a
+            # link among them, goes on to the replace, which fails on it.
+            return _absent_result(path, list(updates))
     with atomic_edit.edit_lock(path, busy_error=SecurityEditError, refused_error=SecurityEditError):
         original, crlf = atomic_edit.read_text_if_present(path, refused_error=SecurityEditError)
         doc = tomlkit.parse(original) if original is not None else tomlkit.document()
@@ -142,9 +151,9 @@ def set_security(
 def _nothing_at(path: Path) -> bool:
     """Whether nothing at all is at ``path``, so an edit that changes no key may skip it.
 
-    Only a lstat that says the file is not found counts, and only below a folder or a missing
-    one: a name the system refuses, or a path under a regular file, is a mistyped path an edit
-    must fail on rather than report as absent. ``os.path.lexists`` alone reads every failed lstat
+    Only a lstat that says the file is not found counts, and only in a folder that exists: a name
+    the system refuses, a missing folder, or a path under a regular file, is a mistyped path an
+    edit must fail on rather than report as absent. ``os.path.lexists`` alone reads every failed lstat
     as absent, so the editors' shared stat gate also refuses a file behind an unreachable share."""
     try:
         os.lstat(path)
@@ -154,11 +163,8 @@ def _nothing_at(path: Path) -> bool:
         return False
     else:
         return False
-    for folder in path.parents:
-        if os.path.lexists(folder):
-            if not os.path.isdir(folder):
-                return False
-            break
+    if not os.path.isdir(path.parent):
+        return False
     return not atomic_edit.is_file(path, refused_error=SecurityEditError)
 
 
