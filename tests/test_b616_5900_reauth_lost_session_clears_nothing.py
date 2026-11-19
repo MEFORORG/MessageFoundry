@@ -679,13 +679,14 @@ async def test_a_commit_made_visible_late_still_reads_as_cleared(
         await store.close()
 
 
-async def test_a_partial_read_back_is_unknown_not_cleared(
+async def test_a_read_back_missing_a_later_row_still_reads_as_cleared(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The reset and both rows committed, then the store raised, and the read-back finds the
-    ``auth.reauth`` row but not the ``auth.login_after_failures`` row. Not every row matched, so
-    the outcome is unknown and answered as refused: the re-auth writes its own row, and neither a
-    notice nor a tee is sent on the strength of half a match."""
+    ``auth.reauth`` row carrying this write's ``clear_id`` but not the
+    ``auth.login_after_failures`` row. That row commits only with the reset, so the clear reads as
+    cleared: one ``auth.reauth`` row, the counter cleared, one notice, the row found teed, and a
+    warning naming how many rows were read back."""
     store = await MessageStore.open(":memory:")
     try:
         service, notifier, identity, token = await _setup(store)
@@ -710,10 +711,18 @@ async def test_a_partial_read_back_is_unknown_not_cleared(
         caplog.set_level("WARNING", logger="messagefoundry.auth.service")
         out = await service.reauth(identity, GOOD, token=token)
         assert out.ok and out.token is not None
-        assert len(await real_read(action="auth.reauth")) == before + 2
-        assert not [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
-        assert not [t for t in teed if t["action"] == "auth.login_after_failures"]
-        assert "outcome is unknown" in caplog.text
+        reauth_rows = await real_read(action="auth.reauth")
+        assert len(reauth_rows) == before + 1
+        user = await store.get_user("u-bob")
+        assert user is not None and user.failed_attempts == 0
+        assert len([e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]) == 1
+        found = dict(reauth_rows[0])
+        assert [
+            (t["action"], t["detail"], t["seq"], t["row_hash"])
+            for t in teed
+            if t["action"] in ("auth.reauth", "auth.login_after_failures")
+        ] == [(found["action"], found["detail"], found["seq"], found["row_hash"])]
+        assert "read back only 1 of the 2 rows" in caplog.text
     finally:
         await store.close()
 
@@ -722,8 +731,8 @@ async def test_a_failed_read_back_logs_the_outcome_as_unknown(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The write raised and the read-back raised too, so whether the reset committed is unknown.
-    The answer stays refused, and the log says the outcome is unknown, never that the reset was
-    refused and wrote nothing."""
+    The re-auth still hands back its token, and the log says the outcome is unknown, never that
+    the reset wrote nothing."""
     store = await MessageStore.open(":memory:")
     try:
         service, _, identity, token = await _setup(store)

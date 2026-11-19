@@ -241,6 +241,7 @@ from messagefoundry.store.store import (
     session_epochs_current,
     session_seal_ok_async,
     session_sealed_by_retired_key_async,
+    tee_audits,
     user_seal_ok_async,
 )
 from messagefoundry.store.transit_attestation import utf16_units
@@ -15485,11 +15486,10 @@ class AuthService:
         A store error from :func:`~messagefoundry.store.base.audit_write_errors` leaves the outcome
         unknown, since at least an ``OSError`` for a connection lost at the socket can follow a
         commit that landed. So ``audits`` are read back (:meth:`_reauth_clear_readback`). Found,
-        the reset and its rows are in: they are teed off-box, and the answer is ``"cleared"``. Not
-        found, found in part, or the read-back failing, the answer is ``"refused"``: the session has already
+        the reset is in: the rows found are teed off-box, and the answer is ``"cleared"``. Not
+        found, or the read-back failing, the answer is ``"refused"``: the session has already
         rotated, and the caller writes its own row, hard, so the step-up is granted only once that
-        row is in. So is a
-        Vault transit Outage, which is paged (ADR 0217's Outage row ends nothing). A seal refusal
+        row is in. So is a Vault transit Outage, which is paged (ADR 0217's Outage row ends nothing). A seal refusal
         of another kind than the account's record raises, as on the login leg, and so does a
         defect."""
         now = time.time()
@@ -15535,8 +15535,8 @@ class AuthService:
             if readback == "absent":
                 _log.warning(
                     "a re-auth of account id %r rotated its session, but its lockout reset raised "
-                    "(%s) and its committed rows were not found when read back, so it is answered "
-                    "as refused",
+                    "(%s) and the rows it would have committed were not found when read back, so "
+                    "it is answered as refused",
                     decided.id,
                     type(exc).__name__,
                 )
@@ -15570,13 +15570,14 @@ class AuthService:
         self, user_id: str, audits: Sequence[AuditAppend], now: float
     ) -> Literal["landed", "absent", "unknown"]:
         """Whether a lockout reset whose write raised committed after all (BACKLOG #5900).
-        ``"landed"`` when every one of ``audits`` is in the trail as this write appended it: each
-        action, actor and detail compared exactly, the first detail carrying the caller's per-call
-        ``clear_id``, at the reset's own timestamp. They commit only with the reset, so finding
-        them finds both. The committed rows are then teed off-box, as the store's own tee would have
-        after the commit. ``"absent"`` when no read over :data:`_REAUTH_READBACK_PAUSES` finds the
-        first, so a commit made visible late is still found. ``"unknown"`` when a read raises, or
-        finds some of ``audits`` and not all, which ends the reads at once; the caller logs it."""
+        ``"landed"`` when the first of ``audits`` is in the trail as this write appended it: its
+        action, actor and detail compared exactly, the detail carrying the caller's per-call
+        ``clear_id``, at the reset's own timestamp. It commits only with the reset, so finding it
+        finds the reset committed. Every row found is then teed off-box, as the store's own tee
+        would have after the commit; a later row not found is logged. ``"absent"`` when no read
+        over :data:`_REAUTH_READBACK_PAUSES` finds the first, so a commit made visible late is
+        still found. ``"unknown"`` when a read raises, which ends the reads at once; the caller
+        logs it."""
         for pause in _REAUTH_READBACK_PAUSES:
             if pause:
                 await asyncio.sleep(pause)
@@ -15592,19 +15593,17 @@ class AuthService:
                     type(exc).__name__,
                 )
                 return "unknown"
-            if rows and len(rows) == len(audits):
-                for audit, row in zip(audits, rows, strict=True):
-                    audit.tee(ts=now, row=row)
-                return "landed"
             if rows:
-                _log.warning(
-                    "a re-auth of account id %r read back %d of the %d rows its lockout reset "
-                    "appends",
-                    user_id,
-                    len(rows),
-                    len(audits),
-                )
-                return "unknown"
+                tee_audits(audits[: len(rows)], rows, ts=now)
+                if len(rows) < len(audits):
+                    _log.warning(
+                        "a re-auth of account id %r found its lockout reset committed, but read "
+                        "back only %d of the %d rows the reset appends",
+                        user_id,
+                        len(rows),
+                        len(audits),
+                    )
+                return "landed"
         return "absent"
 
     async def _committed_reauth_audits(

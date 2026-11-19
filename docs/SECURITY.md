@@ -3796,8 +3796,7 @@ no such check:
   token is never handed back.
 - The `auth.reauth` row, and the `auth.login_after_failures` row when the clear ends a run of
   failures, are appended in the reset's own transaction, so the counters are not reset without
-  them, and a refused append rolls the reset back. The out-of-band notice is sent right after
-  that commit.
+  them, and a refused append rolls the reset back.
 - A raise from the stamp onward writes an `auth.reauth` row marked `interrupted`, softly, beside
   any row the clear already committed. A raise inside the re-proof itself, after the password
   verified, writes no `auth.reauth` row.
