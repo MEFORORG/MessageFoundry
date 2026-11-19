@@ -74,6 +74,7 @@ import {
   pickPartSeed,
   readEditMessage,
   readPickPartMessage,
+  rebaseQueuedEdit,
   releaseEdit,
   renderHandlersHtml,
   renderStepsContextMenuHtml,
@@ -84,6 +85,7 @@ import {
   traceRowValues,
   withPickedPath,
   type AddMenuItem,
+  type AppliedRewrite,
   type EditMessage,
   type HandlerViewModel,
   type LensParseResult,
@@ -460,15 +462,14 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // so the engine compares the row as it was PROJECTED against the live buffer's row at that line range
     // and REFUSES a stale coordinate (F7). We must NOT recompute expect_src from the same live buffer we
     // send as stdin — that compares the buffer against itself and the guard always passes (the defect).
-    const applyOne = async (msg: EditMessage): Promise<void> => {
+    // A written edit returns the buffer it was given and the one it wrote, so drainEdits can rebase a
+    // queued edit to the same row on it (BACKLOG #5943); every other outcome returns nothing.
+    const applyOne = async (msg: EditMessage): Promise<AppliedRewrite | undefined> => {
       const spec = buildEditRequest(msg);
       // At the SAME contract the rows were projected with — the engine re-locates the row through that
       // grammar, so sending v2 coordinates into a v1 partition would miss it (or hit a different row).
-      const res = await lensRewriteStdin(
-        spec,
-        document.getText(),
-        workspaceDir(),
-      );
+      const before = document.getText();
+      const res = await lensRewriteStdin(spec, before, workspaceDir());
       if (disposed) {
         return;
       }
@@ -491,7 +492,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         document.positionAt(document.getText().length),
       );
       edit.replace(document.uri, fullRange, outcome.source);
-      await vscode.workspace.applyEdit(edit);
+      if (!(await vscode.workspace.applyEdit(edit))) {
+        return undefined;
+      }
+      return { before, after: outcome.source };
     };
 
     // One edit at a time. A change that races an in-flight rewrite is NOT dropped — it is queued and
@@ -592,7 +596,11 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       try {
         let current: EditMessage | undefined = msg;
         while (current) {
-          await applyOne(current); // applyOne handles its own error + revert-render
+          const applied = await applyOne(current); // applyOne handles its own error + revert-render
+          if (applied) {
+            const done = current; // a raced edit to the same row is sent as this one left it (#5943)
+            guard.rebasePending((queued) => rebaseQueuedEdit(done, applied, queued));
+          }
           current = guard.takePending(); // drain a raced typed edit (F5) — NEVER clearPending (that drops it)
         }
       } finally {

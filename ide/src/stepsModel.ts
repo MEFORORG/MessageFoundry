@@ -2776,6 +2776,13 @@ export class EditLoopGuard {
     return msg;
   }
 
+  /** Replace every queued edit with `fn` of it, keeping the queue order (BACKLOG #5943). */
+  rebasePending(fn: (msg: EditMessage) => EditMessage): void {
+    for (const [key, msg] of this.pending) {
+      this.pending.set(key, fn(msg));
+    }
+  }
+
   /**
    * Discard every queued param edit WITHOUT applying it (the orphaned-queue hazard, ADR 0076 §5 v2). A
    * STRUCTURAL op (insert/delete/move) shifts every row coordinate and forces a full re-projection, so a
@@ -2904,6 +2911,44 @@ export class RerenderDebouncer<H = unknown> {
   }
 }
 
+/** A param edit that was written: the buffer `lens rewrite` was given, and the one it returned. */
+export interface AppliedRewrite {
+  before: string;
+  after: string;
+}
+
+/**
+ * A queued edit, rebased on a param edit applied ahead of it (BACKLOG #5943). Each queued edit carries
+ * the row's PROJECTION-TIME source as `expectSrc`, and the engine refuses one that no longer matches
+ * the buffer. A second edit to the row the first edit just rewrote would always be refused that way,
+ * so it takes the row's text from the rewritten buffer instead.
+ *
+ * Only an edit to the SAME row, projected from the SAME text, is rebased, and only when the rewrite
+ * kept the file's line count, so every coordinate still names the row it named. Anything else is
+ * returned unchanged and the engine's stale check judges it, as before.
+ */
+export function rebaseQueuedEdit(
+  applied: EditMessage,
+  rewrite: AppliedRewrite,
+  queued: EditMessage,
+): EditMessage {
+  if (
+    queued.handler !== applied.handler ||
+    queued.lineStart !== applied.lineStart ||
+    queued.lineEnd !== applied.lineEnd ||
+    queued.expectSrc === undefined ||
+    queued.expectSrc !== applied.expectSrc
+  ) {
+    return queued;
+  }
+  const before = physicalLines(rewrite.before);
+  const after = physicalLines(rewrite.after);
+  if (before.length !== after.length) {
+    return queued;
+  }
+  return { ...queued, expectSrc: after.slice(queued.lineStart - 1, queued.lineEnd).join("\n") };
+}
+
 /**
  * Drain one edit + any queued follow-ups through `apply`, one at a time, under the loop guard (ADR 0076
  * §5). Extracted from the provider (which imports vscode) so the whole drain — including the guarantee
@@ -2917,11 +2962,15 @@ export class RerenderDebouncer<H = unknown> {
  * the user types again. The slot is always released in `finally` — through {@link releaseEdit}, so a
  * document change suppressed during the drain still gets its re-projection (BACKLOG #1759), including on
  * the rejected-apply path above. Never throws.
+ *
+ * When `apply` reports the buffer it rewrote ({@link AppliedRewrite}), the queued edits are rebased
+ * on it ({@link rebaseQueuedEdit}) before the next is taken, so a second edit to the same row is sent
+ * with the row as the first edit left it, not as it was projected (BACKLOG #5943).
  */
 export async function drainEdits(
   guard: EditLoopGuard,
   first: EditMessage,
-  apply: (msg: EditMessage) => Promise<void>,
+  apply: (msg: EditMessage) => Promise<AppliedRewrite | void>,
   onError?: (err: unknown, msg: EditMessage) => void,
   onRefreshOwed?: () => void,
 ): Promise<void> {
@@ -2933,7 +2982,11 @@ export async function drainEdits(
     let current: EditMessage | undefined = first;
     while (current) {
       try {
-        await apply(current);
+        const applied = await apply(current);
+        if (applied) {
+          const done = current;
+          guard.rebasePending((queued) => rebaseQueuedEdit(done, applied, queued));
+        }
       } catch (err) {
         onError?.(err, current);
       }
