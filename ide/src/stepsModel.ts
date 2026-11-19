@@ -232,8 +232,8 @@ export interface RowViewModel {
   // A read-only PRAGMA note — carried so the webview greys its edit/delete controls rather than letting
   // the user discover the engine's refusal as an error toast (F6). Absent on every other row.
   pragma?: boolean;
-  // {@link isRowDeletable}, stamped so the per-row Delete button, the menu's Delete and the webview's
-  // Cut all read the one rule the engine's delete gate mirrors (BACKLOG #5944). Absent means false.
+  // Whether the per-row Delete button is drawn: {@link isRowDeletable}, minus a control block, which
+  // waits on an engine check (BACKLOG #5944; buildRowViewModel says why). Absent means false.
   deletable?: boolean;
   title: string;
   subtitle?: string;
@@ -552,17 +552,11 @@ export function isRowMovable(row: LensRow): boolean {
 
 /**
  * Whether a row can be DELETED. Mirrors the toolkit's delete gate (messagefoundry_toolkit/lens rewrite_source):
- * any {@link isRowMutable} row (action/lookup/send/diagnostic/note/route, a pragma note excepted) but a
- * Read Field, plus a whole `if`/`for` control BLOCK (its header removes the block). A
- * `raise`/`elif`/`else`/`code` row is NOT deletable — the engine refuses it (so the webview greys the
- * trash to avoid an error toast, F6).
+ * any lens-editable leaf (action/lookup/send/diagnostic), plus a whole `if`/`for` control BLOCK (its
+ * header removes the block). A `raise`/`elif`/`else`/`code` row is NOT deletable — the engine refuses it
+ * (so the webview greys the trash to avoid an error toast, F6).
  */
-export function isRowDeletable(row: {
-  kind: RowKind;
-  pragma?: boolean;
-  action?: string;
-  control?: LensRow["control"];
-}): boolean {
+export function isRowDeletable(row: LensRow): boolean {
   if (isBindingRead(row)) {
     return false;
   }
@@ -912,7 +906,9 @@ export function buildRowViewModel(row: LensRow, index: number, lines: string[]):
   if (row.kind === "control" && row.control !== undefined) {
     vm.control = row.control;
   }
-  if (isRowDeletable(row)) {
+  // A control block deletes from its header in the engine, but no trash or menu Delete is offered
+  // on it until the engine checks for a name the block binds and a later step reads (BACKLOG #5944).
+  if (isRowDeletable(row) && row.kind !== "control") {
     vm.deletable = true;
   }
   // A control row whose test falls outside the bounded grammar keeps its structure but is flagged — it
@@ -1956,8 +1952,8 @@ export interface ContextMenuEnablement {
  * The enable/disable state of each row context-menu item for a given row (pure; unit-testable). Rules:
  * Insert BEFORE is always available; Insert AFTER is suppressed on a `send` row (a step after the return
  * would be dead code — the same reason {@link buildToolbarInsertRequest} derives `before` for a send);
- * Delete is offered only on a {@link isRowDeletable} row (a `code` row never; a `control` row only as a
- * whole if/for block); Move up/down follow the ↑/↓ walk (`canMoveUp`/`canMoveDown` come from
+ * Delete is offered only on an editable `action`/`lookup`/`send` row (a `code`/`control` row is read-only
+ * — the §4 degradation ladder); Move up/down follow the ↑/↓ walk (`canMoveUp`/`canMoveDown` come from
  * {@link walkMove} returning a destination, so a suite edge / non-movable / sole-child row greys them).
  */
 export function contextMenuEnablement(
@@ -1968,7 +1964,6 @@ export function contextMenuEnablement(
     filtered?: boolean;
     pragma?: boolean;
     action?: string;
-    control?: LensRow["control"];
   },
   ctx: { canMoveUp: boolean; canMoveDown: boolean },
 ): ContextMenuEnablement {
@@ -1979,9 +1974,7 @@ export function contextMenuEnablement(
     // normal step, not a return.
     // A `route` row is a return too: a step after a routing return is dead code.
     insertAfter: !isReturnRow(row) && row.kind !== "route",
-    // isRowDeletable, the rule the per-row button keys on too: a whole if/for block deletes from its
-    // header (BACKLOG #5944).
-    deleteRow: isRowDeletable(row),
+    deleteRow: isRowMutable(row) && !isBindingRead(row),
     moveUp: ctx.canMoveUp && !isBindingRead(row),
     moveDown: ctx.canMoveDown && !isBindingRead(row),
     // ADR 0104 fan-out: add another destination — on any real send (returned or appended), never the filter.
@@ -2954,58 +2947,6 @@ export class RerenderDebouncer<H = unknown> {
   }
 }
 
-/** A param edit that was written: the buffer `lens rewrite` was given, and the one it returned. */
-export interface AppliedRewrite {
-  before: string;
-  after: string;
-}
-
-/**
- * Rebases queued edits on the param edits a drain has written (BACKLOG #5943). Each edit carries the
- * row's PROJECTION-TIME source as `expectSrc`, and the engine refuses one that no longer matches the
- * buffer. The page is not re-projected during a drain, so every edit it posts to a row the drain has
- * rewritten would be refused that way; {@link rebase} gives it the row's text as last written.
- *
- * Only an edit to a row the drain wrote, whose `expectSrc` is a text that row held during the drain,
- * is rebased, and only while every write kept the file's line count, so each coordinate still names
- * the row it named. Anything else is sent unchanged and the engine's stale check judges it, as before.
- * One instance serves one drain.
- */
-export class QueuedEditRebaser {
-  /** Per row written: every text it has held in this drain, and its text after the last write. */
-  private readonly rows = new Map<string, { held: Set<string>; now: string }>();
-
-  private static rowKey(msg: EditMessage): string {
-    return `${msg.handler} ${msg.lineStart} ${msg.lineEnd}`;
-  }
-
-  /** Record a param edit `lens rewrite` wrote. */
-  noteApplied(msg: EditMessage, rewrite: AppliedRewrite): void {
-    const after = physicalLines(rewrite.after);
-    if (physicalLines(rewrite.before).length !== after.length) {
-      this.rows.clear(); // every recorded coordinate may now name another row
-      return;
-    }
-    const key = QueuedEditRebaser.rowKey(msg);
-    const held = this.rows.get(key)?.held ?? new Set<string>();
-    held.add(physicalLines(rewrite.before).slice(msg.lineStart - 1, msg.lineEnd).join("\n"));
-    const now = after.slice(msg.lineStart - 1, msg.lineEnd).join("\n");
-    held.add(now);
-    this.rows.set(key, { held, now });
-  }
-
-  /** The edit to send for `msg`, taken from the queue. */
-  rebase(msg: EditMessage): EditMessage {
-    const row = this.rows.get(QueuedEditRebaser.rowKey(msg));
-    // An edit projected before any of this drain's writes to the row, or after some of them (a
-    // re-projection mid-drain), holds one of the row's texts from this drain.
-    if (row === undefined || msg.expectSrc === undefined || !row.held.has(msg.expectSrc)) {
-      return msg;
-    }
-    return msg.expectSrc === row.now ? msg : { ...msg, expectSrc: row.now };
-  }
-}
-
 /**
  * Drain one edit + any queued follow-ups through `apply`, one at a time, under the loop guard (ADR 0076
  * §5). Extracted from the provider (which imports vscode) so the whole drain — including the guarantee
@@ -3019,15 +2960,11 @@ export class QueuedEditRebaser {
  * the user types again. The slot is always released in `finally` — through {@link releaseEdit}, so a
  * document change suppressed during the drain still gets its re-projection (BACKLOG #1759), including on
  * the rejected-apply path above. Never throws.
- *
- * When `apply` reports the buffer it rewrote ({@link AppliedRewrite}), each edit taken from the queue
- * afterwards is rebased on it ({@link QueuedEditRebaser}), so a later edit to the same row is sent with
- * the row as the earlier edits left it, not as it was projected (BACKLOG #5943).
  */
 export async function drainEdits(
   guard: EditLoopGuard,
   first: EditMessage,
-  apply: (msg: EditMessage) => Promise<AppliedRewrite | void>,
+  apply: (msg: EditMessage) => Promise<void>,
   onError?: (err: unknown, msg: EditMessage) => void,
   onRefreshOwed?: () => void,
 ): Promise<void> {
@@ -3036,19 +2973,14 @@ export async function drainEdits(
     return;
   }
   try {
-    const rebaser = new QueuedEditRebaser();
     let current: EditMessage | undefined = first;
     while (current) {
       try {
-        const applied = await apply(current);
-        if (applied) {
-          rebaser.noteApplied(current, applied);
-        }
+        await apply(current);
       } catch (err) {
         onError?.(err, current);
       }
-      const next = guard.takePending();
-      current = next === undefined ? undefined : rebaser.rebase(next);
+      current = guard.takePending();
     }
   } finally {
     releaseEdit(guard, onRefreshOwed);
@@ -3432,8 +3364,8 @@ function renderParamsHtml(
 
 /**
  * Render the per-row STRUCTURAL affordances (move up/down, delete) of a writable projection (a known
- * `handlerName`): move on a {@link isRowMovable} row, delete on a {@link isRowDeletable} one. A `code`
- * row gets neither. Each button carries the row's edit coordinates + its projection-time source
+ * `handlerName`): move on a {@link isRowMovable} row, delete on a {@link RowViewModel.deletable} one.
+ * A `code` row gets neither. Each button carries the row's edit coordinates + its projection-time source
  * (`data-expect-src`) for the F7 stale guard. Pure.
  *
  * NOTE: the per-row ＋ (add-step-after) button was REPLACED by the top-of-lens INSERT TOOLBAR (a native
@@ -3442,8 +3374,8 @@ function renderParamsHtml(
 function renderRowActionsHtml(row: RowViewModel, handlerName: string): string {
   // ↑/↓ appear on any MOVABLE row (an action/lookup/send row or a whole if/for block); the client greys
   // the ↑ on the first sibling and the ↓ on the last (a reorder never crosses a suite edge).
-  // BACKLOG #5944: the trash keys on `deletable` (isRowDeletable), not on movability or the kind alone,
-  // so a Comment (deletable, not movable) and a whole if/for block get it and a raise does not.
+  // BACKLOG #5944: the trash keys on `deletable`, not on movability, so a Comment (deletable, not
+  // movable) gets it. A control row has no `deletable` (buildRowViewModel says why).
   if (!handlerName || (!row.movable && !row.deletable)) {
     return "";
   }
@@ -3460,9 +3392,7 @@ function renderRowActionsHtml(row: RowViewModel, handlerName: string): string {
     );
   }
   if (row.deletable) {
-    // An if/for header deletes its whole block, every clause and step in it, so it says so.
-    const what = row.kind === "control" ? "Delete this whole block" : "Delete this row";
-    buttons.push(btn("deleteRow", "&#128465;", what));
+    buttons.push(btn("deleteRow", "&#128465;", "Delete this row"));
   }
   // ADR 0104 fan-out: a per-row "＋ dest" on a real send (not the `return []` filter) adds another
   // destination — appending into the accumulator, or converting a returned send up to it.
@@ -3526,8 +3456,6 @@ export function renderRowHtml(
     // BACKLOG #1505: a Read Field binds a name, so the mirror greys its delete/move items (the engine
     // refuses both). `movable` is already false for it, which drops its arrows, drag and cut.
     `data-binding-read="${isBindingRead(row) ? "true" : ""}" ` +
-    // BACKLOG #5944: isRowDeletable, so the mirror's menu Delete and Cut read the model's one rule.
-    `data-deletable="${row.deletable ? "true" : ""}" ` +
     // ADR 0076 Amendment D: the enclosing element's role, so the Add-palette can grey the items this
     // role may not author rather than letting the user meet the engine's refusal as an error toast (F6).
     `data-role="${escapeHtml(role)}" ` +

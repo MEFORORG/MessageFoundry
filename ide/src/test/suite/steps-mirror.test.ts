@@ -1471,15 +1471,7 @@ suite("Steps mirror — context-menu enablement parity (STEPS-10)", () => {
         // the walk result as an INPUT, so the model side composes the same two facts from its own data.
         const movable = vm.movable === true;
         const expected = contextMenuEnablement(
-          {
-            kind: vm.kind,
-            appended: vm.appended,
-            scaffold: vm.scaffold,
-            filtered: vm.filtered,
-            pragma: vm.pragma,
-            action: vm.action,
-            control: vm.control,
-          },
+          { kind: vm.kind, appended: vm.appended, scaffold: vm.scaffold, filtered: vm.filtered },
           {
             canMoveUp: movable && walkMove(L.modelRows, vm.lineStart, "up") !== null,
             canMoveDown: movable && walkMove(L.modelRows, vm.lineStart, "down") !== null,

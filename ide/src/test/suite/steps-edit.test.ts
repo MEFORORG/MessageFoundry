@@ -32,7 +32,6 @@ import {
   isRowMovable,
   opForcesReprojection,
   parseRewriteResult,
-  QueuedEditRebaser,
   physicalLines,
   releaseEdit,
   renderRowHtml,
@@ -568,83 +567,6 @@ suite("Steps update-loop guard — a suppressed document change is DEFERRED, not
     assert.strictEqual(errors.length, 1, "the rejection is still surfaced");
     assert.strictEqual(guard.isEditing, false, "the slot is still released");
     assert.strictEqual(refreshes, 1, "the save suppressed mid-drain is re-projected, not lost");
-  });
-
-  // BACKLOG #5943: a second edit to a row, queued while the first rewrote it, was sent with the row's
-  // pre-first source as expect_src, so the engine's stale check refused it and the edit was lost.
-  test("later edits to the same row, queued mid-rewrite, are sent as the earlier ones left it", async () => {
-    let buffer = 'def h(msg):\n    msg.set_field("PID-5", "A", "x")\n    return msg\n';
-    const projected = physicalLines(buffer)[1];
-    const guard = new EditLoopGuard();
-    const outcomes: string[] = [];
-    // Every edit the page posts before a re-projection carries the same projected text.
-    const edit = (name: string, value: string): EditMessage => ({
-      command: "edit",
-      handler: "h",
-      lineStart: 2,
-      lineEnd: 2,
-      name,
-      value,
-      expectSrc: projected,
-    });
-    const literalOf: Record<string, string> = { path: '"PID-5"', value: '"A"', note: '"x"' };
-    // The user edits the next field while each rewrite is in flight, the third after the first rebase.
-    const raced: Record<string, EditMessage> = { path: edit("value", "B"), value: edit("note", "y") };
-    // A stand-in for lens rewrite: refuse a stale expect_src, else rewrite the one literal it names.
-    const apply = async (msg: EditMessage): Promise<{ before: string; after: string } | void> => {
-      const next = raced[msg.name];
-      if (next !== undefined) {
-        guard.queue(next);
-      }
-      const lines = physicalLines(buffer);
-      if (lines[msg.lineStart - 1] !== msg.expectSrc) {
-        outcomes.push(`refused ${msg.name}`);
-        return;
-      }
-      const before = buffer;
-      lines[msg.lineStart - 1] = lines[msg.lineStart - 1].replace(
-        literalOf[msg.name],
-        JSON.stringify(msg.value),
-      );
-      buffer = lines.join("\n");
-      outcomes.push(`applied ${msg.name}`);
-      return { before, after: buffer };
-    };
-
-    await drainEdits(guard, edit("path", "PID-7"), apply);
-
-    assert.deepStrictEqual(outcomes, ["applied path", "applied value", "applied note"]);
-    assert.strictEqual(physicalLines(buffer)[1], '    msg.set_field("PID-7", "B", "y")');
-  });
-
-  test("QueuedEditRebaser leaves an edit to another row, or after a line-count change, unchanged", () => {
-    const applied: EditMessage = {
-      command: "edit",
-      handler: "h",
-      lineStart: 2,
-      lineEnd: 2,
-      name: "path",
-      value: "X",
-      expectSrc: "    a()",
-    };
-    const sameRow: EditMessage = { ...applied, name: "value", value: "Y" };
-    const otherRow: EditMessage = { ...sameRow, lineStart: 3, lineEnd: 3, expectSrc: "    b()" };
-    const kept = { before: "def h():\n    a()\n    b()", after: "def h():\n    a(1)\n    b()" };
-    const grown = { before: "def h():\n    a()\n    b()", after: "def h():\n    a(\n        1)\n    b()" };
-    const rebaser = new QueuedEditRebaser();
-    rebaser.noteApplied(applied, kept);
-    assert.strictEqual(rebaser.rebase(sameRow).expectSrc, "    a(1)");
-    assert.strictEqual(rebaser.rebase(otherRow), otherRow);
-    // An edit posted after a re-projection mid-drain carries a text the row held after a write.
-    const reprojected: EditMessage = { ...sameRow, expectSrc: "    a(1)" };
-    rebaser.noteApplied({ ...sameRow, expectSrc: "    a(1)" }, {
-      before: kept.after,
-      after: "def h():\n    a(2)\n    b()",
-    });
-    assert.strictEqual(rebaser.rebase(reprojected).expectSrc, "    a(2)");
-    assert.strictEqual(rebaser.rebase(sameRow).expectSrc, "    a(2)");
-    rebaser.noteApplied(applied, grown);
-    assert.strictEqual(rebaser.rebase(sameRow), sameRow, "a line-count change drops every rebase");
   });
 
   test("drainEdits with NO suppressed change never schedules a refresh", async () => {
@@ -1618,7 +1540,7 @@ suite("Steps v2 — structural affordances appear ONLY on recognized rows", () =
     assert.ok(html.includes('data-kind="code"'), "the code kind lets the page script recognize + lock it");
   });
 
-  test("an if/for control row is MOVABLE — ↑/↓ + draggable — and deletes its block (BACKLOG #5944)", () => {
+  test("an if/for control row is MOVABLE — ↑/↓ + draggable, but no delete (ADR 0089 block-move)", () => {
     const control: LensRow = {
       kind: "control",
       control: "if",
@@ -1635,8 +1557,9 @@ suite("Steps v2 — structural affordances appear ONLY on recognized rows", () =
       "↑/↓ reorder the whole block",
     );
     assert.ok(html.includes('draggable="true"'), "the block is a drag source");
-    // ...and the engine's delete gate takes a whole if/for block from its header, so it gets the trash.
-    assert.ok(html.includes('data-op="deleteRow"'), "delete on an if/for block");
+    // ...but no one-click delete: the engine's block delete does not yet check for a name the block
+    // binds and a later step reads, so the trash waits on that check (BACKLOG #5944).
+    assert.ok(!html.includes('data-op="deleteRow"'), "no delete on a control block");
     // A raise moves, but the engine refuses to delete it.
     const raise: LensRow = { ...control, control: "raise", test_src: null };
     const raiseHtml = renderRowHtml(vmOf(raise, SRC), "h");
