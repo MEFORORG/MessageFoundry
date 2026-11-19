@@ -268,9 +268,9 @@ def _encrypt_in_a_thread(factory: Callable[[], Any]) -> list[BaseException]:
 
 @_vault_extra
 def test_a_thread_client_build_refusal_is_a_refusal_not_an_outage() -> None:
-    """Mutation: relabel every build failure as a requests ConnectionError. Red: a deterministic
-    configuration refusal, such as the TLS-suite check's ValueError, reads as an outage that gave
-    no verdict, which the upload save route would answer 503 with a retry hint."""
+    """Mutation: relabel every build failure as a requests ConnectionError. Red: a build failure
+    the failure classifier reads as a refusal, here a synthetic ValueError, reads as an outage
+    that gave no verdict on an encrypt."""
 
     def refuse() -> Any:
         raise ValueError("synthetic TLS-suite refusal")

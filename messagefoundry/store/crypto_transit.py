@@ -397,12 +397,10 @@ def _build_failure(op: str, key: str, exc: Exception) -> CipherError:
     For a ``decrypt`` it is always :class:`CipherUnavailableError`: Transit was never asked, so it
     gave no verdict on the value, and a cell walk that reads :func:`gave_no_verdict` would stop as
     could-not-run rather than mark every cell damaged. For an ``encrypt`` it stays what
-    :func:`_transit_failure` reads, so a deterministic build failure, a TLS-suite ValueError among
-    them, is not raised as :class:`CipherUnavailableError`, and a caller that answers that class as
-    an outage, at least the upload save route's 503 with ``Retry-After``, does not invite a retry
-    for it. :func:`gave_no_verdict` also reads the cause, so a build failure whose cause is an
-    ``OSError`` still reads as no verdict there. A stage handoff does not read the class at all:
-    the runner's store-fault handling takes either."""
+    :func:`_transit_failure` reads ``exc`` as, so a build failure that classifier does not read as
+    an outage is not raised as :class:`CipherUnavailableError`. :func:`gave_no_verdict` also reads
+    the cause, so a build failure whose cause is an ``OSError`` still reads as no verdict there. A
+    stage handoff does not read the class at all."""
     error = _transit_failure(op, key, exc)
     if op == "decrypt" and not isinstance(error, CipherUnavailableError):
         error = CipherUnavailableError(str(error))

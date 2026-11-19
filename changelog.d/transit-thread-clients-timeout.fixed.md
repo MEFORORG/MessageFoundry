@@ -5,12 +5,12 @@
   thread's client is closed when the thread ends, and closing a SQLite, SQL Server or Postgres
   store closes the others it holds, even when an earlier close step raised; the cipher stays
   usable, because more than one store can share it. A cipher no store holds is not closed this
-  way. Building a client sends no request to Vault, so a build failure is never a network
-  failure; a TLS-suite refusal is one such build failure. A thread whose client cannot be built gets, on a read, the
-  no-verdict outage error, since Vault was never asked about the value. On a write it gets the
-  error the cipher gives that failure, which for a deterministic refusal such as the TLS-suite
-  check is not the outage error, so an upload that hits it is not answered 503 with a retry
-  hint. (`BACKLOG #5963`)
+  way. Building a client sends no request to Vault, so a build failure is never a failure of a
+  request to Vault. A thread whose client cannot be built gets, on a read, the no-verdict outage
+  error, since Vault was never asked about the value. On a write it gets the error the cipher's
+  failure classifier reads the build failure as, which is the outage error only where that
+  classifier reads it as an outage. A stage handoff does not read which of the two it is.
+  (`BACKLOG #5963`)
 - **Every Transit request the cipher sends now times out at 5 seconds to connect and 30 seconds
   per socket read,** set by the engine rather than left at hvac's 30-second default for both; the
   read figure is unchanged and only the connect bound is tighter. This does not
