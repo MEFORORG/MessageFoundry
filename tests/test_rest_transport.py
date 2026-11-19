@@ -181,6 +181,28 @@ def test_rest_bearer_token_beside_basic_is_refused() -> None:
     assert _AUTH_SECRET not in str(ei.value)
 
 
+@pytest.mark.parametrize("timeout", [0, 0.0, "0", -1, -0.5, "-2"])
+def test_rest_timeout_that_is_not_positive_is_refused_at_construction(timeout: object) -> None:
+    """BACKLOG #5796: float_setting passes zero and negatives through, and either built a
+    destination that failed every send."""
+    with pytest.raises(ValueError, match="timeout_seconds must be a number of seconds above zero"):
+        _dest(timeout_seconds=timeout)
+
+
+@pytest.mark.parametrize("encoding", ["not-a-real-codec", "base64", "undefined", None, 8])
+def test_rest_encoding_that_is_not_a_text_codec_is_refused_at_construction(
+    encoding: object,
+) -> None:
+    """BACKLOG #5796: an unknown or non-text codec built a destination that failed every send."""
+    with pytest.raises(ValueError, match="'encoding' must name a Python text codec"):
+        _dest(encoding=encoding)
+
+
+def test_rest_positive_timeout_and_text_codec_still_build() -> None:
+    dest = _dest(timeout_seconds=0.25, encoding="latin-1")
+    assert (dest.timeout, dest.encoding) == (0.25, "latin-1")
+
+
 def test_rest_bearer_token_alone_still_sends_it() -> None:
     dest = _dest(bearer_token="tok")
     assert dest._headers["Authorization"] == "Bearer tok"
