@@ -598,6 +598,143 @@ def test_negative_infinity_round_trips_and_clones(
     assert load_config(cfg).inbound["IB2"].validation.strict_timeout_s == float("-inf")
 
 
+def test_clone_decodes_env_default_and_settings_float_by_type(
+    cfg: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The settings branch types by the transport factory, and an env() reference's `default` takes
+    its field's type, so a clone writes both as a bare `inf` (Lander hold, item 1)."""
+    monkeypatch.delenv("MEFOR_TEST_PS_UNSET", raising=False)
+    out_dir = (cfg / "out").as_posix()
+    (cfg / "connections.toml").write_text(
+        textwrap.dedent(
+            f"""\
+            [[outbound]]
+            name = "OB"
+            transport = "file"
+              [outbound.settings]
+              directory = "{out_dir}"
+              poll_seconds = {{ env = "MEFOR_TEST_PS_UNSET", default = inf, cast = "float" }}
+              min_age_seconds = inf
+            """
+        ),
+        encoding="utf-8",
+    )
+    svc = _svc(cfg, f'[egress]\nallowed_file_dirs = ["{out_dir}"]\n')
+    entry = _listed(cfg, capsys)["OB"]
+    assert entry["settings"]["poll_seconds"]["default"] == "inf"
+    entry["name"] = "OB2"
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 0, out
+    clone = _table_text(cfg, "OB2")
+    assert "default = inf" in clone and "min_age_seconds = inf" in clone
+    assert '"inf"' not in clone
+    load_config(cfg)
+
+
+def test_typed_mapping_and_union_of_arrays_decode_by_element_type() -> None:
+    from messagefoundry.config.connections_edit import _decode_value
+
+    assert _decode_value({"a": "inf", "b": "x"}, (dict[str, float],), None) == {
+        "a": float("inf"),
+        "b": "x",
+    }
+    assert _decode_value({"a": "inf"}, (dict[str, str],), None) == {"a": "inf"}
+    assert _decode_value(["-inf"], (list[float] | tuple[int, ...],), None) == [float("-inf")]
+
+
+def test_fresh_nan_in_a_float_field_is_still_refused(
+    cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Main refused the string "nan" in a float field, and the IDE relies on that. A NaN backstop
+    would never fire (`nan > 0` is false), so only "inf" / "-inf" decode by type (hold item 4)."""
+    _inf_file(cfg, "strict_timeout_s")
+    before = (cfg / "connections.toml").read_bytes()
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entry = _listed(cfg, capsys)["IB"]
+    entry["strict_timeout_s"] = "nan"
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 1, out
+    assert "strict_timeout_s" in out
+    assert (cfg / "connections.toml").read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        "strict_timeout_s = nan  # kept\n",
+        "strict_timeout_s = -nan  # kept\n",
+    ],
+)
+def test_existing_nan_no_op_save_is_byte_identical(
+    line: str, cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A NaN the file already holds decodes from its position, sign kept, and compares unchanged."""
+    before = _INF_ROUND_TRIP_FILE.format(
+        inbound_extra=line, outbound_extra="", outbound_tables=""
+    ).encode("utf-8")
+    (cfg / "connections.toml").write_bytes(before)
+    svc = _svc(cfg, _EPIC_EGRESS)
+    rc, out = _upsert(cfg, _listed(cfg, capsys)["IB"], capsys, svc=svc)
+    assert rc == 0, out
+    assert (cfg / "connections.toml").read_bytes() == before
+
+
+def test_hand_written_string_inf_survives_a_no_op_save(
+    cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A float field the author spelled as the STRING "inf" (pydantic reads it) stays as written."""
+    before = _INF_ROUND_TRIP_FILE.format(
+        inbound_extra="",
+        outbound_extra="",
+        outbound_tables='  [outbound.buildup]\n  max_oldest_seconds = "inf"  # hand\n',
+    ).encode("utf-8")
+    (cfg / "connections.toml").write_bytes(before)
+    svc = _svc(cfg, _EPIC_EGRESS)
+    rc, out = _upsert(cfg, _listed(cfg, capsys)["OB"], capsys, svc=svc)
+    assert rc == 0, out
+    assert (cfg / "connections.toml").read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("edit", "expected"),
+    [
+        (lambda limits: limits.insert(0, 0.5), [0.5, 1.0, float("inf")]),
+        (lambda limits: limits.pop(0), [float("inf")]),
+    ],
+    ids=["insert", "delete"],
+)
+def test_untouched_inf_survives_an_array_shift(
+    edit: object, expected: list[float], cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Array elements match the file's floats by value, so a shift keeps the untouched inf."""
+    (cfg / "connections.toml").write_text(
+        _INF_ROUND_TRIP_FILE.format(
+            inbound_extra="", outbound_extra="", outbound_tables=""
+        ).replace(
+            "  [inbound.settings]", "  metadata = { limits = [1.0, inf] }\n  [inbound.settings]"
+        ),
+        encoding="utf-8",
+    )
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entry = _listed(cfg, capsys)["IB"]
+    assert callable(edit)
+    edit(entry["metadata"]["limits"])
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 0, out
+    assert load_config(cfg).inbound["IB"].metadata == {"limits": expected}
+
+
+def test_policy_models_cover_every_typed_sub_table() -> None:
+    """Drift guard: a new pydantic-read sub-table must be added to _POLICY_MODELS, or its float
+    fields would not decode on a clone. `settings` is typed elsewhere, `metadata` not at all."""
+    from messagefoundry.config import connections_edit
+
+    assert set(connections_edit._POLICY_MODELS) == set(connections_edit._SUB_TABLES) - {
+        "settings",
+        "metadata",
+    }
+
+
 def test_a_string_field_holding_inf_stays_a_string(
     cfg: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

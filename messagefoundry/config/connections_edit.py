@@ -26,7 +26,7 @@ silently deleted by the next GUI/CLI save (the #234 data-loss bug this closes).
 from __future__ import annotations
 
 import contextlib
-import inspect
+import logging
 import math
 from collections.abc import Callable, Iterator
 from datetime import date, datetime, time
@@ -44,6 +44,8 @@ from messagefoundry.config.connections_file import (
     _TRANSPORTS,
     CONNECTIONS_FILE_NAME,
     _classify,
+    _factory_signature,
+    _is_env_marker,
     validating_candidate,
 )
 from messagefoundry.config.models import (
@@ -141,6 +143,8 @@ assert "direction" not in _SCALAR_FIELDS + _SUB_TABLES
 
 Validate = Callable[[Path], None]
 
+_log = logging.getLogger(__name__)
+
 
 @contextlib.contextmanager
 def locked(config_dir: str | Path) -> Iterator[None]:
@@ -202,7 +206,7 @@ def _jsonable(value: Any) -> Any:
         # TOML's inf / -inf / nan have no JSON literal: json.dumps would print a bare Infinity or
         # NaN token a strict parser (the IDE's JSON.parse) refuses. On the way back in,
         # _decode_non_finite turns the string into the float again before upsert compares and
-        # writes, so a re-save or a clone writes `inf`, not "inf". A null instead would drop the key
+        # writes. A null instead would drop the key
         # on re-save, turning an `inf` (off) alert age back into its default (BACKLOG #5778).
         return str(value)
     return value
@@ -232,20 +236,17 @@ def upsert_connection(
         if aot is None:
             aot = tomlkit.aot()
             doc[direction] = aot
-        existing = next((table for table in aot if table.get("name") == obj["name"]), None)
-        new_table = _build_table(
-            _decode_non_finite(obj, existing.unwrap() if existing is not None else None)
-        )
-        for index in range(len(aot)):
-            if aot[index].get("name") == obj["name"]:
-                # Update the EXISTING table object key-wise. Assigning ``aot[index] = new_table``
-                # swaps the whole table out, and tomlkit discards the trivia around it: the edited
-                # table's own inline comments AND the leading comment block of the FOLLOWING entry
-                # (which tomlkit carries as trivia on the array body, not on the next table). A no-op
-                # save therefore deleted the documentation of a connection the user never touched.
-                # Mutating in place keeps every comment that is not attached to a value we change.
-                _apply_table(aot[index], new_table)
-                break
+        index = next((i for i, table in enumerate(aot) if table.get("name") == obj["name"]), None)
+        existing = aot[index].unwrap() if index is not None else None
+        new_table = _build_table(_decode_non_finite(obj, existing))
+        if index is not None:
+            # Update the EXISTING table object key-wise. Assigning ``aot[index] = new_table``
+            # swaps the whole table out, and tomlkit discards the trivia around it: the edited
+            # table's own inline comments AND the leading comment block of the FOLLOWING entry
+            # (which tomlkit carries as trivia on the array body, not on the next table). A no-op
+            # save therefore deleted the documentation of a connection the user never touched.
+            # Mutating in place keeps every comment that is not attached to a value we change.
+            _apply_table(aot[index], new_table)
         else:
             aot.append(new_table)
 
@@ -326,11 +327,13 @@ def _validate_input(obj: Any) -> None:
             )
 
 
-#: The strings :func:`_jsonable` lists a non-finite float as, mapped back to the float.
-_NON_FINITE: dict[str, float] = {str(value): value for value in (math.inf, -math.inf, math.nan)}
+#: The non-finite spellings decoded by TYPE alone. "nan" is not one: a fresh NaN in a float field
+#: stays refused, as on main (``nan > 0`` is false, so it would switch a backstop off unseen). A
+#: "nan" decodes only where the file already holds a NaN there.
+_BY_TYPE: dict[str, float] = {"inf": math.inf, "-inf": -math.inf}
 
 #: The sub-tables whose keys a pydantic model types. ``settings`` is typed by the transport factory,
-#: and ``metadata`` by nothing.
+#: and ``metadata`` by nothing. tests/test_connections_cli.py pins this against _SUB_TABLES.
 _POLICY_MODELS: dict[str, type[BaseModel]] = {
     "retry": RetryPolicy,
     "buildup": BuildupThreshold,
@@ -342,12 +345,15 @@ _POLICY_MODELS: dict[str, type[BaseModel]] = {
 
 @cache
 def _parameter_annotations(factory: Callable[..., Any]) -> dict[str, Any]:
-    """``factory``'s keyword annotations, resolved; empty when they will not resolve. Cached on a
-    closed key set: ``inbound``, ``outbound`` and the transport factories, all module-level."""
-    try:
-        signature = inspect.signature(factory, eval_str=True)
-    except (NameError, AttributeError, SyntaxError, TypeError):
-        return {}  # an unresolvable annotation types nothing, so no string is decoded by type
+    """``factory``'s parameter annotations, resolved; empty, logged once, when they will not."""
+    signature = _factory_signature(factory)
+    if signature is None:
+        _log.warning(
+            "connections editor: %s annotations did not resolve; its float fields are not "
+            "decoded by type",
+            getattr(factory, "__name__", factory),
+        )
+        return {}
     return {name: param.annotation for name, param in signature.parameters.items()}
 
 
@@ -360,63 +366,78 @@ def _field_annotations(key: str, transport: Any) -> dict[str, Any]:
     return {}
 
 
-def _admits_float(annotation: Any) -> bool:
-    accepted = _classify(annotation) if annotation is not None else None
-    return accepted is not None and float in accepted.scalars
-
-
-def _item_annotation(annotation: Any) -> Any:
-    """The element annotation of an array-typed field, or ``None`` when it is not one."""
-    accepted = _classify(annotation) if annotation is not None else None
-    if accepted is None or len(accepted.sequence_items) != 1:
-        return None
-    return accepted.sequence_items[0]
+def _accepted(annotations: tuple[Any, ...]) -> list[Any]:
+    return [accepted for accepted in map(_classify, annotations) if accepted is not None]
 
 
 def _decode_non_finite(obj: dict[str, Any], existing: dict[str, Any] | None) -> dict[str, Any]:
-    """``obj`` with each ``"inf"`` / ``"-inf"`` / ``"nan"`` that :func:`_jsonable` listed for a
-    float decoded back to that float, so upsert compares and writes the float (BACKLOG #5778).
+    """``obj`` with the strings :func:`_jsonable` lists a non-finite float as decoded back to the
+    float, so upsert compares and writes the float (BACKLOG #5778).
 
-    A string is decoded only where the schema types the field as a float -- the ``inbound()`` /
-    ``outbound()`` keyword, the policy model field, or the transport's settings parameter -- or, in
-    an untyped place such as ``metadata`` or an array element, where ``existing`` (the same-named
-    table already in the file) holds that very float at the same position. So a clone or rename
-    writes ``inf`` for a typed field, a real string field holding "inf" stays a string, and the read
-    schema accepts nothing it did not accept before."""
+    ``"inf"`` / ``"-inf"`` decode where the schema types the value as a float: the ``inbound()`` /
+    ``outbound()`` keyword, the policy model field, the transport's settings parameter, an env()
+    reference's ``default`` under one, or a typed mapping or array element. All three spellings
+    decode where ``existing`` (the same-named table in the file) holds that float, matched by key,
+    or by value within an array. An untyped value with no such match, such as a cloned ``metadata``
+    float, stays a string, and so does a string the file already holds."""
     direction = obj["direction"]
     top = _parameter_annotations(inbound if direction == "inbound" else outbound)
+    transport = obj.get("transport")
     prior = existing or {}
-    out: dict[str, Any] = {}
-    for key, value in obj.items():
-        if key in _SUB_TABLES and isinstance(value, dict):
-            fields = _field_annotations(key, obj.get("transport"))
-            prior_sub = prior.get(key)
-            prior_sub = prior_sub if isinstance(prior_sub, dict) else {}
-            out[key] = {
-                name: _decode_value(item, fields.get(name), prior_sub.get(name))
-                for name, item in value.items()
-            }
-        else:
-            out[key] = _decode_value(value, top.get(key), prior.get(key))
-    return out
+    return {
+        key: _decode_value(
+            value,
+            (top.get(key),),
+            prior.get(key),
+            _field_annotations(key, transport) if key in _SUB_TABLES else None,
+        )
+        for key, value in obj.items()
+    }
 
 
-def _decode_value(value: Any, annotation: Any, prior: Any) -> Any:
+def _decode_value(
+    value: Any, annotations: tuple[Any, ...], prior: Any, fields: dict[str, Any] | None = None
+) -> Any:
     if isinstance(value, str):
-        if value in _NON_FINITE and (_admits_float(annotation) or _is_listed_as(prior, value)):
-            return _NON_FINITE[value]
+        if _is_listed_as(prior, value):
+            return prior  # the float the file holds, a NaN's sign included
+        typed_float = any(float in accepted.scalars for accepted in _accepted(annotations))
+        if value in _BY_TYPE and prior != value and typed_float:
+            return _BY_TYPE[value]
         return value
     if isinstance(value, list):
-        item = _item_annotation(annotation)
+        items = tuple(
+            item for accepted in _accepted(annotations) for item in accepted.sequence_items
+        )
         prior_items = prior if isinstance(prior, list) else []
-        return [
-            _decode_value(element, item, prior_items[i] if i < len(prior_items) else None)
-            for i, element in enumerate(value)
-        ]
+        # Match a listed string to the file's float by VALUE, not index: an insert or delete
+        # shifts every position after it.
+        pool = [item for item in prior_items if isinstance(item, float) and not math.isfinite(item)]
+        out = []
+        for index, element in enumerate(value):
+            element_prior = prior_items[index] if index < len(prior_items) else None
+            if isinstance(element, str):
+                match = next((i for i, item in enumerate(pool) if str(item) == element), None)
+                element_prior = pool.pop(match) if match is not None else None
+            out.append(_decode_value(element, items, element_prior))
+        return out
     if isinstance(value, dict):
         prior_map = prior if isinstance(prior, dict) else {}
+        values = tuple(
+            item for accepted in _accepted(annotations) for item in accepted.mapping_values
+        )
+        env_ref = _is_env_marker(value)
+
+        def child(name: str) -> tuple[Any, ...]:
+            if fields is not None:
+                return (fields.get(name),)
+            if env_ref:
+                return annotations if name == "default" else ()
+            return values
+
         return {
-            name: _decode_value(item, None, prior_map.get(name)) for name, item in value.items()
+            name: _decode_value(item, child(name), prior_map.get(name))
+            for name, item in value.items()
         }
     return value
 
@@ -470,9 +491,22 @@ def _plain(item: Any) -> Any:
 def _same_value(current: Any, new: Any) -> bool:
     """Compare a tomlkit item against a freshly built one by VALUE, ignoring formatting."""
     try:
-        return bool(_plain(current) == _plain(new))
+        old, value = _plain(current), _plain(new)
+        return bool(old == value) or _same_nan(old, value)
     except Exception:  # pragma: no cover - defensive: an exotic item type compares as "changed"
         return False
+
+
+def _same_nan(old: Any, new: Any) -> bool:
+    """Two NaNs of one sign are the same value. NaN never compares equal, so without this an
+    untouched ``nan`` was rewritten, losing its comment, on every save."""
+    return (
+        isinstance(old, float)
+        and isinstance(new, float)
+        and math.isnan(old)
+        and math.isnan(new)
+        and math.copysign(1.0, old) == math.copysign(1.0, new)
+    )
 
 
 def _is_table_like(item: Any) -> bool:
