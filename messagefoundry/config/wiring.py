@@ -4615,6 +4615,8 @@ def Direct(
     ``host:port`` over STARTTLS. Cert/key material is loaded + validated at construction (fail loud),
     except the certificates' validity window: construction only warns on it, and each send refuses
     a recipient cert or issuing anchor outside it (code ``direct-cert-validity``, BACKLOG #5631).
+    What construction refuses in the recipient cert, including one that does not name every address
+    in ``recipients``, is listed under *Recipient trust* in ``docs/CONNECTIONS.md``.
 
     **The relay's TLS certificate is verified** (``tls_verify=True``, #323 — ``smtplib``'s own default
     verifies nothing). Note the two trust settings are unrelated and easy to confuse: ``trust_anchor``
