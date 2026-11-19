@@ -1375,6 +1375,7 @@ const MIRRORED = new Set([
  * entry carries the reason it is exempt. Adding an 11th mirror without a parity test must fail. */
 const NOT_A_MIRROR: Record<string, string> = {
   selectRow: "DOM: applies the .selected class and records the toolbar's insert anchor",
+  numberEditValue: "DOM: reads a number <input>; steps-modes-webview.test.ts drives it (BACKLOG #5942)",
   updateAddState: "DOM: greys the toolbar Add button from the <select> + selection",
   getClipboard: "storage: reads the webview's vscode.getState() clipboard slot",
   setClipboard: "storage: writes the webview's vscode.setState() clipboard slot",

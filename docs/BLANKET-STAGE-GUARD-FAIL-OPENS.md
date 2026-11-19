@@ -668,6 +668,24 @@ the cap, every payload family measured for section 4a finished well inside the l
 machine, or a payload shape nobody has measured, could still take longer. This page does not claim
 that none exists.
 
+**A quoted global-option value is a residual too (BACKLOG #5450).** Unlike the rows above, these
+forms were measured for the guard's verdict only: git was not run on them for this page. The guard
+allows at least `git -C "x" add "-A"`, `git --config-env "user.name=GN" add "-A"`,
+`git -C "D:/repo" add "."`, and the glued forms `git --config-env="a=B" add "-A"` and
+`git --git-dir=".git" add "-A"`; it also allows `git --attr-source 'status' add '-A'`, which git
+could run as a stage only where a ref named `status` exists. The guard finds the subcommand on the
+view with quoted text blanked to spaces, so a quoted value leaves its two quotes as two words.
+After a separate value (`-C "x"`) the resolver skips the opening quote as the value and reads the
+closing quote as the subcommand. After a glued value (`--git-dir=".git"`) the option word itself
+ends in the opening quote and is on neither skip list, so the closing quote is read as the
+subcommand; that is why a glued value opens the hole for any global option, listed or not. Either
+way the arguments are then read from the blanked view, where the quoted `"-A"` or `"."` is not
+seen. A loop that skipped to the closing quote was tried and reverted: the blanker ignores
+escapes, so that loop could skip past the real subcommand onto a read-only word and turn a deny
+into an allow. Closing this needs a reading that knows the shell's quoting.
+tests/test_blanket_stage_config_env.py pins these forms as strict xfails, so a repair shows up as
+an unexpected pass.
+
 **5.2 Forms next to an accepted one, where the answer's words do not fit.** Each has a nearest
 accepted line. This page does not sort them under it, because the words differ.
 
@@ -775,6 +793,7 @@ means the guard at the first measured commit allowed the command.
 | `git commit -ma a.txt` | committed `a.txt` only, with the message `a` | before |
 | `git add a.txt # not .`, `git add a.txt # not -A` | staged `a.txt` only | before |
 | `git commit -m wip a.txt # not -a` | committed `a.txt` only | before |
+| `git --attr-source HEAD log add -A` | staged nothing; see the note | before |
 | Any command longer than 65,536 characters, such as a heredoc that writes a large file | not measured; most run no git at all | the length cap |
 
 Notes on these rows:
@@ -783,10 +802,20 @@ Notes on these rows:
   pathspec. Quoting the message avoids it.
 - **Rows 3 and 4** follow from matching the word `commit` wherever the subcommand is not `add`
   or `stage`. The guard's staging rule falls back to the bare word the same way, so that an
-  option it does not know cannot hide the subcommand.
+  option it does not know is less likely to hide the subcommand. It does not make an unknown
+  option harmless; section 5.1, *A quoted global-option value*, says what still passes.
+- **The `--attr-source` row** comes from BACKLOG #5450, which added `--config-env`, `--attr-source`
+  and `--shallow-file` to the guard's skip list. Read with the wider list alone, the command
+  resolves to `log`, which is read-only, and would be allowed; read with the list before #5450, it
+  resolves to `HEAD` and is denied on the word `add`. The guard judges each segment under both
+  lists and denies when either reading denies, so that the wider list removes no deny. Measured
+  for the row: git 2.55.0 takes `HEAD` as the option's value and runs `log`, and
+  `git --attr-source HEAD log -A` exited 128 with `fatal: unrecognized argument: -A` and staged
+  nothing. The full form was not run, because the guard refuses it.
+  tests/test_blanket_stage_config_env.py pins it, and two rows of the same shape, as denies.
 - **Rows 5 and 8** are a stage or a commit scoped to one directory. The guard cannot see the
   working directory, so it reads the dot as the whole tree.
-- **The last two rows** hold the blanket spelling in a trailing comment. The `add` rules and the
+- **The two `# not` rows** hold the blanket spelling in a trailing comment. The `add` rules and the
   `commit -a` rule read the comment as arguments. Only the commit pathspec rule drops it, so
   `git commit -m wip a.txt # not .` is allowed.
 - **The dry-run rows** change nothing in the repository.

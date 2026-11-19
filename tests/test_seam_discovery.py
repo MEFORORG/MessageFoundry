@@ -592,3 +592,229 @@ def test_an_unresolved_forward_ref_fails_loud() -> None:
 
     with pytest.raises(sd.SeamDiscoveryError, match="UNRESOLVED ForwardRef"):
         sd._closure({"_Dangling"}, unresolved, "synthetic")
+
+
+# --- BACKLOG #5471: dataclass DTOs under postponed annotations, and computed fields ---------------
+
+# A fixture MODULE rather than classes in this file: typing.get_type_hints resolves a dataclass's
+# string annotations in its DEFINING module's globals, so the nested names must live there.
+_POSTPONED_SOURCE = """
+from __future__ import annotations
+
+import dataclasses
+import enum
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
+
+from pydantic import BaseModel, ConfigDict, computed_field
+
+if TYPE_CHECKING:
+    from somewhere import Registry
+
+
+class Colour(enum.Enum):
+    RED = "red"
+    BLUE = "blue"
+
+
+class Shade(enum.Enum):
+    DARK = "dark"
+
+
+class Leaf(BaseModel):
+    x: int = 0
+
+
+class Other(BaseModel):
+    y: int = 0
+
+
+@dataclasses.dataclass
+class Holder:
+    leaves: list[Leaf]
+    colour: Colour | None = None
+    scope: Literal["own", "any_owner"] = "own"
+
+
+class WithComputed(BaseModel):
+    plain: int = 0
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def other(self) -> list[Other]:
+        return []
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def tone(self) -> Literal["light", "heavy"] | Shade:
+        return "light"
+
+
+class Marker(BaseModel):
+    z: int = 0
+
+
+@dataclasses.dataclass
+class WithClassVar:
+    name: str = ""
+    registry: ClassVar[Registry | None] = None
+
+
+@dataclasses.dataclass
+class WithMetadata:
+    v: Annotated[int, Marker] = 0
+
+
+class Deferred(BaseModel):
+    model_config = ConfigDict(defer_build=True)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def leaf(self) -> Leaf:
+        return Leaf()
+
+
+class DeferredBroken(BaseModel):
+    model_config = ConfigDict(defer_build=True)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def gone(self) -> NoSuchModel:  # noqa: F821 -- deliberately unresolvable
+        raise AssertionError
+
+
+class ComputedMeta(BaseModel):
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def v(self) -> Annotated[int, Marker]:
+        return 0
+
+
+@dataclasses.dataclass
+class WithCallable:
+    cb: Callable[[NoSuchArg], int] | None = None  # noqa: F821 -- deliberately unresolvable
+
+
+@dataclasses.dataclass
+class Broken:
+    missing: NoSuchName  # noqa: F821 -- deliberately unresolvable
+"""
+
+
+@pytest.fixture
+def postponed(monkeypatch: pytest.MonkeyPatch) -> types.ModuleType:
+    module = types.ModuleType("fake.postponed")
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    exec(compile(_POSTPONED_SOURCE, "fake_postponed.py", "exec"), module.__dict__)
+    return module
+
+
+def _names(found: set[type]) -> set[str]:
+    return {c.__name__ for c in found}
+
+
+def test_a_dataclass_dto_under_postponed_annotations_reaches_its_nested_dto(
+    postponed: types.ModuleType,
+) -> None:
+    """``Field.type`` is the STRING ``"list[Leaf]"`` here, and ``typing.get_args`` returns ``()`` on a
+    string, so the closure used to stop at ``Holder`` and ``Leaf``'s field set left the contract."""
+    assert _names(sd._closure({"Holder"}, postponed, "synthetic")) == {"Holder", "Leaf"}
+
+
+def test_a_dataclass_dto_under_postponed_annotations_yields_its_enums_and_literals(
+    postponed: types.ModuleType,
+) -> None:
+    found = sd._closure({"Holder"}, postponed, "synthetic")
+    assert sd.enums_in_surface(found) == {"fake.postponed.Colour": ("BLUE", "RED")}
+    assert sd.literals_in_surface(found) == {"fake.postponed.Holder.scope": ("any_owner", "own")}
+
+
+def test_a_computed_field_return_type_is_walked(postponed: types.ModuleType) -> None:
+    """The console renders a computed field exactly like a stored one, so a DTO, enum or literal
+    reached only through its return type is contract too."""
+    found = sd._closure({"WithComputed"}, postponed, "synthetic")
+    assert _names(found) == {"WithComputed", "Other"}
+    assert sd.enums_in_surface(found) == {"fake.postponed.Shade": ("DARK",)}
+    assert sd.literals_in_surface(found) == {"fake.postponed.WithComputed.tone": ("heavy", "light")}
+
+
+def test_an_unresolvable_dataclass_annotation_fails_loud(postponed: types.ModuleType) -> None:
+    """A skip here would be indistinguishable from full coverage, so it refuses instead."""
+    with pytest.raises(sd.SeamDiscoveryError, match="UNRESOLVED"):
+        sd._closure({"Broken"}, postponed, "synthetic")
+
+
+def test_an_unresolvable_classvar_does_not_refuse_the_dto(postponed: types.ModuleType) -> None:
+    """A ClassVar is not a field, so a TYPE_CHECKING-only name in one is not a coverage hole."""
+    assert _names(sd._closure({"WithClassVar"}, postponed, "synthetic")) == {"WithClassVar"}
+
+
+def test_annotated_metadata_is_not_walked_as_a_type(postponed: types.ModuleType) -> None:
+    """A model used as ``Annotated`` metadata is data; nothing renders its fields."""
+    assert _names(sd._closure({"WithMetadata"}, postponed, "synthetic")) == {"WithMetadata"}
+
+
+def test_a_deferred_build_is_completed_rather_than_order_dependent(
+    postponed: types.ModuleType,
+) -> None:
+    """A ``defer_build`` model's computed return type is unresolved until first use; discovery
+    completes it itself, so the result does not depend on what validated the model earlier."""
+    assert _names(sd._closure({"Deferred"}, postponed, "synthetic")) == {"Deferred", "Leaf"}
+
+
+def test_a_computed_field_that_cannot_resolve_fails_loud(postponed: types.ModuleType) -> None:
+    with pytest.raises(sd.SeamDiscoveryError, match="not resolved yet"):
+        sd._closure({"DeferredBroken"}, postponed, "synthetic")
+
+
+def test_a_computed_field_annotated_metadata_is_not_walked(postponed: types.ModuleType) -> None:
+    assert _names(sd._closure({"ComputedMeta"}, postponed, "synthetic")) == {"ComputedMeta"}
+
+
+def test_an_unresolved_callable_parameter_fails_loud(postponed: types.ModuleType) -> None:
+    """``Callable[[X], R]`` holds ``X`` in a list ``get_args`` does not flatten."""
+    with pytest.raises(sd.SeamDiscoveryError, match="UNRESOLVED"):
+        sd._closure({"WithCallable"}, postponed, "synthetic")
+
+
+def test_a_string_annotation_left_unresolved_fails_loud() -> None:
+    """The bare-string form of the ForwardRef hole: a string in a TYPE position is refused, while a
+    Literal value or Annotated metadata string is data and passes."""
+    from typing import Annotated
+
+    with pytest.raises(sd.SeamDiscoveryError, match="UNRESOLVED"):
+        sd._refuse_unresolved(_Root, [list["Leaf"]])  # type: ignore[name-defined]  # noqa: F821
+    sd._refuse_unresolved(_Root, [Literal["a", "b"], Annotated[int, "metadata"]])
+
+
+# --- A field typed as pydantic's own BaseModel ---------------------------------------------------
+
+
+class _AnyModelHolder(BaseModel):
+    inner: BaseModel | None = None
+
+
+def test_a_field_typed_basemodel_itself_does_not_crash_discovery() -> None:
+    """``BaseModel`` is never ``__pydantic_complete__`` and has no generic metadata, so rebuilding it
+    raises ``AttributeError``. It has no fields to complete, so discovery skips the rebuild and walks
+    it as an empty DTO, as origin/main did before the deferred-build completion was added."""
+    module = types.ModuleType("fake.anymodel")
+    module.__dict__["_AnyModelHolder"] = _AnyModelHolder
+    assert _names(sd._closure({"_AnyModelHolder"}, module, "synthetic")) == {
+        "_AnyModelHolder",
+        "BaseModel",
+    }
+
+
+def test_a_failing_rebuild_is_refused_as_a_seam_discovery_error(
+    postponed: types.ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rebuild failure must come out loud and TYPED, never as a raw exception from pydantic."""
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise AttributeError("synthetic rebuild failure")
+
+    monkeypatch.setattr(postponed.Deferred, "model_rebuild", _boom)
+    monkeypatch.setattr(postponed.Deferred, "__pydantic_complete__", False)
+    with pytest.raises(sd.SeamDiscoveryError, match="synthetic rebuild failure"):
+        sd._closure({"Deferred"}, postponed, "synthetic")

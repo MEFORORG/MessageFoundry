@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
 import subprocess
 import sys
@@ -81,6 +82,23 @@ RESTORE_HISTORY_DEPTH = 200
 # with `pwsh -NoProfile -File scripts/coord/alloc.ps1 -Kind adr -Title "<title>"`.
 
 
+#: Environment switches that change what a pathspec means. GIT_LITERAL_PATHSPECS turns every `*`
+#: literal and also disables `:(glob)` magic, so the history walk below would find no commit for a
+#: number the base did spend, exit 0, and grant a rename on that empty answer (BACKLOG #5453).
+#: GIT_GLOB_PATHSPECS and GIT_ICASE_PATHSPECS make `git ls-tree` refuse its pathspec, which crashed
+#: the hook. Every pathspec this gate passes is its own, so it drops all four rather than honour them.
+_PATHSPEC_ENV = (
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
+)
+
+
+def _git_env() -> dict[str, str]:
+    return {k: v for k, v in os.environ.items() if k not in _PATHSPEC_ENV}
+
+
 def git(*args: str) -> str:
     # encoding= is REQUIRED, not cosmetic: `text=True` alone decodes with the LOCALE default, which is
     # cp1252 on a stock Windows box. docs/BACKLOG.md and docs/adr/README.md are UTF-8 (em-dashes,
@@ -89,7 +107,12 @@ def git(*args: str) -> str:
     # ledger file. The gate's own failure mode was the one it exists to prevent: silent, and worst on
     # the files it guards.
     proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
-        ["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace"
+        ["git", *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=_git_env(),
     )
     # A git failure (bad ref, missing path) must not read as "the file is empty" — an empty ledger parses
     # as "no numbers taken", which is exactly the false-clean this gate must never emit.
@@ -243,6 +266,16 @@ def adr_index_coverage(adr_dir: Path) -> AdrCoverage:
     return AdrCoverage(files, companions, unrepresented)
 
 
+def _adr_numbers_in(ref: str) -> dict[str, str]:
+    """ADR number -> the first basename under it, in ``ref``'s docs/adr/. A git failure raises."""
+    out: dict[str, str] = {}
+    for f in _paths(git("ls-tree", "-z", "--name-only", ref, "docs/adr/")):
+        m = ADR_FILE.match(f)
+        if m:
+            out.setdefault(m.group(1), f.rsplit("/", 1)[-1])
+    return out
+
+
 class _RestoreEvidence(NamedTuple):
     """What one bounded history walk established about an ADR number (BACKLOG #1468).
 
@@ -353,6 +386,15 @@ class Ledger:
         # Measured 2026-09-10 on this box: a `git` spawn is 53-315 ms whatever it does, and the
         # retired per-ref item sweep was five spawns plus two full parses of a 30k-line file per ref.
         self._parents: list[str] | None = None
+        # Rename pairs, keyed by whether the old tree is the base (see renamed_from).
+        self._pairs: dict[bool, dict[str, str]] = {}
+        self._shallow: bool | None = None
+        # Number -> the base commits that touched that number's ADR path, or None where git failed.
+        self._number_commits: dict[str, list[str] | None] = {}
+        # The ADR numbers at the fork point with the base, read once; None where git failed.
+        self._fork_read = False
+        self._fork_sha: str | None = None
+        self._fork_numbers: frozenset[str] | None = None
 
     def _resolve_alloc(self) -> None:
         if self._alloc_resolved:
@@ -400,11 +442,145 @@ class Ledger:
     # This mattered more than it looks: the three-dot failure was SILENT. git() used to swallow a nonzero
     # exit and return "", so added_files() was [] and the gate reported PASS on every run where it could
     # not see. A false clean, on the one check whose whole purpose is never to emit one.
+    #
+    # --no-renames IS REQUIRED WITH --diff-filter=A (BACKLOG #5453). git detects renames by default,
+    # and copies under `diff.renames=copies`, so a `git mv` onto an ADR path reports as R (a copy as
+    # C), the A filter dropped it, and the file skipped every rule below. With detection off, the
+    # destination of a rename or copy is the plain add it is.
+    _ADDED = ("-z", "--name-only", "--no-renames", "--diff-filter=A")
+
     def added_files(self) -> list[str]:
         """Files ADDED by this change. In CI, HEAD is the PR merged into base, so this is the PR's set."""
         if self.ci:
-            return _paths(git("diff", "-z", "--name-only", "--diff-filter=A", self.base, "HEAD"))
-        return _paths(git("diff", "-z", "--cached", "--name-only", "--diff-filter=A"))
+            return _paths(git("diff", *self._ADDED, self.base, "HEAD"))
+        return _paths(git("diff", "--cached", *self._ADDED))
+
+    def renamed_from(self, *, against_base: bool) -> dict[str, str]:
+        """New path -> old path, for each pair git itself calls a RENAME in this change.
+
+        Only the WORDING of a refusal, and the ownership arm's rename grant, read this. A file is
+        still an add to every rule (added_files). A pair needs the old path in the old tree and a
+        body git scores as similar, so a plain add under a number the base has since spent, and most
+        unrelated replacements of a deleted ADR, are not pairs.
+
+        ``against_base`` picks the old tree locally. The base side words rule 1, as CI does, so a
+        base ADR renamed over two commits pairs with its base name, and a branch's own ADR under a
+        number the base has since spent pairs with nothing of the base's unless git scores the two
+        bodies as similar. The HEAD side feeds the grant, whose source is a branch ADR the base never
+        held. CI has one old tree, the base, for both. A git failure raises, as everywhere here.
+
+        -l0 KEEPS THE PAIRING FROM DEPENDING ON THE SIZE OF THE CHANGE. Past diff.renameLimit, which
+        counts every unpaired removed and added path, git pairs only EXACT renames, so a large change
+        cost an edited ADR rename its pairing: the wording fell back to a reuse, and a branch ADR's
+        rename to an ownership refusal. -l0 lifts the limit; the pathspec keeps that unlimited search
+        to docs/adr/, the only place a same-number source can be.
+        """
+        args = ("-z", "--name-status", "-M", "-l0", "--diff-filter=R")
+        adr = ("--", "docs/adr/")
+        if self.ci:
+            out = git("diff", *args, self.base, "HEAD", *adr)
+        elif against_base:
+            out = git("diff", "--cached", *args, self.base, *adr)
+        else:
+            out = git("diff", "--cached", *args, *adr)
+        parts = _paths(out)
+        return {parts[i + 2]: parts[i + 1] for i in range(0, len(parts) - 2, 3)}
+
+    def same_number_source(
+        self, path: str, number: str, *, against_base: bool = False
+    ) -> str | None:
+        """The ADR this added path was renamed FROM, when that ADR has the same number; else None."""
+        key = against_base and not self.ci  # CI has one old tree, so one memo
+        if key not in self._pairs:
+            self._pairs[key] = self.renamed_from(against_base=key)
+        src = self._pairs[key].get(path)
+        m = ADR_FILE.match(src) if src else None
+        return src if m and m.group(1) == number else None
+
+    def _renames_a_number_new_on_this_branch(self, path: str, number: str) -> bool:
+        """Is this add a same-number rename of an ADR this branch itself introduced (BACKLOG #5453)?
+
+        Such a rename allocates nothing, so the ownership arm grants it. The grant needs POSITIVE
+        facts, and every doubt refuses. Git must pair the file with a same-number ADR. The base's
+        history must show the number never spent: no commit reachable from the base touched an ADR
+        under it, in a clone that is not shallow. And the fork point with the base must hold no ADR
+        under it. A rename onto a number the base once held revives a number the base lost, which is
+        the restore rule's to judge, whether the branch was cut before the base deleted it, merged
+        the base after, or restored the file exactly and renamed it in a later commit. The caller
+        reaches this only for a number absent from the base tip, so the source is never a live base
+        ADR there. A git failure, a shallow clone and a fork point git cannot compute are doubts.
+        """
+        if self.same_number_source(path, number) is None:
+            return False
+        if self._commits_touching_number(number) != [] or self._is_shallow():
+            return False
+        fork_numbers = self._numbers_at_fork()
+        return fork_numbers is not None and number not in fork_numbers
+
+    def _is_shallow(self) -> bool:
+        if self._shallow is None:
+            self._shallow = _clone_is_shallow()
+        return self._shallow
+
+    def _fork_point(self) -> str | None:
+        """The merge-base with the base, or None where git cannot say. Read once a run, with the ADR
+        numbers in its tree."""
+        if not self._fork_read:
+            self._fork_read = True
+            try:
+                fork = git("merge-base", self.base, "HEAD").strip()
+                self._fork_numbers = frozenset(_adr_numbers_in(fork))
+                self._fork_sha = fork or None
+            except OSError:
+                self._fork_sha, self._fork_numbers = None, None
+        return self._fork_sha
+
+    def _numbers_at_fork(self) -> frozenset[str] | None:
+        """The ADR numbers in the fork point's tree, or None where git cannot say."""
+        return self._fork_numbers if self._fork_point() is not None else None
+
+    def _removed_by_this_branch(self, src: str) -> bool:
+        """Did this branch carry ``src`` before this change removed it?
+
+        A local diff against the base reads an ADR the base added after the fork as removed by the
+        branch, so a stale branch's similar-bodied ADR under that number would pair with it and read
+        as a rename. Only a source at HEAD or at the fork point is one this branch removed.
+
+        CI ANSWERS TRUE WITHOUT ASKING GIT. There HEAD is the PR merged into the base and the pairing
+        diffs against the base, so the source is in the base by construction. Asking anyway broke the
+        real checkout: a depth-1 merge commit beside a shallow fetch of the base has no merge base,
+        so every rename of a base ADR read as a reuse and was told to allocate a new number.
+        """
+        if self.ci:
+            return True
+        if _obj_exists(f"HEAD:{src}"):
+            return True
+        fork = self._fork_point()
+        return fork is not None and _obj_exists(f"{fork}:{src}")
+
+    def _commits_touching_number(self, number: str) -> list[str] | None:
+        """Base commits that touched an ADR under this number, newest first, capped; None on a git
+        failure. One walk a number a run, shared by the rename grant and the restore rule.
+
+        --full-history IS REQUIRED NOW THAT AN EMPTY ANSWER GRANTS (BACKLOG #5453). By default git
+        simplifies history: past a merge whose result matches its first parent at these paths, it
+        follows that parent alone, so a number added and dropped on a side branch merged with
+        --no-ff read as never spent. The `:(glob)` magic keeps `*` a wildcard that stops at `/`.
+        """
+        if number not in self._number_commits:
+            try:
+                out: list[str] | None = git(
+                    "rev-list",
+                    "--full-history",
+                    f"--max-count={RESTORE_HISTORY_DEPTH}",
+                    self.base,
+                    "--",
+                    f":(glob)docs/adr/{number}-*.md",
+                ).split()
+            except OSError:
+                out = None
+            self._number_commits[number] = out
+        return self._number_commits[number]
 
     def head_text(self, path: str) -> str:
         """The file as it will exist after this commit — the INDEX, not the working tree."""
@@ -414,12 +590,7 @@ class Ledger:
         return git("show", f"{self.base}:{path}")
 
     def base_adr_numbers(self) -> dict[str, str]:
-        out: dict[str, str] = {}
-        for f in _paths(git("ls-tree", "-z", "--name-only", self.base, "docs/adr/")):
-            m = ADR_FILE.match(f)
-            if m:
-                out.setdefault(m.group(1), f.rsplit("/", 1)[-1])
-        return out
+        return _adr_numbers_in(self.base)
 
     # -- merge parents -------------------------------------------------------------------------------
     #
@@ -502,7 +673,9 @@ class Ledger:
     #   it fails closed        every uncertain answer is False, and False is the status quo refusal.
     #   it never runs in CI    its only caller sits inside the `not self.ci` ownership arm.
     #   it costs nothing on    the caller is the last conjunct of a chain that has already decided to
-    #     a passing commit     refuse, and ONE walk answers both questions the refusal needs.
+    #     a passing commit     refuse, and ONE walk answers both questions the refusal needs. The one
+    #                          exception is the rename grant (BACKLOG #5453), which runs the same
+    #                          memoized walk for a file git pairs with a same-number ADR.
     #   a negative is not      a shallow clone and a saturated cap both report no commits and exit 0,
     #     always an absence    so the walk returns WHY it found nothing. See _RestoreEvidence.
     def _history_of_this_number(self, path: str, number: str) -> _RestoreEvidence:
@@ -513,15 +686,8 @@ class Ledger:
         see :class:`_RestoreEvidence`, whose ``exhausted`` flag is what stops the refusal text claiming
         the base never held bytes it simply did not walk far enough to see.
         """
-        try:
-            commits = git(
-                "rev-list",
-                f"--max-count={RESTORE_HISTORY_DEPTH}",
-                self.base,
-                "--",
-                f"docs/adr/{number}-*.md",
-            ).split()
-        except OSError:  # pragma: no cover - defensive; an unreadable base is never a restore
+        commits = self._commits_touching_number(number)
+        if commits is None:  # pragma: no cover - defensive; an unreadable base is never a restore
             return _RestoreEvidence(False, False, False)
         staged = _blob_id(f":{path}")
         restores = staged is not None and any(
@@ -529,7 +695,7 @@ class Ledger:
         )
         # "I found nothing" and "I could not look" must not share an answer. A shallow clone is the
         # measured case; a walk that hit its own cap is the other.
-        truncated = (not commits and _clone_is_shallow()) or len(commits) >= RESTORE_HISTORY_DEPTH
+        truncated = (not commits and self._is_shallow()) or len(commits) >= RESTORE_HISTORY_DEPTH
         return _RestoreEvidence(restores, bool(commits), truncated)
 
     # -- ownership -----------------------------------------------------------------------------------
@@ -669,7 +835,14 @@ class Ledger:
         ]
         return "\n      ".join(lines)
 
-    def _ownership_refusal(self, number: str, seen: _RestoreEvidence) -> tuple[str, str, str]:
+    def _ownership_refusal(
+        self,
+        number: str,
+        seen: _RestoreEvidence,
+        *,
+        renamed: bool = False,
+        fork_unknown: bool = False,
+    ) -> tuple[str, str, str]:
         """Word an ownership refusal against what history actually showed (BACKLOG #1468).
 
         ***THE REMEDY NEVER BUILDS A SHELL COMMAND OUT OF A REPO-CONTROLLED VALUE, AND AN EARLIER
@@ -686,6 +859,12 @@ class Ledger:
         "nobody can be holding a number the base already spent" is true of the ALLOCATOR and false of
         the registry. Dropping the recover-first advice on this branch would have re-introduced the
         BACKLOG #1414 number-burn through the door opened to close it.
+
+        ``renamed`` marks a file git pairs with a same-number ADR, which the rename grant declined
+        (BACKLOG #5453). Only it gets the lines about a shallow clone and about renaming a restore,
+        because only for it do those lines change what will pass. ``fork_unknown`` marks a renamed
+        file whose grant failed only because git found no fork point with the base: the number may
+        well be allocated, so that refusal names the fork point first and the allocator only last.
         """
         if self.alloc is None:
             # Unresolved is not unowned. Refusing costs a retry; guessing hands out a spent number.
@@ -706,7 +885,20 @@ class Ledger:
                 "because guessing in the other direction hands out a number that is already spent.",
                 "deepen the clone, then retry:\n"
                 "          git fetch --deepen=1000 origin\n"
-                "      If this is NOT a restore, the number simply needs allocating:\n"
+                + (
+                    (
+                        "      A RENAME of an ADR the base never held is refused in ANY shallow clone,\n"
+                        "      deepened or not: only an unshallowed one (git fetch --unshallow origin)\n"
+                        "      can show the number is new. Committing from the allocating tree avoids it.\n"
+                        if self._is_shallow()
+                        else "      This file is a RENAME, and the base's history already touched this\n"
+                        "      number, so it is not a number new to this branch and deepening will not\n"
+                        "      grant it. Committing from the allocating tree avoids it.\n"
+                    )
+                    if renamed
+                    else ""
+                )
+                + "      If this is NOT a restore, the number simply needs allocating:\n"
                 f"      {remedy}",
             )
         if seen.number_is_historical:
@@ -719,7 +911,25 @@ class Ledger:
                 "      amend it in a SECOND commit; an amended file is no longer an ADD, so this rule\n"
                 "      does not look at it again. The commands are in docs/LEDGER-GATE.md,\n"
                 "      'Restoring a number the base lost'.\n"
-                f"      If a claim record still names a live tree, prefer that route:\n      {remedy}",
+                + (
+                    "      This file is a RENAME, and a rename is refused even after an exact restore:\n"
+                    "      keep the name the base lost until the restore lands there, then rename it\n"
+                    "      in a later change.\n"
+                    if renamed
+                    else ""
+                )
+                + f"      If a claim record still names a live tree, prefer that route:\n      {remedy}",
+            )
+        if fork_unknown:
+            # Reached only in a clone that is not shallow (a shallow one reads as TRUNCATED above),
+            # so a failed merge-base means the histories share no commit; a fetch cannot fix that.
+            return (
+                f"ADR {number} is a rename, but git found no fork point with {self.base}",
+                f"This branch shares no commit with {self.base}, so the gate cannot tell whether "
+                f"{self.base} held this number when the branch began, and it refuses. The number "
+                "itself may well be allocated; this is not by itself a request for a new one.",
+                "commit from the worktree that allocated the number, or rebuild this branch on\n"
+                f"      {self.base} and retry. Otherwise:\n      {remedy}",
             )
         return (
             f"ADR {number} was not allocated to this worktree",
@@ -736,7 +946,8 @@ class Ledger:
         ledgers hid a deletion differently. A backlog item was a HEADING inside a 30k-line file:
         absorb it into the line above and the diffstat reads 5 insertions, 1 deletion, with the
         item's whole body still present and re-attributed (BACKLOG #1470). An ADR is a FILE --
-        delete it and git prints `D docs/adr/0084-x.md` in the diffstat and in the PR's file list.
+        delete it and git prints `D docs/adr/0084-x.md` in the diffstat and in the PR's file list,
+        or, where rename detection pairs it with a new path, a rename line naming the old path.
         Building the same machinery against a threat git already reports is not depth, it is noise.
         So the reverse arm went with the half that needed it, and nothing is owed here.
 
@@ -768,22 +979,61 @@ class Ledger:
                 # names the companion. ADR 0013 is exactly this and is CORRECT. Only an UNdeclared reuse
                 # is a collision.
                 if not row_names_file(first_rows.get(number, ""), basename):
-                    self.fail(
-                        f"ADR {number} already exists on {self.base} as "
-                        f"{_safe_for_message(base_adrs[number])}",
-                        "Two sessions picking the same number create DIFFERENT filenames, merge CLEAN, and "
-                        "silently corrupt the ledger. This has happened 3x (d1d0a5a, 5b7d046, 9f3483d).",
-                        'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind adr -Title "<title>"'
-                        "   # then rename your file to the number it prints",
-                    )
+                    src = self.same_number_source(path, number, against_base=True)
+                    if src is not None and not self._removed_by_this_branch(src):
+                        src = None
+                    staged = _blob_id(f":{path}") if not self.ci else None
+                    if src is not None:
+                        # git pairs this file, against the base, with the base's own ADR of the
+                        # SAME number, so it is a RENAME of that ADR (BACKLOG #5453), not a second
+                        # session's reuse. It allocates nothing; it owes a row linking the new name.
+                        # With no row left at all, the index-row rule below refuses it and names
+                        # that remedy, so this wording, about the row that stays, is not printed.
+                        if number in rows:
+                            self.fail(
+                                f"ADR {number} was renamed from "
+                                f"{_safe_for_message(src.rsplit('/', 1)[-1])}, and its row in "
+                                "docs/adr/README.md does not link the new file",
+                                "The row still points away from the renamed file, so the ADR under "
+                                "its new name would be invisible in the index.",
+                                "make the row link the renamed file in THIS commit; keep the number",
+                            )
+                    elif staged is not None and staged == _blob_id(f"{self.base}:{path}"):
+                        # The staged file IS the base's own, path and bytes, as when a merge brings
+                        # in an ADR the base renamed and the row was resolved back to the old link.
+                        # Nothing is reused; the row is wrong. Same path with other bytes is a
+                        # stale branch's collision, and stays a reuse.
+                        if number in rows:
+                            self.fail(
+                                f"ADR {number}'s row in docs/adr/README.md does not link a file "
+                                f"{self.base} carries under that number",
+                                "The row points away from the base's own file, so that ADR would be "
+                                "invisible in the index.",
+                                "make the row link the file this commit adds, as the base does; "
+                                "keep the number",
+                            )
+                    else:
+                        self.fail(
+                            f"ADR {number} already exists on {self.base} as "
+                            f"{_safe_for_message(base_adrs[number])}",
+                            "Two sessions picking the same number create DIFFERENT filenames, merge "
+                            "CLEAN, and silently corrupt the ledger. This has happened 3x (d1d0a5a, "
+                            "5b7d046, 9f3483d).",
+                            'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind adr -Title "<title>"'
+                            "   # then rename your file to the number it prints",
+                        )
             elif (
                 not self.ci
                 and not self.owns("adr", number)
                 and not self._carried_by_a_merge_parent(path)
+                and not self._renames_a_number_new_on_this_branch(path, number)
             ):
                 # LAST, AND THE ORDER IS THE COST CONTROL. Everything above is cheap or memoized; the
                 # history walk is not. Reaching it means the commit was already headed for a refusal,
-                # so the walk is never paid on a passing commit (BACKLOG #1468).
+                # so the walk is never paid on a passing commit (BACKLOG #1468), with one exception:
+                # the rename grant above walks the same history for a file git pairs with a
+                # same-number ADR (BACKLOG #5453). The walk is memoized per number, so a refusal
+                # after that grant declines reuses it rather than walking again.
                 #
                 # ***IT MUST NOT `continue`, AND WRITING IT THAT WAY ONCE IS WHY THIS SAYS SO.*** The
                 # index-row rule below is the second half of THIS iteration, and a restore needs its
@@ -792,7 +1042,19 @@ class Ledger:
                 # dropped-row defect through the restore door.
                 seen = self._history_of_this_number(path, number)
                 if not seen.restores_lost_bytes:
-                    self.fail(*self._ownership_refusal(number, seen))
+                    renamed = self.same_number_source(path, number) is not None
+                    # Read the fork point only where the refusal would use it.
+                    fork_unknown = (
+                        renamed
+                        and not seen.truncated
+                        and not seen.number_is_historical
+                        and self._fork_point() is None
+                    )
+                    self.fail(
+                        *self._ownership_refusal(
+                            number, seen, renamed=renamed, fork_unknown=fork_unknown
+                        )
+                    )
 
             # Only ADDED files are checked here, the right scope for a commit-time gate. The whole
             # corpus is adr_index_coverage's, and it needs no legacy exemption: 0077/0079/0080 have rows.

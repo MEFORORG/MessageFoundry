@@ -130,6 +130,7 @@ from messagefoundry.transports.rest import (
     hop_reaches_a_proxy,
     http_credentials_sent,
     http_family_trust_anchor,
+    mint_bearer,
     normalize_header_allowlist,
     outbound_headers_from_metadata,
     refuse_cleartext_credentials,
@@ -1567,14 +1568,28 @@ class FhirDestination(DestinationConnector):
         url = f"{self.base_url.rstrip('/')}/metadata"
         headers = self._headers
         if self._token_provider is not None:
-            # Acquire a real SMART token so reachability reflects the actual credentials.
-            headers = {
-                **self._headers,
-                "Authorization": f"Bearer {self._token_provider.access_token()}",
-            }
-        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
-            url, headers=headers, method="GET"
-        )
+            # Acquire a real SMART token so reachability reflects the actual credentials. BACKLOG
+            # #5795: a token request that cannot be built is a classified DeliveryError, and a
+            # NegativeAckError from the token hop (a refused Digest challenge) is retyped to one,
+            # since a probe raises only a plain DeliveryError, as the REST probe does.
+            try:
+                bearer = mint_bearer(
+                    self._token_provider.access_token,
+                    f"FHIR {_redact_url(self.base_url)} probe",
+                    probe=True,
+                )
+            except NegativeAckError as exc:
+                raise DeliveryError(str(exc)) from exc
+            headers = {**self._headers, "Authorization": f"Bearer {bearer}"}
+        try:
+            req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
+                url, headers=headers, method="GET"
+            )
+        except ValueError as exc:
+            # BACKLOG #5795: classified as the open's ValueError arm below classifies it.
+            raise DeliveryError(
+                f"FHIR {_redact_url(self.base_url)} rejected an invalid request value"
+            ) from exc
         # ASVS 4.2.5: this probe MINTS a real bearer above (so reachability reflects the actual
         # credentials), and that token is the one value the construction gate could not see -- the URL
         # and the static headers were already bounded there. Gated here so an operator's "test
@@ -1594,7 +1609,7 @@ class FhirDestination(DestinationConnector):
         except NegativeAckError as exc:
             if exc.credential_fault and self._token_provider is not None:
                 self._token_provider.invalidate()
-            raise
+            raise DeliveryError(str(exc)) from exc  # BACKLOG #5795: as the REST probe retypes it
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # ASVS 15.2.2: the probe body is discarded, but draining it unbounded would let a
@@ -1677,8 +1692,12 @@ class FhirDestination(DestinationConnector):
         headers = {**self._headers, **extra_headers}
         if self._token_provider is not None:
             # ADR 0024: a fresh SMART bearer per request, acquired off-loop past the queue boundary (a
-            # retry re-mints — re-run purity holds). Overrides any static bearer_token.
-            headers["Authorization"] = f"Bearer {self._token_provider.access_token()}"
+            # retry re-mints — re-run purity holds). Overrides any static bearer_token. BACKLOG
+            # #5795: a token request that cannot be built is a configuration fault.
+            bearer = mint_bearer(
+                self._token_provider.access_token, f"FHIR {_redact_url(self.base_url)}"
+            )
+            headers["Authorization"] = f"Bearer {bearer}"
         if self._signer is not None:
             # ASVS 4.1.5 (ADR 0018): detached JWS over the body bytes, minted off-loop past the queue
             # boundary so a retry re-mints it (re-run purity holds).

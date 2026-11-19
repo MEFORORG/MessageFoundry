@@ -35,6 +35,7 @@ fixed and cannot be quietly closed.
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import re
@@ -959,6 +960,53 @@ def test_the_claim_primitive_reports_a_failure_it_cannot_have_won(tmp_path: Path
     assert r["firstWon"] is True
     assert r["againWon"] is False, "a sequential re-move of an already-moved source reported a win"
     assert r["againThrew"] is True
+
+
+HOST_PROBE = r"""
+param([Parameter(Mandatory)][string]$ClaimLib)
+$ErrorActionPreference = 'Stop'
+. $ClaimLib
+# 'other' FIRST: it is the case an env-first rule would fail, so a cache filled by an earlier case
+# could never hide it. Get-ClaimHostToken caches nothing today, so the rest run in the same process.
+$rows = foreach ($case in @('other', 'unset', 'empty')) {
+    switch ($case) {
+        'unset' { Remove-Item Env:COMPUTERNAME -ErrorAction SilentlyContinue }
+        'empty' { $env:COMPUTERNAME = '' }
+        'other' { $env:COMPUTERNAME = 'other-box' }
+    }
+    $tok = New-ClaimToken
+    [pscustomobject]@{
+        case = $case; computername = [string]$env:COMPUTERNAME; host = Get-ClaimHostToken
+        tokenHost = $tok.Split('-')[0]; ownState = Get-ClaimTokenOwnerState -Token $tok
+    }
+}
+([pscustomobject]@{ machine = [Environment]::MachineName; rows = @($rows) } | ConvertTo-Json -Depth 3) | Write-Output
+"""
+
+
+def test_the_claim_host_token_ignores_an_overridden_computername(tmp_path: Path) -> None:
+    """Vault BACKLOG #5306. Red pre-fix: the host token hashed ``$env:COMPUTERNAME``, which is
+    inherited and overwritable, so two machines with it unset or equal would share a token and a live
+    remote claim could be judged dead and swept to stranded/. The token must hash the machine's own
+    name whatever the variable says.
+    """
+    script = tmp_path / "host_probe.ps1"
+    script.write_text(HOST_PROBE, encoding="ascii")
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script), "-ClaimLib", str(MAIL_CLAIM)],
+        capture_output=True, text=True, timeout=TIMEOUT, check=False,
+    )  # fmt: skip
+    assert proc.returncode == 0, proc.stderr
+    r = json.loads(proc.stdout)
+    want = hashlib.sha256(r["machine"].lower().encode("utf-8")).hexdigest()[:4]
+    assert [row["case"] for row in r["rows"]] == ["other", "unset", "empty"], r
+    for row in r["rows"]:
+        # The variable really differed from the machine name, or this case measures nothing.
+        assert row["computername"].lower() != r["machine"].lower(), row
+        assert row["host"] == want, f"{row} is not the hash of {r['machine']!r}"
+        # The token a claimer mints carries the same host, so its own claim still reads live here.
+        assert row["tokenHost"] == want, row
+        assert row["ownState"] == "live", row
 
 
 DRAINS = (

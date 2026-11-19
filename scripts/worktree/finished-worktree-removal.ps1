@@ -313,6 +313,7 @@ Command.
                            cannot be re-read
              ORPHANED      deregistered, but the directory is still on disk or cannot be read; needs a
                            human
+             NOT-REACHED   -StopAt had passed before this path was started; nothing was attempted
     Command  the exact removal command, run or (in a dry run) not run. Never carries --force.
 #>
 function Invoke-FinishedWorktreeRemoval {
@@ -323,7 +324,10 @@ function Invoke-FinishedWorktreeRemoval {
         [Parameter(Mandatory)][double]$IdleHours,
         # Worktrees that must never be removed whatever they look like: the one the caller runs from.
         [string[]]$Protect = @(),
-        [switch]$Apply
+        [switch]$Apply,
+        # Start no path once this time has passed (run-daily-prune.ps1 -StopAfterMinutes). Each path left
+        # gets a NOT-REACHED row; nothing was attempted on it.
+        [Nullable[datetime]]$StopAt
     )
     $ErrorActionPreference = 'Stop'
     $PSNativeCommandUseErrorActionPreference = $false
@@ -364,6 +368,13 @@ function Invoke-FinishedWorktreeRemoval {
 
     foreach ($path in @($Paths | Where-Object { $_ })) {
         $row = [pscustomobject]@{ Path = $path; Outcome = 'REFUSED'; Reason = ''; Command = "git -C `"$Primary`" worktree remove `"$path`"" }
+        # A run-wide refusal still wins: it is the one line saying the setup is broken.
+        if (-not $allRefusal -and $null -ne $StopAt -and [DateTime]::UtcNow -ge $StopAt.ToUniversalTime()) {
+            $row.Outcome = 'NOT-REACHED'
+            $row.Reason = "the run's deadline ($($StopAt.ToLocalTime().ToString('HH:mm:ss'))) passed first; nothing was attempted"
+            $row
+            continue
+        }
         try {
             $refusal = if ($allRefusal) { $allRefusal } else {
                 Get-FinishedWorktreeRefusal -Primary $Primary -Path $path -IdleHours $IdleHours -ProtectNorm $protectNorm `

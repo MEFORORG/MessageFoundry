@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -416,6 +417,164 @@ def test_a_backlog_that_could_not_be_read_refuses_rather_than_reporting_nothing(
     proc = adjudicate(repo)
     assert proc.returncode != 0
     assert "no backlog file found" in (proc.stderr + proc.stdout)
+
+
+def test_a_backlog_named_file_with_no_item_refuses_rather_than_reporting_no_item(
+    repo: Path, tmp_path: Path
+) -> None:
+    """BACKLOG #5480. The ledger left this repository and docs/BACKLOG.md became a stub with no item
+    heading, while other docs carry BACKLOG in their names. A file-name match then passed the check
+    above and every numeric key read NO-ITEM over a namespace that holds nothing.
+
+    THE CONTROL is the same claim against a ledger holding one item: it is adjudicated, so the
+    refusal is caused by the missing item heading and not by the fixture.
+    """
+    write_claim(repo, "26", tmp_path / "gone", "seat")
+    stub = (
+        "Planning and the backlog for this project are maintained privately.\n\n"
+        "## How to contribute\n\nOpen a pull request.\n\n"
+        "## Why `BACKLOG #N` does not resolve here\n\nThose numbers index the private ledger.\n"
+    )
+    proposals = repo / "docs" / "backlog-proposals" / "packet.md"
+    proposals.parent.mkdir(parents=True)
+    proposals.write_text("# Proposal\n\n## Item 26 would be this\n", encoding="utf-8")
+    backlog(repo, stub)
+
+    proc = adjudicate(repo)
+    combined = proc.stderr + proc.stdout
+    assert proc.returncode != 0, f"a ledger with no item still produced a report:\n{combined}"
+    assert "no backlog item heading found" in combined, combined
+    assert "vault" in combined, combined
+    assert "NO-ITEM" not in proc.stdout, combined
+
+    backlog(repo, f"## 26. A real item\n\n> {SHIPPED} SHIPPED\n")
+    proc = adjudicate(repo, "-Json")
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout)
+    assert {c["key"] for c in report["claims"]} == {"26"}
+    # The proposals file matches BACKLOG by name but holds no item, so it is not a source.
+    assert report["sources"]["backlog"] == ["docs/BACKLOG.md"], report["sources"]
+
+
+def _failing_git_env(tmp_path: Path, subcommand: str, said: str) -> dict[str, str]:
+    """PATH with a ``git.cmd`` shim first that fails ONE git subcommand, writing ``said`` to stderr.
+
+    The script spells every namespace read ``git -C <repo> <subcommand> ...``, so the subcommand is
+    ``%3``; every other call passes through to the real git. pwsh finds a ``.cmd`` first on PATH.
+    """
+    real_git = shutil.which("git")
+    assert real_git is not None
+    shim = tmp_path / f"shim-{subcommand}"
+    shim.mkdir()
+    (shim / "git.cmd").write_text(
+        "@echo off\r\n"
+        f'if "%3"=="{subcommand}" (\r\n'
+        f"  echo {said} 1>&2\r\n"
+        "  exit /b 128\r\n"
+        ")\r\n"
+        f'"{real_git}" %*\r\n',
+        encoding="ascii",
+        newline="",
+    )
+    return dict(os.environ, PATH=f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+
+def _with_quoting_forced(env: dict[str, str]) -> dict[str, str]:
+    """``env`` with git's path quoting forced ON, appended after any inherited GIT_CONFIG_* entries.
+
+    A machine with ``core.quotePath=false`` never quotes a non-ASCII name, so the pre-``-z`` code
+    would pass the non-ASCII case there and it would no longer pin the regression. Appended at the
+    inherited count rather than overwriting index 0, so config a runner injects the same way stays.
+    """
+    out = dict(env)
+    n = int(out.get("GIT_CONFIG_COUNT", "0") or "0")
+    out[f"GIT_CONFIG_KEY_{n}"] = "core.quotePath"
+    out[f"GIT_CONFIG_VALUE_{n}"] = "true"
+    out["GIT_CONFIG_COUNT"] = str(n + 1)
+    return out
+
+
+def _flat(text: str) -> str:
+    """pwsh's error view colours a thrown message and word-wraps it at the console width with a
+    ``|`` gutter, so a phrase can straddle a line. Strip both before matching a phrase."""
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    return re.sub(r"\s*\n\s*\|?\s*", " ", text)
+
+
+def _adjudicate_env(
+    repo: Path, env: dict[str, str], *args: str
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(repo / "scripts" / "coord" / "claim-adjudicate.ps1"),
+            *args,
+        ],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=TIMEOUT,
+        env=env,
+    )
+
+
+def test_the_failing_git_shim_passes_every_other_call_through(repo: Path, tmp_path: Path) -> None:
+    """THE CONTROL for the refusals below: a shim failing a subcommand the script never runs still
+    lets the claim be adjudicated, so a refusal there is the failing call and not the shim."""
+    write_claim(repo, "27", tmp_path / "gone", "seat")
+    backlog(repo, f"## 27. A real item\n\n> {SHIPPED} SHIPPED\n")
+    proc = _adjudicate_env(repo, _failing_git_env(tmp_path, "never-run", "fatal: unused"), "-Json")
+    assert proc.returncode == 0, proc.stderr
+    assert {c["key"] for c in json.loads(proc.stdout)["claims"]} == {"27"}
+
+
+@pytest.mark.parametrize(
+    "subcommand,phrase",
+    [("show", "only partly read"), ("ls-tree", "not read")],
+)
+def test_a_failed_namespace_read_refuses_and_carries_gits_own_words(
+    repo: Path, tmp_path: Path, subcommand: str, phrase: str
+) -> None:
+    """MUST TRIP. A git show or ls-tree that fails must refuse the whole run rather than drop a file
+    (its items would read NO-ITEM) or read an empty tree, and the refusal must carry git's own stderr
+    so the operator sees why. The control is the pass-through case above.
+    """
+    write_claim(repo, "27", tmp_path / "gone", "seat")
+    backlog(repo, f"## 27. A real item\n\n> {SHIPPED} SHIPPED\n")
+    said = f"fatal: synthetic {subcommand} failure"
+    proc = _adjudicate_env(repo, _failing_git_env(tmp_path, subcommand, said))
+    combined = _flat(proc.stderr + proc.stdout)
+    assert proc.returncode != 0, f"a failed {subcommand} still produced a report:\n{combined}"
+    assert f"git {subcommand} exited 128" in combined, combined
+    assert phrase in combined, combined
+    assert said in combined, f"the refusal dropped git's stderr:\n{combined}"
+    assert "NO-ITEM" not in proc.stdout, combined
+
+
+def test_a_non_ascii_backlog_file_name_is_read_not_quoted_away(repo: Path, tmp_path: Path) -> None:
+    """MUST TRIP on ``ls-tree`` without ``-z``: git quotes a path holding a non-ASCII byte, and the
+    quoted spelling is not a path git show can read. The control is
+    ``test_the_archived_backlog_file_is_read_too``, the same shape with an ASCII name.
+    """
+    name = "BACKLOG-CLOS\N{LATIN CAPITAL LETTER E WITH ACUTE}.md"
+    p = repo / "docs" / "archive" / "backlog" / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        f"# Closed\n\n## 11. Retired thing\n\n> {RETIRED} retired\n\nbody\n", encoding="utf-8"
+    )
+    backlog(repo, f"## 12. Something else\n\n> {PRIORITIZED} open\n\nbody\n")
+    unmerged_branch(repo, "seat")
+    write_claim(repo, "11", tmp_path / "gone", "seat")
+    # Quoting forced ON, so a developer's core.quotePath=false cannot hide the regression.
+    env = _with_quoting_forced(dict(os.environ))
+    proc = _adjudicate_env(repo, env, "-Json")
+    assert proc.returncode == 0, proc.stderr
+    r = {c["key"]: c for c in json.loads(proc.stdout)["claims"]}["11"]
+    assert r["verdict"] == "SUPERSEDED", r
 
 
 def test_the_script_carries_no_control_characters() -> None:

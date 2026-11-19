@@ -34,6 +34,7 @@ mojibake on a stock Windows code page. Asserting on it would be testing the code
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -69,8 +70,13 @@ def _derived_tokens(marker: str) -> str:
     )
 
 
+#: Git variables that would point a temp checkout's git calls at another repository or index.
+_GIT_REDIRECTS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")
+
+
 def _git(*args: str, cwd: Path) -> None:
-    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True)
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_REDIRECTS}
+    subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, env=env)
 
 
 def _checkout(path: Path) -> Path:
@@ -95,7 +101,8 @@ def _checkout(path: Path) -> Path:
 def _python_shim(path: Path) -> Path:
     """A directory holding a ``python`` that forwards to THIS interpreter.
 
-    The script resolves ``<repo>/.venv/Scripts/python.exe`` or falls back to bare ``python`` on PATH.
+    The script resolves the checkout's venv interpreter (``<repo>/.venv/Scripts/python.exe`` on
+    Windows, ``<repo>/.venv/bin/python`` on POSIX) or falls back to bare ``python`` on PATH.
     A temp checkout has no venv, so the verify step would otherwise depend on whichever ``python`` the
     runner happens to expose -- which is why the neighbouring anchoring test declines to assert the
     verify step at all. The shim makes the interpreter an INPUT of the test rather than an accident of
@@ -130,6 +137,9 @@ def _env(shim: Path, **over: str) -> dict[str, str]:
         "MEFOR_MIN_DETECTORS",
         "PYTHONIOENCODING",
         "PYTHONUTF8",
+        # Exported by a hook running the suite, these would point the scanner's git at another
+        # repository or index, and put a directory the tests treat as outside any checkout inside one.
+        *_GIT_REDIRECTS,
     ):
         env.pop(var, None)
     env["PATH"] = str(shim) + os.pathsep + env.get("PATH", "")
@@ -137,7 +147,10 @@ def _env(shim: Path, **over: str) -> dict[str, str]:
     return env
 
 
-def _run(root: Path, *args: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def _run(
+    root: Path, *args: str, env: dict[str, str], cwd: Path | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run the checkout's script by absolute path, from ``cwd`` (the checkout itself by default)."""
     return subprocess.run(
         [
             "pwsh",
@@ -147,7 +160,7 @@ def _run(root: Path, *args: str, env: dict[str, str]) -> subprocess.CompletedPro
             str(root / "scripts" / "dev" / "setup-leak-gate.ps1"),
             *args,
         ],
-        cwd=str(root),
+        cwd=str(cwd or root),
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -333,3 +346,171 @@ def test_a_healthy_run_still_exits_zero(rig: tuple[Path, Path, Path]) -> None:
     proc = _run(root, "-Synthetic", env=_env(shim))
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "VERIFY FAILED" not in proc.stdout
+
+
+# --------------------------------------------------------------------------------------------------
+# the verify step scans the checkout the script derives, not the caller's directory (BACKLOG #5467)
+# --------------------------------------------------------------------------------------------------
+
+
+def test_the_verify_step_runs_from_outside_any_git_directory(
+    rig: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    """With no path argument the scanner lists the tracked files of its CURRENT DIRECTORY. Invoked by
+    absolute path from a directory that is no git checkout, the verify step used to fail there."""
+    root, shim, _ = rig
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    env = _env(shim)
+    # The premise: a basetemp inside a checkout would make this a git directory after all.
+    probe = subprocess.run(
+        ["git", "rev-parse", "--git-dir"], cwd=str(elsewhere), capture_output=True, env=env
+    )
+    if probe.returncode == 0:
+        pytest.skip("tmp_path is inside a git checkout here, so the premise does not hold")
+    proc = _run(root, "-Synthetic", env=env, cwd=elsewhere)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "CONFIGURED (synthetic)" in proc.stdout, proc.stdout
+    assert "VERIFY FAILED" not in proc.stdout
+
+
+def test_the_verify_step_scans_the_derived_checkout_not_the_callers(
+    rig: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    """The caller's checkout tracks a file carrying a listed token; the derived checkout does not.
+
+    Scanning the caller's directory would report that hit against a checkout it does not belong to.
+    The paired control below proves the planted file IS a hit, so a pass here is not a blind scanner.
+    """
+    root, shim, ext = rig
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    (caller / "notes.txt").write_text(f"{_EXTERNAL_MARKER}\n", encoding="utf-8")
+    _git("init", "-b", "main", ".", cwd=caller)
+    _git("add", "notes.txt", cwd=caller)
+    env = _env(shim, MEFOR_FORBIDDEN_TOKENS=str(ext))
+
+    proc = _run(root, "-Synthetic", env=env, cwd=caller)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "VERIFY FAILED" not in proc.stdout
+
+    # The control: the same planted file, tracked in the DERIVED checkout, does fail the verify step.
+    (root / "notes.txt").write_text(f"{_EXTERNAL_MARKER}\n", encoding="utf-8")
+    _git("add", "notes.txt", cwd=root)
+    control = _run(root, "-Synthetic", env=env, cwd=caller)
+    assert control.returncode != 0, control.stdout
+    assert "VERIFY FAILED" in control.stdout, control.stdout
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="a POSIX venv interpreter has no .exe to launch on Windows"
+)
+def test_a_posix_venv_interpreter_is_used(rig: tuple[Path, Path, Path], tmp_path: Path) -> None:
+    """``<repo>/.venv/bin/python`` is the checkout's interpreter on POSIX; it was ignored in favour of
+    whatever ``python`` PATH offered."""
+    root, shim, _ = rig
+    marker = tmp_path / "venv-python-ran"
+    venv_py = root / ".venv" / "bin" / "python"
+    venv_py.parent.mkdir(parents=True)
+    venv_py.write_text(
+        f'#!/bin/sh\ntouch "{marker}"\nexec "{sys.executable}" "$@"\n', encoding="ascii"
+    )
+    venv_py.chmod(0o755)
+    proc = _run(root, "-Synthetic", env=_env(shim))
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert marker.exists(), "the checkout's .venv/bin/python was not used"
+
+
+def test_a_relative_env_token_path_is_resolved_against_the_checkout(
+    rig: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    """The scanner runs from the derived checkout, in the verify step and in the pre-commit hook, so
+    a relative ``MEFOR_FORBIDDEN_TOKENS`` path names a file there. The script must name the source
+    the scanner loads, whatever directory it was invoked from, and the caller's same-named file must
+    not be what it reports."""
+    root, shim, ext = rig
+    shutil.copy2(ext, root / "tok.txt")
+    caller = tmp_path / "caller-rel"
+    caller.mkdir()
+    (caller / "tok.txt").write_text("decoy, not a token list", encoding="utf-8")
+    proc = _run(root, "-Synthetic", env=_env(shim, MEFOR_FORBIDDEN_TOKENS="tok.txt"), cwd=caller)
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "STRUCTURAL-ONLY" not in _loaded(proc), _loaded(proc)
+    assert "SYNTHETIC" not in _loaded(proc), "the env file was not the source loaded"
+    assert str(root / "tok.txt") in _source_line(proc), _source_line(proc)
+
+
+def test_an_inherited_git_dir_does_not_point_the_scan_at_another_repository(
+    rig: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    """An exported ``GIT_DIR`` outranks the current directory, so the scanner's file listing would
+    come from ANOTHER repository's index while the files are read from this checkout.
+
+    The other repository tracks ``notes.txt``; this checkout holds a same-named file carrying a listed
+    token, UNTRACKED. Listing the other index makes that untracked file a hit; listing this checkout's
+    own index does not. The control tracks the file here, proving the planted file IS a hit.
+    """
+    root, shim, ext = rig
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "notes.txt").write_text("nothing listed here\n", encoding="utf-8")
+    _git("init", "-b", "main", ".", cwd=other)
+    _git("add", "notes.txt", cwd=other)
+    (root / "notes.txt").write_text(f"{_EXTERNAL_MARKER}\n", encoding="utf-8")
+    env = _env(shim, MEFOR_FORBIDDEN_TOKENS=str(ext), GIT_DIR=str(other / ".git"))
+
+    proc = _run(root, "-Synthetic", env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "VERIFY FAILED" not in proc.stdout, proc.stdout
+
+    _git("add", "notes.txt", cwd=root)
+    control = _run(root, "-Synthetic", env=env)
+    assert control.returncode != 0, control.stdout
+    assert "VERIFY FAILED" in control.stdout, control.stdout
+
+
+def test_an_inherited_git_work_tree_does_not_defeat_the_ignore_guard(
+    rig: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    """An exported ``GIT_WORK_TREE`` naming another directory makes ``git -C <repo> check-ignore``
+    refuse the path as outside the work tree, so the guard read the token file as NOT ignored,
+    deleted what it had just installed and threw. Run with the variable dropped, the guard answers
+    about this checkout."""
+    root, shim, _ = rig
+    other = tmp_path / "other-wt"
+    other.mkdir()
+    proc = _run(root, "-Synthetic", env=_env(shim, GIT_WORK_TREE=str(other)))
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "NOT git-ignored" not in proc.stdout + proc.stderr
+    assert "CONFIGURED (synthetic)" in proc.stdout, proc.stdout
+
+
+def test_the_ignore_guard_still_refuses_an_unignored_token_file(
+    rig: tuple[Path, Path, Path],
+) -> None:
+    """The negative control for the wrapped check-ignore: a checkout that does NOT ignore the token
+    file still has it deleted and the run refused, so the wrapper cannot have made the guard pass
+    unconditionally."""
+    root, shim, _ = rig
+    (root / ".gitignore").write_text("", encoding="utf-8")
+    proc = _run(root, "-Synthetic", env=_env(shim))
+
+    assert proc.returncode != 0, proc.stdout
+    assert "NOT git-ignored" in proc.stdout + proc.stderr
+    assert not (root / "scripts" / "security" / "scan-tokens.local.txt").exists()
+
+
+def test_the_dropped_variables_mirror_the_worktree_gate_redirect_list() -> None:
+    """The script drops the location set scripts/worktree/worktree-gates.ps1 refuses; a name added
+    there must not silently stay outside this guard and the verify step."""
+    names = re.compile(r"'([A-Z_]+)'")
+    gates = (_ROOT / "scripts" / "worktree" / "worktree-gates.ps1").read_text(encoding="utf-8")
+    ours = re.search(r"\$gitRedirects = (.*)", _SETUP.read_text(encoding="utf-8"))
+    theirs = re.search(r"\$GIT_REDIRECT_NAMES = @\(([^)]*)\)", gates)
+    assert ours and theirs, "the instrument found no list to compare"
+    assert sorted(names.findall(ours.group(1))) == sorted(names.findall(theirs.group(1)))
+    assert sorted(_GIT_REDIRECTS) == sorted(names.findall(theirs.group(1)))

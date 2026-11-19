@@ -1125,9 +1125,9 @@ def _mfa_code_form(enrolment_code: bool, reauth_prompt: str | None) -> Markup:
 
     The button stands in for the form while the session holds no confirm proof (BACKLOG #5931): a
     code posted then would be refused at the gate and lost. It posts to the same verify route with
-    no code. Except under the require_action_step_up opt-out, the route answers a code-less post
-    ahead of its gate with the re-auth, which lands on the confirm form with the proof held, so a
-    proof already held is not spent on it."""
+    no code. Except under the require_action_step_up opt-out, the route's gate answers a code-less
+    post with the re-auth before it spends the proof, which lands on the confirm form with the proof
+    held, so a proof already held is not spent on it."""
     if reauth_prompt is not None:
         return el(
             "form",

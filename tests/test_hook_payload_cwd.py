@@ -403,6 +403,31 @@ def _resolve_bytes(repo: Path, tmp_path: Path, stdin: bytes, flags: str = "") ->
         (b'[{"cwd": "C:\\\\", "session_id": "s1"}]', "not a JSON object"),
         (b'{"cwd": ".", "session_id": "s1"}', "relative cwd"),
         (b'{"cwd": "\\\\Code", "session_id": "s1"}', "relative cwd"),
+        # #5586 item 3: the [string] cast read a one-element array as its element.
+        (b'{"cwd": ["C:\\\\"], "session_id": "s1"}', "not a string"),
+        (b'{"cwd": {"path": "C:\\\\"}, "session_id": "s1"}', "not a string"),
+        (b'{"cwd": 5, "session_id": "s1"}', "not a string"),
+        # #5586 item 2: a top-level key named twice in different case is ambiguous. Callers read
+        # top-level keys beside these four: seat-unlock reads `reason`.
+        (
+            b'{"cwd": "C:\\\\", "CWD": "D:\\\\", "session_id": "s1"}',
+            "names cwd in keys that differ",
+        ),
+        (b'{"cwd": "C:\\\\", "session_id": "s1", "Session_Id": "s2"}', "names session_id in keys"),
+        (b'{"cwd": "C:\\\\", "source": "clear", "SOURCE": "startup"}', "names source in keys"),
+        (
+            b'{"cwd": "C:\\\\", "hook_event_name": "Stop", "Hook_Event_Name": "x"}',
+            "hook_event_name",
+        ),
+        (b'{"cwd": "C:\\\\", "reason": "clear", "REASON": "x"}', "names reason in keys"),
+        (b'{"cwd": "C:\\\\", "a": 1, "A": 2}', "names a in keys"),
+        # A cast would read a one-element array as its element: an array event became SessionStart.
+        (b'{"cwd": "C:\\\\", "hook_event_name": ["SessionStart"]}', "hook_event_name that is not"),
+        (b'{"cwd": "C:\\\\", "session_id": ["s1"]}', "session_id that is not a string"),
+        (b'{"cwd": "C:\\\\", "source": 1}', "source that is not a string"),
+        # Still not JSON, even through -AsHashtable.
+        (b'{"a": 1, "A": 2', "not readable JSON"),
+        (b'[{"a": 1, "A": 2}]', "not a JSON object"),
     ],
 )
 def test_input_the_helper_cannot_use_is_a_fault(tmp_path: Path, stdin: bytes, why: str) -> None:
@@ -410,7 +435,8 @@ def test_input_the_helper_cannot_use_is_a_fault(tmp_path: Path, stdin: bytes, wh
     got = _resolve_bytes(repo, tmp_path, stdin)
     assert got["Dir"] is None and got["Named"] is True, got
     assert why in got["Reason"], got
-    # Get-CcxHookPayloadCwd, which hooks such as collision_gate call directly, agrees.
+    # Get-CcxHookPayloadCwd -Text agrees. Hooks such as collision_gate call it with -Payload on
+    # their own parse, which reads only the cwd field, so this does not speak for them.
     assert got["PNamed"] is True and why in got["PReason"], got
 
 
@@ -419,6 +445,71 @@ def test_an_object_with_no_cwd_is_still_no_fault(tmp_path: Path) -> None:
     repo, _ = _primary_with(tmp_path, "linked")
     got = _resolve_bytes(repo, tmp_path, b'{"session_id": "s1"}')
     assert got["Reason"] == "" and got["PReason"] == "" and got["PNamed"] is False, got
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        '"": 1',
+        '"psobject": 1',
+        '"ToString": 5, "": 1',
+        '"Keys": ["zz"], "": 1',
+        '"tool_input": {"Keys": ["zz"], "a": 1, "A": 2}',
+        '"tool_input": {"path": "x", "PATH": "y"}',
+        '"tool_input": {"list": [{"k": 1, "K": 2}]}',
+    ],
+)
+def test_json_that_only_convertfrom_json_refuses_is_still_read(tmp_path: Path, extra: str) -> None:
+    """#5586 item 2: keys below the top level that differ only in case, an empty key, or a reserved
+    member name are valid JSON, and a tool's own input can hold any of them. They made
+    ConvertFrom-Json throw, and read as "not readable JSON". A key named `Keys` must not stand in for
+    the key list when the object is rebuilt."""
+    repo, _ = _primary_with(tmp_path, "linked")
+    sub = repo / "sub"
+    sub.mkdir()
+    cwd = json.dumps(str(sub))
+    got = _resolve_bytes(repo, tmp_path, f'{{"cwd": {cwd}, "session_id": "s1", {extra}}}'.encode())
+    assert got["Reason"] == "" and got["PReason"] == "", got
+    assert got["Dir"] and _same_dir(got["Dir"], sub), got
+
+
+def test_a_date_shaped_session_id_is_still_a_string(tmp_path: Path) -> None:
+    """ConvertFrom-Json reads an ISO-8601 string as a date; that is not a non-string input."""
+    repo, _ = _primary_with(tmp_path, "linked")
+    sub = repo / "sub"
+    sub.mkdir()
+    payload = {"cwd": str(sub), "session_id": "2026-11-18T10:00:00Z", "source": "2026-11-18"}
+    got = _resolve_bytes(repo, tmp_path, _raw(payload))
+    assert got["Reason"] == "" and got["PReason"] == "", got
+    assert got["Dir"] and _same_dir(got["Dir"], sub), got
+
+
+def test_a_payload_read_through_the_fallback_keeps_its_other_keys(tmp_path: Path) -> None:
+    """The fallback rebuilds the object; callers such as seat-unlock read keys beside `cwd`."""
+    repo, _ = _primary_with(tmp_path, "linked")
+    probe = tmp_path / "fallback.ps1"
+    probe.write_text(
+        f". '{HELPER}'\n$t = Read-CcxHookInput\n$r = Resolve-CcxHookSession -Text $t\n"
+        "@{ Reason = $r.Reason; Event = $r.Event; Sid = $r.SessionId;"
+        " Why = [string]$r.Payload.reason; Kept = [string]$r.Payload.tool_input.keep;"
+        " Gone = [bool]$r.Payload.tool_input.PSObject.Properties['a'];"
+        " One = $r.Payload.list.Count } | ConvertTo-Json -Compress\n",
+        encoding="utf-8",
+    )
+    stdin = (
+        b'{"session_id": "s9", "hook_event_name": "Stop", "reason": "logout", "list": ["x"],'
+        b' "tool_input": {"keep": "k", "a": 1, "A": 2}, "": 0}'
+    )
+    got = json.loads(_run(probe, repo, stdin).stdout)
+    assert got == {
+        "Reason": "",
+        "Event": "Stop",
+        "Sid": "s9",
+        "Why": "logout",
+        "Kept": "k",
+        "Gone": False,
+        "One": 1,
+    }, got
 
 
 def test_a_stdin_read_that_throws_is_a_fault(tmp_path: Path) -> None:
@@ -470,6 +561,110 @@ def test_a_cwd_named_to_a_hook_started_outside_every_checkout_is_a_fault(tmp_pat
     scratch.mkdir()
     took = _resolve(outside, tmp_path, {"cwd": str(scratch)}, "-ReadOnly -AllowOutside")
     assert took["Dir"] and _same_dir(took["Dir"], scratch) and took["Reason"] == "", took
+
+
+def _short_name(path: Path) -> str:
+    """The 8.3 spelling of `path`, or '' where the volume keeps none."""
+    import ctypes
+
+    buf = ctypes.create_unicode_buffer(32767)
+    n = ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, len(buf))  # type: ignore[attr-defined,unused-ignore]
+    return buf.value if 0 < n < len(buf) else ""
+
+
+def _junction(link: Path, target: Path) -> None:
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_a_cd_inside_a_start_folder_outside_every_checkout_is_not_a_fault(tmp_path: Path) -> None:
+    """#5586 item 1: started in no checkout, only a `cwd` spelled exactly as the start directory was
+    taken, so a `cd` into a subfolder, or a junction spelling of it, was a fault and steer-inject in
+    a non-git project stopped delivering."""
+    base = Path(os.path.realpath(tmp_path))
+    start = base / "start"
+    sub = start / "deeper" / "still"
+    sub.mkdir(parents=True)
+    _junction(base / "jn", start)
+    for cwd in (sub, start / "deeper", base / "jn", base / "jn" / "deeper"):
+        got = _resolve(start, tmp_path, {"cwd": str(cwd), "session_id": "s1"})
+        assert got["Reason"] == "" and got["Dir"] is None, (cwd, got)
+
+
+def test_an_8dot3_spelling_of_a_start_folder_outside_every_checkout_is_not_a_fault(
+    tmp_path: Path,
+) -> None:
+    """#5586 item 1, the short-name half: a subfolder of the start reached through its 8.3 name."""
+    base = Path(os.path.realpath(tmp_path))
+    start = base / "no repo long name"
+    (start / "deeper").mkdir(parents=True)
+    short = _short_name(start)
+    if not short or short.lower() == str(start).lower():
+        pytest.skip("this volume keeps no 8.3 names, so the short-name branch cannot run here")
+    assert "~" in Path(short).name, short
+    for cwd in (Path(short), Path(short) / "deeper"):
+        got = _resolve(start, tmp_path, {"cwd": str(cwd), "session_id": "s1"})
+        assert got["Reason"] == "" and got["Dir"] is None, (cwd, got)
+
+
+def test_a_cd_inside_a_start_folder_below_an_unreadable_git_is_not_a_fault(tmp_path: Path) -> None:
+    """A start below a `.git` this file cannot read (a removed worktree's) is in no checkout it can
+    read, and a `cd` into a subfolder there is the same folder, not a move (review round 1)."""
+    base = Path(os.path.realpath(tmp_path))
+    stale = base / "stale-wt"
+    start = stale / "start"
+    (start / "sub").mkdir(parents=True)
+    (stale / ".git").write_text("gitdir: C:/nonexistent/worktrees/x\n", encoding="utf-8")
+    got = _resolve(start, tmp_path, {"cwd": str(start / "sub"), "session_id": "s1"})
+    assert got["Reason"] == "" and got["Dir"] is None, got
+    # Through a junction to the stale folder, the two roots differ only in spelling (review round 2).
+    _junction(base / "jstale", stale)
+    for cwd, where in (
+        (base / "jstale" / "start" / "sub", start),
+        (start / "sub", base / "jstale" / "start"),
+    ):
+        linked = _resolve(where, tmp_path, {"cwd": str(cwd), "session_id": "s1"})
+        assert linked["Reason"] == "" and linked["Dir"] is None, (cwd, where, linked)
+    # The control: a sibling of the start inside the same stale folder is still a move.
+    (stale / "other").mkdir()
+    moved = _resolve(start, tmp_path, {"cwd": str(stale / "other"), "session_id": "s1"})
+    assert "in no checkout this hook can read" in moved["Reason"], moved
+
+
+def test_a_rooted_relative_link_target_resolves_against_the_drive_root(tmp_path: Path) -> None:
+    """Windows reads a symlink target `\\x` against the link's drive root, not its folder."""
+    base = Path(os.path.realpath(tmp_path))
+    link = base / "l"
+    leaf = f"mefor-no-such-{base.name}"
+    try:
+        os.symlink("\\" + leaf, link, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"this account may not create a symlink: {exc}")
+    got = _helper(tmp_path, f"@{{ Real = ConvertTo-CcxRealPath '{link}' }}", _raw({}))
+    assert got["Real"].lower() == (base.anchor + leaf).lower(), got
+
+
+def test_a_cwd_that_leaves_a_start_folder_outside_every_checkout_is_still_a_fault(
+    tmp_path: Path,
+) -> None:
+    """The negative controls for the arm above: a sibling folder, a junction to one, a parent, and
+    a folder below the start that holds a checkout are each still a fault."""
+    base = Path(os.path.realpath(tmp_path))
+    start = base / "start"
+    start.mkdir()
+    sibling = base / "start-sibling"
+    sibling.mkdir()
+    _junction(start / "out", sibling)
+    nested = start / "nested"
+    nested.mkdir()
+    _git(nested, "init", "-q", "-b", "main")
+    for cwd in (sibling, start / "out", base, nested, nested / ".git"):
+        got = _resolve(start, tmp_path, {"cwd": str(cwd), "session_id": "s1"})
+        assert "in no checkout this hook can read" in got["Reason"], (cwd, got)
+        assert got["Dir"] is None, (cwd, got)
 
 
 def test_a_launch_that_cannot_replace_the_pin_keeps_no_stale_one(tmp_path: Path) -> None:

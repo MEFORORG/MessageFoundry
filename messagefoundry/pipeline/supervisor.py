@@ -46,6 +46,7 @@ import asyncio
 import logging
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -85,10 +86,11 @@ DEFAULT_CRASH_LOOP_LIMIT = 10
 class ShardSpec:
     """The fixed launch parameters for one shard's subprocess.
 
-    ``db_path`` and ``port`` are derived deterministically from the operator's ``--db``/``--port``
-    bases so a restart re-attaches to the SAME store and re-binds the SAME API port. ``argv`` is the
-    full command line: :func:`messagefoundry.childenv.python_child_argv` for ``messagefoundry``,
-    then ``serve ...``. That function says how the shard imports this build without searching the
+    ``db_path`` and ``port`` are derived deterministically from the supervisor's merged
+    ``[store].path`` and ``[api].port`` (which ``--db`` and ``--base-port`` override) so a restart
+    re-attaches to the SAME store and re-binds the SAME API port. ``argv`` is the full command
+    line: :func:`messagefoundry.childenv.python_child_argv` for ``messagefoundry``, then
+    ``serve ...``. That function says how the shard imports this build without searching the
     working directory.
     """
 
@@ -96,6 +98,22 @@ class ShardSpec:
     db_path: str
     port: int
     argv: tuple[str, ...]
+
+
+def base_names_no_stem(db_base: str) -> bool:
+    """Whether ``db_base``, as written, is empty, ends in a ``.`` or ``..`` part, or names only a
+    drive, root or share, so it has no stem for each engine shard's ``<stem>_<shard>`` name
+    (BACKLOG #5817). On Windows a backslash also separates parts. A trailing separator after a real
+    name is not one of these: pathlib drops it, and the name before it is the stem.
+
+    A drive, root or share (``C:/``, ``C:``, ``/``, ``//srv/share/``) is tested through pathlib's
+    own empty ``name``, the case in which ``Path.with_name`` raises a ``ValueError`` that quotes the
+    path; testing it here lets the caller refuse it with the value withheld instead."""
+    if db_base == "":
+        return True
+    parts = re.split(r"[\\/]", db_base) if os.name == "nt" else db_base.split("/")
+    last = next((part for part in reversed(parts) if part), "")
+    return last in ("", ".", "..") or Path(db_base).name == ""
 
 
 def _shard_db_path(db_base: str, shard: str, *, single: bool) -> str:
@@ -106,6 +124,17 @@ def _shard_db_path(db_base: str, shard: str, *, single: bool) -> str:
     """
     if single:
         return db_base
+    if base_names_no_stem(db_base):
+        # A server store's [store].path may name a directory, and with --db no longer defaulted
+        # that path is the base (BACKLOG #5817). "", a last part of "." or "..", or a bare drive,
+        # root or share has no stem to derive each engine shard's name from, so several engine
+        # shards are refused, before Path.with_name could raise an error quoting the path. A
+        # trailing separator after a real name ("state/") still derives from that name.
+        raise ValueError(
+            "--db or [store].path is empty, ends in a '.' or '..' part, or names only a drive, "
+            "root or share (value withheld); several engine shards each derive their file name "
+            "from its last part, so name a file, e.g. 'messagefoundry.db'"
+        )
     p = Path(db_base)
     return str(p.with_name(f"{p.stem}_{shard}{p.suffix}"))
 
@@ -131,6 +160,16 @@ def build_shard_specs(
     """
     ordered = sorted(shard_list)
     single = len(ordered) <= 1
+    # A single engine shard binds base_port as `serve` binds [api].port, 0 included. Several count
+    # up from it, so 0 (one ephemeral port, then 1, 2, ...) or a last port past 65535 names no
+    # port each can bind; refused here rather than left to crash-loop.
+    lowest = 0 if single else 1
+    if not lowest <= base_port <= 65536 - max(len(ordered), 1):
+        raise ValueError(
+            f"API port {base_port} gives {len(ordered)} engine shard(s) ports "
+            f"{base_port}..{base_port + len(ordered) - 1}; each needs a port from {lowest} to "
+            "65535"
+        )
     specs: list[ShardSpec] = []
     for i, shard in enumerate(ordered):
         port = base_port + i
@@ -142,8 +181,9 @@ def build_shard_specs(
             config,
             "--shard",
             shard,
-            "--db",
-            db_path,
+            # One token: a store path from [store].path or MEFOR_STORE_PATH may start with "-",
+            # which as a separate token argparse would take for an option (BACKLOG #5817).
+            f"--db={db_path}",
             "--port",
             str(port),
         ]
