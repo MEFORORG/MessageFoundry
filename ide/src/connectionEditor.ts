@@ -123,7 +123,12 @@ export async function openConnectionEditor(
       settings?: Record<string, unknown>;
     }) => {
       if (m?.command === "save" && m.conn) {
-        await save(m.conn, current, { editName: opts.editName, cloneFrom: opts.cloneFrom }, opts.onSaved);
+        await save(
+          m.conn,
+          current,
+          { editName: opts.editName, cloneFrom: opts.cloneFrom, sourceDirection: initial?.direction },
+          opts.onSaved,
+        );
       } else if (m?.command === "delete" && m.name) {
         await remove(m.name, current, opts.onSaved);
       } else if (m?.command === "cancel") {
@@ -166,7 +171,9 @@ export async function openConnectionEditor(
 async function save(
   conn: ConnObj,
   current: vscode.WebviewPanel,
-  ctx: { editName?: string; cloneFrom?: string },
+  // sourceDirection: the direction of the connection the form was opened from. An inbound and an
+  // outbound may share a name, and a clone may change direction, so the name alone cannot find it.
+  ctx: { editName?: string; cloneFrom?: string; sourceDirection?: ConnObj["direction"] },
   onSaved?: () => void,
 ): Promise<void> {
   const ws = workspaceDir();
@@ -194,6 +201,7 @@ async function save(
   }
   const plan = planSave(entries, conn, {
     mergeFrom: ctx.editName ?? ctx.cloneFrom,
+    mergeFromDirection: ctx.sourceDirection,
     editingName: ctx.editName,
   });
   if (plan.collision) {

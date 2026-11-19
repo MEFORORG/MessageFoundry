@@ -213,28 +213,33 @@ export interface SavePlan {
  * apply over a save-time FRESH `connection list` (#234 merge-source policy — no cached copy, so an
  * external edit between open and save is never resurrected):
  *
- * 1. collision gate — a create/clone whose name matches an existing connection is refused;
+ * 1. collision gate — a create/clone whose name matches an existing connection OF THE POSTED
+ *    DIRECTION is refused. An inbound and an outbound may share a name (the loader keeps them in
+ *    separate tables, and `connection upsert` replaces within the posted direction's table only),
+ *    so a same-named connection of the other direction is not one the save would replace;
  * 2. merge — the post is merged over the `mergeFrom` entry (the connection the form was opened
- *    from: the edited name, or the clone source), preserving every non-rendered key. No
- *    `mergeFrom`, or the entry vanished externally: the post stands alone (there is nothing left
- *    to preserve).
+ *    from: the edited name, or the clone source), preserving every non-rendered key. The entry is
+ *    looked up by name AND direction: `mergeFromDirection` when the writer knows it (a clone may
+ *    change direction), else the posted direction (an edit locks it). No `mergeFrom`, or the entry
+ *    vanished externally: the post stands alone (there is nothing left to preserve).
  */
 export function planSave(
   entries: readonly ConnObj[],
   posted: ConnObj,
-  opts: { mergeFrom?: string; editingName?: string },
+  opts: { mergeFrom?: string; mergeFromDirection?: Direction; editingName?: string },
 ): SavePlan {
   const collision = findNameCollision(
-    entries.map((entry) => entry.name),
+    entries.filter((entry) => entry.direction === posted.direction).map((entry) => entry.name),
     posted.name,
     opts.editingName,
   );
   if (collision !== undefined) {
     return { conn: posted, collision };
   }
+  const sourceDirection = opts.mergeFromDirection ?? posted.direction;
   const initial =
     opts.mergeFrom !== undefined
-      ? entries.find((entry) => entry.name === opts.mergeFrom)
+      ? entries.find((entry) => entry.name === opts.mergeFrom && entry.direction === sourceDirection)
       : undefined;
   return { conn: mergeFormIntoInitial(initial, posted) };
 }
