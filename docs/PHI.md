@@ -861,27 +861,51 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    blank sidecar, or one that is not UTF-8, is the damaged kind below. A plaintext
    sidecar that is not UTF-8 only past that part is removed by the prune at expiry, and since
    BACKLOG #5388 the same override holder can delete it through the API too: the read's decode
-   error is refused as damaged, and the delete then classes it.
+   error is refused as damaged, and the delete then classes it. A plaintext sidecar refused as
+   oversized (below) over such a body is classed the same way.
    **On every cipher, a sidecar that is damaged or out of shape is not trusted (BACKLOG #5387,
    #5388).** At least these are refused: one that is blank, not UTF-8 or not a JSON object, one
    whose `file_id` is not its own path id, a count that is negative or above 2^53, an
-   `uploaded_at` that is missing, not a number, 0 or less, or above 2^53, and a text field that
-   is not a string, is longer than the store allows, or holds a lone surrogate. The check reads no clock: an `uploaded_at` far ahead is not a defect, since after a
+   `uploaded_at` that is missing, not a number, earlier than 2026-01-01T00:00:00Z, or above 2^53,
+   a text field that is not a string, is longer than the store allows, or holds a lone surrogate,
+   and a sidecar larger than 128 KiB on disk. A plaintext sidecar longer than the longest whose
+   seal still fits 128 KiB, about 96 KiB once its padding is skipped, is refused the same way, on
+   every cipher. No reader reads more than 128 KiB of a sidecar, so a planted large one cannot
+   exhaust memory under the quota lock. The floor is before this engine's first release, so no
+   sidecar the store wrote is older. The check reads no clock: an `uploaded_at` far ahead is not a defect, since after a
    host clock is stepped back every genuine upload is dated ahead, so such an upload is still
-   listed, billed by the quota and readable by its owner. A missing or non-positive `uploaded_at`
-   is refused rather than read as 1970, which the prune would take as past every window and
-   delete on its first pass; refused, the pair is aged by its mtimes as below. An upload never
-   writes an over-long or surrogate field, or an `uploaded_at` the reader refuses, such as one
-   from a clock set before 1970: the save refuses it up front, and the API answers 400 with
-   nothing stored.
+   listed, billed by the quota and readable by its owner. A missing `uploaded_at`, or one before
+   the floor, such as 0, a negative one or a small positive one, is refused rather than read as
+   decades old, which the prune would take as past every window and delete on its first pass;
+   refused, the pair is aged by its mtimes as below. A planted `uploaded_at` after the floor but
+   older than the retention window is not refused, since no rule that reads no clock can tell it
+   from a genuine old upload; planting it needs write access to the store, which can delete the
+   body anyway. An upload never writes an over-long or surrogate field, an `uploaded_at` the
+   reader refuses, such as one from a clock set before the floor, or sealed metadata larger than
+   128 KiB: the save refuses it up front, and the API answers 400 with nothing stored.
+   **A UTF-8 byte-order mark and JSON whitespace around a sidecar's value are skipped (BACKLOG
+   #5387).** Every reader skips them, `rotate-key` and the startup count included, so a sealed
+   sidecar that gained them still reads as sealed under its key and is never taken for a damaged
+   one. A sidecar that holds nothing else is blank, the damaged kind. A plaintext sidecar longer
+   than that seal bound is left as it is by `rotate-key`, which counts it apart from `skipped`, so
+   it does not hold the rotation open; the command's output does not report that count, and the
+   log names each such upload.
+   **A part the filesystem refuses the engine is not damaged (BACKLOG #5388).** At least a
+   permission or an ACL the engine lacks, and on Windows a file another program holds open, are
+   answered on a by-id read where a damaged file's 423 would be, with a 423 whose own text says
+   the file is not known to be damaged and does not invite a delete. The listing scan skips such a sidecar and logs it, and the prune never
+   ages it, so it stays until the cause is fixed. Any other I/O error on that read, such as too many
+   open files, is answered as a server error, since a retry may pass.
    Apart from the never-sealable kind above, which the quota still bills, a refused sidecar is
    left out of the listing and the quota, and the API answers 404 to its owner and 423 to an
    override holder, with text naming the file as damaged and saying it is not served. That text
    promises no removal, because at least the cases kept out of retention below are not removed,
    and the delete it says may be refused does succeed for the non-UTF-8 never-sealable kind above.
-   The web console's `/ui` page does not
-   pass that text on: it shows its one locked notice for every 423, which names `rotate-key` as
-   the conditional fix, and `rotate-key` does not repair a damaged file. It is not left out of
+   The web console's `/ui` page shows its own notices for a damaged file, which name no key and
+   no `rotate-key`, and for a file the filesystem refused the engine. It picks them by the kind of
+   refusal the engine's 423 carries on the exception, not by the 423's text. Its notice for a
+   refused delete promises no removal: it says the prune removes some damaged files, and names at
+   least the kinds kept out of retention below. A damaged sidecar is not otherwise left out of
    retention: the prune removes the pair once the later of its
    sidecar's and its body's **mtimes** passes the retention window, never by the time the sidecar
    claims. Unlike the never-sealable kind, a pair dated ahead is not pruned early, so a damaged

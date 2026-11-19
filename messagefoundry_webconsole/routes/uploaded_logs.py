@@ -154,6 +154,9 @@ BROWSE_LOCKED_CODE = "browse_locked"
 RESEND_DAMAGED_CODE = "resend_damaged"
 DELETE_DAMAGED_CODE = "delete_damaged"
 BROWSE_DAMAGED_CODE = "browse_damaged"
+RESEND_ACCESS_CODE = "resend_access_refused"
+DELETE_ACCESS_CODE = "delete_access_refused"
+BROWSE_ACCESS_CODE = "browse_access_refused"
 BROWSE_HOP_REFUSED_CODE = "browse_hop_refused"
 BROWSE_THROTTLED_CODE = "browse_throttled"
 UPLOADS_UNAVAILABLE_CODE = "uploads_unavailable"
@@ -196,7 +199,8 @@ DELETE_FAILED_NOTICE = (
 #: common case and its fix without claiming either is the only one. The store's opt-out for unmarked
 #: values would also let the file through; it is a loosening, so no notice here may point at it.
 #: A damaged file's 423 (BACKLOG #5388) gets the notices below it instead, because no key and no
-#: rotate-key repairs it, and a keyless store has no key to name at all.
+#: rotate-key repairs it, and a keyless store has no key to name at all. So does the 423 of a file
+#: the filesystem refused the engine (BACKLOG #5388 added item 2), which no key concerns either.
 _LOCKED_CAUSE = (
     "The engine cannot read the file under the store's encryption key, so it refuses it. A file "
     "stored as plaintext before the key was turned on stays refused until an administrator seals "
@@ -209,15 +213,6 @@ BROWSE_LOCKED_NOTICE = f"{_BROWSE_LEAD} {_LOCKED_CAUSE}"
 RESEND_LOCKED_NOTICE = f"{_RESEND_LEAD} {_LOCKED_CAUSE}"
 DELETE_LOCKED_NOTICE = f"{_DELETE_LEAD} {_LOCKED_CAUSE}"
 
-#: The engine's own 423 text for a damaged file (BACKLOG #5388 added item 1). It is compared with
-#: the refusal's detail, never rendered, to tell a damaged file from one the store key refuses: the
-#: two share the status. This console reaches the engine only through its handlers, so it keeps a
-#: copy, and a test pins the copy to what the engine answers. If the two ever differ, a damaged
-#: file falls back to the locked notice above, as it did before this split.
-_ENGINE_DAMAGED_DETAIL = (
-    "this uploaded file is damaged, so it was not read and is not served. No key and no "
-    "command repairs it. An operator may try to delete it, and the delete may be refused too"
-)
 #: Why a damaged file is refused, with no key or command named, since none repairs it. It promises
 #: no removal, as the engine's text does not: some damaged files are refused by the delete too.
 _DAMAGED_CAUSE = (
@@ -227,12 +222,28 @@ _DAMAGED_CAUSE = (
 _MAY_DELETE = "It may be deleted, but the engine may refuse that too."
 BROWSE_DAMAGED_NOTICE = f"{_BROWSE_LEAD} {_DAMAGED_CAUSE} {_MAY_DELETE}"
 RESEND_DAMAGED_NOTICE = f"{_RESEND_LEAD} {_DAMAGED_CAUSE} {_MAY_DELETE}"
-#: A refused delete is not answered with advice to delete. Where uploaded-file retention is on,
-#: the engine's prune removes a damaged file by its age on disk.
+#: A refused delete is not answered with advice to delete. The retention prune removes only some
+#: damaged files, by their age on disk, so the notice promises no removal: at least a sidecar that
+#: is a link or not a regular file is skipped by the prune, and a body that is a directory is one
+#: its unlink refuses (BACKLOG #5388 added item 1 follow-up; docs/PHI.md section 3).
 DELETE_DAMAGED_NOTICE = (
     f"{_DELETE_LEAD} {_DAMAGED_CAUSE} Deleting it again is refused the same way. Where "
-    "uploaded-file retention is on, the engine removes it once it is old enough on disk."
+    "uploaded-file retention is on, the engine removes some damaged files once they are old "
+    "enough on disk, but not every one: at least a file that is a link or is not a regular "
+    "file, or whose body is a folder, stays until an administrator removes it on the server."
 )
+
+#: Why a file the filesystem refused the engine is refused (BACKLOG #5388 added item 2): at least a
+#: permission or ACL the engine lacks, and on Windows a file another program holds open. The file
+#: is not known to be damaged, so no notice here invites a delete, and none names a key.
+_DENIED_CAUSE = (
+    "The engine was refused access to the file on the server, for example by the file's "
+    "permissions or because another program holds it open. The file is not known to be damaged."
+)
+_TRY_AGAIN = "Once an administrator fixes that on the server, try again."
+BROWSE_ACCESS_NOTICE = f"{_BROWSE_LEAD} {_DENIED_CAUSE} {_TRY_AGAIN}"
+RESEND_ACCESS_NOTICE = f"{_RESEND_LEAD} {_DENIED_CAUSE} {_TRY_AGAIN}"
+DELETE_ACCESS_NOTICE = f"{_DELETE_LEAD} {_DENIED_CAUSE} {_TRY_AGAIN}"
 
 #: Three more engine answers the routes used to let escape as JSON (BACKLOG #1169, PR 1506
 #: follow-up A). Each is this module's own text. The engine's detail for each names config keys and
@@ -285,6 +296,9 @@ _LIST_NOTICES: dict[str, str] = {
     RESEND_DAMAGED_CODE: RESEND_DAMAGED_NOTICE,
     DELETE_DAMAGED_CODE: DELETE_DAMAGED_NOTICE,
     BROWSE_DAMAGED_CODE: BROWSE_DAMAGED_NOTICE,
+    RESEND_ACCESS_CODE: RESEND_ACCESS_NOTICE,
+    DELETE_ACCESS_CODE: DELETE_ACCESS_NOTICE,
+    BROWSE_ACCESS_CODE: BROWSE_ACCESS_NOTICE,
     BROWSE_HOP_REFUSED_CODE: BROWSE_HOP_REFUSED_NOTICE,
     BROWSE_THROTTLED_CODE: BROWSE_THROTTLED_NOTICE,
     KEY_SERVICE_BUSY_CODE: KEY_SERVICE_BUSY_NOTICE,
@@ -341,19 +355,36 @@ _BROWSE_CODES: dict[int, str] = {
 _MINTED_FILE_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
 
 
-#: The code a locked refusal becomes when the engine's detail says the file is damaged.
-_DAMAGED_CODES: dict[str, str] = {
-    BROWSE_LOCKED_CODE: BROWSE_DAMAGED_CODE,
-    RESEND_LOCKED_CODE: RESEND_DAMAGED_CODE,
-    DELETE_LOCKED_CODE: DELETE_DAMAGED_CODE,
+#: The engine's 423 carries which refusal it is as ``upload_refusal`` on the exception, never in
+#: the response: ``"locked"``, ``"damaged"`` or ``"denied"`` (``_UploadRefused`` in
+#: ``messagefoundry/api/app.py``). It is a typed signal, read in place of the detail text, so a
+#: reworded detail cannot send a damaged or access-refused file to the store-key notice. A test pins
+#: these values to what the engine raises. A refusal that carries none keeps its locked code.
+_REFUSAL_ATTR = "upload_refusal"
+#: The code a locked refusal becomes for each other kind the engine names.
+_KIND_CODES: dict[str, dict[str, str]] = {
+    # BACKLOG #5388 added item 1: a damaged file, which no key or rotate-key repairs.
+    "damaged": {
+        BROWSE_LOCKED_CODE: BROWSE_DAMAGED_CODE,
+        RESEND_LOCKED_CODE: RESEND_DAMAGED_CODE,
+        DELETE_LOCKED_CODE: DELETE_DAMAGED_CODE,
+    },
+    # BACKLOG #5388 added item 2: a file the filesystem refused the engine, which is not damaged.
+    "denied": {
+        BROWSE_LOCKED_CODE: BROWSE_ACCESS_CODE,
+        RESEND_LOCKED_CODE: RESEND_ACCESS_CODE,
+        DELETE_LOCKED_CODE: DELETE_ACCESS_CODE,
+    },
 }
 
 
 def _refusal_code(exc: HTTPException, codes: dict[int, str]) -> str | None:
     """The allow-listed code for an engine refusal, or ``None`` for one ``codes`` does not map.
 
-    A 423 whose detail is the engine's damaged-file text maps to that operation's damaged code
-    (BACKLOG #5388 added item 1), so its notice offers no key or rotate-key remedy.
+    A 423 that the engine names damaged maps to that operation's damaged code (BACKLOG #5388 added
+    item 1), so its notice offers no key or rotate-key remedy, and one it names access-refused maps
+    to the access code (BACKLOG #5388 added item 2), so its notice does not invite a delete. The
+    kind is read from ``upload_refusal`` (:data:`_REFUSAL_ATTR`), never from the detail text.
 
     A 503 that carries ``Retry-After`` is a key-service outage (BACKLOG #3734), whatever ``codes``
     maps 503 to, because there an uploads store IS configured. It is told apart by its header, not
@@ -363,10 +394,10 @@ def _refusal_code(exc: HTTPException, codes: dict[int, str]) -> str | None:
     if exc.status_code == _UNAVAILABLE_STATUS and "Retry-After" in (exc.headers or {}):
         return KEY_SERVICE_BUSY_CODE
     code = codes.get(exc.status_code)
-    damaged = _DAMAGED_CODES.get(code) if code is not None else None
-    if damaged is not None and exc.detail == _ENGINE_DAMAGED_DETAIL:
-        return damaged
-    return code
+    kind = getattr(exc, _REFUSAL_ATTR, None)
+    if code is None or not isinstance(kind, str):
+        return code
+    return _KIND_CODES.get(kind, {}).get(code, code)
 
 
 def _log_file_id(file_id: str) -> str:

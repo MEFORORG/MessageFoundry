@@ -1520,8 +1520,8 @@ async def test_a_damaged_file_is_explained_without_a_key_remedy(
 
     A damaged body under a sound sidecar reaches its owner. A damaged sidecar hides its owner, so
     only the files:access_any holder gets the 423, on browse and on delete. Landing on the damaged
-    code at all also pins the console's copy of the engine's text: if the two differed, the 423
-    would land on the locked code."""
+    code at all also pins the kind the engine's refusal carries (``upload_refusal``) to the one
+    the console reads: if the two differed, the 423 would land on the locked code."""
     from messagefoundry_webconsole.routes import uploaded_logs as ul_routes
 
     service = await _service(engine, ("op", Role.OPERATOR), ("root", Role.ADMINISTRATOR))

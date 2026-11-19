@@ -699,14 +699,17 @@ async def test_a_body_unreadable_for_another_cause_still_waits_for_rotate_key(
     root = tmp_path / "uploads"
     fid = await _plaintext_upload(root)
     store = UploadStore(root, _keyed(generate_key()), max_bytes=1 << 20)
-    real = Path.read_text
+    # The reseal opens each half through _open_plain (BACKLOG #5387 added item 1 follow-up).
+    import messagefoundry.uploads as uploads_mod
 
-    def refuse_the_body(self: Path, *args: object, **kwargs: object) -> str:
-        if self.name == f"{fid}.blob":
+    real = uploads_mod._open_plain
+
+    def refuse_the_body(path: Path) -> object:
+        if path.name == f"{fid}.blob":
             raise PermissionError("refused for the test")
-        return real(self, *args, **kwargs)  # type: ignore[arg-type]
+        return real(path)
 
-    monkeypatch.setattr(Path, "read_text", refuse_the_body)
+    monkeypatch.setattr(uploads_mod, "_open_plain", refuse_the_body)
     assert await store.reseal_to_active() == ResealResult(skipped=1)
     monkeypatch.undo()
     assert (await store.prune_expired(now=10**12)).pruned == []

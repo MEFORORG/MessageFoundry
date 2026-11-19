@@ -22,6 +22,7 @@ import pytest
 import messagefoundry.uploads as uploads
 from messagefoundry.store.crypto import generate_key, make_cipher
 from messagefoundry.uploads import (
+    UploadAccessError,
     UploadDamagedError,
     UploadedFileMeta,
     UploadFieldError,
@@ -288,10 +289,12 @@ async def test_a_part_the_engine_may_not_read_is_a_handled_refusal(
         return os.open(path, flags, *args)
 
     monkeypatch.setattr(uploads, "os", _OsWith(_deny))
+    # Follow-up: refused as access, never as damage an operator may then delete for good.
     if part == "meta":
-        with pytest.raises(UploadDamagedError):
+        with pytest.raises(UploadAccessError) as read:
             await store.get_meta(meta.file_id)
-        with pytest.raises(UploadDamagedError):
+        assert not isinstance(read.value, UploadDamagedError)
+        with pytest.raises(UploadAccessError):
             await store.delete(meta.file_id)
         # Nothing was removed.
         assert denied.exists() and _blob(store, meta.file_id).exists()
@@ -300,8 +303,9 @@ async def test_a_part_the_engine_may_not_read_is_a_handled_refusal(
         _age(denied, _blob(store, meta.file_id), days=60)
         assert (await store.prune_expired(retention_days=30)).pruned == []
     else:
-        with pytest.raises(UploadDamagedError):
+        with pytest.raises(UploadAccessError) as read:
             await store.read_bytes(meta.file_id)
+        assert not isinstance(read.value, UploadDamagedError)
 
 
 # --- the padding tolerance holds in rotate-key, the startup count and the tag alert -------------
@@ -401,12 +405,16 @@ async def test_rotate_key_leaves_a_sidecar_that_would_seal_past_the_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Review round 2: sealing grows a sidecar by a third, so a plaintext one under the cap could be
-    # written past it, then refused by every read and aged out by the prune.
+    # written past it, then refused by every read and aged out by the prune. Follow-up: it was then
+    # counted a skip, which failed every rotate-key run and held the rotation record open for good,
+    # though nothing of it is under the prior key. It is now its own terminal count.
     root = tmp_path / "uploads"
     meta = await _saved(_store(root))
     sidecar = root / f"{meta.file_id}.meta"
     plain = sidecar.read_text(encoding="utf-8")
-    monkeypatch.setattr(uploads, "_SIDECAR_LIMIT", len(plain) + 8)
+    monkeypatch.setattr(uploads, "_PLAIN_SIDECAR_LIMIT", len(plain.encode("utf-8")) - 1)
     result = await _store(root, generate_key()).reseal_to_active()
-    assert result.skipped == 1
+    assert (result.skipped, result.too_long) == (0, 1)
+    assert not result.incomplete
+    assert result.resealed == 1  # the body is still sealed
     assert sidecar.read_text(encoding="utf-8") == plain

@@ -32,6 +32,7 @@ from typing import Any
 
 import pytest
 
+from messagefoundry import uploads as uploads_mod
 from messagefoundry.store.crypto import (
     AesGcmCipher,
     Cipher,
@@ -285,14 +286,15 @@ async def test_a_body_unreadable_for_another_cause_is_still_a_skip(
     root = tmp_path / "uploads"
     key_a, key_b = generate_key(), generate_key()
     fid = await _seed(_keyed_store(root, key_a))
-    real = Path.read_text
+    # The reseal opens each half through _open_plain (BACKLOG #5387 added item 1 follow-up).
+    real = uploads_mod._open_plain
 
-    def refuse_the_body(self: Path, *args: object, **kwargs: object) -> str:
-        if self.name == f"{fid}.blob":
+    def refuse_the_body(path: Path) -> Any:
+        if path.name == f"{fid}.blob":
             raise PermissionError("refused for the test")
-        return real(self, *args, **kwargs)  # type: ignore[arg-type]
+        return real(path)
 
-    monkeypatch.setattr(Path, "read_text", refuse_the_body)
+    monkeypatch.setattr(uploads_mod, "_open_plain", refuse_the_body)
     result = await _keyed_store(root, key_b, (key_a,)).reseal_to_active()
     monkeypatch.undo()
     assert result == ResealResult(resealed=1, skipped=1)
@@ -353,18 +355,19 @@ async def test_a_planted_body_under_a_sealed_sidecar_is_counted_when_its_read_fa
     plain = await _seed(_keyed_store(root / "plain", None))
     (root / f"{fid}.blob").write_bytes((root / "plain" / f"{plain}.blob").read_bytes())
     sidecar = root / f"{fid}.meta"
-    real_open = Path.open
+    # The reseal opens each half through _open_plain (BACKLOG #5387 added item 1 follow-up).
+    real_open = uploads_mod._open_plain
     failed = False
 
-    def _open_failing_once(self: Path, *args: Any, **kwargs: Any) -> Any:
+    def _open_failing_once(path: Path) -> Any:
         nonlocal failed
-        if self == sidecar and not failed:
+        if path == sidecar and not failed:
             failed = True
             raise PermissionError("held open by another process")
-        return real_open(self, *args, **kwargs)
+        return real_open(path)
 
     with monkeypatch.context() as m:
-        m.setattr(Path, "open", _open_failing_once)
+        m.setattr(uploads_mod, "_open_plain", _open_failing_once)
         first = await _keyed_store(root, key).reseal_to_active()
     second = await _keyed_store(root, key).reseal_to_active()
     assert first.sealed_plaintext + second.sealed_plaintext == 1, (first, second)

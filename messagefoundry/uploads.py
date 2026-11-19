@@ -195,11 +195,19 @@ _UNSEALABLE_OWNER_READ_LIMIT = 64 * 1024
 # is a few hundred bytes. The longest it can be is its text fields at their bounds
 # (``_MAX_SIDECAR_TEXT``), every character an astral one that ``json.dumps`` escapes as twelve, then
 # sealed, which base64 grows by a third: under 40 KiB. :meth:`UploadStore.save` refuses to write a
-# longer one. The listing scan, which runs under ``_quota_lock``, and the by-id reads read no more
-# than this, so a planted file cannot exhaust memory there. At least ``rotate-key`` is not bound by
-# it: its pass reads a sidecar up to the body's own limit, and sealing a planted plaintext sidecar
-# just under the cap can grow it past the cap, after which the reads refuse it as malformed.
+# longer one. The listing scan, which runs under ``_quota_lock``, the by-id reads and the startup
+# count read no more than this, so a planted file cannot exhaust memory there; a longer sidecar is
+# refused as damaged. A plaintext sidecar is held to the tighter ``_PLAIN_SIDECAR_LIMIT``, the
+# longest whose sealed form still fits here. ``rotate-key`` reads a sidecar up to the body's own
+# limit rather than this one, and never writes a sidecar longer than this
+# (:meth:`UploadStore._reseal_half`).
 _SIDECAR_LIMIT = 128 * 1024
+# The longest a PLAINTEXT sidecar may be, in UTF-8 bytes once unpadded (BACKLOG #5387 added item
+# 1): the longest whose sealed form fits ``_SIDECAR_LIMIT``. Sealing adds a 12-byte nonce and a
+# 16-byte tag, base64 grows that by a third, and the marker in front is under 256 characters
+# (``_MARKER_READ_LIMIT``), so 32 bytes of slack covers the rest. A test pins that a plaintext this
+# long seals within the cap. Far above any sidecar the store writes, so it refuses only a plant.
+_PLAIN_SIDECAR_LIMIT = (_SIDECAR_LIMIT - 256) // 4 * 3 - 32
 # The chunk size for checking that a body decodes as text. It bounds memory, not the work.
 _BODY_CHECK_CHUNK = 1 << 20
 
@@ -324,11 +332,16 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
 
     The ``lstat`` before the open is the check :func:`_not_a_plain_file` makes. The ``fstat`` after
     it must show a regular file, so a FIFO swapped in between the two is refused rather than waited
-    on. Where there is no ``O_NOFOLLOW``, the name is checked again after the open and must still
-    be no link and name the file that was opened, so a link swapped in is refused rather than
-    followed. A regular file put in its place, as an atomic replace does, is read. Raises
+    on. Where there is ``O_NOFOLLOW``, the open itself refuses a link swapped in after the
+    ``lstat``.
+
+    **Windows has no ``O_NOFOLLOW``, so there the open FOLLOWS a link swapped in after the
+    ``lstat``, and opens whatever it names.** Only then is it refused: the name is checked again
+    after the open, and must still be no link and name the file that was opened
+    (``os.path.samestat``), so this function returns no handle to, and nothing is read from, the
+    link's target. A regular file put in its place, as an atomic replace does, is read. Raises
     :class:`_NotPlainError` for a refusal, and any other ``OSError`` the filesystem gives,
-    ``FileNotFoundError`` included."""
+    ``FileNotFoundError`` and ``PermissionError`` included."""
     before = path.lstat()
     if _names_a_link(before) or not S_ISREG(before.st_mode):
         raise _NotPlainError(f"{path.name} is not a plain file")
@@ -381,15 +394,36 @@ def _read_plain_text(path: Path, limit: int | None = None) -> str:
 _SIDECAR_PAD = " \t\r\n"
 
 
-def _is_refused_read(exc: BaseException) -> bool:
-    """Whether ``exc``, raised reading an upload's part, is the file's own refusal: a permission
-    the engine lacks, a part that is not a plain file, or a link the open would not follow
-    (BACKLOG #5388 added item 2). Any other ``OSError``, such as too many open files or an I/O
-    error, may pass on a retry, so it is never answered as a damaged file, which an operator
-    may then delete."""
-    if isinstance(exc, PermissionError | _NotPlainError):
-        return True
-    return isinstance(exc, OSError) and exc.errno == errno.ELOOP
+def _read_sidecar(path: Path) -> str:
+    """The text of sidecar ``path``, as :func:`_read_plain_text` reads it with
+    :data:`_SIDECAR_LIMIT`. A plaintext one longer than :data:`_PLAIN_SIDECAR_LIMIT` once unpadded
+    is refused as oversized too (BACKLOG #5387 added item 1): no store writes one, and no
+    ``rotate-key`` could seal it within :data:`_SIDECAR_LIMIT`, so every reader and the reseal
+    agree it is damaged rather than leave it refused under the key and never sealable."""
+    text = _read_plain_text(path, _SIDECAR_LIMIT)
+    value = _unpadded(text)
+    if not value.startswith(MARKER_PREFIX) and len(value.encode("utf-8")) > _PLAIN_SIDECAR_LIMIT:
+        raise _OversizedFileError(_PLAIN_SIDECAR_LIMIT)
+    return text
+
+
+#: How a by-id read answers a refused ``OSError`` (:func:`_refused_read`).
+_ReadRefusal = Literal["damaged", "denied"]
+
+
+def _refused_read(exc: OSError) -> _ReadRefusal | None:
+    """How a by-id read answers ``exc``, raised reading an upload's part (BACKLOG #5388 added item
+    2). ``"damaged"`` for a part that is not a plain file, or a link the open would not follow.
+    ``"denied"`` for a ``PermissionError``: at least a permission or an ACL the engine lacks, and
+    on Windows a file another program holds open (a sharing violation). That is not damage, so it
+    is never answered as a file an operator should delete. ``None`` for any other ``OSError``,
+    such as too many open files or an I/O error, which may pass on a retry, so the caller
+    re-raises it."""
+    if isinstance(exc, _NotPlainError) or exc.errno == errno.ELOOP:
+        return "damaged"
+    if isinstance(exc, PermissionError):
+        return "denied"
+    return None
 
 
 def _unpadded(text: str) -> str:
@@ -451,10 +485,12 @@ class UploadNotTextError(UploadContentError):
 
 class UploadFieldError(UploadContentError):
     """A value :meth:`UploadStore.save` would store in the sidecar is one the sidecar reader refuses
-    (BACKLOG #5387): an account name or id longer than :data:`_MAX_SIDECAR_TEXT` allows, or a field
-    that holds a lone surrogate, or an engine clock that reads as no time after 1970
-    (:func:`_stamp_in_range`). That last is the host's fault, not the uploader's, and is still
-    answered 400. Refused before anything is written, so no upload is stored that
+    (BACKLOG #5387): at least an account name or id longer than :data:`_MAX_SIDECAR_TEXT` allows, a
+    field that holds a lone surrogate, an engine clock that reads earlier than
+    :data:`_MIN_SIDECAR_STAMP` (2026-01-01T00:00:00Z) or later than 2^53 seconds
+    (:func:`_stamp_in_range`), and sealed metadata longer than :data:`_SIDECAR_LIMIT`. The clock is
+    the host's fault, not the uploader's, and is still answered 400. Refused before anything is
+    written, so no upload is stored that
     its own owner could not see, and the quota would not bill. A subclass, so the API answers it
     as any other :class:`UploadContentError`: 400 and a metadata-only ``upload.reject`` audit.
     ``reason`` names the field and the defect, never the value."""
@@ -556,11 +592,11 @@ class UploadUnreadableError(UploadError, CipherError):
     API maps it to HTTP 423 without importing the cipher module. The message is the cipher's own,
     which names only the surface and the remedies it offers, or
     :data:`_REFUSED_NOT_UNSEALABLE` from :meth:`UploadStore.delete`, which names neither. A damaged
-    file raises the subclass :class:`UploadDamagedError` (BACKLOG #5388), and so does a part the
-    filesystem refused to read, such as one whose permissions deny the engine (BACKLOG #5388 added
-    item 2). On a store that refuses plaintext, :meth:`UploadStore.delete` may instead remove a
-    sidecar that is not UTF-8 or is oversized, when it is the never-sealable kind the scan classes
-    too."""
+    file raises the subclass :class:`UploadDamagedError` (BACKLOG #5388), and a part the filesystem
+    refused the engine, such as one whose permissions deny it, raises the subclass
+    :class:`UploadAccessError` instead (BACKLOG #5388 added item 2). On a store that refuses
+    plaintext, :meth:`UploadStore.delete` may instead remove a sidecar that is not UTF-8 or is
+    oversized, when it is the never-sealable kind the scan classes too."""
 
 
 class UploadUnavailableError(UploadError, CipherError):
@@ -580,6 +616,10 @@ _DAMAGED = "the uploaded file's {part} is damaged or is not this upload's, so it
 
 _STILL_SEALED = "the uploaded file's {part} is sealed under a store key this engine does not hold"
 
+_ACCESS_REFUSED = (
+    "the uploaded file's {part} could not be opened: the filesystem refused the engine"
+)
+
 
 def _refuse_still_sealed(text: str, part: str) -> None:
     """Raise a :class:`CipherError` when the cipher handed back text that is still sealed, as the
@@ -597,6 +637,24 @@ class UploadDamagedError(UploadUnreadableError):
     (BACKLOG #5388): at least a file that is not UTF-8, a body that is not strict base64, a sidecar
     that is not this upload's metadata, and a part that is not a regular file. A subclass, so a
     caller that catches the refusal still does, and the API can answer it with its own text."""
+
+
+class UploadAccessError(UploadUnreadableError):
+    """The :class:`UploadUnreadableError` of a part the filesystem refused the engine (BACKLOG
+    #5388 added item 2): a ``PermissionError``, which is at least a permission or an ACL the engine
+    lacks, or on Windows a file another program holds open. The file is not known to be damaged,
+    and fixing the cause makes it readable again, so the API answers it with its own text, which
+    does not invite a delete. The listing scan skips such a sidecar and the prune never ages it."""
+
+
+def _refusal(file_id: str, part: str, defect: str, kind: _ReadRefusal) -> UploadUnreadableError:
+    """The refusal a by-id read raises for a part read as ``kind`` (:func:`_refused_read`), logged
+    as :func:`_damaged` logs one. ``defect`` is already rendered content-free, and the caller
+    raises after its handler ends, so the error is not left on the refusal's ``__context__``."""
+    if kind == "denied":
+        _log.warning("uploaded-file %s %s: access refused on disk: %s", part, file_id, defect)
+        return UploadAccessError(_ACCESS_REFUSED.format(part=part))
+    return _damaged(file_id, part, defect)
 
 
 def _damaged(file_id: str, part: str, defect: str) -> UploadDamagedError:
@@ -1084,6 +1142,14 @@ class ResealResult:
     #: removes it by hand. A symlink is not counted here: its target may be under the prior key, so
     #: it is a skip.
     not_regular: int = 0
+    #: How many UPLOADS have a sidecar every reader refuses for its size (BACKLOG #5387 added item
+    #: 1): larger than :data:`_SIDECAR_LIMIT` on disk, or PLAINTEXT and longer than
+    #: :data:`_PLAIN_SIDECAR_LIMIT`, so that no seal of it fits that cap. No store writes one. It is
+    #: refused before anything is decrypted, so nothing of it is readable under any key, retiring
+    #: the prior key loses nothing, and no re-run changes it: not a skip, and it does not keep
+    #: ``rotate-key`` from completing. The sidecar is left as it is, and its body is still re-sealed
+    #: as any other. ``rotate-key``'s output does not report this count; the log names each one.
+    too_long: int = 0
     #: True when the uploads root could not be listed, as when it is missing or is not a directory
     #: (BACKLOG #4940). ``rotate-key`` refuses such a root before it writes anything, so this is a
     #: backstop. A root that stays listable is not missing, so an empty mount point over a volume
@@ -1110,6 +1176,7 @@ class _Half(Enum):
     LOST = auto()  # a body that is missing or is not text
     UNSEALABLE = auto()  # a plaintext sidecar over a lost body
     NOT_REGULAR = auto()  # no regular file or link, or a plaintext sidecar over one; left as is
+    TOO_LONG = auto()  # a sidecar every reader refuses for its size; left as is
     SKIPPED = auto()  # it may still be under the prior key
 
 
@@ -1485,7 +1552,7 @@ class UploadStore:
             broken = False
             stored = ""
             try:
-                stored = _read_plain_text(entry, _SIDECAR_LIMIT)
+                stored = _read_sidecar(entry)
                 out.append(self._decrypt_meta(stored, fid))
             except CipherError as exc:
                 if isinstance(exc, CipherUnavailableError):
@@ -1655,37 +1722,40 @@ class UploadStore:
 
         Only a regular file no larger than a body the engine could have written is read, because the
         quota scan runs this under ``_quota_lock``. A FIFO, a device or an oversized plant would
-        otherwise stall every later upload. Any of those returns ``None`` and waits for an operator."""
+        otherwise stall every later upload. Any of those returns ``None`` and waits for an operator.
+        The body is opened by :func:`_open_plain` (BACKLOG #5387 added item 1), so a link, a
+        dangling one included, is never followed and returns ``None`` too, and a FIFO swapped in
+        after the check is refused rather than waited on."""
         try:
-            stat = blob.stat()
+            handle, stat = _open_plain(blob)
         except FileNotFoundError:
             return 0
+        except _NotPlainError:
+            _log.warning("uploaded file %s: not a regular file; it was not read", blob.name)
+            return None
         except OSError:
             return None
-        if not S_ISREG(stat.st_mode) or stat.st_size > self._stored_limit:
-            _log.warning(
-                "uploaded file %s: not a regular file of a size an upload can be", blob.name
-            )
-            return None
-        key = (stat.st_mtime_ns, stat.st_size)
-        cached = self._body_checks.get(blob.name)
-        if cached is not None and cached[0] == key:
-            decodes = cached[1]
-        else:
-            try:
-                with blob.open(encoding="utf-8") as handle:
-                    while handle.read(_BODY_CHECK_CHUNK):
-                        pass
-            except FileNotFoundError:
-                return 0
-            except UnicodeDecodeError:
-                decodes = False
-            except OSError as exc:
-                _log.warning("uploaded file %s: could not check the body: %s", blob.name, exc)
+        with handle:
+            if stat.st_size > self._stored_limit:
+                _log.warning("uploaded file %s: larger than an upload can be", blob.name)
                 return None
+            key = (stat.st_mtime_ns, stat.st_size)
+            cached = self._body_checks.get(blob.name)
+            if cached is not None and cached[0] == key:
+                decodes = cached[1]
             else:
-                decodes = True
-            self._body_checks[blob.name] = (key, decodes)
+                try:
+                    with io.TextIOWrapper(handle, encoding="utf-8") as text:
+                        while text.read(_BODY_CHECK_CHUNK):
+                            pass
+                except UnicodeDecodeError:
+                    decodes = False
+                except OSError as exc:
+                    _log.warning("uploaded file %s: could not check the body: %s", blob.name, exc)
+                    return None
+                else:
+                    decodes = True
+                self._body_checks[blob.name] = (key, decodes)
         return None if decodes else stat.st_size
 
     # --- public API (all disk/crypto/split work off the event loop) --------------------------------
@@ -2594,13 +2664,16 @@ class UploadStore:
 
     async def get_meta(self, file_id: str) -> UploadedFileMeta:
         """Return one file's metadata (path-traversal-guarded). Raises :class:`UploadNotFoundError`,
-        and :class:`UploadUnreadableError` for a sidecar the cipher refuses or that is damaged."""
+        and :class:`UploadUnreadableError` for a sidecar the cipher refuses, that is damaged
+        (:class:`UploadDamagedError`) or that the filesystem refused the engine
+        (:class:`UploadAccessError`)."""
 
         def _read() -> UploadedFileMeta:
             _, meta_path = self._paths(file_id)
             _refuse_unplain(file_id, "sidecar", meta_path)
+            kind: _ReadRefusal = "damaged"
             try:
-                return self._decrypt_meta(_read_plain_text(meta_path, _SIDECAR_LIMIT), file_id)
+                return self._decrypt_meta(_read_sidecar(meta_path), file_id)
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
             except CipherUnavailableError as exc:
@@ -2610,22 +2683,27 @@ class UploadStore:
             except (OSError, UnicodeDecodeError, _MalformedSidecarError) as exc:
                 # An OSError only when it is the file's own refusal, such as a permission the
                 # engine lacks, which answered a server error (BACKLOG #5388 added item 2).
-                if isinstance(exc, OSError) and not _is_refused_read(exc):
-                    raise
+                if isinstance(exc, OSError):
+                    refused = _refused_read(exc)
+                    if refused is None:
+                        raise
+                    kind = refused
                 defect = codec_safe_str(exc)
             # Raised after the handler, so the error holding the file is on no chain.
-            raise _damaged(file_id, "sidecar", defect)
+            raise _refusal(file_id, "sidecar", defect, kind)
 
         return await asyncio.to_thread(_read)
 
     async def read_bytes(self, file_id: str) -> bytes:
         """Return the decrypted body bytes (path-traversal-guarded). Raises
         :class:`UploadNotFoundError`, and :class:`UploadUnreadableError` for a body the cipher
-        refuses or that is damaged."""
+        refuses, that is damaged (:class:`UploadDamagedError`) or that the filesystem refused the
+        engine (:class:`UploadAccessError`)."""
 
         def _read() -> bytes:
             blob_path, _ = self._paths(file_id)
             _refuse_unplain(file_id, "body", blob_path)
+            kind: _ReadRefusal = "damaged"
             try:
                 # No size cap: a sound body stored under a larger max_upload_bytes is still
                 # served, as the reseal pass keeps it too.
@@ -2639,10 +2717,13 @@ class UploadStore:
             except (OSError, UnicodeError, binascii.Error) as exc:
                 # Refused on disk (BACKLOG #5388 added item 2), not UTF-8, not ASCII, or not the
                 # strict base64 the body is stored as.
-                if isinstance(exc, OSError) and not _is_refused_read(exc):
-                    raise
+                if isinstance(exc, OSError):
+                    refused = _refused_read(exc)
+                    if refused is None:
+                        raise
+                    kind = refused
                 defect = codec_safe_str(exc)
-            raise _damaged(file_id, "body", defect)
+            raise _refusal(file_id, "body", defect, kind)
 
         return await asyncio.to_thread(_read)
 
@@ -2676,6 +2757,7 @@ class UploadStore:
             meta: UploadedFileMeta | None = None
             refusal = _REFUSED_NOT_UNSEALABLE
             defect: str | None = None
+            kind: _ReadRefusal = "damaged"
             classed = False
             if sidecar_refused:
                 # The store checks the caller's claim: only a cipher that refuses plaintext can
@@ -2684,7 +2766,7 @@ class UploadStore:
                     raise UploadUnreadableError(refusal)
             else:
                 try:
-                    meta = self._decrypt_meta(_read_plain_text(meta_path, _SIDECAR_LIMIT), file_id)
+                    meta = self._decrypt_meta(_read_sidecar(meta_path), file_id)
                 except FileNotFoundError as exc:
                     raise UploadNotFoundError(file_id) from exc
                 except CipherUnavailableError as exc:
@@ -2695,17 +2777,20 @@ class UploadStore:
                 except (OSError, UnicodeDecodeError, _MalformedSidecarError) as exc:
                     # An OSError only when it is the file's own refusal, such as a permission the
                     # engine lacks, which answered a server error (BACKLOG #5388 added item 2).
-                    # It is never classed.
-                    if isinstance(exc, OSError) and not _is_refused_read(exc):
-                        raise
+                    # It is never classed, and a permission refusal is not answered as damage.
+                    if isinstance(exc, OSError):
+                        refused = _refused_read(exc)
+                        if refused is None:
+                            raise
+                        kind = refused
                     defect = codec_safe_str(exc)
                     classed = isinstance(exc, UnicodeDecodeError | _OversizedFileError)
-            # Damaged, never trusted, and raised after the handler, so the error holding the file
+            # Refused, never trusted, and raised after the handler, so the error holding the file
             # is on no chain. Classed only where the scan classes it too: a sidecar that is not
             # UTF-8 or is oversized, on a cipher that refuses plaintext, may be the never-sealable
             # kind. That one is logged as a refusal below only if the class check refuses it too.
             if defect is not None and not (classed and self._refuses_plaintext):
-                raise _damaged(file_id, "sidecar", defect)
+                raise _refusal(file_id, "sidecar", defect, kind)
             if meta is None:
                 held = self._unsealable_sync(file_id, meta_path)
                 if held is None:
@@ -2718,11 +2803,13 @@ class UploadStore:
                     except FileNotFoundError as exc:
                         raise UploadNotFoundError(file_id) from exc
                     except OSError as exc:
-                        if not _is_refused_read(exc):
+                        refused = _refused_read(exc)
+                        if refused is None:
                             raise
+                        kind = refused
                         defect = codec_safe_str(exc)
                     if defect is not None:
-                        raise _damaged(file_id, "sidecar", defect)
+                        raise _refusal(file_id, "sidecar", defect, kind)
                     raise UploadUnreadableError(refusal)
                 meta = held.as_meta()
             # Remove the body first, then the sidecar (best-effort on the body — the sidecar is the
@@ -2821,7 +2908,7 @@ class UploadStore:
             )
             return ResealResult(root_missing=True)
         gate = _ResealLockCheck(self._root / LOCK_FILE_NAME)
-        resealed = skipped = sealed_plaintext = unsealable = body_lost = not_regular = 0
+        resealed = skipped = sealed_plaintext = unsealable = body_lost = not_regular = too_long = 0
         for fid, _sidecar in pairs:
             try:
                 blob_path, meta_path = self._paths_unfollowed(fid)
@@ -2855,21 +2942,25 @@ class UploadStore:
                 unsealable += 1
             elif _Half.SKIPPED in (body, meta):
                 skipped += 1
+            elif meta is _Half.TOO_LONG:
+                too_long += 1
             elif _Half.NOT_REGULAR in (body, meta):
                 not_regular += 1
             elif body is _Half.LOST:
                 body_lost += 1
-        if resealed or skipped or unsealable or body_lost or not_regular:
+        if resealed or skipped or unsealable or body_lost or not_regular or too_long:
             _log.info(
                 "re-sealed %d uploaded-file value(s) under the active key, sealing %d plaintext "
                 "upload(s) (%d upload(s) skipped, %d that cannot be sealed, %d whose body is lost, "
-                "%d holding a file that is not regular)",
+                "%d holding a file that is not regular, %d whose plaintext sidecar is too long "
+                "to seal)",
                 resealed,
                 sealed_plaintext,
                 skipped,
                 unsealable,
                 body_lost,
                 not_regular,
+                too_long,
             )
         return ResealResult(
             resealed=resealed,
@@ -2878,6 +2969,7 @@ class UploadStore:
             unsealable=unsealable,
             body_lost=body_lost,
             not_regular=not_regular,
+            too_long=too_long,
         )
 
     def _reseal_half(
@@ -2927,23 +3019,43 @@ class UploadStore:
             # this filter into SQL (`WHERE col NOT LIKE ...`) for the same reason; on a filesystem
             # the equivalent is a bounded read. So an already-current file is never size-checked: a
             # lowered max_upload_bytes must not turn one into a skip.
+            #
+            # Opened by _open_plain (BACKLOG #5387 added item 1), so a link or FIFO swapped in
+            # after the lstat above is refused, a skip as an unreadable file is, and the marker,
+            # the size and the text all come from the one file that was opened.
             active = cipher.active_marker_prefix.encode("ascii")
-            with path.open("rb") as handle:
-                if handle.read(len(active)) == active:
+            handle, opened = _open_plain(path)
+            with handle:
+                head = handle.read(len(active))
+                if head == active:
                     return _Half.CURRENT  # already under the active key in the active format
-            if info.st_size > self._stored_limit:
-                # BACKLOG #3737: a read of the whole file could raise MemoryError, which no handler
-                # takes, so a planted one would abort the pass. A skip and not a loss: it may be a
-                # real body from before a lowered max_upload_bytes, still under the prior key.
-                _log.warning(
-                    "uploaded file %s (%s): skipped, %d bytes is larger than an upload can be. If "
-                    "it is a real upload, raise [store].max_upload_bytes for this run",
-                    fid,
-                    kind,
-                    info.st_size,
-                )
-                return _Half.SKIPPED
-            stored = path.read_text(encoding="utf-8")
+                if kind == "meta" and opened.st_size > _SIDECAR_LIMIT:
+                    # BACKLOG #5387 added item 1: every reader refuses a sidecar this large as
+                    # damaged before it decrypts anything, so nothing of it is readable under any
+                    # key and no re-run changes that. Not a skip, which would fail every later run
+                    # and hold the rotation record open for good. A sidecar is held to this cap,
+                    # not to the body's limit below, so a small max_upload_bytes skips none.
+                    _log.warning(
+                        "uploaded file %s (meta): left as it is for good, %d bytes is larger than "
+                        "any sidecar can be; every read refuses it as damaged",
+                        fid,
+                        opened.st_size,
+                    )
+                    return _Half.TOO_LONG
+                if kind == "body" and opened.st_size > self._stored_limit:
+                    # BACKLOG #3737: a read of the whole file could raise MemoryError, which no
+                    # handler takes, so a planted one would abort the pass. A skip and not a loss:
+                    # it may be a real body from before a lowered max_upload_bytes, still under the
+                    # prior key.
+                    _log.warning(
+                        "uploaded file %s (%s): skipped, %d bytes is larger than an upload can be. "
+                        "If it is a real upload, raise [store].max_upload_bytes for this run",
+                        fid,
+                        kind,
+                        opened.st_size,
+                    )
+                    return _Half.SKIPPED
+                stored = (head + handle.read()).decode("utf-8")
             if kind == "meta":
                 # As the reader unpads it, so a sealed sidecar that gained a byte-order mark or
                 # whitespace is re-sealed, never sealed a second time as plaintext (BACKLOG #5387
@@ -2992,6 +3104,17 @@ class UploadStore:
             if body is _Half.SKIPPED:
                 _log.warning("uploaded file %s (meta): left unsealed, its body was not", fid)
                 return _Half.SKIPPED
+        if kind == "meta" and plaintext and len(stored.encode("utf-8")) > _PLAIN_SIDECAR_LIMIT:
+            # BACKLOG #5387 added item 1: checked before encrypting, because no seal of it fits
+            # _SIDECAR_LIMIT, and every reader refuses it as damaged already (_read_sidecar). It
+            # is plaintext, so nothing of it is under the prior key and no re-run changes it: not
+            # a skip, which would fail every later run and hold the rotation record open for good.
+            _log.warning(
+                "uploaded file %s (meta): left unsealed for good, the plaintext sidecar is longer "
+                "than any sidecar can be once sealed; every read refuses it as damaged",
+                fid,
+            )
+            return _Half.TOO_LONG
         blocked = gate.check()
         if blocked == "gone":
             # Not a skip: the pass ends as root_missing once this pair is done, and _pair_lock
@@ -3024,8 +3147,10 @@ class UploadStore:
             return _Half.SKIPPED
         del stored  # the write holds its own copy, so free this file-sized buffer before it
         if kind == "meta" and len(sealed.encode("utf-8")) > _SIDECAR_LIMIT:
-            # The readers refuse a sidecar this long as damaged, which the prune ages on disk, so
-            # the plaintext one is left as it is and counted a skip (BACKLOG #5387 added item 1).
+            # A backstop (BACKLOG #5387 added item 1): a plaintext sidecar this would grow past the
+            # cap was left as TOO_LONG above, so this is a sealed one whose re-seal grew it. The
+            # readers refuse a sidecar this long as damaged, so it is not written. It is still
+            # under the prior key, so it is a skip: retiring that key would lose it.
             _log.warning(
                 "uploaded file %s (meta): skipped, sealed it would be larger than a sidecar can be",
                 fid,
@@ -3096,10 +3221,12 @@ class UploadStore:
         that line says what does remove it. It is not in the returned count, which is the number
         ``rotate-key`` should report as sealed.
 
-        The cost is one directory walk and a read of at most a marker's length from each file, plus,
-        for each upload with a PLAINTEXT sidecar, a read of its whole body, to tell the two kinds
-        apart. That body read is new work at startup, bounded by the plaintext uploads still waiting
-        for ``rotate-key``, and the first quota scan or prune after it does not repeat it
+        The cost is one directory walk, a read of at most a marker's length from each body, and a
+        read of each sidecar whole, up to :data:`_SIDECAR_LIMIT`, since its byte-order mark and
+        whitespace are skipped as the reader skips them (BACKLOG #5387 added item 1). A sidecar
+        every reader refuses as oversized is not counted. Then, for each upload with a PLAINTEXT
+        sidecar, a read of its whole body, to tell the two kinds apart. That body read is new work
+        at startup, bounded by the plaintext uploads still waiting for ``rotate-key``, and the first quota scan or prune after it does not repeat it
         (``_body_checks``). Runs off the event loop. **The body read is whole on purpose (BACKLOG
         #3183).** One byte that is not UTF-8, anywhere in it, makes an upload one ``rotate-key``
         cannot seal, so a prefix cannot decide it. Each read is bounded by the size an upload can
@@ -3158,7 +3285,7 @@ class UploadStore:
                         # The reader's padding is skipped, so a padded sealed sidecar is not
                         # counted as plaintext, and one the reader refuses as oversized is not
                         # counted at all (BACKLOG #5387 added item 1).
-                        head = _unpadded(_read_plain_text(path, _SIDECAR_LIMIT))
+                        head = _unpadded(_read_sidecar(path))
                         head = head[: len(MARKER_PREFIX)]
                     else:
                         handle, _ = _open_plain(path)
