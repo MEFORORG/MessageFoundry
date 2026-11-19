@@ -1218,10 +1218,18 @@ async def test_an_empty_verify_code_still_meets_the_gates_pending_refusal(
             assert (
                 await c.post("/ui/mfa", data={"code": totp.totp(secret, now=t1)})
             ).status_code == 303
+        if not pending:
+            # The control: without a held proof the gate refuses an empty code for want of it, the
+            # same answer the hook gives. With one held, a hook that let the empty code through
+            # would spend it and the route would check "" (a 400).
+            from messagefoundry.auth.service import STEP_UP_ACTION_MFA_CONFIRM
+
+            tok = c.cookies.get("mf_session")
+            assert tok is not None
+            service._grant_action_step_up(hash_token(tok), STEP_UP_ACTION_MFA_CONFIRM)
         calls = _spy_admin_write(service, monkeypatch)
-        # The control: a missing proof gives the same answer, so count the body reads. The gate's
-        # empty-code hook reads the body once, after the base; the base refuses a pending session
-        # before the hook runs.
+        # The gate's empty-code hook reads the body once, after the base; the base refuses a
+        # pending session before the hook runs.
         parsed: list[int] = []
         form_pairs = account_routes._form_pairs
 
@@ -1233,6 +1241,8 @@ async def test_an_empty_verify_code_still_meets_the_gates_pending_refusal(
         r = await c.post(path, data={"code": ""}, headers=SAME_ORIGIN)
         assert r.status_code == 303
         assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
+        if not pending:
+            assert await service.holds_action_step_up(tok, STEP_UP_ACTION_MFA_CONFIRM)
 
     assert parsed == ([] if pending else [1]), "the empty code did not stop at the gate's hook"
     assert len(calls) == (0 if pending else 1), f"allow_admin_write calls: {calls}"

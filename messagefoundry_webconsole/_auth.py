@@ -2129,7 +2129,7 @@ def require_ui_reauth_only_action(
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
         nxt = reauth_next(request) if reauth_next is not None else None
         # _ui_action_step_up_ok repeats the factor-binding check, so the refusal still holds if the
-        # base ever loses its hook.
+        # base ever loses its pending_refusal (refuse_pending above).
         if (
             new_ip
             or (
