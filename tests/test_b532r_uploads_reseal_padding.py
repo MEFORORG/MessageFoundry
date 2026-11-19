@@ -360,12 +360,12 @@ def test_the_startup_count_skips_a_body_too_large_to_seal(tmp_path: Path) -> Non
 # --- the command's error over a refused sidecar ---------------------------------------------------
 
 
-def test_rotate_key_never_advises_deleting_a_refused_sidecar(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Deleting it could destroy a value under the prior key, so the error says it could not be
-    read, that it may hold such a value, and that the prior key stays until it is fixed or
-    deliberately removed."""
+def _rotate_over_a_refused_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, also_unopenable: bool = False
+) -> int:
+    """Run ``main(["rotate-key"])`` over one upload whose sidecar is padded past the cap, so every
+    reader refuses it. ``also_unopenable`` adds a second upload sealed under a key the run is not
+    given, a skip that is not a refused sidecar. Returns the exit code."""
     from messagefoundry.__main__ import main
     from tests.test_cli import _rotate_env, _seed_store_and_upload
 
@@ -375,16 +375,58 @@ def test_rotate_key_never_advises_deleting_a_refused_sidecar(
     fid = _seed_store_and_upload(db, root, key_a)
     sidecar = root / f"{fid}.meta"
     sidecar.write_bytes(_padded_past_the_cap(sidecar.read_bytes(), "trailing"))
+    if also_unopenable:
+        _save(root, generate_key())
     _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=root)
-    assert main(["rotate-key", "--db", str(db)]) == 1
+    return main(["rotate-key", "--db", str(db)])
+
+
+#: Phrases that advise removing or deleting an upload's files. "deliberately removed" is not one:
+#: it is the condition the prior key waits on, never advice to remove.
+_REMOVAL_ADVICE = ("remove its two files", "remove the two files", "delete", "remove it")
+
+
+def test_rotate_key_never_advises_deleting_a_refused_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Deleting it could destroy a value under the prior key, so the error says every reader
+    refuses it, that it may hold such a value, and that the prior key stays until it is fixed or
+    deliberately removed."""
+    assert _rotate_over_a_refused_sidecar(tmp_path, monkeypatch) == 1
     err = capsys.readouterr().err
     refused = [line for line in err.splitlines() if line.startswith("error: 1 of those")]
     assert len(refused) == 1, err
     line = refused[0]
-    assert "error: 1 of those uploaded file(s) have a sidecar that could not be read" in line
+    assert "error: 1 of those uploaded file(s) have a sidecar that every reader refuses" in line
     assert "It may hold a value under the prior key" in line
     assert "Do not retire the prior key until each such sidecar is fixed" in line
     assert "deliberately removed" in line
     assert "delete" not in line.lower() and "two files" not in line
-    # The skip's generic advice to remove a damaged file's two files excludes this one.
-    assert "That does not apply to a sidecar that could not be read" in err
+
+
+def test_rotate_key_output_over_only_a_refused_sidecar_advises_no_removal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5387. When every skip is a refused sidecar, no line of the command's output, the
+    closing note after the audit roll included, advises removing or deleting an upload's files.
+    At 0639d3657d the closing note offered removing the two files of an upload that cannot be
+    fixed, and the skip error advised removing a damaged file's two files, whatever the skip."""
+    assert _rotate_over_a_refused_sidecar(tmp_path, monkeypatch) == 1
+    out = capsys.readouterr()
+    lines = (out.out + out.err).splitlines()
+    assert any(line.startswith("note: this run did not complete") for line in lines), lines
+    advising = [line for line in lines if any(p in line.lower() for p in _REMOVAL_ADVICE)]
+    assert advising == [], advising
+
+
+def test_rotate_key_still_offers_removal_for_a_skip_that_is_not_a_refused_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control: with a second skip that is not a refused sidecar, the removal advice is still
+    given, and it says it does not cover the refused sidecar."""
+    assert _rotate_over_a_refused_sidecar(tmp_path, monkeypatch, also_unopenable=True) == 1
+    out = capsys.readouterr()
+    assert "That does not apply to a sidecar every reader refuses" in out.err
+    note = [line for line in out.out.splitlines() if line.startswith("note: this run did not")]
+    assert len(note) == 1, out.out
+    assert "for a skip that is not a sidecar every reader refuses, remove the two files" in note[0]

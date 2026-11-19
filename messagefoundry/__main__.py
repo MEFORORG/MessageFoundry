@@ -12362,12 +12362,18 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "pair lock this "
             "account could not take (BACKLOG #3181). The log names each file and its "
             "cause. Fix the cause and re-run rotate-key BEFORE retiring any prior key "
-            "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). No key will ever open a file the log names as "
-            "damaged because a key did not open it, so restore that upload, or remove its two "
-            "files from the uploads directory, before the re-run. "
+            "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). "
             + (
-                "That does not apply to a sidecar that could not be read, below. "
-                if uploads.refused_sidecars
+                # BACKLOG #5387: never said when every skip is a refused sidecar, below.
+                "No key will ever open a file the log names as damaged because a key did not open "
+                "it, so restore that upload, or remove its two files from the uploads directory, "
+                "before the re-run. "
+                + (
+                    "That does not apply to a sidecar every reader refuses, below. "
+                    if uploads.refused_sidecars
+                    else ""
+                )
+                if uploads.skipped > uploads.refused_sidecars
                 else ""
             )
             + "This run did not stamp the key's rotation date, and no serve start does while the "
@@ -12380,7 +12386,7 @@ def _rotate_key(args: argparse.Namespace) -> int:
             # never advises it.
             print(
                 f"error: {uploads.refused_sidecars} of those uploaded file(s) have a sidecar that "
-                "could not be read: it is larger than a sidecar can be, is not UTF-8, or is "
+                "every reader refuses, as one larger than a sidecar can be, not UTF-8, or "
                 "plaintext too long to seal. It may hold a value under the prior key. Do not "
                 "retire the prior key until each such sidecar is fixed, for example by restoring "
                 "it from a backup, or is deliberately removed. The log names each one.",
@@ -12431,10 +12437,18 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # BACKLOG #3737, owner ruling 2026-10-30: a skip does not stop the roll, so an operator who
         # reads PARTIAL as "go back" must be told. Conditional, because this run cannot see whether
         # the key changed: a same-key run or a keyless chain rolled nothing. A new key is no remedy
-        # here, because the file skips the same way under it.
+        # here, because the file skips the same way under it. Removal is offered only for the skips
+        # that are not a refused sidecar, which may hold a value under the prior key (BACKLOG #5387).
+        removal = (
+            "Fix the cause and re-run, or, for a skip that is not a sidecar every reader refuses, "
+            "remove the two files of an upload that cannot be fixed and re-run. "
+            if uploads.skipped > uploads.refused_sidecars
+            else "Fix the cause and re-run. "
+        )
         print(
-            "note: this run did not complete. Fix the cause and re-run, or remove the two files of "
-            "an upload that cannot be fixed and re-run. If this store is moving to a new key and "
+            "note: this run did not complete. "
+            + removal
+            + "If this store is moving to a new key and "
             "its audit chain is keyed, the chain has rolled to that key, and a key opens one audit "
             "range, so you cannot go back to the prior key: keep it in "
             "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED until a run completes."

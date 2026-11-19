@@ -820,7 +820,9 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    that upload, or remove its two files from the uploads directory. A sidecar every reader refuses
    before decrypting, as below, is skipped on every run too, but it is neither decrypted nor
    looked inside, so it may hold a value under the prior key: do not retire that key until the sidecar is fixed, as by restoring
-   it, or deliberately removed. The log names each skipped file, and says whether the key its marker names is configured. A file
+   it, or deliberately removed. The log names each skipped file. For a sealed value no key opens,
+   it also says whether the key its marker names is configured, where the marker names one; for a
+   refused sidecar it names the refusal instead, and nothing about a key. A file
    larger than an upload can be is skipped too, and only its first bytes are read. A body that
    starts with the active key's marker reads as already current instead, and is not reported; a
    sidecar does not, since it is decoded whole first. If a skipped
@@ -906,13 +908,16 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    removed. That holds over any body, one that is missing or is not text included, so such a
    plaintext sidecar is not the never-sealable kind `rotate-key` reports apart, though the prune
    and the delete class it as that kind. The command's error names how many of its skips are
-   such a sidecar, says it may hold a value under the prior key, and does not advise deleting
-   it. Its closing note after the audit roll still offers removing the two files of an upload that
-   cannot be fixed, whatever the skip, and the retention prune and the API delete class such a
-   plaintext sidecar over a lost body as the never-sealable kind and remove it; both are open
-   findings. The one sidecar `rotate-key` leaves as it is without a skip is one that provably holds
-   nothing: read in full within 128 KiB, it is empty, or only a byte-order mark and whitespace.
-   It counts that one apart from `skipped`, as `damaged`, so it does not hold the rotation open.
+   such a sidecar, says it may hold a value under the prior key, and says not to retire that key
+   until each is fixed or deliberately removed. Its advice to remove an upload's two files, in
+   that error and in its closing note after the audit roll, is given only when some skip is not
+   such a sidecar, and says it covers only those other skips. The retention prune and the API
+   delete still class such a plaintext sidecar over a lost body as the never-sealable kind and
+   remove it; that is an open finding. Among the sidecars `rotate-key` leaves as they are without
+   a skip is at least one that provably holds nothing: read in full within 128 KiB, it is empty,
+   or only a byte-order mark and whitespace. One that is not a regular file is another, counted in
+   the note on such files above. Over a body the run does not skip, `rotate-key` counts a sidecar
+   that holds nothing apart from `skipped`, as `damaged`, so it does not hold the rotation open.
    The command's output does not report that count, and the log names each such upload. The
    startup count agrees with `rotate-key` over each of these kinds: it counts none of their
    sidecars, and counts the plaintext body under one only where `rotate-key` would seal it.

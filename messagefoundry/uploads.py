@@ -411,7 +411,10 @@ _SIDECAR_PAD = " \t\r\n"
 def _too_long_to_seal(value: str) -> bool:
     """Whether unpadded sidecar text ``value`` is plaintext longer than
     :data:`_PLAIN_SIDECAR_LIMIT`, so no seal of it fits :data:`_SIDECAR_LIMIT` (BACKLOG #5387).
-    The one test the save, every reader and ``rotate-key`` apply, so they cannot drift apart."""
+    The test the save, every reader through :func:`_read_sidecar` and ``rotate-key``'s
+    :meth:`UploadStore._reseal_half` apply. :meth:`UploadStore._unsealable_sync`, which classes an
+    upload as never sealable for at least the prune, the delete and the startup count, does not
+    call it."""
     return not value.startswith(MARKER_PREFIX) and len(value.encode("utf-8")) > _PLAIN_SIDECAR_LIMIT
 
 
@@ -1176,16 +1179,19 @@ class ResealResult:
     #: whitespace a reader skips. Every reader refuses it as damaged. No value under any key is in
     #: it, so retiring the prior key loses nothing of it, and no re-run changes it, so it is not a
     #: skip and does not keep ``rotate-key`` from completing. The sidecar is left as it is, and its
-    #: body is still re-sealed as any other. Every other sidecar a reader refuses before decrypting
-    #: is a skip instead, never counted here, since the pass does not look inside it for a value
-    #: under the prior key (:meth:`UploadStore._refused_meta`). ``rotate-key``'s output does not
-    #: report this count; the log names each one.
+    #: body is still re-sealed as any other, and over a body the pass skips the upload counts in
+    #: ``skipped`` instead. At least a sidecar every reader refuses before decrypting as over
+    #: :data:`_SIDECAR_LIMIT`, not UTF-8 or plaintext too long to seal is a skip, never counted
+    #: here, since the pass does not look inside it for a value under the prior key
+    #: (:meth:`UploadStore._refused_meta`). A sidecar that is not a regular file is not counted
+    #: here either (``not_regular``). ``rotate-key``'s output does not report this count; the log
+    #: names each one.
     damaged: int = 0
     #: How many of the ``skipped`` UPLOADS were skipped because their sidecar is one every reader
     #: refuses before decrypting, as over :data:`_SIDECAR_LIMIT`, not UTF-8, or plaintext too long
-    #: to seal (BACKLOG #5387). Each is also counted in ``skipped``. It could not be read, and it
-    #: may hold a value under the prior key, so ``rotate-key`` tells the operator to fix it or
-    #: remove it deliberately before retiring that key, never to delete it as a damaged file.
+    #: to seal (BACKLOG #5387). Each is also counted in ``skipped``. It could not be used, and it
+    #: may hold a value under the prior key, so ``rotate-key`` says not to retire that key until
+    #: it is fixed or deliberately removed, and never advises deleting it as a damaged file.
     refused_sidecars: int = 0
     #: True when the uploads root could not be listed, as when it is missing or is not a directory
     #: (BACKLOG #4940). ``rotate-key`` refuses such a root before it writes anything, so this is a
@@ -2938,8 +2944,9 @@ class UploadStore:
         **It does not seal a plaintext sidecar over a body it did not seal (BACKLOG #2322).** Sealing
         it would list an upload with no usable body, and would seal a planted lone sidecar too. Where
         the body is missing or is not text, no re-run can change that, so the upload is counted in
-        ``unsealable`` rather than ``skipped``, unless every reader refuses the sidecar before
-        decrypting, as one past the plaintext seal bound, which is a skip (``refused_sidecars``), and the retention prune removes it at expiry. The same
+        ``unsealable`` rather than ``skipped``, and the retention prune removes it at expiry. The
+        exception is a sidecar every reader refuses before decrypting, as one past the plaintext
+        seal bound: that upload is a skip, also counted in ``refused_sidecars``. The same
         body under a SEALED sidecar is counted in ``body_lost``, also not a skip, and its sidecar is
         re-sealed. **That is a judgment about the body as it is now (BACKLOG #3737):** a missing body
         that comes back under a key retired since then is unreadable, so the command's note tells
@@ -3021,8 +3028,9 @@ class UploadStore:
         if resealed or skipped or unsealable or body_lost or not_regular or damaged:
             _log.info(
                 "re-sealed %d uploaded-file value(s) under the active key, sealing %d plaintext "
-                "upload(s) (%d upload(s) skipped, %d of them over a sidecar that could not be "
-                "read and must not be deleted, %d that cannot be sealed, %d whose body is lost, "
+                "upload(s) (%d upload(s) skipped, %d of them over a sidecar every reader refuses, "
+                "which may hold a value under a prior key, so do not retire that key until each is "
+                "fixed or deliberately removed, %d that cannot be sealed, %d whose body is lost, "
                 "%d holding a file that is not regular, %d whose sidecar is blank and every reader "
                 "refuses as damaged)",
                 resealed,
@@ -3073,7 +3081,7 @@ class UploadStore:
         decodes as UTF-8, such as a BOM-less UTF-16 re-save, reads as plaintext and is sealed,
         within the plaintext bound. ``cause`` names the refusal."""
         _log.warning(
-            "uploaded file %s (meta): skipped, %s, so it could not be read and may hold a value "
+            "uploaded file %s (meta): skipped, %s, so it could not be used and may hold a value "
             "under a prior key; do not retire that key until it is fixed or deliberately removed",
             fid,
             cause,
@@ -3121,12 +3129,15 @@ class UploadStore:
             if not S_ISREG(info.st_mode):
                 _log.warning("uploaded file %s (%s): not a file; left as it is", fid, kind)
                 return _Half.NOT_REGULAR
-            # Read the MARKER first, not the file. The idempotency test is a prefix compare, and a
-            # sealed 25 MiB upload is ~44 MiB on disk — reading it whole only to skip it made a
-            # re-run cost a full pass over every already-current file. The store's own passes push
-            # this filter into SQL (`WHERE col NOT LIKE ...`) for the same reason; on a filesystem
-            # the equivalent is a bounded read. So an already-current file is never size-checked: a
-            # lowered max_upload_bytes must not turn one into a skip.
+            # For a body, read the MARKER first, not the file. The idempotency test is a prefix
+            # compare, and a sealed 25 MiB upload is ~44 MiB on disk — reading it whole only to
+            # skip it made a re-run cost a full pass over every already-current file. The store's
+            # own passes push this filter into SQL (`WHERE col NOT LIKE ...`) for the same reason;
+            # on a filesystem the equivalent is a bounded read. So an already-current body is
+            # never size-checked: a lowered max_upload_bytes must not turn one into a skip. A
+            # sidecar is size-checked first and decoded whole before it is taken as current
+            # (BACKLOG #5387), since every reader refuses one over the cap or not UTF-8, whatever
+            # its marker.
             #
             # Opened by _open_plain (BACKLOG #5387 added item 1), so a link or FIFO swapped in
             # after the lstat above is refused, a skip as an unreadable file is, and the marker,
@@ -3415,8 +3426,10 @@ class UploadStore:
         matches that pass's ``sealed_plaintext`` over every one of them (BACKLOG #5387). A
         plaintext body under a sidecar that is not plaintext is counted only when it is a regular
         file no larger than a body can be that decodes to its end (:meth:`_seals_whole`), as
-        ``rotate-key`` seals only such a body. One it cannot read for another cause, such as a
-        permission, is still counted, though that pass skips it."""
+        ``rotate-key`` seals only such a body. A body this scan cannot open for its head, such as
+        one whose permission denies it, is not counted. One whose head it reads but whose whole read
+        then fails for another cause is still counted, since :meth:`_lost_body_size` answers
+        ``None`` for it, though that pass skips it."""
         count = unsealable = 0
         for fid, sidecar in self._iter_sidecars():
             try:
