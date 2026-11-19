@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from harness._async import join_worker_thread
 from harness._console_widgets import ConfigurableTable
 from harness.file_transport import DropResult, FileDropWorker
 from harness.mllp import SendItem, SendResult, SendWorker
@@ -228,10 +229,9 @@ class ComposePanel(QWidget):
         if self._worker is not None:
             self._worker.stop()
         if self._thread is not None:
-            self._thread.quit()
-            if not self._thread.wait(6000):
-                self._thread.terminate()
-                self._thread.wait()
+            # The send worker sees stop() while dialling too, so this join is prompt and never
+            # needs QThread.terminate (BACKLOG #5947).
+            join_worker_thread(self._thread)
             self._thread = None
         self._worker = None
 
