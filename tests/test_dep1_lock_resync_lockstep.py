@@ -317,8 +317,8 @@ def test_the_resync_checkout_persists_no_credential() -> None:
 def test_only_the_push_step_receives_the_app_token() -> None:
     """RED when: a step other than the push names the minted token's output (BACKLOG #5477).
 
-    This pins the expression reference only. That the token is not live while uv and the repository
-    script run is the mint step's position, pinned by the test below.
+    This pins the expression reference only. The token is live on the runner from the mint step on;
+    what this holds is that no other step is handed it.
     """
     readers = [
         str(s.get("name") or s.get("uses"))
@@ -331,7 +331,7 @@ def test_only_the_push_step_receives_the_app_token() -> None:
 
 
 # The uv the DEP-1 gate installs, e.g. `pip install --upgrade pip "uv==0.12.0"`.
-_GATE_UV_PIN_RE = re.compile(r"""["']?\buv==(?P<version>[0-9][0-9A-Za-z.+-]*)["']?""")
+_GATE_UV_PIN_RE = re.compile(r"\buv==(?P<version>[0-9][0-9A-Za-z.+-]*)")
 
 
 def test_the_resync_installs_the_uv_the_gate_pins() -> None:
@@ -352,20 +352,14 @@ def test_the_resync_installs_the_uv_the_gate_pins() -> None:
     )
 
 
-def test_the_app_token_is_minted_after_the_steps_that_run_on_the_pr_tree() -> None:
-    """RED when: the contents-write token is minted before uv or the repository script runs.
+def test_the_app_key_is_used_before_any_step_runs_on_the_pr_tree() -> None:
+    """RED when: the mint step, which holds the App's long-lived private key, runs after the checkout.
 
-    Once minted, the token lives on the runner until the job ends, readable by any later step on
-    the same machine, so the steps that run on the Dependabot-changed tree must all come first.
+    Every step from the checkout on can run code from the Dependabot-changed tree as the runner user,
+    who could tamper with a later step's action or environment. The key must have been used and gone
+    before then; the short-lived token it mints is what later steps share a runner with.
     """
     steps = _resync_steps()
     position = {str(s.get("id") or s.get("name")): i for i, s in enumerate(steps)}
-    mint = position["app-token"]
-    uv_steps = [
-        i
-        for i, s in enumerate(steps)
-        if any(line.lstrip().startswith("uv ") for line in str(s.get("run", "")).splitlines())
-    ]
-    assert uv_steps, "no step runs uv; the ordering assertion would pass over nothing"
-    assert mint > max(uv_steps), "the App token is minted before a step that runs uv"
-    assert mint > position["closure"], "the App token is minted before the repository script runs"
+    checkout = position["Check out the PR head"]
+    assert position["app-token"] < checkout, "the App private key is used after the PR checkout"

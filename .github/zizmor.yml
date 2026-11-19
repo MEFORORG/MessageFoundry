@@ -109,7 +109,7 @@ rules:
       #
       # NOT suppressed (fixed at the source instead): release.yml's checkouts set persist-credentials:
       # false, because it DOES upload build artifacts. dependabot-lock-resync.yml is NOT listed either:
-      # its checkout persists nothing, and the App token is minted after uv runs (BACKLOG #5477).
+      # its checkout persists nothing and hands the App token to the push step alone (BACKLOG #5477).
       - benchmark.yml
       - ci.yml
       - security.yml

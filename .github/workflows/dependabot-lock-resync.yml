@@ -104,6 +104,20 @@ jobs:
             echo "::warning title=lock-resync skipped (misconfiguration)::This run WAS triggered by dependabot[bot], yet LOCK_RESYNC_APP_ID is empty. The App credentials must live under Settings > Secrets and variables > *Dependabot* (not Actions) for a Dependabot-triggered run to read them. Skipping the re-export; DEP-1 lock sync is still enforced by the pip-audit job in security.yml."
           fi
 
+      # MINTED FIRST, BEFORE ANY STEP RUNS ON THE DEPENDABOT-CHANGED TREE. The mint step holds the App's
+      # long-lived PRIVATE KEY, which must never share a runner with code an earlier step could have
+      # planted. The short-lived token it mints then exists while uv and the repository script run, but
+      # is in neither their environment nor .git/config (BACKLOG #5477). Separating the two fully, with
+      # the re-export in a job that holds no secret, is a larger change than that row.
+      - name: Mint a scoped GitHub App token
+        id: app-token
+        if: steps.creds.outputs.present == 'true'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.LOCK_RESYNC_APP_ID }}
+          private-key: ${{ secrets.LOCK_RESYNC_APP_PRIVATE_KEY }}
+          permission-contents: write
+
       - name: Check out the PR head
         if: steps.creds.outputs.present == 'true'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -114,8 +128,8 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha }}
           # NO CREDENTIAL IN THE CHECKOUT (BACKLOG #5477). The fetch uses the run's read-only token,
           # and nothing is persisted into .git/config, so uv and the repository script below run on a
-          # Dependabot-changed tree with no write credential on disk to read. The App token is minted
-          # only after those steps, and reaches the push step through that step's environment.
+          # Dependabot-changed tree with no write credential on disk to read. The App token reaches
+          # the push step alone, through that step's environment.
           persist-credentials: false
 
       - name: Set up uv
@@ -176,31 +190,22 @@ jobs:
           set -euo pipefail
           python3 scripts/security/runtime_closure.py
 
-      # MINTED HERE, AFTER uv AND THE REPOSITORY SCRIPT HAVE RUN (BACKLOG #5477), so no step that runs
-      # on the Dependabot-changed tree executes while a contents-write token exists on this runner.
-      - name: Mint a scoped GitHub App token
-        id: app-token
-        if: steps.creds.outputs.present == 'true'
-        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
-        with:
-          app-id: ${{ secrets.LOCK_RESYNC_APP_ID }}
-          private-key: ${{ secrets.LOCK_RESYNC_APP_PRIVATE_KEY }}
-          permission-contents: write
-
       - name: Commit and push the resynced locks
         if: steps.creds.outputs.present == 'true'
         env:
           # Pass the PR head ref through the environment, NOT inline ${{ }} in the run block, so a branch
           # name containing shell metacharacters can never be evaluated as code (template injection).
           HEAD_REF: ${{ github.event.pull_request.head.ref }}
-          # The only step that reads the App token (BACKLOG #5477), which is minted just above.
+          # The only step that reads the App token (BACKLOG #5477).
           APP_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
           # Earlier steps ran uv and a repository script on the Dependabot-changed tree, as the same
-          # user, so they could have written .git/hooks or a core.fsmonitor command. Both are turned
-          # off for every git command below, through git's environment config, which outranks
-          # .git/config, because this step holds the token while git runs.
+          # user. Hooks and core.fsmonitor are turned off for every git command below, through git's
+          # environment config, which outranks .git/config. That NARROWS what such a step could plant
+          # to run beside the token here; it does not close it: at least a filter driver, gpg.program,
+          # include.path, and GIT_CONFIG_PARAMETERS or BASH_ENV written to $GITHUB_ENV stay open. The
+          # security model above rests on no package or untrusted code running in those steps.
           export GIT_CONFIG_COUNT=2
           export GIT_CONFIG_KEY_0='core.hooksPath' GIT_CONFIG_VALUE_0='/dev/null'
           export GIT_CONFIG_KEY_1='core.fsmonitor' GIT_CONFIG_VALUE_1='false'
