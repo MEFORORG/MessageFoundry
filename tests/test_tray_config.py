@@ -691,26 +691,25 @@ def test_load_config_an_operator_chain_pins_nothing(tmp_path: Path) -> None:
     assert cfg.engine_cacert is None
 
 
-# --- The bind, dialled and verified (BACKLOG #5973) ------------------------------------------------
+# --- The bind, and where it is dialled (BACKLOG #5973) -------------------------------------------
 
 
 @pytest.mark.parametrize(
-    ("bind", "dial", "name"),
+    ("bind", "dial"),
     [
-        ("0.0.0.0", "127.0.0.1", "0.0.0.0"),
-        ("::", "::1", "::"),
-        ("[::]", "::1", "::"),
-        ("0:0:0:0:0:0:0:0", "::1", "0:0:0:0:0:0:0:0"),
-        ("localhost", "127.0.0.1", "localhost"),
-        ("LocalHost", "127.0.0.1", "LocalHost"),
-        ("127.0.0.1", "127.0.0.1", None),
-        ("::1", "::1", None),
-        ("10.0.0.9", "10.0.0.9", None),
-        ("engine.example.test", "engine.example.test", None),
+        ("0.0.0.0", "127.0.0.1"),
+        ("::", "::1"),
+        ("[::]", "::1"),
+        ("0:0:0:0:0:0:0:0", "::1"),
+        ("127.0.0.1", "127.0.0.1"),
+        ("::1", "::1"),
+        ("localhost", "localhost"),
+        ("10.0.0.9", "10.0.0.9"),
+        ("engine.example.test", "engine.example.test"),
     ],
 )
-def test_dial_target(bind: str, dial: str, name: str | None) -> None:
-    assert dial_target(bind) == (dial, name)
+def test_dial_target(bind: str, dial: str) -> None:
+    assert dial_target(bind) == dial
 
 
 @pytest.mark.parametrize(
@@ -718,52 +717,65 @@ def test_dial_target(bind: str, dial: str, name: str | None) -> None:
     [
         (None, (None, None)),
         ({}, (None, None)),
-        ({"api": "nope"}, (None, None)),
-        ({"api": {"host": "0.0.0.0", "port": 9100}}, ("0.0.0.0", 9100)),
-        ({"api": {"host": "bad host", "port": True}}, (None, None)),
-        ({"api": {"host": 7, "port": 70000}}, (None, None)),
-        ({"api": {"port": "9100"}}, (None, None)),
+        ({"api": "nope", "security": "nope"}, (None, None)),
+        # The engine's own reading: the host only through [security], and only off loopback.
+        (
+            {"security": {"local_access_only": False, "listen_address": "0.0.0.0"}},
+            ("0.0.0.0", None),
+        ),
+        ({"security": {"local_access_only": False}}, ("127.0.0.1", None)),
+        ({"security": {"listen_address": "::1"}}, (None, None)),
+        ({"security": {"local_access_only": True, "listen_address": "::1"}}, (None, None)),
+        ({"security": {"local_access_only": False, "listen_address": "bad host"}}, (None, None)),
+        ({"security": {"local_access_only": False, "listen_address": 7}}, (None, None)),
+        # [api].host is refused by the engine at load, so it is never read here.
+        ({"api": {"host": "0.0.0.0"}}, (None, None)),
+        ({"api": {"port": 9100}}, (None, 9100)),
+        ({"api": {"port": "9100"}}, (None, 9100)),  # the settings model coerces a digit string
+        ({"api": {"port": True}}, (None, None)),
+        ({"api": {"port": 70000}}, (None, None)),
+        ({"api": {"port": "nine"}}, (None, None)),
     ],
 )
 def test_service_toml_bind(toml: dict[str, object] | None, expected: object) -> None:
     assert service_toml_bind(toml) == expected
 
 
-def test_compose_a_wildcard_flag_dials_loopback_and_verifies_the_bind_name() -> None:
+def test_compose_a_wildcard_flag_dials_loopback() -> None:
     reg = ServiceRegistryInfo(app_parameters="serve --host 0.0.0.0 --port 9100")
     cfg = compose_config(None, reg)
     assert cfg.engine_url == "https://127.0.0.1:9100"
-    assert cfg.engine_tls_name == "0.0.0.0"
     assert cfg.monitor_only is False
 
 
 def test_compose_the_serve_flag_overrides_the_settings_toml_bind() -> None:
-    """``serve --host/--port`` override ``[api]``, as in ``serve`` itself; each field on its own."""
+    """``serve --host/--port`` override the settings TOML, as in ``serve`` itself; each field on
+    its own, so a lone ``--port`` is honoured too."""
     reg = ServiceRegistryInfo(app_parameters="serve --port 9200")
-    cfg = compose_config(None, reg, engine_bind=("localhost", 9100))
-    assert cfg.engine_url == "https://127.0.0.1:9200"
-    assert cfg.engine_tls_name == "localhost"
-    reg = ServiceRegistryInfo(app_parameters="serve --host ::1")
+    cfg = compose_config(None, reg, engine_bind=("::", 9100))
+    assert cfg.engine_url == "https://[::1]:9200"
+    reg = ServiceRegistryInfo(app_parameters="serve --host 127.0.0.1")
     cfg = compose_config(None, reg, engine_bind=("0.0.0.0", 9100))
-    assert cfg.engine_url == "https://[::1]:9100"
-    assert cfg.engine_tls_name is None
+    assert cfg.engine_url == "https://127.0.0.1:9100"
 
 
-def test_compose_an_explicit_engine_url_drops_the_bind_name() -> None:
-    reg = ServiceRegistryInfo(app_parameters="serve --host 0.0.0.0 --port 9100")
-    cfg = compose_config({"engine_url": "https://127.0.0.1:9100"}, reg)
-    assert cfg.engine_tls_name is None
+def test_compose_a_registry_entry_without_bind_flags_follows_the_scheme() -> None:
+    """With no bind flags the URL is the engine's default bind in the scheme the settings say. It
+    used to stay the https default even behind a declared upstream terminator."""
+    reg = ServiceRegistryInfo(app_parameters="serve --config C:\\cfg")
+    assert compose_config(None, reg).engine_url == "https://127.0.0.1:8765"
+    assert compose_config(None, reg, engine_tls=False).engine_url == "http://127.0.0.1:8765"
 
 
 def test_load_config_reads_the_bind_from_the_service_toml(tmp_path: Path) -> None:
-    """The bind set only in ``messagefoundry.toml``: before BACKLOG #5973 the tray dialled the
+    """A bind set only in ``messagefoundry.toml``: before BACKLOG #5973 the tray dialled the
     default 127.0.0.1:8765, which is not where this engine listens."""
     (tmp_path / "messagefoundry.toml").write_text(
-        '[api]\nhost = "::"\nport = 9300\n', encoding="utf-8"
+        '[security]\nlocal_access_only = false\nlisten_address = "::"\n[api]\nport = 9300\n',
+        encoding="utf-8",
     )
     db = tmp_path / "messagefoundry.db"
     reader = _FakeReader(_reg(f'serve --config "C:\\MF\\config" --db "{db}"', str(tmp_path)))
     cfg = load_config(tmp_path, reader)
     assert cfg.engine_url == "https://[::1]:9300"
-    assert cfg.engine_tls_name == "::"
     assert cfg.engine_cacert == str(tmp_path / "api-generated-cert.pem")

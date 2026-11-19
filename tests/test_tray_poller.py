@@ -818,17 +818,15 @@ def test_a_successful_tick_that_outlives_stop_does_not_publish() -> None:
 
 def test_the_default_client_factory_carries_the_config_pin(monkeypatch: pytest.MonkeyPatch) -> None:
     """The pin reaches the probe client. Without it the tray would derive a pin and never use it."""
-    seen: list[tuple[str, str | None, str | None]] = []
+    seen: list[tuple[str, str | None]] = []
 
-    def factory(
-        url: str, *, cacert: str | None = None, tls_name: str | None = None
-    ) -> httpx.Client:
-        seen.append((url, cacert, tls_name))
+    def factory(url: str, *, cacert: str | None = None) -> httpx.Client:
+        seen.append((url, cacert))
         return httpx.Client(base_url=url)
 
     monkeypatch.setattr("messagefoundry.tray.poller.make_probe_client", factory)
     poller = StatusPoller(
-        TrayConfig(engine_url=_ENGINE_URL, engine_cacert="minted.pem", engine_tls_name="0.0.0.0"),
+        TrayConfig(engine_url=_ENGINE_URL, engine_cacert="minted.pem"),
         on_update=lambda _r: None,
         scm_reader=lambda _n: ScmReading(ScmState.RUNNING),
         health_probe=lambda _c: HealthProbe.OK,
@@ -836,7 +834,7 @@ def test_the_default_client_factory_carries_the_config_pin(monkeypatch: pytest.M
     )
     poller.start()
     poller.stop()
-    assert seen == [(_ENGINE_URL, "minted.pem", "0.0.0.0")]
+    assert seen == [(_ENGINE_URL, "minted.pem")]
 
 
 def test_a_pin_minted_after_start_is_picked_up_without_a_restart(
@@ -853,11 +851,7 @@ def test_a_pin_minted_after_start_is_picked_up_without_a_restart(
     built: list[tuple[str | None, ssl.SSLContext | None]] = []
 
     def factory(
-        url: str,
-        *,
-        cacert: str | None = None,
-        pinned: ssl.SSLContext | None = None,
-        tls_name: str | None = None,
+        url: str, *, cacert: str | None = None, pinned: ssl.SSLContext | None = None
     ) -> httpx.Client:
         built.append((cacert, pinned))
         return httpx.Client(base_url=url)

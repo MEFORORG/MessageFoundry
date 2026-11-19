@@ -4263,6 +4263,27 @@ def test_the_minted_certificate_names_the_bind_host(tmp_path: Path) -> None:
     assert api.host in common_names
 
 
+@pytest.mark.parametrize(
+    ("host", "names"),
+    [
+        ("127.0.0.1", ["127.0.0.1"]),
+        ("::1", ["::1"]),
+        ("localhost", ["localhost"]),
+        ("10.0.0.9", ["10.0.0.9"]),
+        # A wildcard is dialled on its own family's loopback, so that is named too (BACKLOG #5973).
+        ("0.0.0.0", ["0.0.0.0", "127.0.0.1"]),
+        ("::", ["::", "::1"]),
+    ],
+)
+def test_the_minted_certificate_names_a_wildcard_binds_loopback(
+    host: str, names: list[str], tmp_path: Path
+) -> None:
+    cert, _ = ensure_api_tls_material(ApiSettings(host=host), state_dir=tmp_path)
+    loaded = x509.load_pem_x509_certificate(Path(cert).read_bytes())
+    san = loaded.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert [str(n.value) for n in san] == names
+
+
 def test_a_second_start_reuses_a_fresh_pair_and_never_re_mints(tmp_path: Path) -> None:
     # MINT ONCE, THEN REUSE WHILE FRESH. A pair with most of its lifetime left is never replaced:
     # early renewal (ADR 0172, 2026-09-26 amendment) starts only in its last third, and the tests

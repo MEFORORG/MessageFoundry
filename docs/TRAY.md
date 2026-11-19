@@ -117,6 +117,14 @@ registry entry (`AppParameters` → host/port and the `--project-root` repo path
 interactively-logged-on user can read without elevation. Registry values are treated as untrusted
 hints (validated, never executed).
 
+The host and port come from `serve --host`/`--port` in `AppParameters`, else from the engine's
+settings TOML (`[security].listen_address` once `local_access_only = false`, and `[api].port`), else
+from the engine's defaults. The tray does not see `MEFOR_*` variables in the service's environment,
+which outrank the TOML; set `engine_url` if you bind through one. A wildcard bind (`0.0.0.0` or `::`)
+is not an address a client can connect to, so the tray dials the loopback of the same family
+(`127.0.0.1` or `::1`), and the certificate the engine mints for a wildcard bind names that loopback
+too.
+
 **What "View Service Log" will open.** Windows opens a file with whatever program owns its
 extension, so a `log_path` naming a `.bat` or `.lnk` would run it. The tray therefore opens
 `log_path` only when all of these hold. Otherwise it shows "Service log not opened" and opens

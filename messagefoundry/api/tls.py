@@ -10,6 +10,7 @@ isolation. The ``tls_min_version`` floor (NIST SP 800-52r2: 1.2+) is enforced vi
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -232,6 +233,26 @@ _MINT_LOCK_POLL_S = 0.05
 #: The generated pair's lifetime, inheriting the ``cert self-signed`` CLI default rather than
 #: inventing a second lifetime for the same primitive.
 _GENERATED_LIFETIME_DAYS = 365
+
+
+def _generated_sans(host: str) -> list[str]:
+    """The names a generated certificate carries beside ``host``, its subject (BACKLOG #5973).
+
+    A WILDCARD bind (``0.0.0.0``, ``::``) is not an address any client can dial, so a certificate
+    naming it alone verifies against no URL at all. It also names the loopback of the same family,
+    the address the tray and any other client on this box reach a wildcard bind through. Every
+    other bind needs nothing extra: a client dials that host as written. Only the one loopback of
+    the bind's own family is added, because a ``0.0.0.0`` bind does not listen on ``::1``.
+    """
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return []
+    if not ip.is_unspecified:
+        return []
+    return ["::1" if ip.version == 6 else "127.0.0.1"]
+
+
 #: Renew the generated pair at startup once less than this share of its OWN validity period is
 #: left: about 122 of 365 days (ADR 0172, 2026-09-26 amendment). Early rather than at expiry, so a
 #: renewal lands at an ordinary restart months before any client could see an expired certificate.
@@ -878,7 +899,9 @@ def _renew_generated_pair(
     from messagefoundry.__main__ import _write_private_key
 
     staged_cert, staged_key = _staged_pair(cert_path, key_path)
-    cert_pem, key_pem = pki.make_self_signed(api.host, [], _GENERATED_LIFETIME_DAYS)
+    cert_pem, key_pem = pki.make_self_signed(
+        api.host, _generated_sans(api.host), _GENERATED_LIFETIME_DAYS
+    )
     new = pki.read_self_signed_facts(cert_pem)
     try:
         _write_private_key(staged_key, key_pem)
@@ -932,7 +955,9 @@ def _mint_generated_pair(api: ApiSettings, cert_path: Path, key_path: Path) -> S
     from messagefoundry import pki
     from messagefoundry.__main__ import _write_private_key
 
-    cert_pem, key_pem = pki.make_self_signed(api.host, [], _GENERATED_LIFETIME_DAYS)
+    cert_pem, key_pem = pki.make_self_signed(
+        api.host, _generated_sans(api.host), _GENERATED_LIFETIME_DAYS
+    )
     _write_private_key(key_path, key_pem)
     paired = False
     try:

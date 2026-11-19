@@ -191,9 +191,7 @@ class StatusPoller:
         if client_factory is None:
             if is_tls_url(config.engine_url):
                 self._pin = config.engine_cacert
-            client_factory = functools.partial(
-                make_probe_client, cacert=config.engine_cacert, tls_name=config.engine_tls_name
-            )
+            client_factory = functools.partial(make_probe_client, cacert=config.engine_cacert)
         self._client_factory = client_factory
         #: The pin bytes the current client was built from, or None when it was not built from them.
         self._pin_pem: bytes | None = None
@@ -382,12 +380,7 @@ class StatusPoller:
     def _adopt_pin(self, loaded: LoadedPin) -> None:
         """Open a client trusting exactly the loaded context, and record the bytes it came from."""
         pem, context = loaded
-        self._client = make_probe_client(
-            self._config.engine_url,
-            cacert=self._pin,
-            pinned=context,
-            tls_name=self._config.engine_tls_name,
-        )
+        self._client = make_probe_client(self._config.engine_url, cacert=self._pin, pinned=context)
         self._pin_pem = pem
 
     def _unknown_result(self) -> PollResult:

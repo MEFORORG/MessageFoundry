@@ -56,7 +56,6 @@ from __future__ import annotations
 import json
 import logging
 import ssl
-from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -368,16 +367,8 @@ def make_probe_client(
     *,
     cacert: str | None = None,
     pinned: ssl.SSLContext | None = None,
-    tls_name: str | None = None,
 ) -> httpx.Client:
     """A tokenless httpx client for probing: short timeout, no redirect-follow by default.
-
-    ``tls_name`` is the name the server certificate is verified against when it is not
-    ``engine_url``'s host: the engine's bind host, for a bind the tray dials on loopback instead
-    (:func:`messagefoundry.tray.config.dial_target`, BACKLOG #5973). It is set as each request's
-    ``sni_hostname``, which httpcore passes to the handshake as ``server_hostname``, so the context
-    still checks the hostname, against the name the engine minted its certificate for. It never
-    turns verification off, and it changes nothing for plain http.
 
     ``pinned`` is a context :func:`load_pin` already built from ``cacert``, and it is used as it is.
     That is how the poller keeps the context tied to the exact bytes it recorded: letting this
@@ -398,17 +389,8 @@ def make_probe_client(
     ADR 0088 protects for ``apiclient``, and a third copy of an 8192 that nothing pins is worse than
     a documented absence. If the tray ever carries a token or takes a remote URL, close it.
     """
-    hooks: dict[str, list[Callable[[httpx.Request], None]]] = {}
-    if tls_name is not None and is_tls_url(engine_url):
-        name = tls_name
-
-        def _verify_as_bind_name(request: httpx.Request) -> None:
-            request.extensions["sni_hostname"] = name
-
-        hooks["request"] = [_verify_as_bind_name]
     return httpx.Client(
         base_url=engine_url.rstrip("/"),
-        event_hooks=hooks,
         timeout=timeout,
         follow_redirects=False,
         verify=pinned if pinned is not None else build_verify(engine_url, cacert),
