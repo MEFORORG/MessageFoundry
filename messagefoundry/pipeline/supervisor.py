@@ -372,13 +372,17 @@ class Supervisor:
         ``restart``). A cancellation, a watcher that raised, and :meth:`stop` once the watchers
         return all drain every child the same way. A launch in flight does not hold a watcher up:
         each races the stop, and the drain settles the launches itself, within twice
-        ``terminate_grace``. A drain whose :meth:`_terminate_all` may have left a child running
-        (one the force could not end, or a launch that outlived its cancellation) raises
-        :class:`ShardDrainError`, which outranks the other outcomes, except a fatal BaseException
-        a watcher raised, which propagates chained to it. :attr:`drain_failure` records that
-        outcome. A cancellation of the drain's own task during :meth:`_drain`'s wait for the
-        watchers, before :meth:`_terminate_all` runs, raises ``CancelledError`` instead, with
-        :attr:`drain_failure` ``None`` and no child asked to stop.
+        ``terminate_grace``. A drain whose :meth:`_terminate_all` finishes having found a child it
+        may have left running (one the force could not end, or a launch that outlived its
+        cancellation) raises :class:`ShardDrainError`, and :attr:`drain_failure` records that
+        outcome. It outranks the other outcomes, except at least these: a fatal BaseException a
+        watcher raised propagates instead, chained to it when the drain finished; a fatal
+        BaseException a launch raised during the drain propagates instead, chained to it; and a
+        cancellation of the drain's own task raises ``CancelledError``, unless a watcher raised a
+        fatal BaseException, which propagates. Cancelled inside :meth:`_terminate_all`, the drain
+        leaves its placeholder :attr:`drain_failure` set; cancelled earlier, during
+        :meth:`_drain`'s wait for the watchers, it leaves :attr:`drain_failure` ``None`` with no
+        child asked to stop.
 
         Refuses to start, with ``RuntimeError``, while a launch an earlier run stranded is still
         pending: this run's drain would otherwise report that launch as its own.
@@ -396,8 +400,9 @@ class Supervisor:
             for spec in self.specs
         ]
         # Cooperative shutdown, a stop, or one watcher raised: every route drains every child
-        # before ``run`` ends. A cancellation during the drain is absorbed rather than cutting it
-        # short, and is raised once the drain is done.
+        # before ``run`` ends. A cancellation of ``run``'s own task during the drain is absorbed
+        # rather than cutting it short, and is raised once the drain is done. A cancellation of
+        # the drain's own task is not absorbed (:func:`_finish_despite_cancel`).
         raised: BaseException | None = None
         try:
             await asyncio.gather(*watchers)
@@ -407,9 +412,23 @@ class Supervisor:
         for w in watchers:
             w.cancel()
         drain, cancelled = await _finish_despite_cancel(self._drain(watchers, raised))
+        fatal = raised is not None and not isinstance(raised, (Exception, asyncio.CancelledError))
+        if drain.cancelled():
+            # The drain's own task was cancelled, at least by ``asyncio.run``'s teardown. A fatal
+            # exit (SystemExit, KeyboardInterrupt) a watcher raised is not replaced by that.
+            if fatal:
+                assert raised is not None
+                raise raised
+            if isinstance(raised, Exception):
+                logger.error(
+                    "supervise: an engine shard watcher failed before the drain was cancelled",
+                    exc_info=raised,
+                )
+            raise asyncio.CancelledError
         if (failure := drain.exception()) is not None:
-            if raised is not None and not isinstance(raised, (Exception, asyncio.CancelledError)):
-                # A fatal exit (SystemExit, KeyboardInterrupt) is never replaced, even by this.
+            if fatal:
+                assert raised is not None
+                # A fatal exit a watcher raised is not replaced by the drain's failure either.
                 logger.error("supervise: the drain also failed: %s", failure)
                 raise raised from failure
             # A failed drain may have left a child running, which outranks ``raised``.
@@ -722,9 +741,9 @@ class Supervisor:
         The stop requests go out first, so a launch in flight does not delay them. One child's
         failure does not stop the rest being drained. A refused request falls through to the
         force; a child that may still be running is raised once every child has been tried, so
-        ``run`` does not end as a clean shutdown with it still running. :attr:`drain_failure` is
-        set first, so a drain cut short reads as failed, and settled once every child is tried.
-        A fatal BaseException a launch raised is raised last, chained to the drain's failure."""
+        ``run`` does not end as a clean shutdown with it still running. The comment on
+        :attr:`drain_failure` says when this sets and settles it. A fatal BaseException a launch
+        raised is raised last, chained to the drain's failure."""
         live = [c for c in self._children.values() if c.process.returncode is None]
         if live or self._launches:
             self.drain_failure = ShardDrainError(

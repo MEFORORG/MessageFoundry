@@ -628,3 +628,31 @@ async def test_a_cancelled_runner_after_a_failed_drain_exits_3() -> None:
 def test_a_non_finite_terminate_grace_is_refused() -> None:
     with pytest.raises(ValueError, match="terminate_grace"):
         Supervisor([_spec("default")], terminate_grace=float("inf"))
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.asyncio
+async def test_a_fatal_watcher_exit_is_not_replaced_when_the_drain_task_is_cancelled() -> None:
+    # The drain's own task is cancelled, as asyncio.run's teardown does, while it waits out the
+    # grace on a child that ignored its stop request. The watcher's fatal exit still propagates,
+    # not the drain's CancelledError.
+    class _Fatal(BaseException):
+        pass
+
+    proc = _Proc()
+
+    async def spawn(spec: ShardSpec) -> _Proc:
+        if spec.shard == "b":
+            await proc.waiting.wait()
+            raise _Fatal
+        return proc
+
+    sup = Supervisor([_spec("a"), _spec("b", 1)], spawn=_spawner(spawn), terminate_grace=5.0)
+    runner = asyncio.create_task(sup.run())
+    await asyncio.wait_for(proc.terminated.wait(), 5)
+    drains = [t for t in asyncio.all_tasks() if t.get_coro().__qualname__ == "Supervisor._drain"]  # type: ignore[union-attr]
+    assert len(drains) == 1
+    drains[0].cancel()
+    with pytest.raises(_Fatal):
+        await asyncio.wait_for(runner, 5)
+    assert proc.returncode is None
