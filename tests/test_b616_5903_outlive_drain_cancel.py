@@ -162,4 +162,7 @@ async def test_a_route_whose_operation_is_drained_answers_503(engine: Engine) ->
     detail = response.json()["detail"]
     assert "DR release was interrupted" in detail and "outcome is unknown. Check" in detail
     # Conditional, because an ungated operation released no approval.
-    assert "If it ran as an approval's release, that approval is now interrupted" in detail
+    assert (
+        "If it ran as an approval's release, that approval is now interrupted; resolve it rather "
+        "than approving it again." in detail
+    )

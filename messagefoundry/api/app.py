@@ -4996,8 +4996,8 @@ def create_app(
         return JSONResponse(
             {
                 "detail": f"{exc}. Check the audit log and the state it changes before running it "
-                "again. If it ran as an approval's release, that approval is now interrupted and "
-                "is resolved, not approved."
+                "again. If it ran as an approval's release, that approval is now interrupted; "
+                "resolve it rather than approving it again."
             },
             status_code=503,
         )

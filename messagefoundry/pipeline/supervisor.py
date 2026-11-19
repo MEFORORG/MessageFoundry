@@ -339,9 +339,11 @@ class Supervisor:
     restarts: dict[str, int] = field(default_factory=dict, init=False)
     #: Shards that tripped the crash-loop breaker in the current :meth:`run`: down, and not relaunched.
     crash_looped: set[str] = field(default_factory=set, init=False)
-    #: Set once the current :meth:`run`'s drain may have left an engine shard's child running, and
-    #: ``None`` otherwise. :meth:`_terminate_all` sets it before its first await and settles it at
-    #: the end, so a drain cut short still reads as failed. :func:`supervise` maps it to exit 3.
+    #: Set by :meth:`_terminate_all` when the current :meth:`run`'s drain may have left an engine
+    #: shard's child running. With a child or a launch live, it sets it before its first await and
+    #: settles it at the end, so a drain cut short inside :meth:`_terminate_all` reads as failed.
+    #: A drain cancelled earlier, during :meth:`_drain`'s wait for the watchers, leaves it ``None``
+    #: with no child asked to stop. :func:`supervise` maps it to exit 3.
     drain_failure: ShardDrainError | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
@@ -370,10 +372,13 @@ class Supervisor:
         ``restart``). A cancellation, a watcher that raised, and :meth:`stop` once the watchers
         return all drain every child the same way. A launch in flight does not hold a watcher up:
         each races the stop, and the drain settles the launches itself, within twice
-        ``terminate_grace``. A drain that may have left a child running (one the force could not
-        end, or a launch that outlived its cancellation) raises :class:`ShardDrainError`, which
-        outranks the other outcomes, except a fatal BaseException a watcher raised, which
-        propagates chained to it. :attr:`drain_failure` records the same outcome.
+        ``terminate_grace``. A drain whose :meth:`_terminate_all` may have left a child running
+        (one the force could not end, or a launch that outlived its cancellation) raises
+        :class:`ShardDrainError`, which outranks the other outcomes, except a fatal BaseException
+        a watcher raised, which propagates chained to it. :attr:`drain_failure` records that
+        outcome. A cancellation of the drain's own task during :meth:`_drain`'s wait for the
+        watchers, before :meth:`_terminate_all` runs, raises ``CancelledError`` instead, with
+        :attr:`drain_failure` ``None`` and no child asked to stop.
 
         Refuses to start, with ``RuntimeError``, while a launch an earlier run stranded is still
         pending: this run's drain would otherwise report that launch as its own.
@@ -795,9 +800,9 @@ async def supervise(
     Runs while any engine shard is alive. Returns 0 on a clean shutdown, 1 when every engine shard
     tripped the crash-loop breaker, 2 on a config/discovery error, which includes a graph
     ``registry_guard`` refuses (:func:`discover_shard_specs`), and 3 when
-    :attr:`Supervisor.drain_failure` is set, which outranks 0 and 1. Known limit: a launch, which
-    only an injected ``spawn`` can make, that ignores every cancellation is reported as exit 3,
-    and ``asyncio.run``'s teardown may then still wait on it.
+    :attr:`Supervisor.drain_failure` is set, which outranks 0 and 1. Known limit: the BACKLOG
+    #5894 note in ADR 0037 (``docs/adr/0037-multi-process-sharding-l3.md``) lists at least the cases
+    that can leave a child running with no exit 3, or to report exit 3 and still wait at teardown.
 
     While the engine shards run, a :class:`~messagefoundry.pipeline.crl_reload.CrlReloadRunner`
     applies a replaced CRL file to this process's own TLS contexts, as an engine process's runner
