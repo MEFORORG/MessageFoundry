@@ -1318,7 +1318,8 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > **Per-connection overrides ([ADR 0027](adr/0027-per-connection-retention.md)).** `messages_days` and
 > `dead_letter_days` are **global defaults** an individual connection may override: an **inbound** sets its
 > own `messages_days`, an **outbound** its own `dead_letter_days` (both `None` = inherit this global window,
-> `0` = keep that connection's bodies forever, `>0` = days). An inbound may also opt into **embedded-document
+> `0` = keep that connection's PHI forever, subject to the engine shard limit on an inbound's override
+> stated in the note below, `>0` = days). An inbound may also opt into **embedded-document
 > pruning** (`prune_documents_after` + `prune_documents_min_bytes`, [ADR 0042](adr/0042-embedded-document-pruning.md))
 > to strip bulky base64 attachments while keeping the readable message. These live on the connection (code-first
 > or in `connections.toml`) — see [CONNECTIONS.md](CONNECTIONS.md).
@@ -1326,11 +1327,12 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > **Under `enforce`, an override of `0` needs the same acknowledgement as a global `0`** (BACKLOG
 > #2368). Subject to the engine shard limit next, it keeps that connection's PHI forever, whatever
 > the global window says, but not every row about its messages; the refusal and the `AUDIT:` line
-> state which (BACKLOG #5967). One limit applies to an inbound's override alone. Where a
-> `serve --shard` process runs on a config that names more than one engine shard, it keeps nothing
-> past a bounded global window: each such process purges the shared store with only its own
-> inbounds' overrides, so an engine shard that does not hold that inbound purges its message bodies
-> on the global window. One such process is enough. Plain `serve` on the same config honours it. The
+> state which (BACKLOG #5967). The engine shard limit binds an inbound's override alone. Each
+> `serve --shard` process purges the shared store with only its own inbounds' overrides, so where a
+> `serve --shard` process that does not hold that inbound runs retention against the same store, it
+> purges that inbound's message bodies on a bounded global window, and the override keeps nothing
+> past that window. Plain `serve`, and the `serve --shard` process that holds the inbound, honour
+> the override. The
 > overrides live in the graph, so `serve` checks them when it loads the graph, at least at startup
 > and on every config reload:
 >

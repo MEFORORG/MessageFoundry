@@ -257,17 +257,18 @@ def test_the_override_text_names_what_is_kept_and_the_engine_shard_limit(
     assert "this, (" not in text and ",," not in text
     if inbound_days is None:
         assert "PHI message bodies" not in text
-    # The limit is keyed on a `serve --shard` process running, not on the config naming several
-    # engine shards: plain `serve` on such a config honours the override.
+    # The limit is keyed on a `serve --shard` process that does NOT hold the inbound: plain `serve`
+    # and the `serve --shard` process that holds it honour the override, a lone one included.
     shard_limit = (
-        "Where a serve --shard process runs on a config that names more than one engine shard, an "
-        "inbound override keeps nothing past the global [security].delete_message_bodies_after_days "
-        "window where that window is bounded"
+        "Where a serve --shard process that does not hold that inbound runs retention against the "
+        "same store, an inbound override keeps nothing past the global "
+        "[security].delete_message_bodies_after_days window where that window is bounded"
     )
     assert (shard_limit in text) is (inbound_days is not None)
-    assert ("Otherwise, plain serve included, it keeps forever" in text) is (
-        inbound_days is not None
-    )
+    assert (
+        "Otherwise, under plain serve or the serve --shard process that holds that inbound, it "
+        "keeps forever" in text
+    ) is (inbound_days is not None)
     if outbound_days is not None:
         assert (
             "which is that inbound's own override or else the global "

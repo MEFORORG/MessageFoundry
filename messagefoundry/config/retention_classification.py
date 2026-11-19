@@ -539,8 +539,8 @@ def keep_forever_overrides(registry: Registry) -> tuple[str, ...]:
     an outbound sets ``dead_letter_days``. ``None`` inherits the global window and a positive number
     bounds it. ``0`` asks to keep that connection's PHI forever, whatever the global window says, so
     it is the same choice as a global ``0`` made for one connection. Which rows each kind keeps,
-    which it does not, and how a ``serve --shard`` process on a config that names more than one
-    engine shard purges an inbound override's bodies on the global window anyway, is stated on
+    which it does not, and how a ``serve --shard`` process that does not hold an inbound purges
+    that inbound override's bodies on the global window anyway, is stated on
     :func:`_override_scope`. The global windows live in the service settings, where
     :func:`unbounded_windows` reads them; these live in the graph, so the start gate cannot see them
     and a registry guard must (vault BACKLOG #2368).
@@ -583,26 +583,27 @@ def _override_scope(kept: tuple[str, ...]) -> str:
     Each engine shard runs its own retention over the one shared store, with the override maps
     :meth:`~messagefoundry.pipeline.retention.RetentionRunner._resolve_overrides` reads from its own
     registry. :func:`~messagefoundry.pipeline.sharding.filter_registry_for_shard` keeps only that
-    engine shard's inbounds and every outbound, so where a ``serve --shard`` process runs on a
-    config that names more than one engine shard, an inbound's hold is honoured only by the engine
-    shard that holds it, and the text says so. One such process is enough, the case of a lone
-    ``serve --shard`` included, so the text keys on that and not on a count of processes. An
-    outbound's hold is in every engine shard's registry. Plain
-    ``serve`` does not filter its registry, so it honours every inbound's hold."""
+    engine shard's inbounds and every outbound. So an inbound's hold is honoured by plain ``serve``,
+    which does not filter its registry, and by the ``serve --shard`` process that holds that
+    inbound; a ``serve --shard`` process that does not hold it, running retention against the same
+    store, purges that inbound's bodies on the global window. The text keys on that process, not on
+    how many engine shards the config names or how many processes run: a lone ``serve --shard``
+    that holds the inbound keeps its bodies. An outbound's hold is in every engine shard's
+    registry."""
     dead_global = _window_setting("dead_letter_days")
     body_global = _window_setting("messages_days")
     inbound, outbound = _override_kinds(kept)
     parts = []
     if inbound:
         parts.append(
-            "Where a serve --shard process runs on a config that names more than one engine "
-            f"shard, an inbound override keeps nothing past the global {body_global} window where "
-            "that window is bounded: each serve --shard process purges the shared store with the "
-            "inbound overrides of its own registry, which holds no other engine shard's inbounds, "
-            "so an engine shard that does not hold that inbound purges at least what is listed "
-            "next for its messages on the global window, whether or not "
-            f"{BODY_ACKNOWLEDGEMENT_SETTING} is set. Otherwise, plain serve included, it keeps "
-            "forever, "
+            "Where a serve --shard process that does not hold that inbound runs retention against "
+            f"the same store, an inbound override keeps nothing past the global {body_global} "
+            "window where that window is bounded: each serve --shard process purges the shared "
+            "store with the inbound overrides of its own registry, which holds no other engine "
+            "shard's inbounds, so that process purges at least what is listed next for that "
+            "inbound's messages on the global window, whether or not "
+            f"{BODY_ACKNOWLEDGEMENT_SETTING} is set. Otherwise, under plain serve or the "
+            "serve --shard process that holds that inbound, it keeps forever, "
             "while that inbound stays in the live graph with it, at least what the purge of "
             "message bodies holds for the messages that inbound "
             "received: each stored body, though the inbound's own prune_documents_after, where "
@@ -622,9 +623,8 @@ def _override_scope(kept: tuple[str, ...]) -> str:
             "cancelled payloads, the event detail and the replies that outbound captured: those "
             "are purged on the body window of the inbound that received the message, which is "
             f"that inbound's own override or else the global {body_global}, where that window is "
-            "bounded. Where a serve --shard process runs on a config that names more than one "
-            "engine shard, an engine shard that does not hold that inbound purges them on the "
-            "global window."
+            "bounded. Where a serve --shard process that does not hold that inbound runs "
+            "retention against the same store, it purges them on the global window."
         )
     return " ".join(parts)
 
