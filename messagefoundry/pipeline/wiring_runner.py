@@ -107,6 +107,7 @@ from messagefoundry.config.tls_policy import (
     log_attested_crossing,
 )
 from messagefoundry.config.wiring import (
+    _INTAKE_KEY_MODES,
     CLEARTEXT_REVOCATION_KEYS,
     INTAKE_AUTH_RATE_LIMIT_DEFAULT,
     INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,
@@ -15988,8 +15989,9 @@ def check_http_tls_exposure(
 _INTAKE_ALLOWLIST_MIN_PREFIX_V4 = ALLOWLIST_MIN_PREFIX_V4
 _INTAKE_ALLOWLIST_MIN_PREFIX_V6 = ALLOWLIST_MIN_PREFIX_V6
 
-#: The ``intake_auth`` modes :func:`_has_effective_peer_control` judges without the allow-list.
-_INTAKE_MODES_JUDGED_ALONE = frozenset({"api_key", "bearer", "mtls_subject"})
+#: The ``intake_auth`` modes :func:`_has_effective_peer_control` judges without the allow-list,
+#: built from wiring's key modes so a key mode added there is not read here as weighing the list.
+_INTAKE_MODES_JUDGED_ALONE = frozenset({*_INTAKE_KEY_MODES, "mtls_subject"})
 
 
 def _allowlist_weighed(settings: Mapping[str, Any]) -> bool:

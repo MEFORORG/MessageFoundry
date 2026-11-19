@@ -59,8 +59,11 @@ __all__ = [
 ALLOWLIST_MIN_PREFIX_V4: Final = 8
 ALLOWLIST_MIN_PREFIX_V6: Final = 32
 
-#: The most IPv4 addresses a whole ``source_ip_allowlist`` may admit and still count (vault BACKLOG
-#: #5393): twice what one entry at the IPv4 floor admits. Without it, entries that each meet the
+#: The most IPv4 addresses the whole-list count of a ``source_ip_allowlist`` may reach and the list
+#: still count (vault BACKLOG #5393): twice what one entry at the IPv4 floor admits. The count is
+#: not every address the list admits: it leaves out at least the plain-space loopback and
+#: multicast blocks (:data:`_NOT_A_PEER_V4`) and plain IPv6 entries, as :func:`allowlist_shortfall`
+#: says. Without it, entries that each meet the
 #: floor, such as the 256 ``/8`` networks, together admit the IPv4 internet. Twice a ``/8`` leaves
 #: room for ``10.0.0.0/8`` beside the other RFC 1918 private ranges (``172.16.0.0/12``,
 #: ``192.168.0.0/16``) and RFC 6598's shared address space, a ``/10``. An IPv4-embedded IPv6 entry
