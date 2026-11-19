@@ -1831,3 +1831,29 @@ async def test_sqlserver_step_down_mirrors_the_postgres_seam() -> None:
         False,
     )
     assert len(store.executed) == writes
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "heartbeat_seconds",
+        "node_timeout_seconds",
+        "reclaim_interval_seconds",
+        "leader_lease_ttl_seconds",
+        "leader_fence_timeout_seconds",
+        "lease_renew_timeout_seconds",
+    ],
+)
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_cluster_timing_fields_refuse_a_non_finite_value(field: str, value: float) -> None:
+    """BACKLOG #5771: NaN compares False with everything, so a ``<= 0`` check passed it, and an
+    infinity passed too. Before the fix at least ``node_timeout_seconds`` and
+    ``reclaim_interval_seconds`` loaded NaN, and the lease TTL loaded infinity."""
+    with pytest.raises(ValueError, match="must be a finite number > 0"):
+        ClusterSettings(**{field: value})
+
+
+def test_cluster_timing_fields_still_take_the_shipped_defaults() -> None:
+    """The negative control for the non-finite refusal."""
+    assert ClusterSettings(reclaim_interval_seconds=1e6).reclaim_interval_seconds == 1e6
+    assert ClusterSettings(lease_renew_timeout_seconds=2.0).lease_renew_timeout_seconds == 2.0
