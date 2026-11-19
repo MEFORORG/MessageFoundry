@@ -120,18 +120,25 @@ async def _confirm_proof_held(request: Request) -> bool:
     return await ui_action_proof_held(request, STEP_UP_ACTION_MFA_CONFIRM)
 
 
+def _posted_code(form: dict[str, str]) -> str:
+    """The TOTP code a verify post carries. Stripped once, and that value is both the one measured
+    and the one sent, as at /ui/login: a correct code with surrounding space still counts. The
+    gate's empty-code hook and the route read the code through this one helper, so they cannot
+    disagree on whether a post carries one."""
+    return form.get("code", "").strip()
+
+
 async def _no_code_posted(request: Request) -> bool:
     """The verify gate's ``before_spend`` hook: a post to ``/ui/account/mfa/verify`` with no code
     goes to the gate's re-auth with the confirm proof unspent (BACKLOG #5931).
 
     The Continue button posts no code. With the confirm grant already held (another tab, or Back),
     the gate would spend it and ``""`` would be checked, writing a false ``auth.mfa_failed`` row
-    and drawing the attempt budget. The gate asks this after its base, so sign-in, must-change, the
-    origin check, the pending refusal and the admin-write charge apply first, and only while action
-    binding is on: under the opt-out an empty code is checked as a wrong one. The re-auth is still
-    asked for when a grant was held, and mints a fresh grant over it. Starlette caches the body, so
-    the route reads it again."""
-    return not dict(await _form_pairs(request)).get("code", "").strip()
+    and drawing the attempt budget. When the gate asks this, and what it has already checked, is
+    stated once, on :func:`require_ui_reauth_only_action`. The re-auth is still asked for when a
+    grant was held, and mints a fresh grant over it. Starlette caches the body, so the route reads
+    it again."""
+    return not _posted_code(dict(await _form_pairs(request)))
 
 
 # --- L5a: WebAuthn passkeys (ADR 0068, WP-14b) -------------------------------
@@ -624,9 +631,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if not token:  # pragma: no cover - require_ui already authenticated this cookie
             return RedirectResponse("/ui/login", status_code=303)
         form = dict(await _form_pairs(request))
-        # Stripped once, and that value is both the one measured and the one sent, as at
-        # /ui/login: a correct code with surrounding space still counts.
-        code = form.get("code", "").strip()
+        code = _posted_code(form)
         enrolment_code = form.get("enrolment_code", "")
         try:
             # The JSON MfaConfirmRequest's bound, by length only: an oversized code is refused,

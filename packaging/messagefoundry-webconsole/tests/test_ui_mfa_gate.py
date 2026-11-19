@@ -1096,9 +1096,10 @@ _PENDING_REFUSED_POSTS = (
 )
 
 #: A password form that can never rotate: the two new passwords differ. On the password route it
-#: keeps a control from signing the session out. The code is for the TOTP verify route: an empty
-#: one is answered ahead of the gate (BACKLOG #5931), so a code keeps that case on the gate itself,
-#: and ``test_an_empty_verify_code_still_meets_the_gates_pending_refusal`` covers the empty one.
+#: keeps a control from signing the session out. The code is for the TOTP verify route: the gate
+#: sends an empty one to the re-auth before its proof check (BACKLOG #5931), so a code keeps that
+#: case on the proof check itself, and
+#: ``test_an_empty_verify_code_still_meets_the_gates_pending_refusal`` covers the empty one.
 #: Every other route ignores the body.
 _NO_ROTATION = {
     "current_password": PW,

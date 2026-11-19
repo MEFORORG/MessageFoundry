@@ -580,8 +580,13 @@ def test_the_empty_code_check_is_the_verify_gates_own_hook(engine: Engine) -> No
     calls = [d.call for d in route.dependant.dependencies]  # type: ignore[attr-defined]
     gates = [c for c in calls if is_route_gate(c)]
     assert len(gates) == 1
-    # Nothing runs between the service and the gate, or after the gate.
-    assert calls[-2:] == [account_routes._service, gates[0]], calls
+    # The route declares the service and the gate and nothing else; any dependency ahead of them
+    # comes from the app, not from this module.
+    first = calls.index(account_routes._service)
+    assert calls[first:] == [account_routes._service, gates[0]], calls
+    assert not any(
+        getattr(c, "__module__", None) == account_routes.__name__ for c in calls[:first]
+    ), calls
     gate_vars = inspect.getclosurevars(gates[0]).nonlocals
     assert gate_vars["action"] == STEP_UP_ACTION_MFA_CONFIRM
     assert gate_vars["before_spend"] is account_routes._no_code_posted
