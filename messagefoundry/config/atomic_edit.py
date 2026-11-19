@@ -435,7 +435,7 @@ def replace_validated(
     restrict_to_owner(path, live=live)
 
 
-def restrict_to_owner(path: Path, *, live: _LiveSecurity | None = None) -> None:
+def restrict_to_owner(path: Path, *, live: _LiveSecurity | None = None) -> bool:
     """Restrict ``path`` to its owner, the step :func:`replace_validated` ends with.
 
     ``live`` is whose the file must stay, read before :func:`replace_validated` renamed its
@@ -446,17 +446,22 @@ def restrict_to_owner(path: Path, *, live: _LiveSecurity | None = None) -> None:
     keeps the owner it never lost, which is what the replace leaves where its ownership hand-back
     succeeds, and where that hand-back is refused the replace instead leaves the editor owning the
     file at full control. Any other file gets the editing account's own list (the module docstring
-    says why each). Best-effort as the replace's own step is: a failure is logged, not raised."""
+    says why each). Best-effort as the replace's own step is: a failure is logged, not raised.
+
+    ``False`` on Windows when no access list could be written and only the ``store._secure_file``
+    fallback ran, whose outcome is logged and not returned. On POSIX that fallback is the step
+    itself, so this is ``True`` and the caller reads the mode to learn whether it took."""
     if live is None:
         live = _live_security(path)
     if live.windows_owner is not None and _restrict_to_owner_and_editor(path, live.windows_owner):
-        return
+        return True
     # When the owner-and-editor list write fails, the fallback writes the same list again: the live
     # owner at full control, the editor at read only. A refused ownership hand-back whose list was
     # written never gets here.
     if sys.platform == "win32" and _restrict_to_editor(path, owner=live.windows_owner):
-        return
+        return True
     _secure_file(path)
+    return sys.platform != "win32"
 
 
 def restrict_in_place(path: Path, refused_error: Callable[[str], Exception]) -> None:
@@ -467,17 +472,47 @@ def restrict_in_place(path: Path, refused_error: Callable[[str], Exception]) -> 
     The replace renames a new file over the name, so it never changes another file. A restriction
     by name does, so the path is refused as ``refused_error(message)`` when it is now a link
     (:func:`refuse_a_link`), or holds anything but a regular file with one name: restricting a hard
-    link would also restrict the file behind its other name."""
+    link would also restrict the file behind its other name. A link count of 0, which some file
+    systems report when they keep none, is not read as a second name.
+
+    The file is held open, without following a link where the platform can refuse one, from the
+    check through the restriction, and is refused when the name no longer leads to the file held,
+    or when the restriction did not take: on POSIX a mode that still grants the group or others
+    anything, as when the editing account neither owns the file nor is root; on Windows no access
+    list written. The replace would have left a file restricted in either case, so a no-change
+    edit reports the difference rather than exit as if it had. The restriction itself is by name,
+    as the replace's is; the identity check after it is what bounds a swap during it."""
     refuse_a_link(path, refused_error)
-    with refused_as(path, refused_error, _STAT_STEP):
-        info = os.lstat(path)
-    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-        raise refused_error(
-            f"{path.name} was not changed: it is not a regular file with one name, and restricting "
-            "it to its owner would also restrict the file behind its other name. Replace it with a "
-            "file of its own"
-        )
-    restrict_to_owner(path)
+    flags = os.O_RDONLY | _O_BINARY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with refused_as(path, refused_error, READ_STEP):
+        fd = os.open(path, flags)
+    try:
+        held = os.fstat(fd)
+        if not stat.S_ISREG(held.st_mode) or held.st_nlink > 1:
+            raise refused_error(
+                f"{path.name} was not changed: it is not a regular file with one name, and "
+                "restricting it to its owner would also restrict the file behind its other name. "
+                "Replace it with a file of its own"
+            )
+        written = restrict_to_owner(path)
+        with refused_as(path, refused_error, _STAT_STEP):
+            now = os.lstat(path)
+        if (now.st_dev, now.st_ino) != (held.st_dev, held.st_ino):
+            raise refused_error(
+                f"{path.name} was not changed by this edit, but it was replaced by something else "
+                "while the edit ran, so its permissions are not known. Check the file and run the "
+                "edit again"
+            )
+        if sys.platform != "win32":
+            written = stat.S_IMODE(os.fstat(fd).st_mode) & 0o077 == 0
+        if not written:
+            raise refused_error(
+                f"{path.name} was not changed, but it could not be restricted to its owner, as "
+                "every edit restricts it: this account may not change its permissions. Run the "
+                "edit as the account that owns the file"
+            )
+    finally:
+        os.close(fd)
 
 
 @contextlib.contextmanager

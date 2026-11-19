@@ -130,7 +130,7 @@ def _check_unchanged(path: Path, *, exists: bool, validate: Validate) -> None:
     """The refusals an edit that changes nothing keeps from the validated replace it skips.
 
     A link is refused as the replace refuses it (vault BACKLOG #5619), and a path holding something
-    other than a regular file, which the replace could not have replaced, is refused too. A file
+    other than a regular file, which is no settings file to check in place, is refused too. A file
     that is there is checked as it stands, under the edit lock the caller holds, so a file the
     engine would refuse is never reported as left fine, and one that passes is then restricted to
     its owner as the replace restricts the file it writes, without its bytes being rewritten; a

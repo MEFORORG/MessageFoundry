@@ -1296,7 +1296,43 @@ def test_an_edit_that_changes_nothing_refuses_a_hard_link_and_leaves_its_other_n
         pytest.skip(f"cannot create a hard link here: {exc}")
     if sys.platform != "win32":
         os.chmod(other, 0o644)
-    before = (other.read_bytes(), os.stat(other).st_mode)
+    before = (other.read_bytes(), _permissions(other))
     with pytest.raises(security_edit.SecurityEditError, match="not a regular file with one name"):
         security_edit.set_security(toml, {"require_mfa": False}, validate=lambda _c: None)
-    assert (other.read_bytes(), os.stat(other).st_mode) == before
+    assert (other.read_bytes(), _permissions(other)) == before
+
+
+def _permissions(path: Path) -> object:
+    """The mode on POSIX; on Windows the owner and access list too, which the mode does not show."""
+    import os
+
+    if sys.platform != "win32":
+        return os.stat(path).st_mode
+    from messagefoundry.store.store import _read_dacl_sddl
+
+    return _read_dacl_sddl(path, owner=True)
+
+
+def test_an_edit_that_changes_nothing_is_refused_when_the_restriction_does_not_take(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The replace always leaves a restricted file, so a no-change edit whose restriction did not
+    take, as for an account that neither owns the file nor is root, reports it rather than exit
+    as if it had. The file's bytes are left as they were."""
+    import os
+
+    from messagefoundry.config import atomic_edit, security_edit
+
+    monkeypatch.setattr(atomic_edit, "_restrict_to_owner_and_editor", lambda _path, _owner: False)
+    monkeypatch.setattr(atomic_edit, "_restrict_to_editor", lambda _path, **_kw: False)
+    monkeypatch.setattr(atomic_edit, "_secure_file", lambda _path: None)
+    toml = tmp_path / "mf.toml"
+    toml.write_bytes(b"[security]\nrequire_mfa = false\n")
+    if sys.platform != "win32":
+        os.chmod(toml, 0o644)
+    before = toml.read_bytes()
+    with pytest.raises(
+        security_edit.SecurityEditError, match="could not be restricted to its owner"
+    ):
+        security_edit.set_security(toml, {"require_mfa": False}, validate=lambda _c: None)
+    assert toml.read_bytes() == before
