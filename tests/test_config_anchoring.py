@@ -313,6 +313,54 @@ def test_absolute_db_bypasses_root_at_serve(
     assert store_path == abs_db
 
 
+@pytest.mark.skipif(
+    Path("/data/mf.db").is_absolute(), reason="a leading slash is drive-relative only on Windows"
+)
+def test_a_drive_relative_db_stays_under_the_root_at_serve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5391 item 1, S19-26: ``_serve`` anchors ``[store].path`` through
+    ``anchored_store_path``. A direct ``root / path`` join lets a leading-slash path discard the
+    root on Windows and name a store on the launch drive's root, with no warning. The path comes
+    from the settings file, because a ``--db`` is anchored before the load as well."""
+    cfg = _config_dir(tmp_path, _NO_ENV_GRAPH)
+    root = tmp_path / "repo"
+    root.mkdir()
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text(
+        f'[environments]\nbase_dir = "{root.as_posix()}"\n\n[store]\npath = "/data/mf.db"\n',
+        encoding="utf-8",
+    )
+    argv = ["serve", "--config", str(cfg), "--service-config", str(svc), "--env", "dev"]
+    assert _serve_capturing_store_path(tmp_path, monkeypatch, argv) == str(root / "data" / "mf.db")
+
+
+@pytest.mark.skipif(
+    Path("/data/mf.db").is_absolute(), reason="a leading slash is drive-relative only on Windows"
+)
+def test_a_drive_relative_db_stays_under_the_root_at_the_fleet_renewal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5391 item 1, S19-26: the supervisor's TLS-pair renewal derives the state dir from
+    the anchored store path, so a drive-relative ``--db`` names the pair under the root that each
+    engine shard's ``serve`` uses, never one on the launch drive's root."""
+    from messagefoundry.__main__ import _renew_api_tls_before_spawning
+    from messagefoundry.config.settings import load_settings
+
+    seen: list[Path] = []
+
+    def _no_mint(_api: object, *, state_dir: Path, replacements: list[object]) -> None:
+        seen.append(Path(state_dir))
+
+    monkeypatch.setattr("messagefoundry.api.tls.ensure_api_tls_material", _no_mint)
+    settings = load_settings(
+        environ={"MEFOR_ENVIRONMENTS_BASE_DIR": str(tmp_path)}, default_file=False
+    )
+    state_dir = _renew_api_tls_before_spawning(settings, "/data/mf.db")
+    assert seen == [Path(state_dir)]
+    assert Path(state_dir) == (tmp_path / "data").resolve()
+
+
 def test_no_root_keeps_db_default_at_serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # Back-compat: with no root, a relative --db is CWD-relative as before (not rewritten).
     # Run from tmp_path: a CWD-relative store puts the default log spool (BACKLOG #1966) beside it,
