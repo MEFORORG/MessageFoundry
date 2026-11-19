@@ -3209,6 +3209,27 @@ def test_the_logon_right_switch_refuses_to_empty_the_right_for_everyone(tmp_path
     )
 
 
+def test_the_logon_right_switch_removes_the_account_written_by_its_name(tmp_path: Path) -> None:
+    """The installer counts a holder written as the account's name as held (BACKLOG #5401), so
+    the removal must take that name out too, or it reports 'does not hold' and leaves the right."""
+    got = _logon_right_arms(
+        tmp_path, holders=["*S-1-5-32-545", "NT SERVICE\\MessageFoundry"], sid="S-1-5-80-4001"
+    )
+    assert got["result"] is True, got
+    assert "SeServiceLogonRight = *S-1-5-32-545 |" in got["configured"], got["configured"]
+
+
+@_windows_only
+def test_the_logon_right_switch_removes_a_name_that_resolves_to_the_sid(tmp_path: Path) -> None:
+    # BUILTIN\Administrators resolves to S-1-5-32-544 on every Windows host; BUILTIN\Users does
+    # not, and must stay.
+    got = _logon_right_arms(
+        tmp_path, holders=["BUILTIN\\Users", "BUILTIN\\Administrators"], sid="S-1-5-32-544"
+    )
+    assert got["result"] is True, got
+    assert "SeServiceLogonRight = BUILTIN\\Users |" in got["configured"], got["configured"]
+
+
 def test_a_right_the_account_does_not_hold_is_a_no_op(tmp_path: Path) -> None:
     """POSITIVE CONTROL the other way: nothing is rewritten when there is nothing to remove, so a
     re-run cannot disturb a host it already cleaned."""

@@ -606,7 +606,19 @@ function Remove-ServiceLogonRight {
         }
         $value = ($row -replace '^\s*SeServiceLogonRight\s*=', '')
         $held = @($value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        $kept = @($held | Where-Object { $_ -ne ("*" + $Sid) -and $_ -ne $Sid })
+        # A holder can be written as an account NAME rather than the '*SID' form, and the installer
+        # counts such a name as held (BACKLOG #5401), so a name is this account when it is the
+        # account's own name or resolves to its SID. A '*SID' token and a name that does not
+        # resolve to this SID are kept.
+        $kept = @($held | Where-Object {
+            if ($_ -eq ("*" + $Sid) -or $_ -eq $Sid) { return $false }
+            if ($_.StartsWith('*')) { return $true }
+            if ($_ -eq $Account) { return $false }
+            try {
+                ([Security.Principal.NTAccount]$_).Translate(
+                    [Security.Principal.SecurityIdentifier]).Value -ne $Sid
+            } catch { $true }
+        })
         if ($kept.Count -eq $held.Count) {
             Write-Host "  Right  : '$Account' does not hold SeServiceLogonRight; nothing to remove."
             return $false
@@ -781,7 +793,7 @@ $acePrincipal = $accountSpec.Principal
 $configProtected = $false
 if ($configDir) {
     try {
-        $configProtected = [bool](Get-Acl -Path $configDir -ErrorAction Stop).AreAccessRulesProtected
+        $configProtected = [bool](Get-Acl -LiteralPath $configDir -ErrorAction Stop).AreAccessRulesProtected
     } catch {
         $unreadable += ("the permissions of the config directory '$configDir' " +
             "($($_.Exception.Message))")

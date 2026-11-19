@@ -106,6 +106,7 @@ def test_a_gated_engine_requires_the_operators_attestation(service: str) -> None
 _CHECK = "revocation-attestation-check"
 
 
+@functools.cache
 def _all_services() -> dict[str, dict[str, Any]]:
     doc = yaml.safe_load(_COMPOSE.read_text(encoding="utf-8"))
     return dict(doc.get("services") or {})
@@ -137,9 +138,19 @@ def test_the_check_reads_the_same_required_value_and_never_restarts() -> None:
     assert not check.get("profiles"), "a profiled check would not run for every engine"
 
 
-@pytest.mark.parametrize(
-    ("value", "passes"),
-    [
+def test_the_check_runs_the_engines_image() -> None:
+    # A check in another image would read the value with another version's parser, or fail to
+    # pull an image the operator never built.
+    image = _all_services()[_CHECK]["image"]
+    for name, svc in _serving_engines().items():
+        assert svc["image"] == image, f"{name} runs {svc['image']!r}, the check {image!r}"
+
+
+def test_the_check_uses_the_parser_serve_calls() -> None:
+    # The values in-process, against the function serve's gate calls; the shipped command is run
+    # for one value each way below, which is what proves it calls that function.
+    assert "tls_revocation_attested" in " ".join(_check_argv())
+    for value, passes in [
         ("1", True),
         ("true", True),
         (" Yes ", True),
@@ -149,21 +160,23 @@ def test_the_check_reads_the_same_required_value_and_never_restarts() -> None:
         ("no", False),
         ("attested", False),
         ("", False),
-    ],
-)
-def test_the_check_accepts_exactly_what_serve_accepts(value: str, passes: bool) -> None:
-    # Run the check's own command with this interpreter, so the shipped text is what is tested,
-    # and compare it with the parser serve's gate calls.
+    ]:
+        with mock.patch.dict(os.environ, {TLS_REVOCATION_ATTESTED_ENV: value}):
+            assert tls_revocation_attested() is passes, value
+
+
+@pytest.mark.parametrize(("value", "passes"), [("1", True), ("0", False)])
+def test_the_shipped_check_command_runs(value: str, passes: bool) -> None:
+    # Run the check's own command with this interpreter, so the shipped text is what is tested.
     env = {k: v for k, v in os.environ.items() if k != TLS_REVOCATION_ATTESTED_ENV}
     env[TLS_REVOCATION_ATTESTED_ENV] = value
     done = subprocess.run(
         [sys.executable, *_check_argv()], env=env, capture_output=True, text=True, timeout=120
     )
-    with mock.patch.dict(os.environ, {TLS_REVOCATION_ATTESTED_ENV: value}):
-        assert tls_revocation_attested() is passes
-    assert (done.returncode == 0) is passes, done.stderr
-    if not passes:
-        assert done.returncode == 1
+    if passes:
+        assert done.returncode == 0, done.stderr
+    else:
+        assert done.returncode == 1, done.stderr
         assert "API revocation gate" in done.stderr
 
 

@@ -1746,16 +1746,19 @@ function Set-ServiceLogonRight {
             $value = $lines[$at] -replace '^\s*SeServiceLogonRight\s*=', ''
             $holders = @($value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
             # An exported row can hold an account NAME rather than the '*SID' form (BACKLOG #5401), so
-            # a name is resolved and its SID compared too; read by SID alone, a held name re-adds it. SID tokens are compared first, so an
-            # already-held SID needs no lookup. A name that does not resolve is not this account.
+            # a name is resolved and its SID compared too; read by SID alone, a held name re-adds it.
+            # SID tokens are compared first, so an already-held SID needs no lookup. A name that does
+            # not resolve is not this account. uninstall-service.ps1's Remove-ServiceLogonRight
+            # matches a holder the same way.
             $held = @($holders | Where-Object { $_ -eq ("*" + $sid) -or $_ -eq $sid })
             if (-not $held) {
+                # -First 1 stops at the first match, so later names cost no lookup.
                 $held = @($holders | Where-Object { -not $_.StartsWith('*') } | Where-Object {
                     try {
                         ([Security.Principal.NTAccount]$_).Translate(
                             [Security.Principal.SecurityIdentifier]).Value -eq $sid
                     } catch { $false }
-                })
+                } | Select-Object -First 1)
             }
             if ($held) {
                 Write-Host "  Right  : '$Account' already holds SeServiceLogonRight (Log on as a service)."
