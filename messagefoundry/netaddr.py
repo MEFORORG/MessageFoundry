@@ -104,6 +104,9 @@ IPV4_EMBEDDINGS: Final[tuple[tuple[ipaddress.IPv6Network, int], ...]] = (
     (TEREDO, _LATE_IPV4_START),
     (SIX_TO_FOUR, 16),  # 2002:V4ADDR::/48
 )
+# 6to4 starts its IPv4 address at bit 16, so an entry inside it that meets the IPv6 floor fixes at
+# least 16 IPv4 bits, more than the IPv4 floor: the per-entry rule never refuses one there. It is
+# in IPV4_EMBEDDINGS for the whole-list count, where each such entry still admits IPv4 addresses.
 
 #: The ranges of :data:`IPV4_EMBEDDINGS` whose addresses the HTTP listener's failed-attempt budget
 #: does not key on their ``/64``, read by the span limit on its ``trusted_proxies``
@@ -120,13 +123,14 @@ IPV4_EMBEDDING_PREFIXES: Final = tuple(
     network for network, _start in IPV4_EMBEDDINGS if network not in (IPV4_MAPPED, IPV4_TRANSLATED)
 )
 
-#: IPv4 space a remote peer's packet cannot carry as its source: loopback, which a host drops as a
-#: martian when it arrives on another interface, and multicast, never a unicast source. The
-#: whole-list count in :func:`allowlist_shortfall` leaves it out of the plain IPv4 space only, so
-#: listing ``127.0.0.0/8`` beside the private ranges does not use up the cap. The same blocks
-#: reached through another range of :data:`IPV4_EMBEDDINGS`, NAT64 for one, are counted. "This
-#: network" (``0.0.0.0/8``) and the reserved class E block are counted: at least Linux can be set
-#: to use them as unicast addresses. Not counting loopback is not a claim that a loopback entry
+#: IPv4 space from which no remote peer completes a TCP connection directly: loopback, which a
+#: host drops as a martian when it arrives on another interface unless set not to (Linux's
+#: ``route_localnet``), and a reply to which is routed back to the host itself either way, and
+#: multicast, never a unicast source. The whole-list count in :func:`allowlist_shortfall` leaves
+#: it out of the plain IPv4 space only, so listing ``127.0.0.0/8`` beside the private ranges does
+#: not use up the cap. The same blocks reached through another range of :data:`IPV4_EMBEDDINGS`,
+#: NAT64 for one, are counted. "This network" (``0.0.0.0/8``) and the reserved class E block are
+#: counted: at least Linux can be set to use them as unicast addresses. Not counting loopback is not a claim that a loopback entry
 #: admits no remote client: an on-box relay, such as a reverse proxy, a port forward or an SSH
 #: tunnel, connects from loopback for whoever it forwards, and neither gate weighs that.
 _NOT_A_PEER_V4: Final = (
@@ -280,11 +284,6 @@ _ALLOWLIST_ENTRY_TYPES: Final = (
     ipaddress.IPv6Address,
 )
 
-# 6to4 starts its IPv4 address at bit 16, so an entry inside it that meets the IPv6 floor fixes at
-# least 16 IPv4 bits, more than the IPv4 floor: the per-entry rule never refuses one there. It is
-# in IPV4_EMBEDDINGS for the whole-list count, where each such entry still admits IPv4 addresses.
-
-
 #: Ranges of :data:`IPV4_EMBEDDINGS` whose IPv4 address starts at bit 96, named in
 #: :data:`ALLOWLIST_RULE_TEXT` as written there; ``str()`` of the mapped block prints it dotted.
 #: tests/test_allowlist_restricts.py pins them to the table.
@@ -366,13 +365,13 @@ def allowlist_shortfall(allowlist: Any) -> str | None:
     **The list is also judged whole** (vault BACKLOG #5393). Entries that each meet a floor can
     together admit the IPv4 internet, so the list's IPv4 address count, as
     :data:`ALLOWLIST_RULE_TEXT` defines it, may be at most :data:`ALLOWLIST_MAX_IPV4_ADDRESSES`.
-    That count is not every IPv4 address the list admits, as the rest of this paragraph says. Plain IPv4 entries and IPv4-mapped ones are one space,
-    where an overlap is counted once. Each other range in :data:`IPV4_EMBEDDINGS` is counted
-    apart, since its addresses cannot be matched to plain IPv4 ones with certainty, so the same
-    hosts listed under two ranges count twice, which can only fail closed. In the plain IPv4
-    space, address space no remote peer's packet can carry as its source (:data:`_NOT_A_PEER_V4`)
-    is not counted. Plain
-    IPv6 entries outside those ranges are judged by the per-entry floor alone."""
+    That count is not every IPv4 address the list admits, as the rest of this paragraph says.
+    Plain IPv4 entries and IPv4-mapped ones are one space, where an overlap is counted once. Each
+    other range in :data:`IPV4_EMBEDDINGS` is counted apart, since its addresses cannot be matched
+    to plain IPv4 ones with certainty, so the same hosts listed under two ranges count twice,
+    which can only fail closed. In the plain IPv4 space, loopback and multicast
+    (:data:`_NOT_A_PEER_V4`) are not counted. Plain IPv6 entries outside those ranges are judged
+    by the per-entry floor alone."""
     if not isinstance(allowlist, (list, tuple, set, frozenset)) or not allowlist:
         return "it is not a non-empty list of addresses and networks"
     # The IPv4 ranges the list admits, keyed by the embedding range they arrive under, or by None
