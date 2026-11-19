@@ -60,6 +60,7 @@ from __future__ import annotations
 import contextlib
 import enum
 import logging
+import math
 import os
 import re
 from collections.abc import Mapping, Sequence
@@ -3312,6 +3313,19 @@ class EngineLadderResult:
         return "\n".join(lines)
 
 
+def _soak_field(soak_msg: Mapping[str, Any], key: str, default: float) -> float | None:
+    """One LADDER_SOAK number, or ``None`` when the drive's value cannot arm a soak. The message is the
+    other box's content, read from a shared directory: a missing, non-numeric, boolean, non-finite or
+    negative value would otherwise raise out of the ladder or arm a soak no rung could run."""
+    value = soak_msg.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
+
+
 async def _seen_stop(base_coord: FileDropCoord, grace: float) -> bool:
     """Poll for ``LADDER_STOP`` under the base run_id for up to ``grace`` seconds; True if it lands. A
     BOUNDED poll (not a single non-blocking read) so the drive's just-posted STOP — which it emits only
@@ -3438,6 +3452,9 @@ async def run_engine_ladder(
     for planned in [*(r.run_suffix for r in climb), "soak"]:
         base_coord.for_run(f"{base_coord.run_id}.{planned}").clear_messages(ENGINE_SETUP_FAILED)
 
+    # Set when this half ends the climb for a reason that is not the drive's normal early-stop. The drive
+    # then has no soak to post, so waiting out ``soak_timeout`` for LADDER_SOAK would only waste it.
+    climb_aborted = False
     for rung in climb:
         # Early-stop: before arming any rung after the first, give the drive's just-posted LADDER_STOP a
         # brief window to land (a bounded poll — see _seen_stop). Skip the poll for the first rung (no prior
@@ -3502,6 +3519,7 @@ async def run_engine_ladder(
                     f"aborting climb: no DRIVE_START for {rung.run_suffix} and no LADDER_STOP "
                     "(drive unresponsive)"
                 )
+                climb_aborted = True
             break
         payload = _engine_rung_payload(report)
         _attach_rung_timings(payload, _rung_log_paths(keep_dir, report.shards))
@@ -3513,7 +3531,12 @@ async def run_engine_ladder(
             result.notes.append(
                 f"{rung.run_suffix}: store-truth INVALID — drive aborted mid-delivery (stopping climb)"
             )
+            climb_aborted = True
             break
+
+    if climb_aborted:
+        result.notes.append("no soak: the climb aborted")
+        return result
 
     # Soak: the drive picks the rate (highest sustained, or an override) and posts LADDER_SOAK.
     try:
@@ -3525,15 +3548,24 @@ async def run_engine_ladder(
         result.notes.append("drive signalled no soak (no sustained rung)")
         return result
 
-    soak_rate = float(soak_msg["soak_rate"])
+    soak_rate = _soak_field(soak_msg, "soak_rate", math.nan)
+    soak_hold = _soak_field(soak_msg, "hold_seconds", soak_hold_seconds)
+    soak_drain = _soak_field(soak_msg, "drain_timeout", soak_drain_timeout)
+    soak_coord = base_coord.for_run(f"{base_coord.run_id}.soak")
+    if soak_rate is None or soak_hold is None or soak_drain is None:
+        result.notes.append("LADDER_SOAK malformed: ending without a soak")
+        # Tell the drive at once rather than leave it waiting out its SHARDS_READY window. Best effort, as
+        # in _reset_store_or_signal: a coord write error must not replace this half's own outcome.
+        with contextlib.suppress(OSError):
+            soak_coord.post(ENGINE_SETUP_FAILED, {"reason": "LADDER_SOAK malformed"})
+        return result
     soak_rung = LadderRung(
         index=-1,
         ingress_rate=soak_rate,
-        hold_seconds=float(soak_msg.get("hold_seconds", soak_hold_seconds)),
-        drain_timeout=float(soak_msg.get("drain_timeout", soak_drain_timeout)),
+        hold_seconds=soak_hold,
+        drain_timeout=soak_drain,
         is_soak=True,
     )
-    soak_coord = base_coord.for_run(f"{base_coord.run_id}.soak")
     soak_coord.clear_messages(
         SHARDS_READY, DRIVE_START, ENGINE_DRAINED, ENGINE_RUNG_REPORT, RUNG_ABORTED
     )
@@ -3711,10 +3743,10 @@ async def run_drive_ladder(
             break
 
     # Soak selection + handshake.
+    # An aborted climb (a rendezvous failure, or the engine's failed setup) skips the soak: the run already
+    # reads setup-degraded, and the engine half stops on that abort rather than arm one.
     soak_rate = (
-        pick_soak_rate(outcomes, soak_rate_override)
-        if do_soak and not engine_setup_failed
-        else None
+        pick_soak_rate(outcomes, soak_rate_override) if do_soak and not climb_aborted else None
     )
     soak_outcome: RungOutcome | None = None
     if soak_rate is None:
@@ -3731,6 +3763,8 @@ async def run_drive_ladder(
             notes.append("no soak (soak disabled)")
         elif engine_setup_failed:
             notes.append("no soak: the engine half failed its setup and exited")
+        elif climb_aborted:
+            notes.append("no soak: the climb aborted (setup-degraded)")
         elif sustained and len(void_sustained) == len(sustained):
             notes.append(
                 f"no soak: {len(sustained)} of {len(outcomes)} climb rung(s) SUSTAINED but ALL were "
