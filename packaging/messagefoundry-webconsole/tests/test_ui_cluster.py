@@ -842,6 +842,11 @@ async def test_a_failed_lease_read_degrades_and_keeps_the_notice(
         assert page_.status_code == 503
         assert "could not read cluster membership" in page_.text
         assert "Leadership lease released with force" in page_.text
+        released = await c.get("/ui/cluster", params={"m": "released"})
+        # Neither the notice nor the intro points at a lease owner or a cluster view not shown.
+        assert "lease owner below" not in released.text
+        assert "shows the whole cluster" not in released.text
+        assert "cannot read the lease owner right now" in released.text
         warnings = [r for r in caplog.records if r.name == _LOGGER and r.levelname == "WARNING"]
         assert len(warnings) == 1
         # The store answers again, so the next failure is a new outage and warns again.

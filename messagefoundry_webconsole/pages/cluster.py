@@ -452,10 +452,24 @@ def high_availability_unreadable_fragment(cluster: ClusterStatus) -> Markup:
     return _unreadable_body(cluster)
 
 
+# The post-stepdown notices for the degraded page. "released" points at a lease owner the
+# degraded page cannot show, so it says where to confirm instead; "drained" names nothing shown.
+_UNREADABLE_NOTICES: dict[str, str] = {
+    **_NOTICES,
+    "released": (
+        "Leadership lease released. A standby takes the lease on its next heartbeat, or after its "
+        "acquire delay if it has one. This page cannot read the lease owner right now, so before "
+        "you start maintenance, confirm here once the store answers that the lease owner has moved "
+        "and this node's connections are quiet."
+    ),
+}
+
+
 def high_availability_unreadable(cluster: ClusterStatus, *, notice: str = "") -> Markup:
     """The High Availability page when the membership read raised (BACKLOG #5932). It keeps the
-    post-stepdown notice, since the stepdown it reports already ran whatever this read did."""
-    message = _NOTICES.get(notice)
+    post-stepdown notice, since the stepdown it reports already ran whatever this read did, and
+    leaves out the intro, which describes the whole-cluster view this page cannot show."""
+    message = _UNREADABLE_NOTICES.get(notice)
     live = el(
         "div",
         _unreadable_body(cluster),
@@ -467,7 +481,6 @@ def high_availability_unreadable(cluster: ClusterStatus, *, notice: str = "") ->
         "High Availability",
         el("h1", "High Availability"),
         el("p", message, class_="banner") if message else Markup(""),
-        el("p", _INTRO, class_="muted"),
         live,
         active="cluster",
     )
