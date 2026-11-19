@@ -818,8 +818,8 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    gives no such warning, or you cannot tell, do not put the prior key back: go forward. **Some skips need a person (BACKLOG #3737).** A sealed value the
    key it names does not open is skipped on every run, because no key will ever open it. Restore
    that upload, or remove its two files from the uploads directory. A sidecar every reader refuses
-   before decrypting, as below, is skipped on every run too, but it is not opened, so it may hold a
-   value under the prior key: do not retire that key until the sidecar is fixed, as by restoring
+   before decrypting, as below, is skipped on every run too, but it is neither decrypted nor
+   looked inside, so it may hold a value under the prior key: do not retire that key until the sidecar is fixed, as by restoring
    it, or deliberately removed. The log names each skipped file, and says whether the key its marker names is configured. A file
    larger than an upload can be is skipped too, and only its first bytes are read. One that starts
    with the active key's marker reads as already current instead, and is not reported. If a skipped
@@ -893,9 +893,14 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    one. A sidecar that holds nothing else is blank, the damaged kind. **`rotate-key` skips a
    sidecar every reader refuses before decrypting, whatever it holds (BACKLOG #5387).** At least
    one over 128 KiB, one that is not UTF-8, such as a UTF-16 re-save with its byte-order mark,
-   and a plaintext one past that seal bound are such. `rotate-key` does not look inside it for
-   a key's marker, so padding, a stray byte, a re-encoding or text around a value sealed under a
-   prior key cannot make it read as holding nothing. Each is counted in `skipped`, so the run exits non-zero, writes no
+   and a plaintext one past that seal bound are such. `rotate-key` does not decrypt it or look
+   inside it for a key's marker, so padding, a stray byte, a re-encoding or text around a value
+   sealed under a prior key cannot make such a sidecar read as holding nothing. That covers only a
+   sidecar the readers refuse: a prior-key value behind a stray prefix that still decodes as UTF-8,
+   such as a BOM-less UTF-16 re-save or a leading `x`, reads as plaintext, and `rotate-key` seals it
+   within the plaintext bound and completes, so the prior key would then not open it. A sidecar that
+   starts with the active key's marker is decoded before it is taken as current, so one that is not
+   UTF-8 past the marker is such a skip too. Each is counted in `skipped`, so the run exits non-zero, writes no
    rotation stamp, and the rotation stays open until the sidecar is fixed or deliberately
    removed. That holds over any body, one that is missing or is not text included, so such a
    plaintext sidecar is not the never-sealable kind `rotate-key` reports apart, though the prune

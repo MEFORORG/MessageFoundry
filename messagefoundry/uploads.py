@@ -408,6 +408,13 @@ def _read_plain_text(path: Path, limit: int | None = None) -> str:
 _SIDECAR_PAD = " \t\r\n"
 
 
+def _too_long_to_seal(value: str) -> bool:
+    """Whether unpadded sidecar text ``value`` is plaintext longer than
+    :data:`_PLAIN_SIDECAR_LIMIT`, so no seal of it fits :data:`_SIDECAR_LIMIT` (BACKLOG #5387).
+    The one test the save, every reader and ``rotate-key`` apply, so they cannot drift apart."""
+    return not value.startswith(MARKER_PREFIX) and len(value.encode("utf-8")) > _PLAIN_SIDECAR_LIMIT
+
+
 def _read_sidecar(path: Path) -> str:
     """The text of sidecar ``path``, as :func:`_read_plain_text` reads it with
     :data:`_SIDECAR_LIMIT`. A plaintext one longer than :data:`_PLAIN_SIDECAR_LIMIT` once unpadded
@@ -416,8 +423,7 @@ def _read_sidecar(path: Path) -> str:
     damaged rather than leave it refused under the key and never sealable. ``rotate-key`` skips
     it, since it may hold a value under a prior key (:meth:`UploadStore._refused_meta`)."""
     text = _read_plain_text(path, _SIDECAR_LIMIT)
-    value = _unpadded(text)
-    if not value.startswith(MARKER_PREFIX) and len(value.encode("utf-8")) > _PLAIN_SIDECAR_LIMIT:
+    if _too_long_to_seal(_unpadded(text)):
         raise _OversizedFileError(_PLAIN_SIDECAR_LIMIT)
     return text
 
@@ -1180,7 +1186,7 @@ class ResealResult:
     #: to seal (BACKLOG #5387). Each is also counted in ``skipped``. It could not be read, and it
     #: may hold a value under the prior key, so ``rotate-key`` tells the operator to fix it or
     #: remove it deliberately before retiring that key, never to delete it as a damaged file.
-    sidecar_refused: int = 0
+    refused_sidecars: int = 0
     #: True when the uploads root could not be listed, as when it is missing or is not a directory
     #: (BACKLOG #4940). ``rotate-key`` refuses such a root before it writes anything, so this is a
     #: backstop. A root that stays listable is not missing, so an empty mount point over a volume
@@ -1940,10 +1946,7 @@ class UploadStore:
             # grows a value past it would meet this.
             # An unsealed one is held to the plaintext bound every reader applies, so a store with
             # no key never writes a sidecar it then refuses as damaged.
-            meta_len = len(meta_ct.encode("utf-8"))
-            if meta_len > _SIDECAR_LIMIT or (
-                not meta_ct.startswith(MARKER_PREFIX) and meta_len > _PLAIN_SIDECAR_LIMIT
-            ):
+            if len(meta_ct.encode("utf-8")) > _SIDECAR_LIMIT or _too_long_to_seal(meta_ct):
                 raise UploadFieldError(
                     display, "was not stored: its metadata is larger than the store can read back"
                 )
@@ -2971,7 +2974,7 @@ class UploadStore:
             return ResealResult(root_missing=True)
         gate = _ResealLockCheck(self._root / LOCK_FILE_NAME)
         resealed = skipped = sealed_plaintext = unsealable = body_lost = not_regular = damaged = 0
-        sidecar_refused = 0
+        refused_sidecars = 0
         for fid, _sidecar in pairs:
             try:
                 blob_path, meta_path = self._paths_unfollowed(fid)
@@ -3005,7 +3008,7 @@ class UploadStore:
                 unsealable += 1
             elif _Half.SKIPPED in (body, meta) or meta is _Half.REFUSED:
                 skipped += 1
-                sidecar_refused += meta is _Half.REFUSED
+                refused_sidecars += meta is _Half.REFUSED
             elif meta is _Half.DAMAGED:
                 damaged += 1
             elif _Half.NOT_REGULAR in (body, meta):
@@ -3034,7 +3037,7 @@ class UploadStore:
             body_lost=body_lost,
             not_regular=not_regular,
             damaged=damaged,
-            sidecar_refused=sidecar_refused,
+            refused_sidecars=refused_sidecars,
         )
 
     @staticmethod
@@ -3057,11 +3060,13 @@ class UploadStore:
         """Answer a sidecar every reader refuses before decrypting, as over :data:`_SIDECAR_LIMIT`,
         not UTF-8, or plaintext too long to seal (BACKLOG #5387). It is a skip, whatever it holds.
         Padding, a stray byte, a re-encoding or text around it may hide a whole value sealed under
-        a PRIOR key, which a repair recovers with that key, and the pass does not look inside it
-        for a marker to rule that out: a bounded read cannot see all of an oversized file, and a
+        a PRIOR key, which a repair recovers with that key, and the pass neither decrypts it nor
+        looks inside it for a marker to rule that out: a bounded read cannot see all of an oversized file, and a
         marker test is defeated by at least a cut at the read bound, stripped padding and UTF-16.
-        So retiring the prior key is never reported safe while one is on disk. ``cause`` names
-        the refusal."""
+        So retiring the prior key is never reported safe while one is on disk. A sidecar that the
+        readers decode is not one of these: a prior-key value behind a stray prefix that still
+        decodes as UTF-8, such as a BOM-less UTF-16 re-save, reads as plaintext and is sealed,
+        within the plaintext bound. ``cause`` names the refusal."""
         _log.warning(
             "uploaded file %s (meta): skipped, %s, so it could not be read and may hold a value "
             "under a prior key; do not retire that key until it is fixed or deliberately removed",
@@ -3131,7 +3136,7 @@ class UploadStore:
                 if kind == "meta" and opened.st_size > limit:
                     return self._refused_meta(fid, f"{opened.st_size} bytes is over the cap")
                 head = handle.read(len(active))
-                if head == active:
+                if head == active and kind == "body":
                     return _Half.CURRENT  # already under the active key in the active format
                 size = opened.st_size
                 if size <= limit:
@@ -3164,6 +3169,11 @@ class UploadStore:
                     if kind == "meta":
                         return self._refused_meta(fid, "it is not UTF-8")
                     raise
+                if head == active:
+                    # A sidecar is small, so it is decoded before this test: one that starts with
+                    # the active marker and is not UTF-8 past it is refused by every reader, so it
+                    # is a skip above, never current (BACKLOG #5387).
+                    return _Half.CURRENT
                 del data  # free the raw copy before the decrypt and the encrypt make two more
             if kind == "meta":
                 # As the reader unpads it, so a sealed sidecar that gained a byte-order mark or
@@ -3173,7 +3183,7 @@ class UploadStore:
                 if not stored:
                     return self._damaged_meta(fid)
             plaintext = bool(stored) and not stored.startswith(MARKER_PREFIX)
-            if kind == "meta" and plaintext and len(stored.encode("utf-8")) > _PLAIN_SIDECAR_LIMIT:
+            if kind == "meta" and _too_long_to_seal(stored):
                 # Checked before the body's outcome is weighed, because every reader refuses it
                 # before decrypting (_read_sidecar), so it is a skip over any body, a lost one too.
                 return self._refused_meta(fid, "it is plaintext too long to seal")
@@ -3252,7 +3262,7 @@ class UploadStore:
         del stored  # the write holds its own copy, so free this file-sized buffer before it
         if kind == "meta" and len(sealed.encode("utf-8")) > _SIDECAR_LIMIT:
             # A backstop (BACKLOG #5387 added item 1): a plaintext sidecar this would grow past the
-            # cap was left as DAMAGED above, so this is a sealed one whose re-seal grew it. The
+            # cap was a skip above, as REFUSED, so this is a sealed one whose re-seal grew it. The
             # readers refuse a sidecar this long as damaged, so it is not written. It is still
             # under the prior key, so it is a skip: retiring that key would lose it.
             _log.warning(

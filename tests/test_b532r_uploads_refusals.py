@@ -100,7 +100,7 @@ async def test_rotate_key_skips_a_too_long_plaintext_sidecar(tmp_path: Path) -> 
     planted = _too_long(sidecar)
     sidecar.write_text(planted, encoding="utf-8")
     result = await _store(root, generate_key()).reseal_to_active()
-    assert (result.skipped, result.sidecar_refused, result.damaged) == (1, 1, 0)
+    assert (result.skipped, result.refused_sidecars, result.damaged) == (1, 1, 0)
     assert result.incomplete
     assert sidecar.read_text(encoding="utf-8") == planted
 
@@ -276,7 +276,7 @@ async def test_a_sidecar_that_grew_after_its_fstat_is_read_bounded(
 
     monkeypatch.setattr(uploads, "_open_plain", _stale)
     result = await _store(root, generate_key()).reseal_to_active()
-    assert (result.skipped, result.sidecar_refused, result.damaged) == (1, 1, 0)
+    assert (result.skipped, result.refused_sidecars, result.damaged) == (1, 1, 0)
     assert sum(read) <= uploads._SIDECAR_LIMIT + 1
 
 
@@ -312,7 +312,7 @@ async def test_a_current_sidecar_padded_past_the_cap_is_a_skip_not_current(
     padded = sidecar.read_bytes() + b" " * (uploads._SIDECAR_LIMIT + 1)
     sidecar.write_bytes(padded)
     result = await _store(root, key).reseal_to_active()
-    assert (result.skipped, result.sidecar_refused, result.damaged) == (1, 1, 0)
+    assert (result.skipped, result.refused_sidecars, result.damaged) == (1, 1, 0)
     assert sidecar.read_bytes() == padded
 
 

@@ -329,8 +329,8 @@ async def test_a_skipped_plaintext_body_leaves_its_sidecar_untouched_and_unliste
 
 def _deny_open(monkeypatch: pytest.MonkeyPatch, denied: Path) -> None:
     """Make ``denied`` one the filesystem refuses to open. A sidecar that is not UTF-8 is not this:
-    every reader refuses it as damaged, so the reseal leaves it as ``damaged``, not a skip
-    (BACKLOG #5387 added item 1 follow-up)."""
+    every reader refuses it before decrypting, so the reseal counts it a skip in
+    ``refused_sidecars`` without opening it under any key (BACKLOG #5387)."""
     real_open = uploads_mod._open_plain
 
     def _open(path: Path) -> Any:

@@ -414,7 +414,7 @@ async def test_rotate_key_leaves_a_sidecar_that_would_seal_past_the_cap(
     plain = sidecar.read_text(encoding="utf-8")
     monkeypatch.setattr(uploads, "_PLAIN_SIDECAR_LIMIT", len(plain.encode("utf-8")) - 1)
     result = await _store(root, generate_key()).reseal_to_active()
-    assert (result.skipped, result.sidecar_refused, result.damaged) == (1, 1, 0)
+    assert (result.skipped, result.refused_sidecars, result.damaged) == (1, 1, 0)
     assert result.incomplete
     assert result.resealed == 1  # the body is still sealed
     assert sidecar.read_text(encoding="utf-8") == plain

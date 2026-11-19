@@ -12364,17 +12364,22 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "cause. Fix the cause and re-run rotate-key BEFORE retiring any prior key "
             "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). No key will ever open a file the log names as "
             "damaged because a key did not open it, so restore that upload, or remove its two "
-            "files from the uploads directory, before the re-run. That does not apply to a "
-            "sidecar that could not be read, below. "
-            "This run did not stamp the key's rotation date, and no serve start does while the "
+            "files from the uploads directory, before the re-run. "
+            + (
+                "That does not apply to a sidecar that could not be read, below. "
+                if uploads.refused_sidecars
+                else ""
+            )
+            + "This run did not stamp the key's rotation date, and no serve start does while the "
             "rotation stands open, though one that came before this run may have.",
             file=sys.stderr,
         )
-        if uploads.sidecar_refused:
-            # BACKLOG #5387: such a sidecar is not opened, so nothing rules out a value under the
-            # prior key inside it. Deleting it could destroy that value, so this never advises it.
+        if uploads.refused_sidecars:
+            # BACKLOG #5387: such a sidecar is neither decrypted nor looked inside, so nothing rules
+            # out a value under the prior key in it. Deleting it could destroy that value, so this
+            # never advises it.
             print(
-                f"error: {uploads.sidecar_refused} of those uploaded file(s) have a sidecar that "
+                f"error: {uploads.refused_sidecars} of those uploaded file(s) have a sidecar that "
                 "could not be read: it is larger than a sidecar can be, is not UTF-8, or is "
                 "plaintext too long to seal. It may hold a value under the prior key. Do not "
                 "retire the prior key until each such sidecar is fixed, for example by restoring "

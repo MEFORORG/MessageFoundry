@@ -48,7 +48,7 @@ def _reseal(root: Path, cipher: AesGcmCipher) -> ResealResult:
 
 
 def _is_refused_skip(result: ResealResult) -> bool:
-    return (result.skipped, result.sidecar_refused, result.damaged) == (1, 1, 0) and (
+    return (result.skipped, result.refused_sidecars, result.damaged) == (1, 1, 0) and (
         result.incomplete
     )
 
@@ -94,7 +94,7 @@ def test_a_utf16_resave_of_a_prior_key_value_is_a_skip(tmp_path: Path, codec: st
     text = sidecar.read_text(encoding="utf-8")
     # With no byte-order mark, ASCII in UTF-16 is still valid UTF-8, so the BOM-less forms are
     # given one; a BOM-less re-save reads as plaintext, the pre-existing stray-prefix case.
-    bom = {"utf-16": "", "utf-16-le": "﻿", "utf-16-be": "﻿"}[codec]
+    bom = {"utf-16": "", "utf-16-le": "\ufeff", "utf-16-be": "\ufeff"}[codec]
     planted = (bom + text).encode(codec)
     sidecar.write_bytes(planted)
     result = _reseal(tmp_path, _aes(key_b, key_a))
@@ -130,12 +130,21 @@ def test_an_over_cap_sidecar_whose_head_is_only_padding_is_a_skip(
     ids=["ff", "utf16-bom", "a0", "cut-sequence"],
 )
 @pytest.mark.parametrize("prior", [True, False], ids=["prior-key", "active-key"])
-def test_a_sidecar_that_is_not_utf8_is_a_skip(tmp_path: Path, planted: bytes, prior: bool) -> None:
+@pytest.mark.parametrize("at", ["before", "after"])
+def test_a_sidecar_that_is_not_utf8_is_a_skip(
+    tmp_path: Path, planted: bytes, prior: bool, at: str
+) -> None:
+    """Appended after an active-key value, the marker test must not take it for current: every
+    reader refuses it before decrypting, so it is a skip too (review round 1)."""
     key_a, key_b = generate_key(), generate_key()
-    fid = _save(tmp_path, key_a)
+    saved = _aes(key_a)  # one instance: a cipher's marker carries its own store salt
+    fid = _save(tmp_path, saved)
     sidecar = tmp_path / f"{fid}.meta"
-    sidecar.write_bytes(planted + sidecar.read_bytes())
-    assert _is_refused_skip(_reseal(tmp_path, _aes(key_b, key_a) if prior else _aes(key_a)))
+    sealed = sidecar.read_bytes()
+    if not prior:
+        assert sealed.startswith(saved.active_marker_prefix.encode("ascii"))
+    sidecar.write_bytes(planted + sealed if at == "before" else sealed + planted)
+    assert _is_refused_skip(_reseal(tmp_path, _aes(key_b, key_a) if prior else saved))
 
 
 def test_a_plaintext_sidecar_padded_past_the_cap_is_a_skip(tmp_path: Path) -> None:
@@ -225,11 +234,12 @@ def test_a_blank_sidecar_within_the_cap_is_damaged(
     """Read in full within the cap, it holds nothing under any key, so retiring the prior key
     loses nothing and the run completes."""
     key_a, key_b = generate_key(), generate_key()
-    fid = _save(tmp_path, key_a)
+    saved = _aes(key_a)  # one instance, as above
+    fid = _save(tmp_path, saved)
     sidecar = tmp_path / f"{fid}.meta"
     sidecar.write_bytes(planted)
-    result = _reseal(tmp_path, _aes(key_b, key_a) if prior else _aes(key_a))
-    assert (result.skipped, result.sidecar_refused, result.damaged) == (0, 0, 1)
+    result = _reseal(tmp_path, _aes(key_b, key_a) if prior else saved)
+    assert (result.skipped, result.refused_sidecars, result.damaged) == (0, 0, 1)
     assert not result.incomplete
     assert sidecar.read_bytes() == planted
 
@@ -289,7 +299,9 @@ _PAIRS = [
 
 
 @pytest.mark.parametrize(("damage", "sidecar_sealed"), _PAIRS)
-@pytest.mark.parametrize("body", ["plaintext", "lost", "not-text", "too-large", "as-saved"])
+@pytest.mark.parametrize(
+    "body", ["plaintext", "lost", "not-text", "not-text-late", "too-large", "as-saved"]
+)
 def test_the_startup_count_agrees_with_rotate_key_over_a_refused_or_blank_sidecar(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -311,6 +323,9 @@ def test_the_startup_count_agrees_with_rotate_key_over_a_refused_or_blank_sideca
         blob.write_bytes(_BODY)
     elif body == "lost":
         blob.unlink()
+    elif body == "not-text-late":
+        # Past the count's first decoded chunk, so its head read succeeds and the body test decides.
+        blob.write_bytes(b"p" * 9000 + b"\xff")
     elif body == "not-text":
         blob.write_bytes(b"p" * 3000 + b"\xff")
     elif body == "too-large":
@@ -327,7 +342,7 @@ def test_the_startup_count_agrees_with_rotate_key_over_a_refused_or_blank_sideca
     blank = damage in (_blank, _empty)
     # A skipped body takes the pair's one count, so a blank sidecar over it is not counted damaged.
     assert result.damaged == int(blank and body != "too-large")
-    assert result.sidecar_refused == int(not blank)
+    assert result.refused_sidecars == int(not blank)
     assert result.incomplete == (not blank or body == "too-large")
 
 
