@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import ast
 import importlib.util
+import itertools
 import sys
 from pathlib import Path
 from typing import Any
@@ -319,6 +320,22 @@ def test_a_tie_or_an_unreadable_stamp_lets_the_failing_run_speak(
     assert mod.unmet_contexts(mod.newest_by_name([passing, failing]), ["CI gate"]) == [
         "CI gate=failure"
     ]
+
+
+def test_three_runs_give_one_answer_in_every_order() -> None:
+    """An unplaceable failure keeps the label in all six orders of a three-run set.
+
+    A pairwise comparison folded over the list returned the passing run for some orders: the
+    unstamped failure lost to the stamped failure, which then lost to the later success.
+    """
+    stamped_fail = _check("CI gate", conclusion="failure", started="2026-09-15T05:00:00Z", ident=1)
+    later_pass = _check("CI gate", conclusion="success", started="2026-09-15T06:00:00Z", ident=2)
+    unplaced_fail = _check("CI gate", conclusion="failure", started=None, ident=3)
+    picks = {
+        mod.newest_by_name(list(order))["CI gate"]["id"]
+        for order in itertools.permutations([stamped_fail, later_pass, unplaced_fail])
+    }
+    assert picks == {3}
 
 
 def test_a_later_readable_stamp_still_outranks_a_failure() -> None:

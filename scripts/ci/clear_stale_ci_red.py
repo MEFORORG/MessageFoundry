@@ -94,7 +94,7 @@ import json
 import re
 import subprocess
 import sys
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -199,7 +199,7 @@ def newest_by_name(check_runs: list[dict[str, object]]) -> dict[str, dict[str, o
     carried two CI runs created 35 seconds apart whose durations differed by 67, so the
     EARLIER-created one finished LAST. Picking "the newest" there can read a still-running leg as
     green. Second, among runs in the same settled state, the greatest ``started_at`` wins; on a tie
-    or an unreadable stamp the run that is not a success wins (:func:`_outranks`).
+    or an unreadable stamp the run that is not a success wins (:func:`_rank`).
 
     LIST ORDER IS NEVER USED. The GraphQL ``statusCheckRollup`` sibling is measurably not ordered by
     ``startedAt`` -- on this repository's own PR 1226, a later entry carried an OLDER settled success
@@ -212,13 +212,7 @@ def newest_by_name(check_runs: list[dict[str, object]]) -> dict[str, dict[str, o
         if not name:
             continue
         held = speaks.get(name)
-        if held is None:
-            speaks[name] = run
-            continue
-        run_unsettled = run.get("status") != "completed"
-        held_unsettled = held.get("status") != "completed"
-        unsettled_wins = run_unsettled and not held_unsettled
-        if unsettled_wins or (run_unsettled == held_unsettled and _outranks(run, held)):
+        if held is None or _rank(run) > _rank(held):
             speaks[name] = run
     return speaks
 
@@ -235,23 +229,23 @@ def _started(run: dict[str, object]) -> datetime | None:
     return stamp if stamp.tzinfo is not None else None
 
 
-def _outranks(run: dict[str, object], held: dict[str, object]) -> bool:
-    """Whether ``run`` speaks over ``held``, two runs of one name in the same settled state.
+_NEVER = datetime.min.replace(tzinfo=UTC)
 
-    A later start wins only when BOTH stamps parse and differ. On a tie -- one second is the API's
-    resolution, so a passing and a failing run can share it -- or when either stamp cannot be read,
-    order in time is unknown, and the run that is NOT a success wins: the answer fails CLOSED and
-    keeps the label rather than clearing it on whichever run was listed first (BACKLOG #5464). Only
-    when both runs agree on success does a stamped run beat an unstamped one.
+
+def _rank(run: dict[str, object]) -> tuple[bool, bool, datetime, bool, str]:
+    """The key the run that speaks for a name maximizes. A TOTAL order, so list order cannot decide.
+
+    In order: an unsettled run first; then a non-success whose start cannot be placed in time, since
+    it may be the newest and failing closed keeps the label; then the later readable start, an
+    unreadable one counting as earliest; then, on a tie -- one second is the API's resolution, so a
+    passing and a failing run can share it -- the non-success (BACKLOG #5464). The run id last only
+    makes equal-verdict picks deterministic. A pairwise "does this run outrank that one" folded over
+    the list was not transitive across three runs, so it is a key and not a comparison.
     """
-    run_at, held_at = _started(run), _started(held)
-    if run_at is not None and held_at is not None and run_at != held_at:
-        return run_at > held_at
-    run_fails = run.get("conclusion") != "success"
-    held_fails = held.get("conclusion") != "success"
-    if run_fails != held_fails:
-        return run_fails
-    return run_at is not None and held_at is None
+    unsettled = run.get("status") != "completed"
+    fails = run.get("conclusion") != "success"
+    started = _started(run)
+    return (unsettled, fails and started is None, started or _NEVER, fails, str(run.get("id")))
 
 
 def unmet_contexts(speaks: dict[str, dict[str, object]], required: list[str]) -> list[str]:
