@@ -10,8 +10,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import contextlib
 import logging
+import os
 import subprocess
 import sys
 import threading
@@ -561,69 +561,166 @@ async def test_hung_children_wait_out_one_grace_together_not_one_each() -> None:
     assert all(p.killed for p in procs.values())
 
 
-#: The shard child for the Windows job test: it starts a grandchild, writes both pids to the marker,
-#: then sleeps. Both sleeps are bounded, so a failed run leaks nothing for long.
+@pytest.mark.asyncio
+async def test_an_exited_shards_job_is_released_and_a_forced_ones_after_its_exit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shard that exits on its own has its job released before the relaunch, and a shard forced
+    on the drain has its job released once it is gone. Released, not ended: what a shard left
+    running on purpose outlives the shard as it did before the job existed (BACKLOG #5978)."""
+    released: list[int] = []
+    monkeypatch.setattr(proctree, "release_job", released.append)
+    spawned: list[_FakeProcess] = []
+
+    class _Hung(_FakeProcess):
+        def terminate(self) -> None:  # the request, ignored, so the drain forces it
+            self.terminated = True
+
+    async def spawn(spec: ShardSpec) -> _FakeProcess:
+        p = _FakeProcess() if not spawned else _Hung()
+        spawned.append(p)
+        supervisor_mod._SHARD_JOBS[p] = 7000 + len(spawned)  # type: ignore[index]
+        return p
+
+    sup = Supervisor([_spec("a")], spawn=_spawner(spawn), terminate_grace=0.05, sleep=_no_wait)
+    run = asyncio.create_task(sup.run())
+    while not spawned:
+        await asyncio.sleep(0)
+    spawned[0].finish(1)
+    for _ in range(100):
+        if len(spawned) == 2:
+            break
+        await asyncio.sleep(0)
+    assert len(spawned) == 2
+    assert released == [7001]  # the exited shard's job, before the relaunch's
+
+    sup.stop()
+    await asyncio.wait_for(run, timeout=5.0)
+    assert spawned[1].killed
+    assert released == [7001, 7002]
+    assert not any(p in supervisor_mod._SHARD_JOBS for p in spawned)  # type: ignore[comparison-overlap]
+
+
+#: Long enough that nothing in a tree exits on its own inside the test, short enough that a tree
+#: that escaped every cleanup still goes by itself.
+_TREE_SLEEP = 90
+
+#: The shard child for the Windows job tests: it starts a grandchild, then writes both pids to the
+#: marker (renamed into place, so a reader never sees half of it), then sleeps.
 _SHARD_WITH_GRANDCHILD = (
-    "import os, subprocess, sys, time, pathlib\n"
-    "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(90)'])\n"
-    "pathlib.Path(sys.argv[1]).write_text(f'{os.getpid()} {g.pid}')\n"
-    "time.sleep(90)\n"
+    "import os, subprocess, sys, time\n"
+    f"g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep({_TREE_SLEEP})'])\n"
+    "tmp = sys.argv[1] + '.tmp'\n"
+    "with open(tmp, 'w') as f:\n"
+    "    f.write(f'{os.getpid()} {g.pid}')\n"
+    "os.replace(tmp, sys.argv[1])\n"
+    f"time.sleep({_TREE_SLEEP})\n"
 )
 
 #: A stand-in supervisor: it launches one shard through the REAL ``_default_spawn``, then idles
-#: until the test hard-kills it.
+#: until the test hard-kills it. ``argv[3] == "nojob"`` resumes the shard without a job: the
+#: control.
 _SUPERVISOR_STAND_IN = (
-    "import asyncio, sys\n"
+    "import asyncio, os, sys\n"
+    "import psutil\n"
+    "from messagefoundry import proctree\n"
     "from messagefoundry.pipeline.supervisor import ShardSpec, _default_spawn\n"
+    "if sys.argv[3] == 'nojob':\n"
+    "    def resume_without_job(pid, *, who):\n"
+    "        psutil.Process(pid).resume()\n"
+    "    proctree.resume_into_job = resume_without_job\n"
     "async def main():\n"
+    "    with open(sys.argv[2] + '.sup.tmp', 'w') as f:\n"
+    "        f.write(str(os.getpid()))\n"
+    "    os.replace(sys.argv[2] + '.sup.tmp', sys.argv[2] + '.sup')\n"
     "    argv = (sys.executable, '-c', sys.argv[1], sys.argv[2])\n"
     "    await _default_spawn(ShardSpec(shard='s', db_path='unused', port=0, argv=argv))\n"
-    "    await asyncio.sleep(120)\n"
+    f"    await asyncio.sleep({_TREE_SLEEP})\n"
     "asyncio.run(main())\n"
 )
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="the kill-on-close job is a Windows job object")
-def test_a_hard_killed_windows_supervisor_takes_its_shards_with_it(tmp_path: Path) -> None:
-    """Hard-kill a supervisor process, as a service stop that timed out would, and its shard and
-    the shard's own child must end too. Without the job both outlive it (BACKLOG #5978).
+def _hard_kill_a_stand_in(tmp_path: Path, mode: str) -> tuple[list[Any], list[Any]]:
+    """Start a stand-in supervisor in ``mode``, hard-kill it once its shard tree is up, and return
+    the shard tree and every process this started, the stand-in's own included, for cleanup.
 
-    Every process here is this test's own, and each is killed by its pid, never by image name."""
+    Every process here is this test's own, and each is killed by its pid, never by image name. The
+    stand-in's whole chain is killed (the venv launcher and the interpreter under it), with no
+    chance to run any cleanup, as a hard kill or a service manager's forced stop would end it."""
     import time
 
     import psutil
 
-    marker = tmp_path / "pids.txt"
-    stand_in = subprocess.Popen(
-        [sys.executable, "-c", _SUPERVISOR_STAND_IN, _SHARD_WITH_GRANDCHILD, str(marker)]
+    from tests._proc_tree import kill_all, tree_of
+
+    root = Path(__file__).resolve().parents[1]
+    marker = tmp_path / f"pids-{mode}.txt"
+    stand_in = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-c", _SUPERVISOR_STAND_IN, _SHARD_WITH_GRANDCHILD, str(marker), mode],
+        cwd=root,
+        env={**os.environ, "PYTHONPATH": str(root)},
     )
-    pids: list[int] = []
+    started = [psutil.Process(stand_in.pid)]
     try:
         deadline = time.monotonic() + 60.0
-        while not marker.exists() or not marker.read_text().strip():
+        while not marker.exists():
             assert stand_in.poll() is None, (
                 "the stand-in supervisor exited before its shard started"
             )
             assert time.monotonic() < deadline, "the shard never wrote its pids"
             time.sleep(0.05)
-        pids = [int(x) for x in marker.read_text().split()]
-        assert all(psutil.pid_exists(pid) for pid in pids)
-
-        stand_in.kill()  # TerminateProcess: no cleanup code in the supervisor runs
+        supervisor_pid = int(Path(f"{marker}.sup").read_text())
+        # The shard's own launcher (where there is one), its interpreter, and the grandchild.
+        tree = tree_of(supervisor_pid)[1:]
+        started += tree
+        reported = {int(pid) for pid in marker.read_text().split()}
+        assert reported <= {p.pid for p in tree}, "the shard tree is not under the stand-in"
+        # The stand-in's own chain: the venv launcher where there is one, and its interpreter.
+        in_tree = {p.pid for p in tree}
+        chain = [p for p in tree_of(stand_in.pid) if p.pid not in in_tree]
+        started += chain
+        kill_all(chain)
         stand_in.wait(timeout=10)
+        return tree, started
+    except BaseException:
+        kill_all(started)
+        raise
 
-        deadline = time.monotonic() + 10.0
-        while any(psutil.pid_exists(pid) for pid in pids) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        survivors = [pid for pid in pids if psutil.pid_exists(pid)]
-        assert not survivors, f"processes outlived their supervisor: {survivors}"
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the kill-on-close job is a Windows job object")
+def test_control_without_the_job_a_shard_tree_outlives_its_hard_killed_supervisor(
+    tmp_path: Path,
+) -> None:
+    """The control that arms the test below: with the job left out, the shard and its child must
+    SURVIVE their killed supervisor. Otherwise a pass below could come from something else ending
+    the tree, such as a job the test runner sits in, and would show nothing about this one."""
+    import time
+
+    from tests._proc_tree import alive, kill_all
+
+    tree, started = _hard_kill_a_stand_in(tmp_path, "nojob")
+    try:
+        time.sleep(1.0)
+        assert len(alive(tree)) == len(tree), (
+            "THE CONTROL DID NOT LEAK; the test below proves nothing"
+        )
     finally:
-        if stand_in.poll() is None:
-            stand_in.kill()
-            stand_in.wait(timeout=10)
-        for pid in pids:
-            with contextlib.suppress(psutil.Error):
-                psutil.Process(pid).kill()
+        kill_all(started)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the kill-on-close job is a Windows job object")
+def test_a_hard_killed_windows_supervisor_takes_its_shards_with_it(tmp_path: Path) -> None:
+    """Hard-kill a supervisor process, as a service manager's forced stop would, and its shard and
+    the shard's own child must end too. Without the job both outlive it (BACKLOG #5978)."""
+    from tests._proc_tree import alive, describe, kill_all, wait_until
+
+    tree, started = _hard_kill_a_stand_in(tmp_path, "job")
+    try:
+        wait_until(lambda: not alive(tree), 10.0)
+        survivors = alive(tree)
+        assert not survivors, "outlived their supervisor:\n" + describe(survivors)
+    finally:
+        kill_all(started)
 
 
 # --- vault BACKLOG #2773: restart backoff and the crash-loop breaker -------------------------------

@@ -50,7 +50,6 @@ import signal
 import subprocess
 import sys
 import time
-import weakref
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -266,12 +265,12 @@ SpawnFn = Callable[["ShardSpec"], Awaitable["asyncio.subprocess.Process"]]
 
 #: The kill-on-close job each Windows shard child runs in, keyed by its process (BACKLOG #5978).
 #: Holding the handle here is what ties the shard's lifetime to the supervisor's: when the
-#: supervisor exits by any route, a hard kill or a service-stop timeout included, Windows closes the
-#: handle and ends the shard and every process it started. Weak keys, so a process nobody holds
-#: drops its entry; the handle then stays open, which still ends the shard with the supervisor.
-_SHARD_JOBS: weakref.WeakKeyDictionary[asyncio.subprocess.Process, int] = (
-    weakref.WeakKeyDictionary()
-)
+#: supervisor process ends by any route, a hard kill or a service manager's forced stop included,
+#: Windows closes the handle and ends at least the shard and the processes it started in its own
+#: tree. Work handed to a process outside that tree escapes, as :mod:`messagefoundry.proctree`
+#: says: this is process hygiene, not a trust control. An entry is removed, and its limit cleared,
+#: once the shard has exited (:func:`_release_shard_job`).
+_SHARD_JOBS: dict[asyncio.subprocess.Process, int] = {}
 
 
 async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
@@ -288,12 +287,14 @@ async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
     :meth:`Supervisor._request_stop` has to deliver the break explicitly on every shutdown path.
 
     On Windows the child also starts suspended and is put in a kill-on-close job before it runs
-    (:func:`messagefoundry.proctree.resume_into_job`), so it and everything it starts end when the
-    supervisor does, however the supervisor ends (BACKLOG #5978). Without the job a supervisor that
-    was hard-killed, or that a service stop timed out on, would leave its shards running, holding
-    their ports and the store. A job that cannot be set up is logged and the shard still runs,
-    without that guarantee. A child that cannot be resumed is killed and the launch raises
-    :class:`OSError`, which the restart path counts as a fast exit.
+    (:func:`messagefoundry.proctree.resume_into_job`), so it ends with the supervisor process while
+    it is running, however that process ends (BACKLOG #5978, :data:`_SHARD_JOBS`). Without the job a
+    supervisor that was hard-killed, or force-stopped by a service manager whose stop timed out,
+    would leave its shards running, holding their ports and the store. The cost is accepted: such a
+    death also ends what a running shard started, at least a DR release hook it left running on
+    purpose. A job that cannot be set up is logged and the shard still runs, without that guarantee.
+    A child that cannot be resumed is killed and the launch raises :class:`OSError`, which the
+    restart path counts as a fast exit.
 
     The child is a whole engine, so it gets the whole environment, secrets included, and gets it
     by name (:func:`messagefoundry.childenv.engine_environment`, vault BACKLOG #2587).
@@ -310,9 +311,11 @@ async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
         job = proctree.resume_into_job(process.pid, who=f"shard {spec.shard!r}")
     except OSError:
         # Suspended, it would never run; ending it here keeps a failed launch from leaving it behind.
+        # resume_into_job may already have ended it through its job, and killing a process that is
+        # still exiting is refused, so either refusal leaves the resume error as the one raised.
         try:  # noqa: SIM105
             process.kill()
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
         await process.wait()
         raise
@@ -321,17 +324,16 @@ async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
     return process
 
 
-def _end_shard_job(process: asyncio.subprocess.Process) -> bool:
-    """End the kill-on-close job of a shard ``process``, killing whatever is still in it, and close
-    the handle. Returns whether there was a job (only a Windows :func:`_default_spawn` makes one).
+def _release_shard_job(process: asyncio.subprocess.Process) -> None:
+    """Close the kill-on-close job of a shard ``process`` that has exited, leaving alive whatever
+    it started (:func:`messagefoundry.proctree.release_job`). A no-op for a process with no job.
 
-    Called once the shard has exited, or to force it. Its leftovers are killed rather than released:
-    the shard is about to be relaunched on the same port and store, or the fleet is stopping."""
+    Released rather than ended: what a shard leaves running on purpose, such as a DR release hook,
+    outlives the shard's own exit exactly as it did before the job existed. Only the supervisor's
+    own death ends it."""
     job = _SHARD_JOBS.pop(process, None)
-    if job is None:
-        return False
-    proctree.terminate_job(job)
-    return True
+    if job is not None:
+        proctree.release_job(job)
 
 
 @dataclass
@@ -449,7 +451,7 @@ class Supervisor:
                 exit_rc = await self._unless_stopped(process.wait())
                 if exit_rc is None:
                     return  # shutdown — leave the child for _terminate_all to drain
-                _end_shard_job(process)  # what the exited shard left running would hold its port
+                _release_shard_job(process)
                 rc = exit_rc
                 if not self.restart:
                     logger.info("shard %r exited rc=%s (restart disabled)", spec.shard, rc)
@@ -551,18 +553,25 @@ class Supervisor:
         """Ask every live child to stop, then force what is still running after ``terminate_grace``.
 
         The children wait out the grace together, so a drain takes one grace period however many
-        hang, rather than one per hung child (BACKLOG #5978). A service manager that stops waiting
-        before then would leave the rest running for its own force."""
+        hang, rather than one per hung child (BACKLOG #5978). One drain that fails does not stop
+        the others; the first failure is raised once they have all finished."""
         live = [c for c in self._children.values() if c.process.returncode is None]
         for child in live:
             self._request_stop(child)
-        await asyncio.gather(*(self._drain(child) for child in live))
-        for child in self._children.values():
-            _end_shard_job(child.process)
+        try:
+            results = await asyncio.gather(
+                *(self._drain(child) for child in live), return_exceptions=True
+            )
+        finally:
+            for child in self._children.values():
+                if child.process.returncode is not None:
+                    _release_shard_job(child.process)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
 
     async def _drain(self, child: _Child) -> None:
-        """Wait ``terminate_grace`` for one asked child, then force it: its whole job on Windows,
-        the one process otherwise."""
+        """Wait ``terminate_grace`` for one asked child, then force it."""
         try:
             await asyncio.wait_for(child.process.wait(), timeout=self.terminate_grace)
         except TimeoutError:
@@ -571,11 +580,10 @@ class Supervisor:
                 child.spec.shard,
                 self.terminate_grace,
             )
-            if not _end_shard_job(child.process):
-                try:  # noqa: SIM105
-                    child.process.kill()
-                except ProcessLookupError:
-                    pass
+            try:  # noqa: SIM105
+                child.process.kill()
+            except ProcessLookupError:
+                pass
             await child.process.wait()
 
 

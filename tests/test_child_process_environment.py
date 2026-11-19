@@ -37,7 +37,7 @@ import pytest
 from pydantic import ValidationError
 
 import messagefoundry
-from messagefoundry import _child_bootstrap, childenv
+from messagefoundry import _child_bootstrap, childenv, proctree
 from messagefoundry.config import settings
 from messagefoundry.config.environments import VALUE_ENV_PREFIX
 from messagefoundry.config.run_context import RunContext
@@ -788,11 +788,16 @@ async def test_the_supervisor_starts_a_shard_with_that_environment(
 ) -> None:
     captured: dict[str, Any] = {}
 
+    class _Started:
+        pid = 4242
+
     async def fake_exec(*argv: str, **kwargs: Any) -> object:
         captured.update(kwargs)
-        return object()
+        return _Started()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    # On Windows the launch puts the child in a job by its pid; there is no child here to put.
+    monkeypatch.setattr(proctree, "resume_into_job", lambda pid, *, who: None)
     monkeypatch.setenv(settings.STORE_DEK_SECRET_CLASS, _MARKER)
     spec = supervisor.ShardSpec(shard="a", db_path="a.db", port=1, argv=("python", "a"))
 
