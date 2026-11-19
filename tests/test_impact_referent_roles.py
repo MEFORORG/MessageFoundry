@@ -11,6 +11,7 @@ the old name in another role is reported unresolved rather than passed as clean.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ import pytest
 from messagefoundry.config.impact import apply_rename, plan_rename
 from messagefoundry.config.reachability import Reference
 from messagefoundry.config.wiring import load_config
+from messagefoundry_toolkit.__main__ import main
 
 _HEAD = "from messagefoundry import MLLP, Send, code_set, handler, inbound, outbound, router\n\n"
 
@@ -510,3 +512,63 @@ def test_an_accepts_lambda_is_scanned_not_a_lambda_in_the_body(tmp_path: Path) -
     plan = plan_rename(load_config(config_dir), config_dir, "code_set", "diets", "meals")
     assert plan.unresolved == ()
     assert [e.new_literal for e in plan.edits] == ['"meals"']
+
+
+_UNRESOLVABLE = {
+    "field_comparison": (
+        "outbound",
+        "OB_OLD",
+        "OB_NEW",
+        'inbound("IB_U", MLLP(port=2851), router="r_u")\n'
+        'outbound("OB_OLD", MLLP(host="127.0.0.1", port=6991))\n'
+        "\n"
+        '@router("r_u")\n'
+        "def r_u(msg):\n"
+        '    return ["h_u"]\n'
+        "\n"
+        '@handler("h_u")\n'
+        "def h_u(msg):\n"
+        '    if str(msg) == "OB_OLD":\n'
+        "        return None\n"
+        '    return Send("OB_OLD", msg)\n',
+    ),
+    "router_splat": (
+        "router",
+        "r_old",
+        "r_new",
+        'inbound("IB_S", MLLP(port=2852), **{"router": "r_old"})\n'
+        'outbound("OB_S", MLLP(host="127.0.0.1", port=6992))\n'
+        "\n"
+        '@router("r_old")\n'
+        "def r_old(msg):\n"
+        '    return ["h_s"]\n'
+        "\n"
+        '@handler("h_s")\n'
+        "def h_s(msg):\n"
+        '    return Send("OB_S", msg)\n',
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_UNRESOLVABLE))
+def test_apply_refuses_and_writes_nothing_when_a_reference_is_unresolved(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], case: str
+) -> None:
+    """A plan with an unresolved referrer would leave a half-renamed config, so `--apply` must
+    refuse before any write, name the referrer, and exit non-zero; the dry run still shows it."""
+    kind, old, new, body = _UNRESOLVABLE[case]
+    config_dir = _write_config(tmp_path, body)
+    before = (config_dir / "mod.py").read_bytes()
+    argv = ["impact", "--config", str(config_dir), kind, old, "--rename-to", new, "--json"]
+
+    assert main(argv) == 0
+    dry = json.loads(capsys.readouterr().out)
+    assert dry["dry_run"] is True and dry["unresolved"], dry
+
+    rc = main([*argv, "--apply"])
+    out = json.loads(capsys.readouterr().out)
+    assert rc != 0, out
+    assert "--apply refused" in out["error"], out
+    for ref in dry["unresolved"]:
+        assert repr(ref["referrer"]) in out["error"], out
+    assert (config_dir / "mod.py").read_bytes() == before
