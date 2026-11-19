@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -395,8 +396,63 @@ def test_a_start_time_in_the_past_is_refused(tmp_path: Path) -> None:
     assert list(d.iterdir()) == []
 
 
-def test_two_real_processes_race_clean(tmp_path: Path) -> None:
-    d = _dst(tmp_path, "race")
+# The only reason a real run may be retried: a side started past the limit, so its slots were
+# never raced and the run proves nothing either way. Any other invalid entry is a real finding.
+_LATE_START = re.compile(r"^P[12] started \d+ ms late, past the \d+ ms limit$")
+
+
+def _race_verdict(code: int, summary: Any) -> str:
+    """Classify one real run's -Compare result as "accept", "retry" or "fail"."""
+    if code not in (0, 2) or not isinstance(summary, dict):
+        return "fail"
+    if summary.get("doubleWinners") or summary.get("emptySlots") or summary.get("mismatches"):
+        return "fail"
+    if code == 0:
+        return "accept"
+    invalid = summary.get("invalid") or []
+    if invalid and all(isinstance(i, str) and _LATE_START.fullmatch(i) for i in invalid):
+        return "retry"
+    return "fail"
+
+
+_LATE = "P2 started 25 ms late, past the 20 ms limit"
+
+
+@pytest.mark.parametrize(
+    ("code", "summary", "expected"),
+    [
+        (0, {"doubleWinners": [], "emptySlots": [], "invalid": []}, "accept"),
+        (2, {"doubleWinners": [], "emptySlots": [], "invalid": [_LATE]}, "retry"),
+        (
+            2,
+            {"doubleWinners": [], "emptySlots": [], "invalid": [_LATE, _LATE.replace("P2", "P1")]},
+            "retry",
+        ),
+        (
+            2,
+            {
+                "doubleWinners": [],
+                "emptySlots": [],
+                "invalid": [_LATE, "P2 won no slot, so the two may never have overlapped"],
+            },
+            "fail",
+        ),
+        (2, {"doubleWinners": [], "emptySlots": [], "invalid": [_LATE + " extra"]}, "fail"),
+        (3, {"doubleWinners": [{"slot": 1}], "emptySlots": [], "invalid": [_LATE]}, "fail"),
+        (2, {"doubleWinners": [{"slot": 1}], "emptySlots": [], "invalid": [_LATE]}, "fail"),
+        (2, {"doubleWinners": [], "emptySlots": [4], "invalid": [_LATE]}, "fail"),
+        (2, {"doubleWinners": [], "emptySlots": [], "invalid": []}, "fail"),
+        (1, {"doubleWinners": [], "emptySlots": [], "invalid": [_LATE]}, "fail"),
+        (2, None, "fail"),
+    ],
+)
+def test_a_real_run_is_retried_only_when_a_side_started_late(
+    code: int, summary: Any, expected: str
+) -> None:
+    assert _race_verdict(code, summary) == expected
+
+
+def _run_race(d: Path) -> None:
     start = _soon(8)
     procs = [
         subprocess.Popen(
@@ -427,7 +483,23 @@ def test_two_real_processes_race_clean(tmp_path: Path) -> None:
     for p in procs:
         out, err = p.communicate(timeout=TIMEOUT)
         assert p.returncode == 0, (out, err)
-    proc, summary = _compare(d)
+
+
+def test_two_real_processes_race_clean(tmp_path: Path) -> None:
+    # A loaded runner can start one side past coord-race.ps1's limit; that run raced nothing, so
+    # it is retried in a fresh directory. Every other outcome is decided on the first attempt.
+    inconclusive: list[list[str]] = []
+    for attempt in range(1, 4):
+        d = _dst(tmp_path, f"race-{attempt}")
+        _run_race(d)
+        proc, summary = _compare(d)
+        verdict = _race_verdict(proc.returncode, summary)
+        assert verdict != "fail", (proc.returncode, proc.stdout, proc.stderr)
+        if verdict == "accept":
+            break
+        inconclusive.append(list(summary["invalid"]))
+    else:
+        pytest.fail(f"every attempt had a side start late, so none was a race: {inconclusive}")
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
     assert summary["doubleWinners"] == [] and summary["emptySlots"] == []
     assert summary["invalid"] == []
