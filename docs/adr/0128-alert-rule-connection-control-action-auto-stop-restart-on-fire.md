@@ -96,7 +96,7 @@ restart storm. It is **independent of transport suppression**: a rule may set `t
 auto-remediate **quietly** (restart, no page) or fire alongside a page. The control action requires the
 **notifier** to be active (≥1 transport configured), since it is a notifier outcome; a deployment that
 wants transportless remediation configures at least one transport (documented; a transportless-notifier
-mode is a possible follow-up).
+mode is a possible follow-up) (amended 2026-11-19, see below).
 
 **Amendment (BACKLOG #1741).** A `connection_stopped` window can end early. When alert-state is
 wired, an operator's start or restart that finds an inbound up raises a `connection_started` that
@@ -143,7 +143,7 @@ notification throttle is otherwise unchanged. The `connection_started` clear abo
 
 **Positive** — the common "just restart the wedged lane" case is auto-remediated at alert latency with a
 human still paged (or deliberately quiet); additive, off by default, no new dependency, no layering
-change. Reuses the existing throttle so it can't storm.
+change. Reuses the existing throttle so it can't storm (amended 2026-11-19, see the amendment under §4).
 
 **Negative / residual** — auto-restarting a lane wedged on a *persistent* fault will restart-loop it (once
 per cooldown) until an operator intervenes — the same class of caveat as retry-forever; an operator scopes
