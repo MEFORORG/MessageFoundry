@@ -62,8 +62,8 @@
        its own hazard; leaving no trace is worse than either. A -Record hook input refused under
        scripts/hooks/_hookinput.ps1's rules is NOT a failure, so it never goes there. It goes to
        stderr, which seat-record.ps1 discards, and to seats/.writer-refusals.txt in the registry of
-       the checkout the hook started in, at most one line per session key per hour. fleet.ps1 does
-       not read that file.
+       the checkout the hook started in, where that checkout and its registry resolve, at most one
+       line per session key and host per hour. fleet.ps1 does not read that file.
 
     3. TOUCH seats/.writer-alive/<boxKey>.txt ON EVERY INVOCATION, including no-op ones. "The writer
        ran" and "the seat had something to say" are different sentences, and a reader that cannot
@@ -194,30 +194,33 @@ function Set-StartSeatsDir {
 function Write-WriterRefusal {
     param([string]$SessionKey, [string]$Cwd, [string]$Reason)
     # A refused hook input, recorded where a reader can find it. Never .writer-errors.txt (rule 2).
-    # At most one line per session key per hour, because an unpinned session is refused on EVERY
-    # Stop and one line says as much as a hundred. The refused cwd is written as its leaf only.
+    # At most one line per session key and host per hour, because an unpinned session is refused on
+    # EVERY Stop and one line says as much as a hundred. A line stamped in the future (another PC's
+    # clock on a shared root) does not count, or skew would silence refusals for hours. Columns: UTC
+    # time, host, session key, the leaf of the refused cwd, and the helper's Reason as it stands,
+    # which may quote paths; no payload text beyond the cwd is written.
     try {
         if (-not $script:SeatsDir) { return }
         $f = Join-Path $script:SeatsDir '.writer-refusals.txt'
         $now = [DateTime]::UtcNow
+        $hostName = Get-CoordHost
         if (Test-Path -LiteralPath $f -PathType Leaf) {
             foreach ($l in [System.IO.File]::ReadLines($f)) {
                 $cols = $l -split "`t"
-                if ($cols.Count -lt 3 -or $cols[2] -ne $SessionKey) { continue }
+                if ($cols.Count -lt 3 -or $cols[1] -ne $hostName -or $cols[2] -ne $SessionKey) { continue }
                 $at = [DateTime]::MinValue
                 $ok = [DateTime]::TryParseExact($cols[0], 'yyyy-MM-ddTHH:mm:ssZ', [Globalization.CultureInfo]::InvariantCulture,
                     ([Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal), [ref]$at)
-                if ($ok -and ($now - $at) -lt [TimeSpan]::FromHours(1)) { return }
+                $age = $now - $at
+                if ($ok -and $age -ge [TimeSpan]::Zero -and $age -lt [TimeSpan]::FromHours(1)) { return }
             }
         }
         $leaf = ''
-        if ($Cwd) {
-            $leaf = Split-Path -Leaf ($Cwd.TrimEnd('\', '/'))
-            $Reason = $Reason.Replace($Cwd, "<cwd $leaf>")
-        }
+        $trimmed = $Cwd.TrimEnd('\', '/')
+        if ($trimmed) { $leaf = Split-Path -Leaf $trimmed }
         $why = $Reason -replace '\s+', ' '
         if ($why.Length -gt 300) { $why = $why.Substring(0, 300) }
-        $line = "{0}`t{1}`t{2}`t{3}`t{4}" -f $now.ToString('yyyy-MM-ddTHH:mm:ssZ'), $env:COMPUTERNAME, $SessionKey, $leaf, $why
+        $line = "{0}`t{1}`t{2}`t{3}`t{4}" -f $now.ToString('yyyy-MM-ddTHH:mm:ssZ'), $hostName, $SessionKey, $leaf, $why
         Add-Content -LiteralPath $f -Value $line -Encoding utf8 -EA SilentlyContinue
     } catch { }
 }

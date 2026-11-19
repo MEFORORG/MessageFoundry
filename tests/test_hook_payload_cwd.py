@@ -799,9 +799,18 @@ def test_a_refused_seat_record_leaves_one_refusal_line_an_hour(
     assert len(lines) == 1, lines
     cols = lines[0].split("\t")
     assert cols[2] == "s1" and cols[3] == sibling.name, cols
-    assert str(sibling) not in lines[0], lines[0]
 
     _record_stop(repo, _stop("s1", sibling))
     assert refusals.read_text(encoding="utf-8").splitlines() == lines, "the hour's limit failed"
     assert not errors.exists() or errors.read_text(encoding="utf-8").strip() == "", errors
     assert _seat_records(repo) == []
+
+    # The controls: the limit is per session key, and a line over an hour old, or stamped in the
+    # future by a skewed clock, does not hold it.
+    _record_stop(repo, _stop("s2", sibling))
+    assert len(refusals.read_text(encoding="utf-8").splitlines()) == 2, "another key was silenced"
+    for stamp in ("2000-01-01T00:00:00Z", "2999-01-01T00:00:00Z"):
+        refusals.write_text("\t".join([stamp, *cols[1:]]) + "\n", encoding="utf-8")
+        _record_stop(repo, _stop("s1", sibling))
+        got = refusals.read_text(encoding="utf-8").splitlines()
+        assert len(got) == 2 and got[1].split("\t")[2] == "s1", (stamp, got)
