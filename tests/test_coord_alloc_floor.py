@@ -630,3 +630,74 @@ def test_the_allocator_does_not_speak_the_work_claim_register() -> None:
         "the success output no longer names the worktree the number is recorded against, so the "
         "absence check above would pass on a line that had simply been deleted"
     )
+
+
+# --- BACKLOG #5479: a failed plumbing call refuses rather than shrinking the sweep ------------
+
+
+def _failing_git_env(tmp_path: Path, subcommand: str) -> dict[str, str]:
+    """PATH with a ``git.cmd`` shim first that fails ONE git subcommand and passes the rest through.
+
+    alloc.ps1 spells every sweep call ``git -C <repo> <subcommand> ...``, so the subcommand is
+    ``%3``. ``tests/test_coord_unbacked_check.py`` uses the same shim shape for the same reason:
+    pwsh's command discovery finds a ``.cmd`` first on PATH.
+    """
+    real_git = shutil.which("git")
+    assert real_git is not None
+    shim = tmp_path / f"shim-{subcommand}"
+    shim.mkdir()
+    (shim / "git.cmd").write_text(
+        f'@echo off\r\nif "%3"=="{subcommand}" exit /b 128\r\n"{real_git}" %*\r\n',
+        encoding="ascii",
+        newline="",
+    )
+    return dict(os.environ, PATH=f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+
+def _repo_with_90_on_a_side_branch(path: Path) -> Path:
+    repo = _checkout(path, {"0001-first.md": "# First\n"})
+    _git("checkout", "-q", "-b", "side", cwd=repo)
+    (repo / "docs" / "adr" / "0090-only-on-a-branch.md").write_text("# Side\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-m", "side adr", "--no-verify", cwd=repo)
+    _git("checkout", "-q", "main", cwd=repo)
+    return repo
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the git.cmd shim needs cmd.exe")
+def test_the_failing_git_shim_passes_every_other_call_through(tmp_path: Path) -> None:
+    """THE CONTROL for the case below: a shim failing a subcommand alloc.ps1 never runs still lets
+    the floor read 90, so a refusal there is caused by the failing call and not by the shim."""
+    repo = _repo_with_90_on_a_side_branch(tmp_path / "repo")
+    assert _floor(repo, env=_failing_git_env(tmp_path, "never-run")) == 90
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the git.cmd shim needs cmd.exe")
+@pytest.mark.parametrize("subcommand", ["for-each-ref", "cat-file", "ls-tree"])
+def test_a_failed_sweep_call_refuses_instead_of_lowering_the_floor(
+    tmp_path: Path, subcommand: str
+) -> None:
+    """MUST TRIP. Each sweep call used to run with its exit code unread, so a failure shrank the set
+    of numbers seen and the floor fell below the 90 that sits on a side branch. The control is
+    ``test_the_failing_git_shim_passes_every_other_call_through``.
+    """
+    repo = _repo_with_90_on_a_side_branch(tmp_path / "repo")
+    env = _failing_git_env(tmp_path, subcommand)
+    shown = _run(repo, "-ShowFloor", "-Kind", "adr", env=env)
+    combined = shown.stdout + shown.stderr
+    assert shown.returncode != 0, f"a failed {subcommand} still printed a floor:\n{combined}"
+    assert f"git {subcommand}" in combined, combined
+    assert not re.search(r"^floor\s*:", shown.stdout, re.MULTILINE), combined
+
+    # The allocation path reaches the same sweep and the same throw whichever call failed, so one
+    # subcommand is enough to pin that it writes nothing; each pwsh spawn costs seconds.
+    if subcommand != "for-each-ref":
+        return
+    registry = repo / ".git" / "mefor-coord" / "alloc"
+    allocated = _run(repo, "-Kind", "adr", "-Title", "refusal probe", "-NoFetch", env=env)
+    combined = allocated.stdout + allocated.stderr
+    assert allocated.returncode != 0, f"a failed {subcommand} still allocated:\n{combined}"
+    assert "REFUSING TO ALLOCATE" in combined, combined
+    assert sorted(p.name for p in registry.rglob("*.json")) == [], (
+        "the refusal left a claimed number behind, so it does not fail closed"
+    )

@@ -489,11 +489,36 @@ function Get-Floor {
     #
     # `alloc_strand_sweep.py::numbers_on_refs` is the same sweep in Python and now the same shape.
     # Two implementations of one question drift; change one and read the other.
-    $refs = @("origin/main") + @(& git -C $repo for-each-ref --format='%(refname)' refs/heads refs/remotes)
+    #
+    # A FAILED PLUMBING CALL REFUSES, IT DOES NOT SHRINK THE SWEEP (BACKLOG #5479). Each of the three
+    # calls below used to run with its exit code unread, so a for-each-ref that failed left only
+    # origin/main, a cat-file that failed left no trees, and an ls-tree that failed dropped that
+    # tree's names. Each is a smaller set, so a lower floor, so a number already in use reading FREE.
+    # A legitimate absence is not a failure: cat-file reports a ref with no docs/adr as `missing` and
+    # still exits 0. -1 is the never-ran sentinel the pre-flight block below uses, for its reason.
+    #
+    # ONE WRAPPER, so a later sweep call cannot drop the reset or the check. The refusal phrase is
+    # the pre-flight block's, picked by the same switch (the call site passes -Peek:$ShowFloor).
+    $refusal = if ($Peek) { "REFUSING TO REPORT A FLOOR" } else { "REFUSING TO ALLOCATE" }
+    function Invoke-SweepGit([string[]]$GitArgs, [string]$Stdin) {
+        $global:LASTEXITCODE = -1
+        $out = if ($PSBoundParameters.ContainsKey('Stdin')) {
+            @($Stdin | & git -C $repo @GitArgs 2>$null)
+        } else {
+            @(& git -C $repo @GitArgs 2>$null)
+        }
+        if ($LASTEXITCODE -ne 0) {
+            throw "alloc.ps1: $refusal -- git $($GitArgs[0]) exited $LASTEXITCODE while sweeping refs for the ADR floor. An incomplete sweep would understate the floor and could re-issue a number already in use, so nothing was read as a floor or allocated. Run 'git -C $repo $($GitArgs -join ' ')' by hand to see its error, fix the clone, and re-run."
+        }
+        $out
+    }
+
+    $refs = @("origin/main") + @(Invoke-SweepGit @('for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes'))
     $specs = foreach ($r in ($refs | Select-Object -Unique)) { "${r}:docs/adr" }
 
     $trees = [System.Collections.Generic.HashSet[string]]::new()
-    foreach ($line in ($specs -join "`n" | & git -C $repo cat-file --batch-check='%(objectname) %(objecttype)' 2>$null)) {
+    $batch = Invoke-SweepGit @('cat-file', '--batch-check=%(objectname) %(objecttype)') -Stdin ($specs -join "`n")
+    foreach ($line in $batch) {
         $p = "$line".Split(' ')
         if ($p.Count -ge 2 -and $p[1] -eq 'tree') { [void]$trees.Add($p[0]) }
     }
@@ -502,7 +527,8 @@ function Get-Floor {
     # pre-dedupe spelling produced. `--name-only` yields one name per line and nothing else.
     $rx = [regex]::new('^(\d{4})-')
     foreach ($t in $trees) {
-        foreach ($n in (& git -C $repo ls-tree --name-only $t 2>$null)) {
+        $names = Invoke-SweepGit @('ls-tree', '--name-only', $t)
+        foreach ($n in $names) {
             $m = $rx.Match("$n")
             if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
         }
