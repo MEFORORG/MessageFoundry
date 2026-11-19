@@ -1038,6 +1038,7 @@ def test_apply_rechecks_a_holder_that_changed_after_the_scan(
     assert moved.exists(), "a holder that changed after the scan must keep its claim"
     assert out["9121"]["verdict"] == "MERGED-HELD", out["9121"]
     assert "changed since the scan" in out["9121"]["why"]
+    assert out["9121"]["outcome"].startswith("NOT released"), out["9121"]
     assert not still.exists(), "the untouched holder is the positive control"
     assert out["9122"]["verdict"] == "RELEASABLE"
     assert out["9122"]["outcome"] == "released", "the JSON carries each release's outcome"
@@ -1106,19 +1107,24 @@ def test_apply_rereads_a_gone_holder_claim_and_keeps_one_that_changed(
 ) -> None:
     """A gone holder's release takes -Force, so -Apply re-reads the claim file before it.
 
-    The gh stub rewrites two claim files while the scan probes their pull requests, so the scan
-    judges both RELEASABLE from what it read before the edit. One edit re-spells the key, the other
-    names another holder; both must survive with the outcome NOT released. The landed claim in the
-    same run, which nothing edits, is the positive control and IS released.
+    The gh stub changes three claims while the scan probes their pull requests, so the scan judges
+    each RELEASABLE from what it read before the change. One edit re-spells the key, one names
+    another holder, and one re-creates the holder directory with the file untouched; all three must
+    survive with the outcome NOT released. The landed claim in the same run, which nothing changes,
+    is the positive control and IS released.
     """
     unmerged_branch(repo, "respelled")
     unmerged_branch(repo, "retaken")
+    unmerged_branch(repo, "recreated")
     landed_branch(repo, "landed")
     respelled = write_claim(repo, "k-respelled", tmp_path / "vanished", "respelled")
     retaken = write_claim(repo, "k-retaken", tmp_path / "vanished", "retaken")
     control = write_claim(repo, "k-control", tmp_path / "vanished", "landed")
+    # A bare -Take re-asserts a claim without writing it, so only the holder shows it is back.
+    reborn = tmp_path / "reborn-holder"
+    recreated = write_claim(repo, "k-recreated", reborn, "recreated")
     github_origin(repo)
-    tips = [git(repo, "rev-parse", b).strip() for b in ("respelled", "retaken")]
+    tips = [git(repo, "rev-parse", b).strip() for b in ("respelled", "retaken", "recreated")]
     payload = json.dumps([json.loads(_merged_pr(t))[0] for t in tips])
     other = str(tmp_path / "someone-else").replace("\\", "/")
     # Each edit fires only on the probe for its own branch, which runs after the scan read that file.
@@ -1131,23 +1137,29 @@ def test_apply_rereads_a_gone_holder_claim_and_keeps_one_that_changed(
             json.dumps({"worktree": other})[1:-1],
         ),
     ]
-    side_effect = "\n".join(
+    lines = [
         f"if ($a -like '*--head {branch} *') {{ $p = {_ps_quote(str(p))}; "
         f"[IO.File]::WriteAllText($p, [IO.File]::ReadAllText($p).Replace({_ps_quote(a)}, {_ps_quote(b)})) }}"
         for branch, p, a, b in edits
+    ]
+    lines.append(
+        "if ($a -like '*--head recreated *') { "
+        f"New-Item -ItemType Directory -Path {_ps_quote(str(reborn))} | Out-Null }}"
     )
+    side_effect = "\n".join(lines)
     stub = gh_router(tmp_path, head=payload, on_head=side_effect)
 
     proc = reconcile(repo, "-Json", "-Apply", "-GhCommand", str(stub))
     assert proc.returncode == 0, proc.stderr
     out = {c["key"]: c for c in json.loads(proc.stdout)["claims"]}
 
-    assert respelled.exists() and retaken.exists(), out
+    assert respelled.exists() and retaken.exists() and recreated.exists(), out
     assert "K-Respelled" in respelled.read_text(encoding="utf-8"), "the edit must have landed"
     assert "someone-else" in retaken.read_text(encoding="utf-8"), "the edit must have landed"
     for key, reason in (
         ("k-respelled", "another spelling of its key"),
         ("k-retaken", "held by another worktree"),
+        ("k-recreated", "holder directory exists again"),
     ):
         assert out[key]["verdict"] == "CHANGED-SINCE-SCAN", out[key]
         assert reason in out[key]["why"], out[key]

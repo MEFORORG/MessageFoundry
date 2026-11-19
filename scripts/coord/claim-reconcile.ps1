@@ -56,9 +56,12 @@
     -Apply RE-READS A GONE HOLDER'S CLAIM just before it releases one. The release takes -Force, which
     deletes whatever claim sits under the key by then, so a key re-taken between the scan and -Apply
     would otherwise be released. The re-read compares the key, holder, host, branch, both stamps and
-    the file's whole text with what the scan read. On any difference the row reads CHANGED-SINCE-SCAN
-    with the outcome "NOT released", and nothing is touched. A window remains between that re-read and
-    claim.ps1's own read; it is narrowed, not closed.
+    the file's whole text with what the scan read, and then re-tests that the holder directory is
+    still absent and unregistered and that the branch still names the commit the scan judged; a bare
+    `claim.ps1 -Take` on a held key writes nothing, so the file alone cannot show a re-assertion. On
+    any difference the row reads CHANGED-SINCE-SCAN with the outcome "NOT released", and nothing is
+    touched. A holder-present row that changed reads MERGED-HELD, with the same outcome. A window
+    remains between that re-read and claim.ps1's own read; it is narrowed, not closed.
 
     The gone-holder pull-request probe passes --repo, from origin's GitHub URL, and --base, the branch
     the reference names, and re-checks the base on each row it gets back. Without a GitHub origin it
@@ -557,6 +560,8 @@ function Read-ClaimAgain([string]$File, [object]$Row) {
         $r.Claim = $r.Text | ConvertFrom-Json -DateKind String -EA Stop
     }
     catch { $r.Why = "the claim file no longer parses"; return $r }
+    # An emptied file parses to nothing without throwing; the scan reads that as UNREADABLE.
+    if ($null -eq $r.Claim) { $r.Why = "the claim file no longer parses"; return $r }
     $c = $r.Claim
     $k = Get-ClaimKey $c ([IO.Path]::GetFileNameWithoutExtension($File))
     if (-not $k.NamesFile) { $r.Why = "the claim file's key no longer names that file" }
@@ -585,7 +590,9 @@ function Test-StillReleasable([object]$Row) {
 # The -Apply re-check for a gone-holder row. Returns "" when the claim file still reads exactly as the
 # scan read it, otherwise what changed. That release goes through -Force, which deletes whatever claim
 # sits under the key by then, so without this a key re-taken between the scan and -Apply would be
-# released. The shared checks run first, then the branch and stamps, then the whole text.
+# released. The shared checks run first, then the branch and stamps, then the whole text. A session
+# re-asserting a claim with a bare -Take writes nothing, so the holder's absence and deregistration and
+# the branch tip the verdict rested on are read again too.
 function Test-GoneHolderUnchanged([object]$Row) {
     $seen = $script:scannedByKey[$Row.key]
     if (-not $seen) { return "the scan kept no copy of the claim to compare against" }
@@ -597,6 +604,26 @@ function Test-GoneHolderUnchanged([object]$Row) {
         if ([string]$c.$field -cne [string]$seen.Claim.$field) { return "the claim's '$field' stamp changed, so it was taken again" }
     }
     if ($again.Text -cne $seen.Text) { return "the claim file's text changed" }
+    if (Test-Path -LiteralPath $Row.holder) { return "the holder directory exists again" }
+    if ((Read-WorktreeRegistry).Registered.ContainsKey($Row.holder)) { return "the holder is a registered worktree again" }
+    if ((Get-BranchTip $Row.branch) -ne $seen.Tip) { return "the branch '$($Row.branch)' moved, or can no longer be read" }
+    return ""
+}
+
+# The ref a claim's branch resolves to, local first, then origin's; "" when neither exists.
+function Resolve-BranchRef([string]$Branch) {
+    foreach ($cand in @($Branch, "origin/$Branch")) {
+        if (& git -C $repo rev-parse --verify --quiet $cand) { return $cand }
+    }
+    return ""
+}
+
+# The commit that ref names, "" when there is none. The gone-holder re-check compares it with the scan's.
+function Get-BranchTip([string]$Branch) {
+    $ref = Resolve-BranchRef $Branch
+    if (-not $ref) { return "" }
+    $tip = (& git -C $repo rev-parse --verify --quiet "$ref^{commit}" 2>$null)
+    if ($tip) { return ([string]$tip).Trim() }
     return ""
 }
 
@@ -683,10 +710,8 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
         continue
     }
 
-    $ref = $null
-    foreach ($cand in @($branch, "origin/$branch")) {
-        if (& git -C $repo rev-parse --verify --quiet $cand) { $ref = $cand; break }
-    }
+    $ref = Resolve-BranchRef $branch
+    if ($ref) { $script:scannedByKey[$key] | Add-Member -NotePropertyName Tip -NotePropertyValue (Get-BranchTip $branch) }
     if (-not $ref) {
         # The branch is gone everywhere. That is consistent with a squash-merge plus remote deletion,
         # and equally with somebody deleting unmerged work. Both look identical from here, so this is
@@ -853,6 +878,7 @@ if ($Apply) {
             if ($changed) {
                 $r.verdict = "MERGED-HELD"
                 $r.why = "$($r.why) -- but changed since the scan, so it was not released: $changed"
+                $r | Add-Member -NotePropertyName outcome -NotePropertyValue "NOT released -- the claim or its holder changed since the scan" -Force
                 continue
             }
             # -AsWorktree and NO -Force: claim.ps1 re-tests that the holder still owns the key, in its
@@ -868,7 +894,7 @@ if ($Apply) {
             if ($changed) {
                 $r.verdict = "CHANGED-SINCE-SCAN"
                 $r.why = "$($r.why) -- but the claim changed since the scan: $changed"
-                $r | Add-Member -NotePropertyName outcome -NotePropertyValue "NOT released -- the claim changed since the scan" -Force
+                $r | Add-Member -NotePropertyName outcome -NotePropertyValue "NOT released -- the claim or its holder changed since the scan" -Force
                 continue
             }
         }
@@ -880,9 +906,12 @@ if ($Apply) {
         # either, so neither the exit code nor a missing file shows a release happened. Its own
         # success line does. The scan let through only keys that fold to their own file name.
         $released = $code -eq 0 -and @($said | Where-Object { $_ -like "Released claim on *" }).Count -gt 0
-        $outcome = if ($code -ne 0) { "release FAILED -- claim untouched" }
+        # A non-zero exit can follow the delete (a step after it threw), so the file says which it was.
+        $keyFile = Join-Path $claimsDir "$(Get-KeyFileName $r.key).json"
+        $outcome = if ($code -ne 0 -and (Test-Path -LiteralPath $keyFile)) { "release FAILED (exit $code) -- the claim file is still there" }
+        elseif ($code -ne 0) { "release FAILED (exit $code) -- but the claim file is gone; read claims/.history" }
         elseif (-not $released) { "NOT released -- claim.ps1 found no claim under that key" }
-        elseif (Test-Path -LiteralPath (Join-Path $claimsDir "$(Get-KeyFileName $r.key).json")) { "released -- and a claim file is under that key again" }
+        elseif (Test-Path -LiteralPath $keyFile) { "released -- and a claim file is under that key again" }
         else { "released" }
         $r | Add-Member -NotePropertyName outcome -NotePropertyValue $outcome -Force
     }
