@@ -801,7 +801,7 @@ async def test_a_store_failure_degrades_the_pages_instead_of_a_500(
         assert page_.status_code == 503, page_.text
         assert "<h1>High Availability</h1>" in page_.text
         assert "could not read cluster membership" in page_.text
-        assert "node-a (primary)" in page_.text
+        assert "unconfirmed" in page_.text and "primary" in page_.text
         assert not _offers(page_.text, CONFIRM)
         live = await c.get("/ui/cluster/live")
         # Ok, so the page's poller swaps it in rather than keeping the last good view.

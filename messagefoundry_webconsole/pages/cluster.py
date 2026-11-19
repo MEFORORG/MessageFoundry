@@ -430,7 +430,10 @@ def _unreadable_body(cluster: ClusterStatus) -> Markup:
                 "Clustering",
                 "enabled (active-passive)" if cluster.clustered else "disabled (single-node)",
             ],
-            ["This console runs on", f"{cluster.node_id} ({cluster.role})"],
+            ["This console runs on", cluster.node_id],
+            # Without the lease row nothing confirms the in-memory role: a node cut off from the
+            # store can still read itself as primary after its lease has moved.
+            ["Role in this node's memory, unconfirmed", cluster.role],
             ["Config version", cluster.config_version],
         ],
         adjustable=False,

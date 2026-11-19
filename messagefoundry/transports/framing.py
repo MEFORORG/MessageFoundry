@@ -31,8 +31,6 @@ from messagefoundry.framing import (
 from messagefoundry.parsing._builtin_hl7 import _extract_separators
 from messagefoundry.parsing.sniff import _LEADING_WS_STR
 from messagefoundry.parsing.split import _sends_more_than_one_message
-from messagefoundry.parsing.x12.delimiters import discover_delimiters
-from messagefoundry.parsing.x12.errors import X12PeekError
 from messagefoundry.transports.base import NegativeAckError, encode_wire_body
 
 __all__ = [
@@ -130,7 +128,7 @@ def _refuse_more_than_one_message(payload: str, transport: str) -> None:
 def declared_encoding(declared: object) -> str:
     """The charset name an inbound's ``encoding`` setting declares (default ``utf-8``).
 
-    The one rule for the name, read by the MLLP, TCP and X12 listeners for their replies, by the sources
+    The one rule for the name, read by the MLLP and TCP listeners for their replies, by the sources
     that encode or decode with the setting themselves (at least the file, remote-file, timer, X12
     and database sources), and by :func:`~messagefoundry.pipeline.ingress_guards.ingress_encoding`
     for the decode (BACKLOG #2431).
@@ -140,7 +138,7 @@ def declared_encoding(declared: object) -> str:
     sees a ``str`` or ``None``. The ``str()`` stays as a
     backstop: a value that got past load anyway is never a ``TypeError`` out of ``encode`` or
     ``decode``. Its ``str()`` either names a codec (``1252`` reads as ``cp1252``) or fails as a
-    ``LookupError`` the decode refuses and :func:`encode_reply` falls back from."""
+    ``LookupError`` the decode refuses and :func:`frame_reply` falls back from."""
     return str(declared) if declared else "utf-8"
 
 
@@ -217,10 +215,8 @@ def _encode_replacing(reply: str, encoding: str, connection: str) -> bytes:
     delimiter or the segment terminator a replaced data character would become structure (ADR
     0206). That reply is refused with the same fixed error instead. So is one with a delimiter the
     charset cannot hold: the delimiter itself would become ``?`` beside replaced data characters,
-    and both would read as one delimiter. An ``ISA``-led reply, which the X12 listener can send,
-    declares its delimiters in its ISA header, so they are read and refused alike, and one whose
-    ISA header cannot be read is refused with the same fixed error (BACKLOG #5958). A reply led by
-    neither has no declared delimiters to collide with."""
+    and both would read as one delimiter. A reply not led by ``MSH`` has no declared delimiters to
+    collide with."""
     delimiters = _reply_delimiters(reply)
     if _REPLACEMENT in delimiters or not all(_encodes(d, encoding) for d in delimiters):
         raise UnicodeError(
@@ -267,30 +263,13 @@ def _encodes(delimiter: str, encoding: str) -> bool:
 
 def _reply_delimiters(reply: str) -> frozenset[str]:
     """The delimiters an ``MSH``-led ``reply`` declares, read as the parser reads them, plus the
-    segment terminator; for an ``ISA``-led reply, the delimiters its ISA header declares (BACKLOG
-    #5958); empty for any other reply. Read only: nothing here changes the reply.
+    segment terminator; empty for any other reply. Read only: nothing here changes the reply.
 
     Leading whitespace and a BOM are skipped first, as the engine's one definition of tolerated
     leading noise (``sniff._LEADING_WS_STR``) skips them. The first line is measured, not the whole
     reply, so a first line of ``MSH`` alone has no field separator to read and declares nothing,
-    rather than indexing past its end. An ``ISA`` header that cannot be read raises a fixed
-    ``UnicodeError``, as :func:`_encode_replacing` does, outside the handler, so it chains nothing."""
-    body = reply.lstrip(_LEADING_WS_STR)
-    if body.startswith("ISA"):
-        try:
-            found = discover_delimiters(body, 0)
-        except X12PeekError:
-            found = None
-        if found is None:
-            raise UnicodeError(
-                "the reply holds characters its charset cannot encode, and its ISA header cannot "
-                "be read for the delimiters the replacement could collide with"
-            )
-        isa = {found.element, found.component, *found.segment}
-        if found.repetition is not None:
-            isa.add(found.repetition)
-        return frozenset(isa)
-    line = body.partition("\r")[0]
+    rather than indexing past its end."""
+    line = reply.lstrip(_LEADING_WS_STR).partition("\r")[0]
     if not line.startswith("MSH") or len(line) < 4:
         return frozenset()
     return frozenset((*_extract_separators(line), "\r"))
