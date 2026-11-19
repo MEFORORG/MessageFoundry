@@ -603,8 +603,9 @@ SITES: dict[str, Site] = {
         7,
         GUARDED,
         "Reads the git metadata of the operator's own config checkout, read only, to an object id. "
-        "The symbolic ref HEAD names is joined only once _confined_ref holds it under refs/ "
-        "(vault BACKLOG #5325); the other joins are fixed names or the checkout's own pointers.",
+        "The symbolic ref HEAD names is joined only once _confined_ref holds it, lexically, under "
+        "refs/ of the root it joins (vault BACKLOG #5325). The other joins are fixed names, or the "
+        "checkout's own .git and commondir pointers, which are not confined.",
         "messagefoundry/config/fingerprint.py::_confined_ref",
         called=True,
     ),

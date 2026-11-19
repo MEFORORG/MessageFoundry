@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+import messagefoundry.config.fingerprint as fp_mod
 from messagefoundry.config.fingerprint import (
     UNREADABLE_FILES_KEY,
     ConfigDirMissing,
@@ -542,15 +543,56 @@ def test_a_loose_ref_that_cannot_be_stated_does_not_fall_back_to_packed_refs(
     loose = git_dir / "refs" / "heads" / "main"
     loose.write_text(_SHA256, encoding="utf-8")
     (git_dir / "packed-refs").write_text(f"{_SHA1} refs/heads/main\n", encoding="utf-8")
-    real = Path.stat
+    real = os.stat
 
-    def _stat(self: Path, **kwargs: Any) -> os.stat_result:
-        if self == loose:
-            raise PermissionError(13, "Permission denied", str(self))
-        return real(self, **kwargs)
+    def _stat(path: Any, *args: Any, **kwargs: Any) -> os.stat_result:
+        if os.fspath(path) == str(loose):
+            raise PermissionError(13, "Permission denied", str(path))
+        return real(path, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "stat", _stat)
+    monkeypatch.setattr(os, "stat", _stat)
     assert _git_head(cfg) is None
+
+
+def test_a_loose_ref_removed_before_its_read_falls_through_to_packed_refs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``git pack-refs`` writes packed-refs and then deletes the loose ref, so a ref gone by the
+    read is packed, as git would read it."""
+    cfg, git_dir = _repo(tmp_path, b"ref: refs/heads/main\n")
+    loose = git_dir / "refs" / "heads" / "main"
+    loose.write_text(_SHA256, encoding="utf-8")
+    (git_dir / "packed-refs").write_text(f"{_SHA1} refs/heads/main\n", encoding="utf-8")
+    real = os.open
+
+    def _open(path: Any, *args: Any, **kwargs: Any) -> int:
+        if os.fspath(path) == str(loose):
+            loose.unlink()
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", _open)
+    assert _git_head(cfg) == _SHA1
+
+
+def test_a_reftable_head_reads_as_unknown_without_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Every reftable repository writes ``ref: refs/heads/.invalid``; that is no tampering."""
+    cfg, _ = _repo(tmp_path, b"ref: refs/heads/.invalid\n")
+    with caplog.at_level("DEBUG", logger="messagefoundry.config.fingerprint"):
+        assert _git_head(cfg) is None
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+def test_a_refused_symbolic_ref_logs_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A refusal is not silent, and the log line does not carry the crafted ref text."""
+    cfg, _ = _repo(tmp_path, b"ref: ../crafted-text\n")
+    with caplog.at_level("WARNING", logger="messagefoundry.config.fingerprint"):
+        assert _git_head(cfg) is None
+    assert [r.levelname for r in caplog.records] == ["WARNING"]
+    assert "crafted-text" not in caplog.text
 
 
 @pytest.mark.parametrize("rel", ["HEAD", "refs/heads/main"])
@@ -585,10 +627,6 @@ def test_a_fifo_head_reads_as_unknown_without_blocking(tmp_path: Path) -> None:
         "refs\\..\\..\\outside",
         "refs/heads/a:b",
         "refs/heads/a b",
-        "refs/heads/CON",
-        "refs/heads/com1",
-        "refs/heads/CONIN$",
-        "refs/heads/nul.txt",
         "refs/heads/main.",
     ],
 )
@@ -600,6 +638,24 @@ def test_a_symbolic_ref_outside_refs_is_not_followed(tmp_path: Path, ref: str) -
     (tmp_path / "outside").write_text(_SHA1, encoding="utf-8")
     (git_dir / "packed-refs").write_text(f"{_SHA1} {ref}\n", encoding="utf-8")
     assert _git_head(cfg) is None
+
+
+@pytest.mark.parametrize("name", ["CON", "com1", "CONIN$", "nul.txt", "a."])
+def test_a_symbolic_ref_naming_a_windows_device_is_refused_only_on_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """On Windows the read would open the device, or a name Windows strips; on POSIX each is an
+    ordinary file name git accepts, so it still resolves."""
+    ref = f"refs/heads/{name}/x"
+    cfg, git_dir = _repo(tmp_path, f"ref: {ref}\n".encode())
+    (git_dir / "packed-refs").write_text(f"{_SHA1} {ref}\n", encoding="utf-8")
+    monkeypatch.setattr(os, "name", "nt")
+    assert fp_mod._confined_ref(ref) is False
+    monkeypatch.setattr(os, "name", "posix")
+    assert fp_mod._confined_ref(ref) is True
+    if os.name == "nt":
+        monkeypatch.undo()
+        assert _git_head(cfg) is None
 
 
 def test_an_absolute_symbolic_ref_is_not_followed(tmp_path: Path) -> None:
