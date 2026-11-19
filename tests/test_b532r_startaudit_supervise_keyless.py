@@ -4,9 +4,10 @@
 
 Each engine shard's ``serve`` writes its own keyless-start record to its own handlers. The
 supervisor's pair renewal opens the store keyless in its own process, so when the at-rest opt-out
-lets the fleet start with no store key, the supervisor records that too, once, through
-``_start_logging``'s queue. Like every queued start line it is a decision-time record, written on
-a refused or raised start as well (BACKLOG #5390's reviewed not-a-bug).
+lets the fleet through with no store key, the supervisor records that too, once, through
+``_start_logging``'s queue, so after its handlers and forwarder are installed. Like every queued
+start line it is a decision-time record, written on a refused or raised start as well (BACKLOG
+#5390's reviewed not-a-bug).
 """
 
 from __future__ import annotations
@@ -16,22 +17,43 @@ from pathlib import Path
 import pytest
 
 from messagefoundry import __main__ as cli
-from tests.test_b5391_serve_audit_after_logging import _SECURE, SAMPLES_CONFIG, _recorded
+from messagefoundry.logging_setup import configure_logging
+from tests.test_b5391_serve_audit_after_logging import _SECURE, SAMPLES_CONFIG, _recorded, _serve
 
 _KEYLESS_WARN = 'security.enforcement = "warn"\nsecurity.allow_unencrypted_phi = true\n'
-_FLEET_KEYLESS = "AUDIT: starting the fleet keyless"
+_OPT_OUT = "[security].allow_unencrypted_phi=true"
+_FLEET_LINE = cli._keyless_start_audit_line(
+    _OPT_OUT,
+    env_name="staging",
+    production=False,
+    enforcing=False,
+    what="the at-rest opt-out accepts a keyless fleet start",
+)
 
 
 def _supervise(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, key: bool
 ) -> tuple[int, list[tuple[str, bool]]]:
+    """``supervise`` with each record marked by whether ``_start_logging``'s ``configure_logging``
+    call, the one that is handed the forwarder, had run. The bare call at the top of supervise
+    passes no ``forward`` and does not count."""
     monkeypatch.chdir(tmp_path)
     if key:
         monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
     else:
         monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
     (tmp_path / "messagefoundry.toml").write_text(_KEYLESS_WARN + _SECURE, encoding="utf-8")
-    return _recorded(["supervise", "--config", str(SAMPLES_CONFIG), "--env", "staging"], [])
+    configured: list[bool] = []
+
+    def configure(*args: object, **kwargs: object) -> bool:
+        live = configure_logging(*args, **kwargs)  # type: ignore[arg-type]
+        if "forward" in kwargs:
+            configured.append(True)
+        return live
+
+    monkeypatch.setattr(cli, "configure_logging", configure)
+    argv = ["supervise", "--config", str(SAMPLES_CONFIG), "--env", "staging"]
+    return _recorded(argv, configured)
 
 
 def _stop_at_the_renewal(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
@@ -50,20 +72,18 @@ def _stop_at_the_renewal(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
     return reached
 
 
-def _fleet_keyless(seen: list[tuple[str, bool]]) -> list[str]:
-    return [message for message, _ in seen if message.startswith(_FLEET_KEYLESS)]
+def _keyless(seen: list[tuple[str, bool]]) -> list[tuple[str, bool]]:
+    return [(m, after) for m, after in seen if m.startswith("AUDIT:") and "keyless" in m]
 
 
-def test_supervise_writes_its_own_keyless_audit_line_once(
+def test_supervise_writes_its_own_keyless_audit_line_once_after_configure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     reached = _stop_at_the_renewal(monkeypatch)
     rc, seen = _supervise(tmp_path, monkeypatch, key=False)
     assert rc == 2
     assert reached == [True]
-    (line,) = _fleet_keyless(seen)
-    assert "because [security].allow_unencrypted_phi=true" in line
-    assert "UNENCRYPTED at rest" in line
+    assert _keyless(seen) == [(_FLEET_LINE, True)]
 
 
 def test_supervise_with_a_store_key_writes_no_keyless_audit_line(
@@ -74,34 +94,31 @@ def test_supervise_with_a_store_key_writes_no_keyless_audit_line(
     rc, seen = _supervise(tmp_path, monkeypatch, key=True)
     assert rc == 2
     assert reached == [True]
-    assert [message for message, _ in seen if "keyless" in message] == []
+    assert _keyless(seen) == []
 
 
 def test_a_raise_in_supervise_still_writes_its_keyless_audit_line(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Queued before the guarded span, so a raise in it writes the line on its way out, once.
+    # Queued before the guarded span, so a raise in it writes the line on its way out, once,
+    # to the handlers the process has then.
     def boom(*_a: object, **_k: object) -> str:
         raise RuntimeError("spool directory evaluation failed")
 
     monkeypatch.setattr(cli, "_supervisor_forward_spool_dir", boom)
     rc, seen = _supervise(tmp_path, monkeypatch, key=False)
     assert rc != 0
-    assert len(_fleet_keyless(seen)) == 1
+    assert _keyless(seen) == [(_FLEET_LINE, False)]
 
 
-def test_serve_and_supervise_share_the_keyless_line_text() -> None:
+def test_serve_writes_the_shared_keyless_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # serve's line comes from the same helper, so the two records share one text.
+    rc, seen = _serve(tmp_path, monkeypatch, _KEYLESS_WARN, env="staging", key=False)
+    assert rc == 0
     serve_line = cli._keyless_start_audit_line(
-        "[security].allow_unencrypted_phi=true", env_name="prod", production=True, enforcing=True
+        _OPT_OUT, env_name="staging", production=False, enforcing=False
     )
-    assert serve_line.startswith("AUDIT: starting keyless on a production PHI instance")
-    assert "+ [security].allow_unencrypted_phi_under_strict_enforcement=true" in serve_line
-    fleet_line = cli._keyless_start_audit_line(
-        "[security].allow_unencrypted_phi=true",
-        env_name="staging",
-        production=False,
-        enforcing=False,
-        what="starting the fleet keyless",
-    )
-    assert fleet_line.startswith(f"{_FLEET_KEYLESS} on a PHI instance")
-    assert "strict_enforcement" not in fleet_line
+    assert serve_line.startswith("AUDIT: starting keyless on a PHI instance")
+    assert _keyless(seen) == [(serve_line, True)]

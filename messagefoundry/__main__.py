@@ -559,23 +559,27 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     security.add_argument("--json", action="store_true", help="emit JSON")
 
-    support_bundle = sub.add_parser(
-        "support-bundle",
-        # The old wording read "a SECRET-FREE / PHI-free support zip". That is true of the config
-        # summary and the status snapshot and NOT of the log tail, whose redaction is best-effort: a
-        # single-token identifier survives it (messagefoundry/redaction.py states that residual), and an
-        # operator username is exactly that shape while this engine's own settings classifier calls a
-        # username a credential. A blanket claim resting on a member that does not meet it is the
-        # false-premise shape CLAUDE.md section 11 forbids, so the claim was repaired rather than the
-        # control -- see BACKLOG #1475 and the exclusion table in
-        # tests/test_log_redaction_secret_domain.py for why the username class stays out. The help
-        # used to name one residual as if it were the whole of it; it now names none and points at
-        # the manifest's phi_contract, the one place the residual is stated (BACKLOG #5385).
-        help="write a support zip to hand to support (#49): a secret-free config summary "
+    # The old wording read "a SECRET-FREE / PHI-free support zip". That is true of the config
+    # summary and the status snapshot and NOT of the log tail, whose redaction is best-effort: a
+    # single-token identifier survives it (messagefoundry/redaction.py states that residual), and an
+    # operator username is exactly that shape while this engine's own settings classifier calls a
+    # username a credential. A blanket claim resting on a member that does not meet it is the
+    # false-premise shape CLAUDE.md section 11 forbids, so the claim was repaired rather than the
+    # control -- see BACKLOG #1475 and the exclusion table in
+    # tests/test_log_redaction_secret_domain.py for why the username class stays out. The help
+    # repeats the manifest phi_contract's log-tail residual because an operator reads it before the
+    # zip exists; tests/test_support_bundle.py holds the two to the same terms (BACKLOG #5385).
+    # Both the command list and `support-bundle --help` print it.
+    support_bundle_help = (
+        "write a support zip to hand to support (#49): a secret-free config summary "
         "(counts/names only) + a PHI-free /status snapshot + a REDACTED app-log tail. The tail's "
-        "redaction is BEST-EFFORT and values survive it, so handle the zip as a copy of the app "
-        "log, not as secret-free or PHI-free. The phi_contract in the zip's manifest.json states "
-        "what survives",
+        "redaction is BEST-EFFORT, and values survive it: at least a single-token identifier such "
+        "as an operator username and, on a non-production instance logging at DEBUG, a message "
+        "body the log recorded in a shape the redaction does not read. Handle the zip as a copy of "
+        "the app log, not as secret-free or PHI-free; manifest.json's phi_contract states it too"
+    )
+    support_bundle = sub.add_parser(
+        "support-bundle", help=support_bundle_help, description=support_bundle_help
     )
     support_bundle.add_argument(
         "--out", required=True, help="path to write the support-bundle .zip"
@@ -2256,8 +2260,10 @@ def _write_start_audit(lines: list[str]) -> None:
     ``configure_logging`` it reaches ``main()``'s filtered lastResort on stderr.
 
     Each line is a decision-time record: it says what a gate accepted when it decided, and is
-    written the same way whether or not a later gate refuses the start, which records its own
-    refusal (BACKLOG #5390, the reviewed not-a-bug for its last limb). The static-credential
+    written the same way whether or not a later gate refuses the start. A later refusal is
+    reported on its own, on stderr at least; not every one is also a log record, so a forwarded
+    copy of these lines can lack the refusal beside it (BACKLOG #5390, the reviewed not-a-bug for
+    its last limb). The static-credential
     (#1989) and remote-debugging (#2700) AUDIT lines, logged after ``_start_logging``, come through
     here too, so ``[logging].level`` does not filter them either. At least five other AUDIT lines
     ``serve`` logs after ``_start_logging`` still go through ``logger.warning``, so that level
@@ -5702,6 +5708,9 @@ def _supervise(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # The gate passed with no key, so the audited opt-out is what let the fleet through: its
+    # AUDIT line is queued below (BACKLOG #5391 item 4).
+    fleet_keyless = not _store_key_configured(settings)
 
     # Vault BACKLOG #2601: the two key-file checks each shard's `serve` makes, for the same reason
     # as the gates above: every shard would refuse, and the supervisor would only restart them. The
@@ -5728,19 +5737,19 @@ def _supervise(args: argparse.Namespace) -> int:
     # BACKLOG #5391: the opt-out's AUDIT line is written on every way out of this span, a refusal or
     # a raise, the spool directory's evaluation included, until _start_logging's own guard takes it.
     #
-    # BACKLOG #5391 item 4: first, the keyless-start AUDIT line, when the at-rest opt-out lets the
-    # fleet start with no store key (the gate above refused every other keyless case). Each engine
-    # shard's `serve` writes its own, to its own handlers. This one is the supervisor's own record:
-    # the pair renewal below opens the store keyless in this process when it re-mints the pair.
+    # BACKLOG #5391 item 4: first, the keyless-start AUDIT line, when the at-rest opt-out let the
+    # fleet through with no store key at the gate above. Each engine shard's `serve` writes its
+    # own, to its own handlers. This one is the supervisor's own record: the pair renewal below
+    # opens the store keyless in this process when it re-mints the pair.
     posture_audit: list[str] = []
-    if not _store_key_configured(settings):
+    if fleet_keyless:
         posture_audit.append(
             _keyless_start_audit_line(
                 _keyless_opt_out_switches(settings),
                 env_name=env_name,
                 production=production,
                 enforcing=enforcing,
-                what="starting the fleet keyless",
+                what="the at-rest opt-out accepts a keyless fleet start",
             )
         )
     try:
