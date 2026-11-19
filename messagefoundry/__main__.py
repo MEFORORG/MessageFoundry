@@ -2245,7 +2245,16 @@ def _log_static_credential_outcome(outcome: StaticCredentialGateOutcome | None) 
         logging.getLogger(__name__).warning("%s", outcome.refusal)
 
 
-def _write_start_audit(lines: list[str]) -> None:
+#: Appended to each queued start AUDIT line a refused or failed start writes (BACKLOG #5390, #5391).
+#: The lines are worded as a posture the start accepted, "starting keyless" among them, and a start
+#: that stops before it runs never takes that posture, so the record says so rather than leave a
+#: false statement in the audit trail.
+_START_AUDIT_NOT_APPLIED = (
+    " (Not applied: this start was refused, or stopped on an error, before it ran.)"
+)
+
+
+def _write_start_audit(lines: list[str], *, refused: bool = False) -> None:
     """Log the start's AUDIT lines to whatever handlers this process has now, then empty
     ``lines``, so a second call writes nothing (BACKLOG #5390, #5391).
 
@@ -2253,11 +2262,15 @@ def _write_start_audit(lines: list[str]) -> None:
     :func:`_start_logging` and of the span in ``serve`` and ``supervise`` that queues lines before
     it, a refusal or a raise, so a refused start does not lose a record the old decision-time log
     call wrote: in ``supervise`` that reached its stdout handler, and in ``serve`` before
-    ``configure_logging`` it reaches ``main()``'s filtered lastResort on stderr. The static-
-    credential (#1989) and remote-debugging (#2700) AUDIT lines, logged after ``_start_logging``,
-    come through here too, so ``[logging].level`` does not filter them either. At least five other
-    AUDIT lines ``serve`` logs after ``_start_logging`` still go through ``logger.warning``, so that
-    level does filter those.
+    ``configure_logging`` it reaches ``main()``'s filtered lastResort on stderr. Those ways out
+    pass ``refused``, which appends :data:`_START_AUDIT_NOT_APPLIED` to each line, because the
+    start never took the posture the line records. A start refused after ``configure`` has
+    returned has written its lines already, unqualified: it had passed every gate they record.
+
+    The static-credential (#1989) and remote-debugging (#2700) AUDIT lines, logged after
+    ``_start_logging``, come through here too, so ``[logging].level`` does not filter them
+    either. At least five other AUDIT lines ``serve`` logs after ``_start_logging`` still go
+    through ``logger.warning``, so that level does filter those.
 
     Each line goes through ``Logger.handle``, which skips the logger's effective level. A
     process-wide ``logging.disable()`` at WARNING or above still drops it, as it would drop
@@ -2275,6 +2288,8 @@ def _write_start_audit(lines: list[str]) -> None:
         return
     fn, lno, func, _sinfo = logger.findCaller(stacklevel=2)
     for line in pending:
+        if refused:
+            line = f"{line}{_START_AUDIT_NOT_APPLIED}"
         logger.handle(
             logger.makeRecord(logger.name, logging.WARNING, fn, lno, "%s", (line,), None, func)
         )
@@ -2312,7 +2327,8 @@ def _start_logging(
     :func:`_write_start_audit` either way (BACKLOG #5391). The warn-mode hop's AUDIT line is queued
     behind them once that gate decides it, so it is written on every way out, as the old
     decision-time log call wrote it: a later refusal or raise included, and a refused collector CA
-    that turns forwarding off (BACKLOG #5390)."""
+    that turns forwarding off (BACKLOG #5390). On a refusal or a raise each line says it was not
+    applied (:data:`_START_AUDIT_NOT_APPLIED`)."""
     pending = pending_audit if pending_audit is not None else []
     try:
         return _start_logging_gates(
@@ -2325,8 +2341,9 @@ def _start_logging(
             pending_audit=pending,
         )
     finally:
-        # A start that passed has written and emptied them already, so this writes nothing then.
-        _write_start_audit(pending)
+        # A start that passed has written and emptied them already, so this writes nothing then,
+        # and anything it does write is a refused or failed start's (BACKLOG #5390).
+        _write_start_audit(pending, refused=True)
 
 
 def _start_logging_gates(
@@ -3191,10 +3208,9 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         _start_audit.append(
-            f"AUDIT: starting keyless on a {'production ' if production else ''}PHI instance "
-            f"(environment {env_name!r}) because {opt_out_switches}"
-            f"{' + [security].allow_unencrypted_phi_under_strict_enforcement=true' if enforcing else ''}"
-            " — PHI is stored UNENCRYPTED at rest (at-rest encryption opt-out override)."
+            _keyless_start_audit_line(
+                settings, env_name=env_name, production=production, enforcing=enforcing
+            )
         )
 
     # The store key file is checked BEFORE it is used (vault BACKLOG #2601), first in the guarded
@@ -3251,7 +3267,7 @@ def _serve(args: argparse.Namespace) -> int:
             audit=_start_audit,
         )
         if _posture_refused:
-            _write_start_audit(_start_audit)
+            _write_start_audit(_start_audit, refused=True)
             return 2
         _log_file = (
             LogFile(
@@ -3264,7 +3280,7 @@ def _serve(args: argparse.Namespace) -> int:
         )
         _spool_dir = _forward_spool_dir(settings, getattr(args, "shard", None))
     except BaseException:
-        _write_start_audit(_start_audit)
+        _write_start_audit(_start_audit, refused=True)
         raise
     # BACKLOG #3470: a refused collector CA does not stop the start here. The forwarder is not
     # built, and the API lifespan's audited preflight refuses the start. It writes its audit row
@@ -5724,7 +5740,22 @@ def _supervise(args: argparse.Namespace) -> int:
     #
     # BACKLOG #5391: the opt-out's AUDIT line is written on every way out of this span, a refusal or
     # a raise, the spool directory's evaluation included, until _start_logging's own guard takes it.
+    #
+    # BACKLOG #5391 item 4: first, the keyless-start AUDIT line, when the at-rest opt-out lets the
+    # fleet start with no store key (the gate above refused every other keyless case). Each engine
+    # shard's `serve` writes its own, to its own handlers. This one is the supervisor's own record:
+    # the pair renewal below opens the store keyless in this process when it re-mints the pair.
     posture_audit: list[str] = []
+    if not _store_key_configured(settings):
+        posture_audit.append(
+            _keyless_start_audit_line(
+                settings,
+                env_name=env_name,
+                production=production,
+                enforcing=enforcing,
+                what="starting the fleet keyless",
+            )
+        )
     try:
         posture_refused = _forwarder_posture_refused(
             settings,
@@ -5734,11 +5765,11 @@ def _supervise(args: argparse.Namespace) -> int:
             audit=posture_audit,
         )
         if posture_refused:
-            _write_start_audit(posture_audit)
+            _write_start_audit(posture_audit, refused=True)
             return 2
         supervisor_spool_dir = _supervisor_forward_spool_dir(settings, db_base)
     except BaseException:
-        _write_start_audit(posture_audit)
+        _write_start_audit(posture_audit, refused=True)
         raise
     forwarder_installed = False
 
@@ -8565,6 +8596,29 @@ def _keyless_opt_out_switches(settings: ServiceSettings) -> str:
     if security.allow_unencrypted_phi or not switches:
         switches.append("[security].allow_unencrypted_phi=true")
     return " and ".join(switches)
+
+
+def _keyless_start_audit_line(
+    settings: ServiceSettings,
+    *,
+    env_name: str | None,
+    production: bool,
+    enforcing: bool,
+    what: str = "starting keyless",
+) -> str:
+    """The AUDIT line for a start the at-rest opt-out lets run keyless (BACKLOG #5391).
+
+    One text for ``serve`` and ``supervise``, which differ only in ``what``. Under strict
+    enforcement the second acknowledgment was verified by the caller's gate, so the line names it
+    too; the warn posture names the opt-out alone, as the operator wrote it (vault BACKLOG #2340)."""
+    strict = (
+        " + [security].allow_unencrypted_phi_under_strict_enforcement=true" if enforcing else ""
+    )
+    return (
+        f"AUDIT: {what} on a {'production ' if production else ''}PHI instance "
+        f"(environment {env_name!r}) because {_keyless_opt_out_switches(settings)}{strict}"
+        " — PHI is stored UNENCRYPTED at rest (at-rest encryption opt-out override)."
+    )
 
 
 def _keyless_store_gate(settings: ServiceSettings) -> str | None:
