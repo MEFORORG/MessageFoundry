@@ -10,8 +10,9 @@ not import (CLAUDE.md section 4). So both live here, beside the other client-imp
 as :mod:`messagefoundry.mllpcodec`. This module imports only the standard library at load, and at
 call time only :mod:`messagefoundry.redaction` and :mod:`messagefoundry.secretscrub`;
 ``tests/test_b532r_verify_harness_a5.py`` pins, in a fresh interpreter, that the harness probes
-load neither of those two packages, nor ``messagefoundry.verify``, through the A5 probe and through
-an error arm that runs the scrub. :mod:`messagefoundry.verify.model` and
+load none of ``messagefoundry.transports``, ``config``, ``verify``, ``pipeline`` and ``store``,
+through the A5 probe and through an error arm that runs the scrub. They do load ``redaction`` and
+``secretscrub``, which the scrub needs. :mod:`messagefoundry.verify.model` and
 :mod:`messagefoundry.verify.checks` re-export what they used to define.
 """
 

@@ -36,8 +36,9 @@ def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -
     then the text as ``safe_exc_detail``. A report row leaves the box, and driver or OS text can
     quote a DSN, a credential or a path.
 
-    The scrub is imported here, at call time, and a failure to load or run it withholds the text
-    rather than printing it raw. A1 exists to report an interpreter the engine cannot run on, and
+    The scrub is imported here, at call time, and a failure to load or run it withholds both
+    ``before`` and the text rather than printing either raw, since ``before`` was to be scrubbed
+    with the text, and names the failure's type instead. A1 exists to report an interpreter the engine cannot run on, and
     there the engine's modules may not even parse, so this must not take the runner down either."""
     try:
         from messagefoundry.verify_leaf import DRIVER_DETAIL_LIMIT, safe_exc_detail, safe_exc_text
@@ -47,7 +48,7 @@ def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -
         return safe_exc_text(exc, before=before)
     except Exception as scrub_failure:  # SyntaxError or ImportError on such an interpreter
         return (
-            f"{before}{type(exc).__name__} (text withheld: the detail scrub failed with "
+            f"{type(exc).__name__} (detail withheld: the detail scrub failed with "
             f"{type(scrub_failure).__name__})"
         )
 

@@ -44,7 +44,7 @@ from messagefoundry.verify.model import (
     safe_exc_detail,
     safe_exc_text,
 )
-from messagefoundry.verify_leaf import port_state as port_state
+from messagefoundry.verify_leaf import port_state
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import AuthSettings, StoreSettings

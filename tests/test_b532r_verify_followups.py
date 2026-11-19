@@ -263,5 +263,6 @@ def test_the_harness_scrub_withholds_the_text_when_it_cannot_run(
     monkeypatch.setattr(verify_leaf, "safe_exc_detail", broken)
     for typed in (False, True):
         text = probes.scrubbed_exc(RuntimeError(_LEAKY), before="x: ", typed=typed)
-        assert text.startswith("x: RuntimeError (text withheld"), text
+        assert text.startswith("RuntimeError (detail withheld"), text
+        assert "x: " not in text, text
         assert _PLANTED not in text, text

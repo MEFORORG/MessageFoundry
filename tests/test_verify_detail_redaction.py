@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib
 import socket
 import ssl
+import sys
 from pathlib import Path
 
 import pytest
@@ -650,6 +651,8 @@ def test_the_console_window_import_failure_hides_the_credential(
         raise ImportError(_LEAKY)
 
     monkeypatch.setattr(importlib, "import_module", boom)
+    # The import is reached on Windows only; elsewhere the row is the platform SKIP.
+    monkeypatch.setattr(sys, "platform", "win32")
     row = checks.check_console_no_window()
     assert row.status is Status.SKIP
     assert _PLANTED not in row.detail, row.detail
