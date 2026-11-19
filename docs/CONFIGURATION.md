@@ -1324,11 +1324,12 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > or in `connections.toml`) — see [CONNECTIONS.md](CONNECTIONS.md).
 >
 > **Under `enforce`, an override of `0` needs the same acknowledgement as a global `0`** (BACKLOG
-> #2368). On a config of one engine shard it keeps that connection's PHI forever, whatever the
-> global window says, but not every row about its messages; the refusal and the `AUDIT:` line state
-> which (BACKLOG #5967). On a config of more than one engine shard, an inbound's override keeps
-> nothing past a bounded global window: each engine shard purges the shared store with only its own
-> inbounds' overrides, so a sibling engine shard purges those bodies on the global window. The
+> #2368). It keeps that connection's PHI forever, whatever the global window says, but not every
+> row about its messages; the refusal and the `AUDIT:` line state which (BACKLOG #5967). One limit
+> applies to an inbound's override alone. When the config runs as more than one engine shard process
+> (`serve --shard`), it keeps nothing past a bounded global window: each engine shard process purges
+> the shared store with only its own inbounds' overrides, so a sibling engine shard purges that
+> inbound's message bodies on the global window. Plain `serve` on the same config honours it. The
 > overrides live in the graph, so `serve` checks them when it loads the graph, at least at startup
 > and on every config reload:
 >

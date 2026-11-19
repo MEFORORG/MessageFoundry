@@ -247,15 +247,33 @@ def test_the_override_text_names_what_is_kept_and_the_engine_shard_limit(
     assert text is not None
     opening = f"keeps {kept} indefinitely" if refused else f"connections' {kept} are retained"
     assert opening in text
-    caveat = "except where a sibling engine shard purges them as stated below"
+    # The caveat names the inbound overrides' bodies alone, so in the mixed case its "them" cannot
+    # be read as covering the outbound's dead rows, and it leaves no comma before "(status)".
+    caveat = (
+        "except the inbound overrides' message bodies where a sibling engine shard process purges "
+        "them as stated below"
+    )
     assert (caveat in text) is (inbound_days is not None)
+    assert "below, (" not in text and ",," not in text
     if inbound_days is None:
         assert "PHI message bodies" not in text
+    # The limit is keyed on how many engine shard processes run, not on how many the config names:
+    # plain `serve` on a config that names several honours the override.
     shard_limit = (
-        "On a config of more than one engine shard, an inbound override keeps nothing past the "
-        "global [security].delete_message_bodies_after_days window where that window is bounded"
+        "When the config runs as more than one engine shard process (serve --shard), an inbound "
+        "override keeps nothing past the global [security].delete_message_bodies_after_days window "
+        "where that window is bounded"
     )
     assert (shard_limit in text) is (inbound_days is not None)
+    assert ("Otherwise, plain serve included, it keeps forever" in text) is (
+        inbound_days is not None
+    )
+    if outbound_days is not None:
+        assert "override, which a sibling engine shard does not hold, override" not in text
+        assert (
+            "which is that inbound's own override or else the global "
+            "[security].delete_message_bodies_after_days, where that window is bounded" in text
+        )
 
 
 def test_the_remedy_does_not_offer_an_unbounded_global_window_as_a_bound(tmp_path: Path) -> None:

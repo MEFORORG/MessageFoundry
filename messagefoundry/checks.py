@@ -4134,10 +4134,10 @@ def _check_retention_overrides(
 
     An inbound ``messages_days = 0`` keeps that inbound's PHI bodies forever, and an outbound
     ``dead_letter_days = 0`` that outbound's dead-lettered rows, but not every row about their
-    messages, and on a config of more than one engine shard not past a bounded global window:
-    :func:`~messagefoundry.config.retention_classification._override_scope` states which. ``serve``
-    hands the engine a
-    registry guard that refuses such a graph under ``enforce`` unless
+    messages; and when the config runs as more than one engine shard process, an inbound override
+    keeps nothing past a bounded global window, while every engine shard holds every outbound
+    override: :func:`~messagefoundry.config.retention_classification._override_scope` states which.
+    ``serve`` hands the engine a registry guard that refuses such a graph under ``enforce`` unless
     ``[security].allow_keeping_phi_indefinitely`` is set, and this gate passed it. The decision is
     :func:`~messagefoundry.config.retention_classification.judge_keep_forever_overrides`, the
     function that guard calls, so for the same graph and switches the two agree and the refusal
