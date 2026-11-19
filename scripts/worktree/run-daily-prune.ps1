@@ -86,6 +86,7 @@ $ErrorActionPreference = 'Stop'
 $log = $null
 $code = $null
 $childExit = $null
+$removalStepStarted = $false
 $pruneStarted = $false
 # In UTC: Task Scheduler's limit counts elapsed time, and a local clock repeats an hour at the DST
 # fall-back, which would put this deadline an hour past the kill.
@@ -155,8 +156,11 @@ trap {
     Write-Error -Message $fault -ErrorAction Continue
     # 2 promises nothing was removed: true before the prune started and on a dry run. Once an -Apply
     # prune has started, even if it has not exited, 1, the rule the step's own refusal follows. Never
-    # below a code already set: an orphan's 3 must survive a later error.
-    Exit-Run ([math]::Max([int]$code, $(if (-not $pruneStarted -or -not $Apply) { 2 } else { 1 })))
+    # below a code already set: an orphan's 3 must survive a later error. The one exception is a 2 the
+    # prune itself returned: once the -Apply step has started removing, that promise is false, so 1.
+    $trapCode = [math]::Max([int]$code, $(if (-not $pruneStarted -or -not $Apply) { 2 } else { 1 }))
+    if ($trapCode -eq 2 -and $removalStepStarted) { $trapCode = 1 }
+    Exit-Run $trapCode
 }
 
 # BEFORE ANYTHING ASKS GIT, the primary's resolution below included: the helper refuses these too, but
@@ -296,7 +300,8 @@ elseif ($RemoveFinishedClaudeWorktrees) {
 
         # Logged per row as the helper emits it, not after it returns: a run killed part way still leaves
         # the record of every tree it already removed.
-        $rows = @(Invoke-FinishedWorktreeRemoval -Primary $RepoRoot -Paths @($finished | ForEach-Object { $_.path }) `
+        $removalStepStarted = [bool]$Apply
+        $rows =@(Invoke-FinishedWorktreeRemoval -Primary $RepoRoot -Paths @($finished | ForEach-Object { $_.path }) `
                 -IdleHours ([double]$listing.fence.idleHours) -Protect $protect -Apply:$Apply -StopAt $deadline | ForEach-Object {
                 $f = $why[$_.Path]
                 $detail = if ($_.Outcome -in 'REMOVED', 'WOULD-REMOVE') { "$($_.Reason) [$($f.branch)]; listed because: $($f.whyFinished)" } else { $_.Reason }
@@ -325,6 +330,10 @@ elseif ($RemoveFinishedClaudeWorktrees) {
         # deregistered tree still on disk is an orphan -- the same severity order prune-merged.ps1 uses.
         if ((& $n 'FAILED') -gt 0) { $code = [math]::Max($code, 1) }
         if ((& $n 'ORPHANED') -gt 0) { $code = [math]::Max($code, 3) }
+        # A 2 from the prune says nothing was attempted. Once this step has run a removal, whether it
+        # removed, failed or git declined it, that is false; 1 says something was attempted and not all of
+        # it succeeded. (An orphan is already 3.)
+        if ($code -eq 2 -and ((& $n 'REMOVED') + (& $n 'FAILED') + (& $n 'DECLINED')) -gt 0) { $code = 1 }
     }
 }
 

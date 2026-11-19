@@ -489,3 +489,59 @@ def test_a_hand_run_stopped_part_way_leaves_the_shells_prompt_variables_alone(
     assert started.read_text(encoding="utf-8").strip() == "stub prompt=0 gcm=never"
     assert "state=Stopped " in proc.stdout, f"the run must be stopped part way: {proc.stdout}"
     assert "after prompt=[] gcm=[]" in proc.stdout, proc.stdout + proc.stderr
+
+
+# A prune-merged.ps1 stand-in that REFUSES the prune (exit 2, nothing attempted) and lists one finished
+# tree for the -RemoveFinishedClaudeWorktrees step.
+REFUSING_PRUNE_STUB = (
+    "param([string]$RepoRoot, [switch]$Apply, [double]$IdleHours, [switch]$Json, [switch]$SkipGh)\n"
+    "if ($Json) {\n"
+    '  \'{"fence":{"idleHours":24},"counts":{"reportOnlyHeld":0},"reportOnly":['
+    '{"path":"X:/r/.claude/worktrees/a","claudeManaged":true,"branch":"b","whyFinished":"w"}]}\'\n'
+    "  exit 0\n"
+    "}\n"
+    '"stub refused"\n'
+    "exit 2\n"
+)
+
+# A finished-worktree-removal.ps1 stand-in: every path comes back REMOVED, and with $env:T_THROW set
+# the helper then throws, as an unexpected error after a removal would.
+REMOVING_HELPER_STUB = (
+    "function Assert-NoGitRedirect([string]$Who) { }\n"
+    "function Invoke-FinishedWorktreeRemoval {\n"
+    "  param([string]$Primary, [string[]]$Paths, [double]$IdleHours, [string[]]$Protect,"
+    " [switch]$Apply, $StopAt)\n"
+    "  foreach ($p in $Paths) {"
+    " [pscustomobject]@{ Path = $p; Outcome = 'REMOVED'; Reason = 'stub'; Command = 'stub' } }\n"
+    "  if ($env:T_THROW) { throw 'stub failure after a removal' }\n"
+    "}\n"
+)
+
+
+@requires_windows
+@pytest.mark.parametrize("throw", [False, True], ids=["normal-end", "error-after-removal"])
+def test_the_exit_code_never_says_nothing_was_attempted_after_a_removal(
+    tmp_path: Path, throw: bool
+) -> None:
+    """2 promises nothing was attempted. A refused prune returns 2, but the step may then remove trees.
+
+    Before, the normal end passed the prune's 2 through, and the trap's Max kept it; either way a run
+    that removed a tree said it had attempted nothing. Now both end at 1.
+    """
+    proc, text = run_copied_runner(
+        tmp_path,
+        "-RepoRoot",
+        str(tmp_path),
+        "-Apply",
+        "-RemoveFinishedClaudeWorktrees",
+        prune_stub=REFUSING_PRUNE_STUB,
+        extra={"finished-worktree-removal.ps1": REMOVING_HELPER_STUB},
+        env_extra={"T_THROW": "1"} if throw else {},
+    )
+    assert text is not None, proc.stdout + proc.stderr
+    assert "--- prune-merged.ps1 exit 2 at " in text, text
+    assert "REMOVED      X:/r/.claude/worktrees/a" in text, text
+    if throw:
+        assert "STOPPED on an unhandled error: stub failure after a removal" in text, text
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert re.match(r"=== exit 1 \(FAILED", text.splitlines()[-1]), text
