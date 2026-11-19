@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 
 import pytest
 
 import messagefoundry.verify_leaf as verify_leaf
 from harness.acceptance import probes
+from harness.acceptance.matrix import Status
 from messagefoundry.verify_leaf import DRIVER_DETAIL_LIMIT, safe_exc_detail, safe_exc_text
 from tests._content_free import escapes
 
@@ -156,45 +158,89 @@ def _inside_except(typed: bool) -> str:
         return probes.scrubbed_exc(exc, before="Zqxfiltorig ", typed=typed)
 
 
-@pytest.mark.parametrize("typed", [False, True])
-@pytest.mark.parametrize("call", [_direct, _inside_except], ids=["direct", "inside_except"])
-def test_a_raising_log_filter_is_dropped_by_the_harness_scrub(
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    typed: bool,
-    call: Callable[[bool], str],
-) -> None:
-    """The log call is the scrub's last resort, so a filter that raises inside it must not escape:
-    an escape would leave ``run_probe``'s catch-all and abort ``run_matrix``, carrying frames that
-    hold the raw text. ``ran`` is the positive control that the filter was called and raised."""
+@contextmanager
+def _raising_log_call(
+    monkeypatch: pytest.MonkeyPatch, where: str, ran: list[str]
+) -> Iterator[None]:
+    """A broken scrub, and a log call on the probes logger that raises from ``where``: a logger
+    filter, or the record factory. Each appends the formatted message to ``ran`` first, which is
+    the positive control that it was called."""
 
     def broken(*_args: object, **_kwargs: object) -> str:
         raise RuntimeError(_FILTER_SCRUB)
-
-    ran: list[str] = []
 
     def refuse(record: logging.LogRecord) -> bool:
         ran.append(record.getMessage())
         raise ValueError("the filter refuses")
 
+    def factory(*args: object, **_kwargs: object) -> logging.LogRecord:
+        msg, msg_args = args[4], args[5]
+        assert isinstance(msg, str) and isinstance(msg_args, tuple)
+        ran.append(msg % msg_args)
+        raise ValueError("the factory refuses")
+
     monkeypatch.setattr(verify_leaf, "safe_exc_text", broken)
     monkeypatch.setattr(verify_leaf, "safe_detail_text", broken)
-    monkeypatch.setattr(logging, "raiseExceptions", True)
     logger = logging.getLogger(probes.__name__)
     monkeypatch.setattr(logger, "disabled", False)
     monkeypatch.setattr(logger, "level", logging.DEBUG)
     previous = logging.root.manager.disable
+    previous_factory = logging.getLogRecordFactory()
     logging.disable(logging.NOTSET)
-    logger.addFilter(refuse)
+    if where == "filter":
+        logger.addFilter(refuse)
+    else:
+        logging.setLogRecordFactory(factory)
     try:
-        row = call(typed)
+        yield
     finally:
         logger.removeFilter(refuse)
+        logging.setLogRecordFactory(previous_factory)
         logging.disable(previous)
+
+
+def _assert_nothing_planted(row: str, err: str, ran: list[str]) -> None:
     assert len(ran) == 1 and "RuntimeError" in ran[0] and "OSError" in ran[0]
-    assert row == "OSError (detail withheld: the detail scrub failed with RuntimeError)"
-    captured = capsys.readouterr()
-    for fragment in _FILTER_PLANTED:
+    # Positive control for the stderr capture: the fixed line naming the log failure's type.
+    assert "the scrub-failure warning was not logged: ValueError" in err
+    for fragment in (*_FILTER_PLANTED, "refuses"):
         assert fragment not in row
-        assert fragment not in captured.err
+        assert fragment not in err
         assert fragment not in ran[0]
+
+
+@pytest.mark.parametrize("where", ["filter", "factory"])
+@pytest.mark.parametrize("typed", [False, True])
+@pytest.mark.parametrize("call", [_direct, _inside_except], ids=["direct", "inside_except"])
+def test_a_raising_log_call_is_dropped_by_the_harness_scrub(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    where: str,
+    typed: bool,
+    call: Callable[[bool], str],
+) -> None:
+    """The log call is the scrub's last resort, so a filter or record factory that raises inside it
+    must not escape: an escape would leave ``run_probe``'s catch-all and abort ``run_matrix``,
+    carrying frames that hold the raw text."""
+    ran: list[str] = []
+    with _raising_log_call(monkeypatch, where, ran):
+        row = call(typed)
+    assert row == "OSError (detail withheld: the detail scrub failed with RuntimeError)"
+    _assert_nothing_planted(row, capsys.readouterr().err, ran)
+
+
+def test_run_probe_reports_an_error_row_when_the_scrub_and_its_log_both_fail(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The contract the drop protects: ``run_probe`` returns a row rather than raising."""
+
+    def raising_probe() -> probes.ProbeResult:
+        raise OSError(_FILTER_ORIG)
+
+    monkeypatch.setitem(probes.PROBES, "zqx_raising", raising_probe)
+    ran: list[str] = []
+    with _raising_log_call(monkeypatch, "filter", ran):
+        result = probes.run_probe("zqx_raising")
+    assert result.status is Status.ERROR
+    assert result.detail == "OSError (detail withheld: the detail scrub failed with RuntimeError)"
+    _assert_nothing_planted(result.detail, capsys.readouterr().err, ran)

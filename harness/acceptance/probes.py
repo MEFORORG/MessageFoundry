@@ -54,13 +54,14 @@ def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -
     and with :class:`_ChainCut` current, its ``__context__`` cleared. A handler whose ``emit``
     fails and calls ``logging``'s ``handleError`` prints the current chain to stderr; this way
     that chain reaches neither the scrub failure nor an exception the caller is handling, either
-    of which could quote the text. An exception raised by the log call itself, such as one from a
-    log filter or a record factory, is dropped, so this still returns the withheld row: the log
-    call is the last resort and has nowhere left to report its own failure, and letting it
-    propagate would carry frames holding the raw ``exc`` and ``before`` out of here and break the
-    contract that a probe never raises. A1 exists to report an
-    interpreter the engine cannot run on, and there the engine's modules may not even parse, so a
-    scrub that fails to load must not take the runner down either."""
+    of which could quote the text. An ``Exception`` raised by the log call itself, such as one from
+    a log filter or a record factory, is dropped, so this still returns the withheld row, and one
+    fixed line naming only its type goes to stderr. The log call is the last resort, and letting
+    its failure propagate would carry frames holding the raw ``exc`` and ``before`` out of here and
+    break the contract that a probe never raises. A ``BaseException`` such as ``KeyboardInterrupt``
+    is not caught, so it still propagates with those frames. A1 exists to report an interpreter the
+    engine cannot run on, and there the engine's modules may not even parse, so a scrub that fails
+    to load must not take the runner down either."""
     # Bound on every path, though only the except below reaches the code that reads it.
     failure_name = "unknown"
     try:
@@ -96,15 +97,23 @@ def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -
         raise _ChainCut from None
     except _ChainCut as cut:
         cut.__context__ = None
-        # The last resort: a filter or record factory that raises here has nowhere left to report
-        # to, and propagating would leak frames holding the raw exc and before and break the probe
-        # contract that run_probe and run_matrix rely on. Exception only, never BaseException.
-        with contextlib.suppress(Exception):
+        try:
             _log.warning(
                 "the detail scrub failed with %s; a row's %s detail is withheld",
                 failure_name,
                 exc_name,
             )
+        except Exception as log_failure:  # Exception only, never BaseException
+            # The log call is the last resort: logging has no channel left to report its own
+            # failure, and propagating would leak frames holding the raw exc and before and break
+            # the probe contract that run_probe and run_matrix rely on. So the failure is dropped,
+            # and one fixed line of type names goes to stderr, under its own guard, so the drop is
+            # not silent. The failure's text is not printed: it could quote the record's args.
+            with contextlib.suppress(Exception):
+                sys.stderr.write(
+                    "harness.acceptance.probes: the scrub-failure warning was not logged: "
+                    f"{type(log_failure).__name__}; the row's {exc_name} detail is withheld\n"
+                )
     return f"{exc_name} (detail withheld: the detail scrub failed with {failure_name})"
 
 

@@ -15,9 +15,10 @@ load none of ``messagefoundry.transports``, ``config``, ``verify``, ``pipeline``
 through the A5 probe and through an error arm that runs the scrub. They do load ``redaction`` and
 ``secretscrub``, which the scrub needs. :mod:`messagefoundry.verify.model` re-exports the public
 scrub names its own import lines list. The private names, at least ``_PLACEHOLDER``, live only
-here. The public port probe :func:`port_state` is defined here, and
-:mod:`messagefoundry.verify.checks` binds it by import: neither ``verify.model._PLACEHOLDER`` nor
-``verify.checks._port_state`` exists.
+here, and ``verify.model._PLACEHOLDER`` does not exist. The public port probe :func:`port_state` is
+defined here, and :mod:`messagefoundry.verify.checks` binds it by import under the same name, so a
+test that patches this module's ``port_state`` does not reach the checks;
+``verify.checks._port_state`` does not exist.
 """
 
 from __future__ import annotations
