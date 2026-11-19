@@ -15489,9 +15489,9 @@ class AuthService:
         the reset is in: the rows found are teed off-box, and the answer is ``"cleared"``. Not
         found, or the read-back failing, the answer is ``"refused"``: the session has already
         rotated, and the caller writes its own row, hard, so the step-up is granted only once that
-        row is in. So is a Vault transit Outage, which is paged (ADR 0217's Outage row ends nothing). A seal refusal
-        of another kind than the account's record raises, as on the login leg, and so does a
-        defect."""
+        row is in. So is a Vault transit Outage, which is paged (ADR 0217's Outage row ends
+        nothing). A seal refusal of another kind than the account's record raises, as on the login
+        leg, and so does a defect."""
         now = time.time()
         try:
             answer = await self._store.record_login_success(
@@ -15542,9 +15542,9 @@ class AuthService:
                 )
             else:
                 _log.warning(
-                    "a re-auth of account id %r had its lockout reset raise (%s) and could not read "
-                    "back whether it committed, so the reset's outcome is unknown; it is answered "
-                    "as refused, and the re-auth writes its own row",
+                    "a re-auth of account id %r had its lockout reset raise (%s) and could not "
+                    "read back whether it committed, so the reset's outcome is unknown; it is "
+                    "answered as refused, and the re-auth writes its own row",
                     decided.id,
                     type(exc).__name__,
                 )
@@ -15574,54 +15574,68 @@ class AuthService:
         action, actor and detail compared exactly, the detail carrying the caller's per-call
         ``clear_id``, at the reset's own timestamp. It commits only with the reset, so finding it
         finds the reset committed. Every row found is then teed off-box, as the store's own tee
-        would have after the commit; a later row not found is logged. ``"absent"`` when no read
-        over :data:`_REAUTH_READBACK_PAUSES` finds the first, so a commit made visible late is
-        still found. ``"unknown"`` when a read raises, which ends the reads at once; the caller
-        logs it."""
+        would have after the commit; a later row not found, or whose read raises, is logged. Every
+        pause of :data:`_REAUTH_READBACK_PAUSES` is used until the first is found, a read that
+        raises included, so a commit or a connection that comes back late is still found.
+        ``"absent"`` when the last read succeeded and found nothing. ``"unknown"`` when the last
+        read raised; the caller logs it."""
+        failure: str | None = None
         for pause in _REAUTH_READBACK_PAUSES:
             if pause:
                 await asyncio.sleep(pause)
             try:
-                rows = await self._committed_reauth_audits(audits, now)
+                rows, later_failure = await self._committed_reauth_audits(audits, now)
             except audit_write_errors() as exc:
                 if isinstance(exc, AUDIT_WRITE_DEFECTS):
                     raise
-                _log.warning(
-                    "a re-auth of account id %r could not read back whether its lockout reset "
-                    "committed (%s)",
-                    user_id,
-                    type(exc).__name__,
-                )
-                return "unknown"
+                failure = type(exc).__name__
+                continue
+            failure = None
             if rows:
                 tee_audits(audits[: len(rows)], rows, ts=now)
                 if len(rows) < len(audits):
                     _log.warning(
                         "a re-auth of account id %r found its lockout reset committed, but read "
-                        "back only %d of the %d rows the reset appends",
+                        "back only %d of the %d rows the reset appends%s",
                         user_id,
                         len(rows),
                         len(audits),
+                        "" if later_failure is None else f" (a read raised {later_failure})",
                     )
                 return "landed"
+        if failure is not None:
+            _log.warning(
+                "a re-auth of account id %r could not read back whether its lockout reset "
+                "committed (%s)",
+                user_id,
+                failure,
+            )
+            return "unknown"
         return "absent"
 
     async def _committed_reauth_audits(
         self, audits: Sequence[AuditAppend], now: float
-    ) -> list[AppendedAuditRow]:
+    ) -> tuple[list[AppendedAuditRow], str | None]:
         """The rows of ``audits`` one committed write appended at ``now``, in order: the first
         matched exactly, each later one at the next sequence number. Empty when the first is not
         in the trail. The store's actor filter may compare loosely, at least on SQL Server, so each
-        row is compared again here, exactly."""
+        row is compared again here, exactly. A read of the first that raises propagates; a read of
+        a later one that raises ends the reads, keeping what was found, and its error class is
+        returned beside them."""
         found: list[AppendedAuditRow] = []
         for audit in audits:
-            rows = await self._store.list_audit(
-                limit=_REAUTH_READBACK_PAGE,
-                actor=audit.actor,
-                action=audit.action,
-                since=now,
-                until=now,
-            )
+            try:
+                rows = await self._store.list_audit(
+                    limit=_REAUTH_READBACK_PAGE,
+                    actor=audit.actor,
+                    action=audit.action,
+                    since=now,
+                    until=now,
+                )
+            except audit_write_errors() as exc:
+                if not found or isinstance(exc, AUDIT_WRITE_DEFECTS):
+                    raise
+                return found, type(exc).__name__
             want_seq = found[-1].seq + 1 if found else None
             match = next(
                 (
@@ -15639,7 +15653,7 @@ class AuthService:
             found.append(
                 AppendedAuditRow(int(match["id"]), int(match["seq"]), str(match["row_hash"]))
             )
-        return found
+        return found, None
 
     async def _end_reauth_rotated_session(self, rotated_token: str, actor: str) -> bool:
         """Ask the store to end the session a re-auth rotated once :meth:`_clear_after_reauth`

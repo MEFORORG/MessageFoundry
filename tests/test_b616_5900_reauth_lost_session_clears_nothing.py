@@ -727,6 +727,107 @@ async def test_a_read_back_missing_a_later_row_still_reads_as_cleared(
         await store.close()
 
 
+def _commit_then_lose(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> Callable[..., Awaitable[Any]]:
+    real_write = store.record_login_success
+
+    async def committed_then_lost(user_id: str, **kwargs: Any) -> Any:
+        # The raise comes at the commit, so the store's own tee after it never runs.
+        with monkeypatch.context() as m:
+            m.setattr("messagefoundry.store.store.tee_audits", lambda *a, **k: None)
+            await real_write(user_id, **kwargs)
+        raise OSError("synthetic connection lost after the commit")
+
+    return committed_then_lost
+
+
+async def test_a_later_row_read_that_raises_keeps_the_found_row(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The reset and both rows committed, then the store raised. The read-back finds the
+    ``clear_id`` ``auth.reauth`` row, and the read of the ``auth.login_after_failures`` row raises.
+    The clear reads as cleared: one ``auth.reauth`` row, the counter cleared, one notice, the row
+    found teed, and a warning naming how many rows were read back."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, notifier, identity, token = await _setup(store)
+        before = len(await store.list_audit(action="auth.reauth"))
+        real_read = store.list_audit
+        teed = _record_tees(monkeypatch)
+
+        async def flag_row_read_raises(**kwargs: Any) -> Any:
+            if kwargs.get("action") == "auth.login_after_failures":
+                raise OSError("synthetic read refused")
+            return await real_read(**kwargs)
+
+        monkeypatch.setattr(store, "record_login_success", _commit_then_lose(store, monkeypatch))
+        monkeypatch.setattr(store, "list_audit", flag_row_read_raises)
+        caplog.set_level("WARNING", logger="messagefoundry.auth.service")
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.ok and out.token is not None
+        reauth_rows = await real_read(action="auth.reauth")
+        assert len(reauth_rows) == before + 1
+        user = await store.get_user("u-bob")
+        assert user is not None and user.failed_attempts == 0
+        assert len([e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]) == 1
+        found = dict(reauth_rows[0])
+        assert [
+            (t["action"], t["detail"], t["seq"], t["row_hash"])
+            for t in teed
+            if t["action"] in ("auth.reauth", "auth.login_after_failures")
+        ] == [(found["action"], found["detail"], found["seq"], found["row_hash"])]
+        assert "read back only 1 of the 2 rows" in caplog.text
+    finally:
+        await store.close()
+
+
+async def test_a_first_read_that_raises_does_not_end_the_read_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The reset and both rows committed, then the store raised, and the first read-back raises
+    too. A later read finds the rows, so the clear reads as cleared: one ``auth.reauth`` row, the
+    counter cleared, one notice, and both committed rows teed."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, notifier, identity, token = await _setup(store)
+        before = len(await store.list_audit(action="auth.reauth"))
+        real_read = store.list_audit
+        teed = _record_tees(monkeypatch)
+        calls: list[object] = []
+
+        async def first_read_raises(**kwargs: Any) -> Any:
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise OSError("synthetic read refused")
+            return await real_read(**kwargs)
+
+        monkeypatch.setattr(store, "record_login_success", _commit_then_lose(store, monkeypatch))
+        monkeypatch.setattr(store, "list_audit", first_read_raises)
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.ok and out.token is not None
+        assert len(await real_read(action="auth.reauth")) == before + 1
+        user = await store.get_user("u-bob")
+        assert user is not None and user.failed_attempts == 0
+        assert len([e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]) == 1
+        committed = []
+        for action in ("auth.reauth", "auth.login_after_failures"):
+            for row in await real_read(action=action, limit=1):
+                r = dict(row)
+                committed.append((r["action"], r["seq"], r["row_hash"]))
+        committed.sort()
+        assert (
+            sorted(
+                (t["action"], t["seq"], t["row_hash"])
+                for t in teed
+                if t["action"] in ("auth.reauth", "auth.login_after_failures")
+            )
+            == committed
+        )
+    finally:
+        await store.close()
+
+
 async def test_a_failed_read_back_logs_the_outcome_as_unknown(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
