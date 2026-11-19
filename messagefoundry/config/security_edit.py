@@ -109,7 +109,7 @@ def set_security(
             else:
                 sec[key] = value
                 changed.append(key)
-        if not changed and _nothing_at(path):
+        if not changed and original is None and _nothing_at(path):
             # The file went between the check above and the lock: still nothing to reset, and a
             # 0-byte file would be the edit's only effect.
             return _absent_result(path, unchanged)
@@ -140,12 +140,26 @@ def set_security(
 
 
 def _nothing_at(path: Path) -> bool:
-    """Whether nothing at all is at ``path``. ``os.path.lexists`` alone reads every failed lstat
-    as absent, so a file behind an unreachable share would be reported as missing; the editors'
-    shared stat gate refuses that case instead."""
-    return not os.path.lexists(path) and not atomic_edit.is_file(
-        path, refused_error=SecurityEditError
-    )
+    """Whether nothing at all is at ``path``, so an edit that changes no key may skip it.
+
+    Only a lstat that says the file is not found counts, and only below a folder or a missing
+    one: a name the system refuses, or a path under a regular file, is a mistyped path an edit
+    must fail on rather than report as absent. ``os.path.lexists`` alone reads every failed lstat
+    as absent, so the editors' shared stat gate also refuses a file behind an unreachable share."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        return False
+    else:
+        return False
+    for folder in path.parents:
+        if os.path.lexists(folder):
+            if not os.path.isdir(folder):
+                return False
+            break
+    return not atomic_edit.is_file(path, refused_error=SecurityEditError)
 
 
 def _absent_result(path: Path, unchanged: list[str]) -> dict[str, Any]:

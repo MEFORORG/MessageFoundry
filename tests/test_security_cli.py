@@ -273,6 +273,18 @@ def test_null_reset_where_the_stat_is_refused_is_not_reported_absent(
         )
 
 
+def test_null_reset_under_a_regular_file_is_not_reported_absent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5327: a path under a regular file is a mistyped path, not a missing settings
+    file, so a reset there fails rather than exit 0 as finding no file."""
+    notes = tmp_path / "notes.txt"
+    notes.write_text("x", encoding="utf-8")
+    rc, _res = _set(notes / "mf.toml", {"require_mfa": None}, capsys)
+    assert rc != 0
+    assert sorted(tmp_path.iterdir()) == [notes]
+
+
 def test_null_reset_of_an_absent_known_key_reports_nothing_changed(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
