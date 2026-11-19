@@ -219,6 +219,7 @@ from messagefoundry.pipeline.reference_sync import (
     reference_connection_name,
     reference_max_rows,
     reference_statement,
+    reference_statement_timeout,
 )
 from messagefoundry.pipeline.refused_body import RefusedBodyAllowance, with_refusal_note
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
@@ -15442,9 +15443,10 @@ def _build_check_connectors(
         database_source_dsn(rsettings, connection=reference_connection_name(rname))
         # BACKLOG #3432: the sync reads acquire_timeout by this rule, so an env() value it would
         # refuse fails check here rather than as a failed sync after start. max_rows the same way
-        # (BACKLOG #2617).
+        # (BACKLOG #2617), and statement_timeout (BACKLOG #5891).
         reference_acquire_timeout(rsettings)
         reference_max_rows(rsettings)
+        reference_statement_timeout(rsettings)
     resolved_fhir_lookups: dict[str, dict[str, Any]] = {}
     for fname, fspec in registry.fhir_lookups.items():
         resolved_fhir_lookups[fname] = _fhir_lookup_settings(fspec, env_values, egress)
