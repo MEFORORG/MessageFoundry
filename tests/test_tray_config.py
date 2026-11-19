@@ -710,16 +710,40 @@ def test_compose_a_host_only_bind_keeps_the_default_port() -> None:
     assert compose_config(None, reg).engine_url == "https://10.0.0.5:8765"
 
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "::"])
-def test_a_wildcard_bind_is_monitor_only_as_on_main(host: str) -> None:
-    """``serve --host 0.0.0.0`` or ``::`` is not a loopback URL, so the tray is monitor-only.
+@pytest.mark.parametrize(
+    ("host", "probed"),
+    [
+        ("0.0.0.0", "127.0.0.1"),
+        ("::", "[::1]"),
+        ("[::]", "[::1]"),
+        ("::0", "[::1]"),
+        ("0:0:0:0:0:0:0:0", "[::1]"),
+        ("10.0.0.5", "10.0.0.5"),
+        ("::1", "[::1]"),
+    ],
+)
+def test_build_engine_url_probes_loopback_for_a_wildcard_bind(host: str, probed: str) -> None:
+    """No client can connect to a wildcard address, and a wildcard bind accepts on loopback too."""
+    assert build_engine_url(host, 9100, tls=True) == f"https://{probed}:9100"
 
-    Probing a wildcard on loopback, and with it keeping service control, is withdrawn: under ADR
-    0113 AC-7 monitor-only keys on the engine URL's locality alone."""
-    reg = ServiceRegistryInfo(app_parameters=f"serve --host {host} --port 8765")
-    cfg = compose_config(None, reg)
+
+@pytest.mark.parametrize(
+    "app_parameters", ["--host 0.0.0.0 --port 8765", "--host ::", "--host [::]"]
+)
+def test_a_wildcard_bind_is_probed_on_loopback_and_stays_monitor_only(app_parameters: str) -> None:
+    """The probe and Open Console use loopback, so the engine is not read as down, but a bind
+    that listens on every interface keeps service control and Open Repo disabled."""
+    cfg = compose_config(None, ServiceRegistryInfo(app_parameters=f"serve {app_parameters}"))
+    assert is_local_engine(cfg.engine_url)
+    assert console_url(cfg.engine_url) == cfg.engine_url + "/ui"
     assert cfg.monitor_only is True
-    assert not is_local_engine(cfg.engine_url)
+
+
+def test_a_tray_toml_engine_url_clears_the_wildcard_hold() -> None:
+    """An operator's loopback ``engine_url`` replaces the discovered bind, and with it the hold."""
+    reg = ServiceRegistryInfo(app_parameters="serve --host 0.0.0.0 --port 8765")
+    cfg = compose_config({"engine_url": "https://127.0.0.1:8765"}, reg)
+    assert cfg.monitor_only is False
 
 
 @pytest.mark.parametrize(
@@ -738,7 +762,9 @@ def test_a_settings_file_bind_does_not_move_the_probe_or_the_console(
     """ADR 0113's 2026-07-22 amendment lifts no host or port out of the operator settings file.
 
     The file is reached through an untrusted registry hint, so a host or port named there must
-    change neither the URL the tray probes nor the one Open Console opens.
+    change neither the URL the tray probes nor the one Open Console opens. A known open limit
+    follows: a LAN bind set only through ``[security].listen_address`` reads as the loopback
+    default, so it is probed there and keeps service control.
     """
     (tmp_path / "messagefoundry.toml").write_text(service_toml, encoding="utf-8")
     reader = _FakeReader(
@@ -776,7 +802,7 @@ def test_a_remote_tray_toml_engine_url_is_monitor_only() -> None:
 def test_a_relative_service_config_anchors_under_the_project_root(tmp_path: Path) -> None:
     """``serve`` resolves a relative ``--service-config`` under ``--project-root`` (ADR 0050).
 
-    The tray reads the bind from that file, so it must read the file the engine loaded, not one
+    The tray reads the scheme from that file, so it must read the file the engine loaded, not one
     of the same name under the service's working directory.
     """
     install = tmp_path / "install"
@@ -804,7 +830,15 @@ def test_a_relative_service_config_anchors_under_the_project_root(tmp_path: Path
         app_directory=str(install), app_parameters=f'serve --project-root "{repo}"'
     )
     assert service_toml_path(reg) == install / "messagefoundry.toml"
-    # A drive-relative root joins the working directory, as serve's resolve_values_base_dir does.
+    # A drive-letter relative --service-config on another drive keeps that drive, as serve's
+    # root / value keeps it.
+    reg = ServiceRegistryInfo(
+        app_directory=str(install),
+        app_parameters=f'serve --project-root "{repo}" --service-config Q:conf\\mf.toml',
+    )
+    assert service_toml_path(reg) == repo / "Q:conf\\mf.toml"
+    # A drive-relative root is joined to the working directory as serve's resolve_values_base_dir
+    # joins it; on Windows that lands at the root of the working directory's drive.
     reg = ServiceRegistryInfo(
         app_directory=str(install),
         app_parameters="serve --project-root \\estate --service-config mf.toml",

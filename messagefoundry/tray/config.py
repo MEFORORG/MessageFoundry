@@ -35,6 +35,7 @@ from __future__ import annotations
 # load service_status (asyncio, subprocess, ctypes) or tomllib.
 __lazy_modules__ = ["messagefoundry.service_status", "tomllib"]
 
+import ipaddress
 import re
 import sys
 import tomllib
@@ -81,16 +82,22 @@ class TrayConfig:
     log_path: str | None = None
     #: A PEM the probe pins as its ONLY trust anchor, or ``None`` for the OS trust store.
     engine_cacert: str | None = None
+    #: True when ``serve --host`` names a wildcard (unspecified) address. The probe then connects
+    #: on loopback, but the bind itself listens on every interface, so it stays monitor-only.
+    bind_unspecified: bool = False
 
     @property
     def monitor_only(self) -> bool:
         """A **remote** engine → monitor-only (service control + Open-Repo disabled).
 
-        Keyed on locality alone: a loopback engine is controllable whether it serves http or
-        https (see the module docstring). Only a non-loopback host degrades the tray, because
-        only then are "start the local service" and "open the local repo" meaningless.
+        Keyed on locality, never on the scheme: a loopback engine is controllable whether it
+        serves http or https (see the module docstring). A non-loopback host degrades the tray,
+        because then "start the local service" and "open the local repo" are meaningless.
+
+        A wildcard bind named by ``serve --host`` is monitor-only too, though the tray probes it
+        on loopback: it listens on every interface, so it is not a loopback-only engine.
         """
-        return not is_local_engine(self.engine_url)
+        return self.bind_unspecified or not is_local_engine(self.engine_url)
 
 
 @dataclass(frozen=True)
@@ -313,6 +320,23 @@ def _last_path_option(app_parameters: str, flags: frozenset[str]) -> str | None:
     return found
 
 
+def _is_unspecified(host: str) -> bool:
+    """Whether ``host`` is a wildcard (unspecified) address, ``0.0.0.0`` or ``::`` in any spelling."""
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_unspecified
+    except ValueError:
+        return False
+
+
+def _probe_host(host: str) -> str:
+    """``host``, or the loopback of its family when it is a wildcard (unspecified) address.
+
+    No client can connect to a wildcard address, and a wildcard bind accepts on loopback too."""
+    if not _is_unspecified(host):
+        return host
+    return "::1" if ":" in host else "127.0.0.1"
+
+
 def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -> str | None:
     """A validated ``http(s)://host:port`` URL, or ``None`` if either part is missing/invalid.
 
@@ -326,6 +350,7 @@ def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -
         return None
     # A bare IPv6 literal must be bracketed or the ':'s read as the port separator — `serve
     # --host ::1` would otherwise yield the unparseable "http://::1:8765".
+    host = _probe_host(host)
     authority = f"[{host}]" if ":" in host and not host.startswith("[") else host
     return f"{'https' if tls else 'http'}://{authority}:{port}"
 
@@ -460,6 +485,7 @@ def compose_config(
     repo_path: str | None = None
     poll_seconds = DEFAULT_POLL_SECONDS
     log_path: str | None = None
+    bind_unspecified = False
 
     # Registry hints (untrusted; validated).
     if reg is not None:
@@ -473,6 +499,7 @@ def compose_config(
         )
         if url_hint is not None:
             engine_url = url_hint
+            bind_unspecified = host_hint is not None and _is_unspecified(host_hint)
         repo_path = (
             parse_project_root_arg(reg.app_parameters or "")
             or _clean_path_hint(reg.app_directory)
@@ -486,6 +513,7 @@ def compose_config(
         if isinstance(raw_url, str) and raw_url:
             engine_url = raw_url
             cacert = None
+            bind_unspecified = False
         raw_cacert = _clean_path_hint(toml_data.get("engine_cacert"))
         if raw_cacert is not None and Path(raw_cacert).is_absolute():
             cacert = raw_cacert
@@ -505,6 +533,7 @@ def compose_config(
         poll_seconds=poll_seconds,
         log_path=log_path,
         engine_cacert=cacert,
+        bind_unspecified=bind_unspecified,
     )
 
 
@@ -533,9 +562,11 @@ def service_toml_path(reg: ServiceRegistryInfo | None) -> Path | None:
     Mirrors ``serve``'s own resolution (ADR 0050): an explicit ``--service-config``, where a
     relative path resolves under ``--project-root`` when one is given and otherwise against the
     service's working directory, which NSSM records as ``AppDirectory``; else
-    ``<AppDirectory>/messagefoundry.toml``. A relative ``--project-root`` is itself taken against
-    ``AppDirectory``, a Windows drive-relative ``\\repo`` included. Under a root, a drive-relative ``--service-config`` keeps
-    its tail under the root, as ``serve``'s anchor does. The inputs are untrusted registry strings,
+    ``<AppDirectory>/messagefoundry.toml``. A relative ``--project-root`` is joined to
+    ``AppDirectory`` as ``serve`` joins it to its working directory, so a Windows drive-relative
+    ``\\repo`` lands at the root of that directory's drive. Under a root, a ``--service-config``
+    with a leading separator keeps its tail under the root, as ``serve``'s anchor does. The inputs
+    are untrusted registry strings,
     already length/NUL-validated by :func:`_clean_path_hint`; the result is only ever *read*.
     """
     if reg is None:
@@ -556,8 +587,10 @@ def service_toml_path(reg: ServiceRegistryInfo | None) -> Path | None:
                 # serve's resolve_values_base_dir joins it to the working directory, drive-relative
                 # or not (it warns on a drive-relative one and still uses it).
                 anchor = Path(base) / anchor
-            # Drop a drive-relative leading separator so the tail stays under the root.
-            return anchor.joinpath(*candidate.parts[1:] if candidate.anchor else candidate.parts)
+            # Drop a leading separator (``\x``) so the tail stays under the root, as serve's
+            # anchor_under_root does. A drive-letter relative ``C:x`` keeps its drive, as there.
+            drop = 1 if candidate.root and not candidate.drive else 0
+            return anchor.joinpath(*candidate.parts[drop:])
         return Path(base) / candidate if base else None
     return Path(base) / _DEFAULT_SERVICE_TOML if base else None
 

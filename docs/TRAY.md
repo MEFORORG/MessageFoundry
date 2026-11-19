@@ -120,7 +120,13 @@ hints (validated, never executed).
 **Where the tray finds the engine's host and port.** From `serve --host` and `--port` in
 `AppParameters` only. A part they leave unset is the engine's default, `127.0.0.1` or `8765`. The
 tray takes neither from the engine's settings TOML nor from `MEFOR_*` variables in the service's
-environment, so set `engine_url` in `tray.toml` when the bind comes from either. (BACKLOG #5936)
+environment, so set `engine_url` in `tray.toml` when the bind comes from either. A LAN bind set
+only through `[security].listen_address` is therefore probed on the loopback default and keeps
+service control. A wildcard `--host`, `0.0.0.0` or `::`, is probed on the loopback address of the
+same family, because no client can connect to a wildcard address, and the tray stays monitor-only
+for it, because that bind listens on every interface. The probe verifies the engine's certificate
+against the loopback address it connects to, so for a wildcard bind serve your own
+`[api].tls_cert_file` that names it. (BACKLOG #5936)
 
 **What "View Service Log" will open.** Windows opens a file with whatever program owns its
 extension, so a `log_path` naming a `.bat` or `.lnk` would run it. The tray therefore opens
