@@ -2780,6 +2780,8 @@ class ConsolidatedLadderReport:
             lines.append(
                 "  soak: ABORTED (two-box rendezvous/timeout broke during the soak — NOT a bench result)"
             )
+        elif self.climb_aborted:
+            lines.append("  soak: (skipped — the climb aborted, setup-degraded)")
         else:
             lines.append("  soak: (skipped — no sustained rung to soak)")
         lines.append("")
@@ -3320,7 +3322,10 @@ def _soak_field(soak_msg: Mapping[str, Any], key: str, default: float) -> float 
     value = soak_msg.get(key, default)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    number = float(value)
+    try:
+        number = float(value)
+    except OverflowError:  # a JSON integer too large for a float
+        return None
     if not math.isfinite(number) or number < 0:
         return None
     return number
@@ -3534,8 +3539,13 @@ async def run_engine_ladder(
             climb_aborted = True
             break
 
+    soak_coord = base_coord.for_run(f"{base_coord.run_id}.soak")
     if climb_aborted:
         result.notes.append("no soak: the climb aborted")
+        # A drive that was slow rather than gone may still reach the soak. Tell it at once rather than
+        # leave it waiting out its SHARDS_READY window. Best effort, as below.
+        with contextlib.suppress(OSError):
+            soak_coord.post(ENGINE_SETUP_FAILED, {"reason": "the engine half aborted its climb"})
         return result
 
     # Soak: the drive picks the rate (highest sustained, or an override) and posts LADDER_SOAK.
@@ -3545,13 +3555,14 @@ async def run_engine_ladder(
         result.notes.append("no LADDER_SOAK from the drive — ending without a soak")
         return result
     if soak_msg.get("skip"):
-        result.notes.append("drive signalled no soak (no sustained rung)")
+        # The drive names its cause in its own report: no sustained rung, the soak disabled, or an
+        # aborted climb at least.
+        result.notes.append("drive signalled no soak (its report says why)")
         return result
 
     soak_rate = _soak_field(soak_msg, "soak_rate", math.nan)
     soak_hold = _soak_field(soak_msg, "hold_seconds", soak_hold_seconds)
     soak_drain = _soak_field(soak_msg, "drain_timeout", soak_drain_timeout)
-    soak_coord = base_coord.for_run(f"{base_coord.run_id}.soak")
     if soak_rate is None or soak_hold is None or soak_drain is None:
         result.notes.append("LADDER_SOAK malformed: ending without a soak")
         # Tell the drive at once rather than leave it waiting out its SHARDS_READY window. Best effort, as

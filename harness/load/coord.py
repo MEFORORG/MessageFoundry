@@ -104,7 +104,8 @@ DRIVE_GO = "DRIVE_GO"
 #:   signal is lost both halves simply finish the bounded fixed plan (no hang).
 #: * :data:`LADDER_SOAK` (drive→engine) — after the climb, the drive picks the soak rate (the highest
 #:   sustained rung, or an override) and posts it so the engine arms one final long-hold soak rung under
-#:   ``run_id`` ``"<base>.soak"`` — or ``{"skip": true}`` when there is no sustained rung to soak.
+#:   ``run_id`` ``"<base>.soak"`` — or ``{"skip": true}`` when there is no soak to run: at least no sustained rung to soak, the soak
+#:   disabled, or an aborted climb.
 #: * :data:`RUNG_ABORTED` (drive→engine, PER-RUNG) — the drive posts this on the RUNG coord the instant it
 #:   aborts a rung (a broken rendezvous / timeout). It tells the engine that its sinks were torn down mid-
 #:   delivery, so the drain failure it is about to see is a HARNESS artifact, not a product collapse: the

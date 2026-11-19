@@ -860,6 +860,8 @@ async def test_engine_ladder_does_not_wait_for_a_soak_after_its_climb_aborts(
     assert len(calls) == 1
     assert "soak" not in result.rungs_armed
     assert "no soak: the climb aborted" in result.notes
+    # A drive that was slow rather than gone is told at once, rather than wait out SHARDS_READY.
+    assert coord.for_run("eab.soak").read(sc.ENGINE_SETUP_FAILED) is not None
 
 
 @pytest.mark.parametrize(
@@ -876,6 +878,7 @@ async def test_engine_ladder_does_not_wait_for_a_soak_after_its_climb_aborts(
         {"soak_rate": 10.0, "hold_seconds": -1.0},
         {"soak_rate": 10.0, "drain_timeout": float("nan")},
         {"soak_rate": 10.0, "drain_timeout": [1]},
+        {"soak_rate": 10**400},
     ],
 )
 async def test_engine_ladder_refuses_a_malformed_ladder_soak(
@@ -995,6 +998,29 @@ async def test_drive_ladder_launches_no_soak_after_a_climb_abort(
     assert coord.read(LADDER_SOAK) == {"skip": True}
     assert built["soak"] is None and built["climb_aborted"] is True
     assert "no soak: the climb aborted (setup-degraded)" in built["notes"]
+
+
+def test_report_names_an_aborted_climb_as_the_soak_skip() -> None:
+    """The soak line must not say 'no sustained rung' when the climb aborted after one sustained."""
+    import harness.load.shardcert_ladder as ladder
+
+    report = ladder.build_consolidated_report(
+        shards=(),
+        dests=0,
+        handlers=0,
+        delivering=0,
+        routing=BROADCAST,
+        lanes_per_shard=1,
+        driver_count=1,
+        sink_count=1,
+        climb=[],
+        soak=None,
+        notes=[],
+        climb_aborted=True,
+    )
+    rendered = report.render()
+    assert "soak: (skipped — the climb aborted, setup-degraded)" in rendered, rendered
+    assert "no sustained rung to soak" not in rendered, rendered
 
 
 # --- BACKLOG #5640 / #5977 (https and session half): the two-box drain poll ------------------------
