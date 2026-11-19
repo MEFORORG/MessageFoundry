@@ -248,26 +248,29 @@ def test_the_override_text_names_what_is_kept_and_the_engine_shard_limit(
     opening = f"keeps {kept} indefinitely" if refused else f"connections' {kept} are retained"
     assert opening in text
     # The caveat only points at the limit, and it leaves no comma before "(status)".
-    caveat = ", subject to the engine shard limit stated after this"
+    caveat = ", subject, for an inbound override, to the engine shard limit stated after this"
     assert (caveat in text) is (inbound_days is not None)
     assert "this, (" not in text and ",," not in text
     if inbound_days is None:
         assert "PHI message bodies" not in text
-    # The limit is keyed on a `serve --shard` process that does NOT hold the inbound: plain `serve`
-    # and the `serve --shard` process that holds it apply the override. It is stated once.
+    # The limit is keyed on an engine whose graph does NOT hold the inbound, and it covers all the
+    # body purge holds, not the stored body alone. It is stated once.
     shard_limit = (
-        "The engine shard limit: where a serve --shard process that does not hold an inbound runs "
-        "retention against the same store, that inbound's override does not keep its message "
-        "bodies past that process's global [security].delete_message_bodies_after_days window; no "
-        "messages_days value on that inbound changes this. Plain serve, and the serve --shard "
-        "process that holds the inbound, apply the override."
+        "The engine shard limit: where an engine whose live graph does not hold an inbound runs "
+        "retention against the same store, such as a serve --shard process for another engine "
+        "shard, that inbound's override keeps none of what the purge of message bodies holds for "
+        "that inbound's messages past that engine's global "
+        "[security].delete_message_bodies_after_days window; no messages_days value on that "
+        "inbound changes this."
     )
     assert text.count(shard_limit) == (1 if inbound_days is not None else 0)
-    assert text.count("serve --shard") == (2 if inbound_days is not None else 0)
+    assert text.count("serve --shard") == (1 if inbound_days is not None else 0)
+    # Keep-forever is conditioned on the limit's absence, never on the holding process applying it.
     assert (
-        "Where it applies, an inbound override keeps forever, while that inbound stays in the live "
-        "graph" in text
+        "Where no such engine runs, an inbound override keeps forever, while that inbound stays in "
+        "the live graph" in text
     ) is (inbound_days is not None)
+    assert "apply the override" not in text
     if outbound_days is not None:
         assert "the replies that outbound captured." in text
 
@@ -337,6 +340,7 @@ def test_the_override_text_recommends_no_configuration_for_engine_shards(
         "Those explicit days do not keep",
         "keeps the override as written",
         "does not stop that purge",
+        "to deliberately retain forever",
     ):
         assert removed not in text
 

@@ -3976,11 +3976,11 @@ _OVERRIDE_NOTE_FACTS = (
     # alone, so the limit is keyed on a `serve --shard` process that does not hold the inbound. The
     # note states it once, in the words the refusal and the AUDIT line use.
     "Subject to the engine shard limit next, it keeps forever what that override's purge holds",
-    "**The engine shard limit:** where a `serve --shard` process that does not hold an inbound "
-    "runs retention against the same store, that inbound's override does not keep its message "
-    "bodies past that process's global body window; no `messages_days` value on that inbound "
-    "changes this. Plain `serve`, and the `serve --shard` process that holds the inbound, apply "
-    "the override.",
+    "**The engine shard limit:** where an engine whose live graph does not hold an inbound runs "
+    "retention against the same store, such as a `serve --shard` process for another engine shard, "
+    "that inbound's override keeps none of what the purge of message bodies holds for that "
+    "inbound's messages past that engine's global `[security].delete_message_bodies_after_days` "
+    "window; no `messages_days` value on that inbound changes this.",
     # The body windows' line is the older rule, left alone by the 2026-11-01 ruling. The other
     # global tiers are not in this claim: an acknowledged one writes its line on either dial.
     "The startup gate for the global body windows differs: it writes its `AUDIT:` line only under "
@@ -3995,6 +3995,8 @@ _OVERRIDE_NOTE_REMOVED = (
     "With the global window unbounded",
     "Those explicit days do not keep",
     "keeps the override as written",
+    "does not stop that purge",
+    "apply the override",
 )
 _LOOSENING_DOC = _ROOT / "docs" / "SECURITY-LOOSENING.md"
 _PHI_DOC = _ROOT / "docs" / "PHI.md"
@@ -4025,8 +4027,9 @@ _RETIRED_RETENTION_CLAIMS: tuple[tuple[Path, str], ...] = (
 def _override_note_findings(doc: str) -> list[str]:
     """What the *Per-connection overrides* note in CONFIGURATION.md no longer says.
 
-    Reads prose, and only checks that at least these phrases are PRESENT. A contradicting sentence
-    added beside them is not caught."""
+    Reads prose. It checks that at least these phrases are PRESENT, and that the removed phrases of
+    :data:`_OVERRIDE_NOTE_REMOVED` are absent. Any other contradicting sentence added beside them is
+    not caught."""
     quoted = blockquote_lines(doc, _OVERRIDE_NOTE)
     text = "\n".join(line.removeprefix(">").strip() for line in quoted)
     # A wrapped line joins the one above it, so a phrase is found wherever the doc wraps it.
@@ -4242,6 +4245,13 @@ def test_the_override_prose_readers_detect_a_planted_violation() -> None:
             "expected 3 bullets",
         ),
         "dry-run-dropped": ("A dry-run reload counts, and", "And", "A dry-run reload counts"),
+        # BACKLOG #5967: the removed engine shard recommendation, put back where it stood.
+        "removed-recommendation-back": (
+            "each of those windows to an explicit number of days.",
+            "each of those windows to an explicit number of days. One configuration that keeps them "
+            "there gives every other inbound a positive `messages_days`.",
+            "the removed",
+        ),
         # The claim this row corrected: the global gate audits on either dial.
         "global-gate-unconditional": (
             "its `AUDIT:` line only under `enforce`.",

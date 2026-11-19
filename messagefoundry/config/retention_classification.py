@@ -539,8 +539,8 @@ def keep_forever_overrides(registry: Registry) -> tuple[str, ...]:
     an outbound sets ``dead_letter_days``. ``None`` inherits the global window and a positive number
     bounds it. ``0`` asks to keep that connection's PHI forever, whatever the global window says, so
     it is the same choice as a global ``0`` made for one connection. Which rows each kind keeps,
-    which it does not, and the engine shard limit on an inbound override, are stated on
-    :func:`_override_scope`. The global windows live in the service settings, where
+    and which it does not, is stated on :func:`_override_scope`, and the engine shard limit on an
+    inbound override on :func:`_engine_shard_limit`. The global windows live in the service settings, where
     :func:`unbounded_windows` reads them; these live in the graph, so the start gate cannot see them
     and a registry guard must (vault BACKLOG #2368).
 
@@ -575,14 +575,14 @@ def _engine_shard_limit() -> str:
     Each ``serve --shard`` process's retention reads its override maps from its own registry
     (:meth:`~messagefoundry.pipeline.retention.RetentionRunner._resolve_overrides`), and
     :func:`~messagefoundry.pipeline.sharding.filter_registry_for_shard` leaves only that process's
-    inbounds in it. Plain ``serve`` does not filter its registry."""
+    inbounds in it. An engine with no graph wired reads no overrides at all."""
     return (
-        "The engine shard limit: where a serve --shard process that does not hold an inbound "
-        "runs retention against the same store, that inbound's override does not keep its "
-        "message bodies past that process's global "
+        "The engine shard limit: where an engine whose live graph does not hold an inbound runs "
+        "retention against the same store, such as a serve --shard process for another engine "
+        "shard, that inbound's override keeps none of what the purge of message bodies holds for "
+        "that inbound's messages past that engine's global "
         f"{_window_setting('messages_days')} window; no messages_days value on that inbound "
-        "changes this. Plain serve, and the serve --shard process that holds the inbound, apply "
-        "the override."
+        "changes this."
     )
 
 
@@ -601,9 +601,9 @@ def _override_scope(kept: tuple[str, ...]) -> str:
     parts = []
     if inbound:
         parts.append(
-            f"{_engine_shard_limit()} Where it applies, an inbound override keeps forever, while "
-            "that inbound stays in the live graph with it, at least what the purge of "
-            "message bodies holds for the messages that inbound "
+            f"{_engine_shard_limit()} Where no such engine runs, an inbound override keeps "
+            "forever, while that inbound stays in the live graph with it, at least what that "
+            "purge holds for the messages that inbound "
             "received: each stored body, though the inbound's own prune_documents_after, where "
             "set, still strips embedded documents from it; its delivered and cancelled outbound "
             "payloads, its event detail and the replies captured for it. It does not keep their "
@@ -631,7 +631,7 @@ def _keep_forever_remedy() -> str:
     auto_bounded = ", ".join(w.setting for w in auto_bounded_windows())
     return (
         "Set each override to a positive number of days, or remove it to inherit the global "
-        "window where that window is bounded; or, to deliberately retain forever, set "
+        "window where that window is bounded; or, to keep the override deliberately, set "
         f"{BODY_ACKNOWLEDGEMENT_SETTING}=true and restart each engine, which reads that switch "
         "only when it starts, so a reload does not pick it up. With it set, an engine writes an "
         "AUDIT line naming these connections for each graph its guard passes. That switch covers "
@@ -666,7 +666,11 @@ def _engine_shard_caveat(kept: tuple[str, ...]) -> str:
     states; empty otherwise. It carries no trailing comma, so each caller punctuates its own
     sentence."""
     inbound, _ = _override_kinds(kept)
-    return ", subject to the engine shard limit stated after this" if inbound else ""
+    return (
+        ", subject, for an inbound override, to the engine shard limit stated after this"
+        if inbound
+        else ""
+    )
 
 
 def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None) -> str:
