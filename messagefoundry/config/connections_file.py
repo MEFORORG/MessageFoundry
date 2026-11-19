@@ -1024,13 +1024,17 @@ def _policy(  # noqa: UP047
     An unknown key at the table's top level is refused here, by name, before the model sees the
     table. pydantic's own ``extra_forbidden`` error would quote the key's value, so a secret written
     under the wrong table would reach the load error; this names only the key, as every other table
-    in the file does. A nested table, such as a schedule's ``windows``, is still checked by its model
-    alone.
+    in the file does. Only that top-level unknown key is kept out of the error: an unknown key in a
+    nested table, such as a schedule's ``windows``, is checked by its model alone, and that error and
+    a wrong-typed value's error both still quote the value.
 
     ``strict``, the default, refuses a value of the wrong TOML type instead of coercing it, so
     ``max_attempts = "3"``, ``max_depth = true`` or ``max_count = 10.0`` is a load error rather than
-    a number. The schedule table passes ``strict=False``: its ``days`` arrive as a TOML array, and
-    strict mode refuses a list for the model's ``frozenset``."""
+    a number. The schedule table passes ``strict=False``, so its values are coerced, not strictly
+    typed: a window's ``days`` arrive as a TOML array, which strict mode refuses for the model's
+    ``frozenset``, and its ``start``/``end`` times arrive as strings such as ``"07:00:00"``, which
+    strict mode refuses for the model's ``time``. ``connections_edit.list_connections`` writes them
+    back in that string form, so every schedule the editor saves carries string times."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
@@ -1045,10 +1049,12 @@ def _policy(  # noqa: UP047
 def _coerce_retry_forever(raw: Any) -> Any:
     """BACKLOG #1217 half 2. TOML has no null literal, so a per-outbound retry-forever posture
     (``[outbound.retry] max_attempts = "forever"``, case-insensitive) needs a string spelling here —
-    mirrors the ``[delivery]`` global's field validator on ``DeliverySettings.retry_max_attempts``
-    (``config/settings.py``). Anything else (not a table, no ``max_attempts`` key, or a value that
-    isn't the literal word) passes through untouched to ``_policy``, which refuses a non-table, an
-    unknown key and a wrong-typed value (BACKLOG #5899) before RetryPolicy's own validation runs.
+    the same spelling the ``[delivery]`` global's field validator on
+    ``DeliverySettings.retry_max_attempts`` (``config/settings.py``) accepts. Anything else (not a
+    table, no ``max_attempts`` key, or a value that isn't the literal word) passes through untouched
+    to ``_policy``, which refuses a non-table and an unknown key, then validates the table with
+    RetryPolicy in strict mode, so a wrong-typed value is refused by that validation itself
+    (BACKLOG #5899).
     """
     if not isinstance(raw, dict):
         return raw
