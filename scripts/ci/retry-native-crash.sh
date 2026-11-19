@@ -93,18 +93,20 @@ fi
 # A process killed by signal N exits with 128+N. 139 = 128+SIGSEGV(11) (the observed
 # segfault); 134 = 128+SIGABRT(6) (the param/TVP path can abort() with a core dump instead).
 #
-# ON A WINDOWS RUNNER THESE SAME TWO CODES ARE WHAT THIS SCRIPT SEES, NOT AN NTSTATUS. Every caller
-# runs it as `bash scripts/ci/retry-native-crash.sh ...` under `shell: bash`, which is Git Bash there,
-# and Git Bash's runtime folds a native child's 32-bit exit code into $? itself. Measured 2026-11-18
-# under Git Bash 5.3.15 on Windows 11, with a child exiting os._exit(<code>):
-#   0xC0000005 (access violation)        -> 139, so it is already retried here
+# ON A WINDOWS RUNNER THIS SCRIPT SEES A FOLDED CODE, NEVER AN NTSTATUS. The ci.yml callers at the
+# time of writing run it as `bash scripts/ci/retry-native-crash.sh ...` under `shell: bash`, which is
+# Git Bash there, and Git Bash's runtime folds a native child's 32-bit exit code into $? itself.
+# Measured 2026-11-18 under Git Bash 5.3.15 on Windows 11, with a child exiting os._exit(<code>):
+#   0xC0000005 (access violation)        -> 139, so a Windows segfault is already retried here
 #   0xC000001D (illegal instruction)     -> 132
 #   0xC0000409 (stack buffer overrun, and Python's own abort() on Windows), 0xC00000FD (stack
 #   overflow), 0xC0000374 (heap corruption), 0xC0000094 (divide by zero) and 0xC0000135 (DLL not
 #   found)                               -> 127
-# $? is never the raw 3221225477 or its low byte (5 or 9), so neither is listed. The rest arrive as
-# 127, which is also "command not found", so retrying 127 would retry a missing command and print a
-# native-crash cause for it; it is deliberately not listed (tests/test_ci_retry_native_crash.py).
+# So 134 never arrives from a Windows child: an abort there arrives as 127 and is not retried. $? is
+# never the raw 3221225477 or its low byte (5 or 9), so neither is listed. 127 is also "command not
+# found", so retrying it would retry a missing command and print a native-crash cause for it; it is
+# not listed, and tests/test_ci_retry_native_crash.py pins that. 132 is not listed either, because
+# adding it widens what a retry can turn green; that is a decision this note does not make.
 is_native_crash() {
   [ "$1" -eq 139 ] || [ "$1" -eq 134 ]
 }

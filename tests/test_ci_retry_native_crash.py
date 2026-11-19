@@ -139,6 +139,18 @@ def test_no_command_is_refused(bash: Path) -> None:
         assert "no command" in r.stdout
 
 
+def test_exit_127_is_not_retried(bash: Path) -> None:
+    """127 is "command not found" as well as where Git Bash folds most Windows crash codes.
+
+    Retrying it would re-run a missing command and print a native-crash cause for it, so it fails
+    once, like any ordinary failure.
+    """
+    r = _run(bash, 127, attempts="3")
+    assert r.stdout.count("ran") == 1
+    assert r.returncode == 127
+    assert "NATIVE CRASH" not in r.stdout
+
+
 @pytest.mark.skipif(os.name != "nt", reason="a Windows NTSTATUS exit needs a Windows child")
 def test_a_windows_access_violation_reaches_the_wrapper_as_139_and_is_retried(bash: Path) -> None:
     """The wrapper's Windows note, measured: Git Bash folds 0xC0000005 into 139 itself.
