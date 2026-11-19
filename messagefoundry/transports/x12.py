@@ -886,8 +886,8 @@ class X12Source(SourceConnector):
         reply resends on the close; one that waits for none never does (``hold_and_retry``), so for
         it the loss of a complete interchange, an over-cap one included, is final and is logged at
         ERROR. A remainder that is only a partial interchange is logged at WARNING where the
-        listener cut it off (``listener_cut``: a stop's cancel, or a close the listener chose), and
-        at DEBUG on a close the peer made (EOF, idle, frame deadline, reset), where nothing complete
+        listener cut it off (``listener_cut``: a stop, inside its grace or past it, or a close the
+        listener chose), and at DEBUG on a close the peer made (EOF, idle, frame deadline, reset), where nothing complete
         was lost, so line noise or connection churn cannot flood the log.
         """
         left = 0
@@ -1047,7 +1047,8 @@ class X12Source(SourceConnector):
                                     # A sender owed a reply waits on it, so close and let it
                                     # resend. One owed none waits on nothing: closing would only
                                     # drop the interchanges behind this one, so skip the reply and
-                                    # carry on.
+                                    # carry on. The shipped runner returns no reply where none is
+                                    # owed, so only a pipeline handler that replies anyway gets here.
                                     owed = owes_hl7_reply(self.ack_mode, self.content_type)
                                     logger.error(
                                         "X12 reply to %s could not be encoded: %s; the interchange "
@@ -1119,7 +1120,11 @@ class X12Source(SourceConnector):
                         frames,
                         decoder,
                         writer.get_extra_info("peername"),
-                        listener_cut=cancelled or (failed and not reset),
+                        # A stop inside its grace closes the writer, so the read sees EOF and
+                        # neither `cancelled` nor `failed` is set; `stopping` names that cut.
+                        listener_cut=cancelled
+                        or self._admission.stopping
+                        or (failed and not reset),
                     )
                 finally:
                     self._admission.release(peer_host, epoch)

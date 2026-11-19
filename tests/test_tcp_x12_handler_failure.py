@@ -651,3 +651,49 @@ async def test_x12_a_partial_the_listener_cuts_off_is_a_warning(
     assert len(lines) == 1 and lines[0].levelno == logging.WARNING
     assert "closed with 0 complete interchange(s)" in lines[0].getMessage()
     assert "a partial interchange still arriving" in lines[0].getMessage()
+
+
+class _PartialThenStop:
+    """Hands over ``data``, then waits for ``release`` and reads EOF, as a stop inside its grace
+    does when it closes the client's writer."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self.waiting = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def read(self, _n: int) -> bytes:
+        if self._data:
+            chunk, self._data = self._data, b""
+            return chunk
+        self.waiting.set()
+        await self.release.wait()
+        return b""
+
+
+@pytest.mark.parametrize("stopping", [True, False], ids=["stop", "peer-eof-control"])
+async def test_x12_a_partial_a_stop_inside_its_grace_cuts_off_is_a_warning(
+    stopping: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    # stop() sets `stopping` and closes the writer, so the pending read returns EOF and the
+    # connection ends with neither a cancel nor a failure. That cut is still the listener's, so the
+    # partial is named at WARNING. The control is the same EOF with no stop: the peer closed, DEBUG.
+    source = _no_reply(_x12)
+    reader = _PartialThenStop(EDI[:200])
+    events: list[Event] = []
+    source.on_connection_event = _sink(events)  # type: ignore[assignment]
+
+    async def handler(raw: bytes) -> None:
+        return None
+
+    source._handler = handler
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.transports.x12"):
+        client = asyncio.create_task(source._on_client(reader, _Peer()))  # type: ignore[arg-type]
+        await asyncio.wait_for(reader.waiting.wait(), timeout=2.0)
+        source._admission.stopping = stopping
+        reader.release.set()
+        await asyncio.wait_for(client, timeout=2.0)
+    lines = [r for r in caplog.records if "not handed to the pipeline" in r.getMessage()]
+    assert len(lines) == 1
+    assert lines[0].levelno == (logging.WARNING if stopping else logging.DEBUG)
+    assert "a partial interchange still arriving" in lines[0].getMessage()
