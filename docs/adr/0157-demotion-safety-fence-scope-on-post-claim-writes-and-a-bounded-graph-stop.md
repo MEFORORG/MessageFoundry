@@ -413,9 +413,15 @@ today** (30 vs 30), so ship it with a defaults change or rely on the clamp alone
 >    **As built since BACKLOG #5979, the residual is narrower:** `ServiceSettings._sqlserver_renew_bounds`
 >    now checks the pool wait plus the whole-second statement timeout against the margin at load. A
 >    set clamp whose two windows reach it is refused, a derived one is stepped down to the largest
->    whole second that fits, and a fence/TTL pair no clamp of at least 1 s fits is refused. The
->    warning above stays for what that check cannot see: the cursor's creation between the windows
->    and the COMMIT after them.
+>    whole second that fits, and a fence/TTL pair no clamp of at least 1 s fits is refused. At
+>    least two steps stay outside that check: the cursor's creation between the windows and the
+>    COMMIT after them. No load-time check covers them, and that is the remaining residual. The
+>    warning above, which is unchanged, does not cover them either: it fires only when twice the
+>    clamp reaches the margin, and at the stock `[store]` timeouts a whole-second clamp's two
+>    windows are already twice the clamp, so a whole-second clamp that passes the refusal never
+>    draws it. A whole-second clamp that passes with little headroom, or a derived one stepped down,
+>    which is always a whole second, therefore logs nothing. A fractional clamp, such as the stock
+>    derived 4.5, can still draw it.
 >    `tests/test_adr0157_b1497_sqlserver_renew_clamp.py` pins it offline, by the warning's arithmetic and
 >    by a timing test of the two windows, and its gated test shows the driver
 >    ending a slow statement at the clamp.

@@ -19,8 +19,9 @@ from harness.load.profile import LoadProfile, load_profile_text
 # pool_size = 1 (sound per-lane ordering), and a generous drain for a server-DB round-trip per handoff.
 # recovery_ttl_multiple is roomy (3×) so ordinary CI scheduling jitter doesn't flake the time bound.
 # The TTL is 6.0, not 5.0, because SQL Server refuses a pair whose lease claim's pool wait plus its
-# statement (1 + 1 s at the derived clamp) reaches the detection margin (BACKLOG #5979): 3.0 / 5.0 left
-# 1.4 s, 3.0 / 6.0 leaves 2.4 s.
+# statement reaches the detection margin (BACKLOG #5979): 3.0 / 5.0 leaves a 1.4 s margin, which even
+# the 1 s floor clamp's 1 + 1 s reaches; 3.0 / 6.0 leaves 2.4 s, and its derived 1.2 s clamp runs
+# 1.2 + 1 s = 2.2 s.
 _PROFILE = """
 [load]
 name = "failover-it"

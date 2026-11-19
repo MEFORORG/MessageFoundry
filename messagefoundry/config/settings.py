@@ -1263,8 +1263,10 @@ class StoreSettings(_Section):
     @classmethod
     def _positive_acquire_timeout(cls, value: float) -> float:
         # No "0 disables" escape hatch, unlike command_timeout: an unbounded pool wait is the defect
-        # this setting exists to remove, so there is deliberately no way to configure it back.
-        if value <= 0:
+        # this setting exists to remove, so there is deliberately no way to configure it back. A
+        # positive test, so a NaN is refused too: it would pass ``<= 0`` and then poison the
+        # renew-reach arithmetic in ServiceSettings._sqlserver_renew_bounds (BACKLOG #5979).
+        if not value > 0:
             raise ValueError("acquire_timeout must be > 0 (the pool wait is always bounded)")
         return value
 
@@ -8199,10 +8201,16 @@ class ServiceSettings(_InputHidingModel):
            A DERIVED clamp is first stepped down to the largest whole-second value whose windows
            fit, so only a fence/TTL pair that no clamp of at least 1 s fits is refused.
 
-        Passing this is not proof that a renew lands inside the margin: the cursor's creation
-        between the two windows and the COMMIT after the statement are outside both
-        (:func:`_sqlserver_renew_reach_seconds`). :meth:`sqlserver_renew_bound_warning` stays the
-        start-up warning for that approximate case."""
+        Passing this is not proof that a renew lands inside the margin. At least the cursor's
+        creation between the two windows and the COMMIT after the statement are outside both
+        (:func:`_sqlserver_renew_reach_seconds`), and no load-time check covers them: that is the
+        remainder this refusal leaves. :meth:`sqlserver_renew_bound_warning` does not cover them
+        either. It fires only on ``2 * clamp >= margin``, which reads neither step, and at the stock
+        ``[store]`` timeouts a whole-second clamp that passes this check never meets it: such a
+        clamp's two windows are ``2 * clamp`` already. So a whole-second clamp that passes with
+        little headroom draws no warning, and neither does a derived clamp this check stepped down,
+        which is always a whole second. A fractional clamp, such as the stock derived 4.5, can
+        still draw it."""
         bounds = self._sqlserver_clamp_and_margin()
         if bounds is None:
             return self

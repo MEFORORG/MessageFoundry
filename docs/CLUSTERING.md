@@ -581,13 +581,18 @@ The defaults (`heartbeat_seconds=10`, `leader_fence_timeout_seconds=20`, `leader
 trade a ~30 s crash-failover for ample margin. Lower all three proportionally (keeping
 `heartbeat < fence < ttl`) for faster failover at the cost of less tolerance for a slow DB / GC pause.
 
-**The validator enforces the ordering, not a margin.** `heartbeat < fence < ttl` is checked at config
-load; nothing checks that any usable time survives between the fence firing and the lease expiring. The
-real margin is `ttl - fence` *minus* the renew round trip (the fence baseline is taken after the renew
-returns, while the expiry is stamped on the database clock at statement execution) *minus* up to one
-fence tick of detection lag — and graph teardown then has to fit in what remains. Tightening these
-proportionally keeps the ordering legal while shrinking that budget toward zero, and the failure mode
-is a longer overlap between an old and a new primary, not a config error. Keep headroom on a
+**Config load checks the ordering and the renew clamp against the margin, not that teardown fits.**
+`heartbeat < fence < ttl` is checked at config load. So, at least, is the detection margin, `ttl -
+fence - one fence tick`: a pair that leaves none is refused, and so is a renew clamp that does not
+fit inside it. On SQL Server load also refuses a config whose lease claim's pool wait plus its
+statement timeout reaches the margin, stepping a derived clamp down to a whole second that fits
+first (BACKLOG #5979). Load does not check that graph teardown fits in what is left, and on SQL
+Server it does not cover the claim's cursor creation or its COMMIT. The real margin is `ttl - fence`
+*minus* the renew round trip (the fence baseline is taken after the renew returns, while the expiry is
+stamped on the database clock at statement execution) *minus* up to one fence tick of detection lag —
+and graph teardown then has to fit in what remains. Tightening these proportionally can pass every
+load check while shrinking that teardown budget toward zero, and the failure mode there is a longer
+overlap between an old and a new primary, not a config error. Keep headroom on a
 synchronous-commit or cross-AZ database.
 
 Because the **leadership** lease is evaluated on the **database's** clock, node clock skew does not
