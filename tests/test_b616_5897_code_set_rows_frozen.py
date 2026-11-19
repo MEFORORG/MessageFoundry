@@ -318,3 +318,45 @@ def test_the_caller_mapping_passed_to_the_constructor_is_not_shared() -> None:
     cs = CodeSet("direct", source)
     source["K"]["a"] = "2"
     assert cs["K"] == {"a": "1"}
+
+
+def test_a_deep_copy_keeps_a_shared_sub_object_shared() -> None:
+    row = _toml_set()["A"]
+    mine = copy.deepcopy({"row": row, "tags": row["tags"], "inner": row["inner"]})
+    assert mine["tags"] is mine["row"]["tags"]
+    assert mine["inner"] is mine["row"]["inner"]
+    assert type(mine["tags"]) is list
+    # Reached from outside the row and through a tuple, each sub-object is still copied once.
+    frozen = CodeSet("shared", {"K": {"a": [1], "t": (2, [3])}})["K"]
+    again = copy.deepcopy([frozen, frozen["a"], frozen["t"], frozen["t"][1]])
+    assert again[0] is not frozen
+    assert again[1] is again[0]["a"]
+    assert again[2] is again[0]["t"]
+    assert again[3] is again[0]["t"][1]
+
+
+def test_a_self_referencing_row_deep_copies_as_a_cycle() -> None:
+    row = _toml_set()["A"]
+    dict.__setitem__(row, "self", row)  # only a C-level write can build this cycle
+    list.append(row["tags"], row)
+    mine = copy.deepcopy(row)
+    assert type(mine) is dict
+    assert mine["self"] is mine
+    assert mine["tags"][-1] is mine
+    mine["label"] = "changed"  # the copy is mutable and the original is untouched
+    assert row["label"] == "Alpha"
+
+
+def test_a_cycle_closed_by_a_recorded_row_copies_through_a_tuple() -> None:
+    pair = CodeSet("cyclic", {"K": ({"a": 1},)})["K"]
+    dict.__setitem__(pair[0], "back", pair)
+    mine = copy.deepcopy(pair[0])  # the row is recorded first, so the tuple's member resolves
+    assert mine["back"][0] is mine
+    assert copy.deepcopy(pair)[0]["back"][0]["back"] is not pair
+
+
+def test_a_cycle_back_into_an_open_tuple_fails_fast() -> None:
+    row = CodeSet("cyclic", {"K": {"t": ({"a": 1},)}})["K"]
+    dict.__setitem__(row["t"][0], "back", row["t"])
+    with pytest.raises(RecursionError, match="tuple"):
+        copy.deepcopy(row)
