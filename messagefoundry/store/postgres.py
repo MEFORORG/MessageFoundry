@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -64,6 +65,7 @@ from collections.abc import (
     Callable,
     Collection,
     Iterable,
+    Iterator,
     Mapping,
     MutableMapping,
     Sequence,
@@ -73,7 +75,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from time import perf_counter
 from types import MappingProxyType
-from typing import Any, Final, assert_never
+from typing import Any, ClassVar, Final, assert_never
 from uuid import uuid4
 
 from messagefoundry.config.models import RetryPolicy
@@ -3468,19 +3470,29 @@ class PostgresStore:
         Only a CONTIGUOUS bump (the held version was ``ver - 1``) proves this handle reflects ``ver``:
         a gap means another process bumped in between, and recording ``ver`` would make the next
         converge skip that sibling's write for good (BACKLOG #5984; engine shards write the same
-        namespaces at once). On a gap the held version is set to ``ver - 1``, which is below the
-        shared version, so the next converge re-reads the namespace, and it also differs from the
-        ``seen`` a converge in flight captured, so that pass merges rather than reseeds.
+        namespaces at once). Any other record, a gap or a late record at or below the held version,
+        sets a fresh stale mark (:meth:`_new_stale_mark`).
 
-        The held version never moves down. Two transform workers in this process can record out of
-        order, the later bump first; lowering the held version for the earlier one could land it back
-        on the ``seen`` a converge in flight captured, and that pass would then reseed destructively
-        and drop the later write's just-published key for a tick. Keeping the higher value loses
-        nothing: the earlier write committed before the later bump's upsert could take the row lock,
-        so any read the higher value vouches for already holds it."""
+        A stale mark matches no shared version, so the next converge re-reads the namespace, and it
+        matches no value held before, so a converge in flight whose captured ``seen`` it replaced
+        merges rather than reseeds. Recording ``ver - 1`` on a gap could do neither reliably: two
+        transform workers in this process recording out of order could land it back on that ``seen``,
+        and that pass would reseed destructively and drop the later write's just-published key for a
+        tick. A late record also must not leave the held version alone: the write published its
+        value just before, possibly over a newer sibling value a converge already read, so the
+        namespace has to be re-read."""
         for ns, ver in bumped:
             held = self._state_versions.get(ns, 0)
-            self._state_versions[ns] = max(held, ver if held == ver - 1 else ver - 1)
+            self._state_versions[ns] = ver if held == ver - 1 else self._new_stale_mark()
+
+    # Process-wide source of stale marks: negative, so never a shared version (those start at 1), and
+    # each drawn once. Only the event loop draws from it.
+    _stale_marks: ClassVar[Iterator[int]] = itertools.count(-1, -1)
+
+    def _new_stale_mark(self) -> int:
+        """A held-version value that equals no shared version and no value this handle held before, so
+        the namespace is re-read on the next converge and an in-flight converge sees it change."""
+        return next(self._stale_marks)
 
     async def _bump_state_versions(
         self, conn: Any, namespaces: Iterable[str], now: float
@@ -3489,8 +3501,9 @@ class PostgresStore:
         order, and return the versions bumped to.
 
         Every path that locks these rows takes them in one global order, so two engine shards (or two
-        cluster nodes) writing overlapping namespaces wait on each other instead of deadlocking, as a
-        first-appearance order could (BACKLOG #5984)."""
+        cluster nodes) bumping overlapping namespaces cannot deadlock on the ``state_version`` rows,
+        as a first-appearance order could (BACKLOG #5984). The ``state`` rows a write or purge locks
+        before this are not ordered here."""
         bumped: list[tuple[str, int]] = []
         for ns in sorted(set(namespaces)):
             row = await conn.fetchrow(
@@ -3560,15 +3573,17 @@ class PostgresStore:
                 # window, advancing the DB version past `version`. A destructive reseed from the stale
                 # `fresh` would drop that just-committed local key; merge non-destructively instead
                 # (setdefault keeps any newer local value) so the sibling rows we read still land. We
-                # deliberately record `version - 1`, below the version just scanned, so the next tick
-                # does a clean reseed that reconciles any sibling update or delete this merge kept a
-                # stale local value over. Recording `version` was safe only while the local write
-                # always landed after the scan; with engine shards writing at once it can land before
-                # it, and the scanned version is then the shared one (BACKLOG #5984).
+                # deliberately record a stale mark, so the next tick does a clean reseed that
+                # reconciles any sibling update or delete this merge kept a stale local value over.
+                # Recording `version` was safe only while the local write always landed after the
+                # scan; with engine shards writing at once it can land before it, and the scanned
+                # version is then the shared one. `version - 1` is no better: a later own bump to
+                # `version` would read as contiguous and raise the held version to the shared one
+                # with the stale value still cached (BACKLOG #5984).
                 for k, v in fresh.items():
                     if (ns, k) not in self._state_cache:  # setdefault would decrypt the kept value
                         self._state_cache[(ns, k)] = v
-                version -= 1
+                version = self._new_stale_mark()
             self._state_versions[ns] = version
             refreshed.append(ns)
         return refreshed

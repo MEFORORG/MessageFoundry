@@ -244,7 +244,9 @@ def test_postgres_records_only_a_contiguous_own_bump() -> None:
     # would make the next converge skip the sibling's write. "solo": contiguous, so 4 is reflected.
     # "new": this handle's write created the namespace at version 1.
     store._record_own_state_bumps([("corr", 7), ("solo", 4), ("new", 1)])
-    assert store._state_versions == {"corr": 6, "solo": 4, "new": 1}
+    corr = store._state_versions.pop("corr")
+    assert corr < 0  # a stale mark: matches no shared version, so the next converge re-reads
+    assert store._state_versions == {"solo": 4, "new": 1}
 
 
 async def test_postgres_open_reads_versions_before_rows() -> None:
@@ -286,19 +288,56 @@ async def test_postgres_converge_merge_leaves_the_namespace_for_a_clean_reseed()
     store._fetchall = _fetchall
     assert await store.converge_state_cache() == ["corr"]
     assert store._state_cache[("corr", "K")] == "local, stale"  # the merge keeps the local value
-    assert store._state_versions == {"corr": 6}  # below the shared 7, so the next tick reseeds
+    assert store._state_versions["corr"] < 0  # a stale mark, so the next tick reseeds
 
 
-def test_postgres_own_bump_record_never_lowers_the_held_version() -> None:
+def test_postgres_out_of_order_own_records_never_return_to_an_earlier_held_version() -> None:
     from messagefoundry.store.postgres import PostgresStore
 
     store: Any = object.__new__(PostgresStore)
     store._state_versions = {"corr": 5}
     # Two transform workers in this process bumped "corr" to 6 and 7; the later one records first.
     store._record_own_state_bumps([("corr", 7)])
-    assert store._state_versions == {"corr": 6}
+    first = store._state_versions["corr"]
     store._record_own_state_bumps([("corr", 6)])
-    assert store._state_versions == {"corr": 6}  # not back down to 5
+    second = store._state_versions["corr"]
+    # Neither lands back on 5, which a converge in flight may have captured as its `seen`.
+    assert first < 0 and second < 0 and first != second
+
+
+def test_postgres_late_own_record_after_a_reseed_leaves_the_namespace_for_a_re_read() -> None:
+    from messagefoundry.store.postgres import PostgresStore
+
+    store: Any = object.__new__(PostgresStore)
+    # A converge reseeded "corr" at the shared 7, then this handle's own write bumped to 6 publishes
+    # its value, possibly over the sibling's newer one, and records late.
+    store._state_versions = {"corr": 7}
+    store._record_own_state_bumps([("corr", 6)])
+    assert store._state_versions["corr"] != 7  # so the next converge re-reads and heals
+
+
+async def test_postgres_merge_mark_survives_a_later_own_bump_to_the_scanned_version() -> None:
+    from messagefoundry.store.postgres import PostgresStore
+
+    cipher = make_cipher(generate_key())
+    store: Any = object.__new__(PostgresStore)
+    store._cipher = cipher
+    store._state_cache = new_state_cache()
+    store._state_cache[("corr", "K")] = "a"
+    store._state_versions = {"corr": 3}
+
+    async def _fetchall(sql: str, *args: Any) -> list[dict[str, Any]]:
+        if "state_version" in sql:
+            return [{"namespace": "corr", "version": 6}]
+        store._record_own_state_bumps([("corr", 5)])  # an own write lands mid-read: merge
+        aad = cell_aad("state", "value", "corr", "K")
+        return [{"key": "K", "value": cipher.encrypt(json.dumps("b"), aad=aad)}]
+
+    store._fetchall = _fetchall
+    assert await store.converge_state_cache() == ["corr"]
+    assert store._state_cache[("corr", "K")] == "a"  # the merge kept the stale local value
+    store._record_own_state_bumps([("corr", 6)])  # a later own write records the scanned version
+    assert store._state_versions["corr"] != 6  # still not the shared version, so it re-reads
 
 
 async def test_postgres_out_of_order_own_records_do_not_reseed_over_a_local_key() -> None:
