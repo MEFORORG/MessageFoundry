@@ -89,10 +89,33 @@ _DECLINED_SEMICOLON = (
 
 
 @pytest.mark.parametrize(("line", "secret"), _DECLINED_SEMICOLON)
-def test_the_bundle_reading_the_log_still_hides_a_value_after_a_dsn_label(
+def test_the_bundle_reading_the_log_hides_the_value_the_declined_semicolon_reading_printed(
     line: str, secret: str
 ) -> None:
+    """Only these two lines, each ending in further members. It shows the shipped reading does
+    not print what the declined ";" alternative printed, not that a value after a DSN label is
+    hidden in general. A residual, printed on ``origin/main`` as here and not this test's subject:
+    ``cfg accessToken=redis://:Kv9@cache,userPwd='Sec_77;PWD='``, with no member after the
+    quote, prints ``Sec_77`` through the same chain."""
     assert secret not in redact_log_line(scrub_log_text(line))
+
+
+#: KNOWN RESIDUALS, pinned as printed so the comment on ``secretscrub._WIDE_DSN_PASSWORD`` cannot
+#: drift back to saying a percent-encoded password is read wherever its "%" sits. A "%" is taken
+#: only in an empty user's first password segment, which ends at the first "=" or "@". Each line
+#: with the value it prints. A red here means the reading changed: fix the comment with it.
+_PERCENT_AFTER_FIRST_SEGMENT = (
+    ("connect redis://:p=s%40Kv9x@db.invalid failed", "p=s%40Kv9x"),
+    ("connect redis://:p%40s@Kv9x%41@db.invalid failed", "Kv9x%41"),
+)
+
+
+@pytest.mark.parametrize("call", _ENTRY_POINTS, ids=_IDS)
+@pytest.mark.parametrize(("line", "printed"), _PERCENT_AFTER_FIRST_SEGMENT)
+def test_known_residual_a_percent_after_the_first_segment_is_printed(
+    line: str, printed: str, call: Callable[[str], str]
+) -> None:
+    assert printed in call(line)
 
 
 def test_a_semicolon_separated_address_list_keeps_its_host() -> None:

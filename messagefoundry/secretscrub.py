@@ -165,9 +165,10 @@ line 13 against 5.2 us, a 6 KB run of alternating letters naming every family an
 word 3.1 against 0.51 ms, the quote-ended value above under ``accessToken=`` 1.1 against 0.19 ms,
 and 6 KB of nothing but ``aToken=b;`` labels, one traced match each, 6.0 against 1.7 ms. Each sits
 under the ceiling. Since BACKLOG #5386 such a line also pays for :func:`_union`'s shortcut probe,
-which these figures predate and do not include. ``tests/test_secretscrub_camelcase_label.py`` times four of these shapes for
-linear growth: ``_BEARER`` alone on a mixed-case run, the quote-ended value under both labels, and
-the line of labels. The others were measured at 6 KB alone.
+which these figures predate and do not include. ``tests/test_secretscrub_camelcase_label.py``
+times four of these shapes for linear growth: ``_BEARER`` alone on a mixed-case run, the
+quote-ended value under both labels, and the line of labels. The others were measured at 6 KB
+alone.
 """
 
 from __future__ import annotations
@@ -1358,9 +1359,14 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # BUT A "%" THAT OPENS NEITHER AN ENCODED HL7 SEPARATOR (``%7C``, ``%7E``, ``%5E``, ``%26``) NOR
 # THE ENCODED FORM OF A CHARACTER IT STOPS AT FOR STRUCTURE (``%2C``, ``%3B``, ``%3F``, ``%23``, a
 # quote or a parenthesis), either case. That "%" it takes (BACKLOG #5386, added item 3), so a
-# percent-encoded password is read; an encoded separator still stops it, for the reason a literal
-# "|" does, below, and an encoded "," for the reason a literal one does: taken, it read
-# ``smtp://:587%2Ccc=admin@corp`` as a password and named the wrong host (code review). It still stops at "[" and
+# percent-encoded password is read where its "%" sits in that FIRST SEGMENT, which ends at the
+# first "=" or "@": ``redis://:p%40Kv9x@host`` is hidden. ONLY THERE. The run after the first
+# segment still stops at every "%", so a "%" after the password's own "=" or "@" is not taken, and
+# these are residuals, not hidden: ``redis://:p=s%40Kv9x@host`` matches nothing and prints whole,
+# and ``redis://:p%40s@Kv9x%41@host`` is cut at its own "@" and prints ``Kv9x%41``. An encoded
+# separator still stops the first segment, for the reason a literal "|" does, below, and an
+# encoded "," for the reason a literal one does: taken, it read ``smtp://:587%2Ccc=admin@corp`` as
+# a password and named the wrong host (code review). It still stops at "[" and
 # "]", so it never crosses a placeholder: taking them was tried and declined, since the only
 # placeholder this reading crosses is a user's whole first segment, as ``support.redact`` and
 # ``docs/PHI.md`` state it.
@@ -1375,8 +1381,9 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # prints, as the whole tail did before, so ``postgres://svc:Kv9x@Zq7;w@db`` prints ``Zq7;w``; and
 # an empty user's password holding one of those but a "%", or holding an encoded HL7 separator, is
 # not read at all, as before #5386, so ``redis://:p;ss@host`` and ``redis://:p%7Css@host`` print
-# whole. An "=" is not one of those: the run after the first segment may hold it, so
-# ``redis://:p=ss@host`` is read and hidden. Both count a character an earlier filter wrote: on the
+# whole; and one holding a "%" after its own "=" or "@" is not read or is cut, as stated above, so
+# ``redis://:p=s%40Kv9x@host`` prints whole. An "=" is not one of those: the run after the first
+# segment may hold it, so ``redis://:p=ss@host`` is read and hidden. Both count a character an earlier filter wrote: on the
 # log chain the PHI pass runs first, so a password holding a date- or name-shaped run reaches this
 # pass holding ``[redacted]``, and ``redis://:Zq7-19800505-Kv9x@host`` prints ``Zq7-`` and
 # ``-Kv9x`` (code review, round 4).
@@ -2237,10 +2244,13 @@ def _run(
     masked at its end, which only the tracing reads.
 
     ``wide`` False leaves out the widened DSN pass (BACKLOG #5386). :func:`_union` passes it only
-    on the probe its shortcut is decided on, and says why there. THE UNION RUNS THE WIDENED PASS on
-    both of its readings otherwise, so the pass also runs where the union returns its reading before
-    whole: on a line where the shipped reading would hide a member key's ";", and on an
-    untraceable one. The widened pattern holds no camelCase fragment, so
+    on the probe its shortcut is decided on, and says why there. EVERY OTHER RUN THE UNION MAKES
+    TAKES THE WIDENED PASS: the shipped reading alone, where the probe matched nothing and the
+    shortcut returns it; both traced readings, where it did not; and the reading before alone, on
+    an untraceable line. :func:`scrub_credentials`'s own run, on a line it sends to no union,
+    takes it too. So the pass also runs where the union returns its reading before whole:
+    on a line where the shipped reading would hide a member key's ";", and on an untraceable one.
+    The widened pattern holds no camelCase fragment, so
     :func:`_pre_camel` leaves it as it is and both readings apply the same pattern. Its run does not
     cross a camelCase label only the shipped reading reads, because every segment of the widened
     match stops at a label word (``_DSN_RUN_STOP``): on ``redis://:pw@h?accessToken=Tail@Sec`` and

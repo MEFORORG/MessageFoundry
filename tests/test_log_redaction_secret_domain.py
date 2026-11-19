@@ -1494,10 +1494,13 @@ def test_a_label_glued_after_a_dsn_is_masked_and_main_did_no_better(
 
 def test_an_empty_user_dsn_hides_an_equals_sign_and_states_its_residual() -> None:
     """The residuals secretscrub's ``_WIDE_DSN_PASSWORD`` comment states, pinned both ways. A
-    password-only DSN whose value holds "=" or a "%" is read; one holding ";", "|" or an encoded HL7
-    separator is not, and prints whole; and with a user, a password that starts with "@" prints, as
-    it did before #5386. A red on a residual line means the comment is stale, not that a leak
-    opened."""
+    password-only DSN whose value holds "=" is read, and so is one holding a "%" before its first
+    "=" or "@"; one holding ";", "|" or an encoded HL7 separator is not, and prints whole; a "%"
+    after the password's own "=" or "@" is not taken, so ``redis://:p=s%40Kv9x@host`` prints whole
+    and ``redis://:p%40s@Kv9x%41@host`` prints ``Kv9x%41`` (pinned in
+    tests/test_b532r_redaction_segments.py); and with a user, a password that starts with "@"
+    prints, as it did before #5386. A red on a residual line means the comment is stale, not that a
+    leak opened."""
     for line in ("redis://:pw=Eq_Sec-81@host", "ws://:8765=accessToken=Tail@Tok_Sec-82"):
         for out in (redact_log_line(line), scrub_credentials(line)):
             assert "Eq_Sec-81" not in out and "Tok_Sec-82" not in out, out
@@ -1505,9 +1508,9 @@ def test_an_empty_user_dsn_hides_an_equals_sign_and_states_its_residual() -> Non
     assert "pw|Pipe_Sec-84" in scrub_credentials("redis://:pw|Pipe_Sec-84@host")
     assert "p%7CKv9x" in scrub_credentials("redis://:p%7CKv9x@host")
     assert "Lead_At-74" in scrub_credentials("store dsn postgres://svc:@Lead_At-74@db.invalid/m")
-    # Round 4 review: a placeholder the PHI pass wrote first is a residual. A percent-encoded
-    # password is read since BACKLOG #5386's added item 3; tests/test_b532r_redaction_segments.py
-    # holds it.
+    # Round 4 review: a placeholder the PHI pass wrote first is a residual. A "%" in an empty
+    # user's first password segment is read since BACKLOG #5386's added item 3, and one after the
+    # password's own "=" or "@" is not; tests/test_b532r_redaction_segments.py holds both.
     chained = scrub_credentials(redact_untrusted("connect redis://:Zq7-19800505-Kv9x@host failed"))
     assert "Zq7-" in chained and "-Kv9x" in chained, chained
     assert "Kv9x" not in scrub_credentials("redis://:p%40Kv9x@host")
