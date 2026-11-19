@@ -205,7 +205,14 @@ _ROW_REF_LEN: Final = 12
 
 
 type QueueTagCause = Literal[
-    "tag", "unknown", "corrupt", "blank", "ref", "ref-unsealed", "ref-not-delivered"
+    "tag",
+    "unknown",
+    "corrupt",
+    "marker-unparsed",
+    "blank",
+    "ref",
+    "ref-unsealed",
+    "ref-not-delivered",
 ]
 
 #: Every ``cause`` a :class:`QueueTagError` carries, and the words its alert and WARNING use for it
@@ -218,9 +225,12 @@ type QueueTagCause = Literal[
 #: - ``unknown``: the row was refused and its cause was not determined. Nothing more is claimed.
 #:   A Vault Transit verdict that is not an AEAD failure reads this, as does a
 #:   :class:`QueueTagError` raised with no cause.
-#: - ``corrupt``: a cipher that names its keys could not parse the cell's marker, or refused a cell
-#:   under a key it holds for a reason other than a failed AEAD check
-#:   (:class:`CorruptQueueCellError`).
+#: - ``corrupt``: a cipher that names its keys refused a cell under a key it holds for a reason
+#:   other than a failed AEAD check (:class:`CorruptQueueCellError`).
+#: - ``marker-unparsed``: the cell is marked, but a cipher that names its keys could not read a key
+#:   id of the shape it writes out of the marker. At least a prior key not supplied (a legacy id),
+#:   another cipher's cell, an unknown marker version or alg, or a damaged marker read this. Which
+#:   one is not known, so no corruption is claimed.
 #: - ``blank``: the row holds a blank ``payload`` where a sealed cell must be.
 #: - ``ref``: on a keyed store, a store-once row's cell opened and the ``shared_body`` key it holds
 #:   differs from the row's ``body_ref`` column. Whether this one payload was sealed is not checked.
@@ -232,6 +242,8 @@ QUEUE_TAG_CAUSES: Final[Mapping[QueueTagCause, str]] = MappingProxyType(
         "tag": "failed its integrity tag",
         "unknown": "was refused, and its cause was not determined,",
         "corrupt": "holds a payload that is corrupt",
+        "marker-unparsed": "has a cell marker this cipher could not read (a key not supplied,"
+        " another cipher's cell, or a damaged marker),",
         "blank": "holds no sealed payload",
         "ref": "holds a reference that differs from its body_ref (the store is keyed)",
         "ref-unsealed": "holds a reference that differs from its body_ref (the store is keyless)",
@@ -277,8 +289,8 @@ class QueueTagError(CipherError):
 class CorruptQueueCellError(QueueTagError):
     """A queue row's ``payload`` under a key this process holds that no tag check can judge,
     because the cell is corrupt (BACKLOG #5884). That covers at least bad base64, a ciphertext too
-    short to hold a tag, a plaintext whose tag VERIFIED but is not UTF-8, and a marker the cipher
-    cannot parse, such as a v4 cell whose salt segment is damaged.
+    short to hold a tag, and a plaintext whose tag VERIFIED but is not UTF-8. A marker the cipher
+    cannot read is not this error: it is cause ``marker-unparsed`` (:data:`QUEUE_TAG_CAUSES`).
 
     It is not drift, so its alert says corrupt rather than a failed tag, under its own alert
     subject (:data:`QUEUE_CORRUPT_ALERT_TABLE`), and a claim's audit row names cause ``corrupt``.
@@ -497,9 +509,10 @@ def _names_tag_failure(cipher: Cipher, stored: str, exc: CipherError) -> bool:
 
 
 def _marker_unparsed(cipher: Cipher, stored: str, exc: CipherError) -> bool:
-    """Whether ``stored`` is marked, yet a cipher that names its keys cannot parse a key id out of
-    its marker, and the failed open was a verdict. A well-formed marker naming a key that is not
-    configured parses, so it stays the cipher's own key-configuration error."""
+    """Whether ``stored`` is marked, yet a cipher that names its keys cannot read a key id of the
+    shape it writes out of its marker (``named_key_id`` is None), and the failed open was a verdict.
+    A marker naming a whole key id this cipher does not hold is not this case: it stays the
+    cipher's own key-configuration error."""
     named = getattr(cipher, "named_key_id", None)
     return (
         callable(named)
@@ -514,13 +527,15 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
     ``shared_body`` key for a ``ref`` row.
 
     Raises :class:`QueueTagError`, which is drift, when the cell does not open under the row's
-    tag (see :func:`_names_tag_failure`; a key or format problem raises the cipher's own error, and
-    so does a key service that gave no verdict, :func:`is_transient_open_failure`), when a keyed
-    store's row (or any ``ref`` row) holds a blank ``payload``, or when a ``ref`` row's sealed key
-    differs from its ``body_ref`` column. Raises its subclass :class:`CorruptQueueCellError`, which
-    is not drift, only when a cipher that names its keys refuses a cell under a key it holds for a
-    reason other than a failed AEAD check. A keyless store writes plaintext and has no tag to check,
-    so there only the reference comparison binds anything."""
+    tag (see :func:`_names_tag_failure`), when a cipher that names its keys cannot read the cell's
+    marker (:func:`_marker_unparsed`), when a keyed store's row (or any ``ref`` row) holds a blank
+    ``payload``, or when a ``ref`` row's opened key differs from its ``body_ref`` column. Any other
+    key or format problem raises the cipher's own error, and so does a key service that gave no
+    verdict (:func:`is_transient_open_failure`). Raises its subclass
+    :class:`CorruptQueueCellError`, which is not drift, only when a cipher that names its keys
+    refuses a cell under a key it holds for a reason other than a failed AEAD check. A keyless
+    store writes plaintext and has no tag to check, so there only the reference comparison binds
+    anything. :data:`QUEUE_TAG_CAUSES` names each case's ``cause``."""
     payload = row["payload"]
     body_ref = row["body_ref"]
     if payload == "" and (cipher.encrypts or body_ref is not None):
@@ -534,10 +549,12 @@ def open_queue_cell(cipher: Cipher, row: Any) -> str:
         opened = cipher.decrypt(payload, aad=queue_row_aad(row))
     except CipherError as exc:
         if _marker_unparsed(cipher, payload, exc):
-            # A marked value whose marker this cipher cannot parse names no key, so holds_key_for
-            # is False and it would leave unreported. It is the cell that is damaged (BACKLOG #5884).
-            raise CorruptQueueCellError(
-                f"the queue row's payload is corrupt: its marker cannot be parsed ({exc})"
+            # A marked value whose marker this cipher cannot read names no key, so holds_key_for
+            # is False and it would leave unreported. Which fault it is cannot be told, so it
+            # claims no corruption (BACKLOG #5884).
+            raise QueueTagError(
+                f"integrity: the queue row's cell marker could not be read by this cipher ({exc})",
+                cause="marker-unparsed",
             ) from exc
         if not _names_tag_failure(cipher, payload, exc):
             raise  # a key, format or key-service problem, which the cipher's own error names

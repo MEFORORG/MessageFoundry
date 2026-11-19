@@ -205,23 +205,34 @@ def test_a_real_transit_cipher_verdict_stays_drift() -> None:
         assert refused.value.cause == cause, text
 
 
-def test_a_v4_cell_with_a_corrupt_salt_is_reported_as_corrupt() -> None:
-    """A v4 cell whose salt segment does not parse names no key id, so ``holds_key_for`` is False.
-    It must still reach the audited, alerted corrupt path, not a silent dead-letter (BACKLOG
-    #5884)."""
+def test_an_unreadable_marker_is_reported_and_claims_no_corruption() -> None:
+    """A marked cell whose marker names no key id of the cipher's shape has ``holds_key_for``
+    False. It must still reach the audited, alerted path, not a silent dead-letter, and its cause
+    must not claim corruption, since a prior key not supplied, another cipher's cell and a damaged
+    marker all read this way (BACKLOG #5884)."""
     cipher, _key_b64, seen = _cipher_and_hook()
     row = _row()
     sealed = cipher.encrypt("SYNTH-BODY", aad=queue_row_aad(row))
     head, salt, blob = sealed.rsplit(":", 2)
     assert sealed.startswith("mfenc:v4:") and len(salt) > 2  # the cell is v4, with a salt
-    damaged = f"{head}:zz{salt[2:]}:{blob}"
-    assert cipher.named_key_id(damaged) is None  # the marker no longer parses
-    with pytest.raises(CorruptQueueCellError) as corrupt:
-        open_queue_cell(cipher, {**row, "payload": damaged})
-    assert corrupt.value.cause == "corrupt"
-    sink = _Sink()
-    asyncio.run(report_queue_tag_failure(sink, cipher, row, error=corrupt.value))
-    assert json.loads(sink.details[0])["cause"] == "corrupt" and len(seen) == 1
+    unreadable = {
+        "v4 bad salt": f"{head}:zz{salt[2:]}:{blob}",
+        "v1 legacy key id 0, its retired key not supplied": "mfenc:v1:0:"
+        + base64.b64encode(bytes(40)).decode("ascii"),
+        "v3 Transit cell under the local cipher": "mfenc:v3:vault:v1:AAAA",
+        "unknown marker version": "mfenc:v9:x:AAAA",
+    }
+    for case, payload in unreadable.items():
+        assert cipher.is_encrypted(payload) and cipher.named_key_id(payload) is None, case
+        with pytest.raises(QueueTagError) as refused:
+            open_queue_cell(cipher, {**row, "payload": payload})
+        assert type(refused.value) is QueueTagError and refused.value.drift, case
+        assert refused.value.cause == "marker-unparsed", case
+        sink = _Sink()
+        seen.clear()
+        asyncio.run(report_queue_tag_failure(sink, cipher, row, error=refused.value))
+        assert json.loads(sink.details[0])["cause"] == "marker-unparsed", case
+        assert len(seen) == 1 and "corrupt" not in seen[0], case
     # Control: a well-formed marker naming a key this cipher does not hold stays the cipher's own
     # key-configuration error, unreported here.
     other = make_cipher(generate_key(), write_v2=True)
