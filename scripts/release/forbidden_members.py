@@ -133,7 +133,7 @@ KNOWN_DISTRIBUTIONS: frozenset[str] = frozenset(
     }
 )
 
-#: What may follow ``messagefoundry.`` in a top-level FILE of a toolkit archive: documentation and
+#: What may follow ``messagefoundry.`` in a top-level FILE of any non-engine archive: documentation and
 #: configuration, which Python never imports. Every other suffix, and none, is refused, so a module,
 #: extension module or a suffix nobody listed stays refused; only this list is let through. A
 #: top-level ``.pth`` is refused whatever its name, by its own check in :func:`_split_rule`.
@@ -453,9 +453,20 @@ def _canonical(name: str) -> str:
 
 def _versioned_as(part: str, dist: str) -> bool:
     """Whether one normalised component is a ``<name>-<version>`` entry for ``dist``: its
-    ``.dist-info``, ``.data`` or ``.egg-info`` directory, or its sdist root."""
+    ``.dist-info``, ``.data`` or ``.egg-info`` directory, or its sdist root.
+
+    A ``.dist-info`` or ``.egg-info`` directory is also read as ``importlib.metadata`` reads it:
+    the suffix dropped and the name ended at the first hyphen, with no version required, so
+    ``messagefoundry-dev.dist-info`` declares the engine just as ``messagefoundry-0.4.0`` does."""
     name = _name_version(part)
-    return name is not None and _canonical(name) == dist
+    if name is not None and _canonical(name) == dist:
+        return True
+    stem, dot, suffix = part.rpartition(".")
+    return (
+        bool(dot)
+        and suffix in {"dist-info", "egg-info"}
+        and (_canonical(stem.partition("-")[0]) == dist)
+    )
 
 
 def _names_dist(part: str, dist: str) -> bool:

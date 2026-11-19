@@ -1220,18 +1220,34 @@ def test_the_cli_refuses_any_non_engine_wheel_writing_into_the_engine(
 
 
 @pytest.mark.parametrize(
-    "member",
+    ("dist", "member"),
     [
-        "harness/__init__.py",
-        "harness/load/profile.toml",
-        "messagefoundry_harness-0.4.0.dist-info/METADATA",
-        "messagefoundry_webconsole/static/app.js",
-        "messagefoundry_webconsole-0.4.0.dist-info/RECORD",
+        ("messagefoundry-harness", "harness/__init__.py"),
+        ("messagefoundry-harness", "harness/load/profile.toml"),
+        ("messagefoundry-harness", "messagefoundry_harness-0.4.0.dist-info/METADATA"),
+        ("messagefoundry-webconsole", "messagefoundry_webconsole/static/app.js"),
+        ("messagefoundry-webconsole", "messagefoundry_webconsole-0.4.0.dist-info/RECORD"),
     ],
 )
-def test_harness_and_console_members_pass_the_split_rule(member: str) -> None:
-    for dist in ("messagefoundry-harness", "messagefoundry-webconsole"):
-        assert split_violation(member, dist) is None, dist
+def test_harness_and_console_members_pass_the_split_rule(dist: str, member: str) -> None:
+    assert split_violation(member, dist) is None
+
+
+@pytest.mark.parametrize(
+    ("dist", "member"),
+    [
+        ("messagefoundry-toolkit", "messagefoundry-dev.dist-info/METADATA"),
+        ("messagefoundry-harness", "MessageFoundry-x.dist-info/entry_points.txt"),
+        ("messagefoundry-webconsole", "messagefoundry.egg-info/PKG-INFO"),
+        ("messagefoundry", "messagefoundry_toolkit-dev.dist-info/METADATA"),
+        ("messagefoundry", "messagefoundry.toolkit.egg-info/PKG-INFO"),
+    ],
+)
+def test_a_metadata_directory_is_placed_as_importlib_reads_it(dist: str, member: str) -> None:
+    """importlib.metadata names a ``.dist-info`` or ``.egg-info`` directory by the text before its
+    first hyphen, with no version needed, so a non-numeric version still declares the other
+    distribution."""
+    assert split_violation(member, dist) is not None
 
 
 @pytest.mark.parametrize(
@@ -1261,7 +1277,7 @@ def test_a_tilde_digit_outside_the_8_3_shape_is_not_an_alias(member: str) -> Non
 def test_a_version_must_start_with_an_ascii_digit() -> None:
     """U+0663 (ARABIC-INDIC DIGIT THREE) passes ``str.isdigit``. It is named by escape rather than
     written, because the cp1252 console gate refuses the literal."""
-    assert filename_problem(Path("messagefoundry_toolkit-٣.0-py3-none-any.whl")) is not None
+    assert filename_problem(Path("messagefoundry_toolkit-\u0663.0-py3-none-any.whl")) is not None
 
 
 def test_the_per_archive_line_says_an_archive_level_refusal(
