@@ -253,16 +253,18 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             )
         parts.append(_Part(name=name, filename=filename, start=content_start, end=content_end))
     # BACKLOG #5787: a body in which the closing delimiter appears nowhere is refused, because a body
-    # cut short in transit is one, and its last part would otherwise run to the end of the body and
-    # be taken as complete. Checked last, so a body that fails a check above gets that refusal. A
+    # that ends before its close marker (for example one built from a file still being written) is
+    # one, and its last part would otherwise run to the end of the body and be taken as complete. Checked last, so a body that fails a check above gets that refusal. A
     # close marker the walk did not stop on still counts wherever it sits, so this refuses only a
     # body that carries none. It does not catch a cut-short body whose content holds the close
     # marker text: the walk takes that text as the close wherever it sits (delimiters are not
     # anchored to a line start), and the part ends there.
     if not closed:
         if not seen:
-            # No delimiter at all: an empty body, or one built with another boundary than the
-            # Content-Type names. Not a truncation, so the refusal does not say it is one.
+            # No delimiter at all. At least an empty body, one built with another boundary than the
+            # Content-Type names, and one cut inside its first delimiter line land here. A body
+            # built with a boundary the declared one is a prefix of (declared B, body uses BX)
+            # does not: it has delimiters, so it gets the missing-terminator refusal below.
             raise MultipartError(
                 "multipart body holds no delimiter for the boundary its Content-Type names"
             )
