@@ -403,23 +403,40 @@ def _speaker(runs: list[Any]) -> Any:
     A run still IN PROGRESS beats a finished one outright; a head can carry two concurrent runs of
     a name and the earlier-started one can finish last. Among finished runs the latest start wins,
     whatever its conclusion, so a COMPLETED run with a STALE or null conclusion does not outrank a
-    newer SUCCESS. A run with no timestamp loses. On a tie the worse verdict wins, so list order
-    is never used.
-    """
+    newer SUCCESS. On a tie the worse verdict wins, so list order is never used.
 
-    def key(run: Any) -> tuple[int, str, int]:
+    Stamps are compared as aware datetimes, never as strings: a fractional-second stamp sorts
+    BEFORE the same second without one as text ('.' < 'Z'), and an empty stamp sorted before every
+    real one, so a later failing run could lose to an older success and a failing head read green.
+    FAIL-CLOSED RULE: a run whose stamp is missing or unparseable could be the newest, so it ranks
+    as TIED with the newest parseable stamp, and the tie-break then lets the worse verdict win. An
+    unstamped failure therefore beats any success, and an unstamped success never beats a newer
+    failure. The cost is deliberate: an unstamped failure also beats a later stamped re-run that
+    passed, so that name reads red until the unstamped run leaves the head. GitHub stamps every
+    started check run, so this is an anomaly, and reading it red is the fail-closed answer.
+    """
+    earliest = datetime.min.replace(tzinfo=UTC)
+    newest = max((s for s in map(_stamp, runs) if s is not None), default=earliest)
+
+    def key(run: Any) -> tuple[int, datetime, int]:
         if not isinstance(run, dict):
-            return (0, "", 1)
-        stamp = run.get("startedAt") or run.get("createdAt")
+            return (0, earliest, 1)
         failing, unsettled = pr_checks.counts([run])
         # Ties go to the worse verdict, so equal stamps never leave the answer to list order. STALE
         # ranks below a failure and above anything unsettled: counts() reads it as neither, but a
         # required STALE run is red here. A total order, so no two verdicts tie.
         stale = pr_checks.verdict_of(run) == pr_checks.STALE
         worse = 3 if failing else 2 if stale else 1 if unsettled else 0
-        return (1 if pr_checks.in_progress(run) else 0, str(stamp or ""), worse)
+        return (1 if pr_checks.in_progress(run) else 0, _stamp(run) or newest, worse)
 
     return max(runs, key=key)
+
+
+def _stamp(run: Any) -> datetime | None:
+    """A run's start (a StatusContext's createdAt), or None when it is missing or unparseable."""
+    if not isinstance(run, dict):
+        return None
+    return parse_iso(run.get("startedAt") or run.get("createdAt"))
 
 
 def _known(value: object) -> str | None:
