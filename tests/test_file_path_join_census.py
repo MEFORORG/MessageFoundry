@@ -465,11 +465,6 @@ SITES: dict[str, Site] = {
     # --- messagefoundry/ ---
     "messagefoundry/__main__.py::_cert_import": Site(3, OPERATOR, _CERT_OUT),
     "messagefoundry/__main__.py::_cert_self_signed": Site(3, OPERATOR, _CERT_OUT),
-    "messagefoundry/__main__.py::_check_env_file_present": Site(
-        1,
-        REVIEWED,
-        "The raw --env value joined under the project root to test that the value file exists.",
-    ),
     "messagefoundry/__main__.py::_emit_anchor_diagnostics": Site(
         1, REVIEWED, "The working directory and a fixed name, tested for existence."
     ),
@@ -591,10 +586,11 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/config/environments.py::values_file_path": Site(
         1,
-        GUARDED,
-        "Every caller passes [ai].environment, which the validator holds to letters, digits, `.`, "
-        "`_` and `-`.",
-        "messagefoundry/config/settings.py::_valid_environment_name",
+        REVIEWED,
+        "The guard itself: it refuses a [environments].dir with a drive, a root or a '..' part, "
+        "and an environment name outside the [ai].environment validator's alphabet, before it "
+        "joins them under the base (BACKLOG #5322). Every caller that names a value file goes "
+        "through it.",
     ),
     "messagefoundry/config/environments.py::resolve_values_base_dir": Site(
         1, OPERATOR, "The operator's [environments].base_dir under the working directory."

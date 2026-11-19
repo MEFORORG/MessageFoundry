@@ -870,7 +870,9 @@ def test_a_path_no_file_can_be_opened_by_is_no_value_file_to_a_start_or_a_snapsh
 
     cfg, _ = _layout(tmp_path)
     (tmp_path / "afile").write_text("", encoding="utf-8")
-    cases = [("afile", "x")] + ([("environments", "bad?name")] if os.name == "nt" else [])
+    # The refused name is in the folder: values_file_path holds the environment name to the
+    # [ai].environment alphabet, which has no '?' (BACKLOG #5322).
+    cases = [("afile", "x")] + ([("bad?dir", "x")] if os.name == "nt" else [])
     for dir_name, environment in cases:
         path = tmp_path / dir_name / f"{environment}.toml"
         assert (

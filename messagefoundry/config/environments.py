@@ -30,7 +30,7 @@ import logging
 import tomllib
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:
@@ -187,11 +187,44 @@ def resolve_values_base_dir(base_dir: str, *, cwd: Path) -> Path:
     return cwd / base_dir
 
 
+def _leaves_base(value: str) -> bool:
+    """Whether joining ``value`` under a base directory could name a path outside it: a drive, a root
+    (``/x``, ``\\x``, ``C:x``, ``C:/x``, a UNC share), or a part of only dots and spaces other than
+    ``.``, such as ``..``. Read under the Windows rules on every host, which split on both
+    separators, so one settings file means the same folder wherever it runs. Windows strips the
+    trailing dots and spaces of a part, so ``...`` and ``.. `` are refused with ``..``."""
+    path = PureWindowsPath(value)
+    return bool(path.drive or path.root) or any(
+        part != "." and not part.strip(". ") for part in path.parts
+    )
+
+
 def values_file_path(base_dir: str | Path, dir_name: str, environment: str) -> Path:
     """The value file :func:`load_environment_values` reads, ``<base_dir>/<dir_name>/<env>.toml``.
 
     One rule, so the ``serve`` and ``supervise`` start checks vet the file the load reads (vault
-    BACKLOG #2626)."""
+    BACKLOG #2626).
+
+    Raises ``ValueError`` when ``dir_name`` would leave ``base_dir`` (:func:`_leaves_base`), or when
+    ``environment`` is not a name ``[ai].environment`` admits, so the value file is always under
+    ``base_dir`` (BACKLOG #5322). That covers a caller that never ran the settings validator, such as
+    the ``--project-root`` check of a raw ``--env``. The check is on the text, so a link inside
+    ``base_dir`` that leads out is not refused here: the ``serve`` start check walks the file's
+    links."""
+    # Imported here, so importing this module does not load the settings model.
+    from messagefoundry.config.settings import _ENV_NAME_ALLOWED
+
+    if _leaves_base(dir_name):
+        raise ValueError(
+            f"[environments].dir {dir_name!r} must be a folder under the environments base "
+            "directory: no drive, no leading slash and no '..'"
+        )
+    # The validator's own alphabet has no separator and no ':', so the file name is one plain part.
+    if not environment or not set(environment) <= _ENV_NAME_ALLOWED:
+        raise ValueError(
+            f"environment name {environment!r} must be a non-empty name of letters, digits, '.', "
+            "'_' or '-'"
+        )
     return Path(base_dir) / dir_name / f"{environment}.toml"
 
 

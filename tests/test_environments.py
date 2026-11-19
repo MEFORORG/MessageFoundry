@@ -17,6 +17,7 @@ from messagefoundry.config.environments import (
     environment_values_from_bytes,
     load_environment_values,
     resolve_values_base_dir,
+    values_file_path,
 )
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
@@ -560,6 +561,102 @@ def test_committed_environment_files_define_the_same_keys() -> None:
     assert not missing, (
         f"environment value files disagree on keys (each must define all of {sorted(union)}): {missing}"
     )
+
+
+# --- BACKLOG #5322: the value file stays under its base directory ---------------------------------
+
+_DIRS_THAT_LEAVE_THE_BASE = [
+    "C:/elsewhere",  # absolute on Windows; drive-qualified on every host
+    "C:elsewhere",  # drive-relative: a join takes C:'s working directory, not the base
+    "/elsewhere",  # rooted
+    "\\elsewhere",  # rooted, Windows spelling
+    "\\\\server\\share",  # UNC
+    "..",
+    "../elsewhere",
+    "environments/../../elsewhere",
+    "..\\elsewhere",
+    "...",  # Windows strips a part's trailing dots
+    ".. ",  # and trailing spaces
+]
+
+
+@pytest.mark.parametrize("dir_name", _DIRS_THAT_LEAVE_THE_BASE)
+def test_values_file_path_refuses_a_dir_that_leaves_the_base(tmp_path: Path, dir_name: str) -> None:
+    with pytest.raises(ValueError, match=r"\[environments\]\.dir .* must be a folder under"):
+        values_file_path(tmp_path, dir_name, "dev")
+
+
+def test_load_environment_values_refuses_a_dir_that_leaves_the_base(tmp_path: Path) -> None:
+    """The load goes through the same rule, so it never reads a value file outside the base."""
+    with pytest.raises(ValueError, match="must be a folder under"):
+        load_environment_values(
+            base_dir=tmp_path, dir_name="../elsewhere", environment="dev", environ={}
+        )
+
+
+@pytest.mark.parametrize(
+    "environment", ["../dev", "..\\dev", "a/b", "C:dev", "dev:stream", "/dev", "", "dev env"]
+)
+def test_values_file_path_refuses_an_environment_the_validator_would_refuse(
+    tmp_path: Path, environment: str
+) -> None:
+    """The name is held to the ``[ai].environment`` alphabet, so a raw ``--env`` that never met the
+    settings validator cannot carry a separator, a drive or a stream name into the join."""
+    with pytest.raises(ValueError, match="must be a non-empty name of letters"):
+        values_file_path(tmp_path, "environments", environment)
+
+
+@pytest.mark.parametrize(
+    ("dir_name", "environment", "parts"),
+    [
+        ("environments", "dev", ("environments", "dev.toml")),
+        ("envs/sub", "prod", ("envs", "sub", "prod.toml")),
+        ("./environments", "staging", ("environments", "staging.toml")),
+        ("", "dev", ("dev.toml",)),
+        ("environments", "..", ("environments", "...toml")),  # a file name, not a parent
+        ("environments", "qa.v2_x-1", ("environments", "qa.v2_x-1.toml")),
+    ],
+)
+def test_values_file_path_takes_a_folder_under_the_base(
+    tmp_path: Path, dir_name: str, environment: str, parts: tuple[str, ...]
+) -> None:
+    """The control: every folder under the base, and every name the settings validator admits."""
+    assert values_file_path(tmp_path, dir_name, environment) == tmp_path.joinpath(*parts)
+
+
+def test_serve_and_supervise_refuse_a_dir_that_leaves_the_base(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The start check both commands make before they vet the value file refuses with exit-ready
+    ``None`` and prints why, rather than raising a traceback."""
+    from messagefoundry.__main__ import _value_file_or_refusal
+
+    assert _value_file_or_refusal(tmp_path, "../elsewhere", "dev", fleet="Fleet refused.") is None
+    err = capsys.readouterr().err
+    assert err.startswith("error: refusing to start: [environments].dir '../elsewhere'")
+    assert err.rstrip().endswith("Fleet refused.")
+    assert _value_file_or_refusal(tmp_path, "environments", "dev") == (
+        tmp_path / "environments" / "dev.toml"
+    )
+
+
+def test_project_root_env_file_check_refuses_a_dir_that_leaves_the_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The offline ``--project-root`` check states the file through the same rule."""
+    from messagefoundry.__main__ import _check_env_file_present
+
+    config = tmp_path / "cfg"
+    config.mkdir()
+    _write(
+        config,
+        """
+        from messagefoundry import outbound, MLLP, env
+        outbound("OB", MLLP(host=env("peer_host"), port=2700))
+        """,
+    )
+    assert _check_env_file_present(str(config), tmp_path, "dev", "../elsewhere") == 2
+    assert "must be a folder under" in capsys.readouterr().err
 
 
 # --- WS-1: anchoring environments/<env>.toml to a project root (ADR 0017) --------------------------
