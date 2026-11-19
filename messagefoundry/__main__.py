@@ -8477,11 +8477,14 @@ def _store_key_configured(settings: ServiceSettings) -> bool:
 
 def _unread_key_text(settings: ServiceSettings) -> str:
     """The refusal text when the gate returns ``KEYLESS_REFUSED_BY_UNREAD_KEY``: which key source the
-    pinned ``[store].key_provider`` reads, and that the one that is set would be ignored (#2077)."""
+    pinned ``[store].key_provider`` reads, and that the one that is set would be ignored (#2077), or
+    that a retired key is set with no active key (BACKLOG #5310, #5308)."""
+    from messagefoundry.store.base import retired_without_active_refusal
     from messagefoundry.store.keyprovider import unread_key_refusal
 
     return (
         unread_key_refusal(settings.store)
+        or retired_without_active_refusal(settings.store)
         or "[store].key_provider does not read the key that is set."
     )
 
@@ -8542,16 +8545,21 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
     A key that IS set but that a pinned ``[store].key_provider`` does not read returns
     ``KEYLESS_REFUSED_BY_UNREAD_KEY`` before the opt-out is consulted (BACKLOG #2077). No opt-out
     waives it: the settings name a key, so a keyless open is not what anyone configured.
-    ``open_store`` refuses the same case, through ``store.base._checked_active_key``."""
+    ``open_store`` refuses the same case, through ``store.base._checked_active_key``. So does a
+    retired key with no active key, by the same return (BACKLOG #5310, #5308)."""
     from messagefoundry.config.settings import (
         KEYLESS_REFUSED_BY_UNREAD_KEY,
         keyless_opt_out_refusal,
     )
+    from messagefoundry.store.base import retired_without_active_refusal
     from messagefoundry.store.keyprovider import unread_key_refusal
 
     if _store_key_configured(settings):
         return None
-    if unread_key_refusal(settings.store) is not None:
+    if (
+        unread_key_refusal(settings.store) is not None
+        or retired_without_active_refusal(settings.store) is not None
+    ):
         return KEYLESS_REFUSED_BY_UNREAD_KEY
     return keyless_opt_out_refusal(settings.store, settings.security)
 

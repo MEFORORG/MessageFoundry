@@ -12,7 +12,13 @@ from __future__ import annotations
 
 import pytest
 
-from messagefoundry.config.settings import StoreSettings
+from messagefoundry.__main__ import _keyless_store_gate, _unread_key_text
+from messagefoundry.config.settings import (
+    KEYLESS_REFUSED_BY_UNREAD_KEY,
+    SecuritySettings,
+    ServiceSettings,
+    StoreSettings,
+)
 from messagefoundry.store import crypto
 from messagefoundry.store.base import (
     StoreCipherConfigError,
@@ -28,19 +34,6 @@ from messagefoundry.store.crypto import (
     make_cipher,
 )
 
-
-@pytest.fixture(autouse=True)
-def _no_ambient_store_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The runner's own environment must not supply a store key to the settings under test.
-    for name in (
-        "MEFOR_STORE_ENCRYPTION_KEY",
-        "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED",
-        "MEFOR_STORE_ENCRYPTION_KEY_FILE",
-        "MEFOR_STORE_KEY_PROVIDER",
-    ):
-        monkeypatch.delenv(name, raising=False)
-
-
 # --- make_cipher (BACKLOG #5310) ---------------------------------------------------------------
 
 
@@ -52,10 +45,10 @@ def test_make_cipher_refuses_retired_keys_with_no_active_key(active: str | None)
 
 
 def test_make_cipher_with_no_key_at_all_is_still_the_identity_cipher() -> None:
-    # The control: the refusal is about the retired key, not the missing active one. Empty retired
-    # entries are not keys, as they never were.
+    # The control: the refusal is about the retired key, not the missing active one. Blank retired
+    # entries are not keys, here as in the settings' comma split.
     assert isinstance(make_cipher(None), IdentityCipher)
-    assert isinstance(make_cipher("", ["", ""]), IdentityCipher)
+    assert isinstance(make_cipher("", ["", "  "]), IdentityCipher)
 
 
 def test_a_key_that_fails_to_decode_leaves_the_decoded_keys_wiped(
@@ -73,6 +66,28 @@ def test_a_key_that_fails_to_decode_leaves_the_decoded_keys_wiped(
     with pytest.raises(ValueError, match="must be valid base64"):
         make_cipher(generate_key(), [generate_key(), "not base64!"])
     # The active key and the first retired key decoded before the third failed.
+    assert len(decoded) == 2
+    assert all(len(buf) == 32 and not any(buf) for buf in decoded)
+
+
+def test_a_cipher_build_that_fails_leaves_the_decoded_keys_wiped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    decoded: list[bytearray] = []
+    real = crypto._decode_key
+
+    def recording(key_b64: str, name: str) -> bytearray:
+        buf = real(key_b64, name)
+        decoded.append(buf)
+        return buf
+
+    def failing(*_args: object, **_kwargs: object) -> None:
+        raise MemoryError("synthetic")
+
+    monkeypatch.setattr(crypto, "_decode_key", recording)
+    monkeypatch.setattr(crypto, "AesGcmCipher", failing)
+    with pytest.raises(MemoryError):
+        make_cipher(generate_key(), [generate_key()])
     assert len(decoded) == 2
     assert all(len(buf) == 32 and not any(buf) for buf in decoded)
 
@@ -122,3 +137,37 @@ def test_resolve_decrypt_keys_still_returns_the_keyring_when_an_active_key_is_se
     assert resolve_active_key(keyless) is None
     assert resolve_decrypt_keys(keyless) == []
     assert isinstance(build_store_cipher(keyless), IdentityCipher)
+
+
+def test_blank_retired_settings_are_no_retired_key_at_any_seam() -> None:
+    # The settings seam and make_cipher read a blank entry alike: no key, so keyless as before.
+    keyless = StoreSettings(encryption_keys_retired=" , ")
+    assert resolve_active_key(keyless) is None
+    assert resolve_decrypt_keys(keyless) == []
+    assert isinstance(build_store_cipher(keyless), IdentityCipher)
+
+
+def test_under_vault_transit_a_retired_key_with_no_local_active_key_is_not_refused() -> None:
+    # Transit's store cipher reads no local key, so its open never meets the identity cipher; the
+    # key seam keeps its earlier answer there, and the DR keyring is the retired key alone.
+    retired = generate_key()
+    store = StoreSettings(cipher_provider="vault_transit", encryption_keys_retired=retired)
+    assert resolve_active_key(store) is None
+    assert resolve_decrypt_keys(store) == [retired]
+
+
+def test_the_start_gate_refuses_before_the_open_whatever_the_opt_out_says() -> None:
+    # serve, supervise and provision-admin take the gate's verdict before the store opens, so the
+    # operator reads the cause rather than the keyless opt-out's remedy, which would not help.
+    opted_out = SecuritySettings(
+        allow_unencrypted_phi=True, allow_unencrypted_phi_under_strict_enforcement=True
+    )
+    store = StoreSettings(encryption_keys_retired=generate_key())
+    for security in (SecuritySettings(), opted_out):
+        settings = ServiceSettings(store=store, security=security)
+        assert _keyless_store_gate(settings) == KEYLESS_REFUSED_BY_UNREAD_KEY
+        assert _unread_key_text(settings) == RETIRED_WITHOUT_ACTIVE
+    # The control: with no retired key the gate does not take this branch.
+    assert _keyless_store_gate(ServiceSettings(store=StoreSettings())) != (
+        KEYLESS_REFUSED_BY_UNREAD_KEY
+    )
