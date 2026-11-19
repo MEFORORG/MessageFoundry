@@ -164,10 +164,10 @@ class ServiceEnvPosture:
     #: Whether a refused name's value, empty in its own string, runs on into the next strings of
     #: its registry value, so the refusal can say to remove those strings too.
     value_runs_on: bool = False
-    #: Whether a string read as part of such a value sets ``MEFOR_SECRETS_DIRECTORY`` on its first
-    #: line, as ``MEFOR_SECRETS_DIRECTORY==`` does (:func:`_continues_string`). NSSM may read that
-    #: string as its own variable, so the refusal must not say to remove it, nor that the lists set
-    #: no secrets directory.
+    #: Whether a string read as part of a refused value that runs on sets
+    #: ``MEFOR_SECRETS_DIRECTORY`` on its first line, as ``MEFOR_SECRETS_DIRECTORY==`` does
+    #: (:func:`_continues_string`). NSSM may read that string as its own variable, so the refusal
+    #: must not say to remove every such string, nor that the lists set no secrets directory.
     directory_joined: bool = False
 
     @property
@@ -414,6 +414,9 @@ class _Variable:
     #: Whether its value, blank in its own string, takes the strings after it, which
     #: :func:`_variables` joins to that string.
     runs_on: bool = False
+    #: Whether it runs on, and the string its value takes first sets ``MEFOR_SECRETS_DIRECTORY``
+    #: on its first line (:func:`_sets_directory_first`).
+    holds_directory: bool = False
 
 
 def _read_string(
@@ -535,6 +538,14 @@ def _continues_string(entry: str) -> bool:
     return (could_be_key or padded) and _line_start(first) is None
 
 
+def _sets_directory_first(entry: str) -> bool:
+    """Whether the first non-blank line of ``entry`` sets ``MEFOR_SECRETS_DIRECTORY``, without
+    regard to case, as Windows compares names."""
+    first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), "")
+    written, equals, _rest = first.partition("=")
+    return bool(equals) and written.strip().upper() == _DIRECTORY_VARIABLE
+
+
 def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     """The variables each registry string sets, read a line at a time (vault BACKLOG #5394).
 
@@ -568,18 +579,9 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     not, and a value that is not empty in its own string does not run on, so a path-form OIDC
     key above an item of PEM armour is still a path. Each string is read alone
     first to decide this, and a joined group is read once more, so the work stays linear."""
-    return _read_groups(_groups(entries))
-
-
-#: One group of :func:`_groups`: its registry value, its strings, its first string read alone,
-#: and for each string but the last the variable it ends on, whose empty value the next string
-#: continues.
-_Group = tuple[str, list[str], list[_Variable], list[_Variable]]
-
-
-def _groups(entries: Sequence[tuple[str, str]]) -> list[_Group]:
-    """The registry strings of ``entries`` as :func:`_variables` joins them."""
-    groups: list[_Group] = []
+    # Each group: its registry value, its strings, its first string read alone, and for each
+    # string but the last the variable it ends on, whose empty value the next string continues.
+    groups: list[tuple[str, list[str], list[_Variable], list[_Variable]]] = []
     ending: _Variable | None = None
     for where, entry in entries:
         alone, ends = _read_string(where, entry)
@@ -591,19 +593,6 @@ def _groups(entries: Sequence[tuple[str, str]]) -> list[_Group]:
         else:
             groups.append((where, [entry], alone, []))
         ending = ends
-    return groups
-
-
-def _sets_directory_first(entry: str) -> bool:
-    """Whether the first non-blank line of ``entry`` sets ``MEFOR_SECRETS_DIRECTORY``, without
-    regard to case, as Windows compares names."""
-    first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), "")
-    written, equals, _rest = first.partition("=")
-    return bool(equals) and written.strip().upper() == _DIRECTORY_VARIABLE
-
-
-def _read_groups(groups: Sequence[_Group]) -> list[_Variable]:
-    """The variables :func:`_groups`' groups set, each joined group read once as one string."""
     read: list[_Variable] = []
     for where, strings, alone, endings in groups:
         if len(strings) == 1:
@@ -627,7 +616,11 @@ def _read_groups(groups: Sequence[_Group]) -> list[_Variable]:
             line_on_string = None if local == 1 else local
             key = (index, variable.written, line_on_string, variable.broken)
             ran_on = key in ran and bool(variable.value.strip())
-            read.append(replace(variable, line=line_on_string, runs_on=ran_on))
+            # Its value takes the next string's first line, which may set the directory.
+            holds = ran_on and _sets_directory_first(strings[index + 1])
+            read.append(
+                replace(variable, line=line_on_string, runs_on=ran_on, holds_directory=holds)
+            )
     return read
 
 
@@ -716,8 +709,7 @@ def read_service_env_posture(
                 else str(exc)
             ),
         )
-    groups = _groups(entries)
-    variables = _read_groups(groups)
+    variables = _variables(entries)
     found = _names(variables)
     empty, unplain = _value_entry_shapes(variables)
     return ServiceEnvPosture(
@@ -731,9 +723,7 @@ def read_service_env_posture(
         unplain_value_names=unplain,
         value_runs_on=any(variable.runs_on and _names([variable]) for variable in variables),
         directory_joined=any(
-            _sets_directory_first(string)
-            for _where, strings, _alone, _ends in groups
-            for string in strings[1:]
+            variable.holds_directory and _names([variable]) for variable in variables
         ),
     )
 
@@ -852,10 +842,15 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
         if posture.directory_joined:
             steps[-1] += (
                 ". At least one string read here as part of such a value sets "
-                f"{_DIRECTORY_VARIABLE}, which NSSM may read as a variable of its own rather than "
-                "as part of that value, so keep it: check "
-                f"that it reads {_DIRECTORY_VARIABLE}=<path>, naming the secrets directory by its "
-                "path, and remove only the other strings"
+                f"{_DIRECTORY_VARIABLE}, which NSSM may instead read as a variable of its own, so "
+                "this reading does not take it as naming the secrets directory. Keep one "
+                f"{_DIRECTORY_VARIABLE} entry in the service's lists, written as "
+                f"{_DIRECTORY_VARIABLE}=<path> naming the secrets directory by its path, and "
+                "remove the other strings. `nssm set` replaces a whole list, so read it first "
+                "with `nssm get`, running the service's own nssm.exe by its full path: see "
+                'docs/SERVICE.md, "Start / stop / status". Where no secrets directory exists '
+                'yet, the bullet "The other secrets: a secrets directory" under docs/SERVICE.md, '
+                '"Protect the store encryption key at rest", says how the directory is created'
             )
     if keys:
         steps.append(
@@ -910,19 +905,9 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
             )
             cite += ' and "[environments]"'
         steps.append(f"{step}. {cite}")
-        if _DIRECTORY_VARIABLE not in posture.listed and posture.directory_joined:
-            # The directory's own string was read as part of a refused value, so the lists may
-            # still set it, and "add it back" would be false.
-            steps.append(
-                f"A string of the service's lists that sets {_DIRECTORY_VARIABLE} is read here as "
-                "part of the refused value above it, so this reading does not take it as naming "
-                f"the secrets directory. Keep that entry, written as {_DIRECTORY_VARIABLE}=<path> "
-                "naming the secrets directory by its path, beside the service's other entries. "
-                "`nssm set` replaces that whole list, so read it first with `nssm get`, running "
-                "the service's own nssm.exe by its full path, and pass back every entry but those "
-                'refused above: see docs/SERVICE.md, "Start / stop / status"'
-            )
-        elif _DIRECTORY_VARIABLE not in posture.listed:
+        if _DIRECTORY_VARIABLE not in posture.listed and not posture.directory_joined:
+            # A joined directory string is covered by the run-on step above: the lists may still
+            # set it, so "add it back" would be false there.
             # Two routes, because install-service.ps1 refuses an existing directory the service
             # does not name: an operator whose later `nssm set` dropped the variable must not be
             # sent to the installer, which would say to remove the directory holding the files.

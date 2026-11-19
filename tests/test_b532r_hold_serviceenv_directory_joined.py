@@ -23,6 +23,7 @@ from messagefoundry.serviceenv import (
 )
 
 _EXTRA = "Parameters\\AppEnvironmentExtra"
+_PLAIN = "Parameters\\AppEnvironment"
 
 
 @dataclass
@@ -39,13 +40,20 @@ class _Probe:
         return list(self.entries)
 
 
+def _read_pairs(pairs: list[tuple[str, str]]) -> ServiceEnvPosture:
+    return read_service_env_posture(probe=_Probe(pairs), environ={})
+
+
 def _read(entries: list[str]) -> ServiceEnvPosture:
-    return read_service_env_posture(probe=_Probe([(_EXTRA, e) for e in entries]), environ={})
+    return _read_pairs([(_EXTRA, e) for e in entries])
 
 
 _KEEP = (
     "At least one string read here as part of such a value sets MEFOR_SECRETS_DIRECTORY, which "
-    "NSSM may read as a variable of its own rather than as part of that value, so keep it"
+    "NSSM may instead read as a variable of its own, so this reading does not take it as naming "
+    "the secrets directory. Keep one MEFOR_SECRETS_DIRECTORY entry in the service's lists, "
+    "written as MEFOR_SECRETS_DIRECTORY=<path> naming the secrets directory by its path, and "
+    "remove the other strings"
 )
 
 
@@ -55,21 +63,40 @@ def test_a_joined_directory_entry_is_kept_by_the_remedy(refused: str, directory:
     posture = _read([refused, directory])
     refusal = service_env_refusal(posture)
     assert refusal is not None  # the join is not narrowed: this still refuses
-    assert posture.value_runs_on
+    assert posture.value_runs_on and posture.directory_joined
     assert _KEEP in refusal
-    assert "remove only the other strings" in refusal
+    assert refusal.count("Keep one MEFOR_SECRETS_DIRECTORY entry") == 1
     assert "The service's lists set no MEFOR_SECRETS_DIRECTORY" not in refusal
     assert "add MEFOR_SECRETS_DIRECTORY naming that existing path back" not in refusal
 
 
-def test_a_value_name_with_a_joined_directory_says_to_keep_that_entry() -> None:
-    refusal = service_env_refusal(_read(["MEFOR_VALUE_A=", "MEFOR_SECRETS_DIRECTORY=="]))
+def test_a_directory_set_elsewhere_too_is_kept_once() -> None:
+    posture = _read_pairs(
+        [
+            (_PLAIN, "MEFOR_SECRETS_DIRECTORY=C:\\synthetic-secrets"),
+            (_EXTRA, "MEFOR_VALUE_A="),
+            (_EXTRA, "MEFOR_SECRETS_DIRECTORY=="),
+        ]
+    )
+    refusal = service_env_refusal(posture)
+    assert refusal is not None and posture.directory_joined
+    assert _KEEP in refusal
+
+
+def test_a_directory_under_a_value_that_is_not_refused_is_not_reported_as_joined() -> None:
+    """A path-form OIDC key is not refused, so a directory string joined to it is not read as
+    part of a refused value, and the remedy must not say it is."""
+    posture = _read_pairs(
+        [
+            (_EXTRA, "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY="),
+            (_EXTRA, "MEFOR_SECRETS_DIRECTORY=="),
+            (_PLAIN, "MEFOR_VALUE_B=1"),
+        ]
+    )
+    assert not posture.directory_joined
+    refusal = service_env_refusal(posture)
     assert refusal is not None
-    assert (
-        "A string of the service's lists that sets MEFOR_SECRETS_DIRECTORY is read here as part "
-        "of the refused value above it, so this reading does not take it as naming the secrets "
-        "directory. Keep that entry, written as MEFOR_SECRETS_DIRECTORY=<path>"
-    ) in refusal
+    assert "sets MEFOR_SECRETS_DIRECTORY, which NSSM may instead read" not in refusal
 
 
 def test_with_no_directory_joined_the_old_remedies_stand() -> None:
@@ -79,8 +106,8 @@ def test_with_no_directory_joined_the_old_remedies_stand() -> None:
     assert value_only is not None
     assert "The service's lists set no MEFOR_SECRETS_DIRECTORY" in value_only
     run_on = _read([f"{KEY_CLASS_NAMES[0]}=", "abc=="])
-    assert run_on.value_runs_on
+    assert run_on.value_runs_on and not run_on.directory_joined
     refusal = service_env_refusal(run_on)
     assert refusal is not None
     assert "so remove those strings with it" in refusal
-    assert _KEEP not in refusal
+    assert "Keep one MEFOR_SECRETS_DIRECTORY entry" not in refusal

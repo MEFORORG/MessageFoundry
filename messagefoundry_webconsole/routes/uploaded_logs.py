@@ -213,7 +213,7 @@ BROWSE_LOCKED_NOTICE = f"{_BROWSE_LEAD} {_LOCKED_CAUSE}"
 RESEND_LOCKED_NOTICE = f"{_RESEND_LEAD} {_LOCKED_CAUSE}"
 DELETE_LOCKED_NOTICE = f"{_DELETE_LEAD} {_LOCKED_CAUSE}"
 
-#: Why a damaged file is refused, with no key or command named, since none repairs it. It promises
+#: Why a damaged file is refused, with no command named, since none repairs it. It promises
 #: no removal, as the engine's text does not: some damaged files are refused by the delete too.
 _DAMAGED_CAUSE = (
     "The engine found the file damaged, so it does not read or serve it. No encryption key and no "
@@ -225,13 +225,13 @@ _DAMAGED_CAUSE = (
 #: takes that command's stance, that the prior key stays until such a sidecar is fixed or
 #: deliberately removed. It names no command, since no damaged notice does.
 _PRIOR_KEY = (
-    "At least a damaged file whose record of its details is larger than the engine reads, is not "
-    "UTF-8 text, or is plaintext too long to seal may still hold a value under a prior store "
-    "encryption key. An "
-    "administrator should not retire a prior key until each such file is fixed, for example by "
-    "restoring it from a backup, or is deliberately removed."
+    "Where the store has had an encryption key, at least a damaged file whose record of its "
+    "details is larger than the engine reads, is not UTF-8 text, or is plaintext too long to seal "
+    "may still hold a value under a prior key. An administrator should not retire a prior key "
+    "until each such file is fixed, for example by restoring it from a backup, or is deliberately "
+    "removed."
 )
-_MAY_DELETE = "It may be deleted, but the engine may refuse that too."
+_MAY_DELETE = "The file may be deleted, but the engine may refuse that too."
 BROWSE_DAMAGED_NOTICE = f"{_BROWSE_LEAD} {_DAMAGED_CAUSE} {_PRIOR_KEY} {_MAY_DELETE}"
 RESEND_DAMAGED_NOTICE = f"{_RESEND_LEAD} {_DAMAGED_CAUSE} {_PRIOR_KEY} {_MAY_DELETE}"
 #: A refused delete is not answered with advice to delete. The retention prune removes only some
@@ -239,7 +239,7 @@ RESEND_DAMAGED_NOTICE = f"{_RESEND_LEAD} {_DAMAGED_CAUSE} {_PRIOR_KEY} {_MAY_DEL
 #: is a link or not a regular file is skipped by the prune, and a body that is a directory is one
 #: its unlink refuses (BACKLOG #5388 added item 1 follow-up; docs/PHI.md section 3).
 DELETE_DAMAGED_NOTICE = (
-    f"{_DELETE_LEAD} {_DAMAGED_CAUSE} {_PRIOR_KEY} Deleting it again is refused the same way. "
+    f"{_DELETE_LEAD} {_DAMAGED_CAUSE} {_PRIOR_KEY} Deleting the file again is refused the same way. "
     "Where uploaded-file retention is on, the engine removes some damaged files once they are "
     "old enough on disk, but not every one. At least a file that is a link or is not a regular "
     "file, or whose body is a folder, stays until an administrator removes it on the server."

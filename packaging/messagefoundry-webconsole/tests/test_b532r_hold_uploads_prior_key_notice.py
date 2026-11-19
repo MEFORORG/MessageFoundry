@@ -20,7 +20,8 @@ _DAMAGED = (ul.BROWSE_DAMAGED_NOTICE, ul.RESEND_DAMAGED_NOTICE, ul.DELETE_DAMAGE
 def test_every_damaged_notice_keeps_the_prior_key_until_the_sidecar_is_settled(notice: str) -> None:
     assert "larger than the engine reads" in notice
     assert "plaintext too long to seal" in notice
-    assert "may still hold a value under a prior store encryption key" in notice
+    assert "Where the store has had an encryption key, at least a damaged file" in notice
+    assert "may still hold a value under a prior key" in notice
     assert (
         "An administrator should not retire a prior key until each such file is fixed, for "
         "example by restoring it from a backup, or is deliberately removed."
@@ -31,4 +32,4 @@ def test_every_damaged_notice_keeps_the_prior_key_until_the_sidecar_is_settled(n
 
 @pytest.mark.parametrize("notice", _DAMAGED[:2])
 def test_the_delete_invitation_follows_the_prior_key_stance(notice: str) -> None:
-    assert notice.index("retire a prior key") < notice.index("It may be deleted")
+    assert notice.index("retire a prior key") < notice.index("The file may be deleted")
