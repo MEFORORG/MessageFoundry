@@ -93,3 +93,97 @@ async def test_a_slow_peer_still_taking_the_queue_is_not_cut_off(
     finally:
         server.close()
         await server.wait_closed()
+
+
+async def test_a_cancelled_stop_still_takes_the_connection_down(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``asyncio.wait`` does not pass a cancellation on to the task it waits for, so stop() does:
+    a caller that cancels stop() (a timeout around it, say) leaves no connection writing behind it,
+    and every queued job's closed-loop slot is released."""
+    monkeypatch.setattr(sender, "_STOP_HARD_MARGIN_S", 30.0)
+    held: list[asyncio.StreamWriter] = []
+    accepted = asyncio.Event()
+
+    async def deaf(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        held.append(writer)
+        accepted.set()
+
+    server = await asyncio.start_server(deaf, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    metrics = LiveMetrics(Counters(), Histogram(), Histogram())
+    conn = sender.PersistentConnection(
+        "127.0.0.1", port, Correlator(1000, metrics), metrics, queue_max=1000
+    )
+    released: list[int] = []
+    count = 500
+    try:
+        conn.start()
+        await asyncio.wait_for(accepted.wait(), timeout=5.0)
+        for seq in range(1, count + 1):
+            assert conn.submit_nowait(
+                Outgoing(seq, "ADT", f"X{seq}", _MSG), lambda: released.append(1)
+            )
+        await asyncio.sleep(0.5)  # the writer blocks in drain with most of the queue unwritten
+        stopping = asyncio.create_task(conn.stop(0.1))
+        await asyncio.sleep(0.3)
+        stopping.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(stopping, timeout=10.0)
+        assert conn._task is not None and conn._task.done()
+        assert conn.queued == 0
+        assert len(released) == count, "a queued or in-flight job kept its slot"
+    finally:
+        for writer in held:
+            writer.transport.abort()
+        server.close()
+        await server.wait_closed()
+
+
+async def test_a_grace_longer_than_the_margin_is_not_cut_short(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After a long drain, the ACK grace still runs in full. The window used to drop to the bare
+    margin once the queue had moved, so a grace longer than the margin was cut short."""
+    from messagefoundry.mllpcodec import frame
+
+    monkeypatch.setattr(sender, "_STOP_HARD_MARGIN_S", 0.3)
+    count = 200  # read slowly: a drain of a couple of seconds, past grace plus the margin
+    ack = frame("MSH|^~\\&|B|A|C|D|20260101||ACK|A1|P|2.5.1\rMSA|AA|X1\r")
+
+    async def slow_then_late_acks(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        seen = 0
+        while seen < count:
+            chunk = await reader.read(131072)
+            if not chunk:
+                return
+            seen += chunk.count(b"\x1c")
+            await asyncio.sleep(0.02)
+        await asyncio.sleep(0.6)  # longer than the margin, shorter than the grace
+        writer.write(ack * count)
+        await writer.drain()
+        await reader.read()
+
+    server = await asyncio.start_server(slow_then_late_acks, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    metrics = LiveMetrics(Counters(), Histogram(), Histogram())
+    conn = sender.PersistentConnection(
+        "127.0.0.1", port, Correlator(1000, metrics), metrics, queue_max=1000
+    )
+    try:
+        conn.start()
+        for seq in range(1, count + 1):
+            assert conn.submit_nowait(Outgoing(seq, "ADT", f"X{seq}", _MSG))
+        for _ in range(100):
+            if conn.up:
+                break
+            await asyncio.sleep(0.02)
+        await asyncio.wait_for(conn.stop(1.0), timeout=60.0)
+        assert metrics.counters.sent == count
+        assert metrics.counters.acked == count
+        assert metrics.counters.timeouts == 0
+    finally:
+        server.close()
+        await server.wait_closed()

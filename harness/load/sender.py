@@ -204,30 +204,43 @@ class PersistentConnection:
         # A hard deadline (BACKLOG #5951): once the connection has made no progress for a window,
         # the socket is aborted, which ends a stalled drain, read or close, and the task is
         # cancelled, which ends a stalled connect. Progress is the queue shrinking, so a healthy
-        # peer that is still taking a long queue is never cut off.
-        window = grace + _STOP_HARD_MARGIN_S
+        # peer that is still taking a long queue is never cut off. Every window covers the whole
+        # ACK grace, so a grace longer than the margin is never cut short after the queue drains.
+        window = max(grace, _STOP_HARD_MARGIN_S) + _STOP_HARD_MARGIN_S
         queued = self._queue.qsize()
-        while True:
-            done, _ = await asyncio.wait({task}, timeout=window)
-            if done:
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=window)
+                if done:
+                    break
+                if self._queue.qsize() < queued:
+                    queued = self._queue.qsize()
+                    continue
+                log.warning(
+                    "load connection %s:%d made no progress for %.1fs while stopping; aborting it",
+                    self._host,
+                    self._port,
+                    window,
+                )
+                self._hard_stop(task)
                 break
-            if self._queue.qsize() < queued:
-                queued = self._queue.qsize()
-                window = _STOP_HARD_MARGIN_S
-                continue
-            log.warning(
-                "load connection %s:%d made no progress for %.1fs while stopping; aborting it",
-                self._host,
-                self._port,
-                window,
-            )
-            if self._writer is not None:
-                self._writer.transport.abort()
-            task.cancel()
-            break
+        except asyncio.CancelledError:
+            # stop() itself was cancelled: asyncio.wait does not pass that on, so take the
+            # connection down here, as awaiting the task used to, then re-raise.
+            self._hard_stop(task)
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            self._release_unsent()
+            raise
         with contextlib.suppress(asyncio.CancelledError):
             await task
         self._release_unsent()
+
+    def _hard_stop(self, task: asyncio.Task[None]) -> None:
+        """Abort the open socket, ending a stalled drain, read or close, and cancel the task."""
+        if self._writer is not None:
+            self._writer.transport.abort()
+        task.cancel()
 
     def _release_unsent(self) -> None:
         """Release the closed-loop slot of each job a hard stop left unwritten, and say how many."""

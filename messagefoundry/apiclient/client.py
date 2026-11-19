@@ -226,8 +226,10 @@ class StepUpRequired(ApiError):
     handler answered it: there was none, as on a :meth:`EngineClient.for_polling` client, or it
     declined, or the retry after it was refused again (BACKLOG #5945).
 
-    A caller holding such a client can re-prove the password on its own GUI thread and retry, rather
-    than guess from the status alone, which a role or scope refusal shares. A subclass of
+    It lets a caller tell a step-up refusal from a role or scope refusal, which shares the status.
+    For a session-window gate the caller can re-prove the password on its own GUI thread and retry.
+    It carries no ``X-Step-Up-Action``, so for a per-action gate (ADR 0077) a re-proof made from it
+    binds no action, and the retry is refused again. A subclass of
     :class:`ApiError`, so a caller that catches only that still sees the refusal. A refusal that
     carries ``X-Step-Up-Via: idp`` raises :class:`IdpStepUpRequired` instead."""
 
@@ -1030,9 +1032,12 @@ class EngineClient:
         :class:`_TokenCell` — but has its **own** ``httpx.Client`` connection pool and **no
         step-up/MFA handlers**, so background reader threads never contend on the main-thread
         client's pool or its mutable auth state. That separation is what makes the console
-        concurrency-safe: the handler-bearing, token-mutating primary client stays **main-thread
-        only** (it serves the modal sign-in/step-up/MFA flows and user actions), while this read-only
-        client is the only one shared across worker threads — and sharing *it* is safe because it
+        concurrency-safe: once its step-up/MFA handlers are registered, the handler-bearing,
+        token-mutating primary client stays **main-thread only** (it serves the modal step-up/MFA
+        flows and user actions), while this read-only client is the only one shared across worker
+        threads. The one exception is the harness sign-in dialog, which runs ``providers()`` and
+        ``login()`` on a worker thread (BACKLOG #5946) before any handler is registered, while
+        nothing else uses the client. Sharing *this* client is safe because it
         never WRITES the token, its 403→prompt retry branches are inert (no handlers), and
         ``httpx.Client`` is itself thread-safe for concurrent requests.
 

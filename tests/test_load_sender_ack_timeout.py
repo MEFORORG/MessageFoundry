@@ -88,6 +88,18 @@ def test_an_unset_ack_timeout_keeps_waiting_as_before() -> None:
     assert pool._conns[0]._ack_timeout is None
 
 
+def test_a_nan_ack_timeout_is_refused_at_profile_load() -> None:
+    from harness.load.profile import LoadProfileError, load_profile_text
+
+    text = (
+        '[load]\nname = "p"\n[[load.target]]\nname = "t"\nack_timeout_s = nan\n'
+        '[load.mix]\n"ADT" = 1.0\n[[load.phase]]\nname = "r"\nkind = "sustained"\n'
+        'loop = "open"\nrate_start = 1.0\nduration_s = 1.0\n'
+    )
+    with pytest.raises(LoadProfileError, match="ack_timeout_s"):
+        load_profile_text(text)
+
+
 @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan")])
 def test_a_non_positive_ack_timeout_is_refused(bad: float) -> None:
     metrics = LiveMetrics(Counters(), Histogram(), Histogram())
