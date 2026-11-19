@@ -38,9 +38,11 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
+import psutil
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -234,6 +236,23 @@ def test_the_exit_code_table_matches_prune_merged() -> None:
     )
 
 
+def test_the_runners_own_exit_code_is_not_one_of_prune_merged() -> None:
+    """The runner's deadline-stop code must mean only that.
+
+    It replaces a 0 and nothing else, so its value need not rank against the others, but a value
+    prune-merged.ps1 also returns would make a log's exit line ambiguous.
+    """
+    declared = {
+        int(m.group(1))
+        for m in re.finditer(
+            r"^\$EXIT_\w+\s*=\s*(\d+)", PRUNE.read_text(encoding="utf-8"), re.MULTILINE
+        )
+    }
+    found = re.search(r"^\$EXIT_DEADLINE = (\d+)", RUNNER.read_text(encoding="utf-8"), re.MULTILINE)
+    assert found, "run-daily-prune.ps1 no longer declares $EXIT_DEADLINE"
+    assert int(found.group(1)) not in declared, (found.group(1), sorted(declared))
+
+
 @requires_windows
 def test_json_registers_nothing() -> None:
     """A plan-only run must leave the task store untouched, under a name nothing else would claim."""
@@ -413,16 +432,24 @@ def test_an_unhandled_error_in_the_runner_still_writes_an_exit_line(tmp_path: Pa
     assert re.search(r"^=== exit 2 \(REFUSED", text.splitlines()[-1]), text
 
 
+# No deadline starts the prune child with `&`; a deadline starts it as a process waited on with a time
+# limit. The tests that pin how the child is started run under both.
+DEADLINES = pytest.mark.parametrize(
+    "deadline", [[], ["-StopAfterMinutes", "10"]], ids=["no-deadline", "deadline"]
+)
+
+
 @requires_windows
+@DEADLINES
 def test_the_prune_run_cannot_wait_on_a_credential_prompt_and_is_bracketed(
-    tmp_path: Path,
+    tmp_path: Path, deadline: list[str]
 ) -> None:
     """A scheduled run has nobody to answer a git credential prompt, so the child must not ask.
 
     A stub prune-merged.ps1 reports what it inherited. The markers either side of it are what tells a
     reader of a log that stops early whether it stopped inside that run.
     """
-    proc, text = run_copied_runner(tmp_path, "-RepoRoot", str(tmp_path))
+    proc, text = run_copied_runner(tmp_path, "-RepoRoot", str(tmp_path), *deadline)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert text is not None, proc.stderr
     lines = text.splitlines()
@@ -515,7 +542,7 @@ REFUSING_PRUNE_STUB = (
     "  exit 0\n"
     "}\n"
     '"stub refused"\n'
-    "exit 2\n"
+    "exit $(if ($env:T_PRUNE_EXIT) { [int]$env:T_PRUNE_EXIT } else { 2 })\n"
 )
 
 # A finished-worktree-removal.ps1 stand-in: every path comes back with the outcome $env:T_OUTCOME
@@ -544,10 +571,12 @@ REMOVING_HELPER_STUB = (
         (True, "DECLINED", True, 1),
         (True, "ORPHANED", False, 3),
         (True, "ORPHANED", True, 3),
+        # A tree the deadline left is a deadline stop, which never replaces the prune's 2.
+        (True, "NOT-REACHED", False, 2),
+        (True, "NOT-REACHED", True, 2),
         # Controls: nothing was attempted, so the prune's 2 stands.
         (True, "REFUSED", False, 2),
         (True, "REFUSED", True, 2),
-        (True, "NOT-REACHED", True, 2),
         (False, "WOULD-REMOVE", False, 2),
         (False, "WOULD-REMOVE", True, 2),
     ],
@@ -580,6 +609,37 @@ def test_the_exit_code_says_nothing_was_attempted_only_when_that_is_true(
     assert re.match(rf"=== exit {expected} \(", text.splitlines()[-1]), text
 
 
+@requires_windows
+@pytest.mark.parametrize(("throw", "expected"), [(False, 4), (True, 1)], ids=["clean", "throws"])
+def test_a_tree_the_deadline_left_turns_only_a_clean_run_into_4(
+    tmp_path: Path, throw: bool, expected: int
+) -> None:
+    """A deadline stop replaces a 0 and nothing else, an unhandled error after it included.
+
+    The prune exits 0 and every tree comes back NOT-REACHED: the run exits 4, DEADLINE. With the helper
+    then throwing, the trap's 1 is the code, since a real failure matters more than a partial run.
+    """
+    proc, text = run_copied_runner(
+        tmp_path,
+        "-RepoRoot",
+        str(tmp_path),
+        "-Apply",
+        "-RemoveFinishedClaudeWorktrees",
+        prune_stub=REFUSING_PRUNE_STUB,
+        extra={"finished-worktree-removal.ps1": REMOVING_HELPER_STUB},
+        env_extra={
+            "T_OUTCOME": "NOT-REACHED",
+            "T_PRUNE_EXIT": "0",
+            **({"T_THROW": "1"} if throw else {}),
+        },
+    )
+    assert text is not None, proc.stdout + proc.stderr
+    assert "--- prune-merged.ps1 exit 0 at " in text, text
+    assert "NOT-REACHED  X:/r/.claude/worktrees/a" in text, text
+    assert proc.returncode == expected, proc.stdout + proc.stderr
+    assert re.match(rf"=== exit {expected} \(", text.splitlines()[-1]), text
+
+
 # A stub that reports the location it ran in and what its -RepoRoot resolved to.
 WHERE_PRUNE_STUB = (
     "param([string]$RepoRoot, [switch]$Apply, [double]$IdleHours)\n"
@@ -589,11 +649,15 @@ WHERE_PRUNE_STUB = (
 
 
 @requires_windows
-def test_a_relative_repo_root_resolves_against_the_callers_location(tmp_path: Path) -> None:
+@DEADLINES
+def test_a_relative_repo_root_resolves_against_the_callers_location(
+    tmp_path: Path, deadline: list[str]
+) -> None:
     """A hand run after Set-Location resolves -RepoRoot . where the caller stands, not where pwsh began.
 
-    The prune child is started with `&`, which starts it in the caller's PowerShell location. A child
-    started any other way can start in the process directory and prune a different repository.
+    Without a deadline the prune child is started with `&`, which starts it in the caller's PowerShell
+    location; with one, it is started as a process whose working directory is set to that location. A
+    child started any other way can start in the process directory and prune a different repository.
     """
     runner, log_dir, env = copy_runner(tmp_path, WHERE_PRUNE_STUB)
     here = tmp_path / "here"
@@ -605,7 +669,8 @@ def test_a_relative_repo_root_resolves_against_the_callers_location(tmp_path: Pa
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            "Set-Location -LiteralPath $env:T_HERE; & $env:T_RUNNER -LogDir $env:T_LOGDIR -RepoRoot .",
+            "Set-Location -LiteralPath $env:T_HERE; & $env:T_RUNNER -LogDir $env:T_LOGDIR -RepoRoot . "
+            + " ".join(deadline),
         ],
         capture_output=True,
         text=True,
@@ -617,3 +682,249 @@ def test_a_relative_repo_root_resolves_against_the_callers_location(tmp_path: Pa
     text = read_log(log_dir)
     assert text is not None, proc.stdout + proc.stderr
     assert f"stub repo={here}" in text.splitlines(), text
+
+
+# A prune-merged.ps1 stand-in that hangs, as one waiting on a git prompt would. It prints a line on each
+# stream, starts a grandchild that holds the output pipes and writes its pid to $env:T_GRANDCHILD, then
+# sleeps. With -Json and $env:T_LIST_ONLY set, only the listing run hangs; the prune run returns at once.
+HANGING_PRUNE_STUB = (
+    "param([string]$RepoRoot, [switch]$Apply, [double]$IdleHours, [switch]$Json, [switch]$SkipGh)\n"
+    "if ($env:T_LIST_ONLY -and -not $Json) { 'stub prune done'; exit 0 }\n"
+    "'stub before the hang'\n"
+    "[Console]::Error.WriteLine('stub stderr before the hang')\n"
+    "$g = Start-Process -FilePath (Get-Process -Id $PID).Path -NoNewWindow -PassThru"
+    " -ArgumentList '-NoProfile', '-NonInteractive', '-Command', 'Start-Sleep -Seconds 40'\n"
+    "Set-Content -LiteralPath $env:T_GRANDCHILD -Value $g.Id\n"
+    "Start-Sleep -Seconds 40\n"
+    "'stub after the hang'\n"
+    "exit 0\n"
+)
+
+TIMED_OUT_LINE = re.compile(
+    r"^--- prune-merged\.ps1 TIMED OUT after \d+\.\d min, killed at \d\d:\d\d:\d\d ---$",
+    re.MULTILINE,
+)
+
+
+def _kill_if_alive(pid_file: Path, since: float) -> bool:
+    """True when the grandchild the hanging stub started was still running. Kills it either way."""
+    if not pid_file.is_file():
+        return False
+    try:
+        child = psutil.Process(int(pid_file.read_text(encoding="utf-8").strip()))
+        # A recycled pid names some other process; only a pwsh started after the test began is ours.
+        if "pwsh" not in child.name().lower() or child.create_time() < since:
+            return False
+        child.kill()
+    except psutil.Error:
+        return False
+    return True
+
+
+@requires_windows
+@pytest.mark.parametrize(
+    ("step", "apply", "expected"),
+    [(False, False, 4), (True, False, 4), (False, True, 1)],
+    ids=["prune-only", "with-step", "apply"],
+)
+def test_a_prune_run_past_the_deadline_is_killed_with_its_tree_and_the_run_still_exits(
+    tmp_path: Path, step: bool, apply: bool, expected: int
+) -> None:
+    """A hung prune-merged.ps1 used to run on into Task Scheduler's kill, which writes nothing.
+
+    With a 12-second deadline the stub is killed with its grandchild, the log keeps what it printed
+    before the hang, then the TIMED OUT line, any later step's SKIPPED line, and the exit line. A dry
+    run exits 4, DEADLINE. An -Apply prune killed part way attempted something and did not finish, so
+    it exits 1, as the trap does for one. On origin/main the child ran its full 40 seconds and exited 0.
+    """
+    grandchild = tmp_path / "grandchild.pid"
+    since = time.time() - 1
+    try:
+        proc, text = run_copied_runner(
+            tmp_path,
+            "-RepoRoot",
+            str(tmp_path),
+            "-StopAfterMinutes",
+            "0.2",
+            *(["-RemoveFinishedClaudeWorktrees"] if step else []),
+            *(["-Apply"] if apply else []),
+            prune_stub=HANGING_PRUNE_STUB,
+            extra={"finished-worktree-removal.ps1": REMOVING_HELPER_STUB} if step else None,
+            env_extra={"T_GRANDCHILD": str(grandchild), "T_OUTCOME": "REMOVED"},
+        )
+    finally:
+        grandchild_survived = _kill_if_alive(grandchild, since)
+    assert text is not None, proc.stdout + proc.stderr
+    assert grandchild.is_file(), f"the stub never reached its hang, so nothing was tested: {text}"
+    assert not grandchild_survived, f"the kill missed the stub's own child: {text}"
+    lines = text.splitlines()
+    assert "stub before the hang" in lines, text
+    assert "stub stderr before the hang" in lines, text
+    assert "stub after the hang" not in lines, text
+    assert TIMED_OUT_LINE.search(text), text
+    assert "--- prune-merged.ps1 exit " not in text, text
+    if step:
+        assert (
+            "=== finished .claude/worktrees: SKIPPED, prune-merged.ps1 was still running at the run's "
+            "deadline (stopAfter="
+        ) in text, text
+        assert "listed finished:" not in text, text
+    assert re.match(rf"=== exit {expected} \(.*\) at \d\d:\d\d:\d\d ===$", lines[-1]), text
+    if expected == 4:
+        assert lines[-1].startswith("=== exit 4 (DEADLINE -- "), text
+    assert proc.returncode == expected, proc.stdout + proc.stderr
+    assert not list((tmp_path / "logs").glob("prune-child-*")), "the logged output files were left"
+
+
+@requires_windows
+@pytest.mark.parametrize(("prune_exit", "expected"), [(0, 4), (2, 2)])
+def test_a_listing_run_past_the_deadline_is_killed_and_the_step_is_skipped(
+    tmp_path: Path, prune_exit: int, expected: int
+) -> None:
+    """The step's listing run is a second prune-merged.ps1 run, and the deadline bounds it too.
+
+    The prune run returns at once; the listing run hangs and is killed. The step attempts no tree. The
+    stop makes a clean prune's 0 into 4, and leaves a refused prune's 2 alone. On origin/main the
+    listing ran 40 seconds.
+    """
+    grandchild = tmp_path / "grandchild.pid"
+    since = time.time() - 1
+    try:
+        proc, text = run_copied_runner(
+            tmp_path,
+            "-RepoRoot",
+            str(tmp_path),
+            "-StopAfterMinutes",
+            "0.2",
+            "-Apply",
+            "-RemoveFinishedClaudeWorktrees",
+            prune_stub=HANGING_PRUNE_STUB.replace(
+                "'stub prune done'; exit 0", f"'stub prune done'; exit {prune_exit}"
+            ),
+            extra={"finished-worktree-removal.ps1": REMOVING_HELPER_STUB},
+            env_extra={"T_GRANDCHILD": str(grandchild), "T_OUTCOME": "REMOVED", "T_LIST_ONLY": "1"},
+        )
+    finally:
+        grandchild_survived = _kill_if_alive(grandchild, since)
+    assert text is not None, proc.stdout + proc.stderr
+    assert grandchild.is_file(), f"the stub never reached its hang, so nothing was tested: {text}"
+    assert not grandchild_survived, f"the kill missed the stub's own child: {text}"
+    assert re.search(rf"^--- prune-merged\.ps1 exit {prune_exit} at ", text, re.MULTILINE), text
+    assert "  stderr: stub stderr before the hang" in text, text
+    assert TIMED_OUT_LINE.search(text), text
+    assert (
+        "=== finished .claude/worktrees: SKIPPED, the listing run was still running at the run's "
+        "deadline"
+    ) in text, text
+    assert "REMOVED" not in text, text
+    assert re.match(rf"=== exit {expected} \(", text.splitlines()[-1]), text
+    assert proc.returncode == expected, proc.stdout + proc.stderr
+    assert not list((tmp_path / "logs").glob("prune-child-*")), "the logged output files were left"
+
+
+# The REFUSING stub's one finished row, with a line on stderr, which must be logged and kept out of the
+# JSON whichever way the listing run was started, and 2,000 rows outside .claude/worktrees. Printed as
+# prune-merged.ps1 prints it, multi-line JSON, so the listing parses only if every line keeps its place.
+NOISY_LISTING_STUB = (
+    "param([string]$RepoRoot, [switch]$Apply, [double]$IdleHours, [switch]$Json, [switch]$SkipGh)\n"
+    "if ($Json) {\n"
+    "  [Console]::Error.WriteLine('stub listing warning')\n"
+    "  $rows = @([pscustomobject]@{ path = 'X:/r/.claude/worktrees/a'; claudeManaged = $true;"
+    " branch = 'b'; whyFinished = 'w' })\n"
+    '  $rows += 1..2000 | ForEach-Object { [pscustomobject]@{ path = "X:/r/other/$_";'
+    " claudeManaged = $false; branch = \"o$_\"; whyFinished = 'w' } }\n"
+    "  [pscustomobject]@{ fence = @{ idleHours = 24 }; counts = @{ reportOnlyHeld = 0 };"
+    " reportOnly = $rows } | ConvertTo-Json -Depth 6\n"
+    "  exit 0\n"
+    "}\n"
+    '"stub refused"\n'
+    "exit 2\n"
+)
+
+
+@requires_windows
+@DEADLINES
+def test_a_listing_run_inside_the_deadline_is_read_as_before(
+    tmp_path: Path, deadline: list[str]
+) -> None:
+    """Started either way, the listing's stdout is parsed and its stderr is logged, not parsed."""
+    proc, text = run_copied_runner(
+        tmp_path,
+        "-RepoRoot",
+        str(tmp_path),
+        "-RemoveFinishedClaudeWorktrees",
+        *deadline,
+        prune_stub=NOISY_LISTING_STUB,
+        extra={"finished-worktree-removal.ps1": REMOVING_HELPER_STUB},
+        env_extra={"T_OUTCOME": "WOULD-REMOVE"},
+    )
+    assert text is not None, proc.stdout + proc.stderr
+    assert "  stderr: stub listing warning" in text.splitlines(), text
+    assert "WOULD-REMOVE X:/r/.claude/worktrees/a" in text, text
+    assert "listed finished: 1 under .claude/worktrees; 2000 elsewhere" in text, text
+    assert "TIMED OUT" not in text, text
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert re.match(r"=== exit 2 \(REFUSED", text.splitlines()[-1]), text
+    assert not list((tmp_path / "logs").glob("prune-child-*")), "the logged output files were left"
+
+
+# A stub that prints a line, records its pid in $env:T_STARTED, then waits long enough to be stopped.
+STOPPABLE_PRUNE_STUB = (
+    "param([string]$RepoRoot, [switch]$Apply, [double]$IdleHours)\n"
+    "'stub printed before the stop'\n"
+    "Set-Content -LiteralPath $env:T_STARTED -Value $PID\n"
+    "Start-Sleep -Seconds 40\n"
+    "exit 0\n"
+)
+
+
+@requires_windows
+def test_a_hand_run_stopped_on_the_deadline_path_kills_the_child_and_keeps_its_output(
+    tmp_path: Path,
+) -> None:
+    """A Stop part way through a bounded run must not leave the child running or lose its output.
+
+    The runner runs in a second runspace and is stopped while the stub waits. The bounded run's
+    finally kills the child, and the output file is kept, because its lines never reached the log.
+    """
+    runner, log_dir, env = copy_runner(tmp_path, STOPPABLE_PRUNE_STUB)
+    started = tmp_path / "stub-started.txt"
+    env.update(
+        {
+            "T_RUNNER": str(runner),
+            "T_LOGDIR": str(log_dir),
+            "T_REPO": str(tmp_path),
+            "T_STARTED": str(started),
+        }
+    )
+    script = (
+        "$ps = [powershell]::Create().AddScript("
+        "'& $env:T_RUNNER -LogDir $env:T_LOGDIR -RepoRoot $env:T_REPO -StopAfterMinutes 10'); "
+        "$null = $ps.BeginInvoke(); $sw = [Diagnostics.Stopwatch]::StartNew(); "
+        "while ($sw.Elapsed.TotalSeconds -lt 60 -and -not (Test-Path -LiteralPath $env:T_STARTED)) "
+        "{ Start-Sleep -Milliseconds 100 }; "
+        "Start-Sleep -Milliseconds 500; $ps.Stop(); "
+        '"state=$($ps.InvocationStateInfo.State)"'
+    )
+    since = time.time() - 1
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        cwd=tmp_path,
+        check=False,
+    )
+    try:
+        assert started.is_file(), proc.stdout + proc.stderr
+        assert "state=Stopped" in proc.stdout, proc.stdout + proc.stderr
+        survived = _kill_if_alive(started, since)
+        assert not survived, "the stopped run left its prune-merged.ps1 child running"
+        kept = list(log_dir.glob("prune-child-*.out.txt"))
+        assert kept, (
+            f"the child's output was deleted before it was logged: {list(log_dir.iterdir())}"
+        )
+        assert "stub printed before the stop" in kept[0].read_text(encoding="utf-8"), kept
+    finally:
+        _kill_if_alive(started, since)
