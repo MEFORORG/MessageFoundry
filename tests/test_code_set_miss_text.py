@@ -3,7 +3,8 @@
 """BACKLOG #5320: a code-set lookup miss never puts the looked-up key into the error text.
 
 The key is usually a message field, so it may carry PHI, and a raised error's text goes to the
-error columns, the events and the log, outside the secured message store (CLAUDE.md section 9).
+error columns, ciphered only when a store key is set, and to the events and the log, which
+are outside the store (CLAUDE.md section 9).
 Both misses keep the key on an attribute for a caller that needs it. Synthetic data only.
 """
 
@@ -50,7 +51,7 @@ def test_item_lookup_miss_names_the_set_and_never_the_key() -> None:
         assert MRN not in text
     # The dict's own KeyError, whose text is the key, is on neither link of the chain.
     assert exc.__cause__ is None and exc.__context__ is None
-    # The Mapping accessor still reads a miss as a KeyError.
+    # get() still returns the default on a miss.
     assert cs.get(MRN, "d") == "d"
 
 
@@ -76,3 +77,8 @@ def test_a_copied_miss_keeps_its_attributes(
     dup = copy.copy(caught.value)
     assert type(dup) is error and str(dup) == str(caught.value)
     assert dup.key == MRN and dup.code_set == "epic_diets"
+
+
+def test_a_one_character_key_reads_in_the_singular() -> None:
+    with pytest.raises(CodeSetKeyError, match="a key of 1 character is not in code set 'sex'"):
+        _ = CodeSet("sex", {"F": "Female"})["X"]

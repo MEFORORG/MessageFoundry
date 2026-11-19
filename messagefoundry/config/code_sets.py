@@ -130,10 +130,13 @@ class CodeSetKeyError(_MissFields, KeyError):
 def _miss_text(code_set: str, key: object) -> str:
     """The message for a lookup miss: the code set and the key's length, never the key (BACKLOG
     #5320). The key is usually a message field, so it may carry PHI, and a raised error's text goes
-    at least to the error columns, the events and the log, all outside the secured message store
-    (CLAUDE.md section 9). A short code is not hidden by a digest, which a lookup over the possible
-    values reverses, so no digest is given."""
-    shape = f"{len(key)} characters" if isinstance(key, str) else f"type {type(key).__name__}"
+    at least to the error columns, ciphered only when a store key is set, and to the events and the
+    log, which are outside the store (CLAUDE.md section 9). A short code is not hidden by a digest,
+    which a lookup over the possible values reverses, so no digest is given."""
+    if isinstance(key, str):
+        shape = f"{len(key)} character" if len(key) == 1 else f"{len(key)} characters"
+    else:
+        shape = f"type {type(key).__name__}"
     return f"a key of {shape} is not in code set {code_set!r}"
 
 
@@ -435,6 +438,10 @@ class CodeSet(Mapping[str, Any]):
         # Name the code set so a miss is self-explanatory in a transform traceback. Raised outside
         # the handler, so the dict's own KeyError, whose text is the key, is not even __context__.
         raise CodeSetKeyError(_miss_text(self._name, key), code_set=self._name, key=key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        # Straight to the dict, so a miss builds no CodeSetKeyError only to discard it.
+        return self._data.get(key, default)
 
     def __contains__(self, key: object) -> bool:
         return key in self._data
