@@ -136,6 +136,12 @@ EXPRESSION_COMMENT_ALLOW = [
     pytest.param("$x = $y.Foo(1).Bar# it`'s; find /proc'", id="comment-after-a-call-and-member"),
     pytest.param("Write-Output ($b# it`'s; find /proc\n)", id="comment-at-a-parenthesis-start"),
     pytest.param("5# it`'s; find /proc'", id="comment-after-a-number-statement"),
+    pytest.param("git status && $x# don`'t; grep -r x /proc", id="expression-after-a-chain"),
+    pytest.param("gci | $x# don`'t; grep -r x /proc", id="expression-after-a-pipe"),
+    pytest.param("$x = 'a'.Length# don`'t; grep -r x /proc", id="member-of-a-string"),
+    pytest.param("return $x# don`'t; grep -r x /proc", id="expression-after-return"),
+    pytest.param("-not $x# don`'t; grep -r x /proc", id="expression-led-by-not"),
+    pytest.param("Write-Output $x.Name# don`'t; grep -r x /proc", id="member-in-an-argument"),
 ]
 
 # THE OTHER DIRECTION: a token PowerShell reads as a generic word keeps its `#` literal, so the
@@ -148,12 +154,24 @@ EXPRESSION_GENERIC_ALLOW = [
     pytest.param("$x = $a -eq b#'\nfind /proc\n'", id="bareword-after-an-operator"),
     pytest.param("Write-Output (gci)a#'\nfind /proc\n'", id="word-glued-after-a-parenthesis"),
     pytest.param("Write-Output a@{ b =#'\nfind /proc\n' }", id="glued-at-brace-is-a-script-block"),
+    pytest.param(
+        "$h = @{ a =\n Get-Thing *#'\nfind /proc\n'\n}", id="hashtable-value-on-the-next-line"
+    ),
+    pytest.param("Write-Output $x.Name-foo#'\nfind /proc\n'", id="parameter-glued-to-a-member"),
+    pytest.param("Write-Output $x[0]x#'\nfind /proc\n'", id="word-glued-to-an-index"),
+    pytest.param("Write-Output $x.Name=#'\nfind /proc\n'", id="equals-glued-to-a-member"),
 ]
 
 EXPRESSION_COMMENT_DENY = [
     pytest.param("$x = 5# it's\ngrep -r x /proc", id="comment-after-a-number-hides-nothing"),
     pytest.param("$h = @{ a =# it's\n}\ngrep -r x /proc", id="comment-in-a-hashtable"),
     pytest.param("($x =# it's\n)\ngrep -r x /proc", id="comment-in-a-parenthesised-assignment"),
+    pytest.param(
+        "Write-Output $x.Name#it's\ngrep -r x /proc", id="comment-after-a-member-argument"
+    ),
+    pytest.param("Write-Output $a[0]#it's\ngrep -r x /proc", id="comment-after-an-index-argument"),
+    pytest.param("git status && $x#it's\ngrep -r x /proc", id="comment-after-a-chained-variable"),
+    pytest.param("$x = 'a'.Length#it's\ngrep -r x /proc", id="comment-after-a-string-member"),
 ]
 
 
@@ -176,4 +194,24 @@ def test_a_run_of_unclosed_braced_variables_is_read_in_linear_time() -> None:
     command = "Write-Output " + "${" * 16000 + " find /proc"
     started = time.perf_counter()
     run_guard(bash(command, tool="PowerShell"))
+    assert time.perf_counter() - started < 25
+
+
+def test_a_long_digit_run_before_a_letter_is_read_in_linear_time() -> None:
+    """The number pattern backtracked through a digit run that a letter ends, quadratically.
+
+    Measured on the unfixed pattern, 24000 digits ran the guard past 85 s. The plain toggle allows
+    this command, so only the PowerShell reading's own speed is timed here.
+    """
+    command = "Write-Output find; $x = " + "1" * 24000 + "z # c"
+    started = time.perf_counter()
+    assert_allowed(run_guard(bash(command, tool="PowerShell")))
+    assert time.perf_counter() - started < 25
+
+
+def test_the_toggle_deny_lands_before_the_powershell_reading_runs() -> None:
+    """The toggle's verdict is judged first, so a slow PowerShell reading cannot delay its deny."""
+    command = "$x = " + "1" * 24000 + "z # c\nfind /proc"
+    started = time.perf_counter()
+    assert_denied(run_guard(bash(command, tool="PowerShell")))
     assert time.perf_counter() - started < 25
