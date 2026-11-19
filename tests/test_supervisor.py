@@ -174,6 +174,282 @@ def test_shard_db_composes_under_project_root(tmp_path: object) -> None:
         assert Path(spec.db_path).name in {"mefor_a.db", "mefor_b.db"}
 
 
+def _supervise_captured(
+    tmp_path: Path,
+    monkey: pytest.MonkeyPatch,
+    argv: list[str],
+) -> dict[str, object]:
+    """Run ``supervise`` through its own parser up to the fleet start and return what the fleet
+    would be started with. The gates it passes on the way are provisioned as in the test above."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.store.crypto import generate_key
+    from tests._phi_gate_provisions import (
+        make_syslog_ca_and_crl,
+        setenv_declared_egress,
+        setenv_verified_log_forwarding,
+    )
+
+    captured: dict[str, object] = {}
+
+    async def _fake_supervise(config: str, *, db_base: str, base_port: int, **_kw: object) -> int:
+        captured["db_base"] = db_base
+        captured["base_port"] = base_port
+        return 0
+
+    monkey.setattr("messagefoundry.pipeline.supervisor.supervise", _fake_supervise)
+    monkey.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    setenv_verified_log_forwarding(monkey, make_syslog_ca_and_crl(tmp_path))
+    setenv_declared_egress(monkey)
+    monkey.setattr(cli, "configure_logging", lambda *args, **kwargs: False)
+    args = cli._build_parser()[0].parse_args(["supervise", "--env", "prod", *argv])
+    assert cli._supervise(args) == 0
+    return captured
+
+
+@pytest.mark.parametrize(
+    ("flags", "env", "db_name", "port"),
+    [
+        pytest.param([], {}, "site.db", 9100, id="settings-file"),
+        pytest.param(
+            [],
+            {"MEFOR_STORE_PATH": "envsite.db", "MEFOR_API_PORT": "9200"},
+            "envsite.db",
+            9200,
+            id="mefor-env",
+        ),
+        pytest.param(
+            ["--db", "flag.db", "--base-port", "9300"], {}, "flag.db", 9300, id="flags-override"
+        ),
+        pytest.param(["--db", "flag.db"], {}, "flag.db", 9100, id="db-flag-only"),
+        pytest.param(["--base-port", "9300"], {}, "site.db", 9300, id="port-flag-only"),
+    ],
+)
+def test_supervise_takes_store_path_and_api_port_from_settings_without_flags(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    flags: list[str],
+    env: dict[str, str],
+    db_name: str,
+    port: int,
+) -> None:
+    """BACKLOG #5817: ``supervise --db`` and ``--base-port`` once defaulted to ``messagefoundry.db``
+    and 8765, so [store].path, [api].port and their MEFOR_ variables never reached the engine
+    shards. Absent flags now leave the settings' values in force; a given flag still overrides."""
+    root = tmp_path / "repo"
+    root.mkdir()
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text('[store]\npath = "site.db"\n\n[api]\nport = 9100\n', encoding="utf-8")
+    monkeypatch.delenv("MEFOR_STORE_PATH", raising=False)
+    monkeypatch.delenv("MEFOR_API_PORT", raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    argv = ["--service-config", str(svc), "--project-root", str(root), *flags]
+    captured = _supervise_captured(tmp_path, monkeypatch, argv)
+    assert captured == {"db_base": str(root / db_name), "base_port": port}
+
+
+#: The no-stem refusal's text, matched whole so a reworded message that no longer says what the
+#: check tests fails here.
+_NO_STEM = (
+    r"^--db or \[store\]\.path is empty, ends in a '\.' or '\.\.' part, or names only a drive, "
+    r"root or share \(value withheld\); several engine shards each derive their file name from "
+    r"its last part, so name a file, e.g\. 'messagefoundry\.db'$"
+)
+
+_BS = "\\"
+_ROOTS = ["/", "//"] + (
+    [
+        "C:/",
+        "C:",
+        "C:" + _BS,
+        "//srv/share/",
+        "//srv/share",
+        _BS * 2 + "srv" + _BS + "share" + _BS,
+        _BS * 2 + "srv" + _BS + "share",
+    ]
+    if sys.platform == "win32"
+    else []
+)
+
+
+@pytest.mark.parametrize("db_base", _ROOTS)
+def test_build_shard_specs_refuses_a_drive_root_or_share_with_the_value_withheld(
+    db_base: str,
+) -> None:
+    """A drive, root or share has an empty pathlib name, so ``Path.with_name`` would raise its own
+    ValueError, which quotes the path, and supervise would log it. It is refused first, with the
+    value withheld (BACKLOG #5817)."""
+    with pytest.raises(ValueError, match=_NO_STEM) as refused:
+        build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
+    # The match is anchored, so the message is the fixed text; this also pins that the path's own
+    # text, and pathlib's error quoting it, appear nowhere in what supervise would log.
+    assert db_base not in str(refused.value)
+    assert refused.value.__context__ is None and refused.value.__cause__ is None
+
+
+@pytest.mark.parametrize("db_base", ["", ".", "..", "data/..", "data/.", "C:/srv/repo/."])
+def test_build_shard_specs_refuses_a_base_with_no_stem_for_several_engine_shards(
+    db_base: str,
+) -> None:
+    """A server store's [store].path may name a directory. With --db no longer defaulted (BACKLOG
+    #5817) that path is the base, and "" or a last part of "." or ".." has no stem for each engine
+    shard's ``<stem>_<shard>`` name, so several engine shards are refused; one keeps the bare
+    base, as a plain `serve` does."""
+    with pytest.raises(ValueError, match=_NO_STEM):
+        build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
+    (single,) = build_shard_specs(["a"], config="c", db_base=db_base, base_port=8765)
+    assert single.db_path == db_base
+
+
+@pytest.mark.parametrize(
+    ("db_base", "names"),
+    [
+        pytest.param("site.db", ["site_a.db", "site_b.db"], id="file"),
+        pytest.param("state/", ["state_a", "state_b"], id="trailing-separator"),
+        pytest.param("C:/mefor/state/", ["state_a", "state_b"], id="absolute-trailing-separator"),
+    ],
+)
+def test_build_shard_specs_derives_names_from_a_base_with_a_stem(
+    db_base: str, names: list[str]
+) -> None:
+    """A trailing separator after a real name is not refused: the name before it is the stem, as
+    on origin/main before BACKLOG #5817."""
+    specs = build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
+    assert [Path(s.db_path).name for s in specs] == names
+
+
+def test_each_engine_shard_gets_its_store_path_as_one_argv_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A [store].path such as "-x.db" now reaches each engine shard from the settings (BACKLOG
+    #5817). As its own token after --db, argparse would take it for an option; as --db=<path> the
+    engine shard's own parser reads it as the store path."""
+    from messagefoundry import __main__ as cli
+
+    monkeypatch.delenv("MEFOR_STORE_PATH", raising=False)
+    monkeypatch.delenv("MEFOR_API_PORT", raising=False)
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text('[store]\npath = "-x.db"\n', encoding="utf-8")
+    # Under a project root, so the TLS pair the start mints lands in tmp_path, not the cwd.
+    root = tmp_path / "repo"
+    root.mkdir()
+    argv = ["--service-config", str(svc), "--project-root", str(root)]
+    captured = _supervise_captured(tmp_path, monkeypatch, argv)
+    db_base = str(captured["db_base"])
+    assert db_base == str(root / "-x.db")
+    # With no project root the base stays as written, leading "-" and all.
+    for base, shards in [(b, s) for b in (db_base, "-x.db") for s in (["a"], ["a", "b"])]:
+        for spec in build_shard_specs(shards, config="c", db_base=base, base_port=8765):
+            serve_argv = list(spec.argv)[list(spec.argv).index("serve") :]
+            args = cli._build_parser()[0].parse_args(serve_argv)
+            assert args.db == spec.db_path, serve_argv
+            assert args.port == spec.port
+
+
+def test_supervise_refuses_an_api_port_no_socket_takes_before_the_tls_renewal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """[api].port is now the default base (BACKLOG #5817) and has no range check at load, so
+    supervise refuses a value no socket takes before the TLS renewal can write anything."""
+    from messagefoundry import __main__ as cli
+
+    def _no_renewal(*args: object, **kwargs: object) -> Path:
+        raise AssertionError("the TLS renewal ran before the port refusal")
+
+    monkeypatch.setattr(cli, "_renew_api_tls_before_spawning", _no_renewal)
+    monkeypatch.delenv("MEFOR_API_PORT", raising=False)
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text('[store]\npath = "site.db"\n\n[api]\nport = 70000\n', encoding="utf-8")
+    args = cli._build_parser()[0].parse_args(
+        ["supervise", "--env", "prod", "--service-config", str(svc)]
+    )
+    assert cli._supervise(args) == 2
+    err = capsys.readouterr().err
+    assert "[api].port 70000 is not a port from 0 to 65535" in err, err
+
+
+class _AtTheRenewal(Exception):
+    """Raised in place of the TLS renewal, so a test reads the base the supervisor derived."""
+
+
+@pytest.mark.parametrize("path", ["", "state/", "."])
+def test_supervise_keeps_a_directory_shaped_store_path_through_the_root_join(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Joining "" or "." under --project-root gives the root itself, whose name would become each
+    engine shard's stem; the supervisor keeps it stemless, so several engine shards are refused
+    (BACKLOG #5817). "state/" keeps deriving from "state", as before."""
+    from messagefoundry import __main__ as cli
+    from messagefoundry.store.crypto import generate_key
+    from tests._phi_gate_provisions import (
+        make_syslog_ca_and_crl,
+        setenv_declared_egress,
+        setenv_verified_log_forwarding,
+    )
+
+    seen: list[str] = []
+
+    def _at_renewal(settings: object, db_base: str) -> Path:
+        seen.append(db_base)
+        raise _AtTheRenewal
+
+    monkeypatch.setattr(cli, "_renew_api_tls_before_spawning", _at_renewal)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    setenv_verified_log_forwarding(monkeypatch, make_syslog_ca_and_crl(tmp_path))
+    setenv_declared_egress(monkeypatch)
+    monkeypatch.setattr(cli, "configure_logging", lambda *args, **kwargs: False)
+    monkeypatch.delenv("MEFOR_STORE_PATH", raising=False)
+    root = tmp_path / "repo"
+    root.mkdir()
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text(
+        f'[store]\nbackend = "postgres"\npath = "{path}"\nserver = "db.example.invalid"\n'
+        'database = "mf"\nusername = "mefor"\n',
+        encoding="utf-8",
+    )
+    argv = ["supervise", "--env", "prod", "--service-config", str(svc)]
+    args = cli._build_parser()[0].parse_args([*argv, "--project-root", str(root)])
+    with pytest.raises(_AtTheRenewal):
+        cli._supervise(args)
+    (db_base,) = seen
+    if path == "state/":
+        # A real name before the separator: derived from, as on origin/main, under the root.
+        specs = build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
+        assert [Path(s.db_path) for s in specs] == [root / "state_a", root / "state_b"]
+        return
+    # "" and "." join to the root itself; the base still names no stem, so several engine
+    # shards are refused, and one engine shard's --db still names the root.
+    assert Path(db_base) == root, db_base
+    with pytest.raises(ValueError, match=_NO_STEM):
+        build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
+
+
+@pytest.mark.parametrize(
+    ("shards", "base_port", "refused"),
+    [
+        pytest.param(["a"], 0, False, id="one-shard-ephemeral"),
+        pytest.param(["a"], 65535, False, id="one-shard-65535"),
+        pytest.param(["a"], 65536, True, id="one-shard-past-65535"),
+        pytest.param(["a"], -1, True, id="one-shard-negative"),
+        pytest.param(["a", "b"], 0, True, id="two-shards-from-zero"),
+        pytest.param(["a", "b"], 65534, False, id="last-port-65535"),
+        pytest.param(["a", "b"], 65535, True, id="past-65535"),
+        pytest.param(["a", "b"], 1, False, id="from-one"),
+    ],
+)
+def test_build_shard_specs_refuses_ports_no_engine_shard_can_bind(
+    shards: list[str], base_port: int, refused: bool
+) -> None:
+    """With [api].port now the default base (BACKLOG #5817), a value serve accepts for its one
+    socket, such as 0, would number several engine shards' ports from it."""
+    if refused:
+        with pytest.raises(ValueError, match=r"from [01] to 65535"):
+            build_shard_specs(shards, config="c", db_base="m.db", base_port=base_port)
+    else:
+        specs = build_shard_specs(shards, config="c", db_base="m.db", base_port=base_port)
+        assert [s.port for s in specs] == [base_port + i for i in range(len(shards))]
+
+
 # --- lifecycle (fake process) ------------------------------------------------
 
 

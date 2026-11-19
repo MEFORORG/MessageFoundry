@@ -123,6 +123,74 @@ def test_comments_and_siblings_survive_add(
     assert len(loaded.rules) == 1 and loaded.rules[0].event_type == "storage_threshold"
 
 
+def test_add_into_an_inline_rules_array_writes_toml_that_loads(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5774: ``rules = [{...}]`` is valid TOML, and the add appended a table into the
+    inline array, which wrote text that did not parse, so the add was refused for the file. The
+    new rule is one more inline table, the earlier rules and the array's comments kept."""
+    svc = _svc(tmp_path)
+    svc.write_text(
+        textwrap.dedent(
+            """
+            # keep this header comment
+            [alerts]
+            rules = [
+                # keep this comment inside the array
+                {event_type = "queue_buildup", min_depth = 50, escalate = [{after_count = 3, severity = "critical"}]},  # and this one
+                {connection = "IB_*", transports = []},
+            ]
+            realert_seconds = 120
+            """
+        ),
+        encoding="utf-8",
+    )
+    rule = {
+        "event_type": "connection_stopped",
+        "escalate": [{"after_count": 2, "severity": "critical"}],
+    }
+    rc, out = _add(svc, rule, capsys)
+    assert rc == 0, out
+    text = svc.read_text(encoding="utf-8")
+    for comment in ("# keep this header comment", "# keep this comment inside", "# and this one"):
+        assert comment in text
+    loaded = load_settings(config_path=svc).alerts
+    assert loaded.realert_seconds == 120
+    assert [r.event_type for r in loaded.rules] == ["queue_buildup", "any", "connection_stopped"]
+    assert loaded.rules[0].min_depth == 50
+    assert [(t.after_count, t.severity) for t in loaded.rules[0].escalate] == [(3, "critical")]
+    assert loaded.rules[1].connection == "IB_*" and loaded.rules[1].transports == []
+    assert [(t.after_count, t.severity) for t in loaded.rules[2].escalate] == [(2, "critical")]
+    assert [r["index"] for r in _list(svc, capsys)] == [0, 1, 2]
+
+
+@pytest.mark.parametrize(
+    "original",
+    [
+        'alerts = {rules = [{event_type = "queue_buildup"}]}\n',
+        'alerts.rules = [{event_type = "queue_buildup"}]\nalerts.realert_seconds = 120\n',
+        "alerts = {realert_seconds = 120}\n",
+    ],
+)
+def test_add_into_an_inline_rules_array_in_other_spellings(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], original: str
+) -> None:
+    """The inline array under an inline ``alerts`` table, and under dotted keys, take the add too,
+    and a dotted sibling key stays on ``[alerts]`` rather than landing in a rule. An inline
+    ``alerts`` table with no rules yet gets an inline array, since no array of tables fits in it.
+    The new rule's top-level keys are written in the usual ``{a = 1, b = 2}`` spacing."""
+    svc = _svc(tmp_path)
+    svc.write_text(original, encoding="utf-8")
+    rc, out = _add(svc, {"event_type": "connection_stopped", "min_depth": 3}, capsys)
+    assert rc == 0, out
+    assert '{event_type = "connection_stopped", min_depth = 3}' in svc.read_text(encoding="utf-8")
+    loaded = load_settings(config_path=svc).alerts
+    earlier = ["queue_buildup"] if "queue_buildup" in original else []
+    assert [r.event_type for r in loaded.rules] == [*earlier, "connection_stopped"]
+    if "realert_seconds" in original:
+        assert loaded.realert_seconds == 120
+
+
 def test_failed_add_rolls_back_byte_stable(tmp_path: Path) -> None:
     # Directly exercise the rollback path: a validate callback that raises must restore the prior
     # file byte-for-byte (the connections editor guarantees the same for connections.toml).

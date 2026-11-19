@@ -130,8 +130,40 @@ def test_env_provider_resolves_and_fails_closed(monkeypatch: pytest.MonkeyPatch)
     assert provider.resolve("MEFOR_VALUE_PARTNER_PW") == "hunter2"
     # An unset/blank env var is a misconfiguration, not a blank credential.
     monkeypatch.delenv("MEFOR_VALUE_MISSING", raising=False)
-    with pytest.raises(SecretProviderError, match="MEFOR_VALUE_MISSING"):
+    with pytest.raises(SecretProviderError, match="unset, empty or whitespace-only") as exc:
         provider.resolve("MEFOR_VALUE_MISSING")
+    assert "MEFOR_VALUE_MISSING" not in str(exc.value)
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\t\r\n "])
+def test_env_provider_refuses_a_whitespace_only_value(
+    monkeypatch: pytest.MonkeyPatch, blank: str
+) -> None:
+    """BACKLOG #5326: a whitespace-only variable is no credential, so it is refused like an unset
+    one. Before the fix only the empty string was refused, and ``" "`` came back as the secret."""
+    monkeypatch.setenv("MEFOR_VALUE_BLANK_PW", blank)
+    with pytest.raises(SecretProviderError, match="unset, empty or whitespace-only"):
+        EnvSecretProvider().resolve("MEFOR_VALUE_BLANK_PW")
+
+
+def test_env_provider_refusal_never_repeats_the_reference(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5326: a secret pasted where its variable name belongs must not reach the error
+    text. Before the fix the refusal quoted the reference verbatim, through the credential point's
+    resolver too. That resolver puts the credential's label in front instead, so the operator
+    still knows which credential's reference to correct."""
+    pasted = "s3cret-pasted-by-mistake 0451"
+    monkeypatch.delenv(pasted, raising=False)
+    with pytest.raises(SecretProviderError) as direct:
+        EnvSecretProvider().resolve(pasted)
+    assert "0451" not in str(direct.value)
+    with pytest.raises(SecretProviderError) as wired:
+        resolve_connector_secret(
+            EnvSecretProvider(), ref=pasted, literal=None, label="[auth].ad_bind_password"
+        )
+    assert "0451" not in str(wired.value)
+    assert str(wired.value).startswith("[auth].ad_bind_password, its *_secret or *_ref reference: ")
 
 
 def test_unknown_provider_name_fails_closed() -> None:

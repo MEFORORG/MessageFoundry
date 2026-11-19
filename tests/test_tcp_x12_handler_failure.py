@@ -26,6 +26,7 @@ from collections.abc import Callable
 import pytest
 
 import messagefoundry.transports.base as base_mod
+import messagefoundry.transports.framing as framing_mod
 import messagefoundry.transports.tcp as tcp_mod
 import messagefoundry.transports.x12 as x12_mod
 from messagefoundry.config.models import AckMode, ContentType
@@ -364,6 +365,53 @@ def test_the_retry_schedule_backs_off_to_a_bounded_pause(monkeypatch: pytest.Mon
     delays = base_mod.HANDLER_RETRY_DELAYS
     assert all(later >= earlier > 0 for earlier, later in zip(delays, delays[1:], strict=False))
     assert delays[-1] <= 60
+
+
+@pytest.mark.parametrize(
+    ("name", "build", "wire", "_raw"), LISTENERS, ids=[n for n, *_ in LISTENERS]
+)
+async def test_a_reply_a_narrow_charset_cannot_hold_is_still_sent(
+    name: str, build: Build, wire: bytes, _raw: bytes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5958. The reply follows the commit, so a raise here closes the connection with no
+    reply and the sender resends a message already stored. The X12 listener encoded its reply
+    strictly; it now replaces what the charset cannot hold, as the raw-TCP listener (the control)
+    already did under BACKLOG #5799."""
+    monkeypatch.setattr(framing_mod, "_reply_fallback_logged", set())
+    monkeypatch.setattr(framing_mod, "_reply_replacement_logged", set())
+    source = build()
+    source.encoding = "latin-1"
+    source.content_type = ContentType.HL7V2
+
+    async def handler(raw: bytes) -> str:
+        return "MSH|^~\\&|ENGINE|FAC\rMSA|AA|C1|note \u2603\r"
+
+    writer = _Peer()
+    events = await _drive(source, _ThenEof(wire), writer, handler=handler)
+    assert "framing_error" not in _kinds(events), name
+    sent = b"".join(writer.written)
+    assert b"MSA|AA|C1|note ?" in sent, name
+
+
+async def test_an_x12_reply_in_an_unusable_charset_name_is_sent_in_utf8(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5958, the other half of encode_reply. A charset name naming no text codec used to
+    raise LookupError into the X12 listener's last-resort arm after the commit; the reply now goes
+    out in utf-8, as the MLLP and TCP listeners send theirs."""
+    monkeypatch.setattr(framing_mod, "_reply_fallback_logged", set())
+    source = _x12()
+    source.encoding = "not-a-real-codec"
+    source.content_type = ContentType.HL7V2
+    reply = "MSH|^~\\&|ENGINE|FAC\rMSA|AA|C1\r"
+
+    async def handler(raw: bytes) -> str:
+        return reply
+
+    writer = _Peer()
+    events = await _drive(source, _ThenEof(EDI), writer, handler=handler)
+    assert "framing_error" not in _kinds(events)
+    assert b"".join(writer.written) == reply.encode("utf-8")
 
 
 # --- BACKLOG #5971: the X12 listener's pipelined remainder and its reply encode -----------------

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -105,6 +106,71 @@ def test_success_passes_straight_through(bash: Path) -> None:
     r = _run(bash, 0, attempts="3")
     assert r.stdout.count("ran") == 1
     assert r.returncode == 0
+
+
+# ---------------------------------------------------------------------------------------------
+# THE REFUSALS -- a run that would run nothing must not exit 0 (BACKLOG #5466)
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("attempts", ["0", "-1", "three", "1.5", "03", " 3"])
+def test_an_attempt_count_that_is_not_a_positive_integer_is_refused(
+    bash: Path, attempts: str
+) -> None:
+    """Before the fix ``seq 1 0`` (or a seq error) ran the loop zero times and the wrapper exited 0."""
+    r = _run(bash, 0, attempts=attempts)
+    assert r.returncode == 2, f"{attempts!r}: {r.stdout!r} {r.stderr!r}"
+    assert "ran" not in r.stdout.replace("nothing ran", "")
+    assert "positive integer" in r.stdout
+
+
+def test_no_command_is_refused(bash: Path) -> None:
+    env = probe_env(bash, dict(os.environ, RETRY_NATIVE_CRASH_ATTEMPTS="3"))
+    for argv in ([], [""]):
+        r = subprocess.run(
+            [str(bash), _WRAPPER.as_posix(), *argv],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+            env=env,
+        )
+        assert r.returncode == 2, f"{argv!r}: {r.stdout!r} {r.stderr!r}"
+        assert "no command" in r.stdout
+
+
+def test_exit_127_is_not_retried(bash: Path) -> None:
+    """127 is "command not found" as well as where Git Bash folds most Windows crash codes.
+
+    Retrying it would re-run a missing command and print a native-crash cause for it, so it fails
+    once, like any ordinary failure.
+    """
+    r = _run(bash, 127, attempts="3")
+    assert r.stdout.count("ran") == 1
+    assert r.returncode == 127
+    assert "NATIVE CRASH" not in r.stdout
+
+
+@pytest.mark.skipif(os.name != "nt", reason="a Windows NTSTATUS exit needs a Windows child")
+def test_a_windows_access_violation_reaches_the_wrapper_as_139_and_is_retried(bash: Path) -> None:
+    """The wrapper's Windows note, measured: Git Bash folds 0xC0000005 into 139 itself.
+
+    The child is a native Windows process exiting with the access-violation NTSTATUS, which is what a
+    segfaulting pytest leaves on a Windows runner. If Git Bash ever stopped folding it, this arm
+    would see the wrapper refuse to retry it.
+    """
+    env = probe_env(bash, dict(os.environ, RETRY_NATIVE_CRASH_ATTEMPTS="2"))
+    child = Path(sys.executable).as_posix()
+    r = subprocess.run(
+        [str(bash), _WRAPPER.as_posix(), child, "-c", "import os; os._exit(-1073741819)"],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+        env=env,
+    )
+    assert r.returncode == 139, f"{r.stdout!r} {r.stderr!r}"
+    assert "NATIVE CRASH (exit 139) on attempt 1/2" in r.stdout
 
 
 # ---------------------------------------------------------------------------------------------

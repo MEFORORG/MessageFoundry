@@ -358,6 +358,60 @@ suite("connectionMerge — planSave (the one merge-source policy for both writer
   });
 });
 
+// BACKLOG #5937: an inbound and an outbound may share a name in a hand-edited file (separate loader
+// tables; `connection upsert` replaces within the posted direction only), so planSave finds the merge
+// source by name and direction.
+suite("connectionMerge — planSave with an inbound and an outbound sharing one name", () => {
+  const sharedName = "ACME_ADT";
+  const inbound = (): ConnObj => ({ ...maximalInbound(), name: sharedName });
+  const outbound = (): ConnObj => ({ ...maximalOutbound(), name: sharedName });
+  const postedOutbound = (): ConnObj => ({
+    direction: "outbound",
+    name: sharedName,
+    transport: "mllp",
+    settings: { host: "acme.example", port: 2580 },
+    ordering: "fifo",
+    retry: { max_attempts: 7 },
+  });
+
+  test("editing the outbound merges over the outbound entry, not the same-named inbound", () => {
+    const plan = planSave([inbound(), outbound()], postedOutbound(), {
+      mergeFrom: sharedName,
+      editingName: sharedName,
+    });
+    assert.strictEqual(plan.collision, undefined);
+    assert.strictEqual(plan.conn.direction, "outbound");
+    assert.deepStrictEqual(plan.conn.buildup, outbound().buildup);
+    assert.strictEqual(plan.conn.simulate, true);
+    assert.strictEqual(plan.conn.dead_letter_days, 14);
+    assert.deepStrictEqual(plan.conn.retry, {
+      max_attempts: 7,
+      backoff_seconds: 2.5,
+      backoff_multiplier: 3.0,
+      max_backoff_seconds: 120.0,
+    });
+    assert.strictEqual(plan.conn.router, undefined);
+  });
+
+  test("creating under a name either direction holds still collides", () => {
+    // Deliberately both directions: the openers and the picker still address a connection by name.
+    assert.strictEqual(planSave([inbound()], postedOutbound(), {}).collision, sharedName);
+    assert.strictEqual(planSave([inbound(), outbound()], postedOutbound(), {}).collision, sharedName);
+  });
+
+  test("a clone takes its merge source by the source direction the writer names", () => {
+    const plan = planSave([inbound(), outbound()], postedInbound({ name: "IB_COPY" }), {
+      mergeFrom: sharedName,
+      mergeFromDirection: "outbound",
+    });
+    assert.strictEqual(plan.collision, undefined);
+    // Cross-direction clone: only direction-neutral keys carry from the OUTBOUND source.
+    assert.deepStrictEqual(plan.conn.schedule, outbound().schedule);
+    assert.strictEqual(plan.conn.priority, "low");
+    assert.strictEqual(plan.conn.shard, undefined);
+  });
+});
+
 suite("connectionMerge — RENDERED_FIELDS matches what build() renders (documented reality)", () => {
   test("per-direction rendered sets", () => {
     // Verified against connectionEditor.ts build(): inbound posts settings/router/ack_mode/strict;

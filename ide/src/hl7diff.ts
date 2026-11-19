@@ -112,48 +112,125 @@ function segKey(seg: Segment): string {
   return seg.id;
 }
 
-interface AlignOp {
+export interface AlignOp {
   a: number | null; // index into the before segments (null = not present on the before side)
   b: number | null; // index into the after segments (null = not present on the after side)
 }
 
-/** Longest-common-subsequence alignment of two key lists → matched / removed / added ops. */
-function lcsAlign(aKeys: string[], bKeys: string[]): AlignOp[] {
-  const n = aKeys.length;
-  const m = bKeys.length;
-  // dp[i][j] = LCS length of aKeys[i:] and bKeys[j:].
-  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array<number>(m + 1).fill(0));
-  for (let i = n - 1; i >= 0; i--) {
-    for (let j = m - 1; j >= 0; j--) {
-      dp[i][j] =
-        aKeys[i] === bKeys[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
-    }
+/**
+ * The most LCS table cells {@link lcsAlign} allocates (BACKLOG #5940). The table is one Uint16Array
+ * of (n+1)*(m+1) cells, so this caps it at 32 MiB. Under the cap the shorter side has at most 4,000
+ * keys, so no LCS length passes 65,535. The diff runs on the Extension Host thread, and a sample may
+ * be up to 16 MiB, so an uncapped table over two long, mostly different segment lists could freeze
+ * VS Code or exhaust its memory. Past the cap the middle is aligned in one linear pass.
+ */
+export const MAX_LCS_CELLS = 16_000_000;
+
+/**
+ * Longest-common-subsequence alignment of two key lists → matched / removed / added ops.
+ *
+ * The common prefix and suffix are matched first and kept out of the table, so a large message with
+ * a local edit costs only the edited middle. A middle whose table would pass {@link MAX_LCS_CELLS}
+ * is aligned positionally instead: equal keys at one position match, unequal ones show as a removal
+ * and an addition. That can show more add/remove than the LCS would, never a wrong match.
+ */
+export function lcsAlign(aKeys: readonly string[], bKeys: readonly string[]): AlignOp[] {
+  let start = 0;
+  while (start < aKeys.length && start < bKeys.length && aKeys[start] === bKeys[start]) {
+    start++;
+  }
+  let aEnd = aKeys.length;
+  let bEnd = bKeys.length;
+  while (aEnd > start && bEnd > start && aKeys[aEnd - 1] === bKeys[bEnd - 1]) {
+    aEnd--;
+    bEnd--;
   }
   const ops: AlignOp[] = [];
+  for (let k = 0; k < start; k++) {
+    ops.push({ a: k, b: k });
+  }
+  const n = aEnd - start;
+  const m = bEnd - start;
+  if ((n + 1) * (m + 1) > MAX_LCS_CELLS) {
+    alignPositionally(aKeys, bKeys, start, aEnd, bEnd, ops);
+  } else {
+    alignByLcs(aKeys, bKeys, start, n, m, ops);
+  }
+  for (let k = 0; aEnd + k < aKeys.length; k++) {
+    ops.push({ a: aEnd + k, b: bEnd + k });
+  }
+  return ops;
+}
+
+/** The LCS over `aKeys[start:start+n]` and `bKeys[start:start+m]`, appended to `ops`. */
+function alignByLcs(
+  aKeys: readonly string[],
+  bKeys: readonly string[],
+  start: number,
+  n: number,
+  m: number,
+  ops: AlignOp[],
+): void {
+  const width = m + 1;
+  // dp[i*width + j] = LCS length of the middle's aKeys[i:] and bKeys[j:].
+  const dp = new Uint16Array((n + 1) * width); // MAX_LCS_CELLS keeps every length under 65,536
+  for (let i = n - 1; i >= 0; i--) {
+    for (let j = m - 1; j >= 0; j--) {
+      dp[i * width + j] =
+        aKeys[start + i] === bKeys[start + j]
+          ? dp[(i + 1) * width + j + 1] + 1
+          : Math.max(dp[(i + 1) * width + j], dp[i * width + j + 1]);
+    }
+  }
   let i = 0;
   let j = 0;
   while (i < n && j < m) {
-    if (aKeys[i] === bKeys[j]) {
-      ops.push({ a: i, b: j });
+    if (aKeys[start + i] === bKeys[start + j]) {
+      ops.push({ a: start + i, b: start + j });
       i++;
       j++;
-    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
-      ops.push({ a: i, b: null }); // removed (present only in before)
+    } else if (dp[(i + 1) * width + j] >= dp[i * width + j + 1]) {
+      ops.push({ a: start + i, b: null }); // removed (present only in before)
       i++;
     } else {
-      ops.push({ a: null, b: j }); // added (present only in after)
+      ops.push({ a: null, b: start + j }); // added (present only in after)
       j++;
     }
   }
-  while (i < n) {
+  for (; i < n; i++) {
+    ops.push({ a: start + i, b: null });
+  }
+  for (; j < m; j++) {
+    ops.push({ a: null, b: start + j });
+  }
+}
+
+/** The linear fallback for a middle too large for the table: pair by position, matching only equal
+ *  keys, then the longer side's remainder. */
+function alignPositionally(
+  aKeys: readonly string[],
+  bKeys: readonly string[],
+  start: number,
+  aEnd: number,
+  bEnd: number,
+  ops: AlignOp[],
+): void {
+  let i = start;
+  let j = start;
+  for (; i < aEnd && j < bEnd; i++, j++) {
+    if (aKeys[i] === bKeys[j]) {
+      ops.push({ a: i, b: j });
+    } else {
+      ops.push({ a: i, b: null });
+      ops.push({ a: null, b: j });
+    }
+  }
+  for (; i < aEnd; i++) {
     ops.push({ a: i, b: null });
-    i++;
   }
-  while (j < m) {
+  for (; j < bEnd; j++) {
     ops.push({ a: null, b: j });
-    j++;
   }
-  return ops;
 }
 
 function diffFields(

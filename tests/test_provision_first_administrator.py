@@ -1221,7 +1221,7 @@ def test_a_secret_the_provider_cannot_resolve_is_refused_before_the_prompt_in_fi
 ) -> None:
     """The control on the test above: the reference names a variable that is unset. The refusal
     is this command's fixed text, before the prompt, and the store is not created. The provider's
-    own message names the reference, which this text does not repeat."""
+    own message does not repeat the reference either (BACKLOG #5326)."""
     monkeypatch.chdir(tmp_path)
     _key_in_this_shell(monkeypatch)
     monkeypatch.delenv("MEFOR_TEST_AD_BIND_2081", raising=False)

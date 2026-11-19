@@ -707,8 +707,8 @@ class X12Source(SourceConnector):
     """Listen for inbound raw-TCP connections, reassemble each ``ISA…IEA`` interchange, and hand its
     **raw bytes** to the pipeline handler. No HL7/X12 ACK: if that *pipeline* handler
     (:data:`~messagefoundry.transports.base.InboundHandler`) returns a non-``None`` reply it is written
-    back on the same connection, in the inbound's charset under the shared reply policy
-    (:func:`~messagefoundry.transports.framing.encode_reply`); the engine's returns ``None`` for every non-HL7 content type,
+    back on the same connection, encoded by :func:`~messagefoundry.transports.framing.encode_reply`
+    (BACKLOG #5958); the engine's returns ``None`` for every non-HL7 content type,
     so an X12 intake is fire-and-forget in practice. A config **Handler**'s return never reaches here —
     see this module's docstring."""
 
@@ -764,7 +764,8 @@ class X12Source(SourceConnector):
         self.max_messages_per_second, self.message_burst = _pacing_settings(
             s, transport="X12 source"
         )
-        # Carried only so a pacing report can name this connection (BACKLOG #290).
+        # Names this connection in a pacing report (BACKLOG #290) and in the reply-encoding warnings
+        # (BACKLOG #5958).
         self._pacing_name = config.name or ""
         # Per-connection peer-IP allowlist (Tier 4 operability): refuse a non-listed peer at accept.
         # Absent/empty = no restriction. Mirrors TcpSource/MLLPSource.
@@ -1026,6 +1027,8 @@ class X12Source(SourceConnector):
                                     break  # handler_error is recorded; close
                                 failed = False
                             if reply is not None:
+                                # BACKLOG #5958: encoded as the MLLP and TCP listeners encode theirs,
+                                # since this write follows the commit.
                                 # BACKLOG #5971: the reply is the engine's, so a charset that cannot
                                 # hold it is the engine's fault. The shared policy replaces what it
                                 # can (BACKLOG #5799); what it still refuses is `handler_error`,

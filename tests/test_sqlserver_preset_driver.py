@@ -290,11 +290,14 @@ def test_the_generic_dialect_still_takes_a_psqlodbc_driver() -> None:
 @pytest.mark.parametrize("server", [f"{HOST},6432", f"{HOST},", f"{HOST},replica.test.invalid"])
 def test_a_server_holding_a_comma_is_refused(check: Check, server: str) -> None:
     # The preset adds its own `,port`, so `db,6432` sent `SERVER=db,6432,1433`. An entry naming the
-    # whole server text matched it, and the shipped code ADMITTED it.
+    # whole server text matched it, and the shipped code ADMITTED it. Such an entry is refused at
+    # load now (BACKLOG #5915), so the check is reached past that with model_construct.
     with pytest.raises(ValueError, match="put the port in the port setting"):
         _build_dsn(_preset(server=server))
+    with pytest.raises(ValueError, match="no host name does"):
+        EgressSettings(allowed_db=[server])
     with pytest.raises(WiringError, match="put the port in the port setting"):
-        check(_preset(server=server), EgressSettings(allowed_db=[server]))
+        check(_preset(server=server), EgressSettings.model_construct(allowed_db=[server]))
 
 
 @pytest.mark.parametrize("character", ["\x00", "\t", "\r", "\n", "\x1f", "\x7f", ";", "="])
@@ -316,8 +319,15 @@ def test_a_server_holding_an_instance_name_is_refused(check: Check, driver: str)
     server = f"{HOST}\\SQLEXPRESS"
     with pytest.raises(ValueError, match="set port to the instance's port"):
         _build_dsn(_preset(server=server, odbc_driver=driver))
+    # Such an entry is refused at load now (BACKLOG #5915), so the check is reached past that with
+    # model_construct.
+    with pytest.raises(ValueError, match="no host name does"):
+        EgressSettings(allowed_db=[server])
     with pytest.raises(WiringError, match="set port to the instance's port"):
-        check(_preset(server=server, odbc_driver=driver), EgressSettings(allowed_db=[server]))
+        check(
+            _preset(server=server, odbc_driver=driver),
+            EgressSettings.model_construct(allowed_db=[server]),
+        )
 
 
 #: Each refusal ``_build_dsn`` can make on an attested weakened connection, with the text it raises:

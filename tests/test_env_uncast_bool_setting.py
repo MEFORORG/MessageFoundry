@@ -15,6 +15,7 @@ import ast
 import dataclasses
 import importlib
 import inspect
+import sys
 import textwrap
 import typing
 from pathlib import Path
@@ -1301,6 +1302,54 @@ def test_the_bool_scan_reads_every_connections_toml_transport() -> None:
     from messagefoundry.config.connections_file import _TRANSPORTS
 
     assert {factory.__name__ for factory in _TRANSPORTS.values()} <= _bool_settings().factories
+
+
+@pytest.mark.parametrize("change", ["bind", "remove"])
+def test_a_module_global_changed_mid_scan_leaves_the_bool_scan_whole(
+    monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    # CI saw the first scan on an xdist worker raise "dictionary changed size during iteration":
+    # it walked wiring's LIVE module dict. Change a wiring global from inside the scan, on its
+    # first factory, so the next step of a live walk raises every time rather than on a race.
+    # __wrapped__ runs the scan uncached, so the process-wide cache is neither read nor reset.
+    from messagefoundry.config import connections_file
+
+    scan = _bool_settings.__wrapped__
+    undisturbed = scan()
+    if change == "bind":
+        name = "_test_global_bound_during_the_bool_scan"
+        assert name not in vars(wiring)
+    else:
+        # The LAST factory in the dict, so a walk that read the live dict after the removal, rather
+        # than a copy taken before it, would leave this factory out and fail the equality below.
+        name = [
+            key
+            for key, value in list(vars(wiring).items())
+            if inspect.isfunction(value) and key in undisturbed.factories
+        ][-1]
+    real = connections_file._factory_signature
+    changed: list[bool] = []
+
+    def changing(factory: Any) -> inspect.Signature | None:
+        caller = sys._getframe(1)
+        # Only a call from the scan's own frame counts, so the change happens inside its walk.
+        if (
+            not changed
+            and caller.f_globals is vars(wiring)
+            and caller.f_code.co_name == "_bool_settings"
+        ):
+            changed.append(True)
+            if change == "bind":
+                monkeypatch.setattr(wiring, name, object(), raising=False)  # undone at teardown
+            else:
+                monkeypatch.delattr(wiring, name)  # restored at teardown
+        return real(factory)
+
+    # _bool_settings imports _factory_signature inside its body, so it reads this patched attribute.
+    monkeypatch.setattr(connections_file, "_factory_signature", changing)
+    disturbed = scan()
+    assert changed, "the scan's own frame never called the patched resolver, so nothing changed"
+    assert disturbed == undisturbed  # a NamedTuple; its MappingProxyType compares by content
 
 
 # --- the flags inbound() and outbound() take themselves (#3234 step 1, engine PR 2929 deferred) -----
