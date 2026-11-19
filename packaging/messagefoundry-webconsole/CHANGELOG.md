@@ -295,8 +295,11 @@ this line.**
   The confirm page, opened while no confirm proof is held (for example after Back from a refused
   code, or after an engine restart), offers the same Continue instead of a code form. A Continue
   can be posted while the confirm proof is already held, from another tab or after Back. It now
-  goes to the re-auth and leaves that proof unspent. No code is checked and no failed attempt is recorded. The verify route's gate chain
-  grew by that check, so the engine seam moves. (BACKLOG #5931)
+  goes to the re-auth and leaves that proof unspent. No code is checked and no failed attempt is
+  recorded. The verify route's gate chain grew by that check, so the engine seam moves. That check
+  now runs inside the verify gate, as `require_ui_reauth_only_action`'s new `before_spend` hook,
+  after the gate's base and before it spends the proof, so a verify post resolves its session once
+  and the check no longer carries its own copy of the gate's base. (BACKLOG #5931)
 - **The flag toggle's "Flag change not confirmed" page keys on the refusal's type.** The console
   gave that page for any 503 the engine's flag handler raised, relying on a comment that the
   handler had no other. The handler raises no other today, so nothing an operator sees changes; a
