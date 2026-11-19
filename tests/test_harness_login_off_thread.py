@@ -123,3 +123,29 @@ def test_a_close_during_the_provider_read_is_taken_when_it_answers(qapp: Any) ->
     finally:
         client.providers_gate.set()
         client.login_gate.set()
+
+
+def test_an_unexpected_sign_in_error_is_logged(qapp: Any, caplog: pytest.LogCaptureFixture) -> None:
+    # A non-ApiError is a fault in the dialog or the client, not the engine's answer: it is shown,
+    # and logged with its traceback so the cause is not lost (REVIEW-STANDARDS R8).
+    import logging
+
+    from messagefoundry.apiclient import ApiError
+
+    client = _GatedClient()
+    client.providers_gate.set()
+    dialog = LoginDialog(client)  # type: ignore[arg-type]
+    try:
+        assert _until(qapp, lambda: not dialog._busy)
+        with caplog.at_level(logging.ERROR, logger="harness._login"):
+            dialog._on_login_error(RuntimeError("boom"))
+            dialog._on_login_error(ApiError("refused", status=401))
+        logged = [r for r in caplog.records if r.name == "harness._login"]
+        assert len(logged) == 1
+        assert logged[0].exc_info is not None
+        raised = logged[0].exc_info[1]
+        assert isinstance(raised, RuntimeError) and raised.args == ("boom",)
+        assert dialog._error.text() == "Sign-in failed."
+    finally:
+        client.login_gate.set()
+        dialog.done(dialog.DialogCode.Rejected)
