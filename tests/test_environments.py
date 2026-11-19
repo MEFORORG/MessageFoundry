@@ -565,26 +565,42 @@ def test_committed_environment_files_define_the_same_keys() -> None:
 
 # --- BACKLOG #5322: the value file stays under its base directory ---------------------------------
 
+# Each case carries this marker, so the withheld-value assertion can fail: a refusal that echoed the
+# value would carry it. A bare spelling such as ".." has nothing distinctive to look for, so each one
+# is tried here with the marker after it, and on its own by the next test.
+_MARK = "zq7mark"
+
 _DIRS_THAT_LEAVE_THE_BASE = [
-    "C:/elsewhere",  # absolute on Windows; drive-qualified on every host
-    "C:elsewhere",  # drive-relative: a join takes C:'s working directory, not the base
-    "/elsewhere",  # rooted
-    "\\elsewhere",  # rooted, Windows spelling
-    "\\\\server\\share",  # UNC
-    "..",
-    "../elsewhere",
-    "environments/../../elsewhere",
-    "..\\elsewhere",
-    "...",  # Windows strips a part's trailing dots
-    ".. ",  # and trailing spaces
+    f"C:/{_MARK}",  # absolute on Windows; drive-qualified on every host
+    f"C:{_MARK}",  # drive-relative: a join takes C:'s working directory, not the base
+    f"/{_MARK}",  # rooted
+    f"\\{_MARK}",  # rooted, Windows spelling
+    f"\\\\server\\{_MARK}",  # UNC
+    f"\\\\{_MARK}\\share",  # UNC, the marker as the server
+    f"../{_MARK}",
+    f"environments/../../{_MARK}",
+    f"..\\{_MARK}",
+    f".../{_MARK}",  # Windows strips a part's trailing dots
+    f".. /{_MARK}",  # and trailing spaces
 ]
 
 
 @pytest.mark.parametrize("dir_name", _DIRS_THAT_LEAVE_THE_BASE)
 def test_values_file_path_refuses_a_dir_that_leaves_the_base(tmp_path: Path, dir_name: str) -> None:
+    assert _MARK in dir_name  # the assertion below can only fail if the case carries the marker
     with pytest.raises(ValueError, match=r"\[environments\]\.dir must be a folder under") as caught:
         values_file_path(tmp_path, dir_name, "dev")
-    assert "elsewhere" not in str(caught.value)  # the value is withheld (R12)
+    assert _MARK not in str(caught.value)  # the value is withheld (R12)
+    assert "(value withheld)" in str(caught.value)
+
+
+@pytest.mark.parametrize("dir_name", ["..", "...", ".. ", "\\\\server\\share"])
+def test_values_file_path_refuses_a_bare_spelling_that_leaves_the_base(
+    tmp_path: Path, dir_name: str
+) -> None:
+    """The bare spellings themselves, refused as they stand, not only with a folder after them."""
+    with pytest.raises(ValueError, match=r"\[environments\]\.dir must be a folder under"):
+        values_file_path(tmp_path, dir_name, "dev")
 
 
 def test_load_environment_values_refuses_a_dir_that_leaves_the_base(tmp_path: Path) -> None:
