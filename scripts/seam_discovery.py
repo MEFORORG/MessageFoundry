@@ -275,8 +275,8 @@ def _refuse_unresolved(dto: type, annotations: list[object]) -> None:
             current = stack.pop()
             if isinstance(current, typing.ForwardRef | str):
                 raise SeamDiscoveryError(
-                    f"{dto.__module__}.{dto.__qualname__}: field annotation {current!r} is "
-                    "UNRESOLVED (a ForwardRef or a bare string), so the nested-model closure "
+                    f"{dto.__module__}.{dto.__qualname__}: field annotation {current!r} is an "
+                    "UNRESOLVED ForwardRef or bare string, so the nested-model closure "
                     "cannot see through it and the contract would be silently under-covered. "
                     "Define or import the referenced type where the annotation can resolve it "
                     "(for a Pydantic model, define it BEFORE this one or call model_rebuild())."
