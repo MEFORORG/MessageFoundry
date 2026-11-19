@@ -181,6 +181,20 @@ def _printed_by_both(primary: str, other: str, source: str) -> str:
     )
 
 
+def scrub_report_text(text: str) -> str:
+    """``text`` with credential values replaced, for the report sink (BACKLOG #5395 added item 1).
+
+    Every renderer in :mod:`messagefoundry.verify.report` passes every field of every row through
+    this, so an arm that quotes an exception raw, or one added later, still cannot write a
+    ``password=`` value, a ``PWD=`` value or a DSN password into a report. It is the credential pass
+    alone. The PHI pass is not run here because it blanks words that rows quoting no exception
+    need, at least ``Windows Server`` and ``Program Files``. So an arm that quotes text a message or
+    a store could hold still takes :func:`safe_detail_text` or :func:`safe_exc_detail` itself."""
+    from messagefoundry.secretscrub import scrub_credentials
+
+    return scrub_credentials(text, placeholder=_PLACEHOLDER)
+
+
 def safe_exc_detail(exc: BaseException, *, limit: int | None = None) -> str:
     """``exc`` for a :class:`CheckResult` detail: its type, then its text through
     :func:`safe_detail_text`. A ``UnicodeError`` takes :func:`~messagefoundry.redaction.safe_exc`

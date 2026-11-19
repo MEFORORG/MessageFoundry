@@ -590,3 +590,56 @@ def test_the_graph_read_failure_reason_hides_the_credential(
     hops = runner._driver_hops(None, None, str(tmp_path), lambda: Registry())
     assert hops.unknown is not None and "graph read raised" in hops.unknown
     assert _PLANTED not in hops.unknown, hops.unknown
+
+
+# --- The report sink (BACKLOG #5395 added item 1) ---------------------------------------------------
+
+
+def _rendered(result: CheckResult) -> dict[str, str]:
+    from messagefoundry.verify.report import render_console
+
+    return {
+        "console": render_console([result]),
+        "markdown": render_markdown([result]),
+        "json": render_json([result]),
+    }
+
+
+def test_the_report_sink_hides_a_credential_an_arm_wrote_raw() -> None:
+    """An arm that interpolates an exception raw, as some federation and checks arms still do, or
+    one added later. The sink scrubs every field of every row in all three reports. Control: the
+    row itself still holds the value, so the sink is what hid it."""
+    raw = CheckResult("x.raw", "A raw arm", Status.FAIL, _LEAKY, evidence=_LEAKY)
+    assert _PLANTED in raw.detail and _PLANTED in raw.evidence
+    for sink, text in _rendered(raw).items():
+        assert _PLANTED not in text, (sink, text)
+        assert "[redacted]" in text, (sink, text)
+
+
+def test_a_federation_read_failure_reaches_the_report_without_the_credential(
+    tmp_path: Path,
+) -> None:
+    """A real raw arm: the ``fed`` file read quotes the OSError, which quotes the path."""
+    from messagefoundry.verify import federation
+
+    path = tmp_path / f"jwks password={_PLANTED}.json"
+    _, row = federation._read(str(path), "fed.jwks", "JWKS")
+    assert row is not None and _PLANTED in row.detail, "control: the arm quotes the path raw"
+    for sink, text in _rendered(row).items():
+        assert _PLANTED not in text, (sink, text)
+
+
+def test_the_report_sink_leaves_a_row_with_no_credential_alone() -> None:
+    """The sink is the credential pass alone, so words the PHI pass would blank survive it."""
+    import json
+
+    row = CheckResult(
+        "host.ports",
+        "Listener ports / firewall",
+        Status.MANUAL,
+        r"Python 3.14 on Windows Server 2025; C:\Program Files\MessageFoundry",
+        evidence="MLLP 2575: free; API 8765: in use/bound",
+    )
+    payload = json.loads(_rendered(row)["json"])["results"][0]
+    assert payload["detail"] == row.detail
+    assert payload["evidence"] == row.evidence
