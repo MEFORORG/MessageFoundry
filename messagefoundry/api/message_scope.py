@@ -30,7 +30,7 @@ from fastapi import HTTPException, Request
 from messagefoundry.api.security import client_ip
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.store.cell_tag import CellTagError
-from messagefoundry.store.crypto import CipherError, gave_no_verdict
+from messagefoundry.store.crypto import CipherError, CipherUnavailableError, gave_no_verdict
 from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
 
 if TYPE_CHECKING:
@@ -118,41 +118,49 @@ async def read_scoped_message(
     answer never says the message exists.
 
     In scope, a row whose cells fail their tag, or are corrupt, was refused by the store, which
-    alerts and audits drift and logs a corrupt cell (BACKLOG #2593); a cell the cipher refuses for
+    alerts and audits drift and logs a corrupt cell (BACKLOG #2593): ``None`` for a caller that
+    skips (the export stream), or, with ``refuse_integrity``, a 423. A cell the cipher refuses for
     another reason (a retired key not supplied, a Transit refusal other than the tag) is logged
-    here by its error class. Either is ``None`` for a caller that skips (the export stream), or,
-    with ``refuse_integrity``, a 423. With ``refuse_integrity``, a key service that gave no verdict
-    answers 503 with ``Retry-After``; a caller that skips gets that error raised."""
+    here by its error class, and is a 423 with ``refuse_integrity``, or a 503 with ``Retry-After``
+    when the key service gave no verdict. A caller that skips gets a fresh :class:`CipherError`
+    (:class:`CipherUnavailableError` for the outage) carrying no chain, as before this check the
+    store's own error stopped it."""
     channel_id = await engine.store.message_channel_id(message_id)
     if channel_id is None:
         return None
     if not identity.can_access_channel(channel_id):
         await audit_channel_denied(engine, identity, channel_id, client_ip(request))
         return None
-    refusal: HTTPException | None = None
+    refusal: Exception | None = None
     try:
         row = await engine.store.get_message(message_id)
-    except CellTagError:
+    except CellTagError as err:
+        # The tag is built from the channel the store read, which may not be the one checked above
+        # if the row changed between the two reads; out of scope it is the uniform refusal.
+        if not identity.can_access_channel(err.channel_id):
+            await audit_channel_denied(engine, identity, err.channel_id, client_ip(request))
+            return None
         if not refuse_integrity:
             return None
         refusal = HTTPException(423, _INTEGRITY_REFUSED)
     except CipherError as exc:
         no_verdict = gave_no_verdict(exc)
-        if no_verdict and not refuse_integrity:
-            raise
         # The class name only: the cipher's text can echo fields cut from the stored value.
-        _log.warning("message %s could not be opened: %s", message_id, type(exc).__name__)
+        cause = f"message {message_id} could not be opened: {type(exc).__name__}"
+        _log.warning("%s", cause)
         if not refuse_integrity:
-            return None
-        refusal = (
-            HTTPException(
+            # The export stream does not skip such a row: an export that leaves out rows nothing
+            # records would read as complete. A fresh error, so no frame holding opened cells rides
+            # on it.
+            refusal = CipherUnavailableError(cause) if no_verdict else CipherError(cause)
+        elif no_verdict:
+            refusal = HTTPException(
                 503,
                 _KEY_SERVICE_UNAVAILABLE,
                 headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
             )
-            if no_verdict
-            else HTTPException(423, _KEYS_REFUSED)
-        )
+        else:
+            refusal = HTTPException(423, _KEYS_REFUSED)
     if refusal is not None:
         # Raised after the handler, so the refusal chains nothing (BACKLOG #1796). Inside it, even
         # with `from None`, __context__ would keep the cipher's error and, through its traceback,
@@ -160,8 +168,9 @@ async def read_scoped_message(
         raise refusal
     if row is None:
         return None
-    # Checked again on the row itself: the channel is an immutable column, so this differs from
-    # the check above only if the id was deleted and reused between the two reads.
+    # Checked again on the row itself. It differs from the check above only if the row changed
+    # between the two reads: an id deleted and reused, or a channel_id rewritten outside the
+    # store's writers, which on a keyless store no tag refuses, so this check is the guard there.
     if not identity.can_access_channel(row["channel_id"]):
         await audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
         return None

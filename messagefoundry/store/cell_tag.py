@@ -398,16 +398,11 @@ def open_message_cell(
     )
 
 
-#: The ``messages`` cells a by-id read opens: raw (the body), error (may embed raw HL7 fragments),
-#: summary and metadata (PHI).
-_MESSAGE_RECORD_CELLS: Final = ("raw", "error", "summary", "metadata")
-
-
 def open_message_record(cipher: Cipher, record: dict[str, Any]) -> None:
     """Open a whole ``messages`` row's cells in place, each under the tag its row's id and channel
     build (ASVS 11.3.3, BACKLOG #2593), so a cell that fails that tag refuses the whole read. Every
     backend's ``get_message`` runs it through ``asyncio.to_thread`` (BACKLOG #5981)."""
-    for column in _MESSAGE_RECORD_CELLS:
+    for column in MESSAGE_TAG_CELLS:
         record[column] = open_message_cell(
             cipher,
             column,
@@ -459,7 +454,9 @@ def withhold_message_cells(
 ) -> None:
     """Open ``columns`` of one message in ``record`` in place, for a list-shaped read. A cell that
     fails its tag withholds every one of the row's cells (``None``) and appends the error to
-    ``failures`` for the caller to audit, so the row still lists by its plaintext columns."""
+    ``failures`` for the caller to audit, so the row still lists by its plaintext columns. A cell
+    the cipher refuses for another reason withholds them too but is only logged, never appended
+    (:func:`withhold_refused_cell`, BACKLOG #5970); an outage raises."""
     try:
         for col in columns:
             if col in record:

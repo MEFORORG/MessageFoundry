@@ -1054,10 +1054,44 @@ async def test_the_scoped_message_read_checks_scope_before_it_decrypts(
     assert refused.value.status_code == status and opened == ["m-scope"]
     if status == 503:
         assert refused.value.headers is not None and "Retry-After" in refused.value.headers
-        with pytest.raises(CipherUnavailableError):  # the export stream does not skip an outage
-            await read_scoped_message(engine, inside, "m-scope", request)
-    else:
-        assert await read_scoped_message(engine, inside, "m-scope", request) is None  # skipped
+    # The export stream does not skip such a row, which would leave a gap nothing records; it
+    # stops on a fresh error of the same kind that carries no chain.
+    with pytest.raises(CipherError) as stopped:
+        await read_scoped_message(engine, inside, "m-scope", request)
+    assert stopped.value is not raised and not isinstance(stopped.value, CellTagError)
+    assert isinstance(stopped.value, CipherUnavailableError) == (status == 503)
+    assert stopped.value.__cause__ is None and stopped.value.__context__ is None
+
+
+async def test_a_tag_failure_on_a_row_moved_between_the_reads_is_the_uniform_404() -> None:
+    """The tag is built from the channel the store read. If that is out of scope although the
+    channel read first was in scope, the answer is the audited 404, never a 423 that would say the
+    message exists."""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    from messagefoundry.api.message_scope import get_scoped_message
+
+    audits: list[str] = []
+
+    class _Store:
+        async def message_channel_id(self, message_id: str) -> str:
+            return "IB_OPEN"
+
+        async def get_message(self, message_id: str) -> None:
+            raise CellTagError("messages", "raw", message_id, "IB_SECRET")
+
+        async def record_audit(self, action: str, **_: object) -> None:
+            audits.append(action)
+
+    engine: Any = SimpleNamespace(store=_Store())
+    request = Request({"type": "http", "client": ("127.0.0.1", 1), "headers": []})
+    who: Any = SimpleNamespace(username="u", can_access_channel=lambda c: c == "IB_OPEN")
+    with pytest.raises(HTTPException) as hidden:
+        await get_scoped_message(engine, who, "m-moved", request)
+    assert hidden.value.status_code == 404 and audits == ["auth.channel_denied"]
 
 
 def test_a_list_read_withholds_a_cell_the_cipher_refuses() -> None:
