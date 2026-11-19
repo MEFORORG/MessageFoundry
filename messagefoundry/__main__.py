@@ -2770,7 +2770,7 @@ def _value_file_or_refusal(
 ) -> Path | None:
     """The value file a command reads, or ``None`` with the refusal printed when
     :func:`~messagefoundry.config.environments.values_file_path` refuses ``[environments].dir`` or
-    the environment name because the file would sit outside ``base_dir`` (BACKLOG #5322). ``serve``
+    the environment name; that function says on what grounds (BACKLOG #5322). ``serve``
     and ``supervise`` call it ahead of :func:`_start_files_refused`, and so does the
     ``--project-root`` check. ``supervise`` passes no ``lead`` and a ``fleet`` sentence that already
     says it refuses to start, and the ``--project-root`` check passes no ``lead``."""

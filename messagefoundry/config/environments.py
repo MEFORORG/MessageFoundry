@@ -220,11 +220,12 @@ def values_file_path(base_dir: str | Path, dir_name: str, environment: str) -> P
     nothing checks that the end lies under ``base_dir``.
 
     It also raises when a part of ``dir_name``, or the file name ``<env>.toml``, is one
-    :func:`ntpath.isreserved` calls reserved, such as ``NUL`` or ``COM1.toml``, read under the
-    Windows rules on every host. On Windows 11 (measured on build 26300) ``NUL.toml`` is an ordinary
-    file name, but a bare ``NUL`` folder part named the device rather than a folder, and older Windows releases, Windows Server
-    among them, were not measured; refusing every such name leaves no release where the path could
-    open a device."""
+    :func:`ntpath.isreserved` calls reserved, read under the Windows rules on every host: at least a
+    device name such as ``NUL`` or ``COM1.toml``, a part ending in a dot or a space, and a part
+    holding a character Windows refuses in a name, such as ``:`` or ``?``. On Windows 11 (measured
+    on build 26300) ``NUL.toml`` is an ordinary file name, but a bare ``NUL`` folder part named the
+    device rather than a folder, and older Windows releases, Windows Server among them, were not
+    measured; refusing every such name leaves no release where the path could open a device."""
     import ntpath
 
     # Imported here, so importing this module does not load the settings model.
@@ -238,7 +239,8 @@ def values_file_path(base_dir: str | Path, dir_name: str, environment: str) -> P
         )
     if any(ntpath.isreserved(part) for part in PureWindowsPath(dir_name).parts):
         raise ValueError(
-            "[environments].dir must not hold a Windows reserved name such as NUL or COM1 "
+            "[environments].dir must not hold a name Windows reserves: a device name such as NUL "
+            "or COM1, a part ending in a dot or a space, or a character such as ':' or '?' "
             "(value withheld)"
         )
     # The validator's own alphabet has no separator and no ':', so the file name is one plain part.
@@ -250,7 +252,7 @@ def values_file_path(base_dir: str | Path, dir_name: str, environment: str) -> P
     file_name = f"{environment}.toml"
     if ntpath.isreserved(file_name):
         raise ValueError(
-            "the environment name must not be a Windows reserved name such as NUL or COM1 "
+            "the environment name must not be a device name Windows reserves, such as NUL or COM1 "
             "(value withheld)"
         )
     return Path(base_dir) / dir_name / file_name
