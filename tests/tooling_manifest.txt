@@ -43,6 +43,7 @@ tests/test_asvs_tally_lint.py
 tests/test_asvs_verifier_vault_contract.py
 tests/test_bash_probe_path.py
 tests/test_bash_resolver.py
+tests/test_blanket_stage_config_env.py
 tests/test_blanket_stage_guard.py
 tests/test_branch_leak_scan_range.py
 tests/test_check_dependency_floors.py
