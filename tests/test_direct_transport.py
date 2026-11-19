@@ -174,7 +174,7 @@ def pki(tmp_path: Path) -> dict[str, Any]:
     written to PEM files under tmp_path. Returns the paths + the in-memory recipient key for decrypt."""
     ca_key, ca_cert = _mint_ca()
     signer_key, signer_cert = _mint_leaf("Sender Direct", ca_key, ca_cert)
-    # An organisation certificate: no rfc822Name, so its dNSNames bind every mailbox at hisp.example
+    # No rfc822Name, so the dNSNames bind every mailbox at hisp.example
     # and at the hospital.example recipients the envelope tests borrow from the Email destination's
     # tests. A cert naming any rfc822Name would bind only that mailbox (BACKLOG #5631).
     recip_key, recip_cert = _mint_leaf(
@@ -2182,8 +2182,8 @@ def test_a_cert_the_ca_issued_to_another_subscriber_is_refused(
 def test_a_dns_name_beside_an_rfc822_name_binds_no_other_mailbox_at_that_domain(
     pki: dict[str, Any], tmp_path: Path
 ) -> None:
-    # A cert the CA issued to recipient@hisp.example that also names hisp.example is that
-    # subscriber's address-bound cert, not an organisation cert for every hisp.example mailbox
+    # A cert the CA issued to recipient@hisp.example that also names hisp.example is
+    # bound to that mailbox, not to every hisp.example mailbox
     # (BACKLOG #5631).
     path = _recipient(
         pki,

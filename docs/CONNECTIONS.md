@@ -3283,11 +3283,11 @@ multi-level path building is deferred. On top of issuance, construction refuses 
   it**: a cert with neither extension is accepted;
 - a `recipient_cert` that does not name **every** address in `recipients`. An address is named by a
   `subjectAltName` `rfc822Name` equal to it, or a `dNSName` equal to its domain on a cert that carries
-  no `rfc822Name` (an organisation certificate). A cert naming any `rfc822Name` is bound to those
-  mailboxes, so a `dNSName` beside them names no other mailbox at that domain. The domain compares
-  case-insensitively and the local part exactly. A CA issues many subscribers' certificates, so issuance
-  alone does not say this one belongs to the mailbox the message goes to. A cert with no
-  `subjectAltName` names no address and is refused.
+  no `rfc822Name`. A cert naming any `rfc822Name` is bound to those mailboxes, so a `dNSName` beside
+  them names no other mailbox at that domain. The domain compares case-insensitively and the local
+  part exactly. A CA issues many subscribers' certificates, so issuance alone does not say this one
+  belongs to the mailbox the message goes to. A cert with no `subjectAltName` names no address and is
+  refused.
 
 Errors name the *setting* and the property that failed (and, for an unnamed address, its position among the
 addresses `recipients` holds, counting each comma-joined address apart), never the material, a cert subject or

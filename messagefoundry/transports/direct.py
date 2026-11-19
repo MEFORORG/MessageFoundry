@@ -467,10 +467,9 @@ def _split_address(address: str) -> tuple[str, str]:
 def _address_binding_problem(cert: x509.Certificate, recipients: Sequence[str]) -> str | None:
     """Why ``cert`` does not name every address in ``recipients``, or None. An address is named by
     an rfc822Name subjectAltName equal to it, or, on a cert that carries no rfc822Name at all, a
-    dNSName equal to its domain (an organisation certificate). A cert carrying any rfc822Name is
-    bound to those mailboxes, so a dNSName beside them binds no other mailbox at that domain: a CA
-    that gave one subscriber a cert naming its mailbox and its domain gave it no other subscriber's
-    mailbox. The refusal names the address's position among the checked addresses, never an
+    dNSName equal to its domain. A cert carrying any rfc822Name is bound to those mailboxes, so a
+    dNSName beside them binds no other mailbox at that domain: a CA that gave one subscriber a cert
+    naming its mailbox and its domain gave it no other subscriber's mailbox. The refusal names the address's position among the checked addresses, never an
     address or a SAN value. One ``recipients`` entry can hold several comma-joined addresses, so
     that position counts addresses, not entries."""
     names = _extension(cert, x509.SubjectAlternativeName, "recipient_cert") or (
