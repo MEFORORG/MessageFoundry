@@ -1507,11 +1507,8 @@ def test_an_empty_user_dsn_hides_an_equals_sign_and_states_its_residual() -> Non
     chained = scrub_credentials(redact_untrusted("connect redis://:Zq7-19800505-Kv9x@host failed"))
     assert "Zq7-" in chained and "-Kv9x" in chained, chained
     assert "p%40Kv9x" in scrub_credentials("redis://:p%40Kv9x@host")
-    # No longer a residual (BACKLOG #5386, added item 2): a line where the union keeps the reading
-    # before whole runs the widened pass too. tests/test_b532r_redaction_dsn.py holds the branch.
-    kept_before = "connect redis://:Zq-Pw_1@h failed; userPwd='a;PWD=b c'"
-    assert "Zq-Pw_1" not in scrub_credentials(kept_before)
-    assert "Zq-Pw_1" not in scrub_credentials("connect redis://:Zq-Pw_1@h failed")
+    # A line where the union keeps the reading before whole is no longer a residual (BACKLOG #5386,
+    # added item 2); tests/test_b532r_redaction_dsn.py holds it.
 
 
 def _one_handler(text: str) -> str:

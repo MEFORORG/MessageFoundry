@@ -2,11 +2,12 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The widened DSN reading on every path of ``secretscrub._union``, and its growth (BACKLOG #5386).
 
-Synthetic values only. ``_union`` runs two readings of a line and has three ways out: the merged
-output, the reading before whole where the shipped one would hide a member key's ";", and the
-reading before alone where a replacement is untraceable. The reading before ran with ``wide=False``
-on all of them, so on the last two the widened pass never ran and a password-only DSN, or the tail
-of a password holding an "@", printed. Each test here fails on that code.
+Synthetic values only. ``_union`` runs two readings of a line and has at least these ways out: the
+merged output, the reading before whole where the shipped one would hide a member key's ";", and
+the reading before alone where a replacement is untraceable. The reading before ran with
+``wide=False``, so on the last two the widened pass never ran and a password-only DSN, or the tail
+of a password holding an "@", printed. The first two tests fail on that code; the growth tests
+hold a property that code already had, and had no stopwatch for.
 """
 
 from __future__ import annotations
@@ -45,9 +46,11 @@ def test_the_reading_before_kept_whole_still_runs_the_widened_pass(
 
     monkeypatch.setattr(scrub_mod, "_run", spy)
     out = scrub_credentials(line)
-    # Control: two readings ran and the first, the reading before, is what came back. Without this
-    # the line could leave by the merged path, which ran the widened pass already.
+    # Control: two readings ran, the first, the reading before, is what came back, and the second
+    # hid the ``;PWD=`` member key the first printed, which is what sends the line down this branch
+    # rather than the merged one.
     assert len(results) == 2 and out == results[0], (results, out)
+    assert ";PWD=" in results[0] and ";PWD=" not in results[1], results
     assert secret not in out, out
     assert CREDENTIAL_PLACEHOLDER in out
 
@@ -72,28 +75,30 @@ def test_an_untraceable_line_still_runs_the_widened_pass(monkeypatch: pytest.Mon
         assert secret not in out, out
 
 
-def test_the_reading_before_is_still_available_without_the_widened_pass() -> None:
-    """``wide=False`` stays for the test that rebuilds the reading as it stood before #5545. Held
-    here so the two readings differ on the residual line, which is what the tests above read."""
+def test_the_reading_before_differs_only_by_the_widened_pass() -> None:
+    """The pre-camelCase reading, as ``_union``'s fallback runs it, prints the residual line's
+    password with ``wide=False`` and hides it without, so the flag is what the tests above turn on."""
     line, secret = _MEMBER_KEY_LINES[0]
     folded = scrub_mod._gate_fold(line)
-    assert secret in scrub_mod._run(line, CREDENTIAL_PLACEHOLDER, folded, wide=False)
-    assert secret not in scrub_mod._run(line, CREDENTIAL_PLACEHOLDER, folded)
+    before = scrub_mod._pre_camel_sub
+    assert secret in scrub_mod._run(line, CREDENTIAL_PLACEHOLDER, folded, before, wide=False)
+    assert secret not in scrub_mod._run(line, CREDENTIAL_PLACEHOLDER, folded, before)
 
 
 # --- GROWTH OF THE WIDENED PATTERN ITSELF ---------------------------------------------------------
 #
 # ``tests/test_security_static.py`` cannot resolve ``_WIDE_DSN_PASSWORD``, since it splices
 # ``_DSN_RUN_STOP``, so its ReDoS gate holds the shape by inspection only. This is the stopwatch for
-# it. The lengths and the bar are ``tests/test_log_redaction_secret_domain.py``'s: 8x the length,
-# linear near 8x, a bar of 24x, quadratic near 64x.
+# it. The ratio and the bar are ``tests/test_log_redaction_secret_domain.py``'s, at half its
+# lengths so the quadratic control stays cheap: 8x the length, linear near 8x, a bar of 24x,
+# quadratic near 64x.
 
 _LENGTHS = (1024, 8192)
 _MAX_GROWTH = 24.0
 
 #: Adversarial shapes, each a function of the run length. The first three reach no "@" the match
 #: could end at, so the scan walks the whole run and fails, which is the worst case. The fourth
-#: matches, after its run backs off over many "@"; the fifth packs scheme heads, each a cheap start.
+#: matches, over a run holding many "@"; the fifth packs scheme heads, each a match attempt.
 _WIDE_SHAPES: tuple[tuple[str, Callable[[int], str]], ...] = (
     # An empty user's first segment over a run both of its classes take: the split the possessive
     # quantifier exists to refuse.
@@ -113,8 +118,10 @@ def _growth(call: Callable[[str], object], shape: Callable[[int], str], *, round
     return _growth_between(call, shape(_LENGTHS[0]), shape(_LENGTHS[1]), rounds=rounds)
 
 
-#: The widened pattern with its first segments backtracking rather than possessive. The comment on
-#: ``_WIDE_DSN_PASSWORD`` names this as the quadratic shape; it is the positive control below.
+#: The widened pattern's skeleton with its first segments backtracking rather than possessive, and
+#: without its label stops and placeholder alternatives. The comment on ``_WIDE_DSN_PASSWORD``
+#: names backtracking there as the quadratic shape; this is the positive control below, and shows
+#: only that the bar catches a quadratic pattern on this box.
 _BACKTRACKING_WIDE = re.compile(
     r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):"
     r"(?:(?<=//:)[^\s/@?#&=;,()|^~{}<>\[\]%\x27\x22]*|(?<!//:)[^\s/@<>\[\]]+)"
@@ -150,10 +157,15 @@ def test_the_widened_dsn_pattern_grows_linearly_in_line_length() -> None:
 
 def test_the_growth_shapes_reach_the_widened_pattern() -> None:
     """The shapes above are only evidence if the pattern reads them: each opens a scheme head the
-    pattern starts on, checked with a probe that ends the run in "@", which then matches."""
+    pattern starts on. The first three match once the run ends in "@"; the fourth matches as it
+    stands; the fifth starts a match at each of its heads."""
     wide = scrub_mod._WIDE_DSN_PASSWORD
+    shapes = dict(_WIDE_SHAPES)
     for label, shape in _WIDE_SHAPES[:3]:
         assert wide.search(shape(64) + "@h") is not None, label
+    assert wide.search(shapes["user, at-sign run"](64)) is not None
+    glued = shapes["glued scheme heads"](64)
+    assert len(wide.findall(glued.replace("://:", "://:x@"))) >= 4
 
 
 def test_both_readings_apply_the_same_widened_pattern() -> None:

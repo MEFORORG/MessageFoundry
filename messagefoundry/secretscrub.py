@@ -406,7 +406,7 @@ _CAMEL_INITIALS = "".join(sorted({word[0].upper() for word in _CAMEL_WORDS}))
 # 1,437 lines printed a value atom it hid. So :func:`scrub_credentials` no longer applies it alone.
 # A line where this start or a compound key word could read anything is scrubbed twice, with these
 # patterns and with :func:`_pre_camel` of them, and :func:`_union` keeps a character only where the
-# second reading, the one ``origin/main`` shipped, printed it too. THAT HOLDS FOR THIS FUNCTION'S OWN
+# second reading, the one ``origin/main`` shipped plus the widened DSN pass, printed it too. THAT HOLDS FOR THIS FUNCTION'S OWN
 # OUTPUT, by construction. A pass that reads that output AFTERWARDS can still differ: :func:`_union`
 # keeps the reading before whole where the bundle's member mask would lose a ";" key, and a record
 # filtered twice is a pinned residual. ``tests/test_secretscrub_camelcase_label.py`` measures the
@@ -2223,17 +2223,15 @@ def _run(
     masked at its end, which only the tracing reads.
 
     ``wide`` False leaves out the widened DSN pass (BACKLOG #5386). Nothing in this module passes
-    it any more. :func:`_union` runs its reading before with the widened pass, so the pass also
-    runs where the union returns that reading whole: on a line where the shipped reading would hide
-    a member key's ";", and on an untraceable one. Until BACKLOG #5386's added item 2, a
-    password-only DSN, or the tail of a password holding an "@", printed on those lines. The
-    widened pattern holds no camelCase fragment, so :func:`_pre_camel` leaves it as it is and both
-    readings apply the same pattern. The hazard once given for leaving it out, its run crossing a
-    camelCase label only the shipped reading reads, does not arise: every segment of the widened
-    match stops at a label word (``_DSN_RUN_STOP``), and on ``redis://:pw@h?accessToken=Tail@Sec``
-    and ``redis://:pw@h;userPassword=Tail@Sec`` the two readings differ only in ``pw``, which the
-    pass hides. The flag stays for a test that rebuilds the reading as it stood before BACKLOG
-    #5545, which had no widened pass."""
+    it. :func:`_union` runs its reading before with the widened pass, so the pass also runs where
+    the union returns that reading whole: on a line where the shipped reading would hide a member
+    key's ";", and on an untraceable one. The widened pattern holds no camelCase fragment, so
+    :func:`_pre_camel` leaves it as it is and both readings apply the same pattern. Its run does not
+    cross a camelCase label only the shipped reading reads, because every segment of the widened
+    match stops at a label word (``_DSN_RUN_STOP``): on ``redis://:pw@h?accessToken=Tail@Sec`` and
+    ``redis://:pw@h;userPassword=Tail@Sec`` the reading before, widened or not, differs only in
+    ``pw``, which the pass hides. The flag stays for tests that rebuild the reading as it stood
+    before BACKLOG #5545, which had no widened pass."""
     apply = _plain_sub if sub is None else sub
     if _admits(folded, _ENV_HINT):
         text = apply(_MEFOR_SECRET, lambda m: _keep_label(m, placeholder), text, _BRACED)
@@ -2288,7 +2286,7 @@ def _run(
 # match's group 1, copied from the line, then fixed text, then optionally the group the pass names
 # written back masked one character for one: the braced tail, or a member's value. A replacement of
 # any other shape raises :class:`_Untraceable`, and the line takes the pre-camelCase reading alone,
-# which is what ``origin/main`` printed.
+# which is what ``origin/main`` printed before BACKLOG #5545, plus the widened DSN pass.
 
 #: The group :func:`_keep_label` and ``_AUTH_SCHEME``'s replacement write back masked at their end.
 _BRACED = "braced_tail"
