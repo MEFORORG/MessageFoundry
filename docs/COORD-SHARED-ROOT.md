@@ -169,7 +169,8 @@ exists to stop.
 
 The fix is part of the change, not a follow-up:
 
-1. Every shared record carries `host` (`$env:COMPUTERNAME`). `seat.ps1` already writes it into its
+1. Every shared record carries `host` (`[Environment]::MachineName`, never `$env:COMPUTERNAME`,
+   which any process can overwrite). `seat.ps1` already writes it into its
    stage log, not into the record.
 2. A liveness check judges only records whose `host` is this machine. A record from another host
    reads `ON <HOST>, NOT CHECKABLE HERE`, never `GONE`.

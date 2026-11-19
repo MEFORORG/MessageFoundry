@@ -244,9 +244,37 @@ def resolve(
     return CoordDir(root / kind, True, source, None)
 
 
+# Windows' MAX_COMPUTERNAME_LENGTH: the NetBIOS name is at most this many characters.
+_NETBIOS_MAX = 15
+
+
+def _windows_computer_name() -> str | None:
+    """The NetBIOS name from ``GetComputerNameW``, the call .NET's MachineName makes; None on failure."""
+    import ctypes  # Windows-only use; imported here so the module loads anywhere
+
+    buf = ctypes.create_unicode_buffer(_NETBIOS_MAX + 1)
+    size = ctypes.c_uint32(len(buf))
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined,unused-ignore]
+    if not kernel32.GetComputerNameW(buf, ctypes.byref(size)):
+        return None
+    return buf.value or None
+
+
 def host() -> str:
-    """The name every shared record carries. Matches PowerShell's ``[Environment]::MachineName``."""
-    return os.environ.get("COMPUTERNAME") or socket.gethostname().split(".")[0].upper()
+    """The name every shared record carries. Matches PowerShell's ``[Environment]::MachineName``.
+
+    It never reads ``COMPUTERNAME``: any process can set that variable, and a child inherits it, so a
+    hook reading it could name a machine other than the one PowerShell names and misjudge this
+    machine's own records. On Windows the name is the NetBIOS name, upper case and at most 15
+    characters, as .NET reads it; should that call fail, the DNS host's first label is cut the same
+    way. Elsewhere it is the host name's first label, case kept, which is what .NET returns there.
+    """
+    if os.name == "nt":
+        name = _windows_computer_name()
+        if name:
+            return name
+        return socket.gethostname().split(".")[0].upper()[:_NETBIOS_MAX]
+    return socket.gethostname().split(".")[0]
 
 
 # What a host field that is present but not a string reads as. It never equals a machine name, so the
