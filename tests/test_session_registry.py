@@ -776,6 +776,53 @@ def test_fleet_counts_a_live_anonymous_record_in_a_real_worktree_in_its_denomina
     assert row["State"] == "POSSIBLY RUNNING", row
 
 
+def _live_named_record(cwd: Path) -> str:
+    """A LIVE registry record naming a session no seat record holds, sitting in ``cwd``."""
+    return json.dumps(
+        {
+            "pid": os.getpid(),
+            "startedAt": NOW_MS,
+            "sessionId": "5485live-0000-0000-0000-000000000000",
+            "cwd": str(cwd),
+        }
+    )
+
+
+@pytest.mark.parametrize(
+    ("where", "counted"),
+    [("repo/sub/dir", 1), ("repo-other", 0)],
+    ids=["subdirectory", "sibling-prefix"],
+)
+def test_fleet_counts_a_live_session_in_a_worktree_subdirectory_in_its_denominator(
+    tmp_path: Path, where: str, counted: int
+) -> None:
+    """BACKLOG #5485. A live session whose cwd is a subdirectory of one of this repo's worktrees is
+    a session in that worktree. Exact equality left it out of liveSessionsWithoutRecord, so the
+    roster read complete without it. A sibling directory sharing the name as a prefix is not inside
+    the worktree, and stays out."""
+    # Not created: the denominator compares paths and never reads the directory, and _fleet makes
+    # the repo itself.
+    proc, _ = _fleet(
+        tmp_path, None, raw_records={"99485.json": _live_named_record(tmp_path / where)}
+    )
+    j = _fleet_json(proc)
+    assert j["receipt"]["liveSessionsWithoutRecord"] == counted, j["receipt"]
+    fired = [s for s in j["receipt"]["stopConditions"] if s.startswith("liveSessionsWithoutRecord")]
+    assert len(fired) == counted, j["receipt"]["stopConditions"]
+
+
+def test_fleet_raises_a_stop_when_a_seat_record_is_unreadable(tmp_path: Path) -> None:
+    """BACKLOG #5485. An unreadable seat record was counted in the receipt and fired no stop, so the
+    roster could read complete with a seat missing from it. The stop names that file and not the
+    parseable seat record _fleet always writes beside it, which is the twin."""
+    proc, _ = _fleet(tmp_path, None, extra_seats={"box-5485": "{not json"})
+    j = _fleet_json(proc)
+    assert j["receipt"]["recordsUnreadable"] == 1, j["receipt"]
+    fired = [s for s in j["receipt"]["stopConditions"] if s.startswith("recordsUnreadable")]
+    assert len(fired) == 1, j["receipt"]["stopConditions"]
+    assert "box-5485" in fired[0] and "box-5491" not in fired[0], fired
+
+
 @pytest.mark.parametrize(
     ("pid", "anonymous", "refusal"),
     [
