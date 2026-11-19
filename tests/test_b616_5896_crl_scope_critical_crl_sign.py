@@ -337,7 +337,7 @@ def test_the_leaf_hop_crl_sign_warning_is_not_repeated_per_build(
         for _ in range(3):
             pki.hop(crl)
         assert warned() == 1
-        assert any("the file is loaded" in r.getMessage() for r in caplog.records)
+        assert any("the file passes this check" in r.getMessage() for r in caplog.records)
         # Control: a new version of the file logs again.
         # an ECDSA signature differs per signing, so these bytes are new
         crl.write_bytes(_crl(pki.key))

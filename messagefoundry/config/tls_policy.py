@@ -388,8 +388,9 @@ def harden_crl_check(
     Since vault BACKLOG #5896, :func:`judge_crl_bytes` also refuses a CRL OpenSSL never judges a
     certificate by, and one with a critical extension OpenSSL does not handle on the CRL or on an
     entry whose extensions ``cryptography`` reads. With ``chain`` only, the signature check also
-    refuses a CRL whose signature verifies and every judged CA that verifies it carries a key
-    usage without ``cRLSign``, after a proven bad signature and before the refusal below. Without ``chain`` that
+    refuses a CRL whose signature verifies where each judged CA whose key verifies it carries a
+    key usage without ``cRLSign``. That refusal comes after a proven bad signature and before the
+    refusal below. Without ``chain`` that
     CRL is not refused: the file loads with a WARNING, logged as :func:`_check_crl_signatures`
     says (:attr:`~messagefoundry.pki.CrlSignature.without_crl_sign`).
 
@@ -744,7 +745,8 @@ def _check_crl_signatures(
         crl_file, fingerprint, ("no-crl-sign", unable.where)
     ):
         logger.warning(
-            "%s: the file is loaded and revocation checking is on, but %s %s. This hop checks "
+            "%s: the file passes this check and will be loaded unless a later check refuses the "
+            "build, but %s %s. This hop checks "
             "only the peer's own certificate. So it fails only peers that CA issued directly, "
             "and a CA that signs only intermediates fails none. %s",
             label,
