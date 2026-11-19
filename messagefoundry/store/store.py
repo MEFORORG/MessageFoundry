@@ -17780,9 +17780,9 @@ class MessageStore:
                 failures.append(err)
                 continue
             except CipherError as exc:
-                # BACKLOG #5970: a candidate the store's keys cannot open is left out, as a failed
-                # tag is, rather than failing the whole search; an outage still raises.
-                withhold_refused_cell("messages", exc)
+                # BACKLOG #5970: a candidate sealed under a key the store does not hold is left
+                # out, as a failed tag is; any other cipher error raises (owner ruling 2026-11-19).
+                withhold_refused_cell(self._cipher, "messages", exc)
                 continue
             rows.append(d)
             if len(rows) >= limit:
@@ -17822,7 +17822,7 @@ class MessageStore:
             out: list[dict[str, Any]] = []
             for r in await cur.fetchall():
                 d = dict(r)
-                # BACKLOG #5970: a last_error the cipher refuses is withheld, not a 500 page.
+                # BACKLOG #5970: only a last_error under a key the store does not hold is withheld.
                 d["last_error"] = open_listed_cell(
                     self._cipher,
                     d["last_error"],
@@ -18094,7 +18094,7 @@ class MessageStore:
                     kind=r["kind"],
                     peer_host=r["peer_host"],
                     message_id=r["message_id"],
-                    # BACKLOG #5970: a reason the cipher refuses is withheld, not a 500 page.
+                    # BACKLOG #5970: only a reason under a key the store does not hold is withheld.
                     reason=open_listed_cell(
                         self._cipher,
                         r["reason"],
@@ -18263,7 +18263,7 @@ class MessageStore:
             first_seen=r["first_seen"],
             last_seen=r["last_seen"],
             count=r["count"],
-            # BACKLOG #5970: a reason the cipher refuses is withheld, not a 500 page.
+            # BACKLOG #5970: only a reason under a key the store does not hold is withheld.
             reason=open_listed_cell(
                 self._cipher,
                 r["reason"],

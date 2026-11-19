@@ -8634,7 +8634,7 @@ class SqlServerStore:
                 kind=r["kind"],
                 peer_host=r["peer_host"],
                 message_id=r["message_id"],
-                # BACKLOG #5970: a reason the cipher refuses is withheld, not a 500 page.
+                # BACKLOG #5970: only a reason under a key the store does not hold is withheld.
                 reason=open_listed_cell(
                     self._cipher,
                     r["reason"],
@@ -8798,7 +8798,7 @@ class SqlServerStore:
             first_seen=float(r["first_seen"]),
             last_seen=float(r["last_seen"]),
             count=int(r["count"]),
-            # BACKLOG #5970: a reason the cipher refuses is withheld, not a 500 page.
+            # BACKLOG #5970: only a reason under a key the store does not hold is withheld.
             reason=open_listed_cell(
                 self._cipher,
                 r["reason"],
@@ -13729,9 +13729,9 @@ class SqlServerStore:
                 failures.append(err)
                 continue
             except CipherError as exc:
-                # BACKLOG #5970: a candidate the store's keys cannot open is left out, as a failed
-                # tag is, rather than failing the whole search; an outage still raises.
-                withhold_refused_cell("messages", exc)
+                # BACKLOG #5970: a candidate sealed under a key the store does not hold is left
+                # out, as a failed tag is; any other cipher error raises (owner ruling 2026-11-19).
+                withhold_refused_cell(self._cipher, "messages", exc)
                 continue
             out.append(d)
             if len(out) >= limit:
@@ -13762,7 +13762,7 @@ class SqlServerStore:
             # Mixed-table join: last_error is queue's (o.id → outbox_id), summary is the messages
             # row's (keyed by message_id and bound to the message's own channel, BACKLOG #2593) —
             # each binds to its own cell (ASVS 11.3.3).
-            # BACKLOG #5970: a last_error the cipher refuses is withheld, not a 500 page.
+            # BACKLOG #5970: only a last_error under a key the store does not hold is withheld.
             r["last_error"] = open_listed_cell(
                 self._cipher,
                 r["last_error"],

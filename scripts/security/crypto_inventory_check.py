@@ -580,8 +580,17 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/store/queue_tag.py": frozenset({"messagefoundry.store.crypto"}),
     # BACKLOG #2593: builds the AES-GCM associated data a message cell (bound to its channel) and a
     # preset's criteria (bound to its owner) are sealed under, and opens those cells through the store
-    # cipher seam. No key of its own.
-    "messagefoundry/store/cell_tag.py": frozenset({"messagefoundry.store.crypto"}),
+    # cipher seam. No key of its own. BACKLOG #5970: to tell a Transit decrypt 400 that names the
+    # key (a retired or unknown version, a key not held) from any other, it reads the reply with
+    # crypto_transit's bounded reader and version texts and keyprovider_vault's 400 test; it makes
+    # no Transit call of its own.
+    "messagefoundry/store/cell_tag.py": frozenset(
+        {
+            "messagefoundry.store.crypto",
+            "messagefoundry.store.crypto_transit",
+            "messagefoundry.store.keyprovider_vault",
+        }
+    ),
     # BACKLOG #5651: the embedded-document strip's shared batch transform opens each candidate's raw
     # cell through cell_tag and re-seals the stripped body through the store cipher, under the row's
     # tag. From store.crypto it takes at least the Cipher type, CipherError, gave_no_verdict (to tell
