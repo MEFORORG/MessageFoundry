@@ -3765,6 +3765,14 @@ _NOT_AN_OBJECT = {
     "flag-null": '{"unavailable": null}',
     "flag-zero": '{"unavailable": 0}',
     "flag-string": '{"unavailable": "false"}',
+    "flag-empty-string": '{"unavailable": ""}',
+    "flag-other-string": '{"unavailable": "yes"}',
+    "flag-array": '{"unavailable": []}',
+    "flag-object": '{"unavailable": {}}',
+    "flag-negative-zero": '{"unavailable": -0.0}',
+    # ConvertFrom-Json keeps the last of a repeated key silently, so this read as AVAILABLE.
+    "flag-repeated": '{"unavailable": true, "unavailable": false}',
+    "flag-repeated-same": '{"unavailable": true, "unavailable": true}',
 }
 
 # Positive controls, classified in the same run: a check that called everything MALFORMED fails here.
@@ -3772,6 +3780,16 @@ _WELL_FORMED = {
     "marked": ('{"unavailable": true, "reason": "cancelled"}', "UNAVAILABLE"),
     "cleared": ('{"unavailable": false}', "AVAILABLE"),
     "reason-only": ('{"reason": "cancelled"}', "UNAVAILABLE"),
+    # A truthy non-boolean flag still reads as the cancellation its writer most likely meant, because
+    # the collector suppresses publishing only on UNAVAILABLE.
+    "flag-one": ('{"unavailable": 1}', "UNAVAILABLE"),
+    "flag-float": ('{"unavailable": 0.5}', "UNAVAILABLE"),
+    "flag-negative": ('{"unavailable": -3}', "UNAVAILABLE"),
+    "flag-big": ('{"unavailable": 123456789012345678901234567890}', "UNAVAILABLE"),
+    "flag-true-string": ('{"unavailable": "true"}', "UNAVAILABLE"),
+    "flag-true-upper": ('{"unavailable": "TRUE"}', "UNAVAILABLE"),
+    # A nested flag is not the marker's own, so it cannot count as a repeat.
+    "nested-flag": ('{"unavailable": false, "detail": {"unavailable": true}}', "AVAILABLE"),
 }
 
 
@@ -3785,13 +3803,18 @@ def test_a_marker_that_parses_to_no_object_is_malformed_not_a_cancellation(tmp_p
     for name, body in bodies.items():
         (tmp_path / name).mkdir()
         (tmp_path / name / "unavailable.json").write_text(body, encoding="utf-8")
+    # A directory at the marker path read as an absent marker, so AVAILABLE; an empty state dir is the
+    # control that the absent case still reads AVAILABLE.
+    (tmp_path / "directory" / "unavailable.json").mkdir(parents=True)
+    (tmp_path / "absent").mkdir()
+    names = [*bodies, "directory", "absent"]
     script = "; ".join(
         [
             f". '{CONFIG_ROOTS}'",
             "$out = [ordered]@{}",
             *(
                 f"$out['{name}'] = (Get-RootUnavailability -StateDir '{tmp_path / name}').state"
-                for name in bodies
+                for name in names
             ),
             "$out | ConvertTo-Json -Compress | Write-Output",
         ]
@@ -3807,6 +3830,7 @@ def test_a_marker_that_parses_to_no_object_is_malformed_not_a_cancellation(tmp_p
     states = json.loads(proc.stdout)
     expected = dict.fromkeys(_NOT_AN_OBJECT, "MALFORMED")
     expected.update({name: state for name, (_, state) in _WELL_FORMED.items()})
+    expected.update({"directory": "MALFORMED", "absent": "AVAILABLE"})
     assert states == expected, states
 
 
