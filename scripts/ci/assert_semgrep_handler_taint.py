@@ -73,7 +73,9 @@ def check(payload: object, fixture: str) -> str | None:
 
     A non-empty ``errors`` array fails it even though JSON parsed (BACKLOG #5463): semgrep reports a
     rule it could not load, or a file it could not parse, there and still exits with results, so a
-    broken rule would otherwise read as one that matched nothing it was not annotated for."""
+    broken rule would otherwise read as one that matched nothing it was not annotated for. Every
+    level fails it, a warning included, on purpose: the fixture is valid Python and the rules are
+    ours, so any entry there means the run did not analyse what the annotations describe."""
     if not isinstance(payload, dict):
         return "semgrep produced no JSON object"
     errors = payload.get("errors")
