@@ -29,15 +29,17 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from harness._async import join_worker_thread
+from harness._batch import MAX_RESULT_ROWS, generated_items
+from harness._batch import RANDOM_TRIGGER as _RANDOM
 from harness._console_widgets import ConfigurableTable
 from harness.file_transport import DropResult, FileDropWorker, FolderWatcher
-from harness.mllp import Received, SendItem
+from harness.mllp import Received
 from messagefoundry_toolkit.generators import (
     _core,
     all_types,  # noqa: F401  (registers the built-in message types)
 )
 
-_RANDOM = "(random across all)"
 _DROP_COLUMNS = ["#", "Type", "Trigger", "Control ID", "File", "Error"]
 _WATCH_COLUMNS = ["Time", "File", "Type", "Trigger", "Control ID"]
 _RAW_ROLE = Qt.ItemDataRole.UserRole
@@ -117,18 +119,14 @@ class FilePanel(QWidget):
         code = self._code.currentText()
         if not code or self._worker is not None:
             return
-        triggers = _core.triggers_for(code)
-        choice = self._trigger.currentText()
-        items: list[SendItem] = []
-        for i in range(1, self._count.value() + 1):
-            trigger = self._rng.choice(triggers) if choice == _RANDOM else choice
-            payload = _core.generate_message(code, trigger, i)
-            items.append(SendItem(i, code, trigger, _core.control_id(code, trigger, i), payload))
+        count = self._count.value()
+        # Generated lazily, on the worker thread as each file is written (BACKLOG #5948).
+        items = generated_items(code, self._trigger.currentText(), count, self._rng)
 
         self._drop_results.setRowCount(0)
         self._drop_results.setSortingEnabled(False)
         self._dropped = self._written = 0
-        self._drop_summary.setText(f"dropping {len(items)} {code} file(s)…")
+        self._drop_summary.setText(f"dropping {count} {code} file(s)…")
 
         self._thread = QThread(self)
         self._worker = FileDropWorker(self._drop_dir.text().strip(), items, rate=self._rate.value())
@@ -146,22 +144,24 @@ class FilePanel(QWidget):
 
     def _on_drop_result(self, res: DropResult) -> None:
         row = self._drop_results.rowCount()
-        self._drop_results.insertRow(row)
-        values = [
-            str(res.item.seq),
-            res.item.code,
-            res.item.trigger,
-            res.item.control_id,
-            res.filename,
-            res.error,
-        ]
-        for col, value in enumerate(values):
-            self._drop_results.setItem(row, col, QTableWidgetItem(value))
+        if row < MAX_RESULT_ROWS:
+            self._drop_results.insertRow(row)
+            values = [
+                str(res.item.seq),
+                res.item.code,
+                res.item.trigger,
+                res.item.control_id,
+                res.filename,
+                res.error,
+            ]
+            for col, value in enumerate(values):
+                self._drop_results.setItem(row, col, QTableWidgetItem(value))
         self._dropped += 1
         self._written += 0 if res.error else 1
-        self._drop_summary.setText(
-            f"dropped {self._dropped} · written {self._written} · failed {self._dropped - self._written}"
-        )
+        summary = f"dropped {self._dropped} · written {self._written} · failed {self._dropped - self._written}"
+        if self._dropped > MAX_RESULT_ROWS:
+            summary += f" (table shows the first {MAX_RESULT_ROWS})"
+        self._drop_summary.setText(summary)
 
     def _on_drop_finished(self) -> None:
         if self._thread is not None:
@@ -180,10 +180,8 @@ class FilePanel(QWidget):
         if self._worker is not None:
             self._worker.stop()
         if self._thread is not None:
-            self._thread.quit()
-            if not self._thread.wait(6000):
-                self._thread.terminate()
-                self._thread.wait()
+            # stop() also ends a pause between files, so this join never needs terminate.
+            join_worker_thread(self._thread)
             self._thread = None
         self._worker = None
 
