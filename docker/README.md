@@ -147,8 +147,6 @@ against one case that matters, described under
   `kubectl create configmap mefor-revocation-attestation --from-literal=attested=1`. The value must
   read as true (`1`, `true`, `yes` or `on`). A value such as `0` passes the kubelet, and the engine
   then exits 2 and the pod crash-loops: neither manifest checks the value before the engine starts.
-  Compose has a check for it, the `revocation-attestation-check` service, and the comment on that
-  service in `compose.yaml` says which compose commands skip it.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
   Postgres-backed `replicas: 3` Deployment with `[cluster].enabled`, a PodDisruptionBudget, and
   lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)
@@ -168,13 +166,14 @@ against one case that matters, described under
   start until you export it or put it in a `.env` beside `compose.yaml` (an `env_file:` does not
   feed substitution, and passing `--env-file` reads the named file instead of that `.env`, so keep
   every substituted value, at least this one and the Postgres password, in the file substitution
-  reads; the `ha` engines still read their own store password from `secrets.env`). A value that does
-  not read as true, such as `0`, stops `docker compose up`, with or without `--profile ha`, at the
-  `revocation-attestation-check` service before any engine starts, and
-  `docker compose logs revocation-attestation-check` shows why. Not every command runs that check:
-  at least `docker compose up --no-deps <engine>` and `docker compose run --no-deps` skip it, as the
-  comment on that service in `compose.yaml` says. Set it only if
-  your PKI enforces revocation; the file never sets it for you.
+  reads; the `ha` engines still read their own store password from `secrets.env`). The
+  `revocation-attestation-check` service refuses a value that does not read as true, such as `0`.
+  `docker compose up` and `docker compose --profile ha up` run that check before they start any
+  serving engine, and `docker compose logs revocation-attestation-check` shows why it refused. Not
+  every command runs the check: at least `docker compose up --no-deps <engine>` and
+  `docker compose run --no-deps` skip it. Never start a serving engine with `--no-deps`; the
+  comment on that service in `compose.yaml` says why. Set it only if your PKI enforces revocation;
+  the file never sets it for you.
 - **(B) Reverse-proxy / same-pod sidecar — k8s-preferred.** Engine stays on loopback behind the
   sidecar, declared with `tls_terminated_upstream=true` + `trusted_proxies=[…]` +
   `plaintext_upstream_hop_acknowledged=true`, because with no `tls_cert_file` that hop is
