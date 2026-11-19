@@ -3859,8 +3859,8 @@ def _resolve_oidc_credential(
 ) -> str:
     """Resolve one ``[auth]`` OIDC client credential, naming the setting the operator wrote.
 
-    ``resolve_connector_secret`` names a reference ``<label>_secret``, which is the AD and SMTP
-    spelling. These references are ``<setting>_ref``, so its no-provider refusal is worded here
+    ``resolve_connector_secret``'s no-provider refusal names ``<label>_secret``, the AD and SMTP
+    spelling. These references are ``<setting>_ref``, so that refusal is worded here
     instead. A credential that resolves empty is refused too, since it would send no credential.
     """
     if ref and provider is None:

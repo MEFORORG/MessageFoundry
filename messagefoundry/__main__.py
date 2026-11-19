@@ -550,7 +550,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     security.add_argument(
         "--service-config",
         default="messagefoundry.toml",
-        help="service settings TOML the [security] section lives in (created on `set` if absent)",
+        help=(
+            "service settings TOML the [security] section lives in (created, if absent, by a "
+            "`set` that changes a key)"
+        ),
     )
     security.add_argument(
         "--data",
@@ -13961,6 +13964,7 @@ def _security(args: argparse.Namespace) -> int:
 
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
+        _REMOVED_KEYS,
         _SECURITY_PASSTHROUGH,
         AuthSettings,
         SecuritySettings,
@@ -13968,6 +13972,9 @@ def _security(args: argparse.Namespace) -> int:
         _auth_default,
         _auth_limit_loosenings,
         _env_overrides,
+        _removed_key_message,
+        _unknown_key_report,
+        _unknown_keys,
         security_loosenings,
     )
 
@@ -14155,7 +14162,9 @@ def _security(args: argparse.Namespace) -> int:
                 "equal to the file's value, or one whose value is no loosening, adds no entry, and "
                 "at least the require_mfa and block_unlisted_outbound variables are never named. "
                 "That needs a whole-file load that ran and succeeded: `show` on an absent file runs "
-                "none and names none, while `set` on a new file loads what it wrote and names it. "
+                "none and names none, and neither does a `set` that changed no key where no file "
+                "exists, since it writes none, while `set` on a new file loads what it wrote and "
+                "names it. "
                 "The other sections are read as the whole-file load "
                 "resolves them, so a MEFOR_<SECTION>_<KEY> variable in THIS command's environment "
                 "counts there, which may not be the service's. One entry is not read from the "
@@ -14224,6 +14233,39 @@ def _security(args: argparse.Namespace) -> int:
             )
         # Precise per-field error before we touch the file: validate the merged [security] view.
         merged = dict(security_edit.read_security(path))
+        # BACKLOG #5327: a null reset of a key [security] does not define, and the file does not
+        # carry, would change nothing, so reporting it as set would leave the loosening the
+        # operator meant to reset in place. A non-null unknown key is refused by the whole-file
+        # load; a null one never reaches it. One the file does carry may be reset, since removing
+        # it is the repair for a file the load refuses.
+        unknown = list(
+            _unknown_keys(
+                "security",
+                SecuritySettings,
+                {k: v for k, v in updates.items() if v is None and k not in merged},
+            )
+        )
+        if unknown:
+            # A removed key is named with the loader's own refusal for it, never a nearest
+            # spelling: for require_sign_in that would be require_mfa, another switch. It is
+            # built directly from the arguments, so the refusal names no environment variable.
+            removed = [
+                _removed_key_message(table, key, _REMOVED_KEYS[(table, key)], built_directly=True)
+                for table, key, _near in unknown
+                if (table, key) in _REMOVED_KEYS
+            ]
+            typos = [item for item in unknown if (item[0], item[1]) not in _REMOVED_KEYS]
+            parts = [
+                "refused, nothing written: a null value resets a [security] key, and resetting a "
+                "key that is neither a [security] key nor set in the file would change nothing."
+            ]
+            if typos:
+                parts.append(
+                    f"Not a [security] key: {_unknown_key_report(typos)}. Check the spelling "
+                    "against docs/CONFIGURATION.md."
+                )
+            parts.extend(removed)
+            return _emit_error(" ".join(parts), as_json=args.json)
         for key, value in updates.items():
             if value is None:
                 merged.pop(key, None)
