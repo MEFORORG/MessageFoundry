@@ -150,12 +150,11 @@ _DRIVE_COMPLETE_MARGIN = 60.0
 _ENGINE_DRAINED_MARGIN = 150.0
 
 #: BACKLOG #5977: with the ENGINE_DRAINED gate armed, the remote ``/stats`` drain poll runs BESIDE the gate
-#: rather than in front of it, and once the gate lands the poll gets only this long to finish. The engine
-#: posts the gate after its own store-truth drain, so a healthy poll needs about two 0.5s intervals more,
-#: and the engine half tears its fleet down ``post_drain_grace`` (3s by default) after posting, so a longer
-#: grace would mostly read a stopped fleet. A poll that cannot read the engine box (an engine shard
-#: unreachable, or the fleet already gone) would otherwise hold the sinks' tally for the whole
-#: ``drain_timeout`` on every rung.
+#: rather than in front of it, and once the gate lands the poll gets this long to finish before it is asked
+#: to stop; it then ends after the sample it has in flight, if any. The engine posts the gate after its own
+#: store-truth drain, so a healthy poll needs about two 0.5s intervals more. A poll that cannot read the
+#: engine box (an engine shard unreachable, or the fleet already torn down) would otherwise hold the sinks'
+#: tally for the whole ``drain_timeout`` on every rung.
 _ADVISORY_DRAIN_GRACE = 5.0
 
 
@@ -208,7 +207,7 @@ def _derive_drive_complete_timeout(
     4. ``drain_timeout``        — the advisory remote ``/stats`` drain poll.
     5. ``engine_drained_timeout`` + ``_ADVISORY_DRAIN_GRACE`` — the PR-C2 store-truth drain gate and the
        poll's grace after it, when ``await_engine_drained``. Since BACKLOG #5977 the gate runs beside the
-       poll and carries step 4's term itself, so steps 4 and 5 together are the gate's own deadline.
+       poll rather than after it, so counting steps 4 and 5 in series over-counts, the safe direction.
 
     Each term is the coordinator's OWN timeout for that step, so the sum is the longest run the coordinator
     can have before it gives up and reaps us anyway. A sink that fires earlier records a partial tally and
@@ -4773,7 +4772,7 @@ async def run_shardcert_drive(
     ``/stats`` poller below is advisory (it can zero out under load on a unified store), so tallying on it
     alone risks reading a teardown-frozen in-flight tail as loss; awaiting the engine's DIRECT store read
     closes that window. The advisory poll runs beside the gate: once the gate lands it gets
-    :data:`_ADVISORY_DRAIN_GRACE` more, then stops. Bounded + best-effort — a missing signal degrades to
+    :data:`_ADVISORY_DRAIN_GRACE` more, then is asked to stop. Bounded + best-effort — a missing signal degrades to
     the advisory-drain fallback (the poll then runs in full) with a note, never a hang."""
     ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
@@ -4942,19 +4941,18 @@ async def run_shardcert_drive(
             coord, DRIVER_DONE, driver_count, timeout=driver_done_wait
         )
         # The poller was opened, and signed in, at step (0); without it the advisory terms stay unread.
-        # The poll runs as a task: without the gate it is the barrier, awaited in full after step (4b);
-        # with the gate armed it is advisory, so it runs BESIDE the gate rather than in front of it
-        # (BACKLOG #5977), and a poll that cannot read the engine box no longer holds the tally.
+        # Without the gate the poll is the barrier, awaited here in full. With the gate armed it is
+        # advisory, so it runs as a task BESIDE the gate rather than in front of it (BACKLOG #5977), and
+        # a poll that cannot read the engine box no longer holds the tally.
         drain_s: float | None = None
         final: EngineSample | None = None
-        # The gate wait used to open only after the poll (up to ``drain_timeout``) returned. It now opens
-        # beside the poll, so it carries that term itself and keeps the same deadline.
-        gate_wait = engine_drained_wait
         if poller is not None:
-            gate_wait += drain_timeout
-            advisory_drain = asyncio.create_task(
-                poller.await_drain(timeout=drain_timeout, interval=0.5, stop=advisory_stop)
-            )
+            if await_engine_drained:
+                advisory_drain = asyncio.create_task(
+                    poller.await_drain(timeout=drain_timeout, interval=0.5, stop=advisory_stop)
+                )
+            else:
+                drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
 
         # (4b) PR-C2 ladder drain gate (default OFF): before releasing the sinks to tally, wait for the
         # ENGINE half's RELIABLE store-truth drain signal. The remote poller above is advisory (zeroes
@@ -4965,7 +4963,7 @@ async def run_shardcert_drive(
         tallied_behind_gate = False
         if await_engine_drained:
             try:
-                drained_msg = await coord.await_message(ENGINE_DRAINED, timeout=gate_wait)
+                drained_msg = await coord.await_message(ENGINE_DRAINED, timeout=engine_drained_wait)
                 tallied_behind_gate = True
                 notes.append(
                     f"engine drain gate: engine_ok={drained_msg.get('engine_ok')} "
@@ -4987,30 +4985,36 @@ async def run_shardcert_drive(
                 # render FROZEN_TAIL (benign, excluded from the ceiling) and a healthy SOAK can read
                 # soak_ok=False. A false negative, never a fabricated collapse.
                 notes.append(
-                    f"ENGINE_DRAINED not seen within {gate_wait}s — sinks tally WITHOUT the "
+                    f"ENGINE_DRAINED not seen within {engine_drained_wait}s — sinks tally WITHOUT the "
                     "store-truth drain barrier; an early tally may render FROZEN_TAIL (a false negative). "
                     "Store-truth still comes from ENGINE_RUNG_REPORT, never the advisory poller"
                 )
 
         if advisory_drain is not None:
-            if tallied_behind_gate:
-                # The gate landed, so the poll only adds telemetry: a short grace, then it stops at its
-                # next sample (a stop, not a cancel, so no sample is in flight when the poller closes).
-                try:
-                    drain_s = await asyncio.wait_for(
-                        asyncio.shield(advisory_drain), _ADVISORY_DRAIN_GRACE
-                    )
-                except TimeoutError:
-                    advisory_stop.set()
-                    drain_s = await advisory_drain
-                    if drain_s is None:
-                        notes.append(
-                            f"advisory /stats drain not seen within {_ADVISORY_DRAIN_GRACE}s of the "
-                            "ENGINE_DRAINED gate; stopped rather than holding the tally"
+            # When the gate landed the poll only adds telemetry: a short grace, then it is asked to stop
+            # (a stop, not a cancel, so no sample is in flight when the poller closes). When the gate never
+            # came the poll is the only barrier left, so it runs in full. Either way it stays advisory, so
+            # a poll that raises is a note, not a failed rung.
+            try:
+                if tallied_behind_gate:
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(
+                            asyncio.shield(advisory_drain), _ADVISORY_DRAIN_GRACE
                         )
-            else:
-                # No gate, or it never came: the poll is the only barrier left, so it runs in full.
+                    advisory_stop.set()
                 drain_s = await advisory_drain
+                if drain_s is None and tallied_behind_gate:
+                    notes.append(
+                        f"advisory /stats drain not seen within {_ADVISORY_DRAIN_GRACE}s of the "
+                        "ENGINE_DRAINED gate; stopped rather than holding the tally"
+                    )
+            # Broad on purpose, and recorded: the poll is advisory on this path, and step (0) treats
+            # its sign-in refusal the same way.
+            except Exception as exc:
+                notes.append(
+                    "advisory /stats drain poll failed, so drained/engine_done/engine_dead are unread: "
+                    f"{type(exc).__name__}: " + escape_for_terminal(str(exc), single_line=True)
+                )
         if poller is not None:
             final = poller.final
 
@@ -5018,11 +5022,14 @@ async def run_shardcert_drive(
         coord.post(DRIVE_COMPLETE, {"t": time.time()})
         sink_dones = await _await_indexed(coord, SINK_DONE, sink_count, timeout=sink_done_timeout)
     finally:
-        if advisory_drain is not None:
-            # An early failure leaves the poll running: stop it and collect it (logging, never
-            # swallowing, whatever it raised) before its clients close under it.
+        if advisory_drain is not None and not advisory_drain.done():
+            # An early failure (or a cancel) leaves the poll running: stop it and let it finish before
+            # its clients close under it. asyncio.wait never raises the task's own outcome, so the
+            # teardown below always runs; an outcome nobody read is logged rather than dropped.
             advisory_stop.set()
-            await _teardown_step("advisory drain poll", advisory_drain)
+            await asyncio.wait({advisory_drain})
+            if not advisory_drain.cancelled() and advisory_drain.exception() is not None:
+                await _teardown_step("advisory drain poll", advisory_drain)
         if poller is not None:
             await _teardown_step("drain poller close", poller.close())
         # Reap CONCURRENTLY so an early failure (e.g. a coord timeout while M+K children are still

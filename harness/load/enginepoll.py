@@ -955,20 +955,24 @@ class EnginePoller:
         fully **stalled** router/transform leaves the outbound backlog at 0 but ``in_pipeline > 0``,
         so it no longer reads as drained.
 
-        ``stop``, once set, ends the poll with ``None`` before its next sample, so a caller can end
-        it early without cancelling a sample in flight on the executor (BACKLOG #5977)."""
+        ``stop``, once set, ends the poll with ``None`` before its next sample (a sample already in
+        flight finishes first), so a caller can end it early without cancelling a sample on the
+        executor (BACKLOG #5977)."""
         loop = asyncio.get_running_loop()
         start = loop.time()
         prev = self.final or await self.sample_once()
         while loop.time() - start < timeout:
-            if stop is not None and stop.is_set():
-                return None
-            try:  # noqa: SIM105 - suppress() would drop the pragma below, which coverage reads
-                await asyncio.wait_for(asyncio.sleep(interval), timeout=interval + 1.0)
-            except TimeoutError:  # pragma: no cover - defensive
-                pass
-            if stop is not None and stop.is_set():
-                return None
+            if stop is None:
+                try:  # noqa: SIM105 - suppress() would drop the pragma below, which coverage reads
+                    await asyncio.wait_for(asyncio.sleep(interval), timeout=interval + 1.0)
+                except TimeoutError:  # pragma: no cover - defensive
+                    pass
+            else:
+                # Wait on the event itself, as run() does, so a stop wakes the poll at once.
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=interval)
+                if stop.is_set():
+                    return None
             cur = await self.sample_once()
             if cur is None:
                 continue

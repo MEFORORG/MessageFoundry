@@ -1250,7 +1250,7 @@ def _gated_drive_fakes(
             return None
 
     monkeypatch.setattr(sc, "EnginePoller", SlowPoller)
-    monkeypatch.setattr(sc, "_ADVISORY_DRAIN_GRACE", 0.2)
+    monkeypatch.setattr(sc, "_ADVISORY_DRAIN_GRACE", 2.0)
     coord = FileDropCoord(tmp_path, run_id=run_id)
     coord.post(
         SHARDS_READY,
@@ -1322,17 +1322,47 @@ async def test_gated_drive_lets_the_poll_run_in_full_when_the_gate_never_lands(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """BACKLOG #5977: when ENGINE_DRAINED never comes, the advisory poll is the only barrier left
-    before the sinks tally, so it runs in full. The gate now opens beside the poll, so its deadline
-    carries the poll's ``drain_timeout`` and is never shorter than it was when it opened after the
-    poll. Mutation: drop that term from the gate's deadline. Red: the note reads 0.0s."""
-    coord, ended = _gated_drive_fakes(monkeypatch, tmp_path, "nogate", poll_seconds=0.6)
+    before the sinks tally, so it runs in full rather than for the grace. Here the gate gives up at
+    once and the poll drains after the 2s grace. Mutation: stop the poll on this path too. Red:
+    the poll reads stopped."""
+    coord, ended = _gated_drive_fakes(monkeypatch, tmp_path, "nogate", poll_seconds=2.5)
     report = await sc.run_shardcert_drive(
-        coord=coord, drain_timeout=1.0, engine_drained_timeout=0.0, **_GATED_DRIVE_KWARGS
+        coord=coord, drain_timeout=10.0, engine_drained_timeout=0.0, **_GATED_DRIVE_KWARGS
     )
     assert ended == ["drained"]
     assert report.drained is True
     assert not report.tallied_behind_gate
-    assert any("ENGINE_DRAINED not seen within 1.0s" in n for n in report.notes), report.notes
+    assert any("ENGINE_DRAINED not seen within 0.0s" in n for n in report.notes), report.notes
+
+
+async def test_gated_drive_notes_an_advisory_poll_that_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5977: on the gated path the poll is advisory, so a poll that raises is a note and
+    the rung still reports. Mutation: let the error propagate. Red: the drive raises."""
+    coord, _ended = _gated_drive_fakes(monkeypatch, tmp_path, "raisepoll", poll_seconds=None)
+
+    class RaisingPoller:
+        def __init__(self, urls: Any, token: Any = None, **kw: Any) -> None:
+            self.final = None
+
+        async def open(self) -> None:
+            return None
+
+        async def await_drain(
+            self, *, timeout: float, interval: float, stop: asyncio.Event | None = None
+        ) -> float | None:
+            raise RuntimeError("odd /stats reply")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(sc, "EnginePoller", RaisingPoller)
+    coord.post(ENGINE_DRAINED, {"engine_ok": True, "stranded": 0, "dead_total": 0})
+    report = await sc.run_shardcert_drive(coord=coord, drain_timeout=60.0, **_GATED_DRIVE_KWARGS)
+    assert report.tallied_behind_gate
+    assert report.drained is False
+    assert any("advisory /stats drain poll failed" in n for n in report.notes), report.notes
 
 
 async def test_coordinator_fails_loud_on_oversized_sink_count(
