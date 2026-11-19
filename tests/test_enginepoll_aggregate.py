@@ -312,3 +312,21 @@ def test_await_drain_times_out_if_a_shard_never_empties(monkeypatch: pytest.Monk
     )
     drain = asyncio.run(poller.await_drain(timeout=0.1, interval=0.01))
     assert drain is None
+
+
+def test_await_drain_ends_at_once_when_stop_is_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #5977: a set ``stop`` ends the poll with ``None`` before its next sample, so a caller
+    can end it early without cancelling a sample in flight. Mutation: ignore ``stop``. Red: the
+    poll runs past the outer 5s bound (its own timeout is 30s)."""
+    busy = _shard(read=10, written=8, in_pipeline=2)
+    poller = _poller_over([[busy] * 50, [busy] * 50, [busy] * 50], monkeypatch)
+
+    async def run() -> float | None:
+        stop = asyncio.Event()
+        stop.set()
+        return await asyncio.wait_for(
+            poller.await_drain(timeout=30.0, interval=0.01, stop=stop), timeout=5.0
+        )
+
+    assert asyncio.run(run()) is None
+    assert len(poller.samples) == 1  # only the baseline sample

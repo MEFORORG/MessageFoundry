@@ -1402,8 +1402,9 @@ def test_derive_drive_complete_timeout_covers_a_900s_soak() -> None:
     # COLLAPSED, indistinguishable from a genuine product collapse. So the bound must DOMINATE the sum of
     # the coordinator's own step timeouts across that window.
     soak = _soak_sink_wait()
-    # 2*120 (sinks bind, senders arm) + (900+150+60 DRIVER_DONE) + 150 (drain) + 300 (engine gate) + 60
-    assert soak == 1860.0
+    # 2*120 (sinks bind, senders arm) + (900+150+60 DRIVER_DONE) + 150 (drain) + 300 (engine gate)
+    # + 5 (the advisory poll's grace after the gate, BACKLOG #5977) + 60
+    assert soak == 1865.0
     assert soak > 600.0  # the bug: the old fixed default, blown by any hold >~540s
     assert soak > 900.0 + 150.0  # clears the hold + drain outright
     # The sink's window strictly CONTAINS the coordinator's DRIVER_DONE wait, so it must outlast it.
@@ -1420,13 +1421,13 @@ def test_derive_drive_complete_timeout_climb_rung_and_toggles() -> None:
         engine_drained_timeout=300.0,
         await_engine_drained=True,
     )
-    assert climb == 240.0 + 270.0 + 150.0 + 300.0 + 60.0 == 1020.0
+    assert climb == 240.0 + 270.0 + 150.0 + 300.0 + 5.0 + 60.0 == 1025.0
     assert climb > 600.0
 
-    # Without the PR-C2 store-truth drain gate the engine_drained term drops out entirely.
-    assert _soak_sink_wait(await_engine_drained=False) == 1860.0 - 300.0
+    # Without the PR-C2 store-truth drain gate the engine_drained term and the grace drop out entirely.
+    assert _soak_sink_wait(await_engine_drained=False) == 1865.0 - 300.0 - 5.0
     # A driver_done override propagates into the sink's bound (the sink still contains that window).
-    assert _soak_sink_wait(driver_done_timeout=25.0) == 240.0 + 25.0 + 150.0 + 300.0 + 60.0
+    assert _soak_sink_wait(driver_done_timeout=25.0) == 240.0 + 25.0 + 150.0 + 300.0 + 5.0 + 60.0
     # An explicit sink override wins outright — the escape hatch, as with driver_done.
     assert _soak_sink_wait(override=42.0) == 42.0
 
