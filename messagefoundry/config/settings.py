@@ -3171,6 +3171,30 @@ class LoggingSettings(_Section):
                 "[logging].forward_tls_ca_file (a PEM trust anchor for the collector); set "
                 "[logging].forward_tls_verify=false to accept an unverified server (insecure)"
             )
+        # The TLS-only settings, refused where nothing would apply them (BACKLOG #5316): a declared
+        # mTLS or revocation check for the SIEM hop would otherwise load and stay silently inactive.
+        # udp and tcp read none of the three. On the verify-off arm (CERT_NONE) the CA and the CRL
+        # have no chain to act on, but the client certificate is still loaded and presented to the
+        # collector (logging_setup._build_tls_context), so it is not refused there.
+        for name, needs_verify in (
+            ("forward_tls_ca_file", True),
+            ("forward_tls_client_cert", False),
+            ("forward_tls_crl_file", True),
+        ):
+            if getattr(self, name) is None:
+                continue
+            if self.forward_protocol is not SyslogProtocol.TLS:
+                raise ValueError(
+                    f"[logging].{name} applies only to forward_protocol='tls', and it is "
+                    f"{self.forward_protocol.value!r}, so the setting would do nothing; remove "
+                    "it, or set [logging].forward_protocol='tls'"
+                )
+            if needs_verify and not self.forward_tls_verify:
+                raise ValueError(
+                    f"[logging].{name} applies only with forward_tls_verify=true, and it is "
+                    "false, so no certificate chain is checked and the setting would do nothing; "
+                    "remove it, or turn [logging].forward_tls_verify on"
+                )
         # The attestation pair is validated by the SAME shared rule connection-level tls_hop_attested
         # uses (a reason without the flag, or a blank reason, is a config mistake) — never re-forked.
         # Re-raised under the [logging] field names so the operator sees which setting is at fault
