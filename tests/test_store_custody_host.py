@@ -1836,7 +1836,9 @@ def test_the_service_commands_the_fallback_names_exist() -> None:
     step = custody_host.keep_the_key_step(
         StoreSettings(key_provider="host", cipher_provider="aesgcm"), new_store=True
     )
-    assert "-DbPath" in step and "supervise --db" in step and "[store].path" in step, step
+    assert "-DbPath" in step and "supervise --db" in step, step
+    assert "(without one, supervise takes [store].path, as serve does)" in step, step
+    assert "as messagefoundry.db" not in step, step
 
 
 def test_the_advised_reinstall_is_one_the_installer_accepts() -> None:

@@ -85,10 +85,11 @@ DEFAULT_CRASH_LOOP_LIMIT = 10
 class ShardSpec:
     """The fixed launch parameters for one shard's subprocess.
 
-    ``db_path`` and ``port`` are derived deterministically from the operator's ``--db``/``--port``
-    bases so a restart re-attaches to the SAME store and re-binds the SAME API port. ``argv`` is the
-    full command line: :func:`messagefoundry.childenv.python_child_argv` for ``messagefoundry``,
-    then ``serve ...``. That function says how the shard imports this build without searching the
+    ``db_path`` and ``port`` are derived deterministically from the supervisor's merged
+    ``[store].path`` and ``[api].port`` (which ``--db`` and ``--base-port`` override) so a restart
+    re-attaches to the SAME store and re-binds the SAME API port. ``argv`` is the full command
+    line: :func:`messagefoundry.childenv.python_child_argv` for ``messagefoundry``, then
+    ``serve ...``. That function says how the shard imports this build without searching the
     working directory.
     """
 
@@ -107,6 +108,10 @@ def _shard_db_path(db_base: str, shard: str, *, single: bool) -> str:
     if single:
         return db_base
     p = Path(db_base)
+    if not p.name:
+        # A server store's [store].path may name a directory such as "" or "." (BACKLOG #5817),
+        # which has no stem to derive from; the engine shards' names then go inside it.
+        p = p / "messagefoundry.db"
     return str(p.with_name(f"{p.stem}_{shard}{p.suffix}"))
 
 
@@ -134,10 +139,12 @@ def build_shard_specs(
     # A single engine shard binds base_port as `serve` binds [api].port, 0 included. Several count
     # up from it, so 0 (one ephemeral port, then 1, 2, ...) or a last port past 65535 names no
     # port each can bind; refused here rather than left to crash-loop.
-    if not single and not 1 <= base_port <= 65536 - len(ordered):
+    lowest = 0 if single else 1
+    if not lowest <= base_port <= 65536 - max(len(ordered), 1):
         raise ValueError(
-            f"base port {base_port} gives {len(ordered)} engine shards ports "
-            f"{base_port}..{base_port + len(ordered) - 1}; each needs a port from 1 to 65535"
+            f"base port {base_port} gives {len(ordered)} engine shard(s) ports "
+            f"{base_port}..{base_port + len(ordered) - 1}; each needs a port from {lowest} to "
+            "65535"
         )
     specs: list[ShardSpec] = []
     for i, shard in enumerate(ordered):

@@ -368,14 +368,14 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--db",
         default=None,
         help="base store path (overrides [store].path, whose default is messagefoundry.db); each "
-        "shard gets <stem>_<shard>.db (a single default shard keeps the bare path)",
+        "engine shard gets <stem>_<shard>.db (a single default engine shard keeps the bare path)",
     )
     supervise.add_argument(
         "--base-port",
         type=int,
         default=None,
-        help="API port for the first shard (overrides [api].port, whose default is 8765); "
-        "subsequent shards get base+1, base+2, ... (sorted order)",
+        help="API port for the first engine shard (overrides [api].port, whose default is 8765); "
+        "subsequent engine shards get base+1, base+2, ... (sorted order)",
     )
     supervise.add_argument(
         "--env",
@@ -5474,19 +5474,6 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
     return state_dir
 
 
-def _supervise_store_base(store: StoreSettings) -> str:
-    """The store path ``supervise`` derives each engine shard's ``--db`` from: the merged
-    ``[store].path`` (BACKLOG #5817). A server store opens no file there, and the load lets its
-    ``[store].path`` name a directory (``""``, ``.``, ``..``). A directory has no stem for each
-    engine shard's ``<stem>_<shard>`` name, so the shards' files then take the default store name
-    inside it."""
-    from messagefoundry.config.settings import StoreBackend, StoreSettings
-
-    if store.backend != StoreBackend.SQLITE and Path(store.path).name in ("", ".", ".."):
-        return str(Path(store.path) / StoreSettings.model_fields["path"].default)
-    return store.path
-
-
 def _supervise(args: argparse.Namespace) -> int:
     """L3 multi-process sharding (messagefoundry/pipeline/supervisor.py): discover the shard ids in the
     config and run one `serve --shard <id>` subprocess per shard, each with its own SQLite db file and
@@ -5507,9 +5494,9 @@ def _supervise(args: argparse.Namespace) -> int:
 
     # ADR 0050 AC-9: anchor the discovery --config here, and the db base once the settings load
     # below has merged it, both before discover_shard_specs runs load_config() — so `supervise
-    # --project-root R --config <relative>` from a non-root CWD discovers shards under R, and each
-    # shard's <stem>_<shard>.db composes under R in the supervisor (not only via each child
-    # re-anchoring a relative --db). --service-config is forwarded raw and each child serve
+    # --project-root R --config <relative>` from a non-root CWD discovers engine shards under R, and
+    # each engine shard's <stem>_<shard>.db composes under R in the supervisor (not only via each
+    # child re-anchoring a relative --db). --service-config is forwarded raw and each child serve
     # resolves it under the forwarded --project-root (same precedence as serve).
     cwd = Path.cwd()
     root = resolve_project_root(args.project_root, cwd=cwd)
@@ -5551,7 +5538,7 @@ def _supervise(args: argparse.Namespace) -> int:
     # Each engine shard's store path is derived from the merged [store].path, from --db or the
     # settings (BACKLOG #5817). The load already refused a SQLite path no anchor can place
     # (BACKLOG #5926): the raw --db went in unanchored, so the load tested the value itself.
-    db_base = anchor_under_root(_supervise_store_base(settings.store), root, cwd=cwd)
+    db_base = anchor_under_root(settings.store.path, root, cwd=cwd)
     assert db_base is not None  # [store].path is a str, never None
 
     # BACKLOG #1120: the protocol floor each shard's `serve` builds, for the same reason as the gate

@@ -249,41 +249,35 @@ def test_supervise_takes_store_path_and_api_port_from_settings_without_flags(
 
 
 @pytest.mark.parametrize(
-    ("backend", "path", "base"),
+    ("db_base", "names"),
     [
-        pytest.param("sqlite", "site.db", "site.db", id="sqlite"),
-        pytest.param("postgres", "state/site.db", "state/site.db", id="server-file"),
-        pytest.param("postgres", "", "messagefoundry.db", id="server-empty"),
-        pytest.param("postgres", ".", "messagefoundry.db", id="server-dot"),
+        pytest.param("site.db", ["site_a.db", "site_b.db"], id="file"),
+        pytest.param("", ["messagefoundry_a.db", "messagefoundry_b.db"], id="empty"),
+        pytest.param(".", ["messagefoundry_a.db", "messagefoundry_b.db"], id="dot"),
     ],
 )
-def test_supervise_store_base_gives_a_server_directory_a_file_name(
-    backend: str, path: str, base: str
+def test_build_shard_specs_names_engine_shards_inside_a_directory_base(
+    db_base: str, names: list[str]
 ) -> None:
-    """A server store's [store].path may name a directory, which has no stem for each engine
-    shard's ``<stem>_<shard>`` name; with --db no longer defaulted (BACKLOG #5817) the merged path
-    is the base, so the directory gets the default store name inside it."""
-    from messagefoundry.__main__ import _supervise_store_base
-    from messagefoundry.config.settings import StoreSettings
-
-    server = {"server": "db.example.invalid", "database": "mf", "username": "mefor"}
-    store = StoreSettings.model_validate(
-        {"backend": backend, "path": path, **(server if backend != "sqlite" else {})}
-    )
-    got = _supervise_store_base(store)
-    assert Path(got) == Path(base)
-    # Two engine shards, the only topology a server store is for, derive their paths from it.
-    specs = build_shard_specs(["a", "b"], config="c", db_base=got, base_port=8765)
-    assert [Path(s.db_path).name for s in specs] == [
-        f"{Path(base).stem}_a.db",
-        f"{Path(base).stem}_b.db",
-    ]
+    """A server store's [store].path may name a directory such as "" or ".", which has no stem for
+    each engine shard's ``<stem>_<shard>`` name. With --db no longer defaulted (BACKLOG #5817) that
+    path is the base, so the names go inside it rather than raising."""
+    specs = build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
+    assert [Path(s.db_path).name for s in specs] == names
+    folder = Path(db_base) if not Path(db_base).name else Path(db_base).parent
+    assert all(Path(s.db_path).parent == folder for s in specs)
+    # One engine shard keeps the bare base, as a plain `serve` does.
+    (single,) = build_shard_specs(["a"], config="c", db_base=db_base, base_port=8765)
+    assert single.db_path == db_base
 
 
 @pytest.mark.parametrize(
     ("shards", "base_port", "refused"),
     [
         pytest.param(["a"], 0, False, id="one-shard-ephemeral"),
+        pytest.param(["a"], 65535, False, id="one-shard-65535"),
+        pytest.param(["a"], 65536, True, id="one-shard-past-65535"),
+        pytest.param(["a"], -1, True, id="one-shard-negative"),
         pytest.param(["a", "b"], 0, True, id="two-shards-from-zero"),
         pytest.param(["a", "b"], 65534, False, id="last-port-65535"),
         pytest.param(["a", "b"], 65535, True, id="past-65535"),
@@ -296,7 +290,7 @@ def test_build_shard_specs_refuses_ports_no_engine_shard_can_bind(
     """With [api].port now the default base (BACKLOG #5817), a value serve accepts for its one
     socket, such as 0, would number several engine shards' ports from it."""
     if refused:
-        with pytest.raises(ValueError, match="from 1 to 65535"):
+        with pytest.raises(ValueError, match=r"from [01] to 65535"):
             build_shard_specs(shards, config="c", db_base="m.db", base_port=base_port)
     else:
         specs = build_shard_specs(shards, config="c", db_base="m.db", base_port=base_port)
