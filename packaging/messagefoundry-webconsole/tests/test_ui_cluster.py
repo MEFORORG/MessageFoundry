@@ -496,6 +496,8 @@ class _Coordinator(NullCoordinator):
         )
         self._step_down = StepdownOutcome(*step_down)
         self._raises = raises
+        # Set by a test after sign-in, since _console reads the page once to prove the session.
+        self.members_raise: Exception | None = None
         self.step_down_calls = 0
 
     def is_clustered(self) -> bool:
@@ -508,6 +510,8 @@ class _Coordinator(NullCoordinator):
         return self._owns_row
 
     async def cluster_members(self) -> list[ClusterMember]:
+        if self.members_raise is not None:
+            raise self.members_raise
         return self._members
 
     async def leadership_lease(self) -> tuple[str | None, float | None]:
@@ -774,3 +778,43 @@ async def test_each_engine_refusal_renders_its_own_page(
     assert f"<h1>{headline}</h1>" in r.text
     assert f"Engine message (status {status})" in r.text
     assert coord.step_down_calls == calls
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [ConnectionError("store unreachable"), TimeoutError("pool exhausted")],
+    ids=["outage", "timeout"],
+)
+async def test_a_store_failure_degrades_the_pages_instead_of_a_500(
+    tmp_path: Path, failure: Exception
+) -> None:
+    """BACKLOG #5932. The membership read is a store read, so a store timeout or outage used to
+    unwind every cluster page into the catch-all 500. Each now renders this node's in-memory status
+    and the reason, and neither confirm page offers a form it could not describe."""
+    coord = _Coordinator()
+    async with _console(tmp_path, coord) as (_engine, c):
+        coord.members_raise = failure
+        page_ = await c.get("/ui/cluster")
+        assert page_.status_code == 503, page_.text
+        assert "<h1>High Availability</h1>" in page_.text
+        assert "could not read cluster membership" in page_.text
+        assert "node-a (primary)" in page_.text
+        assert not _offers(page_.text, CONFIRM)
+        live = await c.get("/ui/cluster/live")
+        # Ok, so the page's poller swaps it in rather than keeping the last good view.
+        assert live.status_code == 200
+        assert 'id="ha-live"' in live.text and "<html" not in live.text
+        assert "could not read cluster membership" in live.text
+        assert not _offers(live.text, CONFIRM)
+        for path, post in (
+            (CONFIRM, "/ui/cluster/stepdown"),
+            (FORCE_CONFIRM, "/ui/cluster/force-stepdown"),
+        ):
+            confirm = await c.get(path)
+            assert confirm.status_code == 503, path
+            assert "could not read cluster membership" in confirm.text
+            assert post not in confirm.text
+        # The store answers again: the same session reads the full page.
+        coord.members_raise = None
+        assert (await c.get("/ui/cluster")).status_code == 200
+    assert coord.step_down_calls == 0

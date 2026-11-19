@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
@@ -17,6 +18,7 @@ from messagefoundry.api.models import (
     ClusterStepdownResult,
 )
 from messagefoundry.auth import Identity, Permission
+from messagefoundry.redaction import safe_exc
 
 from .. import pages
 from .._auth import (
@@ -45,6 +47,8 @@ register_ui_action(
     label="Open the forced cluster step-down confirmation",
 )
 
+_log = logging.getLogger(__name__)
+
 
 def register(app: FastAPI, deps: UiDeps) -> None:
     """The High Availability page (read-mostly, ``monitoring:read``) and the stepdown control.
@@ -55,9 +59,27 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     permission as well and fail closed on either."""
     core = deps.core
 
-    async def _state(engine: Any, identity: Identity) -> tuple[ClusterStatus, ClusterNodeList]:
+    async def _state(
+        engine: Any, identity: Identity
+    ) -> tuple[ClusterStatus, ClusterNodeList | None]:
+        """The in-memory status, and the membership and lease rows, or ``None`` for the rows when
+        their store read raised (BACKLOG #5932). That read is the only one here that touches the
+        store, so a store timeout or outage degrades these pages instead of answering ``500``."""
         cluster = await core.cluster_status(engine=engine, _user=identity)
-        nodes = await core.cluster_nodes(engine=engine, _user=identity)
+        try:
+            nodes = await core.cluster_nodes(engine=engine, _user=identity)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            # As broad as the JSON stepdown handler's membership read, for its reason: the store's
+            # driver exceptions are not importable here without the optional extras.
+            # CancelledError is not an Exception, so a request deadline still unwinds.
+            _log.warning(
+                "cluster page: node %s could not read cluster membership: %s",
+                cluster.node_id,
+                safe_exc(exc),
+            )
+            return cluster, None
         return cluster, nodes
 
     @app.get("/ui/cluster", response_class=HTMLResponse)
@@ -67,6 +89,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         m: str = Query("", max_length=16),
     ) -> HTMLResponse:
         cluster, nodes = await _state(engine, identity)
+        if nodes is None:
+            return HTMLResponse(pages.high_availability_unreadable(cluster), status_code=503)
         can_control = identity.has(Permission.CLUSTER_CONTROL)
         return HTMLResponse(
             pages.high_availability(cluster, nodes, can_control=can_control, notice=m)
@@ -79,6 +103,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui(Permission.MONITORING_READ, activity=False)),
     ) -> HTMLResponse:
         cluster, nodes = await _state(engine, identity)
+        if nodes is None:
+            # 200, not 503: app.js swaps a fragment in only on an ok response, so a refusal here
+            # would leave the last good view, with its lease state and control, on screen.
+            return HTMLResponse(pages.high_availability_unreadable_fragment(cluster))
         can_control = identity.has(Permission.CLUSTER_CONTROL)
         return HTMLResponse(
             pages.high_availability_fragment(cluster, nodes, can_control=can_control)
@@ -92,6 +120,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> HTMLResponse:
         cluster, nodes = await _state(engine, identity)
+        if nodes is None:
+            return HTMLResponse(pages.stepdown_confirm_unreadable(force=False), status_code=503)
         return HTMLResponse(pages.stepdown_confirm(cluster, nodes, force=False))
 
     @app.get("/ui/cluster/force-stepdown-confirm", response_class=HTMLResponse)
@@ -102,6 +132,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> HTMLResponse:
         cluster, nodes = await _state(engine, identity)
+        if nodes is None:
+            return HTMLResponse(pages.stepdown_confirm_unreadable(force=True), status_code=503)
         return HTMLResponse(pages.stepdown_confirm(cluster, nodes, force=True))
 
     async def _stepdown(
