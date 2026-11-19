@@ -15,8 +15,5 @@
   probe that mints one fails. The replies the
   coding check skips are listed on `reply_framing_fault`; they include at least a `204`, a
   `Content-Length: 0` reply and a reply to `HEAD`. (`BACKLOG #5910`)
-- **Under `credential_fault_policy = "dead_letter"`, a configuration fault that dead-letters now
-  marks the outbound lane down.** With `[diagnostics].connection_events` on, its default, one
-  `connection_error` alert fires for the lane, and the next delivery
-  that succeeds clears it. This covers configuration faults a send raises, `token-reply-coded`
-  among them (ADR 0095 Amendment B.2).
+- **The lane alert for a configuration fault that dead-letters under
+  `credential_fault_policy = "dead_letter"`:** see ADR 0095 Amendment B.2.
