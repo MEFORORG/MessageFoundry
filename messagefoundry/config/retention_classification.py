@@ -624,7 +624,8 @@ def _override_scope(kept: tuple[str, ...]) -> str:
             "are purged on the body window of the inbound that received the message, which is "
             f"that inbound's own override or else the global {body_global}, where that window is "
             "bounded. Where a serve --shard process that does not hold that inbound runs "
-            "retention against the same store, it purges them on the global window."
+            "retention against the same store, it purges them on the global window, where that "
+            "window is bounded."
         )
     return " ".join(parts)
 

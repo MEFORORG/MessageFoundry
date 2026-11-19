@@ -3977,7 +3977,8 @@ _OVERRIDE_NOTE_FACTS = (
     # that does not hold that inbound runs: plain `serve`, and the process that holds it, honour it.
     "The engine shard limit binds an inbound's override alone.",
     "where a `serve --shard` process that does not hold that inbound runs retention against the "
-    "same store, it purges that inbound's message bodies on a bounded global window",
+    "same store, it purges that inbound's message bodies on the global window, and where that "
+    "window is bounded the override keeps nothing past it.",
     "Plain `serve`, and the `serve --shard` process that holds the inbound, honour the override.",
     # The body windows' line is the older rule, left alone by the 2026-11-01 ruling. The other
     # global tiers are not in this claim: an acknowledged one writes its line on either dial.

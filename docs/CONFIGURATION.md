@@ -1318,8 +1318,8 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > **Per-connection overrides ([ADR 0027](adr/0027-per-connection-retention.md)).** `messages_days` and
 > `dead_letter_days` are **global defaults** an individual connection may override: an **inbound** sets its
 > own `messages_days`, an **outbound** its own `dead_letter_days` (both `None` = inherit this global window,
-> `0` = keep that connection's PHI forever, subject to the engine shard limit on an inbound's override
-> stated in the note below, `>0` = days). An inbound may also opt into **embedded-document
+> `0` = keep forever what that override's purge holds, which the note below states, subject to the
+> engine shard limit on an inbound's override stated there, `>0` = days). An inbound may also opt into **embedded-document
 > pruning** (`prune_documents_after` + `prune_documents_min_bytes`, [ADR 0042](adr/0042-embedded-document-pruning.md))
 > to strip bulky base64 attachments while keeping the readable message. These live on the connection (code-first
 > or in `connections.toml`) — see [CONNECTIONS.md](CONNECTIONS.md).
@@ -1330,8 +1330,8 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > state which (BACKLOG #5967). The engine shard limit binds an inbound's override alone. Each
 > `serve --shard` process purges the shared store with only its own inbounds' overrides, so where a
 > `serve --shard` process that does not hold that inbound runs retention against the same store, it
-> purges that inbound's message bodies on a bounded global window, and the override keeps nothing
-> past that window. Plain `serve`, and the `serve --shard` process that holds the inbound, honour
+> purges that inbound's message bodies on the global window, and where that window is bounded the
+> override keeps nothing past it. Plain `serve`, and the `serve --shard` process that holds the inbound, honour
 > the override. The
 > overrides live in the graph, so `serve` checks them when it loads the graph, at least at startup
 > and on every config reload:
