@@ -397,8 +397,12 @@ def _build_failure(op: str, key: str, exc: Exception) -> CipherError:
     For a ``decrypt`` it is always :class:`CipherUnavailableError`: Transit was never asked, so it
     gave no verdict on the value, and a cell walk that reads :func:`gave_no_verdict` would stop as
     could-not-run rather than mark every cell damaged. For an ``encrypt`` it stays what
-    :func:`_transit_failure` reads, so a deterministic refusal, a TLS-suite ValueError among them,
-    is not an outage a write would retry for ever."""
+    :func:`_transit_failure` reads, so a deterministic build failure, a TLS-suite ValueError among
+    them, is a refusal rather than a no-verdict outage. Only a caller that reads
+    :func:`gave_no_verdict` on an encrypt treats the two apart: the document strip's re-seal raises
+    a refusal where it skips a no-verdict row. A stage handoff does not: the runner sends any
+    :class:`CipherError` a handoff's encrypt raises to the worker's fault arm, which re-pends the
+    row whichever class it is."""
     error = _transit_failure(op, key, exc)
     if op == "decrypt" and not isinstance(error, CipherUnavailableError):
         error = CipherUnavailableError(str(error))
