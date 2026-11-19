@@ -519,7 +519,10 @@ def _referrer_sites(
             role_params = None if table_kind is not None else {name for _i, name in scan.slots}
             rewritable |= _default_positions(sources, func, file, span, old, role_params)
             if table_kind is None or depth == 0:
-                sites.append(_Site(file, span, None, frozenset(rewritable), ignored))
+                # ``ignored`` holds bare positions in the decorator's own file; a helper elsewhere
+                # at the same (line, col) is a referent and must stay counted.
+                own = ignored if file == own_file else frozenset()
+                sites.append(_Site(file, span, None, frozenset(rewritable), own))
             else:
                 allowed = _accessor_positions(sources, file, span, old, table_kind) | rewritable
                 sites.append(_Site(file, span, frozenset(allowed)))

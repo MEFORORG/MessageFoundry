@@ -785,3 +785,57 @@ def test_apply_refuses_and_writes_nothing_when_a_reference_is_unresolved(
     for ref in dry["unresolved"]:
         assert repr(ref["referrer"]) in out["error"], out
     assert (config_dir / "mod.py").read_bytes() == before
+
+
+def test_a_helper_referent_at_the_decorators_coordinates_in_another_file_is_counted(
+    tmp_path: Path,
+) -> None:
+    """The registering ``@handler("EPIC")`` argument is skipped by its (line, col), and only in the
+    handler's own file. A helper in another file whose ``Send("EPIC", ...)`` sits at the same line
+    and column is a referent there, so it must be rewritten or reported, never silently left."""
+    d = tmp_path / "config"
+    d.mkdir()
+    (d / "mod.py").write_text(
+        "from _epic import send_epic\n"
+        "from messagefoundry import MLLP, Send, handler, inbound, outbound, router\n"
+        "\n"
+        'inbound("IB_EH", MLLP(port=2831), router="r_eh")\n'
+        'outbound("EPIC", MLLP(host="127.0.0.1", port=6981))\n'
+        "\n"
+        "\n"
+        '@router("r_eh")\n'
+        "def r_eh(msg):\n"
+        '    return ["EPIC"]\n'
+        "\n"
+        "\n"
+        '@handler("EPIC")\n'
+        "def epic(msg):\n"
+        # The body's own Send is what makes the handler a referrer of the outbound, so its helper
+        # becomes one of the rename's sites.
+        '    return [Send("EPIC", msg), *send_epic(msg)]\n',
+        encoding="utf-8",
+        newline="",
+    )
+    # Padded so the Send target sits at line 13, column 9: the coordinates of "EPIC" in mod.py's
+    # @handler("EPIC") above.
+    (d / "_epic.py").write_text(
+        "from messagefoundry import Send\n"
+        + "\n" * 9
+        + "def send_epic(msg):\n"
+        + "    return [\n"
+        + '    Send("EPIC", msg)]\n',
+        encoding="utf-8",
+        newline="",
+    )
+    helper_line = (d / "_epic.py").read_text(encoding="utf-8").splitlines()[12]
+    mod_line = _mod(d).splitlines()[12]
+    assert helper_line.index('"EPIC"') == mod_line.index('"EPIC"'), "the fixture lost its overlap"
+
+    plan = plan_rename(load_config(d), d, "outbound", "EPIC", "OB_EPIC")
+    rewritten = any(e.file.endswith("_epic.py") for e in plan.edits)
+    reported = Reference("handler", "EPIC", "outbound", "EPIC") in plan.unresolved
+    assert rewritten or reported, (plan.edits, plan.unresolved)
+    if rewritten:
+        apply_rename(plan)
+        assert 'Send("OB_EPIC", msg)' in (d / "_epic.py").read_text(encoding="utf-8")
+        assert '@handler("EPIC")' in _mod(d)
