@@ -56,7 +56,13 @@ from harness.load.connscale.compare import (
 )
 from harness.load.connscale.driver import ConnScaleDriver
 from harness.load.connscale.intake_audit import IntakeAudit, IntakeLedger, StoreReader
-from harness.load.connscale.probe import FdSampler, ProcSample, subtree_size, time_reload_outcome
+from harness.load.connscale.probe import (
+    _PROBE_ATTEMPT_MAX_S,
+    FdSampler,
+    ProcSample,
+    subtree_size,
+    time_reload_outcome,
+)
 from harness.load.connscale.profile import SANDBOX_OFF, SANDBOX_SUBPROCESS, ConnScaleProfile
 from harness.load.connscale.report import (
     EXIT_OK,
@@ -153,8 +159,8 @@ _RELOAD_LOOKBACK_FLOOR_S = 0.25
 #: a hold behind it and this adds nothing. A slow one used to leave none: the step then had no send
 #: the reload did not touch. At the smoke's 1.5 s hold this is 0.375 s, 4 to 9 sends by lane.
 _POST_RELOAD_HOLD_FRACTION = 0.25
-#: How long a step waits, after its samplers stop and before the stop grace, for the FIRST reply read
-#: after every connection came back from the reload probe (BACKLOG #1292). The stop grace of
+#: How long a step waits, after its engine sampler stops and before the stop grace, for the FIRST reply
+#: read after every connection came back from the reload probe (BACKLOG #1292). The stop grace of
 #: `_STOP_GRACE` follows it, so an engine gets this plus 5 s to answer once before the step says it
 #: stopped answering. See `_await_post_reload_reply`.
 #:
@@ -660,8 +666,11 @@ async def _run_started_step(
                 timeout=profile.warmup_timeout_s,
             )
         # TWO stop events. `sampler_stop` ends the ENGINE sampler, whose readings are the rate window,
-        # and it fires when the hold ends. `probe_stop` ends the OS probe where it always ended, after
-        # the reload probe returns, so the graded FD window is unchanged (BACKLOG #2024).
+        # and it fires when the hold ends. `probe_stop` closes the OS probe's window after the reload
+        # probe returns (BACKLOG #2024). The probe can still read past it: where every reading in the
+        # window was an exhausted budget, its make-up floor takes one more, beside the post-reload
+        # reply wait and before the driver stops, and that reading is graded (BACKLOG #1488; see
+        # `_probe_loop`).
         sampler_stop = asyncio.Event()
         probe_stop = asyncio.Event()
         # TWO tasks, not one task doing both (BACKLOG #1430). The engine poll is cheap; the OS probe
@@ -726,16 +735,16 @@ async def _run_started_step(
             reload_seconds = reload_account.seconds
         # Stop offering; drain the pipeline; final sample.
         probe_stop.set()
-        for task in sampler_tasks:
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        fd_probe_floor_ticks = probe_task.result() if probe_task is not None else 0
-        if reload_account is not None:
-            # After the samplers, so the wait is not in the rate window; before the stop, so a slow
-            # first reply after the reload is waited for rather than read as none (BACKLOG #1292).
-            reload_account = await _await_post_reload_reply(
-                driver, metrics.counters, reload_account
-            )
+        # The reply wait runs after the engine sampler, so it is not in the rate window, and before
+        # the stop, so a slow first reply after the reload is waited for rather than read as none
+        # (BACKLOG #1292). It runs BESIDE the OS probe's last attempt, never behind it, so neither an
+        # in-flight walk nor the make-up floor delays it (BACKLOG #1488).
+        fd_probe_floor_ticks, reload_account = await _await_probe_beside_reply(
+            probe_task,
+            None
+            if reload_account is None
+            else _await_post_reload_reply(driver, metrics.counters, reload_account),
+        )
         # Stop the driver FIRST (flush every queued send + grace the in-flight ACKs) BEFORE draining,
         # so all offered messages have reached the engine's ingress stage before we wait for the
         # pipeline to empty. Draining first would let a message still in the driver's send queue arrive
@@ -1470,14 +1479,31 @@ async def _sample_loop(
 #: The make-up attempts :func:`_probe_loop` may spend past its ``stop`` when every reading the window
 #: took was an exhausted budget (BACKLOG #1488).
 #:
-#: ONE, AND THE BOUND IS THE SMOKE'S WATCHDOG, NOT TASTE. One attempt can cost a walk that ends just
-#: inside ``_PROBE_TIMEOUT_S`` plus a per-PID read that spends all of it: 2 x 5 s. The in-window attempt
-#: can cost the same, which is up to 5 s per step more than the walk timeouts the failing windows-2022
-#: run of 2026-11-19 spent. That run's smoke fixture took 53.41 s for four steps, so the worst case is
-#: 53.41 + 4 x 5 + 4 x 10 = about 113 s against ``pytest.mark.timeout(120)``. A second attempt would
-#: pass 120, and on this repository's ``--timeout-method=thread`` a timeout ends the whole worker
-#: process rather than one test. ``tests/test_connscale_sample_floor.py`` pins this arithmetic.
+#: ONE, AND THE BOUND IS THE SMOKE'S WATCHDOG, NOT TASTE. On this repository's
+#: ``--timeout-method=thread`` a ``pytest.mark.timeout(120)`` that fires ends the whole worker process
+#: rather than one test, so what the floor adds has to fit beside what the sweep already costs.
+#:
+#: What the floor adds, at most, is :data:`_FD_PROBE_MAKEUP_MAX_S` per step. The sweep's other
+#: costs are not priced term by term: the failing windows-2022 run of 2026-11-19 measured them all
+#: at once, as :data:`_FD_PROBE_FLOOR_MEASURED_SETUP_S`, the smoke fixture's setup time on that leg,
+#: with every spawn and kill, reply wait, stop grace, drain and in-window walk as they ran there. So
+#: on that leg the floor would have brought the fixture to at least 53.41 + 4 steps x 10 s =
+#: 93.41 s. A second attempt would make it at least 133.41 s, past 120.
+#:
+#: THAT IS NOT A WORST CASE. It does not cover a run whose other terms cost more than they did on that
+#: leg: a reply wait (``_POST_RELOAD_REPLY_WAIT_S``) or stop grace (``_STOP_GRACE``) that ran longer
+#: than it did there, an in-window attempt that spent both budgets where that run's spent one,
+#: or a slower engine spawn or kill. Nor does it price the kill and reap ``subprocess.run`` does after
+#: a timed-out shell-out, which ``_FD_PROBE_MAKEUP_MAX_S`` leaves out too. Run beside the reply wait
+#: (:func:`_await_probe_beside_reply`), the floor adds less than its maximum wherever that wait runs.
+#: ``tests/test_connscale_sample_floor.py`` pins this sum from these constants.
 _FD_PROBE_MAKEUP_ATTEMPTS = 1
+#: The most :data:`_FD_PROBE_MAKEUP_ATTEMPTS` can add to one step on a Windows leg, on the terms
+#: ``_PROBE_ATTEMPT_MAX_S`` in ``probe.py`` states.
+_FD_PROBE_MAKEUP_MAX_S = _FD_PROBE_MAKEUP_ATTEMPTS * _PROBE_ATTEMPT_MAX_S
+#: The smoke fixture's setup time on the failing job (run 44607871179, job 135856508516), from
+#: pytest's slowest-durations line. A measurement, not a contract.
+_FD_PROBE_FLOOR_MEASURED_SETUP_S = 53.41
 
 
 def _only_budget_gaps(readings: list[ProcReading]) -> bool:
@@ -1514,12 +1540,26 @@ async def _probe_loop(
     WALL #4 assertion then fails on the runner rather than the engine. So when every reading in
     ``out``, which is the step's own list, is a budget-exhausted gap, the loop keeps probing for at
     most ``_FD_PROBE_MAKEUP_ATTEMPTS`` more, stopping at the first reading that is not one. A
-    reading taken here still comes from the step's engine with its connections open: the caller
-    sets ``stop`` only after the reload probe returns, and stops the driver only after this task
-    returns. It is taken after the hold, with no traffic offered, and with any connection the reload
-    left down still down, as for an in-window reading after the reload. ATTEMPTS are counted, so a
-    probe that never answers cannot hold the step open. The count is provenance, reported as
-    ``fd_probe_floor_ticks``.
+    reading taken here still comes from the step's engine before the driver stops: the caller sets
+    ``stop`` only after the reload probe returns, and stops the driver only after this task returns
+    (:func:`_await_probe_beside_reply`, beside the post-reload reply wait). It is taken after the
+    hold, with no traffic offered, and with any connection the reload left down still down, as for
+    an in-window reading after the reload. ATTEMPTS are counted, so a probe whose attempts keep
+    returning gaps cannot hold the step open past that many more. That bounds the number of calls,
+    not their length: a ``sample_proc`` that blocked and never returned would hold this task, and
+    the step behind it, until something cancelled it, and nothing here watches for that. The count
+    is provenance, reported as ``fd_probe_floor_ticks``.
+
+    A MAKE-UP READING IS GRADED, and that rests on a measurement. It feeds ``fd_count_peak`` like an
+    in-window one, so ``fd_count_monotonic`` compares it with in-hold peaks at other N. That is sound
+    only if an idle post-hold reading matches what the hold would have read. Measured on a 32-core
+    Windows box, 2026-11-19, running the real smoke sweep (N=12 and 24, both sweep modes) with two
+    or three extra readings taken right after each step's window: in the 6 steps where the window
+    and the extra reading both measured, across an idle and a 32-busy-loop run, every post-hold
+    handle count equalled the window's peak (367, 403, 363, 399; 403, 404). The growth from N=12 to
+    N=24 was 9 to 11 percent, and the SLO's band is ``_MONOTONIC_TOLERANCE`` (25 percent). A gap of
+    zero handles cannot produce a false red or hide growth at that band. It is one box at these N,
+    not a bound for other N or hosts.
 
     ONE PROBE AT A TIME. :class:`~harness.load.connscale.probe.FdSampler` holds the front-load counter
     and the resolved subtree as mutable state, so overlapping calls would race them. This loop is
@@ -1537,6 +1577,32 @@ async def _probe_loop(
         proc = await loop.run_in_executor(None, fd_sampler.sample_proc)
         out.append(ProcReading(time.perf_counter() - origin, proc))
     return past_stop
+
+
+async def _await_probe_beside_reply(
+    probe_task: asyncio.Task[int] | None,
+    reply: Awaitable[_ReloadAccount] | None,
+) -> tuple[int, _ReloadAccount | None]:
+    """Wait for the OS probe's last reading and the post-reload reply wait TOGETHER, and return the
+    probe's make-up count with the account the reply wait filled in (BACKLOG #1488).
+
+    The caller sets ``probe_stop`` first. The probe can still be busy after that: an attempt already
+    in flight, then at most :data:`_FD_PROBE_MAKEUP_ATTEMPTS` make-up attempts. Awaited one after the
+    other, that time ran in front of the reply wait, which delayed the wait and widened the window
+    ``post_reload_drops`` counts over. Run side by side, the reply wait starts when the window closes
+    and the probe's reading is still taken before the caller stops the driver.
+
+    If the probe raises, the reply wait is cancelled before the error propagates, so it is not left
+    watching past the step. The step's own cleanup cancels the probe task on every path out; that
+    does not stop a walk already running in its executor thread, which ends at its own
+    ``_PROBE_TIMEOUT_S``."""
+    reply_task = None if reply is None else asyncio.ensure_future(reply)
+    try:
+        floor_ticks = 0 if probe_task is None else await probe_task
+        return floor_ticks, None if reply_task is None else await reply_task
+    finally:
+        if reply_task is not None:
+            reply_task.cancel()  # a no-op once it is done
 
 
 async def _time_reload(poller: EnginePoller) -> tuple[float | None, bool]:
@@ -1609,7 +1675,7 @@ class _ReloadAccount:
     # Bookkeeping for `_await_post_reload_reply`: the driver's drop count when every connection
     # was back, so the closes after that moment can be counted.
     drops_at_back: int = 0
-    # Filled in by `_await_post_reload_reply`, which runs once the samplers have stopped. All three
+    # Filled in by `_await_post_reload_reply`, which runs once the engine sampler has stopped. All three
     # stay None on an account it did not see, so nobody reads an unmeasured 0 as a reading.
     # `reply_s`: seconds from every connection being back to the first reply (ACK or NAK) the
     # driver read after that, on any connection. After an applied reload every socket then is one
@@ -1750,7 +1816,7 @@ async def _await_post_reload_reply(
 ) -> _ReloadAccount:
     """Wait for the first reply after the reload, and count the engine's closes up to then.
 
-    Run it after the samplers stop and before ``driver.stop``, so the wait is neither inside the
+    Run it after the engine sampler stops and before ``driver.stop``, so the wait is neither inside the
     rate window nor cut short by the stop. It waits up to ``timeout`` (default
     `_POST_RELOAD_REPLY_WAIT_S`), and returns at once when a reply has already come, which is the
     healthy case. It excuses nothing: it only stops the step judging "no reply" before a slow
@@ -1821,6 +1887,8 @@ def _build_record(
     samples: list[EngineSample],
     in_hold_samples: int,
     in_hold_floor_ticks: int,
+    # Required like its sibling above: a default would report a forgotten make-up count as none.
+    fd_probe_floor_ticks: int,
     proc_readings: list[ProcReading],
     drain_seconds: float | None,
     reload_seconds: float | None,
@@ -1828,7 +1896,6 @@ def _build_record(
     audit_final: IntakeAudit | None = None,
     reload_account: _ReloadAccount | None = None,
     fd_probe_root_pid: int | None = None,
-    fd_probe_floor_ticks: int = 0,
     per_lane_wake: bool | None = None,
     sandbox: SandboxReading | None = None,
     # Required, like the other axes: a default would file a forgotten trial as trial 0 and chain the

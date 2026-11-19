@@ -39,12 +39,14 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 import time
+from typing import cast
 
 import pytest
 
 from harness.load.connscale import runner
-from harness.load.connscale.probe import _PROBE_TIMEOUT_S, ProbeDegraded, ProcSample, _gap
+from harness.load.connscale.probe import _PROBE_ATTEMPT_MAX_S, ProbeDegraded, ProcSample, _gap
 from harness.load.connscale.profile import ConnScaleProfile
 from harness.load.connscale.report import ConnScaleRecord, monotonic_lane
 from harness.load.connscale.runner import (
@@ -313,6 +315,9 @@ async def test_a_hold_with_room_to_spare_is_not_extended_by_the_floor() -> None:
 #: the whole point: it is the walk that outlasts the window.
 _SLOW_ATTEMPT_S = 0.15
 _STARVED_HOLD_S = 0.05
+#: How long a test here waits for something it expects to happen before it fails rather than hangs.
+#: Far above a scheduled thread's start on a loaded runner, far below the module's 30 s timeout.
+_TEST_DEADLINE_S = 5.0
 
 
 def _measured(handles: int) -> ProcSample:
@@ -351,9 +356,13 @@ async def _hold_from_first_call(sampler: _ScriptedSampler, stop: asyncio.Event) 
 
     The sampler reads `stop` on its worker thread, so a hold timed from the loop's start could end
     before a late-scheduled thread made the in-window call, and that call would count as a make-up
-    one. Timing the hold from the call's own start removes that race on a loaded runner."""
-    while not sampler.calls:
-        await asyncio.sleep(0.005)
+    one. Timing the hold from the call's own start removes that race on a loaded runner.
+
+    The wait for that first call has a deadline, so a loop that never probes fails here at once
+    rather than hanging until the module's thread timeout ends the worker."""
+    async with asyncio.timeout(_TEST_DEADLINE_S):
+        while not sampler.calls:
+            await asyncio.sleep(0.005)
     await _hold(stop, _STARVED_HOLD_S)
 
 
@@ -455,37 +464,37 @@ async def test_a_collapse_measured_on_makeup_readings_still_fails_the_fd_slo() -
     assert not check.ok, check.observed
 
 
-#: The smoke fixture's setup time on the failing job (135856508516), from pytest's slowest-durations
-#: line. A measurement, not a contract.
-_SMOKE_SETUP_MEASURED_S = 53.41
-
-
-def test_the_makeup_floor_fits_inside_the_smokes_watchdog() -> None:
-    """Pins the arithmetic in the comment on `_FD_PROBE_MAKEUP_ATTEMPTS`, reading the smoke's own
-    watchdog and step axes, so a longer sweep or a shorter timeout fails here rather than in a killed
-    worker."""
+def _measured_leg_plus_floor(attempts: int) -> tuple[int, float, float]:
+    """The sum the comment on `_FD_PROBE_MAKEUP_ATTEMPTS` states, from its constants and from the
+    smoke's own watchdog and step count: `(steps, measured setup + steps x floor maximum, watchdog)`.
+    A lower bound on the failing leg with the floor, not a worst case; that comment says what it
+    leaves out."""
     (watchdog_s,) = smoke.pytestmark.args
     profile = smoke._smoke_profile(30000)  # any valid port: only the axes are read
     assert isinstance(profile, ConnScaleProfile)
-    steps = (
-        len(profile.counts)
-        * (2 if profile.sweep_mode == "both" else 1)
-        * len(profile.claim_modes)
-        * len(profile.fuse_modes)
-        * len(profile.batch_modes)
-        * len(profile.sandbox_modes)
-        * profile.trials
+    steps = runner.sweep_step_count(profile)
+    floor_s = steps * attempts * _PROBE_ATTEMPT_MAX_S
+    return steps, runner._FD_PROBE_FLOOR_MEASURED_SETUP_S + floor_s, float(watchdog_s)
+
+
+def test_the_makeup_floor_fits_inside_the_smokes_watchdog() -> None:
+    """Pins the comment on `_FD_PROBE_MAKEUP_ATTEMPTS`, so a longer sweep, a shorter watchdog or a
+    second attempt fails here rather than in a killed worker. The comment's 93.41 s is this sum."""
+    steps, with_floor_s, watchdog_s = _measured_leg_plus_floor(_FD_PROBE_MAKEUP_ATTEMPTS)
+    assert steps == 4, steps  # the comment's "4 steps"; a new axis must revisit it
+    assert with_floor_s < watchdog_s, (
+        f"the failing leg's measured {runner._FD_PROBE_FLOOR_MEASURED_SETUP_S}s plus {steps} steps x "
+        f"{runner._FD_PROBE_MAKEUP_MAX_S}s of make-up is {with_floor_s:.2f}s against the smoke's "
+        f"{watchdog_s}s watchdog"
     )
-    # A walk just inside its budget, then a read that spends all of it.
-    attempt_s = 2 * _PROBE_TIMEOUT_S
-    # The in-window attempt can exceed the walk timeouts the measured run spent by one more budget.
-    worst_s = _SMOKE_SETUP_MEASURED_S + steps * (
-        _PROBE_TIMEOUT_S + _FD_PROBE_MAKEUP_ATTEMPTS * attempt_s
-    )
-    assert worst_s < watchdog_s, (
-        f"{steps} smoke steps x {_FD_PROBE_MAKEUP_ATTEMPTS} make-up attempt(s) put the worst case at "
-        f"{worst_s:.0f}s against the smoke's {watchdog_s}s watchdog"
-    )
+
+
+def test_a_second_makeup_attempt_would_not_fit_the_smokes_watchdog() -> None:
+    """THE NEGATIVE CONTROL for the pin above (REVIEW-STANDARDS R21). The same sum at two attempts
+    must breach the watchdog, as the comment says. Without this arm, a pin whose sum could never
+    reach 120 s would pass whatever the attempt count."""
+    _, with_two_s, watchdog_s = _measured_leg_plus_floor(_FD_PROBE_MAKEUP_ATTEMPTS + 1)
+    assert with_two_s >= watchdog_s, with_two_s
 
 
 def test_an_empty_window_is_not_a_timed_out_one() -> None:
@@ -493,3 +502,62 @@ def test_an_empty_window_is_not_a_timed_out_one() -> None:
     it did."""
     assert not runner._only_budget_gaps([])
     assert runner._only_budget_gaps([ProcReading(0.0, _gap(ProbeDegraded.READ_TIMEOUT))])
+
+
+# --- BACKLOG #1488: the floor runs beside the post-reload reply wait, never in front of it ----------
+
+#: The helper only passes the account through, so any object stands in for one.
+_ACCOUNT = cast(runner._ReloadAccount, object())
+
+
+async def test_the_reply_wait_starts_while_the_probe_is_still_reading() -> None:
+    """The make-up attempt must not delay the reply wait. The stand-in probe cannot finish until the
+    reply wait has STARTED, so a helper that awaited the probe first would never start it, and the
+    probe's deadline fails the test instead of a timing threshold."""
+    reply_started = asyncio.Event()
+
+    async def probe() -> int:
+        async with asyncio.timeout(_TEST_DEADLINE_S):
+            await reply_started.wait()
+        return 1
+
+    async def reply() -> runner._ReloadAccount:
+        reply_started.set()
+        return _ACCOUNT
+
+    floor, account = await runner._await_probe_beside_reply(asyncio.create_task(probe()), reply())
+    assert floor == 1
+    assert account is _ACCOUNT
+
+
+async def test_a_probe_that_fails_cancels_the_reply_wait() -> None:
+    """Running the two side by side must not leave a reply wait watching after the probe raised."""
+    cancelled = asyncio.Event()
+
+    async def probe() -> int:
+        raise RuntimeError("walk exploded")
+
+    async def reply() -> runner._ReloadAccount:
+        try:
+            await asyncio.sleep(_TEST_DEADLINE_S)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return _ACCOUNT
+
+    with pytest.raises(RuntimeError, match="walk exploded"):
+        await runner._await_probe_beside_reply(asyncio.create_task(probe()), reply())
+    async with asyncio.timeout(_TEST_DEADLINE_S):
+        await cancelled.wait()
+
+
+async def test_a_step_with_no_probe_and_no_reload_reports_neither() -> None:
+    assert await runner._await_probe_beside_reply(None, None) == (0, None)
+
+
+def test_the_makeup_count_is_a_required_record_argument() -> None:
+    """`fd_probe_floor_ticks` has no default, like `in_hold_floor_ticks`: a caller that forgot it
+    would otherwise report a floored step as one that never needed the floor."""
+    params = inspect.signature(runner._build_record).parameters
+    for name in ("fd_probe_floor_ticks", "in_hold_floor_ticks"):
+        assert params[name].default is inspect.Parameter.empty, name

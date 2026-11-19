@@ -56,6 +56,11 @@ _log = logging.getLogger(__name__)
 _WINDOWS = sys.platform == "win32"
 # Bound every shell-out so a hung child (a stuck WMI/Get-Process or lsof) can't wedge a poll tick.
 _PROBE_TIMEOUT_S = 5.0
+#: The most one Windows :meth:`FdSampler.sample_proc` call can spend in its shell-outs: a process-table
+#: walk that ends just inside ``_PROBE_TIMEOUT_S``, then a per-PID read that spends all of it. It
+#: leaves out the kill and reap after a timed-out child, and it is not a POSIX bound: there the lsof
+#: fallback runs once per PID. The runner prices its FD make-up floor with it (BACKLOG #1488).
+_PROBE_ATTEMPT_MAX_S = 2 * _PROBE_TIMEOUT_S
 # Windows TotalProcessorTime is exposed as .Ticks (100-ns units); seconds = ticks / this. Reading the
 # integer ticks (not the culture-formatted .CPU double) keeps the parse locale-proof.
 _WIN_CPU_TICKS_PER_S = 10_000_000.0

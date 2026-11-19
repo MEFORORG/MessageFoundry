@@ -336,6 +336,7 @@ def _record_over(samples: list[EngineSample], in_hold_samples: int) -> ConnScale
         samples=samples,
         in_hold_samples=in_hold_samples,
         in_hold_floor_ticks=0,
+        fd_probe_floor_ticks=0,
         proc_readings=[],
         drain_seconds=1.0,
         reload_seconds=None,

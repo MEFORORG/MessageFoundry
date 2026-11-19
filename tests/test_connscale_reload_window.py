@@ -475,6 +475,7 @@ def _record(counters: Counters, reload: runner._ReloadAccount | None) -> ConnSca
         samples=[],
         in_hold_samples=0,
         in_hold_floor_ticks=0,
+        fd_probe_floor_ticks=0,
         proc_readings=[],
         drain_seconds=1.0,
         reload_seconds=None if reload is None else reload.seconds,
@@ -1263,7 +1264,7 @@ _HOLD_ORDERING = (
     "in_hold_samples = len(samples)",
     "reload_account = await reload_task",
     "probe_stop.set()",
-    "reload_account = await _await_post_reload_reply(",
+    "fd_probe_floor_ticks, reload_account = await _await_probe_beside_reply(",
 )
 
 
@@ -1295,7 +1296,7 @@ def test_the_engine_sampler_stops_when_the_hold_ends_not_when_the_probe_returns(
             "sampler_stop.set()",
             "in_hold_samples = len(samples)",
             "probe_stop.set()",
-            "reload_account = await _await_post_reload_reply(",
+            "fd_probe_floor_ticks, reload_account = await _await_probe_beside_reply(",
         )
     )
     assert _first_out_of_order(before, _HOLD_ORDERING) == "reload_account = await reload_task"

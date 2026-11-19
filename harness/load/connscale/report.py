@@ -301,9 +301,11 @@ class ConnScaleRecord:
     fd_probe_degraded: tuple[str, ...] = ()
     # How many of `fd_probe_ticks` the probe's make-up floor took AFTER its window closed, because every
     # reading in the window was an exhausted budget (BACKLOG #1488). Zero on a window that measured. A
-    # peak read on such a tick comes from the step's engine with its connections still open, but after
-    # the hold, with no traffic offered, and a reader choosing a verdict should be able to see that.
-    # Reported, never graded.
+    # peak read on such a tick comes from the step's engine before the driver stops, so the
+    # connections the driver opened have not been closed by the harness; one the reload probe left
+    # down is still down, as for an in-window reading after the reload. It is taken after the hold,
+    # with no traffic offered, and a reader choosing a verdict should be able to see that. The count
+    # itself is reported, never graded; the reading it marks feeds `fd_count_peak` like any other.
     fd_probe_floor_ticks: int = 0
     # --- BACKLOG #1210: which processes the FD and RSS peaks were summed over ---
     # The PIDs the tick that set `fd_count_peak` covered, sorted, and the same for
@@ -971,7 +973,14 @@ DIAGNOSTIC_FIELDS: tuple[DiagnosticField, ...] = (
     DiagnosticField(
         "fd_probe_ticks",
         lambda r: r.fd_probe_ticks,
-        "how many intervals the FD walk actually sampled -- a low count is a coarse gauge, not a fault",
+        "how many readings the FD walk took, make-up ticks included -- a low count is a coarse gauge, "
+        "not a fault",
+    ),
+    DiagnosticField(
+        "fd_probe_floor_ticks",
+        lambda r: r.fd_probe_floor_ticks,
+        "an in-window reading vs a make-up one (BACKLOG #1488): NON-ZERO means every reading in the "
+        "window spent its budget and the walk read again after the hold, with no traffic offered",
     ),
     DiagnosticField(
         "fd_probe_degraded_ticks",
