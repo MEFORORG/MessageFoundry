@@ -250,18 +250,9 @@ def test_a_client_close_that_raises_is_logged_and_the_rest_still_close(
     assert "closing a Transit client's connections raised OSError" in caplog.text
 
 
-@pytest.mark.skipif(
-    not extra_is_installed(OPTIONAL_EXTRAS["vault"]),
-    reason="the [vault] extra (hvac + requests + urllib3) is not installed in this interpreter",
-)
-def test_a_thread_client_that_cannot_be_built_is_an_outage_not_a_verdict() -> None:
-    """A thread whose own client cannot be built gave no verdict on the value, so it is the
-    no-verdict error, never a refusal that would read the value as damaged."""
-
-    def refuse() -> Any:
-        raise ValueError("synthetic refusal")
-
-    cipher = TransitCipher(_FakeClient(_FakeTransit()), _KEY_NAME, client_factory=refuse)
+def _encrypt_in_a_thread(factory: Callable[[], Any]) -> list[BaseException]:
+    """Encrypt once in a worker thread of a cipher whose thread clients come from ``factory``."""
+    cipher = TransitCipher(_FakeClient(_FakeTransit()), _KEY_NAME, client_factory=factory)
     failures: list[BaseException] = []
 
     def encrypt() -> None:
@@ -271,8 +262,47 @@ def test_a_thread_client_that_cannot_be_built_is_an_outage_not_a_verdict() -> No
             failures.append(exc)
 
     _in_thread(encrypt)
-    assert len(failures) == 1 and isinstance(failures[0], CipherUnavailableError)
-    assert isinstance(failures[0].__cause__.__cause__, ValueError)  # type: ignore[union-attr]
+    return failures
+
+
+@_vault_extra
+def test_a_thread_client_that_cannot_be_built_is_an_outage_not_a_verdict() -> None:
+    """A thread whose own client cannot be built for a transport reason gave no verdict on the
+    value, so it is the no-verdict error, never a refusal that would read the value as damaged."""
+    import requests
+    import urllib3
+
+    def drop() -> Any:
+        raise urllib3.exceptions.ProtocolError("synthetic dropped connection")
+
+    def refuse_connect() -> Any:
+        raise requests.exceptions.ConnectionError("synthetic connection refused")
+
+    relabelled = _encrypt_in_a_thread(drop)
+    assert len(relabelled) == 1 and isinstance(relabelled[0], CipherUnavailableError)
+    cause = relabelled[0].__cause__
+    assert isinstance(cause, requests.exceptions.ConnectionError)
+    assert isinstance(cause.__cause__, urllib3.exceptions.ProtocolError)
+
+    passed = _encrypt_in_a_thread(refuse_connect)
+    assert len(passed) == 1 and isinstance(passed[0], CipherUnavailableError)
+    assert isinstance(passed[0].__cause__, requests.exceptions.ConnectionError)
+
+
+@_vault_extra
+def test_a_thread_client_build_refusal_is_a_refusal_not_an_outage() -> None:
+    """Mutation: relabel every build failure as a requests ConnectionError. Red: a deterministic
+    configuration refusal, such as the TLS-suite check's ValueError, reads as an outage that a
+    write would retry for ever."""
+
+    def refuse() -> Any:
+        raise ValueError("synthetic TLS-suite refusal")
+
+    failures = _encrypt_in_a_thread(refuse)
+    assert len(failures) == 1
+    assert not isinstance(failures[0], CipherUnavailableError)
+    assert isinstance(failures[0].__cause__, ValueError)
+    assert str(failures[0].__cause__) == "synthetic TLS-suite refusal"
 
 
 async def test_closing_the_sqlite_store_releases_the_transit_clients(tmp_path: Path) -> None:

@@ -115,9 +115,11 @@ PROVIDER_NAME = "vault_transit"
 #: cipher on the event loop, and this does NOT bound how long a stalled Vault can hold the loop:
 #: at least name resolution is not timed, the connect figure applies to each address tried, the
 #: read figure to each socket read rather than the whole reply, and one cipher call can send
-#: several requests (an audit MAC check sends up to six). A request it ends raises a requests
-#: timeout, which :func:`_transit_failure` reads as an outage that gave no verdict on the value.
-TRANSIT_REQUEST_TIMEOUT_S: tuple[float, float] = (5.0, 10.0)
+#: several requests (one audit MAC check was measured sending eight, so at least eight). The read
+#: figure is hvac's own 30 seconds kept as it was; the connect figure is the engine's tighter one.
+#: A request it ends raises a requests timeout, which :func:`_transit_failure` reads as an outage
+#: that gave no verdict on the value.
+TRANSIT_REQUEST_TIMEOUT_S: tuple[float, float] = (5.0, 30.0)
 
 # Connection reuses the shared Vault wiring (a deployment runs one Vault): the address and token are read
 # through keyprovider_vault.store_vault_hop, which refuses either one unset rather
@@ -464,7 +466,13 @@ class TransitCipher(_UnmarkedPolicy):
         """The hvac client the calling thread uses (BACKLOG #5963), built on its first use there
         when this cipher has a factory. The cipher's request paths read it inside the handler that
         turns a failed Transit request into the cipher's own error, so a build that raises reaches
-        that handler too. A failed build is not cached: the thread's next call builds again."""
+        that handler too. A failed build is not cached: the thread's next call builds again.
+
+        Only a network or transport failure of the build reads as an outage: a requests connection
+        error or timeout propagates as it is, and a urllib3 timeout or protocol error is raised as a
+        requests connection error. Every other build failure, a TLS-suite refusal's ValueError among
+        them, propagates unchanged, so the handler reads it as the refusal it is rather than an
+        outage a write would retry for ever."""
         if self._client_factory is None:
             return self._shared_client
         held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
@@ -474,14 +482,17 @@ class TransitCipher(_UnmarkedPolicy):
         try:
             client = self._client_factory()
         except Exception as exc:
-            # Raised as a connection that could not be made, so it reads as an outage that gave no
-            # verdict on any value, except where its chain carries a refusal of the hop, which
-            # is_vault_unavailable reads as a refusal.
-            import requests  # noqa: PLC0415 -- the [vault] extra, present wherever a factory is
+            # The [vault] extra is present wherever a factory is; the import is lazy as elsewhere.
+            import requests  # noqa: PLC0415
+            import urllib3  # noqa: PLC0415
 
-            raise requests.exceptions.ConnectionError(
-                f"a Transit client could not be built for this thread: {type(exc).__name__}"
-            ) from exc
+            if isinstance(exc, (urllib3.exceptions.TimeoutError, urllib3.exceptions.ProtocolError)):
+                # is_vault_unavailable reads the requests families only, and still reads a hop
+                # refusal anywhere in this chain as a refusal.
+                raise requests.exceptions.ConnectionError(
+                    f"a Transit client could not be built for this thread: {type(exc).__name__}"
+                ) from exc
+            raise
         return self._hold(client, generation)
 
     def _hold(self, client: Any, generation: int) -> Any:
