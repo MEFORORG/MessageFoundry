@@ -976,7 +976,9 @@ class QueueStore(StoreLifecycle, Protocol):
         read by the re-ingress worker to HL7-peek the reply (in ``pipeline/``) before
         :meth:`ingress_handoff`. ``None`` if the row is gone or its reference is malformed. ``""``
         if the artifact row is missing, its body was erased, or the reply was empty: the peek needs
-        no more, and :meth:`ingress_handoff` tells those three apart itself (BACKLOG #4996)."""
+        no more, and :meth:`ingress_handoff` tells those three apart itself (BACKLOG #4996). A
+        work-row whose ``payload`` fails its own queue tag is audited and alerted, then raises
+        :class:`~messagefoundry.store.queue_tag.QueueTagError` (BACKLOG #5982)."""
         ...
 
     async def mark_failed(

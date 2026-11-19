@@ -20,8 +20,16 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from messagefoundry.store.queue_tag import QUEUE_TAG_FAILED_ACTION
-from messagefoundry.store.store import MessageStatus, OutboxStatus, Stage
+from messagefoundry.store.crypto import cell_aad
+from messagefoundry.store.queue_tag import QUEUE_TAG_FAILED_ACTION, QueueTagError
+from messagefoundry.store.store import (
+    REINGRESS_READ_TAG_FAILURE_OUTCOME,
+    REINGRESS_TAG_FAILURE_OUTCOME,
+    REINGRESS_TOKEN_TAG_FAILED,
+    MessageStatus,
+    OutboxStatus,
+    Stage,
+)
 from tests._store_audit import no_operator_audit
 
 #: Runs one statement with ``?`` placeholders against the store's database, outside the store.
@@ -268,8 +276,94 @@ async def assert_queue_tag_contract(
     item = await store.claim_next_fifo("OB_QT_O")
     assert item is not None and item.id == rid and item.payload == "SYNTH-BODY-O"
 
+    await _assert_response_stage(store, raw, fetch, hook)
+
     if store_once:
         await _assert_store_once(store, raw, fetch, hook)
+
+
+async def _response_token(store: Any, fetch: RawFetch, lane: str, loop: str) -> tuple[str, str]:
+    """An origin delivered on ``lane`` whose captured reply owes a re-ingress on ``loop``: the
+    origin's id and its ``Stage.RESPONSE`` work-row's id."""
+    mid, rid = await _outbound(store, fetch, lane, "SYNTH-BODY-RESP")
+    item = await store.claim_next_fifo(lane)
+    assert item is not None and item.id == rid
+    await store.complete_with_response(rid, body=_RAW, outcome="accepted", reingress_to=loop)
+    return mid, await _row_id(fetch, mid, Stage.RESPONSE.value)
+
+
+async def _handoff(store: Any, token: str, loop: str) -> bool:
+    produced: bool = await store.ingress_handoff(
+        response_row_id=token,
+        loopback_channel_id=loop,
+        correlation_depth_cap=5,
+        control_id="QT1",
+        message_type="ADT^A01",
+        summary=None,
+    )
+    return produced
+
+
+async def _assert_response_stage(store: Any, raw: RawSql, fetch: RawFetch, hook: _Hook) -> None:
+    """BACKLOG #5982: a ``Stage.RESPONSE`` re-ingress token is held to its tag like every other
+    stage, at the claim and again at the re-ingress worker's two reads after it."""
+    # --- control: an untouched token is claimed, read and handed off ---------------------------
+    _, token = await _response_token(store, fetch, "OB_QT_S0", "LB_QT_S0")
+    item = await store.claim_next_fifo("LB_QT_S0", stage=Stage.RESPONSE.value)
+    assert item is not None and item.id == token
+    assert await store.response_body_for_work_row(token) == _RAW
+    assert await _handoff(store, token, "LB_QT_S0") is True
+    assert await fetch("SELECT id FROM queue WHERE id=?", (token,)) == []  # consumed
+
+    # --- a token changed before its claim is refused at the claim ------------------------------
+    mid, token = await _response_token(store, fetch, "OB_QT_S1", "LB_QT_S1")
+    await raw("UPDATE queue SET handler_name=? WHERE id=?", ("H_QT_S1", token))
+    assert await store.claim_next_fifo("LB_QT_S1", stage=Stage.RESPONSE.value) is None
+    await _assert_refused(store, fetch, hook, message_id=mid, row_id=token, label="response claim")
+
+    # --- a token changed after its claim is refused at the re-ingress reply read ---------------
+    _, token = await _response_token(store, fetch, "OB_QT_S2", "LB_QT_S2")
+    item = await store.claim_next_fifo("LB_QT_S2", stage=Stage.RESPONSE.value)
+    assert item is not None and item.id == token
+    await raw("UPDATE queue SET handler_name=? WHERE id=?", ("H_QT_S2", token))
+    try:
+        await store.response_body_for_work_row(token)
+    except QueueTagError:
+        pass
+    else:
+        raise AssertionError("a reply read through a token whose tag fails was not refused")
+    await _assert_reported(fetch, hook, token, REINGRESS_READ_TAG_FAILURE_OUTCOME, "read")
+
+    # --- a token changed after its reply was read is refused at the handoff --------------------
+    mid, token = await _response_token(store, fetch, "OB_QT_S3", "LB_QT_S3")
+    item = await store.claim_next_fifo("LB_QT_S3", stage=Stage.RESPONSE.value)
+    assert item is not None and item.id == token
+    assert await store.response_body_for_work_row(token) == _RAW  # control: read before the change
+    await raw("UPDATE queue SET handler_name=? WHERE id=?", ("H_QT_S3", token))
+    assert await _handoff(store, token, "LB_QT_S3") is True  # consumed as dead, no child
+    await _assert_refused(store, fetch, hook, message_id=mid, row_id=token, label="handoff")
+    assert any(token[:12] in r and REINGRESS_TAG_FAILURE_OUTCOME in r for r in hook.reasons), (
+        hook.reasons
+    )
+    rows = await fetch("SELECT last_error FROM queue WHERE id=?", (token,))
+    sealed_error = rows[0]["last_error"]
+    assert store.cipher().decrypt(sealed_error, aad=cell_aad("queue", "last_error", token)) == (
+        REINGRESS_TOKEN_TAG_FAILED
+    ), sealed_error
+    children = await fetch("SELECT id FROM messages WHERE channel_id=?", ("LB_QT_S3",))
+    assert children == [], children
+
+
+async def _assert_reported(
+    fetch: RawFetch, hook: _Hook, row_id: str, outcome: str, label: str
+) -> None:
+    """One audit row and an alert carrying ``outcome`` for ``row_id``."""
+    audited = await fetch(
+        "SELECT detail FROM audit_log WHERE action=? AND detail LIKE ?",
+        (QUEUE_TAG_FAILED_ACTION, f"%{row_id[:12]}%"),
+    )
+    assert len(audited) == 1, (label, audited)
+    assert any(row_id[:12] in r and outcome in r for r in hook.reasons), (label, hook.reasons)
 
 
 async def _assert_store_once(store: Any, raw: RawSql, fetch: RawFetch, hook: _Hook) -> None:
