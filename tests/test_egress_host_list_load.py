@@ -61,7 +61,7 @@ _MALFORMED = (
 @pytest.mark.parametrize("field", _HOST_LISTS)
 @pytest.mark.parametrize("entry", _MALFORMED)
 def test_malformed_entry_is_refused_at_load(field: str, entry: str) -> None:
-    with pytest.raises(ValidationError, match=rf"\[egress\]\.{field} entry 2 \(counting non-blank"):
+    with pytest.raises(ValidationError, match=rf"\[egress\]\.{field} entry 2 is refused"):
         EgressSettings.model_validate({field: ["db.example.org", entry]})
 
 
@@ -98,19 +98,35 @@ def test_refusal_names_the_reason(entry: str, reason: str) -> None:
 
 
 @pytest.mark.parametrize("field", _HOST_LISTS)
-def test_well_formed_entries_load_stripped_and_blanks_skipped(field: str) -> None:
+def test_well_formed_entries_load_stripped(field: str) -> None:
     good = [
         " db.example.org ",
         "db.example.org:5432",
-        "",
         "10.0.0.5:06661",
         "my_host",
         "xn--bcher-kva.example",
+        "हिन्दी.example",  # Devanagari, with combining marks
+        "café.example",  # a decomposed accent
     ]
     if field != "allowed_db":
         good += ["[::1]", "[2001:db8::10]:6661"]
     loaded = getattr(EgressSettings.model_validate({field: good}), field)
-    assert loaded == [item.strip() for item in good if item.strip()]
+    assert loaded == [item.strip() for item in good]
+
+
+@pytest.mark.parametrize("field", _HOST_LISTS)
+@pytest.mark.parametrize("blank", ["", " "])
+def test_blank_entry_is_refused_not_dropped(field: str, blank: str) -> None:
+    # Dropped, a list of blanks would read as unset, which the audited opt-out reads as any host.
+    with pytest.raises(ValidationError, match=r"entry 1 is refused: it is blank"):
+        EgressSettings.model_validate({field: [blank], "deny_by_default": False})
+
+
+def test_env_form_still_drops_blank_items() -> None:
+    assert EgressSettings(allowed_http="a.example.org,, ,b.example.org").allowed_http == [  # type: ignore[arg-type]
+        "a.example.org",
+        "b.example.org",
+    ]
 
 
 # --- ports compare as numbers ------------------------------------------------------------------

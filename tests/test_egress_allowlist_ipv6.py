@@ -217,16 +217,42 @@ def test_database_ipv6_server_is_unlisted_saying_why(server: str, dialect: str) 
         _check_db(server, "db.example.org", dialect=dialect)
 
 
-@pytest.mark.parametrize("entry", ["[::1]", "[::1]:6432", "[FE80::1]:6432", "[2001:db8::5]"])
+@pytest.mark.parametrize(
+    "entry", ["[::1]", "[::1]:6432", "[FE80::1]:6432", "[2001:db8::5]", "::1", "fe80::1:443"]
+)
 def test_database_ipv6_entry_is_refused_at_load(entry: str) -> None:
-    # On origin/main such an entry loaded and could never admit a server.
-    with pytest.raises(ValueError, match=r"\[egress\]\.allowed_db entry 1 .* IPv6 address"):
+    # On origin/main such an entry loaded and could never admit a server. The remedy names a host
+    # name and never the bracketed forms this list refuses.
+    with pytest.raises(ValueError, match=r"\[egress\]\.allowed_db entry 1 .* IPv6 address") as e:
         EgressSettings(allowed_db=[entry])
+    assert "[v6]" not in str(e.value)
 
 
 def test_database_ipv6_entry_refusal_counts_its_position() -> None:
     with pytest.raises(ValueError, match=r"\[egress\]\.allowed_db entry 2 "):
-        EgressSettings(allowed_db=["db.example.org", " ", "[::1]"])
+        EgressSettings(allowed_db=["db.example.org", "[::1]"])
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+@pytest.mark.parametrize(("server", "entry"), [("::1", "[::1]"), ("fe80::1", "[FE80::1]:6432")])
+def test_database_colon_guard_holds_against_an_entry_naming_the_address(
+    server: str, entry: str, dialect: str
+) -> None:
+    # The entry cannot load, so it is placed past the load check: the guard alone must refuse.
+    dest = Destination(
+        name="OB_DB_V6", type=ConnectorType.DATABASE, settings=_db_settings(server, dialect)
+    )
+    with pytest.raises(WiringError, match=_COLON):
+        check_egress_allowed(dest, EgressSettings.model_construct(allowed_db=[entry]))
+
+
+@pytest.mark.parametrize(
+    ("dialect", "where"),
+    [("generic", "the PORT keyword in odbc_params"), ("sqlserver", "the port setting")],
+)
+def test_database_colon_refusal_names_the_dialects_port(dialect: str, where: str) -> None:
+    with pytest.raises(WiringError, match=where):
+        _check_db("::1", "db.example.org", dialect=dialect)
 
 
 @pytest.mark.parametrize("server", ["::1", "[::1]"])

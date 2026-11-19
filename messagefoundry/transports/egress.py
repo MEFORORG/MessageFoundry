@@ -930,10 +930,11 @@ def _database_refusal(
     # Unverified driver reads fail closed; docs/CONNECTIONS.md says why (BACKLOG #5915).
     if ":" in host:
         # Refused as unlisted, saying why, since an entry naming the address looks like it lists it.
+        where = "the PORT keyword in odbc_params" if dialect == "generic" else "the port setting"
         return (
             f"server {host!r} is not in the [egress].allowed_db allowlist: a server holding a "
-            "':' is never listed, so give a port in the port setting or the PORT keyword, not in "
-            "server, and name an IPv6 server by host name"
+            f"':' is never listed, so give a port in {where}, not in server, and name an IPv6 "
+            "server by host name"
         )
     pins = _allowed_ports_for(host, allowed)
     if not pins:
@@ -988,6 +989,7 @@ def http_egress_allowed(url: str, allowed: list[str]) -> bool:
         port = parts.port
     except ValueError:
         return False
-    if port is None and parts.scheme.lower() in _HTTP_DEFAULT_PORTS:
-        port = http_dial_port(parts.scheme, None)
+    if port is None:
+        # urlsplit lowercases the scheme, so the table is read as http_dial_port reads it.
+        port = _HTTP_DEFAULT_PORTS.get(parts.scheme)
     return host_port_allowed(parts.hostname or "", port, allowed)

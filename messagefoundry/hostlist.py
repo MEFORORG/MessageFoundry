@@ -13,6 +13,7 @@ outside the standard library.
 from __future__ import annotations
 
 import ipaddress
+import unicodedata
 
 __all__ = [
     "HostKey",
@@ -112,10 +113,10 @@ def parse_allow_entry(entry: str) -> tuple[HostKey, str] | None:
 
 
 def _is_host_name(text: str) -> bool:
-    """True if ``text`` holds only what a host name holds: letters, digits, ``.``, ``-`` and ``_``.
-    Letters of any script pass, so an internationalized name a connection writes unencoded is
-    still listed as written."""
-    return all(char.isalnum() or char in "._-" for char in text)
+    """True if ``text`` holds only what a host name holds: letters, combining marks, digits,
+    ``.``, ``-`` and ``_``. Any script passes, its marks included, so an internationalized name a
+    connection writes unencoded is still listed as written."""
+    return all(unicodedata.category(char)[0] in "LMN" or char in "._-" for char in text)
 
 
 def allow_entry_problem(entry: str) -> str | None:

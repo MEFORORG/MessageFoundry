@@ -4922,26 +4922,26 @@ def _host_list_entries(
     value: list[str],
     setting: str,
     problem: Callable[[str], str | None] = allow_entry_problem,
+    forms: str = "'host', 'host:port', '[v6]' or '[v6]:port', such as 'db.example.org:5432' or "
+    "'[2001:db8::10]:6661'",
 ) -> list[str]:
-    """``value``, a ``host[:port]`` allowlist, with each entry stripped and blank ones skipped, or a
-    refusal naming ``setting`` and the first entry ``problem`` refuses (BACKLOG #5915).
+    """``value``, a ``host[:port]`` allowlist, with each entry stripped, or a refusal naming
+    ``setting`` and the first entry that is blank or that ``problem`` refuses (BACKLOG #5915).
 
     The matcher reads every entry with :func:`~messagefoundry.hostlist.parse_allow_entry`, and an
-    entry it cannot read matches nothing, so it would load and quietly admit nothing. The refusal
-    names the entry by position among the non-blank ones, not by text, as the
-    ``allowed_ech_sidecar`` refusal does: an operator who pasted a URL, credential and all, would
-    otherwise find it in the error."""
+    entry it cannot read matches nothing, so it would load and quietly admit nothing. A blank entry
+    is refused rather than dropped: dropping it would turn a list that admits nothing into an unset
+    one, which the audited opt-out reads as admitting any host. The environment form drops blank
+    items before this runs, as it always has. The refusal names the entry by its position, from 1,
+    not by text, as the ``allowed_ech_sidecar`` refusal does: an operator who pasted a URL,
+    credential and all, would otherwise find it in the error. ``forms`` is the remedy it names."""
     cleaned: list[str] = []
-    for raw in value:
+    for position, raw in enumerate(value, start=1):
         item = raw.strip()
-        if not item:
-            continue
-        why = problem(item)
+        why = "it is blank" if not item else problem(item)
         if why is not None:
             raise ValueError(
-                f"{setting} entry {len(cleaned) + 1} (counting non-blank entries) is refused: "
-                f"{why}. Write each entry as 'host', 'host:port', '[v6]' or '[v6]:port', such "
-                "as 'db.example.org:5432' or '[2001:db8::10]:6661'"
+                f"{setting} entry {position} is refused: {why}. Write each entry as {forms}"
             )
         cleaned.append(item)
     return cleaned
@@ -4949,17 +4949,17 @@ def _host_list_entries(
 
 def _db_entry_problem(entry: str) -> str | None:
     """:func:`~messagefoundry.hostlist.allow_entry_problem`, and an ``[egress].allowed_db`` entry
-    naming an IPv6 address, which no DATABASE server can match (BACKLOG #5915)."""
-    problem = allow_entry_problem(entry)
-    if problem is not None:
-        return problem
+    that names an IPv6 address or holds more than one ``:``, which no DATABASE server can match
+    (BACKLOG #5915). The IPv6 reason comes first, so it is never told to write ``[v6]``."""
     parsed = parse_allow_entry(entry)
-    if parsed is not None and isinstance(parsed[0], ipaddress.IPv6Address):
+    if entry.count(":") > 1 or (
+        parsed is not None and isinstance(parsed[0], ipaddress.IPv6Address)
+    ):
         return (
             "it names an IPv6 address, and while this list is set a DATABASE server holding a ':' "
-            "is refused whatever the entries say, so an IPv6 server cannot be listed"
+            "is refused whatever the entries say, so name the server by a host name and list that"
         )
-    return None
+    return allow_entry_problem(entry)
 
 
 class AiSettings(_Section):
@@ -5716,7 +5716,12 @@ class EgressSettings(_Section):
         refuses every server holding a ``:``, so such an entry could never admit one."""
         setting = f"[egress].{info.field_name}"
         if info.field_name == "allowed_db":
-            return _host_list_entries(value, setting, _db_entry_problem)
+            return _host_list_entries(
+                value,
+                setting,
+                _db_entry_problem,
+                "'host' or 'host:port', such as 'db.example.org:5432'",
+            )
         return _host_list_entries(value, setting)
 
     @field_validator("proxy_url", mode="after")
