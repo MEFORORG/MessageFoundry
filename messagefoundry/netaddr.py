@@ -305,10 +305,12 @@ ALLOWLIST_RULE_TEXT: Final = (
     f"{_RULE_TEXT_LATE_RANGES[-1]}, while inside 6to4's {SIX_TO_FOUR}, whose IPv4 address starts "
     f"at bit {_SIX_TO_FOUR_IPV4_START}, the IPv6 floor already fixes that many; and the entries "
     f"together count at most {ALLOWLIST_MAX_IPV4_ADDRESSES:,} IPv4 addresses, "
-    f"two /{ALLOWLIST_MIN_PREFIX_V4} networks' worth, an IPv6 entry inside any prefix the gate "
-    "reads as carrying IPv4 addresses, 6to4 included, counting the IPv4 addresses it can carry, "
-    "any other IPv6 entry, a site's own NAT64 prefix among them, counting none, and loopback and "
-    "multicast not counted where a plain IPv4 or IPv4-mapped entry lists them"
+    f"two /{ALLOWLIST_MIN_PREFIX_V4} networks' worth, plain IPv4 and IPv4-mapped entries "
+    "counted as one space where an overlap counts once, an IPv6 entry inside any other prefix "
+    "the gate reads as carrying IPv4 addresses, 6to4 included, counting the IPv4 addresses it "
+    "can carry, apart for each such prefix, any other IPv6 entry, a site's own NAT64 prefix among "
+    "them, counting none, and loopback and multicast not counted where a plain IPv4 or "
+    "IPv4-mapped entry lists them"
 )
 
 

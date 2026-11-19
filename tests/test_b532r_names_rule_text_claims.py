@@ -34,7 +34,7 @@ def test_the_rule_text_names_6to4_and_its_ipv4_start() -> None:
 
 
 def test_6to4_entries_count_toward_the_cap_as_the_rule_text_says() -> None:
-    assert "6to4 included, counting the IPv4 addresses it can carry" in ALLOWLIST_RULE_TEXT
+    assert "6to4 included, counting the IPv4 addresses it" in ALLOWLIST_RULE_TEXT
     # 2002:XXYY::/32 carries the IPv4 /16 XX.YY.0.0, so 2 * 2**24 / 2**16 = 512 such entries reach
     # the cap and one more passes it. A 6to4 entry counting none would let any number through.
     per_entry = 2 ** (32 - (ALLOWLIST_MIN_PREFIX_V6 - dict(IPV4_EMBEDDINGS)[SIX_TO_FOUR]))
@@ -44,6 +44,16 @@ def test_6to4_entries_count_toward_the_cap_as_the_rule_text_says() -> None:
     ]
     assert allowlist_restricts(entries[:at_cap]) is True
     shortfall = allowlist_shortfall(entries)
+    assert shortfall is not None and "more than" in shortfall
+
+
+def test_the_same_hosts_under_nat64_and_plain_count_twice_as_the_rule_text_says() -> None:
+    assert "apart for each such prefix" in ALLOWLIST_RULE_TEXT
+    assert "IPv4-mapped entries counted as one space" in ALLOWLIST_RULE_TEXT
+    # 10/8 as plain and as IPv4-mapped is one space: it counts once.
+    assert allowlist_restricts(["10.0.0.0/8", "::ffff:10.0.0.0/104", "192.168.0.0/16"]) is True
+    # The same 10/8 under NAT64 counts apart, so with 192.168/16 it passes the cap.
+    shortfall = allowlist_shortfall(["10.0.0.0/8", "64:ff9b::a00:0/104", "192.168.0.0/16"])
     assert shortfall is not None and "more than" in shortfall
 
 
