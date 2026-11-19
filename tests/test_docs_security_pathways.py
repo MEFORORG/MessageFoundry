@@ -512,7 +512,16 @@ def test_the_intake_numbers_the_doc_quotes_match_the_code() -> None:
         'unless `intake_auth_health = "allow"`',
     ):
         assert quoted in table_b, f"the Table B HTTP rows no longer quote {quoted!r}"
-    assert netaddr.ALLOWLIST_RULE_TEXT, "the rule the Table B HTTP row links to is gone"
+    # The row summarizes the rule as a per-entry floor, IPv6 judged by the IPv4 it carries, and a
+    # whole-list cap; pin each part to the text it links to.
+    rule = netaddr.ALLOWLIST_RULE_TEXT
+    for part in (
+        f"no wider than /{netaddr.ALLOWLIST_MIN_PREFIX_V4} (IPv4)",
+        "fixes at least",
+        f"count at most {netaddr.ALLOWLIST_MAX_IPV4_ADDRESSES:,} IPv4 addresses",
+    ):
+        assert part in rule, f"the rule text no longer holds {part!r}; restate the Table B HTTP row"
+    assert "a cap on the IPv4 addresses" in table_b, "the Table B HTTP row no longer names the cap"
 
 
 def test_the_one_switch_that_flattens_three_pathways_is_named_in_each_row() -> None:
@@ -4316,14 +4325,15 @@ def test_the_thirteenth_sweep_probes_the_code_the_docs_now_state(
             posture=HopPosture(enforcing=enforcing),
         )
 
-    # The allow-list floors docs/DEPLOYMENT.md quotes, probed on both sides of each.
+    # The allow-list floors, probed on both sides of each. docs/DEPLOYMENT.md links to the rule
+    # text in netaddr.py rather than quoting them.
     assert (
         wiring_runner._INTAKE_ALLOWLIST_MIN_PREFIX_V4,
         wiring_runner._INTAKE_ALLOWLIST_MIN_PREFIX_V6,
     ) == (
         8,
         32,
-    ), "the intake allow-list floors moved; restate docs/DEPLOYMENT.md's caveat"
+    ), "the intake allow-list floors moved; update the probes below"
     for refused in (
         {},
         {"tls_ca_file": "ca.pem"},

@@ -119,8 +119,11 @@ IPV4_EMBEDDING_PREFIXES: Final = tuple(
 #: martian when it arrives on another interface, and multicast, never a unicast source. The
 #: whole-list count in :func:`allowlist_shortfall` leaves it out of the plain IPv4 space only, so
 #: listing ``127.0.0.0/8`` beside the private ranges does not use up the cap. The same blocks
-#: reached through another range of :data:`IPV4_EMBEDDINGS`, NAT64 for one, are counted. "This network" (``0.0.0.0/8``) and the reserved
-#: class E block are counted: at least Linux can be set to use them as unicast addresses.
+#: reached through another range of :data:`IPV4_EMBEDDINGS`, NAT64 for one, are counted. "This
+#: network" (``0.0.0.0/8``) and the reserved class E block are counted: at least Linux can be set
+#: to use them as unicast addresses. Not counting loopback is not a claim that a loopback entry
+#: admits no remote client: an on-box relay, such as a reverse proxy, a port forward or an SSH
+#: tunnel, connects from loopback for whoever it forwards, and neither gate weighs that.
 _NOT_A_PEER_V4: Final = (
     ipaddress.IPv4Network("127.0.0.0/8"),
     ipaddress.IPv4Network("224.0.0.0/4"),
@@ -292,10 +295,11 @@ ALLOWLIST_RULE_TEXT: Final = (
     f"one fixes at least {ALLOWLIST_MIN_PREFIX_V4} bits of the IPv4 address it carries, so is at "
     f"least a /{_LATE_IPV4_START + ALLOWLIST_MIN_PREFIX_V4} inside a prefix whose IPv4 address "
     f"starts at bit {_LATE_IPV4_START}, at least {', '.join(_RULE_TEXT_LATE_RANGES[:-1])} and "
-    f"{_RULE_TEXT_LATE_RANGES[-1]}; and the entries together admit at most "
+    f"{_RULE_TEXT_LATE_RANGES[-1]}; and the entries together count at most "
     f"{ALLOWLIST_MAX_IPV4_ADDRESSES:,} IPv4 addresses, two /{ALLOWLIST_MIN_PREFIX_V4} networks' "
-    "worth, an IPv6 entry inside such a prefix counting the IPv4 addresses it can carry, and "
-    "loopback and multicast not counted where a plain IPv4 or IPv4-mapped entry lists them"
+    "worth, an IPv6 entry inside such a prefix counting the IPv4 addresses it can carry, any "
+    "other IPv6 entry, a site's own NAT64 prefix among them, counting none, and loopback and "
+    "multicast not counted where a plain IPv4 or IPv4-mapped entry lists them"
 )
 
 

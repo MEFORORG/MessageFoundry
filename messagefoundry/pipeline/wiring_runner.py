@@ -15982,15 +15982,22 @@ def check_http_tls_exposure(
 
 
 #: The allow-list floors, owned by :mod:`messagefoundry.netaddr` since vault BACKLOG #2622 so the
-#: DICOM server's gate applies the same ones. The refusal text below quotes netaddr's rule text;
-#: these names stay for the tests that pin the floors docs/DEPLOYMENT.md quotes.
+#: DICOM server's gate applies the same ones. The refusal text below quotes netaddr's rule text,
+#: which the docs link to rather than restate; these names stay for the tests that probe the gate
+#: on both sides of each floor.
 _INTAKE_ALLOWLIST_MIN_PREFIX_V4 = ALLOWLIST_MIN_PREFIX_V4
 _INTAKE_ALLOWLIST_MIN_PREFIX_V6 = ALLOWLIST_MIN_PREFIX_V6
 
-#: The ``intake_auth`` modes :func:`_has_effective_peer_control` judges without the allow-list. It
-#: weighs the list for any other value, ``none`` or one ``Http()`` would have refused, so
-#: :func:`check_http_intake_auth` names the list's shortfall for exactly those.
+#: The ``intake_auth`` modes :func:`_has_effective_peer_control` judges without the allow-list.
 _INTAKE_MODES_JUDGED_ALONE = frozenset({"api_key", "bearer", "mtls_subject"})
+
+
+def _allowlist_weighed(settings: Mapping[str, Any]) -> bool:
+    """Whether the peer-control gate judges this listener by its ``source_ip_allowlist``: for any
+    ``intake_auth`` value but a mode judged alone, ``none`` or one ``Http()`` would have refused.
+    One reading, so :func:`check_http_intake_auth` names the list's shortfall exactly when
+    :func:`_has_effective_peer_control` weighed the list."""
+    return str(settings.get("intake_auth") or "none") not in _INTAKE_MODES_JUDGED_ALONE
 
 
 def _has_effective_peer_control(settings: Mapping[str, Any]) -> bool:
@@ -16003,10 +16010,9 @@ def _has_effective_peer_control(settings: Mapping[str, Any]) -> bool:
     configuration that fails this test is treated exactly as one with no control, and is not given a
     softer landing for having a control that does not work.
     """
-    mode = str(settings.get("intake_auth") or "none")
-    if mode not in _INTAKE_MODES_JUDGED_ALONE:
+    if _allowlist_weighed(settings):
         return allowlist_restricts(settings.get("source_ip_allowlist"))
-    if mode == "mtls_subject":
+    if str(settings.get("intake_auth")) == "mtls_subject":
         # The subject list is what tls_ca_file alone does not give you.
         return bool(settings.get("tls_ca_file")) and bool(settings.get("intake_client_subjects"))
     return bool(settings.get("intake_api_key"))  # api_key or bearer
@@ -16171,7 +16177,7 @@ def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | N
     # The list is weighed only when intake_auth names no mode the gate judges alone
     # (_has_effective_peer_control), so only then is its shortfall the reason for this refusal.
     allowlist = source.settings.get("source_ip_allowlist")
-    weighed = str(source.settings.get("intake_auth") or "none") not in _INTAKE_MODES_JUDGED_ALONE
+    weighed = _allowlist_weighed(source.settings)
     shortfall = allowlist_shortfall(allowlist) if allowlist and weighed else None
     detail = (
         f"inbound connection {name!r} binds non-loopback host {host!r} with no effective peer "

@@ -423,11 +423,11 @@ def test_a_reference_twin_by_width_or_trailing_space_is_refused(
 
 def test_the_twin_fold_keeps_a_no_break_space_and_a_superscript_apart(tmp_path: Path) -> None:
     # The fold adds width and trailing U+0020 to casefold, and no more: a no-break space and a
-    # superscript are compared as written, as SQL Server's `=` compares them. This test does not
-    # show the fold keeps apart everything SQL Server keeps apart. casefold folds further than a
-    # SQL Server collation may, at least the long s, the Kelvin sign and the sharp s (to s, k and
-    # ss), so a name beside such a twin can be refused that the store would keep apart. That
-    # over-refusal fails closed.
+    # superscript are compared as written. Whether a given SQL Server collation also keeps these
+    # apart is not measured here, so this test pins the fold, not the store. casefold folds
+    # further than a SQL Server collation may, at least the long s, the Kelvin sign and the sharp
+    # s (to s, k and ss), so a name beside such a twin can be refused that the store would keep
+    # apart. That over-refusal fails closed.
     names = ("EPIC", "EPIC\u00a0", "x2", "x\u00b2")
     (tmp_path / "refs.py").write_text(
         "from messagefoundry import DatabaseRef, Reference\n"
