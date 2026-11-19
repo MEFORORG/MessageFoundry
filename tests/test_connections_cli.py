@@ -454,11 +454,12 @@ transport = "file"
 #: case -> (connection name, file text). `{out_dir}` is filled per test. Every non-finite value
 #: carries a trailing comment, which a rewrite of that value would drop.
 _CASES: dict[str, tuple[str, str]] = {
-    "strict_timeout_s": ("IB", _base(inbound_extra="strict_timeout_s = inf  # off\n")),
-    "strict_timeout_s -inf": ("IB", _base(inbound_extra="strict_timeout_s = -inf  # off\n")),
-    "strict_timeout_s nan": ("IB", _base(inbound_extra="strict_timeout_s = nan  # odd\n")),
-    "strict_timeout_s -nan": ("IB", _base(inbound_extra="strict_timeout_s = -nan  # odd\n")),
-    "waiting_display_delay": ("OB", _base(outbound_extra="waiting_display_delay = inf  # never\n")),
+    # strict_timeout_s and waiting_display_delay are not here: main's finite_seconds refuses a
+    # non-finite value in either at load (BACKLOG #5321), so they are refusal cases below.
+    "metadata -inf": ("IB", _base(inbound_extra="metadata = { low = -inf }  # untyped\n")),
+    "metadata nan": ("IB", _base(inbound_extra="metadata = { odd = nan }  # untyped\n")),
+    "metadata -nan": ("IB", _base(inbound_extra="metadata = { odd = -nan }  # untyped\n")),
+    "outbound metadata": ("OB", _base(outbound_extra="metadata = { cap = inf }  # untyped\n")),
     "buildup": (
         "OB",
         _base(outbound_tables="  [outbound.buildup]\n  max_oldest_seconds = inf  # off\n"),
@@ -673,6 +674,50 @@ def test_a_fresh_non_finite_string_in_a_float_field_is_refused(
     assert rc == 1, out
     assert field in out
     assert not (cfg / "connections.toml").exists()
+
+
+_FINITE_REFUSAL = "is not a valid float value (value withheld): it is not a finite number"
+
+
+@pytest.mark.parametrize("spelling", ["nan", "inf", "-inf"])
+@pytest.mark.parametrize(
+    ("name", "field"), [("IB", "strict_timeout_s"), ("OB", "waiting_display_delay")]
+)
+def test_a_fresh_non_finite_tag_in_a_seconds_field_is_refused(
+    name: str, field: str, spelling: str, cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The tag decodes to the float, and the float meets main's finite_seconds refusal (BACKLOG
+    #5321): a NaN strict_timeout_s would switch the strict-validation backstop off, an infinity
+    would make it, or a display delay, never fire. Nothing is written."""
+    (cfg / "connections.toml").write_text(_base(), encoding="utf-8")
+    before = (cfg / "connections.toml").read_bytes()
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entry = _listed(cfg, capsys)[name]
+    entry[field] = {NON_FINITE_TAG: spelling}
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 1, out
+    assert f"{field} {_FINITE_REFUSAL}" in out
+    assert (cfg / "connections.toml").read_bytes() == before
+
+
+def test_a_clone_of_a_hand_written_non_finite_strict_timeout_is_refused(
+    cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A file holding strict_timeout_s = nan does not load, so a clone of it is refused with main's
+    finite_seconds refusal, as on origin/main, and the file is unchanged."""
+    (cfg / "connections.toml").write_text(
+        _base(inbound_extra="strict_timeout_s = nan\n"), encoding="utf-8"
+    )
+    before = (cfg / "connections.toml").read_bytes()
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entry = _listed(cfg, capsys)["IB"]
+    assert entry["strict_timeout_s"] == {NON_FINITE_TAG: "nan"}
+    entry["name"] = "IB2"
+    entry["settings"]["port"] = 2610
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 1, out
+    assert f"strict_timeout_s {_FINITE_REFUSAL}" in out
+    assert (cfg / "connections.toml").read_bytes() == before
 
 
 @pytest.mark.parametrize("body", ['"$toml" = "inf"', '"$toml" = "anything"'])
