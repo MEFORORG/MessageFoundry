@@ -125,10 +125,11 @@ PHI_FIELDS: dict[type[BaseModel], dict[str, Permission]] = {
 #: each row while ``summary`` beside it was masked.
 #:
 #: ``mask_for_display`` reads the composed-summary grammar, which ``metadata`` does not follow --
-#: its values are code- and operator-attached and its mechanism is still TBD. That is handled
-#: rather than overlooked: an unrecognized part is masked WHOLE, so an unknown shape degrades to
-#: the fixed-width mask rather than being passed through. Fail-closed is the right direction for
-#: a field whose grammar is not yet fixed, and the detail route's reveal still returns it whole.
+#: its values are code- and operator-attached and its mechanism is still TBD. So only ``summary``
+#: goes through it, and ``metadata`` is masked WHOLE with :data:`_MASK` (BACKLOG #5786): that
+#: function reads any comma as a ``FAMILY, GIVEN`` name and keeps initials, so serialized JSON
+#: came back with its initials, digits and structure. Fail-closed is the right direction for a
+#: field whose grammar is not yet fixed, and the detail route's reveal still returns it whole.
 MASKED_UNTIL_REVEALED: frozenset[str] = frozenset({"summary", "metadata"})
 
 #: Free-text error-tier properties, masked WHOLE until their own reveal act (BACKLOG #2436, ASVS
@@ -283,8 +284,9 @@ def redact_unauthorized(  # noqa: UP047
     for prop in allowed & ((MASKED_UNTIL_REVEALED | error_text) - revealed):
         value = getattr(model, prop, None)
         if isinstance(value, str) and value:
-            # Free error text has no grammar to keep, so it is hidden whole (BACKLOG #2436).
-            withheld[prop] = _MASK if prop in error_text else mask_for_display(value)
+            # Only the composed summary has a grammar to keep. Free error text (BACKLOG #2436) and
+            # metadata (BACKLOG #5786) are hidden whole.
+            withheld[prop] = mask_for_display(value) if prop == "summary" else _MASK
             masked.add(prop)
     out = model.model_copy(update=withheld)
     if isinstance(out, PhiGatedModel):

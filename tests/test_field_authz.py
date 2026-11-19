@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from messagefoundry.api.field_authz import (
     ERROR_TEXT_MASKED_UNTIL_REVEALED,
     MASKED_UNTIL_REVEALED,
@@ -311,6 +313,38 @@ def test_metadata_with_an_unknown_grammar_fails_closed() -> None:
     assert masked is not None and "100001" not in masked, (
         f"an unrecognized metadata shape leaked an identifier through the mask: {masked!r}"
     )
+
+
+@pytest.mark.parametrize(
+    "blob",
+    [
+        '{"family": "DOE", "given": "JANE", "mrn": "100001"}',
+        "DOE, JANE",
+        "MRN 100001",
+    ],
+)
+def test_metadata_is_masked_whole_on_both_models(blob: str) -> None:
+    """BACKLOG #5786: metadata went through ``mask_for_display``, which reads any comma as a
+    ``FAMILY, GIVEN`` name, so JSON came back as its initials, digits and structure. It is masked
+    whole now, as the error text is, while ``summary`` keeps its grammar."""
+    holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
+    assert redact_unauthorized(_summary(metadata=blob), holder).metadata == "****"
+    detail = MessageDetail(
+        id="m1",
+        channel_id="IB",
+        received_at=0.0,
+        source_type="mllp",
+        control_id="c1",
+        message_type="ADT^A01",
+        status="PROCESSED",
+        error=None,
+        metadata=blob,
+        outbox=[],
+        events=[],
+    )
+    assert redact_unauthorized(detail, holder).metadata == "****"
+    summary = redact_unauthorized(_summary(summary="MRN 100001 · DOE, JANE"), holder).summary
+    assert summary == "MRN ****0001 · D**, J**"  # the control: summary still keeps its shape
 
 
 def test_the_reveal_set_on_the_detail_route_covers_every_masked_property() -> None:
