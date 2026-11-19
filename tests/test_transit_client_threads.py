@@ -183,16 +183,118 @@ def test_many_threads_never_share_a_client() -> None:
     assert len({next(iter(client.threads)) for client in built}) == 9
 
 
-def test_close_releases_every_client_and_a_later_call_builds_a_fresh_one() -> None:
+def test_close_releases_the_callers_client_and_a_later_call_builds_a_fresh_one() -> None:
     cipher, built = _cipher()
     cipher.encrypt("synthetic")
-    _in_thread(lambda: cipher.encrypt("synthetic"))
+    cipher.close_connections()
+    assert [client.adapter.closed for client in built] == [1]
+    cipher.encrypt("synthetic")  # still usable: more than one store can share the cipher
+    assert len(built) == 2
     cipher.close_connections()
     assert [client.adapter.closed for client in built] == [1, 1]
-    cipher.encrypt("synthetic")  # still usable: more than one store can share the cipher
+
+
+def test_close_leaves_another_threads_client_to_that_thread() -> None:
+    """BACKLOG #5963. Mutation: close every thread's client from the closing thread. Red: the
+    worker's client is closed on the main thread while the worker still holds it. The worker
+    closes it itself on its next call, which builds a fresh client."""
+    cipher, built = _cipher()
+    go, ready, done = threading.Event(), threading.Event(), threading.Event()
+    closed_on: list[int] = []
+
+    def work() -> None:
+        cipher.encrypt("synthetic")
+        ready.set()
+        assert go.wait(timeout=10)
+        cipher.encrypt("synthetic")  # stale: replaces, and so closes, its own client
+        closed_on.append(built[1].adapter.closed)
+        done.set()
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    try:
+        assert ready.wait(timeout=10)
+        cipher.close_connections()
+        assert [client.adapter.closed for client in built] == [1, 0]
+    finally:
+        go.set()
+        worker.join(timeout=10)
+    assert done.is_set()
+    assert closed_on == [1]  # closed on the worker, by the worker's own next call
     assert len(built) == 3
-    cipher.close_connections()
-    assert [client.adapter.closed for client in built] == [1, 1, 1]
+
+
+class _ClosableAdapter:
+    def __init__(self) -> None:
+        self.closed = 0
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+class _SlowClient(_FakeClient):
+    """A fake hvac client whose decrypt waits on ``entered``/``release`` and fails, as a closed
+    session would mid-request, if its adapter was closed while the request was in flight."""
+
+    def __init__(
+        self, transit: _FakeTransit, entered: threading.Event, release: threading.Event
+    ) -> None:
+        super().__init__(transit)
+        self.adapter = _ClosableAdapter()
+        real = transit
+        adapter = self.adapter
+
+        class _Transit:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real, name)
+
+            def decrypt_data(self, **kwargs: Any) -> dict[str, Any]:
+                entered.set()
+                assert release.wait(timeout=10)
+                if adapter.closed:
+                    raise ConnectionError("synthetic: the pool was closed mid-request")
+                return real.decrypt_data(**kwargs)
+
+        self.secrets.transit = _Transit()  # type: ignore[assignment]
+
+
+def test_a_decrypt_in_flight_on_another_thread_completes_across_a_close() -> None:
+    """BACKLOG #5963. A decrypt in flight on thread T while thread U closes the cipher finishes
+    as it would with no close. Mutation: close every thread's client from the closing thread.
+    Red: T's session is closed under it, and its decrypt fails as an outage."""
+    transit = _FakeTransit()
+    entered, release = threading.Event(), threading.Event()
+    clients: list[_SlowClient] = []
+
+    def build() -> _SlowClient:
+        client = _SlowClient(transit, entered, release)
+        clients.append(client)
+        return client
+
+    startup = _FakeClient(transit)
+    cipher = TransitCipher(startup, _KEY_NAME, client_factory=build)
+    stored = cipher.encrypt("synthetic", aad=b"cell")
+    opened: list[str] = []
+    failures: list[BaseException] = []
+
+    def decrypt_on_t() -> None:
+        try:
+            opened.append(cipher.decrypt(stored, aad=b"cell"))
+        except BaseException as exc:  # noqa: BLE001 -- re-raised on the test's thread
+            failures.append(exc)
+
+    t = threading.Thread(target=decrypt_on_t)
+    t.start()
+    try:
+        assert entered.wait(timeout=10)
+        _in_thread(cipher.close_connections)  # thread U
+    finally:
+        release.set()
+        t.join(timeout=10)
+    assert not t.is_alive()
+    if failures:
+        raise failures[0]
+    assert opened == ["synthetic"]
 
 
 def test_a_thread_that_exits_closes_its_own_client() -> None:
@@ -211,44 +313,33 @@ def test_a_thread_that_exits_closes_its_own_client() -> None:
 
 
 def test_a_cipher_without_a_factory_keeps_its_one_client_across_close() -> None:
+    """Every thread shares the one client, and no thread can tell it is idle, so a close leaves
+    it open rather than close a session another thread may be sending on."""
     client = _TrackedClient(_FakeTransit())
     cipher = TransitCipher(client, _KEY_NAME)
     _in_thread(lambda: cipher.encrypt("synthetic"))
     cipher.close_connections()
     cipher.encrypt("synthetic")
     cipher.close_connections()
-    assert client.adapter.closed == 2
+    assert client.adapter.closed == 0
     assert len(client.threads) == 2
 
 
-def test_a_client_close_that_raises_is_logged_and_the_rest_still_close(
+def test_a_client_close_that_raises_is_logged_and_the_cipher_stays_usable(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     cipher, built = _cipher()
-    ready, done = threading.Event(), threading.Event()
 
-    def hold() -> None:
-        cipher.encrypt("synthetic")
-        ready.set()
-        done.wait(timeout=10)  # alive, so its client is still held when the cipher closes
+    def boom() -> None:
+        raise OSError("synthetic")
 
-    worker = threading.Thread(target=hold)
-    worker.start()
-    try:
-        assert ready.wait(timeout=10)
-
-        def boom() -> None:
-            raise OSError("synthetic")
-
-        built[0].adapter.close = boom  # type: ignore[method-assign]
-        cipher.close_connections()
-        assert built[1].adapter.closed == 1
-    finally:
-        done.set()
-        worker.join(timeout=10)
-    gc.collect()
-    assert built[1].adapter.closed == 1  # the thread's exit does not close it a second time
+    built[0].adapter.close = boom  # type: ignore[method-assign]
+    cipher.close_connections()
     assert "closing a Transit client's connections raised OSError" in caplog.text
+    cipher.encrypt("synthetic")
+    assert len(built) == 2
+    gc.collect()
+    assert built[1].adapter.closed == 0  # the release ran once; nothing closes the new client
 
 
 def _encrypt_in_a_thread(factory: Callable[[], Any]) -> list[BaseException]:
@@ -365,12 +456,12 @@ def test_a_build_refusal_on_a_batch_leaves_batching_on() -> None:
 
 
 async def test_closing_the_sqlite_store_releases_the_transit_clients(tmp_path: Path) -> None:
-    """Mutation: drop the close_connections call from MessageStore.close. Red: no client is
-    closed."""
+    """Mutation: drop the close_connections call from MessageStore.close. Red: the closing
+    thread's client is not closed. A worker thread's client is that thread's to close."""
     cipher, built = _cipher()
     store = await MessageStore.open(tmp_path / "store.db", cipher=cipher)
     await store.close()
-    assert built and all(client.adapter.closed == 1 for client in built)
+    assert built[0].adapter.closed == 1
 
 
 @pytest.mark.parametrize("store_class", [MessageStore, PostgresStore, SqlServerStore])

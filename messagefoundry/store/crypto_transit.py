@@ -543,8 +543,8 @@ def _close_client(client: object) -> None:
 
 class _ThreadClient:
     """One thread's own hvac client, from :class:`TransitCipher`'s factory (BACKLOG #5963). Its
-    connections are closed once, by :attr:`release` or when the thread drops it, as it does on
-    exit."""
+    connections are closed once, on that thread: by :attr:`release`, or when the thread drops it,
+    as it does on exit and when it replaces a stale client."""
 
     __slots__ = ("__weakref__", "client", "generation", "release")
 
@@ -581,13 +581,10 @@ class TransitCipher(_UnmarkedPolicy):
         self._client_factory = client_factory
         self._shared_client = client
         self._thread_clients = threading.local()
-        self._clients_lock = threading.Lock()
-        #: The release of each per-thread client, so :meth:`close_connections` can close their
-        #: sockets. Only the finalizers are kept, never the holders: a thread that exits drops its
-        #: own holder, which closes that client's connections. A plain list under the lock, because
-        #: a WeakSet's callbacks run on whichever thread drops an entry, unlocked.
-        self._releases: list[weakref.finalize[Any, Any]] = []
-        #: Bumped by :meth:`close_connections`, so a thread holding an older client builds anew.
+        #: Bumped by :meth:`close_connections`. A thread holding a client of an older generation
+        #: builds a new one on its next call, and dropping the old holder closes the old client on
+        #: that thread, the one thread that ever sends on it. No thread closes another's client, so
+        #: a close never lands on a session another thread may be sending on.
         self._generation = 0
         if client_factory is not None:
             self._hold(client, 0)
@@ -626,31 +623,31 @@ class TransitCipher(_UnmarkedPolicy):
             raise _build_failure(op, self._key, exc) from exc
 
     def _hold(self, client: Any, generation: int) -> Any:
-        """Keep ``client`` as the calling thread's own, closed when the thread drops it or when
-        :meth:`close_connections` runs, whichever is first."""
-        held = _ThreadClient(client, generation)
-        with self._clients_lock:
-            self._releases = [release for release in self._releases if release.alive]
-            self._releases.append(held.release)
-        self._thread_clients.held = held
+        """Keep ``client`` as the calling thread's own. Its connections are closed on this thread,
+        when the thread replaces it after a :meth:`close_connections` or when the thread ends,
+        whichever is first, or by :meth:`close_connections` called on this thread."""
+        self._thread_clients.held = _ThreadClient(client, generation)
         return client
 
     def close_connections(self) -> None:
-        """Close the pooled Vault connections of the clients this cipher holds (BACKLOG #5963). At
-        least a client whose build was still running when this ran is missed; its thread replaces
-        it on its next call, and closes it when it exits. The stores call it from their own
-        ``close``, and nothing calls it for a cipher no store holds. The cipher stays usable, because more than one
-        store can share it: a later call on any thread builds a fresh client when this cipher has a
-        factory, and otherwise reuses the one client, whose session opens a new connection. A client
-        whose close raises is logged by the exception's type and the rest are still closed."""
+        """Release this cipher's Vault connections without touching a session another thread may
+        be sending on (BACKLOG #5963). The stores call it from their own ``close``, and nothing
+        calls it for a cipher no store holds.
+
+        It closes the calling thread's own client at once, and marks every other thread's client
+        stale. Each other thread closes its stale client itself, on its next call, which then builds
+        a fresh one, or when the thread ends. So a Transit call in flight on another thread finishes
+        on its own client, and a thread that never calls again keeps its idle connection until it
+        ends. The cipher stays usable, because more than one store can share it. Without a factory
+        every thread shares one client, and no thread can tell it is idle, so nothing is closed. A
+        client whose close raises is logged by the exception's type."""
         if self._client_factory is None:
-            _close_client(self._shared_client)
             return
-        with self._clients_lock:
-            releases, self._releases = self._releases, []
-            self._generation += 1
-        for release in releases:
-            release()  # once each: a finalizer that already ran does nothing
+        self._generation += 1
+        held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
+        if held is not None:
+            del self._thread_clients.held
+            held.release()
 
     @property
     def transit_key_name(self) -> str:
