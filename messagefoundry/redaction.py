@@ -1677,8 +1677,9 @@ _XML_PHI_END = re.compile(
     r"</(?:[A-Za-z_][\w.-]*+:)?(family|given|name|birthDate|address|identifier|telecom)\s*+>"
 )
 
-#: A vocabulary end tag followed by a space, outside any walked element: the only kind whose rest
-#: :func:`_end_tag_rest` can mask, since every maskable rest opens with a space.
+#: A vocabulary end tag followed by a space, outside any walked element or at the end of a field
+#: run's token (:func:`_glued_end_tag_rest`): the only kind whose rest :func:`_end_tag_rest` can mask
+#: there, since every maskable rest opens with a space.
 _XML_PHI_END_OPEN = re.compile(
     r"</(?:[A-Za-z_][\w.-]*+:)?(?:family|given|name|birthDate|address|identifier|telecom)(?= )"
 )
@@ -1775,8 +1776,10 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     pass reads it; every rest of an end tag outside a walked element that names no vocabulary
     element (``<family>Smith</family></b Zqxdoe>``, :func:`_mask_stray_end_tags`); a rest whose end
     tag's name an HL7 field run took before this pass ran, which that run masks instead
-    (:func:`_glued_end_tag_rest`) only where these rules and :func:`_maskable_rest`'s both allow, so
-    it keeps at least what either refuses; and, where the rest ends the text, every refusal :func:`_maskable_rest` makes there, a last word with a digit or
+    (:func:`_glued_end_tag_rest`) only where these rules allow and the next run's token would not
+    open inside the mask, so it keeps at least what these rules refuse, while a run that took the
+    name of an end tag outside the vocabulary leaves its rest as it stood, even inside a vocabulary
+    element (``<name>a|b|<b>c</b Zqxdoe></name>``); and, where the rest ends the text, every refusal :func:`_maskable_rest` makes there, a last word with a digit or
     ending in ``m``, ``b``, ``f`` or ``n`` among them, and every last word
     :func:`_ends_in_camel_head` refuses (``</family zqxP``)."""
     if not mask or not text.startswith(" ", start):
@@ -2219,11 +2222,6 @@ _GLUED_QUOTED_LABEL = re.compile(
     r"""(?:(["'])(?:family|given|name|birthDate|address|identifier|telecom|0010[0-9A-Fa-f]{4})"""
     r"""\1:[\[{]{0,2}(?:(["'])value\2:)?|(?<!\w)Patient[A-Za-z]*+['"]?[=:])["']\Z"""
 )
-#: The tail of a token that ends on a vocabulary END tag's name, with or without a prefix: the rest
-#: after it is a malformed end tag's (:func:`_glued_end_tag_rest`).
-_GLUED_XML_END_LABEL = re.compile(
-    r"</(?:[A-Za-z_][\w.-]*+:)?(?:family|given|name|birthDate|address|identifier|telecom)"
-)
 #: The tail of a token that ends inside an XML element's text: a vocabulary start tag, then text.
 _GLUED_XML_LABEL = re.compile(
     r"""<(?:family|given|name|birthDate|address|identifier|telecom)>[^<>"'\\]*+"""
@@ -2348,9 +2346,11 @@ def _glued_value(text: str, run: re.Match[str], field_run: re.Pattern[str]) -> s
     to mask: the text after the token, up to the value's terminator. ``None`` leaves the plain
     scrub.
 
-    The PHI arms answer first, exactly as they did before BACKLOG #2968. Only where they decline
-    does a credential label at the token's end mask the next word, so the credential arm adds a
-    mask to an answer and never takes one away."""
+    The PHI arms answer first, exactly as they did before BACKLOG #2968. Where they decline, a token
+    that ends on a vocabulary end tag's name masks that tag's rest (:func:`_glued_end_tag_rest`,
+    BACKLOG #5925); it reads only such a token, which no credential label ends. Only where both
+    decline does a credential label at the token's end mask the next word, so the credential arm
+    adds a mask to an answer and never takes one away."""
     token, end = run.group(), run.end()
     stop = _glued_phi_value_end(text, token, end)
     if stop is not None:
@@ -2372,19 +2372,31 @@ def _glued_end_tag_rest(text: str, token: str, end: int, field_run: re.Pattern[s
     """The rest of a vocabulary end tag a field run cut through, when its ``token`` ends on
     the tag's name (``a|b|<family>Smith</family`` before `` Zqxdoe>``), masked under BOTH rule sets:
     :func:`_end_tag_rest`'s, which the XML pass applies to the same rest when no run took the tag,
-    and :func:`_maskable_rest`'s, which keep the next run's token out of the mask (BACKLOG #5925
-    item 1). The flat passes run before the XML pass, so without this the run took the tag's name
-    and the rest it left was read by neither. ``None`` keeps the rest as it stood."""
+    and the one field-run rule that applies here: a last word glued to what follows must not open the
+    next run's token, which would start inside the mask (BACKLOG #5925 item 1). The flat passes run
+    before the XML pass, so without this the run took the tag's name and the rest it left was read
+    by neither. ``None`` keeps the rest as it stood.
+
+    Only a vocabulary end tag is read, as :func:`_mask_stray_end_tags` reads one outside a walked
+    element: the run hides whether the tag sat inside a vocabulary element, so the rest of any other
+    end tag a run took (``<name>a|b|<b>c</b Zqxdoe></name>``) stays as it stood."""
     lt = token.rfind("<")
-    if lt == -1 or _GLUED_XML_END_LABEL.fullmatch(token, lt) is None:
+    tag = None if lt == -1 else _XML_PHI_END_OPEN.match(text, end - len(token) + lt)
+    if tag is None or tag.end() != end:
         return None
-    line = _END_TAG_LINE.match(text, end)
+    line = _END_TAG_LINE.match(text, end, end + _GLUED_VALUE_MAX + 1)
     assert line is not None  # the pattern matches the empty string
     stop = line.end()
+    rest = text[end:stop]
     # _end_tag_rest returns the line masked, or unchanged where its rules refuse.
-    if stop == end or _end_tag_rest(text, end, stop, True) == text[end:stop]:
+    if _end_tag_rest(text, end, stop, True) == rest:
         return None
-    return _maskable_rest(text, end, stop, field_run, credential=False)
+    words = _GLUED_WORD.findall(rest)
+    if not words:  # _end_tag_rest masks only a rest with a word; this keeps a stand-in honest
+        return None
+    if not rest.endswith(" ") and field_run.match(text, stop - len(words[-1])) is not None:
+        return None
+    return rest
 
 
 def _ends_in_credential_label(token: str) -> bool:
