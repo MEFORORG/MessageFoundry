@@ -2378,8 +2378,8 @@ def _glued_end_tag_rest(text: str, token: str, end: int, field_run: re.Pattern[s
     by neither. ``None`` keeps the rest as it stood.
 
     Only a vocabulary end tag is read, as :func:`_mask_stray_end_tags` reads one outside a walked
-    element. This arm tracks no open elements, so the rest of any other end tag a run took stays as
-    it stood, even inside a vocabulary element (``<name>a|b|<b>c</b Zqxdoe></name>``)."""
+    element: the run hides whether the tag sat inside a vocabulary element, so the rest of any other
+    end tag a run took (``<name>a|b|<b>c</b Zqxdoe></name>``) stays as it stood."""
     lt = token.rfind("<")
     tag = None if lt == -1 else _XML_PHI_END_OPEN.match(text, end - len(token) + lt)
     if tag is None or tag.end() != end:
@@ -2392,7 +2392,7 @@ def _glued_end_tag_rest(text: str, token: str, end: int, field_run: re.Pattern[s
     if _end_tag_rest(text, end, stop, True) == rest:
         return None
     words = _GLUED_WORD.findall(rest)
-    if not words:  # _end_tag_rest masks only a rest with a word; a stand-in for it may not
+    if not words:  # _end_tag_rest masks only a rest with a word; this keeps a stand-in honest
         return None
     if not rest.endswith(" ") and field_run.match(text, stop - len(words[-1])) is not None:
         return None
