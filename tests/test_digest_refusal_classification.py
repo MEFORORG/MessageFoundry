@@ -111,6 +111,11 @@ def _build(
     oauth2_token_url: str | None = None,
     **over: object,
 ) -> Any:
+    if ctype is ConnectorType.DICOMWEB:
+        # A DICOMweb base url refuses a query (vault BACKLOG #5358), so there is none to redact and
+        # the url equalities below hold trivially for it. Its positive control is
+        # test_a_dicomweb_url_cannot_carry_the_marker_query: the build refuses the marker query.
+        url = url.split("?", 1)[0]
     spec = _FACTORY[ctype](url=url, **over)
     if digest:
         spec = with_http_digest(spec, user="u", password="p")
@@ -141,6 +146,28 @@ def _send(ctype: ConnectorType, dest: Any) -> Any:
     if ctype is ConnectorType.DICOMWEB:
         return dest._post(b"DICM-synthetic-object")
     return dest._post("<x/>")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [HTTPS_URL, "https://partner.example.com/x?site=SITE-QUERY-MARKER", f"{REDACTED_URL}#SITE"],
+)
+def test_a_dicomweb_url_cannot_carry_the_marker_query(url: str) -> None:
+    """The positive control for the DICOMweb cells here and in
+    ``test_over_cap_2xx_reply_is_sent_once.py``, which drop the marker query before they build
+    (vault BACKLOG #5358). The build refuses any query or fragment, naming no part of it, so the
+    marker has no route to a refusal, a log line or a stored error."""
+    with (
+        active_hop_posture(_WARN_DIAL),
+        pytest.raises(ValueError, match="no query string or fragment") as exc,
+    ):
+        build_destination(
+            Destination(
+                name="OB", type=ConnectorType.DICOMWEB, settings=DICOMweb(url=url).settings
+            ),
+            egress=EgressSettings(deny_by_default=False),
+        )
+    assert "SITE" not in str(exc.value)
 
 
 # --- every destination arm, with the refusal injected ---------------------------------------------

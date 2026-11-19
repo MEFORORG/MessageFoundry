@@ -829,7 +829,7 @@ def code_set(name: str) -> CodeSet:
 # reads, so no hop can be crossed on an attestation the report does not name.
 
 #: The two settings keys a hop attestation lands in. An inbound/outbound carries the pair as typed
-#: fields and refuses these keys in its transport settings (see :func:`refuse_raw_hop_attestation`).
+#: fields and refuses these keys in its transport settings (see :func:`refuse_raw_declarations`).
 HOP_ATTESTATION_KEYS = ("tls_hop_attested", "tls_hop_attested_reason")
 
 
@@ -929,7 +929,7 @@ def _check_listener_ca(type_: ConnectorType, tls: object, ca: object, pin: objec
     reason reads it by truthiness."""
     factory = _UNREAD_CA_ON_TLS_OFF[type_]
     if ca is not None:
-        _refuse_bool_literals({"tls": tls}, factory)
+        refuse_bool_literals({"tls": tls}, factory)
     _check_tls_ca_file(factory, ca, unread=None if ca is None else _tls_off_reason(tls))
     _check_tls_ca_pin(factory, pin, ca)
 
@@ -1088,29 +1088,55 @@ def _refuse_attested_and_accepted(where: str, attested: bool, accepted: bool) ->
         raise WiringError(f"{where}: {exc}") from exc
 
 
-def refuse_raw_hop_attestation(settings: Mapping[str, Any], where: str) -> None:
-    """Refuse a hop attestation written into an inbound's or outbound's transport settings.
+#: The cleartext (ADR 0153) and revocation (ADR 0173) declaration keys. A connection carries them
+#: as typed fields; an outbound's build mirrors the declared ones into its resolved settings
+#: (``wiring_runner._DECLARATION_MIRROR_KEYS`` is built from this).
+CLEARTEXT_REVOCATION_KEYS = (
+    "cleartext_accepted",
+    "cleartext_reason",
+    "tls_revocation_attested",
+    "tls_revocation_attested_reason",
+)
 
-    The typed field on the connection is the only carrier the gate reads there. Before the owner's
-    2026-09-24 ruling the gate read these keys straight out of the settings dict, so a config module
-    could write them past every factory and cross an enforcing refusal unreported."""
-    raw = [key for key in HOP_ATTESTATION_KEYS if key in settings]
+#: Every hop-policy declaration key a connection carries as a typed field (ADR 0092, ADR 0153,
+#: ADR 0173), so none may stand in its transport settings.
+CONNECTION_DECLARATION_KEYS = (*HOP_ATTESTATION_KEYS, *CLEARTEXT_REVOCATION_KEYS)
+
+
+def refuse_raw_declarations(
+    settings: Mapping[str, Any], where: str, keys: tuple[str, ...] = CONNECTION_DECLARATION_KEYS
+) -> None:
+    """Refuse any of ``keys``, by default every :data:`CONNECTION_DECLARATION_KEYS` key, in an
+    inbound's or outbound's transport settings, whatever its value.
+
+    The typed fields on the connection are the only carriers the gates read there. Before the
+    owner's 2026-09-24 ruling the gate read the hop attestation straight out of the settings dict,
+    so a config module could write it past every factory and cross an enforcing refusal unreported.
+    The cleartext and revocation keys used to load clean and be stripped at an outbound's build, so
+    the author's declaration did nothing and nothing said so (vault BACKLOG #8253 item 2). Run on
+    the declared settings, at the declaration and at the build."""
+    raw = [key for key in keys if key in settings]
     if raw:
+        verb = "is not a transport setting" if len(raw) == 1 else "are not transport settings"
         raise WiringError(
-            f"{where}: {', '.join(raw)} is not a transport setting. Declare tls_hop_attested=True with "
-            "a tls_hop_attested_reason on inbound()/outbound(), or as top-level keys on the "
-            "connections.toml table, so the attestation is validated and reported"
+            f"{where}: {', '.join(raw)} {verb}. Declare tls_hop_attested with "
+            "tls_hop_attested_reason, or tls_revocation_attested with "
+            "tls_revocation_attested_reason, on inbound() or outbound(), and cleartext_accepted "
+            "with cleartext_reason on outbound() only, or as top-level keys on the "
+            "connections.toml table, so the declaration is validated and reported"
         )
 
 
 def apply_hop_attestation(
     settings: dict[str, Any], where: str, attested: bool, reason: str | None
 ) -> None:
-    """Refuse the raw keys in a connection's resolved settings, then mirror its declared pair there.
+    """Refuse a raw attestation pair in a connection's resolved settings
+    (:func:`refuse_raw_declarations`), then mirror its declared pair there.
 
     The mirror is for the settings-driven seams (the SMART, OAuth2, Digest and FTP guards), which
-    receive only a settings mapping. Written only when declared."""
-    refuse_raw_hop_attestation(settings, where)
+    receive only a settings mapping. Written only when declared. Only the attestation keys are
+    refused here, so an outbound's cleartext and revocation mirror may run either side of it."""
+    refuse_raw_declarations(settings, where, HOP_ATTESTATION_KEYS)
     settings.update(_hop_attestation_entries(where, attested, reason))
 
 
@@ -1621,9 +1647,10 @@ _SETTINGS_FACTORY_NAMES: Final = frozenset({"DatabaseLookup"})
 #: The boolean settings a ``with_*`` composer in another module writes under a key that is not its
 #: parameter's name (``with_smart_backend(enabled=)`` stores ``smart_enabled``), so the annotation
 #: scan cannot find them (vault BACKLOG #3234), each with what a resolved ``None`` reads as. SMART
-#: and OAuth2 read it as off, not the composer's default of on: their readers' documented rule is
-#: that a falsy flag is off (``smart_auth_configured``, ``oauth2_auth_configured``), and reading a
-#: ``None`` as on would start a token hop the author did not ask for. ``sign_enabled`` keeps
+#: and OAuth2 read it as off, not the composer's default of on: reading a ``None`` as on would start
+#: a token hop the author did not ask for. ``smart_auth_configured`` takes any falsy flag as off;
+#: ``oauth2_auth_configured`` reads a non-bool flag as off and the build refuses it (vault BACKLOG
+#: #5362), so this resolve is what lets an ``env()`` that resolves to ``None`` build as off. ``sign_enabled`` keeps
 #: ``None``: its reader, ``OutboundSigning``, refuses it, and off would silently stop signing.
 #: Listed rather than imported, so the first resolve does not load the composers' modules and
 #: ``cryptography``. ``tests/test_env_uncast_bool_setting.py`` pins the key set against the source.
@@ -1680,7 +1707,12 @@ def _bool_settings() -> _BoolSettings:
     defaults: dict[str, set[object]] = {}
     other_names: set[str] = set()
     factories: set[str] = set()
-    for obj in globals().values():
+    # A copy, so a global bound or removed mid-scan cannot raise "dictionary changed size during
+    # iteration". Writers include at least another thread, a test patch, and a warning attributed to
+    # a frame of this module, which adds __warningregistry__ here even when the warning is ignored.
+    # list(), not tuple(): on a free-threaded build only list() copies a dict view under the dict's
+    # lock; on a GIL build both are one uninterrupted copy.
+    for obj in list(globals().values()):
         if not inspect.isfunction(obj) or obj.__module__ != __name__:
             continue
         if (
@@ -1734,7 +1766,7 @@ def _read_bool_setting(value: Any, default: bool | None) -> bool | None:
 def _bool_literal_problem(key: str, value: Any) -> str | None:
     """Why the literal ``value`` may not stand on the boolean setting ``key``, or ``None`` when it
     may (vault BACKLOG #3234). :meth:`Registry.bool_literal_problems` says what is refused and why;
-    :func:`_refuse_bool_literals` asks it too, before a connection's own checks read a flag. The
+    :func:`refuse_bool_literals` asks it too, before a connection's own checks read a flag. The
     value is withheld.
 
     Raises :class:`WiringError` when a factory's annotations do not resolve (:func:`_bool_settings`)."""
@@ -1773,13 +1805,13 @@ def _bool_remedy(key: str, value: object) -> str:
 
 def _bool_literal_problems_in(settings: Mapping[str, Any]) -> Iterator[str]:
     """:func:`_bool_literal_problem` for every setting in ``settings``, in order. The one loop
-    behind :func:`_refuse_bool_literals` and :meth:`Registry.bool_literal_problems`."""
+    behind :func:`refuse_bool_literals` and :meth:`Registry.bool_literal_problems`."""
     for key, value in settings.items():
         if (bad := _bool_literal_problem(key, value)) is not None:
             yield bad
 
 
-def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
+def refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
     """Refuse every non-bool literal on a boolean setting, in one error, before a connection's own
     checks or desugars read one (vault BACKLOG #3234). Those read flags by truthiness, so a quoted
     false would otherwise be refused as if it were set, or overwritten (``reingress_to`` sets
@@ -1789,8 +1821,16 @@ def _refuse_bool_literals(settings: Mapping[str, Any], where: str) -> None:
 
     A factory calls it too, on one of its own arguments, where a check inside the factory reads
     that argument by truthiness before ``inbound()`` or ``outbound()`` can refuse it, and names
-    itself as ``where``, since it runs before the declaration has a name. Problems are joined with
-    `` | ``, because a problem can hold a ``;`` before its remedy."""
+    itself as ``where``, since it runs before the declaration has a name.
+
+    It runs again at least where these build, on the declared settings before ``env()`` resolves,
+    because the dict stays mutable and a Registry built in code was never loaded (vault BACKLOG
+    #3234 added step 8): an inbound or outbound connection (``_source_config``, ``_dest_config``),
+    a database lookup (the executor build and the build check), a FHIR lookup
+    (``_fhir_lookup_settings``) and a reference set (the build check, ``refuse_reference_hop_flags``
+    at start, and the sync). This is the one place that list is kept.
+
+    Problems are joined with `` | ``, because a problem can hold a ``;`` before its remedy."""
     if problems := list(_bool_literal_problems_in(settings)):
         raise WiringError(f"{where}: " + " | ".join(problems))
 
@@ -1934,9 +1974,9 @@ def resolve_env_settings(
         else:
             # A literal is NOT read here, even on a bool setting: every pre-resolve reader (the
             # loosening registers, the build-time capture checks) reads spec.settings, so changing
-            # a literal only in this copy would split one setting into two readings. The loader
-            # refuses one that is not a bool (Registry.bool_literal_problems); a Registry built in
-            # code and never validated is not checked there.
+            # a literal only in this copy would split one setting into two readings. Nothing here
+            # refuses a non-bool literal either, so a caller must not assume one was refused before
+            # it got here; refuse_bool_literals says which builds refuse one first.
             resolved[name] = value
     problems: list[str] = []
     if missing:
@@ -2422,8 +2462,11 @@ def _names_a_credential(name: str) -> bool:
 
     A name that ends in a known non-secret (:data:`~messagefoundry.secretscrub._QUERY_NOT_CREDENTIAL_TAILS`,
     such as ``pageToken``) is not one, unless a credential word also sits outside that ending. The
-    ending is judged without a trailing index or digits, as the warning detector judges it, so
-    ``pageToken[0]`` is a cursor, while ``user[password]`` and ``pageToken[password]`` are not."""
+    ending is judged without one trailing index or digits, by :func:`_base_name`, so
+    ``pageToken[0]`` is a cursor, while ``user[password]`` and ``pageToken[password]`` are not.
+    The warning detector reads more (:func:`~messagefoundry.secretscrub._base_names`: every
+    trailing index, and bracket keys as segments), so it may call a name such as
+    ``pageToken[0][0]`` a cursor while this withholds it. That only over-masks."""
     squashed = _squash_name(name)
     if not any(word in squashed for word in _DISPLAY_CREDENTIAL_WORDS):
         return False
@@ -2999,8 +3042,7 @@ def MLLP(
     and how they match. It needs ``tls=True`` and ``tls_ca_file``; unset, nothing changes."""
     if tls_client_subjects is not None:
         # The subjects check reads tls by truthiness, so 0 would be refused as "needs tls=True".
-        # Only here: elsewhere inbound()/outbound() refuse it, naming the connection.
-        _refuse_bool_literals({"tls": tls}, "MLLP")
+        refuse_bool_literals({"tls": tls}, "MLLP")
     client_subjects = _mllp_client_subjects(tls_client_subjects, tls=tls, tls_ca_file=tls_ca_file)
     _check_listener_ca(ConnectorType.MLLP, tls, tls_ca_file, tls_ca_pin)
     return ConnectionSpec(
@@ -3866,7 +3908,7 @@ def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
         return
 
     # mtls_subject. The check below reads tls by truthiness, so 0 would be refused as "needs tls=True".
-    _refuse_bool_literals({"tls": settings["tls"]}, "Http")
+    refuse_bool_literals({"tls": settings["tls"]}, "Http")
     if not settings["tls"] or not settings["tls_ca_file"]:
         raise WiringError(
             "Http intake_auth='mtls_subject' needs tls=True and tls_ca_file — without a CA the "
@@ -4573,6 +4615,8 @@ def Direct(
     ``host:port`` over STARTTLS. Cert/key material is loaded + validated at construction (fail loud),
     except the certificates' validity window: construction only warns on it, and each send refuses
     a recipient cert or issuing anchor outside it (code ``direct-cert-validity``, BACKLOG #5631).
+    What construction refuses in the recipient cert, including one that does not name every address
+    in ``recipients``, is listed under *Recipient trust* in ``docs/CONNECTIONS.md``.
 
     **The relay's TLS certificate is verified** (``tls_verify=True``, #323 — ``smtplib``'s own default
     verifies nothing). Note the two trust settings are unrelated and easy to confuse: ``trust_anchor``
@@ -4831,7 +4875,7 @@ def DICOMweb(
     if tls_ca_file is not None:
         # The CA check below reads verify_tls by truthiness, so 0 would be refused as verification
         # off. Only here: elsewhere outbound() refuses it, naming the connection.
-        _refuse_bool_literals({"verify_tls": verify_tls}, "DICOMweb")
+        refuse_bool_literals({"verify_tls": verify_tls}, "DICOMweb")
     _check_tls_ca_file(
         "DICOMweb",
         tls_ca_file,
@@ -7027,16 +7071,19 @@ class Registry:
         refused graph never runs. Here and not only in the factories, because a ``with_*`` composer
         writes its ``enabled`` flag onto a spec after its factory returns, a ``FhirLookup`` already
         registered. ``inbound()``/``outbound()`` refuse a connection's literals at declaration, and
-        ``MLLP``, ``DICOMweb`` and ``Http`` refuse the one flag a check of their own reads first
-        (:func:`_refuse_bool_literals`); this pass sees the rest, a lookup's and a composer's
+        at least ``MLLP``, ``DICOM``, ``DICOMweb`` and ``Http`` refuse a non-bool literal on the
+        flag that a check of their own would read first, when that check runs
+        (:func:`refuse_bool_literals`), as ``Ftp`` refuses its ``tls``, ``None`` included, by its
+        own check; this pass sees the rest, a lookup's and a composer's
         included. ``None`` passes where the setting has one default on every factory: there an
         explicit ``None`` is that default to ``bool_setting`` (vault BACKLOG #3230). It is refused on
         a composer's flag, whose reader takes ``None`` as off while the composer's own default is on,
         and on a setting with no single default. ``env()`` references are read strictly once
         resolved (:func:`resolve_env_settings`). The value is withheld.
 
-        Only a graph that is validated sees this, as the loader's is; a :class:`Registry` built in
-        code and handed straight to a runner is not checked here."""
+        Only a graph that is validated sees this, as the loader's is. A :class:`Registry` built in
+        code and handed straight to a runner, or settings changed after the load, meet the same
+        rule at the builds :func:`refuse_bool_literals` names."""
         problems: list[str] = []
         try:
             for kind, name, settings, _deployed in self.settings_carriers():
@@ -7346,6 +7393,7 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
     def _refused(name: str, settings: Mapping[str, Any], accepted: bool) -> bool:
         try:
             refuse_unresolved_hop_flags(settings, name)
+            refuse_bool_literals(settings, name)
             # A FhirLookup's typed cleartext_accepted with an attestation written into its settings
             # is refused by the lookup settings builder, so it is marked too.
             _refuse_attested_and_accepted(name, True, accepted)
@@ -7364,7 +7412,8 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         revocation_reason: object = None,
     ) -> bool:
         # What _source_config and _dest_config refuse on a connection's declarations: a raw
-        # attestation key in its transport settings, the cleartext and revocation pairs the Source
+        # declaration key or a non-bool literal in its transport settings, the cleartext and
+        # revocation pairs the Source
         # and Destination validators check, then the typed attestation by the settings carriers'
         # own rule above (the flag type, a missing, blank or control-character reason, and the
         # attested-plus-accepted pair). Such an entry is a hop the engine never builds, however it
@@ -7378,7 +7427,8 @@ def attested_secure_hop_records(registry: Registry) -> list[AttestedHop]:
         # flags go through read_lax_flag, the reader _dest_config's settings mirror uses too, so a
         # string "false" reads unset in both (vault BACKLOG #5286).
         try:
-            refuse_raw_hop_attestation(settings, "")
+            refuse_raw_declarations(settings, "")
+            refuse_bool_literals(settings, "")
             accepted_flag = read_lax_flag(accepted, "", "cleartext_accepted")
             _check_cleartext_acceptance(
                 accepted_flag, _MODEL_REASON.validate_python(cleartext_reason)
@@ -7672,13 +7722,18 @@ def query_credential_hops(
     neither is not read. A ``deployed=False`` outbound with an ``env()`` URL is skipped, as the
     DATABASE and ECH readers skip one: its values are never resolved and it is never built (ADR
     0111 AC-1). It touches nothing but the graph and the values, except that resolving runs an
-    ``env()`` URL's operator ``cast``, as the build does."""
+    ``env()`` URL's operator ``cast``, as the build does. An outbound whose type is in
+    ``transports.egress.URL_QUERY_REFUSED_DESTINATIONS`` is left off: its build refuses any url
+    query (vault BACKLOG #5358), so the hop never exists."""
+    from messagefoundry.transports.egress import URL_QUERY_REFUSED_DESTINATIONS
+
     out: list[tuple[str, str]] = []
     for name, settings in (
         *(
             (oc.name, oc.spec.settings)
             for oc in registry.outbound.values()
-            if oc.deployed or not isinstance(oc.spec.settings.get("url"), EnvRef)
+            if (oc.deployed or not isinstance(oc.spec.settings.get("url"), EnvRef))
+            and oc.spec.type not in URL_QUERY_REFUSED_DESTINATIONS
         ),
         *((fhir_lookup_record_name(s.name), s.settings) for s in registry.fhir_lookups.values()),
     ):
@@ -8772,6 +8827,32 @@ def _coerce_content_type(name: str, content_type: ContentType | str) -> ContentT
     )
 
 
+def finite_seconds(value: object, *, key: str, where: str) -> float:
+    """A connection-level number of seconds, ``strict_timeout_s``, ``waiting_display_delay`` or
+    ``send_min_interval_seconds``, as a finite float, or a :class:`WiringError` naming ``where`` and ``key`` with the value withheld
+    (BACKLOG #5321). Both authoring surfaces read it here: the connections.toml reader and the shared
+    build_inbound_connection / build_outbound_connection choke points.
+
+    A bool and anything but an int or a float are refused first, so text is not read as a number.
+    The number is then read by :func:`~messagefoundry.transports.base.float_setting`, which holds the
+    rest of the rule: a NaN, an infinity and an integer too large for a float are refused. A NaN
+    compares false with ``> 0``, so as ``strict_timeout_s`` it would disable the strict-validation
+    backstop; an infinity would enable one that never fires, or a display delay that never ends. Zero
+    and negatives come back as they are, for the caller's own rule."""
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise WiringError(f"{where}: {key} must be a number of seconds (value withheld)")
+    # Imported here: messagefoundry.transports imports this module at its top level.
+    from messagefoundry.transports.base import float_setting
+
+    # The refusal is raised outside the handler, so it carries no exception chain.
+    refusal: str
+    try:
+        return float_setting(value, knob=key, transport=f"{where}:")
+    except ValueError as exc:
+        refusal = str(exc)
+    raise WiringError(refusal)
+
+
 def build_inbound_connection(
     name: str,
     spec: ConnectionSpec,
@@ -8816,8 +8897,8 @@ def build_inbound_connection(
     # Refused here so `load_config` and `check` fail on it, and again at build (_source_config),
     # because the settings dict stays mutable after the declaration returns. Before the bool-literal
     # refusal, which would otherwise give a raw non-bool tls_hop_attested the generic remedy.
-    refuse_raw_hop_attestation(spec.settings, f"inbound connection {name!r}")
-    _refuse_bool_literals(spec.settings, f"inbound connection {name!r}")
+    refuse_raw_declarations(spec.settings, f"inbound connection {name!r}")
+    refuse_bool_literals(spec.settings, f"inbound connection {name!r}")
     # Before any check below reads one: the content_type check read strict="false" as strict on.
     _refuse_non_bool_flags(
         f"inbound connection {name!r}",
@@ -9025,7 +9106,13 @@ def build_inbound_connection(
         ack_mode=ack_mode,
         ack_after=ack_after,
         validation=Validation(
-            strict=strict, hl7_version=hl7_version, strict_timeout_s=strict_timeout_s
+            strict=strict,
+            hl7_version=hl7_version,
+            strict_timeout_s=None
+            if strict_timeout_s is None
+            else finite_seconds(
+                strict_timeout_s, key="strict_timeout_s", where=f"inbound connection {name!r}"
+            ),
         ),
         content_type=content_type,
         inline=inline,
@@ -9223,8 +9310,8 @@ def build_outbound_connection(
     Pure — it does not touch the active registry; the caller is responsible for ``add_outbound``."""
     # Before the bool-literal refusal, which would otherwise give a raw non-bool tls_hop_attested
     # the generic remedy instead of naming the declaration that carries it.
-    refuse_raw_hop_attestation(spec.settings, f"outbound connection {name!r}")
-    _refuse_bool_literals(spec.settings, f"outbound connection {name!r}")
+    refuse_raw_declarations(spec.settings, f"outbound connection {name!r}")
+    refuse_bool_literals(spec.settings, f"outbound connection {name!r}")
     _refuse_non_bool_flags(
         f"outbound connection {name!r}",
         {"simulate": simulate, "auto_start": auto_start, "deployed": deployed},
@@ -9253,6 +9340,9 @@ def build_outbound_connection(
             f"outbound connection {name!r}: dead_letter_days must be >= 0 "
             "(0 = keep forever, omit to inherit the global [retention] window)"
         )
+    waiting_display_delay = finite_seconds(
+        waiting_display_delay, key="waiting_display_delay", where=f"outbound connection {name!r}"
+    )
     if waiting_display_delay < 0:
         # #136 (ADR 0065 amendment): the cosmetic "Waiting for Reply" pre-display delay is seconds; a
         # negative value is meaningless (0.0 = show immediately). Fail loud at wiring (dry-run / check).
@@ -9285,6 +9375,13 @@ def build_outbound_connection(
             f"(env {send_pace.key!r}) — it is a plain pacing interval in seconds, not a "
             "per-environment or secret value. Give it a plain number (0.5), or omit it "
             "for no pacing."
+        )
+    if send_pace is not None:
+        # BACKLOG #5321: held to the finite rule both surfaces share. An infinity would stall the lane
+        # after its first send, a NaN would turn pacing off, and an integer too large for a float
+        # would raise OverflowError at lane setup rather than at load.
+        send_pace = finite_seconds(
+            send_pace, key="send_min_interval_seconds", where=f"outbound connection {name!r}"
         )
     if send_pace is not None and send_pace < 0:
         # BACKLOG #82: per-connection egress send pacing (min seconds between sends on this lane). A

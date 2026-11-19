@@ -107,6 +107,7 @@ from messagefoundry.config.tls_policy import (
     log_attested_crossing,
 )
 from messagefoundry.config.wiring import (
+    CLEARTEXT_REVOCATION_KEYS,
     INTAKE_AUTH_RATE_LIMIT_DEFAULT,
     INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,
     EnvRef,
@@ -123,7 +124,9 @@ from messagefoundry.config.wiring import (
     inbound_binding_conflicts,
     read_intake_budget,
     read_lax_flag,
+    refuse_bool_literals,
     refuse_capture_conflicts,
+    refuse_raw_declarations,
     refuse_resolved_verify_off,
     refuse_unresolved_hop_flags,
     resolve_env_settings,
@@ -3224,6 +3227,7 @@ class RegistryRunner:
         resolved: dict[str, dict[str, Any]] = {}
         for name, spec in self.registry.lookups.items():
             refuse_unresolved_hop_flags(spec.settings, f"database lookup {name!r}")
+            refuse_bool_literals(spec.settings, f"database lookup {name!r}")
             resolved[name] = resolve_env_settings(spec.settings, self._env_values)
         # #200 (ADR 0092): stamp the derived posture around the live executor build. engine.start()/
         # reload build the executor here WITHOUT going through build_check_registry's
@@ -5341,7 +5345,11 @@ class RegistryRunner:
             # Before anything below can fail the build, as _start_outbound does (BACKLOG #4997).
             # A raise here fails the lane, isolated as the build's own would be.
             warn_url_query_credentials_before_build(
-                f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
+                f"outbound {name!r}",
+                oc.spec.settings,
+                self._env_values,
+                connection=oc.name,
+                connector_type=oc.spec.type,
             )
         except Exception as exc:
             return self._install_lane_destination(name, _LaneBuild(exc, _AnchorVerdict()))
@@ -6844,7 +6852,11 @@ class RegistryRunner:
                 # unresolved setting, a refused CA or any other build failure keeps its ASVS 14.2.1
                 # record. Inside this try, so a step that raises fails this lane only.
                 warn_url_query_credentials_before_build(
-                    f"outbound {name!r}", oc.spec.settings, self._env_values, connection=oc.name
+                    f"outbound {name!r}",
+                    oc.spec.settings,
+                    self._env_values,
+                    connection=oc.name,
+                    connector_type=oc.spec.type,
                 )
             dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
             # vault BACKLOG #2371, ADR 0031 as amended 2026-10-06: a refused CA fails this lane only.
@@ -14710,13 +14722,23 @@ def check_intake_budgets(source: Source, name: str, written: Mapping[str, Any]) 
         _intake_budget(source.settings, knob, name, written)
 
 
+def _refuse_declared_settings(settings: Mapping[str, Any], where: str) -> None:
+    """What a connection's declaration refuses in its transport settings, run again at its build on
+    the settings as declared (vault BACKLOG #8253 item 2; :func:`refuse_bool_literals` says why).
+    The raw declaration keys first, as at declaration, so such a key is named as misplaced rather
+    than as a bad value."""
+    refuse_raw_declarations(settings, where)
+    refuse_bool_literals(settings, where)
+
+
 def _source_config(
     ic: InboundConnection,
     bind_host: str,
     env_values: Mapping[str, Any],
     trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> Source:
-    # Resolve any env() references first (a missing value raises WiringError here, before bind).
+    _refuse_declared_settings(ic.spec.settings, f"inbound connection {ic.name!r}")
+    # Then resolve any env() references (a missing value raises WiringError here, before bind).
     settings = resolve_env_settings(
         ic.spec.settings, env_values, connection=inbound_record_name(ic.name)
     )
@@ -14779,12 +14801,9 @@ def _apply_egress_proxy_default(settings: dict[str, Any], egress: EgressSettings
 
 #: The settings keys mirrored from a connection's typed declarations (ADR 0153, ADR 0173) and its
 #: name, by `_dest_config` for an outbound and `_fhir_lookup_settings` for a lookup. Named once so the
-#: strip and the writes cannot drift apart.
+#: strip and the writes cannot drift apart, and from the keys a connection's build refuses raw.
 _DECLARATION_MIRROR_KEYS: tuple[str, ...] = (
-    "cleartext_accepted",
-    "cleartext_reason",
-    "tls_revocation_attested",
-    "tls_revocation_attested_reason",
+    *CLEARTEXT_REVOCATION_KEYS,
     MIRRORED_CONNECTION_SETTING,
 )
 
@@ -14842,6 +14861,7 @@ def _fhir_lookup_settings(
     # Before env() resolves, so a post-factory env() flag cannot resolve "false" to True (#2232). It
     # checks the attestation pair as FhirLookupSpec does, so a raw flag with no reason is refused too.
     attested = refuse_unresolved_hop_flags(spec.settings, where)
+    refuse_bool_literals(spec.settings, where)
     settings = resolve_env_settings(
         spec.settings, env_values, connection=fhir_lookup_record_name(spec.name)
     )
@@ -14873,7 +14893,19 @@ def _dest_config(
     # off (every existing outbound unchanged). The connector loads the key + mints the signature; this
     # is the single choke point feeding start, check and a reload's dry run, so a bad key fails loud at
     # all three. `messagefoundry dryrun` builds no connector, so it never reaches here.
+    # A raw declaration key is refused, not stripped by the mirror below, which would drop the
+    # author's declaration with no word (vault BACKLOG #8253 item 2).
+    _refuse_declared_settings(oc.spec.settings, f"outbound connection {oc.name!r}")
     settings = resolve_env_settings(oc.spec.settings, env_values, connection=oc.name)
+    # Owner ruling 2026-09-24: the hop attestation is the outbound's typed field, never a transport
+    # setting. Refuse a raw attestation pair, then mirror a declared one for the settings-driven
+    # seams.
+    apply_hop_attestation(
+        settings,
+        f"outbound connection {oc.name!r}",
+        oc.tls_hop_attested,
+        oc.tls_hop_attested_reason,
+    )
     # Vault BACKLOG #3138: a verify_tls env() can resolve falsy, which the factory's literal-only
     # unread-CA check never sees.
     refuse_resolved_verify_off(oc.spec.type, settings, f"outbound connection {oc.name!r}")
@@ -14895,20 +14927,12 @@ def _dest_config(
         tls_revocation_attested=oc.tls_revocation_attested,
         tls_revocation_attested_reason=oc.tls_revocation_attested_reason,
     )
-    # Owner ruling 2026-09-24: the hop attestation is the outbound's typed field, never a transport
-    # setting. Refuse the raw keys, then mirror a declared pair for the same settings-driven seams.
-    apply_hop_attestation(
-        settings,
-        f"outbound connection {oc.name!r}",
-        oc.tls_hop_attested,
-        oc.tls_hop_attested_reason,
-    )
     return Destination(
         name=oc.name,
         type=oc.spec.type,
         settings=settings,
         retry=oc.retry or RetryPolicy(),
-        sign=OutboundSigning.from_settings(settings),
+        sign=OutboundSigning.from_settings(settings, connection=oc.name),
         # BACKLOG #107: surface the per-outbound raw-separator escape-hatch as a typed field. Default
         # False → byte-identical; only an explicit `hl7_raw_separators=True` (MLLP() factory or a
         # connections.toml setting) flips it. The MLLP connector reads config.hl7_raw_separators.
@@ -15380,6 +15404,7 @@ def _build_check_connectors(
     resolved_lookups: dict[str, dict[str, Any]] = {}
     for lname, lspec in registry.lookups.items():
         refuse_unresolved_hop_flags(lspec.settings, f"database lookup {lname!r}")
+        refuse_bool_literals(lspec.settings, f"database lookup {lname!r}")
         resolved_lookups[lname] = resolve_env_settings(lspec.settings, env_values)
     if resolved_lookups:
         # Construct (and discard) the executor: validates each DSN (TLS/auth) without opening a pool.
@@ -15505,9 +15530,11 @@ def refuse_reference_hop_flags(registry: Registry) -> None:
     ``DatabaseRef`` or ``FileRef`` source after its factory was refused only at the set's first
     sync, after start, where it surfaced as a failed sync (vault BACKLOG #3139). It is the same
     :func:`refuse_unresolved_hop_flags` call :func:`build_check_registry` and the sync make, so the
-    three cannot disagree. Every source kind, and it needs no resolved value."""
+    three cannot disagree. Every source kind, and it needs no resolved value. It runs
+    :func:`~messagefoundry.config.wiring.refuse_bool_literals` too (vault BACKLOG #3234)."""
     for rname, rspec in registry.references.items():
         refuse_unresolved_hop_flags(rspec.source.settings, f"reference set {rname!r}")
+        refuse_bool_literals(rspec.source.settings, f"reference set {rname!r}")
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})

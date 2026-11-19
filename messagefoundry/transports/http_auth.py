@@ -85,6 +85,7 @@ __all__ = [
     "refuse_http_digest_conflicts",
     "oauth2_auth_configured",
     "oauth2_cc_provider_from_settings",
+    "refuse_oauth2_settings",
     "proxy_auth_handler_from_settings",
     "refuse_a_digest_proxy_on_the_token_hop",
     "with_http_digest",
@@ -98,14 +99,69 @@ _HTTP_CONNECTOR_TYPES = (ConnectorType.REST, ConnectorType.SOAP, ConnectorType.F
 def oauth2_auth_configured(s: Mapping[str, Any]) -> bool:
     """Whether a settings mapping has OAuth2 client-credentials auth turned ON.
 
-    ON means ``oauth2_token_url`` is present and ``oauth2_enabled`` is not switched off. The SINGLE
-    definition, shared by at least :func:`oauth2_cc_provider_from_settings` (which builds the provider),
-    the mutual-exclusion screen in :func:`bearer_provider_from_settings`, the static-credential hop
-    reader (BACKLOG #1182) and :func:`~messagefoundry.config.wiring.oauth_request_advisories`.
-    Before it existed the builder treated any falsy ``oauth2_enabled`` as off while the screen treated
-    only a literal ``False`` as off. Off is the conservative reading, so a falsy value is off, the same
-    rule :func:`~messagefoundry.transports.smart.smart_auth_configured` states."""
-    return bool(s.get("oauth2_token_url")) and bool(s.get("oauth2_enabled", True))
+    ON means ``oauth2_token_url`` holds a non-blank value and ``oauth2_enabled`` is absent, a real
+    ``True``, or an unresolved ``env()`` reference; every other reading is OFF. The SINGLE
+    definition, shared by at least :func:`oauth2_cc_provider_from_settings` (which builds the
+    provider), the mutual-exclusion screen in
+    :func:`bearer_provider_from_settings`, the static-credential hop reader (BACKLOG #1182) and
+    :func:`~messagefoundry.config.wiring.oauth_request_advisories`. Before it existed the builder
+    treated any falsy ``oauth2_enabled`` as off while the screen treated only a literal ``False``
+    as off.
+
+    Read strictly (vault BACKLOG #5362), and total: it never raises, because readers of the loaded
+    graph (the census, the advisories, the trust-anchor readers) call it as a plain predicate.
+    The build seams refuse, through :func:`refuse_oauth2_settings`, the settings it reads as OFF
+    only because they are wrong, and
+    :func:`with_oauth2_client_credentials` a literal blank token URL when ``enabled`` is
+    ``True``."""
+    if _oauth2_setting_problem(s) is not None:
+        return False
+    enabled = s.get("oauth2_enabled", True)
+    return not _blank_token_url(s.get("oauth2_token_url")) and bool(enabled)
+
+
+def refuse_oauth2_settings(s: Mapping[str, Any]) -> None:
+    """Raise :class:`HttpAuthError` for OAuth2 settings :func:`oauth2_auth_configured` reads as off
+    only because they are wrong (vault BACKLOG #5362): a non-bool ``oauth2_enabled``, or a blank,
+    whitespace-only or unset token URL while the flag is on (absent or ``True``) and either the flag
+    or the URL key was written. Called first by :func:`bearer_provider_from_settings`, the
+    construction seam of every HTTP destination that offers OAuth2. Names the connection, the keys
+    and the type, never a value."""
+    problem = _oauth2_setting_problem(s)
+    if problem is not None:
+        connection = s.get(MIRRORED_CONNECTION_SETTING)
+        raise HttpAuthError(
+            f"{hop_name_prefix(None if connection is None else str(connection))}{problem}"
+        )
+
+
+def _blank_token_url(url: object) -> bool:
+    return not url or (isinstance(url, str) and not url.strip())
+
+
+def _oauth2_setting_problem(s: Mapping[str, Any]) -> str | None:
+    """Why the OAuth2 settings cannot be read as written, or ``None``. The one test behind
+    :func:`oauth2_auth_configured` and :func:`refuse_oauth2_settings`, so the two cannot disagree."""
+    enabled = s.get("oauth2_enabled", True)
+    if not isinstance(enabled, bool) and not _is_env_ref(enabled):
+        return f"oauth2_enabled must be true or false, not {type(enabled).__name__}"
+    url = s.get("oauth2_token_url")
+    # No flag and no URL is a connection with no OAuth2 at all, so only a URL that was written, or
+    # the flag itself, makes a blank URL a fault.
+    if enabled is True and _blank_token_url(url) and ("oauth2_enabled" in s or url is not None):
+        return (
+            "oauth2_token_url is blank or unset while oauth2_enabled is on; set the token "
+            "endpoint URL, or turn oauth2_enabled off"
+        )
+    return None
+
+
+def _is_env_ref(value: object) -> bool:
+    """Whether ``value`` is an unresolved ``env()`` reference. Imported here, not at the top:
+    ``config.wiring`` imports this package, the cycle the ``TYPE_CHECKING`` import above avoids."""
+    from messagefoundry.config.wiring import EnvRef
+
+    return isinstance(value, EnvRef)
 
 
 # Renew this many seconds before the server's stated expiry so a token never expires mid-flight.
@@ -322,11 +378,13 @@ def oauth2_cc_provider_from_settings(
     trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> OAuth2ClientCredentialsProvider | None:
     """The :class:`OAuth2ClientCredentialsProvider` for an ``env()``-resolved settings mapping, or ``None``
-    when symmetric OAuth2-CC auth is off (``oauth2_token_url`` absent, or ``oauth2_enabled`` is False) — so
-    any connection that didn't configure it is byte-identical. ``proxy`` (ADR 0126) routes the
-    token-endpoint POST through the connection's forward proxy; ``ech_sidecar`` (#1176, ADR 0139)
-    re-addresses it to the connection's loopback ECH sidecar instead. The two are mutually exclusive by
-    construction.
+    when :func:`oauth2_auth_configured` reads symmetric OAuth2-CC auth as off — so any connection that
+    didn't configure it is byte-identical. That includes the settings :func:`refuse_oauth2_settings`
+    refuses: this function does not call it and returns ``None`` for them;
+    :func:`bearer_provider_from_settings` refuses them before it gets here. ``proxy`` (ADR 0126)
+    routes the token-endpoint POST through the connection's forward proxy; ``ech_sidecar`` (#1176,
+    ADR 0139) re-addresses it to the connection's loopback ECH sidecar instead. The two are mutually
+    exclusive by construction.
 
     ``trust_anchor_policy`` (#1660) is the instance-wide ``[tls]`` policy the caller already holds, off
     its ``Destination``. ``None`` resolves to the OS trust store, byte-identical."""
@@ -387,9 +445,12 @@ def bearer_provider_from_settings(
     token hop stops leaking the authorization server's SNI while its payload hop is routed.
     ``trust_anchor_policy`` (#1660) likewise reaches whichever provider is built, so the token hop
     verifies against the same instance ``[tls]`` anchor the delivery hop has used since #1180."""
-    # Detect the conflict from settings PRESENCE before constructing either provider, so a "both
+    # A wrong OAuth2 flag or token URL is refused first (vault BACKLOG #5362): the presence test below
+    # reads such settings as OAuth2 off, so it could not report a conflict for them anyway. Then the
+    # conflict is detected from settings PRESENCE before constructing either provider, so a "both
     # configured" mistake reports the mutual-exclusion error rather than whichever provider's own
     # validation happens to fire first on partial config.
+    refuse_oauth2_settings(s)
     has_smart = smart_auth_configured(s)
     has_oauth = oauth2_auth_configured(s)
     if has_smart and has_oauth:
@@ -623,6 +684,10 @@ def with_oauth2_client_credentials(
     id and secret as written. The section also asks for each to be form-encoded first, and that step
     is not applied. The two forms are the same for an id and secret with no reserved character."""
     _require_http_spec(spec, "OAuth2 client-credentials")
+    if enabled is True and isinstance(token_url, str) and not token_url.strip():
+        raise HttpAuthError(
+            "OAuth2 client-credentials token_url is blank; set the token endpoint URL"
+        )
     spec.settings.update(
         {
             "oauth2_enabled": enabled,

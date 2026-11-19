@@ -2036,13 +2036,15 @@ count is above `0` (vault BACKLOG #2613).
 
 ### `url_query_credential` — a credential in a connection `url`'s query string
 > **Connection-scoped**, and like the generic-ODBC entry below it is not a flag anyone sets. It is an
-> outbound `url` (`Rest`, `Soap`, `FHIR`, `DICOMweb`) or a `FhirLookup` `url` whose query string has a
+> outbound `url` (`Rest`, `Soap`, `FHIR`) or a `FhirLookup` `url` whose query string has a
 > parameter named like a credential: `key`, `sig`, `signature`, most names ending in `token`,
 > `secret`, `password` or `credential` (as `access_token` or `accessToken`), and the rest of the
 > engine's credential vocabulary. A few such names are not named, at least `page_token` and
 > `next_token`, because they usually carry a paging cursor; the detector never reads what a
 > parameter carries, so a credential under one of them is missed. `secretscrub.py`
 > `_QUERY_NOT_CREDENTIAL_TAILS` is the list. ASVS 14.2.1.
+> A `DICOMweb` url is not listed: its build refuses any query or fragment (vault BACKLOG #5358),
+> so no such hop exists to report.
 - **What you lose:** the credential rides the request line. The partner's access log holds it, and so
   does the log of any proxy on the path. On an `https` hop TLS still encrypts it on the wire. The
   engine's own log lines drop the query, and `GET /metadata` and `graph --json` withhold the whole

@@ -98,7 +98,7 @@ from .._auth import (
 )
 from .._html import CSP_PROBE_SRC
 from .._service import _service
-from ..pages import restore_eol
+from ..pages import missing_eol_style, restore_eol
 from ..pages._common import _seg
 from ._common import (
     UI_BODY_FILTER_RULES,
@@ -1688,16 +1688,17 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ``eol`` field the editor rendered (BACKLOG #5930), so the repeat key and the spend key both
         hash the body that is resubmitted. An ``eol`` that ``restore_eol`` does not know leaves the
         body as sent, and the route refuses it. Blank fields are kept, so an empty ``eol`` is
-        refused too. ``restore_eol`` is a global of this module so the seam digest hashes its body;
-        ``console_route_gates`` in ``scripts/webconsole_seam_snapshot.py`` says what it misses."""
+        refused too. A form with no ``eol`` takes ``missing_eol_style``'s, CR for an HL7 body.
+        ``restore_eol`` and ``missing_eol_style`` are globals of this module so the seam digest
+        hashes their bodies; ``console_route_gates`` in ``scripts/webconsole_seam_snapshot.py`` says what it misses."""
         cache = request.scope.setdefault("mf_2625", {})
         cached = cache.get("form")
         if isinstance(cached, dict):
             return cached
         form = dict(await _form_pairs(request))
-        if "eol" in form and "raw" in form:
-            restored = restore_eol(form["raw"], form["eol"])
-            if restored is not None:
+        if "raw" in form:
+            eol = form["eol"] if "eol" in form else missing_eol_style(form["raw"])
+            if eol is not None and (restored := restore_eol(form["raw"], eol)) is not None:
                 form["raw"] = restored
         cache["form"] = form
         return form

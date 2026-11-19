@@ -17,10 +17,18 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime, time
 from enum import Enum
-from typing import Any
+from typing import Any, Final
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from messagefoundry.config.input_hiding import _InputHidingModel
 from messagefoundry.config.tls_policy import TrustAnchorPolicy
@@ -246,7 +254,10 @@ def bool_setting(settings: Mapping[str, Any], key: str, *, default: bool) -> boo
     ``bool(settings.get(key, True))`` reads an explicit ``None`` as ``False``, which turns a
     default-on check such as ``tls_verify`` OFF (vault BACKLOG #3230). ``bool("")`` does the same,
     so an empty string is unset too (vault BACKLOG #3533 item 11); for a default-off setting that
-    reads as it did. Any other value is read with ``bool()``, as before.
+    reads as it did. Any other value is read with ``bool()``, as before. A literal empty string on
+    a boolean setting is refused at load and at the builds ``config.wiring.refuse_bool_literals``
+    names, so there the empty-string rule serves only a mapping that reached this reader some
+    other way.
 
     Use it for a transport setting with a default, such as a TLS check, and read it the same way in
     every connector and every reader that reports on it, so the two cannot disagree. Use
@@ -737,6 +748,27 @@ class SignatureAlgorithm(str, Enum):  # noqa: UP042
     ES384 = "ES384"  # ECDSA P-384 (secp384r1) + SHA-384 (EC key; randomized) — SMART Backend Services (ADR 0024)
 
 
+#: ``sign_enabled`` read with the model's lax ``bool`` coercion.
+_SIGN_FLAG: Final = TypeAdapter(bool)
+
+
+def _sign_flag_is_off(value: object, where: str) -> bool:
+    """Whether ``sign_enabled`` reads as false, as :class:`OutboundSigning` reads it. ``None`` is
+    undecided, not false. An unreadable value raises a :class:`ValueError` that names ``where`` and
+    the setting, raised outside the handler so neither its text nor its chain holds the value
+    (BACKLOG #296)."""
+    if value is None:
+        return False
+    readable = True
+    try:
+        enabled = _SIGN_FLAG.validate_python(value)
+    except ValidationError:
+        readable = False
+    if not readable:
+        raise ValueError(f"{where}: sign_enabled must be a boolean")
+    return not enabled
+
+
 class OutboundSigning(_InputHidingModel):
     """Opt-in per-connection message signing for a **REST/SOAP outbound** (ASVS 4.1.5, ADR 0018).
 
@@ -765,16 +797,35 @@ class OutboundSigning(_InputHidingModel):
     header_name: str = "X-JWS-Signature"  # the HTTP header that carries the detached JWS
 
     @classmethod
-    def from_settings(cls, settings: Mapping[str, Any]) -> OutboundSigning | None:
+    def from_settings(
+        cls, settings: Mapping[str, Any], *, connection: str | None = None
+    ) -> OutboundSigning | None:
         """Build from flat ``sign_*`` connector settings, or ``None`` when signing isn't configured.
 
-        Signing is OFF (``None``) unless ``sign_private_key`` is present, so every existing outbound is
-        unchanged. The flat keys (vs a nested table) keep each value a top-level setting that ``env()``
+        ``None`` when neither ``sign_private_key`` nor ``sign_enabled`` is named, or when the key
+        is empty and ``sign_enabled`` reads as false. ``connection`` names the outbound in a
+        refusal. The flat keys (vs a nested table) keep each value a top-level setting that ``env()``
         resolution and ``connections.toml`` decoding already handle. Recognized keys: ``sign_enabled``,
         ``sign_algorithm``, ``sign_private_key``, ``sign_private_key_password``, ``sign_key_id``,
-        ``sign_header``. An unknown/typo'd field raises (``extra='forbid'``)."""
+        ``sign_header``. An unknown/typo'd field raises (``extra='forbid'``).
+
+        An empty key raises ``ValueError`` when ``sign_enabled`` or ``sign_private_key`` is named
+        and the flag does not read as false (BACKLOG #5364): signing was asked for, or left
+        undecided by an ``env()`` flag, and reading the missing key as "off" would deliver every
+        message unsigned. The model's default for an absent flag is on, so only an explicit false
+        keeps an empty key off. With a key, the model refuses an undecided flag the same way."""
         key = settings.get("sign_private_key")
         if not key:
+            if "sign_enabled" not in settings and "sign_private_key" not in settings:
+                return None
+            where = (
+                "outbound signing" if connection is None else f"outbound connection {connection!r}"
+            )
+            if not _sign_flag_is_off(settings.get("sign_enabled", True), where):
+                raise ValueError(
+                    f"{where}: sign_enabled is not false but sign_private_key is empty; set the "
+                    "signing key, or set sign_enabled to false to send unsigned"
+                )
             return None
         data: dict[str, Any] = {"private_key": key}
         if "sign_enabled" in settings:

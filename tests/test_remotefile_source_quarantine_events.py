@@ -6,7 +6,8 @@ Packet 9 finding P9-11, the remote half of the row whose FILE half PR 1583 built
 poll source's four quarantine arms (over the listed size, over the retrieved size, a content-vs-type
 mismatch, a scanner rejection) moved the file to ``error_subdir`` and logged a WARNING, and wrote
 nothing to the store. Each arm now emits the FILE source's matching kind, with a reason that carries
-no exact copy of the file name. A scanner quoting it in another form is kept, the limit
+no copy of the file name in a form ``safe_exc`` replaces. A scanner quoting it in another form is
+kept, the limit
 ``docs/PHI.md`` section 7 row 7 states. The refused-unsafe-name arm deliberately records nothing: it
 moves nothing.
 
@@ -94,7 +95,7 @@ async def test_each_quarantine_arm_records_one_event_without_the_file_name(
     ("name", "quoted", "kept"), [f[1:] for f in _QUOTED_FORMS], ids=[f[0] for f in _QUOTED_FORMS]
 )
 @pytest.mark.usefixtures("_no_scan_hook")
-async def test_the_scan_reject_reason_scrubs_only_an_exact_copy_of_the_name(
+async def test_the_scan_reject_reason_scrubs_only_the_forms_safe_exc_replaces(
     monkeypatch: pytest.MonkeyPatch, name: str, quoted: str, kept: bool
 ) -> None:
     """Pins the limit ``docs/PHI.md`` section 7 row 7 states. A stronger scrub turns this red, and

@@ -1,4 +1,5 @@
 # Vetted false-positive allowlist for scan_forbidden.py (one line-regex per line; '#' comments).
+# Each entry must match the WHOLE scanned line; scan_forbidden.py's _allowlisted says what that holds.
 #
 # NEVER allowlist real customer data -- only genuinely-innocent lines a pattern over-matches.
 # Each entry MUST be narrow enough that a real customer/host string in the same file still trips.
@@ -9,14 +10,17 @@
 # site-code range (e.g. WRITELOG ... 993496 tasks) collides with the site-code guard (99\d{4}) despite
 # being a pure engine perf counter with no customer-data path. This row shape is unambiguous DMV output,
 # so a real site code embedded in a path/HL7 field/prose (PT_<site>_ADT, ^<site>^) does NOT match it.
-^\s*[A-Z0-9_]+\s+\d+ ms\s+\d+ tasks\s*$
+# The wait type is letters and underscores only (every row in the artifacts is), so an identifier
+# carrying a site code cannot stand in the first column either.
+^\s*[A-Z_]+\s+\d+ ms\s+\d+ tasks\s*$
 
-# OIDC Core spec-section citations in the federated-SSO claim ladder (ADR 0142) read as dotted
-# quads: 'OIDC core 3.1.3.7/2' is section 3.1.3.7, rule 2 -- not a host. The citation is worth
-# keeping verbatim in security-critical verification code, so the line is allowlisted rather than
-# reworded. Anchored to the literal 'OIDC core <section>/<rule>' shape, so a real routable IP
-# elsewhere in claims.py (or anywhere else) still trips the scan.
-OIDC core \d+(?:\.\d+)+/\d+
+# The OIDC Core spec-section citation in the federated-SSO claim ladder (ADR 0142,
+# messagefoundry/auth/oidc/claims.py) reads as a dotted quad: the azp rule's section number has four
+# parts, then '/2' for rule 2 -- not a host. The citation is worth keeping verbatim in
+# security-critical verification code, so the line is allowlisted rather than reworded. The entry is
+# that one comment line, literal, so a routable IP, site code or name added to it, or written on any
+# other line beside the same citation shape, still trips the scan.
+^\s*# With multiple audiences, azp MUST be present and equal to our client_id \(OIDC core 3\.1\.3\.7/2\)\.$
 
 # Generated password-wordlist entries in messagefoundry/auth/data/common_passwords.txt that collide
 # with the estate-identifier SHAPE (a six-digit run joined to a letter-bearing segment). Nine lines

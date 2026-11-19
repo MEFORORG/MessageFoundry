@@ -3389,6 +3389,7 @@ def test_the_guards_scrub_composition_still_covers_the_installed_filter_chain() 
     accounted = {
         "RedactionFilter",  # safe_exc, applied with the scrub by _safe_reason
         "CredentialScrubFilter",  # scrub_credentials, composed by _scrub_diagnostic
+        "BinaryCarriageScrubFilter",  # redact_binary_carriage, composed by _scrub_diagnostic
         "ControlCharScrubFilter",  # scrub_control_chars, composed by _scrub_diagnostic
         "CredentialQueryScrubFilter",  # carve-out: no guard diagnostic carries a request URL
     }

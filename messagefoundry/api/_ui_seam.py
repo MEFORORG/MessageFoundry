@@ -891,9 +891,10 @@ from typing import Any
 #:
 #: BACKLOG #5930: the console's edit-resend form parser ``_resubmit_form`` now restores the
 #: original's line endings through ``restore_eol`` and reads the body through ``_form_pairs``. Both
-#: are globals of ``routes/core.py``, so the snapshot hashes their bodies with the closure's. It
-#: does not hash the ``EDIT_EOL_TERMINATORS`` mapping, which is module data, or the route's refusal
-#: of an unknown ``eol``, which sits in the endpoint body. No engine surface changed.
+#: are globals of ``routes/core.py``, so the snapshot hashes their bodies with the closure's. What
+#: it leaves unhashed includes at least the ``EDIT_EOL_TERMINATORS`` mapping, which is module
+#: data, and the route's refusal of an unknown ``eol``, which sits in the endpoint body. No engine
+#: surface changed.
 #: Re-derived with ``--write``, on the branch from ``4b5769ef2c675677`` to ``8386df80553a4313``,
 #: and over the merge with #5931 from ``6737556a16ce6d15`` to ``c537067c6952d93c``.
 #:
@@ -935,12 +936,25 @@ from typing import Any
 #: ``bc56eed44a1590fd`` to ``3485aab8a5abd1bc``, and over the merge with BACKLOG #5397 above, from
 #: ``f16ae6b198ad952b`` to ``10638208017f77d0``.
 #:
+#: BACKLOG #5930: ``_resubmit_form`` now restores the line endings of a form with no ``eol``
+#: field too, to the style ``missing_eol_style`` names (CR for a body that starts with MSH). That
+#: helper is defined in ``pages/messages.py`` and imported as a ``routes/core.py`` global, so the
+#: hashed closure changed. No engine surface changed. Re-derived with ``--write`` on the branch,
+#: from ``f16ae6b198ad952b`` to ``3ae6bcfdebbf1401``, and over the merge with BACKLOG #5505 above,
+#: from ``10638208017f77d0`` to ``92b8db415d6730cc``.
+#:
+#: BACKLOG #5931: the console's ``require_ui_reauth_only_action`` gate takes a ``before_spend``
+#: hook, and the TOTP verify route passes it the empty-code check that used to run as its own
+#: dependency ahead of the gate. The snapshot hashes that gate's body and closure, so the digest
+#: moved. No engine surface changed. Re-derived with ``--write``, from ``92b8db415d6730cc`` to
+#: ``fb220e2a1ada115e``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "10638208017f77d0"
+ENGINE_UI_SEAM: str = "fb220e2a1ada115e"
 
 
 @dataclass(frozen=True, slots=True)

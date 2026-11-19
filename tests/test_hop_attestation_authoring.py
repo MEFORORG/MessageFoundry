@@ -87,7 +87,7 @@ def test_the_raw_settings_hatch_no_longer_crosses_the_mllp_gate(tmp_path: Path) 
         "    return []\n",
         encoding="utf-8",
     )
-    with pytest.raises(WiringError, match="is not a transport setting"):
+    with pytest.raises(WiringError, match="are not transport settings"):
         load_config(tmp_path)
 
 

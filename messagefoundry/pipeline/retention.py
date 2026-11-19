@@ -259,9 +259,13 @@ class RetentionPass:
     # A key-service outage is recorded in the audit row when the pass writes one, but is not itself
     # work: an outage pass must not send an audit row through the failing key service. A failed
     # batch read is a database fault, so it is work (`documents_strip_read_failed`), and the pass
-    # writes an audit row recording it.
+    # writes an audit row recording it. A batch write that failed and rolled back
+    # (`documents_strip_write_failed`) is recorded in the audit row when the pass writes one, but is
+    # not itself work: on a read-only store or a full disk that row's insert would fail too, and
+    # raise out of the pass every interval.
     documents_strip_ended_early: bool = False
     documents_strip_read_failed: bool = False
+    documents_strip_write_failed: bool = False
     document_prune_overrides: Mapping[str, int] = field(default_factory=dict)
     # Resolved operator-alert instances pruned this pass (#56, ADR 0044) — metadata-only, on the same
     # window as connection events. Never an open/acknowledged instance.
@@ -639,6 +643,7 @@ class RetentionRunner:
                 bytes_reclaimed=strip.bytes_reclaimed + part.bytes_reclaimed,
                 ended_early=part.ended_early,
                 read_failed=part.read_failed,
+                write_failed=strip.write_failed or part.write_failed,
             )
             if part.ended_early:
                 # BACKLOG #5651: a key-service outage or a failed batch read. End only this phase;
@@ -819,6 +824,7 @@ class RetentionRunner:
             documents_bytes_reclaimed=strip.bytes_reclaimed,
             documents_strip_ended_early=strip.ended_early,
             documents_strip_read_failed=strip.read_failed,
+            documents_strip_write_failed=strip.write_failed,
             document_prune_overrides=doc_overrides,
             alert_instances_purged=alert_instances_purged,
             app_logs_deleted=app_logs_deleted,
@@ -1403,6 +1409,7 @@ class RetentionRunner:
                 "documents_bytes_reclaimed": result.documents_bytes_reclaimed,
                 "documents_strip_ended_early": result.documents_strip_ended_early,
                 "documents_strip_read_failed": result.documents_strip_read_failed,
+                "documents_strip_write_failed": result.documents_strip_write_failed,
                 # Resolved operator-alert instances pruned this pass (#56, ADR 0044) — metadata only.
                 "alert_instances_purged": result.alert_instances_purged,
                 # Application log files deleted this pass (#120) + the window — metadata only, no PHI.

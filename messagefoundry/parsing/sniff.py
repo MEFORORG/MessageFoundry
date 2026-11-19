@@ -18,7 +18,8 @@ import a transport), and the attachment detach/download paths (``pipeline/wiring
   document's leading bytes agree with the sender-declared OBX-5.2 MIME? A contradiction (an ``image/png``
   label on non-PNG bytes) is stored/served as ``application/octet-stream`` so a mislabelled
   active-content payload can never render as its claimed inert type (narrows the 1.3.4 residual).
-* **Archive-member admission** (:func:`archive_member_name_reason` / :func:`archive_member_content_reason`)
+* **Archive-member admission** (:func:`archive_member_name_reason` / :func:`archive_member_content_reason`,
+  with :func:`windows_member_name_reason` for the Windows name shapes, BACKLOG #5369)
   — is a ZIP member's name a safe relative path, and do its bytes correspond to the type its own
   extension names? Called by :func:`~messagefoundry.parsing.compression.zip_decompress`, which is the
   Handler-facing archive reader, so members reach Handler code already checked (BACKLOG #1128).
@@ -32,6 +33,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ntpath
 
 from messagefoundry.content_type import ContentType
 from messagefoundry.controlchars import has_control_char
@@ -174,9 +176,9 @@ def attachment_mime_agrees(content_type: str | None, head: bytes) -> bool:
 
 
 # --- text-only upload gate (ASVS 14.2.8) ------------------------------------------------------------
-# The uploaded-logs feature (uploads.py) scopes uploads to text diagnostic logs (.hl7/.txt/.xml). Its
-# chokepoint enforces that format contract with HTTP 415 by rejecting any body that is either (a) a known
-# metadata-bearing binary container — its leading magic bytes match a sniffable family (JPEG/PNG/PDF/ZIP
+# The uploaded-logs feature (uploads.py) scopes uploads to text diagnostic logs (.hl7/.hl7v2/.txt/
+# .xml). Its chokepoint enforces that format contract with HTTP 415 by rejecting any body that is
+# either (a) a known metadata-bearing binary container — its leading magic bytes match a sniffable family (JPEG/PNG/PDF/ZIP
 # incl. DOCX, GIF, TIFF: the SAME _MAGIC_PREFIXES families the 5.2.2 attachment sniff uses) — or (b) not
 # plausibly plain text (a NUL byte anywhere, or a high density of non-printable control bytes in one of
 # the body's 8 KiB windows). That is what "no metadata stripping" (ASVS 14.2.8) rests on, WITHOUT a
@@ -289,6 +291,7 @@ def b64_head(b64: str, max_bytes: int = 32) -> bytes:
 #: the ContentType so the check is literally :func:`_content_matches_declared` — one definition.
 _EXTENSION_CONTENT_TYPE: dict[str, ContentType] = {
     ".hl7": ContentType.HL7V2,
+    ".hl7v2": ContentType.HL7V2,  # the uploads allowlist's alias (BACKLOG #5369)
     ".json": ContentType.JSON,
     ".fhir": ContentType.FHIR,
     ".xml": ContentType.XML,
@@ -356,6 +359,42 @@ def archive_member_name_reason(name: object) -> str | None:
     for part in name.split("/"):
         if part in ("", ".", ".."):
             return "member name has an empty or relative path component"
+    return None
+
+
+def windows_member_name_reason(name: str) -> str | None:
+    """Return a human reason when an archive member's name has a shape Windows reads specially, else
+    ``None`` (BACKLOG #5369). Call it after :func:`archive_member_name_reason`, which it does not
+    repeat. :func:`~messagefoundry.parsing.compression.zip_decompress` calls it, because a Handler
+    may write a member on Windows; it runs on every platform, since an archive's name is judged for
+    where it may be written, not where it was read.
+
+    A colon anywhere (``a.hl7:x`` names an NTFS alternate data stream of ``a.hl7``) and a component
+    ending in a dot or space (``a.hl7.`` opens ``a.hl7``, and its extension would read as ``.`` and
+    skip the content check) are refused. So is a component :func:`ntpath.isreserved` names: a
+    reserved device name, bare or with any extension (``NUL``, ``COM1``, ``CONIN$``, ``con.hl7``),
+    or a component holding a character Windows refuses in a name. That arm is the running Python's
+    own list, not a question put to the OS, so one Python release refuses the same names on every
+    platform and Windows build, ordinary member names such as ``con.hl7`` and ``aux.json``
+    included; a later release may change the list.
+    :func:`messagefoundry.pipeline.dr_backup._win_opens_another` asks the OS instead, and records
+    which of these names one Windows build's path rewrite changed. These arms do NOT refuse every
+    alias: two members differing only in case (``adt.hl7``, ``ADT.HL7``) or a long name beside its
+    8.3 short form still pass, so a Handler writing members on Windows keeps its own collision
+    check."""
+    # The colon arm is not covered by ntpath.isreserved on one component: it strips a one-letter drive
+    # prefix, so isreserved("a:b.hl7") is False and this arm alone refuses ``x/a:b.hl7``. The
+    # trailing dot-or-space arm overlaps isreserved and stays for its reason.
+    if ":" in name:
+        return "member name contains a colon, which Windows reads as a drive or a data stream"
+    for part in name.split("/"):
+        if part.endswith((".", " ")):
+            return "member name has a component ending in a dot or space, which Windows drops"
+        if ntpath.isreserved(part):
+            return (
+                "member name has a component that is a reserved Windows device name or holds a "
+                "character Windows refuses in a name"
+            )
     return None
 
 

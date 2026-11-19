@@ -87,13 +87,15 @@ import errno
 import json
 import os
 import re
+import re._constants as _sre_constants
+import re._parser as _sre_parser
 import stat
 import subprocess
 import sys
 import unicodedata
 from collections.abc import Callable
 from pathlib import Path
-from typing import Literal, NamedTuple
+from typing import Any, Literal, NamedTuple
 
 # --------------------------------------------------------------------------------------------------
 # Structural detectors (NO customer data -- safe to commit). These run regardless of the token source.
@@ -1604,6 +1606,13 @@ TOKENS_PRESENT: bool = False
 #: real scan from a vacuous one, so a floor built on it would have inherited the same blindness.
 _SITE_PREFIXES: tuple[str, ...] = ()
 
+#: The width of a site prefix the anonymizer loads (``messagefoundry_toolkit/anon/surrogates.py``
+#: ``_load_site_prefixes``: a two-digit prefix plus four digits). A loaded prefix of another width
+#: still arms this scan, but the anonymizer drops it, so its site-code scrub and leak check match
+#: nothing for it while this gate counts it live. :func:`token_floor_failure` refuses such a source
+#: (BACKLOG #5366). ``tests/test_scan_forbidden_site_prefix_width.py`` holds the two widths together.
+_SITE_PREFIX_WIDTH = 2
+
 
 def _resolve_token_text() -> str | None:
     """The active token content, or ``None`` if no source is configured.
@@ -1801,6 +1810,15 @@ def _parse_tokens(
             # would compile into the site-code alternation and never match an ASCII site code.
             if line.isdigit() and line.isascii():
                 prefixes.append(line)
+                if len(line) != _SITE_PREFIX_WIDTH:
+                    # Kept, so this scan loses no detector, and named: the anonymizer drops it
+                    # (BACKLOG #5366). Position only, as below -- a site prefix is customer data.
+                    print(
+                        f"scan_forbidden: line {lineno}: [site_prefix] entry is not exactly "
+                        f"{_SITE_PREFIX_WIDTH} ASCII digits -- this scan matches it but the anonymizer "
+                        "cannot load it, so a required-token run refuses this source (content withheld)",
+                        file=sys.stderr,
+                    )
             else:
                 # Position only -- see the [names] branch above. A site prefix is customer data.
                 print(
@@ -1966,6 +1984,9 @@ def token_floor_failure(min_detectors: int | dict[str, int] | None = None) -> st
     * the total must meet ``min_detectors`` when given (catches loss WITHIN a section, e.g. 7 names
       down to 3, which the section check alone cannot see).
 
+    A source that passes both is still refused when a ``[site_prefix]`` entry is not two digits
+    (BACKLOG #5366). That check runs after the two above, so its reason names a source that loaded.
+
     The expected total is deliberately supplied from OUTSIDE the token source (CI env / CLI arg). An
     ``[expect]`` count carried inside the file would be destroyed by the very mangling it is meant to
     detect -- self-referential, and vacuous in exactly the way this function exists to prevent.
@@ -1999,6 +2020,19 @@ def token_floor_failure(min_detectors: int | dict[str, int] | None = None) -> st
                 f"({', '.join(f'{s}={counts[s]}' for s in _FLOOR_SECTIONS)}) — the token source is "
                 "incomplete. This is a FLOOR: adding tokens is free, losing them is not"
             )
+    wide = sum(len(p) != _SITE_PREFIX_WIDTH for p in _SITE_PREFIXES)
+    if wide:
+        # A count only, never the entry: a site prefix is customer data. This scan matches the entry,
+        # so the counts read it as live, but the anonymizer loads two-digit prefixes only and its
+        # site-code scrub and leak check would match nothing for it (BACKLOG #5366). Checked after
+        # the floors, so the anonymizer's refusal_advice, which finds this reason by
+        # surrogates.SITE_PREFIX_WIDTH_MARK, can read it as a source that loaded.
+        return (
+            f"{wide} [site_prefix] entr{'y is' if wide == 1 else 'ies are'} not exactly "
+            f"{_SITE_PREFIX_WIDTH} ASCII digits, and the anonymizer loads two-digit prefixes only "
+            "(surrogates.py), so its site-code scrub and leak check would not match what this gate "
+            "reports as loaded"
+        )
     return None
 
 
@@ -2081,8 +2115,27 @@ def _load_allowlist() -> list[re.Pattern[str]]:
         if any(pat.search(probe) is not None for probe in _ALLOWLIST_CANARIES):
             print(
                 f"scan_forbidden: scan-allowlist.txt line {lineno}: pattern matches ordinary text — "
-                "it would veto every line and disable the whole gate. IGNORED. Anchor it or make it "
-                "specific to the false positive you are excusing.",
+                "it would veto every line and disable the whole gate. IGNORED. Write it as the whole "
+                "line it excuses, specific to that false positive.",
+                file=sys.stderr,
+            )
+            continue
+        # A whole-line match (``_allowlisted``) holds an entry to the line it was written for only
+        # if no part of it can absorb arbitrary text: ``.*OIDC.*``, or ``^# keep .* here$``, excuses
+        # a leak written inside the padding exactly as an unanchored entry did (BACKLOG #5445).
+        # The parse-tree walk (``_absorbs_any_text``) refuses a wildcard, a negated class, an
+        # absorbing category, a back reference or a wide body in a repeat reaching past
+        # _MAX_BOUND; a narrow positive class such as ``[0-9.]+`` or a short ``.{1,32}`` still
+        # passes it, and review is what stops those. A verbose entry, ``(?x)`` or a scoped
+        # ``(?x:...)``, is refused outright.
+        if _absorbs_any_text(line) or pat.flags & re.VERBOSE or _VERBOSE_FLAG.search(line):
+            print(
+                f"scan_forbidden: scan-allowlist.txt line {lineno}: pattern has a wildcard (at "
+                "least ., \\S, \\W, \\D, \\w, a negated class, a class holding one of those, a back "
+                "reference, or a body covering half the letters and a space or half the digits) in "
+                "a repeat reaching past 32 characters, could not be read as a regex tree, or is "
+                "verbose ((?x)), so a leak written inside the line it excuses would pass "
+                "every detector. IGNORED. Spell that part out.",
                 file=sys.stderr,
             )
             continue
@@ -2090,8 +2143,176 @@ def _load_allowlist() -> list[re.Pattern[str]]:
     return out
 
 
+#: The class categories refused inside an unbounded repeat. ``\S`` absorbs any run without a space
+#: (a name, an IP, a site code), ``\D`` any run without a digit (a name), ``\w`` any word token.
+#: ``\W`` absorbs only spaces and punctuation, not a name; it is here so that ``[\w\W]``, which with
+#: ``\w`` matches anything, is caught, and as the conservative choice for a bare ``\W+``. ``\s`` and
+#: ``\d`` are not refused alone; a repeat holding them can still be wide (``_Cover``).
+_ABSORBING_CATEGORIES = frozenset(
+    {
+        _sre_constants.CATEGORY_NOT_SPACE,
+        _sre_constants.CATEGORY_NOT_DIGIT,
+        _sre_constants.CATEGORY_WORD,
+        _sre_constants.CATEGORY_NOT_WORD,
+    }
+)
+#: An inline verbose flag, global (``(?x)``) or scoped (``(?ix:...)``); ``(?-x:...)`` turns it off.
+_VERBOSE_FLAG = re.compile(r"\(\?[aiLmsux]*x")
+_REPEATS = frozenset(
+    {_sre_constants.MAX_REPEAT, _sre_constants.MIN_REPEAT, _sre_constants.POSSESSIVE_REPEAT}
+)
+#: The most characters a repeat may reach before its body is judged: the product of its own upper
+#: bound and those of the repeats nested inside it, so ``\S{1,4294967294}`` and
+#: ``(?:.{0,32}){0,32}`` are judged as ``\S+`` and ``.*`` are. A short reach, ``.{1,32}``, still
+#: passes, and review is what stops it.
+_MAX_BOUND = 32
+#: Atoms the walk knows hold no sub-pattern. Any other opcode it does not open is refused, so a
+#: construct this walk was not written for cannot hide a wildcard inside it.
+_LEAVES = frozenset(
+    {
+        _sre_constants.LITERAL,
+        _sre_constants.NOT_LITERAL,
+        _sre_constants.ANY,
+        _sre_constants.IN,
+        _sre_constants.AT,
+        _sre_constants.GROUPREF,
+    }
+)
+_ASCII_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+class _Cover:
+    r"""What one outermost repeat's body can match: the union of every literal and positive class
+    anywhere inside it, so ``(?:[A-Za-z]+|[0-9.]+| )+`` is judged as one class, not three narrow
+    ones, and whether it holds an atom that absorbs a leak on its own (``.``, a negated class, an
+    absorbing category, a back reference). The rule for WIDE: the union covers at least half the
+    ASCII letters (13), each in either case, AND covers a space or at least half the ASCII digits
+    (5). So ``[ -~]+``, ``[ A-Ya-y]+``, ``[ -Y]+``, ``[A-Za-z0-9]+`` and ``(?:[a-z]+| )+`` are wide,
+    while ``[A-Z_]+`` (a letter run, the DMV wait-type column) and ``[ a-f]+`` are not."""
+
+    def __init__(self) -> None:
+        self.literals: set[int] = set()
+        self.ranges: list[tuple[int, int]] = []
+        self.categories: set[Any] = set()
+        self.absorbing = False
+
+    def add_class(self, items: Any) -> None:
+        """Add a parsed class to the union. A negated class, an absorbing category
+        (``_ABSORBING_CATEGORIES``) or a member this does not know marks the body absorbing."""
+        for op, arg in items:
+            if op == _sre_constants.LITERAL:
+                self.literals.add(arg)
+            elif op == _sre_constants.RANGE:
+                self.ranges.append(arg)
+            elif op == _sre_constants.CATEGORY and arg not in _ABSORBING_CATEGORIES:
+                self.categories.add(arg)
+            else:
+                self.absorbing = True
+
+    def covers(self, ch: str) -> bool:
+        code = ord(ch)
+        return (
+            code in self.literals
+            or any(low <= code <= high for low, high in self.ranges)
+            or (ch == " " and _sre_constants.CATEGORY_SPACE in self.categories)
+            or (ch.isdigit() and _sre_constants.CATEGORY_DIGIT in self.categories)
+        )
+
+    def wide(self) -> bool:
+        letters = sum(self.covers(ch) or self.covers(ch.lower()) for ch in _ASCII_LETTERS)
+        digits = sum(self.covers(d) for d in "0123456789")
+        return letters >= 13 and (self.covers(" ") or digits >= 5)
+
+
+def _absorbs_any_text(pattern: str, flags: int = 0) -> bool:
+    r"""Whether ``pattern`` holds a repeat (``*``, ``+``, ``{n,m}``, lazy or possessive) that reaches
+    more than ``_MAX_BOUND`` characters, counting the repeats nested inside it, and whose body,
+    anywhere inside it at any depth of groups, branches and repeats, holds an atom that absorbs a
+    leak or is wide (``_Cover``). An allowlist entry holding one is not tied to the one line it was
+    written for.
+
+    Read from the PARSED pattern, ``re._parser.parse``, as ``re`` compiles it, never from its
+    source text: a comment group parts nothing (``.(?#c)*`` compiles as ``.*``, and ``(?#[).*``
+    opens no class), while a literal class such as ``[.*]`` and an escaped ``\.`` are still no
+    wildcard. An opcode the walk does not know is refused, and so is a parse tree whose shape it
+    does not expect. A short reach such as ``.{1,32}``, and a narrow positive class such as
+    ``[0-9.]+`` or ``[a-z]+``, still pass; review is what stops those."""
+    try:
+        return _seq_absorbs(_sre_parser.parse(pattern, flags))
+    except (re.error, IndexError, TypeError, ValueError):
+        # The loader compiled it already, so a parse that disagrees, or a ``re._parser`` whose
+        # private tuples changed shape, is refused rather than raised out of the module import.
+        return True
+
+
+def _children(op: Any, arg: Any) -> list[Any] | None:
+    """The sub-sequences a container opcode holds, or ``None`` for a leaf. An opcode that is
+    neither raises ``ValueError``, which ``_absorbs_any_text`` turns into a refusal."""
+    if op in _REPEATS:
+        return [arg[2]]
+    if op == _sre_constants.SUBPATTERN:
+        return [arg[3]]
+    if op == _sre_constants.ATOMIC_GROUP:
+        return [arg]
+    if op == _sre_constants.BRANCH:
+        return list(arg[1])
+    if op in (_sre_constants.ASSERT, _sre_constants.ASSERT_NOT):
+        return [arg[1]]
+    if op == _sre_constants.GROUPREF_EXISTS:
+        return [option for option in arg[1:] if option is not None]
+    if op in _LEAVES:
+        return None
+    raise ValueError(f"unknown regex opcode {op}")
+
+
+def _seq_absorbs(seq: Any) -> bool:
+    """``_absorbs_any_text`` over a sequence outside every repeat: each outermost repeat is judged
+    whole, by its reach and the ``_Cover`` of its body."""
+    for op, arg in seq:
+        children = _children(op, arg)
+        if op in _REPEATS:
+            cover = _Cover()
+            reach = min(arg[1], _MAX_BOUND + 1) * _body_reach(arg[2], cover)
+            if reach > _MAX_BOUND and (cover.absorbing or cover.wide()):
+                return True
+        elif children is not None and any(_seq_absorbs(child) for child in children):
+            return True
+    return False
+
+
+def _body_reach(seq: Any, cover: _Cover) -> int:
+    """Fill ``cover`` from ``seq``, inside a repeat, and return the largest product of the upper
+    bounds of the repeats nested in it, capped past ``_MAX_BOUND``; 1 with none."""
+    reach = 1
+    for op, arg in seq:
+        children = _children(op, arg)
+        if children is None:
+            if op in (_sre_constants.ANY, _sre_constants.NOT_LITERAL, _sre_constants.GROUPREF):
+                cover.absorbing = True
+            elif op == _sre_constants.IN:
+                cover.add_class(arg)
+            elif op == _sre_constants.LITERAL:
+                cover.literals.add(arg)
+            continue
+        inner = max(_body_reach(child, cover) for child in children) if children else 1
+        if op in _REPEATS:
+            inner *= min(arg[1], _MAX_BOUND + 1)
+        reach = min(max(reach, inner), _MAX_BOUND + 1)
+    return reach
+
+
 ALLOWLIST = _load_allowlist()
 reload_tokens()
+
+
+def _allowlisted(line: str) -> bool:
+    """Whether an allowlist entry excuses ``line``. An entry must match the WHOLE line: applied with
+    ``search``, an entry missing its ``^``/``$`` excused any line that merely CARRIED its shape, so a
+    leak beside that shape went past every detector (BACKLOG #5445). ``fullmatch`` removes the
+    dependence on anchors. It does not stop an entry whose own pieces can absorb a leak: the
+    loader's wildcard refusal (``_absorbs_any_text``) catches the common spellings of that, and
+    review of each entry is what catches the rest."""
+    return any(a.fullmatch(line) for a in ALLOWLIST)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -2177,12 +2398,41 @@ def _tracked_under(root: Path) -> set[str] | None:
     return tracked
 
 
+#: A file to judge: its openable path, its scan-root-relative posix path, and in ``--path`` mode
+#: where it is (``_locations``), which the location rule judges too; empty elsewhere. The staged and
+#: tracked scans judge only the path they were given, which is relative to the working directory, so
+#: run from a subdirectory they do not see a ``docs/security`` above it (a known open gap).
+_Candidate = tuple[Path, str, tuple[str, ...]]
+
+
+def _locations(path: Path) -> tuple[str, ...]:
+    """Where ``path`` is, as the location rule judges it in ``--path`` mode (BACKLOG #5446): both its
+    path as named, made absolute, and its real path, whole, NFC and case-folded as ``_path_key``
+    folds. A file is a hit if EITHER falls under a docs/security directory. The real path, so a
+    named root or file that is, or sits behind, a link, junction or subst drive into docs/security,
+    a root named from inside ``docs``, or one reached by ``..``, is judged where it lands; ``_walk``
+    asks this of a file link it lists, and of a file under a junction it descends. The named path,
+    so a link that sits under docs/security and points out of it is judged where it sits as well.
+
+    A directory symbolic link BELOW a named root is not followed: ``os.walk`` lists it and does not
+    descend it, so the files behind it are not judged at all, by this rule or any other. That
+    route is left open.
+
+    Whole, not relative to a work tree: no ``.git`` entry, planted in a commit snapshot at ``docs``,
+    at ``docs/security`` or below it, can strip the prefix the rule keys on. The cost is that a
+    tree which itself sits under some ``docs/security`` directory is a hit on every file it holds:
+    fail closed."""
+    named = _path_key(Path(os.path.abspath(path)).as_posix())
+    real = _path_key(Path(os.path.realpath(path)).as_posix())
+    return (named,) if named == real else (named, real)
+
+
 #: How a --path hit for a named root that does not exist ends. ``main`` leaves such a hit out of the
 #: summary's unread count, since nothing was there to be set aside.
 _NO_ROOT = "does not exist, so its files were not scanned (fail closed)"
 
 
-def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
+def _walk(raw: str, out: list[_Candidate], errors: list[str]) -> None:
     """Every file under the directory ``raw``, keyed by its root-relative posix path (BACKLOG #5585).
     SKIP_DIRS is pruned as ``_tracked_under`` answers: where git lists the tracked files, only for
     files it does not list, so by name under a root git tracks nothing under; where git cannot list
@@ -2191,6 +2441,7 @@ def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
     it without a word, except one below the root whose listing raises ENOENT or ENOTDIR, which is
     passed over as removed since it was listed, whatever the cause of that errno."""
     root = Path(raw)
+    at_root = _locations(root)
     tracked = _tracked_under(root)
     tracked_dirs = {
         "/".join(p.split("/")[:i]) for p in tracked or () for i in range(1, p.count("/") + 1)
@@ -2233,13 +2484,19 @@ def _walk(raw: str, out: list[tuple[Path, str]], errors: list[str]) -> None:
                 in_skip_dir and tracked is not None and _path_key(rel) not in tracked
             ):
                 continue
-            out.append((Path(top) / name, rel))
+            path = Path(top) / name
+            # Every file by the root's locations joined to its path, which is where it sits; a link
+            # inside the root (a file link, or a junction the walk descended) where it lands too.
+            key = _path_key(rel)
+            where = tuple(f"{at}/{key}" for at in at_root)
+            if os.path.realpath(path) != os.path.abspath(path):
+                where += _locations(path)
+            out.append((path, rel, where))
 
 
-def _candidate_files(
-    paths: list[str], *, path_mode: bool
-) -> tuple[list[tuple[Path, str]], list[str]]:
-    # Returns (openable path, scan-root-RELATIVE posix) pairs, and an unreadable-directory hit for each
+def _candidate_files(paths: list[str], *, path_mode: bool) -> tuple[list[_Candidate], list[str]]:
+    # Returns (openable path, scan-root-RELATIVE posix, location) triples, the location for --path only
+    # (_Candidate), and an unreadable-directory hit for each
     # directory a --path walk could not list. The relative posix is what all skip decisions and hit
     # reports key on, so the logic is identical whether we scan tracked files (already repo-relative) or
     # a --path snapshot in an arbitrary directory.
@@ -2253,22 +2510,22 @@ def _candidate_files(
         # refusal below only fires when the TOTAL is zero, so mixing one real directory with dropped
         # paths exited 0 and read as "all of these are clean". Measured 2026-08-04: a four-path audit
         # reported clean having examined one of the four.
-        out: list[tuple[Path, str]] = []
+        out: list[_Candidate] = []
         errors: list[str] = []
         for raw in paths:
             root = Path(raw)
             if root.is_file():
                 # rel is the bare name, matching the directory case, where the rel path starts below
-                # the root the caller NAMED. So the path the caller wrote is not judged: a file named
-                # under docs/security/ earns no location hit here, as on origin/main.
+                # the root the caller NAMED. Its locations (_locations) are judged too, so a file
+                # named under docs/security/ is still a hit (BACKLOG #5446).
                 if root.name != ".git":
-                    out.append((root, root.name))
+                    out.append((root, root.name, _locations(root)))
                 continue
             _walk(raw, out, errors)
         return out, errors
     if paths:
-        return [(Path(a), Path(a).as_posix()) for a in paths], []
-    return [(Path(p), Path(p).as_posix()) for p in _git_tracked()], []
+        return [(Path(a), Path(a).as_posix(), ()) for a in paths], []
+    return [(Path(p), Path(p).as_posix(), ()) for p in _git_tracked()], []
 
 
 #: Byte-order marks, longest first: a UTF-32-LE mark begins with the UTF-16-LE one. The wide entries of
@@ -2353,15 +2610,36 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
     return _scan_file(path, rel_posix, show_context=show_context)[0]
 
 
-def _name_hits(path: Path, posix: str) -> tuple[list[str], bool]:
+def _location_reason(posix: str, where: tuple[str, ...] = ()) -> str | None:
+    """Why the location rule forbids a file, judged by ``posix`` and each of ``where``
+    (``_name_hits`` says what those are), or ``None``. Case-folded in every mode, so the staged and
+    tracked scans agree with --path on Docs/Security.
+
+    Asked BEFORE the file skip rules (``_is_skipped``): a skip keys on the root-relative path,
+    which in ``--path`` mode starts below the root the caller named, so a file under a named
+    docs/security whose relative path happened to match SKIP_PATHS or the vendored-bundle pattern
+    was dropped unjudged and the run exited 0 (BACKLOG #5446). NOT before the SKIP_DIRS pruning in
+    ``_walk``, which still runs first: where git lists no tracked file there, or cannot list at all
+    (a planted ``.git`` can make it fail), a file under ``docs/security/build/`` or another skipped
+    directory is never listed, so never judged. That route is left open."""
+    judged = (_path_key(posix), *where)
+    return next(filter(None, map(forbidden_path_reason, judged)), None)
+
+
+def _name_hits(path: Path, posix: str, where: tuple[str, ...] = ()) -> tuple[list[str], bool]:
     """The hits a file earns by its path and name alone, and whether its content is not to be read.
     Judged whatever its bytes are. ``_scan_file`` keeps them when the content cannot be read, and the
     non-file branch of ``main`` keeps them beside any does-not-exist or unreadable hit.
 
     A location hit names ``path``, the root the caller wrote joined to ``posix``, so in a scan of
     several roots it names the root (the branch leak scan's commit directory). Under an absolute root
-    that path can carry a user-home path."""
-    if reason := forbidden_path_reason(posix):
+    that path can carry a user-home path.
+
+    ``where`` is where the file is, from ``_locations``, and the location rule judges each beside
+    ``posix`` (BACKLOG #5446). In ``--path`` mode ``posix`` starts below the root the caller named, so
+    naming ``docs/security`` itself, a file in it, or its parent ``docs`` dropped the prefix the rule
+    keys on, and a private document read clean."""
+    if reason := _location_reason(posix, where):
         return [f"{path.as_posix()}:0: {reason}"], True
     hits: list[str] = []
     # The NAME is half of what #321 found: one of the two leaked identifiers was a feed module's
@@ -2400,7 +2678,7 @@ def _line_hits(text: str, posix: str, path: Path, show_context: bool) -> list[tu
             counts[key] = nth + 1
             out.append((lineno, f"{key}\0{nth}", hit + extra))
 
-        if any(a.search(line) for a in ALLOWLIST):
+        if _allowlisted(line):
             continue
         ctx = f": {line.strip()[:120]}" if show_context else ""
         before = len(out)
@@ -2472,20 +2750,25 @@ _FileState = Literal["read", "unread", "unreadable"]
 
 
 def _scan_file(
-    path: Path, rel_posix: str | None = None, *, show_context: bool = False
+    path: Path,
+    rel_posix: str | None = None,
+    *,
+    show_context: bool = False,
+    where: tuple[str, ...] = (),
 ) -> tuple[list[str], _FileState]:
     """``scan_file``'s hits, and what became of the file's content. A binary file is judged by its name
     and location only, so the run must not count it as scanned, and an unreadable one is an instrument
     failure, not a clean file (BACKLOG #5583)."""
     posix = rel_posix if rel_posix is not None else path.as_posix()
-    if _is_skipped(posix):
+    # The location rule first: a skipped name under docs/security is still a hit (_location_reason).
+    if _is_skipped(posix) and _location_reason(posix, where) is None:
         return [], "unread"
     # LOCATION before content, and deliberately before the binary/unreadable early-return below: a
     # forbidden path is a hit whatever its bytes are, and a PDF or an image under docs/security/ is
     # exactly as much of a leak as the markdown beside it. Reported at line 0 because the finding is
     # the path itself and there is no line to point at -- the reason names the file, not a location
     # inside it. Scanning stops here; content hits on a file that must not exist add nothing.
-    hits, stop = _name_hits(path, posix)
+    hits, stop = _name_hits(path, posix, where)
     if stop:
         return hits, "unread"
     try:
@@ -3114,10 +3397,11 @@ def main(argv: list[str]) -> int:
     # that does not exist is not, since nothing was there. Both still fail the run as unreadable.
     unread = sum(not h.endswith(_NO_ROOT) for h in hits)
     unreadable = len(hits)
-    for abs_path, rel in candidates:
+    for abs_path, rel, where in candidates:
         # SKIP_DIRS is applied by the --path walk alone (_walk); the tracked and staged scans prune no
-        # directory.
-        if _is_skipped(rel):
+        # directory. The location rule is asked before the skip (_location_reason), so a skipped
+        # name under docs/security goes on to be judged by it below.
+        if _is_skipped(rel) and _location_reason(rel, where) is None:
             continue
         if not abs_path.is_file():
             # Not a regular file, or one is_file() could not stat (it hides that error). In every mode,
@@ -3156,13 +3440,13 @@ def main(argv: list[str]) -> int:
             # The path alone decides a location or name hit, so it is kept for every entry that gets
             # here: an unstatable name under docs/security/, or in staged mode a missing one, still
             # exits 1, not 2. A gone entry passed over above earns no hit.
-            hits.extend(_name_hits(abs_path, rel)[0])
+            hits.extend(_name_hits(abs_path, rel, where)[0])
             if reason is None:
                 continue
             hits.append(f"{rel}:0: {reason}, so its content was not scanned (fail closed)")
             unreadable += 1
             continue
-        file_hits, state = _scan_file(abs_path, rel, show_context=show_context)
+        file_hits, state = _scan_file(abs_path, rel, show_context=show_context, where=where)
         hits.extend(file_hits)
         if state == "read":
             scanned += 1

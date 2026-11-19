@@ -506,6 +506,7 @@ from messagefoundry.pipeline.wiring_runner import (
     DrParkedError,
     NotDeployedError,
     RegistryRunner,
+    RunnerLeaseLostError,
     RunnerNotRunningError,
     ShardLaneOwnershipError,
 )
@@ -756,12 +757,9 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
     re-authenticate toward the partner lockout a credential STOP protects against. It does not say
     the lane stays down until an operator acts, which is false (``RegistryRunner.outbound_stop_held``
     says what else re-arms it)."""
-    if not rr.running:
-        # BACKLOG #5702: the start this would point at is refused on a downed graph.
-        return (
-            f"outbound {name!r} is not running because this engine's graph is not running "
-            "(stopped, or a demoted node); resend through the engine that runs the graph"
-        )
+    refused = _graph_down_detail(rr, "outbound", name)
+    if refused is not None:
+        return refused
     if rr.outbound_status(name) == "log_halted":
         return (
             f"outbound {name!r} is halted: this engine cannot write its application log, so nothing "
@@ -773,6 +771,43 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
             "configuration fault — fix the cause, then start the connection, then resend"
         )
     return f"outbound {name!r} is not running — start it before resending"
+
+
+def _graph_down_detail(rr: RegistryRunner, kind: str, name: str) -> str | None:
+    """The outbound resend's 409 reason when every start door is refused on this node, or
+    ``None``: a downed graph (BACKLOG #5702), or a cluster node that lost its lease while its graph
+    still runs, whose start door refuses with ``RunnerLeaseLostError`` (BACKLOG #5906). Either way
+    "start it before resending" would point at a refused control. The upload resend into an
+    inbound has its own text (:func:`_inbound_down_detail`), which names no other engine."""
+    if not rr.running:
+        return (
+            f"{kind} {name!r} is not running because this engine's graph is not running "
+            "(stopped, or a demoted node); resend through the engine that runs the graph"
+        )
+    if not rr.coordinator.is_leader():
+        return (
+            f"{kind} {name!r} is not running and this node no longer holds the cluster lease, so "
+            "it starts no connection; resend through the leader"
+        )
+    return None
+
+
+def _inbound_down_detail(rr: RegistryRunner, name: str) -> str:
+    """The 409 reason for an upload resend into an inbound that is not running. On a downed graph
+    (BACKLOG #5702) or a node that lost its cluster lease (BACKLOG #5906) it says only that this
+    node refuses the resend: the start the inbound needs is refused here too, so "start it before
+    resending" would point at a refused control. Otherwise it says to start the inbound."""
+    if not rr.running:
+        return (
+            f"inbound {name!r} is not running because this engine's graph is not running "
+            "(stopped, or a demoted node), so the resend is refused here"
+        )
+    if not rr.coordinator.is_leader():
+        return (
+            f"inbound {name!r} is not running and this node no longer holds the cluster lease, so "
+            "the resend is refused here"
+        )
+    return f"inbound {name!r} is not running — start it before resending"
 
 
 def _live_outbound_status(rr: RegistryRunner, name: str) -> str:
@@ -1080,9 +1115,16 @@ async def _alert_restart(
     restart: Callable[[str], Awaitable[None]], action: str, target: str
 ) -> None:
     """``restart(target)``, logged at INFO and not raised when the runner's graph is down, as on a
-    demoted follower (BACKLOG #5702), where the leader, if there is one, acts on its own alert."""
+    demoted follower (BACKLOG #5702), or when this cluster node lost its lease while its graph
+    still runs (BACKLOG #5906). Either way the leader, if there is one, acts on its own alert."""
     try:
         await restart(target)
+    except RunnerLeaseLostError:
+        _log.info(
+            "alert control_action %s for %r not run: this node no longer holds the cluster lease",
+            action,
+            target,
+        )
     except RunnerNotRunningError:
         _log.info(
             "alert control_action %s for %r not run: this engine's graph is not running",
@@ -1313,6 +1355,17 @@ def _purge_target_refusal(rr: RegistryRunner | None, name: str) -> HTTPException
             409,
             f"owned by engine shard {owner!r}, so stop and purge outbound {name!r} on that engine "
             "shard's API",
+        )
+    # BACKLOG #5792: a cluster node that does not hold the leader lease delivers nothing, so its
+    # quiesced signal is vacuous the same way, and a stop there needs no lease. A purge on it would
+    # cancel rows of the shared store the leader is still delivering. The single-node
+    # NullCoordinator always leads. A point-in-time read, not a store fence: leadership can still
+    # change before the cancel completes.
+    if not rr.coordinator.is_leader():
+        return HTTPException(
+            409,
+            "this node does not hold the cluster lease, so stop and purge outbound "
+            f"{name!r} on the leader's API",
         )
     # require-stopped-before-purge (after the 404, before any approval is held for a doomed purge):
     # a running/still-"stopping" outbound may have a claimed INFLIGHT row cancel_queued cannot cancel,
@@ -6009,8 +6062,10 @@ def create_app(
                 raise HTTPException(409, str(exc)) from None
             except RunnerNotRunningError as exc:
                 # BACKLOG #5702: the graph is down, as on a demoted follower whose API still serves,
-                # so a start would bind a listener outside the engine lifecycle. 503, as no runner
-                # is, and audited below as every refused inbound start or restart is.
+                # so a start would bind a listener outside the engine lifecycle. Its subclass
+                # RunnerLeaseLostError (BACKLOG #5906) is a node that lost its lease while its graph
+                # still runs, and carries its own text. 503, as no runner is, and audited below as
+                # every refused inbound start or restart is.
                 refused = HTTPException(503, str(exc))
             except TrustAnchorError as exc:
                 # vault BACKLOG #2371: an Ftp poller's CA was refused. The runner recorded it failed
@@ -6088,7 +6143,9 @@ def create_app(
                 raise HTTPException(409, str(exc)) from None
             except RunnerNotRunningError as exc:
                 # BACKLOG #5702: the graph is down, so a start would spawn a delivery worker outside
-                # the engine lifecycle and a stop would record a pause a later start inherits.
+                # the engine lifecycle and a stop would record a pause a later start inherits. Its
+                # subclass RunnerLeaseLostError (BACKLOG #5906) refuses a start or restart on a node
+                # that lost its lease while its graph still runs, with its own text.
                 out_refused = HTTPException(503, str(exc))
             if out_refused is not None:
                 await _record_refused_control_audit(
@@ -7085,7 +7142,11 @@ def create_app(
         building = False  # true only across the EmailTransport build, for the cut below
         start = time.perf_counter()
         try:
-            smtp_password = resolve_connector_secret(
+            # Resolved off the event loop (BACKLOG #5793): a provider reference is a blocking call,
+            # for the vault provider an HTTP round trip, and on the loop it would stall every
+            # request the engine serves while it waits.
+            smtp_password = await asyncio.to_thread(
+                resolve_connector_secret,
                 secret_provider,
                 ref=alerts.email_password_secret,
                 literal=alerts.email_password,
@@ -9188,10 +9249,9 @@ def create_app(
         under the store DEK when a key is set); step-up-gated + audited (metadata only).
 
         **Text-only (ASVS 14.2.8).** This feature accepts only plain-text diagnostic logs (``.hl7`` /
-        ``.txt`` / ``.xml``). A body that begins with a metadata-bearing binary container's signature
-        (JPEG, PNG, PDF, ZIP including DOCX, GIF or TIFF), or holds a NUL byte or a
-        control-dense 8 KiB window, is refused with **HTTP 415** before anything is written. What
-        this lets through is stated in docs/CONNECTIONS.md, under the uploaded-logs upload policy, "Permitted types".
+        ``.hl7v2`` / ``.txt`` / ``.xml``). A body the text-only check refuses is answered **HTTP 415**
+        before anything is written. Which bodies that check refuses, and what it lets through, are
+        stated in docs/CONNECTIONS.md, under the uploaded-logs upload policy, "Permitted types".
 
         **Consent (ASVS 14.2.8).** The original filename you supply and your username are stored and shown
         to you and to authorized operators holding ``files:access_any`` (administrators). Your username
@@ -9576,9 +9636,7 @@ def create_app(
             raise HTTPException(404, f"no such inbound connection: {body.to}")
         try:
             if not rr.inbound_running(body.to):
-                raise HTTPException(
-                    409, f"inbound {body.to!r} is not running — start it before resending"
-                )
+                raise HTTPException(409, _inbound_down_detail(rr, body.to))
         except KeyError:
             raise HTTPException(404, f"no such inbound connection: {body.to}") from None
         # Object-level authorization on the SOURCE file, in ADDITION to the target-channel check above.

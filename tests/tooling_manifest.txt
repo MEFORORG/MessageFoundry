@@ -29,6 +29,7 @@ tests/test_afk_digest.py
 tests/test_afk_gate.py
 tests/test_afk_kill_switch.py
 tests/test_afk_tripwire.py
+tests/test_afk_tripwire_config_env.py
 tests/test_ai_provenance_claims.py
 tests/test_announce_hook.py
 tests/test_attribution_trailer_check.py
@@ -43,6 +44,7 @@ tests/test_asvs_tally_lint.py
 tests/test_asvs_verifier_vault_contract.py
 tests/test_bash_probe_path.py
 tests/test_bash_resolver.py
+tests/test_blanket_stage_config_env.py
 tests/test_blanket_stage_guard.py
 tests/test_branch_leak_scan_range.py
 tests/test_check_dependency_floors.py
@@ -166,6 +168,7 @@ tests/test_install_guide_verify_gate.py
 tests/test_installed_coord_hooks.py
 tests/test_key_usage_scope_inventory.py
 tests/test_ledger_check.py
+tests/test_ledger_check_renames.py
 tests/test_link_resolution.py
 tests/test_lint_scope_parity.py
 tests/test_measure_store_access_exit_code.py
@@ -195,6 +198,7 @@ tests/test_rescue_ref_provenance.py
 tests/test_review_standards.py
 tests/test_role_cards.py
 tests/test_scan_forbidden_loaded_set.py
+tests/test_scan_path_mode_location_5446.py
 tests/test_sbom_finalize.py
 tests/test_script_root_anchoring.py
 tests/test_seat_worktree_lock.py
@@ -217,9 +221,11 @@ tests/test_stale_repo_slug_check.py
 tests/test_stalled_prs.py
 tests/test_steer_inject.py
 tests/test_testpaths_webconsole_coverage.py
+tests/test_fs_scan_escaped_quotes.py
 tests/test_unbounded_fs_scan_guard.py
 tests/test_shell_guard_dispatch.py
 tests/test_api_burn_guard.py
+tests/test_block_api_burn_loops.py
 tests/test_webconsole_engine_floor.py
 tests/test_wheel_license_files.py
 tests/test_wiki_write_prompt_hook.py
@@ -239,6 +245,7 @@ tests/test_worktree_gate_hijack.py
 tests/test_worktree_gate_interpreter_flags.py
 tests/test_worktree_gate_interpreter_sigils.py
 tests/test_worktree_gate_line_split_discriminator.py
+tests/test_worktree_gate_dos_device.py
 tests/test_worktree_gate_path_aliases.py
 tests/test_worktree_gate_quote_straddle.py
 tests/test_usage_headroom_inject.py

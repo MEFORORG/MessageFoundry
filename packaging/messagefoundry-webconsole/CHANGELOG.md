@@ -278,6 +278,12 @@ this line.**
   that set, an empty one included, is refused with the generic "invalid input". A body that starts
   with a line break keeps it. The seam digest moved because the route's form parser changed, and
   it now hashes the helper that rewrites the breaks. (BACKLOG #5930)
+- **A resubmit with no `eol` field gives a body that starts with MSH CR terminators.** A form
+  the editor did not render, such as a stale page or a hand-built POST, used to resubmit the
+  browser's line breaks. A submitted body that starts with MSH now goes out with CR, whatever the
+  original used, since the parser has no original to read; any other body, an `FHS` or `BHS`
+  batch included, goes out as sent. The seam digest moved again, because
+  the form parser and its new helper changed. (BACKLOG #5930)
 
 - **TOTP enrolment no longer drops the first code.** Under the default
   `[auth].require_action_step_up`, the enroll page showed a code form whose submit the confirm
@@ -286,10 +292,12 @@ this line.**
   Continue button that takes the operator through that re-auth to the code form first. Enroll and
   confirm still each take their own proof (ADR 0077), and a refused code still needs a fresh one:
   the re-rendered page offers the same Continue instead of a form that would drop the next code.
-  The confirm page itself is unchanged. A Continue can be posted while the confirm proof is
-  already held, from another tab or after Back. It now goes to the re-auth and leaves that proof
-  unspent. No code is checked and no failed attempt is recorded. The verify route's gate chain
-  grew by that check, so the engine seam moves. (BACKLOG #5931)
+  The confirm page, opened while no confirm proof is held (for example after Back from a refused
+  code, or after an engine restart), offers the same Continue instead of a code form. A Continue
+  can be posted while the confirm proof is already held, from another tab or after Back. It now
+  goes to the re-auth and leaves that proof unspent. No code is checked and no failed attempt is
+  recorded. The verify gate makes that check itself, just before it spends the proof, and the
+  gate's closure changed with it, so the engine seam moves. (BACKLOG #5931)
 - **The flag toggle's "Flag change not confirmed" page keys on the refusal's type.** The console
   gave that page for any 503 the engine's flag handler raised, relying on a comment that the
   handler had no other. The handler raises no other today, so nothing an operator sees changes; a

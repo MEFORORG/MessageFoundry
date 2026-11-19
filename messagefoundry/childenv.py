@@ -377,8 +377,9 @@ def python_module_argv(
     pins this build either: the first ``messagefoundry`` on the import path answers. The tray's
     login command is one user. It passes ``-E`` in ``extra_flags``, so an absolute
     ``PYTHONPATH`` entry naming another copy does not answer that start (vault BACKLOG #2852). The
-    tray it relaunches repeats that ``-E`` (:func:`inherited_interpreter_flags`). The other is
-    :mod:`messagefoundry.security.audit_all_platforms`, which starts ``pip`` and ``pip_audit``.
+    tray it relaunches repeats that ``-E`` (:func:`inherited_interpreter_flags`). Others are
+    :mod:`messagefoundry.security.audit_all_platforms`, which starts ``pip`` and ``pip_audit``, and
+    :mod:`messagefoundry.checks`, which starts ``mypy`` (BACKLOG #5375).
     """
     return [executable or sys.executable, *_flags(extra_flags, inherit), "-m", module]
 

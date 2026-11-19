@@ -374,7 +374,8 @@ list, no `EgressSettings` change**:
   `deny_by_default` correctly refuses an unlisted FHIR destination.
 - `check_egress_allowed` ([wiring_runner.py:1634](../../messagefoundry/pipeline/wiring_runner.py)) — add
   `ConnectorType.FHIR` to the existing `(REST, SOAP)` host-check branch. Its body reads `dest.settings.get("url",
-  "")`, calls `_http_egress_allowed(url, egress.allowed_http)`, and emits a `dest.type.value`-parameterized warning
+  "")`, calls `http_egress_allowed(url, egress.allowed_http)` (CORRECTED 2026-11-18: this named the
+  matcher's former private name, `_http_egress_allowed`), and emits a `dest.type.value`-parameterized warning
   + `WiringError`. **This is exactly why the `FHIR()` factory stores the endpoint under the `"url"` key (§3.3):**
   the gate reads `settings["url"]`, so a `base_url`-keyed value would parse `host=""`, never match the allowlist,
   and (when `allowed_http` is empty) skip this `elif` so the connector receives no `url` and breaks — a

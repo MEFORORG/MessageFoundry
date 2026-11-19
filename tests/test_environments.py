@@ -17,6 +17,7 @@ from messagefoundry.config.environments import (
     environment_values_from_bytes,
     load_environment_values,
     resolve_values_base_dir,
+    values_file_path,
 )
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
@@ -560,6 +561,178 @@ def test_committed_environment_files_define_the_same_keys() -> None:
     assert not missing, (
         f"environment value files disagree on keys (each must define all of {sorted(union)}): {missing}"
     )
+
+
+# --- BACKLOG #5322: the value file stays under its base directory ---------------------------------
+
+# Each case carries this marker, so the withheld-value assertion can fail: a refusal that echoed the
+# value would carry it. A bare spelling such as ".." has nothing distinctive to look for, so each one
+# is tried here with the marker after it, and on its own by the next test.
+_MARK = "zq7mark"
+
+_DIRS_THAT_LEAVE_THE_BASE = [
+    f"C:/{_MARK}",  # absolute on Windows; drive-qualified on every host
+    f"C:{_MARK}",  # drive-relative: a join takes C:'s working directory, not the base
+    f"/{_MARK}",  # rooted
+    f"\\{_MARK}",  # rooted, Windows spelling
+    f"\\\\server\\{_MARK}",  # UNC
+    f"\\\\{_MARK}\\share",  # UNC, the marker as the server
+    f"../{_MARK}",
+    f"environments/../../{_MARK}",
+    f"..\\{_MARK}",
+    f".../{_MARK}",  # Windows strips a part's trailing dots
+    f".. /{_MARK}",  # and trailing spaces
+]
+
+
+@pytest.mark.parametrize("dir_name", _DIRS_THAT_LEAVE_THE_BASE)
+def test_values_file_path_refuses_a_dir_that_leaves_the_base(tmp_path: Path, dir_name: str) -> None:
+    assert _MARK in dir_name  # the assertion below can only fail if the case carries the marker
+    with pytest.raises(ValueError, match=r"\[environments\]\.dir must be a folder under") as caught:
+        values_file_path(tmp_path, dir_name, "dev")
+    assert _MARK not in str(caught.value)  # the value is withheld (R12)
+    assert "(value withheld)" in str(caught.value)
+
+
+@pytest.mark.parametrize("dir_name", ["..", "...", ".. ", "\\\\server\\share"])
+def test_values_file_path_refuses_a_bare_spelling_that_leaves_the_base(
+    tmp_path: Path, dir_name: str
+) -> None:
+    """The bare spellings themselves, refused as they stand, not only with a folder after them."""
+    with pytest.raises(ValueError, match=r"\[environments\]\.dir must be a folder under"):
+        values_file_path(tmp_path, dir_name, "dev")
+
+
+def test_load_environment_values_refuses_a_dir_that_leaves_the_base(tmp_path: Path) -> None:
+    """The load goes through the same rule, so it never reads a value file outside the base."""
+    with pytest.raises(ValueError, match="must be a folder under"):
+        load_environment_values(
+            base_dir=tmp_path, dir_name="../elsewhere", environment="dev", environ={}
+        )
+
+
+@pytest.mark.parametrize(
+    "environment", ["../dev", "..\\dev", "a/b", "C:dev", "dev:stream", "/dev", "", "dev env"]
+)
+def test_values_file_path_refuses_an_environment_the_validator_would_refuse(
+    tmp_path: Path, environment: str
+) -> None:
+    """The name is held to the ``[ai].environment`` alphabet, so a raw ``--env`` that never met the
+    settings validator cannot carry a separator, a drive or a stream name into the join."""
+    with pytest.raises(ValueError, match="must be a non-empty name of letters") as caught:
+        values_file_path(tmp_path, "environments", environment)
+    assert "(value withheld)" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "environment", ["NUL", "nul", "CON", "COM1", "LPT9", "AUX", "PRN", "NUL.x"]
+)
+def test_values_file_path_refuses_a_reserved_environment_name(
+    tmp_path: Path, environment: str
+) -> None:
+    """A reserved name passes the alphabet. Windows 11 opens ``NUL.toml`` as a file (measured), but
+    older releases were not measured, so the name is refused on every host."""
+    with pytest.raises(ValueError, match="must not be a device name Windows reserves") as caught:
+        values_file_path(tmp_path, "environments", environment)
+    assert "(value withheld)" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "dir_name", ["NUL", "envs/nul", "COM1\\sub", "CON.d", "bad?dir", "env:prod", "envs.", "envs "]
+)
+def test_values_file_path_refuses_a_reserved_dir_part(tmp_path: Path, dir_name: str) -> None:
+    """A bare ``NUL`` folder part names the device, not a folder (measured on Windows 11). A part
+    Windows cannot open as written, with a ``?`` or ``:`` or a trailing dot or space, is refused
+    with it, on every host."""
+    with pytest.raises(ValueError, match="must not hold a name Windows reserves") as caught:
+        values_file_path(tmp_path, dir_name, "dev")
+    assert "(value withheld)" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("dir_name", "environment", "parts"),
+    [
+        ("environments", "dev", ("environments", "dev.toml")),
+        ("envs/sub", "prod", ("envs", "sub", "prod.toml")),
+        ("./environments", "staging", ("environments", "staging.toml")),
+        ("", "dev", ("dev.toml",)),
+        ("environments", "..", ("environments", "...toml")),  # a file name, not a parent
+        ("environments", "qa.v2_x-1", ("environments", "qa.v2_x-1.toml")),
+    ],
+)
+def test_values_file_path_takes_a_folder_under_the_base(
+    tmp_path: Path, dir_name: str, environment: str, parts: tuple[str, ...]
+) -> None:
+    """The control: every folder under the base, and every name the settings validator admits."""
+    assert values_file_path(tmp_path, dir_name, environment) == tmp_path.joinpath(*parts)
+
+
+def test_serve_and_supervise_refuse_a_dir_that_leaves_the_base(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The start check both commands make before they vet the value file refuses with exit-ready
+    ``None`` and prints why, rather than raising a traceback."""
+    from messagefoundry.__main__ import _value_file_or_refusal
+
+    assert _value_file_or_refusal(tmp_path, "../elsewhere", "dev", fleet="Fleet refused.") is None
+    err = capsys.readouterr().err
+    assert err.startswith("error: refusing to start: [environments].dir must be a folder under")
+    assert err.rstrip().endswith("Fleet refused.")
+    assert _value_file_or_refusal(tmp_path, "environments", "dev") == (
+        tmp_path / "environments" / "dev.toml"
+    )
+
+
+def test_project_root_env_file_check_refuses_a_dir_that_leaves_the_root(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The offline ``--project-root`` check states the file through the same rule."""
+    from messagefoundry.__main__ import _check_env_file_present
+
+    config = tmp_path / "cfg"
+    config.mkdir()
+    _write(
+        config,
+        """
+        from messagefoundry import outbound, MLLP, env
+        outbound("OB", MLLP(host=env("peer_host"), port=2700))
+        """,
+    )
+    assert _check_env_file_present(str(config), tmp_path, "dev", "../elsewhere") == 2
+    assert "must be a folder under" in capsys.readouterr().err
+
+
+def test_serve_and_supervise_name_the_value_file_through_the_refusing_helper() -> None:
+    """``_serve`` and ``_supervise`` take their start-check value file from
+    ``_value_file_or_refusal`` and stop on its ``None``, and neither calls ``values_file_path``
+    itself, so a refused dir exits 2 with the reason rather than a traceback."""
+    import ast
+    import inspect
+
+    import messagefoundry.__main__ as cli
+
+    for command in (cli._serve, cli._supervise):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(command)))
+        called = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert "_value_file_or_refusal" in called, command.__name__
+        assert "values_file_path" not in called, command.__name__
+        source = ast.unparse(tree)
+        assert "if env_file is None or _start_files_refused(" in source, command.__name__
+
+
+def test_the_reader_refuses_a_dir_that_leaves_the_base_when_it_is_built(tmp_path: Path) -> None:
+    """Built once, refused once, so ``value_file``, which the engine reads on every reload, never
+    raises later; and serve's read turns a refusal into the WiringError its callers arm."""
+    from messagefoundry.__main__ import _environment_values_reader, _read_environment_values
+
+    with pytest.raises(ValueError, match="must be a folder under"):
+        _environment_values_reader(base_dir=tmp_path, dir_name="../elsewhere", environment="dev")
+    with pytest.raises(WiringError, match="must be a folder under"):
+        _read_environment_values(base_dir=tmp_path, dir_name="../elsewhere", environment="dev")
 
 
 # --- WS-1: anchoring environments/<env>.toml to a project root (ADR 0017) --------------------------

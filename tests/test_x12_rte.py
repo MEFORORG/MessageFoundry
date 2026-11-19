@@ -560,6 +560,16 @@ def test_unparseable_reply_detail_is_safe_exc_scrubbed() -> None:
     assert "X12PeekError" in r.detail  # safe_exc's "<type>: <msg>" signature — the scrub ran
 
 
+def test_unparseable_reply_non_capturing_is_scrubbed_and_unchained() -> None:
+    # BACKLOG #5365: the non-capturing arm renders through safe_exc like the capturing arm, and does
+    # not chain the parse error, whose raw text a logged traceback would print, as cause or context.
+    with pytest.raises(DeliveryError) as ei:
+        _dest(capture_response=False)._check_ta1(b"NOT-AN-INTERCHANGE~", payload=EDI)
+    assert str(ei.value).startswith("unparseable X12 reply: ")
+    assert "X12PeekError" in str(ei.value)  # safe_exc's "<type>: <msg>" signature
+    assert ei.value.__cause__ is None and ei.value.__context__ is None
+
+
 # --- X12-18: RTE end-to-end composition (capture -> RESPONSE stage -> re-ingress) ----------------
 #
 # The ADR-0016/0013 loop through the store: a captured reply becomes one immutable `response` artifact +

@@ -24,8 +24,8 @@ the vetted network call.
   endpoint that is not loopback. :func:`_endpoint_opener` says which opener that gives.
 * **Off the event loop.** :meth:`AiBroker.chat` blocks (a provider POST), and so can construction,
   which builds rest.py's shared opener on first use (BACKLOG #2484), or reads the CA and CRL files
-  for an opener of its own. The API route runs the build and :meth:`AiBroker.chat` each through
-  :func:`asyncio.to_thread`.
+  when it builds the anchored opener :func:`_endpoint_opener` holds. The API route runs the build
+  and :meth:`AiBroker.chat` each through :func:`asyncio.to_thread`.
 * **Revocation (BACKLOG #2193 slice (e), BACKLOG #5527).** The endpoint's certificate is verified,
   and stdlib ssl checks no OCSP. It checks no CRL unless ``[tls].crl_file`` is set, the ``[tls]``
   policy is handed in, and the endpoint is not loopback. So an
@@ -187,22 +187,26 @@ def _endpoint_opener(
 ) -> urllib.request.OpenerDirector:
     """The opener the broker dials ``endpoint`` through, under the instance ``[tls]`` ``policy``
     (BACKLOG #5527). ``None``, no policy reached the broker, resolves as the empty policy does:
-    the OS trust store and no CRL. The two differ only in the refusal's text, which offers
-    ``[tls].crl_file`` only where a policy reached the broker (``crl_reachable``).
+    the OS trust store and no CRL. The two differ only in the remedy the refusal and the warn
+    line name: each offers ``[tls].crl_file`` only where a policy reached the broker
+    (``crl_reachable``).
 
     The anchor is resolved by ``rest.http_family_trust_anchor``, as for every HTTP-family hop, here
     with no ``tls_ca_file`` of its own: ``[tls].internal_ca_file`` under ``augment`` or ``pinned``,
     and ``[tls].crl_file`` in any mode, each only for a host that is not loopback. So this is where
-    a CRL reaches this hop. An anchor that narrows gets an anchored opener of its own. One that
-    narrows nothing gets rest.py's shared opener, which is never mutated: callers compare an
-    opener to it by identity to learn that.
+    a CRL reaches this hop. An anchor that narrows gets the held anchored opener, built on first
+    use. One that narrows nothing gets rest.py's shared opener, which is never mutated: callers
+    compare an opener to it by identity to learn that.
 
     **The anchored opener is held across requests**, though the broker is built for each one: one
-    slot, keyed on the resolved anchor, so a changed ``[tls]`` policy builds a new one and drops the
-    old. Held, its context is a live hop as every connection's is, so ``loaded_crls`` records the
-    CRL it holds, the expiry monitor judges that copy, and ``crl_reload`` brings it current when
-    the file is replaced. Built per request, it would read and judge the CA and CRL files on every
-    assist call, and record a held copy for each throwaway context.
+    slot, keyed on the resolved anchor, so a narrowing anchor that differs builds a new one in its
+    place. An anchor that narrows nothing leaves the slot as it is, so an opener held before stays
+    held. A replaced opener is no longer held here, but ``loaded_crls`` keeps its context's record
+    until the opener is garbage-collected. Held, its context is a live hop as every connection's
+    is, so ``loaded_crls`` records the CRL it holds, the expiry monitor judges that copy, and
+    ``crl_reload`` brings it current when the file is replaced. Built per request, it would read
+    and judge the CA and CRL files on every assist call, and record a held copy for each throwaway
+    context.
 
     Raises ``ValueError`` or ``OSError`` for a file that cannot be loaded or a CRL that
     ``harden_crl_check`` refuses; a build that raises caches nothing."""

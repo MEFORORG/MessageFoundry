@@ -9,6 +9,7 @@ subcommand (the smallest CLI surface that runs the anchor resolver without start
 
 from __future__ import annotations
 
+import os
 import textwrap
 from pathlib import Path
 
@@ -698,6 +699,210 @@ def test_anchor_settings_store_path_tolerates_no_settings(tmp_path: Path) -> Non
     from messagefoundry.config.anchor import anchor_settings_store_path
 
     anchor_settings_store_path(None, cwd=tmp_path)  # support-bundle's unloaded case: no raise
+
+
+# BACKLOG #5926 closing steps 1 and 2 (step 1 is also #5927's remaining harm): a store path no
+# anchor can place is refused, at load for [store].path, and before the join for serve's and
+# supervise's --db, which they anchor before the load.
+
+_NO_FILE = "names no file"
+_DRIVE = "drive-relative"
+_TRIMMED = "ends in a dot or a space, which Windows trims from a file name"
+
+
+@pytest.mark.parametrize("value", ["", ".", "./", "..", "site-dir/..", "site-dir/", "site-dir/."])
+def test_a_store_path_naming_no_file_is_refused_at_load(value: str) -> None:
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import StoreSettings, settings_error_detail
+
+    # Joined under the root, each names a directory, which passes an exists() guard.
+    with pytest.raises(ValidationError, match=r"\[store\]\.path .*names no file") as exc:
+        StoreSettings(path=value)
+    assert "site-dir" not in settings_error_detail(exc.value)  # the value is withheld
+
+
+_WHITESPACE = "holds only whitespace or separator characters (value withheld)"
+
+
+@pytest.mark.parametrize("value", ["   ", " ", "\t ", "\n", "\x1f"])
+def test_a_blank_store_path_is_refused_as_blank_not_as_naming_no_file(value: str) -> None:
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import StoreSettings, store_path_refusal
+
+    with pytest.raises(ValidationError) as exc:
+        StoreSettings(path=value)
+    text = str(exc.value)
+    assert "[store].path" in text and _WHITESPACE in text, text
+    assert _NO_FILE not in text, text
+    # store_path_refusal names whatever setting or flag it is given.
+    refusal = store_path_refusal(value, name="--db")
+    assert refusal is not None and refusal.startswith(f"--db {_WHITESPACE}"), refusal
+
+
+@pytest.mark.parametrize(
+    ("value", "why"),
+    [
+        ("C:site-store.db", _DRIVE),  # drive-relative: per-process current directory of C:
+        ("/C:site-store.db", _DRIVE),  # the anchor strips the slash, leaving C:site-store.db
+        ("site-store.db:x", "file stream"),  # an NTFS alternate data stream
+        ("site-store...", _TRIMMED),  # Win32 trims the dots
+        ("site-store.db ", _TRIMMED),  # and a trailing space, so this is site-store.db
+        ("site-store ", _TRIMMED),
+        ("site-store/ ", _TRIMMED),  # a last part of one space names site-store itself
+        ("site-store\\..", _NO_FILE),  # a backslash separates parts on Windows
+    ],
+)
+def test_a_windows_only_store_path_shape_is_refused_on_windows(value: str, why: str) -> None:
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import StoreSettings, settings_error_detail
+
+    if os.name == "nt":
+        with pytest.raises(ValidationError, match=why) as exc:
+            StoreSettings(path=value)
+        assert "site-store" not in settings_error_detail(exc.value)  # the value is withheld
+    else:  # POSIX: each is an ordinary file name and anchors under the root
+        assert StoreSettings(path=value).path == value
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX spelling rules")
+def test_backslash_and_trailing_blank_are_ordinary_file_names_on_posix() -> None:
+    from messagefoundry.config.settings import StoreSettings
+
+    # As on main: neither is a directory on POSIX, so neither is refused.
+    for value in ("store\\..", "data/ ", "mf.db ", "mf.db."):
+        assert StoreSettings(path=value).path == value
+
+
+def test_plain_store_paths_stay_accepted() -> None:
+    from messagefoundry.config.settings import StoreSettings
+
+    for value in ("mf.db", "data/mf.db", ":memory:", str(Path.cwd() / "mf.db")):
+        assert StoreSettings(path=value).path == value
+
+
+def _skip_drive_case_off_windows(db: str) -> None:
+    if db and not Path(db).drive:
+        pytest.skip("drive-qualified relative paths exist only on Windows")
+
+
+_UNANCHORABLE = [
+    pytest.param("", _NO_FILE, id="empty"),
+    pytest.param("C:mf.db", _DRIVE, id="drive"),
+]
+
+
+@pytest.mark.parametrize(("db", "why"), _UNANCHORABLE)
+def test_an_offline_command_refuses_an_unanchorable_db(
+    away_from_root: tuple[Path, Path], capsys: pytest.CaptureFixture[str], db: str, why: str
+) -> None:
+    root, svc = away_from_root
+    _skip_drive_case_off_windows(db)
+    rc = main(["audit-verify", "--service-config", str(svc), "--db", db])
+    out = capsys.readouterr()
+    assert rc == 2, out.out + out.err
+    assert "[store].path" in out.out + out.err and why in out.out + out.err, out.out + out.err
+    assert not any(root.iterdir()), "a refused path must not create a store"
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+@pytest.mark.parametrize(("db", "why"), _UNANCHORABLE)
+def test_serve_and_supervise_refuse_an_unanchorable_db_under_a_root(
+    away_from_root: tuple[Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    db: str,
+    why: str,
+) -> None:
+    def _no_spawn(*args: object, **kwargs: object) -> object:
+        raise AssertionError("supervise spawned engine shards")
+
+    monkeypatch.setattr("messagefoundry.pipeline.supervisor.supervise", _no_spawn)
+    root, svc = away_from_root
+    _skip_drive_case_off_windows(db)
+    argv = [command, "--project-root", str(root), "--service-config", str(svc), "--db", db]
+    rc = main(argv)
+    out = capsys.readouterr()
+    assert rc == 2, out.out + out.err
+    assert "--db" in out.err and why in out.err, out.err
+    assert not any(root.iterdir())
+
+
+# A server backend opens no file at [store].path or --db; the path places at least the generated
+# TLS pair, so a directory is a fair value and the SQLite refusals do not apply.
+
+#: Synthetic connection fields a server backend requires at load; nothing connects in these tests.
+_SERVER = {"server": "db.example.invalid", "database": "mf", "username": "mefor"}
+
+
+@pytest.mark.parametrize("backend", ["postgres", "sqlserver"])
+@pytest.mark.parametrize("value", ["state/", "C:/mefor/state/", ""])
+def test_a_server_backend_store_path_naming_a_directory_loads(backend: str, value: str) -> None:
+    from messagefoundry.config.settings import StoreSettings
+
+    store = StoreSettings.model_validate({"backend": backend, "path": value, **_SERVER})
+    assert store.path == value
+
+
+class _PastTheDbCheck(Exception):
+    """Raised by the first step after the --db check, so the command stops there."""
+
+
+@pytest.mark.parametrize("command", ["serve", "supervise"])
+def test_a_server_backend_db_with_a_colon_is_not_refused(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    # supervise derives each engine shard's --db as <stem>_<shard tag>.db, and an engine shard tag
+    # may hold a colon, which the SQLite rules refuse on Windows. On a server backend it names no file.
+    import messagefoundry.__main__ as cli_main
+
+    reached: list[str] = []
+
+    def _stop(*args: object, **kwargs: object) -> object:
+        reached.append(command)
+        raise _PastTheDbCheck
+
+    for name in _OFFLINE_AT_REST_ENV:
+        monkeypatch.delenv(name, raising=False)
+    # The first step each command takes after its --db check.
+    target = "_client_cert_shim_wanted" if command == "serve" else "_floor_or_refusal"
+    monkeypatch.setattr(cli_main, target, _stop)
+    svc = tmp_path / "messagefoundry.toml"
+    fields = "".join(f'{key} = "{value}"\n' for key, value in _SERVER.items())
+    svc.write_text(f'[store]\nbackend = "postgres"\n{fields}', encoding="utf-8")
+    db = str(tmp_path / "messagefoundry_east:1.db")
+    # main's last-resort guard turns the stop into a failing exit; what matters is that it ran.
+    main([command, "--service-config", str(svc), "--db", db])
+    assert reached == [command], capsys.readouterr().err
+    assert "--db" not in capsys.readouterr().err
+
+
+def test_supervise_judges_its_db_not_an_unused_file_store_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Every engine shard is started with a --db derived from supervise's, which overrides the
+    # file's [store].path, so a bad file value with a valid --db must not refuse the fleet.
+    import messagefoundry.__main__ as cli_main
+
+    reached: list[bool] = []
+
+    def _stop(*args: object, **kwargs: object) -> object:
+        reached.append(True)
+        raise _PastTheDbCheck
+
+    for name in _OFFLINE_AT_REST_ENV:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(cli_main, "_floor_or_refusal", _stop)  # the step after the --db check
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text('[store]\npath = "data/"\n', encoding="utf-8")  # names a directory
+    main(["supervise", "--service-config", str(svc), "--db", str(tmp_path / "mf.db")])
+    assert reached == [True], capsys.readouterr().err
 
 
 def _names(output: str, path: Path) -> bool:

@@ -6,7 +6,8 @@ Its four quarantine arms (oversize, gunzip failure, content mismatch, scanner re
 drop to ``.error`` and logged a WARNING, and wrote nothing to the store, although the runner injects
 the connection-event sink on every source and the MLLP over-cap arm has always used it. An operator
 watching the console saw nothing when a partner's drop was quarantined. Each arm now emits one event
-whose reason carries no exact copy of the file name. A scanner quoting it in another form is kept:
+whose reason carries no copy of the file name in a form ``safe_exc`` replaces. A scanner quoting it in
+another form is kept:
 ``_QUOTED_FORMS`` pins that limit, which ``docs/PHI.md`` section 7 row 7 states.
 
 Deliberately ASCII-only: pytest echoes a failing body to a cp1252 console on Windows.
@@ -37,7 +38,10 @@ _QUOTED_FORMS: list[tuple[str, str, str, bool]] = [
     ("no_extension", _NAME, _NAME.removesuffix(".hl7"), True),
     ("percent_encoded", "DOE JOHN.hl7", "DOE%20JOHN.hl7", True),
     ("decomposed_unicode", "JOS\u00c9_ADT.hl7", "JOSE\u0301_ADT.hl7", True),
-    ("escaped_unicode", "JOS\u00c9_ADT.hl7", "JOS\\xc9_ADT.hl7", True),
+    # The ascii() form, which safe_exc replaces as it does the name (BACKLOG #5815).
+    ("escaped_unicode", "JOS\u00c9_ADT.hl7", "JOS\\xc9_ADT.hl7", False),
+    # A JSON escape with uppercase hex, a spelling none of those forms produces.
+    ("escaped_json_upper_hex", "JOS\u00c9_ADT.hl7", "JOS\\u00C9_ADT.hl7", True),
 ]
 
 
@@ -117,7 +121,7 @@ async def test_each_quarantine_arm_records_one_event_without_the_file_name(
     ("name", "quoted", "kept"), [f[1:] for f in _QUOTED_FORMS], ids=[f[0] for f in _QUOTED_FORMS]
 )
 @pytest.mark.usefixtures("_no_scan_hook")
-async def test_the_scan_reject_reason_scrubs_only_an_exact_copy_of_the_name(
+async def test_the_scan_reject_reason_scrubs_only_the_forms_safe_exc_replaces(
     tmp_path: Path, name: str, quoted: str, kept: bool
 ) -> None:
     """Pins the limit ``docs/PHI.md`` section 7 row 7 states. A stronger scrub turns this red, and

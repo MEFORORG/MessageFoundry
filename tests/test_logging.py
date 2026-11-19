@@ -30,6 +30,7 @@ from messagefoundry import __main__, logging_setup, secretscrub
 from messagefoundry.controlchars import has_lone_surrogate
 from messagefoundry.logging_setup import (
     _CREDENTIAL_QUERY_KEYS,
+    BinaryCarriageScrubFilter,
     ControlCharScrubFilter,
     CredentialQueryScrubFilter,
     CredentialScrubFilter,
@@ -2239,6 +2240,7 @@ def test_configure_stderr_logging_installs_the_filter_chain() -> None:
         RedactionFilter,
         CredentialQueryScrubFilter,
         CredentialScrubFilter,  # BACKLOG #1478 -- the credential-label vocabulary
+        BinaryCarriageScrubFilter,  # BACKLOG #5378 -- after every label pass
         ControlCharScrubFilter,
     ]
 
