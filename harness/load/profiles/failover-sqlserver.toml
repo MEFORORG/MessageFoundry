@@ -11,7 +11,7 @@
 # (no false inversions from sender-pool concurrency).
 [load]
 name = "failover-sqlserver"
-description = "Two-node active-passive primary-kill under load: recovery + no-loss + per-lane ordering"
+description = "Two-node active-passive primary-kill under load on SQL Server (TTL 8.0): recovery + no-loss + per-lane ordering"
 pool_size = 1                 # single serialized stream → sound per-lane ordering check
 corpus_count_per_trigger = 25
 poll_interval_s = 0.5

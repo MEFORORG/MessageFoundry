@@ -199,8 +199,8 @@ before any traffic is sent. Built-ins:
 | `smoke` | Tiny zero-loss wiring check (not a perf measurement) | CI gate |
 | `fanout-baseline` | ADT-dominant mixed feed at high fan-out; characterizes a realistic mix | On-demand |
 | `soak` | Long steady-state; watches DB/WAL growth + dead-letter accumulation | On-demand |
-| `failover` | Two-node active-passive primary-kill under load (`--failover`; see below) | On-demand / CI (server DB) |
-| `failover-sqlserver` | `failover` with a TTL of 8.0 rather than 6.0, for `--db-backend sqlserver`: SQL Server refuses `failover`'s 4.0 / 6.0 at config load (BACKLOG #5979) | On-demand / CI (SQL Server) |
+| `failover` | Two-node active-passive primary-kill under load (`--failover`; see below) | On-demand / CI (Postgres) |
+| `failover-sqlserver` | `failover` with a TTL of 8.0 rather than 6.0, for a SQL Server store (`MEFOR_STORE_BACKEND=sqlserver`; `--db-backend` only labels the report): SQL Server refuses `failover`'s 4.0 / 6.0 at config load (BACKLOG #5979) | On-demand / CI (SQL Server) |
 
 Phases are `warmup` / `ramp` / `sustained` / `spike` / `soak`; only **`sustained`/`soak`** phases are
 *measured* (SLOs evaluated against them — warmup/ramp/spike are transient). Loop models per phase:
@@ -310,8 +310,8 @@ export MEFOR_STORE_SCHEMA_MANAGEMENT=auto
 python -m harness --failover failover --db-backend postgres --report-json out/load/failover.json
 ```
 
-On SQL Server run the `failover-sqlserver` profile instead (`--failover failover-sqlserver --db-backend
-sqlserver`). SQL Server refuses `failover`'s fence 4.0 / TTL 6.0 at config load, so that profile widens
+On a SQL Server store (`MEFOR_STORE_BACKEND=sqlserver`) run the `failover-sqlserver` profile instead
+(`--failover failover-sqlserver --db-backend sqlserver`). SQL Server refuses `failover`'s fence 4.0 / TTL 6.0 at config load, so that profile widens
 the TTL to 8.0, and the Postgres profile keeps its tighter recovery bound (BACKLOG #5979).
 
 What it does ([`harness/load/failover.py`](../harness/load/failover.py)):

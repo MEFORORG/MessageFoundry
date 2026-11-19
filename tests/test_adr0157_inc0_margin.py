@@ -35,6 +35,7 @@ is what a first deployment running active-passive HA would have hit.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -404,6 +405,17 @@ def test_the_postgres_failover_timings_are_not_loosened_for_sql_server() -> None
     assert timings["failover.toml"].leader_lease_ttl_seconds == 6.0
     assert timings["tests/_failover_load_support.py:postgres"].leader_lease_ttl_seconds == 5.0
     assert Failover().leader_lease_ttl_seconds == 6.0
+
+
+def test_the_sql_server_failover_profile_differs_from_failover_only_in_its_ttl() -> None:
+    """failover.toml says the SQL Server profile differs only in its TTL. Pin that, so the two legs'
+    failover gates keep measuring the same scenario."""
+    pg = load_profile(PROFILES_DIR / "failover.toml")
+    ms = load_profile(PROFILES_DIR / "failover-sqlserver.toml")
+    assert pg.failover is not None and ms.failover is not None
+    assert ms.failover.leader_lease_ttl_seconds == 8.0
+    assert replace(ms.failover, leader_lease_ttl_seconds=6.0) == pg.failover
+    assert replace(ms, name=pg.name, failover=pg.failover, description=pg.description) == pg
 
 
 def test_sql_server_refuses_the_postgres_failover_timings(tmp_path: Path) -> None:

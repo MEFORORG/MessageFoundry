@@ -956,7 +956,8 @@ separate broker and no node-to-node socket — coordination rides the shared `[s
    The defaults trade a ~30 s crash-failover for margin; lower all three **proportionally** for faster
    failover at the cost of tolerance for a slow DB / GC pause. **On SQL Server there is a floor:** at
    the stock `[store].acquire_timeout`, config load refuses a fence/TTL pair whose detection margin
-   (`leader_lease_ttl_seconds - leader_fence_timeout_seconds - one fence tick`) is 2 s or less, and a
+   (`leader_lease_ttl_seconds - leader_fence_timeout_seconds - one fence tick`) is 2 s or less, at
+   least, and a
    tighter pair above that can step the derived renew clamp down (BACKLOG #5979). Widen the gap
    between the fence and the TTL rather than lowering them in strict proportion; the
    `lease_renew_timeout_seconds` row of [CONFIGURATION.md](CONFIGURATION.md) gives the arithmetic.
@@ -1018,8 +1019,8 @@ Failover is **not instantaneous** — quantify *your* window from these drills; 
       **re-delivered** after its lease expires — so confirm your downstream connectors **dedupe / are
       idempotent**, then reconcile sent-vs-delivered across the drill.
 - [ ] **Record the measured window** and, if needed, tune `heartbeat < fence < ttl` down proportionally
-      and re-drill. On SQL Server, keep within the margin floor in step 3 above, or the nodes refuse
-      the config at load.
+      and re-drill. On SQL Server, keep within the margin floor in section 14.1, step 3, or the nodes
+      refuse the config at load.
 
 ### 14.4 HA go-live checklist
 
