@@ -43,7 +43,7 @@ import io
 import re
 import tokenize
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import FunctionType
 
@@ -363,7 +363,7 @@ def _add_definition_span(
         if fn is not None:
             file, span = _fn_span(fn)
             positions = (
-                _decorator_positions(sources, file, span, fn, old)
+                _decorator_positions(sources, file, span, fn, old, target_kind)
                 if file is not None and span is not None
                 else frozenset()
             )
@@ -377,7 +377,7 @@ def _add_definition_span(
             add_py_span(
                 conn.source_file,
                 _statement_span(conn.source_file, conn.source_line),
-                _call_line_positions(sources, conn.source_file, conn.source_line, old),
+                _call_line_positions(sources, conn.source_file, conn.source_line, old, target_kind),
             )
         elif conn.source_file and _is_connections_toml(conn.source_file):
             toml_targets.add((conn.source_file, "name"))
@@ -385,10 +385,15 @@ def _add_definition_span(
     if target_kind in _DECLARATION_FACTORIES:
         # lookup/fhir_lookup/reference are code-first declarations (``DatabaseLookup("old", …)`` etc.)
         # whose spec records no source line — locate the declaring statement by parsing the modules.
-        file, span = _scan_declaration_span(config_dir, _DECLARATION_FACTORIES[target_kind], old)
+        file, span, name_arg = _scan_declaration_span(
+            config_dir, _DECLARATION_FACTORIES[target_kind], old
+        )
+        # The scan found the declaring call itself, so its name argument is taken from it, never
+        # re-found by line: a declaration wrapped in another call (with_smart_backend(...)) is
+        # still the one renamed.
         positions = (
-            _call_line_positions(sources, file, span.start, old)
-            if file is not None and span is not None
+            frozenset({sources.position(file, name_arg)})
+            if file is not None and name_arg is not None
             else frozenset()
         )
         add_py_span(file, span, positions)
@@ -473,34 +478,38 @@ def _referrer_sites(
         roots: list[object] = [fn]
         if ref.referrer_kind == "handler" and ref.referrer in registry.handler_accepts:
             roots.append(registry.handler_accepts[ref.referrer])
-        # A router names handlers by returning them, a handler names outbounds by Send(); a helper
-        # either reaches may hand the name back to it, so a helper's return value is a role too.
-        own_roles = _ROLE_RETURN if ref.referrer_kind == "router" else _ROLE_SEND
         sites: list[_Site] = []
         # A referrer whose own function cannot be read is unresolved. A predicate that is not a plain
         # function (a partial, a callable instance) is not: the index cannot read it either, so no
         # edge came from it.
         complete = bool(reached_functions(fn))
+        funcs: list[tuple[int, FunctionType, str, _Span]] = []
+        reached: list[FunctionType] = []
         for root in roots:
             for depth, func in enumerate(reached_functions(root)):
+                reached.append(func)
                 file, span = _fn_span(func)
                 if file is None or span is None:
                     complete = complete and depth > 0
-                elif table_kind is None:
-                    roles = own_roles if depth == 0 else own_roles | _ROLE_RETURN
-                    rewritable = _role_positions(sources, file, span, old, roles)
-                    sites.append(_Site(file, span, None, rewritable))
-                elif depth == 0:
-                    rewritable = _role_positions(sources, file, span, old, frozenset(), table_kind)
-                    rewritable |= _default_positions(sources, func, file, span, old)
-                    sites.append(_Site(file, span, None, rewritable))
                 else:
-                    allowed = _accessor_positions(sources, file, span, old, table_kind)
-                    allowed |= _default_positions(sources, func, file, span, old)
-                    sites.append(_Site(file, span, frozenset(allowed)))
-                bound_sites, located = _module_binding_sites(func, old, table_kind, sources)
-                sites.extend(bound_sites)
-                complete = complete and located
+                    funcs.append((depth, func, file, span))
+        scans = _scan_referrer(sources, funcs, old, ref.referrer_kind, table_kind)
+        role_globals = {name for scan in scans for name in scan.globals}
+        for (depth, func, file, span), scan in zip(funcs, scans, strict=True):
+            rewritable = scan.positions
+            if table_kind is not None:
+                rewritable |= _default_positions(sources, func, file, span, old)
+            if table_kind is None or depth == 0:
+                sites.append(_Site(file, span, None, frozenset(rewritable)))
+            else:
+                allowed = _accessor_positions(sources, file, span, old, table_kind) | rewritable
+                sites.append(_Site(file, span, frozenset(allowed)))
+        for func in reached:
+            bound_sites, located = _module_binding_sites(
+                func, old, table_kind, sources, role_globals
+            )
+            sites.extend(bound_sites)
+            complete = complete and located
         return sites, complete
     if ref.referrer_kind == "inbound":
         conn = registry.inbound.get(ref.referrer)
@@ -514,7 +523,7 @@ def _referrer_sites(
             # the inbound's own name or a sibling argument equal to the router's is another value
             # (BACKLOG #5980). A router= the statement does not spell leaves the site empty, which
             # reports the inbound unresolved.
-            binding = _role_positions(sources, conn.source_file, span, old, _ROLE_ROUTER)
+            binding = _router_binding_positions(sources, conn.source_file, span, old)
             return [_Site(conn.source_file, span, binding)], True
         if conn.source_file and _is_connections_toml(conn.source_file):
             # The referent edge is the router binding; rewrite only the `router = "..."` value.
@@ -563,68 +572,154 @@ def _default_positions(
 
 # --- referent roles (BACKLOG #5980) -------------------------------------------
 
-#: Role tags :func:`_role_positions` looks for: a ``Send()`` target, a function's return value (a
-#: router's handler names, or a name a helper hands back), and an inbound's ``router=`` value.
-_ROLE_SEND = frozenset({"send"})
-_ROLE_RETURN = frozenset({"return"})
-_ROLE_ROUTER = frozenset({"router"})
+#: Calls that hand back their first argument's elements, so a name inside it is still the value.
+_COPY_CALLS = frozenset({"list", "tuple", "set", "frozenset", "sorted", "reversed"})
 
 #: Methods through which a local list or set collects names (``handlers.append("h")``).
 _COLLECTOR_METHODS = frozenset({"append", "extend", "add", "insert"})
 
 _FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
 
+_FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
 
-def _role_positions(
+
+@dataclass
+class _Flow:
+    """What one function's role expressions are made of: the string constants they carry, and the
+    names they read them through that the function does not bind itself -- its own parameters,
+    module globals or attributes, and the helpers whose return value they take."""
+
+    consts: list[ast.Constant] = field(default_factory=list)
+    unbound: set[str] = field(default_factory=set)
+    calls: set[str] = field(default_factory=set)
+
+
+@dataclass
+class _Scan:
+    """One reached function's referent positions, the module names its roles read, and the
+    parameters (as ``(index, name)``, index -1 for keyword-only) whose value reaches a role."""
+
+    positions: set[tuple[int, int]]
+    globals: set[str]
+    calls: set[str]
+    slots: set[tuple[int, str]]
+
+
+def _scan_referrer(
+    sources: SourceCache,
+    funcs: list[tuple[int, FunctionType, str, _Span]],
+    old: str,
+    referrer_kind: str,
+    table_kind: str | None,
+) -> list[_Scan]:
+    """Scan each reached function of one referrer for the literals equal to ``old`` in a referent
+    role: a ``Send()`` target for a handler, a returned name for a router, the accessor's first
+    argument for a table rename, the return value of a helper whose result one of those reads, and
+    an argument passed to a helper parameter that reaches one. Helpers feed each other, so the scan
+    runs to a fixed point."""
+    nodes = [_function_node(sources, file, span, func) for _d, func, file, span in funcs]
+    send = table_kind is None and referrer_kind == "handler"
+    returns: set[str] = set()
+    slots: dict[str, set[tuple[int, str]]] = {}
+    scans: list[_Scan] = []
+    for _ in range(len(funcs) + 1):
+        scans = []
+        for (depth, func, file, span), node in zip(funcs, nodes, strict=True):
+            if depth == 0:
+                give_back = referrer_kind == "router" and table_kind is None
+            else:
+                give_back = func.__name__ in returns
+            scans.append(
+                _scan_function(sources, file, span, node, old, send, give_back, table_kind, slots)
+            )
+        new_returns = {name for scan in scans for name in scan.calls}
+        new_slots: dict[str, set[tuple[int, str]]] = {}
+        for (_depth, func, _file, _span), scan in zip(funcs, scans, strict=True):
+            if scan.slots:
+                new_slots.setdefault(func.__name__, set()).update(scan.slots)
+        if new_returns == returns and new_slots == slots:
+            break
+        returns, slots = new_returns, new_slots
+    return scans
+
+
+def _function_node(
+    sources: SourceCache, file: str, span: _Span, func: FunctionType
+) -> _FunctionNode | None:
+    """The outermost ``def`` (or lambda) node for ``func`` inside ``span``."""
+    parsed = sources.parse(file)
+    if parsed is None:
+        return None
+    is_lambda = func.__name__ == "<lambda>"
+    for node in ast.walk(parsed[0]):
+        if not isinstance(node, _FUNCTION_NODES) or not span.start <= node.lineno <= span.end:
+            continue
+        if (
+            isinstance(node, ast.Lambda)
+            if is_lambda
+            else getattr(node, "name", "") == func.__name__
+        ):
+            return node
+    return None
+
+
+def _scan_function(
     sources: SourceCache,
     file: str,
     span: _Span,
+    node: _FunctionNode | None,
     old: str,
-    roles: frozenset[str],
-    accessor: str | None = None,
-) -> frozenset[tuple[int, int]]:
-    """The positions in ``span`` of the literals equal to ``old`` that one of ``roles`` (or, with
-    ``accessor`` set, that table kind's accessor) reads as a name: written there directly, or
-    carried there by a container, a conditional, or a local variable assigned in the same function.
-    A literal in any other role, such as a comparison operand or a lookup key, is not one."""
-    parsed = sources.parse(file)
-    if parsed is None:
-        return frozenset()
-    out: set[tuple[int, int]] = set()
-    scopes: list[ast.AST] = [parsed[0]]
-    scopes.extend(n for n in ast.walk(parsed[0]) if isinstance(n, _FUNCTION_NODES))
-    for scope in scopes:
-        roots: list[ast.expr] = []
-        if isinstance(scope, ast.Lambda) and "return" in roles:
-            roots.append(scope.body)
-        for node in _own_nodes(scope):
-            roots.extend(_role_roots(node, roles, accessor))
-        if not roots:
-            continue
-        values = _local_values(scope)
-        for root in roots:
-            for const in _carried(root, values, set()):
-                if const.value == old:
-                    pos = sources.position(file, const)
-                    if span.start <= pos[0] <= span.end:
-                        out.add(pos)
-    return frozenset(out)
+    send: bool,
+    give_back: bool,
+    accessor: str | None,
+    slots: Mapping[str, set[tuple[int, str]]],
+) -> _Scan:
+    """The referent literals in ``node``'s own body (never a nested function's), per
+    :func:`_scan_referrer`'s roles."""
+    if node is None:
+        return _Scan(set(), set(), set(), set())
+    flow = _Flow()
+    roots: list[ast.expr] = []
+    if give_back and isinstance(node, ast.Lambda):
+        roots.append(node.body)
+    for child in _own_nodes(node):
+        roots.extend(_role_roots(child, send, give_back, accessor, slots))
+    values = _local_values(node)
+    for root in roots:
+        _carried(root, values, set(), flow)
+    positions = {
+        pos
+        for const in flow.consts
+        if const.value == old
+        and span.start <= (pos := sources.position(file, const))[0] <= span.end
+    }
+    args = node.args
+    positional = [a.arg for a in (*args.posonlyargs, *args.args)]
+    keyword_only = {a.arg for a in args.kwonlyargs}
+    own_slots = {(positional.index(p), p) for p in flow.unbound if p in positional}
+    own_slots |= {(-1, p) for p in flow.unbound if p in keyword_only}
+    module_names = flow.unbound - set(positional) - keyword_only
+    return _Scan(positions, module_names, flow.calls, own_slots)
 
 
-def _role_roots(node: ast.AST, roles: frozenset[str], accessor: str | None) -> list[ast.expr]:
-    """The expressions ``node`` reads as a name in one of ``roles``, or as ``accessor``'s table."""
-    if isinstance(node, ast.Return):
-        return [node.value] if "return" in roles and node.value is not None else []
+def _role_roots(
+    node: ast.AST,
+    send: bool,
+    give_back: bool,
+    accessor: str | None,
+    slots: Mapping[str, set[tuple[int, str]]],
+) -> list[ast.expr]:
+    """The expressions ``node`` reads as a referent name."""
+    if isinstance(node, (ast.Return, ast.Yield, ast.YieldFrom)):
+        return [node.value] if give_back and node.value is not None else []
     if not isinstance(node, ast.Call):
         return []
     out: list[ast.expr] = []
     called = _call_name(node.func)
-    if "send" in roles and called == "Send":
+    if send and called == "Send":
         target = _first_or_keyword(node, "to")
         if target is not None:
             out.append(target)
-    if "router" in roles:
-        out.extend(kw.value for kw in node.keywords if kw.arg == "router")
     if (
         accessor is not None
         and called is not None
@@ -633,6 +728,11 @@ def _role_roots(node: ast.AST, roles: frozenset[str], accessor: str | None) -> l
         and not isinstance(node.args[0], ast.Starred)
     ):
         out.append(node.args[0])
+    for index, name in slots.get(called or "", ()):
+        if 0 <= index < len(node.args) and not isinstance(node.args[index], ast.Starred):
+            out.append(node.args[index])
+        else:
+            out.extend(kw.value for kw in node.keywords if kw.arg == name)
     return out
 
 
@@ -644,15 +744,10 @@ def _first_or_keyword(call: ast.Call, keyword: str) -> ast.expr | None:
     return next((kw.value for kw in call.keywords if kw.arg == keyword), None)
 
 
-def _own_nodes(scope: ast.AST) -> Iterator[ast.AST]:
-    """The nodes ``scope`` (a module or a function) evaluates itself: a nested function's body is its
-    own scope, while its decorators and defaults are evaluated here."""
-    if isinstance(scope, ast.Lambda):
-        stack: list[ast.AST] = [scope.body]
-    elif isinstance(scope, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef)):
-        stack = list(scope.body)
-    else:
-        return
+def _own_nodes(scope: _FunctionNode) -> Iterator[ast.AST]:
+    """The nodes a function evaluates itself: a nested function's or class's body is not one, while
+    a nested function's decorators and defaults are."""
+    stack: list[ast.AST] = [scope.body] if isinstance(scope, ast.Lambda) else list(scope.body)
     while stack:
         node = stack.pop()
         yield node
@@ -661,24 +756,24 @@ def _own_nodes(scope: ast.AST) -> Iterator[ast.AST]:
                 stack.extend(node.decorator_list)
             stack.extend(node.args.defaults)
             stack.extend(d for d in node.args.kw_defaults if d is not None)
-        else:
+        elif not isinstance(node, ast.ClassDef):
             stack.extend(ast.iter_child_nodes(node))
 
 
-def _local_values(scope: ast.AST) -> dict[str, list[ast.expr]]:
-    """The values each local name of a function ``scope`` is given: assigned, or collected through a
-    list or set method. A module name is a binding site of its own (:func:`_module_binding_sites`)."""
+def _local_values(scope: _FunctionNode) -> dict[str, list[ast.expr]]:
+    """The values each local name of a function is given: assigned (a tuple target paired with a
+    tuple value), taken in turn from a ``for`` or comprehension iterable, or collected through a
+    list or set method. Flow-insensitive: every value a name is ever given counts."""
     values: dict[str, list[ast.expr]] = {}
-    if not isinstance(scope, _FUNCTION_NODES):
-        return values
     for node in _own_nodes(scope):
         if isinstance(node, ast.Assign):
             for target in node.targets:
-                if isinstance(target, ast.Name):
-                    values.setdefault(target.id, []).append(node.value)
+                _bind(target, node.value, values, element=False)
         elif isinstance(node, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
-            if isinstance(node.target, ast.Name) and node.value is not None:
-                values.setdefault(node.target.id, []).append(node.value)
+            if node.value is not None:
+                _bind(node.target, node.value, values, element=False)
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            _bind(node.target, node.iter, values, element=True)
         elif (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Attribute)
@@ -690,35 +785,103 @@ def _local_values(scope: ast.AST) -> dict[str, list[ast.expr]]:
     return values
 
 
+def _bind(
+    target: ast.expr, value: ast.expr, values: dict[str, list[ast.expr]], *, element: bool
+) -> None:
+    """Record ``value`` (or, with ``element``, each element of it) for the names ``target`` binds.
+    A tuple target over a value it cannot pair element by element binds nothing, so a name read
+    through it stays unresolved rather than taking a sibling's value."""
+    if element and isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+        for elt in value.elts:
+            _bind(target, elt, values, element=False)
+        return
+    if isinstance(target, ast.Name):
+        values.setdefault(target.id, []).append(value)
+        return
+    if (
+        not element
+        and isinstance(target, (ast.Tuple, ast.List))
+        and isinstance(value, (ast.Tuple, ast.List))
+        and len(target.elts) == len(value.elts)
+        and not any(isinstance(e, ast.Starred) for e in (*target.elts, *value.elts))
+    ):
+        for sub_target, sub_value in zip(target.elts, value.elts, strict=True):
+            _bind(sub_target, sub_value, values, element=False)
+
+
 def _carried(
-    expr: ast.expr, values: Mapping[str, list[ast.expr]], seen: set[str]
-) -> Iterator[ast.Constant]:
-    """The ``str`` constants ``expr``'s value carries whole: itself, an element of a list, tuple or
-    set, a branch of a conditional or a boolean operator, a dict value (never its key), or a value a
-    local name in ``values`` was given. A constant inside a comparison, a call or an f-string is not
-    carried, since the value there is not the constant."""
+    expr: ast.expr, values: Mapping[str, list[ast.expr]], seen: set[str], flow: _Flow
+) -> None:
+    """Add to ``flow`` what ``expr``'s value is made of: a ``str`` constant itself, an element of a
+    list, tuple or set, a branch of a conditional or a boolean operator, a dict value (never its
+    key), an operand of ``+`` that is not itself a constant, the argument of a copying call, a
+    ``.get()`` default, or a value a local name was given. A constant inside a comparison, another
+    call or an f-string is not carried, since the value there is not the constant."""
     if isinstance(expr, ast.Constant):
         if isinstance(expr.value, str):
-            yield expr
+            flow.consts.append(expr)
     elif isinstance(expr, (ast.List, ast.Tuple, ast.Set)):
         for elt in expr.elts:
-            yield from _carried(elt, values, seen)
+            _carried(elt, values, seen, flow)
     elif isinstance(expr, ast.Starred):
-        yield from _carried(expr.value, values, seen)
+        _carried(expr.value, values, seen, flow)
     elif isinstance(expr, ast.IfExp):
-        yield from _carried(expr.body, values, seen)
-        yield from _carried(expr.orelse, values, seen)
+        _carried(expr.body, values, seen, flow)
+        _carried(expr.orelse, values, seen, flow)
     elif isinstance(expr, (ast.BoolOp, ast.Dict)):
-        # A boolean operator's operands, or a dict's values: never a key.
         for value in expr.values:
-            yield from _carried(value, values, seen)
+            _carried(value, values, seen, flow)
+    elif isinstance(expr, ast.BinOp) and isinstance(expr.op, ast.Add):
+        # A list concatenation carries both lists; a constant operand is a string being built.
+        for operand in (expr.left, expr.right):
+            if not isinstance(operand, ast.Constant):
+                _carried(operand, values, seen, flow)
     elif isinstance(expr, ast.Subscript):
-        # A value read out of a local table carries that table's values.
-        yield from _carried(expr.value, values, seen)
-    elif isinstance(expr, ast.Name) and expr.id in values and expr.id not in seen:
-        seen.add(expr.id)
-        for value in values[expr.id]:
-            yield from _carried(value, values, seen)
+        # A value read out of a table carries that table's values.
+        _carried(expr.value, values, seen, flow)
+    elif isinstance(expr, ast.Call):
+        _carried_call(expr, values, seen, flow)
+    elif isinstance(expr, ast.Name):
+        if expr.id not in values:
+            flow.unbound.add(expr.id)
+        elif expr.id not in seen:
+            seen.add(expr.id)
+            for value in values[expr.id]:
+                _carried(value, values, seen, flow)
+    elif isinstance(expr, ast.Attribute):
+        flow.unbound.add(expr.attr)
+
+
+def _carried_call(
+    call: ast.Call, values: Mapping[str, list[ast.expr]], seen: set[str], flow: _Flow
+) -> None:
+    """A call's share of :func:`_carried`: a copying call or ``.get()``/``.copy()`` passes its
+    container through; any other call's return value is recorded as a helper's to scan."""
+    called = _call_name(call.func)
+    if called in _COPY_CALLS and isinstance(call.func, ast.Name) and call.args:
+        _carried(call.args[0], values, seen, flow)
+    elif isinstance(call.func, ast.Attribute) and called in ("get", "copy"):
+        _carried(call.func.value, values, seen, flow)
+        if called == "get" and len(call.args) > 1:
+            _carried(call.args[1], values, seen, flow)
+    elif called is not None:
+        flow.calls.add(called)
+
+
+def _router_binding_positions(
+    sources: SourceCache, file: str, span: _Span, old: str
+) -> frozenset[tuple[int, int]]:
+    """The ``router=`` values equal to ``old`` in an inbound's declaring statement at ``span``."""
+    parsed = sources.parse(file)
+    if parsed is None:
+        return frozenset()
+    flow = _Flow()
+    for node in ast.walk(parsed[0]):
+        if isinstance(node, ast.Call) and span.start <= node.lineno <= span.end:
+            for kw in node.keywords:
+                if kw.arg == "router":
+                    _carried(kw.value, {}, set(), flow)
+    return frozenset(sources.position(file, c) for c in flow.consts if c.value == old)
 
 
 def _name_argument_position(
@@ -732,11 +895,23 @@ def _name_argument_position(
     return None
 
 
+def _definition_positions(
+    sources: SourceCache, file: str, calls: list[ast.Call], kind: str, old: str
+) -> frozenset[tuple[int, int]]:
+    """The name argument of each call to ``kind`` among ``calls``, or of every one of ``calls``
+    when none is spelled ``kind`` (an aliased import)."""
+    named = [call for call in calls if _call_name(call.func) == kind] or calls
+    return frozenset(
+        pos for call in named if (pos := _name_argument_position(sources, file, call, old))
+    )
+
+
 def _decorator_positions(
-    sources: SourceCache, file: str, span: _Span, fn: object, old: str
+    sources: SourceCache, file: str, span: _Span, fn: object, old: str, kind: str
 ) -> frozenset[tuple[int, int]]:
     """The name argument of the ``@router("old")`` / ``@handler("old")`` call registering ``fn``, or
-    of ``router("old")(lambda ...)``. The function's body is not part of its definition."""
+    of ``router("old")(lambda ...)``. The function's body is not part of its definition, and nor is
+    another decorator stacked on it."""
     import inspect
 
     parsed = sources.parse(file)
@@ -749,37 +924,44 @@ def _decorator_positions(
             continue
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == fn_name:
             calls.extend(d for d in node.decorator_list if isinstance(d, ast.Call))
-        elif isinstance(node, ast.Call) and isinstance(node.func, ast.Call):
+        elif (
+            fn_name == "<lambda>"
+            and isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Call)
+            and any(isinstance(arg, ast.Lambda) for arg in node.args)
+        ):
             calls.append(node.func)
-    return frozenset(
-        pos for call in calls if (pos := _name_argument_position(sources, file, call, old))
-    )
+    return _definition_positions(sources, file, calls, kind, old)
 
 
 def _call_line_positions(
-    sources: SourceCache, file: str, line: int, old: str
+    sources: SourceCache, file: str, line: int, old: str, kind: str
 ) -> frozenset[tuple[int, int]]:
-    """The name argument of the declaring call that starts on ``line`` (``outbound("old", …)``). A
-    call nested in its arguments (``File(name=…)``) is not the declaration."""
+    """The name argument of the ``inbound("old", …)`` / ``outbound("old", …)`` call on ``line``,
+    which may sit inside another call (``_keep(outbound("old", …))``). A call nested in its
+    arguments is never the declaration."""
     parsed = sources.parse(file)
     if parsed is None:
         return frozenset()
     calls = [n for n in ast.walk(parsed[0]) if isinstance(n, ast.Call) and n.lineno == line]
-    nested = {
-        id(inner)
-        for call in calls
-        for inner in ast.walk(call)
-        if inner is not call and isinstance(inner, ast.Call)
-    }
-    return frozenset(
-        pos
-        for call in calls
-        if id(call) not in nested and (pos := _name_argument_position(sources, file, call, old))
-    )
+    if not any(_call_name(call.func) == kind for call in calls):
+        # An aliased factory: only the outermost calls on the line can be the declaration.
+        nested = {
+            id(inner)
+            for call in calls
+            for inner in ast.walk(call)
+            if inner is not call and isinstance(inner, ast.Call)
+        }
+        calls = [call for call in calls if id(call) not in nested]
+    return _definition_positions(sources, file, calls, kind, old)
 
 
 def _module_binding_sites(
-    func: FunctionType, old: str, table_kind: str | None, sources: SourceCache
+    func: FunctionType,
+    old: str,
+    table_kind: str | None,
+    sources: SourceCache,
+    role_names: set[str],
 ) -> tuple[list[_Site], bool]:
     """The module-level statements that bind a name ``func`` reads and hold ``old`` -- a global in
     ``func``'s own module, or an attribute of a config module it reads (``_consts.TARGET``) in that
@@ -788,7 +970,11 @@ def _module_binding_sites(
 
     A default argument is written in ``func``'s own signature, so it is located by the function's
     site, never here. A closure's binding lives in an enclosing function, and an imported name's in
-    another module, so neither is ever located: such a referrer is unresolved."""
+    another module, so neither is ever located: such a referrer is unresolved.
+
+    For a non-table rename only a binding of a name the referrer reads in a referent role
+    (``role_names``, as :func:`_scan_referrer` found them) is rewritten, and only in its bound
+    value: ``SKIP = "h"`` read only in a comparison is left, and counted (BACKLOG #5980)."""
     names_by_file: dict[str, set[str]] = {}
     required: set[tuple[str | None, str]] = set()
     for captured in captured_values(func, func.__module__):
@@ -813,10 +999,11 @@ def _module_binding_sites(
                 allowed: set[tuple[int, int]] | None = None
                 found = any(span.start <= p[0] <= span.end for p in sources.occurrences(file, old))
                 # The bound value is the referent, not a dict key or a comparison beside it.
+                flow = _Flow()
+                if stmt.value is not None and stmt_names & role_names:
+                    _carried(stmt.value, {}, set(), flow)
                 rewritable = frozenset(
-                    sources.position(file, c)
-                    for c in (_carried(stmt.value, {}, set()) if stmt.value is not None else ())
-                    if c.value == old
+                    sources.position(file, c) for c in flow.consts if c.value == old
                 )
             else:
                 allowed = _accessor_positions(sources, file, span, old, table_kind)
@@ -913,14 +1100,15 @@ def _statement_span(file: str, start_line: int) -> _Span | None:
 
 def _scan_declaration_span(
     config_dir: Path, factories: frozenset[str], old: str
-) -> tuple[str | None, _Span | None]:
+) -> tuple[str | None, _Span | None, ast.expr | None]:
     """Locate the code-first declaration of ``old`` (``Reference("old", …)`` / ``DatabaseLookup("old",
     …)`` / ``FhirLookup("old", …)``) and return its ``(source_file, statement span)``.
 
     lookup/fhir_lookup/reference specs carry no source line (unlike inbound/outbound), so the declaring
     statement is found by parsing each config-dir ``.py`` module and matching a call to one of
-    ``factories`` whose first positional arg is the string literal ``old``. Best-effort: an unparseable
-    module is skipped; the first match wins (a loaded graph holds the name once). Returns ``(None, None)``
+    ``factories`` whose first positional arg is the string literal ``old``; that literal's node is
+    returned too, as the one a rename rewrites. Best-effort: an unparseable
+    module is skipped; the first match wins (a loaded graph holds the name once). Returns ``(None, None, None)``
     when nothing matches — the definition simply isn't rewritten, exactly as before this branch existed.
     Raises :class:`WiringError` when ``config_dir`` cannot be listed, which is not "nothing matches"."""
     # The loader's own file rule: a dot-named backup of a module (vault BACKLOG #2781) or a file in a
@@ -945,8 +1133,8 @@ def _scan_declaration_span(
                 continue
             first = node.args[0]
             if isinstance(first, ast.Constant) and first.value == old:
-                return str(path), _statement_span(str(path), node.lineno)
-    return None, None
+                return str(path), _statement_span(str(path), node.lineno), first
+    return None, None, None
 
 
 def _call_name(func: ast.expr) -> str | None:

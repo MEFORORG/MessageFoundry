@@ -13,6 +13,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from messagefoundry.config.impact import apply_rename, plan_rename
 from messagefoundry.config.reachability import Reference
 from messagefoundry.config.wiring import load_config
@@ -208,3 +210,205 @@ def test_a_code_set_lookup_key_equal_to_the_table_name_is_left_and_reported(
     assert [e.new_literal for e in plan.edits] == ['"meals"']
     assert plan.edits[0].start_col == len("    label = code_set(")
     assert plan.unresolved == (Reference("handler", "h_k", "code_set", "diets"),)
+
+
+_FANOUT_HEAD = (
+    'inbound("IB_F", MLLP(port=2808), router="r_f")\n'
+    'outbound("OB_OLD", MLLP(host="127.0.0.1", port=6959))\n'
+    'outbound("OB_ALT", MLLP(host="127.0.0.1", port=6960))\n'
+    "\n"
+    "def _out(dest, msg):\n"
+    "    return Send(dest, msg)\n"
+    "\n"
+    '@router("r_f")\n'
+    "def r_f(msg):\n"
+    '    return ["h_f"]\n'
+    "\n"
+    '@handler("h_f")\n'
+    "def h_f(msg):\n"
+)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '    return [Send(d, msg) for d in ("OB_OLD", "OB_ALT")]\n',
+        '    out = []\n    for d in ["OB_OLD", "OB_ALT"]:\n        out.append(Send(d, msg))\n'
+        "    return out\n",
+        '    a, b = "OB_OLD", "OB_ALT"\n    return [Send(a, msg), Send(b, msg)]\n',
+        '    return _out("OB_OLD", msg)\n',
+        '    return _out(dest="OB_OLD", msg=msg)\n',
+    ],
+)
+def test_fan_out_send_forms_are_rewritten(tmp_path: Path, body: str) -> None:
+    config_dir = _write_config(tmp_path, _FANOUT_HEAD + body)
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    text = _mod(config_dir)
+    assert '"OB_OLD"' not in text
+    assert '"OB_ALT"' in text
+    load_config(config_dir)
+
+
+_ROUTER_FORMS_HEAD = (
+    'inbound("IB_RF", MLLP(port=2809), router="r_rf")\n'
+    'outbound("OB_RF", MLLP(host="127.0.0.1", port=6961))\n'
+    "\n"
+    '@handler("h_old")\n'
+    "def h_old(msg):\n"
+    '    return Send("OB_RF", msg)\n'
+    "\n"
+    '@handler("h_x")\n'
+    "def h_x(msg):\n"
+    '    return Send("OB_RF", msg)\n'
+    "\n"
+    '@router("r_rf")\n'
+    "def r_rf(msg):\n"
+)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '    yield "h_old"\n',
+        '    routes = {"ADT": "h_old"}\n    return [routes.get(str(msg), "h_x")]\n',
+        '    return list({"h_old"})\n',
+        '    base = ["h_x"]\n    return base + ["h_old"]\n',
+    ],
+)
+def test_router_return_forms_are_rewritten(tmp_path: Path, body: str) -> None:
+    config_dir = _write_config(tmp_path, _ROUTER_FORMS_HEAD + body)
+    plan = plan_rename(load_config(config_dir), config_dir, "handler", "h_old", "h_new")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert '"h_old"' not in _mod(config_dir)
+    load_config(config_dir)
+
+
+def test_a_wrapped_outbound_definition_is_renamed(tmp_path: Path) -> None:
+    config_dir = _write_config(
+        tmp_path,
+        "def _keep(conn):\n"
+        "    return conn\n"
+        "\n"
+        'inbound("IB_W", MLLP(port=2810), router="r_w")\n'
+        '_keep(outbound("OB_OLD", MLLP(host="127.0.0.1", port=6962)))\n'
+        "\n"
+        '@router("r_w")\n'
+        "def r_w(msg):\n"
+        '    return ["h_w"]\n'
+        "\n"
+        '@handler("h_w")\n'
+        "def h_w(msg):\n"
+        '    return Send("OB_OLD", msg)\n',
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    apply_rename(plan)
+    assert '_keep(outbound("OB_NEW"' in _mod(config_dir)
+    load_config(config_dir)
+
+
+def test_a_wrapped_declaration_is_renamed(tmp_path: Path) -> None:
+    config_dir = _write_config(
+        tmp_path,
+        "from messagefoundry import DatabaseLookup, db_lookup\n"
+        "\n"
+        "def _keep(spec):\n"
+        "    return spec\n"
+        "\n"
+        'inbound("IB_L", MLLP(port=2814), router="r_l")\n'
+        'outbound("OB_L", MLLP(host="127.0.0.1", port=6966))\n'
+        '_keep(DatabaseLookup("clarity", server="db", database="C", username="u", password="p"))\n'
+        "\n"
+        '@router("r_l")\n'
+        "def r_l(msg):\n"
+        '    return ["h_l"]\n'
+        "\n"
+        '@handler("h_l")\n'
+        "def h_l(msg):\n"
+        '    row = db_lookup("clarity", "SELECT 1", ())\n'
+        '    return Send("OB_L", msg)\n',
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "lookup", "clarity", "clarity2")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert '"clarity"' not in _mod(config_dir)
+    load_config(config_dir)
+
+
+def test_a_table_name_passed_to_a_helper_parameter_is_rewritten(tmp_path: Path) -> None:
+    config_dir = _write_config(
+        tmp_path,
+        'inbound("IB_T", MLLP(port=2811), router="r_t")\n'
+        'outbound("OB_T", MLLP(host="127.0.0.1", port=6963))\n'
+        "\n"
+        "def _lookup(code, table):\n"
+        "    return code_set(table).get(code)\n"
+        "\n"
+        '@router("r_t")\n'
+        "def r_t(msg):\n"
+        '    return ["h_t"]\n'
+        "\n"
+        '@handler("h_t")\n'
+        "def h_t(msg):\n"
+        '    label = _lookup("A", "diets")\n'
+        '    return Send("OB_T", msg)\n',
+        codesets=("diets",),
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "code_set", "diets", "meals")
+    assert plan.unresolved == ()
+    assert [e.new_literal for e in plan.edits] == ['"meals"']
+
+
+def test_a_name_read_only_in_a_comparison_is_left_outside_the_body(tmp_path: Path) -> None:
+    config_dir = _write_config(
+        tmp_path,
+        'inbound("IB_M", MLLP(port=2812), router="r_m")\n'
+        'outbound("OB_M", MLLP(host="127.0.0.1", port=6964))\n'
+        'SKIP = "h_old"\n'
+        "\n"
+        "def _tag():\n"
+        '    return "h_old"\n'
+        "\n"
+        '@router("r_m")\n'
+        "def r_m(msg):\n"
+        "    if str(msg) == SKIP or str(msg) == _tag():\n"
+        "        return []\n"
+        '    return ["h_old"]\n'
+        "\n"
+        '@handler("h_old")\n'
+        "def h_old(msg):\n"
+        '    return Send("OB_M", msg)\n',
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "handler", "h_old", "h_new")
+    apply_rename(plan)
+    text = _mod(config_dir)
+    assert 'SKIP = "h_old"' in text
+    assert '    return "h_old"\n' in text
+    assert 'return ["h_new"]' in text
+    assert plan.unresolved == (Reference("router", "r_m", "handler", "h_old"),)
+
+
+def test_a_stacked_decorator_argument_equal_to_the_name_is_left(tmp_path: Path) -> None:
+    config_dir = _write_config(
+        tmp_path,
+        "def tag(_label):\n"
+        "    return lambda fn: fn\n"
+        "\n"
+        'inbound("IB_D", MLLP(port=2813), router="r_d")\n'
+        'outbound("OB_D", MLLP(host="127.0.0.1", port=6965))\n'
+        "\n"
+        '@router("r_d")\n'
+        "def r_d(msg):\n"
+        '    return ["h_old"]\n'
+        "\n"
+        '@handler("h_old")\n'
+        '@tag("h_old")\n'
+        "def h_old(msg):\n"
+        '    return Send("OB_D", msg)\n',
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "handler", "h_old", "h_new")
+    apply_rename(plan)
+    assert '@handler("h_new")\n@tag("h_old")' in _mod(config_dir)
+    load_config(config_dir)
