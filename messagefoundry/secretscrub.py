@@ -1360,8 +1360,7 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # THE ENCODED FORM OF A CHARACTER IT STOPS AT FOR STRUCTURE (``%2C``, ``%3B``, ``%3F``, ``%23``, a
 # quote or a parenthesis), either case. That "%" it takes (BACKLOG #5386, added item 3), so
 # ``redis://:p%40Kv9x@host`` is hidden. The run after an empty user's first segment still stops at
-# every "%", so a "%" there ends the reading as any stop does; the residuals below say what that
-# leaves printed. An encoded separator still stops the first segment, for the reason a
+# every "%". An encoded separator still stops the first segment, for the reason a
 # literal "|" does, below, and an encoded "," for the reason a literal one does: taken, it read
 # ``smtp://:587%2Ccc=admin@corp`` as a password and named the wrong host (code review). It still
 # stops at "[" and "]", so it never crosses a placeholder: taking them was tried and declined,
@@ -1372,22 +1371,11 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # label to the member pass. And a "|" it took, as in ``redis://:Tk|mrn@h``, was a separator the PHI
 # pass of a second handler no longer read, so an unlabelled value elsewhere in the token, which that
 # pass had hidden, printed (code review, round 4). The lookbehind ``(?<=//:)`` is what tells the two
-# cases apart. THE RESIDUALS FOLLOW FROM ONE RULE. The first segment, then the run after it, each
-# take characters up to the first one their class stops at, and the match ends at the last "@"
-# taken; where none was taken, nothing is read. An empty user's first segment hands over to the
-# run at "=" or "@"; at any other character it stops at, the run, whose class stops there too,
-# takes nothing. The run's class is the one above: at least ``; ? # & , ( ) | ^ ~ { } < > [ ] %``
-# and a quote, not "=". So, at least: a stop character after the password's own "@" cuts the
-# password at the last "@" before it, and the rest prints, so ``postgres://svc:Kv9x@Zq7;w@db``
-# prints ``Zq7;w`` and ``redis://:p%40s@Kv9x%41@host`` prints ``Kv9x%41``. With a user the narrow
-# pass made that same cut before #5386; an empty user's password printed whole. And an empty
-# user's password with a stop character before its first "@" is not read at all, a "%" counting
-# there once past an "=", so ``redis://:p;ss@host``, ``redis://:p%7Css@host``,
-# ``redis://:p;x@y;z@host`` and ``redis://:p=s%40Kv9x@host`` print whole, as before #5386. An "="
-# alone stops nothing, so ``redis://:p=ss@host`` is read and hidden. Both cases count a character
-# an earlier filter wrote: on the log chain the PHI pass runs first, so a password holding a
-# date- or name-shaped run reaches this pass holding ``[redacted]``, and
-# ``redis://:Zq7-19800505-Kv9x@host`` prints ``Zq7-`` and ``-Kv9x`` (code review, round 4).
+# cases apart.
+#
+# Known residuals: at least the shapes pinned in tests/test_b532r_redaction_segments.py (the
+# test_known_residual_* tests) print some or all of a password. This list is not complete, and no
+# rule here predicts which shapes are read.
 #
 # AN EMPTY USER'S FIRST SEGMENT MAY BE EMPTY (``*+``), so ``redis://:=Pw@db`` and ``redis://:@Pw@db``
 # are read (code review of BACKLOG #5386). WITH A USER IT MAY NOT (``++``), so

@@ -110,7 +110,7 @@ def test_known_residual_a_value_after_a_dsn_label_with_no_semicolon_in_the_passw
     assert "Sec_77" in redact_log_line(scrub_log_text(line))
 
 
-#: KNOWN RESIDUALS: the two "%" lines the comment on ``secretscrub._WIDE_DSN_PASSWORD`` quotes,
+#: KNOWN RESIDUALS: the two lines with a '%' after the first segment,
 #: each with what an entry point prints of it, ``{placeholder}`` standing for that entry point's
 #: own. This pins the outputs, not the comment's text: a red means the reading changed, and the
 #: comment must change with it.
@@ -129,6 +129,15 @@ def test_known_residual_a_percent_after_the_first_segment_is_printed(
     line: str, printed: str, call: Callable[[str], str], placeholder: str
 ) -> None:
     assert call(line) == printed.replace("{placeholder}", placeholder)
+
+
+@pytest.mark.parametrize("call", _ENTRY_POINTS, ids=_IDS)
+def test_known_residual_a_semicolon_before_the_first_at_prints_whole(
+    call: Callable[[str], str],
+) -> None:
+    """Pinned as printed: a red means the reading changed."""
+    line = "redis://:p;x@y;z@host"
+    assert call(line) == line
 
 
 def test_a_semicolon_separated_address_list_keeps_its_host() -> None:
