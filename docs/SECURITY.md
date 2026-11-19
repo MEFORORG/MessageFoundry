@@ -3776,9 +3776,11 @@ a correct password on a session the ceremony lost clears nothing and raises no
 `auth.login_after_failures`. The write is `record_login_success` with an expected snapshot. On
 every backend it writes only while the account row, read inside the write's own transaction, still
 holds the six lockout columns, `disabled`, `auth_provider`, `directory_object_id` and
-`session_epoch` of the row the proof decided on. So a failure, a lock, a disable, a re-bind or an
-end-every-session raise that any writer commits after that read, on this engine shard or another,
-leaves the counters as they are. On SQLite the conditional write does its Vault transit work
+`session_epoch` of the row the proof decided on. So a failure, a lock, a disable, a re-bind or a
+raise of the account's own `session_epoch` that any writer commits after that read, on this engine
+shard or another, leaves the counters as they are. The store's global session epoch (BACKLOG
+#5091) is not in the snapshot: an every-account revoke is seen only once it has raised this
+account's own `session_epoch`, which it does after raising the global one. On SQLite the conditional write does its Vault transit work
 before it takes the write lock, then re-reads the row under that lock and writes only if the row is
 the one that work read, so another process cannot commit in between. The compare reads the account
 row only: a revoke of the rotated session itself, after the rotation and before the clear, is not
@@ -3786,8 +3788,8 @@ seen. At least these outcomes follow, and **only on a re-auth whose clear is due
 nothing to clear makes no such check:
 
 - A changed lockout column clears nothing, and the re-auth keeps its rotated session.
-- An account gone, disabled, re-bound or with its sessions ended, or whose record fails its seal
-  or cannot be verified by Vault transit, is granted nothing. A failing record is reported, the
+- An account gone, disabled, re-bound or whose own `session_epoch` moved, or whose record fails
+  its seal or cannot be verified by Vault transit, is granted nothing. A failing record is reported, the
   store is asked to end the rotated session, and the re-auth answers `session_lost`. Its
   `auth.reauth` row carries `clear_denied` and `session_ended`, which says whether that revoke
   landed as far as the re-auth saw; when it did not, the rotated session may still exist, its

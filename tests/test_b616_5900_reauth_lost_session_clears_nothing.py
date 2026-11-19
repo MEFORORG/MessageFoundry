@@ -40,6 +40,7 @@ from messagefoundry.auth.service import (
     STEP_UP_ACTION_MFA_ENROLL,
     AuthService,
 )
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.row_seal import (
     SESSION_KIND,
@@ -1023,5 +1024,66 @@ async def test_a_write_outside_the_guard_during_the_transit_work_redoes_it(tmp_p
         assert user is not None and user.failed_attempts == 0
         assert user.password_hash != before.password_hash
         assert len(await store.list_audit(action="auth.reauth")) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_store_error_at_the_clear_ends_the_rotated_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The raise path grants nothing, so the session the ceremony rotated is ended, as on the
+    denied path, rather than left live with its token never handed back. The interrupted row says
+    the session is lost and that its revoke landed."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, identity, token = await _setup(store)
+        before = len(await store.list_audit(action="auth.reauth"))
+        real_revoke = store.revoke_session
+        revoked: list[str] = []
+
+        async def refused(user_id: str, **kwargs: Any) -> None:
+            raise OSError("synthetic store refusal")
+
+        async def spy_revoke(token_hash: str, *args: Any, **kwargs: Any) -> Any:
+            revoked.append(token_hash)
+            return await real_revoke(token_hash, *args, **kwargs)
+
+        monkeypatch.setattr(store, "record_login_success", refused)
+        monkeypatch.setattr(store, "revoke_session", spy_revoke)
+        monkeypatch.setattr("messagefoundry.auth.service._REAUTH_READBACK_PAUSES", (0.0,))
+        with pytest.raises(OSError, match="synthetic store refusal"):
+            await service.reauth(identity, GOOD, token=token)
+        assert len(revoked) == 1 and revoked[0] != hash_token(token)
+        rotated = await store.get_session(revoked[0])
+        assert rotated is not None and rotated.revoked_at is not None
+        rows = [json.loads(r["detail"]) for r in await store.list_audit(action="auth.reauth")]
+        assert len(rows) == before + 1
+        assert rows[0]["interrupted"] is True and rows[0]["session_lost"] is True
+        assert rows[0]["session_ended"] is True
+    finally:
+        await store.close()
+
+
+async def test_a_refused_revoke_on_the_raise_path_is_logged_and_recorded(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The revoke on the raise path refused twice is logged as the denied path logs it, and the
+    interrupted row says the session was not ended."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, identity, token = await _setup(store)
+
+        async def refused(*args: Any, **kwargs: Any) -> None:
+            raise OSError("synthetic store refusal")
+
+        monkeypatch.setattr(store, "record_login_success", refused)
+        monkeypatch.setattr(store, "revoke_session", refused)
+        monkeypatch.setattr("messagefoundry.auth.service._REAUTH_READBACK_PAUSES", (0.0,))
+        caplog.set_level("WARNING", logger="messagefoundry.auth.service")
+        with pytest.raises(OSError, match="synthetic store refusal"):
+            await service.reauth(identity, GOOD, token=token)
+        assert "and could not end the session it rotated" in caplog.text
+        row = json.loads((await store.list_audit(action="auth.reauth"))[0]["detail"])
+        assert row["session_lost"] is True and row["session_ended"] is False
     finally:
         await store.close()
