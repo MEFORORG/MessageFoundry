@@ -558,7 +558,8 @@ async def test_concurrent_upload_parses_hold_at_most_two_threads(
 
 async def test_the_new_multipart_caps_answer_400_and_413(engine: Engine, tmp_path: Path) -> None:
     """BACKLOG #5522: through the route, too many parts is a 400 (the base ``MultipartError``) and an
-    oversized text field is a 413 (``MultipartTooLargeError``). Nothing is stored either way."""
+    oversized text field is a 413 (``MultipartTooLargeError``). A truncated body (#5787) is a 400.
+    Nothing is stored in any case."""
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app, multipart
 
@@ -585,6 +586,11 @@ async def test_the_new_multipart_caps_answer_400_and_413(engine: Engine, tmp_pat
         r = await c.post("/uploads", content=big, headers=h)
         assert r.status_code == 413, r.text
         assert "multipart text field is" in r.json()["detail"], r.text
+        # BACKLOG #5787: a truncated upload, cut before its close marker, is a 400 too.
+        truncated = body_of([file_part])[: -len(b"--\r\n") - 1]
+        r = await c.post("/uploads", content=truncated, headers=h)
+        assert r.status_code == 400, r.text
+        assert "no closing boundary delimiter" in r.json()["detail"], r.text
         assert (await c.get("/uploads", headers=h)).json()["files"] == []
 
 

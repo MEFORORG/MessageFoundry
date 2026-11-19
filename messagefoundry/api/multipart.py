@@ -183,6 +183,7 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     # Anything before the first delimiter is the ignorable preamble; the closing "--boundary--" is
     # the first later delimiter followed by b"--", and anything after it is the ignorable epilogue.
     pos = body.find(delim)
+    seen = pos != -1
     while pos != -1:
         start = pos + len(delim)
         if body.startswith(b"--", start):
@@ -198,7 +199,7 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             first = _NOT_CRLF.search(body, start, end)
             start = end if first is None else first.start()
         if nxt == -1 and start == end:
-            break  # a last delimiter line with nothing after it: not a part (refused just below)
+            break  # a last delimiter line with no close marker and nothing after it: not a part
         # A part with no header separator is skipped below, but it is counted: each one costs a
         # find, so the cap has to bound them too, or a body of empty parts would walk unbounded.
         count += 1
@@ -231,14 +232,6 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
                 content_end = end - 2  # the CRLF before the next delimiter
             spans.append((start, sep, content_start, content_end))
         pos = nxt
-    # BACKLOG #5787: a body that ends before its closing delimiter is a truncated upload, and would
-    # otherwise be taken as a whole one. The walk above found no close marker, so look for one
-    # anywhere: this refuses only a body that carries none, and leaves every body that carries one
-    # parsed exactly as before. Where a delimiter may sit (line start or not) is unchanged.
-    if not closed and delim + b"--" not in body:
-        raise MultipartError(
-            "multipart body has no closing boundary delimiter; the upload may be truncated"
-        )
     parts: list[_Part] = []
     for head_start, head_end, content_start, content_end in spans:
         name, filename = _disposition(body[head_start:head_end])
@@ -256,6 +249,22 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
                 f"{_FILE_AS_FIELD_HINT}"
             )
         parts.append(_Part(name=name, filename=filename, start=content_start, end=content_end))
+    # BACKLOG #5787: a body with no closing delimiter is refused, since a truncated upload is one, and
+    # it would otherwise be taken as a whole one. Last, so a body refused for anything above keeps
+    # that refusal. Where the walk did not stop on a close marker, one is looked for anywhere: this
+    # refuses only a body that carries none, and every body that carries one parses as it did before.
+    # Where a delimiter may sit (line start or not) is unchanged.
+    if not closed:
+        if not seen:
+            # No delimiter at all: an empty body, or one built with another boundary than the
+            # Content-Type names. Not a truncation, so the refusal does not say it is one.
+            raise MultipartError(
+                "multipart body holds no delimiter for the boundary its Content-Type names"
+            )
+        if delim + b"--" not in body:
+            raise MultipartError(
+                "multipart body has no closing boundary delimiter; the upload may be truncated"
+            )
     return parts
 
 

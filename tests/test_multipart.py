@@ -855,19 +855,43 @@ def test_the_same_body_without_its_close_marker_is_refused(
     case: str, content_type: str, body: bytes
 ) -> None:
     """#5787: each corpus body with its close marker turned into a plain delimiter is refused. A body
-    origin/main parsed is refused for the missing terminator, or for the part cap where the walk now
-    runs on into delimiter text that used to sit after the close marker; one it refused stays
-    refused."""
+    origin/main parsed is refused for the missing terminator (or, for the epilogue body, for the part
+    cap, since the walk now runs on into the delimiter text that sat after the close marker). A body
+    main refused keeps main's refusal, class and all, because the terminator check runs last."""
     marker = _close_marker(content_type)
     unterminated = body.replace(marker, marker[:-2])
     assert marker not in unterminated
     with pytest.raises(MultipartError) as caught:
         parse_multipart_form(content_type, unterminated, max_file_bytes=1024)
-    if _MAIN_OUTCOMES[case][0] == "parsed":
-        assert re.search(
-            "no closing boundary delimiter|more parts than the limit", str(caught.value)
-        )
+    main = _MAIN_OUTCOMES[case]
+    if main[0] == "refused":
+        assert (type(caught.value).__name__, str(caught.value)) == main[1:]
+    elif case == "wk-epilogue-delims":
+        assert "more parts than the limit" in str(caught.value)
+    else:
+        assert "no closing boundary delimiter" in str(caught.value)
         assert type(caught.value) is MultipartError  # 400: the body is malformed, not too large
+
+
+@pytest.mark.parametrize(
+    ("content_type", "body"),
+    [
+        (_CT_B, b""),
+        (_CT_B, b"no delimiter here"),
+        ("multipart/form-data; boundary=Y", b"--B\r\n" + _FP + b"MSH|x\r\n--B--\r\n"),
+    ],
+    ids=["empty", "no-delimiter", "other-boundary"],
+)
+def test_a_body_with_no_delimiter_at_all_is_not_called_truncated(
+    content_type: str, body: bytes
+) -> None:
+    """#5787: a body holding no delimiter for the declared boundary (an empty one, or one built with
+    another boundary) is refused, and the refusal does not send the client looking for a truncation."""
+    with pytest.raises(MultipartError, match="no delimiter for the boundary") as caught:
+        parse_multipart_form(content_type, body, max_file_bytes=1024)
+    assert type(caught.value) is MultipartError
+    with pytest.raises(MultipartError, match="no delimiter for the boundary"):
+        parse_single_file_upload(content_type, body, max_file_bytes=1024)
 
 
 @pytest.mark.parametrize("cut", [3, 4, 7, 12, 30])
