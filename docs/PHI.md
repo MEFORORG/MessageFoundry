@@ -117,17 +117,17 @@ error text, unwrapped, as every reason of a single decrypt's 400. That shape was
 either project's source at a commit, so a release that wraps or prefixes the text would turn such a
 refusal back into the cipher's own error, unaudited and unalerted. A queue payload cell still
 classifies through `is_tag_failure`, which counts every marked Transit value as held, so under
-`vault_transit` any refusal of one Transit gave a verdict on reads as a queue tag failure, and is
-dead-lettered and alerted as before. Under a cipher that names its keys, as the local AES-GCM
-cipher does, a queue payload under a held key that the cipher refuses for any reason other than a
-failed AEAD check is read as corrupt, not drift: at least bad base64, a value too short to hold a
-tag, and a verified plaintext that is not UTF-8. It is still dead-lettered or refused, alerted, and
-on a claim audited as `integrity.queue_tag_failed`, under its own alert subject, `queue-corrupt`;
-its WARNING is not rate-limited (BACKLOG #5884). A marked payload whose marker such a cipher cannot
-read a key id from, for example a prior key not supplied, another cipher's cell or a damaged
-marker, is not read as corrupt: it is audited and alerted on the `queue-tag` subject with a cause
-that claims no corruption. Every value the audit detail's `cause` takes, and what each says, is
-defined once, in `QUEUE_TAG_CAUSES` in `store/queue_tag.py`. A failure on which Transit gave no verdict about the row is
+`vault_transit` any refusal of one Transit gave a verdict is dead-lettered and alerted as before.
+Its audit detail's `cause` reads `tag` only for Transit's AEAD failure, and `unknown` for its other
+verdicts. Under a cipher that names its keys, as the local AES-GCM cipher does, a queue payload
+under a held key that the cipher refuses for any reason other than a failed AEAD check is read as
+corrupt, not drift. It is still dead-lettered or refused, alerted, and on a claim audited as
+`integrity.queue_tag_failed`, under its own alert subject, `queue-corrupt`; its WARNING is not
+rate-limited (BACKLOG #5884). Every value the audit detail's `cause` takes, and what each says, is
+defined once, in `QUEUE_TAG_CAUSES` in `store/queue_tag.py`. **A known gap:** at least a queue
+payload whose marker such a cipher cannot read, including a damaged v4 salt and a prior key not
+supplied, is dead-lettered with the cipher's own error. It gets no `integrity.queue_tag_failed`
+audit row and no alert. A failure on which Transit gave no verdict about the row is
 no tag failure, and the claim does not dead-letter the row (BACKLOG #5765, #5735). Which failures
 are verdicts is stated once, in `_key_service_gave_no_verdict` in `store/queue_tag.py`. Only a row the pooled dispatcher claims through `claim_fifo_heads` takes the ADR 0070
 infra-fault path, so a fault that lasts there stops the lane with a `connection_stopped` alert
