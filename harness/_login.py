@@ -80,8 +80,9 @@ class LoginDialog(QDialog):
         # verified (WP-14); the monitor's _ensure_auth asks for it.
         self.mfa_required = False
         self.entered_password = ""  # nosec B105 (empty seam init, not a credential)
-        # Set when a cancelled sign-in's session could not be ended: it may stay valid until it
-        # expires, and the caller says so.
+        # Set when a cancelled sign-in may have left a session that stays valid until it expires:
+        # its logout failed with anything but a 401, or, after a held close, the sign-in got no
+        # reply. The caller says so.
         self.session_may_remain = False
 
         self._username = QLineEdit()

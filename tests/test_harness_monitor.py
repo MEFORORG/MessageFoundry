@@ -543,9 +543,7 @@ def _settle_login(qapp: Any, dialog: Any) -> None:
     assert not dialog._busy
 
 
-_MAY_REMAIN = (
-    "sign-in cancelled, but its session could not be ended and may stay valid until it expires"
-)
+_MAY_REMAIN = "sign-in cancelled, but a session may stay valid until it expires"
 
 
 @pytest.mark.parametrize(

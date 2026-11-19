@@ -336,8 +336,7 @@ class MonitorPanel(QWidget):
         if not dialog.exec():
             if dialog.session_may_remain:
                 self._set_status(
-                    "sign-in cancelled, but its session could not be ended and may stay valid "
-                    "until it expires",
+                    "sign-in cancelled, but a session may stay valid until it expires",
                     error=True,
                 )
             else:
