@@ -149,8 +149,13 @@ function writerSetting(key: PathSettingKey): ContainedPathSetting | undefined {
     void vscode.window.showErrorMessage(writerRefusal(key, s.dropped));
     return undefined;
   }
-  if (!isExecGated() && escapesByLink(workspaceDir(), s.value)) {
-    void vscode.window.showErrorMessage(linkEscapeRefusal(key));
+  // A blank serviceConfig sends no --service-config (connectionServiceConfig), so the CLI opens its
+  // own fallback, `./messagefoundry.toml` in the workspace folder, at least serve does. That file is
+  // checked in its place, since the blank value names the folder itself.
+  const blank = key === "serviceConfig" && s.value.trim() === "";
+  const checked = blank ? PATH_FALLBACK.serviceConfig : s.value;
+  if (!isExecGated() && escapesByLink(workspaceDir(), checked)) {
+    void vscode.window.showErrorMessage(linkEscapeRefusal(key, blank ? checked : undefined));
     return undefined;
   }
   return s;
@@ -182,20 +187,7 @@ export function writerConfigTarget(): { configDir: string; serviceConfig: string
     return undefined;
   }
   // Nothing was dropped, so the setting is set exactly when it did not come from the default.
-  const flag = connectionServiceConfig(file.value, file.source !== "default");
-  // A set but blank value drops the flag, so the CLI falls back to `./messagefoundry.toml` in the
-  // workspace folder, at least serve does, a file the check of the blank value (the folder itself)
-  // did not read (BACKLOG #5404 item 1). The default value was checked as that file already.
-  if (
-    flag === undefined &&
-    file.source !== "default" &&
-    !isExecGated() &&
-    escapesByLink(workspaceDir(), PATH_FALLBACK.serviceConfig)
-  ) {
-    void vscode.window.showErrorMessage(linkEscapeRefusal("serviceConfig"));
-    return undefined;
-  }
-  return { configDir: dir, serviceConfig: flag };
+  return { configDir: dir, serviceConfig: connectionServiceConfig(file.value, file.source !== "default") };
 }
 
 export function configDir(): string {

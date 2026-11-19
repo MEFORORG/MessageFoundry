@@ -213,15 +213,20 @@ and uses your user value or the default instead, until you trust the workspace (
   that refusal; to use a path elsewhere, remove the workspace value and set the path in user
   settings. Version-control setup writes no commit hook when either folder lies outside the
   workspace, because the hook is committed; it still sets up the rest. Readers compare the spelling
-  only. In a trusted window, a command that writes or starts also refuses a value spelled inside the
-  folder whose named path is a symbolic link or junction leading out of it, climbs with `..`, cannot
-  have its real path read, or, on Windows, has a folder or file name ending in a dot or a space or
-  naming a device such as `NUL`; the fix is a plain folder or file inside the workspace folder, and
-  commands other than New Route and the commit hook also take the link's target as an absolute path
-  in user settings. A set but blank `serviceConfig` has the CLI's own fallback,
-  `messagefoundry.toml` in the workspace folder, checked instead. That check reads the named path only,
-  so a link below it, such as a linked folder under `configDir`, is still followed. The New Route
-  wizard and the security editor make their own link checks too before they write.
+  only. Writers also check the real path, in a trusted window. They refuse a value spelled inside the
+  folder when at least one of these holds:
+  - a symbolic link or junction on the named path leads out of the folder;
+  - the value climbs with `..`;
+  - its real path cannot be read;
+  - on Windows, a folder or file name on it ends in a dot or a space.
+
+  The fix is a plain folder or file inside the workspace folder. Commands other than New Route and
+  the commit hook also take a link's target as an absolute path in user settings. For a set but
+  blank `serviceConfig`, the check reads the CLI's own fallback, `messagefoundry.toml` in the
+  workspace folder. The check reads the named path only, so a link below it is still followed, such
+  as a linked folder under `configDir`. The security editor does not run this check. It makes its
+  own: it collapses a `..` rather than refusing it, and it refuses a link anywhere below the folder.
+  The New Route wizard makes its own link check as well.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. The security
   editor refuses a workspace-set value outside the workspace folder, and any path inside the folder

@@ -13,7 +13,7 @@ import { INTERPRETER_OPTIONS } from "../../engineControlModel";
 import {
   containedPathSetting,
   escapesByLink,
-  hasAmbiguousWin32Name,
+  hasTrailingDotOrSpaceName,
   linkEscapeRefusal,
   resolveInsideWorkspace,
 } from "../../workspaceContainment";
@@ -110,8 +110,8 @@ suite("b532r: writers check the real path of a path setting (BACKLOG #5404 item 
     const cli = code("cli.ts");
     const writer = body(cli, "function writerSetting(");
     // Only a trusted window reads a real path, so an untrusted one touches no file before its refusal.
-    assert.ok(writer.includes("if (!isExecGated() && escapesByLink(workspaceDir(), s.value))"), writer);
-    assert.ok(writer.includes("linkEscapeRefusal(key)"), writer);
+    assert.ok(writer.includes("if (!isExecGated() && escapesByLink(workspaceDir(), checked))"), writer);
+    assert.ok(writer.includes("linkEscapeRefusal(key, blank ? checked : undefined)"), writer);
     assert.ok(writer.indexOf("s.dropped !== false") < writer.indexOf("escapesByLink"), writer);
     // The predicate is the shared one, driven below; cli.ts keeps no copy of it.
     assert.ok(!cli.includes("function escapesByLink("), "cli.ts defines its own escapesByLink");
@@ -194,7 +194,7 @@ suite("b532r: writers check the real path of a path setting (BACKLOG #5404 item 
     return calls;
   }
 
-  test("a Windows-ambiguous name and a '..' are refused before any file-system call", () => {
+  test("a name ending in a dot or a space and a '..' are refused before any file-system call", () => {
     const ws = path.resolve(path.sep, "b532r-ide-no-such-ws");
     const refused = [
       ["cfg.", true],
@@ -203,9 +203,6 @@ suite("b532r: writers check the real path of a path setting (BACKLOG #5404 item 
       ["messagefoundry.toml.", true],
       ["messagefoundry.toml ", true],
       ["a. /b", true],
-      ["nul", true],
-      ["conf/con.toml", true],
-      ["COM1", true],
       ["plain/../x", false],
       ["plain\\..\\x", true],
     ] as const;
@@ -224,13 +221,11 @@ suite("b532r: writers check the real path of a path setting (BACKLOG #5404 item 
 
   test("off Windows those names are names, and the folder itself is not refused by spelling", () => {
     withWorkspace((ws) => {
-      for (const v of ["messagefoundry.toml.", "nul"]) {
+      for (const v of ["messagefoundry.toml.", "cfg "]) {
         assert.strictEqual(escapesByLink(ws, v, false), false, JSON.stringify(v));
       }
       assert.strictEqual(escapesByLink(ws, "messagefoundry.toml", true), false);
       assert.strictEqual(escapesByLink(ws, "./messagefoundry.toml", true), false);
-      assert.strictEqual(escapesByLink(ws, "nullable.toml", true), false);
-      assert.strictEqual(escapesByLink(ws, "com10", true), false);
       assert.strictEqual(escapesByLink(ws, ".", true), false);
       assert.strictEqual(escapesByLink(ws, "..conf"), false);
     });
@@ -249,19 +244,23 @@ suite("b532r: writers check the real path of a path setting (BACKLOG #5404 item 
     assert.strictEqual(escapesByLink(undefined, "cfg"), false);
   });
 
-  test("hasAmbiguousWin32Name reads every component, on Windows only", () => {
-    assert.strictEqual(hasAmbiguousWin32Name("a.\\b", true), true);
-    assert.strictEqual(hasAmbiguousWin32Name("a/b ", true), true);
-    assert.strictEqual(hasAmbiguousWin32Name("a/aux.d/b", true), true);
-    assert.strictEqual(hasAmbiguousWin32Name("a/.b/c.toml", true), false);
-    assert.strictEqual(hasAmbiguousWin32Name("a./b", false), false);
+  test("hasTrailingDotOrSpaceName reads every component, on Windows only", () => {
+    assert.strictEqual(hasTrailingDotOrSpaceName("a.\\b", true), true);
+    assert.strictEqual(hasTrailingDotOrSpaceName("a/b ", true), true);
+    assert.strictEqual(hasTrailingDotOrSpaceName(".", true), false);
+    assert.strictEqual(hasTrailingDotOrSpaceName("./a", true), false);
+    assert.strictEqual(hasTrailingDotOrSpaceName("a/.b/c.toml", true), false);
+    assert.strictEqual(hasTrailingDotOrSpaceName("a./b", false), false);
   });
 
-  test("a blank serviceConfig has the CLI's own fallback file checked", () => {
-    const fn = body(code("cli.ts"), "export function writerConfigTarget(");
-    assert.ok(fn.includes('file.source !== "default"'), fn);
-    assert.ok(fn.includes("escapesByLink(workspaceDir(), PATH_FALLBACK.serviceConfig)"), fn);
-    assert.ok(fn.indexOf("!isExecGated()") < fn.indexOf("escapesByLink("), fn);
+  test("a blank serviceConfig has the CLI's own fallback file checked, and named", () => {
+    const fn = body(code("cli.ts"), "function writerSetting(");
+    assert.ok(fn.includes('const blank = key === "serviceConfig" && s.value.trim() === ""'), fn);
+    assert.ok(fn.includes("const checked = blank ? PATH_FALLBACK.serviceConfig : s.value"), fn);
+    assert.ok(fn.includes("if (!isExecGated() && escapesByLink(workspaceDir(), checked))"), fn);
+    assert.ok(fn.includes("linkEscapeRefusal(key, blank ? checked : undefined)"), fn);
+    const text = linkEscapeRefusal("serviceConfig", "messagefoundry.toml");
+    assert.ok(text.includes("serviceConfig is blank, so the CLI opens messagefoundry.toml, a path inside"), text);
     assert.strictEqual(
       pkgDefault("messagefoundry.serviceConfig"),
       "messagefoundry.toml",
@@ -271,15 +270,15 @@ suite("b532r: writers check the real path of a path setting (BACKLOG #5404 item 
 
   test("the refusal's remedy names a fix every writer accepts first, and the two that decline the other", () => {
     const text = linkEscapeRefusal("configDir");
-    assert.ok(text.includes("messagefoundry.configDir"), text);
-    assert.ok(text.includes("ends in a dot or a space or is a device name"), text);
+    assert.ok(text.includes("messagefoundry.configDir names a path inside"), text);
+    assert.ok(text.includes("ends in a dot or a space, or its real path cannot be read"), text);
     assert.ok(text.includes("make the workspace folder readable"), text);
-    const plain = text.indexOf("so the setting names a plain folder or file inside the workspace folder.");
+    const plain = text.indexOf("so the path is a plain folder or file inside the workspace folder.");
     const absolute = text.indexOf("absolute path in user settings");
     assert.ok(plain > 0 && absolute > plain, text);
     // The New Route wizard refuses an absolute path outside the folder, and version-control setup
     // commits no hook for one, so the second remedy names both.
-    assert.ok(text.includes("Other commands than New Route and the commit hook"), text);
+    assert.ok(text.includes("Commands other than New Route and the commit hook"), text);
   });
 });
 
