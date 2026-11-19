@@ -510,6 +510,37 @@ def test_a_branch_whose_files_match_the_LANDING_commit_is_releasable(
     assert out["k-landing"] == "RELEASABLE", out
 
 
+def test_a_rename_whose_deletion_never_landed_holds(repo: Path, tmp_path: Path) -> None:
+    """BACKLOG #5483: arm four must compare a renamed file's OLD path too.
+
+    The branch renames ``old.txt`` to ``new.txt``. The landing commit carries ``new.txt``
+    byte-identical but still has ``old.txt``, so the deletion is unmerged work. With rename detection
+    on, the diff lists only ``new.txt``, which matches, and the claim read releasable.
+    """
+    git(repo, "config", "diff.renames", "true")  # git's default, pinned against a user setting
+    (repo / "old.txt").write_text("content that moves\n" * 20, encoding="utf-8")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "a file the branch will rename")
+
+    git(repo, "branch", "renamer", "main")
+    wt = repo.parent / "wt-renamer"
+    git(repo, "worktree", "add", "-q", str(wt), "renamer")
+    git(wt, "mv", "old.txt", "new.txt")
+    git(wt, "commit", "-qm", "rename old.txt to new.txt")
+    git(repo, "worktree", "remove", "--force", str(wt))
+
+    # the landing: the new path arrives, the old path stays -- half the rename merged
+    shutil.copy2(repo / "old.txt", repo / "new.txt")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-qm", "squash that took the new file but not the deletion (#347)")
+    landing = git(repo, "rev-parse", "HEAD").strip()
+
+    write_claim(repo, "k-rename", tmp_path / "vanished", "renamer")
+    github_origin(repo)
+    stub = _gh_stub(tmp_path, _merged_pr("0" * 40, landing=landing))
+    assert verdicts(repo, "-GhCommand", str(stub))["k-rename"] == "HOLD"
+
+
 def test_a_merged_pr_with_no_readable_landing_commit_holds(repo: Path, tmp_path: Path) -> None:
     """The negative control for arm four: a PR at another tip proves an earlier state landed."""
     unmerged_branch(repo, "other-tip")

@@ -655,8 +655,17 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
             $landing = $pr.Landing
             $base = (& git -C $repo merge-base $ref $landing 2>$null)
             $touched = @()
-            if ($base) { $touched = @(& git -C $repo diff --name-only ($base.Trim()) $ref 2>$null) }
-            $identical = $touched.Count -gt 0
+            $listed = $false
+            # --no-renames (BACKLOG #5483): with rename detection on, a rename lists only its NEW path,
+            # so a deletion the landing commit never took would drop out of the comparison below.
+            # With it the old path is listed and compared too, and a path missing on either side
+            # never matches, so a rename or deletion holds. A failed diff is "could not list", never
+            # "touched nothing".
+            if ($base) {
+                $touched = @(& git -C $repo diff --no-renames --name-only ($base.Trim()) $ref 2>$null)
+                $listed = ($LASTEXITCODE -eq 0)
+            }
+            $identical = $listed -and $touched.Count -gt 0
             foreach ($f in $touched) {
                 $a = (& git -C $repo rev-parse --quiet --verify "${ref}:$f" 2>$null)
                 $b = (& git -C $repo rev-parse --quiet --verify "${landing}:$f" 2>$null)
@@ -668,7 +677,8 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
             }
             else {
                 $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "HOLD"
-                    why = "$ahead commit(s) not on $mainRef; PR #$($pr.Number) merged but this tip is not its head and the branch files differ from the landing commit" }
+                    why = $(if ($listed) { "$ahead commit(s) not on $mainRef; PR #$($pr.Number) merged but this tip is not its head and the branch files differ from the landing commit" }
+                        else { "$ahead commit(s) not on $mainRef; PR #$($pr.Number) merged but this tip is not its head, and the files this branch touched could NOT be listed" }) }
             }
         }
         elseif ($pr -is [pscustomobject]) {
