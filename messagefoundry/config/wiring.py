@@ -51,7 +51,6 @@ import sys
 import threading
 import tokenize
 import traceback
-import unicodedata
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
@@ -6761,15 +6760,29 @@ def case_twins(names: Iterable[str]) -> Iterator[tuple[str, str]]:
     share them there while SQLite and Postgres keep them apart. A connection or FHIR lookup name is
     ASCII (the name rule), so the fold is exactly that collation's comparison for it. A reference
     set or database lookup name is not bound by the name rule, so the fold also drops trailing
-    spaces, which SQL Server's ``=`` ignores, and applies NFKC, which folds the width a ``_CI_AS``
-    collation ignores. It still only approximates the collation for such a name: at least kana
-    differences, which that collation also ignores, are not folded, so a pair differing only there
-    passes. Per table: an inbound and an outbound may share a name, as they may exactly."""
-    seen: dict[str, str] = {}
+    U+0020 spaces, which SQL Server's ``=`` ignores, and maps the full-width ASCII forms and the
+    ideographic space to ASCII, the width a ``_CI_AS`` collation ignores. It still only
+    approximates the collation for such a name: at least kana differences and half-width katakana,
+    which that collation also ignores, are not folded, so a pair differing only there passes. A
+    name that is not a string is compared as it is rather than folded, so it cannot crash this. Per
+    table: an inbound and an outbound may share a name, as they may exactly."""
+    seen: dict[object, str] = {}
     for name in names:
-        first = seen.setdefault(unicodedata.normalize("NFKC", name).casefold().rstrip(" "), name)
+        key: object = name
+        if isinstance(name, str):
+            key = name.translate(_FULL_WIDTH_TO_ASCII).casefold().rstrip(" ")
+        first = seen.setdefault(key, name)
         if first != name:
             yield first, name
+
+
+#: The full-width ASCII forms (U+FF01 to U+FF5E) and the ideographic space, mapped to ASCII: the
+#: width difference a SQL Server ``_CI_AS`` collation ignores, and no more, so it folds nothing
+#: that collation keeps apart (BACKLOG #5392).
+_FULL_WIDTH_TO_ASCII: Final = {
+    **{code: code - 0xFEE0 for code in range(0xFF01, 0xFF5F)},
+    0x3000: 0x20,
+}
 
 
 #: The registry tables :meth:`Registry.graph_problems` refuses case twins in, as (rename kind,

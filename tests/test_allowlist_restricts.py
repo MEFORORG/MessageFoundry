@@ -9,6 +9,9 @@ list it wrongly counts would let either treat an open listener as peer-controlle
 from __future__ import annotations
 
 import ipaddress
+import os
+import subprocess
+import sys
 from typing import Any
 
 import pytest
@@ -148,9 +151,9 @@ def _slash8s(*octets: int, prefix: str = "") -> list[str]:
         # An IPv4 entry and its IPv4-mapped spelling are one range, counted once.
         [*_slash8s(10, 11), "::ffff:10.0.0.0/104"],
         [*_slash8s(10, 11), "10.1.0.0/16"],  # an overlap is counted once
-        # Space no remote peer can hold is not counted: loopback, "this network", multicast.
-        ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "0.0.0.0/8"],
-        [*_slash8s(10, 11), *_slash8s(*range(224, 256))],
+        # Space no remote peer's packet can carry as its source is not counted: loopback, multicast.
+        ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"],
+        [*_slash8s(10, 11), *_slash8s(*range(224, 240))],
         ["10.0.0.0/8", "2001:db8::/32", "2001:db9::/32"],  # plain IPv6 carries no IPv4
     ],
 )
@@ -170,6 +173,9 @@ def test_a_list_within_the_ipv4_cap_restricts(allowlist: list[str]) -> None:
         # The same hosts through NAT64 are counted apart from their plain IPv4 spelling.
         [*_slash8s(10, 11), *_slash8s(10, prefix="64:ff9b::")],
         [f"2002:{index:x}::/32" for index in range(513)],  # 513 IPv4 /16s through 6to4
+        # "This network" and class E are counted: at least Linux can use them as unicast.
+        _slash8s(10, 11, 0),
+        [*_slash8s(10, 11), *_slash8s(*range(240, 256))],
     ],
 )
 def test_entries_that_together_pass_the_ipv4_cap_do_not_restrict(allowlist: list[str]) -> None:
@@ -177,6 +183,43 @@ def test_entries_that_together_pass_the_ipv4_cap_do_not_restrict(allowlist: list
     assert "IPv4 addresses a remote peer can hold, more than" in (
         allowlist_shortfall(allowlist) or ""
     )
+
+
+def test_a_sets_reason_does_not_follow_its_hash_order() -> None:
+    # Each failing entry gives a different reason, so reading a set in hash order would make the
+    # refusal text change between processes.
+    code = (
+        "from messagefoundry.netaddr import allowlist_shortfall;"
+        "print(allowlist_shortfall({'10.0.0.0/7', '::/0', 'x', '0.0.0.0/0', '::ffff:0:0/96'}))"
+    )
+    reasons = {
+        subprocess.run(
+            [sys.executable, "-c", code],
+            env={**os.environ, "PYTHONHASHSEED": str(seed)},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        for seed in range(6)
+    }
+    assert len(reasons) == 1, reasons
+
+
+def test_the_http_gate_names_no_allowlist_shortfall_when_a_mode_is_set() -> None:
+    # Under a named intake_auth mode the gate does not weigh the list, so its shortfall is not the
+    # reason for the refusal.
+    source = Source(
+        type=ConnectorType.HTTP,
+        settings={
+            "host": "0.0.0.0",
+            "port": 8080,
+            "intake_auth": "api_key",
+            "source_ip_allowlist": ["0.0.0.0/0"],
+        },
+    )
+    with pytest.raises(WiringError) as exc:
+        check_http_intake_auth(source, "IB_HTTP", posture=HopPosture(enforcing=True))
+    assert "does not count:" not in str(exc.value)
 
 
 def test_the_cap_is_twice_the_ipv4_floor() -> None:

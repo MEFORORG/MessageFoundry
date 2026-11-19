@@ -16164,8 +16164,11 @@ def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | N
     if _has_effective_peer_control(source.settings):
         return
 
+    # The list is weighed only when intake_auth names no mode (_has_effective_peer_control), so
+    # only then is its shortfall the reason for this refusal.
     allowlist = source.settings.get("source_ip_allowlist")
-    shortfall = allowlist_shortfall(allowlist) if allowlist else None
+    no_mode = str(source.settings.get("intake_auth") or "none") == "none"
+    shortfall = allowlist_shortfall(allowlist) if allowlist and no_mode else None
     detail = (
         f"inbound connection {name!r} binds non-loopback host {host!r} with no effective peer "
         "control: anyone who can reach the socket can submit a message. "

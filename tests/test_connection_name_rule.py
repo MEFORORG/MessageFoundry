@@ -403,7 +403,7 @@ def test_every_twin_table_pairs_a_rename_kind_with_its_own_registry_table() -> N
 
 @pytest.mark.parametrize(
     ("first", "second"),
-    [("EPIC", "EPIC "), ("EPIC", "ＥＰＩＣ")],  # a trailing space; full width
+    [("EPIC", "EPIC "), ("EPIC", "\uff25\uff30\uff29\uff23")],  # a trailing space; full width
     ids=["trailing_space", "full_width"],
 )
 def test_a_reference_twin_by_width_or_trailing_space_is_refused(
@@ -419,3 +419,20 @@ def test_a_reference_twin_by_width_or_trailing_space_is_refused(
     )
     with pytest.raises(WiringError, match="duplicate reference set name: .*differs only in case"):
         load_config(tmp_path, allow_empty=True)
+
+
+def test_the_twin_fold_keeps_apart_what_sql_server_keeps_apart(tmp_path: Path) -> None:
+    # The fold adds width and trailing U+0020 to casefold, and no more: a no-break space and a
+    # superscript are compared as written, as SQL Server's `=` compares them.
+    names = ("EPIC", "EPIC\u00a0", "x2", "x\u00b2")
+    (tmp_path / "refs.py").write_text(
+        "from messagefoundry import DatabaseRef, Reference\n"
+        + "\n".join(_REFERENCE_CALL.format(name=name) for name in names)
+        + "\n",
+        encoding="utf-8",
+    )
+    assert set(load_config(tmp_path, allow_empty=True).references) == set(names)
+
+
+def test_a_name_that_is_not_a_string_does_not_crash_the_twin_check() -> None:
+    assert list(wiring.case_twins([123, "123", "A", "a"])) == [("A", "a")]  # type: ignore[list-item]

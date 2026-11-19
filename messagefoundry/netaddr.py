@@ -64,7 +64,7 @@ ALLOWLIST_MIN_PREFIX_V6: Final = 32
 #: floor, such as the 256 ``/8`` networks, together admit the IPv4 internet. Twice a ``/8`` leaves
 #: room for ``10.0.0.0/8`` beside the other RFC 1918 private ranges (``172.16.0.0/12``,
 #: ``192.168.0.0/16``) and RFC 6598's shared address space, a ``/10``. An IPv4-embedded IPv6 entry
-#: counts the IPv4 addresses it can carry, as :func:`allowlist_restricts` says.
+#: counts the IPv4 addresses it can carry, as :func:`allowlist_shortfall` says.
 ALLOWLIST_MAX_IPV4_ADDRESSES: Final = 2 * 2 ** (32 - ALLOWLIST_MIN_PREFIX_V4)
 
 #: The IPv4-mapped block. An entry or address inside it names IPv4 hosts in their IPv6 spelling
@@ -89,7 +89,7 @@ _LATE_IPV4_START: Final = 96
 
 #: THE table of IPv6 ranges that carry an IPv4 address, each with the bit at which the IPv4
 #: address is taken to start (vault BACKLOG #5393: one table where there were two that disagreed
-#: on SIIT and 6to4). :func:`allowlist_restricts` reads all of it, and
+#: on SIIT and 6to4). :func:`allowlist_shortfall` reads all of it, and
 #: :data:`IPV4_EMBEDDING_PREFIXES` is derived from it. A network-specific NAT64 prefix is the
 #: operator's own and cannot be listed.
 IPV4_EMBEDDINGS: Final[tuple[tuple[ipaddress.IPv6Network, int], ...]] = (
@@ -115,14 +115,14 @@ IPV4_EMBEDDING_PREFIXES: Final = tuple(
     network for network, _start in IPV4_EMBEDDINGS if network not in (IPV4_MAPPED, IPV4_TRANSLATED)
 )
 
-#: IPv4 space no remote peer can hold as its source: "this network", loopback, multicast and the
-#: reserved class E block with the limited broadcast address, the last two together as one /3. The
+#: IPv4 space a remote peer's packet cannot carry as its source: loopback, which a host drops as a
+#: martian when it arrives on another interface, and multicast, never a unicast source. The
 #: whole-list count in :func:`allowlist_shortfall` leaves it out, so listing ``127.0.0.0/8`` beside
-#: the private ranges does not use up the cap.
+#: the private ranges does not use up the cap. "This network" (``0.0.0.0/8``) and the reserved
+#: class E block are counted: at least Linux can be set to use them as unicast addresses.
 _NOT_A_PEER_V4: Final = (
-    ipaddress.IPv4Network("0.0.0.0/8"),
     ipaddress.IPv4Network("127.0.0.0/8"),
-    ipaddress.IPv4Network("224.0.0.0/3"),
+    ipaddress.IPv4Network("224.0.0.0/4"),
 )
 
 #: RFC 1122's "this network" block. ``ipaddress`` names only its first address, as unspecified: it
@@ -281,7 +281,7 @@ _ALLOWLIST_ENTRY_TYPES: Final = (
 #: tests/test_allowlist_restricts.py pins them to the table.
 _RULE_TEXT_LATE_RANGES: Final = ("::ffff:0:0/96", "64:ff9b::/96", "2001::/32")
 
-#: The rule :func:`allowlist_restricts` applies, as one clause both gates' refusals quote, so the
+#: The rule :func:`allowlist_shortfall` applies, as one clause both gates' refusals quote, so the
 #: floors, the examples and the derived ``/104`` are stated once in code (vault BACKLOG #5393).
 ALLOWLIST_RULE_TEXT: Final = (
     f"every entry parses and is no wider than /{ALLOWLIST_MIN_PREFIX_V4} (IPv4) or "
@@ -289,11 +289,12 @@ ALLOWLIST_RULE_TEXT: Final = (
     "IPv4 addresses, as "
     f"{NAT64_WELL_KNOWN.supernet(new_prefix=ALLOWLIST_MIN_PREFIX_V6)} does; an IPv6 entry inside "
     f"one fixes at least {ALLOWLIST_MIN_PREFIX_V4} bits of the IPv4 address it carries, so is at "
-    f"least a /{_LATE_IPV4_START + ALLOWLIST_MIN_PREFIX_V4} inside "
-    f"{', '.join(_RULE_TEXT_LATE_RANGES[:-1])} or {_RULE_TEXT_LATE_RANGES[-1]}; and the entries "
-    f"together admit at most {ALLOWLIST_MAX_IPV4_ADDRESSES:,} IPv4 addresses a remote peer can "
-    f"hold, two /{ALLOWLIST_MIN_PREFIX_V4} networks' worth, an IPv6 entry inside such a prefix "
-    "counting the IPv4 addresses it can carry"
+    f"least a /{_LATE_IPV4_START + ALLOWLIST_MIN_PREFIX_V4} inside a prefix whose IPv4 address "
+    f"starts at bit {_LATE_IPV4_START}, at least {', '.join(_RULE_TEXT_LATE_RANGES[:-1])} and "
+    f"{_RULE_TEXT_LATE_RANGES[-1]}; and the entries together admit at most "
+    f"{ALLOWLIST_MAX_IPV4_ADDRESSES:,} IPv4 addresses a remote peer can hold, two "
+    f"/{ALLOWLIST_MIN_PREFIX_V4} networks' worth, an IPv6 entry inside such a prefix counting the "
+    "IPv4 addresses it can carry"
 )
 
 
@@ -352,14 +353,18 @@ def allowlist_shortfall(allowlist: Any) -> str | None:
     where an overlap is counted once. Each other range in :data:`IPV4_EMBEDDINGS` is counted
     apart, since its addresses cannot be matched to plain IPv4 ones with certainty, so the same
     hosts listed under two ranges count twice, which can only fail closed. In the plain IPv4
-    space, address space no remote peer can hold (:data:`_NOT_A_PEER_V4`) is not counted. Plain
+    space, address space no remote peer's packet can carry as its source (:data:`_NOT_A_PEER_V4`)
+    is not counted. Plain
     IPv6 entries outside those ranges are judged by the per-entry floor alone."""
     if not isinstance(allowlist, (list, tuple, set, frozenset)) or not allowlist:
         return "it is not a non-empty list of addresses and networks"
     # The IPv4 ranges the list admits, keyed by the embedding range they arrive under, or by None
     # for plain IPv4 and IPv4-mapped entries.
     admitted: dict[ipaddress.IPv6Network | None, list[ipaddress.IPv4Network]] = {}
-    for entry in allowlist:
+    # A set's order follows string hashing, which changes per process, so the first failing entry,
+    # and with it the reason, would too: read a set in a fixed order.
+    entries = sorted(allowlist, key=repr) if isinstance(allowlist, (set, frozenset)) else allowlist
+    for entry in entries:
         if not isinstance(entry, _ALLOWLIST_ENTRY_TYPES):
             return "an entry is not an address or network"
         try:
