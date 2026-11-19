@@ -3362,17 +3362,27 @@ class PostgresStore:
         rows = await self._fetchall("SELECT namespace, key, value FROM state")
         cache = new_state_cache()  # sealed (BACKLOG #1174); the decrypt below still fails closed
         for r in rows:
-            # #241 F2: fail closed (StoreKeylessError) on a keyless open of an encrypted store, rather
-            # than a raw JSONDecodeError from feeding an mfenc: blob straight to json.loads.
-            cache[(r["namespace"], r["key"])] = decrypt_json_cell(
-                self._cipher,
-                r["value"],
-                aad=cell_aad("state", "value", r["namespace"], r["key"]),
-                table="state",
+            cache[(r["namespace"], r["key"])] = self._decode_state_cell(
+                r["namespace"], r["key"], r["value"]
             )
         self._state_cache = cache
         vrows = await self._fetchall("SELECT namespace, version FROM state_version")
         self._state_versions = {r["namespace"]: int(r["version"]) for r in vrows}
+
+    def _decode_state_cell(self, namespace: str, key: str, stored: str) -> Any:
+        """Decrypt and decode one ``state`` cell, for both the open-time load and the follower
+        :meth:`converge_state_cache`, so both decode a cell the same way (BACKLOG #5311).
+
+        #241 F2: with no key configured, an encrypted cell raises StoreKeylessError rather than a
+        raw JSONDecodeError from feeding an mfenc: blob straight to json.loads.
+        :func:`decrypt_json_cell` states what else it refuses and what its error's message and
+        chain leave out; the traceback's frame locals still hold the decrypted text."""
+        return decrypt_json_cell(
+            self._cipher,
+            stored,
+            aad=cell_aad("state", "value", namespace, key),
+            table="state",
+        )
 
     async def _load_reference_cache(self) -> None:
         """Populate the in-memory reference cache from the ACTIVE snapshot of each set (ADR 0006).
@@ -3408,7 +3418,7 @@ class PostgresStore:
                 entry = cache[r["name"]] = new_reference_set(r["name"])
             versions[r["name"]] = r["version"]
             if r["key"] is not None:  # NULL key = the LEFT-JOIN miss of an empty snapshot
-                # #241 F2: fail closed on a keyless open of an encrypted store (see _load_state_cache).
+                # #241 F2: fail closed on a keyless open of an encrypted store (see _decode_state_cell).
                 entry[r["key"]] = decrypt_json_cell(
                     self._cipher,
                     r["value"],
@@ -3472,14 +3482,7 @@ class PostgresStore:
             seen = self._state_versions.get(ns)
             if seen != version:
                 rows = await self._fetchall("SELECT key, value FROM state WHERE namespace=$1", ns)
-                fresh = {
-                    r["key"]: json.loads(
-                        self._cipher.decrypt(
-                            r["value"], aad=cell_aad("state", "value", ns, r["key"])
-                        )
-                    )
-                    for r in rows
-                }
+                fresh = {r["key"]: self._decode_state_cell(ns, r["key"], r["value"]) for r in rows}
                 pending.append((ns, version, seen, fresh))
         refreshed: list[str] = []
         for ns, version, seen, fresh in pending:
