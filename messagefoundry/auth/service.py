@@ -15492,8 +15492,8 @@ class AuthService:
         found, or the read-back failing, the store error is re-raised: the reset's answer on the
         account is not known, so nothing is granted; a Vault transit Outage refusing the
         audit-chain MAC of ``audits`` is one of those errors (``CipherError``). An Outage at the
-        account record's seal, which is paged and ends no session (ADR 0217's Outage row),
-        answers ``"refused"``: the caller writes its own row, hard. A seal refusal of another kind than the account's record raises, as on the login
+        account record's seal, which is paged and does not itself end the session (ADR 0217's
+        Outage row), answers ``"refused"``: the caller writes its own row, hard. A seal refusal of another kind than the account's record raises, as on the login
         leg, and so does a defect."""
         now = time.time()
         try:
@@ -15937,7 +15937,7 @@ class AuthService:
                     rotated_token = elevation.token
                     try:
                         clear = await self._clear_after_reauth(proof.user, audits)
-                    except BaseException as exc:
+                    except (Exception, asyncio.CancelledError) as exc:
                         # The clear's outcome on the account is not known, at least for a store
                         # error its read-back did not settle or a cancellation, so nothing is
                         # granted. The rotated session is ended as on the denied path below, run
@@ -15953,7 +15953,7 @@ class AuthService:
                             await self._end_reauth_rotated_session_shielded(
                                 rotated_token,
                                 identity.username,
-                                f"its lockout clear raised ({type(exc).__name__})",
+                                f"lockout clear raised ({type(exc).__name__})",
                                 ended,
                             )
                         finally:
@@ -15983,7 +15983,7 @@ class AuthService:
                             await self._end_reauth_rotated_session_shielded(
                                 rotated_token,
                                 identity.username,
-                                "its clear was denied",
+                                "clear was denied",
                                 denied_ended,
                                 propagate=True,
                             )
@@ -16017,14 +16017,19 @@ class AuthService:
                         detail=reauth_detail(interrupted=not finished),
                         client=client,
                     )
-                except BaseException:
+                except (Exception, asyncio.CancelledError):
                     if finished and elevation.token is not None:
+                        if purpose is not None:
+                            # The grant is never handed back with its token; drop it.
+                            self._action_step_up_grants.pop(
+                                (hash_token(elevation.token), purpose), None
+                            )
                         row_refused_ended: list[bool] = []
                         try:
                             await self._end_reauth_rotated_session_shielded(
                                 elevation.token,
                                 identity.username,
-                                "its auth.reauth row was refused",
+                                "auth.reauth row was refused",
                                 row_refused_ended,
                             )
                         finally:

@@ -3796,9 +3796,10 @@ nothing to clear makes no such check:
   `auth.reauth` row carries `clear_denied` and `session_ended`, which says whether that revoke
   landed as far as the re-auth saw; when it did not, the rotated session may still exist, its
   token never handed back.
-- A Vault transit Outage at the account record's seal, which is paged, clears nothing and does
-  not end the rotated session. The re-auth then writes its `auth.reauth` row hard: refused too, the
-  re-auth raises and its rotated token is never handed back. An Outage at the audit-chain MAC of
+- A Vault transit Outage at the account record's seal, which is paged, clears nothing, and the
+  clear does not end the rotated session. The re-auth then writes its `auth.reauth` row hard:
+  refused too, the re-auth raises, its rotated token is never handed back, and the store is asked
+  to end the rotated session. An Outage at the audit-chain MAC of
   the rows the clear appends is a raise from the clear, covered in the last bullet.
 - The `auth.reauth` row, and the `auth.login_after_failures` row when the clear ends a run of
   failures, are appended in the reset's own transaction, so the counters are not reset without

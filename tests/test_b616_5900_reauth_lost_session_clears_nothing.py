@@ -1183,5 +1183,6 @@ async def test_an_outage_at_the_clear_and_a_refused_row_end_the_rotated_session(
         with pytest.raises(OSError, match="synthetic row refusal"):
             await service.reauth(identity, GOOD, token=token, purpose=STEP_UP_ACTION_MFA_ENROLL)
         assert await store.list_sessions("u-bob") == [], "the rotated session was left live"
+        assert not service._action_step_up_grants
     finally:
         await store.close()
