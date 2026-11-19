@@ -112,6 +112,8 @@ def test_set_security_reports_a_reset_that_finds_nothing_as_unchanged(tmp_path: 
         "detail": "no key changed; mf.toml does not exist, so no settings file was created",
     }
     assert not toml.exists() and seen == []
+    # No edit lock either: its file would be the edit's only trace.
+    assert list(tmp_path.iterdir()) == []
     # A file that is there goes through the validated replace like any set, and says so.
     toml.write_text("[security]\nrequire_mfa = false\n", encoding="utf-8")
     result = security_edit.set_security(toml, {"require_mfa": False}, validate=seen.append)
@@ -121,7 +123,8 @@ def test_set_security_reports_a_reset_that_finds_nothing_as_unchanged(tmp_path: 
         "unchanged": ["require_mfa"],
         "rewritten": True,
         "detail": "no key changed; file rewritten by the validated replace every set uses, which "
-        "restricts it to its owner where it can and logs a warning where it cannot",
+        "restricts it to its owner and, where another account owns it on Windows, the editing "
+        "account, and logs a warning where it cannot",
     }
     assert len(seen) == 1 and seen[0] != toml and seen[0].name == toml.name
     # A value equal in Python but of another type is a change, not the value the file holds.
@@ -231,6 +234,24 @@ def test_null_reset_of_an_unknown_key_the_file_carries_removes_it(
     rc, res = _set(toml, {"require_mfx": None}, capsys)
     assert rc == 0 and res["op"] == "set" and res["keys"] == ["require_mfx"]
     assert "require_mfx" not in toml.read_text(encoding="utf-8")
+
+
+def test_null_reset_in_a_missing_folder_exits_0_and_creates_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5327: a reset that finds nothing where neither the file nor its folder exists
+    exits 0, as `security show` does there, and creates nothing, the edit lock's file included."""
+    toml = tmp_path / "missing" / "mf.toml"
+    rc, res = _set(toml, {"require_mfa": None}, capsys)
+    assert rc == 0
+    assert res["op"] == "unchanged" and res["rewritten"] is False
+    assert res["unchanged"] == ["require_mfa"]
+    assert list(tmp_path.iterdir()) == []
+    # In a folder that exists, no lock file is left beside the absent settings file.
+    toml = tmp_path / "mf.toml"
+    rc, res = _set(toml, {"require_mfa": None}, capsys)
+    assert rc == 0 and res["rewritten"] is False
+    assert list(tmp_path.iterdir()) == []
 
 
 def test_null_reset_of_an_absent_known_key_reports_nothing_changed(
