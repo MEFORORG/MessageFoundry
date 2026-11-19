@@ -42,6 +42,7 @@ import ast
 import codecs
 import io
 import logging
+import os
 import re
 import tokenize
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -1123,14 +1124,15 @@ def _name_argument_position(
 
 
 def _definition_positions(
-    sources: SourceCache, file: str, calls: list[ast.Call], kind: str, old: str
+    sources: SourceCache, file: str, calls: list[ast.Call], spelled: set[str], old: str
 ) -> dict[_Pos, frozenset[_Pos]]:
-    """The name argument of each call to ``kind`` among ``calls``, or of every one of ``calls``
-    when none is spelled ``kind`` (an aliased import), each mapped to the declaring arguments that
-    read it: none for a literal, the ``NAME`` argument for a module constant's literal."""
-    named = [call for call in calls if _call_name(call.func) == kind] or calls
+    """The name argument of each call among ``calls`` spelled as one of ``spelled``
+    (:func:`_factory_spellings`), each mapped to the declaring arguments that read it: none for a
+    literal, the ``NAME`` argument for a module constant's literal."""
     out: dict[_Pos, frozenset[_Pos]] = {}
-    for call in named:
+    for call in calls:
+        if _call_name(call.func) not in spelled:
+            continue
         pos = _name_argument_position(sources, file, call, old)
         if pos is not None:
             out.setdefault(pos, frozenset())
@@ -1231,12 +1233,10 @@ def _decorator_positions(
     registering_only: bool = False,
 ) -> dict[_Pos, frozenset[_Pos]]:
     """The name argument of the ``@router("old")`` / ``@handler("old")`` call registering ``fn``, or
-    of ``router("old")(lambda ...)``. The function's body is not part of its definition, and nor is
-    another decorator stacked on it -- unless the factory is imported under an alias, when every
-    decorator call naming ``old`` is taken, since none can be told apart by name. With
-    ``registering_only``, only a call spelled ``kind`` or an alias the module imports it under is
-    taken, and nothing when there is none, so a literal skipped as the referrer's own name is never
-    a stacked decorator's."""
+    of ``router("old")(lambda ...)``: a call spelled ``kind`` or an alias the module imports it
+    under, and nothing when there is none, so a stacked decorator's equal argument is never taken
+    for the definition's. The function's body is not part of its definition. With
+    ``registering_only``, only a literal argument is taken, never a module constant's."""
     import inspect
 
     parsed = sources.parse(file)
@@ -1256,43 +1256,42 @@ def _decorator_positions(
             and any(isinstance(arg, ast.Lambda) for arg in node.args)
         ):
             calls.append(node.func)
+    spelled = _factory_spellings(parsed[0], {kind})
     if registering_only:
-        spelled = {kind} | {
-            a.asname
-            for node in ast.walk(parsed[0])
-            if isinstance(node, ast.ImportFrom)
-            for a in node.names
-            if a.name == kind and a.asname
-        }
         return {
             pos: frozenset()
             for call in calls
             if _call_name(call.func) in spelled
             and (pos := _name_argument_position(sources, file, call, old))
         }
-    return _definition_positions(sources, file, calls, kind, old)
+    return _definition_positions(sources, file, calls, spelled, old)
+
+
+def _factory_spellings(tree: ast.Module, factories: Iterable[str]) -> set[str]:
+    """The names a call to one of ``factories`` may be spelled by in ``tree``: each factory's own
+    name (``outbound(...)``, ``mf.outbound(...)``) and any alias a ``from`` import binds it to."""
+    names = set(factories)
+    return names | {
+        a.asname
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for a in node.names
+        if a.name in names and a.asname
+    }
 
 
 def _call_line_positions(
     sources: SourceCache, file: str, line: int, old: str, kind: str
 ) -> dict[_Pos, frozenset[_Pos]]:
     """The name argument of the ``inbound("old", …)`` / ``outbound("old", …)`` call on ``line``,
-    which may sit inside another call (``_keep(outbound("old", …))``). Under an aliased factory, the
-    calls on the line naming ``old`` that no other such call holds in its arguments."""
+    which may sit inside another call (``_keep(outbound("old", …))``), spelled ``kind`` or an alias
+    the module imports it under. A factory reached any other way (``ob = outbound``) is not found,
+    so the definition counts as not located rather than guessed among the line's calls."""
     parsed = sources.parse(file)
     if parsed is None:
         return {}
     calls = [n for n in ast.walk(parsed[0]) if isinstance(n, ast.Call) and n.lineno == line]
-    if not any(_call_name(call.func) == kind for call in calls):
-        calls = [c for c in calls if _name_argument_position(sources, file, c, old) is not None]
-        nested = {
-            id(inner)
-            for call in calls
-            for inner in ast.walk(call)
-            if inner is not call and isinstance(inner, ast.Call)
-        }
-        calls = [call for call in calls if id(call) not in nested]
-    return _definition_positions(sources, file, calls, kind, old)
+    return _definition_positions(sources, file, calls, _factory_spellings(parsed[0], {kind}), old)
 
 
 def _module_binding_sites(
@@ -1403,18 +1402,27 @@ def _binding_read_only_by_referents(
 
 def _config_modules(config_dir: Path) -> tuple[str, ...] | None:
     """Every ``.py`` under ``config_dir`` (subdirectories too, since a helper package is importable
-    from a config module), dot-named parts excluded, as resolved paths; ``None`` when the directory
-    cannot be walked, so no reader can be ruled out."""
+    from a config module), as resolved paths. A dot-named directory or file is skipped, and so is a
+    virtual environment (a directory holding ``pyvenv.cfg``), whose installed code is no config
+    module. ``None`` when the directory cannot be walked, so no reader can be ruled out."""
     root = config_dir.resolve()
-    try:
-        return tuple(
-            str(path)
-            for path in sorted(root.rglob("*.py"))
-            if not any(part.startswith(".") for part in path.relative_to(root).parts)
+    found: list[str] = []
+    failed: list[OSError] = []
+    for folder, dirs, names in os.walk(root, onerror=failed.append):
+        dirs[:] = sorted(
+            d
+            for d in dirs
+            if not d.startswith(".") and not (Path(folder, d, "pyvenv.cfg")).exists()
         )
-    except OSError as exc:
-        _log.debug("rename could not list %s for readers: %s", config_dir, type(exc).__name__)
+        found.extend(
+            str(Path(folder, n))
+            for n in sorted(names)
+            if n.endswith(".py") and not n.startswith(".")
+        )
+    if failed:
+        _log.debug("rename could not list %s for readers: %s", config_dir, type(failed[0]).__name__)
         return None
+    return tuple(found)
 
 
 def _name_readers(
@@ -1447,10 +1455,12 @@ def _name_readers(
             if isinstance(node, (ast.Import, ast.ImportFrom))
         )
         if imports:
+            # ``from _consts import DIET as D`` reads DIET as D.
+            spelled = _factory_spellings(tree, names)
             out.extend(
                 (other, node)
                 for node in ast.walk(tree)
-                if (isinstance(node, ast.Name) and node.id in names)
+                if (isinstance(node, ast.Name) and node.id in spelled)
                 or (isinstance(node, ast.Attribute) and node.attr in names)
             )
     return out
@@ -1593,16 +1603,10 @@ def _scan_declaration_span(
         if parsed is None:
             continue
         tree = parsed[0]
-        spelled = set(factories) | {
-            a.asname
-            for node in ast.walk(tree)
-            if isinstance(node, ast.ImportFrom)
-            for a in node.names
-            if a.name in factories and a.asname
-        }
+        spelled = _factory_spellings(tree, factories)
         for node in ast.walk(tree):
-            if isinstance(node, ast.Call) and _call_name(node.func) in spelled:
-                positions = _definition_positions(sources, file, [node], "", old)
+            if isinstance(node, ast.Call):
+                positions = _definition_positions(sources, file, [node], spelled, old)
                 if positions:
                     found.append((file, node, positions))
     if len(found) != 1:

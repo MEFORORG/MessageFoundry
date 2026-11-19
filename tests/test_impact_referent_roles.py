@@ -1295,3 +1295,71 @@ def test_a_table_accessor_bound_and_read_at_module_level_is_renamed(tmp_path: Pa
     plan = plan_rename(load_config(config_dir), config_dir, "code_set", "diets", "meals")
     assert plan.unresolved == ()
     assert [(e.line, e.new_literal) for e in plan.edits] == [(3, '"meals"')]
+
+
+def test_an_aliased_factory_is_told_from_a_call_beside_it(tmp_path: Path) -> None:
+    """Under an aliased ``outbound`` and ``handler``, the definition is the call spelled by the
+    alias. A wrapper or a stacked decorator naming the same literal is another call's argument,
+    and stays: before, both were taken, or only the wrapper's."""
+    config_dir = _write_config(
+        tmp_path,
+        "from messagefoundry import handler as hd, outbound as ob\n"
+        "\n"
+        "def _register(label, spec):\n"
+        "    return spec\n"
+        "\n"
+        "def traced(label):\n"
+        "    return lambda fn: fn\n"
+        "\n"
+        'inbound("IB_A", MLLP(port=2871), router="r_a")\n'
+        '_register("OB_OLD", ob("OB_OLD", MLLP(host="127.0.0.1", port=7031)))\n'
+        "\n"
+        '@router("r_a")\n'
+        "def r_a(msg):\n"
+        '    return ["h_old"]\n'
+        "\n"
+        '@hd("h_old")\n'
+        '@traced("h_old")\n'
+        "def h_old(msg):\n"
+        '    return Send("OB_OLD", msg)\n',
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    plan = plan_rename(load_config(config_dir), config_dir, "handler", "h_old", "h_new")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    text = _mod(config_dir)
+    assert '_register("OB_OLD", ob("OB_NEW"' in text, text
+    assert '@hd("h_new")\n@traced("h_old")\n' in text, text
+    registry = load_config(config_dir)
+    assert "OB_NEW" in registry.outbound and "h_new" in registry.handlers
+
+
+def test_a_definition_constant_read_under_an_import_alias_is_refused(tmp_path: Path) -> None:
+    """``feeds.py`` imports the constant as ``FEED`` and names an inbound with it."""
+    d = tmp_path / "config"
+    d.mkdir()
+    files = {
+        "_consts.py": "from messagefoundry import MLLP, outbound\n"
+        "\n"
+        'OB = "X_FEED"\n'
+        'outbound(OB, MLLP(host="127.0.0.1", port=7032))\n',
+        "feeds.py": _HEAD + "from _consts import OB as FEED\n"
+        "\n"
+        'inbound(FEED, MLLP(port=2872), router="r_x")\n'
+        "\n"
+        '@router("r_x")\n'
+        "def r_x(msg):\n"
+        '    return ["h_x"]\n'
+        "\n"
+        '@handler("h_x")\n'
+        "def h_x(msg):\n"
+        '    return Send("X_FEED", msg)\n',
+    }
+    for name, text in files.items():
+        (d / name).write_text(text, encoding="utf-8", newline="")
+    registry = load_config(d)
+    assert "X_FEED" in registry.inbound and "X_FEED" in registry.outbound
+    with pytest.raises(WiringError, match="other code reads it too"):
+        plan_rename(registry, d, "outbound", "X_FEED", "X_NEW")
