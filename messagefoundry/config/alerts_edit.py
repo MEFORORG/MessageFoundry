@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 import tomlkit
-from tomlkit.items import Array
+from tomlkit.items import Array, InlineTable
 
 from messagefoundry.config import atomic_edit
 
@@ -112,13 +112,16 @@ def add_rule(
             doc["alerts"] = alerts
         rules = alerts.get("rules")
         if rules is None:
-            rules = tomlkit.aot()
+            # An array of tables cannot sit inside an inline ``alerts = {...}`` table (BACKLOG #5774).
+            rules = tomlkit.array() if isinstance(alerts, InlineTable) else tomlkit.aot()
             alerts["rules"] = rules
         if isinstance(rules, Array):
             # BACKLOG #5774: ``rules = [{...}]`` is a valid inline array, and appending a table
-            # into it wrote TOML that does not parse, so the add was refused for that file. A plain
-            # dict is written as one more inline table, and the array's comments stay where they are.
-            rules.append(_rule_values(obj))
+            # into it wrote TOML that does not parse, so the add was refused for that file. One more
+            # inline table is appended instead, and the array's comments stay where they are.
+            rule = tomlkit.inline_table()
+            rule.update(_rule_values(obj))
+            rules.append(rule)
         else:
             rules.append(_build_table(obj))
 

@@ -169,19 +169,24 @@ def test_add_into_an_inline_rules_array_writes_toml_that_loads(
     [
         'alerts = {rules = [{event_type = "queue_buildup"}]}\n',
         'alerts.rules = [{event_type = "queue_buildup"}]\nalerts.realert_seconds = 120\n',
+        "alerts = {realert_seconds = 120}\n",
     ],
 )
 def test_add_into_an_inline_rules_array_in_other_spellings(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], original: str
 ) -> None:
     """The inline array under an inline ``alerts`` table, and under dotted keys, take the add too,
-    and a dotted sibling key stays on ``[alerts]`` rather than landing in a rule."""
+    and a dotted sibling key stays on ``[alerts]`` rather than landing in a rule. An inline
+    ``alerts`` table with no rules yet gets an inline array, since no array of tables fits in it.
+    The new rule is written in the usual ``{a = 1, b = 2}`` spacing."""
     svc = _svc(tmp_path)
     svc.write_text(original, encoding="utf-8")
-    rc, out = _add(svc, {"event_type": "connection_stopped"}, capsys)
+    rc, out = _add(svc, {"event_type": "connection_stopped", "min_depth": 3}, capsys)
     assert rc == 0, out
+    assert '{event_type = "connection_stopped", min_depth = 3}' in svc.read_text(encoding="utf-8")
     loaded = load_settings(config_path=svc).alerts
-    assert [r.event_type for r in loaded.rules] == ["queue_buildup", "connection_stopped"]
+    earlier = ["queue_buildup"] if "queue_buildup" in original else []
+    assert [r.event_type for r in loaded.rules] == [*earlier, "connection_stopped"]
     if "realert_seconds" in original:
         assert loaded.realert_seconds == 120
 
