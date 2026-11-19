@@ -1323,9 +1323,10 @@ def test_release_asset_downloads_in_blocking_jobs_are_checksum_verified() -> Non
     `test_release_asset_downloads_in_oidc_jobs_are_pinned_in_repo` below holds that stronger line.
 
     Scoped to jobs WITHOUT a job-level `continue-on-error`. An advisory job cannot turn a required
-    context green while compromised, so `sbom` (job-level `continue-on-error: true`) is out -- worth
-    hardening, but not on this rule. `trivy` used to be out for the same reason; since 2026-09-22 its
-    flag sits on the scan step instead, so this rule now examines its Trivy install too. "Blocking"
+    context green while compromised, so a job-level-softened job is out -- worth hardening, but not on
+    this rule. `trivy` used to be out for that reason until 2026-09-22, and `sbom` and `sbom-windows`
+    until BACKLOG #5475; each now carries its flag on one step, so this rule examines their sbomqs and
+    Trivy installs too. "Blocking"
     in this test's name means "not job-level softened", not "a required context".
     """
     yaml = pytest.importorskip("yaml")

@@ -557,13 +557,16 @@ jobs:
     # hash-locked core runtime lock) and the VS Code extension (from its npm lockfile) — score their quality,
     # and retain them, so "are we exposed to CVE-X? under what license?" is answerable from a recorded bill of
     # materials rather than a fresh resolve (ASVS 15.1.2). The container image's SBOM is emitted by the `trivy`
-    # job below (which builds the image). Full rationale: docs/SUPPLY-CHAIN.md + ADR 0149. Each step still
-    # fails if its SBOM can't be produced (a lock that won't render is caught), but continue-on-error keeps
-    # the job off the merge path.
-    continue-on-error: true
+    # job below (which builds the image). Full rationale: docs/SUPPLY-CHAIN.md + ADR 0149. Each step fails
+    # if its SBOM can't be produced (a lock that won't render is caught), and so does the job.
+    #
+    # NO JOB-LEVEL continue-on-error (BACKLOG #5475). It rewrote a broken SBOM dry-run into a green job,
+    # so the scheduled run concluded success, nightly-notice.yml's Security watch never fired, and the break
+    # surfaced only at a tagged release. What keeps this job off the merge path is placement: the `if:`
+    # below admits no pull_request or merge_group run, and it is NOT a required check. Only the sbomqs
+    # score step stays advisory, at the step (tests/test_security_posture.py, _STEP_ADVISORY_JOBS).
     # Daily cron + on-demand only (CI cost): the SBOMs derive from COMMITTED lockfiles, so a per-PR build adds
-    # no information over a daily one — a freshness question, not a merge gate. Advisory (continue-on-error)
-    # and NOT a required check, so this gate can never wedge a PR.
+    # no information over a daily one — a freshness question, not a merge gate.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -638,8 +641,8 @@ jobs:
           # against that schema and exits non-zero, before writing it, when it is invalid or the ajv
           # validator packages in ci/npm-tools are absent. Without the flag, 7.x skips validation
           # when they are absent, and at this step's default verbosity it prints nothing about it.
-          # This job is continue-on-error, so a failure here leaves the run without the extension
-          # SBOM and blocks nothing. Guarded by tests/test_ci_tool_and_image_pins.py.
+          # A failure here reddens this schedule-only job, which blocks no pull request and fires the
+          # nightly notice. Guarded by tests/test_ci_tool_and_image_pins.py.
           ../ci/npm-tools/node_modules/.bin/cyclonedx-npm --package-lock-only \
             --spec-version 1.6 --validate \
             --output-format JSON --output-file ../sbom-ide.cdx.json
@@ -693,7 +696,8 @@ jobs:
     # Windows-resolved SBOM is ADR 0149's 2026-09-30 amendment. A separate job rather than a matrix
     # leg of `sbom`, because that job's npm and sbomqs steps are Linux-only and would each need a
     # platform guard.
-    continue-on-error: true
+    # No job-level continue-on-error, as for `sbom` (BACKLOG #5475): a broken dry-run must red the
+    # scheduled run. Only the sbomqs score step below is advisory, at the step.
     # Same gate as `sbom`, for the same reason: the SBOM derives from a committed lockfile.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:

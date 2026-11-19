@@ -21,11 +21,11 @@ while measuring nothing (``scripts/quality/liveness.py``, ``tests/test_gate_live
 catches a gate that RAN and measured nothing. This catches a gate that was told its findings do not
 count.
 
-WHY IT ALSO PINS THE ADVISORY JOBS. The check runs in both directions on purpose. ``sbom`` and
-``trivy`` are advisory *by design* and are scheduled for promotion; if one silently loses
-``continue-on-error`` it starts blocking merges from a cron-only trigger, which is the
-required-but-absent trap wearing the opposite hat. Either move must be a deliberate edit to the lists
-below.
+WHY IT ALSO PINS THE ADVISORY JOBS. The check runs in both directions on purpose. ``sbom``,
+``sbom-windows`` and ``trivy`` are advisory *by design* and are scheduled for promotion; each carries
+``continue-on-error`` on exactly one named STEP, never on the job (``_STEP_ADVISORY_JOBS``), and if
+one silently loses that step flag, or gains a job-level one, it changes what the job reports for a
+reason nobody chose. Either move must be a deliberate edit to the lists below.
 
 NOT VACUOUS BY CONSTRUCTION. ``test_every_security_job_is_classified`` fails when a job is added to
 ``security.yml`` without being named blocking or advisory here, so a new scanner cannot arrive
@@ -80,10 +80,12 @@ _BLOCKING_SECURITY_JOBS = frozenset(
 
 # ADVISORY by design: these MUST keep continue-on-error. All three are cron/dispatch-only, so promoting one
 # without also removing its `if:` would wedge every PR (see security.yml's own notes on trivy).
-# WHERE the flag sits differs: `sbom` carries it on the job, `trivy` on its one scan step, and a job
-# listed in _STEP_ADVISORY_JOBS below is graded there instead of by the job-level rule.
-# `sbom-windows` is `sbom`'s Windows twin (the engine SBOM resolved on win32, ADR 0149's 2026-09-30
-# amendment) and carries the flag on the job, the same way.
+# WHERE the flag sits: on one named step of each, never on the job. All three are listed in
+# _STEP_ADVISORY_JOBS below and graded there instead of by the job-level rule. `sbom` and
+# `sbom-windows` (its Windows twin, the engine SBOM resolved on win32, ADR 0149's 2026-09-30
+# amendment) carried the flag on the JOB until BACKLOG #5475: that turned a broken SBOM dry-run into
+# a green scheduled run, so the nightly notice never fired and the break surfaced only at a tagged
+# release. Each now softens only its sbomqs score step.
 _ADVISORY_SECURITY_JOBS = frozenset({"sbom", "sbom-windows", "trivy"})
 
 # ADVISORY BY PLACEMENT: hard-failing, but NOT in branch protection. This is a third posture the file
@@ -1057,6 +1059,20 @@ _STEP_ADVISORY_JOBS: tuple[tuple[str, str, str, str], ...] = (
         "trivy",
         "trivy (container image vulnerabilities)",
         "Scan the image (advisory - fixable HIGH/CRITICAL reported, never gates)",
+    ),
+    # BACKLOG #5475. A broken SBOM render must red the scheduled run; only the quality SCORE is a
+    # signal rather than a gate (ADR 0149), so only the score step may carry the flag.
+    (
+        "security.yml",
+        "sbom",
+        "SBOMs (CycloneDX, multi-ecosystem)",
+        "Score SBOM quality (sbomqs — advisory)",
+    ),
+    (
+        "security.yml",
+        "sbom-windows",
+        "SBOM (CycloneDX, engine resolved on Windows)",
+        "Score the Windows SBOM's quality (sbomqs -- advisory)",
     ),
 )
 
