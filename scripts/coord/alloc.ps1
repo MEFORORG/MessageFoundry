@@ -500,17 +500,24 @@ function Get-Floor {
     # ONE WRAPPER, so a later sweep call cannot drop the reset or the check. The refusal phrase is
     # the pre-flight block's, picked by the same switch (the call site passes -Peek:$ShowFloor).
     $refusal = if ($Peek) { "REFUSING TO REPORT A FLOOR" } else { "REFUSING TO ALLOCATE" }
+    # Both preferences are pinned in this function's own scope, for the pre-flight block's reason:
+    # under "Stop", with $PSNativeCommandUseErrorActionPreference true, git's first stderr line or
+    # its exit code throws a generic error and the refusal below, with git's own words, never prints.
     function Invoke-SweepGit([string[]]$GitArgs, [string]$Stdin) {
+        $ErrorActionPreference = "Continue"
+        $PSNativeCommandUseErrorActionPreference = $false
         $global:LASTEXITCODE = -1
-        $out = if ($PSBoundParameters.ContainsKey('Stdin')) {
-            @($Stdin | & git -C $repo @GitArgs 2>$null)
+        $all = if ($PSBoundParameters.ContainsKey('Stdin')) {
+            @($Stdin | & git -C $repo @GitArgs 2>&1)
         } else {
-            @(& git -C $repo @GitArgs 2>$null)
+            @(& git -C $repo @GitArgs 2>&1)
         }
-        if ($LASTEXITCODE -ne 0) {
-            throw "alloc.ps1: $refusal -- git $($GitArgs[0]) exited $LASTEXITCODE while sweeping refs for the ADR floor. An incomplete sweep would understate the floor and could re-issue a number already in use, so nothing was read as a floor or allocated. Run 'git -C $repo $($GitArgs -join ' ')' by hand to see its error, fix the clone, and re-run."
+        $code = $LASTEXITCODE
+        if ($code -ne 0) {
+            $detail = (@($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) -join "`n  ").Trim()
+            throw "alloc.ps1: $refusal -- git $($GitArgs[0]) exited $code while sweeping refs for the ADR floor. An incomplete sweep would understate the floor and could re-issue a number already in use, so nothing was read as a floor or allocated. Fix the clone and re-run. git said:`n  $detail"
         }
-        $out
+        @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
     }
 
     $refs = @("origin/main") + @(Invoke-SweepGit @('for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes'))
