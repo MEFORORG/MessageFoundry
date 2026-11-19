@@ -254,7 +254,8 @@ def _max_length(model: type[LoginRequest], name: str) -> int:
         bound = getattr(item, "max_length", None)
         if isinstance(bound, int):
             return bound
-    raise LookupError(f"{model.__name__}.{name} declares no max_length")
+    # An ImportError, so the engine's guarded import names a console that cannot pair with it.
+    raise ImportError(f"{model.__name__}.{name} declares no max_length")
 
 
 #: The longest session token a browser sign-in passes on as the one it replaces: the bound

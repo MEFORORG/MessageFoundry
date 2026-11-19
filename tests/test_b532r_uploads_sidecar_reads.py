@@ -96,9 +96,9 @@ async def test_a_stamp_at_the_floor_is_read(tmp_path: Path) -> None:
 
 
 _PADS = {
-    "bom": ("﻿", ""),
+    "bom": ("\ufeff", ""),
     "whitespace": ("\r\n \t", "\n\n"),
-    "bom-and-whitespace": (" ﻿\n", "\r\n"),
+    "bom-and-whitespace": (" \ufeff\n", "\r\n"),
 }
 
 
@@ -142,7 +142,7 @@ async def test_a_padded_sealed_sidecar_reads_under_its_key(tmp_path: Path) -> No
     store = _store(tmp_path / "uploads", key)
     meta = await _saved(store)
     sidecar = _sidecar(store, meta.file_id)
-    sidecar.write_text("﻿" + sidecar.read_text(encoding="utf-8") + "\r\n", encoding="utf-8")
+    sidecar.write_text("\ufeff" + sidecar.read_text(encoding="utf-8") + "\r\n", encoding="utf-8")
     assert await store.get_meta(meta.file_id) == meta
 
 
@@ -150,7 +150,7 @@ async def test_a_whitespace_only_sidecar_is_damaged(tmp_path: Path) -> None:
     # Control: padding is not a sidecar, so one that holds nothing else is refused as damaged.
     store = _store(tmp_path / "uploads", generate_key())
     meta = await _saved(store)
-    _sidecar(store, meta.file_id).write_text(" \r\n﻿\t", encoding="utf-8")
+    _sidecar(store, meta.file_id).write_text(" \r\n\ufeff\t", encoding="utf-8")
     with pytest.raises(UploadDamagedError):
         await store.get_meta(meta.file_id)
 
@@ -205,11 +205,10 @@ class _OsWith:
         return self._open if name == "open" else getattr(os, name)
 
 
-async def test_a_sidecar_swapped_after_its_check_is_refused(
+async def test_a_regular_file_replaced_after_its_check_is_read(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # On origin/main the lstat check and the read were separate opens, so a file replaced between
-    # them was read. The swap here is another upload's sound sidecar under this one's name.
+    # Control: an atomic replace by a regular file, as a rotate-key reseal does, is not a refusal.
     store = _store(tmp_path / "uploads")
     meta = await _saved(store)
     sidecar = _sidecar(store, meta.file_id)
@@ -222,8 +221,7 @@ async def test_a_sidecar_swapped_after_its_check_is_refused(
         return os.open(path, flags, *args)
 
     monkeypatch.setattr(uploads, "os", _OsWith(_swap_then_open))
-    with pytest.raises(UploadDamagedError):
-        await store.get_meta(meta.file_id)
+    assert await store.get_meta(meta.file_id) == meta
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX FIFOs and O_NONBLOCK")
@@ -245,15 +243,22 @@ async def test_a_fifo_swapped_in_after_its_check_does_not_block_the_read(
         await store.get_meta(meta.file_id)
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="O_NOFOLLOW")
 async def test_a_link_swapped_in_after_its_check_is_not_followed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # On origin/main the lstat check and the read were separate opens, so a link swapped in
+    # between them was followed. POSIX refuses it at the open (O_NOFOLLOW); Windows, which has no
+    # such flag, by the check of the name after the open.
     store = _store(tmp_path / "uploads")
     meta = await _saved(store)
     sidecar = _sidecar(store, meta.file_id)
     target = tmp_path / "elsewhere.meta"
     target.write_text(sidecar.read_text(encoding="utf-8"), encoding="utf-8")
+    probe = tmp_path / "probe"
+    try:
+        probe.symlink_to(target)
+    except OSError:
+        pytest.skip("this account cannot create a symbolic link")
 
     def _link_then_open(path: Any, flags: int, *args: Any) -> int:
         if Path(path) == sidecar:
@@ -296,3 +301,48 @@ async def test_a_part_the_engine_may_not_read_is_a_handled_refusal(
     else:
         with pytest.raises(UploadDamagedError):
             await store.read_bytes(meta.file_id)
+
+
+# --- the padding tolerance holds in rotate-key, the startup count and the tag alert -------------
+
+
+async def test_rotate_key_reseals_a_padded_sealed_sidecar_rather_than_sealing_it_twice(
+    tmp_path: Path,
+) -> None:
+    # Review round 1: the reseal decided "plaintext" on the raw text, so a padded sealed sidecar,
+    # which the reader takes, was sealed a second time and then refused on every read.
+    key = generate_key()
+    store = _store(tmp_path / "uploads", key)
+    meta = await _saved(store)
+    sidecar = _sidecar(store, meta.file_id)
+    sidecar.write_text("\ufeff " + sidecar.read_text(encoding="utf-8"), encoding="utf-8")
+    assert await store.warn_if_unsealed() == 0
+    result = await store.reseal_to_active()
+    assert result.sealed_plaintext == 0
+    assert await store.get_meta(meta.file_id) == meta
+
+
+async def test_a_padded_moved_sidecar_still_raises_the_tag_alert(tmp_path: Path) -> None:
+    # Review round 1: the alert's own checks read the raw text, so padding hid the marker from
+    # them and a sidecar moved under another id with a byte-order mark in front went unreported.
+    key = generate_key()
+    store = UploadStore(tmp_path / "uploads", make_cipher(key, write_v2=True), max_bytes=4096)
+    reports: list[tuple[str, str]] = []
+    store._cipher.set_tag_failure_hook(lambda table, reason: reports.append((table, reason)))  # type: ignore[attr-defined]  # noqa: SLF001
+    a = await _saved(store)
+    b = await _saved(store)
+    moved = "\ufeff" + _sidecar(store, a.file_id).read_text(encoding="utf-8")
+    _sidecar(store, b.file_id).write_text(moved, encoding="utf-8")
+    assert [m.file_id for m in await store.list_files()] == [a.file_id]
+    assert len(reports) == 1 and b.file_id[:12] in reports[0][1]
+
+
+async def test_a_body_stored_under_a_larger_upload_limit_is_still_served(tmp_path: Path) -> None:
+    # Review round 1: no size cap on a body read, so lowering max_upload_bytes does not turn a
+    # sound upload stored before it into a damaged one.
+    root = tmp_path / "uploads"
+    data = b"x" * 9000 + b"\n"
+    meta = await UploadStore(root, make_cipher(None), max_bytes=10_000).save(
+        data=data, filename="a.txt", uploader="op", uploader_id="u-op"
+    )
+    assert await UploadStore(root, make_cipher(None), max_bytes=10).read_bytes(meta.file_id) == data

@@ -195,8 +195,10 @@ _UNSEALABLE_OWNER_READ_LIMIT = 64 * 1024
 # is a few hundred bytes. The longest it can be is its text fields at their bounds
 # (``_MAX_SIDECAR_TEXT``), every character an astral one that ``json.dumps`` escapes as twelve, then
 # sealed, which base64 grows by a third: under 40 KiB. :meth:`UploadStore.save` refuses to write a
-# longer one, so no write is one the reader refuses. Every read of a sidecar, the scan's under
-# ``_quota_lock`` included, reads no more than this, so a planted file cannot exhaust memory there.
+# longer one. The listing scan, which runs under ``_quota_lock``, and the by-id reads read no more
+# than this, so a planted file cannot exhaust memory there. At least ``rotate-key`` is not bound by
+# it: its pass reads a sidecar up to the body's own limit, and sealing a planted plaintext sidecar
+# just under the cap can grow it past the cap, after which the reads refuse it as malformed.
 _SIDECAR_LIMIT = 128 * 1024
 # The chunk size for checking that a body decodes as text. It bounds memory, not the work.
 _BODY_CHECK_CHUNK = 1 << 20
@@ -305,13 +307,10 @@ def _names_a_link(info: os.stat_result) -> bool:
 #: How a sidecar or body is opened (BACKLOG #5387 added item 1). ``O_NOFOLLOW`` refuses a final
 #: name that became a symbolic link after the ``lstat`` that checked it, and ``O_NONBLOCK`` keeps a
 #: FIFO swapped in there from blocking the open, which the ``fstat`` after it then refuses. Windows
-#: has neither flag, so there :func:`_open_plain` compares the open file with that ``lstat``.
-_PLAIN_OPEN_FLAGS = (
-    os.O_RDONLY
-    | getattr(os, "O_BINARY", 0)
-    | getattr(os, "O_NOFOLLOW", 0)
-    | getattr(os, "O_NONBLOCK", 0)
-)
+#: has neither flag, so there :func:`_open_plain` checks the name again once it is open.
+_O_NOFOLLOW: int = getattr(os, "O_NOFOLLOW", 0)
+_O_NONBLOCK: int = getattr(os, "O_NONBLOCK", 0)
+_PLAIN_OPEN_FLAGS = os.O_RDONLY | getattr(os, "O_BINARY", 0) | _O_NOFOLLOW | _O_NONBLOCK
 
 
 class _NotPlainError(OSError):
@@ -324,35 +323,51 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
     (BACKLOG #5387 added item 1). The caller closes it.
 
     The ``lstat`` before the open is the check :func:`_not_a_plain_file` makes. The ``fstat`` after
-    it must show a regular file that is the same file, so a link or a FIFO swapped in between the
-    two is refused rather than followed or waited on. Raises :class:`_NotPlainError` for that, and
-    any other ``OSError`` the filesystem gives, ``FileNotFoundError`` included."""
+    it must show a regular file, so a FIFO swapped in between the two is refused rather than waited
+    on. Where there is no ``O_NOFOLLOW``, the name is checked again after the open and must still
+    be no link and name the file that was opened, so a link swapped in is refused rather than
+    followed. A regular file put in its place, as an atomic replace does, is read. Raises
+    :class:`_NotPlainError` for a refusal, and any other ``OSError`` the filesystem gives,
+    ``FileNotFoundError`` included."""
     before = path.lstat()
     if _names_a_link(before) or not S_ISREG(before.st_mode):
         raise _NotPlainError(f"{path.name} is not a plain file")
     handle = os.fdopen(os.open(path, _PLAIN_OPEN_FLAGS), "rb")
     try:
         after = os.fstat(handle.fileno())
-        if not (S_ISREG(after.st_mode) and os.path.samestat(before, after)):
+        if not S_ISREG(after.st_mode):
             raise _NotPlainError(f"{path.name} changed after it was checked")
+        if not _O_NOFOLLOW:
+            again = path.lstat()
+            if _names_a_link(again) or not os.path.samestat(again, after):
+                raise _NotPlainError(f"{path.name} changed after it was checked")
+        if _O_NONBLOCK:
+            # A regular file, so a blocking read is safe, and some filesystems would otherwise
+            # answer a read with EAGAIN.
+            os.set_blocking(handle.fileno(), True)
     except BaseException:
         handle.close()
         raise
     return handle, after
 
 
-def _read_plain_text(path: Path, limit: int) -> str:
+def _read_plain_text(path: Path, limit: int | None = None) -> str:
     """The text of the regular file ``path``, opened by :func:`_open_plain`, with no more than
-    ``limit`` bytes read (BACKLOG #5387 added item 1). Raises what that raises,
+    ``limit`` bytes read when one is given (BACKLOG #5387 added item 1). Raises what that raises,
     :class:`_OversizedFileError` for a file over ``limit``, and ``UnicodeDecodeError`` for one
     that is not UTF-8."""
     handle, info = _open_plain(path)
     with handle:
-        if info.st_size > limit:
-            raise _OversizedFileError(limit)
-        data = handle.read(limit + 1)
-    if len(data) > limit:
-        raise _OversizedFileError(limit)
+        if limit is None:
+            data = handle.read()
+        else:
+            if info.st_size > limit:
+                raise _OversizedFileError(limit)
+            # Sized by the file, not the limit, so a small file costs a small buffer. One byte
+            # more, so a file that grew past the limit since the fstat is still refused.
+            data = handle.read(info.st_size + 1)
+            if len(data) > limit:
+                raise _OversizedFileError(limit)
     return data.decode("utf-8")
 
 
@@ -738,9 +753,8 @@ class _MalformedSidecarError(ValueError):
 
 
 class _OversizedFileError(_MalformedSidecarError):
-    """A sidecar or body larger than any the store writes, refused before it is read whole
-    (BACKLOG #5387 added item 1). A sidecar's is its damage, as any other malformed sidecar's is.
-    :meth:`UploadStore.read_bytes` catches it by name for a body."""
+    """A sidecar larger than any the store writes, refused before it is read whole (BACKLOG #5387
+    added item 1). It is its damage, as any other malformed sidecar's is."""
 
     def __init__(self, limit: int) -> None:
         super().__init__(f"it is larger than {limit} bytes")
@@ -1471,7 +1485,8 @@ class UploadStore:
                 # another cell, or the refusal of an unmarked (legacy, planted or downgraded)
                 # sidecar. Named on its own so these can be told apart from a damaged file.
                 _log.warning("uploaded-file sidecar %s: cipher declined it: %s", fid, exc)
-                self._report_tag_failure(fid, stored, exc)
+                # Unpadded, as the decrypt saw it, so a padded marker still reaches the check.
+                self._report_tag_failure(fid, _unpadded(stored), exc)
                 classify = True
             except (OSError, UnicodeDecodeError) as exc:
                 # The bytes never reached the cipher — unreadable file, or not valid UTF-8.
@@ -2595,16 +2610,18 @@ class UploadStore:
             blob_path, _ = self._paths(file_id)
             _refuse_unplain(file_id, "body", blob_path)
             try:
-                return self._decrypt_blob(_read_plain_text(blob_path, self._stored_limit), file_id)
+                # No size cap: a sound body stored under a larger max_upload_bytes is still
+                # served, as the reseal pass keeps it too.
+                return self._decrypt_blob(_read_plain_text(blob_path), file_id)
             except FileNotFoundError as exc:
                 raise UploadNotFoundError(file_id) from exc
             except CipherUnavailableError as exc:
                 raise UploadUnavailableError(str(exc)) from exc
             except CipherError as exc:
                 raise UploadUnreadableError(str(exc)) from exc
-            except (OSError, UnicodeError, binascii.Error, _OversizedFileError) as exc:
-                # Not readable on disk (BACKLOG #5388 added item 2), larger than any body the store
-                # writes, not UTF-8, not ASCII, or not the strict base64 the body is stored as.
+            except (OSError, UnicodeError, binascii.Error) as exc:
+                # Not readable on disk (BACKLOG #5388 added item 2), not UTF-8, not ASCII, or not
+                # the strict base64 the body is stored as.
                 defect = codec_safe_str(exc)
             raise _damaged(file_id, "body", defect)
 
@@ -2672,12 +2689,14 @@ class UploadStore:
                 if held is None:
                     # _unsealable_sync declines a sidecar it cannot open, so tell an absent one,
                     # whether it was never there or went since the read, from a refused one.
-                    # Only FileNotFoundError means absent. Any other OSError propagates, as it does
-                    # from the read above, and is never answered as a missing file.
+                    # Only FileNotFoundError means absent. Any other OSError is answered as the
+                    # read above answers it, never as a missing file (BACKLOG #5388 added item 2).
                     try:
                         meta_path.lstat()
                     except FileNotFoundError as exc:
                         raise UploadNotFoundError(file_id) from exc
+                    except OSError as exc:
+                        defect = codec_safe_str(exc)
                     if defect is not None:
                         raise _damaged(file_id, "sidecar", defect)
                     raise UploadUnreadableError(refusal)
@@ -2901,6 +2920,11 @@ class UploadStore:
                 )
                 return _Half.SKIPPED
             stored = path.read_text(encoding="utf-8")
+            if kind == "meta":
+                # As the reader unpads it, so a sealed sidecar that gained a byte-order mark or
+                # whitespace is re-sealed, never sealed a second time as plaintext (BACKLOG #5387
+                # added item 1).
+                stored = _unpadded(stored)
         except (OSError, UnicodeDecodeError) as exc:
             if kind == "body" and isinstance(exc, FileNotFoundError | UnicodeDecodeError):
                 # BACKLOG #3181: the body is missing or is not text, so no key reads it and no
@@ -3086,8 +3110,9 @@ class UploadStore:
     def _count_unsealed_sync(self) -> tuple[int, int]:
         """How many uploads have a non-blank half with no ``mfenc:`` marker, as two counts: those
         ``rotate-key`` can seal, and those it cannot (:meth:`_unsealable_sync`). Reads the first
-        ``len(MARKER_PREFIX)`` characters of each file, and a plaintext sidecar's body whole. A file
-        that cannot be read is not counted here; the listing scan names it on its own."""
+        ``len(MARKER_PREFIX)`` characters of each file, past a sidecar's byte-order mark and
+        whitespace, and a plaintext sidecar's body whole. A file that cannot be read is not counted
+        here; the listing scan names it on its own."""
         count = unsealable = 0
         for fid, sidecar in self._iter_sidecars():
             try:
@@ -3098,6 +3123,13 @@ class UploadStore:
                 try:
                     with path.open(encoding="utf-8") as handle:
                         head = handle.read(len(MARKER_PREFIX))
+                        if path.name.endswith(_META_SUFFIX):
+                            # The reader's padding is skipped, so a padded sealed sidecar is not
+                            # counted as plaintext (BACKLOG #5387 added item 1).
+                            while head and not _lstrip_pad(head):
+                                head = handle.read(len(MARKER_PREFIX))
+                            head = _lstrip_pad(head)
+                            head += handle.read(len(MARKER_PREFIX) - len(head))
                 except (OSError, UnicodeDecodeError):
                     continue
                 if head and head != MARKER_PREFIX:

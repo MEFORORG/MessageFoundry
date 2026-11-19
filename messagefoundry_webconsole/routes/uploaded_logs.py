@@ -222,7 +222,7 @@ _ENGINE_DAMAGED_DETAIL = (
 #: no removal, as the engine's text does not: some damaged files are refused by the delete too.
 _DAMAGED_CAUSE = (
     "The engine found the file damaged, so it does not read or serve it. No encryption key and no "
-    "command repairs it. An administrator may try to delete it, and the engine may refuse that too."
+    "command repairs it. It may be deleted, but the engine may refuse that too."
 )
 BROWSE_DAMAGED_NOTICE = f"{_BROWSE_LEAD} {_DAMAGED_CAUSE}"
 RESEND_DAMAGED_NOTICE = f"{_RESEND_LEAD} {_DAMAGED_CAUSE}"
