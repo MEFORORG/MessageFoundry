@@ -86,7 +86,7 @@ function Get-ClaimHostToken {
     # falls back to the empty name rather than throwing: the worst a shared token does is the visible
     # stranded/ sweep above, and a throw here would break the no-throw contract.
     $n = ''
-    try { $n = [Environment]::MachineName.ToLowerInvariant() } catch [System.InvalidOperationException] { $n = '' }
+    try { $n = [Environment]::MachineName.ToLowerInvariant() } catch [System.InvalidOperationException] { <# $n stays the empty name #> }
     $sha = [System.Security.Cryptography.SHA256]::Create()
     try { $b = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($n)) }
     finally { $sha.Dispose() }

@@ -283,7 +283,7 @@ function Get-RootUnavailability {
     # One cause per damaged shape, so the operator is told what to fix. Every one reads MALFORMED.
     $damage = $null
     $doc = $null
-    $flagCount = 0
+    $repeated = $null
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         # A DIRECTORY AT THE MARKER PATH IS NOT AN ABSENT MARKER. Somebody put something there, so it
         # takes the damaged-marker verdict rather than the silent AVAILABLE arm.
@@ -294,21 +294,35 @@ function Get-RootUnavailability {
             $raw = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
             # -NoEnumerate: unrolled, a one-element array would reach the object check below as its element.
             $doc = $raw | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
-            # A REPEATED `unavailable` KEY IS DAMAGED TOO. ConvertFrom-Json keeps the last value silently,
-            # so `{"unavailable": true, "unavailable": false}` read as AVAILABLE. Newtonsoft's reader is
-            # the grammar ConvertFrom-Json parses with, so it accepts exactly what that accepted, and it
-            # yields every property name; depth 1 is the marker's own keys. A case-variant repeat already
-            # throws in ConvertFrom-Json.
+            # A REPEATED VERDICT KEY IS DAMAGED TOO. ConvertFrom-Json keeps the last value silently, so
+            # `{"unavailable": true, "unavailable": false}` read as AVAILABLE, and a repeated
+            # `effective_from` picks PENDING or UNAVAILABLE by order alone. Newtonsoft's reader is the
+            # grammar ConvertFrom-Json parses with, so it accepts exactly what that accepted, and it yields
+            # every property name; depth 1 is the marker's own keys. A case-variant repeat already throws
+            # in ConvertFrom-Json. Only the two keys that pick the verdict count: a repeated `reason`
+            # changes no verdict, and MALFORMED would let a cancelled account publish.
             if ($doc -is [System.Management.Automation.PSCustomObject]) {
-                $r = [Newtonsoft.Json.JsonTextReader]::new([System.IO.StringReader]::new([string]$raw))
-                $r.MaxDepth = $null
-                $r.DateParseHandling = 'None'
-                while ($r.Read()) {
-                    if ($r.TokenType -eq 'PropertyName' -and $r.Depth -eq 1 -and $r.Value -ieq 'unavailable') { $flagCount++ }
+                $readerType = 'Newtonsoft.Json.JsonTextReader' -as [type]
+                if (-not $readerType) { $damage = 'could not be checked for a repeated key, because Newtonsoft.Json is not loaded' }
+                else {
+                    $r = $readerType::new([System.IO.StringReader]::new([string]$raw))
+                    $r.MaxDepth = $null
+                    $r.DateParseHandling = 'None'
+                    $seen = @{}
+                    while ($r.Read()) {
+                        if ($r.TokenType -eq 'PropertyName' -and $r.Depth -eq 1 -and $r.Value -in 'unavailable', 'effective_from') {
+                            if ($seen[$r.Value]) { $repeated = $r.Value } else { $seen[$r.Value] = $true }
+                        }
+                    }
                 }
             }
         }
-        catch { $damage = "could not be read as JSON ($($_.Exception.Message -replace '\s+', ' '))" }
+        catch {
+            # Capped: a deeply nested marker makes the parser name a path thousands of characters long.
+            $m = $_.Exception.Message -replace '\s+', ' '
+            if ($m.Length -gt 200) { $m = $m.Substring(0, 200) + '...' }
+            $damage = "could not be read as JSON ($m)"
+        }
     }
     # A MARKER THAT PARSES TO ANYTHING BUT AN OBJECT IS DAMAGED TOO. An empty or whitespace-only file
     # and JSON null parse to $null without throwing, and an array or a scalar parses cleanly, so the
@@ -324,7 +338,7 @@ function Get-RootUnavailability {
     $flag = $null
     if (-not $damage) {
         if ($doc -isnot [System.Management.Automation.PSCustomObject]) { $damage = 'is not a JSON object' }
-        elseif ($flagCount -gt 1) { $damage = "repeats the 'unavailable' key" }
+        elseif ($repeated) { $damage = "repeats the '$repeated' key" }
         else { $flag = $doc.PSObject.Properties['unavailable'] }
     }
     if ($flag) {

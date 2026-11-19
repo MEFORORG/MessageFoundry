@@ -3750,8 +3750,9 @@ def test_a_damaged_marker_does_not_stop_a_live_account_publishing(tmp_path: Path
     assert doc["marker_state"] == "MALFORMED"
 
 
-# Each parses WITHOUT throwing, so on origin/main the catch that names a damaged marker never ran.
-_NOT_AN_OBJECT = {
+# Each parses WITHOUT throwing, so before BACKLOG #5305 the catch that names a damaged marker never
+# ran. Not all are non-objects: the flag-* bodies are objects whose flag cannot be read.
+_MALFORMED_BODIES = {
     "empty": "",
     "whitespace": "  \r\n ",
     "null": "null",
@@ -3773,6 +3774,11 @@ _NOT_AN_OBJECT = {
     # ConvertFrom-Json keeps the last of a repeated key silently, so this read as AVAILABLE.
     "flag-repeated": '{"unavailable": true, "unavailable": false}',
     "flag-repeated-same": '{"unavailable": true, "unavailable": true}',
+    # A repeated effective_from picked PENDING or UNAVAILABLE by order alone.
+    "effective-from-repeated": (
+        '{"unavailable": true, "effective_from": "2000-01-01T00:00:00Z",'
+        ' "effective_from": "2099-01-01T00:00:00Z"}'
+    ),
 }
 
 # Positive controls, classified in the same run: a check that called everything MALFORMED fails here.
@@ -3794,6 +3800,8 @@ _WELL_FORMED = {
         "{'unavailable': true, /* c */ reason: 'cancelled\nby owner',}",
         "UNAVAILABLE",
     ),
+    # A repeated reason picks no verdict, so it is no damage.
+    "reason-repeated": ('{"unavailable": true, "reason": "a", "reason": "b"}', "UNAVAILABLE"),
     # A nested flag is not the marker's own, so it cannot count as a repeat.
     "nested-flag": ('{"unavailable": false, "detail": {"unavailable": true}}', "AVAILABLE"),
 }
@@ -3805,7 +3813,7 @@ def test_a_marker_that_parses_to_no_object_is_malformed_not_a_cancellation(tmp_p
     or read as AVAILABLE outright. One pwsh run classifies them all beside well-formed controls; the
     end-to-end test below drives the collector and the reader on two of them.
     """
-    bodies = {**_NOT_AN_OBJECT, **{name: body for name, (body, _) in _WELL_FORMED.items()}}
+    bodies = {**_MALFORMED_BODIES, **{name: body for name, (body, _) in _WELL_FORMED.items()}}
     for name, body in bodies.items():
         (tmp_path / name).mkdir()
         (tmp_path / name / "unavailable.json").write_text(body, encoding="utf-8")
@@ -3839,7 +3847,7 @@ def test_a_marker_that_parses_to_no_object_is_malformed_not_a_cancellation(tmp_p
     states = json.loads(proc.stdout)
     assert "is a directory" in states.pop("directory-reason"), states
     assert "repeats the 'unavailable' key" in states.pop("flag-repeated-reason"), states
-    expected = dict.fromkeys(_NOT_AN_OBJECT, "MALFORMED")
+    expected = dict.fromkeys(_MALFORMED_BODIES, "MALFORMED")
     expected.update({name: state for name, (_, state) in _WELL_FORMED.items()})
     expected.update({"directory": "MALFORMED", "absent": "AVAILABLE"})
     assert states == expected, states
@@ -3856,7 +3864,7 @@ def test_a_marker_that_parses_to_no_object_does_not_stop_a_live_account_publishi
     root.mkdir()
     state = root / "mefor-usage"
     state.mkdir()
-    (state / "unavailable.json").write_text(_NOT_AN_OBJECT[name], encoding="utf-8")
+    (state / "unavailable.json").write_text(_MALFORMED_BODIES[name], encoding="utf-8")
 
     line = collect(state, {"rate_limits": {"seven_day": window(42.0, 3600)}})
     assert "unavailable" not in line, f"a damaged marker blanked a live account: {line}"
