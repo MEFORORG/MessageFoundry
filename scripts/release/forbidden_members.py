@@ -180,6 +180,9 @@ _SHORT_NAME = re.compile(r"[^.]{1,6}~\d+(\.[^.]{0,3})?")
 
 _SPECIAL = "a link or special file; a published distribution carries regular files only"
 
+#: The characters ``zipfile.extractall`` rewrites to ``_`` on Windows (:func:`non_canonical`).
+_REWRITTEN_CHARS = frozenset(':<>|"?*')
+
 
 #: The Unix file types a zip entry may carry: none recorded, a regular file, or a directory.
 _ZIP_PLAIN_TYPES: frozenset[int] = frozenset({0, stat.S_IFREG, stat.S_IFDIR})
@@ -290,16 +293,22 @@ def non_canonical(member: str) -> str | None:
     written as ``messagefoundry/anon/__init__.py``, because ``zipfile`` DROPS a ``..`` component
     where a reader that applies it, as :func:`_split_candidates` does, sees ``anon/__init__.py``. So
     the retired ``messagefoundry/anon`` package passed the split rule and would have installed. The
-    same run wrote ``e./f.py`` as ``e/f.py`` and ``... /i.py`` as ``i.py``. Every rule below models
-    some readings of such a name, and a model is one reading short whenever an extractor disagrees
-    with it. A build backend writes none of these shapes, so the gate refuses the class, as it
-    refuses links, before any rule reads the name: a backslash, an empty component (a doubled or a
-    leading separator; one trailing ``/`` on a zip directory entry is allowed), a component made
-    only of dots and spaces (``.``, ``..``, ``...``, ``   ``, ``.. ``), and a component ending in a
-    dot or a space.
+    same run wrote ``e./f.py`` as ``e/f.py`` and ``... /i.py`` as ``i.py``, and on Windows
+    ``zipfile`` also rewrites each of ``:<>|"?*`` to ``_`` (``ZipFile._sanitize_windows_name``), so
+    ``messagefoundry?toolkit/x.py`` extracts as ``messagefoundry_toolkit/x.py``. Every rule below
+    models some readings of such a name, and a model is one reading short whenever an extractor
+    disagrees with it. A build backend writes none of these shapes, so :func:`inspect` refuses the
+    class, as it refuses links, before the test-content and split rules read the name: a backslash,
+    one of ``zipfile``'s rewritten characters or an ASCII control character, an empty component (a
+    doubled or a leading separator; one trailing ``/`` on a zip directory entry is allowed), a
+    component made only of dots and spaces (``.``, ``..``, ``...``, ``   ``, ``.. ``), and a
+    component ending in a dot or a space. That covers every rewrite ``zipfile`` makes; it is not a
+    claim that no other extractor or filesystem has an alias this list misses.
     """
     if "\\" in member:
         return "the name holds a backslash, which extractors do not agree is a separator"
+    if bad := sorted({c for c in member if c in _REWRITTEN_CHARS or ord(c) < 0x20 or c == "\x7f"}):
+        return f"the name holds {''.join(bad)!r}, which an extractor may rewrite or truncate at"
     for part in member.removesuffix("/").split("/"):
         if not part:
             return "the name has an empty component, a doubled or leading separator"
@@ -320,9 +329,11 @@ def _parts(member: str) -> list[str]:
     (``. ``, ``...``, ``   ``) is dropped too, so the per-rule readings see the path an extractor
     that strips trailing dots and spaces would write. ``..`` (and ``.. ``) is kept, because it climbs.
 
-    THIS READING IS NOT THE DEFENCE AGAINST SUCH NAMES. :func:`non_canonical` refuses every name
-    holding one of these components, because extractors disagree on them and no single reading can
-    be right for all of them. The reading stays so a refused name still gets its per-rule reason."""
+    THIS READING IS NOT THE DEFENCE AGAINST SUCH NAMES. :func:`inspect` refuses every name holding
+    one of these components through :func:`non_canonical`, before the test-content and split rules
+    run, because extractors disagree on them and no single reading can be right for all of them.
+    The reading stays so :func:`forbidden`, :func:`development_content` and
+    :func:`split_violation` still give a sound verdict when called on their own."""
     return [
         p for p in member.replace("\\", "/").split("/") if p.rstrip(" ") == ".." or _normalise(p)
     ]

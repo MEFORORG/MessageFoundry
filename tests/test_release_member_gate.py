@@ -1871,3 +1871,41 @@ def test_the_cli_still_passes_a_clean_engine_wheel(
     """Control for the parent-hop cases: the same wheel without the hop passes."""
     wheel = _write_wheel(tmp_path / "dist" / _ENGINE_WHEEL, _CLEAN_WHEEL)
     assert main([str(wheel)]) == 0, capsys.readouterr().err
+
+
+# Round 1 of that repair: on Windows ``zipfile`` rewrites each of ``:<>|"?*`` to ``_``, so each
+# member below extracts there as a retired path or the toolkit package. Each passed the gate at
+# 681c3ee898e.
+
+_REWRITTEN = (
+    "messagefoundry/lens?schema.py",
+    "messagefoundry?toolkit/__init__.py",
+    "messagefoundry/corepoint|import.py",
+    "messagefoundry/adr*analyze.py",
+    "messagefoundry/lens<schema.py",
+    'messagefoundry/corepoint"import.py',
+    "messagefoundry/adr>analyze.py",
+)
+
+
+@pytest.mark.parametrize("member", _REWRITTEN)
+def test_the_cli_refuses_an_engine_wheel_member_zipfile_rewrites(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], member: str
+) -> None:
+    wheel = _write_wheel(tmp_path / "dist" / _ENGINE_WHEEL, (*_CLEAN_WHEEL, member))
+    assert main([str(wheel)]) == 1
+    assert f"ships {member} -- the name holds" in capsys.readouterr().err
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="zipfile rewrites these characters on Windows")
+def test_zipfile_rewrites_the_character_to_an_underscore(tmp_path: Path) -> None:
+    """The premise of the refusal, measured: the forged name extracts as the forbidden one."""
+    wheel = _write_wheel(tmp_path / "w.whl", ("messagefoundry?toolkit/__init__.py",))
+    with zipfile.ZipFile(wheel) as zf:
+        zf.extractall(tmp_path / "out")
+    assert (tmp_path / "out" / "messagefoundry_toolkit" / "__init__.py").is_file()
+
+
+@pytest.mark.parametrize("char", [*':<>|"?*', "\x00", "\x1f", "\x7f"])
+def test_a_rewritten_or_control_character_is_refused(char: str) -> None:
+    assert non_canonical(f"messagefoundry_toolkit/a{char}b.py") is not None
