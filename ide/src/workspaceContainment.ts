@@ -110,10 +110,12 @@ export function hasTrailingDotOrSpaceName(rel: string, win32: boolean = path.sep
 /**
  * Whether `rel`, a path relative to a folder, has a folder or file name holding a colon, when `win32`
  * (by default, on Windows). `rel` is relative, so it carries no drive letter. A Win32 open reads
- * `name:stream` as an NTFS alternate data stream on the entry `name`, so `cfg:x`, with `cfg` a
- * junction out of the folder, writes to a stream on the folder outside, while Node reads the whole
- * name as one missing entry and the real-path check passes it. Either separator splits `rel`. Spelling
- * only, with no I/O. Shared by {@link escapesByLink} and securityConfigTarget (BACKLOG #5404 item 1).
+ * `name:stream` as an NTFS alternate data stream on the entry `name`. With `cfg` a junction out of
+ * the folder, Python's open of `cfg:x` wrote a stream on the folder outside (measured in review, 2026-11-19),
+ * while Node's real-path read finds no such entry and the real-path check passes the name. Behind a
+ * file symbolic link Node can resolve the stream, so the real-path check may refuse that case
+ * itself; this refuses either before any read. Either separator splits `rel`. Spelling only, with no
+ * I/O. Shared by {@link escapesByLink} and securityConfigTarget (BACKLOG #5404 item 1).
  */
 export function hasColonInName(rel: string, win32: boolean = path.sep === "\\"): boolean {
   return win32 && rel.split(/[\\/]/).some((part) => part.includes(":"));
@@ -135,8 +137,8 @@ export type PathSettingKey = "configDir" | "serviceConfig" | "messageSetsDir";
  * Two spellings are refused outright, before any I/O. A `..` component: the real-path check collapses
  * `..` by spelling, but on POSIX the CLI's kernel follows a link before it applies the `..` after it,
  * so `link/../x` could land outside the folder although its spelling is `x`. And, on Windows, a name
- * {@link hasTrailingDotOrSpaceName} or {@link hasColonInName} names, which the real-path check would
- * read as a missing path.
+ * {@link hasTrailingDotOrSpaceName} or {@link hasColonInName} names, which the real-path check can
+ * pass although the CLI's Win32 open reaches another entry.
  *
  * Open limits. The check reads the named path only: a link BELOW it, such as a linked `codesets`
  * folder under `configDir`, is not caught here. The real-path reads are synchronous, because cli.ts
@@ -225,8 +227,9 @@ export interface PathSettingScopes {
  * act on the one used in its place, and shows {@link writerRefusal} (cli.ts `writerPathSetting`).
  *
  * Open limit: this compares spellings only, with no file-system call, because every CLI call reads
- * these settings. It does not catch a link or junction inside the folder that leads out of it, or a
- * Windows name ending in a dot or a space. A writer that needs those checks makes them itself
+ * these settings. It does not catch at least a link or junction inside the folder that leads out of
+ * it, a Windows name ending in a dot or a space, or a Windows name holding a colon. A writer that
+ * needs those checks makes them itself
  * ({@link escapesByLink}, {@link resolveInsideWorkspace}, securityConfigTarget).
  */
 export function containedPathSetting(

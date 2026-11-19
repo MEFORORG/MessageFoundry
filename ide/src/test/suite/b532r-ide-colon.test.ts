@@ -2,8 +2,8 @@
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 // Batch 532 remainder (BACKLOG #5404 item 1): on Windows a writer refuses a path setting with a
 // folder or file name holding a colon. A Win32 open reads `cfg:x` as an NTFS stream on `cfg`, so with
-// `cfg` a junction out of the folder the write lands on the folder outside, while Node reads the
-// whole name as one missing entry and the real-path check passes it.
+// `cfg` a junction out of the folder the CLI's write would land on the folder outside, while the
+// real-path check can pass the name.
 import * as assert from "assert";
 import * as fs from "fs";
 import * as os from "os";
@@ -55,7 +55,10 @@ function recordingFs(calls: string[]): LinkFs {
 }
 
 suite("b532r: a name holding a colon is refused on Windows (BACKLOG #5404 item 1)", () => {
-  test("on Windows, a write through `cfg:x` lands outside the folder, and the writer check refuses it", function () {
+  // Measured in review, 2026-11-19, on Windows 11 with Node 24: Python 3.14.7's open, the CLI's opener, of `ws\cfg:x` with
+  // `cfg` a junction wrote the stream `outside:x`. Node 24's own open of that path fails with ENOENT,
+  // so the write is not reproduced here; the control below is the half Node can show.
+  test("on Windows, the real-path check passes `cfg:x` through a junction, and the writer check refuses it", function () {
     if (process.platform !== "win32") {
       this.skip(); // the control needs a Win32 open and NTFS streams; the refusal is driven below
     }
@@ -72,16 +75,6 @@ suite("b532r: a name holding a colon is refused on Windows (BACKLOG #5404 item 1
       }
       // THE CONTROL: the real-path check alone passes the name.
       assert.notStrictEqual(resolveInsideWorkspace(ws, "cfg:x"), undefined);
-      // And a write through it reaches the folder outside, as a stream on it.
-      let streamWritten = true;
-      try {
-        fs.writeFileSync(path.join(ws, "cfg:x"), "synthetic");
-      } catch {
-        streamWritten = false; // a volume with no stream support: the refusal is still asserted
-      }
-      if (streamWritten) {
-        assert.strictEqual(fs.readFileSync(`${outside}:x`, "utf8"), "synthetic");
-      }
       assert.strictEqual(escapesByLink(ws, "cfg:x"), true);
       assert.strictEqual(escapesByLink(ws, "cfg:x/new.toml"), true);
     } finally {
@@ -105,9 +98,9 @@ suite("b532r: a name holding a colon is refused on Windows (BACKLOG #5404 item 1
     assert.notDeepStrictEqual(calls, []);
   });
 
-  test("a colon in the drive of an absolute value inside the folder is not a name", () => {
+  test("a colon in the drive of an absolute value inside the folder is not a name", function () {
     if (process.platform !== "win32") {
-      return; // no drive letter to spell off Windows
+      this.skip(); // no drive letter to spell off Windows
     }
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "b532r-ide-colon-"));
     try {

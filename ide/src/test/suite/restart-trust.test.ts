@@ -295,6 +295,21 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     assert.strictEqual(run.started, false);
   });
 
+  test("a command-link value the link check does not read reaches the no-file refusal, and is not echoed", async () => {
+    // A user value outside the folder on Windows, and a plain name inside it elsewhere: neither is
+    // stopped by the colon refusal, so the no-file refusal's own no-echo is still driven on both legs.
+    stubSetting = "\\\\attacker.invalid\\share\\[x](command:foo)";
+    const run = await restart(LOOPBACK);
+
+    assert.strictEqual(notices.length, 1, JSON.stringify(notices));
+    assert.ok(!notices[0].includes("[x](command:foo)"), notices[0]);
+    assert.ok(!notices[0].includes("command:"), notices[0]);
+    assert.match(notices[0], /^MessageFoundry: messagefoundry\.serviceConfig names a path which is not a file in this workspace/);
+    assert.deepStrictEqual(run.statted, [`statSync ${path.resolve(ws, stubSetting)}`]);
+    assert.strictEqual(run.stopped, false);
+    assert.strictEqual(run.started, false);
+  });
+
   test("no folder open: Restart gives Start's folder refusal and does not stop the engine", async () => {
     stubWorkspace = undefined;
     stubScope = "workspaceValue";
