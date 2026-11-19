@@ -18,6 +18,7 @@ import {
   trustRemedy,
 } from "./engineTrustModel";
 import type { HostPin } from "./engineTrustModel";
+import { SIGN_IN_TIMEOUT_MS } from "./signInSession";
 
 /**
  * What a step-up refusal asked for (403 + `X-Step-Up-Required`). `action` is the
@@ -448,16 +449,16 @@ function networkError(err: NodeJS.ErrnoException, baseUrl: string): NetworkError
  * through {@link postApprovable}. Here a 202 rejects with a {@link HeldError} rather than decoding as
  * `T`: a caller that does not handle a hold must not read one as success (BACKLOG #1981).
  *
- * `timeoutMs`, when given, fails a request that goes silent for that long, as {@link getJson} does,
- * with a {@link NetworkError} carrying {@link TIMEOUT_CODE}. Omitted, there is no cap. At least the
- * sign-in (BACKLOG #2281) and the step-up re-proof (vault BACKLOG #2950) pass one.
+ * `timeoutMs` (default {@link POST_TIMEOUT_MS}) is a wall-clock deadline on the whole request: one
+ * not finished by then fails with a {@link NetworkError} carrying {@link TIMEOUT_CODE}, however
+ * slowly the engine or a proxy trickles its reply (BACKLOG #5938).
  */
 export function postJson<T>(
   baseUrl: string,
   route: string,
   body: unknown,
   token?: string,
-  timeoutMs?: number,
+  timeoutMs: number = POST_TIMEOUT_MS,
 ): Promise<T> {
   const attempt = (): Promise<PostReply> => postReply(baseUrl, route, body, token, timeoutMs);
   return withRenewalRetry(baseUrl, attempt, false).then((reply) => {
@@ -537,19 +538,27 @@ export function approvalText(approvalId: string | undefined): string {
 /**
  * POST to a route dual control may hold, and report whether it ran or was held.
  *
- * Same transport, errors and auth as {@link postJson}; only the 2xx handling differs. The engine's
- * holdable routes are `/config/reload`, `/dead-letters/replay` and `/connections/{name}/purge`.
+ * Same transport, errors, auth and deadline as {@link postJson}; only the 2xx handling differs. The
+ * engine's holdable routes are `/config/reload`, `/dead-letters/replay` and `/connections/{name}/purge`.
  */
 export function postApprovable<T>(
   baseUrl: string,
   route: string,
   body: unknown,
   token?: string,
+  timeoutMs: number = POST_TIMEOUT_MS,
 ): Promise<Approvable<T>> {
-  return withRenewalRetry(baseUrl, () => postReply(baseUrl, route, body, token), false).then((reply) =>
-    classifyApprovable<T>(reply.status, reply.body),
+  return withRenewalRetry(baseUrl, () => postReply(baseUrl, route, body, token, timeoutMs), false).then(
+    (reply) => classifyApprovable<T>(reply.status, reply.body),
   );
 }
+
+/**
+ * Default POST deadline (ms), wall-clock from the request's start (BACKLOG #5938). It is
+ * {@link SIGN_IN_TIMEOUT_MS}, which outlasts the engine's default request deadline by the margin
+ * that constant states, so the engine's own 503 at that deadline still has time to arrive.
+ */
+export const POST_TIMEOUT_MS = SIGN_IN_TIMEOUT_MS;
 
 /** A decoded 2xx POST reply. The status is kept so {@link postApprovable} can tell a hold apart. */
 interface PostReply {
@@ -561,10 +570,20 @@ function postReply(
   baseUrl: string,
   route: string,
   body: unknown,
-  token?: string,
-  timeoutMs?: number,
+  token: string | undefined,
+  timeoutMs: number,
 ): Promise<PostReply> {
-  return new Promise<PostReply>((resolve, reject) => {
+  return new Promise<PostReply>((settle, fail) => {
+    // The deadline below runs until the promise settles, whatever settles it.
+    let deadline: ReturnType<typeof setTimeout> | undefined;
+    const resolve = (reply: PostReply): void => {
+      clearTimeout(deadline);
+      settle(reply);
+    };
+    const reject = (err: unknown): void => {
+      clearTimeout(deadline);
+      fail(err);
+    };
     let url: URL;
     try {
       // Concatenate (not URL-resolve) so a base URL with a path prefix (e.g. a reverse-proxy
@@ -608,11 +627,15 @@ function postReply(
         );
       });
     });
-    if (timeoutMs !== undefined) {
-      req.setTimeout(timeoutMs, () =>
-        req.destroy(new NetworkError(`engine request timed out after ${timeoutMs}ms`, TIMEOUT_CODE)),
-      );
-    }
+    // A wall-clock deadline, not `req.setTimeout`: that is an idle timeout, so a reply trickled a
+    // byte at a time never tripped it and the request could pend forever (BACKLOG #5938). It also
+    // times the connect, which the idle timeout did not. Rejecting here as well as destroying keeps
+    // the rejection certain once a response has begun, when the destroy need not reach 'error'.
+    deadline = setTimeout(() => {
+      const err = new NetworkError(`engine request timed out after ${timeoutMs}ms`, TIMEOUT_CODE);
+      reject(err);
+      req.destroy(err);
+    }, timeoutMs);
     req.on("error", (err: NodeJS.ErrnoException) =>
       reject(err instanceof NetworkError ? err : networkError(err, baseUrl)),
     );

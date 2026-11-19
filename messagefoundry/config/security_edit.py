@@ -20,6 +20,7 @@ next engine restart (``POST /config/reload`` re-runs the ``--config`` graph, not
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -54,36 +55,141 @@ def read_security(service_config: str | Path) -> dict[str, Any]:
 def set_security(
     service_config: str | Path, updates: Mapping[str, Any], *, validate: Validate
 ) -> dict[str, Any]:
-    """Merge ``updates`` into the ``[security]`` table (creating the file + table if needed), validate the
-    whole file still loads, then write comment-preservingly. A value of ``None`` **removes** that key
-    (resets it to its secure default). Raises :class:`SecurityEditError` if the result wouldn't load —
-    leaving the TOML untouched. Only the ``[security]`` table is edited; other sections are byte-stable."""
+    """Merge ``updates`` into the ``[security]`` table (creating the file + table when a key
+    changes), validate the whole file still loads, then write comment-preservingly. A value of
+    ``None`` **removes** that key (resets it to its secure default). Raises
+    :class:`SecurityEditError` if the result wouldn't load, leaving the TOML untouched. Only the
+    ``[security]`` table is edited; other sections are byte-stable.
+
+    The result says what changed (BACKLOG #5327): ``keys`` lists the keys written or removed, and
+    ``unchanged`` the keys the edit left as they were, a ``None`` reset that found no such key or a
+    value the file already holds. When no key changed, ``op`` is ``"unchanged"``. An existing file
+    still goes through the same validated replace, so a file the engine would refuse, or a link, is
+    refused as it is for any edit, and the file is rewritten by that replace, which restricts it
+    as for every set (:func:`atomic_edit.replace_validated`): on POSIX to its owner afterwards,
+    the editing account unless root keeps the previous owner; on Windows to the editing account
+    or, where another account owned it, to that account and the editing account; logging a
+    warning where it cannot. ``rewritten`` says so, and ``detail`` says it in
+    words when no key changed. With only resets asked and no file at the path in a folder that
+    exists, nothing is created or checked and ``rewritten`` is false. No edit lock is taken when
+    the file is absent at the first check; if it is deleted between that check and the lock, the
+    lock is taken and its lock file left as any edit leaves it. A missing folder, or a missing
+    drive, is refused, so a mistyped path does not read as a successful reset. This
+    module cannot tell a known ``[security]`` key from a misspelled one, since it stays outside the
+    settings import graph, so refusing a reset of an unknown key is the caller's job; the
+    ``security`` CLI does it."""
     if not isinstance(updates, Mapping):
         raise SecurityEditError("security updates must be a JSON object of {key: value}")
     path = Path(service_config)
+    if updates and all(value is None for value in updates.values()):
+        # A mistyped path must not read as a successful reset. The shared stat gate tells a
+        # folder that is not there from one it could not stat, which it refuses in its own words.
+        if not atomic_edit.is_dir(path.parent, refused_error=SecurityEditError):
+            raise SecurityEditError(
+                f"refused, nothing written: {path.parent} is not a folder that exists, so there "
+                f"is no settings file {path.name} to reset; check the settings file path"
+            )
+        if _nothing_at(path):
+            # Only resets, and no file to reset them in: nothing can change, so take no lock,
+            # whose file would be the edit's only trace. Anything at the path, a directory or a
+            # link among them, goes on to the replace, which fails on it.
+            return _absent_result(path, list(updates))
     with atomic_edit.edit_lock(path, busy_error=SecurityEditError, refused_error=SecurityEditError):
         original, crlf = atomic_edit.read_text_if_present(path, refused_error=SecurityEditError)
         doc = tomlkit.parse(original) if original is not None else tomlkit.document()
 
         sec = doc.get("security")
+        created = sec is None
         if sec is None:
             sec = tomlkit.table()
             doc["security"] = sec
+        changed: list[str] = []
+        unchanged: list[str] = []
+        current = sec.unwrap()
         for key, value in updates.items():
             if value is None:
                 if key in sec:
                     del sec[key]
+                    changed.append(key)
+                else:
+                    # Reporting this as set would claim a reset that did not happen.
+                    unchanged.append(key)
+            elif key in current and _same(current[key], value):
+                unchanged.append(key)
             else:
                 sec[key] = value
-        # Drop an emptied [security] table so a full reset-to-defaults leaves no bare header behind.
-        if not len(sec):
+                changed.append(key)
+        if not changed and original is None and _nothing_at(path):
+            # The file went between the check above and the lock: still nothing to reset, and a
+            # 0-byte file would be the edit's only effect.
+            return _absent_result(path, unchanged)
+        # Drop a [security] table this edit emptied, the bare one added above, or a bare header,
+        # so a full reset-to-defaults leaves no header behind. A table that already held only
+        # comments is kept when the edit removed nothing from it.
+        if not len(sec) and (changed or created or not sec.as_string().strip()):
             del doc["security"]
 
         _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
-    return {"op": "set", "keys": list(updates.keys())}
+    if changed:
+        return {"op": "set", "keys": changed, "unchanged": unchanged, "rewritten": True}
+    return {
+        "op": "unchanged",
+        "keys": [],
+        "unchanged": unchanged,
+        "rewritten": True,
+        # The replace does not report whether its restriction took, so this names the step
+        # rather than claim its outcome.
+        "detail": "no key changed; file rewritten by the validated replace every set uses, which "
+        "restricts it, on POSIX to its owner afterwards (the editing account unless root keeps the "
+        "previous owner), on Windows to the editing account or, where another account owned it, to "
+        "that account and the editing account, and logs a warning where it cannot",
+    }
 
 
 # --- internals ---------------------------------------------------------------
+
+
+def _nothing_at(path: Path) -> bool:
+    """Whether nothing at all is at ``path``, so an edit that changes no key may skip it.
+
+    Only a lstat that says the file is not found counts, and only in a folder that exists: a name
+    the system refuses, a missing folder, or a path under a regular file, is a mistyped path an
+    edit must fail on rather than report as absent. ``os.path.lexists`` alone reads every failed lstat
+    as absent, so the editors' shared stat gate also refuses a file behind an unreachable share."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        return False
+    else:
+        return False
+    if not os.path.isdir(path.parent):
+        return False
+    return not atomic_edit.is_file(path, refused_error=SecurityEditError)
+
+
+def _absent_result(path: Path, unchanged: list[str]) -> dict[str, Any]:
+    """The result of an edit that changed no key where no file exists: none is created."""
+    return {
+        "op": "unchanged",
+        "keys": [],
+        "unchanged": unchanged,
+        "rewritten": False,
+        "detail": f"no key changed; {path.name} does not exist, so no settings file was created",
+    }
+
+
+def _same(held: Any, value: Any) -> bool:
+    """Whether ``value`` is exactly what the file holds, type by type all the way down, since
+    ``True == 1`` and ``1.0 == 1`` would otherwise call a different value the same."""
+    if type(held) is not type(value):
+        return False
+    if isinstance(value, list):
+        return len(held) == len(value) and all(map(_same, held, value))
+    if isinstance(value, dict):
+        return held.keys() == value.keys() and all(_same(held[k], value[k]) for k in value)
+    return bool(held == value)
 
 
 def _write_validated(path: Path, data: bytes, validate: Validate) -> None:

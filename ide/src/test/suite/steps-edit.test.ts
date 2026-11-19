@@ -1557,8 +1557,23 @@ suite("Steps v2 — structural affordances appear ONLY on recognized rows", () =
       "↑/↓ reorder the whole block",
     );
     assert.ok(html.includes('draggable="true"'), "the block is a drag source");
-    // ...but NOT delete: a control block is read-only (not template-regenerable, ADR 0076 §5).
+    // ...but no one-click delete: the engine's block delete does not yet check for a name the block
+    // binds and a later step reads, so the trash waits on that check (BACKLOG #5944).
     assert.ok(!html.includes('data-op="deleteRow"'), "no delete on a control block");
+    // A raise moves, but the engine refuses to delete it.
+    const raise: LensRow = { ...control, control: "raise", test_src: null };
+    const raiseHtml = renderRowHtml(vmOf(raise, SRC), "h");
+    assert.ok(raiseHtml.includes('data-op="moveUp"'), "a raise moves");
+    assert.ok(!raiseHtml.includes('data-op="deleteRow"'), "no delete on a raise");
+  });
+
+  test("a Comment row, deletable but not movable, gets the trash alone (BACKLOG #5944)", () => {
+    const note: LensRow = { kind: "note", line_start: 2, line_end: 2, nesting: 0 };
+    const html = renderRowHtml(vmOf(note, SRC), "h");
+    assert.ok(html.includes('data-op="deleteRow"'), "delete on a Comment");
+    assert.ok(!html.includes('data-op="moveUp"'), "a Comment does not move");
+    const pragma = renderRowHtml(vmOf({ ...note, pragma: true }, SRC), "h");
+    assert.ok(!pragma.includes('data-op="deleteRow"'), "a pragma note is not deletable");
   });
 
   test("an elif/else control row is NOT movable (part of its if, not an independent block)", () => {

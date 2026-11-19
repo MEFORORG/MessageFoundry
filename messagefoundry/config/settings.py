@@ -40,11 +40,12 @@ import difflib
 import functools
 import ipaddress
 import logging
+import math
 import os
 import re
 import string
 import tomllib
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date
@@ -111,6 +112,7 @@ from messagefoundry.domainshape import (
     is_canonical_ipv4,
     upn_suffix_key,
 )
+from messagefoundry.hostlist import allow_entry_problem, parse_allow_entry
 from messagefoundry.logging_setup import LOG_LEVELS
 
 # Moved to netaddr, the neutral leaf, so the HTTP listener reads them without importing private
@@ -760,6 +762,15 @@ def _check_revocation_attestation_pair(
 _SCHEMA_LOCK_TIMEOUT_MAX: Final[float] = float((2**31 - 1) // 1000)
 
 
+def store_path_names_a_directory(value: str) -> bool:
+    """Whether ``value``'s last part, as written, is empty, ``.`` or ``..``, so the path names a
+    directory rather than a file (``""``, ``data/``, ``data/..``). On Windows a backslash also
+    separates parts. The test :func:`store_path_refusal` applies, shared with ``supervise``, which
+    derives each engine shard's file name from the path's stem (BACKLOG #5817)."""
+    last = re.split(r"[\\/]", value)[-1] if os.name == "nt" else value.split("/")[-1]
+    return last in ("", ".", "..")
+
+
 def store_path_refusal(
     value: str, *, name: str = "[store].path (from the settings file, MEFOR_STORE_PATH or --db)"
 ) -> str | None:
@@ -789,7 +800,7 @@ def store_path_refusal(
     windows = os.name == "nt"
     # The last part as written: Win32 trims a trailing dot or space, so it is tested unstripped.
     last = re.split(r"[\\/]", value)[-1] if windows else value.split("/")[-1]
-    if last in ("", ".", ".."):
+    if store_path_names_a_directory(value):
         return (
             f"{name} names no file (value withheld); name the SQLite file, e.g. 'messagefoundry.db'"
         )
@@ -2217,6 +2228,18 @@ class ApiSettings(_Section):
                 "[api].tls_client_cert_identities requires [api].tls_client_ca_file (in-process mTLS "
                 "verifies the client cert before its subject is resolved to a principal)"
             )
+        # The client-CA pin and the client CRL each act only on the client chain that
+        # tls_client_ca_file has the server verify. Without it no client certificate is asked for,
+        # so a pin or CRL would load while enforcing nothing. Fail loud at load (BACKLOG #5315).
+        for name, value in (
+            ("tls_client_ca_pin", self.tls_client_ca_pin),
+            ("tls_client_crl_file", self.tls_client_crl_file),
+        ):
+            if value is not None and not self.tls_client_ca_file:
+                raise ValueError(
+                    f"[api].{name} requires [api].tls_client_ca_file (in-process mTLS): without "
+                    "it no client certificate is verified, so the setting would enforce nothing"
+                )
         # A declared upstream terminator means nothing unless the engine knows (and trusts) the proxy
         # in front -- otherwise it's an unverifiable claim that XFF could spoof. It never satisfies
         # the off-loopback exposed-bind gate on its own (BACKLOG #4636; docs/SECURITY.md, Plaintext
@@ -3014,7 +3037,8 @@ class LoggingSettings(_Section):
     # #299). The syslog forwarder builds its own context and resolves no trust anchor, so
     # [tls].crl_file never reaches it -- this is its own knob rather than a silent inheritance, which
     # would be the per-hop scoping error that item warns about. Applies only with
-    # forward_tls_verify=true: the opt-out arm is CERT_NONE, where there is no chain to check against.
+    # forward_tls_verify=true: the opt-out arm is CERT_NONE, where there is no chain to check against,
+    # so the load refuses it there and on any forward_protocol but "tls" (BACKLOG #5316).
     # Same fail-closed refusals as every other CRL: absent, unloadable or past nextUpdate refuses at
     # startup rather than at the first collector handshake.
     forward_tls_crl_file: str | None = None
@@ -3133,8 +3157,11 @@ class LoggingSettings(_Section):
     @field_validator("time_sync_max_skew_seconds")
     @classmethod
     def _check_skew_threshold(cls, value: float) -> float:
-        if value <= 0:
-            raise ValueError("[logging].time_sync_max_skew_seconds must be > 0")
+        # NaN passes `value <= 0` and no offset compares above it, and infinity is above every
+        # offset, so either would leave the skew warning and the fail-closed refusal unable to fire
+        # (BACKLOG #5317).
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("[logging].time_sync_max_skew_seconds must be a finite number > 0")
         return value
 
     @model_validator(mode="after")
@@ -3145,6 +3172,10 @@ class LoggingSettings(_Section):
         if self.forward_enabled and not self.forward_host:
             raise ValueError(
                 "[logging].forward_enabled requires [logging].forward_host (the syslog/SIEM collector)"
+            )
+        if self.forward_enabled and _is_limited_broadcast(self.forward_host or ""):
+            raise ValueError(
+                "[logging].forward_host is the broadcast address, which names no collector"
             )
         # Native TLS-syslog: verifying the collector needs an explicit CA anchor (see forward_tls_ca_file
         # above). Only enforced when forwarding is actually on and verification is not opted out.
@@ -3157,8 +3188,35 @@ class LoggingSettings(_Section):
             raise ValueError(
                 "[logging].forward_protocol='tls' with certificate verification requires "
                 "[logging].forward_tls_ca_file (a PEM trust anchor for the collector); set "
-                "[logging].forward_tls_verify=false to accept an unverified server (insecure)"
+                "[logging].forward_tls_verify=false to accept an unverified server (insecure; "
+                "a forward_tls_crl_file must then be removed, since nothing would check it)"
             )
+        # The TLS-only settings, refused where the forwarder's own protocol or verify setting means
+        # they could never take effect (BACKLOG #5316): a declared mTLS or revocation check for the
+        # SIEM hop would otherwise load and stay silently inactive. udp and tcp read none of the
+        # three. On the verify-off arm (CERT_NONE) the CA and the CRL have no chain to act on, but
+        # the client certificate is still loaded and presented to the collector
+        # (logging_setup._build_tls_context), so it is not refused there. A disabled forwarder is
+        # not what this check keys on: it refuses only on the protocol and verify settings.
+        for name, value, needs_verify in (
+            ("forward_tls_ca_file", self.forward_tls_ca_file, True),
+            ("forward_tls_client_cert", self.forward_tls_client_cert, False),
+            ("forward_tls_crl_file", self.forward_tls_crl_file, True),
+        ):
+            if value is None:
+                continue
+            if self.forward_protocol is not SyslogProtocol.TLS:
+                raise ValueError(
+                    f"[logging].{name} applies only to forward_protocol='tls', and it is "
+                    f"{self.forward_protocol.value!r}, so the setting would do nothing; remove "
+                    "it, or set [logging].forward_protocol='tls'"
+                )
+            if needs_verify and not self.forward_tls_verify:
+                raise ValueError(
+                    f"[logging].{name} applies only with forward_tls_verify=true, and it is "
+                    "false, so no certificate chain is checked and the setting would do nothing; "
+                    "remove it, or turn [logging].forward_tls_verify on"
+                )
         # The attestation pair is validated by the SAME shared rule connection-level tls_hop_attested
         # uses (a reason without the flag, or a blank reason, is a config mistake) — never re-forked.
         # Re-raised under the [logging] field names so the operator sees which setting is at fault
@@ -4917,6 +4975,56 @@ _KNOWN_ENV_POSTURE: dict[str, bool] = {
 _SERVICEABLE_AI_PROVIDERS = frozenset({"claude"})
 
 
+def _host_list_entries(
+    value: list[str],
+    setting: str,
+    problem: Callable[[str], str | None] = allow_entry_problem,
+    forms: str = "'host', 'host:port', '[v6]' or '[v6]:port', such as 'db.example.org:5432' or "
+    "'[2001:db8::10]:6661'",
+) -> list[str]:
+    """``value``, a ``host[:port]`` allowlist, with each entry stripped, or a refusal naming
+    ``setting`` and the first entry that is blank or that ``problem`` refuses (BACKLOG #5915).
+
+    The matcher reads every entry with :func:`~messagefoundry.hostlist.parse_allow_entry`, and an
+    entry it cannot read matches nothing, so it would load and quietly admit nothing. A blank entry
+    is refused rather than dropped: dropping it would turn a list that admits nothing into an unset
+    one, which the audited opt-out reads as admitting any host. The environment form drops blank
+    items before this runs, as it always has. The refusal names the entry by its position, from 1,
+    not by text, as the ``allowed_ech_sidecar`` refusal does: an operator who pasted a URL,
+    credential and all, would otherwise find it in the error. ``forms`` is the remedy it names."""
+    cleaned: list[str] = []
+    for position, raw in enumerate(value, start=1):
+        item = raw.strip()
+        why = "it is blank" if not item else problem(item)
+        if why is not None:
+            raise ValueError(
+                f"{setting} entry {position} is refused: {why}. Write each entry as {forms}"
+            )
+        cleaned.append(item)
+    return cleaned
+
+
+def _db_entry_problem(entry: str) -> str | None:
+    """:func:`~messagefoundry.hostlist.allow_entry_problem`, and an ``[egress].allowed_db`` entry
+    that names an IPv6 address or holds more than one ``:``, which no DATABASE server can match
+    (BACKLOG #5915). Those two reasons come before the generic one, which would tell the operator
+    to write ``[v6]``; a URL or a path keeps the generic reason, which names it as one."""
+    text = entry.strip()
+    if "://" in text or "@" in text or "/" in text:
+        return allow_entry_problem(text)
+    parsed = parse_allow_entry(text)
+    if parsed is not None and isinstance(parsed[0], ipaddress.IPv6Address):
+        what = "it names an IPv6 address"
+    elif text.count(":") > 1:
+        what = "it holds more than one ':'"
+    else:
+        return allow_entry_problem(text)
+    return (
+        f"{what}, and while this list is set a DATABASE server holding a ':' is refused whatever "
+        "the entries say, so name the server by a host name and list that"
+    )
+
+
 class AiSettings(_Section):
     """Central AI-assistance policy plus the instance's active **environment name** and security
     **posture**. The two AI axes (mode + data scope) are bounded by the production-posture ceiling
@@ -4954,7 +5062,8 @@ class AiSettings(_Section):
     # The broker credential (the LLM provider API key). SECRET — env only (MEFOR_AI_API_KEY), listed in
     # _FILE_SECRET_KEYS (warns if placed in the file) and _SECRET_SETTING_KEYS (redacted). Never logged.
     api_key: str | None = None
-    # SSRF fail-closed allowlist (ADR 0135): each entry is "host" (any port) or "host:port". The broker
+    # SSRF fail-closed allowlist (ADR 0135): each entry is "host" or "[v6]" (any port), or
+    # "host:port" or "[v6]:port"; an entry no host can match is refused at load. The broker
     # validates its configured `endpoint` against THIS list ITSELF — an un-listed host (or an empty list)
     # is REFUSED. Deliberately independent of [egress].allowed_http, which, when empty, allows any
     # host under the audited `[security].block_unlisted_outbound = false` opt-out (see
@@ -4989,6 +5098,12 @@ class AiSettings(_Section):
             "what was relied on",
         )
         return self
+
+    @field_validator("allowed_endpoints", mode="after")
+    @classmethod
+    def _endpoint_entries_are_read(cls, value: list[str]) -> list[str]:
+        """Refuse at load an entry the broker's host match cannot read (BACKLOG #5915)."""
+        return _host_list_entries(value, "[ai].allowed_endpoints")
 
     @field_validator("provider")
     @classmethod
@@ -5197,6 +5312,24 @@ def _fail_open_note(note: str) -> None:
         _log.warning("%s", note)
     else:
         held.append(note)
+
+
+#: The IPv4 limited broadcast address (RFC 919), which ``[logging].forward_host`` refuses (BACKLOG #5923).
+_LIMITED_BROADCAST = ipaddress.IPv4Address("255.255.255.255")
+
+
+def _is_limited_broadcast(host: str) -> bool:
+    """Whether ``host`` is the IPv4 limited broadcast address, in any spelling
+    :func:`_host_ip_literal` reads, its IPv4-mapped IPv6 form included. No DNS.
+
+    BACKLOG #5923: with forwarding on, such a ``[logging].forward_host`` names no collector. The
+    forwarder never sets ``SO_BROADCAST``, so the OS refuses each UDP send there (EACCES on Linux)
+    and a spool would hold every record behind it; a stream connect to it fails too. A directed
+    subnet broadcast cannot be told from a host address without the netmask, so it is not read."""
+    addr = _host_ip_literal(_bare_host(host))
+    if isinstance(addr, ipaddress.IPv6Address):
+        addr = addr.ipv4_mapped  # ::ffff:255.255.255.255 is the same IPv4 send
+    return addr == _LIMITED_BROADCAST
 
 
 def _host_ip_literal(h: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
@@ -5460,8 +5593,8 @@ def pinned_host_port(entry: str) -> tuple[str, int] | None:
     The one parse ``[egress].allowed_ech_sidecar`` is validated with at load and matched with at
     the gate, which reads the sidecar it dials back through it, so the two cannot read a host or a
     port differently (BACKLOG #5528). It splits at the LAST ``:``, so ``[::1]:8123`` reads as a
-    host and a port. The ``host[:port]`` lists have their own entry parse, in ``transports.egress``
-    (BACKLOG #5915), which differs at least in that a port is optional there. ``None`` for at
+    host and a port. The ``host[:port]`` lists have their own entry parse,
+    :func:`~messagefoundry.hostlist.parse_allow_entry` (BACKLOG #5915), which differs at least in that a port is optional there. ``None`` for at
     least: no port; a port that is not 1 to 65535 in at most five ASCII digits; a host holding a
     ``:`` outside brackets, or none inside them; and a host the
     sidecar resolver would refuse, because :func:`is_loopback_hop_host` does not read it as this
@@ -5504,23 +5637,27 @@ class EgressSettings(_Section):
     The comment on ``deny_by_default`` says what else it covers and how operators set it.
     """
 
-    # Allowed MLLP outbound destinations: each entry is "host" (any port) or "host:port".
+    # Allowed MLLP outbound destinations: each entry is "host" or "[v6]" (any port), or "host:port"
+    # or "[v6]:port". `_host_entries_are_read` names the lists that refuse at load an entry no host
+    # can match.
     allowed_mllp: list[str] = []
-    # Allowed raw-TCP outbound destinations: each entry is "host" (any port) or "host:port".
+    # Allowed raw-TCP outbound destinations: each entry is an MLLP-style host entry.
     allowed_tcp: list[str] = []
     # Allowed File outbound directories: a destination's directory must resolve at/under one of these.
     allowed_file_dirs: list[str] = []
-    # Allowed REST/SOAP (HTTP) outbound hosts: each entry is "host" (any port) or "host:port".
+    # Allowed REST/SOAP (HTTP) outbound hosts: each entry is an MLLP-style host entry.
     allowed_http: list[str] = []
-    # Allowed DATABASE outbound servers: each entry is "host" (any port) or "host:port".
+    # Allowed DATABASE outbound servers: each entry is "host" (any port) or "host:port". An IPv6
+    # entry is refused at load: while this list is set a server holding a ':' is refused whatever
+    # the entries say (docs/CONNECTIONS.md).
     allowed_db: list[str] = []
     # Allowed REMOTEFILE (SFTP/FTP/FTPS) hosts — gates the connector in BOTH directions (the source
-    # dials out to poll, the destination dials out to upload). Each entry is "host" or "host:port".
+    # dials out to poll, the destination dials out to upload). Each entry is an MLLP-style host entry.
     allowed_remote: list[str] = []
-    # Allowed EMAIL (SMTP) outbound hosts: each entry is "host" (any port) or "host:port" (ADR 0029).
+    # Allowed EMAIL (SMTP) outbound hosts: each entry is an MLLP-style host entry (ADR 0029).
     allowed_smtp: list[str] = []
-    # Allowed DIRECT (S/MIME-over-SMTP HISP relay) outbound hosts: each entry is "host" (any port) or
-    # "host:port" (ADR 0085). Kept SEPARATE from allowed_smtp so an operator can permit a Direct HISP
+    # Allowed DIRECT (S/MIME-over-SMTP HISP relay) outbound hosts: each entry is an MLLP-style host
+    # entry (ADR 0085). Kept SEPARATE from allowed_smtp so an operator can permit a Direct HISP
     # relay without opening generic email egress (a distinct trust relationship carrying encrypted PHI).
     allowed_direct: list[str] = []
     # Allowed EMAIL recipient domains (vault BACKLOG #2616): every address an Email destination
@@ -5557,7 +5694,7 @@ class EgressSettings(_Section):
     # that matches nothing sends that host through the proxy; that rule ignores a port and reads
     # '*:443' as '*', so a malformed entry can also bypass the proxy for every host.
     proxy_no_proxy: list[str] = []
-    # The forward-PROXY host allowlist (BACKLOG #1659). Each entry is "host" (any port) or "host:port".
+    # The forward-PROXY host allowlist (BACKLOG #1659). Each entry is an MLLP-style host entry.
     # NOT a destination list: it gates the operator-chosen transport INTERMEDIARY an http-family
     # connection dials through, which under `proxy_auth_type = basic` receives a pre-emptive
     # `Proxy-Authorization` header on both destination schemes (ADR 0126) and so is a second
@@ -5596,7 +5733,7 @@ class EgressSettings(_Section):
     # MEFOR_EGRESS_ALLOWED_ECH_SIDECAR.
     allowed_ech_sidecar: list[str] = []
     # Allowed SYSLOG collectors for the off-box log forwarder (``[logging].forward_host`` and
-    # ``forward_port``; BACKLOG #2356): each entry is "host" (any port) or "host:port". The forwarder
+    # ``forward_port``; BACKLOG #2356): each entry is an MLLP-style host entry. The forwarder
     # is not a connection, so no graph check sees it; ``serve`` and ``supervise`` check it at start,
     # before the forwarder opens a socket, through ``syslog_forward_refusal`` in
     # messagefoundry/transports/egress.py. Empty and unset mean what they mean for ``allowed_tcp``:
@@ -5640,6 +5777,33 @@ class EgressSettings(_Section):
         if isinstance(v, str):
             return [item.strip() for item in v.split(",") if item.strip()]
         return v
+
+    @field_validator(
+        "allowed_mllp",
+        "allowed_tcp",
+        "allowed_http",
+        "allowed_db",
+        "allowed_remote",
+        "allowed_smtp",
+        "allowed_direct",
+        "allowed_proxy",
+        "allowed_syslog",
+        mode="after",
+    )
+    @classmethod
+    def _host_entries_are_read(cls, value: list[str], info: ValidationInfo) -> list[str]:
+        """Refuse at load an entry the host matcher cannot read (BACKLOG #5915). An ``allowed_db``
+        entry naming an IPv6 address is refused too: while the list is set the DATABASE check
+        refuses every server holding a ``:``, so such an entry could never admit one."""
+        setting = f"[egress].{info.field_name}"
+        if info.field_name == "allowed_db":
+            return _host_list_entries(
+                value,
+                setting,
+                _db_entry_problem,
+                "'host' or 'host:port', such as 'db.example.org:5432'",
+            )
+        return _host_list_entries(value, setting)
 
     @field_validator("proxy_url", mode="after")
     @classmethod
@@ -6767,8 +6931,10 @@ class ClusterSettings(_Section):
     )
     @classmethod
     def _positive(cls, value: float) -> float:
-        if value <= 0:
-            raise ValueError("must be > 0")
+        # BACKLOG #5771: written so NaN fails too, since every comparison with NaN is False, and an
+        # infinite or NaN lease, timeout or interval would break renewal, membership or reclaim.
+        if not 0 < value < float("inf"):
+            raise ValueError("must be a finite number > 0")
         return value
 
     @field_validator("lease_renew_timeout_seconds")
@@ -6777,8 +6943,10 @@ class ClusterSettings(_Section):
         # Split out of _positive above because None is this field's "derive it" sentinel, and the
         # shared validator would compare None to 0. There is deliberately no "0 disables" escape
         # hatch: an unbounded renew is the defect the knob removes.
-        if value is not None and value <= 0:
-            raise ValueError("must be > 0 (leave it unset to derive it from the detection margin)")
+        if value is not None and not 0 < value < float("inf"):
+            raise ValueError(
+                "must be a finite number > 0 (leave it unset to derive it from the detection margin)"
+            )
         return value
 
     @field_validator("acquire_delay_seconds")

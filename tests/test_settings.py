@@ -959,6 +959,67 @@ def test_logging_tls_verify_false_needs_no_ca(tmp_path: Path) -> None:
     assert log.forward_protocol.value == "tls" and log.forward_tls_verify is False
 
 
+# --- BACKLOG #5316: the forwarder's TLS-only settings refuse where nothing would apply them -------
+
+_FORWARD_TLS_ONLY = ["forward_tls_ca_file", "forward_tls_client_cert", "forward_tls_crl_file"]
+
+
+def _forward_toml(tmp_path: Path, extra: str) -> Path:
+    return _write(
+        tmp_path / "messagefoundry.toml", f'[logging]\nforward_host = "siem.local"\n{extra}'
+    )
+
+
+def _forward_value(tmp_path: Path, key: str) -> str:
+    # The CRL setting refuses a missing file first, so it gets a real one.
+    return str(_write(tmp_path / "crl.pem", "x")) if key == "forward_tls_crl_file" else "x.pem"
+
+
+@pytest.mark.parametrize("protocol", ["udp", "tcp"])
+@pytest.mark.parametrize("key", _FORWARD_TLS_ONLY)
+def test_a_tls_only_forward_setting_on_a_plaintext_protocol_is_refused(
+    tmp_path: Path, protocol: str, key: str
+) -> None:
+    """udp and tcp read none of the three, so a declared CA, client certificate or CRL would load
+    and do nothing. Red under: the refusal removed, where each loads."""
+    value = json.dumps(_forward_value(tmp_path, key))
+    cfg = _forward_toml(tmp_path, f'forward_protocol = "{protocol}"\n{key} = {value}\n')
+    with pytest.raises(ValidationError, match=rf"\[logging\]\.{key} applies only to "):
+        load_settings(config_path=cfg, environ={})
+
+
+@pytest.mark.parametrize("key", ["forward_tls_ca_file", "forward_tls_crl_file"])
+def test_a_forward_ca_or_crl_with_verification_off_is_refused(tmp_path: Path, key: str) -> None:
+    """forward_tls_verify=false is CERT_NONE: no chain is checked, so the CA and the CRL do nothing.
+    Red under: the verify-off arm of the refusal removed."""
+    value = json.dumps(_forward_value(tmp_path, key))
+    extra = f'forward_protocol = "tls"\nforward_tls_verify = false\n{key} = {value}\n'
+    cfg = _forward_toml(tmp_path, extra)
+    with pytest.raises(ValidationError, match=rf"\[logging\]\.{key} applies only with "):
+        load_settings(config_path=cfg, environ={})
+
+
+def test_a_forward_client_cert_with_verification_off_still_loads(tmp_path: Path) -> None:
+    """The client certificate is still loaded and presented with verification off
+    (logging_setup._build_tls_context), so it is not inert there and not refused."""
+    extra = (
+        'forward_protocol = "tls"\nforward_tls_verify = false\nforward_tls_client_cert = "c.pem"\n'
+    )
+    log = load_settings(config_path=_forward_toml(tmp_path, extra), environ={}).logging
+    assert log.forward_tls_client_cert == "c.pem"
+
+
+def test_every_tls_only_forward_setting_loads_on_verified_tls(tmp_path: Path) -> None:
+    """The control for the refusals above: the same three load together on verified TLS."""
+    crl = json.dumps(_forward_value(tmp_path, "forward_tls_crl_file"))
+    extra = (
+        'forward_protocol = "tls"\nforward_tls_ca_file = "ca.pem"\n'
+        f'forward_tls_client_cert = "c.pem"\nforward_tls_crl_file = {crl}\n'
+    )
+    log = load_settings(config_path=_forward_toml(tmp_path, extra), environ={}).logging
+    assert all(getattr(log, key) is not None for key in _FORWARD_TLS_ONLY)
+
+
 def test_logging_time_sync_requires_peer(tmp_path: Path) -> None:
     cfg = _write(tmp_path / "messagefoundry.toml", "[logging]\nrequire_time_sync = true\n")
     with pytest.raises(ValidationError):
@@ -993,6 +1054,29 @@ def test_logging_time_sync_skew_threshold_must_be_positive(tmp_path: Path) -> No
     )
     with pytest.raises(ValidationError):
         load_settings(config_path=cfg, environ={})
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
+def test_logging_time_sync_skew_threshold_must_be_finite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """NaN passes a bare `<= 0` check, and no offset compares above NaN or infinity, so either
+    would silence the skew warning and the fail-closed refusal (BACKLOG #5317). Red under: the
+    finiteness check removed, where nan and inf load."""
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        '[logging]\nrequire_time_sync = true\nntp_peer = "ntp.local"\n'
+        f"time_sync_max_skew_seconds = {value}\n",
+    )
+    with pytest.raises(ValidationError, match=r"time_sync_max_skew_seconds must be a finite"):
+        load_settings(config_path=cfg, environ={})
+    # The control: the environment spelling reaches the same refusal, and a finite value loads.
+    (tmp_path / "empty").mkdir()
+    monkeypatch.chdir(tmp_path / "empty")  # no ./messagefoundry.toml for the loader to pick up
+    with pytest.raises(ValidationError, match=r"time_sync_max_skew_seconds must be a finite"):
+        load_settings(environ={"MEFOR_LOGGING_TIME_SYNC_MAX_SKEW_SECONDS": value})
+    finite = load_settings(environ={"MEFOR_LOGGING_TIME_SYNC_MAX_SKEW_SECONDS": "1e9"})
+    assert finite.logging.time_sync_max_skew_seconds == 1e9
 
 
 def test_logging_time_sync_default_noop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2438,6 +2522,15 @@ def test_a_blank_crl_path_is_refused_at_load_naming_its_own_setting(
         load_settings(config_path=cfg, environ={})
 
 
+#: The settings a CRL knob needs beside it to load at all: the client CRL acts only under in-process
+#: mTLS (BACKLOG #5315), and the forwarder's only on verified TLS-syslog (BACKLOG #5316).
+_CRL_COMPANIONS = {
+    "api": 'tls_cert_file = "server.pem"\ntls_client_ca_file = "client-ca.pem"\n',
+    "logging": 'forward_host = "siem.local"\nforward_protocol = "tls"\n'
+    'forward_tls_ca_file = "siem-ca.pem"\n',
+}
+
+
 @pytest.mark.parametrize(("section", "key", "name"), [p for p in _CRL_KNOBS if p.id != "store"])
 def test_an_existing_crl_path_loads_on_each_setting(
     tmp_path: Path, section: str, key: str, name: str
@@ -2446,6 +2539,27 @@ def test_an_existing_crl_path_loads_on_each_setting(
     about the path and not the setting. The store is left out because it also needs the postgres
     backend and its server fields; test_hop_refusal_revocation.py covers it."""
     crl = _write(tmp_path / "crl.pem", "placeholder")
-    cfg = _write(tmp_path / "messagefoundry.toml", _toml(section, key, str(crl)))
+    body = _toml(section, key, str(crl)) + _CRL_COMPANIONS.get(section, "")
+    cfg = _write(tmp_path / "messagefoundry.toml", body)
     loaded = load_settings(config_path=cfg, environ={})
     assert getattr(getattr(loaded, section), key) == str(crl), name
+
+
+# --- BACKLOG #5315: the client-CA pin and the client CRL need the client CA they act on --------------
+
+
+@pytest.mark.parametrize("field", ["tls_client_ca_pin", "tls_client_crl_file"])
+def test_a_client_pin_or_crl_without_the_client_ca_is_refused_at_load(
+    tmp_path: Path, field: str
+) -> None:
+    """Without [api].tls_client_ca_file the server asks for no client certificate, so the pin and
+    the CRL would load and enforce nothing. Red under: the refusal removed, where both load."""
+    value = "ab" * 32 if field == "tls_client_ca_pin" else str(_write(tmp_path / "c.pem", "x"))
+    refusal = rf"\[api\]\.{field} requires \[api\]\.tls_client_ca_file"
+    with pytest.raises(ValidationError, match=refusal):
+        ApiSettings.model_validate({"tls_cert_file": "server.pem", field: value})
+    # The control: the same value beside the client CA it acts on loads unchanged.
+    loaded = ApiSettings.model_validate(
+        {"tls_cert_file": "server.pem", "tls_client_ca_file": "client-ca.pem", field: value}
+    )
+    assert getattr(loaded, field) == value

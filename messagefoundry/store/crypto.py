@@ -791,7 +791,8 @@ class AuditKeyVersionRefusedError(CipherError):
 class AuditKeyVersionUnverifiedError(AuditKeyVersionRefusedError):
     """A Transit check of a stored audit MAC at one key version got HTTP 400 that
     :func:`~messagefoundry.store.crypto_transit._names_no_version_reason` does not read as a version
-    refusal, or whose reading runs out of memory or stack, while the key still answers under the
+    refusal, or whose reading raises one of
+    :data:`~messagefoundry.store.crypto_transit._READ_FAULTS`, while the key still answers under the
     latest (BACKLOG #6707).
 
     The 400 may still be a refusal of the version: a proxy can replace Vault's reply with its own
@@ -2287,6 +2288,34 @@ def _decode_key(key_b64: str, name: str) -> bytearray:
     return bytearray(decoded)
 
 
+#: Why a keyring with retired keys and no active key is refused (BACKLOG #5310, #5308), under
+#: ``[store].cipher_provider = "aesgcm"``. The text reads only which settings are set, never a key.
+#: :func:`make_cipher` raises it, and so do the store's key seam and start gate (through
+#: ``store.base.retired_without_active_refusal``); every one counts an entry as a key when it is not
+#: blank once stripped, as ``keyprovider._split_retired`` reads the setting, and an active key of
+#: blanks only as no active key.
+RETIRED_WITHOUT_ACTIVE = (
+    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED is set but no active store key resolved "
+    "(MEFOR_STORE_ENCRYPTION_KEY, [store].encryption_key_file or the [store].key_provider). "
+    "That is a rotation missing its new key, so it is refused rather than run keyless: a keyless "
+    "store would write new rows unencrypted. Set the active key; a store meant to run keyless "
+    "lists no retired keys. A key of blanks only counts as no key: if MEFOR_STORE_ENCRYPTION_KEY "
+    "is blanks, unset that variable."
+)
+
+#: The same refusal under ``[store].cipher_provider = "vault_transit"`` (BACKLOG #5310, #5308).
+#: Transit encrypts the store's rows there whatever the local keys are, so the text does not claim
+#: the store would write rows unencrypted; what reads the local keys there is the DR backup and
+#: restore. Kept short, because what renders it under Transit, at least the DR backup, the CLI
+#: ``backup`` and DR activation's seed verify, renders it through ``safe_exc``, which cuts a long
+#: text, and the cause and remedy must survive the cut.
+RETIRED_WITHOUT_ACTIVE_TRANSIT = (
+    "Retired store keys are set with no active local key (blanks count as none). Under "
+    "vault_transit DR backup and restore read local keys, so they refuse. Set the key, or list no "
+    "retired keys."
+)
+
+
 def make_cipher(
     key_b64: str | None,
     retired_b64: Sequence[str] = (),
@@ -2295,23 +2324,45 @@ def make_cipher(
     allow_unmarked: bool = False,
 ) -> Cipher:
     """Build the store cipher. ``key_b64`` is the active key (base64 32-byte); ``retired_b64`` are
-    decrypt-only keys to keep available during a rotation window. Empty active key → identity cipher
-    (backward-compatible default). ``write_v2`` selects the cell-bound writer, ``mfenc:v4`` under the
-    store data sub-key since ADR 0196; ``open_store`` passes ``[store].aad_bind``, which defaults ON.
-    Off here, the frozen v1 writer (CRYPTO-1: v1 byte-identical). ``allow_unmarked`` is
-    ``[store].allow_unmarked_ciphertext``: off, a keyed cipher refuses a non-blank unmarked value."""
-    if not key_b64:
-        return IdentityCipher()
-    # Named by role, not by one variable: the active key may come from MEFOR_STORE_ENCRYPTION_KEY,
-    # a DPAPI key file or another provider, and an error naming only the variable sends an operator
-    # to a source that is not set (vault BACKLOG #3054, item 8).
-    active = _decode_key(
-        key_b64,
-        "the active store key (MEFOR_STORE_ENCRYPTION_KEY, [store].encryption_key_file or the "
-        "[store].key_provider)",
-    )
-    retired = [_decode_key(k, "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED") for k in retired_b64 if k]
-    return AesGcmCipher(active, retired, write_v2=write_v2, allow_unmarked=allow_unmarked)
+    decrypt-only keys to keep available during a rotation window. No active key and no retired key
+    gives the identity cipher (the keyless store). No active key WITH a retired key raises
+    ``ValueError`` (:data:`RETIRED_WITHOUT_ACTIVE`, BACKLOG #5310): that is a rotation missing its
+    new key, and the identity cipher would write new rows unencrypted. An active key of blanks only
+    counts as no active key there; with no retired key it is refused as a key that does not decode,
+    as before. A retired entry of blanks only is no key when there is no active key, and is refused
+    as a key that does not decode beside one. ``write_v2`` selects the cell-bound writer,
+    ``mfenc:v4`` under the store data sub-key since ADR 0196; ``open_store`` passes
+    ``[store].aad_bind``, which defaults ON. Off here, the frozen v1 writer (CRYPTO-1: v1
+    byte-identical). ``allow_unmarked`` is ``[store].allow_unmarked_ciphertext``: off, a keyed cipher
+    refuses a non-blank unmarked value."""
+    if not key_b64 or not key_b64.strip():
+        if any(k.strip() for k in retired_b64):
+            raise ValueError(RETIRED_WITHOUT_ACTIVE)
+        if not key_b64:
+            return IdentityCipher()
+    # Every key decoded is wiped on every exit (BACKLOG #5310): on a failure, before the cipher
+    # took them; on success, after the cipher wiped each as it installed it, so the second wipe
+    # finds zeros. The cipher keeps no reference to a buffer.
+    keys: list[bytearray] = []
+    try:
+        # Named by role, not by one variable: the active key may come from
+        # MEFOR_STORE_ENCRYPTION_KEY, a DPAPI key file or another provider, and an error naming only
+        # the variable sends an operator to a source that is not set (vault BACKLOG #3054, item 8).
+        keys.append(
+            _decode_key(
+                key_b64,
+                "the active store key (MEFOR_STORE_ENCRYPTION_KEY, [store].encryption_key_file or "
+                "the [store].key_provider)",
+            )
+        )
+        # Every non-empty entry is decoded, so one of blanks only is refused as a bad key, as before.
+        for k in retired_b64:
+            if k:
+                keys.append(_decode_key(k, "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"))
+        return AesGcmCipher(keys[0], keys[1:], write_v2=write_v2, allow_unmarked=allow_unmarked)
+    finally:
+        for buf in keys:
+            _secure_zero(buf)
 
 
 def generate_key() -> str:

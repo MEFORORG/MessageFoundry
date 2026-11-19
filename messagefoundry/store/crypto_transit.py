@@ -54,9 +54,10 @@ import os
 import threading
 import time
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
+from messagefoundry.logging_guard import _last_resort
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.store.crypto import (
     _V3_PREFIX,
@@ -101,8 +102,6 @@ from messagefoundry.store.keyprovider_vault import (
 from messagefoundry.store.row_seal import transit_mac_version
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from messagefoundry.config.settings import StoreSettings
     from messagefoundry.config.tls_policy import HopPosture
 
@@ -142,11 +141,8 @@ _ENV_AUDIT_KEY = "MEFOR_STORE_TRANSIT_AUDIT_KEY"
 #: ``sdk/helper/keysutil/policy.go`` (``HMACKey``, ``safeGetKeyEntry``) at commit cbc874e2358f, and
 #: from OpenBao, which says the same, at 80e208bf4f83 and 79e101fe2e59. ``version is too new`` was
 #: read on 2026-11-11 from Vault's ``pathHMACVerify`` at cbc874e2358f only (BACKLOG #2720); OpenBao
-#: was not read for it. They never decide whether
-#: the row is a break, and are read only inside an ``errors`` value that is a list
-#: (:func:`_names_no_version_reason`): a list entry holding one keeps the refused-version label,
-#: even beside a reason in :data:`_NOT_VERSION_TEXTS`. One anywhere else, such as in a bare JSON
-#: list or a string ``errors`` value, is not read.
+#: was not read for it. They choose only the error's label, never whether the row is a break
+#: (:func:`_names_no_version_reason` says where they are looked for).
 _VERSION_REFUSAL_TEXTS = (
     "key version does not exist",
     "no such key version",
@@ -154,18 +150,27 @@ _VERSION_REFUSAL_TEXTS = (
     "no hmac key exists for that key version",
     "version is too new",
 )
-#: Whole Vault error texts, lower-cased, that say an audit-MAC 400 is NOT about the version
-#: (BACKLOG #6707), from the same Vault source. Matched whole once stripped and lower-cased, never
-#: as a substring. Kept short on purpose: :meth:`TransitCipher.verify_audit_hmac` sends base64 it
-#: encoded, a fixed algorithm and only a MAC that :func:`transit_mac_version` accepts, so at least
-#: the input-encoding, MAC-shape and algorithm 400s are not reachable from it.
-_NOT_VERSION_TEXTS = frozenset({"missing input for hmac", "encryption key not found"})
 #: The longest reply body, in characters, that :func:`_reply_errors` parses when hvac parsed none
-#: (BACKLOG #6707). Vault's own refusal is far shorter. It bounds both readers of a 400: the audit
-#: walk's version check, where a MemoryError would turn a row's break into a walk that could not run
-#: and a longer body is not read as a version refusal, and the data-key decrypt's AEAD check
-#: (BACKLOG #5650), where a longer body is not read as a tag refusal. A change here changes both.
+#: (BACKLOG #6707): a body over this many characters is not parsed, and one of up to this many is.
+#: Vault's own refusal is far shorter. It bounds both readers of a 400, and a change here changes
+#: both. The audit walk's version check reads nothing from a longer body, not even a list hvac
+#: parsed. The data-key decrypt's AEAD check (BACKLOG #5650) does not re-parse one, but still reads
+#: a list hvac parsed.
 _REPARSED_BODY_MAX_CHARS = 64 * 1024
+#: The fixed reasons :func:`_names_no_version_reason` gives, and the one a fault reading the 400
+#: gives, so none is built while the read may be short of memory (BACKLOG #6707).
+_OVERSIZE_BODY = f"its body is past the {_REPARSED_BODY_MAX_CHARS}-character bound and was not read"
+_NO_ERRORS_LIST = "it carries no errors list"
+_NO_VERSION_REFUSAL = "its errors list names no version refusal"
+_READ_RAISED = "reading it raised"
+#: The failures caught while a 400 is read, which then picks the unconfirmed label, and while that
+#: label's warning is made and logged (BACKLOG #6707): a step short of memory or stack. Anything
+#: else the read raises propagates. No reply is known to cause either: a body past
+#: :data:`_REPARSED_BODY_MAX_CHARS` is not read, and the parser,
+#: :func:`~messagefoundry.redaction.json_loads_or_refusal`, returns its ``RecursionError`` refusal
+#: rather than raising it. Out of memory or stack, a fault on the unconfirmed label's path can still
+#: propagate, including one raised after a caught one.
+_READ_FAULTS = (MemoryError, RecursionError)
 #: The texts Vault and OpenBao Transit answer a data-key ``decrypt`` with, lower-cased, when the
 #: value's AEAD tag does not verify under its associated data (BACKLOG #5650): Go's own AEAD error
 #: texts, ``crypto/cipher``'s GCM for ``aes256-gcm96`` and ``golang.org/x/crypto``'s
@@ -179,14 +184,17 @@ _AEAD_FAILURE_TEXTS = frozenset(
 )
 
 
-def _reply_errors(exc: Exception) -> tuple[object, int | None]:
+def _reply_errors(exc: Exception, *, bound_parsed: bool = False) -> tuple[object, int | None]:
     """A Vault error's ``errors`` value, and, when it went unread because the body is too long,
     that body's length. hvac fills ``exc.errors`` only when the reply's Content-Type is exactly
     ``application/json``, so a proxy that adds a charset leaves the same JSON in ``exc.text``;
     that is parsed when hvac parsed no JSON (``exc.json`` is None) and the body is at most
-    :data:`_REPARSED_BODY_MAX_CHARS` long. Callers read only a list."""
+    :data:`_REPARSED_BODY_MAX_CHARS` long. With ``bound_parsed``, a body past that bound is
+    unread even when hvac parsed it. Callers read only a list."""
     errors: object = getattr(exc, "errors", None)
     body: object = getattr(exc, "text", None)
+    if bound_parsed and isinstance(body, str) and len(body) > _REPARSED_BODY_MAX_CHARS:
+        return None, len(body)
     if errors is None and getattr(exc, "json", None) is None and isinstance(body, str):
         if len(body) > _REPARSED_BODY_MAX_CHARS:
             return None, len(body)
@@ -196,37 +204,27 @@ def _reply_errors(exc: Exception) -> tuple[object, int | None]:
     return errors, None
 
 
-def _names_no_version_reason(exc: Exception) -> bool:
-    """Whether an audit-MAC ``verify`` 400 is NOT read as a version refusal (BACKLOG #6707). Only an
-    ``errors`` value that is a list is read. With none, this is True whatever the reply says: at
-    least a proxy or WAF page, text that is not JSON, a bare JSON list, and a string or object
-    ``errors`` value. A list is True only when it is non-empty, every entry is text whose whole
-    value, stripped and lower-cased, is in :data:`_NOT_VERSION_TEXTS`, and no entry holds a
-    :data:`_VERSION_REFUSAL_TEXTS` text; any other list, an empty one, one with a non-text entry
-    and unknown Vault wording included, is False. A True 400 may still be a refusal of the version, so this chooses only the
-    error's text: :class:`~messagefoundry.store.crypto.AuditKeyVersionUnverifiedError` rather than
-    its parent.
+def _names_no_version_reason(exc: Exception) -> str | None:
+    """Why an audit-MAC ``verify`` 400 is NOT read as Vault's own refusal of the key version, or
+    ``None`` when it is (BACKLOG #6707). It is read as one only when its ``errors`` value
+    (:func:`_reply_errors`, ``bound_parsed``) is a list with a text entry holding a
+    :data:`_VERSION_REFUSAL_TEXTS` text, in any case. Any other 400 gets a fixed reason, never the
+    reply's own text.
 
-    The list is read by :func:`_reply_errors`, which says when a body hvac did not parse is read. A
-    body too long for it is True, unparsed."""
-    errors, oversize = _reply_errors(exc)
+    A 400 with a reason may still be a refusal of the version, so the answer chooses only the
+    error's text: :class:`~messagefoundry.store.crypto.AuditKeyVersionUnverifiedError` rather than
+    its parent."""
+    errors, oversize = _reply_errors(exc, bound_parsed=True)
     if oversize is not None:
-        # Too long to be Vault's own refusal, and never parsed (BACKLOG #6707).
-        log.warning(
-            "an audit MAC verify got a 400 whose %d-character body is past the %d-character "
-            "bound; not read as a version refusal",
-            oversize,
-            _REPARSED_BODY_MAX_CHARS,
-        )
-        return True
+        return _OVERSIZE_BODY
     if not isinstance(errors, list):
-        return True  # no errors list, so nothing in the reply is read
-    texts = [text.strip().lower() for text in errors if isinstance(text, str)]
-    if any(known in text for text in texts for known in _VERSION_REFUSAL_TEXTS):
-        return False
-    return (
-        bool(errors) and len(texts) == len(errors) and all(t in _NOT_VERSION_TEXTS for t in texts)
-    )
+        return _NO_ERRORS_LIST
+    for entry in errors:
+        if isinstance(entry, str):
+            text = entry.lower()
+            if any(known in text for known in _VERSION_REFUSAL_TEXTS):
+                return None
+    return _NO_VERSION_REFUSAL
 
 
 def _batches(costs: Sequence[int]) -> list[list[int]]:
@@ -299,7 +297,10 @@ def _classify_batch_failure(exc: Exception) -> tuple[bool, bool]:
     try:
         return is_vault_unavailable(exc), is_vault_bad_request(exc)
     except Exception as fault:  # noqa: BLE001 -- see the docstring
-        log.warning("Transit failure classifier raised %s; read as a 400", type(fault).__name__)
+        kind = type(fault)  # the class alone, so no frame is tied to the error
+        _warn_quietly(
+            lambda: ("Transit failure classifier raised %s; read as a 400", kind.__name__)
+        )
         return False, True
 
 
@@ -339,28 +340,146 @@ def _names_aead_failure(exc: Exception) -> bool:
     return isinstance(errors, list) and bool(errors) and all(map(_is_aead_failure_text, errors))
 
 
-#: How long a decrypt 400 whose body went unread is logged once per process (BACKLOG #5650).
-_UNREAD_BODY_LOG_INTERVAL_S = 3600.0
-_unread_body_logged_at: float | None = None
-_unread_body_lock = threading.Lock()
+#: The seconds within which each :func:`_warn_when_due` warning is logged at most once per process
+#: unless logging it raises, and :func:`_report_unlogged`'s rate limit (BACKLOG #5650, #6707). A proxy can cause one on every
+#: read or every row; once is the signal.
+_WARNING_LOG_INTERVAL_S = 3600.0
+#: When each such warning, by kind, was last logged.
+_logged_at: dict[object, float] = {}
+_logged_at_lock = threading.Lock()
+
+
+#: What :func:`_report_unlogged` writes, by the step that failed, when even naming the failure's
+#: class fails: the log call, building the warning, or the warning's rate limit.
+_WARNING_UNLOGGED = "a Transit cipher warning could not be logged"
+_WARNING_UNBUILT = "a Transit cipher warning could not be built"
+_WARNING_UNTHROTTLED = "a Transit cipher warning's rate limit failed"
+#: What :func:`_report_unlogged` writes when its own rate limit fails, before its report.
+_REPORT_UNTHROTTLED = "a Transit cipher warning report's rate limit failed"
+
+#: A warning built on demand: the ``log.warning`` message and its arguments.
+_WarningParts = Callable[[], tuple[object, ...]]
+
+
+def _report_unlogged(
+    fault: BaseException, site: object = None, what: str = _WARNING_UNLOGGED
+) -> None:
+    """Report, on the last-resort stderr line, that a warning failed at the step ``what`` names,
+    by the failure's class alone. The line is written at most once in
+    :data:`_WARNING_LOG_INTERVAL_S` for each ``site``, step and failure class, a callable ``site``
+    standing for its code, so a log path that fails on every read cannot flood stderr. When that
+    bookkeeping itself fails, :data:`_REPORT_UNTHROTTLED` is written, then the line. The text falls
+    back to ``what`` alone when building it fails, and
+    :func:`~messagefoundry.logging_guard._last_resort` suppresses a failure of the write."""
+    try:
+        slot = ("unlogged", getattr(site, "__code__", site), what, type(fault))
+        now = time.monotonic()
+        with _logged_at_lock:
+            last = _logged_at.get(slot)
+            if last is not None and now - last < _WARNING_LOG_INTERVAL_S:
+                return
+            _logged_at[slot] = now
+    except Exception:  # noqa: BLE001 -- reported by a fixed literal, then the line is written
+        _last_resort(_REPORT_UNTHROTTLED)
+    text = what
+    with contextlib.suppress(Exception):
+        text = f"{what} ({ascii(type(fault).__name__)})"
+    _last_resort(text)
+
+
+def _warn_quietly(build: _WarningParts, *, stacklevel: int = 2, site: object = None) -> bool:
+    """``log.warning(*build())`` under a guard, and whether that call returned without raising
+    (BACKLOG #6707); a handler that swallows its own write failure still counts as returned.
+    ``build`` is called inside the guard. A failure is reported by :func:`_report_unlogged` under
+    ``site``, by default ``build``, so each call site is rate-limited apart. The record names the
+    caller ``stacklevel`` frames up."""
+    where = build if site is None else site
+    try:
+        parts = build()
+    except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
+        _report_unlogged(fault, where, _WARNING_UNBUILT)
+        return False
+    try:
+        log.warning(*parts, stacklevel=stacklevel)
+    except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
+        _report_unlogged(fault, where)
+        return False
+    return True
+
+
+def _warn_when_due(kind: Callable[[], object], build: _WarningParts) -> None:
+    """Log the warning ``build`` makes, rate-limited per key ``kind()`` returns by
+    :data:`_WARNING_LOG_INTERVAL_S`, with at least the exceptions below. The slot is taken before
+    the warning, so concurrent callers emit it at most once. When building or logging the warning
+    fails, or a fault escapes it, the slot is given back, to the time it held before or to empty,
+    unless a later caller has taken it since; when giving it back fails too, the slot stays taken
+    for the interval. A failure building the key, or in the slot's bookkeeping, is reported by
+    :func:`_report_unlogged` naming that step, and the warning is then not logged. Where
+    :func:`_report_unlogged` itself raises, out of memory or stack, the exception propagates."""
+    try:
+        key = kind()
+    except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
+        _report_unlogged(fault, kind, _WARNING_UNBUILT)
+        return
+    try:
+        with _logged_at_lock:
+            last = _logged_at.get(key)
+            now = time.monotonic()
+            if last is not None and now - last < _WARNING_LOG_INTERVAL_S:
+                return
+            _logged_at[key] = now
+    except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
+        _report_unlogged(fault, kind, _WARNING_UNTHROTTLED)
+        return
+    emitted = False
+    try:
+        emitted = _warn_quietly(build, stacklevel=3, site=key)
+    finally:
+        if not emitted:
+            try:
+                with _logged_at_lock:
+                    if _logged_at.get(key) == now:  # give it back unless a later caller took it
+                        if last is None:
+                            del _logged_at[key]
+                        else:
+                            _logged_at[key] = last
+            except Exception as fault:  # noqa: BLE001 -- see the docstring; reported, not swallowed
+                _report_unlogged(fault, kind, _WARNING_UNTHROTTLED)
 
 
 def _log_unread_decrypt_body(length: int) -> None:
-    """Log, once per :data:`_UNREAD_BODY_LOG_INTERVAL_S`, that a data-key decrypt 400 was not read
-    for its AEAD reason because its body is past :data:`_REPARSED_BODY_MAX_CHARS`, so the refusal
-    stays the cipher's plain error. A proxy can cause it on every read; once is the signal."""
-    global _unread_body_logged_at
-    now = time.monotonic()
-    with _unread_body_lock:
-        last = _unread_body_logged_at
-        if last is not None and now - last < _UNREAD_BODY_LOG_INTERVAL_S:
-            return
-        _unread_body_logged_at = now
-    log.warning(
-        "a Transit data-key decrypt got a 400 whose %d-character body is past the %d-character "
-        "bound; not read as a tag refusal, so the value keeps the cipher's plain error",
-        length,
-        _REPARSED_BODY_MAX_CHARS,
+    """Log, when due (:func:`_warn_when_due`), that a data-key decrypt 400 was not read for its
+    AEAD reason because its body is past :data:`_REPARSED_BODY_MAX_CHARS`, so the refusal stays
+    the cipher's plain error."""
+    _warn_when_due(
+        lambda: "decrypt-body-unread",
+        lambda: (
+            "a Transit data-key decrypt got a 400 whose %d-character body is past the "
+            "%d-character bound; not read as a tag refusal, so the value keeps the cipher's "
+            "plain error",
+            length,
+            _REPARSED_BODY_MAX_CHARS,
+        ),
+    )
+
+
+def _unconfirmed_warning(
+    audit_key: str, version: int, cause: str, raised: str
+) -> tuple[Callable[[], object], _WarningParts]:
+    """The :func:`_warn_when_due` key and text for an audit-MAC 400 labelled unconfirmed because
+    of ``cause`` (BACKLOG #6707); ``raised`` names the read's fault class, or is empty."""
+    return (
+        lambda: ("unconfirmed", audit_key, cause, raised),
+        lambda: (
+            "an audit MAC verify at key version %d got a 400 labelled unconfirmed, because %s%s "
+            "(key=%r); logged at most once in %d seconds per process for this key and this cause "
+            "unless logging it raises",
+            version,
+            cause,
+            " " + raised if raised else "",
+            audit_key,
+            _WARNING_LOG_INTERVAL_S,
+        ),
     )
 
 
@@ -382,7 +501,10 @@ def _transit_failure(op: str, key: str, exc: Exception) -> CipherError:
         unavailable = is_vault_unavailable(exc)
         unauthenticated = op == "decrypt" and not unavailable and _names_aead_failure(exc)
     except Exception as fault:  # noqa: BLE001 -- see the docstring; the caller raises CipherError
-        log.warning("Transit failure classifier raised %s; read as a refusal", type(fault).__name__)
+        kind = type(fault)  # the class alone, so no frame is tied to the error
+        _warn_quietly(
+            lambda: ("Transit failure classifier raised %s; read as a refusal", kind.__name__)
+        )
         unavailable = unauthenticated = False
     if unavailable:
         return CipherUnavailableError(f"Transit {op} failed (key={key!r}): {type(exc).__name__}")
@@ -615,11 +737,13 @@ class TransitCipher(_UnmarkedPolicy):
 
     def _send_alone_from_now(self, op: str, why: str) -> None:
         if not self._batch_alone:
-            log.warning(
-                "Transit %s a batch %s (key=%r); sending each value alone from now on",
-                why,
-                op,
-                self._key,
+            _warn_quietly(
+                lambda: (
+                    "Transit %s a batch %s (key=%r); sending each value alone from now on",
+                    why,
+                    op,
+                    self._key,
+                )
             )
         self._batch_alone = True
 
@@ -891,17 +1015,18 @@ class TransitCipher(_UnmarkedPolicy):
         answers with a string that does not start ``vault:v<N>:`` for the version ``stored``
         names, raises :class:`AuditKeyVersionRefusedError` (see :meth:`_refuses_only_version`);
         Transit refusing the version is one cause, not the only one. It raises the subclass
-        :class:`AuditKeyVersionUnverifiedError` when :func:`_names_no_version_reason` does not read
-        the 400 as Vault's own refusal, for example a proxy's page, or when reading it runs out of
-        memory or stack (BACKLOG #6707).
+        :class:`AuditKeyVersionUnverifiedError` when :func:`_names_no_version_reason` gives a
+        reason, for example for a proxy's page, or when it raises one of :data:`_READ_FAULTS`,
+        both except as :data:`_READ_FAULTS` says (BACKLOG #6707). Anything else it raises
+        propagates.
 
-        A 400 on which hvac raises an exception other than ``InvalidRequest`` raises neither of
-        those (BACKLOG #6707). For example, these
-        exact 400 bodies with the Content-Type exactly ``application/json``: ``[]``, ``null``,
-        ``{"errors":[{"message":"x"}]}``, ``{"errors":[1]}``, ``{"errors":5}`` and
-        ``{"errors":true}``. On each, hvac 2.4.0 raises ``AttributeError`` or ``TypeError`` in
-        place of ``InvalidRequest``. A ``MemoryError`` that hvac raises while it joins a truthy
-        ``errors`` value, before it raises any ``InvalidRequest``, is not read as a refusal either.
+        A 400 on which hvac raises something other than ``InvalidRequest`` raises neither of
+        those, and is read as the next paragraph says (BACKLOG #6707). hvac 2.4.0 raises
+        ``AttributeError`` or ``TypeError`` when it parses the body as JSON (see
+        :func:`_reply_errors` for when it does) and the value is not an object, or its ``errors``
+        value is truthy and is a number, ``true``, or a list holding an entry that is not text. A
+        ``MemoryError`` hvac raises while it joins a truthy ``errors`` value is read the same way,
+        though out of memory or stack a later fault can still propagate.
 
         A failure of the verify call not read as a refused version, and not an outage
         (:meth:`_is_outage`), is checked once the handler has let go
@@ -924,9 +1049,14 @@ class TransitCipher(_UnmarkedPolicy):
             try:
                 self.audit_hmac(data)
             except CipherError as exc:
-                log.warning(
-                    "the cost-only audit HMAC beside a malformed stored MAC failed: %s", exc
+                failure = exc  # a closure may not name the except variable (ruff F821)
+                _warn_quietly(
+                    lambda: (
+                        "the cost-only audit HMAC beside a malformed stored MAC failed: %s",
+                        failure,
+                    )
                 )
+                del failure  # else the error's traceback and this frame hold each other
             return False
         failed: Exception | None = None
         try:
@@ -950,26 +1080,36 @@ class TransitCipher(_UnmarkedPolicy):
         outage (:meth:`_is_outage`) is plain :class:`CipherError`. Runs inside the caller's
         handler. Blocking."""
         if self._refuses_only_version(exc, version):
-            # The same flow, labelled apart (BACKLOG #6707). A reply that runs out of memory or
-            # stack while it is read, such as a huge errors list, is not read as a refusal:
-            # escaping here, the error would make the walk "could not run" and drop the row's
-            # break and its alert.
-            unreadable: str | None = None
+            # The same flow, labelled apart (BACKLOG #6707). Reading the reply only picks the
+            # label, so a failure in _READ_FAULTS picks the unconfirmed one rather than ending the
+            # walk, except as _READ_FAULTS says. Any other exception propagates.
+            reason: str | None
+            raised = ""  # the read's fault, by its class's existing name, so nothing is built
             try:
-                unverified = _names_no_version_reason(exc)
-            except (MemoryError, RecursionError) as read_exc:
-                unverified, unreadable = True, type(read_exc).__name__
-            if unreadable is not None:
-                log.warning(
-                    "could not read the 400 for audit key version %d (%s); labelled "
-                    "unconfirmed (key=%r)",
-                    version,
-                    unreadable,
-                    self._audit_key,
-                )
-            if unverified:
-                return AuditKeyVersionUnverifiedError(version)
-            return AuditKeyVersionRefusedError(version)
+                reason = _names_no_version_reason(exc)
+            except _READ_FAULTS as read_exc:
+                reason, raised = _READ_RAISED, type(read_exc).__name__
+            if reason is None:
+                return AuditKeyVersionRefusedError(version)
+            unverified = AuditKeyVersionUnverifiedError(version)
+            # Making the warning's closures runs outside _warn_when_due's guard, so a fault there
+            # writes a fixed literal on stderr in place of the warning. A fault in _READ_FAULTS
+            # escaping the warning or that write is handed to :func:`_report_unlogged`, which
+            # names its class under a rate limit; the label and the row's break survive a second
+            # such fault in that report.
+            try:
+                try:
+                    kind, build = _unconfirmed_warning(self._audit_key, version, reason, raised)
+                except _READ_FAULTS:
+                    _last_resort(_WARNING_UNBUILT)
+                else:
+                    _warn_when_due(kind, build)
+            except _READ_FAULTS as fault:
+                try:  # noqa: SIM105 -- constructing contextlib.suppress can itself raise here
+                    _report_unlogged(fault, "unconfirmed-warning-escaped")
+                except _READ_FAULTS:
+                    pass
+            return unverified
         if self._is_outage(exc):
             return self._verify_failed(exc)
         return None
@@ -1016,11 +1156,13 @@ class TransitCipher(_UnmarkedPolicy):
                 f"Transit audit HMAC verify timed out on both asks (key={self._audit_key!r}): "
                 f"{vault_failure_text(again)}"
             ) from again
-        log.warning(
-            "Transit refused the audit MAC verify of one row twice while a verify over fixed "
-            "input succeeded before and after (key=%r): %s; read as a break at that row",
-            self._audit_key,
-            vault_failure_text(again),
+        _warn_quietly(
+            lambda: (
+                "Transit refused the audit MAC verify of one row twice while a verify over fixed "
+                "input succeeded before and after (key=%r): %s; read as a break at that row",
+                self._audit_key,
+                vault_failure_text(again),
+            )
         )
         return False
 
@@ -1085,12 +1227,15 @@ class TransitCipher(_UnmarkedPolicy):
         try:
             answered = self._probe_mac()
         except Exception as probe_exc:  # the latest version fails too: not a version refusal
-            log.warning(
-                "Transit refused audit key version %d, and the probe under the latest version failed "
-                "too (key=%r): %s",
-                key_version,
-                self._audit_key,
-                vault_failure_text(probe_exc),
+            text = vault_failure_text(probe_exc)  # a str ties no frame to it
+            _warn_quietly(
+                lambda: (
+                    "an audit MAC verify at key version %d got HTTP 400, and the probe under the "
+                    "latest version failed too (key=%r): %s",
+                    key_version,
+                    self._audit_key,
+                    text,
+                )
             )
             return False
         return isinstance(answered, str) and not answered.startswith(f"vault:v{key_version}:")
@@ -1102,8 +1247,9 @@ class TransitCipher(_UnmarkedPolicy):
         try:
             return is_vault_unavailable(exc)
         except Exception as fault:  # noqa: BLE001 -- see the docstring
-            log.warning(
-                "Transit failure classifier raised %s; read as an outage", type(fault).__name__
+            kind = type(fault)  # the class alone, so no frame is tied to the error
+            _warn_quietly(
+                lambda: ("Transit failure classifier raised %s; read as an outage", kind.__name__)
             )
             return True
 
@@ -1116,25 +1262,33 @@ class TransitCipher(_UnmarkedPolicy):
         try:
             mac = self._probe_mac()
             if not isinstance(mac, str) or transit_mac_version(mac) is None:
-                log.warning(
-                    "an audit MAC verify failed, and the fixed-input probe answered no "
-                    "well-formed MAC (key=%r)",
-                    self._audit_key,
+                _warn_quietly(
+                    lambda: (
+                        "an audit MAC verify failed, and the fixed-input probe answered no "
+                        "well-formed MAC (key=%r)",
+                        self._audit_key,
+                    )
                 )
                 return False
             valid = self._transit_verify(self._audit_key, _VERSION_PROBE_BYTES, mac)
         except Exception as probe_exc:  # the fixed input fails too: the service, not the row
-            log.warning(
-                "an audit MAC verify failed, and a verify over fixed input failed too (key=%r): %s",
-                self._audit_key,
-                vault_failure_text(probe_exc),
+            text = vault_failure_text(probe_exc)  # a str ties no frame to it
+            _warn_quietly(
+                lambda: (
+                    "an audit MAC verify failed, and a verify over fixed input failed too "
+                    "(key=%r): %s",
+                    self._audit_key,
+                    text,
+                )
             )
             return False
         if valid is not True:
-            log.warning(
-                "an audit MAC verify failed, and a verify over fixed input did not answer valid "
-                "(key=%r)",
-                self._audit_key,
+            _warn_quietly(
+                lambda: (
+                    "an audit MAC verify failed, and a verify over fixed input did not answer "
+                    "valid (key=%r)",
+                    self._audit_key,
+                )
             )
             return False
         return True

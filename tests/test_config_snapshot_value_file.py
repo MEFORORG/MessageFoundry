@@ -870,15 +870,24 @@ def test_a_path_no_file_can_be_opened_by_is_no_value_file_to_a_start_or_a_snapsh
 
     cfg, _ = _layout(tmp_path)
     (tmp_path / "afile").write_text("", encoding="utf-8")
-    cases = [("afile", "x")] + ([("environments", "bad?name")] if os.name == "nt" else [])
+    # The refused name is in the folder: values_file_path holds the environment name to the
+    # [ai].environment alphabet, which has no '?' (BACKLOG #5322). It refuses the '?' folder too,
+    # on every host, so on Windows only the snapshot half can still meet the name the open refuses.
+    cases = [("afile", "x")] + ([("bad?dir", "x")] if os.name == "nt" else [])
     for dir_name, environment in cases:
         path = tmp_path / dir_name / f"{environment}.toml"
-        assert (
-            load_environment_values(
-                base_dir=tmp_path, dir_name=dir_name, environment=environment, environ={}
+        if dir_name == "afile":
+            assert (
+                load_environment_values(
+                    base_dir=tmp_path, dir_name=dir_name, environment=environment, environ={}
+                )
+                == {}
             )
-            == {}
-        )
+        else:
+            with pytest.raises(ValueError, match="must not hold a name Windows reserves"):
+                load_environment_values(
+                    base_dir=tmp_path, dir_name=dir_name, environment=environment, environ={}
+                )
         snapshot = with_value_file(read_config_snapshot(cfg, strict=True), path, strict=True)
         assert snapshot.environment_file(path) is None
 

@@ -10845,7 +10845,8 @@ class SqlServerStore:
         self, d: dict[str, Any], stage: str, exc: CipherError
     ) -> QueueOpenFault | None:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
-        tag is also audited and alerted (BACKLOG #2593). Returns ``None`` then.
+        tag is also audited and alerted (BACKLOG #2593), a corrupt cell included, whose audit row
+        names its cause as corrupt (BACKLOG #5884). Returns ``None`` then.
 
         A key service that gave no verdict (:func:`is_transient_open_failure`) says nothing about
         the row, so it is returned instead, with nothing written (BACKLOG #5735), and so is the
@@ -10854,7 +10855,9 @@ class SqlServerStore:
         the caller does with it."""
         if is_transient_open_failure(exc):
             return queue_open_fault(exc)
-        log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], exc)
+        # The text, not the error: a record keeps its args, and the error's traceback holds the
+        # claim frame's locals, which can include other rows' opened bodies (BACKLOG #5884).
+        log.warning("dead-lettering undecryptable queue row %s: %s", d["id"], str(exc))
         row = {**d, "stage": stage}
         try:
             await self.dead_letter_now(d["id"], f"undecryptable payload: {exc}")
@@ -10868,11 +10871,11 @@ class SqlServerStore:
             )
             if isinstance(exc, QueueTagError):
                 await report_queue_tag_failure(
-                    self, self._cipher, row, outcome="could not be dead-lettered"
+                    self, self._cipher, row, error=exc, outcome="could not be dead-lettered"
                 )
             return queue_open_fault(failed)
         if isinstance(exc, QueueTagError):
-            await report_queue_tag_failure(self, self._cipher, row)
+            await report_queue_tag_failure(self, self._cipher, row, error=exc)
         return None
 
     async def _set_aside_claimed(self, tail: Sequence[dict[str, Any]], now: float | None) -> None:
@@ -10898,9 +10901,11 @@ class SqlServerStore:
         propagates, refusing the read. ``cur`` is the caller's cursor."""
         try:
             opened = open_queue_cell(self._cipher, row)
-        except QueueTagError:
+        except QueueTagError as refused:
             if alert:
-                alert_queue_tag_failure(self._cipher, row, outcome="the read was refused")
+                alert_queue_tag_failure(
+                    self._cipher, row, error=refused, outcome="the read was refused"
+                )
             raise
         if row["body_ref"] is None:
             return opened

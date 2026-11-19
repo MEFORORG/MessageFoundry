@@ -787,12 +787,12 @@ def keep_the_key_step(
         if service_account is not None:
             text += f', --service-account "{service_account}" among them'
         # --db overrides [store].path, for serve as for provision-admin, so the old --db would
-        # point a new SQLite store's re-run and its service back at the old store. At least two
-        # shipped service paths always pass one: install-service.ps1 writes serve --db <DbPath>, and
-        # supervise passes its --db, default messagefoundry.db, to its one SQLite engine shard. So
-        # --db must name the new path in both (PR 2804 eighth hold). Absolute, since a relative --db
-        # resolves under [environments].base_dir when one is set, for provision-admin as for serve
-        # (BACKLOG #5926), and otherwise against each one's own working directory.
+        # point a new SQLite store's re-run and its service back at the old store.
+        # install-service.ps1 always writes serve --db <DbPath>, and a supervise started with --db
+        # passes it to its one SQLite engine shard (without one it takes [store].path, BACKLOG
+        # #5817). So --db must name the new path in both (PR 2804 eighth hold). Absolute, since a
+        # relative --db resolves under [environments].base_dir when one is set, for provision-admin
+        # as for serve (BACKLOG #5926), and otherwise against each one's own working directory.
         # A reinstall that omits -DbPath writes the default path back, so -DbPath goes on every
         # later reinstall too. install-service.ps1 refuses -EngineWheel over a root that exists and
         # refuses its companions without it, so a reinstall over the root it built leaves out all
@@ -813,10 +813,9 @@ def keep_the_key_step(
                 "-EngineWheel and each parameter that goes only with it, at least "
                 "-EngineWheelSha256, -RequirementsLock, -RequirementsLockSha256 and -BasePython, "
                 "as for any re-run over the install root it built (`messagefoundry service "
-                "install` cannot pass -DbPath, so never reinstall with it), and supervise --db, "
-                "which supervise "
-                "passes to its engine shard as messagefoundry.db, under --project-root if one is "
-                "given, when its own command line leaves it out"
+                "install` cannot pass -DbPath, so never reinstall with it), and supervise --db "
+                "wherever a supervise command line passes one (without one, supervise takes "
+                "[store].path, as serve does)"
             )
         if service_account is None and sys.platform == "win32":
             text += (

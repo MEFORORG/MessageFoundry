@@ -67,7 +67,7 @@ from messagefoundry.transports.base import (
     register_source,
     wait_for_intake,
 )
-from messagefoundry.transports.framing import declared_encoding
+from messagefoundry.transports.framing import declared_encoding, encode_reply
 from messagefoundry.transports.mllp import (
     DEFAULT_MAX_CONNECTIONS,
     DEFAULT_MAX_CONNECTIONS_PER_HOST,
@@ -707,7 +707,8 @@ class X12Source(SourceConnector):
     """Listen for inbound raw-TCP connections, reassemble each ``ISA…IEA`` interchange, and hand its
     **raw bytes** to the pipeline handler. No HL7/X12 ACK: if that *pipeline* handler
     (:data:`~messagefoundry.transports.base.InboundHandler`) returns a non-``None`` reply it is written
-    back verbatim on the same connection; the engine's returns ``None`` for every non-HL7 content type,
+    back on the same connection, encoded by :func:`~messagefoundry.transports.framing.encode_reply`
+    (BACKLOG #5958); the engine's returns ``None`` for every non-HL7 content type,
     so an X12 intake is fire-and-forget in practice. A config **Handler**'s return never reaches here —
     see this module's docstring."""
 
@@ -763,7 +764,8 @@ class X12Source(SourceConnector):
         self.max_messages_per_second, self.message_burst = _pacing_settings(
             s, transport="X12 source"
         )
-        # Carried only so a pacing report can name this connection (BACKLOG #290).
+        # Names this connection in a pacing report (BACKLOG #290) and in the reply-encoding warnings
+        # (BACKLOG #5958).
         self._pacing_name = config.name or ""
         # Per-connection peer-IP allowlist (Tier 4 operability): refuse a non-listed peer at accept.
         # Absent/empty = no restriction. Mirrors TcpSource/MLLPSource.
@@ -951,7 +953,11 @@ class X12Source(SourceConnector):
                                     break  # handler_error is recorded; close
                                 failed = False
                             if reply is not None:
-                                writer.write(reply.encode(self.encoding))  # verbatim reply
+                                # BACKLOG #5958: encoded as the MLLP and TCP listeners encode
+                                # theirs, since this write follows the commit.
+                                writer.write(
+                                    encode_reply(reply, self.encoding, connection=self._pacing_name)
+                                )
                                 await self._drain_reply(writer)
                         if failed:
                             break

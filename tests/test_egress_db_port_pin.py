@@ -130,14 +130,19 @@ def test_generic_server_carrying_a_port_is_refused(
     # The host is matched as written, so only an entry naming the whole `server` text reaches the
     # port question. A port in `server` is refused whatever the entry says and whatever PORT says:
     # psqlODBC does not read it as a port, and libpq reads a comma there as a second host. The
-    # shipped code ADMITTED every one of these on a host-only entry; it read neither port.
+    # shipped code ADMITTED every one of these on a host-only entry; it read neither port. An entry
+    # holding a comma is refused at load (BACKLOG #5915), so the check is reached past that with
+    # model_construct.
     server = f"{HOST},6432"
     for entry in (server, f"{server}:6432"):
+        with pytest.raises(ValueError, match="no host name does"):
+            EgressSettings(allowed_db=[entry])
         with pytest.raises(
             WiringError, match="holds a comma, read as a port suffix or a host list"
         ):
             check(
-                _generic(server=server, odbc_params=odbc_params), EgressSettings(allowed_db=[entry])
+                _generic(server=server, odbc_params=odbc_params),
+                EgressSettings.model_construct(allowed_db=[entry]),
             )
 
 
@@ -145,17 +150,21 @@ def test_generic_server_carrying_a_port_is_refused(
 def test_generic_server_holding_a_comma_anywhere_is_refused(check: Check, server: str) -> None:
     # libpq reads every one of these as a host list. The first two have no suffix the split reads
     # as a port, so a check keyed on the split's port text let them through. Brackets in an entry
-    # hold an IPv6 literal alone (BACKLOG #5915), so no entry lists `[db],6432`: it is unlisted.
+    # hold an IPv6 literal alone, so an entry spelled `[db],6432` is refused at load and the host's
+    # own entry does not list the bracketed server: it is unlisted (BACKLOG #5915).
+    bracketed = server.startswith("[")
     refusal = (
         r"is not in the \[egress\]\.allowed_db allowlist$"
-        if server.startswith("[")
+        if bracketed
         else "holds a comma, read as a port suffix or a host list"
     )
-    for entry in (server, f"{server}:5432"):
+    # An entry holding a comma is refused at load, so the unbracketed cases are checked past that
+    # with model_construct.
+    for entry in (HOST, f"{HOST}:5432") if bracketed else (server, f"{server}:5432"):
         with pytest.raises(WiringError, match=refusal):
             check(
                 _generic(server=server, odbc_params={"PORT": "5432"}),
-                EgressSettings(allowed_db=[entry]),
+                EgressSettings.model_construct(allowed_db=[entry]),
             )
 
 
@@ -180,9 +189,13 @@ def test_the_no_port_refusal_leads_with_its_remedy(check: Check) -> None:
 @pytest.mark.parametrize("server", [f"{HOST}:6432", "[::1]:6432"])
 def test_generic_server_with_a_colon_port_matches_no_entry(check: Check, server: str) -> None:
     # An entry's host holds no port (BACKLOG #5915: `[::1]:6432` is the host ::1 pinned to 6432), so
-    # no entry names a `host:port` server whole: refused as unlisted, as the shipped code refused it.
-    for entry in (server, HOST, "[::1]", "::1"):
-        with pytest.raises(WiringError, match=r"is not in the \[egress\]\.allowed_db allowlist$"):
+    # no entry names a `host:port` server whole: refused as unlisted, saying why. An entry naming
+    # an IPv6 address is refused at load (tests/test_egress_allowlist_ipv6.py).
+    for entry in (HOST, f"{HOST}:6432"):
+        with pytest.raises(
+            WiringError,
+            match=r"is not in the \[egress\]\.allowed_db allowlist: a server holding a ':'",
+        ):
             check(
                 _generic(server=server, odbc_params={"PORT": "6432"}),
                 EgressSettings(allowed_db=[entry]),
@@ -210,9 +223,12 @@ def test_no_port_never_matches_a_pin_spelled_like_none(
     check: Check,
 ) -> None:
     # "No port" is not a value that can match a pin. An entry whose port text happens to read
-    # "None" must not admit a connection whose port the engine could not read.
+    # "None" must not admit a connection whose port the engine could not read. Such an entry is
+    # refused at load (BACKLOG #5915); the matcher is checked past that with model_construct.
+    with pytest.raises(ValueError, match="its port is not a number"):
+        EgressSettings(allowed_db=[f"{HOST}:None"])
     with pytest.raises(WiringError, match="set the PORT keyword to the pinned port"):
-        check(_generic(server=HOST), EgressSettings(allowed_db=[f"{HOST}:None"]))
+        check(_generic(server=HOST), EgressSettings.model_construct(allowed_db=[f"{HOST}:None"]))
 
 
 def test_generic_port_keyword_given_twice_is_refused(check: Check) -> None:
@@ -225,11 +241,14 @@ def test_generic_port_keyword_given_twice_is_refused(check: Check) -> None:
 @pytest.mark.parametrize("value", ["²", "70000", "0"], ids=["superscript", "over", "zero"])
 def test_generic_port_keyword_that_is_not_a_port_is_unreadable(check: Check, value: str) -> None:
     # Not a crash, and not a match: a superscript digit passes `isdigit` and fails `int()`, and
-    # 70000 is not a port, even against a pin spelled the same way.
+    # 70000 is not a port, even against a pin spelled the same way. Such a pin is refused at load
+    # (BACKLOG #5915); the matcher is checked past that with model_construct.
+    with pytest.raises(ValueError, match="its port is not a number"):
+        EgressSettings(allowed_db=[f"{HOST}:{value}"])
     with pytest.raises(WiringError, match="set the PORT keyword to the pinned port"):
         check(
             _generic(server=HOST, odbc_params={"PORT": value}),
-            EgressSettings(allowed_db=[f"{HOST}:{value}"]),
+            EgressSettings.model_construct(allowed_db=[f"{HOST}:{value}"]),
         )
 
 

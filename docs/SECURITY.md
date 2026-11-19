@@ -1643,7 +1643,7 @@ tuple: they act only on the caller's own account.
 |---|---|---|---|
 | `POST` | `/auth/logout` | `require` | exempt from the `must_change_password` confinement |
 | `GET` | `/auth/me` | `require` | exempt from the `must_change_password` confinement |
-| `POST` | `/me/password` | `require` | per-**actor** credential-ceremony limiter; refused (400) for an AD identity; exempt from the confinement; MFA-exempt only for an account with **no** factor: a pending session on an account that has one gets 403 + `X-MFA-Required` (BACKLOG #1954). A local account `[security].require_mfa` covers that has no TOTP gets 403 `enrol an authenticator app first`, before its current password is read (ADR 0197 Amendment A) |
+| `POST` | `/me/password` | `require` | Per-**actor** credential-ceremony limiter. Refused (400) for an AD identity. Exempt from the `must_change_password` confinement. MFA-exempt only for an account with **no** factor: a pending session on an account that has one gets 403 + `X-MFA-Required` (BACKLOG #1954). A local account `[security].require_mfa` covers gets 403 `enrol an authenticator app first` when it holds no factor with a way past (ADR 0197 Amendment A). That is asked before its current password is read. An account deleted, or whose record fails its integrity seal, while the current password is checked gets at least the wrong-password 403 `current password is incorrect`, audited `auth.password_change_failed` with `reason=bad_password`, or 401 `session ended; sign in again`, audited `reason=session_gone`, where a deletion has already removed the session when the check reads it. Once the current password is checked, the change answers at least these refusals (BACKLOG #5902). An unusable bundled breach corpus gets 503 `password screening is unavailable; ask an administrator to repair it`. An account the change finds gone, when it reads the record before the write or re-reads it after a write that matched no row, gets 401 `session ended; sign in again`, with no `auth.password_changed` row. One deleted after that re-read can get the 409 below instead. A record that fails its integrity seal, or that Vault transit cannot verify, gets 423 and sets nothing. A Vault transit Outage on that record gets 503 and sets nothing. A write that lost to a concurrent change of the account sets nothing. It gets the enrolment 403 where a covered account no longer holds a factor with a way past, and 409 otherwise. Once the write commits, a deletion, or a store refusal of its `auth.password_changed` row, still reports the change. A session revoke that fails past its retries still fails the request, although the change has already committed, so the new password is in effect |
 | `POST` | `/me/notify-email` | `require_paced` | fills a **missing** notification address only (409 when one is set, 400 when blank); the way out of the address confinement, and **not** MFA-exempt, so a session owing its factor gets 403 + `X-MFA-Required` (BACKLOG #1139). Paced, and refused from a host the session has not verified from, like its console twin `POST /ui/account/notify-address` (vault BACKLOG #3052) |
 | `POST` | `/me/reauth` | `require` | per-**actor** credential-ceremony limiter; mints the action-bound grant when `purpose=` is given; refuses an `oidc` session with 403 naming `/ui/reauth`, before any verify and charging nothing to the lockout (that session steps up at the IdP) |
 | `POST` | `/auth/mfa-verify` | `require` | draws the **sign-in** window (per-IP + global); feeds the per-account lockout; exempt from the confinement, so a must-change account that has a factor can prove it before it rotates (BACKLOG #1954) |
@@ -3049,7 +3049,7 @@ same with its `connection_purge` row, which names the outbound, the scope and th
 attributed to the requester (vault BACKLOG #3217). A released purge re-reads the refusals the route
 makes about its target, through `_purge_target_refusal` (vault BACKLOG #3798). The release skips at
 least if no graph is loaded, or the outbound has left the graph, is running, or is owned by another
-engine shard. It cancels nothing, writes no
+engine shard, or if this node does not hold the cluster lease (BACKLOG #5792). It cancels nothing, writes no
 `connection_purge` row, and its `approval.approved` row records the route's refusal text as the
 skip. The operator clears the cause and requests the purge again. The on-box row is whole. Its
 off-box copy is cut at the bound stated for `approval.standing_shown` above, and this row's detail
@@ -3728,10 +3728,12 @@ transaction, so a re-read answers it as a lost session. An MFA reset removes the
 revokes the sessions in separate writes, so a re-read that falls between them reads as the factor
 gone. The factor is then not marked and no counter is cleared, and because the proof is already
 spent the refusal is audited, with at least the reasons named here. A factor that cannot be read
-at the re-read is refused `reason=factor_unverified`. That covers a TOTP secret that does not open
-once the code has been checked, which is also logged, and a passkey set that fails its seal. A
-TOTP secret that does not open for the check itself is refused the same way, before any code is
-read, so no recovery code is spent and nothing is charged. **A correct code whose TOTP factor is
+at the re-read is refused `reason=factor_unverified`. That covers a TOTP secret whose stored
+enrolment, its stamp or its cell, moved during the check and that then does not open, which is
+also logged, and a passkey set that fails its seal. A re-read that finds the stored TOTP enrolment
+unmoved opens nothing (BACKLOG #5781): the request opens the secret once, before the check, and
+checks the code against that open. A TOTP secret that does not open there is refused the same way,
+before any code is read, so no recovery code is spent and nothing is charged. **A correct code whose TOTP factor is
 turned off or enrolled again during the check charges no lockout** (BACKLOG #3780 item 1). Either
 change can leave the check nothing to spend, so the code fails its spend. Only a code that
 MATCHED the factor is asked further: the session, the account and its lock are read again, as

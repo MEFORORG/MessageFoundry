@@ -205,11 +205,15 @@ _ONE_ACCOUNT_KINDS = frozenset({1, 9})
 #: one no token carries, so the grant would reach nobody. Kept apart from the handoff's
 #: ``_ONE_ACCOUNT_KINDS``: the two gates have different callers and may change apart.
 _GRANT_NAME_KINDS = frozenset({1, 5, 9})
-#: The SID_NAME_USE an owner NAME may resolve to: a user or a well-known account. Any other kind of
-#: owner is named by its SID.
+#: The SID_NAME_USE an owner NAME may resolve to: a user or a well-known account. An owner of a
+#: kind in :data:`_OWNER_BY_SID_KINDS` is named by its SID.
 _OWNER_NAME_KINDS = frozenset({1, 5})
 #: SidTypeDeletedAccount, SidTypeInvalid and SidTypeUnknown: a name that resolves to no live account.
 _NOT_A_LIVE_ACCOUNT_KINDS = frozenset({6, 7, 8})
+#: SidTypeGroup, SidTypeAlias and SidTypeComputer: an owner of one of these kinds can hold a file,
+#: so an owner NAME of that kind is refused with advice to name it by its SID. A domain (3), a
+#: label (10) or a logon session (11) is no owner to name, so its refusal gives no such advice.
+_OWNER_BY_SID_KINDS = frozenset({2, 4, 9})
 _SID_TYPE_NAMES: Mapping[int, str] = MappingProxyType(
     {
         1: "a user account",
@@ -244,14 +248,21 @@ def _name_kind_problem(principal: str, kind: int, *, as_owner: bool) -> str | No
         # Its SID literal would be taken as given, so do not point the operator at one.
         return f"Windows resolves {principal!r} to {what}, not a live account; name one that exists"
     if as_owner:
+        if kind in _OWNER_BY_SID_KINDS:
+            return (
+                f"Windows resolves {principal!r} to {what}, not a user or well-known account; name "
+                "an owner that is a group, an alias or a computer account by its SID"
+            )
         return (
-            f"Windows resolves {principal!r} to {what}, not a user or well-known account; name an "
-            "owner that is a group, a computer or any other kind by its SID"
+            f"Windows resolves {principal!r} to {what}, not a user or well-known account; name a "
+            "user or well-known account as the owner"
         )
     return (
         f"Windows resolves {principal!r} to {what}, and a key file is granted by name only to a "
-        "user, a well-known account or group, or a computer account. Name the one account the "
-        "engine runs as, such as a virtual service account or a group managed service account"
+        "user account, a computer account, or a name Windows reports as well-known, such as "
+        "SYSTEM or a virtual service account, less at least the known broad groups. Name the "
+        "one account the engine runs as, such as a virtual service account or a group managed "
+        "service account"
     )
 
 
@@ -462,10 +473,23 @@ _MORE_BROAD_GROUP_SIDS: frozenset[str] = frozenset(
         "S-1-15-2-2",  # ALL RESTRICTED APPLICATION PACKAGES
         "S-1-18-1",  # Authentication authority asserted identity
         "S-1-18-2",  # Service asserted identity
+        "S-1-18-3",  # Fresh public key identity
+        "S-1-18-4",  # Key trust identity
+        "S-1-18-5",  # Key property MFA
+        "S-1-18-6",  # Key property attestation
+        "S-1-5-1000",  # Other Organization
+        "S-1-5-65-1",  # This Organization Certificate
+        "S-1-5-90-0",  # Window Manager\Window Manager Group
+        "S-1-5-9",  # Enterprise Domain Controllers
+        "S-1-5-22",  # Legacy Enterprise Read-only Domain Controllers Beta
+        "S-1-5-32-554",  # BUILTIN\Pre-Windows 2000 Compatible Access
+        "S-1-5-64-36",  # Cloud Account Authentication
+        "S-1-5-83-0",  # NT VIRTUAL MACHINE\Virtual Machines
+        "S-1-5-84-0-0-0-0-0",  # USER MODE DRIVERS
     }
 )
-#: The relative id of Domain Computers, in any domain: every machine account holds it.
-_DOMAIN_COMPUTERS_RID = "515"
+#: Relative ids of at least these groups of machine accounts (498 exists only in the forest root domain).
+_DOMAIN_MACHINE_GROUP_RIDS = frozenset({"515", "516", "521", "498"})
 
 
 def _is_broad_group(sid: str) -> bool:
@@ -478,7 +502,7 @@ def _is_broad_group(sid: str) -> bool:
 
     if _is_broad_sid(sid.lower()) or sid in _MORE_BROAD_GROUP_SIDS:
         return True
-    return sid.startswith("S-1-5-21-") and sid.rsplit("-", 1)[-1] == _DOMAIN_COMPUTERS_RID
+    return sid.startswith("S-1-5-21-") and sid.rsplit("-", 1)[-1] in _DOMAIN_MACHINE_GROUP_RIDS
 
 
 #: APPLICATION PACKAGE AUTHORITY: every AppContainer package SID and capability SID starts here.
@@ -2090,8 +2114,8 @@ def write_restricted_file(
     ``owner`` (Windows only) is the account the file is created owned by, in the call that creates
     it, and read back through the creating handle before a byte is written. It is a SID, with or
     without a leading ``*``, or a name: a name Windows reports as a group, an alias, a domain or a
-    computer account is refused (a read grant admits a computer account; an owner does not), so a
-    group such as Administrators is named by its SID. A name it
+    computer account is refused (a read grant admits a computer account; an owner name does not),
+    so a group such as Administrators is named by its SID. A name it
     reports as a well-known group (SID_NAME_USE 5, as SYSTEM, a service's virtual account and
     Everyone all report) passes that gate, and a SID is taken as given. Then an
     application package, and at least the broad groups :func:`_is_broad_group` knows, are refused

@@ -1045,28 +1045,130 @@ async def run_batch_engine(
 # --- the DRIVER half ---------------------------------------------------------
 
 
+# What a band may spend beyond its hold and its two drain windows. It covers at least: interpreter
+# start-up, signing in, the inbound port preflight (two waits of up to 60 s), the batched connects,
+# binding its sinks, the engine reads that bracket the hold, the sender stop graces, closing its
+# sinks and poller, and writing its report. A child still running past the bound is hung, and is
+# killed so it cannot hang the driver (BACKLOG #5304).
+_REMOTE_PROC_SLACK = 300.0
+
+# How much of a band's stderr is kept: the tail is what names why it failed.
+_STDERR_TAIL_BYTES = 4096
+
+
+def _remote_proc_timeout(hold_seconds: float, drain_timeout: float) -> float:
+    """The wall-clock bound on one ``connscale-remote`` band. The child may spend ``drain_timeout``
+    twice, once awaiting the drain and once more sampling until the counts reconcile (remote.py), so
+    a band that is slow but healthy has its measured report read rather than killed."""
+    return hold_seconds + 2 * drain_timeout + _REMOTE_PROC_SLACK
+
+
+def _stderr_reason(said: bytes) -> str:
+    """The tail of what a ``connscale-remote`` child wrote to stderr, as the reason its band failed.
+    Escaped, since it reaches the operator's terminal in the cell's notes."""
+    tail = said.decode("utf-8", "replace").strip()[-600:]
+    return escape_for_terminal(tail) if tail else "it said nothing on stderr"
+
+
+async def _kill_and_reap(proc: asyncio.subprocess.Process) -> bool:
+    """Kill ``proc`` and wait, bounded, for it to exit. False when it is still there after
+    ``_STOP_GRACE``: a child stuck in uninterruptible I/O must not hang the driver either."""
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    try:
+        await asyncio.wait_for(proc.wait(), _STOP_GRACE)
+    except TimeoutError:
+        return False
+    return True
+
+
 # Module-level so a structural test can monkeypatch the subprocess spawn (no real connscale-remote runs).
-async def _run_remote_proc(argv: list[str], report_path: Path, cwd: Path) -> dict[str, Any]:
+async def _run_remote_proc(
+    argv: list[str], report_path: Path, cwd: Path, *, timeout: float
+) -> dict[str, Any]:
     """Spawn one ``connscale-remote`` process, wait for it, and return its JSON report. Real work — the
-    tests replace this seam with a synthetic report per band so the fleet drive runs offline."""
+    tests replace this seam with a synthetic report per band so the fleet drive runs offline.
+
+    Any file already at ``report_path`` is removed before the spawn (BACKLOG #5304), so only a report
+    THIS child wrote can be read: a child that fails before writing would otherwise hand back the band
+    report an earlier run left at the same path.
+
+    A child still running after ``timeout`` seconds is killed and the band fails, and so is one left
+    running when this wait is cancelled: an unbounded wait let one hung child hang the whole driver."""
+    report_path.unlink(missing_ok=True)
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=str(cwd),
         stdout=asyncio.subprocess.DEVNULL,
         stderr=asyncio.subprocess.PIPE,
     )
-    _, said = await proc.communicate()
+    stderr = proc.stderr
+    assert stderr is not None  # stderr=PIPE above
+    heard = bytearray()
+
+    async def _hear() -> None:
+        # Read as it arrives, so what a child said before it hung -- the only clue to the phase it
+        # hung in -- is still here once it has been killed. Only the tail is kept.
+        while chunk := await stderr.read(65536):
+            heard.extend(chunk)
+            del heard[:-_STDERR_TAIL_BYTES]
+
+    hearing = asyncio.ensure_future(_hear())
+    try:
+        try:
+            await asyncio.wait_for(proc.wait(), timeout)
+            hung, reaped = False, True
+        except TimeoutError:
+            # A child that exited just as the bound fired is not hung: its report stands.
+            hung = proc.returncode is None
+            reaped = await _kill_and_reap(proc)
+        # The pipe closes once the child exits. Bounded, since a grandchild that outlived the
+        # child could hold it open; asyncio.wait never raises what the reader hit.
+        done, _ = await asyncio.wait({hearing}, timeout=_STOP_GRACE)
+        cut = "" if hearing in done else " (stderr was still open, so this tail may be cut short)"
+        if hung:
+            fate = "was killed" if reaped else f"did not exit within {_STOP_GRACE:g}s of the kill"
+            raise ConnScaleError(
+                f"connscale-remote was still running after {timeout:g}s and {fate}: "
+                f"{_stderr_reason(bytes(heard))}{cut}"
+            )
+    finally:
+        if proc.returncode is None:
+            await _kill_and_reap(proc)
+        hearing.cancel()
+        await asyncio.gather(hearing, return_exceptions=True)
+    said = bytes(heard)
     if not report_path.exists():
         # The process writes its report only when it ran. One that could not start (a band layout
         # it refused, a sign-in the engine refused) says why on stderr and writes nothing, and that
         # reason used to be discarded, leaving a bare FileNotFoundError.
-        reason = said.decode("utf-8", "replace").strip()[-600:] or "it said nothing on stderr"
         raise ConnScaleError(
-            f"connscale-remote exited {proc.returncode} and wrote no report: {reason}"
+            f"connscale-remote exited {proc.returncode} and wrote no report: {_stderr_reason(said)}"
         )
-    data = json.loads(report_path.read_text(encoding="utf-8"))
+    try:
+        data = json.loads(report_path.read_text(encoding="utf-8"))
+    except ValueError as exc:
+        # A child killed or failing mid-write leaves a partial report; its exit and stderr say why.
+        raise ConnScaleError(
+            f"connscale-remote exited {proc.returncode} and its report {report_path} is not JSON "
+            f"({exc}): {_stderr_reason(said)}"
+        ) from exc
     if not isinstance(data, dict):
-        raise ConnScaleError(f"connscale-remote report {report_path} is not a JSON object")
+        raise ConnScaleError(
+            f"connscale-remote exited {proc.returncode} and its report {report_path} is not a JSON "
+            f"object: {_stderr_reason(said)}"
+        )
+    # A report on disk does not by itself mean the child finished cleanly, so its exit code is read
+    # too. A child that ran exits with the code its report records: 0 on PASS, 1 on its own FAIL
+    # verdict, whose counts the aggregation judges again. Any other exit, or one the report does
+    # not record, fails the band with the child's stderr reason rather than reading the report
+    # as if nothing had gone wrong.
+    recorded = data.get("exit_code")
+    if proc.returncode != 0 and not (type(recorded) is int and recorded == proc.returncode):
+        raise ConnScaleError(
+            f"connscale-remote exited {proc.returncode}, but its report records exit code "
+            f"{recorded!r}: {_stderr_reason(said)}"
+        )
     return data
 
 
@@ -1147,7 +1249,14 @@ async def _drive_cell_fleet(
             drain_timeout=drain_timeout,
             report_path=report_path,
         )
-        tasks.append(_run_remote_proc(argv, report_path, cwd))
+        tasks.append(
+            _run_remote_proc(
+                argv,
+                report_path,
+                cwd,
+                timeout=_remote_proc_timeout(hold_seconds, drain_timeout),
+            )
+        )
     # return_exceptions=True so a crashed band is COLLECTED (never left un-retrieved) and every sibling
     # still completes — then fail the whole cell explicitly if ANY band raised, so the caller records a
     # failed/loss cell instead of the cell silently going absent from the verdict.
