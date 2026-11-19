@@ -23,6 +23,7 @@ import pytest
 
 from scripts.docs.asvs_tally_lint import (
     CORPUS_TOTAL,
+    EmptyScan,
     Hit,
     counted,
     idioms_for_line,
@@ -239,10 +240,120 @@ def test_the_allowlist_exempts_the_rendered_record(tmp_path: Path) -> None:
     doc = tmp_path / "docs" / "security" / "ASVS-CURRENT.md"
     doc.parent.mkdir(parents=True)
     doc.write_text("| pass | partial | fail | na |\n| 168 | 105 | 3 | 69 |\n", encoding="utf-8")
+    # A second, tally-free document, so the allowlisted run still reads one file: a run that
+    # allowlists EVERY file it found has scanned nothing, which is an error of its own (below).
+    (tmp_path / "docs" / "other.md").write_text("prose with no tally\n", encoding="utf-8")
     assert main(["docs", "--repo", str(tmp_path)]) == 1, "without the allowlist it must red"
     assert (
         main(["docs", "--repo", str(tmp_path), "--allow", "docs/security/ASVS-CURRENT.md"]) == 0
     ), "with the allowlist it must pass"
+
+
+# --------------------------------------------------------------------------------------------
+# Examining nothing is an error, never a clean run (BACKLOG #5469).
+# --------------------------------------------------------------------------------------------
+
+
+def _tree(tmp_path: Path, text: str = "prose with no tally\n") -> Path:
+    doc = tmp_path / "docs" / "d.md"
+    doc.parent.mkdir(parents=True, exist_ok=True)
+    doc.write_text(text, encoding="utf-8")
+    return doc
+
+
+def test_a_scan_of_zero_files_is_an_error_not_a_clean_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "docs").mkdir()
+    assert main(["docs", "--repo", str(tmp_path)]) == 2, "an empty root must not pass"
+    assert "scanned ZERO markdown files" in capsys.readouterr().out
+    # Control: the same tree with one tally-free document is a clean run, exit 0.
+    _tree(tmp_path)
+    assert main(["docs", "--repo", str(tmp_path)]) == 0
+
+
+def test_a_root_that_does_not_exist_is_an_error_not_a_clean_run(tmp_path: Path) -> None:
+    _tree(tmp_path)
+    assert main(["doc", "--repo", str(tmp_path)]) == 2, "a misspelt root must not pass"
+
+
+def test_a_wholly_allowlisted_scan_is_an_error_not_a_clean_run(tmp_path: Path) -> None:
+    _tree(tmp_path)
+    assert main(["docs", "--repo", str(tmp_path), "--allow", "docs/"]) == 2
+
+
+def test_a_missing_baseline_file_is_an_error_not_an_empty_baseline(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _tree(tmp_path)
+    rc = main(["docs", "--repo", str(tmp_path), "--baseline", str(tmp_path / "nope.txt")])
+    assert rc == 2
+    assert "does not exist" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "content",
+    ["", "\n\n", "# a header and nothing else\n# Format: path TAB idiom TAB token TAB count\n"],
+    ids=["zero-byte", "blank-lines", "header-only"],
+)
+def test_a_baseline_carrying_zero_claims_is_an_error(tmp_path: Path, content: str) -> None:
+    """The zero-byte case is what a refused generating run leaves behind, since the shell truncates
+    the redirect target before the program starts. Omitting --baseline is the explicit form."""
+    _tree(tmp_path)
+    base = tmp_path / "b.txt"
+    base.write_text(content, encoding="utf-8")
+    with pytest.raises(EmptyScan, match="zero claims"):
+        load_baseline(base)
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 2
+    assert main(["docs", "--repo", str(tmp_path)]) == 0, "omitting --baseline still scans"
+
+
+def test_print_keys_stdout_loads_as_a_baseline_and_round_trips(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _tree(tmp_path, "score 212/0/0/133 here\n| Posture | 179 | 51 | 5 | 110 |\nagain 212/0/0/133\n")
+    rc = main(["docs", "--repo", str(tmp_path), "--print-keys"])
+    captured = capsys.readouterr()
+    assert rc == 1, "against no baseline every tally is NEW, so the generating run exits 1"
+    assert "SCANNED:" in captured.err and "FOUND:" in captured.err, "the inventory still prints"
+    assert "SCANNED" not in captured.out and "FOUND" not in captured.out
+    assert captured.out.splitlines() == [
+        "docs/d.md\tSLASH_RUN\t212/0/0/133\t2",
+        "docs/d.md\tTABLE_ROW\t179|51|5|110\t1",
+    ]
+
+    base = tmp_path / "b.txt"
+    base.write_text(captured.out, encoding="utf-8")
+    assert load_baseline(base) == {
+        "docs/d.md\tSLASH_RUN\t212/0/0/133": 2,
+        "docs/d.md\tTABLE_ROW\t179|51|5|110": 1,
+    }
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 0
+    assert "OK: no new" in capsys.readouterr().out, "the gate run still reports on stdout"
+
+
+def test_print_keys_round_trips_through_a_real_shell_redirect(tmp_path: Path) -> None:
+    """The documented command, as a subprocess whose stdout is the file, then the gate run on it."""
+    _tree(tmp_path, "score 212/0/0/133 here\n")
+    base = tmp_path / "b.txt"
+    lint = str(REPO_ROOT / LINT_REL)
+    with base.open("w", encoding="utf-8") as fh:
+        gen = subprocess.run(
+            [sys.executable, lint, "docs", "--repo", str(tmp_path), "--print-keys"],
+            stdout=fh,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=120,
+        )
+    assert gen.returncode == 1, gen.stderr
+    assert "SCANNED:" in gen.stderr
+    check = subprocess.run(
+        [sys.executable, lint, "docs", "--repo", str(tmp_path), "--baseline", str(base)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert check.returncode == 0, check.stdout + check.stderr
 
 
 # --------------------------------------------------------------------------------------------

@@ -33,6 +33,28 @@ It prints the files it scanned, the idioms it matched and the per-file counts, s
 nothing cannot be mistaken for a run that found nothing. Stdlib only, so it can be mirrored into the
 assessment repo and run there without an install -- the same property ``scripts/asvs/scorecard.py``
 is held to.
+
+THREE WAYS TO EXAMINE NOTHING ARE ERRORS, exit 2, not a clean run (BACKLOG #5469):
+
+  * a scan that read ZERO Markdown files -- a root that moved, was misspelt, or is wholly
+    allowlisted. "no new tally" and "nothing was read" must not share an exit code;
+  * a ``--baseline`` that names no file. Read as empty, it reclassifies every grandfathered tally
+    as NEW, and the cause reads as a finding rather than as a wrong path;
+  * a ``--baseline`` file carrying zero claims. The generating command below redirects stdout, and
+    the shell truncates the target before this program starts, so a generating run that refused
+    leaves exactly that file behind.
+
+Scanning with no baseline is still allowed, and it is explicit: omit ``--baseline``. That is the
+form the generating command uses.
+
+    python scripts/docs/asvs_tally_lint.py docs --print-keys > <baseline.txt>
+
+Under ``--print-keys`` stdout carries baseline lines and nothing else; the inventory and the verdict
+go to stderr, still printed for a person to read but not swallowed into the artifact. The output
+therefore loads as a baseline as written. The generating run exits 1 whenever the tree holds a
+tally, because against no baseline every tally is NEW; verify the result by re-running with
+``--baseline <baseline.txt>`` and requiring exit 0. The checked-in baseline carries a hand-written
+``#`` header that a regeneration does not reproduce, so carry it over by hand.
 """
 
 from __future__ import annotations
@@ -42,6 +64,7 @@ import re
 import sys
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 
 # The pinned ASVS 5.0.0 corpus size. It is a CONSTANT, which is the whole reason a number that sums
@@ -247,16 +270,29 @@ def iter_markdown(roots: Iterable[Path], repo: Path) -> Iterator[tuple[str, Path
             yield p.relative_to(repo).as_posix(), p
 
 
+class EmptyScan(RuntimeError):
+    """Raised when nothing was examined. Never let that report as success."""
+
+
 def load_baseline(path: Path | None) -> dict[str, int]:
     """Grandfathered tallies as ``key -> occurrence count``.
 
     The count is what stops the baseline being a licence to add more of the same: one extra copy of
     an already-grandfathered tally is a NEW tally, and removing one leaves the recorded count too
     high, which fails and forces the entry down. The list can only shrink.
+
+    ``None`` -- no ``--baseline`` given -- is the one explicit way to scan without a baseline. A
+    path that names no file, or a file carrying zero claims, raises :class:`EmptyScan`; see the
+    module docstring.
     """
     out: dict[str, int] = {}
-    if path is None or not path.is_file():
+    if path is None:
         return out
+    if not path.is_file():
+        raise EmptyScan(
+            f"baseline {path} does not exist. Read as empty, it would report every grandfathered "
+            f"tally as NEW. Omit --baseline to scan without one deliberately."
+        )
     for raw in path.read_text(encoding="utf-8").splitlines():
         line = raw.rstrip("\n")
         if not line.strip() or line.lstrip().startswith("#"):
@@ -265,6 +301,12 @@ def load_baseline(path: Path | None) -> dict[str, int]:
         if not key or not count.isdigit():
             raise ValueError(f"malformed baseline line (expected 'key<TAB>count'): {line!r}")
         out[key] = int(count)
+    if not out:
+        raise EmptyScan(
+            f"baseline {path} carries zero claims. A generating run redirects stdout and the "
+            f"shell truncates the target before this program starts, so a refused generation "
+            f"leaves exactly this file behind. Omit --baseline to scan without one deliberately."
+        )
     return out
 
 
@@ -320,8 +362,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--print-keys", action="store_true", help="emit baseline keys for the findings")
     args = ap.parse_args(argv)
 
+    # Everything this run has to SAY goes through `say`; the only bare `print` calls left are the
+    # baseline lines themselves. Under --print-keys stdout is the artifact, so the inventory and the
+    # verdict move to stderr rather than being mixed into a file that then cannot load.
+    say = partial(print, file=sys.stderr if args.print_keys else sys.stdout)
+
+    try:
+        baseline = load_baseline(args.baseline)
+    except EmptyScan as exc:
+        say(f"FAIL: {exc}")
+        return 2
+
     docs = list(iter_markdown([Path(r) for r in args.roots], args.repo))
-    baseline = load_baseline(args.baseline)
     allow = tuple(args.allow)
 
     scanned = 0
@@ -338,26 +390,33 @@ def main(argv: list[str] | None = None) -> int:
     new = [h for h in hits if observed[h.key()] > baseline.get(h.key(), 0)]
     grandfathered = sum(min(n, baseline.get(k, 0)) for k, n in observed.items())
 
-    print(
+    say(
         f"SCANNED: {scanned} markdown files ({skipped} allowlisted) under {[str(r) for r in args.roots]}"
     )
-    print(
+    say(
         f"SCANNED: baseline {args.baseline} carries {len(baseline)} grandfathered claims "
         f"({sum(baseline.values())} occurrences)"
     )
-    print(
+    if scanned == 0:
+        say(
+            f"FAIL: scanned ZERO markdown files under {[str(r) for r in args.roots]} "
+            f"(repo {args.repo}). That is a root that moved, is misspelt or is wholly allowlisted, "
+            f"not a clean tree: 'no new tally' and 'nothing was read' must not share an exit code."
+        )
+        return 2
+    say(
         f"FOUND:   {len(hits)} tallies total, {grandfathered} grandfathered, "
         f"{len(hits) - grandfathered} NEW"
     )
     per_idiom: dict[str, int] = {}
     for h in hits:
         per_idiom[h.idiom] = per_idiom.get(h.idiom, 0) + 1
-    print(f"FOUND:   idioms {per_idiom or '{}'}")
+    say(f"FOUND:   idioms {per_idiom or '{}'}")
     per_file: dict[str, int] = {}
     for h in hits:
         per_file[h.path] = per_file.get(h.path, 0) + 1
     for path in sorted(per_file, key=lambda k: (-per_file[k], k)):
-        print(f"         {per_file[path]:4d}  {path}")
+        say(f"         {per_file[path]:4d}  {path}")
 
     if args.print_keys:
         for key in sorted(observed):
@@ -367,23 +426,23 @@ def main(argv: list[str] | None = None) -> int:
     rc = 0
     if new:
         rc = 1
-        print(f"\nFAIL: {len(new)} hard-coded ASVS tally/tallies are not grandfathered:")
+        say(f"\nFAIL: {len(new)} hard-coded ASVS tally/tallies are not grandfathered:")
         for h in sorted(new, key=lambda h: (h.path, h.line)):
-            print(f"  {h.path}:{h.line}: [{h.idiom} {h.token}] {h.text[:150]}")
-        print(
+            say(f"  {h.path}:{h.line}: [{h.idiom} {h.token}] {h.text[:150]}")
+        say(
             "\nThe count is computed (ADR 0156). Cite the rendered record instead of copying a "
             "number out of it: every copy goes stale on the next re-score, and of the roughly "
             "fifty that exist, approximately one is correct."
         )
     if stale:
         rc = 1
-        print(f"\nFAIL: {len(stale)} baseline entr(ies) now over-count what is in the tree.")
-        print("The baseline may only SHRINK -- lower or delete these in the change that removed")
-        print("the tally, so a fix is recorded rather than leaving a licence behind:")
+        say(f"\nFAIL: {len(stale)} baseline entr(ies) now over-count what is in the tree.")
+        say("The baseline may only SHRINK -- lower or delete these in the change that removed")
+        say("the tally, so a fix is recorded rather than leaving a licence behind:")
         for k in stale:
-            print(f"  have {observed.get(k, 0)}, baseline says {baseline[k]}:  {k}")
+            say(f"  have {observed.get(k, 0)}, baseline says {baseline[k]}:  {k}")
     if rc == 0:
-        print("\nOK: no new hard-coded ASVS tally.")
+        say("\nOK: no new hard-coded ASVS tally.")
     return rc
 
 
