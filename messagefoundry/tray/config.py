@@ -35,6 +35,7 @@ from __future__ import annotations
 # load service_status (asyncio, subprocess, ctypes) or tomllib.
 __lazy_modules__ = ["messagefoundry.service_status", "tomllib"]
 
+import ipaddress
 import re
 import sys
 import tomllib
@@ -63,9 +64,6 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 # How pydantic's lax mode reads a bool, which is how serve reads [security].local_access_only.
 _LAX_TRUE = frozenset({"1", "on", "t", "true", "y", "yes"})
 _LAX_FALSE = frozenset({"0", "off", "f", "false", "n", "no"})
-# A wildcard bind accepts on every interface of its family, but it is no address a client can
-# connect to. The loopback of the same family is one the bind accepts on (BACKLOG #5936).
-_WILDCARD_PROBE_HOSTS = {"0.0.0.0": "127.0.0.1", "::": "::1", "[::]": "::1"}  # nosec B104
 _ENGINE_SCHEMES = frozenset({"http", "https"})
 _VALID_HOST = re.compile(r"^[A-Za-z0-9._:\[\]-]{1,255}$")
 _MAX_PATH_LEN = 4096
@@ -353,13 +351,17 @@ def service_toml_bind(service_toml: dict[str, object] | None) -> tuple[str | Non
 
 
 def _lax_bool(value: object) -> bool | None:
-    """``value`` as pydantic's lax mode reads a bool, or ``None`` where it would refuse it."""
+    """``value`` as pydantic's lax mode reads a bool, or ``None`` where it would refuse it.
+
+    The tray imports no pydantic, so this restates the rule; tests/test_tray_config.py holds it to
+    the engine's own ``SecuritySettings`` over a set of spellings. Case is ignored and surrounding
+    space is not, as there."""
     if isinstance(value, bool):
         return value
-    if isinstance(value, int) and value in (0, 1):
+    if isinstance(value, (int, float)) and value in (0, 1):
         return bool(value)
     if isinstance(value, str):
-        word = value.strip().lower()
+        word = value.lower()
         if word in _LAX_TRUE:
             return True
         if word in _LAX_FALSE:
@@ -368,14 +370,32 @@ def _lax_bool(value: object) -> bool | None:
 
 
 def _lax_int(value: object) -> int | None:
-    """``value`` as pydantic's lax mode reads a whole number, or ``None`` where it would refuse it."""
+    """``value`` as pydantic's lax mode reads a whole number, or ``None`` where it would refuse it.
+
+    Restated for the reason :func:`_lax_bool` gives, and held to the engine's ``ApiSettings`` the
+    same way: surrounding space, a sign, digit underscores and a zero fraction are accepted."""
     if isinstance(value, bool):
         return None
     if isinstance(value, int):
         return value
-    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
-        return int(value.strip())
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str):
+        whole = re.fullmatch(r"([+-]?\d+(?:_\d+)*)(?:\.0+)?", value.strip())
+        if whole:
+            return int(whole.group(1))
     return None
+
+
+def _probe_host(host: str) -> str:
+    """``host``, or the loopback of its family when it is a wildcard (unspecified) address."""
+    try:
+        address = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return host
+    if not address.is_unspecified:
+        return host
+    return "::1" if address.version == 6 else "127.0.0.1"
 
 
 def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -> str | None:
@@ -391,7 +411,7 @@ def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -
         return None
     # A bare IPv6 literal must be bracketed or the ':'s read as the port separator — `serve
     # --host ::1` would otherwise yield the unparseable "http://::1:8765".
-    host = _WILDCARD_PROBE_HOSTS.get(host, host)
+    host = _probe_host(host)
     authority = f"[{host}]" if ":" in host and not host.startswith("[") else host
     return f"{'https' if tls else 'http'}://{authority}:{port}"
 

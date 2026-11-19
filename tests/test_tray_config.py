@@ -714,15 +714,17 @@ def test_load_config_an_operator_chain_pins_nothing(tmp_path: Path) -> None:
         ({"api": {"port": 9443}}, (None, 9443)),
         # Read as serve reads them: pydantic's lax mode takes these quoted and numeric spellings.
         (
-            {"security": {"local_access_only": " FALSE ", "listen_address": "10.0.0.5"}},
+            {"security": {"local_access_only": "FALSE", "listen_address": "10.0.0.5"}},
             ("10.0.0.5", None),
         ),
         ({"security": {"local_access_only": 0, "listen_address": "10.0.0.5"}}, ("10.0.0.5", None)),
         ({"security": {"local_access_only": "yes"}}, ("127.0.0.1", None)),
         ({"api": {"port": " 9443 "}}, (None, 9443)),
         ({"api": {"port": "+9443"}}, (None, 9443)),
-        # What serve would refuse reads as unset, so the default applies.
+        ({"api": {"port": 9443.0}}, (None, 9443)),
+        # What serve would refuse, or a port no client can reach, reads as unset.
         ({"security": {"local_access_only": "maybe", "listen_address": "10.0.0.5"}}, (None, None)),
+        ({"security": {"local_access_only": " false", "listen_address": "10.0.0.5"}}, (None, None)),
         ({"security": {"local_access_only": 2, "listen_address": "10.0.0.5"}}, (None, None)),
         ({"security": {"local_access_only": False, "listen_address": "bad host"}}, (None, None)),
         ({"api": {"port": True}}, (None, None)),
@@ -737,12 +739,66 @@ def test_service_toml_bind(
     assert service_toml_bind(data) == bind
 
 
-def test_build_engine_url_probes_loopback_for_a_wildcard_bind() -> None:
-    """0.0.0.0 and :: accept on loopback too, and neither is an address a client can connect to."""
-    assert build_engine_url("0.0.0.0", 9100, tls=True) == "https://127.0.0.1:9100"
-    assert build_engine_url("::", 9100, tls=True) == "https://[::1]:9100"
-    assert build_engine_url("[::]", 9100, tls=True) == "https://[::1]:9100"
-    assert is_local_engine(build_engine_url("0.0.0.0", 9100) or "") is True
+_LAX_BOOL_SPELLINGS: list[object] = [
+    True, False, "false", "FALSE", " false", "Off", "no", "n", "f", "0", "1", 0, 1, 2,
+    0.0, 1.0, "yes", "on", "t", "y", "maybe", "", None, "true ",
+]  # fmt: skip
+_LAX_INT_SPELLINGS: list[object] = [
+    9443, " 9443 ", "+9443", "9_443", "9443.0", 9443.0, 9443.5, "9443.5", "1e3", True, "0x10",
+    "", "-1", "9443 ", "9__443", None, [9443],
+]  # fmt: skip
+
+
+@pytest.mark.parametrize("value", _LAX_BOOL_SPELLINGS)
+def test_local_access_only_is_read_as_the_engine_reads_it(value: object) -> None:
+    """The tray restates pydantic's lax bool; the engine's own model is the oracle."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import SecuritySettings
+    from messagefoundry.tray.config import _lax_bool
+
+    try:
+        expected: bool | None = SecuritySettings.model_validate(
+            {"local_access_only": value}
+        ).local_access_only
+    except ValidationError:
+        expected = None
+    assert _lax_bool(value) == expected
+
+
+@pytest.mark.parametrize("value", _LAX_INT_SPELLINGS)
+def test_api_port_is_read_as_the_engine_reads_it(value: object) -> None:
+    """The tray restates pydantic's lax int; the engine's own model is the oracle."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import ApiSettings
+    from messagefoundry.tray.config import _lax_int
+
+    try:
+        expected: int | None = ApiSettings.model_validate({"port": value}).port
+    except ValidationError:
+        expected = None
+    assert _lax_int(value) == expected
+
+
+@pytest.mark.parametrize(
+    ("host", "probed"),
+    [
+        ("0.0.0.0", "127.0.0.1"),
+        ("::", "[::1]"),
+        ("[::]", "[::1]"),
+        ("::0", "[::1]"),
+        ("0:0:0:0:0:0:0:0", "[::1]"),
+        ("10.0.0.5", "10.0.0.5"),
+        ("::1", "[::1]"),
+    ],
+)
+def test_build_engine_url_probes_loopback_for_a_wildcard_bind(host: str, probed: str) -> None:
+    """An unspecified address, in any spelling, accepts on loopback too, and no client can connect
+    to it."""
+    assert build_engine_url(host, 9100, tls=True) == f"https://{probed}:9100"
+    if probed != "10.0.0.5":
+        assert is_local_engine(build_engine_url(host, 9100) or "") is True
 
 
 def test_compose_a_declared_terminator_with_no_bind_named_is_probed_over_http() -> None:
