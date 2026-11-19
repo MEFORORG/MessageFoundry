@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tomllib
 import zipfile
 from collections.abc import Sequence
 from pathlib import Path
@@ -43,6 +44,7 @@ from _bash_resolver import explain_returncode, probe_env, require_bash  # noqa: 
 from forbidden_members import (  # noqa: E402
     FORBIDDEN_BASENAMES,
     FORBIDDEN_PATH_COMPONENTS,
+    KNOWN_DISTRIBUTIONS,
     RETIRED_ENGINE_PATHS,
     TEST_CONTENT_BASENAMES,
     TEST_CONTENT_PATH_COMPONENTS,
@@ -641,7 +643,9 @@ def test_distribution_reads_a_hyphenated_toolkit_filename_as_the_toolkit(filenam
     ],
 )
 def test_a_prefixed_or_dotted_engine_member_in_a_toolkit_archive_is_refused(member: str) -> None:
-    # The root a tar's listing shares, as inspect() derives it; a .data tree is refused with it.
+    # The member's first written component as the root. That is the root inspect() derives for the
+    # name-version cases; for a member with a ``..`` it derives the resolved first component, and
+    # those cases are refused by the raw or resolved reading whatever the root is.
     first = [p for p in member.split("/") if p not in ("", ".")][0]
     assert split_violation(member, "messagefoundry-toolkit", first) is not None
 
@@ -1055,6 +1059,42 @@ def test_a_toolkit_doc_or_config_file_named_for_the_engine_passes(member: str) -
 )
 def test_a_toolkit_code_member_named_for_the_engine_is_still_refused(member: str) -> None:
     assert split_violation(member, "messagefoundry-toolkit", _TK_ROOT) is not None
+
+
+@pytest.mark.parametrize("member", ["zz.pth", "messagefoundry_toolkit.pth", "X.PTH."])
+def test_a_toolkit_archive_may_not_carry_a_top_level_pth_of_any_name(member: str) -> None:
+    assert split_violation(member, "messagefoundry-toolkit") is not None
+    # A .pth below the top level is not on a site directory, so it runs nothing.
+    assert split_violation(f"messagefoundry_toolkit/{member}", "messagefoundry-toolkit") is None
+
+
+@pytest.mark.parametrize("member", ["./C:/x.py", "a/C:/x.py", "a\\c:\\x.py"])
+def test_a_drive_letter_in_any_component_is_absolute(member: str) -> None:
+    assert escapes_root(member) is not None
+
+
+def test_an_empty_name_before_the_version_places_nothing() -> None:
+    assert filename_problem(Path("-1.0-py3-none-any.whl")) is not None
+
+
+def test_known_distributions_match_the_published_project_names() -> None:
+    """A distribution added or renamed under packaging/ fails here, not on a release tag."""
+    projects = [_REPO / "pyproject.toml", *sorted((_REPO / "packaging").glob("*/pyproject.toml"))]
+    names = {
+        re.sub(
+            r"[-_.]+", "-", tomllib.loads(p.read_text(encoding="utf-8"))["project"]["name"]
+        ).casefold()
+        for p in projects
+    }
+    assert names == KNOWN_DISTRIBUTIONS
+
+
+def test_the_root_refusal_names_an_entry_that_normalises_to_nothing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    sdist = _write_tar(tmp_path / "dist" / _TK_SDIST, _files(f"{_TK_ROOT}/PKG-INFO", "..."))
+    assert main([str(sdist)]) == 1
+    assert "(''," in capsys.readouterr().err
 
 
 def test_the_cli_passes_a_toolkit_sdist_with_an_engine_named_config_file(

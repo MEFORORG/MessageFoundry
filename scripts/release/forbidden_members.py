@@ -134,7 +134,8 @@ KNOWN_DISTRIBUTIONS: frozenset[str] = frozenset(
 
 #: What may follow ``messagefoundry.`` in a top-level FILE of a toolkit archive: documentation and
 #: configuration, which Python never imports. Every other suffix, and none, is refused, so a module,
-#: ``.pth``, extension module or a suffix nobody listed stays refused; only this list is let through.
+#: extension module or a suffix nobody listed stays refused; only this list is let through. A
+#: top-level ``.pth`` is refused whatever its name, by its own check in :func:`_split_rule`.
 _INERT_SUFFIXES: frozenset[str] = frozenset(
     {"md", "rst", "txt", "toml", "json", "yaml", "yml", "cfg", "ini"}
 )
@@ -229,7 +230,8 @@ def _archive_root(names: Sequence[str]) -> tuple[str | None, str | None]:
     if len(firsts) == 1 and any(len(r) > 1 for r in resolved):
         return firsts[0], None
     if len(firsts) > 1:
-        return None, f"it has {len(firsts)} top-level entries ({', '.join(firsts[:5])})"
+        shown = ", ".join(repr(f) for f in firsts[:5])
+        return None, f"it has {len(firsts)} top-level entries ({shown})"
     return None, "it has no top-level directory"
 
 
@@ -381,7 +383,9 @@ def escapes_root(member: str) -> str | None:
     file the archive does not hold, such as an installed engine package, so no rule here can read
     it. A published distribution has no reason to carry one, so it is refused (BACKLOG #5470)."""
     unified = member.replace("\\", "/")
-    if unified.startswith("/") or re.match(r"[A-Za-z]:", unified):
+    # A drive letter in ANY component, not only the first: ``./C:/x.py`` is ``C:/x.py`` once the
+    # ``.`` component drops out, as every other rule here reads it.
+    if unified.startswith("/") or any(re.match(r"[A-Za-z]:", p) for p in _parts(member)):
         return "the path is absolute, outside the archive"
     if _resolve_dots(_parts(member))[1]:
         return "the path climbs above the archive's top level"
@@ -391,9 +395,10 @@ def escapes_root(member: str) -> str | None:
 def _split_candidates(member: str, root: str | None) -> list[list[str]]:
     """Every reading of ``member`` the split rule tests, normalised: as written and with ``..``
     applied, each also without the archive's common ``root`` when it starts with it (BACKLOG
-    #5470). The root is stripped AFTER ``..`` is applied as well as before, so
+    #5470). The root is stripped from the ``..``-resolved reading too, so
     ``<root>/../<root>/messagefoundry/x.py`` is read as the ``messagefoundry/x.py`` an extractor
-    writes. Every reading is tested, so stripping a root cannot hide a ``<name>.data/`` tree."""
+    writes. Every reading is tested, so stripping a root cannot hide a ``<name>.data/`` tree.
+    ``root`` may be given raw; it is normalised here."""
     # Resolved and stripped on the components as written: normalising first would turn ``..`` into
     # an empty string that no longer climbs.
     raw = _parts(member)
@@ -401,7 +406,6 @@ def _split_candidates(member: str, root: str | None) -> list[list[str]]:
     if root is not None:
         key = _normalise(root)
         readings += [parts[1:] for parts in readings if parts and _normalise(parts[0]) == key]
-        readings += [_resolve_dots(parts)[0] for parts in readings]
     unique = dict.fromkeys(tuple(_normalise(p) for p in parts) for parts in readings if parts)
     return [list(parts) for parts in unique]
 
@@ -442,6 +446,10 @@ def _split_rule(parts: list[str], dist: str) -> str | None:
             len(parts) > 1 or first.partition(".")[2] not in _INERT_SUFFIXES
         ):
             return "the toolkit may not write into the engine's package directory (ADR 0201)"
+        # A top-level .pth of ANY name runs its import lines at every interpreter start, where it
+        # can rebind engine modules: the split-package override ADR 0201 rejects.
+        if len(parts) == 1 and first.endswith(".pth"):
+            return "the toolkit ships no top-level .pth, which runs code at interpreter start"
         if first.endswith(".data"):
             return "the toolkit ships no wheel .data tree, which installs outside its package"
     return None
@@ -511,7 +519,8 @@ def filename_problem(archive: Path) -> str | None:
     ``messagefoundry-v0.4.0.tar.gz``), and a ``messagefoundry`` name outside
     :data:`KNOWN_DISTRIBUTIONS`, which reading up to the first hyphen once gave the engine's rule.
     :func:`inspect` still inspects such an archive, under both split rules."""
-    if _name_version(_filename_stem(archive)) is None:
+    # Falsy, not `is None`: an empty name (``-1.0-py3-none-any.whl``) places nothing either.
+    if not _name_version(_filename_stem(archive)):
         return (
             "its filename has no <name>-<version> shape, so the distribution, and the engine and "
             "toolkit split rule that applies to it, cannot be read"
