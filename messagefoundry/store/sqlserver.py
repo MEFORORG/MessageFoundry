@@ -9507,7 +9507,15 @@ class SqlServerStore:
 
     async def _load_state_cache(self) -> None:
         """Warm the transform-state read-through cache from the ``state`` table at open (ADR 0005)."""
-        rows = await self._fetchall("SELECT namespace, [key], value FROM state")
+        self._state_cache = self._decode_state_rows(
+            await self._fetchall("SELECT namespace, [key], value FROM state")
+        )
+
+    def _decode_state_rows(
+        self, rows: Sequence[Mapping[str, Any]]
+    ) -> MutableMapping[tuple[str, str], Any]:
+        """Decrypt ``state`` rows into a fresh sealed cache. Synchronous, so the promotion reload can run
+        it off the event loop."""
         cache = new_state_cache()  # sealed (BACKLOG #1174); the decrypt below still fails closed
         for r in rows:
             # #241 F2: UN-MASK the former silent-skip of unreadable state rows — that quietly dropped
@@ -9521,7 +9529,7 @@ class SqlServerStore:
                 aad=cell_aad("state", "value", r["namespace"], r["key"]),
                 table="state",
             )
-        self._state_cache = cache
+        return cache
 
     async def _load_state_cache_noting(self, folded_collation: str | None) -> None:
         """:meth:`_load_state_cache`, with a note on a ``CipherError`` naming the folding collation
@@ -9737,9 +9745,11 @@ class SqlServerStore:
         SQL Server HA is active-passive: only the leader runs transforms, but a standby warmed its cache
         at open, so on promotion it would serve state as of its own start while the prior leader went on
         writing. The engine calls this on promotion, before the graph's workers start, so nothing reads
-        the cache mid-swap. It fails closed like the open-time warm: a row it cannot decrypt raises, and
-        the cache in place is kept."""
-        await self._load_state_cache()
+        the cache mid-swap. The decrypt runs in a worker thread: the coordinator's lease renewal is
+        live by then, and a whole-table decrypt on the loop could stall it into a fence. It fails closed
+        like the open-time warm: a row it cannot decrypt raises, and the cache in place is kept."""
+        rows = await self._fetchall("SELECT namespace, [key], value FROM state")
+        self._state_cache = await asyncio.to_thread(self._decode_state_rows, rows)
 
     async def dead_letter_missing_handlers(
         self, valid_names: set[str], now: float | None = None

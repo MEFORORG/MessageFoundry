@@ -230,3 +230,33 @@ async def test_sqlite_and_postgres_reload_are_no_ops() -> None:
     for cls in (PostgresStore, MessageStore):
         bare: Any = object.__new__(cls)
         assert await bare.reload_state_cache() is None  # touches nothing on the handle
+
+
+def test_postgres_records_only_a_contiguous_own_bump() -> None:
+    from messagefoundry.store.postgres import PostgresStore
+
+    store: Any = object.__new__(PostgresStore)
+    store._state_versions = {"corr": 5, "solo": 3}
+    # "corr": a sibling shard bumped to 6 before this handle's own write bumped to 7, so recording 7
+    # would make the next converge skip the sibling's write. "solo": contiguous, so 4 is reflected.
+    # "new": this handle's write created the namespace at version 1.
+    store._record_own_state_bumps([("corr", 7), ("solo", 4), ("new", 1)])
+    assert store._state_versions == {"corr": 6, "solo": 4, "new": 1}
+
+
+async def test_postgres_open_reads_versions_before_rows() -> None:
+    from messagefoundry.store.postgres import PostgresStore
+
+    store: Any = object.__new__(PostgresStore)
+    store._cipher = make_cipher(generate_key())
+    order: list[str] = []
+
+    async def _fetchall(sql: str, *args: Any) -> list[dict[str, Any]]:
+        is_versions = "state_version" in sql
+        order.append("versions" if is_versions else "rows")
+        return [{"namespace": "ns", "version": 9}] if is_versions else []
+
+    store._fetchall = _fetchall
+    await store._load_state_cache()
+    assert order == ["versions", "rows"]  # a write between the reads leaves the version behind
+    assert store._state_versions == {"ns": 9}

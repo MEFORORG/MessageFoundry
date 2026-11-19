@@ -81,7 +81,7 @@ class StateConvergenceRunner:
         self._stop.clear()
         self._task = asyncio.create_task(self._run())
         log.info(
-            "cluster transform-state convergence enabled: read-through every %gs",
+            "transform-state convergence enabled: read-through every %gs",
             self._interval_seconds,
         )
 

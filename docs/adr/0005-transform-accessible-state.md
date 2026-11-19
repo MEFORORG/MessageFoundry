@@ -149,9 +149,9 @@ whose shared version differs from the one its cache reflects (re-reading + decry
 rows before mutating the cache, so a decrypt failure leaves the last-good cache intact). The version scan
 runs before the per-namespace rows (read-skew-safe: worst case is one harmless extra re-converge, never a
 skipped write). Convergence is a **background, off-path** refresh, so `state_get` stays a pure synchronous
-dict lookup on the hot path. The bump is **gated on clustered** (the engine calls `enable_state_convergence()`
-only when `coordinator.is_clustered()`), so single-node writes no `state_version` rows and stays
-byte-identical. Cross-node reads remain eventually-consistent (bounded by the heartbeat interval), which is
+dict lookup on the hot path. The bump is **gated** on another process sharing the store (the engine calls
+`enable_state_convergence()` only for a cluster node or an engine shard, see below), so a lone process
+writes no `state_version` rows and stays byte-identical. Cross-node reads remain eventually-consistent (bounded by the heartbeat interval), which is
 fine for the read-mostly correlation use cases (the same non-linearization caveat the read side already
 documents).
 

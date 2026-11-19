@@ -641,8 +641,8 @@ class Engine:
         self._config_convergence: ConfigConvergenceRunner | None = None
         self._applied_config_version: int = 0
         self._config_version_seeded = False
-        # Transform-state read-through convergence (Track B Step 6b). Spawned ONLY in clustered mode
-        # (is_clustered()), so single-node never pays for it. Each tick it read-throughs any namespace a
+        # Transform-state read-through convergence (Track B Step 6b). Spawned ONLY where another process
+        # shares a converging store (_start_state_convergence), so a lone process never pays for it. Each tick it read-throughs any namespace a
         # sibling node wrote/purged into this node's local _state_cache (off the hot path, so state_get
         # stays a pure sync dict lookup). Mirrors _config_convergence's lifecycle.
         self._state_convergence: StateConvergenceRunner | None = None
@@ -1896,12 +1896,9 @@ class Engine:
     def _shares_transform_state(self) -> bool:
         """Whether another engine process writes transform state to this store: a cluster node, or an
         engine shard of a multi-shard config (BACKLOG #5984). Each process holds its own state cache,
-        so a write in one reaches the others only through ``converge_state_cache``."""
-        if self._coordinator.is_clustered():
-            return True
-        # filter_registry_for_shard sets shard_id only for a config naming more than one shard.
-        runner = self._registry_runner
-        return runner is not None and runner.registry.shard_id is not None
+        so a write in one reaches the others only through ``converge_state_cache``. It is the test
+        :attr:`instance_identity` names the process by."""
+        return self.instance_identity is not None
 
     def _start_state_convergence(self) -> None:
         """Spawn the transform-state read-through loop (Track B Step 6b) where another process shares
@@ -2679,6 +2676,7 @@ class Engine:
             # (Single-node NullCoordinator is_clustered() is False, so this never runs there; its boot
             # residue was already recovered by the unconditional reset_stale_inflight in start().)
             await self.store.reset_stale_inflight()
+        if self._coordinator.is_clustered() and not self.store.converges_transform_state:
             # BACKLOG #5984: this backend cannot converge transform state while it runs, and a standby
             # warmed its cache at open, so it would serve state as of its own start while the prior
             # leader went on writing. Re-read it whole here, before the workers start. A write the
