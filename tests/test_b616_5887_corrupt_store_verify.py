@@ -114,8 +114,9 @@ def test_a_count_that_will_not_decode_is_a_fail(
 def test_an_integrity_failure_stays_the_verdict_when_the_count_hits_a_snapshot_fault(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A coded SQLITE_CORRUPT from the count is a snapshot fault, so it reaches the arm that keeps
-    the failed integrity_check as the verdict and logs the count's error."""
+    """A coded SQLITE_CORRUPT from the count, a real code rather than an uncoded stand-in, reaches the
+    arm that keeps the failed integrity_check as the verdict and logs the count's error. Any count
+    error reaches it once integrity_check has failed; the volume-fault sibling below covers that."""
 
     def _count_raises(_path: Path) -> dict[str, int]:
         raise _coded(

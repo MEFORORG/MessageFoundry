@@ -991,14 +991,13 @@ class BackupRunner:
                 )
                 # A verify staging directory its teardown could not clear rides on the exception
                 # as a note, and may hold decrypted bytes. It LEADS, ahead of the archive's
-                # location, so the 200-character cut the failure record applies keeps the
-                # plaintext's path; the `.part` name follows it.
-                notes = [str(note) for note in getattr(exc, "__notes__", None) or []]
-                if notes:
-                    lead = notes[0]
-                    for note in notes[1:]:
-                        lead = join_before_checks(lead, "; ", note)
-                    message = join_before_checks(lead, "; ", message)
+                # location, so the 200-character cut the failure record applies reaches it first.
+                # That keeps a short leftover's path, not every one: a leftover whose path comes
+                # after a long sentence (`_rewritten_staging_refusal`) can still lose it, and a
+                # long leftover pushes the `.part` name, which under `allow_unencrypted` is itself
+                # a plaintext archive, and the cause past the cut.
+                for note in reversed(getattr(exc, "__notes__", None) or []):
+                    message = join_before_checks(str(note), "; ", message)
                 raise BackupError("write", message) from exc
             if not verify.ok:
                 # A verify FAIL means the archive is unusable, so it never earns the canonical name
@@ -1909,16 +1908,12 @@ def _verify_archive_blocking(
         except (BackupCodecError, OSError, tarfile.TarError) as exc:
             result = _verify_failure(exc)
         except sqlite3.Error as exc:
-            # `_check_snapshot` turns at least the snapshot's own unreadable bytes into a FAIL, so
-            # what reaches here is a SQLite error it did not classify as one, or one from another
-            # read in `_verify_in_staging` that maps none. That is usually a volume, process or
-            # engine fault, but not always: a crafted table name `_count_tables` cannot put into
-            # SQL (a NUL raises ProgrammingError) is the file's and still lands here. A backup's
-            # own verify re-raises it, so THIS path does not quarantine the archive; a standalone
-            # verify reports it as not the archive's, as it does a staging refusal above. Other
-            # paths still can FAIL a good archive on a volume fault: at least `integrity_check`
-            # reporting an unreadable page as a row, and the full verify's `_walk`,
-            # `forget_store_salt` and `_open`, which turn any SQLite error into a FAIL.
+            # A SQLite error `_check_snapshot` did not classify as the snapshot's own bytes, or one
+            # from another read in `_verify_in_staging` that maps none. A backup's own verify
+            # re-raises it, so THIS arm does not quarantine the archive; a standalone verify
+            # reports it as not the archive's, as it does a staging refusal above. Neither half is
+            # exact: `_SNAPSHOT_FAULT_CODES` names an error of the file's that still lands here and
+            # the paths that still FAIL a good archive on a volume fault.
             if not standalone:
                 raise
             result = VerifyResult(
@@ -4451,15 +4446,15 @@ def _integrity_check(db_path: Path) -> tuple[bool, str]:
 #: SQLite primary result codes that are a verdict on the snapshot's own bytes: a file that is not a
 #: database, a corrupt one, or a schema this engine cannot read. ``SQLITE_ERROR`` is in the list
 #: because the reads here run on a read-only file, and their SQL is fixed except for the table
-#: names ``_count_tables`` reads back from the file itself and quotes, so what raises it is at least
-#: usually the file's schema: an unsupported file format, a collation or virtual-table module nobody
-#: registered, a malformed schema row, or a table name the count's SQL cannot read. Other codes are
-#: at least usually the volume's, the process's or this code's, and this classifier does not turn
-#: them into a verdict on the archive. That is narrower than every volume fault: at least
-#: ``integrity_check`` reports an unreadable page as a result row, which fails the check, and the
-#: full verify (``_full_open_check``) turns any SQLite error into a FAIL. Nor is every unlisted
-#: error the volume's: a NUL in a table name makes ``_count_tables`` raise ``ProgrammingError``,
-#: which is the file's.
+#: names ``_count_tables`` reads back from the file itself and quotes, so what raises it is the
+#: file's: at least an unsupported file format, a collation or virtual-table module nobody
+#: registered, a malformed schema row, or a table name the count's SQL cannot read. Other codes
+#: are not turned into a verdict on the archive by this classifier, but that does not keep every
+#: volume fault from being one, nor every unlisted error from being the file's. At least these
+#: break it: ``integrity_check`` reports an unreadable page as a result row, which fails the check;
+#: the full verify's ``_walk``, ``forget_store_salt`` and ``_open`` (``_full_open_check``) turn
+#: any SQLite error into a FAIL; and a NUL in a table name makes ``_count_tables`` raise
+#: ``ProgrammingError``, which is the file's but is classified as this code's.
 _SNAPSHOT_FAULT_CODES = frozenset(
     {sqlite3.SQLITE_NOTADB, sqlite3.SQLITE_CORRUPT, sqlite3.SQLITE_ERROR}
 )
@@ -4474,7 +4469,7 @@ def _is_snapshot_fault(exc: sqlite3.Error) -> bool:
     database, a corrupt one, a schema it cannot read, or text that does not decode. An allowlist
     (:data:`_SNAPSHOT_FAULT_CODES`), so a code nobody listed is not turned into a verdict HERE; what
     that does and does not cover is stated there. A ``ProgrammingError`` is treated as this code's
-    fault, though at least a NUL in a table name is the file's (:data:`_SNAPSHOT_FAULT_CODES`)."""
+    fault; the exception is stated there too."""
     if not isinstance(exc, sqlite3.DatabaseError) or isinstance(exc, sqlite3.ProgrammingError):
         return False
     code = getattr(exc, "sqlite_errorcode", None)
