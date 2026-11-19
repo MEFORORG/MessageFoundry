@@ -91,6 +91,13 @@ if (-not $refSha) {
 # -z, because a path may contain a space, and porcelain v1 QUOTES such paths rather than emitting
 # them raw -- parsing the quoted form is a second, silently different unescaper.
 $raw = & git -C $script:Root status --porcelain --untracked-files=all -z 2>$null
+# A failed status is NOT an empty one. Unchecked, it left $raw empty and the run reported no
+# untracked files and exited 0 -- cannot-look rendered as nothing-at-risk. Exit 2, not a throw:
+# a throw exits 1, which is the AT-RISK verdict, and a caller must be able to tell the two apart.
+if ($LASTEXITCODE -ne 0) {
+    [Console]::Error.WriteLine("git status failed (exit $LASTEXITCODE) in $script:Root -- refusing to report the untracked files as safe when they could not be listed")
+    exit 2
+}
 $entries = @()
 if ($raw) { $entries = ($raw -split "`0") | Where-Object { $_ } }
 
