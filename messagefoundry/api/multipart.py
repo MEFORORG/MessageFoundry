@@ -11,8 +11,9 @@ delimiter, and each part's ``Content-Disposition`` gives its field name + (for a
 
 What it refuses, at least: more than ``_MAX_PARTS`` parts, a part header block over
 ``_MAX_PART_HEADER_BYTES``, a file part over the caller's cap, any other part over
-``_MAX_FIELD_BYTES`` (a nameless one, and one with no header block, included), and, in
-:func:`parse_single_file_upload`, a body with no file part or with more than one.
+``_MAX_FIELD_BYTES`` (a nameless one, and one with no header block, included), a body with no
+closing delimiter (BACKLOG #5787), and, in :func:`parse_single_file_upload`, a body with no file
+part or with more than one.
 
 Scope: exactly what an upload form needs — one file part + optional small text fields. It is not a
 general RFC-2388 implementation (no nested multipart/mixed, no transfer-encoding decode); those are out
@@ -159,6 +160,11 @@ class _Part:
         )
 
 
+def _after_line_feed(found: int) -> int:
+    """The offset of a delimiter :func:`_locate_parts` found with its line feed in front, or -1."""
+    return -1 if found == -1 else found + 1
+
+
 def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int) -> list[_Part]:
     """Find every part of a ``multipart/form-data`` body by offset and apply every cap, copying no
     part's content (BACKLOG #5522).
@@ -175,17 +181,23 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     if boundary is None:
         raise MultipartError("Content-Type is not multipart/form-data with a boundary")
     delim = b"--" + boundary
+    # BACKLOG #5787: RFC 2046 puts a delimiter at the start of a line, so one is found only there:
+    # at the very start of the body or after a line feed (a CRLF, or the bare LF a non-conforming
+    # client sends). The boundary text later in a line is part content, not a split point.
+    line_delim = b"\n" + delim
     # (header start, header end, content start, content end) for each part with a header block.
     spans: list[tuple[int, int, int, int]] = []
     count = 0
+    closed = False
     # Anything before the first delimiter is the ignorable preamble; the closing "--boundary--" is
     # the first later delimiter followed by b"--", and anything after it is the ignorable epilogue.
-    pos = body.find(delim)
+    pos = 0 if body.startswith(delim) else _after_line_feed(body.find(line_delim))
     while pos != -1:
         start = pos + len(delim)
         if body.startswith(b"--", start):
+            closed = True
             break
-        nxt = body.find(delim, start)
+        nxt = _after_line_feed(body.find(line_delim, start))
         end = len(body) if nxt == -1 else nxt
         # After each delimiter comes CRLF, then the part's header block.
         if body.startswith(b"\r\n", start, end):
@@ -228,6 +240,12 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
                 content_end = end - 2  # the CRLF before the next delimiter
             spans.append((start, sep, content_start, content_end))
         pos = nxt
+    if not closed:
+        # BACKLOG #5787: a body cut short loses its closing delimiter, and its last part would
+        # otherwise be kept as if whole. Refused after the walk, so the part cap still answers first.
+        raise MultipartError(
+            "multipart body has no closing boundary delimiter; the upload may be truncated"
+        )
     parts: list[_Part] = []
     for head_start, head_end, content_start, content_end in spans:
         name, filename = _disposition(body[head_start:head_end])
@@ -257,8 +275,9 @@ def parse_multipart_form(
     holds more than ``_MAX_PARTS`` parts, or a part with no header block exceeds ``_MAX_FIELD_BYTES``
     (all HTTP 400 at the route), and :class:`MultipartTooLargeError` if a file part exceeds
     ``max_file_bytes`` or a non-file part with a header block exceeds ``_MAX_FIELD_BYTES`` (HTTP 413
-    at the route). The boundary is trusted not
-    to appear inside a part body (the RFC-2046 invariant every multipart parser relies on).
+    at the route), and :class:`MultipartError` if the body has no closing delimiter. A delimiter
+    counts only at the start of a line, and the boundary is trusted not to start a line inside a
+    part body (the RFC-2046 invariant every multipart parser relies on).
 
     The function is synchronous and walks the whole body. The upload route keeps one file and no
     field, so it calls :func:`parse_upload_off_loop`, which runs :func:`parse_single_file_upload`

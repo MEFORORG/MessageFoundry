@@ -322,7 +322,8 @@ def _field(name: str, value: bytes) -> bytes:
     return f'Content-Disposition: form-data; name="{name}"'.encode() + b"\r\n\r\n" + value
 
 
-_FILE_PART = b'Content-Disposition: form-data; name="file"; filename="a.hl7"\r\n\r\nMSH|body'
+_FILE_PART_HEAD = b'Content-Disposition: form-data; name="file"; filename="a.hl7"\r\n\r\n'
+_FILE_PART = _FILE_PART_HEAD + b"MSH|body"
 
 
 def _no_part_parse(head: bytes) -> tuple[str | None, str | None]:
@@ -464,14 +465,65 @@ def test_an_oversized_field_refusal_copies_nothing_of_the_field() -> None:
 
 def test_a_trailing_delimiter_line_without_a_close_marker_is_not_a_part() -> None:
     """#5520 item 22: a body at the part cap that ends with a delimiter line but no ``--`` close
-    marker parses, as it did before the cap. That last line has no part after it to count."""
+    marker is not over the cap, since that last line has no part after it to count. Since BACKLOG
+    #5787 it is refused for the missing close marker instead, not for the part count."""
     delim = f"--{_B}".encode()
     body = b"".join(delim + b"\r\n" + p + b"\r\n" for p in _parts(multipart._MAX_PARTS))
-    form = parse_multipart_form(
-        f"multipart/form-data; boundary={_B}", body + delim + b"\r\n", max_file_bytes=1024
+    with pytest.raises(MultipartError, match="no closing boundary delimiter"):
+        parse_multipart_form(
+            f"multipart/form-data; boundary={_B}", body + delim + b"\r\n", max_file_bytes=1024
+        )
+
+
+_TRUNCATED_HL7 = b"MSH|^~\\&|A|B|C|D|202601010000||ADT^A01|X1|P|2.5\rPID|1||MR"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [b"", b"\r\n", f"\r\n--{_B}".encode(), f"\r\n--{_B}\r\n".encode()],
+    ids=["mid-content", "after-crlf", "delimiter-no-close", "delimiter-line-no-close"],
+)
+def test_a_body_cut_short_of_its_closing_delimiter_is_refused(tail: bytes) -> None:
+    """BACKLOG #5787: a truncated upload has no closing delimiter, and its last part used to be
+    kept as if whole. Each cut point is refused rather than ingested."""
+    head = f"--{_B}\r\n".encode() + _FILE_PART_HEAD + _TRUNCATED_HL7
+    with pytest.raises(MultipartError, match="no closing boundary delimiter") as caught:
+        parse_single_file_upload(
+            f"multipart/form-data; boundary={_B}", head + tail, max_file_bytes=1024
+        )
+    assert type(caught.value) is MultipartError  # 400, not 413
+
+
+def test_a_body_with_no_delimiter_at_all_is_refused() -> None:
+    with pytest.raises(MultipartError, match="no closing boundary delimiter"):
+        parse_multipart_form(f"multipart/form-data; boundary={_B}", b"", max_file_bytes=1024)
+
+
+def test_boundary_text_inside_a_line_is_content_not_a_split() -> None:
+    """BACKLOG #5787: a delimiter starts a line (RFC 2046). The same text later in a line is part
+    content, so it neither splits the part nor closes the body early."""
+    content = f"OBX|1|TX|||see --{_B}-- and --{_B}\rNTE|1|tail".encode()
+    body = _body([_FILE_PART_HEAD + content])
+    file = parse_single_file_upload(
+        f"multipart/form-data; boundary={_B}", body, max_file_bytes=1024
     )
-    assert len(form.files) == 1
-    assert len(form.fields) == multipart._MAX_PARTS - 1
+    assert file.data == content
+
+
+def test_a_bare_lf_client_and_a_preamble_still_parse() -> None:
+    """Control for the line anchor: a delimiter after a bare LF, and one after a preamble line,
+    are still found, as before."""
+    body = (
+        b"preamble\r\n"
+        + f"--{_B}\n".encode()
+        + _FILE_PART_HEAD
+        + b"MSH|body\n"
+        + f"--{_B}--\n".encode()
+    )
+    file = parse_single_file_upload(
+        f"multipart/form-data; boundary={_B}", body, max_file_bytes=1024
+    )
+    assert file.data == b"MSH|body\n"  # only a CRLF before the delimiter is trimmed, as before
 
 
 def test_a_part_with_neither_name_nor_filename_is_bounded_too() -> None:
