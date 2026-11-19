@@ -878,17 +878,18 @@ class X12Source(SourceConnector):
         (BACKLOG #5971).
 
         A sender may pipeline several interchanges into one read. When the connection closes part
-        way through them (at least a handler fault, a failed reply, an unexpected error, a stop or a
-        reset), the rest were taken
-        off the socket but never handed to the pipeline, so nothing records them. Draining the
+        way through them (at least a handler fault, a reply that will not encode, an unexpected
+        error, a stop or a reset), the rest were taken off the socket but never handed to the
+        pipeline, so nothing records them. Draining the
         decoder's generator only reassembles bytes already in memory; it does no I/O and hands
         nothing on. The count is the record: no frame content is logged. A sender waiting for a
         reply resends on the close; one that waits for none never does (``hold_and_retry``), so for
         it the loss of a complete interchange, an over-cap one included, is final and is logged at
         ERROR. A remainder that is only a partial interchange is logged at WARNING where the
-        listener cut it off (``listener_cut``: a stop, inside its grace or past it, or a close the
-        listener chose), and at DEBUG on a close the peer made (EOF, idle, frame deadline, reset), where nothing complete
-        was lost, so line noise or connection churn cannot flood the log.
+        listener cut it off (``listener_cut``: a stop, inside its grace or past it, or a fault on
+        the listener's side), and at DEBUG otherwise: EOF, an idle or frame-deadline close, a
+        reset, or a reply the peer did not drain in time, which arrives as a reset. There nothing
+        complete was lost, so line noise or connection churn cannot flood the log.
         """
         left = 0
         over_cap = False

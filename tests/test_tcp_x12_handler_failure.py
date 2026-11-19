@@ -689,10 +689,13 @@ async def test_x12_a_partial_a_stop_inside_its_grace_cuts_off_is_a_warning(
     source._handler = handler
     with caplog.at_level(logging.DEBUG, logger="messagefoundry.transports.x12"):
         client = asyncio.create_task(source._on_client(reader, _Peer()))  # type: ignore[arg-type]
-        await asyncio.wait_for(reader.waiting.wait(), timeout=2.0)
-        source._admission.stopping = stopping
-        reader.release.set()
-        await asyncio.wait_for(client, timeout=2.0)
+        try:
+            await asyncio.wait_for(reader.waiting.wait(), timeout=2.0)
+            source._admission.stopping = stopping
+            reader.release.set()
+            await asyncio.wait_for(client, timeout=2.0)
+        finally:
+            client.cancel()
     lines = [r for r in caplog.records if "not handed to the pipeline" in r.getMessage()]
     assert len(lines) == 1
     assert lines[0].levelno == (logging.WARNING if stopping else logging.DEBUG)
