@@ -98,6 +98,20 @@ async def _read_one_frame(reader: asyncio.StreamReader, max_frame_bytes: int) ->
             return message
 
 
+async def _close_bounded(writer: asyncio.StreamWriter, timeout: float) -> None:
+    """Close a connection, aborting it if the close has not finished within ``timeout``.
+
+    A graceful close waits for buffered bytes to flush, which never happens if the peer stopped
+    reading, so an unbounded ``wait_closed()`` would wedge the caller (and through it stop())."""
+    writer.close()
+    try:
+        await asyncio.wait_for(writer.wait_closed(), timeout)
+    except TimeoutError:
+        writer.transport.abort()
+    except OSError:
+        pass
+
+
 async def _forward_once(
     endpoint: Endpoint,
     payload: bytes,
@@ -128,9 +142,7 @@ async def _forward_once(
     except (OSError, mllp.FrameError) as exc:
         raise ForwardError(f"I/O error talking to {host}:{port}: {exc}") from exc
     finally:
-        writer.close()
-        with suppress(OSError):
-            await writer.wait_closed()
+        await _close_bounded(writer, send_timeout)
 
     code, detail = mllp.parse_ack(ack)
     outcome = "accepted" if code in ("AA", "CA") else "nak"
@@ -204,6 +216,9 @@ class TeeRelay:
             return True
         except (TimeoutError, OSError) as exc:
             logger.warning("failed to ACK a peer (connection slow or closed): %r", exc)
+            # Discard the queued ACK: left buffered, it could still reach the peer later for a
+            # message the caller now neither forwards nor records.
+            writer.transport.abort()
             return False
 
     # -- lifecycle -----------------------------------------------------------
@@ -244,7 +259,12 @@ class TeeRelay:
 
     async def stop(self) -> None:
         """Tear the relay down. Runs once: a concurrent or repeated call (``serve_forever``'s own
-        ``finally`` among them) waits for the same teardown rather than starting a second one."""
+        ``finally`` among them) waits for the same teardown rather than starting a second one.
+        Before start() there is nothing to tear down, so nothing is memoized and a later stop()
+        still cleans up whatever start() opened."""
+        if self.store is None:
+            self._shutdown.set()
+            return
         if self._stop_task is None:
             self._stop_task = asyncio.ensure_future(self._stop())
         await asyncio.shield(self._stop_task)
@@ -398,7 +418,7 @@ class TeeRelay:
                 " control_id=%s",
                 control_id,
             )
-            with suppress(Exception):
+            try:
                 await store.record_leg(
                     direction="epic_to_corepoint",
                     leg="corepoint",
@@ -408,6 +428,10 @@ class TeeRelay:
                     outcome="transport_error",
                     ack_code=None,
                     detail="cancelled by relay stop after the ACK; delivery unknown",
+                )
+            except Exception as exc:  # noqa: BLE001 -- the cancel must still propagate
+                logger.error(
+                    "could not record the cut-off message (%r) control_id=%s", exc, control_id
                 )
             raise
         except ForwardError as exc:

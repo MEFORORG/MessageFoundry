@@ -37,6 +37,7 @@ import contextlib
 import io
 import json
 import logging
+import math
 import os
 import re
 import ssl
@@ -130,6 +131,17 @@ def _parse_endpoint(value: str) -> Endpoint:
     return (host, port_num)
 
 
+def _positive_seconds(value: str) -> float:
+    """A finite, positive number of seconds (refuses 0, negatives, ``nan`` and ``inf``)."""
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"expected a number of seconds, got {value!r}") from None
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError(f"expected a finite positive number, got {value!r}")
+    return seconds
+
+
 def _parse_age(spec: str) -> float:
     """A time cutoff (epoch seconds) for purge/export: a relative age ``Nd``/``Nh``/``Nm`` (days/hours/
     minutes ago) or an absolute UTC date ``YYYY-MM-DD``."""
@@ -216,7 +228,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--mefor-queue-max", type=int, default=1000)
     run.add_argument(
         "--stop-grace",
-        type=float,
+        type=_positive_seconds,
         default=30.0,
         help="seconds a shutdown lets in-flight messages finish, then the MEFOR queue drain,"
         " before cancelling what is left",

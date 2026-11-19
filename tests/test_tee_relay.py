@@ -702,15 +702,20 @@ async def test_stop_is_bounded_when_a_peer_never_reads_its_acks(tmp_path: Path) 
     sock.setblocking(False)
     await asyncio.get_running_loop().sock_connect(sock, relay.epic_address)
     _reader, writer = await asyncio.open_connection(sock=sock)
-    writer.write(mllp.frame(SAMPLE) * 3000)  # never drained or read: the peer is wedged
     try:
         server = relay._epic_server  # noqa: SLF001
 
-        def _acks_buffered() -> bool:
-            clients = getattr(server, "_clients", ())  # asyncio.Server's own transport set
-            return any(t.get_write_buffer_size() > 0 for t in clients)
+        def _clients() -> list[asyncio.Transport]:
+            return list(getattr(server, "_clients", ()))  # asyncio.Server's own transport set
 
-        await _wait_until(_acks_buffered, timeout=40.0)
+        await _wait_until(lambda: bool(_clients()))
+        for transport in _clients():
+            # Shrink the relay's kernel send buffer too: a Linux loopback one absorbs megabytes.
+            transport.get_extra_info("socket").setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        writer.write(mllp.frame(SAMPLE) * 3000)  # never drained or read: the peer is wedged
+        await _wait_until(
+            lambda: any(t.get_write_buffer_size() > 0 for t in _clients()), timeout=40.0
+        )
         async with asyncio.timeout(5.0):
             await relay.stop()
     finally:
@@ -744,7 +749,9 @@ async def test_stop_bounds_a_mefor_worker_that_cannot_drain(
             relay._enqueue_mefor(  # noqa: SLF001
                 _MeforItem(SAMPLE, f"C{i}", "ADT^A01", "epic_to_corepoint")
             )
-        await mefor.wait_for(1)  # the worker is parked on MEFOR's ACK with the queue full
+        await mefor.wait_for(1)  # the worker is parked on MEFOR's ACK
+        relay._enqueue_mefor(_MeforItem(SAMPLE, "C4", "ADT^A01", "epic_to_corepoint"))  # noqa: SLF001
+        assert relay._mefor_queue.full()  # noqa: SLF001 -- so the sentinel put itself must block
         with caplog.at_level(logging.WARNING):
             async with asyncio.timeout(5.0):
                 await asyncio.gather(relay.stop(), relay.stop())  # a second stop joins the first
@@ -754,3 +761,21 @@ async def test_stop_bounds_a_mefor_worker_that_cannot_drain(
         await relay.stop()
         await corepoint.stop()
         await mefor.stop()
+
+
+async def test_stop_before_start_does_not_disarm_a_later_stop(tmp_path: Path) -> None:
+    relay = TeeRelay(
+        RelayConfig(
+            listen_epic=("127.0.0.1", 0),
+            corepoint=("127.0.0.1", 1),
+            mefor=("127.0.0.1", 2),
+            db_path=str(tmp_path / "tee.db"),
+        )
+    )
+    await relay.stop()  # nothing started yet
+    await relay.start()
+    worker = relay._mefor_worker  # noqa: SLF001
+    assert worker is not None
+    async with asyncio.timeout(5.0):
+        await relay.stop()
+    assert worker.done()  # the second stop() really tore down what start() opened

@@ -117,8 +117,10 @@ fail-closed), `--connect-timeout` / `--send-timeout`, `--max-frame-bytes` (frame
 `--stop-grace` (default 30 seconds). On shutdown the relay stops ACKing new messages, then gives
 messages it has already ACKed up to the grace to finish their Corepoint and MEFOR legs, then gives
 the MEFOR shadow queue up to the grace again to drain. It cancels whatever is left at each deadline
-and logs it. A message cut off after its ACK is logged as a `transport_error` row, so `naks`
-lists it. Keep twice the grace inside your service manager's stop timeout.
+and logs it. A message cut off while it is being forwarded to Corepoint is logged as a
+`transport_error` row, so `naks` lists it. A message cut off at any other point after its ACK
+(a store write, or a MEFOR copy dropped at the queue deadline) appears only in the log. Keep twice
+the grace inside your service manager's stop timeout.
 
 ## The SQLite log
 
