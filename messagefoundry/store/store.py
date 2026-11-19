@@ -14820,8 +14820,8 @@ class MessageStore:
         ``alert`` is for a read (a resend source, a body view): a tag failure there raises the
         alert and propagates, refusing the read. A claim leaves it off, because its dead-letter
         path reports the failure with an audit row as well. A corrupt cell
-        (:class:`~messagefoundry.store.queue_tag.CorruptQueueCellError`) is only logged on both
-        paths (BACKLOG #5884)."""
+        (:class:`~messagefoundry.store.queue_tag.CorruptQueueCellError`) takes both paths the same
+        way, its alert and audit row saying corrupt rather than drift (BACKLOG #5884)."""
         try:
             opened = open_queue_cell(self._cipher, row)
         except QueueTagError as refused:
@@ -14845,8 +14845,8 @@ class MessageStore:
         """Dead-letter a claimed row whose payload could not be opened, standalone (Hazard A: this
         runs after the claim committed, so it must never join a group batch). A row that failed its
         queue tag is also reported: a WARNING, an audit row and an ``integrity_drift`` alert
-        (BACKLOG #2593), except a corrupt cell, which is only logged (BACKLOG #5884). Returns
-        ``None`` then.
+        (BACKLOG #2593), a corrupt cell included, whose audit row names its cause as corrupt
+        (BACKLOG #5884). Returns ``None`` then.
 
         A failure that says nothing about the row is returned instead, with nothing written
         (BACKLOG #5735): a key service that gave no verdict (:func:`is_transient_open_failure`) or
@@ -15015,8 +15015,8 @@ class MessageStore:
             # The dead-letter records the message ERROR (visible in the tracking view). An UNMARKED
             # payload is also pushed as an `integrity_drift` alert: the cipher's refusal hook reaches
             # the AlertSink that this store cannot (BACKLOG #1169). A payload that fails its row tag
-            # is audited and alerted too (BACKLOG #2593), unless it is corrupt rather than drift,
-            # which is only logged (BACKLOG #5884).
+            # is audited and alerted too (BACKLOG #2593), and so is one that is corrupt rather than
+            # drift, its audit row naming that cause (BACKLOG #5884).
             # STANDALONE (Hazard A): post-claim-commit, force an immediate inline commit (no grouping).
             if await self._dead_letter_unopenable(claimed, exc) is not None:
                 await self._set_aside_claimed([claimed], now)

@@ -5,14 +5,15 @@
 Bad base64, a ciphertext too short for a tag, and a plaintext whose tag verified but is not UTF-8
 say the cell is unreadable, not that it was sealed for another row. They raise
 :class:`CorruptQueueCellError`, which every claim and read still contains as a
-:class:`QueueTagError`, but which writes no tag-failed audit row and raises no
-``integrity_drift`` alert, as the tagged-cell path's ``CorruptCellError`` does. Synthetic data only.
+:class:`QueueTagError`, and which keeps its tag-failed audit row and ``integrity_drift`` alert,
+each saying corrupt rather than drift. Synthetic data only.
 """
 
 from __future__ import annotations
 
 import asyncio
 import base64
+import json
 import logging
 from typing import Any
 
@@ -51,9 +52,11 @@ def _row(**changes: Any) -> dict[str, Any]:
 class _Sink:
     def __init__(self) -> None:
         self.audits: list[str] = []
+        self.details: list[str] = []
 
-    async def record_audit(self, action: str, **_kw: Any) -> None:
+    async def record_audit(self, action: str, *, detail: str | None = None, **_kw: Any) -> None:
         self.audits.append(action)
+        self.details.append(detail or "")
 
 
 def _cipher_and_hook() -> tuple[AesGcmCipher, str, list[str]]:
@@ -99,27 +102,76 @@ def test_a_corrupt_payload_under_a_held_key_is_corrupt_not_drift() -> None:
         assert cause in str(corrupt.value.__cause__)
 
 
-def test_a_corrupt_payload_is_logged_never_audited_or_alerted(
+def test_a_corrupt_payload_keeps_its_audit_and_alert_naming_no_payload(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level(logging.WARNING, logger="messagefoundry.store.queue_tag")
     cipher, key_b64, seen = _cipher_and_hook()
     row = _row()
     sealed = cipher.encrypt("SYNTH-BODY", aad=queue_row_aad(row))
-    sink = _Sink()
-    for payload in _corrupt_payloads(cipher, key_b64, sealed).values():
+    corrupt_payloads = _corrupt_payloads(cipher, key_b64, sealed)
+    for payload in corrupt_payloads.values():
+        sink = _Sink()
+        seen.clear()
         with pytest.raises(CorruptQueueCellError) as corrupt:
             open_queue_cell(cipher, {**row, "payload": payload})
         asyncio.run(report_queue_tag_failure(sink, cipher, row, error=corrupt.value))
+        # Exactly one audit row, saying corrupt, and one alert, saying corrupt.
+        assert sink.audits == ["integrity.queue_tag_failed"]
+        assert json.loads(sink.details[0])["cause"] == "corrupt"
+        assert len(seen) == 1 and "is corrupt" in seen[0] and "SYNTH" not in seen[0]
+        assert "SYNTH" not in sink.details[0]
+        # The read path alerts with no audit row, as drift does there.
         alert_queue_tag_failure(cipher, row, error=corrupt.value, outcome="the read was refused")
-    assert sink.audits == [] and seen == []
-    # The log line is the only signal left, so it must be there, naming no payload.
-    corrupt_lines = [r.getMessage() for r in caplog.records if "is corrupt" in r.getMessage()]
-    assert len(corrupt_lines) == 2 * len(_corrupt_payloads(cipher, key_b64, sealed))
-    assert all("outbound" in m and "SYNTH" not in m for m in corrupt_lines)
+        assert sink.audits == ["integrity.queue_tag_failed"] and len(seen) == 2
+    corrupt_records = [r for r in caplog.records if "is corrupt" in r.getMessage()]
+    assert len(corrupt_records) == 2 * len(corrupt_payloads)
+    for record in corrupt_records:
+        assert "outbound" in record.getMessage() and "SYNTH" not in record.getMessage()
+        # A record keeps its args, and an exception's traceback keeps the claim frame's locals.
+        assert all(isinstance(arg, str) for arg in record.args or ())
+        assert record.exc_info is None
 
-    # Control: drift is still audited and alerted.
+    # Control: drift is still audited and alerted, and its cause says so.
+    sink = _Sink()
+    seen.clear()
     with pytest.raises(QueueTagError) as moved:
         open_queue_cell(cipher, {**row, "channel_id": "IB_B", "payload": sealed})
     asyncio.run(report_queue_tag_failure(sink, cipher, row, error=moved.value))
     assert sink.audits == ["integrity.queue_tag_failed"] and len(seen) == 1
+    assert json.loads(sink.details[0])["cause"] == "drift"
+    assert "failed its integrity tag" in seen[0]
+
+
+def test_a_real_transit_cipher_verdict_stays_drift() -> None:
+    """The corrupt-vs-drift split reads only ``holds_key_for``. A real :class:`TransitCipher` has
+    none, so a Transit verdict that is not an AEAD failure still reads as drift."""
+    pytest.importorskip("hvac")
+    from hvac.exceptions import InvalidRequest  # type: ignore[import-untyped]  # noqa: PLC0415
+
+    from messagefoundry.store.crypto_transit import TransitCipher  # noqa: PLC0415
+
+    class _Transit:
+        error: Exception | None = None
+
+        def decrypt_data(self, **_kw: Any) -> Any:
+            assert self.error is not None
+            raise self.error
+
+    class _Client:
+        def __init__(self, transit: _Transit) -> None:
+            self.secrets = type("S", (), {"transit": transit})()
+
+    transit = _Transit()
+    cipher = TransitCipher(_Client(transit), "mefor-store")
+    assert not callable(getattr(cipher, "holds_key_for", None))
+    row = {**_row(), "payload": "mfenc:v3:vault:v1:AAAA"}
+    verdicts = [
+        "ciphertext version is disallowed by policy (too old)",  # not an AEAD failure
+        "cipher: message authentication failed",  # control: an AEAD failure
+    ]
+    for text in verdicts:
+        transit.error = InvalidRequest(errors=[text])
+        with pytest.raises(QueueTagError) as refused:
+            open_queue_cell(cipher, row)
+        assert type(refused.value) is QueueTagError and refused.value.drift, text

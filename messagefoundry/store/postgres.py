@@ -5724,8 +5724,8 @@ class PostgresStore:
 
     async def _dead_letter_unopenable(self, row: Any, exc: CipherError) -> QueueOpenFault | None:
         """Dead-letter a claimed row whose payload could not be opened. A row that failed its queue
-        tag is also audited and alerted (BACKLOG #2593), except a corrupt cell, which is only logged
-        (BACKLOG #5884). Returns ``None`` then.
+        tag is also audited and alerted (BACKLOG #2593), a corrupt cell included, whose audit row
+        names its cause as corrupt (BACKLOG #5884). Returns ``None`` then.
 
         A key service that gave no verdict (:func:`is_transient_open_failure`) says nothing about
         the row, so it is returned instead, with nothing written (BACKLOG #5735), and so is the

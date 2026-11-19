@@ -16,6 +16,7 @@ is still dead-lettered and reported (the control). SQLite; the server backends m
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import pathlib
 import sqlite3
@@ -370,22 +371,40 @@ async def test_a_verdict_is_still_dead_lettered_and_reported(
 
 
 @_ALL_CLAIMS
-async def test_a_corrupt_cell_under_a_held_key_is_dead_lettered_unaudited(
-    tmp_path: pathlib.Path, claim: Claim
+async def test_a_corrupt_cell_under_a_held_key_is_dead_lettered_and_reported(
+    tmp_path: pathlib.Path, claim: Claim, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5884: a cipher that names its keys refusing a held-key cell for a reason other than
-    its AEAD check reads a corrupt cell, not drift, so the claim dead-letters it with no tag-failed
-    audit row."""
+    its AEAD check reads a corrupt cell, not drift. The claim still dead-letters it with exactly
+    one tag-failed audit row, whose cause says corrupt, and one alert, and its WARNING carries no
+    exception object, whose traceback could hold other rows' opened bodies."""
+    caplog.set_level(logging.WARNING, logger="messagefoundry.store.queue_tag")
     store, cipher, db = await _open(tmp_path)
     alerts: list[str] = []
     cipher.set_tag_failure_hook(lambda _table, reason: alerts.append(reason))
     try:
-        cipher.fault = lambda: CipherError("synthetic corrupt envelope")
-        cipher.healthy_opens = 0
+        # Corrupt the head's stored cell (bad base64 under the held key's marker); the row behind
+        # it stays intact, so exactly one cell is corrupt.
+        head = "(SELECT MIN(rowid) FROM queue WHERE destination_name=?)"
+        ((sealed,),) = _side(db, f"SELECT payload FROM queue WHERE rowid={head}", (_DEST,))
+        corrupt = str(sealed).rsplit(":", 1)[0] + ":AAAAA"
+        _side(db, f"UPDATE queue SET payload=? WHERE rowid={head}", (corrupt, _DEST))
         assert all(i.payload != "B1" for i in await claim(store))
         assert _rows(db)[0][0] == "dead"
-        assert _audited(db) == 0
-        assert alerts == []
+        assert _audited(db) == 1
+        (detail,) = _side(
+            db, "SELECT detail FROM audit_log WHERE action=?", (QUEUE_TAG_FAILED_ACTION,)
+        )
+        assert json.loads(detail[0])["cause"] == "corrupt"
+        assert len(alerts) == 1 and "is corrupt" in alerts[0] and "B1" not in alerts[0]
+        warned = [
+            r
+            for r in caplog.records
+            if r.name == "messagefoundry.store.queue_tag" and "is corrupt" in r.getMessage()
+        ]
+        assert len(warned) == 1 and "B1" not in warned[0].getMessage()
+        assert all(isinstance(a, str) for a in warned[0].args or ())
+        assert warned[0].exc_info is None
     finally:
         await store.close()
 
