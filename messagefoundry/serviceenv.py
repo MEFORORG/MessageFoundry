@@ -344,6 +344,10 @@ _ORDINARY_LINE = re.compile(r"\s*[^=\s][^=]*=(?![=\s]*\Z)")
 _KEY_SHAPED_RUN = re.compile(r"[A-Za-z0-9+/]{43}")
 
 
+#: Text of the standard base64 alphabet alone, as the body of a padded secret is.
+_BASE64_TEXT = re.compile(r"[A-Za-z0-9+/]+")
+
+
 def _holds_key_run(text: str) -> bool:
     """Whether ``text`` holds a store-key-shaped run (:data:`_KEY_SHAPED_RUN`)."""
     return _KEY_SHAPED_RUN.search(text) is not None
@@ -374,7 +378,7 @@ def _line_start(line: str) -> Literal["kept", "ends"] | None:
     refusal is about, so it is a variable of its own; ``"ends"`` when it sets an ordinary
     variable (:func:`_is_ordinary_line`), which ends the value above and is not kept; ``None``
     when it starts no variable and so belongs to the value above. :func:`_continues_string`
-    applies it to a string's first line, with the one exception it names."""
+    applies it to a string's first line, narrowed as it says."""
     written, equals, _rest = line.partition("=")
     if not equals:
         return None
@@ -490,24 +494,27 @@ def _continues_string(entry: str) -> bool:
     ``MEFOR_VALUE_A<LF>X=1``, and its first non-blank line starts no variable under
     :func:`_line_start`, the rule :func:`_read_string` applies to a later line of one string.
 
-    Two shapes of first line differ from that rule, since NSSM reads each item as its own
-    variable, and each ends the value above: one whose name is empty, as in Windows' own
-    ``=C:=C:\\x`` entries, and one that sets ``MEFOR_SECRETS_DIRECTORY``, which read alone the
-    refusal takes as set. As a later line of one string each belongs to the value above.
-
-    So, on a first line of neither shape, no equals sign, a padded base64 secret with one ``=``
-    of padding or two, ``NAME=`` with an empty value or a value of only equals signs and blanks,
-    and a name holding a store-key-sized base64 run each continue the value, an error toward
-    refusing, unless the name is one the refusal is about. A name the refusal is about, or an
-    ordinary variable set to a value, ends it. Only the first non-blank line decides: the item's
-    later lines are read when the strings are joined, as later lines of one string."""
+    NSSM reads each item as its own variable, so at an item's start that rule is narrowed to
+    what could be key material: a first line holding an equals sign continues the value only
+    when its name is standard base64 text or holds a store-key-sized run
+    (:data:`_KEY_SHAPED_RUN`). So a padded base64 secret, one ``=`` of padding or two, continues
+    it, an error toward refusing, while ``HTTP_PROXY=``, ``MEFOR_SECRETS_DIRECTORY=`` and
+    Windows' own empty-named ``=C:=C:\\x`` entries end it, as the same lines below the value in
+    one string would not. A name of base64 letters alone, such as ``PATH`` set to nothing, still
+    continues it. Only the first non-blank line decides: the item's later lines are read when
+    the strings are joined, as later lines of one string."""
     first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), None)
-    if first is None or _refused_name(entry.partition("=")[0].strip().upper()):
+    if first is None:
+        return False
+    whole, whole_equals, _value = entry.partition("=")
+    if whole_equals and _refused_name(whole.strip().upper()):
         return False
     written, equals, _rest = first.partition("=")
-    if equals and written.strip().upper() in ("", _DIRECTORY_VARIABLE):
-        return False
-    return _line_start(first) is None
+    if not equals:
+        return True
+    name = written.strip()
+    could_be_key = _BASE64_TEXT.fullmatch(name) is not None or _holds_key_run(name)
+    return could_be_key and _line_start(first) is None
 
 
 def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
@@ -578,9 +585,8 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
             index = bisect.bisect_right(starts, variable.line or 1) - 1
             local = (variable.line or 1) - starts[index] + 1
             line_on_string = None if local == 1 else local
-            ran_on = bool(variable.value.strip()) and (
-                (index, variable.written, line_on_string, variable.broken) in ran
-            )
+            key = (index, variable.written, line_on_string, variable.broken)
+            ran_on = key in ran and bool(variable.value.strip())
             read.append(replace(variable, line=line_on_string, runs_on=ran_on))
     return read
 
@@ -792,7 +798,7 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     steps: list[str] = []
     if posture.value_runs_on:
         steps.append(
-            "At least one refused variable is empty on its own line and its value runs on into "
+            "At least one refused variable is empty in its own string and its value runs on into "
             "the strings after it in the same registry value, as `nssm set` writes each argument "
             "as its own string, so remove those strings with it, or the value stays in the "
             "registry key"

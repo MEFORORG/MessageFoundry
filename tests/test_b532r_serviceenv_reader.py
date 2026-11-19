@@ -81,13 +81,15 @@ def test_a_retired_keys_list_on_the_line_below_an_empty_name_refuses(key: str) -
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)
 def test_an_empty_store_key_item_above_an_ordinary_item_does_not_refuse(key: str) -> None:
     """The control: an empty key is harmless when the next item's first line sets an ordinary
-    variable to a value, or is empty-named like Windows' own ``=C:`` entries. An item whose first
-    line sets a variable to nothing continues the key, as the same line would below it in one
-    string (the one-line-rule tests below)."""
+    variable, even to nothing, under a name that could not be key material, or is empty-named
+    like Windows' own ``=C:`` entries."""
     followers = (
         "MEFOR_AI_ENVIRONMENT=prod",
         "ProgramFiles(x86)=C:\\x",
         "=C:=C:\\x",
+        "HTTP_PROXY=",  # an ordinary variable set to nothing still ends the value above
+        "NO_PROXY=",
+        "MEFOR_SECRETS_DIRECTORY=",
         "A" * 42 + "_B=1",  # a base64 run one short of a key's, so this is a name
     )
     for follower in followers:
@@ -351,12 +353,13 @@ def test_a_one_padded_secret_split_into_the_next_item_refuses(name: str) -> None
 
 
 #: Items, each read as the next item below an empty store key and as the lines below it in one
-#: string. None has a first line of the two shapes the readings differ on.
+#: string. None has a first line of the shapes the readings differ on.
 _FOLLOWERS = (
     _ONE_PAD,
     base64.b64encode(b"synthetic-tok-16").decode(),  # two ``=`` of padding
-    "HTTP_PROXY=",
+    "PATH=",  # a name of base64 letters alone, set to nothing
     "X= =",
+    "mefor_value_synthetic",  # no equals sign, so no name starts it
     f"{_KEY_RUN}=x",
     f"{_KEY_RUN},x\nPATH=C:\\x",
     "foo",
@@ -380,12 +383,17 @@ def test_the_next_item_is_read_as_the_same_lines_below_the_key_in_one_string(
     one_string = _read([f"MEFOR_AI_ENVIRONMENT=prod\n{KEY_CLASS_NAMES[0]}=\n{follower}"])
     split = _read([f"{KEY_CLASS_NAMES[0]}=", follower])
     assert split.listed == one_string.listed, follower
+    assert split.empty_value_names == one_string.empty_value_names, follower
+    assert split.unplain_value_names == one_string.unplain_value_names, follower
 
 
-@pytest.mark.parametrize("item", ["=C:=C:\\x", "MEFOR_SECRETS_DIRECTORY="])
-def test_the_two_first_line_shapes_the_readings_differ_on(item: str) -> None:
+@pytest.mark.parametrize(
+    "item", ["=C:=C:\\x", "MEFOR_SECRETS_DIRECTORY=", "HTTP_PROXY=", "ProgramFiles(x86)= ="]
+)
+def test_the_first_line_shapes_the_readings_differ_on(item: str) -> None:
     """Below the key in one string each line belongs to the key's value, so it refuses; as the
-    next item each ends the value above, since read alone the item is a variable of its own."""
+    next item each ends the value above, since NSSM reads the item as its own variable and its
+    name could not be key material."""
     key = KEY_CLASS_NAMES[0]
     assert _read([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\n{item}"]).listed_keys == (key,)
     assert _read([f"{key}=", item]).listed_keys == ()
