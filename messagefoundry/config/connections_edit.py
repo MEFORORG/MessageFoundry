@@ -208,8 +208,8 @@ def _jsonable(value: Any, where: str = "connection") -> Any:
     ``{"$toml": "inf"}`` (``-inf``, ``nan``, ``-nan``), containers recurse, and everything else
     passes verbatim, so the result is standard JSON with no bare ``Infinity`` or ``NaN`` token.
 
-    A table in the file whose only key is ``$toml`` would list as a tag and come back as a float,
-    so it is refused here rather than listed ambiguously."""
+    A table whose only key is ``$toml`` is reserved for the tag: upsert reads it as one, or refuses
+    it, so it is refused here rather than listed ambiguously."""
     if _is_tag_shaped(value):
         raise WiringError(
             f"{where}: a table whose only key is {NON_FINITE_TAG!r} is reserved for the "
@@ -229,9 +229,16 @@ def _jsonable(value: Any, where: str = "connection") -> Any:
 def _decode_tags(value: Any) -> Any:
     """``value`` with each exact non-finite tag (one key, ``$toml``, one of the four spellings)
     decoded to its float, at any depth. Nothing else is decoded: a plain ``"inf"`` string stays a
-    string, and the read schema refuses it in a float field as it always has."""
-    if _is_tag_shaped(value) and value[NON_FINITE_TAG] in _NON_FINITE:
-        return _NON_FINITE[value[NON_FINITE_TAG]]
+    string, and the read schema refuses it in a float field as it always has. Any other one-key
+    ``$toml`` table is refused, since ``connection list`` could not list it back."""
+    if _is_tag_shaped(value):
+        spelling = value[NON_FINITE_TAG]
+        if isinstance(spelling, str) and spelling in _NON_FINITE:
+            return _NON_FINITE[spelling]
+        raise WiringError(
+            f"a table whose only key is {NON_FINITE_TAG!r} is the non-finite number tag, and its "
+            f"value must be one of {', '.join(_NON_FINITE)}"
+        )
     if isinstance(value, dict):
         return {key: _decode_tags(item) for key, item in value.items()}
     if isinstance(value, list):
@@ -401,10 +408,18 @@ def _plain(item: Any) -> Any:
 def _same_value(current: Any, new: Any) -> bool:
     """Compare a tomlkit item against a freshly built one by VALUE, ignoring formatting."""
     try:
-        old, value = _plain(current), _plain(new)
-        return bool(old == value) or _same_nan(old, value)
+        return _same_plain(_plain(current), _plain(new))
     except Exception:  # pragma: no cover - defensive: an exotic item type compares as "changed"
         return False
+
+
+def _same_plain(old: Any, new: Any) -> bool:
+    """Plain equality that also holds :func:`_same_nan` inside an array or inline table."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        return old.keys() == new.keys() and all(_same_plain(old[key], new[key]) for key in old)
+    if isinstance(old, list) and isinstance(new, list):
+        return len(old) == len(new) and all(map(_same_plain, old, new))
+    return bool(old == new) or _same_nan(old, new)
 
 
 def _same_nan(old: Any, new: Any) -> bool:

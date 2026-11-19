@@ -690,6 +690,39 @@ def test_a_table_shaped_like_the_tag_is_refused_on_list(
     assert "$toml" in out and "'IB'" in out
 
 
+@pytest.mark.parametrize("value", ["bogus", ["inf"], {}, 5])
+def test_upsert_refuses_a_tag_shaped_table_that_is_not_a_tag(
+    value: object, cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A one-key `$toml` table that is not one of the four spellings would be written, and then
+    refused by `connection list`, locking the editor out of the file. Upsert refuses it first, as a
+    WiringError, an unhashable value included."""
+    (cfg / "connections.toml").write_text(_base(), encoding="utf-8")
+    before = (cfg / "connections.toml").read_bytes()
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entry = _listed(cfg, capsys)["IB"]
+    entry["metadata"] = {"t": {NON_FINITE_TAG: value}}
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 1, out
+    assert "non-finite number tag" in out
+    assert (cfg / "connections.toml").read_bytes() == before
+
+
+def test_untouched_nan_in_a_multi_line_array_is_byte_identical(
+    cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """NaN never compares equal, so the comparison holds it equal inside an array too; otherwise the
+    whole array was rewritten on a no-op save, its comments and layout lost."""
+    before = _base(
+        inbound_extra="metadata = { m = [\n  nan,  # keep me\n  -nan,\n  1.0,\n] }\n"
+    ).encode("utf-8")
+    (cfg / "connections.toml").write_bytes(before)
+    svc = _svc(cfg, _EPIC_EGRESS)
+    rc, out = _upsert(cfg, _listed(cfg, capsys)["IB"], capsys, svc=svc)
+    assert rc == 0, out
+    assert (cfg / "connections.toml").read_bytes() == before
+
+
 def test_only_the_exact_tag_decodes(cfg: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """A dict with the tag key and another key, or an unknown spelling, is data, not a tag."""
     (cfg / "connections.toml").write_text(_base(), encoding="utf-8")
