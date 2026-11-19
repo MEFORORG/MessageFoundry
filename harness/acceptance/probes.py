@@ -32,11 +32,11 @@ _DEFAULT_PORTS: dict[str, int] = {"MLLP": 2575, "DICOM": 11112, "API": 8765}
 
 def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -> str:
     """``exc`` for a report row, through the verifier's detail scrub (BACKLOG #5395): ``before`` and
-    the text as :func:`messagefoundry.verify_leaf.safe_exc_text`, or, with ``typed``, ``before``
-    then the type name and text as ``safe_exc_detail`` renders them, that whole line through
-    ``safe_detail_text`` once more so ``before`` is scanned with the text on this path too. A report
-    row leaves the box, and driver or OS text can quote a DSN, a credential or a path, and so can
-    ``before``, which can name a path or a key the caller built.
+    the text as :func:`messagefoundry.verify_leaf.safe_exc_text`, or, with ``typed``, ``before``,
+    the type name and the text, all three through one ``safe_detail_text`` pass, so ``before`` is
+    scanned with the raw text on this path too. A ``UnicodeError`` gives ``safe_exc_detail``'s
+    rendering in place of its text, which quotes no character of the message. A report row leaves
+    the box, and driver or OS text can quote a DSN, a credential or a path, and so can ``before``.
 
     The scrub is imported here, at call time, and a failure to load or run it withholds both
     ``before`` and the text rather than printing either raw, and names the failure's type instead.
@@ -44,6 +44,7 @@ def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -
     interpreter the engine cannot run on, and there the engine's modules may not even parse, so this
     must not take the runner down either."""
     try:
+        from messagefoundry.redaction import codec_safe_str
         from messagefoundry.verify_leaf import (
             DRIVER_DETAIL_LIMIT,
             safe_detail_text,
@@ -52,8 +53,14 @@ def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -
         )
 
         if typed:
-            detail = safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)
-            return safe_detail_text(before + detail, limit=DRIVER_DETAIL_LIMIT)
+            # One pass, not safe_exc_detail then a second scrub: a second pass would read text the
+            # first had already hidden, and its length bound would drop the first's notes.
+            if isinstance(exc, UnicodeError):
+                line = safe_exc_detail(exc)
+            else:
+                text = codec_safe_str(exc)
+                line = f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+            return safe_detail_text(before + line, limit=DRIVER_DETAIL_LIMIT)
         return safe_exc_text(exc, before=before)
     except Exception as scrub_failure:  # SyntaxError or ImportError on such an interpreter
         return (

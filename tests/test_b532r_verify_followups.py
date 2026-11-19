@@ -261,6 +261,7 @@ def test_the_harness_scrub_withholds_the_text_when_it_cannot_run(
 
     monkeypatch.setattr(verify_leaf, "safe_exc_text", broken)
     monkeypatch.setattr(verify_leaf, "safe_exc_detail", broken)
+    monkeypatch.setattr(verify_leaf, "safe_detail_text", broken)
     for typed in (False, True):
         text = probes.scrubbed_exc(RuntimeError(_LEAKY), before="x: ", typed=typed)
         assert text.startswith("RuntimeError (detail withheld"), text
@@ -277,6 +278,25 @@ def test_the_typed_harness_scrub_scans_before_and_keeps_the_probe_key() -> None:
     assert _PLANTED not in text, text
     assert text.startswith("probe 'db_driver' raised"), text
     assert "RuntimeError" in text, text
+
+
+def test_the_typed_harness_scrub_reads_before_against_the_raw_text() -> None:
+    # A second pass over already-scrubbed text no longer sees the value it hid, so ``before``
+    # quoting that value printed it. One pass over the whole line hides both copies.
+    text = probes.scrubbed_exc(
+        RuntimeError(f"Login Password: {_PLANTED}"),
+        before=f"probe for {_PLANTED} raised ",
+        typed=True,
+    )
+    assert _PLANTED not in text, text
+
+
+def test_the_typed_harness_scrub_keeps_the_unscanned_note() -> None:
+    # A second length bound once dropped the first pass's unscanned-input note.
+    text = probes.scrubbed_exc(
+        RuntimeError("word " * 20000), before="probe 'k' raised ", typed=True
+    )
+    assert "unscanned" in text, text[-200:]
 
 
 def test_run_probe_names_the_key_and_scrubs_the_text(monkeypatch: pytest.MonkeyPatch) -> None:
