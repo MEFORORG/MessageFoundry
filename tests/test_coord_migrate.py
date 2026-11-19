@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import warnings
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -396,9 +397,10 @@ def test_a_start_time_in_the_past_is_refused(tmp_path: Path) -> None:
     assert list(d.iterdir()) == []
 
 
-# The only reason a real run may be retried: a side started past the limit, so its slots were
-# never raced and the run proves nothing either way. Any other invalid entry is a real finding.
-_LATE_START = re.compile(r"^P[12] started \d+ ms late, past the \d+ ms limit$")
+# The only reason a real run may be retried: a side started past the limit, so the gates already
+# past when it started were not raced and -Compare gives no verdict. Any other invalid entry is a
+# real finding. The pattern copies coord-race.ps1's wording; the -Compare test below pins it.
+_LATE_START = re.compile(r"P[12] started \d+ ms late, past the \d+ ms limit")
 
 
 def _race_verdict(code: int, summary: Any) -> str:
@@ -441,6 +443,7 @@ _LATE = "P2 started 25 ms late, past the 20 ms limit"
         (3, {"doubleWinners": [{"slot": 1}], "emptySlots": [], "invalid": [_LATE]}, "fail"),
         (2, {"doubleWinners": [{"slot": 1}], "emptySlots": [], "invalid": [_LATE]}, "fail"),
         (2, {"doubleWinners": [], "emptySlots": [4], "invalid": [_LATE]}, "fail"),
+        (2, {"mismatches": [{"slot": 3}], "invalid": [_LATE]}, "fail"),
         (2, {"doubleWinners": [], "emptySlots": [], "invalid": []}, "fail"),
         (1, {"doubleWinners": [], "emptySlots": [], "invalid": [_LATE]}, "fail"),
         (2, None, "fail"),
@@ -450,6 +453,18 @@ def test_a_real_run_is_retried_only_when_a_side_started_late(
     code: int, summary: Any, expected: str
 ) -> None:
     assert _race_verdict(code, summary) == expected
+
+
+def test_compare_late_start_wording_is_what_the_retry_matches(tmp_path: Path) -> None:
+    """Real -Compare output for a side 25 ms late classifies as a retry, so a reworded line fails here."""
+    d = _dst(tmp_path, "race")
+    for n, tag in ((1, "P1"), (2, "P2")):
+        (d / f"slot-{n}").write_text(tag, encoding="utf-8")
+    _result(d, "P1", [1], 2)
+    _result(d, "P2", [2], 2, "2026-10-21T10:00:00.025Z")
+    proc, summary = _compare(d)
+    assert summary["invalid"] == ["P2 started 25 ms late, past the 20 ms limit"], proc.stdout
+    assert _race_verdict(proc.returncode, summary) == "retry", (proc.stdout, proc.stderr)
 
 
 def _run_race(d: Path) -> None:
@@ -480,24 +495,33 @@ def _run_race(d: Path) -> None:
         )
         for tag in ("P1", "P2")
     ]
-    for p in procs:
-        out, err = p.communicate(timeout=TIMEOUT)
-        assert p.returncode == 0, (out, err)
+    try:
+        for p in procs:
+            out, err = p.communicate(timeout=TIMEOUT)
+            assert p.returncode == 0, (out, err)
+    finally:
+        # A failed side must not leave its sibling writing into tmp_path during teardown.
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+                p.communicate()
 
 
 def test_two_real_processes_race_clean(tmp_path: Path) -> None:
-    # A loaded runner can start one side past coord-race.ps1's limit; that run raced nothing, so
-    # it is retried in a fresh directory. Every other outcome is decided on the first attempt.
+    # A loaded runner can start one side past coord-race.ps1's limit, and -Compare then gives no
+    # verdict; that attempt is retried in a fresh directory. Any other outcome ends the test at once.
     inconclusive: list[list[str]] = []
     for attempt in range(1, 4):
         d = _dst(tmp_path, f"race-{attempt}")
         _run_race(d)
         proc, summary = _compare(d)
         verdict = _race_verdict(proc.returncode, summary)
-        assert verdict != "fail", (proc.returncode, proc.stdout, proc.stderr)
+        assert verdict != "fail", (attempt, inconclusive, proc.returncode, proc.stdout, proc.stderr)
         if verdict == "accept":
             break
         inconclusive.append(list(summary["invalid"]))
+        # Visible in the warnings summary, so a rising late-start rate shows before all three fail.
+        warnings.warn(f"race attempt {attempt} inconclusive: {summary['invalid']}", stacklevel=1)
     else:
         pytest.fail(f"every attempt had a side start late, so none was a race: {inconclusive}")
     assert proc.returncode == 0, (proc.stdout, proc.stderr)
