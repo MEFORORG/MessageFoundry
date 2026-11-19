@@ -360,8 +360,7 @@ function Get-RootUnavailability {
     }
     # A MARKER THAT PARSES TO ANYTHING BUT AN OBJECT IS DAMAGED TOO. An empty or whitespace-only file
     # and JSON null parse to $null without throwing, and an array or a scalar parses cleanly, so the
-    # catch alone let all of them fall through to UNAVAILABLE -- the verdict for a recorded
-    # cancellation, which stops the collector publishing a live account. An array holding
+    # catch alone let all of them fall through to UNAVAILABLE. An array holding
     # `{"unavailable": false}` even read as AVAILABLE. Only an object can say anything here.
     #
     # ITS `unavailable` FLAG IS A JSON BOOLEAN, OR A TRUTHY STAND-IN FOR ONE. A [bool] cast read null,

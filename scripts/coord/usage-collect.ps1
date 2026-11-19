@@ -252,8 +252,7 @@ try {
     #
     # GUARDED ON $HaveConfigRoots AND WRAPPED. This is a statusLine: never throws, never blocks. A
     # missing sibling or an unreadable marker must fall through to the normal publish rather than
-    # suppress a live account's reading -- the fail-closed direction belongs in the READER, where a
-    # wrong answer is visible, not in the writer, where it would silently blank a working account.
+    # suppress a live account's reading.
     #
     # THE STATE OR THE BIT (BACKLOG #5305). The reader now reports MALFORMED for markers it used to
     # read as UNAVAILABLE -- an array-wrapped marker, an agreeing repeated key, a flag of "yes".

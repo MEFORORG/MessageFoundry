@@ -3722,15 +3722,12 @@ def test_an_unmarked_root_is_untouched_by_any_of_this(tmp_path: Path) -> None:
 
 
 def test_a_damaged_marker_does_not_stop_a_live_account_publishing(tmp_path: Path) -> None:
-    """FAIL CLOSED IN THE READER, FAIL OPEN IN THE WRITER -- and the first version of the collector
-    guard got this backwards.
-
-    It suppressed on MALFORMED as well as UNAVAILABLE, so a torn write or a half-flushed marker would
+    """It suppressed on MALFORMED as well as UNAVAILABLE, so a torn write would
     stop a LIVE account publishing at all, with one status-bar line as the only signal. That is exactly
     what the collector's own comment forbids, and the try/catch around the call did not cover it: the
     guard catches a THROW, not a MALFORMED verdict.
 
-    The asymmetry is deliberate and this test is the only thing pinning it. A damaged marker must still
+    A damaged marker must still
     REFUSE on the read -- asserted here in the same test, so a fix that simply stopped honouring
     MALFORMED anywhere would fail rather than pass.
     """
@@ -3807,10 +3804,8 @@ _WELL_FORMED = {
 
 
 def test_a_marker_that_parses_to_no_object_is_malformed_not_a_cancellation(tmp_path: Path) -> None:
-    """Vault BACKLOG #5305. Red pre-fix: every one of these fell through to UNAVAILABLE -- the verdict
-    for a recorded cancellation, which the collector honours by refusing to publish a live account --
-    or read as AVAILABLE outright. One pwsh run classifies them all beside well-formed controls; the
-    end-to-end test below drives the collector and the reader on two of them.
+    """Vault BACKLOG #5305. Red pre-fix: every one of these fell through to UNAVAILABLE
+    or read as AVAILABLE outright. One pwsh run classifies them all beside well-formed controls.
     """
     bodies = {**_MALFORMED_BODIES, **{name: body for name, (body, _) in _WELL_FORMED.items()}}
     for name, body in bodies.items():
