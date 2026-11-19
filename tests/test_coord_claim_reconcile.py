@@ -228,6 +228,42 @@ def _gh_stub(tmp_path: Path, payload: str) -> Path:
     return stub
 
 
+def github_origin(repo: Path) -> None:
+    """A GitHub-shaped origin: every pull-request probe is scoped with --repo, and holds without one."""
+    if "origin" not in git(repo, "remote").split():
+        git(repo, "remote", "add", "origin", "https://github.com/example/sandbox.git")
+
+
+def _merged_pr(tip: str, base: str = "main", landing: str | None = None) -> str:
+    """One merged pull request as `gh pr list --json` prints it."""
+    pr: dict[str, object] = {
+        "number": 346,
+        "headRefOid": tip,
+        "mergedAt": "2026-08-12T17:45:36Z",
+        "baseRefName": base,
+    }
+    if landing is not None:
+        pr["mergeCommit"] = {"oid": landing}
+    return json.dumps([pr])
+
+
+def _scoped_gh_stub(tmp_path: Path, payload: str) -> Path:
+    """A `gh` that answers ``payload`` only to a call scoped to the sandbox repo and to base main.
+
+    Any other call gets ``[]``, the answer a correctly scoped query gets from a repository where the
+    branch never merged. So only a probe that passes both --repo and --base sees the evidence.
+    """
+    stub = tmp_path / "gh-scoped.ps1"
+    stub.write_text(
+        "$a = $args -join ' '\n"
+        "if ($a -like '*--repo example/sandbox*' -and $a -like '*--base main*') {\n"
+        f"@'\n{payload}\n'@\n"
+        "} else { '[]' }\n",
+        encoding="utf-8",
+    )
+    return stub
+
+
 def test_a_squash_merged_branch_is_releasable_when_a_merged_pr_has_its_tip(
     repo: Path, tmp_path: Path
 ) -> None:
@@ -239,22 +275,53 @@ def test_a_squash_merged_branch_is_releasable_when_a_merged_pr_has_its_tip(
     unmerged_branch(repo, "squashed")
     tip = git(repo, "rev-parse", "squashed").strip()
     write_claim(repo, "k-squashed", tmp_path / "vanished", "squashed")
-    stub = _gh_stub(
-        tmp_path, f'[{{"number":346,"headRefOid":"{tip}","mergedAt":"2026-08-12T17:45:36Z"}}]'
-    )
+    github_origin(repo)
+    stub = _gh_stub(tmp_path, _merged_pr(tip))
 
     out = verdicts(repo, "-GhCommand", str(stub))
     assert out["k-squashed"] == "RELEASABLE"
+
+
+def test_a_gone_holder_probe_is_scoped_to_the_repo_and_base(repo: Path, tmp_path: Path) -> None:
+    """BACKLOG #5481: the gone-holder probe asks the same scoped question the present arm asks."""
+    unmerged_branch(repo, "scoped")
+    tip = git(repo, "rev-parse", "scoped").strip()
+    write_claim(repo, "k-scoped", tmp_path / "vanished", "scoped")
+    github_origin(repo)
+    out = verdicts(repo, "-GhCommand", str(_scoped_gh_stub(tmp_path, _merged_pr(tip))))
+    assert out["k-scoped"] == "RELEASABLE", out
+
+
+def test_a_gone_holder_pr_merged_into_another_base_does_not_release(
+    repo: Path, tmp_path: Path
+) -> None:
+    """BACKLOG #5481: a branch of that name merged into another base proves nothing about main."""
+    unmerged_branch(repo, "other-base")
+    tip = git(repo, "rev-parse", "other-base").strip()
+    write_claim(repo, "k-other-base", tmp_path / "vanished", "other-base")
+    github_origin(repo)
+    stub = _gh_stub(tmp_path, _merged_pr(tip, base="parent-feature"))
+    assert verdicts(repo, "-GhCommand", str(stub))["k-other-base"] == "HOLD"
+
+
+def test_a_gone_holder_with_no_github_origin_does_not_release(repo: Path, tmp_path: Path) -> None:
+    """BACKLOG #5481: with no repository to scope the probe to, the question cannot be asked."""
+    unmerged_branch(repo, "no-origin")
+    tip = git(repo, "rev-parse", "no-origin").strip()
+    write_claim(repo, "k-no-origin", tmp_path / "vanished", "no-origin")
+    proc = reconcile(repo, "-Json", "-GhCommand", str(_gh_stub(tmp_path, _merged_pr(tip))))
+    assert proc.returncode == 0, proc.stderr
+    row = {c["key"]: c for c in json.loads(proc.stdout)["claims"]}["k-no-origin"]
+    assert row["verdict"] == "HOLD", row
+    assert "could NOT be established" in row["why"], row
 
 
 def test_a_merged_pr_at_a_DIFFERENT_tip_does_not_release(repo: Path, tmp_path: Path) -> None:
     """A PR proves some earlier state landed -- not the state this claim is guarding."""
     unmerged_branch(repo, "moved-on")
     write_claim(repo, "k-moved", tmp_path / "vanished", "moved-on")
-    stub = _gh_stub(
-        tmp_path,
-        '[{"number":1,"headRefOid":"0000000000000000000000000000000000000000","mergedAt":"2026-08-01T00:00:00Z"}]',
-    )
+    github_origin(repo)
+    stub = _gh_stub(tmp_path, _merged_pr("0" * 40))
 
     assert verdicts(repo, "-GhCommand", str(stub))["k-moved"] == "HOLD"
 
@@ -379,11 +446,8 @@ def test_a_branch_whose_files_match_the_LANDING_commit_is_releasable(
     git(repo, "commit", "-qm", "main moves on and edits the same file")
 
     write_claim(repo, "k-landing", tmp_path / "vanished", "feature")
-    stub = _gh_stub(
-        tmp_path,
-        '[{"number":346,"headRefOid":"0000000000000000000000000000000000000000",'
-        f'"mergedAt":"2026-08-12T17:45:36Z","mergeCommit":{{"oid":"{landing}"}}}}]',
-    )
+    github_origin(repo)
+    stub = _gh_stub(tmp_path, _merged_pr("0" * 40, landing=landing))
     out = verdicts(repo, "-GhCommand", str(stub))
     assert out["k-landing"] == "RELEASABLE", out
 
@@ -392,11 +456,8 @@ def test_a_merged_pr_with_no_readable_landing_commit_holds(repo: Path, tmp_path:
     """The negative control for arm four: a PR at another tip proves an earlier state landed."""
     unmerged_branch(repo, "other-tip")
     write_claim(repo, "k-other", tmp_path / "vanished", "other-tip")
-    stub = _gh_stub(
-        tmp_path,
-        '[{"number":1,"headRefOid":"0000000000000000000000000000000000000000",'
-        '"mergedAt":"2026-08-01T00:00:00Z","mergeCommit":{"oid":""}}]',
-    )
+    github_origin(repo)
+    stub = _gh_stub(tmp_path, _merged_pr("0" * 40, landing=""))
     assert verdicts(repo, "-GhCommand", str(stub))["k-other"] == "HOLD"
 
 
@@ -485,8 +546,7 @@ def present_holder(repo: Path, name: str) -> tuple[Path, str]:
     Also gives the sandbox a GitHub-shaped origin, because the arm scopes every gh call with --repo
     and holds the claim when it cannot. The stub ignores the value; no network is touched.
     """
-    if "origin" not in git(repo, "remote").split():
-        git(repo, "remote", "add", "origin", "https://github.com/example/sandbox.git")
+    github_origin(repo)
     wt = repo.parent / f"wt-{name}"
     git(repo, "worktree", "add", "-q", str(wt), "-b", name)
     (wt / f"{name}.txt").write_text("the delivered work", encoding="utf-8")

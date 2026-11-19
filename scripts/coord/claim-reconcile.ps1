@@ -146,8 +146,9 @@ param(
     # carries 13 commits origin/main lacks, and its five claims all read HOLD on the local test alone.
     [switch]$NoPullRequests,
     # The probe itself, injectable so a test can stub it -- the pattern test_announce_hook.py uses
-    # for presence.ps1. Must accept `pr list --head <branch> --state merged --json ...` and, for the
-    # holder-present arm, `pr list --repo --base --head|--search`, and `pr view <n> --repo --json commits`.
+    # for presence.ps1. Must accept `pr list --repo --head <branch> --base --state merged --json ...`
+    # and, for the holder-present arm, `pr list --repo --base --head|--search`, and
+    # `pr view <n> --repo --json commits`.
     [string]$GhCommand = "gh",
     # Audit a set of claims that is not the live registry. Exists for one job: replaying these rules
     # over claims that have ALREADY been released, reconstructed from claims/.history, so a release
@@ -262,13 +263,30 @@ $ghAvailable = $false
 if (-not $NoPullRequests) {
     $ghAvailable = [bool](Get-Command $GhCommand -ErrorAction SilentlyContinue)
 }
+# Both pull-request arms scope every GitHub call with --repo, and with --base (BACKLOG #5481). Without
+# --repo gh answers from the caller's cwd or its default-repo setting, and this script is run by
+# absolute path from other checkouts -- the
+# vault shares engine history and has pull requests of its own. prune-merged.ps1 scopes the same way
+# for the same reason. No GitHub origin means the question cannot be asked, and the claim is held.
+$ghRepo = ""
+$originUrl = (& git -C $repo remote get-url origin 2>$null)
+if ($originUrl -and ([string]$originUrl) -match '^(?:https?://[^/@]*@?[^/]*github\.com/|git@github\.com:|ssh://git@github\.com/)(?<o>[^/]+)/(?<r>[^/]+?)(?:\.git)?/?$') {
+    $ghRepo = "$($Matches['o'])/$($Matches['r'])"
+}
+# The base a pull request must have merged INTO for its merge to say anything about $mainRef.
+$baseBranch = $mainRef -replace '^origin/', ''
+
 function Test-LandedByPullRequest {
     param([string]$Branch, [string]$Tip)
-    if (-not $ghAvailable) { return $null }
+    # Scoped like Find-MergedPullRequestCarrying: an unscoped `--head` answers from the caller's cwd
+    # or gh's default repo, and a branch of the same name merged into another repository or another
+    # base proves nothing about $mainRef. No GitHub origin means the question cannot be asked.
+    if (-not $ghAvailable -or -not $ghRepo) { return $null }
     try {
-        $raw = & $GhCommand pr list --head $Branch --state merged --json number,headRefOid,mergedAt,mergeCommit --limit 5 2>$null
+        $raw = & $GhCommand pr list --repo $ghRepo --head $Branch --base $baseBranch --state merged --json number,headRefOid,mergedAt,mergeCommit,baseRefName --limit 5 2>$null
         if ($LASTEXITCODE -ne 0 -or -not $raw) { return $null }
-        $prs = @($raw | ConvertFrom-Json)
+        # The base is checked again on each row, so an answer that ignored --base still proves nothing.
+        $prs = @(@(ConvertFrom-GhJson $raw) | Where-Object { $_.baseRefName -eq $baseBranch })
         foreach ($pr in $prs) {
             if ($pr.headRefOid -and $Tip -and $pr.headRefOid -eq $Tip) {
                 return [pscustomobject]@{ Number = $pr.number; MergedAt = $pr.mergedAt; ExactTip = $true; Landing = "" }
@@ -303,18 +321,6 @@ function ConvertFrom-GhJson($Raw) {
     if (-not $Raw) { return @() }
     return @((@($Raw) -join "`n") | ConvertFrom-Json)
 }
-
-# The holder-present arm scopes every GitHub call with --repo. Without it gh answers from the caller's
-# cwd or its default-repo setting, and this script is run by absolute path from other checkouts -- the
-# vault shares engine history and has pull requests of its own. prune-merged.ps1 scopes the same way
-# for the same reason. No GitHub origin means the question cannot be asked, and the claim is held.
-$ghRepo = ""
-$originUrl = (& git -C $repo remote get-url origin 2>$null)
-if ($originUrl -and ([string]$originUrl) -match '^(?:https?://[^/@]*@?[^/]*github\.com/|git@github\.com:|ssh://git@github\.com/)(?<o>[^/]+)/(?<r>[^/]+?)(?:\.git)?/?$') {
-    $ghRepo = "$($Matches['o'])/$($Matches['r'])"
-}
-# The base a pull request must have merged INTO for its merge to say anything about $mainRef.
-$baseBranch = $mainRef -replace '^origin/', ''
 
 function New-PrEvidence($Pr, [string]$As) {
     [pscustomobject]@{ Number = $Pr.number; MergedAt = $Pr.mergedAt; As = $As; Text = "$($Pr.title)`n$($Pr.body)" }
