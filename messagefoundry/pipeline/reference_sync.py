@@ -443,8 +443,8 @@ async def _load_database_source(
             # A cancellation returns the connection only once its statement and cursor close have
             # ended (BACKLOG #2394). The pool close below stops waiting for such a held connection
             # at a bound, so once a stop cancels this sync, a statement with no time limit does not
-            # hold that stop. An uncancelled statement's calls are bounded by statement_timeout,
-            # applied at the borrow above, except in the cases listed there; at 0 it holds the pass.
+            # hold that stop. An uncancelled statement's calls are bounded by statement_timeout
+            # except in the cases the comment at the _bound_statements call above lists.
             await _close_and_release(pool, conn, cur)
     finally:
         await _close_pool_bounded(pool, "DATABASE reference source")
