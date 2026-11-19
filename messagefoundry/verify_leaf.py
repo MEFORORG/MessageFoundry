@@ -14,10 +14,9 @@ call time only :mod:`messagefoundry.redaction` and :mod:`messagefoundry.secretsc
 load none of ``messagefoundry.transports``, ``config``, ``verify``, ``pipeline`` and ``store``,
 through the A5 probe and through an error arm that runs the scrub. They do load ``redaction`` and
 ``secretscrub``, which the scrub needs. :mod:`messagefoundry.verify.model` re-exports the public
-names it used to define, ``DRIVER_DETAIL_LIMIT``, ``safe_detail_text`` and ``safe_exc_detail``, and
-also ``safe_exc_text``. Its private helpers, at least ``_PLACEHOLDER``, live only here now.
-:mod:`messagefoundry.verify.checks` imports :func:`port_state`, which replaced its private
-``_port_state``, and keeps no name of its own for it.
+scrub names its own import lines list. The private names, at least ``_PLACEHOLDER`` and the port
+probe, live only here: neither ``verify.model._PLACEHOLDER`` nor ``verify.checks._port_state``
+exists, and the checks call :func:`port_state`.
 """
 
 from __future__ import annotations

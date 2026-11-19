@@ -27,10 +27,9 @@ class Status(str, Enum):  # noqa: UP042
 FAILING: tuple[Status, ...] = (Status.FAIL, Status.ERROR)
 
 
-# The detail scrub imported above lives in a leaf that loads only the standard library at import
-# time, and imports messagefoundry.redaction and messagefoundry.secretscrub when a scrub runs. So the
-# acceptance harness can share it without loading this package's runner (BACKLOG #5389, #5395); it
-# is re-exported for the checks.
+# The detail scrub imported above lives in the client-importable leaf messagefoundry.verify_leaf,
+# whose module docstring says what it imports, so the acceptance harness can share it without
+# loading this package's runner (BACKLOG #5389, #5395); it is re-exported for the checks.
 
 
 @dataclass

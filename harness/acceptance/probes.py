@@ -14,6 +14,7 @@ rules admitting external traffic, service-account ACLs, a real interactive deskt
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import os
 import sys
@@ -43,7 +44,9 @@ def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -
 
     The scrub is imported here, at call time, and a failure to load or run it withholds both
     ``before`` and the text rather than printing either raw, and names the failure's type instead.
-    That row then names no probe key or path the caller put in ``before``. A1 exists to report an
+    That row then names no probe key or path the caller put in ``before``. The failure is logged at
+    WARNING with the two exceptions' type names and no text, and a log call that itself raises is
+    ignored. A1 exists to report an
     interpreter the engine cannot run on, and there the engine's modules may not even parse, so this
     must not take the runner down either."""
     try:
@@ -66,11 +69,14 @@ def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -
             return safe_detail_text(before + line, limit=DRIVER_DETAIL_LIMIT)
         return safe_exc_text(exc, before=before)
     except Exception as scrub_failure:  # SyntaxError or ImportError on such an interpreter
-        # The type name only: the failure's own text could quote the detail it failed to scrub.
-        _log.warning(
-            "the detail scrub failed with %s; the row's detail is withheld",
-            type(scrub_failure).__name__,
-        )
+        # Type names only: the failure's own text could quote the detail it failed to scrub.
+        # A log filter that raises has no log left to report to, and must not take the runner down.
+        with contextlib.suppress(Exception):
+            _log.warning(
+                "the detail scrub failed with %s; a row's %s detail is withheld",
+                type(scrub_failure).__name__,
+                type(exc).__name__,
+            )
         return (
             f"{type(exc).__name__} (detail withheld: the detail scrub failed with "
             f"{type(scrub_failure).__name__})"
@@ -179,10 +185,9 @@ def probe_firewall_ports() -> ProbeResult:
 
     Each port's state is the verifier's own ``host.ports`` probe, so the two read a port the same
     way. The copy this replaced bound 127.0.0.1 with ``SO_REUSEADDR`` and so would have read a held
-    port as free on Windows (BACKLOG #5389). It comes from the leaf :mod:`messagefoundry.verify_leaf`,
-    which loads only the standard library at import time and imports ``messagefoundry.redaction`` and
-    ``messagefoundry.secretscrub`` when a scrub runs, never from :mod:`messagefoundry.verify`, whose
-    runner loads the engine's transports and config."""
+    port as free on Windows (BACKLOG #5389). It comes from the client-importable leaf
+    :mod:`messagefoundry.verify_leaf`, whose module docstring says what it imports, never from
+    :mod:`messagefoundry.verify`, whose runner loads the engine's transports and config."""
     from messagefoundry.verify_leaf import port_state
 
     parts = [f"{name} {port}: {port_state(port)}" for name, port in _DEFAULT_PORTS.items()]
