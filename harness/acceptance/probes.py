@@ -22,18 +22,34 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from harness.acceptance.matrix import Status
-from messagefoundry.verify_leaf import (
-    DRIVER_DETAIL_LIMIT,
-    port_state,
-    safe_exc_detail,
-    safe_exc_text,
-)
 
 #: Repo root (…/harness/acceptance/probes.py → parents[2]).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 #: Default listener ports referenced by section A5 (informational bindability check).
 _DEFAULT_PORTS: dict[str, int] = {"MLLP": 2575, "DICOM": 11112, "API": 8765}
+
+
+def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -> str:
+    """``exc`` for a report row, through the verifier's detail scrub (BACKLOG #5395): ``before`` and
+    the text as :func:`messagefoundry.verify_leaf.safe_exc_text`, or, with ``typed``, the type name
+    then the text as ``safe_exc_detail``. A report row leaves the box, and driver or OS text can
+    quote a DSN, a credential or a path.
+
+    The scrub is imported here, at call time, and a failure to load or run it withholds the text
+    rather than printing it raw. A1 exists to report an interpreter the engine cannot run on, and
+    there the engine's modules may not even parse, so this must not take the runner down either."""
+    try:
+        from messagefoundry.verify_leaf import DRIVER_DETAIL_LIMIT, safe_exc_detail, safe_exc_text
+
+        if typed:
+            return before + safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)
+        return safe_exc_text(exc, before=before)
+    except Exception as scrub_failure:  # SyntaxError or ImportError on such an interpreter
+        return (
+            f"{before}{type(exc).__name__} (text withheld: the detail scrub failed with "
+            f"{type(scrub_failure).__name__})"
+        )
 
 
 @dataclass
@@ -107,7 +123,7 @@ def probe_sqlserver_odbc_driver() -> ProbeResult:
         drivers = list(pyodbc.drivers())
     except Exception as exc:  # pyodbc surfaces driver-manager errors as bare Exception
         # Driver-manager text can quote a DSN or a credential, as the verifier's copy found.
-        return ProbeResult(Status.ERROR, safe_exc_text(exc, before="pyodbc.drivers() failed: "))
+        return ProbeResult(Status.ERROR, scrubbed_exc(exc, before="pyodbc.drivers() failed: "))
     target = "ODBC Driver 18 for SQL Server"
     if target in drivers:
         return ProbeResult(Status.PASS, f"{target} present", evidence=", ".join(drivers))
@@ -141,6 +157,8 @@ def probe_firewall_ports() -> ProbeResult:
     port as free on Windows (BACKLOG #5389). It comes from the stdlib-only leaf
     :mod:`messagefoundry.verify_leaf`, never :mod:`messagefoundry.verify`, whose runner loads the
     engine's transports and config."""
+    from messagefoundry.verify_leaf import port_state
+
     parts = [f"{name} {port}: {port_state(port)}" for name, port in _DEFAULT_PORTS.items()]
     return ProbeResult(
         Status.MANUAL,
@@ -157,7 +175,7 @@ def probe_writable_dirs() -> ProbeResult:
             pass
     except OSError as exc:
         return ProbeResult(
-            Status.FAIL, safe_exc_text(exc, before=f"cannot write working dir {cwd}: ")
+            Status.FAIL, scrubbed_exc(exc, before=f"cannot write working dir {cwd}: ")
         )
     return ProbeResult(
         Status.MANUAL,
@@ -216,5 +234,6 @@ def run_probe(key: str) -> ProbeResult:
     try:
         return probe()
     except Exception as exc:  # a probe must never take the runner down
-        detail = safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)
-        return ProbeResult(Status.ERROR, f"probe {key!r} raised {detail}")
+        return ProbeResult(
+            Status.ERROR, scrubbed_exc(exc, before=f"probe {key!r} raised ", typed=True)
+        )

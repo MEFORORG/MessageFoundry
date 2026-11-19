@@ -26,7 +26,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from messagefoundry.config.settings import ServiceSettings
-from messagefoundry.redaction import codec_safe_line
 from messagefoundry.verify.model import (
     DRIVER_DETAIL_LIMIT,
     CheckResult,
@@ -668,7 +667,7 @@ def _replay_rows(
                 "fed.replay",
                 "Offline id_token replay",
                 Status.ERROR,
-                codec_safe_line(exc),
+                safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT),  # BACKLOG #5395
             )
         )
         return rows

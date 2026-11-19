@@ -27,8 +27,8 @@ class Status(str, Enum):  # noqa: UP042
 FAILING: tuple[Status, ...] = (Status.FAIL, Status.ERROR)
 
 
-#: The detail scrub lives in a stdlib-only leaf, so the acceptance harness can share it without
-#: loading this package's runner (BACKLOG #5389, #5395). Re-exported here for the checks.
+# The detail scrub imported above lives in a stdlib-only leaf, so the acceptance harness can share it
+# without loading this package's runner (BACKLOG #5389, #5395); it is re-exported for the checks.
 
 
 @dataclass

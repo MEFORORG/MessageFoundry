@@ -20,7 +20,7 @@ from messagefoundry.config.settings import ServiceSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.verify import cipher_policy, federation, smoke
 from messagefoundry.verify.cipher_policy import ProbeFailed, ProbeUnavailable
-from messagefoundry.verify.model import Status
+from messagefoundry.verify.model import CheckResult, Status
 
 _PLANTED = "pw-V3rify_Fol-52"
 _LEAKY = f"connection to postgresql://svc:{_PLANTED}@db.invalid:5432/mefor failed"
@@ -213,3 +213,55 @@ def test_an_unreadable_junit_file_is_scrubbed(monkeypatch: pytest.MonkeyPatch) -
     r = runner.default_pytest_runner(["tests/test_nothing.py"])
     assert r.run_error.startswith("unreadable JUnit XML ("), r.run_error
     assert _PLANTED not in r.run_error, r.run_error
+
+
+# ---- round-1 review: further raw arms, and the harness scrub's fail-closed path ---------------
+
+
+def test_the_replay_catch_all_is_scrubbed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    from messagefoundry.auth import oidc
+
+    def boom(*args: object) -> object:
+        raise RuntimeError(_LEAKY)
+
+    token, jwks = tmp_path / "t.jwt", tmp_path / "jwks.json"
+    token.write_text("a.b.c", encoding="ascii")
+    jwks.write_text("{}", encoding="ascii")
+    ok = CheckResult("fed.jwks", "JWKS", Status.PASS, "parsed")
+    monkeypatch.setattr(federation, "_jwks_row", lambda raw: (object(), ok))
+    monkeypatch.setattr(oidc, "validate_id_token", boom)
+    rows = federation._replay_rows(_settings(), str(token), str(jwks), None)
+    last = rows[-1]
+    assert last.id == "fed.replay" and last.status is Status.ERROR, rows
+    assert last.detail.startswith("RuntimeError: "), last.detail
+    assert _PLANTED not in last.detail, last.detail
+
+
+def test_a_settings_load_failure_is_scrubbed(monkeypatch: pytest.MonkeyPatch) -> None:
+    from messagefoundry.config import settings as settings_module
+    from messagefoundry.verify import runner as verify_runner
+
+    def refuse(**kwargs: object) -> object:
+        raise ValueError(f"[auth].oidc_token_endpoint https://svc:{_PLANTED}@idp.invalid/ refused")
+
+    monkeypatch.setattr(settings_module, "load_settings", refuse)
+    settings, error = verify_runner._load_settings("svc.toml")
+    assert settings is None and error is not None
+    assert "oidc_token_endpoint" in error, error
+    assert _PLANTED not in error, error
+
+
+def test_the_harness_scrub_withholds_the_text_when_it_cannot_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry import verify_leaf
+
+    def broken(*args: object, **kwargs: object) -> str:
+        raise SyntaxError("an interpreter too old for the engine")
+
+    monkeypatch.setattr(verify_leaf, "safe_exc_text", broken)
+    monkeypatch.setattr(verify_leaf, "safe_exc_detail", broken)
+    for typed in (False, True):
+        text = probes.scrubbed_exc(RuntimeError(_LEAKY), before="x: ", typed=typed)
+        assert text.startswith("x: RuntimeError (text withheld"), text
+        assert _PLANTED not in text, text

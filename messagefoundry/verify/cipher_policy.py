@@ -756,8 +756,9 @@ def _policy_reading(path: Path, missing: Status = Status.FAIL) -> _Reading:
     try:
         taken = _taken("OpenSSL file", partial(_openssl_policy_lines, path), _BY_HAND)
     except FileNotFoundError as exc:
-        # The path is the exception's, at least one OPENSSL_CONF names, so it is scrubbed as its
-        # text is (BACKLOG #5395).
+        # Quoted from the exception, so scrubbed as exception text is (BACKLOG #5395). This is not a
+        # control on the path itself: the reading arms below print the same path, which the operator
+        # set, unscrubbed.
         where = safe_detail_text(f"no file at {exc.filename}", limit=DRIVER_DETAIL_LIMIT)
         if missing is not Status.FAIL:
             return _Reading(missing, f"OpenSSL file not read ({where}){_BY_HAND}")

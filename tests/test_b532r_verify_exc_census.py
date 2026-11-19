@@ -1,16 +1,17 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""No arm of the verifier, or of the acceptance harness's report rows, quotes an exception raw
-(BACKLOG #5395).
+"""No arm of the verifier, or of the acceptance harness's report rows, quotes an exception raw in a
+shape this walk names (BACKLOG #5395).
 
 A verify or acceptance report is written to a file an operator pastes into a ticket, and an
 exception's text can quote a DSN, a ``password=`` pair or a path. Each caught exception must reach a
 row through :mod:`messagefoundry.verify_leaf`'s scrub. This walk refuses AT LEAST these raw shapes
-inside an ``except ... as NAME`` arm: ``NAME`` or ``NAME.attr`` in an f-string, and ``str(NAME)``,
-``repr(NAME)`` or ``codec_safe_str(NAME)`` whose result is not passed straight to a scrub. A shape it
-does not name, such as an exception copied to another variable first, is not proven scrubbed. A
-``raise`` is skipped: what it builds is a new exception, scrubbed where it is caught, and a log call
-is skipped because a log line is not a report row."""
+inside an ``except ... as NAME`` arm: ``NAME`` or ``NAME.attr`` in an f-string, and ``NAME`` passed
+to one of :data:`_RAW_CALLS`, where the first call the value reaches is not a scrub. A shape it does
+not name, at least an exception copied to another variable first, ``.format(NAME)`` and
+``NAME.args``, is not proven scrubbed. A ``raise`` is skipped: what it builds is a new exception,
+scrubbed where it is caught. A call on a logger (``_log``, ``log``, ``logger``) is skipped, because
+a log line is not a report row."""
 
 from __future__ import annotations
 
@@ -19,16 +20,36 @@ from pathlib import Path
 
 import pytest
 
+import harness.acceptance.probes
+import harness.acceptance.runner
+import messagefoundry.verify
+import messagefoundry.verify_leaf
+
 _REPO = Path(__file__).resolve().parents[1]
+# Located from the imported modules, so the walk reads the code that runs.
 _SCANNED = [
-    *sorted((_REPO / "messagefoundry" / "verify").glob("*.py")),
-    _REPO / "messagefoundry" / "verify_leaf.py",
-    _REPO / "harness" / "acceptance" / "probes.py",
-    _REPO / "harness" / "acceptance" / "runner.py",
+    *sorted(Path(messagefoundry.verify.__file__).parent.glob("*.py")),
+    Path(messagefoundry.verify_leaf.__file__),
+    Path(harness.acceptance.probes.__file__),
+    Path(harness.acceptance.runner.__file__),
 ]
-_SCRUBS = frozenset({"safe_detail_text", "safe_exc_text", "safe_exc_detail", "safe_exc"})
-_RAW_CALLS = frozenset({"str", "repr", "codec_safe_str"})
-_LOG_METHODS = frozenset({"debug", "info", "warning", "error", "exception", "critical", "log"})
+_SCRUBS = frozenset(
+    {
+        "safe_detail_text",
+        "safe_exc_text",
+        "safe_exc_detail",
+        "safe_exc",
+        "scrubbed_exc",
+        "_not_probed",
+    }
+)
+#: Calls that render an exception's text with no PHI or credential pass, at least these.
+_RAW_CALLS = frozenset(
+    {"str", "repr", "codec_safe_str", "codec_safe_line", "settings_error_detail"}
+)
+_LOGGERS = frozenset({"_log", "log", "logger", "_logger"})
+#: Nodes a value passes through on its way to the call that receives it.
+_CARRIERS = (ast.JoinedStr, ast.FormattedValue, ast.BinOp)
 
 
 def _callee(node: ast.Call) -> str:
@@ -43,15 +64,26 @@ def _raw_uses(tree: ast.AST) -> list[str]:
             parents[child] = node
 
     def exempt(node: ast.AST) -> bool:
-        while node in parents:
-            node = parents[node]
-            if isinstance(node, ast.Raise):
+        up: ast.AST | None = node
+        while up in parents:
+            up = parents[up]
+            if isinstance(up, ast.Raise):
                 return True
-            if isinstance(node, ast.Call) and (
-                _callee(node) in _LOG_METHODS or _callee(node) in _SCRUBS
-            ):
-                return True
-        return False
+        # Only the call the value reaches first counts: a raw f-string nested deeper inside a
+        # scrub's argument, such as in a ``.join`` over it, is not scrubbed by it.
+        up = parents.get(node)
+        while isinstance(up, _CARRIERS):
+            up = parents.get(up)
+        if not isinstance(up, ast.Call):
+            return False
+        if _callee(up) in _SCRUBS:
+            return True
+        f = up.func
+        return (
+            isinstance(f, ast.Attribute)
+            and isinstance(f.value, ast.Name)
+            and f.value.id in _LOGGERS
+        )
 
     def is_name(node: ast.AST, name: str) -> bool:
         if isinstance(node, ast.Attribute):
@@ -93,14 +125,18 @@ def f():
         c = str(exc)
         d = repr(exc)
         e = codec_safe_str(exc)
+        g = codec_safe_line(exc)
+        h = rows.error(f"{exc}")
+        i = safe_exc_text(x, before=y).join([f"{exc}"])
         ok1 = safe_exc_text(exc)
         ok2 = f"{safe_detail_text(codec_safe_str(exc))}"
         ok3 = type(exc).__name__
+        ok4 = safe_detail_text(before + codec_safe_str(exc))
         _log.debug("x %s", str(exc))
         raise ValueError(f"wrapped {exc}") from exc
 """
     found = _raw_uses(ast.parse(planted))
-    assert len(found) == 5, found
+    assert len(found) == 8, found
 
 
 def test_the_walk_covers_the_files_it_names() -> None:

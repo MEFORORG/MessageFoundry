@@ -61,6 +61,14 @@ import sys
 import harness.acceptance.probes as probes
 probes.probe_firewall_ports()
 probes.run_probe("writable_dirs")
+# The error arms import the scrub at call time, so run one: a probe that raises.
+PLANTED = "pw-Isolat_Ion-1"
+def _raises():
+    raise RuntimeError("password=" + PLANTED)
+probes.PROBES["raises"] = _raises
+result = probes.run_probe("raises")
+assert PLANTED not in result.detail, result.detail
+assert "RuntimeError" in result.detail and "withheld" not in result.detail, result.detail
 loaded = sorted(m for m in sys.modules if m.split(".")[:2] in (
     ["messagefoundry", "transports"], ["messagefoundry", "config"],
     ["messagefoundry", "verify"], ["messagefoundry", "pipeline"], ["messagefoundry", "store"]))
