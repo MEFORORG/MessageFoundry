@@ -351,17 +351,63 @@ def fingerprint_matches(current: object, loaded: str) -> bool:
     return isinstance(current, str) and constant_time_equal(current, loaded)
 
 
+#: A git object id as git writes one: SHA-1 (40) or SHA-256 (64) lower-case hex. ``git_head`` is
+#: recorded only in this shape, so the audit field never carries other text a crafted ref file holds
+#: (vault BACKLOG #5325).
+_OBJECT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
+
+#: Characters git's ``check-ref-format`` refuses in a ref name. Two of them, a backslash and a colon,
+#: would also let a name leave ``refs/`` on Windows, as a separator or a drive.
+_REF_FORBIDDEN = frozenset(" ~^:?*[\\\x7f")
+
+
+def _object_id(text: str) -> str | None:
+    """``text`` stripped, if it is a git object id (:data:`_OBJECT_ID`), else ``None``."""
+    text = text.strip()
+    return text if _OBJECT_ID.fullmatch(text) else None
+
+
+def _confined_ref(ref: str) -> bool:
+    """Whether a symbolic ref names a path under ``refs/`` in the git dir and nowhere else: relative,
+    ``refs/`` first, no ``..``, no empty, dot-led or ``.lock`` part, and none of the characters git
+    refuses in a ref name (vault BACKLOG #5325). The ref is joined onto the git dir, so ``ref:
+    ../../x`` or an absolute path would otherwise read a file outside it. The git dir itself is
+    where the checkout's ``.git`` points, which is the operator's layout and is not confined; what
+    keeps file text out of ``git_head`` is :func:`_object_id`."""
+    parts = ref.split("/")
+    if len(parts) < 2 or parts[0] != "refs" or ".." in ref:
+        return False
+    if any(ch in _REF_FORBIDDEN or ord(ch) < 0x20 for ch in ref):
+        return False
+    return all(part and not part.startswith(".") and not part.endswith(".lock") for part in parts)
+
+
+def _read_git_text(path: Path) -> str | None:
+    """The UTF-8 text of a git metadata file, or ``None`` when it cannot be read or decoded. The
+    ``ValueError`` covers a file that is not UTF-8 (``UnicodeDecodeError``) and a path holding a
+    NUL; either reads as unknown provenance, as an unreadable file does (vault BACKLOG #5325)."""
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+
+
 def _git_head(start: Path) -> str | None:
     """Best-effort current commit of the git work tree containing ``start`` — no subprocess.
 
-    Returns the 40-hex commit, or ``None`` when ``start`` is not in a work tree or the ref can't be
-    resolved purely from on-disk files (e.g. an exotic ref layout). Handles a detached HEAD, a
-    symbolic ``ref:`` HEAD (resolved against loose refs then ``packed-refs``), and a linked worktree
-    (``.git`` is a file pointing at a ``gitdir``, whose refs live in the ``commondir``).
+    Returns the commit's object id (40 hex, or 64 in a SHA-256 repository), or ``None`` when
+    ``start`` is not in a work tree or the ref can't be resolved purely from on-disk files (e.g. an
+    exotic ref layout). Handles a detached HEAD, a symbolic ``ref:`` HEAD (resolved against loose
+    refs then ``packed-refs``), and a linked worktree (``.git`` is a file pointing at a ``gitdir``,
+    whose refs live in the ``commondir``).
+
+    It never raises, and returns only a value in the shape of an object id: a file it cannot read or
+    decode, a symbolic ref outside ``refs/`` (:func:`_confined_ref`), or a value that is not an
+    object id each read as ``None`` (vault BACKLOG #5325).
     """
     try:
         base = start.resolve()
-    except OSError:
+    except (OSError, ValueError):
         return None
     git_dir: Path | None = None
     for parent in (base, *base.parents):
@@ -370,12 +416,15 @@ def _git_head(start: Path) -> str | None:
             git_dir = candidate
             break
         if candidate.is_file():
-            try:
-                line = candidate.read_text(encoding="utf-8").strip()
-            except OSError:
+            text = _read_git_text(candidate)
+            if text is None:
                 return None
+            line = text.strip()
             if line.startswith("gitdir:"):
-                pointed = (parent / line[len("gitdir:") :].strip()).resolve()
+                try:
+                    pointed = (parent / line[len("gitdir:") :].strip()).resolve()
+                except (OSError, ValueError):
+                    return None
                 git_dir = pointed if pointed.exists() else None
             break
     if git_dir is None:
@@ -383,30 +432,35 @@ def _git_head(start: Path) -> str | None:
 
     # Refs may live in this gitdir or, for a linked worktree, in the shared commondir.
     roots = [git_dir]
-    common_file = git_dir / "commondir"
-    if common_file.is_file():
+    common_text = _read_git_text(git_dir / "commondir")
+    if common_text is not None:
         try:
-            common = (git_dir / common_file.read_text(encoding="utf-8").strip()).resolve()
+            common = (git_dir / common_text.strip()).resolve()
+        except (OSError, ValueError):
+            pass  # no shared refs to read: the gitdir's own still are
+        else:
             if common != git_dir:
                 roots.append(common)
-        except OSError:
-            pass
 
-    try:
-        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
-    except OSError:
+    head = _read_git_text(git_dir / "HEAD")
+    if head is None:
         return None
+    head = head.strip()
     if not head.startswith("ref:"):
-        return head or None  # detached HEAD: the commit sha directly
+        return _object_id(head)  # detached HEAD: the commit id directly
     ref = head[len("ref:") :].strip()
+    if not _confined_ref(ref):
+        return None
     for root in roots:
-        loose = root / ref
+        # Read as bytes, not through _read_git_text: only a loose ref that is not there may fall
+        # through to packed-refs, and that helper's None cannot tell absent from undecodable.
         try:
-            sha = loose.read_text(encoding="utf-8").strip()
-            if sha:
-                return sha
-        except OSError:
-            pass
+            raw = (root / ref).read_bytes()
+        except (OSError, ValueError):
+            continue  # no loose ref under this root: try the next, then packed-refs
+        # A loose ref that is there but holds no object id (another symbolic ref, a crafted file)
+        # reads as unknown: falling through to packed-refs could report a value git would not.
+        return _object_id(raw.decode("ascii", "replace"))
     for root in roots:
         packed = _scan_packed_refs(root / "packed-refs", ref)
         if packed is not None:
@@ -415,15 +469,16 @@ def _git_head(start: Path) -> str | None:
 
 
 def _scan_packed_refs(packed: Path, ref: str) -> str | None:
-    try:
-        lines = packed.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    """The object id ``packed`` records for ``ref``, or ``None`` when it records none, cannot be read
+    or decoded, or records one that is not an object id (vault BACKLOG #5325)."""
+    text = _read_git_text(packed)
+    if text is None:
         return None
-    for raw in lines:
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith(("#", "^")):
             continue
         sha, _, name = line.partition(" ")
         if name == ref:
-            return sha or None
+            return _object_id(sha)
     return None

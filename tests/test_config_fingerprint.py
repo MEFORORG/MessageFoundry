@@ -20,6 +20,7 @@ import pytest
 from messagefoundry.config.fingerprint import (
     UNREADABLE_FILES_KEY,
     ConfigDirMissing,
+    _git_head,
     config_fingerprint,
     config_fingerprint_detail,
     digest_coverage,
@@ -378,3 +379,165 @@ def test_a_file_a_read_called_missing_that_is_still_there_is_unreadable(
 
     monkeypatch.setattr(Path, "read_bytes", _read)
     assert config_fingerprint_detail(d)[UNREADABLE_FILES_KEY] == ["cfg.py"]
+
+
+# --- vault BACKLOG #5325: git_head is read safely, confined, and only an object id -------------
+
+_SHA1 = "a" * 40
+_SHA256 = "b" * 64
+
+
+def _repo(tmp_path: Path, head: bytes) -> tuple[Path, Path]:
+    """A work tree with a ``.git`` dir whose HEAD holds ``head``; returns (config dir, git dir)."""
+    git_dir = tmp_path / "repo" / ".git"
+    (git_dir / "refs" / "heads").mkdir(parents=True)
+    (git_dir / "HEAD").write_bytes(head)
+    cfg = tmp_path / "repo" / "cfg"
+    _bundle(cfg)
+    return cfg, git_dir
+
+
+@pytest.mark.parametrize("sha", [_SHA1, _SHA256])
+def test_git_head_reads_a_detached_head(tmp_path: Path, sha: str) -> None:
+    """The positive control: a detached HEAD in either object format is the recorded commit."""
+    cfg, _ = _repo(tmp_path, f"{sha}\n".encode())
+    assert config_fingerprint_detail(cfg)["git_head"] == sha
+
+
+def test_git_head_resolves_a_loose_ref_then_packed_refs(tmp_path: Path) -> None:
+    """The positive control: a symbolic HEAD under refs/ resolves loose first, then packed-refs."""
+    cfg, git_dir = _repo(tmp_path, b"ref: refs/heads/main\n")
+    (git_dir / "packed-refs").write_text(
+        f"# pack-refs with: peeled\n{_SHA256} refs/heads/main\n^{_SHA1}\n", encoding="utf-8"
+    )
+    assert _git_head(cfg) == _SHA256
+    (git_dir / "refs" / "heads" / "main").write_text(f"{_SHA1}\n", encoding="utf-8")
+    assert _git_head(cfg) == _SHA1
+
+
+def test_git_head_resolves_through_a_linked_worktree(tmp_path: Path) -> None:
+    """The positive control: ``.git`` as a file points at a gitdir whose refs sit in commondir."""
+    common = tmp_path / "main" / ".git"
+    (common / "refs" / "heads").mkdir(parents=True)
+    (common / "refs" / "heads" / "topic").write_text(f"{_SHA1}\n", encoding="utf-8")
+    linked = common / "worktrees" / "wt"
+    linked.mkdir(parents=True)
+    (linked / "HEAD").write_text("ref: refs/heads/topic\n", encoding="utf-8")
+    (linked / "commondir").write_text("../..\n", encoding="utf-8")
+    cfg = tmp_path / "wt" / "cfg"
+    _bundle(cfg)
+    (tmp_path / "wt" / ".git").write_text(f"gitdir: {linked}\n", encoding="utf-8")
+    assert _git_head(cfg) == _SHA1
+
+
+_NOT_UTF8 = b"\xff\xfe" + _SHA1.encode()
+
+
+@pytest.mark.parametrize(
+    ("rel", "data"),
+    [
+        ("HEAD", _NOT_UTF8),
+        ("packed-refs", _NOT_UTF8 + b" refs/heads/main\n"),
+        ("refs/heads/main", _NOT_UTF8),
+    ],
+)
+def test_a_git_file_that_is_not_utf8_reads_as_unknown(
+    tmp_path: Path, rel: str, data: bytes
+) -> None:
+    """A non-UTF-8 git file raised UnicodeDecodeError out of provenance capture, and with it out of
+    the whole fingerprint detail. Now it reads as unknown, as an unreadable file does."""
+    cfg, git_dir = _repo(tmp_path, b"ref: refs/heads/main\n")
+    (git_dir / rel).write_bytes(data)
+    detail = config_fingerprint_detail(cfg)
+    assert "git_head" not in detail
+    assert detail["fingerprint"] == config_fingerprint(cfg)
+
+
+def test_a_git_file_pointer_that_is_not_utf8_reads_as_unknown(tmp_path: Path) -> None:
+    """The same for a linked worktree's ``.git`` file."""
+    (tmp_path / "repo").mkdir()
+    (tmp_path / "repo" / ".git").write_bytes(b"gitdir: \xff\n")
+    cfg = tmp_path / "repo" / "cfg"
+    _bundle(cfg)
+    assert "git_head" not in config_fingerprint_detail(cfg)
+
+
+def test_a_commondir_that_is_not_utf8_drops_only_the_shared_refs(tmp_path: Path) -> None:
+    """The gitdir's own refs still resolve."""
+    cfg, git_dir = _repo(tmp_path, b"ref: refs/heads/main\n")
+    (git_dir / "commondir").write_bytes(_NOT_UTF8)
+    (git_dir / "refs" / "heads" / "main").write_text(_SHA1, encoding="utf-8")
+    assert config_fingerprint_detail(cfg)["git_head"] == _SHA1
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "../outside",
+        "refs/../../outside",
+        "refs/heads/../../../outside",
+        "heads/main",
+        "refs",
+        "refs/",
+        "refs//main",
+        "refs/heads/.hidden",
+        "refs/heads/main.lock",
+        "refs\\..\\..\\outside",
+        "refs/heads/a:b",
+        "refs/heads/a b",
+    ],
+)
+def test_a_symbolic_ref_outside_refs_is_not_followed(tmp_path: Path, ref: str) -> None:
+    """``ref:`` was joined onto the git dir unchecked, so a crafted HEAD read any file. Each file it
+    could reach holds an object id here, so only the confinement can keep it out of git_head."""
+    cfg, git_dir = _repo(tmp_path, f"ref: {ref}\n".encode())
+    (tmp_path / "repo" / "outside").write_text(_SHA1, encoding="utf-8")
+    (tmp_path / "outside").write_text(_SHA1, encoding="utf-8")
+    (git_dir / "packed-refs").write_text(f"{_SHA1} {ref}\n", encoding="utf-8")
+    assert _git_head(cfg) is None
+
+
+def test_an_absolute_symbolic_ref_is_not_followed(tmp_path: Path) -> None:
+    """An absolute path joined onto the git dir replaced it, reading that file."""
+    target = tmp_path / "elsewhere"
+    target.write_text(_SHA1, encoding="utf-8")
+    cfg, _ = _repo(tmp_path, f"ref: {target}\n".encode())
+    assert _git_head(cfg) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "synthetic file text, not a commit",
+        _SHA1.upper(),
+        _SHA1[:-1],
+        _SHA1 + "0",
+        _SHA256 + "0",
+        "g" * 40,
+        "ref: refs/heads/other",
+    ],
+)
+@pytest.mark.parametrize(
+    ("rel", "template"),
+    [("HEAD", "{}\n"), ("refs/heads/main", "{}"), ("packed-refs", "{} refs/heads/main\n")],
+)
+def test_git_head_records_only_an_object_id(
+    tmp_path: Path, text: str, rel: str, template: str
+) -> None:
+    """Whatever text the ref file held became the git_head audit field. Only a 40- or 64-hex object
+    id is recorded now; anything else reads as unknown. Writing HEAD replaces the symbolic ref with
+    the text, as a detached HEAD."""
+    cfg, git_dir = _repo(tmp_path, b"ref: refs/heads/main\n")
+    (git_dir / rel).write_text(template.format(text), encoding="utf-8")
+    assert "git_head" not in config_fingerprint_detail(cfg)
+
+
+def test_a_loose_ref_that_is_no_object_id_does_not_fall_back_to_packed_refs(
+    tmp_path: Path,
+) -> None:
+    """git reads the loose ref over packed-refs, so a malformed loose ref is unknown, never the
+    stale packed value."""
+    cfg, git_dir = _repo(tmp_path, b"ref: refs/heads/main\n")
+    (git_dir / "refs" / "heads" / "main").write_text("not an id", encoding="utf-8")
+    (git_dir / "packed-refs").write_text(f"{_SHA1} refs/heads/main\n", encoding="utf-8")
+    assert _git_head(cfg) is None
