@@ -656,3 +656,82 @@ def test_lane_level_says_aloud_when_the_cwd_does_not_exist(
     text = _lane(repo, {"hook_event_name": "Stop", "cwd": gone})
     assert "[lane] COULD NOT READ THIS SESSION'S WORKTREE" in text, text
     assert "deleted-worktree, which does not exist" in text, text
+
+
+# --------------------------------------------------------------------------------------------------
+# seat-record.ps1, the Stop hook that writes the seat record through seat.ps1 -Record (BACKLOG
+# #5961). seat.ps1 took the payload `cwd` as it stood, so after a `cd` the record would land in a
+# sibling's box or in another repository's registry. It now answers through the helper's pin.
+# --------------------------------------------------------------------------------------------------
+
+SEAT_RECORD = HOOKS / "seat-record.ps1"
+
+
+def _seat_records(start: Path) -> list[dict[str, Any]]:
+    """Every seat record in the registry of the clone ``start`` belongs to."""
+    common = Path(_git(start, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    seats = common / "mefor-coord" / "seats"
+    return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(seats.rglob("*.json"))]
+
+
+def _record_stop(repo: Path, payload: dict[str, Any]) -> None:
+    """Run the Stop hook in the primary, as the app runs it.
+
+    tests/conftest.py drops MEFOR_COORD_ROOT for the whole run, so no record can reach the real
+    shared root: each fixture clone's own ``.git/mefor-coord`` is its registry."""
+    _run(SEAT_RECORD, repo, _raw(payload))
+
+
+@pytest.fixture
+def seat_clones(tmp_path: Path) -> tuple[Path, Path, Path, Path]:
+    """A primary, its linked worktree, a sibling worktree, and an unrelated repository."""
+    repo, wt, sibling = _opted_in(tmp_path)
+    other = _other_repo(tmp_path)
+    _git(other, "config", "user.email", "t@example.invalid")
+    _git(other, "config", "user.name", "t")
+    _git(other, "commit", "-q", "--allow-empty", "-m", "init")
+    for clone in (repo, other):
+        (clone / ".git" / "mefor-coord").mkdir()
+    return repo, wt, sibling, other
+
+
+def test_the_seat_recorder_records_the_pinned_worktree_its_cwd_names(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """The control. Without it, a fixture that records nothing would pass the arms below."""
+    repo, wt, _, _ = seat_clones
+    seed_pin(repo, wt, "s1")
+    _record_stop(repo, _stop("s1", wt))
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+
+
+def test_after_a_cd_to_a_sibling_the_seat_recorder_records_the_pinned_worktree(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    repo, wt, sibling, _ = seat_clones
+    seed_pin(repo, wt, "s1")
+    _record_stop(repo, _stop("s1", sibling))
+    recs = _seat_records(repo)
+    assert not any(_same_dir(r["worktree"], sibling) for r in recs), recs
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+
+
+def test_after_a_cd_to_another_repository_the_seat_recorder_writes_nothing_there(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    repo, wt, _, other = seat_clones
+    seed_pin(repo, wt, "s1")
+    _record_stop(repo, _stop("s1", other))
+    assert _seat_records(other) == []
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+
+
+def test_an_unpinned_seat_recorder_writes_no_record_for_a_sibling_cwd(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """No pin says the session started in the sibling, and the only other record is the primary's."""
+    repo, _, sibling, _ = seat_clones
+    _record_stop(repo, _stop("s1", sibling))
+    assert _seat_records(repo) == []

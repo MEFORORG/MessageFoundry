@@ -286,12 +286,45 @@ function Resolve-Worktree {
 function Read-HookPayload {
     # Hooks receive JSON on stdin. Absent or unparsable stdin is NORMAL for a manual run and is not
     # an error -- it just means every payload-derived field reports its source as 'absent'.
+    # The raw text is kept for Resolve-RecordHookDir, which hands it to the shared hook-input helper.
+    $script:HookPayloadText = ''
     if ([Console]::IsInputRedirected -ne $true) { return $null }
     try {
         $raw = [Console]::In.ReadToEnd()
         if (-not $raw -or -not $raw.Trim()) { return $null }
+        $script:HookPayloadText = $raw
         return ($raw | ConvertFrom-Json -EA Stop)
     } catch { return $null }
+}
+
+function Resolve-RecordHookDir {
+    <#
+      Which directory -Record answers for when the hook payload names a `cwd`. Returns
+      @{ Dir = <path or $null>; Reason = <fault or ''> }. A Reason means NO WRITE.
+
+      THE PAYLOAD CWD IS WHERE THE SESSION IS NOW, NOT WHERE IT STARTED. A session that ran `cd`
+      into a sibling worktree, or into an unrelated repository, carries that directory in `cwd` at
+      every later Stop. Taken as it stands, it put this session's record in the sibling's box, or
+      in the other repository's registry (BACKLOG #5961). scripts/hooks/_hookinput.ps1 is the one
+      place the answer lives: same repository only, a pinned session answers for its pin, an
+      unpinned one only for the checkout the hook started in. It is read -ReadOnly, because a Stop
+      must never write a pin.
+
+      A missing helper is a Reason, not a fallback to the raw `cwd`: the raw `cwd` is the defect.
+    #>
+    $helper = Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks/_hookinput.ps1'
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        return @{ Dir = $null; Reason = "scripts/hooks/_hookinput.ps1 is missing beside this script, so the payload cwd cannot be checked" }
+    }
+    try {
+        . $helper
+        $s = Resolve-CcxHookSession -Text $script:HookPayloadText -ReadOnly
+    } catch {
+        return @{ Dir = $null; Reason = "the hook-input helper failed ($($_.Exception.Message))" }
+    }
+    if ($s.Reason) { return @{ Dir = $null; Reason = [string]$s.Reason } }
+    $dir = if ($s.Root) { [string]$s.Root } elseif ($s.Dir) { [string]$s.Dir } else { $null }
+    return @{ Dir = $dir; Reason = '' }
 }
 
 function Get-SessionKey {
@@ -897,7 +930,16 @@ try {
     $payload = if ($Record) { Read-HookPayload } else { $null }
 
     $wtHint = $Worktree
-    if (-not $wtHint -and $payload -and ($payload.PSObject.Properties.Name -contains 'cwd')) { $wtHint = [string]$payload.cwd }
+    if (-not $wtHint -and $payload -and ($payload.PSObject.Properties.Name -contains 'cwd')) {
+        $hookDir = Resolve-RecordHookDir
+        if ($hookDir.Reason) {
+            # Rule 1 again: a `cwd` this cannot vouch for is no worktree, so NO WRITE, and exit 0
+            # because this is the Stop path.
+            [System.Console]::Error.WriteLine("seat.ps1: the hook payload's cwd was refused, so nothing was recorded: $($hookDir.Reason)")
+            exit 0
+        }
+        $wtHint = $hookDir.Dir
+    }
     $wt = Resolve-Worktree -Hint $wtHint
 
     if (-not $wt) {
