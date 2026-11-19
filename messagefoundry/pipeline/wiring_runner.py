@@ -143,8 +143,9 @@ from messagefoundry.logging_guard import active_guard as active_log_guard
 from messagefoundry.netaddr import (
     ALLOWLIST_MIN_PREFIX_V4,
     ALLOWLIST_MIN_PREFIX_V6,
+    ALLOWLIST_RULE_TEXT,
     allowlist_restricts,
-    allowlist_rule_text,
+    allowlist_shortfall,
 )
 from messagefoundry.parsing import (
     HL7PeekError,
@@ -15981,7 +15982,8 @@ def check_http_tls_exposure(
 
 
 #: The allow-list floors, owned by :mod:`messagefoundry.netaddr` since vault BACKLOG #2622 so the
-#: DICOM server's gate applies the same ones. Kept under these names for the refusal text below.
+#: DICOM server's gate applies the same ones. The refusal text below quotes netaddr's rule text;
+#: these names stay for the tests that pin the floors docs/DEPLOYMENT.md quotes.
 _INTAKE_ALLOWLIST_MIN_PREFIX_V4 = ALLOWLIST_MIN_PREFIX_V4
 _INTAKE_ALLOWLIST_MIN_PREFIX_V6 = ALLOWLIST_MIN_PREFIX_V6
 
@@ -16162,12 +16164,16 @@ def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | N
     if _has_effective_peer_control(source.settings):
         return
 
+    allowlist = source.settings.get("source_ip_allowlist")
+    shortfall = allowlist_shortfall(allowlist) if allowlist else None
     detail = (
         f"inbound connection {name!r} binds non-loopback host {host!r} with no effective peer "
-        "control: anyone who can reach the socket can submit a message. Set intake_auth "
+        "control: anyone who can reach the socket can submit a message. "
+        + (f"The source_ip_allowlist set does not count: {shortfall}. " if shortfall else "")
+        + "Set intake_auth "
         "(api_key/bearer with intake_api_key, or mtls_subject with tls_ca_file + "
-        "intake_client_subjects), or narrow source_ip_allowlist until it counts: "
-        f"{allowlist_rule_text()}. "
+        "intake_client_subjects), or narrow source_ip_allowlist until it counts, which it does "
+        f"when {ALLOWLIST_RULE_TEXT}. "
         "Note that tls + tls_ca_file alone does NOT satisfy this: it accepts any certificate that CA "
         "ever signed, which binds no subject. TLS is confidentiality; this gate is authentication."
     )

@@ -13,18 +13,20 @@ from typing import Any
 
 import pytest
 
+from messagefoundry import netaddr
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.netaddr import (
     ALLOWLIST_MAX_IPV4_ADDRESSES,
+    ALLOWLIST_RULE_TEXT,
     IPV4_EMBEDDING_PREFIXES,
     IPV4_EMBEDDINGS,
     IPV4_MAPPED,
     IPV4_TRANSLATED,
     SIX_TO_FOUR,
     allowlist_restricts,
-    allowlist_rule_text,
+    allowlist_shortfall,
     peer_ip_allowed,
 )
 from messagefoundry.pipeline.wiring_runner import check_http_intake_auth
@@ -105,8 +107,10 @@ def test_the_http_gate_names_an_entry_that_holds_an_ipv4_carrying_prefix() -> No
     with pytest.raises(WiringError) as exc:
         check_http_intake_auth(source, "IB_HTTP", posture=HopPosture(enforcing=True))
     msg = str(exc.value)
-    assert "an IPv6 entry that holds such a prefix, such as 64:ff9b::/32, does not count" in msg
-    assert "must also be at least a /104" in msg
+    assert "does not count: an IPv6 entry holds a prefix that carries IPv4 addresses" in msg
+    assert "no IPv6 entry holds a prefix the gate reads as carrying IPv4" in msg
+    assert "64:ff9b::/32 does" in msg
+    assert "is at least a /104 inside" in msg
 
 
 def test_the_dicom_gate_names_an_entry_that_holds_an_ipv4_carrying_prefix() -> None:
@@ -119,15 +123,20 @@ def test_the_dicom_gate_names_an_entry_that_holds_an_ipv4_carrying_prefix() -> N
     with pytest.raises(ValueError) as exc:
         DicomScpSource(Source(type=ConnectorType.DIMSE, settings=settings))
     msg = str(exc.value)
-    assert "an IPv6 entry that holds such a prefix, such as 64:ff9b::/32, does not count" in msg
-    assert "must also be at least a /104" in msg
+    assert "peer control: an IPv6 entry holds a prefix that carries IPv4 addresses" in msg
+    assert "no IPv6 entry holds a prefix the gate reads as carrying IPv4" in msg
+    assert "64:ff9b::/32 does" in msg
+    assert "is at least a /104 inside" in msg
 
 
 # --- the list judged whole, and one rule text (vault BACKLOG #5393 added items 1 and 2) ----------
 
 
-def _every_other_slash8() -> list[str]:
-    return [f"{octet}.0.0.0/8" for octet in range(0, 256, 2)]
+def _slash8s(*octets: int, prefix: str = "") -> list[str]:
+    """Whole /8 networks, generated rather than written out, as ``prefix`` + ``N.0.0.0`` + its
+    length: /8, or /104 under an IPv6 ``prefix``."""
+    length = 104 if prefix else 8
+    return [f"{prefix}{octet}.0.0.0/{length}" for octet in octets]
 
 
 @pytest.mark.parametrize(
@@ -135,10 +144,13 @@ def _every_other_slash8() -> list[str]:
     [
         # The RFC 1918 private ranges together, a list the cap is set to leave counting.
         ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
-        ["10.0.0.0/8", "127.0.0.0/8"],  # exactly the cap
+        _slash8s(10, 11),  # exactly the cap
         # An IPv4 entry and its IPv4-mapped spelling are one range, counted once.
-        ["10.0.0.0/8", "::ffff:10.0.0.0/104", "127.0.0.0/8"],
-        ["10.0.0.0/8", "10.1.0.0/16", "127.0.0.0/8"],  # an overlap is counted once
+        [*_slash8s(10, 11), "::ffff:10.0.0.0/104"],
+        [*_slash8s(10, 11), "10.1.0.0/16"],  # an overlap is counted once
+        # Space no remote peer can hold is not counted: loopback, "this network", multicast.
+        ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8", "0.0.0.0/8"],
+        [*_slash8s(10, 11), *_slash8s(*range(224, 256))],
         ["10.0.0.0/8", "2001:db8::/32", "2001:db9::/32"],  # plain IPv6 carries no IPv4
     ],
 )
@@ -149,40 +161,59 @@ def test_a_list_within_the_ipv4_cap_restricts(allowlist: list[str]) -> None:
 @pytest.mark.parametrize(
     "allowlist",
     [
-        [f"{octet}.0.0.0/8" for octet in range(256)],  # every /8: the IPv4 internet
-        _every_other_slash8(),  # half of it, with no two entries adjacent
-        ["10.0.0.0/8", "127.0.0.0/8", "224.0.0.0/8"],
-        [f"::ffff:{octet}.0.0.0/104" for octet in range(256)],  # the internet, IPv4-mapped
-        ["10.0.0.0/8", "::ffff:127.0.0.0/104", "224.0.0.0/8"],
-        [f"64:ff9b::{octet}.0.0.0/104" for octet in range(3)],  # through NAT64
+        _slash8s(*range(256)),  # every /8: the IPv4 internet
+        _slash8s(*range(0, 256, 2)),  # half of it, with no two entries adjacent
+        _slash8s(10, 11, 12),
+        _slash8s(*range(256), prefix="::ffff:"),  # the internet, IPv4-mapped
+        [*_slash8s(10, 12), *_slash8s(11, prefix="::ffff:")],
+        _slash8s(10, 11, 12, prefix="64:ff9b::"),  # through NAT64
         # The same hosts through NAT64 are counted apart from their plain IPv4 spelling.
-        ["10.0.0.0/8", "64:ff9b::10.0.0.0/104", "127.0.0.0/8"],
+        [*_slash8s(10, 11), *_slash8s(10, prefix="64:ff9b::")],
         [f"2002:{index:x}::/32" for index in range(513)],  # 513 IPv4 /16s through 6to4
     ],
 )
 def test_entries_that_together_pass_the_ipv4_cap_do_not_restrict(allowlist: list[str]) -> None:
     assert allowlist_restricts(allowlist) is False
+    assert "IPv4 addresses a remote peer can hold, more than" in (
+        allowlist_shortfall(allowlist) or ""
+    )
 
 
 def test_the_cap_is_twice_the_ipv4_floor() -> None:
     assert 2 * ipaddress.ip_network("10.0.0.0/8").num_addresses == ALLOWLIST_MAX_IPV4_ADDRESSES
 
 
-def test_one_embedding_table_serves_every_reader() -> None:
+def test_one_embedding_table_serves_the_allowlist_and_the_proxy_span() -> None:
     ranges = [network for network, _start in IPV4_EMBEDDINGS]
-    # The two readers once held different tables (SIIT in one, 6to4 in the other).
-    assert IPV4_TRANSLATED in IPV4_EMBEDDING_PREFIXES
-    assert SIX_TO_FOUR in ranges
-    assert set(IPV4_EMBEDDING_PREFIXES) == set(ranges) - {IPV4_MAPPED}
+    # The two tables once disagreed (SIIT in one, 6to4 in the other); both now read this one.
+    assert {SIX_TO_FOUR, IPV4_TRANSLATED} <= set(ranges)
+    # The span count leaves out the mapped block, read as IPv4 first, and SIIT, which the budget
+    # keys on its /64; every other range is the table's.
+    assert set(IPV4_EMBEDDING_PREFIXES) == set(ranges) - {IPV4_MAPPED, IPV4_TRANSLATED}
     # Disjoint, which the whole-list count relies on to place an entry in one range.
     assert not any(a.overlaps(b) for i, a in enumerate(ranges) for b in ranges[i + 1 :])
 
 
-def test_both_gates_quote_the_one_rule_text() -> None:
-    rule = allowlist_rule_text()
+def test_the_ranges_the_rule_text_names_start_their_ipv4_at_bit_96() -> None:
+    starts = {str(network): start for network, start in IPV4_EMBEDDINGS}
+    for spelled in netaddr._RULE_TEXT_LATE_RANGES:
+        network = ipaddress.ip_network(spelled)
+        assert any(network == other for other, _start in IPV4_EMBEDDINGS), spelled
+        assert starts[str(network)] == 96, spelled
+        assert spelled in ALLOWLIST_RULE_TEXT
+
+
+def test_a_6to4_entry_at_the_ipv6_floor_restricts() -> None:
+    # 6to4's IPv4 address starts at bit 16, so the /104 the rule text names for the others does
+    # not bind it: a /32 there fixes 16 IPv4 bits.
+    assert allowlist_restricts(["2002:a00::/32"]) is True
+
+
+def test_both_gates_quote_the_one_rule_text_and_name_the_cap() -> None:
+    rule = ALLOWLIST_RULE_TEXT
     assert "/104" in rule and "64:ff9b::/32" in rule
     assert f"{ALLOWLIST_MAX_IPV4_ADDRESSES:,} IPv4 addresses" in rule
-    wide = _every_other_slash8()
+    wide = _slash8s(*range(0, 256, 2))
     http = Source(
         type=ConnectorType.HTTP,
         settings={"host": "0.0.0.0", "port": 8080, "source_ip_allowlist": wide},
@@ -200,5 +231,8 @@ def test_both_gates_quote_the_one_rule_text() -> None:
     )
     with pytest.raises(ValueError) as dicom_exc:
         DicomScpSource(dicom)
-    assert rule in str(http_exc.value)
-    assert rule in str(dicom_exc.value)
+    shortfall = allowlist_shortfall(wide)
+    assert shortfall is not None and "more than" in shortfall
+    for msg in (str(http_exc.value), str(dicom_exc.value)):
+        assert rule in msg
+        assert shortfall in msg  # which rule failed, not only the whole rule

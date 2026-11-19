@@ -51,6 +51,7 @@ import sys
 import threading
 import tokenize
 import traceback
+import unicodedata
 import urllib.parse
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
@@ -6758,15 +6759,15 @@ def case_twins(names: Iterable[str]) -> Iterator[tuple[str, str]]:
     #5392). A SQL Server store with a case-insensitive default collation compares the queue,
     response and scope rows a connection name keys without case, so two such connections would
     share them there while SQLite and Postgres keep them apart. A connection or FHIR lookup name is
-    ASCII (the name rule), so ``casefold`` is exactly that collation's comparison for it; trailing
-    spaces and width, which SQL Server also ignores, cannot occur in one. A reference set or
-    database lookup name is not bound by the name rule, so for a non-ASCII one ``casefold`` only
-    approximates the collation; where the two differ, it can refuse a pair the collation keeps
-    apart, which fails closed. Per table: an inbound and an outbound may share a name, as they may
-    exactly."""
+    ASCII (the name rule), so the fold is exactly that collation's comparison for it. A reference
+    set or database lookup name is not bound by the name rule, so the fold also drops trailing
+    spaces, which SQL Server's ``=`` ignores, and applies NFKC, which folds the width a ``_CI_AS``
+    collation ignores. It still only approximates the collation for such a name: at least kana
+    differences, which that collation also ignores, are not folded, so a pair differing only there
+    passes. Per table: an inbound and an outbound may share a name, as they may exactly."""
     seen: dict[str, str] = {}
     for name in names:
-        first = seen.setdefault(name.casefold(), name)
+        first = seen.setdefault(unicodedata.normalize("NFKC", name).casefold().rstrip(" "), name)
         if first != name:
             yield first, name
 
@@ -6999,7 +7000,8 @@ class Registry:
         for _rename_kind, attribute, kind in CASE_TWIN_TABLES:
             for first, second in case_twins(getattr(self, attribute)):
                 yield (
-                    f"duplicate {kind} name: {second!r} differs only in case from {first!r}, and "
+                    f"duplicate {kind} name: {second!r} differs only in case, width or trailing "
+                    f"spaces from {first!r}, and "
                     "a SQL Server store column that compares without case would read the records "
                     "naming the two as one"
                 )

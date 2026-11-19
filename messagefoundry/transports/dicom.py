@@ -94,7 +94,7 @@ from messagefoundry.config.tls_policy import (
     skips_validity_period,
 )
 from messagefoundry.keywrap import load_connection_cert_chain
-from messagefoundry.netaddr import allowlist_restricts, allowlist_rule_text
+from messagefoundry.netaddr import ALLOWLIST_RULE_TEXT, allowlist_restricts, allowlist_shortfall
 from messagefoundry.parsing.binary import BinaryCarriageError
 from messagefoundry.parsing.binary import decode as _carriage_decode
 from messagefoundry.parsing.dicom import _inflate as _dicom_inflate
@@ -1991,9 +1991,10 @@ class DicomScpSource(SourceConnector):
                 else ""
             )
             too_wide = (
-                " You set source_ip_allowlist, but it restricts nobody it can be shown to, so it"
-                f" does not count. It counts only when {allowlist_rule_text()} (vault BACKLOG"
-                " #2622, #5393). Narrow every entry, or list fewer."
+                " You set source_ip_allowlist, but it does not count as a peer control:"
+                f" {allowlist_shortfall(self._source_ip_allowlist)}. It counts only when"
+                f" {ALLOWLIST_RULE_TEXT} (vault BACKLOG #2622, #5393). Narrow every entry, or list"
+                " fewer."
                 if self._source_ip_allowlist
                 else ""
             )

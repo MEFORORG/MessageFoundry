@@ -19,7 +19,7 @@ import pytest
 
 from messagefoundry import connection_names
 from messagefoundry.api import validation
-from messagefoundry.config import wiring
+from messagefoundry.config import impact, wiring
 from messagefoundry.config.connections_edit import upsert_connection
 from messagefoundry.config.impact import RENAMEABLE_KINDS, plan_rename
 from messagefoundry.config.wiring import WiringError, load_config
@@ -393,8 +393,29 @@ def test_a_lookup_rename_onto_a_case_twin_is_refused_at_plan_time(
     plan_rename(registry, config, kind, "CLAR", "clar")
 
 
-def test_every_twin_table_is_a_registry_table_and_a_rename_kind() -> None:
+def test_every_twin_table_pairs_a_rename_kind_with_its_own_registry_table() -> None:
     registry = wiring.Registry()
     for rename_kind, attribute, _label in wiring.CASE_TWIN_TABLES:
         assert rename_kind in RENAMEABLE_KINDS
-        assert isinstance(getattr(registry, attribute), dict)
+        # The table plan_rename checks is the one graph_problems checks, not merely a table.
+        assert getattr(registry, attribute) is impact._table(registry, rename_kind)
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [("EPIC", "EPIC "), ("EPIC", "ＥＰＩＣ")],  # a trailing space; full width
+    ids=["trailing_space", "full_width"],
+)
+def test_a_reference_twin_by_width_or_trailing_space_is_refused(
+    tmp_path: Path, first: str, second: str
+) -> None:
+    # A reference set name is not bound by the name rule, and SQL Server's `=` ignores a trailing
+    # space and a _CI_AS collation ignores width, so casefold alone would let these load.
+    (tmp_path / "refs.py").write_text(
+        "from messagefoundry import DatabaseRef, Reference\n"
+        + "\n".join(_REFERENCE_CALL.format(name=name) for name in (first, second))
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match="duplicate reference set name: .*differs only in case"):
+        load_config(tmp_path, allow_empty=True)

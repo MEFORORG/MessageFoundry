@@ -32,6 +32,7 @@ __all__ = [
     "ALLOWLIST_MAX_IPV4_ADDRESSES",
     "ALLOWLIST_MIN_PREFIX_V4",
     "ALLOWLIST_MIN_PREFIX_V6",
+    "ALLOWLIST_RULE_TEXT",
     "IPV4_COMPATIBLE",
     "IPV4_EMBEDDINGS",
     "IPV4_EMBEDDING_PREFIXES",
@@ -43,7 +44,7 @@ __all__ = [
     "SIX_TO_FOUR",
     "TEREDO",
     "allowlist_restricts",
-    "allowlist_rule_text",
+    "allowlist_shortfall",
     "client_network_allowed",
     "host_address",
     "ipv4_meaning",
@@ -87,9 +88,10 @@ IPV4_COMPATIBLE: Final = ipaddress.IPv6Network("::/96")
 _LATE_IPV4_START: Final = 96
 
 #: THE table of IPv6 ranges that carry an IPv4 address, each with the bit at which the IPv4
-#: address is taken to start (vault BACKLOG #5393: one table, so no two readers disagree on which
-#: ranges carry IPv4). :func:`allowlist_restricts` reads all of it. A network-specific NAT64 prefix
-#: is the operator's own and cannot be listed.
+#: address is taken to start (vault BACKLOG #5393: one table where there were two that disagreed
+#: on SIIT and 6to4). :func:`allowlist_restricts` reads all of it, and
+#: :data:`IPV4_EMBEDDING_PREFIXES` is derived from it. A network-specific NAT64 prefix is the
+#: operator's own and cannot be listed.
 IPV4_EMBEDDINGS: Final[tuple[tuple[ipaddress.IPv6Network, int], ...]] = (
     (IPV4_MAPPED, _LATE_IPV4_START),  # how a dual-stack socket reports an IPv4 peer
     (IPV4_COMPATIBLE, _LATE_IPV4_START),
@@ -100,14 +102,27 @@ IPV4_EMBEDDINGS: Final[tuple[tuple[ipaddress.IPv6Network, int], ...]] = (
     (SIX_TO_FOUR, 16),  # 2002:V4ADDR::/48
 )
 
-#: The ranges of :data:`IPV4_EMBEDDINGS` other than the IPv4-mapped block, which a reader that
-#: first turns a mapped range into the IPv4 range it names (:func:`ipv4_meaning`) handles apart.
-#: The span limit on the HTTP listener's ``trusted_proxies`` (``config.listener_proxies``) reads
-#: it (BACKLOG #5525). The listener's budget keying, at least ``_budget_key``,
-#: ``_embedded_client`` and ``_is_phantom``, reads the named constants above instead, and does not
-#: read SIIT as carrying an IPv4 client.
+#: The ranges of :data:`IPV4_EMBEDDINGS` whose addresses the HTTP listener's failed-attempt budget
+#: does not key on their ``/64``, read by the span limit on its ``trusted_proxies``
+#: (``config.listener_proxies``, BACKLOG #5525), which must count keys the way the budget makes
+#: them. Two are left out. The IPv4-mapped block is read as the IPv4 range it names
+#: (:func:`ipv4_meaning`) before this is asked. SIIT is left out because the budget keying, at
+#: least ``_budget_key``, ``_embedded_client`` and ``_is_phantom``, does not read it as carrying an
+#: IPv4 client and keys its addresses on their ``/64``. That keying reads ``NAT64_WELL_KNOWN``,
+#: ``NAT64_LOCAL_USE``, ``IPV4_COMPATIBLE`` and ``ipaddress``'s Teredo and 6to4 readings, not this
+#: table.
 IPV4_EMBEDDING_PREFIXES: Final = tuple(
-    network for network, _start in IPV4_EMBEDDINGS if network != IPV4_MAPPED
+    network for network, _start in IPV4_EMBEDDINGS if network not in (IPV4_MAPPED, IPV4_TRANSLATED)
+)
+
+#: IPv4 space no remote peer can hold as its source: "this network", loopback, multicast and the
+#: reserved class E block with the limited broadcast address, the last two together as one /3. The
+#: whole-list count in :func:`allowlist_shortfall` leaves it out, so listing ``127.0.0.0/8`` beside
+#: the private ranges does not use up the cap.
+_NOT_A_PEER_V4: Final = (
+    ipaddress.IPv4Network("0.0.0.0/8"),
+    ipaddress.IPv4Network("127.0.0.0/8"),
+    ipaddress.IPv4Network("224.0.0.0/3"),
 )
 
 #: RFC 1122's "this network" block. ``ipaddress`` names only its first address, as unspecified: it
@@ -261,22 +276,25 @@ _ALLOWLIST_ENTRY_TYPES: Final = (
 # in IPV4_EMBEDDINGS for the whole-list count, where each such entry still admits IPv4 addresses.
 
 
-def allowlist_rule_text() -> str:
-    """The rule :func:`allowlist_restricts` applies, as one clause both gates' refusals quote, so
-    the floors, the examples and the derived ``/104`` are stated once, from the constants (vault
-    BACKLOG #5393)."""
-    late = (IPV4_MAPPED, NAT64_WELL_KNOWN, TEREDO)
-    holder = NAT64_WELL_KNOWN.supernet(new_prefix=ALLOWLIST_MIN_PREFIX_V6)
-    return (
-        "no entry may fail to parse or be wider than "
-        f"/{ALLOWLIST_MIN_PREFIX_V4} (IPv4) or /{ALLOWLIST_MIN_PREFIX_V6} (IPv6); an IPv6 entry inside a prefix the gate reads as "
-        f"carrying IPv4 addresses (at least {', '.join(str(net) for net in late)}) must also be "
-        f"at least a /{_LATE_IPV4_START + ALLOWLIST_MIN_PREFIX_V4}, and an IPv6 entry that holds "
-        f"such a prefix, such as {holder}, does not count; and the entries together may admit at "
-        f"most {ALLOWLIST_MAX_IPV4_ADDRESSES:,} IPv4 addresses, two /{ALLOWLIST_MIN_PREFIX_V4} "
-        "networks' worth, an IPv6 entry inside such a prefix counting the IPv4 addresses it can "
-        "carry"
-    )
+#: Ranges of :data:`IPV4_EMBEDDINGS` whose IPv4 address starts at bit 96, named in
+#: :data:`ALLOWLIST_RULE_TEXT` as written there; ``str()`` of the mapped block prints it dotted.
+#: tests/test_allowlist_restricts.py pins them to the table.
+_RULE_TEXT_LATE_RANGES: Final = ("::ffff:0:0/96", "64:ff9b::/96", "2001::/32")
+
+#: The rule :func:`allowlist_restricts` applies, as one clause both gates' refusals quote, so the
+#: floors, the examples and the derived ``/104`` are stated once in code (vault BACKLOG #5393).
+ALLOWLIST_RULE_TEXT: Final = (
+    f"every entry parses and is no wider than /{ALLOWLIST_MIN_PREFIX_V4} (IPv4) or "
+    f"/{ALLOWLIST_MIN_PREFIX_V6} (IPv6); no IPv6 entry holds a prefix the gate reads as carrying "
+    "IPv4 addresses, as "
+    f"{NAT64_WELL_KNOWN.supernet(new_prefix=ALLOWLIST_MIN_PREFIX_V6)} does; an IPv6 entry inside "
+    f"one fixes at least {ALLOWLIST_MIN_PREFIX_V4} bits of the IPv4 address it carries, so is at "
+    f"least a /{_LATE_IPV4_START + ALLOWLIST_MIN_PREFIX_V4} inside "
+    f"{', '.join(_RULE_TEXT_LATE_RANGES[:-1])} or {_RULE_TEXT_LATE_RANGES[-1]}; and the entries "
+    f"together admit at most {ALLOWLIST_MAX_IPV4_ADDRESSES:,} IPv4 addresses a remote peer can "
+    f"hold, two /{ALLOWLIST_MIN_PREFIX_V4} networks' worth, an IPv6 entry inside such a prefix "
+    "counting the IPv4 addresses it can carry"
+)
 
 
 def _embedded_ipv4(net: ipaddress.IPv6Network, ipv4_start: int) -> ipaddress.IPv4Network:
@@ -287,9 +305,29 @@ def _embedded_ipv4(net: ipaddress.IPv6Network, ipv4_start: int) -> ipaddress.IPv
     return ipaddress.IPv4Network((value, fixed), strict=False)
 
 
+def _peer_addresses(blocks: list[ipaddress.IPv4Network]) -> int:
+    """How many addresses in ``blocks``, already collapsed so disjoint, a remote peer can hold."""
+    total = 0
+    for block in blocks:
+        total += block.num_addresses
+        for excluded in _NOT_A_PEER_V4:
+            # Aligned networks either nest or are disjoint, and the excluded ones are disjoint.
+            if block.subnet_of(excluded):
+                total -= block.num_addresses
+            elif excluded.subnet_of(block):
+                total -= excluded.num_addresses
+    return total
+
+
 def allowlist_restricts(allowlist: Any) -> bool:
     """Whether a ``source_ip_allowlist`` actually limits who may connect, so a gate may count it as
-    a peer control.
+    a peer control: :func:`allowlist_shortfall` finds nothing wrong with it."""
+    return allowlist_shortfall(allowlist) is None
+
+
+def allowlist_shortfall(allowlist: Any) -> str | None:
+    """Why a ``source_ip_allowlist`` does not count as a peer control, or ``None`` when it does. The
+    reason names the rule that failed and quotes no entry, so a refusal can carry it.
 
     **Strength-based, not presence-based.** ``["0.0.0.0/0"]`` parses fine and restricts nobody. So
     every entry must be at least a :data:`ALLOWLIST_MIN_PREFIX_V4` (IPv4) or
@@ -313,40 +351,50 @@ def allowlist_restricts(allowlist: Any) -> bool:
     :data:`ALLOWLIST_MAX_IPV4_ADDRESSES`. Plain IPv4 entries and IPv4-mapped ones are one space,
     where an overlap is counted once. Each other range in :data:`IPV4_EMBEDDINGS` is counted
     apart, since its addresses cannot be matched to plain IPv4 ones with certainty, so the same
-    hosts listed under two ranges count twice, which can only fail closed. Plain IPv6 entries
-    outside those ranges are judged by the per-entry floor alone."""
+    hosts listed under two ranges count twice, which can only fail closed. In the plain IPv4
+    space, address space no remote peer can hold (:data:`_NOT_A_PEER_V4`) is not counted. Plain
+    IPv6 entries outside those ranges are judged by the per-entry floor alone."""
     if not isinstance(allowlist, (list, tuple, set, frozenset)) or not allowlist:
-        return False
+        return "it is not a non-empty list of addresses and networks"
     # The IPv4 ranges the list admits, keyed by the embedding range they arrive under, or by None
     # for plain IPv4 and IPv4-mapped entries.
     admitted: dict[ipaddress.IPv6Network | None, list[ipaddress.IPv4Network]] = {}
     for entry in allowlist:
         if not isinstance(entry, _ALLOWLIST_ENTRY_TYPES):
-            return False
+            return "an entry is not an address or network"
         try:
             net = ipaddress.ip_network(entry, strict=False)
         except ValueError:
-            return False
+            return "an entry does not parse"
         if isinstance(net, ipaddress.IPv4Network):
             if net.prefixlen < ALLOWLIST_MIN_PREFIX_V4:
-                return False
+                return f"an IPv4 entry is wider than /{ALLOWLIST_MIN_PREFIX_V4}"
             admitted.setdefault(None, []).append(net)
             continue
         if net.prefixlen < ALLOWLIST_MIN_PREFIX_V6:
-            return False
+            return f"an IPv6 entry is wider than /{ALLOWLIST_MIN_PREFIX_V6}"
         for embedding, ipv4_start in IPV4_EMBEDDINGS:
             if not net.overlaps(embedding):
                 continue
             if net.prefixlen < embedding.prefixlen:
-                return False  # it holds the whole range, so every embedded IPv4 address
+                # It holds the whole range, so every embedded IPv4 address.
+                return "an IPv6 entry holds a prefix that carries IPv4 addresses"
             if net.prefixlen - ipv4_start < ALLOWLIST_MIN_PREFIX_V4:
-                return False
+                return (
+                    "an IPv6 entry inside a prefix that carries IPv4 addresses fixes fewer than "
+                    f"{ALLOWLIST_MIN_PREFIX_V4} bits of the IPv4 address"
+                )
             # Overlapping and no wider, so inside it, and the ranges are disjoint: one match.
             key = None if embedding == IPV4_MAPPED else embedding
             admitted.setdefault(key, []).append(_embedded_ipv4(net, ipv4_start))
-    total = sum(
-        block.num_addresses
-        for ranges in admitted.values()
-        for block in ipaddress.collapse_addresses(ranges)
-    )
-    return total <= ALLOWLIST_MAX_IPV4_ADDRESSES
+    total = 0
+    for key, ranges in admitted.items():
+        blocks = list(ipaddress.collapse_addresses(ranges))
+        # Only the plain space can be matched to the excluded blocks: Teredo, for one, inverts it.
+        total += _peer_addresses(blocks) if key is None else sum(b.num_addresses for b in blocks)
+    if total > ALLOWLIST_MAX_IPV4_ADDRESSES:
+        return (
+            f"the entries together admit {total:,} IPv4 addresses a remote peer can hold, more "
+            f"than {ALLOWLIST_MAX_IPV4_ADDRESSES:,}"
+        )
+    return None
