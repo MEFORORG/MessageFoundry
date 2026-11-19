@@ -257,6 +257,15 @@ this line.**
 
 ### Fixed
 
+- **The High Availability pages degrade when the store does not answer.** The page, its live
+  fragment and both step-down confirm pages read the cluster membership and lease rows with no error
+  handling, so a store timeout or outage answered with an error body in place of the page. The page
+  and its fragment now show this node's in-memory status and the reason, with no node list and no
+  step-down control, and the confirm pages show the reason with no form. The page and the confirm
+  pages answer 503, and the live fragment answers 200 so the poller replaces the last view. The role shown is the node's
+  in-memory one and is marked unconfirmed. These pages log the failure once per run of failed reads.
+  (BACKLOG #5932)
+
 - **Federated sign-in and the IdP step-up reach the identity provider.** `POST /ui/oidc/start` and
   `POST /ui/reauth/oidc` answered with a 303 to the IdP, which Chromium blocks under the console's
   `form-action 'self'` because it checks that directive again on the redirect after a form POST.

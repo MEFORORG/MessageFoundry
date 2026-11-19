@@ -372,8 +372,8 @@ meets what any empty body meets. What each source does with a non-empty one, at 
 
 - **MLLP and TCP listeners** record each body as an `ERROR` row. Where the inbound sends HL7
   replies, the answer is `AE`; a non-HL7 inbound gets no `AE`. **An `X12()` listener** records the
-  row too, and sends no `AE` either: an `x12` inbound owes no HL7 reply, and one that declares HL7
-  encodes its reply in the inbound's own charset, which fails.
+  row too. An `x12` inbound owes no HL7 reply and gets no `AE`; one that declares HL7 gets its
+  `AE` in utf-8, as the MLLP and TCP listeners send theirs (BACKLOG #5958).
 - **`Http()`** records the row and answers `503` with **no** `Retry-After`.
 - **A DICOM SCP** never decodes: its inbound must declare a binary `content_type` such as `dicom`,
   and one that declares a text type is refused when the config loads. Should a configuration
