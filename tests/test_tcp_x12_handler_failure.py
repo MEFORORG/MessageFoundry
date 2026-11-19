@@ -560,3 +560,44 @@ async def test_x12_a_refused_reply_on_a_no_reply_inbound_carries_on(
     assert not writer.written
     assert _unhandled_lines(caplog) == []
     assert not any("SYNTH" in r.getMessage() for r in caplog.records), "the reply is never logged"
+
+
+async def _cancel_mid_read(data: bytes, **settings: object) -> None:
+    """Cancel a no-reply listener's client task while its handler hangs on the first interchange
+    of ``data``, as a stop past its grace does."""
+    source = _no_reply(lambda: _x12(**settings))
+    handler = _Blocking()
+    events: list[Event] = []
+    source.on_connection_event = _sink(events)  # type: ignore[assignment]
+    source._handler = handler
+    client = asyncio.create_task(source._on_client(_ThenEof(data), _Peer()))  # type: ignore[arg-type]
+    await asyncio.wait_for(handler.blocked.wait(), timeout=2.0)
+    client.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(client, timeout=2.0)
+
+
+async def test_x12_an_over_cap_only_remainder_on_a_no_resend_inbound_is_an_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The over-cap interchange behind the one in hand is a complete loss this sender never
+    # resends, so it is logged at ERROR like a counted one, not at WARNING.
+    big = EDI.replace(b"~IEA", b"~" + b"X" * 64 + b"~IEA", 1)
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.transports.x12"):
+        await _cancel_mid_read(EDI + big, max_interchange_bytes=len(EDI) + 16)
+    lines = [r for r in caplog.records if "not handed to the pipeline" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelno == logging.ERROR
+    assert "over-cap interchange" in lines[0].getMessage()
+
+
+async def test_x12_a_partial_the_listener_cuts_off_is_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A stop that cancels the connection cuts off an interchange still arriving: the listener did
+    # that, not the peer, so the note is visible at WARNING rather than hidden at DEBUG.
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.transports.x12"):
+        await _cancel_mid_read(EDI + EDI[:200])
+    lines = [r for r in caplog.records if "not handed to the pipeline" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelno == logging.WARNING
+    assert "closed with 0 complete interchange(s)" in lines[0].getMessage()
+    assert "a partial interchange still arriving" in lines[0].getMessage()

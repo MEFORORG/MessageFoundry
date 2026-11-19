@@ -866,7 +866,12 @@ class X12Source(SourceConnector):
             raise
 
     def _report_unhandled(
-        self, frames: Iterator[bytes], decoder: X12FrameReader | None, peer: object
+        self,
+        frames: Iterator[bytes],
+        decoder: X12FrameReader | None,
+        peer: object,
+        *,
+        listener_cut: bool,
     ) -> None:
         """Count, and log, the complete interchanges of the last read that a close leaves unhandled
         (BACKLOG #5971).
@@ -878,9 +883,11 @@ class X12Source(SourceConnector):
         decoder's generator only reassembles bytes already in memory; it does no I/O and hands
         nothing on. The count is the record: no frame content is logged. A sender waiting for a
         reply resends on the close; one that waits for none never does (``hold_and_retry``), so for
-        it the loss of a complete interchange is final and is logged at ERROR. A remainder that is
-        only a partial interchange loses nothing complete and is logged at DEBUG, so line noise or
-        connection churn cannot flood the log.
+        it the loss of a complete interchange, an over-cap one included, is final and is logged at
+        ERROR. A remainder that is only a partial interchange is logged at WARNING where the
+        listener cut it off (``listener_cut``: a stop's cancel, or a close the listener chose), and
+        at DEBUG on a close the peer made (EOF, idle, frame deadline, reset), where nothing complete
+        was lost, so line noise or connection churn cannot flood the log.
         """
         left = 0
         over_cap = False
@@ -902,12 +909,12 @@ class X12Source(SourceConnector):
             return
         resends = owes_hl7_reply(self.ack_mode, self.content_type)
         # ERROR only for complete interchanges a non-resending sender has lost. A partial-only
-        # remainder is an ordinary close (EOF, idle, frame deadline) or line noise such as a stray
-        # "ISA": nothing complete was lost, and a line per close at WARNING could be flooded by
-        # connection churn, so it stays at DEBUG.
-        if left and not resends:
-            level = logging.ERROR
-        elif left or over_cap:
+        # remainder on a close the peer made (EOF, idle, frame deadline, reset) or from line noise
+        # such as a stray "ISA" lost nothing complete, and a line per close at WARNING could be
+        # flooded by connection churn, so it stays at DEBUG.
+        if left or over_cap:
+            level = logging.WARNING if resends else logging.ERROR
+        elif listener_cut:
             level = logging.WARNING
         else:
             level = logging.DEBUG
@@ -949,6 +956,7 @@ class X12Source(SourceConnector):
             # The interchanges of the read in hand; whatever a close leaves in it is counted below.
             frames: Iterator[bytes] = iter(())
             decoder: X12FrameReader | None = None
+            cancelled = reset = False  # who ended the connection, for the remainder's log level
             try:
                 # Inside the try whose finally releases the slot, so a cancellation delivered at
                 # this await cannot leak a per-host count.
@@ -1097,11 +1105,19 @@ class X12Source(SourceConnector):
                         trailer_only=decoder.trailer_only,
                     )
             except OSError as exc:
-                failed = True  # peer reset; nothing to do but drop the connection
+                failed = reset = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
+            except asyncio.CancelledError:
+                cancelled = True  # a stop past its grace
+                raise
             finally:
                 try:
-                    self._report_unhandled(frames, decoder, writer.get_extra_info("peername"))
+                    self._report_unhandled(
+                        frames,
+                        decoder,
+                        writer.get_extra_info("peername"),
+                        listener_cut=cancelled or (failed and not reset),
+                    )
                 finally:
                     self._admission.release(peer_host, epoch)
         finally:
