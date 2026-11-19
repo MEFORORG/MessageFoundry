@@ -38,6 +38,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -247,8 +248,8 @@ def test_the_runners_own_exit_code_is_not_one_of_prune_merged() -> None:
             r"^\$EXIT_\w+\s*=\s*(\d+)", PRUNE.read_text(encoding="utf-8"), re.MULTILINE
         )
     }
-    found = re.search(r"^\$EXIT_STOPPED = (\d+)", RUNNER.read_text(encoding="utf-8"), re.MULTILINE)
-    assert found, "run-daily-prune.ps1 no longer declares $EXIT_STOPPED"
+    found = re.search(r"^\$EXIT_DEADLINE = (\d+)", RUNNER.read_text(encoding="utf-8"), re.MULTILINE)
+    assert found, "run-daily-prune.ps1 no longer declares $EXIT_DEADLINE"
     assert int(found.group(1)) > max(declared), (found.group(1), sorted(declared))
 
 
@@ -674,18 +675,18 @@ TIMED_OUT_LINE = re.compile(
 )
 
 
-def _kill_if_alive(pid_file: Path) -> bool:
+def _kill_if_alive(pid_file: Path, since: float) -> bool:
     """True when the grandchild the hanging stub started was still running. Kills it either way."""
     if not pid_file.is_file():
         return False
     try:
         child = psutil.Process(int(pid_file.read_text(encoding="utf-8").strip()))
-    except psutil.NoSuchProcess:
+        # A recycled pid names some other process; only a pwsh started after the test began is ours.
+        if "pwsh" not in child.name().lower() or child.create_time() < since:
+            return False
+        child.kill()
+    except psutil.Error:
         return False
-    # A recycled pid names some other process; only a pwsh started after the test began is ours.
-    if "pwsh" not in child.name().lower():
-        return False
-    child.kill()
     return True
 
 
@@ -696,26 +697,28 @@ def test_a_prune_run_past_the_deadline_is_killed_with_its_tree_and_the_run_still
 ) -> None:
     """A hung prune-merged.ps1 used to run on into Task Scheduler's kill, which writes nothing.
 
-    With a 3-second deadline the stub is killed with its grandchild, the log keeps what it printed
+    With a 12-second deadline the stub is killed with its grandchild, the log keeps what it printed
     before the hang, then the TIMED OUT line, any later step's SKIPPED line, and the exit line, and the
-    run exits 4, STOPPED. On origin/main the child ran its full 40 seconds and the run exited 0.
+    run exits 4, DEADLINE. On origin/main the child ran its full 40 seconds and the run exited 0.
     """
     grandchild = tmp_path / "grandchild.pid"
+    since = time.time() - 1
     try:
         proc, text = run_copied_runner(
             tmp_path,
             "-RepoRoot",
             str(tmp_path),
             "-StopAfterMinutes",
-            "0.05",
+            "0.2",
             *(["-RemoveFinishedClaudeWorktrees"] if step else []),
             prune_stub=HANGING_PRUNE_STUB,
             extra={"finished-worktree-removal.ps1": REMOVING_HELPER_STUB} if step else None,
             env_extra={"T_GRANDCHILD": str(grandchild), "T_OUTCOME": "REMOVED"},
         )
     finally:
-        grandchild_survived = _kill_if_alive(grandchild)
+        grandchild_survived = _kill_if_alive(grandchild, since)
     assert text is not None, proc.stdout + proc.stderr
+    assert grandchild.is_file(), f"the stub never reached its hang, so nothing was tested: {text}"
     assert not grandchild_survived, f"the kill missed the stub's own child: {text}"
     lines = text.splitlines()
     assert "stub before the hang" in lines, text
@@ -729,7 +732,7 @@ def test_a_prune_run_past_the_deadline_is_killed_with_its_tree_and_the_run_still
             "deadline (stopAfter="
         ) in text, text
         assert "listed finished:" not in text, text
-    assert re.match(r"=== exit 4 \(STOPPED -- .*\) at \d\d:\d\d:\d\d ===$", lines[-1]), text
+    assert re.match(r"=== exit 4 \(DEADLINE -- .*\) at \d\d:\d\d:\d\d ===$", lines[-1]), text
     assert proc.returncode == 4, proc.stdout + proc.stderr
 
 
@@ -743,13 +746,14 @@ def test_a_listing_run_past_the_deadline_is_killed_and_the_step_is_skipped(
     tree, and the stop raises the code over the prune's 2. On origin/main the listing ran 40 seconds.
     """
     grandchild = tmp_path / "grandchild.pid"
+    since = time.time() - 1
     try:
         proc, text = run_copied_runner(
             tmp_path,
             "-RepoRoot",
             str(tmp_path),
             "-StopAfterMinutes",
-            "0.05",
+            "0.2",
             "-Apply",
             "-RemoveFinishedClaudeWorktrees",
             prune_stub=HANGING_PRUNE_STUB.replace(
@@ -759,8 +763,9 @@ def test_a_listing_run_past_the_deadline_is_killed_and_the_step_is_skipped(
             env_extra={"T_GRANDCHILD": str(grandchild), "T_OUTCOME": "REMOVED", "T_LIST_ONLY": "1"},
         )
     finally:
-        grandchild_survived = _kill_if_alive(grandchild)
+        grandchild_survived = _kill_if_alive(grandchild, since)
     assert text is not None, proc.stdout + proc.stderr
+    assert grandchild.is_file(), f"the stub never reached its hang, so nothing was tested: {text}"
     assert not grandchild_survived, f"the kill missed the stub's own child: {text}"
     assert re.search(r"^--- prune-merged\.ps1 exit 2 at ", text, re.MULTILINE), text
     assert "  stderr: stub stderr before the hang" in text, text
@@ -769,14 +774,27 @@ def test_a_listing_run_past_the_deadline_is_killed_and_the_step_is_skipped(
         "=== finished .claude/worktrees: SKIPPED, the listing run was killed at the run's deadline"
     ) in text, text
     assert "REMOVED" not in text, text
-    assert re.match(r"=== exit 4 \(STOPPED", text.splitlines()[-1]), text
+    assert re.match(r"=== exit 4 \(DEADLINE", text.splitlines()[-1]), text
     assert proc.returncode == 4, proc.stdout + proc.stderr
 
 
-# The REFUSING stub's listing, with a line on stderr as well, which must be logged and kept out of the
-# JSON whichever way the listing run was started.
-NOISY_LISTING_STUB = REFUSING_PRUNE_STUB.replace(
-    "if ($Json) {\n", "if ($Json) {\n  [Console]::Error.WriteLine('stub listing warning')\n"
+# The REFUSING stub's one finished row, with a line on stderr, which must be logged and kept out of the
+# JSON whichever way the listing run was started, and 2,000 rows outside .claude/worktrees. Printed as
+# prune-merged.ps1 prints it, multi-line JSON, so the listing parses only if every line keeps its place.
+NOISY_LISTING_STUB = (
+    "param([string]$RepoRoot, [switch]$Apply, [double]$IdleHours, [switch]$Json, [switch]$SkipGh)\n"
+    "if ($Json) {\n"
+    "  [Console]::Error.WriteLine('stub listing warning')\n"
+    "  $rows = @([pscustomobject]@{ path = 'X:/r/.claude/worktrees/a'; claudeManaged = $true;"
+    " branch = 'b'; whyFinished = 'w' })\n"
+    '  $rows += 1..2000 | ForEach-Object { [pscustomobject]@{ path = "X:/r/other/$_";'
+    " claudeManaged = $false; branch = \"o$_\"; whyFinished = 'w' } }\n"
+    "  [pscustomobject]@{ fence = @{ idleHours = 24 }; counts = @{ reportOnlyHeld = 0 };"
+    " reportOnly = $rows } | ConvertTo-Json -Depth 6\n"
+    "  exit 0\n"
+    "}\n"
+    '"stub refused"\n'
+    "exit 2\n"
 )
 
 
@@ -799,6 +817,7 @@ def test_a_listing_run_inside_the_deadline_is_read_as_before(
     assert text is not None, proc.stdout + proc.stderr
     assert "  stderr: stub listing warning" in text.splitlines(), text
     assert "WOULD-REMOVE X:/r/.claude/worktrees/a" in text, text
+    assert "listed finished: 1 under .claude/worktrees; 2000 elsewhere" in text, text
     assert "TIMED OUT" not in text, text
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert re.match(r"=== exit 2 \(REFUSED", text.splitlines()[-1]), text

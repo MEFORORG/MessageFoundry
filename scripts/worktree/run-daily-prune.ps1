@@ -18,7 +18,8 @@
 
     IT DOES NOT DECIDE ANYTHING ABOUT THE SIBLINGS. Every safety judgement on them stays in
     prune-merged.ps1: what is merged, what is occupied, what is locked, what gets removed. This script
-    starts that one, records what it said, and passes its exit code back.
+    starts that one, records what it said, and passes its exit code back, or 4 when the run stopped at
+    its -StopAfterMinutes deadline.
 
     -RemoveFinishedClaudeWorktrees ADDS ONE OPT-IN STEP, and it is the only thing here that can touch
     .claude/worktrees. prune-merged.ps1 still removes nothing there; it lists the trees there that look
@@ -51,14 +52,18 @@
 
     With it, each prune-merged.ps1 run is a child process waited on for the time left to the deadline.
     One still running at the deadline is killed with its whole process tree, git included, and logged
-    as `--- prune-merged.ps1 TIMED OUT after N min, killed at HH:mm:ss ---`, after what it printed. A
-    killed -Apply prune can leave a removal half done; the next run's orphan check reports a directory
-    that leaves broken. Past the deadline before the prune run, it is not started and the log says so.
+    as `--- prune-merged.ps1 TIMED OUT after N min, killed at HH:mm:ss ---`, after what it printed.
+    The kill is a hard one, the same Task Scheduler's limit would make, only earlier and logged. Under
+    -Apply it can leave what the child was doing half done, and no later run is sure to report it: a
+    worktree partly deleted before git deregistered it, a stale git lock file (index.lock,
+    packed-refs.lock) in the primary that refuses later git commands until removed by hand, claims
+    left behind, or a truncated orphan ledger. Past the deadline before the prune run, it is not
+    started and the log says so.
     The .claude/worktrees step is skipped with one SKIPPED line when the prune run was not started or
     was killed, when the deadline passed before the listing run, or when the listing run was killed.
     Inside the step, past the deadline no further tree is started, and each one left is logged as
     NOT-REACHED (the next run lists them again). Every one of those stops still writes the exit line,
-    and exits 4, STOPPED; see $EXIT_STOPPED below.
+    and exits 4, DEADLINE, unless the run found an orphan (3); see $CODE_RANK below.
 
 .PARAMETER KeepLogs
     How many dated logs to keep. Older ones are deleted after each run.
@@ -69,8 +74,8 @@
 
     Exit codes: 0 to 3 are prune-merged.ps1's, passed through and explained by $EXIT_MEANING below. 4
     is this runner's own: the run stopped at its -StopAfterMinutes deadline and left work for the next
-    run. Codes only ever rise, so a 4 also stands over a 1, 2 or 3 the run earned before it stopped;
-    the log's rows still carry those.
+    run. Codes only ever rise, in $CODE_RANK's order, so a 4 stands over a 1 or 2 the run earned and a
+    3 stands over a 4; the log's rows still carry the code a higher one hides.
 
 .EXAMPLE
     pwsh -File scripts\worktree\run-daily-prune.ps1 -LogDir C:\logs            # dry run, logged
@@ -126,13 +131,23 @@ $EXIT_MEANING = @{
     2 = 'REFUSED -- safety could not be established, nothing was attempted'
     3 = 'ORPHANED DIRECTORY -- a worktree is broken on disk right now; needs a human'
 }
-# The runner's own code, kept out of the table above because prune-merged.ps1 never returns it. It is
-# above every code there, so raising to it never lowers one. A deadline stop used to leave the code alone,
-# which made a run that skipped work exit as if it had finished it.
-# tests/test_worktree_install_daily_prune.py::test_the_runners_own_exit_code_is_not_one_of_prune_merged
+# The runner's own code, kept out of the table above because prune-merged.ps1 never returns it. A
+# deadline stop used to leave the code alone, which made a run that skipped work exit as if it had
+# finished it. tests/test_worktree_install_daily_prune.py::test_the_runners_own_exit_code_is_not_one_of_prune_merged
 # holds it apart from prune-merged.ps1's.
-$EXIT_STOPPED = 4
-$EXIT_STOPPED_MEANING = 'STOPPED -- the run reached its -StopAfterMinutes deadline and left work for the next run; a prune-merged.ps1 run still going then was killed'
+$EXIT_DEADLINE = 4
+$EXIT_DEADLINE_MEANING = 'DEADLINE -- the run reached its -StopAfterMinutes deadline and left work for the next run; a prune-merged.ps1 run still going then was killed'
+
+# Codes rank in this order, lowest first, and a code is only ever raised. 4 outranks 0 to 2, but not 3:
+# an orphan is a directory broken on disk that needs a human, and a deadline stop resumes on the next
+# run, so a deadline stop must not hide one. A code outside the list compares by number.
+$CODE_RANK = @(0, 1, 2, $EXIT_DEADLINE, 3)
+function Get-RaisedCode($Current, [int]$New) {
+    $c = $CODE_RANK.IndexOf([int]$Current)
+    $n = $CODE_RANK.IndexOf($New)
+    if ($c -lt 0 -or $n -lt 0) { return [math]::Max([int]$Current, $New) }
+    if ($n -gt $c) { $New } else { [int]$Current }
+}
 
 $prune = Join-Path $PSScriptRoot 'prune-merged.ps1'
 if (-not (Test-Path -LiteralPath $prune)) { throw "prune-merged.ps1 not found beside this script: $prune" }
@@ -143,7 +158,7 @@ $log = Join-Path $LogDir ("prune-" + (Get-Date -Format 'yyyy-MM-dd') + ".log")
 
 # Writes the exit line (while the log can be written), trims the log directory, and exits.
 function Exit-Run([int]$Code) {
-    $meaning = if ($Code -eq $EXIT_STOPPED) { $EXIT_STOPPED_MEANING } elseif ($EXIT_MEANING.ContainsKey($Code)) { $EXIT_MEANING[$Code] } else { "UNKNOWN exit code $Code" }
+    $meaning = if ($Code -eq $EXIT_DEADLINE) { $EXIT_DEADLINE_MEANING } elseif ($EXIT_MEANING.ContainsKey($Code)) { $EXIT_MEANING[$Code] } else { "UNKNOWN exit code $Code" }
     try { "=== exit $Code ($meaning) at $(Get-Date -Format 'HH:mm:ss') ===" | Add-Content -LiteralPath $log }
     catch [System.Management.Automation.RuntimeException], [System.IO.IOException], [System.UnauthorizedAccessException] {
         Write-Error -Message "exit $Code ($meaning); the log could not take this line: $($_.Exception.Message)" -ErrorAction Continue
@@ -159,89 +174,93 @@ function Exit-Run([int]$Code) {
 
 # Runs prune-merged.ps1 with $ChildArgs as a child process and waits on it until $deadline, which `&`
 # cannot do. Used only when there is a deadline; without one the run keeps its `&` calls unchanged.
-# Started the way `&` starts it: the same pwsh, in the caller's location (so a relative -RepoRoot resolves
-# the same), inheriting the environment, decoding output as `&` does. Its stdout and stderr lines are
-# kept in arrival order, each marked, as `*>&1` would interleave them. A child still running at the
-# deadline is killed with its whole process tree, since a hung `git fetch` under it is the likely hang.
+# Started the way `&` starts it: the same pwsh, on the same console, in the caller's location (so a
+# relative -RepoRoot resolves the same), inheriting the environment, decoding output as `&` does.
+#
+# Its stdout and stderr go straight to two files beside the log, written by the child itself, so each
+# keeps its own order, and a run killed from outside still leaves on disk what the child printed (in
+# prune-child-<pid>.out.txt and .err.txt). Read back after the child ends: stdout's lines, then stderr's.
+# The one thing lost against `*>&1` is how the two streams interleaved. Lines collected from the
+# process's own stream events came back out of order even within one stream (156 of 20,000 measured
+# 2026-11-19), which scrambled the listing run's multi-line JSON.
+#
+# A child still running at the deadline is killed with its whole process tree, since a hung `git fetch`
+# under it is the likely hang.
 function Invoke-BoundedPrune([object[]]$ChildArgs) {
-    $psi = [System.Diagnostics.ProcessStartInfo]::new((Get-Process -Id $PID).Path)
-    foreach ($a in @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $prune) + $ChildArgs) {
-        $psi.ArgumentList.Add([string]$a)
-    }
-    $psi.UseShellExecute = $false
-    $psi.WorkingDirectory = (Get-Location -PSProvider FileSystem).ProviderPath
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    $psi.StandardOutputEncoding = [Console]::OutputEncoding
-    $psi.StandardErrorEncoding = [Console]::OutputEncoding
-    $p = [System.Diagnostics.Process]::new()
-    $p.StartInfo = $psi
-    # Registered events with no -Action are only queued, from the reader threads, so no runspace is needed
-    # there; this one drains the queue after the wait.
-    $id = "run-daily-prune-$([guid]::NewGuid())"
-    $ids = @("$id.out", "$id.err")
-    $null = Register-ObjectEvent -InputObject $p -EventName OutputDataReceived -SourceIdentifier $ids[0]
-    $null = Register-ObjectEvent -InputObject $p -EventName ErrorDataReceived -SourceIdentifier $ids[1]
-    $started = $false
+    # Start-Process joins its arguments with spaces and quotes none, so quote each as the C runtime
+    # splits them: a run of backslashes before a quote, or at the end, is doubled.
+    $argLine = (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $prune) + $ChildArgs | ForEach-Object {
+            $a = [string]$_
+            if ($a -and $a -notmatch '[\s"]') { $a } else { '"' + ($a -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"' }
+        }) -join ' '
+    # Absolute: the FileStream below resolves a relative path against the process directory.
+    $logDirFull = (Resolve-Path -LiteralPath $LogDir).ProviderPath
+    $out = Join-Path $logDirFull "prune-child-$PID.out.txt"
+    $err = Join-Path $logDirFull "prune-child-$PID.err.txt"
+    $p = $null
     $timedOut = $false
     $killedAt = $null
     $killFault = $null
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
-        $started = $p.Start()
-        $p.BeginOutputReadLine()
-        $p.BeginErrorReadLine()
-        # WaitForExitAsync completes once the process has exited AND both streams are drained. Waited on in
-        # slices so a Stop of this runspace (Ctrl+C, a host's Stop) is not held up until the child ends.
-        $done = $p.WaitForExitAsync()
-        while (-not $done.Wait(250)) {
+        $p = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $argLine -NoNewWindow -PassThru `
+            -WorkingDirectory (Get-Location -PSProvider FileSystem).ProviderPath -RedirectStandardOutput $out -RedirectStandardError $err
+        # Read once now: a Process from Start-Process that never had its handle read can report no exit code.
+        $null = $p.Handle
+        # In slices, so a Stop of this runspace (Ctrl+C, a host's Stop) is not held up until the child ends.
+        while (-not $p.WaitForExit(250)) {
             if ([DateTime]::UtcNow -lt $deadline) { continue }
-            $timedOut = $true
             $killedAt = Get-Date
             try { $p.Kill($true) }
             catch [System.InvalidOperationException], [System.ComponentModel.Win32Exception], [System.AggregateException], [System.NotSupportedException] {
                 $killFault = $_.Exception.Message
             }
-            # Bounded: a descendant the tree kill missed would hold the output pipes open, and the run must
-            # still reach its exit line.
-            $null = $done.Wait(15000)
+            # Bounded, so the run still reaches its exit line if the kill did not take.
+            $null = $p.WaitForExit(15000)
+            # A child that ended on its own between the last wait and the kill was not timed out, and its
+            # exit code is real. TerminateProcess, which Kill uses on Windows, leaves -1.
+            $timedOut = -not $p.HasExited -or $p.ExitCode -eq -1
             break
         }
         $sw.Stop()
-        $lines = @(Get-Event | Where-Object { $_.SourceIdentifier -in $ids } | ForEach-Object {
-                if ($null -ne $_.SourceEventArgs.Data) {
-                    [pscustomobject]@{ Stderr = ($_.SourceIdentifier -eq $ids[1]); Text = [string]$_.SourceEventArgs.Data }
-                }
-            })
+        $lines = foreach ($f in @(@{ Path = $out; Stderr = $false }, @{ Path = $err; Stderr = $true })) {
+            if (-not (Test-Path -LiteralPath $f.Path)) { continue }
+            # ReadWrite sharing: a descendant the kill missed may still hold the file open for writing.
+            $fs = [System.IO.FileStream]::new($f.Path, 'Open', 'Read', 'ReadWrite, Delete')
+            try {
+                $reader = [System.IO.StreamReader]::new($fs, [Console]::OutputEncoding)
+                while ($null -ne ($line = $reader.ReadLine())) { [pscustomobject]@{ Stderr = $f.Stderr; Text = $line } }
+            }
+            finally { $fs.Dispose() }
+        }
         [pscustomobject]@{
             TimedOut  = $timedOut
             ExitCode  = if ($timedOut) { $null } else { $p.ExitCode }
             Minutes   = $sw.Elapsed.TotalMinutes
             KilledAt  = $killedAt
             KillFault = $killFault
-            Lines     = $lines
+            Lines     = @($lines)
         }
     }
     finally {
         # Reached on a throw or a runspace Stop too: never leave the child running behind the run.
-        if ($started -and -not $p.HasExited) {
+        if ($null -ne $p -and -not $p.HasExited) {
             try { $p.Kill($true) }
             catch [System.InvalidOperationException], [System.ComponentModel.Win32Exception], [System.AggregateException], [System.NotSupportedException] {
                 Write-Error -Message "could not kill prune-merged.ps1 (pid $($p.Id)): $($_.Exception.Message)" -ErrorAction Continue
             }
         }
-        foreach ($s in $ids) {
-            Unregister-Event -SourceIdentifier $s -ErrorAction SilentlyContinue
-            Remove-Event -SourceIdentifier $s -ErrorAction SilentlyContinue
-        }
-        $p.Dispose()
+        if ($null -ne $p) { $p.Dispose() }
+        Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue
     }
 }
 
-# The timed line a killed child leaves, after whatever it printed.
+# The timed line a killed child leaves, after whatever it printed. Invariant culture, so the minutes read
+# the same under any locale.
 function Write-TimedOut([pscustomobject]$Run) {
     $fault = if ($Run.KillFault) { "; the kill reported: $($Run.KillFault)" } else { '' }
-    "--- prune-merged.ps1 TIMED OUT after $('{0:0.0}' -f $Run.Minutes) min, killed at $($Run.KilledAt.ToString('HH:mm:ss'))$fault ---" |
+    $minutes = $Run.Minutes.ToString('0.0', [cultureinfo]::InvariantCulture)
+    "--- prune-merged.ps1 TIMED OUT after $minutes min, killed at $($Run.KilledAt.ToString('HH:mm:ss'))$fault ---" |
         Add-Content -LiteralPath $log
 }
 
@@ -373,12 +392,12 @@ try {
         }
     }
 
-    # Every deadline stop is logged and raises the code to STOPPED, which is above every other code.
+    # Every deadline stop is logged and raises the code to DEADLINE; see $CODE_RANK for what it outranks.
     if ($stopReason) {
         if ($RemoveFinishedClaudeWorktrees) {
             "=== finished .claude/worktrees: SKIPPED, $stopReason; no .claude/worktrees tree was attempted ===" | Add-Content -LiteralPath $log
         }
-        $code = [math]::Max([int]$code, $EXIT_STOPPED)
+        $code = Get-RaisedCode $code $EXIT_DEADLINE
     }
     elseif ($RemoveFinishedClaudeWorktrees) {
         $listing = $null
@@ -416,12 +435,12 @@ try {
                     $detail = if ($_.Outcome -in 'REMOVED', 'WOULD-REMOVE') { "$($_.Reason) [$($f.branch)]; listed because: $($f.whyFinished)" } else { $_.Reason }
                     # The code is raised here, per row and BEFORE the row's log line, so an error later in the
                     # run, a failed log write included, reaches the trap with it. A deregistered tree still on
-                    # disk is an orphan, 3. A tree the deadline left is a deadline stop, STOPPED. A 2 from the
+                    # disk is an orphan, 3. A tree the deadline left is a deadline stop, 4. A 2 from the
                     # prune says nothing was attempted, which a REMOVED, FAILED or DECLINED row makes false,
                     # so 1. A failure is at least 1. Otherwise the code never goes lower, and a refusal
                     # changes nothing.
-                    if ($_.Outcome -eq 'ORPHANED') { $script:code = [math]::Max([int]$script:code, 3) }
-                    elseif ($_.Outcome -eq 'NOT-REACHED') { $script:code = [math]::Max([int]$script:code, $EXIT_STOPPED) }
+                    if ($_.Outcome -eq 'ORPHANED') { $script:code = Get-RaisedCode $script:code 3 }
+                    elseif ($_.Outcome -eq 'NOT-REACHED') { $script:code = Get-RaisedCode $script:code $EXIT_DEADLINE }
                     elseif ($_.Outcome -in 'REMOVED', 'FAILED', 'DECLINED') {
                         if ([int]$script:code -eq 2) { $script:code = 1 }
                         elseif ($_.Outcome -eq 'FAILED') { $script:code = [math]::Max([int]$script:code, 1) }

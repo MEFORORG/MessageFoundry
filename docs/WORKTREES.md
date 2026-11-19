@@ -700,7 +700,7 @@ race deterministically with no threads and no sleeps.
 scheduled task, as you and never as SYSTEM, that runs
 [`run-daily-prune.ps1`](../scripts/worktree/run-daily-prune.ps1) from the **primary** checkout. The
 runner calls `prune-merged.ps1`, appends what it printed to a dated log under
-`%LOCALAPPDATA%\MessageFoundry\worktree-prune`, and passes its exit code back. The task **dry-runs
+`%LOCALAPPDATA%\MessageFoundry\worktree-prune`, and passes its exit code back (or `4`, below). The task **dry-runs
 unless registered with `-Apply`**, and the installer refuses to run inside Claude Code (`-Json`, which
 registers nothing, excepted). Run it from a plain terminal:
 
@@ -744,17 +744,20 @@ one-hour limit and no deadline until `install-daily-prune.ps1` is run again.
 **The deadline bounds both `prune-merged.ps1` runs too**, the prune and the step's listing run. With
 it, each is started as a child process and waited on for the time left. One still running at the
 deadline is killed with its whole process tree, `git` included, and logged as `--- prune-merged.ps1
-TIMED OUT after N min, killed at HH:mm:ss ---` after what it printed. A killed `-Apply` prune can
-leave a removal half done, which the next run's orphan check reports. Past the deadline before the
-prune run, nothing is started and the log says `NOT STARTED`. The step is skipped with one `SKIPPED`
+TIMED OUT after N min, killed at HH:mm:ss ---` after what it printed. The kill is a hard one, the
+same Task Scheduler's limit would make, only earlier and logged. Under `-Apply` it can leave what the
+child was doing half done, and no later run is sure to report it: a worktree partly deleted before git
+deregistered it, a stale git lock file in the primary that refuses later git commands until removed
+by hand, claims left behind, or a truncated orphan ledger. Past the deadline before the prune run,
+nothing is started and the log says `NOT STARTED`. The step is skipped with one `SKIPPED`
 line when the prune run was not started or was killed, when the deadline passed before the listing
 run, or when the listing run was killed. Without a deadline both runs are started with `&`, unbounded,
 as before.
 
-**Every deadline stop exits `4`, STOPPED**: a killed or unstarted run, a skipped step, or a
-`NOT-REACHED` tree. `4` is the runner's own code, not one `prune-merged.ps1` returns, and it sits above
-that script's `0` to `3`, so it also stands over a `1`, `2` or `3` the run earned before it stopped; the
-log's rows still carry those. Before, a deadline stop left the code alone, so a run that skipped work
+**Every deadline stop exits `4`, DEADLINE**: a killed or unstarted run, a skipped step, or a
+`NOT-REACHED` tree. `4` is the runner's own code, not one `prune-merged.ps1` returns. It stands over a
+`1` or `2` the run earned, but an orphan's `3` stands over it, since a broken directory needs a human
+and a deadline stop resumes on the next run; the log's rows still carry the code a higher one hides. Before, a deadline stop left the code alone, so a run that skipped work
 exited as if it had finished it.
 
 The exit code starts as the prune's, and each row changes it as the row arrives, before the row's
