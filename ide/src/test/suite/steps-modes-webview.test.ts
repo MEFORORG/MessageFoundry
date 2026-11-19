@@ -597,3 +597,44 @@ suite("Steps webview: a route row shows and edits its Handler names as a list", 
     }
   });
 });
+
+// BACKLOG #5944: Cut keyed on draggable alone, so a raise row (movable, not deletable) offered a Cut
+// whose delete the engine refuses.
+suite("Steps webview: Cut deletes only a deletable row", () => {
+  const RAISE: LensRow = {
+    kind: "control",
+    control: "raise",
+    test_src: null,
+    recognized: true,
+    line_start: 6,
+    line_end: 6,
+    nesting: 0,
+    suite: "5",
+  };
+
+  teardown(() => {
+    for (const w of OPEN_WINDOWS.splice(0)) {
+      (w as unknown as { close(): void }).close();
+    }
+  });
+
+  const cutRow = (p: Page, line: number): Record<string, unknown>[] => {
+    const li = p.doc.querySelector(`li.row[data-line-start="${line}"]`);
+    assert.ok(li, `no row at line ${line}`);
+    click(p, li);
+    const before = p.posted.length;
+    p.doc.dispatchEvent(new p.window.KeyboardEvent("keydown", { key: "x", ctrlKey: true, bubbles: true }));
+    return sent(p, before);
+  };
+
+  test("a raise row is not cut", () => {
+    const p = loadPage([RAISE]);
+    assert.deepStrictEqual(cutRow(p, 6), [], "no cut, so no delete the engine refuses");
+  });
+
+  test("a deletable action row is cut: kept on the clipboard, then deleted", () => {
+    const p = loadPage([{ ...STATIC_VALUE, line_start: 6, line_end: 6 }]);
+    const commands = cutRow(p, 6).map((m) => m.command);
+    assert.deepStrictEqual(commands, ["cutInfo", "deleteRow"]);
+  });
+});

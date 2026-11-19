@@ -506,7 +506,9 @@
       vscode.postMessage({ command: 'copyBlock', text: 'MessageFoundry: copied ' + label + ' to the Steps clipboard.' });
     }
     function cutSelected() {
-      if (!selectedIsMovable()) { return; }
+      // Cut deletes, so it also needs a deletable row: a raise moves and copies but the engine refuses
+      // to delete it (BACKLOG #5944).
+      if (!selectedIsMovable() || selectedEl.dataset.deletable !== 'true') { return; }
       const cap = captureBlock(stepsCtxRows(), Number(selectedEl.dataset.lineStart));
       if (!cap) { return; }
       const label = clipLabel(cap);
@@ -868,7 +870,7 @@
           const ctxRows = stepsCtxRows();
           // Mirrors stepsModel.contextMenuEnablement: Insert before always; Insert after suppressed on a
           // terminal RETURN / scaffold footer (dead code after the return) but ALLOWED on a mid-body append
-          // send (ADR 0104); Delete only on an editable action/lookup/send row; ↑/↓ per walk.
+          // send (ADR 0104); Delete only on a deletable row (isRowDeletable); ↑/↓ per walk.
           for (const p of insertParents) {
             setDisabled(p, p.dataset.sub === 'after' && isReturn);
           }
@@ -881,7 +883,9 @@
           // Mirror isBindingRead (BACKLOG #1505): a Read Field binds a name, so the engine refuses to
           // delete or move it. Its path stays editable.
           const bindingRead = el.dataset.bindingRead === 'true';
-          setDisabled(delItem, !mutable || bindingRead);
+          // Delete reads the model's isRowDeletable, stamped as data-deletable: a whole if/for block
+          // deletes from its header, a raise does not (BACKLOG #5944).
+          setDisabled(delItem, el.dataset.deletable !== 'true');
           // ADR 0104 fan-out: "Add destination" only on a real send row (never the `return []` filter).
           setDisabled(addDestItem, !(kind === 'send' && el.dataset.filtered !== 'true'));
           // ADR 0106: Else / Else If (data-anchor="if_chain") only apply to an if-chain anchor (an if/elif row).

@@ -232,6 +232,9 @@ export interface RowViewModel {
   // A read-only PRAGMA note — carried so the webview greys its edit/delete controls rather than letting
   // the user discover the engine's refusal as an error toast (F6). Absent on every other row.
   pragma?: boolean;
+  // {@link isRowDeletable}, stamped so the per-row Delete button, the menu's Delete and the webview's
+  // Cut all read the one rule the engine's delete gate mirrors (BACKLOG #5944). Absent means false.
+  deletable?: boolean;
   title: string;
   subtitle?: string;
   badge?: string; // e.g. "unrecognized" for a control whose test is outside the bounded grammar (§4)
@@ -550,7 +553,12 @@ export function isRowMovable(row: LensRow): boolean {
  * header removes the block). A `raise`/`elif`/`else`/`code` row is NOT deletable — the engine refuses it
  * (so the webview greys the trash to avoid an error toast, F6).
  */
-export function isRowDeletable(row: LensRow): boolean {
+export function isRowDeletable(row: {
+  kind: RowKind;
+  pragma?: boolean;
+  action?: string;
+  control?: LensRow["control"];
+}): boolean {
   if (isBindingRead(row)) {
     return false;
   }
@@ -893,6 +901,9 @@ export function buildRowViewModel(row: LensRow, index: number, lines: string[]):
   }
   if (row.kind === "control" && row.control !== undefined) {
     vm.control = row.control;
+  }
+  if (isRowDeletable(row)) {
+    vm.deletable = true;
   }
   // A control row whose test falls outside the bounded grammar keeps its structure but is flagged — it
   // is still shown, never hidden (§4 degradation ladder). recognized is only meaningful for controls.
@@ -1947,6 +1958,7 @@ export function contextMenuEnablement(
     filtered?: boolean;
     pragma?: boolean;
     action?: string;
+    control?: LensRow["control"];
   },
   ctx: { canMoveUp: boolean; canMoveDown: boolean },
 ): ContextMenuEnablement {
@@ -1957,7 +1969,9 @@ export function contextMenuEnablement(
     // normal step, not a return.
     // A `route` row is a return too: a step after a routing return is dead code.
     insertAfter: !isReturnRow(row) && row.kind !== "route",
-    deleteRow: isRowMutable(row) && !isBindingRead(row),
+    // isRowDeletable, the rule the per-row button keys on too: a whole if/for block deletes from its
+    // header (BACKLOG #5944).
+    deleteRow: isRowDeletable(row),
     moveUp: ctx.canMoveUp && !isBindingRead(row),
     moveDown: ctx.canMoveDown && !isBindingRead(row),
     // ADR 0104 fan-out: add another destination — on any real send (returned or appended), never the filter.
@@ -3399,20 +3413,20 @@ function renderParamsHtml(
 }
 
 /**
- * Render the per-row STRUCTURAL affordances (move up/down, delete) — but ONLY on a recognized
- * (`action`/`lookup`/`send`) row of a writable projection (a known `handlerName`). `code` and `control`
- * rows are structurally read-only (they are not regenerable from a template), so they get NO structural
- * buttons — matching the param-edit read-only rule (ADR 0076 §5). Each button carries the row's edit
- * coordinates + its projection-time source (`data-expect-src`) for the F7 stale guard. Pure.
+ * Render the per-row STRUCTURAL affordances (move up/down, delete) of a writable projection (a known
+ * `handlerName`): move on a {@link isRowMovable} row, delete on a {@link isRowDeletable} one. A `code`
+ * row gets neither. Each button carries the row's edit coordinates + its projection-time source
+ * (`data-expect-src`) for the F7 stale guard. Pure.
  *
  * NOTE: the per-row ＋ (add-step-after) button was REPLACED by the top-of-lens INSERT TOOLBAR (a native
  * <select> + green Add that inserts at the SELECTED row, ADR 0076 §5 / BACKLOG #222). Delete + move stay.
  */
 function renderRowActionsHtml(row: RowViewModel, handlerName: string): string {
   // ↑/↓ appear on any MOVABLE row (an action/lookup/send row or a whole if/for block); the client greys
-  // the ↑ on the first sibling and the ↓ on the last (a reorder never crosses a suite edge). 🗑 stays on
-  // EDITABLE rows only — deleting mutates the row and is refused on a read-only control/code row.
-  if (!handlerName || !row.movable) {
+  // the ↑ on the first sibling and the ↓ on the last (a reorder never crosses a suite edge).
+  // BACKLOG #5944: the trash keys on `deletable` (isRowDeletable), not on movability or the kind alone,
+  // so a Comment (deletable, not movable) and a whole if/for block get it and a raise does not.
+  if (!handlerName || (!row.movable && !row.deletable)) {
     return "";
   }
   const coords =
@@ -3420,16 +3434,19 @@ function renderRowActionsHtml(row: RowViewModel, handlerName: string): string {
     `data-line-end="${row.lineEnd}" data-expect-src="${escapeHtml(row.expectSrc ?? "")}"`;
   const btn = (op: string, glyph: string, title: string): string =>
     `<button class="rowop" data-op="${op}" ${coords} data-tip="${escapeHtml(title)}">${glyph}</button>`;
-  const buttons = [
-    btn("moveUp", "&#8593;", "Move up one step (walks into / out of blocks)"),
-    btn("moveDown", "&#8595;", "Move down one step (walks into / out of blocks)"),
-  ];
-  if (isRowEditable(row.kind)) {
+  const buttons: string[] = [];
+  if (row.movable) {
+    buttons.push(
+      btn("moveUp", "&#8593;", "Move up one step (walks into / out of blocks)"),
+      btn("moveDown", "&#8595;", "Move down one step (walks into / out of blocks)"),
+    );
+  }
+  if (row.deletable) {
     buttons.push(btn("deleteRow", "&#128465;", "Delete this row"));
   }
   // ADR 0104 fan-out: a per-row "＋ dest" on a real send (not the `return []` filter) adds another
   // destination — appending into the accumulator, or converting a returned send up to it.
-  if (row.kind === "send" && !row.filtered) {
+  if (row.movable && row.kind === "send" && !row.filtered) {
     buttons.push(btn("addDestination", "&#65291;", "Add another destination (fan out)"));
   }
   return `<span class="row-actions">${buttons.join("")}</span>`;
@@ -3489,6 +3506,8 @@ export function renderRowHtml(
     // BACKLOG #1505: a Read Field binds a name, so the mirror greys its delete/move items (the engine
     // refuses both). `movable` is already false for it, which drops its arrows, drag and cut.
     `data-binding-read="${isBindingRead(row) ? "true" : ""}" ` +
+    // BACKLOG #5944: isRowDeletable, so the mirror's menu Delete and Cut read the model's one rule.
+    `data-deletable="${row.deletable ? "true" : ""}" ` +
     // ADR 0076 Amendment D: the enclosing element's role, so the Add-palette can grey the items this
     // role may not author rather than letting the user meet the engine's refusal as an error toast (F6).
     `data-role="${escapeHtml(role)}" ` +
