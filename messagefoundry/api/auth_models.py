@@ -11,7 +11,6 @@ the two bases.
 
 from __future__ import annotations
 
-import unicodedata
 from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, Field
@@ -19,16 +18,14 @@ from pydantic import AfterValidator, BaseModel, Field
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
     MAX_MAP_ENTRIES,
-    PRINTABLE_TEXT_OR_EMPTY_PATTERN,
-    PRINTABLE_TEXT_PATTERN,
+    SIGN_IN_NAME_PATTERN,
     ChannelScopeEntry,
     PermissionId,
     RoleId,
 )
-from messagefoundry.auth.permissions import ROLE_METADATA, Role
 from messagefoundry.auth.tokens import ENROLMENT_CODE_MAX
 from messagefoundry.auth.totp import MAX_DIGITS as TOTP_DIGITS
-from messagefoundry.auth.usernames import renders_as_nothing, username_refusal
+from messagefoundry.auth.usernames import username_refusal
 from messagefoundry.password_bounds import PASSWORD_MAX as _PASSWORD_MAX
 
 # Upper bounds on free-text request fields (API-INPUT): reject absurd inputs before they reach the
@@ -278,49 +275,6 @@ class ChannelScope(RequestModel):
     expected_source: Literal["ad", "manual"] | None = Field(default=None, exclude=True)
 
 
-#: Categories a name may not hold anywhere: a line or paragraph separator, a lone surrogate, a
-#: private-use or an unassigned code point (BACKLOG #5784).
-_NAME_REFUSED_CATEGORIES = frozenset({"Zl", "Zp", "Cs", "Co", "Cn"})
-#: Unicode's Bidi_Control characters: the embeddings, overrides and isolates, which reorder how a
-#: name and the text beside it display, so a reversed spelling could render as a built-in role's
-#: name, and the marks U+061C, U+200E and U+200F (BACKLOG #5785).
-_BIDI_CONTROLS = (
-    frozenset(range(0x202A, 0x202F))
-    | frozenset(range(0x2066, 0x206A))
-    | frozenset({0x061C, 0x200E, 0x200F})
-)
-
-
-def visible_text(value: str) -> str:
-    """``value`` without the characters that draw nothing (``renders_as_nothing``), such as a
-    zero-width space, a soft hyphen or a Hangul filler: what a reader sees of it."""
-    return "".join(c for c in value if not renders_as_nothing(c))
-
-
-def _printable_name(value: str) -> str:
-    if any(
-        unicodedata.category(c) in _NAME_REFUSED_CATEGORIES or ord(c) in _BIDI_CONTROLS
-        for c in value
-    ):
-        raise ValueError("must not hold a line separator, bidi control or unassigned character")
-    if not visible_text(value).strip():
-        raise ValueError("must not be blank")
-    return value
-
-
-#: A name an administrator types for an account or a custom role, or a directory account's name
-#: (BACKLOG #5784, #5785). Refused: a C0, DEL or C1 control (:data:`PRINTABLE_TEXT_PATTERN`), at
-#: least the characters :func:`_printable_name` names, and a name that is blank once white space
-#: and the characters that draw nothing are set aside. A joiner some scripts need inside a word,
-#: such as U+200C, is kept. A request model holds this rule; a name another writer stores, such as
-#: a directory sync, does not pass through it.
-PrintableName = Annotated[
-    str,
-    Field(max_length=_NAME_MAX, pattern=PRINTABLE_TEXT_PATTERN),
-    AfterValidator(_printable_name),
-]
-
-
 def _valid_new_username(username: str) -> str:
     """BACKLOG #5521: the rule ``AuthService.create_local_user`` applies, checked here as well so a
     refused name never reaches the route."""
@@ -352,7 +306,7 @@ class UserCreateRequest(RequestModel):
 
     #: Refused, 422, by the new-username rule ``auth/usernames.py`` states (BACKLOG #5521).
     username: NewUsername
-    display_name: PrintableName | None = None
+    display_name: str | None = Field(default=None, max_length=_NAME_MAX)
     #: REQUIRED (BACKLOG #2018, ASVS 6.3.7). It seeds both the profile address and ``notify_email``,
     #: where every security notice goes. An account born without one is told nothing about a change
     #: made to it before its holder's first sign-in, an administrator's password reset included. The
@@ -375,16 +329,14 @@ class DirectoryUserCreateRequest(RequestModel):
     cannot point the holder's notices away from the directory's (ASVS 6.3.7).
     """
 
-    # vault BACKLOG #5342, #5784: no control character and not blank. Pinned by
-    # tests/test_auth_federated_identity_routes.py::
+    # vault BACKLOG #5342. Pinned by tests/test_auth_federated_identity_routes.py::
     # test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory.
-    username: PrintableName
+    username: str = Field(min_length=1, max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
     notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 
 
 class UserUpdateRequest(RequestModel):
-    #: An explicit null clears it; a value takes the ``PrintableName`` rule (BACKLOG #5784).
-    display_name: PrintableName | None = None
+    display_name: str | None = Field(default=None, max_length=_NAME_MAX)
     #: The PROFILE address. It does not move ``notify_email`` (BACKLOG #1139, ADR 0182 Amendment A).
     #: Its shape rule is in ``AuthService.update_user`` (BACKLOG #3278).
     email: str | None = Field(default=None, max_length=_NAME_MAX)
@@ -611,42 +563,13 @@ class RoleInfo(BaseModel):
     builtin: bool = True
 
 
-def _fold_role_name(name: str) -> str:
-    """A role name as a reader would see it: the characters that draw nothing dropped, then NFKC,
-    case-folded, and runs of whitespace as one space."""
-    return " ".join(unicodedata.normalize("NFKC", visible_text(name)).casefold().split())
-
-
-#: Every built-in role's id and label, folded. A custom role may not take one (BACKLOG #5785).
-_BUILTIN_ROLE_NAMES = frozenset(
-    _fold_role_name(name) for role in Role for name in (role.value, ROLE_METADATA[role][0])
-)
-
-
-def _not_a_builtin_role_name(name: str) -> str:
-    """Refuse a custom role name that reads as a built-in role's id or label, so a custom role named
-    ``ADMINISTRATOR`` cannot pass for the built-in Administrator (BACKLOG #5785). It compares as
-    :func:`_fold_role_name` folds; a name that only looks alike, such as one with a letter from
-    another script, is not caught here."""
-    if _fold_role_name(name) in _BUILTIN_ROLE_NAMES:
-        raise ValueError("a custom role cannot take a built-in role's name")
-    return name
-
-
 class CustomRoleRequest(RequestModel):
     """Create/update an admin-defined custom role (ADR 0045): a named SUBSET of the existing Permission
     catalog. The engine validates the subset (recognized perms only, non-empty, no carved-out
-    escalation primitive) and rejects otherwise.
+    escalation primitive) and rejects otherwise."""
 
-    The name takes the ``PrintableName`` rule and may not be a built-in role's name, and the
-    description may not carry a control character (BACKLOG #5785)."""
-
-    display_name: Annotated[PrintableName, AfterValidator(_not_a_builtin_role_name)]
-    description: str | None = Field(
-        default=None, max_length=_NAME_MAX, pattern=PRINTABLE_TEXT_OR_EMPTY_PATTERN
-    )
-    #: A repeated permission is one grant: ``validate_custom_role_permissions`` collects them into
-    #: a set before anything is stored.
+    display_name: str = Field(max_length=_NAME_MAX)
+    description: str | None = Field(default=None, max_length=_NAME_MAX)
     permissions: list[PermissionId] = Field(max_length=64)
 
 

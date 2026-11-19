@@ -12,9 +12,9 @@ page still match the code, and fails if the page drops one. It does not check ev
 page. At least four rules in the table are written, in whole or in part, elsewhere. The
 connection-name pattern is defined in
 [`messagefoundry/connection_names.py`](../messagefoundry/connection_names.py) and imported by that
-module, because the config loader enforces the same rule. The account and role name rule is
-`PrintableName` in [`messagefoundry/api/auth_models.py`](../messagefoundry/api/auth_models.py),
-which uses this module's printable pattern and adds its own checks.
+module, because the config loader enforces the same rule. The directory user name's NUL rule is
+in `validation.py`, but its length bounds, 1 to 256 characters, are set on the request model in
+[`messagefoundry/api/auth_models.py`](../messagefoundry/api/auth_models.py).
 The HL7 field-path grammar is `parse_path` in
 [`messagefoundry/parsing/peek.py`](../messagefoundry/parsing/peek.py). The layered preset ids'
 pattern is in `validation.py`, but their 1024-character bound is set on the route in
@@ -54,8 +54,7 @@ filesystem path, a log line or a CSV export.
 | Audit action filter | Printable text, no control characters, 1 to 128 characters | `action` on `GET /audit` and `GET /audit/export` |
 | Display label | Printable text, no control characters, 1 to 128 characters | `name` on `POST /search/presets` |
 | Filesystem path | Printable text, no control characters, 1 to 4096 characters | `config_dir` on `POST /config/reload`, and `archive` on `POST /dr/activate` |
-| Account or role name | Printable text, 1 to 256 characters: no control character, line or paragraph separator, bidi control or unassigned code point, and not blank once white space and characters that draw nothing, such as a zero-width space, are set aside. A custom role name may not also read as a built-in role's id or label. Pinned by `tests/test_auth_models_input.py` | `username` on `POST /users/directory`; `display_name` on `POST /users` and `PATCH /users/{user_id}`; `display_name` on `POST /roles/custom` and `PUT /roles/custom/{role_id}` |
-| Custom role description | No control characters, up to 256 characters, empty included | `description` on `POST /roles/custom` and `PUT /roles/custom/{role_id}` |
+| Directory user name | No NUL, 1 to 256 characters. Pinned by `tests/test_auth_federated_identity_routes.py::test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory` | `username` on `POST /users/directory` |
 | Layered preset ids | Resource ids joined by single commas with no spaces, up to 1024 characters in all | `presets` on `GET /search/layered` |
 
 The email-address row covers `recipient_override` only. The account email fields follow a different
