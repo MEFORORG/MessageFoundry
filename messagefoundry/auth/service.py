@@ -19833,31 +19833,18 @@ class AuthService:
             # BACKLOG #5968: a custom role deleted after the caller's check refused the role write,
             # which rolled back. The account row committed first, holding the username with no
             # role and no `user.created` row, so it is removed: otherwise a retry under the same
-            # name would be refused as taken. It holds no role, so not Administrator, which is
-            # what `delete_user` requires. It is a user deletion, so it commits the `user.deleted`
-            # row `delete_user` writes, in the same transaction, with the race as its reason. A
-            # store fault in the removal leaves the orphan the crash case above leaves, and is
-            # logged rather than masking the refusal; a defect raises.
+            # name would be refused as taken. It holds no role, so not Administrator, which is the
+            # precondition of the store's unguarded `delete_user`. The removal is a user deletion,
+            # so it writes a `user.deleted` row, naming the username and roles the refused create
+            # asked for and the race as its reason. The row is a second write after the delete:
+            # the guarded delete that commits it in one transaction would also take the
+            # last-administrator lock and re-verify every administrator's seal for an account that
+            # cannot hold the role. A crash between the two, or a refused row, leaves the removal
+            # unaudited, and the refused row is logged. A store fault in the removal leaves the
+            # orphan the crash case above leaves and is logged; neither masks the refusal, and a
+            # defect raises.
             try:
-                await self._store.remove_unless_last_admin(
-                    user_id,
-                    AdminRemoval.DELETE,
-                    admin_role_id=Role.ADMINISTRATOR.value,
-                    audits=(
-                        AuditAppend(
-                            "user.deleted",
-                            actor=actor,
-                            detail=_json(
-                                {
-                                    "user_id": user_id,
-                                    "reason": "role write refused: a role it named was deleted "
-                                    "after the role check",
-                                }
-                            ),
-                            client=client,
-                        ),
-                    ),
-                )
+                await self._store.delete_user(user_id)
             except _passkey_read_errors() as delete_exc:
                 if isinstance(delete_exc, AUDIT_WRITE_DEFECTS):
                     raise
@@ -19866,6 +19853,30 @@ class AuthService:
                     "(BACKLOG #5968)",
                     user_id,
                 )
+            else:
+                try:
+                    await self._audit(
+                        "user.deleted",
+                        actor=actor,
+                        detail=_json(
+                            {
+                                "user_id": user_id,
+                                "username": username,
+                                "roles": list(roles),
+                                "reason": "role write refused: a role it named was deleted "
+                                "after the role check",
+                            }
+                        ),
+                        client=client,
+                    )
+                except audit_write_errors() as audit_exc:
+                    if _is_held_write_error(audit_exc):
+                        raise
+                    _log.exception(
+                        "account %s, whose role write was refused, was removed, but its "
+                        "user.deleted row could not be written (BACKLOG #5968)",
+                        user_id,
+                    )
             if role_refusal is exc:
                 raise
             raise role_refusal from exc

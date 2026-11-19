@@ -162,10 +162,42 @@ async def test_the_orphan_removal_after_a_role_write_race_is_audited(
         r = await c.post("/users", headers=headers, json=body)
         assert r.status_code == 400, r.text
     [orphan_id] = written
+    assert await service.store.get_user(orphan_id) is None
     rows = await service.store.list_audit(action="user.deleted", limit=10)
     [row] = [row for row in rows if json.loads(row["detail"])["user_id"] == orphan_id]
     assert row["actor"] == "adm"
-    assert "role write" in json.loads(row["detail"])["reason"]
+    detail = json.loads(row["detail"])
+    assert detail["username"] == "orphan" and detail["roles"] == [role_id]
+    assert "role write" in detail["reason"]
+
+
+async def test_a_refused_orphan_removal_row_keeps_the_400_and_is_logged(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5968: a store refusal of the orphan removal's ``user.deleted`` row does not mask
+    the role refusal. The route still answers 400, the account is still removed, and the log
+    line names the account."""
+    service = await _service(engine)
+    async with _client(engine, service) as c:
+        headers = await _admin_headers(service, c)
+        role_id = await _custom_role(service)
+        _delete_first(monkeypatch, service, "set_user_roles", role_id)
+        original: Callable[..., Awaitable[Any]] = service.store.record_audit
+
+        async def refusing(action: str, *args: Any, **kwargs: Any) -> Any:
+            if action == "user.deleted":
+                raise sqlite3.OperationalError("synthetic audit refusal")
+            return await original(action, *args, **kwargs)
+
+        monkeypatch.setattr(service.store, "record_audit", refusing)
+        body = {"username": "orphan2", "roles": [role_id], "email": "orphan2@example.org"}
+        r = await c.post("/users", headers=headers, json=body)
+        assert r.status_code == 400, r.text
+    assert await service.store.get_user_by_username("orphan2") is None
+    [record] = [
+        rec for rec in caplog.records if "user.deleted row could not be written" in rec.message
+    ]
+    assert record.args is not None and len(record.args) == 1
 
 
 async def test_set_roles_racing_a_role_delete_is_400_and_writes_nothing(
