@@ -1240,12 +1240,30 @@ def test_cell_aad_spells_a_mixin_enum_member_by_its_value() -> None:
 
 
 @pytest.mark.parametrize("bad", [None, True, False])
-def test_cell_aad_refuses_a_component_str_would_collide(bad: object) -> None:
-    # str(None) == "None" and str(True) == "True" would bind the same AAD as those strings. The
-    # refusal is a CipherError too, so a read path contains a NULL key like any unopenable cell.
+def test_a_sealed_cell_refuses_a_key_component_str_would_collide(bad: object) -> None:
+    # str(None) == "None" and str(True) == "True" would bind the same AAD as those strings, so the
+    # cell-bound cipher refuses to seal or open under one. The refusal is a CipherError too, so a
+    # read path contains a NULL key like any unopenable cell.
+    aad = cell_aad("t", "c", bad)  # building it never raises: the store builds before it knows
+    assert aad == cell_aad("t", "c", str(bad))  # the collision the refusal exists for
+    bound = make_cipher(generate_key(), write_v2=True)
     with pytest.raises(AADComponentError, match=r"^t\.c: ") as ei:
-        cell_aad("t", "c", bad)
+        bound.encrypt("x", aad=aad)
     assert isinstance(ei.value, CipherError) and isinstance(ei.value, TypeError)
+    sealed = bound.encrypt("x", aad=cell_aad("t", "c", str(bad)))
+    with pytest.raises(AADComponentError, match=r"^t\.c: "):
+        bound.decrypt(sealed, aad=aad)
+
+
+@pytest.mark.parametrize("bad", [None, True])
+def test_a_null_key_binds_nothing_where_no_aad_is_bound(bad: object) -> None:
+    # BACKLOG #5962: the refusal fires only where an AAD is bound. A keyless store, the frozen v1
+    # writer (which seals with no AAD) and a purged '' cell all read as they did before it.
+    aad = cell_aad("t", "c", bad)
+    assert IdentityCipher().decrypt(IdentityCipher().encrypt("x", aad=aad), aad=aad) == "x"
+    v1 = make_cipher(generate_key())
+    assert v1.decrypt(v1.encrypt("x", aad=aad), aad=aad) == "x"
+    assert make_cipher(generate_key(), write_v2=True).decrypt("", aad=aad) == ""
 
 
 def test_cell_aad_binds_a_lone_surrogate_to_bytes_no_valid_string_spells() -> None:

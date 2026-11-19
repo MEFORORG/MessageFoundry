@@ -73,11 +73,13 @@ from messagefoundry.store.crypto import (
     CipherUnavailableError,
     TransitSealRefused,
     UnauthenticatedCipherError,
+    UnboundAAD,
     _UnmarkedPolicy,
     b64_chars,
     batch_chars,
     decrypt_or_error,
     gave_no_verdict,
+    require_bound_aad,
 )
 from messagefoundry.store.keyprovider import KeyProviderError
 from messagefoundry.store.keyprovider_vault import (
@@ -410,6 +412,8 @@ class TransitCipher(_UnmarkedPolicy):
 
     def _associated_data(self, aad: bytes | None) -> str | None:
         # Transit's associated_data is base64; None → omit it (symmetric with a None-aad encrypt).
+        # BACKLOG #5962: a cell_aad with a None or bool key component never reaches Vault.
+        require_bound_aad(aad)
         return base64.b64encode(aad).decode("ascii") if aad is not None else None
 
     def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
@@ -513,7 +517,8 @@ class TransitCipher(_UnmarkedPolicy):
         results: dict[int, str | CipherError] = {}
         sealed: list[int] = []
         for index, (stored, aad) in enumerate(items):
-            if stored.startswith(_V3_PREFIX):
+            # An UnboundAAD is answered alone: decrypt refuses it, and in a batch it fails the request.
+            if stored.startswith(_V3_PREFIX) and not isinstance(aad, UnboundAAD):
                 sealed.append(index)
             else:
                 results[index] = decrypt_or_error(self, stored, aad)

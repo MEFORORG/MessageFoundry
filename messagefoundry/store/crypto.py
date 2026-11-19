@@ -350,22 +350,49 @@ def cell_aad(table: str, column: str, *pk: object) -> bytes:
     the re-encrypt/rotation and cross-backend restore paths must reconstruct the same value. AAD length is
     irrelevant to GCM (it is hashed into the tag), so a verbose, collision-free form is free.
 
-    :func:`_aad_component` says how each component is spelled. A ``None`` or ``bool`` component raises
-    :class:`AADComponentError`, a :class:`CipherError` naming the table and column, because on a read
-    path it comes from a damaged or planted row, which the caller must contain like any cell that does
-    not open."""
+    :func:`_aad_component` says how each component is spelled. A ``None`` or ``bool`` component is
+    refused where the AAD is bound, not here: the value returned is an :class:`UnboundAAD`, and a
+    cipher that binds it into a seal or an open raises :class:`AADComponentError`, a
+    :class:`CipherError` naming the table and column, so a read path contains it like any cell that
+    does not open. Building one never raises, because a store builds the AAD for a row's cells before
+    it knows whether any is sealed: a NULL cell, a keyless store, or a v1 cell sealed with no AAD
+    binds nothing, and reads as it did before BACKLOG #5962."""
     fields = (
         _AAD_SCHEME,
         table.encode("utf-8"),
         column.encode("utf-8"),
-        *(_aad_component(p, table, column) for p in pk),
+        *(_aad_component(p) for p in pk),
     )
-    return b"".join(len(f).to_bytes(4, "big") + f for f in fields)
+    aad = b"".join(len(f).to_bytes(4, "big") + f for f in fields)
+    refused = [p for p in pk if p is None or isinstance(p, bool)]
+    if not refused:
+        return aad
+    unbound = UnboundAAD(aad)
+    unbound.refusal = f"{table}.{column}: cell_aad key component must not be {refused[0]!r}"
+    return unbound
 
 
-def _aad_component(value: object, table: str, column: str) -> bytes:
+class UnboundAAD(bytes):
+    """A :func:`cell_aad` whose key holds a ``None`` or ``bool`` component (BACKLOG #5962).
+
+    Its bytes are the ``str()`` spelling every component had before #5962, so ``None`` and the
+    string ``"None"`` give equal bytes. That is why no cipher may bind it: :func:`require_bound_aad`
+    raises :class:`AADComponentError` with ``refusal`` as its message, and each cipher calls it
+    before an AAD reaches AES-GCM or Transit. Concatenating one gives a plain ``bytes``; the two
+    builders that append to a :func:`cell_aad` append to the keyless frame, which is never one."""
+
+    refusal: str
+
+
+def require_bound_aad(aad: bytes | None) -> None:
+    """Raise :class:`AADComponentError` when ``aad`` is an :class:`UnboundAAD`. A cipher calls it
+    only where it binds ``aad``, so a value it seals or opens with no AAD is not refused."""
+    if isinstance(aad, UnboundAAD):
+        raise AADComponentError(aad.refusal)
+
+
+def _aad_component(value: object) -> bytes:
     """One :func:`cell_aad` key component as bytes, spelled the same at seal time and at every read.
-    ``table`` and ``column`` only name the cell in the refusal.
 
     A writer binds what it has in hand, and a reader binds what the column hands back, so a number
     is spelled by its value, not its Python type: a timestamp column (SQLite ``REAL``, Postgres
@@ -373,12 +400,15 @@ def _aad_component(value: object, table: str, column: str) -> bytes:
     it, and both must bind ``1000``. An integral float is therefore spelled as its integer, and any
     other float by ``float.__repr__``, which round-trips exactly. The base types' own methods are
     called, so a subclass (an ``int``-valued Enum member, say) is spelled as the value a driver binds,
-    never by its own ``__str__``. ``None`` and ``bool`` raise :class:`AADComponentError`: ``str()``
-    would bind them to the same bytes as the strings ``"None"`` and ``"True"``, the int spelling
-    would bind ``True`` as ``1``, and no key column holds either. A string is UTF-8 with ``surrogatepass``, so a lone surrogate binds bytes no valid string produces instead of
-    raising here; the backend's own write still refuses one. Any other type, such as a BLOB a damaged
-    SQLite row hands back, keeps its ``str()`` spelling, so a keyless open or a read whose cell is
-    NULL does not fail on it.
+    never by its own ``__str__``. ``None`` and ``bool`` keep their ``str()`` spelling here, and
+    :func:`cell_aad` returns an :class:`UnboundAAD` for them: ``str()`` gives them the same bytes as
+    the strings ``"None"`` and ``"True"``, and the int spelling would give ``True`` the bytes of
+    ``1``. A nullable key column can hand back ``None``, for example a SQLite ``TEXT`` key that a
+    damaged or planted row leaves NULL. A string is UTF-8 with ``surrogatepass``, so a lone surrogate
+    binds bytes no valid string produces instead of raising here; the backend's own write still
+    refuses one. Any other type, such as a BLOB a damaged SQLite row hands back, keeps its ``str()``
+    spelling. No spelling raises, so a keyless open or a read whose cell is NULL does not fail on
+    its key.
 
     Not covered, at least: a float bound into a TEXT-affinity key column comes back as the text
     ``"1000.0"``; an int past 2**53 written to a float column comes back rounded; and a ``Decimal``
@@ -386,7 +416,7 @@ def _aad_component(value: object, table: str, column: str) -> bytes:
     binds ``1000.0``, not the ``1000`` an int or integral float binds. No key column today takes
     any of the three; no store schema has a NUMERIC or DECIMAL column."""
     if value is None or isinstance(value, bool):
-        raise AADComponentError(f"{table}.{column}: cell_aad key component must not be {value!r}")
+        return str(value).encode("ascii")
     if isinstance(value, str):
         return str.encode(value, "utf-8", "surrogatepass")
     if isinstance(value, int):
@@ -719,12 +749,14 @@ class CipherError(Exception):
 
 
 class AADComponentError(CipherError, TypeError):
-    """A :func:`cell_aad` key component is ``None`` or a ``bool`` (BACKLOG #5962).
+    """A cipher was asked to bind an :class:`UnboundAAD`, a :func:`cell_aad` whose key holds a
+    ``None`` or a ``bool`` component (BACKLOG #5962). Raised at the seal or the open, never when
+    the AAD is built.
 
     A :class:`CipherError`, so a read or rotation path that contains an unopenable cell contains a
-    row whose key column holds a NULL the same way. Also a ``TypeError``, because on a write path it
-    is a caller passing the wrong type. The message names the table, the column and the refused
-    value, never the row's key."""
+    sealed cell whose key column holds a NULL the same way. Also a ``TypeError``, because on a write
+    path it is a caller passing the wrong type. The message names the table, the column and the
+    refused value, never the row's key."""
 
 
 class TransitSealRefused(Exception):
@@ -2154,6 +2186,8 @@ class AesGcmCipher(_UnmarkedPolicy):
         return write
 
     def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
+        if self._write_v2:
+            require_bound_aad(aad)  # before the invocation is charged, so nothing is sealed
         write = self._count_invocation()  # fail-closed before 2**32 (#190-F); no-op cost otherwise
         nonce = os.urandom(_NONCE_BYTES)
         # Cell-bound AAD (ASVS 11.3.3) is bound ONLY on the cell-bound (v4) writer. The v1 writer is FROZEN (CRYPTO-1):
@@ -2246,6 +2280,7 @@ class AesGcmCipher(_UnmarkedPolicy):
         # `aad`; a v2 blob cut-and-pasted into another cell (a different `aad`) fails the tag below →
         # CipherError (fail-closed, never a silent mis-decrypt). v4 is the cell-bound writer too.
         gcm_aad = aad if stored.startswith((_V2_PREFIX, _V4_PREFIX)) else None
+        require_bound_aad(gcm_aad)
         key_id, salt, blob = self._parse(stored)
         try:
             raw = base64.b64decode(blob)

@@ -79,14 +79,18 @@ def test_each_routing_field_changes_the_tag(field: str, value: object) -> None:
 
 
 def test_a_null_destination_is_not_the_text_none_or_blank() -> None:
-    """AC-10: ``cell_aad`` once str()-encoded, so NULL and ``"None"`` built the same bytes."""
+    """AC-10: ``cell_aad`` str()-encodes None, so NULL and ``"None"`` build the same bytes."""
     tags = {
         queue_payload_aad(**{**_BASE, "destination_name": value}) for value in (None, "None", "")
     }
     assert len(tags) == 3
-    # cell_aad now refuses a None component rather than spell it "None" (BACKLOG #5962).
+    # The control that shows why the encoder matters: the id-only cell_aad conflates them. A cipher
+    # refuses to bind that AAD (BACKLOG #5962), but its bytes are the same.
+    assert cell_aad("queue", "payload", None) == cell_aad("queue", "payload", "None")
     with pytest.raises(AADComponentError):
-        cell_aad("queue", "payload", None)
+        make_cipher(generate_key(), write_v2=True).encrypt(
+            "x", aad=cell_aad("queue", "payload", None)
+        )
 
 
 def test_the_tag_still_names_its_cell_and_reads_off_a_row() -> None:
