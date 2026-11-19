@@ -19,12 +19,12 @@ Within each registry table that `CASE_TWIN_TABLES` in
 [config/wiring.py](../messagefoundry/config/wiring.py) lists, two names may not differ only in case
 (`IB_Test_ADT` beside `IB_TEST_ADT`): the config refuses to load, and a rename onto such a name is
 refused, because a SQL Server store column that compares without case would read the two as one
-(BACKLOG #5392). Those tables are inbound connections, outbound connections, `FhirLookup`s,
-`DatabaseLookup`s and reference sets; router and handler names are in none of them, so no case
-twin among them is refused. A `DatabaseLookup` or reference-set name, which the connection-name rule
-does not bind, is also refused beside one that differs from it only in width or trailing spaces;
-`case_twins` there says what the check still misses. An inbound and an outbound
-may still share a name up to case, as they may exactly.
+(BACKLOG #5392). A name of a kind no table there lists is not checked: at least router, handler
+and code-set names. A `DatabaseLookup` or reference-set name, which the connection-name rule
+does not bind, is also refused beside one that differs from it only in trailing spaces, or in the
+width of the full-width forms `case_twins` there folds; that function says what the check still
+misses, other width differences among them. An inbound and an outbound may still share a name up
+to case, as they may exactly.
 
 Example: **`IB_ACME_ADT`** = inbound MLLP from ACME carrying ADT. The shipped sample uses partner
 `Test`: **`IB_Test_ADT`** (inbound MLLP) → **`FILE-OUT_Test_ADT`** (outbound file).
