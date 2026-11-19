@@ -5,7 +5,8 @@
   connection-scoped. See the amendment under §1. Amended 2026-10-08 (BACKLOG #2527): no action
   fires on an event whose `connection` key is not a connection name. Amended 2026-10-08 (BACKLOG
   #2528): with no `control_target`, the restart runs only when the name is declared on the action's
-  side alone.
+  side alone. Amended 2026-11-19 (owner ruling, PR 3069): the control action runs on its own
+  throttle, apart from the notification's. See the amendment under §4.
 - **Built:** Yes — additive. `AlertRule.control_action` / `control_target` in
   [`config/settings.py`](../../messagefoundry/config/settings.py), carried through
   `AlertRuleSet.decide → _RuleDecision`, dispatched by
@@ -109,10 +110,13 @@ lists the operator starts that still raise nothing, so leave the window standing
 from the notification's. The sink records when it dispatched a control task for an
 `(event_type, connection)`, and decides the next control action from that time alone, whether or not
 the notification for the same emit is throttled. So the restart still fires at most once per
-connection per cooldown, for each event type. It is recorded only when a control task is scheduled:
-an emit whose action is skipped (for example: no control callback wired, the engine shutting down,
-or an event that is not about a connection) records nothing. A restart can therefore fire on a throttled alert
-when an earlier alert in the window ran no restart. The notification throttle is unchanged, and a
+connection per cooldown, for each event type. The key is the connection that raised the event, not
+the one restarted, so a `control_target` that several connections' events name can be restarted
+once per cooldown for each of them. The time is recorded only when the sink schedules a control
+task: an emit whose action the sink skips (for example: no control callback wired, the engine
+shutting down, or an event that is not about a connection) records nothing. A scheduled task records
+the time even when the callback then restarts nothing. A restart can therefore fire on a throttled
+alert when an earlier alert in the window ran no restart. The notification throttle is unchanged, and a
 `connection_error` of kind `config_fault` keeps its own notification throttle (ADR 0095 Amendment
 B.2) while sharing the `connection_error` control throttle with the transport kind. The
 `connection_started` clear above ends both windows, and a failed resolve restores both.

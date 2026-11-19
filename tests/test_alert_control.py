@@ -219,13 +219,13 @@ async def test_control_explicit_target() -> None:
     assert cb.calls == [("restart_inbound", "IB_FEED")]
 
 
-async def test_control_throttled_with_notification() -> None:
+async def test_control_throttled_per_cooldown() -> None:
     cb = _Control()
     rule = AlertRule(event_type="connection_stopped", control_action="restart_outbound")
     sink = NotifierAlertSink([_RecordingTransport()], realert_seconds=10_000.0, rules=[rule])
     sink.set_control_callback(cb)
     sink.connection_stopped("OB_X", detail="boom")
-    sink.connection_stopped("OB_X", detail="boom again")  # throttled → no second restart
+    sink.connection_stopped("OB_X", detail="boom again")  # inside the restart's cooldown
     await _drain(sink)
     assert cb.calls == [("restart_outbound", "OB_X")]  # exactly once per cooldown
 
@@ -326,6 +326,22 @@ async def test_a_skipped_dispatch_records_no_control_time(clock: _Clock) -> None
     assert restarts == [5.0]
     assert sink._last_control == {"connection_error:OB_X": 1005.0}
     assert [e.get("kind") for e in t.events] == ["config_fault"]  # the second page was throttled
+
+
+async def test_a_skip_logs_once_per_notification_cooldown(
+    clock: _Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A skip records no control time, so it is re-evaluated on every emit; its warning still
+    # follows the notification throttle rather than repeating on every emit.
+    rule = AlertRule(event_type="connection_stopped", control_action="restart_outbound")
+    sink = NotifierAlertSink([_RecordingTransport()], realert_seconds=10.0, rules=[rule])
+    with caplog.at_level("WARNING", logger=alert_sinks.log.name):
+        for at in (0.0, 3.0, 9.0, 11.0):
+            clock.now = 1000.0 + at
+            sink.connection_stopped("OB_X", detail="boom")
+    await _drain(sink)
+    wired = [r for r in caplog.records if "no control callback is wired" in r.getMessage()]
+    assert len(wired) == 2  # at 0 and 11, the two emits whose page was not throttled
 
 
 async def test_a_config_fault_storm_pages_once_and_restarts_once(clock: _Clock) -> None:

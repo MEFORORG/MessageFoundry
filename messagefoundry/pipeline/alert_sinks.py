@@ -2272,45 +2272,56 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # #144 (ADR 0128 section 4, owner ruling 2026-11-19): the auto-remediation control action is
         # decided on its own throttle, _last_control, per (event_type, connection), whether or not
         # the notification was throttled. It is recorded only when a control task is dispatched, so
-        # an emit the guards below skip does not hold back a later restart. It runs BEFORE the
-        # notification returns, so a rule may auto-remediate QUIETLY (transports=[]) or alongside a
-        # page. Dispatched off-worker + never-raise (see _dispatch_control).
-        control_key = f"{event['type']}:{event['connection']}"
-        last_control = self._last_control.get(control_key)
-        if decision.control_action is not None and (
-            last_control is None or now - last_control >= cooldown
-        ):
-            subject = str(event["connection"])
-            dispatched = False
-            if event["type"] not in _ALERT_CONTROL_EVENT_TYPES:
-                # BACKLOG #1898: AlertRule refuses this pair at load, so a loaded rule never reaches
-                # here. This covers only a rule built past that validator (model_construct).
-                log.warning(
-                    "alert control_action %s skipped: event type %r is not connection-scoped",
-                    decision.control_action,
-                    event["type"],
-                )
-            elif not is_connection_name(subject):
-                # BACKLOG #2527: an allowed type can still carry a stand-in. reference_sync and
-                # state_convergence raise connection_stopped under a colon key, which no connection
-                # name can hold. The event is then not about a connection, so no restart fires,
-                # not even at an explicit control_target. The subject is not logged: a stand-in is
-                # not a connection name, and this line must not echo whatever it is.
-                log.warning(
-                    "alert control_action %s skipped: the %r event is not about a connection",
-                    decision.control_action,
-                    event["type"],
-                )
-            elif decision.control_target is not None:
-                dispatched = self._dispatch_control(
-                    decision.control_action, decision.control_target, default_target=False
-                )
-            else:
-                dispatched = self._dispatch_control(
-                    decision.control_action, subject, default_target=True
-                )
-            if dispatched:
-                self._last_control[control_key] = now
+        # an emit the guards below skip does not hold back a later restart. A skip is logged only
+        # on an emit whose notification is not throttled, so a skip that repeats on every emit
+        # logs once per notification cooldown. It runs BEFORE the notification returns, so a rule
+        # may auto-remediate QUIETLY (transports=[]) or alongside a page. Dispatched off-worker +
+        # never-raise (see _dispatch_control).
+        if decision.control_action is not None:
+            control_key = f"{event['type']}:{event['connection']}"
+            last_control = self._last_control.get(control_key)
+            if last_control is None or now - last_control >= cooldown:
+                subject = str(event["connection"])
+                dispatched = False
+                if event["type"] not in _ALERT_CONTROL_EVENT_TYPES:
+                    # BACKLOG #1898: AlertRule refuses this pair at load, so a loaded rule never
+                    # reaches here. This covers only a rule built past that validator
+                    # (model_construct).
+                    if not throttled:
+                        log.warning(
+                            "alert control_action %s skipped: event type %r is not connection-scoped",
+                            decision.control_action,
+                            event["type"],
+                        )
+                elif not is_connection_name(subject):
+                    # BACKLOG #2527: an allowed type can still carry a stand-in. reference_sync and
+                    # state_convergence raise connection_stopped under a colon key, which no
+                    # connection name can hold. The event is then not about a connection, so no
+                    # restart fires, not even at an explicit control_target. The subject is not
+                    # logged: a stand-in is not a connection name, and this line must not echo
+                    # whatever it is.
+                    if not throttled:
+                        log.warning(
+                            "alert control_action %s skipped: the %r event is not about a connection",
+                            decision.control_action,
+                            event["type"],
+                        )
+                elif decision.control_target is not None:
+                    dispatched = self._dispatch_control(
+                        decision.control_action,
+                        decision.control_target,
+                        default_target=False,
+                        log_skip=not throttled,
+                    )
+                else:
+                    dispatched = self._dispatch_control(
+                        decision.control_action,
+                        subject,
+                        default_target=True,
+                        log_skip=not throttled,
+                    )
+                if dispatched:
+                    self._last_control[control_key] = now
         if throttled:
             return  # the notification is throttled for this window
         # #143 (ADR 0044 amendment): the windowed suspend gate — NOTIFICATION-only. The durable instance
@@ -2636,31 +2647,36 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 )
                 await asyncio.gather(*pending, return_exceptions=True)
 
-    def _dispatch_control(self, action: str, target: str, *, default_target: bool) -> bool:
+    def _dispatch_control(
+        self, action: str, target: str, *, default_target: bool, log_skip: bool = True
+    ) -> bool:
         """Schedule the injected connection-control callback OFF the delivery worker (a fire-and-forget
         task, exactly like the ADR 0044 state observer). Synchronous + non-blocking: it only creates the
         task, never awaits the runner, so a slow/hung restart can never stall the worker that emitted the
-        alert. A no-op when no callback is wired, logged on each emit that reaches it. Returns whether
-        a task was scheduled."""
+        alert. A no-op when no callback is wired, logged when ``log_skip`` is set. Returns whether a
+        task was scheduled."""
         cb = self._control_cb
         if cb is None and self._control_stopped:
             # Shutdown cleared it on purpose (stop_control), so this is not a wiring fault.
-            log.info("alert control_action %s for %r not run: shutting down", action, target)
+            if log_skip:
+                log.info("alert control_action %s for %r not run: shutting down", action, target)
             return False
         if cb is None:
-            log.warning(
-                "alert control_action %s for %r requested but no control callback is wired",
-                action,
-                target,
-            )
+            if log_skip:
+                log.warning(
+                    "alert control_action %s for %r requested but no control callback is wired",
+                    action,
+                    target,
+                )
             return False
+        run = self._run_control(cb, action, target, default_target=default_target)
         try:
-            task = asyncio.ensure_future(
-                self._run_control(cb, action, target, default_target=default_target)
-            )
+            task = asyncio.ensure_future(run)
         except RuntimeError:
             # No running loop (e.g. a control emit on a non-async test path) — best-effort, drop it rather
-            # than raise into the caller. The notification path is unaffected.
+            # than raise into the caller. The notification path is unaffected. Closing the coroutine
+            # spares a never-awaited warning.
+            run.close()
             return False
         self._control_tasks.add(task)
         task.add_done_callback(self._control_tasks.discard)
