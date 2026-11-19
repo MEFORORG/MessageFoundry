@@ -3801,7 +3801,9 @@ nothing to clear makes no such check:
   failures, are appended in the reset's own transaction, so the counters are not reset without
   them, and a refused append rolls the reset back.
 - A raise from the stamp onward writes an `auth.reauth` row marked `interrupted`, softly, beside
-  any row the clear already committed. A raise inside the re-proof itself, after the password
+  any row the clear already committed. When the clear itself raises, at least on a store error
+  whose commit the re-auth cannot read back, the store is first asked to end the rotated session,
+  and the row carries `clear_raised` and `session_ended`. A raise inside the re-proof itself, after the password
   verified, writes no `auth.reauth` row.
 
 **A directory step-up or enrolment leg refuses a present account that lost a role in the directory

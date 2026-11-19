@@ -15653,11 +15653,11 @@ class AuthService:
 
     async def _end_reauth_rotated_session(self, rotated_token: str, actor: str) -> bool:
         """Ask the store to end the session a re-auth rotated once :meth:`_clear_after_reauth`
-        answered ``"denied"`` or raised (BACKLOG #5900), and say whether the revoke landed, as far as this
-        call saw. A refused revoke is tried once more, as ``confirm_mfa_enrollment`` tries its own
-        (BACKLOG #3025). Refused twice, it is logged and answered False: the elevated session may
-        then stay live, unreachable, because the caller answers ``session_lost`` either way and
-        its new token is never handed back. The caller records the answer on its ``auth.reauth``
+        answered ``"denied"`` or raised (BACKLOG #5900), and say whether the revoke landed, as far
+        as this call saw. A refused revoke is tried once more, as ``confirm_mfa_enrollment`` tries
+        its own (BACKLOG #3025). Refused twice, it is logged and answered False: the elevated
+        session may then stay live, unreachable, because the caller answers ``session_lost`` or
+        raises either way and its new token is never handed back. The caller records the answer on its ``auth.reauth``
         row."""
         rotated = hash_token(rotated_token)
         for attempt in ("retrying", "and could not end the session it rotated"):
@@ -15773,6 +15773,8 @@ class AuthService:
         # Set when the deferred clear could not establish the account (BACKLOG #5900): whether the
         # revoke of the rotated session landed, as far as it saw. None otherwise.
         clear_denied_session_ended: bool | None = None
+        # Set when that revoke followed a raise from the clear rather than a denial.
+        clear_raised = False
         provider_detail = {"provider": identity.auth_provider.value}
         # Both counters, as the login leg sums them (ADR 0197): a run of wrong codes is on the
         # second-step counter now. Read off the row the proof decided on; the clear writes only
@@ -15813,9 +15815,13 @@ class AuthService:
                     **({"reason": proof.reason} if proof.reason is not None else {}),
                     # A good password whose deferred clear could not establish the account
                     # (BACKLOG #5900), so the rotated session was asked to end; session_ended says
-                    # whether that revoke landed. Only when set, so other rows keep their shape.
+                    # whether that revoke landed. Only when set, so other rows keep their shape. A
+                    # clear that raised, its outcome unknown, is named clear_raised instead.
                     **(
-                        {"clear_denied": True, "session_ended": clear_denied_session_ended}
+                        {
+                            "clear_raised" if clear_raised else "clear_denied": True,
+                            "session_ended": clear_denied_session_ended,
+                        }
                         if clear_denied_session_ended is not None
                         else {}
                     ),
@@ -15900,6 +15906,7 @@ class AuthService:
                         # session is ended as on the denied path below, rather than left live
                         # with its token never handed back; the row the ``finally`` writes says
                         # whether that revoke landed.
+                        clear_raised = True
                         lost = True
                         elevation = Elevation(session_lost=True)
                         clear_denied_session_ended = False

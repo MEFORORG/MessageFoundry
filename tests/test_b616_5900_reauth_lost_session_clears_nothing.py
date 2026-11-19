@@ -1060,6 +1060,7 @@ async def test_a_store_error_at_the_clear_ends_the_rotated_session(
         assert len(rows) == before + 1
         assert rows[0]["interrupted"] is True and rows[0]["session_lost"] is True
         assert rows[0]["session_ended"] is True
+        assert rows[0]["clear_raised"] is True and "clear_denied" not in rows[0]
     finally:
         await store.close()
 
