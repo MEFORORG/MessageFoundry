@@ -366,11 +366,14 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         "test_scan_allowlist_whole_line_5445.py",
         # NOT engine source, so this entry widens the list's stated rule, as
         # test_windows_lock_install.py above does and for the same reason (the path gate).
-        # Pins the cap on the workers `pytest -n auto` starts: tests/_xdist_worker_cap.py and the
-        # two conftests that register it, tests/conftest.py and the web console suite's. ci.yml's
-        # `tooling=` path predicate matches tests/conftest.py but neither of the other two, so an
-        # edit to one of those alone does not trip the tooling path gate; listed as tooling this
-        # guard would not run on the change that breaks it.
+        # Pins the cap on the workers `pytest -n auto` starts: tests/_xdist_worker_cap.py and at
+        # least the four places that register it, the `addopts` of pyproject.toml and of the web
+        # console's pyproject.toml, tests/conftest.py and the web console suite's conftest. ci.yml's
+        # `tooling=` path predicate matches both pyproject.toml files and tests/conftest.py but not
+        # tests/_xdist_worker_cap.py or the console conftest, so an edit to one of those two alone
+        # does not trip the tooling path gate; listed as tooling this
+        # guard would not run on the change that breaks it. It starts two child pytest processes,
+        # each stopped before any worker spawns.
         "test_xdist_auto_worker_cap.py",
     }
 )
