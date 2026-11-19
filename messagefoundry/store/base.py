@@ -77,7 +77,6 @@ from messagefoundry.store.crypto import (
     CipherInfo,
     UnmarkedRefusalHook,
     make_cipher,
-    retired_keys_present,
 )
 from messagefoundry.store.document_strip import StripResult
 from messagefoundry.store.keyprovider import KeyProviderError, _split_retired, resolve_key_provider
@@ -3759,9 +3758,9 @@ def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = 
     So does a pinned built-in provider that ignores the key the settings name (BACKLOG #2077):
     ``dpapi`` with only ``MEFOR_STORE_ENCRYPTION_KEY``, or ``env`` with only a key file.
 
-    And so does no key beside a retired one (BACKLOG #5308), unless ``cipher_provider`` is
-    ``vault_transit``: that raises a :class:`StoreCipherConfigError`, a ``ValueError``, with
-    ``make_cipher``'s text, where the two refusals above raise ``KeyProviderError``.
+    And so does no key beside a retired one (BACKLOG #5308), under every ``cipher_provider``: that
+    raises a :class:`StoreCipherConfigError`, a ``ValueError``, with ``make_cipher``'s text, where
+    the two refusals above raise ``KeyProviderError``.
 
     ``posture`` is the instance posture the caller holds, for an external provider's hop guard
     (vault BACKLOG #2983). ``None`` counts as enforcing there.
@@ -3800,14 +3799,14 @@ def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = 
 
 def retired_without_active_refusal(settings: StoreSettings) -> str | None:
     """Why a retired key with no active key is refused, or ``None`` when no retired key is set
-    (BACKLOG #5310, #5308). The caller has found no active key: ``store.base._checked_active_key``
-    after the provider resolved none, and the start gate after it found none configured. The text
-    is ``make_cipher``'s, by its test, so the start gate, the store open and a DR restore refuse
-    alike. ``None`` under ``cipher_provider = 'vault_transit'``: that store cipher reads no local
-    key, so its open never meets the identity cipher this refuses."""
-    if settings.cipher_provider == "vault_transit":
-        return None
-    if not retired_keys_present(settings.encryption_keys_retired.split(",")):
+    (BACKLOG #5310, #5308). The caller has found no active key: :func:`_checked_active_key` after
+    the provider resolved none, and the start gate after it found none configured. The text is
+    ``make_cipher``'s, and an entry counts as a key by the same test, not blank once stripped.
+
+    It applies under every ``cipher_provider``. Under ``vault_transit`` the store cipher reads no
+    local key and never reaches :func:`_checked_active_key`, so the store open does not refuse
+    there; what reads a local key there, the start gate and the DR backup and restore, does."""
+    if not _split_retired(settings.encryption_keys_retired):
         return None
     return RETIRED_WITHOUT_ACTIVE
 
@@ -3815,8 +3814,9 @@ def retired_without_active_refusal(settings: StoreSettings) -> str | None:
 def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
     """``key`` (a provider's ``active_key()``), refusing "no key" wherever the settings promised one:
     from an EXTERNAL provider (BACKLOG #1998), from a pinned built-in provider that ignores the
-    local key that is set (BACKLOG #2077), or beside a retired key (BACKLOG #5308). The one check both :func:`resolve_active_key` and
-    :func:`resolve_decrypt_keys` pass, so every command that opens a store gets it."""
+    local key that is set (BACKLOG #2077), or beside a retired key (BACKLOG #5308). The one check
+    both :func:`resolve_active_key` and :func:`resolve_decrypt_keys` pass, so every command that
+    resolves a local store key gets it."""
     from messagefoundry.store.keyprovider import (
         _EXTERNAL_PROVIDERS,
         KeyProviderError,
@@ -3839,8 +3839,8 @@ def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
     if (retired := retired_without_active_refusal(settings)) is not None:
         # ``make_cipher``'s rule, with its text (BACKLOG #5310, #5308): a retired key with no
         # active key is a rotation missing its new key. Refused here, the check every key resolve
-        # passes, so the DR restore's keyring and the store's cipher do not diverge on it;
-        # recorded, so the cipher build's fixed-text replacement keeps the text.
+        # passes, so a DR restore's keyring is never the retired keys alone; recorded, so the
+        # cipher build's fixed-text replacement keeps the text.
         raise _recorded(StoreCipherConfigError(retired), retired)
     return key
 
@@ -3856,9 +3856,9 @@ def resolve_decrypt_keys(
     now-retired key after a rotation (ADR 0049 AC-5: "incl. retired keys") — uses this, not just the
     active key. Order is active-first; duplicates and empties are dropped; an unset active key yields an
     empty list (identity cipher), and an unset active key beside a retired one is refused as
-    ``make_cipher`` refuses it (:func:`_checked_active_key`, BACKLOG #5308), so a DR restore never
-    decrypts under a keyring the store itself would not open under. ``posture`` is as on
-    :func:`resolve_active_key`.
+    ``make_cipher`` refuses it (:func:`_checked_active_key`, BACKLOG #5308), under every
+    ``cipher_provider``, so a DR restore never decrypts under the retired keys alone. ``posture``
+    is as on :func:`resolve_active_key`.
 
     The three refusals there apply here too, and here also to the key check (BACKLOG #4882): an
     error from the provider or the key check that has a codec error on it, whose chain cannot be

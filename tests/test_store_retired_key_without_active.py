@@ -140,20 +140,26 @@ def test_resolve_decrypt_keys_still_returns_the_keyring_when_an_active_key_is_se
 
 
 def test_blank_retired_settings_are_no_retired_key_at_any_seam() -> None:
-    # The settings seam and make_cipher read a blank entry alike: no key, so keyless as before.
+    # The settings seam and make_cipher read a blank entry alike: no key, so keyless as before,
+    # and beside an active key a blank entry is skipped, not decoded as a bad key.
+    active = generate_key()
+    assert isinstance(make_cipher(active, ["  "]), AesGcmCipher)
     keyless = StoreSettings(encryption_keys_retired=" , ")
     assert resolve_active_key(keyless) is None
     assert resolve_decrypt_keys(keyless) == []
     assert isinstance(build_store_cipher(keyless), IdentityCipher)
 
 
-def test_under_vault_transit_a_retired_key_with_no_local_active_key_is_not_refused() -> None:
-    # Transit's store cipher reads no local key, so its open never meets the identity cipher; the
-    # key seam keeps its earlier answer there, and the DR keyring is the retired key alone.
-    retired = generate_key()
-    store = StoreSettings(cipher_provider="vault_transit", encryption_keys_retired=retired)
-    assert resolve_active_key(store) is None
-    assert resolve_decrypt_keys(store) == [retired]
+def test_under_vault_transit_the_dr_key_resolves_and_the_gate_still_refuse() -> None:
+    # Transit's store open reads no local key, but the DR backup and restore do resolve one: a
+    # backup with allow_unencrypted would otherwise write a cleartext archive beside a retired key,
+    # and a restore would decrypt under the retired key alone.
+    store = StoreSettings(cipher_provider="vault_transit", encryption_keys_retired=generate_key())
+    for resolve in (resolve_active_key, resolve_decrypt_keys):
+        with pytest.raises(StoreCipherConfigError) as caught:
+            resolve(store)
+        assert str(caught.value) == RETIRED_WITHOUT_ACTIVE
+    assert _keyless_store_gate(ServiceSettings(store=store)) == KEYLESS_REFUSED_BY_UNREAD_KEY
 
 
 def test_the_start_gate_refuses_before_the_open_whatever_the_opt_out_says() -> None:

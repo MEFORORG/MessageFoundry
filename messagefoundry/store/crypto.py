@@ -112,7 +112,7 @@ import os
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
@@ -2290,21 +2290,15 @@ def _decode_key(key_b64: str, name: str) -> bytearray:
 #: Why a keyring with retired keys and no active key is refused (BACKLOG #5310, #5308). The text
 #: reads only which settings are set, never a key. :func:`make_cipher` raises it, and so does the
 #: store's key seam (``store.base._checked_active_key``, through
-#: ``store.base.retired_without_active_refusal``), both deciding by
-#: :func:`retired_keys_present`. The seam excludes ``cipher_provider = 'vault_transit'``, whose store
-#: cipher reads no local key.
+#: ``store.base.retired_without_active_refusal``); both count an entry as a key when it is not
+#: blank once stripped, as ``keyprovider._split_retired`` reads the setting.
 RETIRED_WITHOUT_ACTIVE = (
     "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED is set but no active store key resolved "
-    "(MEFOR_STORE_ENCRYPTION_KEY, [store].encryption_key_file or the [store].key_provider); "
-    "refusing the identity (plaintext) cipher, which would write new rows unencrypted. Set the "
-    "active key; a store meant to run keyless lists no retired keys"
+    "(MEFOR_STORE_ENCRYPTION_KEY, [store].encryption_key_file or the [store].key_provider). "
+    "That is a rotation missing its new key, so it is refused rather than run keyless: a keyless "
+    "store writes new rows, and a keyless DR backup its archive, unencrypted. Set the active key; "
+    "a store meant to run keyless lists no retired keys."
 )
-
-
-def retired_keys_present(retired: Iterable[str]) -> bool:
-    """Whether any of ``retired`` is a key: an entry that is not blank once stripped, as the
-    settings' comma split reads it. The one test behind :data:`RETIRED_WITHOUT_ACTIVE`."""
-    return any(k.strip() for k in retired)
 
 
 def make_cipher(
@@ -2324,7 +2318,7 @@ def make_cipher(
     byte-identical). ``allow_unmarked`` is ``[store].allow_unmarked_ciphertext``: off, a keyed cipher
     refuses a non-blank unmarked value."""
     if not key_b64:
-        if retired_keys_present(retired_b64):
+        if any(k.strip() for k in retired_b64):
             raise ValueError(RETIRED_WITHOUT_ACTIVE)
         return IdentityCipher()
     # Every key decoded so far is wiped if a later one fails to decode, or the cipher's own build
@@ -2343,7 +2337,7 @@ def make_cipher(
             )
         )
         for k in retired_b64:
-            if k:
+            if k.strip():  # a blank entry is no key, by the test the refusal above applies
                 keys.append(_decode_key(k, "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"))
         return AesGcmCipher(keys[0], keys[1:], write_v2=write_v2, allow_unmarked=allow_unmarked)
     except BaseException:
