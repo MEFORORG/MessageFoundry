@@ -10,7 +10,6 @@ isolation. The ``tls_min_version`` floor (NIST SP 800-52r2: 1.2+) is enforced vi
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import logging
 import os
@@ -23,7 +22,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from messagefoundry.api_tls_source import GENERATED_CERT_NAME, ApiTlsSource, api_tls_source
+from messagefoundry.api_tls_source import (
+    GENERATED_CERT_NAME,
+    ApiTlsSource,
+    api_tls_source,
+    wildcard_loopback,
+)
 from messagefoundry.audit_write import write_audit_soft
 from messagefoundry.auth.trust_anchors import (
     anchor_refusal,
@@ -239,18 +243,13 @@ def _generated_sans(host: str) -> list[str]:
     """The names a generated certificate carries beside ``host``, its subject (BACKLOG #5973).
 
     A WILDCARD bind (``0.0.0.0``, ``::``) is not an address any client can dial, so a certificate
-    naming it alone verifies against no URL at all. It also names the loopback of the same family,
-    the address the tray and any other client on this box reach a wildcard bind through. Every
-    other bind needs nothing extra: a client dials that host as written. Only the one loopback of
-    the bind's own family is added, because a ``0.0.0.0`` bind does not listen on ``::1``.
+    naming it alone verifies against no URL at all. It also names the loopback of the same family
+    (:func:`messagefoundry.api_tls_source.wildcard_loopback`), the address the tray and any other
+    client on this box reach a wildcard bind through. Every other bind needs nothing extra: a
+    client dials that host as written.
     """
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        return []
-    if not ip.is_unspecified:
-        return []
-    return ["::1" if ip.version == 6 else "127.0.0.1"]
+    loopback = wildcard_loopback(host)
+    return [] if loopback is None else [loopback]
 
 
 #: Renew the generated pair at startup once less than this share of its OWN validity period is

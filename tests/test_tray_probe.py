@@ -989,3 +989,7 @@ def test_a_pair_naming_only_the_wildcard_still_fails_verification(
         url = build_engine_url(dial_host, port, tls=True) or ""
         with make_probe_client(url, cacert=cert) as client:
             assert probe_health(client) is HealthProbe.DOWN
+            # DOWN for the right reason: the handshake reached the server and the hostname check
+            # refused it, rather than a refused connection or a dead server thread.
+            with pytest.raises(httpx.ConnectError, match="IP address mismatch"):
+                client.get("/health")

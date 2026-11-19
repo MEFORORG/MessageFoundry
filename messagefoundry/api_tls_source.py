@@ -12,6 +12,7 @@ of the rule. Two copies had drifted before: keying the scheme on
 
 from __future__ import annotations
 
+import ipaddress
 from typing import Literal
 
 #: Where the material the API bind serves with comes from. ``upstream`` is the one source that is not
@@ -32,3 +33,24 @@ def api_tls_source(*, cert_file: str | None, tls_terminated_upstream: bool) -> A
     if cert_file:
         return "operator"
     return "upstream" if tls_terminated_upstream else "generated"
+
+
+def wildcard_loopback(host: str) -> str | None:
+    """The loopback a client on this box reaches a WILDCARD bind through, or ``None`` (BACKLOG #5973).
+
+    A wildcard bind (``0.0.0.0``, ``::``, bracketed or not) listens on every address of its family,
+    loopback included, but is not itself an address a client can connect to. ``::`` maps to ``::1``
+    rather than ``127.0.0.1`` because asyncio's ``create_server``, which ``uvicorn.run`` reaches, sets
+    ``IPV6_V6ONLY`` on an IPv6 listener. Any other host, a name included, is not a wildcard.
+
+    ONE copy for two callers: the engine names this address in the certificate it mints for a
+    wildcard bind (:mod:`messagefoundry.api.tls`), and the tray dials it
+    (:mod:`messagefoundry.tray.config`), so the address dialled and the name verified are one rule.
+    """
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return None
+    if not ip.is_unspecified:
+        return None
+    return "::1" if ip.version == 6 else "127.0.0.1"

@@ -724,6 +724,11 @@ def test_dial_target(bind: str, dial: str) -> None:
             ("0.0.0.0", None),
         ),
         ({"security": {"local_access_only": False}}, ("127.0.0.1", None)),
+        # The settings model's lax bool: these spellings of false open the bind too.
+        ({"security": {"local_access_only": "no", "listen_address": "::"}}, ("::", None)),
+        ({"security": {"local_access_only": 0, "listen_address": "::"}}, ("::", None)),
+        ({"security": {"local_access_only": "true", "listen_address": "::"}}, (None, None)),
+        ({"security": {"local_access_only": 1, "listen_address": "::"}}, (None, None)),
         ({"security": {"listen_address": "::1"}}, (None, None)),
         ({"security": {"local_access_only": True, "listen_address": "::1"}}, (None, None)),
         ({"security": {"local_access_only": False, "listen_address": "bad host"}}, (None, None)),
@@ -739,6 +744,21 @@ def test_dial_target(bind: str, dial: str) -> None:
 )
 def test_service_toml_bind(toml: dict[str, object] | None, expected: object) -> None:
     assert service_toml_bind(toml) == expected
+
+
+def test_the_tray_copies_of_the_engine_bind_defaults_match_the_engine() -> None:
+    """The tray may not import config/, so it copies these; this pins the copies."""
+    from messagefoundry.config.settings import ApiSettings, SecuritySettings
+    from messagefoundry.tray import config as tray_config
+
+    assert ApiSettings().host == tray_config._DEFAULT_API_HOST
+    assert SecuritySettings().listen_address == tray_config._DEFAULT_API_HOST
+    assert ApiSettings().port == tray_config._DEFAULT_API_PORT
+    for spelling in tray_config._FALSE_WORDS:
+        assert (
+            SecuritySettings.model_validate({"local_access_only": spelling}).local_access_only
+            is False
+        )
 
 
 def test_compose_a_wildcard_flag_dials_loopback() -> None:
