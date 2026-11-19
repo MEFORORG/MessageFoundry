@@ -14,9 +14,11 @@ import asyncio
 import logging
 import os
 from pathlib import Path
+from typing import Any, BinaryIO
 
 import pytest
 
+import messagefoundry.uploads as uploads
 from messagefoundry.__main__ import main
 from messagefoundry.store.crypto import AesGcmCipher, generate_key, make_cipher
 from messagefoundry.uploads import ResealResult, UploadStore
@@ -179,22 +181,44 @@ def test_a_file_too_large_for_an_upload_is_a_skip_and_is_never_read_whole(
     tmp_path: Path, keys: tuple[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A skip and not a lost body: it may be a real one from before ``max_upload_bytes`` came down.
-    The spy stands in for the ``MemoryError`` a real read of such a file would raise."""
+    The spy stands in for the ``MemoryError`` a real read of such a file would raise. It wraps the
+    handle the reseal reads through (``_open_plain``), so an unbounded read, or one past the
+    limit, of this file raises; a spy on ``Path.read_text``, which the pass no longer calls, could
+    not fail (BACKLOG #5387)."""
     key_a, key_b = keys
     fid = _save(tmp_path, _aes(key_a))
     blob = tmp_path / f"{fid}.blob"
     with blob.open("ab") as handle:
         handle.truncate(2 * _MAX + 4097)
-    real = Path.read_text
+    limit = 2 * _MAX + 4096  # UploadStore._stored_limit
+    real_open = uploads._open_plain  # noqa: SLF001 - the spy wraps the seam the pass reads through
+    taken: list[int] = []
 
-    def refuse_the_big_one(self: Path, *args: object, **kwargs: object) -> str:
-        if self == blob:
-            raise MemoryError
-        return real(self, *args, **kwargs)  # type: ignore[arg-type]
+    class _Bounded:
+        def __init__(self, inner: BinaryIO) -> None:
+            self._inner = inner
 
-    monkeypatch.setattr(Path, "read_text", refuse_the_big_one)
+        def read(self, size: int | None = -1) -> bytes:
+            if size is None or size < 0 or size > limit + 1 or sum(taken) + size > limit + 1:
+                raise MemoryError
+            data = self._inner.read(size)
+            taken.append(len(data))
+            return data
+
+        def __enter__(self) -> _Bounded:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._inner.close()
+
+    def spy(path: Path) -> tuple[Any, os.stat_result]:
+        handle, info = real_open(path)
+        return (_Bounded(handle), info) if path == blob else (handle, info)
+
+    monkeypatch.setattr(uploads, "_open_plain", spy)
     result = _reseal(tmp_path, _aes(key_b, key_a))
     assert (result.skipped, result.body_lost) == (1, 0)
+    assert taken, "the spy never saw the body read, so it could not have failed"
 
 
 def test_a_large_file_already_under_the_active_key_is_not_a_skip(

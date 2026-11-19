@@ -891,7 +891,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    one. A sidecar that holds nothing else is blank, the damaged kind. `rotate-key` leaves as it is
    a sidecar every reader refuses before decrypting. At least one over 128 KiB, a plaintext one
    past that seal bound, a blank one and one that is not UTF-8 are such. It counts each apart from
-   `skipped`, so none holds the rotation open. The command's output does not report that count,
+   `skipped`, so none holds the rotation open, except one over 128 KiB or not UTF-8 whose first
+   bytes past its padding show, or may hide, a marker naming a key other than the active one. That
+   one may be a value under a prior key that only its padding or a stray byte keeps from being
+   read, so it is a skip, and the rotation stays open until it is repaired. The command's output does not report that count,
    and the log names each such upload.
    **A part the filesystem refuses the engine is not damaged (BACKLOG #5388).** At least a
    permission or an ACL the engine lacks, and on Windows a file another program holds open, are

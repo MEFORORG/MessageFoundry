@@ -1130,8 +1130,9 @@ class ResealResult:
     which the pass leaves as it was and moves past. A readable-sized body that is missing or is not
     text is not counted here when its sidecar is readable: no key reads that body and no re-run
     changes it (``unsealable``, ``body_lost``), and neither is anything that is not a file, such as
-    a FIFO or a directory (``not_regular``). At least a file too large for an upload, a symlink and a
-    sidecar that is not text are still skips.
+    a FIFO or a directory (``not_regular``). At least a body too large for an upload, a symlink and
+    a sidecar over :data:`_SIDECAR_LIMIT`, or not UTF-8, whose head may hide a marker naming
+    another key are still skips.
 
     The counts use different units. ``resealed`` counts VALUES: each body or sidecar it rewrites
     adds one. ``skipped`` counts UPLOADS: a pair adds at most one, whichever half failed (BACKLOG
@@ -1164,11 +1165,14 @@ class ResealResult:
     #: it is a skip.
     not_regular: int = 0
     #: How many UPLOADS have a sidecar every reader refuses as damaged before it decrypts anything
-    #: (BACKLOG #5387 added item 1): at least one larger than :data:`_SIDECAR_LIMIT` on disk, one
-    #: PLAINTEXT and longer than :data:`_PLAIN_SIDECAR_LIMIT`, so that no seal of it fits that cap,
-    #: one that is blank once its padding is skipped, and one that is not UTF-8. Nothing of it is
-    #: readable under any key, retiring the prior key loses nothing, and no re-run changes it: not
-    #: a skip, and it does not keep ``rotate-key`` from completing. The sidecar is left as it is,
+    #: (BACKLOG #5387 added item 1), and that is under no key but the active one: at least one
+    #: larger than :data:`_SIDECAR_LIMIT` on disk, or not UTF-8, whose head past its padding is
+    #: plaintext or has a marker naming the active key, one PLAINTEXT and longer than
+    #: :data:`_PLAIN_SIDECAR_LIMIT`, so that no seal of it fits that cap, and one that is blank
+    #: once its padding is skipped. One over the cap or not UTF-8 whose head shows, or may hide, a
+    #: marker naming another key is a skip instead (:meth:`UploadStore._refused_meta`). So none of
+    #: these is under the prior key: retiring it loses nothing, and no re-run changes it. Not a
+    #: skip, and it does not keep ``rotate-key`` from completing. The sidecar is left as it is,
     #: and its body is still re-sealed as any other. ``rotate-key``'s output does not report this
     #: count; the log names each one.
     damaged: int = 0
@@ -1206,6 +1210,11 @@ class _Half(Enum):
 _WRITTEN = frozenset({_Half.RESEALED, _Half.SEALED_PLAINTEXT})
 #: More characters than any ``mfenc:`` marker has before its ciphertext.
 _MARKER_READ_LIMIT = 256
+#: :data:`_SIDECAR_PAD`, :data:`MARKER_PREFIX` and a UTF-8 byte-order mark, as bytes, for a head
+#: read before it is decoded (:meth:`UploadStore._refused_meta`).
+_SIDECAR_PAD_BYTES = _SIDECAR_PAD.encode("ascii")
+_MARKER_BYTES = MARKER_PREFIX.encode("ascii")
+_BOM_BYTES = b"\xef\xbb\xbf"
 
 
 @dataclass(frozen=True)
@@ -3027,8 +3036,9 @@ class UploadStore:
     @staticmethod
     def _damaged_meta(fid: str, cause: str) -> _Half:
         """Log and answer a sidecar every reader refuses as damaged before it decrypts anything
-        (BACKLOG #5387 added item 1): at least one over the cap, a plaintext one too long to seal,
-        one that is blank and one that is not UTF-8. Nothing of it is readable under any key and
+        (BACKLOG #5387 added item 1) and that is under no key but the active one: at least one over
+        the cap or not UTF-8 whose head shows no other key's marker (:meth:`_refused_meta`), a
+        plaintext one too long to seal, and one that is blank. Nothing of it is readable under any key and
         no re-run changes that, so it is not a skip, which would fail every later run and hold
         the rotation record open for good. It is left as it is."""
         _log.warning(
@@ -3037,6 +3047,30 @@ class UploadStore:
             cause,
         )
         return _Half.DAMAGED
+
+    @classmethod
+    def _refused_meta(cls, cipher: AesGcmCipher, fid: str, head: bytes, cause: str) -> _Half:
+        """Answer a sidecar every reader refuses before decrypting, as over :data:`_SIDECAR_LIMIT`
+        or not UTF-8, from ``head``, its first bytes read with that bound (BACKLOG #5387). Padding
+        alone may have grown a value sealed under a PRIOR key past the cap, or a stray byte made one
+        not UTF-8, and trimming it recovers that value with that key. So a head that, past its
+        byte-order mark and whitespace, shows the ``mfenc:`` marker is a skip, unless the marker
+        names the active key: retiring the prior key would lose it. A head that is padding to its
+        end, or whose marker is cut short or names no key, cannot rule one out, so it is a skip too.
+        Only a head whose marker names the active key, or one that is not sealed, is damaged, since
+        retiring the prior key loses nothing of either. ``cause`` names the refusal in the log."""
+        value = head.lstrip(_SIDECAR_PAD_BYTES).removeprefix(_BOM_BYTES).lstrip(_SIDECAR_PAD_BYTES)
+        if value[: len(_MARKER_BYTES)] == _MARKER_BYTES[: len(value)]:
+            named = cipher.named_key_id(value.decode("utf-8", errors="replace"))
+            if named is None or named != cipher.active_key_id:
+                _log.warning(
+                    "uploaded file %s (meta): skipped, %s and it may be sealed under a prior key; "
+                    "repair it and re-run before retiring that key",
+                    fid,
+                    cause,
+                )
+                return _Half.SKIPPED
+        return cls._damaged_meta(fid, cause)
 
     def _reseal_half(
         self,
@@ -3097,7 +3131,12 @@ class UploadStore:
                 # refuses it whatever its marker. A body is not: a lowered max_upload_bytes must
                 # not turn an already-current one into a skip.
                 if kind == "meta" and opened.st_size > limit:
-                    return self._damaged_meta(fid, f"{opened.st_size} bytes is over the cap")
+                    return self._refused_meta(
+                        cipher,
+                        fid,
+                        handle.read(limit + 1),
+                        f"{opened.st_size} bytes is over the cap",
+                    )
                 head = handle.read(len(active))
                 if head == active:
                     return _Half.CURRENT  # already under the active key in the active format
@@ -3112,7 +3151,7 @@ class UploadStore:
                         data += handle.read(limit + 1 - len(data))
                     size = len(data)
                 if kind == "meta" and size > limit:
-                    return self._damaged_meta(fid, f"{size} bytes is over the cap")
+                    return self._refused_meta(cipher, fid, data, f"{size} bytes is over the cap")
                 if size > limit:
                     # BACKLOG #3737: a read of the whole file could raise MemoryError, which no
                     # handler takes, so a planted one would abort the pass. A skip and not a loss:
@@ -3126,7 +3165,12 @@ class UploadStore:
                         size,
                     )
                     return _Half.SKIPPED
-                stored = data.decode("utf-8")
+                try:
+                    stored = data.decode("utf-8")
+                except UnicodeDecodeError:
+                    if kind == "meta":
+                        return self._refused_meta(cipher, fid, data, "it is not UTF-8")
+                    raise
                 del data  # free the raw copy before the decrypt and the encrypt make two more
             if kind == "meta":
                 # As the reader unpads it, so a sealed sidecar that gained a byte-order mark or
@@ -3137,8 +3181,6 @@ class UploadStore:
                     return self._damaged_meta(fid, "it is blank")
             plaintext = bool(stored) and not stored.startswith(MARKER_PREFIX)
         except (OSError, UnicodeDecodeError) as exc:
-            if kind == "meta" and isinstance(exc, UnicodeDecodeError):
-                return self._damaged_meta(fid, "it is not UTF-8")
             if kind == "body" and isinstance(exc, FileNotFoundError | UnicodeDecodeError):
                 # BACKLOG #3181: the body is missing or is not text, so no key reads it and no
                 # re-run changes that. It holds nothing under the OLD key, so it is not a skip;
@@ -3292,7 +3334,10 @@ class UploadStore:
         The cost is one directory walk, a read of at most a marker's length from each body, and a
         read of each sidecar whole, up to :data:`_SIDECAR_LIMIT`, since its byte-order mark and
         whitespace are skipped as the reader skips them (BACKLOG #5387 added item 1). A sidecar
-        every reader refuses as oversized is not counted. Then, for each upload with a PLAINTEXT
+        every reader refuses as oversized, blank or not UTF-8 is never itself counted as plaintext,
+        but its upload is counted by its body, which ``rotate-key`` seals under it; an oversized one
+        is counted as one ``rotate-key`` cannot seal where the class check holds it, over a body no
+        key reads. Then, for each upload with a PLAINTEXT
         sidecar, a read of its whole body, to tell the two kinds apart. That body read is new work
         at startup, bounded by the plaintext uploads still waiting for ``rotate-key``, and the first quota scan or prune after it does not repeat it
         (``_body_checks``). Runs off the event loop. **The body read is whole on purpose (BACKLOG
@@ -3341,9 +3386,13 @@ class UploadStore:
         mark and whitespace, reading no more of a sidecar than :data:`_SIDECAR_LIMIT`. Each file is
         opened by :func:`_open_plain`, so a link is not followed and a FIFO does not block startup.
         A file that cannot be read is not counted here; the listing scan names it on its own. The
-        sidecar is read first: one every reader refuses as oversized is never counted as one
-        ``rotate-key`` can seal, whatever its body holds, since ``rotate-key`` leaves it as it is
-        (``damaged``). It is counted as one it cannot seal only where the class check holds it."""
+        sidecar is read first. One every reader refuses before decrypting, as oversized, blank or
+        not UTF-8, is never itself counted as plaintext, since ``rotate-key`` leaves it as it is
+        (``damaged``) or skips it. Its upload is still counted by its body, as under any other
+        sidecar, because ``rotate-key`` seals a plaintext body under each of those kinds, so the
+        count matches that pass's ``sealed_plaintext`` over every one of them (BACKLOG #5387). An
+        oversized one the class check holds, over a body no key reads, is counted as one
+        ``rotate-key`` cannot seal instead."""
         count = unsealable = 0
         for fid, sidecar in self._iter_sidecars():
             try:
@@ -3362,9 +3411,14 @@ class UploadStore:
                         with io.TextIOWrapper(handle, encoding="utf-8") as text_handle:
                             head = text_handle.read(len(MARKER_PREFIX))
                 except _OversizedFileError:
+                    # rotate-key leaves the sidecar as it is but still seals the body under it, as
+                    # it does under a blank one or one that is not UTF-8, so the body is counted
+                    # the same way under each (BACKLOG #5387). Over a body no key reads, the class
+                    # check holds it and the body cannot be counted.
                     if self._unsealable_sync(fid, sidecar) is not None:
                         unsealable += 1
-                    break  # never one rotate-key seals
+                        break
+                    continue
                 except (OSError, UnicodeDecodeError, _MalformedSidecarError):
                     continue
                 if head and head != MARKER_PREFIX:
