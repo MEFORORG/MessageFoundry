@@ -15,9 +15,12 @@ Mirth/NextGen Connect parity reference for what's planned.
 - **MESSAGE TYPE** — the HL7 message code carried (`ADT`, `ORM`, `ORU`, `SIU`, `DFT`, `MDM`, `VXU`, …),
   or `MIXED` / `ALL` when a connection isn't message‑type‑specific.
 
-Two inbound, or two outbound, connections may not have names that differ only in case
-(`IB_Test_ADT` beside `IB_TEST_ADT`): the config refuses to load, because a SQL Server store column
-that compares without case would read the two as one (BACKLOG #5392).
+Two names of one kind may not differ only in case (`IB_Test_ADT` beside `IB_TEST_ADT`): the config
+refuses to load, and a rename onto such a name is refused, because a SQL Server store column that
+compares without case would read the two as one (BACKLOG #5392). The kinds are at least inbound
+connections, outbound connections, `FhirLookup`s, `DatabaseLookup`s and reference sets;
+`CASE_TWIN_TABLES` in [config/wiring.py](../messagefoundry/config/wiring.py) is the list. An inbound
+and an outbound may still share a name up to case, as they may exactly.
 
 Example: **`IB_ACME_ADT`** = inbound MLLP from ACME carrying ADT. The shipped sample uses partner
 `Test`: **`IB_Test_ADT`** (inbound MLLP) → **`FILE-OUT_Test_ADT`** (outbound file).

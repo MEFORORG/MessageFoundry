@@ -21,7 +21,7 @@ from messagefoundry import connection_names
 from messagefoundry.api import validation
 from messagefoundry.config import wiring
 from messagefoundry.config.connections_edit import upsert_connection
-from messagefoundry.config.impact import plan_rename
+from messagefoundry.config.impact import RENAMEABLE_KINDS, plan_rename
 from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry_toolkit.corepoint_import import import_corepoint
 from tests.test_api_input_validation import _accepts
@@ -329,3 +329,72 @@ def test_a_rename_onto_a_case_twin_is_refused_at_plan_time(tmp_path: Path) -> No
         plan_rename(registry, config, "inbound", "IB_ACME_ORU", "ib_acme_adt")
     # The control: a rename to its own case variant is not a twin of another connection.
     plan_rename(registry, config, "inbound", "IB_ACME_ORU", "ib_acme_oru")
+
+
+_REFERENCE_CALL = (
+    'Reference("{name}", source=DatabaseRef(server="db.example.org", database="d", '
+    'statement="SELECT code FROM t", key_column="code"))'
+)
+_LOOKUP_CALL = 'DatabaseLookup("{name}", server="db.example.org", database="d")'
+_FHIR_CALL = 'FhirLookup("{name}", url="https://fhir.example.org/fhir")'
+
+
+def _lookups(tmp_path: Path, *names: str, module: str = "lookups.py") -> Path:
+    """A config declaring a FhirLookup, a DatabaseLookup and a reference set under each name."""
+    lines = ["from messagefoundry import DatabaseLookup, DatabaseRef, FhirLookup, Reference"]
+    for name in names:
+        lines += [call.format(name=name) for call in (_FHIR_CALL, _LOOKUP_CALL, _REFERENCE_CALL)]
+    (tmp_path / module).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return tmp_path
+
+
+@pytest.mark.parametrize(
+    ("call", "kind"),
+    [
+        (_FHIR_CALL, "fhir lookup"),
+        (_LOOKUP_CALL, "database lookup"),
+        (_REFERENCE_CALL, "reference set"),
+    ],
+    ids=["fhir_lookup", "lookup", "reference"],
+)
+def test_a_lookup_or_reference_case_twin_is_refused_at_load(
+    tmp_path: Path, call: str, kind: str
+) -> None:
+    # BACKLOG #5392: the twin check covered only inbound, outbound and FHIR lookup names.
+    _lookups(tmp_path, "EPIC")
+    (tmp_path / "twin.py").write_text(
+        "from messagefoundry import DatabaseLookup, DatabaseRef, FhirLookup, Reference\n"
+        + call.format(name="epic")
+        + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match=f"duplicate {kind} name: 'epic' differs only in case"):
+        load_config(tmp_path, allow_empty=True)
+
+
+def test_one_name_in_each_lookup_kind_still_loads(tmp_path: Path) -> None:
+    # The control: the check is per table, so one name may be a FHIR lookup, a database lookup and
+    # a reference set at once, and two names differing by more than case load.
+    registry = load_config(_lookups(tmp_path, "EPIC", "EPIC2"), allow_empty=True)
+    assert set(registry.fhir_lookups) == set(registry.lookups) == set(registry.references)
+    assert set(registry.lookups) == {"EPIC", "EPIC2"}
+
+
+@pytest.mark.parametrize("kind", ["fhir_lookup", "lookup", "reference"])
+def test_a_lookup_rename_onto_a_case_twin_is_refused_at_plan_time(
+    tmp_path: Path, kind: str
+) -> None:
+    # BACKLOG #5392: plan_rename refused a twin only for inbound and outbound names.
+    config = _lookups(tmp_path, "EPIC", "CLAR")
+    registry = load_config(config, allow_empty=True)
+    with pytest.raises(WiringError, match="differs only in case"):
+        plan_rename(registry, config, kind, "CLAR", "epic")
+    # The control: a rename to its own case variant is not a twin of another name.
+    plan_rename(registry, config, kind, "CLAR", "clar")
+
+
+def test_every_twin_table_is_a_registry_table_and_a_rename_kind() -> None:
+    registry = wiring.Registry()
+    for rename_kind, attribute, _label in wiring.CASE_TWIN_TABLES:
+        assert rename_kind in RENAMEABLE_KINDS
+        assert isinstance(getattr(registry, attribute), dict)
