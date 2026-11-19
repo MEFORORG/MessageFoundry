@@ -27,7 +27,13 @@ from typing import TYPE_CHECKING
 
 from messagefoundry.config.settings import ServiceSettings
 from messagefoundry.redaction import codec_safe_line
-from messagefoundry.verify.model import CheckResult, Status
+from messagefoundry.verify.model import (
+    DRIVER_DETAIL_LIMIT,
+    CheckResult,
+    Status,
+    safe_exc_detail,
+    safe_exc_text,
+)
 
 if TYPE_CHECKING:
     import urllib.request
@@ -116,10 +122,7 @@ def _config_rows(settings: ServiceSettings) -> list[CheckResult]:
             "confirm these pinned endpoints are the intended identity provider",
             evidence=(
                 f"issuer={auth.oidc_issuer}; client_id={auth.oidc_client_id}; "
-                # token_endpoint, not token: the report sink's credential pass reads a bare
-                # ``token=`` label as a credential and would blank the URL (BACKLOG #5395).
-                f"authorize={auth.oidc_authorization_endpoint}; "
-                f"token_endpoint={auth.oidc_token_endpoint}; "
+                f"authorize={auth.oidc_authorization_endpoint}; token={auth.oidc_token_endpoint}; "
                 f"jwks={auth.oidc_jwks_uri}; redirect={settings.api.public_origin or '<unset>'}"
                 f"{auth.oidc_redirect_path}"
             ),
@@ -255,13 +258,15 @@ def _client_credential_row(settings: ServiceSettings) -> CheckResult:
         try:
             crossing = _serve_crossing(settings, exc)
         except Exception as err:  # never raise out of a check; keep the read's own failure
-            classify = f"the refusal could not be classified: {type(err).__name__}: {err}"
-            return CheckResult(rid, title, Status.FAIL, str(exc), evidence=classify)
+            classify = f"the refusal could not be classified: {safe_exc_detail(err, limit=DRIVER_DETAIL_LIMIT)}"
+            return CheckResult(rid, title, Status.FAIL, safe_exc_text(exc), evidence=classify)
         if crossing is None:
-            return CheckResult(rid, title, Status.FAIL, str(exc))
-        return CheckResult(rid, title, Status.MANUAL, crossing, evidence=str(exc))
+            return CheckResult(rid, title, Status.FAIL, safe_exc_text(exc))
+        return CheckResult(rid, title, Status.MANUAL, crossing, evidence=safe_exc_text(exc))
     except Exception as exc:  # never raise out of a check
-        return CheckResult(rid, title, Status.ERROR, f"{type(exc).__name__}: {exc}")
+        return CheckResult(
+            rid, title, Status.ERROR, safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)
+        )
     if isinstance(credential, ClientSecretPost):
         return CheckResult(rid, title, Status.PASS, f"resolved from the {source} (value not shown)")
     return CheckResult(
@@ -356,13 +361,19 @@ def _idp_opener(
             anchor=anchor,
         )
     except OSError as exc:
-        return CheckResult(*_TLS_ROW, Status.FAIL, f"could not build the pinned TLS context: {exc}")
+        return CheckResult(
+            *_TLS_ROW, Status.FAIL, f"could not build the pinned TLS context: {safe_exc_text(exc)}"
+        )
     except TrustAnchorError as exc:
-        return CheckResult(*_TLS_ROW, Status.FAIL, f"the engine refuses this anchor: {exc}")
+        return CheckResult(
+            *_TLS_ROW, Status.FAIL, f"the engine refuses this anchor: {safe_exc_text(exc)}"
+        )
     except ValueError as exc:  # harden_crl_check: a missing, expired, CRL-less or cert-bearing file
-        return CheckResult(*_TLS_ROW, Status.FAIL, f"the engine refuses this CRL file: {exc}")
+        return CheckResult(
+            *_TLS_ROW, Status.FAIL, f"the engine refuses this CRL file: {safe_exc_text(exc)}"
+        )
     except Exception as exc:
-        return CheckResult(*_TLS_ROW, Status.ERROR, f"{type(exc).__name__}: {exc}")
+        return CheckResult(*_TLS_ROW, Status.ERROR, safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT))
 
 
 def _tls_row(
@@ -400,7 +411,7 @@ def _tls_row(
         spec = oidc_anchor_spec(ca, pin) if ca else None
         verdict = evaluate_anchor(spec) if spec is not None else None
     except Exception as exc:
-        fail = f"the context built, but re-reading the anchor for this report failed: {exc}"
+        fail = f"the context built, but re-reading the anchor for this report failed: {safe_exc_text(exc)}"
         return CheckResult(rid, title, Status.ERROR, fail), opener
     if verdict is None:
         return CheckResult(
@@ -501,7 +512,7 @@ def _revocation_row(
                 try:
                     guard.enforce_construction()  # raises, so the text is the engine's own
                 except InsecureHopRefused as exc:
-                    refusals.append(str(exc))
+                    refusals.append(safe_exc_text(exc))
                 else:  # a REFUSE that did not raise is still a refusal; never drop the leg
                     refusals.append(f"{leg}: refused")
                 continue
@@ -527,7 +538,9 @@ def _revocation_row(
                 note = "crosses with NO certificate revocation checking. Confirm that is intended"
             notes.append(f"{leg} {note}")
     except Exception as exc:
-        return CheckResult(rid, title, Status.ERROR, f"{type(exc).__name__}: {exc}")
+        return CheckResult(
+            rid, title, Status.ERROR, safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)
+        )
     if refusals:
         return CheckResult(
             rid, title, Status.FAIL, "the engine refuses to start: " + "; ".join(refusals)
@@ -573,7 +586,9 @@ def _read(path: str, rid: str, title: str) -> tuple[bytes | None, CheckResult | 
     except (OSError, ValueError) as exc:
         # ValueError too: a path carrying a NUL raises it from io.open, and this module
         # promises never to raise.
-        return None, CheckResult(rid, title, Status.FAIL, f"could not read {path}: {exc}")
+        return None, CheckResult(
+            rid, title, Status.FAIL, safe_exc_text(exc, before=f"could not read {path}: ")
+        )
 
 
 def _jwks_row(jwks_bytes: bytes) -> tuple[object | None, CheckResult]:
@@ -584,9 +599,11 @@ def _jwks_row(jwks_bytes: bytes) -> tuple[object | None, CheckResult]:
     try:
         keys = parse_jwks(jwks_bytes)
     except JwksError as exc:
-        return None, CheckResult(rid, title, Status.FAIL, str(exc))
+        return None, CheckResult(rid, title, Status.FAIL, safe_exc_text(exc))
     except Exception as exc:
-        return None, CheckResult(rid, title, Status.ERROR, f"{type(exc).__name__}: {exc}")
+        return None, CheckResult(
+            rid, title, Status.ERROR, safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)
+        )
     return keys, CheckResult(
         rid,
         title,

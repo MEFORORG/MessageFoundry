@@ -11,6 +11,7 @@ underscore so the unrelated long-base64 sweep cannot be what hides it.
 
 from __future__ import annotations
 
+import importlib
 import socket
 import ssl
 from pathlib import Path
@@ -403,6 +404,8 @@ def test_a_password_glued_to_punctuation_is_hidden_at_every_occurrence(text: str
         "token=tk-1,mrn: Kv9x7Qz3 Svc Account Login Password: Kv9x7Qz3",
         # ...and placeholders the source already held, which the walk did not count as slots.
         "[redacted] [redacted] Login Password: Kv9x7Qz3 then token=tk-1,mrn: Kv9x7Qz3",
+        # Code review round 2: a trailing name misled the backward walk of the other order too.
+        "token=tk-1,mrn: Kv9x7Qz3 Login Password: Kv9x7Qz3 Mary Ann Lee Smith",
     ],
 )
 def test_a_password_each_order_prints_at_a_different_place_is_hidden(text: str) -> None:
@@ -433,18 +436,18 @@ def test_a_password_each_order_prints_at_a_different_place_is_hidden(text: str) 
     assert "Kv9x7Qz3" in counted_only, counted_only
 
 
-def test_a_repeated_word_placed_on_different_copies_is_hidden() -> None:
-    """A placeholder stands for at least one hidden fragment, so ``[redacted] X`` and ``X
-    [redacted]`` read from ``X X`` place their ``X`` on different copies."""
+def test_a_word_either_order_hid_a_copy_of_is_hidden_everywhere() -> None:
+    """Each order hid a different copy of ``X X``, so the counts are equal and both orders print
+    one copy. The test is against the source, which holds two."""
     from messagefoundry.verify import model
 
     ph = model._PLACEHOLDER
     assert model._printed_by_both(f"{ph} Kv9x7Qz3", f"Kv9x7Qz3 {ph}", "Kv9x7Qz3 Kv9x7Qz3") == (
         f"{ph} {ph}"
     )
-    # Control: both orders printing the same copy keep it.
-    assert model._printed_by_both(f"{ph} Kv9x7Qz3", f"{ph} Kv9x7Qz3", "Kv9x7Qz3 Kv9x7Qz3") == (
-        f"{ph} Kv9x7Qz3"
+    # Control: a word neither order hid any copy of is kept, at every copy.
+    assert model._printed_by_both("at Kv9x7Qz3 at", "at Kv9x7Qz3 at", "at Kv9x7Qz3 at") == (
+        "at Kv9x7Qz3 at"
     )
 
 
@@ -598,94 +601,56 @@ def test_the_graph_read_failure_reason_hides_the_credential(
     assert _PLANTED not in hops.unknown, hops.unknown
 
 
-# --- The report sink (BACKLOG #5395 added item 1) ---------------------------------------------------
+# --- The arms that still quoted an exception raw (BACKLOG #5395 added item 1) ---------------------
 
 
-def _rendered(result: CheckResult) -> dict[str, str]:
-    from messagefoundry.verify.report import render_console
-
-    return {
-        "console": render_console([result]),
-        "markdown": render_markdown([result]),
-        "json": render_json([result]),
-    }
-
-
-def test_the_report_sink_hides_a_credential_an_arm_wrote_raw() -> None:
-    """An arm that interpolates an exception raw, as some federation and checks arms still do, or
-    one added later. The sink scrubs every field of every row in all three reports. Control: the
-    row itself still holds the value, so the sink is what hid it."""
-    raw = CheckResult("x.raw", "A raw arm", Status.FAIL, _LEAKY, evidence=_LEAKY)
-    assert _PLANTED in raw.detail and _PLANTED in raw.evidence
-    for sink, text in _rendered(raw).items():
-        assert _PLANTED not in text, (sink, text)
-        assert "[redacted]" in text, (sink, text)
-
-
-def test_a_federation_read_failure_reaches_the_report_without_the_credential(
-    tmp_path: Path,
-) -> None:
-    """A real raw arm: the ``fed`` file read quotes the OSError, which quotes the path."""
+def test_a_federation_file_read_failure_hides_the_credential(tmp_path: Path) -> None:
+    """The ``fed`` file read quotes the path, and the OSError quotes it again."""
     from messagefoundry.verify import federation
 
     path = tmp_path / f"jwks password={_PLANTED}.json"
     _, row = federation._read(str(path), "fed.jwks", "JWKS")
-    assert row is not None and _PLANTED in row.detail, "control: the arm quotes the path raw"
-    for sink, text in _rendered(row).items():
-        assert _PLANTED not in text, (sink, text)
+    assert row is not None
+    _assert_hidden(row, "could not read ")
 
 
-def test_the_report_sink_leaves_a_row_with_no_credential_alone() -> None:
-    """The sink is the credential pass alone, so words the PHI pass would blank survive it."""
-    import json
+def test_a_federation_unforeseen_failure_hides_the_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import messagefoundry.auth.oidc as oidc
+    from messagefoundry.verify import federation
 
-    row = CheckResult(
-        "host.ports",
-        "Listener ports / firewall",
-        Status.MANUAL,
-        r"Python 3.14 on Windows Server 2025; C:\Program Files\MessageFoundry",
-        evidence="MLLP 2575: free; API 8765: in use/bound",
-    )
-    payload = json.loads(_rendered(row)["json"])["results"][0]
-    assert payload["detail"] == row.detail
-    assert payload["evidence"] == row.evidence
+    def boom(_jwks: bytes) -> object:
+        raise RuntimeError(_LEAKY)
+
+    monkeypatch.setattr(oidc, "parse_jwks", boom)
+    _, row = federation._jwks_row(b"{}")
+    _assert_hidden(row, "RuntimeError: ")
 
 
-def test_the_report_sink_leaves_the_federation_rows_alone() -> None:
-    """Code review round 1: ``fed.enabled`` labelled the IdP token endpoint ``token=``, which the
-    credential pass reads as a credential label, so the sink blanked the URL the row asks an
-    operator to confirm. JSON is the only report that prints evidence. Every federation row a
-    configured deployment emits must render as the row holds it."""
-    import json
+class _UnstatablePath:
+    def is_dir(self) -> bool:
+        raise OSError(_LEAKY)
 
-    from messagefoundry.config.settings import ServiceSettings
-    from messagefoundry.verify.federation import run_federation_checks
+    def __str__(self) -> str:
+        return "/srv/mefor"
 
-    settings = ServiceSettings.model_validate(
-        {
-            "auth": {
-                "ad_enabled": True,
-                "ad_server": "ldaps://x",
-                "ad_user_search_base": "DC=x",
-                "ad_bind_dn": "CN=svc,DC=x",
-                "ad_bind_password": "x",
-                "ad_domain": "corp.example",
-                "oidc_enabled": True,
-                "oidc_issuer": "https://idp.example",
-                "oidc_client_id": "mefor-console",
-                "oidc_client_secret": "synthetic-client-secret",
-                "oidc_authorization_endpoint": "https://idp.example/authorize",
-                "oidc_token_endpoint": "https://idp.example/token",
-                "oidc_jwks_uri": "https://idp.example/jwks",
-                "oidc_allowed_endpoints": ["idp.example"],
-            },
-            "api": {"public_origin": "https://ops.example"},
-        }
-    )
-    rows = run_federation_checks(settings)
-    rendered = json.loads(render_json(rows))["results"]
-    assert len(rows) > 1
-    for row, out in zip(rows, rendered, strict=True):
-        assert (out["detail"], out["evidence"]) == (row.detail, row.evidence), row.id
-    enabled = next(out for out in rendered if out["id"] == "fed.enabled")
-    assert "https://idp.example/token" in enabled["evidence"]
+
+def test_the_writable_dir_stat_failure_hides_the_credential() -> None:
+    from typing import cast
+
+    row = checks.check_writable_dir(cast("Path", _UnstatablePath()))
+    _assert_hidden(row, "cannot stat /srv/mefor: ")
+
+
+def test_the_console_window_import_failure_hides_the_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(name: str) -> object:
+        raise ImportError(_LEAKY)
+
+    monkeypatch.setattr(importlib, "import_module", boom)
+    row = checks.check_console_no_window()
+    assert row.status is Status.SKIP
+    assert _PLANTED not in row.detail, row.detail
+    assert "not importable: " in row.detail

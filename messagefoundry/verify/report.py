@@ -1,26 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Render verify results — console summary, Markdown, JSON. Standard library plus
-:mod:`messagefoundry.terminal_text`, itself standard-library only, for the peer-text escape, and
-:func:`~messagefoundry.verify.model.scrub_report_text` for the credential pass.
-
-Every renderer scrubs every text field of every row for credentials (:func:`_scrubbed`), so the
-three reports are one sink, and a check's arm that quotes an exception raw no longer puts a
-labelled credential, such as a ``password=`` or ``PWD=`` value or a DSN password, into a report that
-an operator pastes into a ticket (BACKLOG #5395). It is a backstop, not a replacement for an arm's
-own redaction: it has the credential pass's residuals, at least a credential with no label it
-reads, and it runs no PHI pass."""
+:mod:`messagefoundry.terminal_text`, itself standard-library only, for the peer-text escape."""
 
 from __future__ import annotations
 
 import json
 from collections import Counter
 from collections.abc import Sequence
-from dataclasses import fields, replace
-from typing import Any
 
 from messagefoundry.terminal_text import escape_for_markdown_cell, escape_for_terminal
-from messagefoundry.verify.model import FAILING, CheckResult, Status, scrub_report_text
+from messagefoundry.verify.model import FAILING, CheckResult, Status
 
 
 def summarize(results: Sequence[CheckResult]) -> Counter[Status]:
@@ -33,23 +23,11 @@ def exit_code(results: Sequence[CheckResult]) -> int:
     return 1 if any(r.status in FAILING for r in results) else 0
 
 
-def _scrubbed(r: CheckResult) -> CheckResult:
-    """``r`` with every text field through the credential pass. Before any escape, so an escape
-    cannot split a ``password=`` label from its value. The fields are read off the dataclass, so a
-    text field added later is scrubbed too; ``type is str`` leaves the ``str``-mixin status alone."""
-    changes: dict[str, Any] = {
-        f.name: scrub_report_text(getattr(r, f.name))
-        for f in fields(r)
-        if type(getattr(r, f.name)) is str
-    }
-    return replace(r, **changes)
-
-
 def _shown(text: str) -> str:
     # A detail can carry what a peer wrote: a JWKS key id, an ACK, an exception naming a peer's
     # reply. Escaped HERE, at the console sink, and not in CheckResult, so the JSON report keeps
-    # the value as it was, credentials apart (it is data, not a terminal or a rendered page). Every
-    # field gets the same rule, so a detail added later is covered without anyone deciding it is peer text. One
+    # the value as it was (it is data, not a terminal or a rendered page). Every field gets the
+    # same rule, so a detail added later is covered without anyone deciding it is peer text. One
     # line per check, so a newline is escaped too, or a peer's text could start a line reading as a
     # check that passed; printable Unicode is kept, so the engine's own em dashes print as
     # themselves. The Markdown sink does not call this: escape_for_markdown_cell passes the same
@@ -60,7 +38,6 @@ def _shown(text: str) -> str:
 def render_console(results: Sequence[CheckResult]) -> str:
     """A compact, aligned one-line-per-check summary for stdout, peer text escaped (ASVS 1.1.2)."""
     counts = summarize(results)
-    results = [_scrubbed(r) for r in results]
     lines = [
         f"{r.status.value:<6} {_shown(r.id):<14} {_shown(r.title)}"
         + (f"  [{_shown(r.detail)}]" if r.detail else "")
@@ -77,7 +54,6 @@ def render_markdown(results: Sequence[CheckResult]) -> str:
     The rule is :func:`~messagefoundry.terminal_text.escape_for_markdown_cell`, shared with the
     harness acceptance report; what it covers, and at least what it leaves, is stated there."""
     counts = summarize(results)
-    results = [_scrubbed(r) for r in results]
     out = [
         "# MessageFoundry — deployment verify",
         "",
@@ -97,7 +73,6 @@ def render_markdown(results: Sequence[CheckResult]) -> str:
 def render_json(results: Sequence[CheckResult]) -> str:
     """A JSON document: per-check results + tally + exit code."""
     counts = summarize(results)
-    results = [_scrubbed(r) for r in results]
     payload = {
         "results": [
             {

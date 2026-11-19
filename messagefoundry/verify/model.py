@@ -5,9 +5,7 @@
 from __future__ import annotations
 
 import re
-from bisect import bisect_left
 from collections import Counter
-from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from typing import Final
@@ -43,7 +41,7 @@ _PLACEHOLDER: Final = "[redacted]"
 
 def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     """``text`` for a :class:`CheckResult` detail: bounded, then both orders of the PHI and
-    credential passes, comparing how often and where each prints a fragment, then the length bound
+    credential passes, hiding every fragment either order hid a copy of, then the length bound
     (BACKLOG #5395).
 
     A verify report is written to JSON and Markdown that an operator pastes into a ticket, so it
@@ -55,19 +53,18 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     :func:`~messagefoundry.secretscrub.scrub_credentials`, the write-time credential vocabulary the
     log filter and wiring's own diagnostics use.
 
-    NEITHER ORDER OF THE TWO PASSES HIDES WHAT THE OTHER DOES, so both run, and a fragment the
-    PHI-first order prints more often than the credentials-first order does, or prints from a place
-    the credentials-first order hid, is hidden. Credentials
-    first: the credential pass read ``tk-1,mrn:`` in ``token=tk-1,mrn: MRN7712345`` as the token's
-    value, the PHI pass then found no ``mrn:`` label, and the MRN printed. PHI first: the PHI pass takes a label the credential pass needs, at least a capitalized pair read
-    as a name (``Login Password=``, ``Svc\\nPassword:``) and an HL7 field run that holds the label
+    NEITHER ORDER OF THE TWO PASSES HIDES WHAT THE OTHER DOES, so both run, and a fragment either
+    order hid a copy of is hidden in the result. Credentials first: the credential pass read
+    ``tk-1,mrn:`` in ``token=tk-1,mrn: MRN7712345`` as the token's value, the PHI pass then found no
+    ``mrn:`` label, and the MRN printed. PHI first: the PHI pass takes a label the credential pass
+    needs, at least a capitalized pair read as a name (``Login Password=``, ``Svc\\nPassword:``) and an HL7 field run that holds the label
     (``a|b^password= <value>``), and the value printed. The primary result is PHI first, then the
     credential pass over the WHOLE of it, which can only hide more than the PHI pass did; not split at
     the placeholders, which cut ``postgresql://19800505:<pw>@`` in two once the PHI pass had replaced
     the user. Then every whitespace-separated word of that result holding a fragment, a run of word
-    characters between placeholders, that the credentials-first result hides there is replaced
-    whole, at every occurrence (:func:`_printed_by_both`). That errs toward hiding: a label the
-    other order spelled differently goes with its value.
+    characters between placeholders, that either result hid a copy of is replaced whole, at every
+    occurrence (:func:`_printed_by_both`), with the residuals that function names. That errs toward
+    hiding: a label the other order spelled differently goes with its value.
 
     The input is cut to :func:`~messagefoundry.redaction.clamp_untrusted`'s window before any pass
     reads it, and its note is kept past the length bound. That note is the only unscanned note the
@@ -112,114 +109,43 @@ def _fragments(word: str) -> list[str]:
     ]
 
 
-def _tokens(text: str) -> list[str]:
-    """The fragments of ``text`` in order (:func:`_fragments`), with each placeholder kept as a
-    token of its own, so a placeholder the source already held is a slot the walk can count."""
-    tokens: list[str] = []
-    for word in text.split():
-        for n, piece in enumerate(word.split(_PLACEHOLDER)):
-            if n:
-                tokens.append(_PLACEHOLDER)
-            tokens.extend(_WORD_RUN.findall(piece) or ([piece] if piece else []))
-    return tokens
-
-
-def _walk(tokens: Sequence[str], source: Sequence[str]) -> list[int | None]:
-    """For each of ``tokens``, the index of the ``source`` token a forward walk places it on, or
-    ``None`` for a placeholder or a fragment no later source token matches.
-
-    A fragment is placed on the next source copy of it. A placeholder moves the walk on by one, as
-    it hides at least one source token. That is a floor, not a measure: a placeholder that hid
-    several tokens leaves the walk behind, so a later fragment can be placed on an earlier copy. The
-    caller walks both ways for that reason."""
-    where: dict[str, list[int]] = {}
-    for at, token in enumerate(source):
-        where.setdefault(token, []).append(at)
-    placed: list[int | None] = []
-    floor = 0  # the lowest source index the next token may be placed on
-    for token in tokens:
-        copies = where.get(token, []) if token != _PLACEHOLDER else []
-        k = bisect_left(copies, floor)
-        if k < len(copies):
-            placed.append(copies[k])
-            floor = copies[k] + 1
-        else:
-            placed.append(None)
-            floor += token == _PLACEHOLDER
-    return placed
-
-
-def _places(tokens: Sequence[str], source: Sequence[str]) -> list[tuple[int | None, int | None]]:
-    """Each token's place walking forward and walking backward (:func:`_walk`)."""
-    last = len(source) - 1
-    backward = [None if at is None else last - at for at in _walk(tokens[::-1], source[::-1])]
-    return list(zip(_walk(tokens, source), backward[::-1], strict=True))
-
-
 def _printed_by_both(primary: str, other: str, source: str) -> str:
-    """``primary`` with each word replaced by the placeholder where it holds a fragment ``primary``
-    prints and ``other`` hides: printed more often, or printed from a place in ``source`` where
-    ``other`` printed no copy of it. One split of each text, then sorted-list lookups.
+    """``primary`` with each word replaced by the placeholder where it holds a fragment that either
+    order hid a copy of: printed fewer times by ``primary`` or by ``other`` than ``source`` holds
+    it, or printed more often by ``primary`` than by ``other``. Linear: one split of each text and
+    counter lookups.
 
-    COUNTS, NOT A SET (BACKLOG #5395). Against a set, a password equal to another word the line
-    prints survived: in ``user svcadmin ... Login Password: svcadmin`` the credentials-first order
-    hid the second ``svcadmin`` and printed the first, so the word was "printed by both" and both
-    printed. So a fragment ``primary`` prints more often than ``other`` is hidden at EVERY
-    occurrence: which occurrence is the password is a position, and the first is the password when
-    the label comes first (``Login Password: svcadmin for user svcadmin``). That errs toward hiding:
-    the user name goes with the password it equals. A fragment is a run of word characters
+    NOT A SET, AND NOT COUNTS BETWEEN THE ORDERS ALONE (BACKLOG #5395). Against a set of the other
+    order's words, a password equal to another word the line prints survived: in ``user svcadmin
+    ... Login Password: svcadmin`` the credentials-first order hid the second ``svcadmin`` and
+    printed the first, so the word was "printed by both" and both printed. Comparing how often each
+    order printed a fragment still kept one each order printed at a different place (BACKLOG #5395
+    added item 2): in ``Login Password: Kv9x7Qz3 then token=tk-1,mrn: Kv9x7Qz3`` the PHI-first
+    order printed the password and hid the copy after ``mrn:``, the credentials-first order did the
+    reverse, and the counts were equal. Placing each fragment back on the source by walking it was
+    misled by a placeholder that hid several words (code review of this change). So the test is
+    against the source: a fragment either order printed fewer times than the source holds it was
+    hidden somewhere by a pass, and it is hidden at EVERY occurrence, wherever it stood. That errs
+    toward hiding: the user name goes with the password it equals, and a word the PHI pass took
+    from a name goes everywhere it appears. A fragment is a run of word characters
     (:func:`_fragments`), so in ``Login Password: Kv9x7Qz3 retry with Kv9x7Qz3.`` the value glued to
     the full stop counts with the bare one and goes too, and a whole word goes when any run in it
     does.
 
-    POSITIONS AS WELL AS COUNTS (BACKLOG #5395 added item 2). Counts alone kept a fragment ``primary``
-    prints at one place while ``other`` prints it as often at another: in ``Login Password: Kv9x7Qz3
-    then token=tk-1,mrn: Kv9x7Qz3`` the PHI-first order printed the password and hid the copy after
-    ``mrn:``, the credentials-first order did the reverse, and the password printed. Each fragment is
-    placed back on ``source`` by a walk forward and a walk backward (:func:`_places`). One that
-    ``primary`` prints from a place, by either walk, that ``other`` printed nothing from by the same
-    walk is hidden, at every occurrence. The count test stays, so the position test can only hide
-    more than counts did.
-
-    Best-effort: the walks place a fragment, they do not know where it came from. Residuals, at
-    least these. A value glued to a word character is a different run, so ``xKv9x7Qz3y`` elsewhere
-    on the line prints. A placeholder that hid several source tokens, or a word a pass masked
-    rather than replaced (the PHI pass and the credential pass both keep a masked word's shape, as
-    ``Xx0x0Xx0``), can mislead a walk; a copy prints only if both walks are misled the same way."""
-    src = _tokens(source)
-    printed = _places(_tokens(other), src)
-    forward_at = {fwd for fwd, _ in printed if fwd is not None}
-    backward_at = {back for _, back in printed if back is not None}
-    shown = _tokens(primary)
-    leaked = {
-        token
-        for token, (fwd, back) in zip(shown, _places(shown, src), strict=True)
-        if (fwd is not None and fwd not in forward_at)
-        or (back is not None and back not in backward_at)
+    Best-effort. Residuals, at least these: a value glued to a word character is a different run,
+    so ``xKv9x7Qz3y`` elsewhere on the line prints; and a pass that rewrote a value into a fragment
+    the source does not hold is caught only by the count between the orders."""
+    in_source = Counter(run for word in source.split() for run in _fragments(word))
+    printed = Counter(run for word in other.split() for run in _fragments(word))
+    shown = Counter(run for word in primary.split() for run in _fragments(word))
+    hidden = {
+        run for run, n in shown.items() if n > printed[run] or min(n, printed[run]) < in_source[run]
     }
-    counted = Counter(t for t in _tokens(other) if t != _PLACEHOLDER)
-    leaked |= {t for t, n in Counter(shown).items() if t != _PLACEHOLDER and n > counted[t]}
-    leaked.discard(_PLACEHOLDER)
     return re.sub(
         r"\S+",
-        lambda m: _PLACEHOLDER if any(p in leaked for p in _fragments(m[0])) else m[0],
+        lambda m: _PLACEHOLDER if any(p in hidden for p in _fragments(m[0])) else m[0],
         primary,
     )
-
-
-def scrub_report_text(text: str) -> str:
-    """``text`` with credential values replaced, for the report sink (BACKLOG #5395 added item 1).
-
-    Every renderer in :mod:`messagefoundry.verify.report` passes every text field of every row
-    through this, so an arm that quotes an exception raw, or one added later, no longer writes a
-    labelled credential, such as a ``password=`` value, a ``PWD=`` value or a DSN password, into a
-    report. It is the credential pass alone, with that pass's residuals, at least a credential with
-    no label it reads. The PHI pass is not run here because it blanks words that rows quoting no exception
-    need, at least ``Windows Server`` and ``Program Files``. So an arm that quotes text a message or
-    a store could hold still takes :func:`safe_detail_text` or :func:`safe_exc_detail` itself."""
-    from messagefoundry.secretscrub import scrub_credentials
-
-    return scrub_credentials(text, placeholder=_PLACEHOLDER)
 
 
 def safe_exc_detail(exc: BaseException, *, limit: int | None = None) -> str:
@@ -234,6 +160,17 @@ def safe_exc_detail(exc: BaseException, *, limit: int | None = None) -> str:
         return safe_exc(exc) if limit is None else safe_exc(exc, limit=limit)
     message = safe_detail_text(codec_safe_str(exc), limit=limit)
     return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+
+
+def safe_exc_text(exc: BaseException, *, before: str = "") -> str:
+    """``before`` then ``exc``'s text, through :func:`safe_detail_text` together and bounded at
+    :data:`DRIVER_DETAIL_LIMIT`, for an arm that quotes an exception with no type name, such as the
+    engine's own refusals (BACKLOG #5395 added item 1). Those quote paths, hosts, and an IdP's or a
+    secret provider's text, which can carry a credential. ``before`` is scanned with the exception
+    because an arm's own words can quote the same path."""
+    from messagefoundry.redaction import codec_safe_str
+
+    return safe_detail_text(before + codec_safe_str(exc), limit=DRIVER_DETAIL_LIMIT)
 
 
 @dataclass

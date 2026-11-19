@@ -42,6 +42,7 @@ from messagefoundry.verify.model import (
     Status,
     safe_detail_text,
     safe_exc_detail,
+    safe_exc_text,
 )
 
 if TYPE_CHECKING:
@@ -248,10 +249,13 @@ def smoke_self(
         # must not read green (BACKLOG #1707). The detail names the flag, or the operator is told to
         # choose with no word on how. NAME, not `<name>`, so a viewer that renders the detail as
         # HTML cannot read it as a tag; the Markdown report escapes `<` now, but other sinks may not.
-        return CheckResult(rid, title, Status.SKIP, f"{exc}; pass --inbound NAME to pick one")
+        return CheckResult(
+            rid, title, Status.SKIP, safe_exc_text(exc) + "; pass --inbound NAME to pick one"
+        )
     except (UnknownInboundError, NoInboundError) as exc:
-        # Connection names and operator input only, never message content, so nothing to redact.
-        return CheckResult(rid, title, Status.FAIL, str(exc))
+        # Connection names and operator input only, never message content; scrubbed all the same,
+        # as every arm quoting an exception is (BACKLOG #5395 added item 1).
+        return CheckResult(rid, title, Status.FAIL, safe_exc_text(exc))
     except Exception as exc:
         # Raised while the message was in flight, so its text can quote the message (BACKLOG #1779).
         return CheckResult(rid, title, Status.ERROR, f"dry-run raised: {safe_exc_detail(exc)}")
@@ -352,7 +356,12 @@ def smoke_live(
     try:
         frame = frame_checked(message)
     except (FramePayloadError, FrameEncodeError) as exc:
-        return CheckResult("smoke.live", "Live smoke (MLLP + ACK)", Status.FAIL, f"not sent: {exc}")
+        return CheckResult(
+            "smoke.live",
+            "Live smoke (MLLP + ACK)",
+            Status.FAIL,
+            safe_exc_text(exc, before="not sent: "),
+        )
     try:
         with socket.create_connection((host, port), timeout=timeout) as raw:
             # Handshake FIRST when TLS is asked for, so no application byte can precede it.

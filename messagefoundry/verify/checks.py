@@ -44,6 +44,7 @@ from messagefoundry.verify.model import (
     Status,
     safe_detail_text,
     safe_exc_detail,
+    safe_exc_text,
 )
 
 if TYPE_CHECKING:
@@ -199,7 +200,7 @@ def check_sqlserver_odbc_driver(driver_hops: Callable[[], OdbcHops]) -> CheckRes
         listed = [str(d) for d in pyodbc.drivers()]
     except Exception as exc:  # pyodbc surfaces driver-manager errors as bare Exception
         return _unreadable_driver_list(
-            f"pyodbc.drivers() failed: {codec_safe_str(exc)}", _census(driver_hops, rid)
+            safe_exc_text(exc, before="pyodbc.drivers() failed: "), _census(driver_hops, rid)
         )
     hops = _census(driver_hops, rid)
     evidence = ", ".join(listed)
@@ -312,7 +313,7 @@ def check_host_cipher_policy(odbc_hops: Callable[[], OdbcHops]) -> CheckResult:
             rid,
             title,
             Status.ERROR,
-            f"the policy read raised {type(exc).__name__}: {codec_safe_str(exc)}",
+            f"the policy read raised {safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)}",
         )
     return _as_the_hops_make_it(reading, hops, "the policy", "whether this host takes an ODBC hop")
 
@@ -469,7 +470,9 @@ def check_writable_dir(path: Path) -> CheckResult:
     try:
         exists = path.is_dir()
     except OSError as exc:  # e.g. a permission error stat-ing an ancestor
-        return CheckResult(rid, title, Status.FAIL, f"cannot stat {path}: {exc}")
+        return CheckResult(
+            rid, title, Status.FAIL, safe_exc_text(exc, before=f"cannot stat {path}: ")
+        )
     if not exists:
         return CheckResult(
             rid,
@@ -483,7 +486,9 @@ def check_writable_dir(path: Path) -> CheckResult:
         with tempfile.NamedTemporaryFile(dir=path, prefix="._mefor_verify_", delete=True):
             pass
     except OSError as exc:
-        return CheckResult(rid, title, Status.FAIL, f"cannot write {path}: {exc}")
+        return CheckResult(
+            rid, title, Status.FAIL, safe_exc_text(exc, before=f"cannot write {path}: ")
+        )
     return CheckResult(
         rid,
         title,
@@ -547,7 +552,9 @@ def check_console_no_window() -> CheckResult:
         try:
             module = importlib.import_module(name)
         except ImportError as exc:
-            return CheckResult(rid, title, Status.SKIP, f"{name} not importable: {exc}")
+            return CheckResult(
+                rid, title, Status.SKIP, safe_exc_text(exc, before=f"{name} not importable: ")
+            )
         flag = getattr(module, "_NO_WINDOW", None)
         if not isinstance(flag, int) or flag == 0:
             return CheckResult(
@@ -563,7 +570,7 @@ def check_console_no_window() -> CheckResult:
             missing = _spawns_without_creationflags(Path(origin).read_text(encoding="utf-8"))
         except (OSError, SyntaxError, ValueError) as exc:
             return CheckResult(
-                rid, title, Status.ERROR, f"could not inspect {name}: {codec_safe_str(exc)}"
+                rid, title, Status.ERROR, safe_exc_text(exc, before=f"could not inspect {name}: ")
             )
         if missing:
             return CheckResult(
@@ -631,7 +638,7 @@ def check_lockable_accounts(
     try:
         census = run_guarded(_census())
     except CensusNeedsTheStoreKey as exc:
-        return CheckResult(rid, title, Status.ERROR, str(exc))
+        return CheckResult(rid, title, Status.ERROR, safe_exc_text(exc))
     except Exception as exc:  # any driver or decode failure: the check broke, not a finding
         return CheckResult(
             rid,
