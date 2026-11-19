@@ -32,10 +32,10 @@ and does not fail the job (:data:`EXIT_FINDINGS` is returned only under ``--stri
 could not obtain a scorecard, could not run the prover, or could not reconcile its own numbers
 returns :data:`EXIT_INSTRUMENT` unconditionally -- the rule ``scorecard.py`` already states for its
 own loader failure ("could not measure -- never 0, never confused with clean"). So does every prover
-exit 2, and the prover exits 2 on a record where no absence claim names a ``mutation_path``: it skips
-every claim, so the pass proved and screened nothing. Advisory mode does not turn that into a pass.
-Until at least one claim carries a ``mutation_path``, every run therefore fails the job, in advisory
-mode as well as under ``--strict``.
+exit 2, in advisory mode as well as under ``--strict``. One prover exit 2 is a record where no
+absence claim names a ``mutation_path`` (``_run_prove_absences`` in ``scorecard.py``): the prover
+skipped every claim, so the pass proved and screened nothing, and that is an instrument failure, not
+an advisory finding. This module does not check that case itself; it rests on the prover's exit code.
 
 **Per-claim detail is suppressed by default because this repo is public.** The prover's problem
 lines name the cell and the control that would not prove, which is a ranked list of the weakest
@@ -700,8 +700,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument(
         "--strict",
         action="store_true",
-        help="findings fail the job; this is the whole ratchet. A record where no claim names a "
-        "mutation_path fails as an instrument failure with or without it.",
+        help="findings fail the job; this is the whole ratchet. A prover exit 2, such as a record "
+        "where no claim names a mutation_path, fails the job with or without it.",
     )
     r.set_defaults(func=run)
 

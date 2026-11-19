@@ -18,12 +18,9 @@ name: ASVS prove-absences
 # deliberately the FIRST half of a two-step: wire it while adoption is zero, harden it after. Making
 # it fail on zero adoption would be correct and entirely inert, because nothing was running it.
 #
-# CORRECTED 2026-11-18: the hardening half has landed for zero adoption, and a run now DOES fail on
-# it. The prover exits 2 on a record where no absence claim names a `mutation_path`, because it
-# skips every claim and so measured nothing, and `prove_report.py` treats every prover exit 2 as an
-# instrument failure, in advisory mode as well as strict. Until a claim carries a `mutation_path`, a
-# dispatched `prove` run is red in either mode. The paragraph above is kept as the record of the
-# first step.
+# CORRECTED 2026-11-18: a run over a record where no absence claim names a `mutation_path` now DOES
+# fail, in advisory mode too. The paragraph above is kept as the record of the first step; the rule
+# is stated once, under ADVISORY APPLIES TO FINDINGS below.
 #
 # WHY HERE AND NOT IN THE VAULT'S asvs-scorecard.yml. That job is `timeout-minutes: 5`, has no install
 # step, and its own comment states the stdlib-only constraint is deliberate "so this job cannot rot on
@@ -81,9 +78,10 @@ name: ASVS prove-absences
 # Those are two different questions and conflating them is what a `schedule:` here would have done.
 #
 # ADVISORY APPLIES TO FINDINGS, NEVER TO THE INSTRUMENT. A claim that will not prove is reported and
-# does not fail this job (see `vars.ASVS_PROVE_STRICT`). A record where no absence claim names a
-# `mutation_path` is not such a finding: the prover skips every claim and exits 2, and that fails
-# this job in advisory mode too. A run that could not obtain a scorecard
+# does not fail this job (see `vars.ASVS_PROVE_STRICT`). Every prover exit 2 fails it, in advisory
+# mode too, and the prover exits 2 on a record where no absence claim names a `mutation_path`: it
+# skipped every claim, so that is an instrument failure, not a finding. A run that could not obtain
+# a scorecard
 # scanned ZERO claims and is not evidence about any of them, so it exits non-zero -- the rule
 # `scorecard.py` already states for its own loader ("Fail closed, never skip ... refusing to report a
 # pass on a missing file"). That is unchanged and must stay unchanged: never make the no-input path
@@ -183,8 +181,7 @@ jobs:
 
   prove:
     # The real pass over the record. Advisory: findings are reported, never fatal (see
-    # `vars.ASVS_PROVE_STRICT`). An instrument failure IS fatal -- that distinction is the point --
-    # and a record where no claim names a `mutation_path` is one, so this job is red until one does.
+    # `vars.ASVS_PROVE_STRICT`). An instrument failure IS fatal -- that distinction is the point.
     name: prove absence claims (advisory)
     needs: selftest
     # ON DEMAND ONLY. On a PR there is no credential and nothing to prove; the wiring question is
@@ -197,8 +194,8 @@ jobs:
     # Generous because the prover spawns a pytest run per provable claim, and that is what the budget
     # is for. The tree is copied ONCE for the whole pass (save/apply/run/restore against one pristine
     # copy, plus a rebuild if a run writes into it), so the copy cost no longer scales with adoption
-    # -- it used to be one copytree per claim at roughly 1.2s each. At today's adoption -- zero -- the
-    # whole pass is under a second, so this budget is for the future, not the present.
+    # -- it used to be one copytree per claim at roughly 1.2s each. At zero adoption -- the 2026-08-09
+    # census above -- the whole pass was under a second, so this budget is for growth past that.
     timeout-minutes: 60
     permissions:
       contents: read
@@ -267,11 +264,10 @@ jobs:
         working-directory: engine
         env:
           # Both default OFF. STRICT is the whole ratchet -- one variable, proved to bite by selftest
-          # limb L3. It changes nothing while no claim names a `mutation_path`: that run fails as an
-          # instrument failure (exit 2) with or without it, and a claim with no `mutation_path` is
-          # skipped rather than raised as a problem, so it is never a finding STRICT could fail on.
-          # DETAIL prints the per-claim problem lines and is ONLY appropriate where the run log is
-          # private.
+          # limb L3. It decides only whether problems on claims that carry a `mutation_path` fail
+          # the job; a prover exit 2 fails it either way (header, ADVISORY APPLIES TO FINDINGS). When
+          # to turn it on is the owner's call (`EXIT_FINDINGS` in prove_report.py). DETAIL prints
+          # the per-claim problem lines and is ONLY appropriate where the run log is private.
           STRICT: ${{ vars.ASVS_PROVE_STRICT }}
           DETAIL: ${{ vars.ASVS_PROVE_DETAIL }}
           SCORECARD: ${{ github.workspace }}/vault/docs/security/asvs-scorecard.toml
@@ -296,8 +292,7 @@ jobs:
           #
           # No pipe, so the exit code reaching the runner is this command's own (SDS-3.8). The three
           # outcomes it can return are distinct and all three matter: 0 clean-or-advisory,
-          # 1 findings-under-strict, 2 the instrument could not measure (a record where no claim
-          # names a `mutation_path` included).
+          # 1 findings-under-strict, 2 the instrument could not measure.
           python scripts/asvs/prove_report.py run \
             --scorecard "${SCORECARD}" \
             --root . \
