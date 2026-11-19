@@ -20577,7 +20577,7 @@ class MessageStore:
         *,
         now: float | None = None,
         expected: tuple[object, ...] | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> LoginSuccessAnswer:
         """Write a full authentication (:func:`full_authentication_clear`). With ``expected`` (a
         :func:`full_authentication_snapshot`), only while the row still holds it, decided in the

@@ -3030,13 +3030,13 @@ async def test_an_unrelated_write_inside_the_confirm_window_still_confirms(
         identity, token, _ = await login_admin(service)
         enroll = await service.begin_mfa_enrollment(identity)
         await store.set_user_notify_email(identity.user_id, email="admin@example.test")
-        await store.record_login_success(identity.user_id)
+        await store.record_login_success(identity.user_id, audits=())
 
         real_elevated = service._elevated
 
         async def elevated_then_write(*args: Any, **kwargs: Any) -> Any:
             out = await real_elevated(*args, **kwargs)
-            await store.record_login_success(identity.user_id)
+            await store.record_login_success(identity.user_id, audits=())
             return out
 
         monkeypatch.setattr(service, "_elevated", elevated_then_write)

@@ -639,7 +639,7 @@ async def _assert_totp_binding_contract(store: Any) -> None:
     # The false-refusal trap: writes to OTHER columns between the stage and the enable carry the
     # stored cell over byte for byte, so the compare still matches.
     await store.set_user_notify_email("totp-u2", email="bob@example.test", now=5.0)
-    await store.record_login_success("totp-u2", now=6.0)
+    await store.record_login_success("totp-u2", now=6.0, audits=())
     assert (
         await store.enable_totp(
             "totp-u2", recovery_code_hashes=["y"], expected_secret_cell=replacing, now=7.0

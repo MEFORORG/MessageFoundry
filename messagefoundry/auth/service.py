@@ -6373,7 +6373,7 @@ class AuthService:
             # by logging in again -- three cycles of password plus four wrong codes never locked the
             # account. It is the MFA leg (``verify_mfa`` / ``finish_webauthn_assertion``) that clears
             # it when a factor is owed; this branch covers the accounts that owe none.
-            await self._store.record_login_success(user.id, now=now)
+            await self._store.record_login_success(user.id, now=now, audits=())
         try:
             token = await self._issue_session(
                 user.id,
@@ -8749,7 +8749,7 @@ class AuthService:
             #
             # ``verify_mfa`` and ``finish_webauthn_assertion`` are the two legs that finish the job,
             # and both clear the counter themselves.
-            await self._store.record_login_success(user.id)
+            await self._store.record_login_success(user.id, audits=())
             # vault BACKLOG #2145, closing the #2156 review's R1-1: only a directory sign-in that owes
             # nothing more marks its address known. The audit baseline this replaced counted a
             # directory row that still owed a factor, because that row carries no marker of it.
@@ -17733,7 +17733,7 @@ class AuthService:
                             # BACKLOG #2592: as above, the session has been ended.
                             return Elevation(session_lost=True)
                         self._restart_new_ip_dedupe(hash_token(token))
-                    await self._store.record_login_success(user.id, now=now)
+                    await self._store.record_login_success(user.id, now=now, audits=())
                     await self._window_audit(
                         window, "auth.mfa_verified", actor=user.username, client=client
                     )
@@ -19601,7 +19601,7 @@ class AuthService:
             # Sited before ``_elevated`` rotates the session for the same reason the group in
             # ``verify_mfa`` is -- though this write targets the USER row, not the session, so it is
             # ordering by parity rather than by necessity.
-            await self._store.record_login_success(user.id, now=now)
+            await self._store.record_login_success(user.id, now=now, audits=())
             await self._window_audit(
                 window, "auth.webauthn_verified", actor=user.username, client=client
             )

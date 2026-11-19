@@ -10999,7 +10999,7 @@ class PostgresStore:
         *,
         now: float | None = None,
         expected: tuple[object, ...] | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> LoginSuccessAnswer:
         """See the SQLite twin (BACKLOG #5900): the compare with ``expected`` reads the row
         ``_write_user`` holds ``FOR UPDATE``, and ``audits`` share the reset's transaction. This leg

@@ -220,17 +220,17 @@ async def _assert_single_counter_policy(store: Any) -> None:
     assert user is not None and user.lock_cycles == 2
 
     # --- a successful login clears every lockout column, cycles included (AC-8) --------------------
-    await store.record_login_success("lock-u1", now=second + 1.0)
+    await store.record_login_success("lock-u1", now=second + 1.0, audits=())
     user = await store.get_user("lock-u1")
     assert user is not None and _lockout_columns(user) == (0, None, 0, 0, None, 0)
     assert await _fail(store, "lock-u1", now=second + 2.0) == (1, False, 0)
 
     # --- threshold 1 locks on the FIRST failure, which is why the doc says it is not an off switch -
-    await store.record_login_success("lock-u1", now=second + 3.0)
+    await store.record_login_success("lock-u1", now=second + 3.0, audits=())
     assert await _fail(store, "lock-u1", now=second + 4.0, threshold=1) == (1, True, 1)
 
     # --- lockout_minutes = 0 still means "the lock expires at once", escalated or not --------------
-    await store.record_login_success("lock-u1", now=second + 5.0)
+    await store.record_login_success("lock-u1", now=second + 5.0, audits=())
     assert await _fail(store, "lock-u1", now=second + 6.0, threshold=1, lockout_seconds=0.0) == (
         1,
         True,
@@ -307,7 +307,7 @@ async def _assert_escalation(store: Any) -> None:
             cycles = user.lock_cycles if counter == "sign_in" else user.second_step_lock_cycles
             assert cycles == cycle
             start = locked + 1.0  # the next cycle starts after this lock lapses
-        await store.record_login_success(user_id, now=start)
+        await store.record_login_success(user_id, now=start, audits=())
 
     # --- the exponent is capped before it is computed, so a huge stored count cannot overflow -----
     start = 20_000.0
@@ -1418,7 +1418,7 @@ async def _assert_conditional_full_authentication(store: Any) -> None:
     assert await _reset_rows(store) == rows + 1
     # The unconditional form still writes, and appends nothing it was not given.
     await _fail(store, uid, now=t0 + 10.0)
-    assert await store.record_login_success(uid, now=t0 + 11.0) == "written"
+    assert await store.record_login_success(uid, now=t0 + 11.0, audits=()) == "written"
     assert await columns() == (0, None, 0, 0, None, 0)
     assert await _reset_rows(store) == rows + 1
 

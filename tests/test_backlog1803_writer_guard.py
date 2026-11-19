@@ -464,7 +464,7 @@ async def test_a_cipher_failure_mid_claim_leaves_no_torn_write(tmp_path: Path) -
         assert not db.in_transaction, "the failed claim left its partial write open"
 
         # An unrelated SHORT writer takes the lock next and commits.
-        await store.record_login_success("bystander")
+        await store.record_login_success("bystander", audits=())
         # Nothing of the failed claim became durable: same status, attempts and events as before.
         assert await state() == before
 

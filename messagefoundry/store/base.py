@@ -2873,7 +2873,7 @@ class AuthStore(Protocol):
         *,
         now: float | None = None,
         expected: tuple[object, ...] | None = None,
-        audits: Sequence[AuditAppend] = (),
+        audits: Sequence[AuditAppend],
     ) -> LoginSuccessAnswer: ...
 
     # The offline administrator unlock's write (ADR 0171 as amended by ADR 0197): clears both locks and

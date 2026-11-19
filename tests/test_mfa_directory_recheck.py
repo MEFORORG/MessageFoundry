@@ -859,7 +859,7 @@ async def test_a_local_rejoin_refuses_a_lock_read_before_it_lets_the_queue_go(
             if lock:
                 await _lock_second_step(store, a.user_id)
         elif calls == 2 and lock:
-            await store.record_login_success(a.user_id)  # clears the second-step lock
+            await store.record_login_success(a.user_id, audits=())  # clears the second-step lock
         async with real_lock(username):
             yield
 
