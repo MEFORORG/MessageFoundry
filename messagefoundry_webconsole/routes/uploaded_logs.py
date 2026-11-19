@@ -219,17 +219,29 @@ _DAMAGED_CAUSE = (
     "The engine found the file damaged, so it does not read or serve it. No encryption key and no "
     "command repairs it."
 )
+#: The engine's 423 does not say which damage it found, and some damaged files are ones
+#: ``rotate-key`` reports as possibly holding a value under the prior key: a sidecar larger than a
+#: sidecar can be, not UTF-8, or plaintext too long to seal (BACKLOG #5387). So every damaged notice
+#: takes that command's stance, that the prior key stays until such a sidecar is fixed or
+#: deliberately removed. It names no command, since no damaged notice does.
+_PRIOR_KEY = (
+    "At least a damaged file whose record of its details is larger than the engine reads, is not "
+    "UTF-8 text, or is plaintext too long to seal may still hold a value under a prior store "
+    "encryption key. An "
+    "administrator should not retire a prior key until each such file is fixed, for example by "
+    "restoring it from a backup, or is deliberately removed."
+)
 _MAY_DELETE = "It may be deleted, but the engine may refuse that too."
-BROWSE_DAMAGED_NOTICE = f"{_BROWSE_LEAD} {_DAMAGED_CAUSE} {_MAY_DELETE}"
-RESEND_DAMAGED_NOTICE = f"{_RESEND_LEAD} {_DAMAGED_CAUSE} {_MAY_DELETE}"
+BROWSE_DAMAGED_NOTICE = f"{_BROWSE_LEAD} {_DAMAGED_CAUSE} {_PRIOR_KEY} {_MAY_DELETE}"
+RESEND_DAMAGED_NOTICE = f"{_RESEND_LEAD} {_DAMAGED_CAUSE} {_PRIOR_KEY} {_MAY_DELETE}"
 #: A refused delete is not answered with advice to delete. The retention prune removes only some
 #: damaged files, by their age on disk, so the notice promises no removal: at least a sidecar that
 #: is a link or not a regular file is skipped by the prune, and a body that is a directory is one
 #: its unlink refuses (BACKLOG #5388 added item 1 follow-up; docs/PHI.md section 3).
 DELETE_DAMAGED_NOTICE = (
-    f"{_DELETE_LEAD} {_DAMAGED_CAUSE} Deleting it again is refused the same way. Where "
-    "uploaded-file retention is on, the engine removes some damaged files once they are old "
-    "enough on disk, but not every one. At least a file that is a link or is not a regular "
+    f"{_DELETE_LEAD} {_DAMAGED_CAUSE} {_PRIOR_KEY} Deleting it again is refused the same way. "
+    "Where uploaded-file retention is on, the engine removes some damaged files once they are "
+    "old enough on disk, but not every one. At least a file that is a link or is not a regular "
     "file, or whose body is a folder, stays until an administrator removes it on the server."
 )
 
