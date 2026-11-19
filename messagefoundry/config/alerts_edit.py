@@ -114,12 +114,13 @@ def add_rule(
         if rules is None:
             rules = tomlkit.aot()
             alerts["rules"] = rules
-        elif isinstance(rules, Array):
+        if isinstance(rules, Array):
             # BACKLOG #5774: ``rules = [{...}]`` is a valid inline array, and appending a table
-            # into it wrote TOML that does not parse, so the add was refused for that file.
-            rules = _as_array_of_tables(rules)
-            alerts["rules"] = rules
-        rules.append(_build_table(obj))
+            # into it wrote TOML that does not parse, so the add was refused for that file. A plain
+            # dict is written as one more inline table, and the array's comments stay where they are.
+            rules.append(_rule_values(obj))
+        else:
+            rules.append(_build_table(obj))
 
         _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
     return {"op": "add", "index": len(rules) - 1}
@@ -155,21 +156,6 @@ def _existing_rules(doc: Any) -> Any:
     return alerts.get("rules")
 
 
-def _as_array_of_tables(rules: Any) -> Any:
-    """An inline ``rules`` array rewritten as the ``[[alerts.rules]]`` array of tables this module
-    writes, every rule's keys and values kept in order. An element that is not a table is refused,
-    since no array of tables can hold it and the settings loader refuses it too."""
-    aot = tomlkit.aot()
-    for element in rules.unwrap():
-        if not isinstance(element, dict):
-            raise AlertRuleError("[alerts].rules must hold only tables")
-        table = tomlkit.table()
-        for key, value in element.items():
-            table[key] = value
-        aot.append(table)
-    return aot
-
-
 def _validate_input(obj: Any) -> None:
     if not isinstance(obj, dict):
         raise AlertRuleError("alert rule must be a JSON object")
@@ -189,11 +175,15 @@ def _validate_input(obj: Any) -> None:
         )
 
 
+def _rule_values(obj: dict[str, Any]) -> dict[str, Any]:
+    # None = field absent; [] (suppress) is a real value, kept.
+    return {key: obj[key] for key in _RULE_FIELDS if obj.get(key) is not None}
+
+
 def _build_table(obj: dict[str, Any]) -> Any:
     table = tomlkit.table()
-    for key in _RULE_FIELDS:
-        if obj.get(key) is not None:  # None = field absent; [] (suppress) is a real value, kept
-            table[key] = obj[key]
+    for key, value in _rule_values(obj).items():
+        table[key] = value
     return table
 
 

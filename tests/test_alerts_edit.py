@@ -128,7 +128,7 @@ def test_add_into_an_inline_rules_array_writes_toml_that_loads(
 ) -> None:
     """BACKLOG #5774: ``rules = [{...}]`` is valid TOML, and the add appended a table into the
     inline array, which wrote text that did not parse, so the add was refused for the file. The
-    inline rules become an array of tables, each kept whole and in order, a nested tier included."""
+    new rule is one more inline table, the earlier rules and the array's comments kept."""
     svc = _svc(tmp_path)
     svc.write_text(
         textwrap.dedent(
@@ -136,7 +136,8 @@ def test_add_into_an_inline_rules_array_writes_toml_that_loads(
             # keep this header comment
             [alerts]
             rules = [
-                {event_type = "queue_buildup", min_depth = 50, escalate = [{after_count = 3, severity = "critical"}]},
+                # keep this comment inside the array
+                {event_type = "queue_buildup", min_depth = 50, escalate = [{after_count = 3, severity = "critical"}]},  # and this one
                 {connection = "IB_*", transports = []},
             ]
             realert_seconds = 120
@@ -144,26 +145,45 @@ def test_add_into_an_inline_rules_array_writes_toml_that_loads(
         ),
         encoding="utf-8",
     )
-    rc, out = _add(svc, {"event_type": "connection_stopped"}, capsys)
+    rule = {
+        "event_type": "connection_stopped",
+        "escalate": [{"after_count": 2, "severity": "critical"}],
+    }
+    rc, out = _add(svc, rule, capsys)
     assert rc == 0, out
-    assert "# keep this header comment" in svc.read_text(encoding="utf-8")
+    text = svc.read_text(encoding="utf-8")
+    for comment in ("# keep this header comment", "# keep this comment inside", "# and this one"):
+        assert comment in text
     loaded = load_settings(config_path=svc).alerts
     assert loaded.realert_seconds == 120
     assert [r.event_type for r in loaded.rules] == ["queue_buildup", "any", "connection_stopped"]
     assert loaded.rules[0].min_depth == 50
     assert [(t.after_count, t.severity) for t in loaded.rules[0].escalate] == [(3, "critical")]
     assert loaded.rules[1].connection == "IB_*" and loaded.rules[1].transports == []
+    assert [(t.after_count, t.severity) for t in loaded.rules[2].escalate] == [(2, "critical")]
     assert [r["index"] for r in _list(svc, capsys)] == [0, 1, 2]
 
 
-def test_add_into_an_inline_rules_array_holding_a_non_table_is_refused(tmp_path: Path) -> None:
-    """No array of tables can hold a bare value, so the add says why and writes nothing."""
+@pytest.mark.parametrize(
+    "original",
+    [
+        'alerts = {rules = [{event_type = "queue_buildup"}]}\n',
+        'alerts.rules = [{event_type = "queue_buildup"}]\nalerts.realert_seconds = 120\n',
+    ],
+)
+def test_add_into_an_inline_rules_array_in_other_spellings(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], original: str
+) -> None:
+    """The inline array under an inline ``alerts`` table, and under dotted keys, take the add too,
+    and a dotted sibling key stays on ``[alerts]`` rather than landing in a rule."""
     svc = _svc(tmp_path)
-    original = "[alerts]\nrules = [1]\n"
     svc.write_text(original, encoding="utf-8")
-    with pytest.raises(alerts_edit.AlertRuleError, match="must hold only tables"):
-        alerts_edit.add_rule(svc, {"event_type": "connection_stopped"}, validate=lambda _p: None)
-    assert svc.read_text(encoding="utf-8") == original
+    rc, out = _add(svc, {"event_type": "connection_stopped"}, capsys)
+    assert rc == 0, out
+    loaded = load_settings(config_path=svc).alerts
+    assert [r.event_type for r in loaded.rules] == ["queue_buildup", "connection_stopped"]
+    if "realert_seconds" in original:
+        assert loaded.realert_seconds == 120
 
 
 def test_failed_add_rolls_back_byte_stable(tmp_path: Path) -> None:
