@@ -262,7 +262,7 @@ def test_the_watcher_wakes_on_mail_under_the_legacy_key(repo: Path, shared: Path
 def test_a_legacy_seat_id_is_sent_to_the_new_box(repo: Path, shared: Path) -> None:
     """A seat id published before the change names the old box, which every PC at the path reads."""
     legacy = _key(repo, legacy=True)
-    _plant_seat(shared / "seats", legacy, str(repo), None)
+    _plant_seat(shared / "seats", legacy, str(repo), _this_host())
     proc = _send(repo, shared, legacy, "to an old id")
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout)[0]["Key"] == _key(repo)
@@ -274,6 +274,48 @@ def test_a_legacy_seat_id_is_sent_to_the_new_box(repo: Path, shared: Path) -> No
     proc = _send(repo, shared, legacy, "to the other pc")
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout)[0]["Key"] == _key(repo, OTHER)
+
+
+def _this_host() -> str:
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-Command", "[Environment]::MachineName"],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=True,
+    )
+    return proc.stdout.strip()
+
+
+def _refused(proc: subprocess.CompletedProcess[str], shared: Path, to: str) -> None:
+    assert proc.returncode != 0, proc.stdout
+    assert "is not a seat id in the shared seat registry" in proc.stderr
+    box = shared / "mail" / "box"
+    assert not box.exists() or not any(box.iterdir()), "no box may be minted for a refused send"
+
+
+def test_a_hostless_legacy_seat_record_is_refused(repo: Path, shared: Path) -> None:
+    """A legacy record naming no host may be another PC's; keying it with this PC's host would queue
+    the mail to a box nobody drains, so the send is refused rather than defaulted to this PC."""
+    legacy = _key(repo, legacy=True)
+    _plant_seat(shared / "seats", legacy, str(repo), None)
+    _refused(_send(repo, shared, legacy, "to nobody"), shared, legacy)
+
+
+@pytest.mark.parametrize("host", [None, OTHER])
+@pytest.mark.parametrize("worktree", ["", "   ", None])
+def test_a_seat_record_with_no_worktree_is_refused(
+    repo: Path, shared: Path, host: str | None, worktree: str | None
+) -> None:
+    """With no worktree the legacy-key check cannot run, so the id might be the shared legacy box;
+    the send is refused rather than queued under the id as given."""
+    seat_id = _key(repo, legacy=True)
+    path = _plant_seat(shared / "seats", seat_id, worktree or "", host)
+    if worktree is None:
+        rec = json.loads(path.read_text(encoding="utf-8"))
+        del rec["worktree"]
+        path.write_text(json.dumps(rec), encoding="utf-8")
+    _refused(_send(repo, shared, seat_id, "to a pathless seat"), shared, seat_id)
 
 
 # ------------------------------------------------------------------------------------ seats

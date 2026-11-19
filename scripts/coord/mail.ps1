@@ -54,7 +54,8 @@
     two PCs has two seat ids and two mailboxes. A path target is keyed for THIS PC, because a path is
     only an address on the PC that holds it; reach another PC's seat by its seat id. A seat id written
     before the change is the old path-only key. It is still accepted, and the mail goes to the box that
-    seat's worktree and host key to now, never to the old box, which every PC at that path reads.
+    seat's worktree and host key to now, never to the old box, which every PC at that path reads. A
+    record under it that names no host, or no worktree, is refused: it cannot be keyed to one PC.
     A cwd is matched case-insensitively and EXACTLY, never by prefix: every worktree cwd in this repo is
     an extension of the primary checkout's path, so a prefix match resolves any peer to some arbitrary
     worktree. VS Code also records a lowercase drive letter where the Desktop app records an uppercase
@@ -220,14 +221,17 @@ function Resolve-SeatRecipient {
     $seatHost = Get-CoordRecordHost $best
     # A SEAT ID PUBLISHED BEFORE THE HOST JOINED THE KEY is the old path-only key. Mail is never
     # written under it: on a shared root every PC at that path would read that box. It goes to the box
-    # the same worktree and host key to now, which is the one the recipient's drain reads. No host on
-    # the record means this machine, as everywhere. A host that is not text names no box, and a
-    # worktree that does not normalise to a path names no key, so either one REFUSES the send.
+    # the same worktree and host key to now, which is the one the recipient's drain reads. A record
+    # with no worktree cannot be told from a legacy one, so it REFUSES the send. So does a worktree
+    # that does not normalise to a path, and a legacy id whose record names no host or a host that is
+    # not text: that record may be another PC's, and keying it with this PC's host would queue the
+    # mail to a box nobody drains. A hostless record is never defaulted to this PC here.
+    if (-not $wt.Trim()) { return $null }
     $key = $Id
     $legacy = $null
-    try { if ($wt) { $legacy = ConvertTo-LegacyBoxKey -Path $wt } } catch { return $null }
+    try { $legacy = ConvertTo-LegacyBoxKey -Path $wt } catch { return $null }
     if ($legacy -and $Id -ceq $legacy) {
-        if ($seatHost -eq $script:CoordUnreadableHost) { return $null }
+        if (-not $seatHost -or $seatHost -eq $script:CoordUnreadableHost) { return $null }
         $key = ConvertTo-BoxKey -Path $wt -HostName $seatHost
     }
     return [pscustomobject]@{ Key = $key; Worktree = $wt; Host = $seatHost }
