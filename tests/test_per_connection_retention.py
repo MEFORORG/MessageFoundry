@@ -410,7 +410,7 @@ async def test_a_sibling_engine_shard_purges_an_inbound_keep_forever_body(
     """BACKLOG #5967: each engine shard's runner reads the overrides of its own filtered registry,
     so an inbound's ``messages_days = 0`` is honoured only by the engine shard that holds it. A
     sibling engine shard's runner, purging the same store, takes the global window for that
-    inbound's bodies. ``_engine_shard_limit`` states this; this pins the behaviour it describes."""
+    inbound's bodies. ``ENGINE_SHARD_LIMIT`` states this; this pins the behaviour it describes."""
     from messagefoundry.pipeline.sharding import filter_registry_for_shard
 
     keep, _ = await _delivered(store, channel_id="IB_KEEP", dest="OB", now=0.0, control="S-KEEP")

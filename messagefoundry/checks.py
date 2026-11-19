@@ -4136,7 +4136,7 @@ def _check_retention_overrides(
     connection's PHI forever. What each keeps is stated once, on
     :func:`~messagefoundry.config.retention_classification._override_scope`, and the engine shard
     limit on an inbound override on
-    :func:`~messagefoundry.config.retention_classification._engine_shard_limit`.
+    :data:`~messagefoundry.config.retention_classification.ENGINE_SHARD_LIMIT`.
     ``serve`` hands the engine a registry guard that refuses such a graph under ``enforce`` unless
     ``[security].allow_keeping_phi_indefinitely`` is set, and this gate passed it. The decision is
     :func:`~messagefoundry.config.retention_classification.judge_keep_forever_overrides`, the

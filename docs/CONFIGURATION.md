@@ -1327,13 +1327,11 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > **Under `enforce`, an override of `0` needs the same acknowledgement as a global `0`** (BACKLOG
 > #2368). Subject to the engine shard limit next, it keeps forever what that override's purge
 > holds, whatever the global window says, and not every row about its messages; the refusal and the
-> `AUDIT:` line state which (BACKLOG #5967). **The engine shard limit:** where an engine whose live
-> graph does not hold an inbound runs retention against the same store, such as a `serve --shard`
-> process for another engine shard, that inbound's override keeps none of what the purge of message
-> bodies holds for that inbound's messages past that engine's global
-> `[security].delete_message_bodies_after_days` window; no `messages_days` value on that inbound
-> changes this. Changing that behaviour is its own backlog row, on retention under engine shards.
-> The
+> `AUDIT:` line state which (BACKLOG #5967). **The engine shard limit:** where a `serve --shard`
+> process that does not hold an inbound runs retention against the same store, that inbound's
+> override keeps none of what the purge of message bodies holds for that inbound's messages past
+> that process's global `[security].delete_message_bodies_after_days` window; no `messages_days`
+> value on that inbound changes this. The
 > overrides live in the graph, so `serve` checks them when it loads the graph, at least at startup
 > and on every config reload:
 >
