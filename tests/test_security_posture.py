@@ -1395,55 +1395,100 @@ def test_the_sbomqs_split_check_reds_on_the_merged_shape(key: str) -> None:
     assert any("carries continue-on-error" in o for o in offences), offences
 
 
-_STATUS_FUNCTIONS = ("always", "success", "failure", "cancelled")
+_STATUS_FUNCTIONS = frozenset({"always", "success", "failure", "cancelled"})
 
 
-def _step_if_runs(step: dict, *, earlier_failed: bool, outcomes: dict[str, str]) -> bool:
-    """Evaluate a STEP's ``if:`` as GitHub does for one run state. A condition naming no status
-    function gets an implicit ``success() &&`` in front, so it is added here rather than assumed
-    away. ``outcomes`` maps a step id to its ``steps.<id>.outcome``; an id not seeded reads empty.
-    The run is never cancelled."""
-    from tests.test_dependabot_automerge_guardrails import _evaluate_expression
+def _step_if_runs(
+    step: dict, *, earlier_failed: bool, outcomes: dict[str, str], cancelled: bool = False
+) -> bool:
+    """Evaluate a STEP's ``if:`` as GitHub does for one run state.
 
-    body = str(step.get("if") or "").strip()
+    A condition calling no status function gets an implicit ``success() &&`` in front, decided from
+    the parsed tokens so a string literal cannot count. A YAML boolean is read as one. ``outcomes``
+    maps a step id to its outcome, seeded as both ``steps.<id>.outcome`` and ``.conclusion`` (equal
+    for a step with no continue-on-error). Any other context name is REFUSED rather than read as
+    the empty string, so an ``||`` term on a context this job always carries cannot pass unseen.
+    """
+    from tests.test_dependabot_automerge_guardrails import (
+        _evaluate_expression,
+        _tokenize_expression,
+    )
+
+    raw = step.get("if")
+    if isinstance(raw, bool):
+        return raw and not earlier_failed and not cancelled
+    body = str(raw or "").strip()
     if body.startswith("${{") and body.endswith("}}"):
         body = body[3:-2].strip()
-    if not re.search(rf"\b(?:{'|'.join(_STATUS_FUNCTIONS)})\s*\(", body, re.IGNORECASE):
+    tokens = _tokenize_expression(body) if body else ()
+    context = {
+        f"steps.{sid}.{field}": outcome
+        for sid, outcome in outcomes.items()
+        for field in ("outcome", "conclusion")
+    }
+    seeded = {k.casefold() for k in context}
+    called: set[str] = set()
+    for i, (kind, text) in enumerate(tokens):
+        if kind != "ref":
+            continue
+        if i + 1 < len(tokens) and tokens[i + 1] == ("op", "("):
+            called.add(text.casefold())
+        else:
+            assert text.casefold() in seeded, f"unseeded context {text!r} in {body!r}"
+    if not called & _STATUS_FUNCTIONS:
         body = f"success() && ({body})" if body else "success()"
     functions: dict[str, Callable[..., str | bool]] = {
         "always": lambda: True,
-        "success": lambda: not earlier_failed,
+        "success": lambda: not earlier_failed and not cancelled,
         "failure": lambda: earlier_failed,
-        "cancelled": lambda: False,
+        "cancelled": lambda: cancelled,
     }
-    context = {f"steps.{sid}.outcome": outcome for sid, outcome in outcomes.items()}
     return _evaluate_expression(body, context, functions)
 
 
 def _sbomqs_score_gate_offences(job: dict, soft_step: str, *, must_survive: bool) -> list[str]:
-    """Why ``job``'s sbomqs score could run after its install step failed; empty when it cannot.
+    """Why ``job``'s sbomqs score could run with no verified binary behind it; empty when it cannot.
 
-    The install step's id, when it has one, is seeded with each outcome. ``must_survive`` adds the
-    BACKLOG #2521 case: an unrelated earlier failure with a good install must still score."""
+    The score must not run after the install step failed, was skipped or was cancelled, and must
+    run after a good install. ``must_survive`` adds the BACKLOG #2521 case: after an unrelated
+    earlier failure the install's OUTCOME is derived from its own ``if:``, and the score must still
+    run."""
     steps = [s for s in job.get("steps") or [] if isinstance(s, dict)]
-    install = next(s for s in steps if "sha256sum -c" in _shell_lines(s))
-    score = next(s for s in steps if s.get("name") == soft_step)
+    verifying = [s for s in steps if "sha256sum -c" in _shell_lines(s)]
+    scores = [s for s in steps if s.get("name") == soft_step]
+    if len(verifying) != 1 or len(scores) != 1:
+        return [
+            f"expected one `sha256sum -c` step and one {soft_step!r}, found "
+            f"{len(verifying)} and {len(scores)}"
+        ]
+    install, score = verifying[0], scores[0]
     sid = str(install.get("id") or "")
-    offences: list[str] = []
-    failed = {sid: "failure"} if sid else {}
-    if _step_if_runs(score, earlier_failed=True, outcomes=failed):
-        offences.append(
-            f"the score step runs after a failed install: if: {score.get('if')!r}, install id "
-            f"{sid or None!r}"
+    shown = f"if: {score.get('if')!r}, install id {sid or None!r}"
+
+    def seed(outcome: str) -> dict[str, str]:
+        return {sid: outcome} if sid else {}
+
+    offences = [
+        f"the score step runs after a {outcome} install: {shown}"
+        for outcome in ("failure", "skipped", "cancelled")
+        if _step_if_runs(
+            score,
+            earlier_failed=outcome != "cancelled",
+            outcomes=seed(outcome),
+            cancelled=outcome == "cancelled",
         )
-    passed = {sid: "success"} if sid else {}
-    if not _step_if_runs(score, earlier_failed=False, outcomes=passed):
-        offences.append(f"the score step never runs after a good install: if: {score.get('if')!r}")
-    if must_survive and not _step_if_runs(score, earlier_failed=True, outcomes=passed):
-        offences.append(
-            "the score step skips after an unrelated earlier failure with a good install "
-            f"(BACKLOG #2521): if: {score.get('if')!r}"
-        )
+    ]
+    if not _step_if_runs(score, earlier_failed=False, outcomes=seed("success")):
+        offences.append(f"the score step never runs after a good install: {shown}")
+    if must_survive:
+        ran = _step_if_runs(install, earlier_failed=True, outcomes={})
+        if not _step_if_runs(
+            score, earlier_failed=True, outcomes=seed("success" if ran else "skipped")
+        ):
+            offences.append(
+                "the score step skips after an unrelated earlier failure (BACKLOG #2521); install "
+                f"if: {install.get('if')!r}, {shown}"
+            )
     return offences
 
 
@@ -1466,43 +1511,84 @@ def test_the_sbomqs_score_never_runs_after_a_failed_install() -> None:
         assert not offences, f"security.yml:{key}: {offences}"
 
 
+_SBOM_SOFT = next(
+    step for wf, key, _, step in _STEP_ADVISORY_JOBS if wf == _SECURITY and key == "sbom"
+)
+
+
+def _sbom_with(score_if: object = None, install_edit: Callable[[dict], dict] | None = None) -> dict:
+    """The `sbom` job with its score step's ``if:`` replaced and/or its install step edited."""
+    job = jobs_of(_SECURITY)["sbom"]
+    steps = []
+    for s in job["steps"]:
+        if not isinstance(s, dict):
+            continue
+        if score_if is not None and s.get("name") == _SBOM_SOFT:
+            s = {**s, "if": score_if}
+        elif install_edit is not None and "sha256sum -c" in _shell_lines(s):
+            s = install_edit(dict(s))
+        steps.append(s)
+    return {**job, "steps": steps}
+
+
 @pytest.mark.parametrize(
     ("score_if", "needle"),
     [
-        ("always()", "runs after a failed install"),
-        ("always() || steps.sbomqs-install.outcome == 'success'", "runs after a failed install"),
+        ("always()", "runs after a failure install"),
+        ("always() || steps.sbomqs-install.outcome == 'success'", "runs after a failure install"),
+        ("always() && steps.sbomqs-install.outcome != 'failure'", "runs after a skipped install"),
         ("steps.sbomqs-install.outcome == 'success'", "unrelated earlier failure"),
-        ("always() && steps.other.outcome == 'success'", "never runs after a good install"),
-        ("false_flag", "never runs after a good install"),
+        (False, "never runs after a good install"),
     ],
-    ids=["always-only", "or-always", "implicit-success", "wrong-id", "never"],
+    ids=[
+        "always-only",
+        "or-always",
+        "not-failure",
+        "implicit-success",
+        "yaml-false",
+    ],
 )
-def test_the_sbomqs_score_gate_check_reds_on_each_loosening(score_if: str, needle: str) -> None:
+def test_the_sbomqs_score_gate_check_reds_on_each_loosening(score_if: object, needle: str) -> None:
     """The controls: the gate before this fix (``always()`` alone), an ``||`` that admits a failed
-    install, a gate that loses the BACKLOG #2521 survival, and gates that never run."""
-    soft = {k: step for wf, k, _, step in _STEP_ADVISORY_JOBS if wf == _SECURITY}["sbom"]
-    job = jobs_of(_SECURITY)["sbom"]
-    steps = [
-        {**s, "if": score_if} if s.get("name") == soft else s
-        for s in job["steps"]
-        if isinstance(s, dict)
-    ]
-    offences = _sbomqs_score_gate_offences({**job, "steps": steps}, soft, must_survive=True)
+    install, a test that admits a skipped one, a gate that loses the BACKLOG #2521 survival, and a
+    gate that never runs."""
+    offences = _sbomqs_score_gate_offences(_sbom_with(score_if), _SBOM_SOFT, must_survive=True)
     assert any(needle in o for o in offences), offences
 
 
-def test_the_sbomqs_score_gate_check_reds_when_the_install_loses_its_id() -> None:
-    """The control for the id: an install step with no id leaves ``steps.<id>.outcome`` empty, so
-    the shipped gate never runs; that must be reported, not pass as a skip."""
-    soft = {k: step for wf, k, _, step in _STEP_ADVISORY_JOBS if wf == _SECURITY}["sbom"]
-    job = jobs_of(_SECURITY)["sbom"]
-    steps = [
-        {k: v for k, v in s.items() if k != "id"} if "sha256sum -c" in _shell_lines(s) else s
-        for s in job["steps"]
-        if isinstance(s, dict)
-    ]
-    offences = _sbomqs_score_gate_offences({**job, "steps": steps}, soft, must_survive=True)
-    assert any("never runs after a good install" in o for o in offences), offences
+def test_the_sbomqs_score_gate_check_accepts_the_conclusion_form() -> None:
+    """The control against a false red: ``conclusion`` equals ``outcome`` for a step with no
+    continue-on-error, so that spelling of the gate is accepted."""
+    score_if = "${{ !cancelled() && steps.sbomqs-install.conclusion == 'success' }}"
+    assert not _sbomqs_score_gate_offences(_sbom_with(score_if), _SBOM_SOFT, must_survive=True)
+
+
+@pytest.mark.parametrize(
+    "job",
+    [
+        _sbom_with(
+            "!cancelled() && (steps.sbomqs-install.outcome == 'success' || github.ref != '')"
+        ),
+        _sbom_with("!cancelled() && steps.other.outcome == 'success'"),
+        _sbom_with(install_edit=lambda s: {k: v for k, v in s.items() if k != "id"}),
+    ],
+    ids=["or-github-ref", "wrong-id", "install-without-id"],
+)
+def test_the_sbomqs_score_gate_check_refuses_an_unseeded_context(job: dict) -> None:
+    """A name the check does not seed fails the test rather than reading as the empty string. An
+    ``||`` on a context the job always carries (``github.ref`` on a scheduled run from main) would
+    run the score after every failed install; a gate on another step's id, or an install that lost
+    its id, gates on nothing the install decides."""
+    with pytest.raises(AssertionError, match="unseeded context"):
+        _sbomqs_score_gate_offences(job, _SBOM_SOFT, must_survive=True)
+
+
+def test_the_sbomqs_score_gate_check_reds_when_the_install_runs_on_success() -> None:
+    """The control for the install's own ``if:``: on ``success()`` it is skipped after an unrelated
+    failure, so the IDE SBOM goes unscored (BACKLOG #2521)."""
+    job = _sbom_with(install_edit=lambda s: {**s, "if": "success()"})
+    offences = _sbomqs_score_gate_offences(job, _SBOM_SOFT, must_survive=True)
+    assert any("unrelated earlier failure" in o for o in offences), offences
 
 
 # --- trivy: run the scan step and its reporter against each other, verbatim ----------------------
