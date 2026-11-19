@@ -58,30 +58,42 @@ try {
     # a worktree into one record, so the payload is worth forwarding carefully.
     $payload = Read-CcxHookInput
     $session = Enter-CcxHookSession -Text $payload -ReadOnly
+    $worktree = $null
     if ($session.Reason) {
-        # The only worktree left to record is the one this hook started in, the PRIMARY under the
-        # desktop app, and a record there would say this session sits in the primary.
-        Write-Output "[seat] could not read this session's worktree: $($session.Reason). Nothing was recorded for this turn."
-        exit 0
+        # AN UNPINNED SESSION WHOSE cwd IS A WORKTREE OF THIS SAME REPOSITORY keeps the record it always
+        # had, at that worktree. That is every desktop-app worktree session after a /clear, which never
+        # pins (rule 5), and refusing it would leave such a session unrecorded with a notice at every
+        # turn end. Only a pin can tell its own worktree from a sibling it moved into, so this case is
+        # no better than before and no worse. Another repository, no checkout, and input that cannot
+        # be read are still refused below.
+        $p = Get-CcxHookPayloadCwd -Payload $session.Payload
+        $startCommon = Get-CcxGitCommonDir (Get-CcxWorktreeRoot (Get-Location).ProviderPath)
+        $cwdRoot = if ($p.Cwd) { Get-CcxWorktreeRoot $p.Cwd } else { $null }
+        $cwdCommon = if ($cwdRoot) { Get-CcxGitCommonDir $cwdRoot } else { $null }
+        if (-not $session.Pinned -and $startCommon -and $cwdCommon -and (Test-CcxSamePath $cwdCommon $startCommon)) {
+            $worktree = [string]$cwdRoot
+        }
+        else {
+            # The only worktree left to record is the one this hook started in, the PRIMARY under the
+            # desktop app, and a record there would say this session sits in the primary.
+            Write-Output "[seat] could not read this session's worktree: $($session.Reason). Nothing was recorded for this turn."
+            exit 0
+        }
     }
     # Named explicitly, so seat.ps1 never falls back to the payload's cwd as its hint.
-    $worktree = if ($session.Dir) { [string]$session.Dir } else { (Get-Location).ProviderPath }
+    if (-not $worktree) { $worktree = if ($session.Dir) { [string]$session.Dir } else { (Get-Location).ProviderPath } }
 
-    # The running pwsh by full path, not a PATH lookup: a launch error must not be discarded with the
-    # recorder's output, because a recorder that never ran is the failure this layer exists to show.
-    $pwsh = if ($PSVersionTable.PSEdition -eq 'Core') { [Environment]::ProcessPath } else { '' }
-    if (-not $pwsh) { $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source }
+    # The pwsh on PATH, as before, resolved to its full path first: a launch error must not be
+    # discarded with the recorder's output, because a recorder that never ran is the failure this
+    # layer exists to show. A missing pwsh throws into the catch below.
+    $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
     $recorderArgs = @('-NoProfile', '-File', $seat, '-Record', '-Worktree', $worktree)
-    # Cleared first, so a launch that never sets it reads as no exit code rather than an earlier one.
-    $global:LASTEXITCODE = $null
     $out = if ($payload) { $payload | & $pwsh @recorderArgs 2>&1 } else { & $pwsh @recorderArgs 2>&1 }
-    # seat.ps1 -Record exits 0 on every route it controls, so any other code, or none, means it never
-    # ran as written: pwsh refused the file, or it could not start.
-    $code = $global:LASTEXITCODE
-    if ($code -ne 0) {
+    # seat.ps1 -Record exits 0 on every route it controls, so any other code means it never ran as
+    # written, for example because pwsh refused the file.
+    if ($LASTEXITCODE -ne 0) {
         $detail = (@($out) | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() } | Select-Object -Last 3) -join ' | '
-        $exited = if ($null -eq $code) { 'did not start' } else { "exited $code" }
-        Write-Output "[seat] the seat recorder $exited, so this turn was not recorded. $detail"
+        Write-Output "[seat] the seat recorder exited $LASTEXITCODE, so this turn was not recorded. $detail"
     }
 } catch {
     # Last resort. seat.ps1 owns the error log; if we could not even reach it, say so on stdout, where

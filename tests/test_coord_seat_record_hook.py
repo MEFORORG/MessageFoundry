@@ -113,10 +113,23 @@ class TestTheRecordLandsOnTheSessionsWorktree:
         assert recs, "no episode record was written"
         assert all(_same_dir(r["worktree"], own) for r in recs), [r["worktree"] for r in recs]
 
-    def test_an_unpinned_worktree_cwd_records_nothing_and_says_so(self, repo: Path) -> None:
-        """With no pin the hook cannot tell the session's worktree from a sibling it moved into."""
+    def test_an_unpinned_worktree_cwd_of_this_repository_is_still_recorded_there(
+        self, repo: Path
+    ) -> None:
+        """A desktop-app session after /clear has no pin (rule 5). Its record still lands at its
+        cwd's worktree, as before this hook used the pin rules, and the turn end stays silent."""
         own = _linked(repo, "own")
         proc = _hook(repo, {"session_id": "s1", "hook_event_name": "Stop", "cwd": str(own)})
+        recs = _records(repo)
+        assert recs, proc.stdout + proc.stderr
+        assert all(_same_dir(r["worktree"], own) for r in recs), [r["worktree"] for r in recs]
+        assert "[seat]" not in proc.stdout, proc.stdout
+
+    def test_a_cwd_that_does_not_exist_records_nothing_and_says_so(
+        self, repo: Path, tmp_path: Path
+    ) -> None:
+        gone = str(Path(os.path.realpath(tmp_path)) / "deleted-worktree")
+        proc = _hook(repo, {"session_id": "s1", "hook_event_name": "Stop", "cwd": gone})
         assert "could not read this session's worktree" in proc.stdout, proc.stdout
         assert "Nothing was recorded" in proc.stdout, proc.stdout
         assert _records(repo) == []
