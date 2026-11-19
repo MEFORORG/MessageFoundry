@@ -11,6 +11,7 @@ the two bases.
 
 from __future__ import annotations
 
+import unicodedata
 from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, Field
@@ -23,6 +24,7 @@ from messagefoundry.api.validation import (
     PermissionId,
     RoleId,
 )
+from messagefoundry.auth.permissions import ROLE_METADATA, Role
 from messagefoundry.auth.tokens import ENROLMENT_CODE_MAX
 from messagefoundry.auth.totp import MAX_DIGITS as TOTP_DIGITS
 from messagefoundry.auth.usernames import username_refusal
@@ -282,9 +284,9 @@ def _not_blank(value: str) -> str:
     return value
 
 
-#: A name an administrator types for an account (BACKLOG #5784): printable, so no C0 control, DEL or
-#: C1 control reaches the store (a NUL is a server error on PostgreSQL), and not blank or
-#: whitespace only.
+#: A name an administrator types for an account or a custom role (BACKLOG #5784, #5785): printable,
+#: so no C0 control, DEL or C1 control reaches the store (a NUL is a server error on PostgreSQL), and
+#: not blank or whitespace only.
 DisplayName = Annotated[
     str, Field(max_length=_NAME_MAX, pattern=PRINTABLE_TEXT_PATTERN), AfterValidator(_not_blank)
 ]
@@ -580,14 +582,48 @@ class RoleInfo(BaseModel):
     builtin: bool = True
 
 
+def _fold_role_name(name: str) -> str:
+    """A role name as a reader would see it: NFKC, case-folded, runs of whitespace as one space."""
+    return " ".join(unicodedata.normalize("NFKC", name).casefold().split())
+
+
+#: Every built-in role's id and label, folded. A custom role may not take one (BACKLOG #5785).
+_BUILTIN_ROLE_NAMES = frozenset(
+    _fold_role_name(name) for role in Role for name in (role.value, ROLE_METADATA[role][0])
+)
+
+
+def _not_a_builtin_role_name(name: str) -> str:
+    """Refuse a custom role name that reads as a built-in role's id or label in any case or spacing,
+    so a custom role named ``ADMINISTRATOR`` cannot pass for the built-in Administrator (BACKLOG
+    #5785). It compares after NFKC and case folding; a name that only looks alike, such as one with
+    a letter from another script, is not caught here."""
+    if _fold_role_name(name) in _BUILTIN_ROLE_NAMES:
+        raise ValueError("a custom role cannot take a built-in role's name")
+    return name
+
+
+def _distinct_permissions(permissions: list[str]) -> list[str]:
+    """A repeated permission is one grant, kept once in first-seen order (BACKLOG #5785)."""
+    return list(dict.fromkeys(permissions))
+
+
 class CustomRoleRequest(RequestModel):
     """Create/update an admin-defined custom role (ADR 0045): a named SUBSET of the existing Permission
     catalog. The engine validates the subset (recognized perms only, non-empty, no carved-out
-    escalation primitive) and rejects otherwise."""
+    escalation primitive) and rejects otherwise.
 
-    display_name: str = Field(max_length=_NAME_MAX)
-    description: str | None = Field(default=None, max_length=_NAME_MAX)
-    permissions: list[PermissionId] = Field(max_length=64)
+    The name takes the :data:`DisplayName` rule and may not be a built-in role's name; the
+    description may not carry a control character; a repeated permission is kept once (BACKLOG
+    #5785)."""
+
+    display_name: Annotated[DisplayName, AfterValidator(_not_a_builtin_role_name)]
+    description: str | None = Field(
+        default=None, max_length=_NAME_MAX, pattern=r"^[^\x00-\x1f\x7f-\x9f]*$"
+    )
+    permissions: Annotated[list[PermissionId], AfterValidator(_distinct_permissions)] = Field(
+        max_length=64
+    )
 
 
 class CustomRoleInfo(BaseModel):
