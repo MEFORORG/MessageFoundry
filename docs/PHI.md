@@ -870,8 +870,10 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    a text field that is not a string, is longer than the store allows, or holds a lone surrogate,
    and a sidecar larger than 128 KiB on disk. A plaintext sidecar longer than the longest whose
    seal still fits 128 KiB, about 96 KiB once its padding is skipped, is refused the same way, on
-   every cipher. No reader reads more than 128 KiB of a sidecar, so a planted large one cannot
-   exhaust memory under the quota lock. The floor is before this engine's first release, so no
+   every cipher. Each reader bounds what it reads of a sidecar, so a planted large one cannot
+   exhaust memory under the quota lock: the listing scan, the by-id reads, the startup count and
+   `rotate-key` read no more than about 128 KiB, and the check that classes an upload
+   `rotate-key` cannot seal reads up to 64 Ki characters, at most about 256 KiB. The floor is before this engine's first release, so no
    sidecar the store wrote is older. The check reads no clock: an `uploaded_at` far ahead is not a defect, since after a
    host clock is stepped back every genuine upload is dated ahead, so such an upload is still
    listed, billed by the quota and readable by its owner. A missing `uploaded_at`, or one before

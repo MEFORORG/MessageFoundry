@@ -162,6 +162,152 @@ async def test_the_body_check_does_not_follow_a_link(tmp_path: Path) -> None:
     assert store._lost_body_size(blob) is None  # noqa: SLF001
 
 
+async def test_the_body_check_opens_nothing_on_a_cached_match(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review round 1: the body was opened on every scan, even when its check was cached.
+    root = tmp_path / "uploads"
+    store = _store(root)
+    meta = await _saved(store)
+    blob = root / f"{meta.file_id}.blob"
+    assert store._lost_body_size(blob) is None  # noqa: SLF001 - fills the cache
+    opened: list[str] = []
+    real = uploads._open_plain
+
+    def _spy(path: Path) -> Any:
+        opened.append(path.name)
+        return real(path)
+
+    monkeypatch.setattr(uploads, "_open_plain", _spy)
+    assert store._lost_body_size(blob) is None  # noqa: SLF001
+    assert opened == []
+    # Control: a changed body is opened and checked again.
+    blob.write_bytes(b"\xff\xfe not text")
+    assert store._lost_body_size(blob) == len(b"\xff\xfe not text")  # noqa: SLF001
+    assert opened == [blob.name]
+
+
+async def test_the_body_check_logs_a_refused_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    root = tmp_path / "uploads"
+    store = _store(root)
+    meta = await _saved(store)
+    blob = root / f"{meta.file_id}.blob"
+
+    def _deny(path: Path) -> Any:
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(uploads, "_open_plain", _deny)
+    with caplog.at_level("WARNING", logger=uploads._log.name):  # noqa: SLF001
+        assert store._lost_body_size(blob) is None  # noqa: SLF001
+    assert "could not check the body" in caplog.text
+
+
+def test_open_plain_closes_the_descriptor_when_fdopen_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "plain.txt"
+    path.write_bytes(b"synthetic")
+    opened: list[int] = []
+    closed: list[int] = []
+    real_open, real_close = os.open, os.close
+
+    def _open(p: Any, flags: int, *args: Any) -> int:
+        fd = real_open(p, flags, *args)
+        opened.append(fd)
+        return fd
+
+    def _close(fd: int) -> None:
+        closed.append(fd)
+        real_close(fd)
+
+    def _fdopen(*_a: Any, **_k: Any) -> Any:
+        raise MemoryError("synthetic")
+
+    monkeypatch.setattr(os, "open", _open)
+    monkeypatch.setattr(os, "close", _close)
+    monkeypatch.setattr(os, "fdopen", _fdopen)
+    with pytest.raises(MemoryError):
+        uploads._open_plain(path)
+    assert opened and closed == opened
+
+
+async def test_a_sidecar_that_grew_after_its_fstat_is_read_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review round 1: past the size gate the reseal read the rest of the file without a bound, so
+    # one that grew after the fstat was read whole.
+    root = tmp_path / "uploads"
+    meta = await _saved(_store(root))
+    sidecar = root / f"{meta.file_id}.meta"
+    sidecar.write_text("x" * (uploads._SIDECAR_LIMIT + 4096), encoding="utf-8")
+    real = uploads._open_plain
+    read: list[int] = []
+
+    class _Counted:
+        def __init__(self, handle: Any) -> None:
+            self._h = handle
+
+        def read(self, n: int = -1) -> bytes:
+            data: bytes = self._h.read(n)
+            read.append(len(data))
+            return data
+
+        def __enter__(self) -> _Counted:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self._h.close()
+
+    class _Small:
+        def __init__(self, st: os.stat_result) -> None:
+            self._st = st
+            self.st_size = 10
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._st, name)
+
+    def _stale(path: Path) -> Any:
+        handle, st = real(path)
+        if path == sidecar:
+            return _Counted(handle), _Small(st)
+        return handle, st
+
+    monkeypatch.setattr(uploads, "_open_plain", _stale)
+    result = await _store(root, generate_key()).reseal_to_active()
+    assert result.too_long == 1 and not result.incomplete
+    assert sum(read) <= uploads._SIDECAR_LIMIT + 1
+
+
+async def test_a_padding_only_sidecar_over_a_lost_body_is_left_unsealable(
+    tmp_path: Path,
+) -> None:
+    # Review round 1: unpadding made it blank, so it was not plaintext and was sealed as an empty
+    # value, with a fresh mtime that restarted the prune's window.
+    root = tmp_path / "uploads"
+    meta = await _saved(_store(root))
+    sidecar = root / f"{meta.file_id}.meta"
+    sidecar.write_bytes(b" \r\n")
+    (root / f"{meta.file_id}.blob").unlink()
+    result = await _store(root, generate_key()).reseal_to_active()
+    assert result.unsealable == 1 and result.resealed == 0
+    assert sidecar.read_bytes() == b" \r\n"
+
+
+async def test_a_keyless_save_refuses_a_sidecar_past_the_plaintext_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Review round 1: a keyless store could write a plaintext sidecar every reader then refuses.
+    store = _store(tmp_path / "uploads")
+    monkeypatch.setattr(uploads, "_PLAIN_SIDECAR_LIMIT", 64)
+    with pytest.raises(uploads.UploadFieldError):
+        await _saved(store)
+    assert not any(p.suffix in {".meta", ".blob"} for p in tmp_path.rglob("*"))
+    # Control: a keyed store seals the same sidecar, so the plaintext bound does not apply.
+    assert (await _saved(_store(tmp_path / "keyed", generate_key()))).file_id
+
+
 # --- the API answers an access refusal with its own text and kind ---------------------------------
 
 _ACCESS_TEXT_START = "this uploaded file could not be opened, because the filesystem refused"

@@ -195,12 +195,13 @@ _UNSEALABLE_OWNER_READ_LIMIT = 64 * 1024
 # is a few hundred bytes. The longest it can be is its text fields at their bounds
 # (``_MAX_SIDECAR_TEXT``), every character an astral one that ``json.dumps`` escapes as twelve, then
 # sealed, which base64 grows by a third: under 40 KiB. :meth:`UploadStore.save` refuses to write a
-# longer one. The listing scan, which runs under ``_quota_lock``, the by-id reads and the startup
-# count read no more than this, so a planted file cannot exhaust memory there; a longer sidecar is
-# refused as damaged. A plaintext sidecar is held to the tighter ``_PLAIN_SIDECAR_LIMIT``, the
-# longest whose sealed form still fits here. ``rotate-key`` reads a sidecar up to the body's own
-# limit rather than this one, and never writes a sidecar longer than this
-# (:meth:`UploadStore._reseal_half`).
+# longer one. The listing scan, which runs under ``_quota_lock``, the by-id reads, the startup
+# count and ``rotate-key`` (:meth:`UploadStore._reseal_half`) read no more than this, plus one
+# byte, so a planted file cannot exhaust memory there; a longer sidecar is refused as damaged.
+# :meth:`UploadStore._unsealable_sync` reads by characters instead, up to
+# ``_UNSEALABLE_OWNER_READ_LIMIT`` of them, at most about 256 KiB. A plaintext sidecar is held to
+# the tighter ``_PLAIN_SIDECAR_LIMIT``, the longest whose sealed form still fits here, and
+# ``rotate-key`` never writes a sidecar longer than this.
 _SIDECAR_LIMIT = 128 * 1024
 # The longest a PLAINTEXT sidecar may be, in UTF-8 bytes once unpadded (BACKLOG #5387 added item
 # 1): the longest whose sealed form fits ``_SIDECAR_LIMIT``. Sealing adds a 12-byte nonce and a
@@ -345,7 +346,12 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
     before = path.lstat()
     if _names_a_link(before) or not S_ISREG(before.st_mode):
         raise _NotPlainError(f"{path.name} is not a plain file")
-    handle = os.fdopen(os.open(path, _PLAIN_OPEN_FLAGS), "rb")
+    fd = os.open(path, _PLAIN_OPEN_FLAGS)
+    try:
+        handle = os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
     try:
         after = os.fstat(handle.fileno())
         if not S_ISREG(after.st_mode):
@@ -1709,8 +1715,9 @@ class UploadStore:
 
     @property
     def _stored_limit(self) -> int:
-        """The largest file a body or sidecar can be on disk: base64 of ``max_bytes``, plus a generous
-        allowance for the cipher's marker and tag."""
+        """The largest file a body can be on disk: base64 of ``max_bytes``, plus a generous
+        allowance for the cipher's marker and tag. A sidecar is held to ``_SIDECAR_LIMIT``
+        instead."""
         return 2 * self._max_bytes + 4096
 
     def _lost_body_size(self, blob: Path) -> int | None:
@@ -1725,7 +1732,24 @@ class UploadStore:
         otherwise stall every later upload. Any of those returns ``None`` and waits for an operator.
         The body is opened by :func:`_open_plain` (BACKLOG #5387 added item 1), so a link, a
         dangling one included, is never followed and returns ``None`` too, and a FIFO swapped in
-        after the check is refused rather than waited on."""
+        after the check is refused rather than waited on. A body whose ``lstat`` matches a cached
+        check is not opened at all."""
+        try:
+            before = blob.lstat()
+        except FileNotFoundError:
+            return 0
+        except OSError as exc:
+            _log.warning("uploaded file %s: could not check the body: %s", blob.name, exc)
+            return None
+        if _names_a_link(before) or not S_ISREG(before.st_mode):
+            _log.warning("uploaded file %s: not a regular file; it was not read", blob.name)
+            return None
+        if before.st_size > self._stored_limit:
+            _log.warning("uploaded file %s: larger than an upload can be", blob.name)
+            return None
+        cached = self._body_checks.get(blob.name)
+        if cached is not None and cached[0] == (before.st_mtime_ns, before.st_size):
+            return None if cached[1] else before.st_size
         try:
             handle, stat = _open_plain(blob)
         except FileNotFoundError:
@@ -1733,7 +1757,8 @@ class UploadStore:
         except _NotPlainError:
             _log.warning("uploaded file %s: not a regular file; it was not read", blob.name)
             return None
-        except OSError:
+        except OSError as exc:
+            _log.warning("uploaded file %s: could not check the body: %s", blob.name, exc)
             return None
         with handle:
             if stat.st_size > self._stored_limit:
@@ -1881,7 +1906,12 @@ class UploadStore:
             # The reader's own cap, so no write is one the reader refuses (BACKLOG #5387 added item
             # 1). The bounded fields keep a sealed sidecar far below it, so only a cipher that
             # grows a value past it would meet this.
-            if len(meta_ct.encode("utf-8")) > _SIDECAR_LIMIT:
+            # An unsealed one is held to the plaintext bound every reader applies, so a store with
+            # no key never writes a sidecar it then refuses as damaged.
+            meta_len = len(meta_ct.encode("utf-8"))
+            if meta_len > _SIDECAR_LIMIT or (
+                not meta_ct.startswith(MARKER_PREFIX) and meta_len > _PLAIN_SIDECAR_LIMIT
+            ):
                 raise UploadFieldError(
                     display, "was not stored: its metadata is larger than the store can read back"
                 )
@@ -2952,8 +2982,8 @@ class UploadStore:
             _log.info(
                 "re-sealed %d uploaded-file value(s) under the active key, sealing %d plaintext "
                 "upload(s) (%d upload(s) skipped, %d that cannot be sealed, %d whose body is lost, "
-                "%d holding a file that is not regular, %d whose plaintext sidecar is too long "
-                "to seal)",
+                "%d holding a file that is not regular, %d whose sidecar every reader refuses "
+                "for its size)",
                 resealed,
                 sealed_plaintext,
                 skipped,
@@ -3029,7 +3059,14 @@ class UploadStore:
                 head = handle.read(len(active))
                 if head == active:
                     return _Half.CURRENT  # already under the active key in the active format
-                if kind == "meta" and opened.st_size > _SIDECAR_LIMIT:
+                limit = _SIDECAR_LIMIT if kind == "meta" else self._stored_limit
+                data = head
+                if opened.st_size <= limit:
+                    # Bounded, so a file that grew since the fstat is read only to one byte past
+                    # its limit, and refused below, never read whole (BACKLOG #3737).
+                    data += handle.read(limit + 1 - len(head))
+                size = max(opened.st_size, len(data))
+                if kind == "meta" and size > limit:
                     # BACKLOG #5387 added item 1: every reader refuses a sidecar this large as
                     # damaged before it decrypts anything, so nothing of it is readable under any
                     # key and no re-run changes that. Not a skip, which would fail every later run
@@ -3039,10 +3076,10 @@ class UploadStore:
                         "uploaded file %s (meta): left as it is for good, %d bytes is larger than "
                         "any sidecar can be; every read refuses it as damaged",
                         fid,
-                        opened.st_size,
+                        size,
                     )
                     return _Half.TOO_LONG
-                if kind == "body" and opened.st_size > self._stored_limit:
+                if size > limit:
                     # BACKLOG #3737: a read of the whole file could raise MemoryError, which no
                     # handler takes, so a planted one would abort the pass. A skip and not a loss:
                     # it may be a real body from before a lowered max_upload_bytes, still under the
@@ -3052,15 +3089,22 @@ class UploadStore:
                         "If it is a real upload, raise [store].max_upload_bytes for this run",
                         fid,
                         kind,
-                        opened.st_size,
+                        size,
                     )
                     return _Half.SKIPPED
-                stored = (head + handle.read()).decode("utf-8")
+                stored = data.decode("utf-8")
+            # Judged on the text as stored, so a sidecar of padding alone, which every reader
+            # refuses as blank, is still plaintext here, as it was before the padding tolerance:
+            # over a lost body it stays UNSEALABLE and is not rewritten.
+            plaintext = bool(stored) and not stored.startswith(MARKER_PREFIX)
             if kind == "meta":
                 # As the reader unpads it, so a sealed sidecar that gained a byte-order mark or
                 # whitespace is re-sealed, never sealed a second time as plaintext (BACKLOG #5387
-                # added item 1).
-                stored = _unpadded(stored)
+                # added item 1). Padding alone is kept as it is, never turned into an empty value.
+                unpadded = _unpadded(stored)
+                if unpadded:
+                    stored = unpadded
+                plaintext = plaintext and not unpadded.startswith(MARKER_PREFIX)
         except (OSError, UnicodeDecodeError) as exc:
             if kind == "body" and isinstance(exc, FileNotFoundError | UnicodeDecodeError):
                 # BACKLOG #3181: the body is missing or is not text, so no key reads it and no
@@ -3077,7 +3121,6 @@ class UploadStore:
                 "uploaded file %s (%s): skipped, unreadable: %s", fid, kind, codec_safe_str(exc)
             )
             return _Half.SKIPPED
-        plaintext = bool(stored) and not stored.startswith(MARKER_PREFIX)
         if plaintext and over is not None:
             body, blob = over
             # BACKLOG #2322: the body was not sealed, so a PLAINTEXT sidecar stays as it is. A keyed
@@ -3272,25 +3315,31 @@ class UploadStore:
         ``len(MARKER_PREFIX)`` characters of each body, and of each sidecar past its byte-order
         mark and whitespace, reading no more of a sidecar than :data:`_SIDECAR_LIMIT`. Each file is
         opened by :func:`_open_plain`, so a link is not followed and a FIFO does not block startup.
-        A file that cannot be read is not counted here; the listing scan names it on its own."""
+        A file that cannot be read is not counted here; the listing scan names it on its own. The
+        sidecar is read first: one every reader refuses as oversized is never counted as one
+        ``rotate-key`` can seal, whatever its body holds, since ``rotate-key`` leaves it as it is
+        (``too_long``). It is counted as one it cannot seal only where the class check holds it."""
         count = unsealable = 0
         for fid, sidecar in self._iter_sidecars():
             try:
-                paths = self._paths(fid)
+                body, meta = self._paths(fid)
             except UploadPathError:
                 continue
-            for path in paths:
+            for path in (meta, body):
                 try:
-                    if path.name.endswith(_META_SUFFIX):
+                    if path is meta:
                         # The reader's padding is skipped, so a padded sealed sidecar is not
-                        # counted as plaintext, and one the reader refuses as oversized is not
-                        # counted at all (BACKLOG #5387 added item 1).
+                        # counted as plaintext (BACKLOG #5387 added item 1).
                         head = _unpadded(_read_sidecar(path))
                         head = head[: len(MARKER_PREFIX)]
                     else:
                         handle, _ = _open_plain(path)
                         with io.TextIOWrapper(handle, encoding="utf-8") as text_handle:
                             head = text_handle.read(len(MARKER_PREFIX))
+                except _OversizedFileError:
+                    if self._unsealable_sync(fid, sidecar) is not None:
+                        unsealable += 1
+                    break  # never one rotate-key seals
                 except (OSError, UnicodeDecodeError, _MalformedSidecarError):
                     continue
                 if head and head != MARKER_PREFIX:
