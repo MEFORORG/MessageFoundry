@@ -3135,15 +3135,17 @@ def _logon_right_arms(
     $global:LASTEXITCODE = 0
   }}
   $warnings = @()
+  $said = @()
   $result = $null
   $outputs = 0
-  $emitted = & {{ {_SECEDIT_FN} -Account 'NT SERVICE\MessageFoundry' -Sid {_psq(sid)} }} 3>&1 6>$null
+  $emitted = & {{ {_SECEDIT_FN} -Account 'NT SERVICE\MessageFoundry' -Sid {_psq(sid)} }} 3>&1 6>&1
   foreach ($o in @($emitted)) {{
     if ($o -is [System.Management.Automation.WarningRecord]) {{ $warnings += "$o" }}
+    elseif ($o -is [System.Management.Automation.InformationRecord]) {{ $said += "$o" }}
     else {{ $result = $o; $outputs++ }}
   }}
   [pscustomobject]@{{
-    result = [bool]$result; outputs = $outputs; warnings = @($warnings)
+    result = [bool]$result; outputs = $outputs; warnings = @($warnings); said = @($said)
     exportCalls = $script:ExportCalls; configureCalls = $script:ConfigureCalls
     configured = $script:Configured; cfg = $script:Cfg; db = $script:Db; folder = $script:Folder
     left = @(Get-ChildItem -LiteralPath {_psq(str(parent))} -Force | ForEach-Object {{ $_.Name }})
@@ -3157,6 +3159,7 @@ def _logon_right_arms(
         .splitlines()[-1]
     )
     parsed["warnings"] = [w for w in (parsed.get("warnings") or []) if w]
+    parsed["said"] = [s for s in (parsed.get("said") or []) if s]
     return parsed
 
 
@@ -4367,3 +4370,92 @@ def test_the_uninstall_ace_removal_reads_a_bracketed_data_dir_literally(
     result, count, call = out.splitlines()[-1].removeprefix("OUT=").split("|", 2)
     assert (result, count) == ("True", "1"), f"the existing directory read as gone: {out}"
     assert call.startswith(str(target)), call
+
+
+# --- a holder-name lookup that could not be made is not "not this account" (BACKLOG #5401) --------
+# Both scripts used `catch { $true }` / `catch { $false }` around Translate, so ANY failure, a domain
+# controller that cannot be reached for example, read as "this holder is some other account". The
+# uninstaller then printed "does not hold" for an account that may hold the right. Only
+# IdentityNotMappedException means "no such account" now. A holder longer than any account name
+# (512 characters) makes the NTAccount constructor throw ArgumentException, which is a failure other
+# than "not mapped" on every platform, so it stands in for the unreachable domain controller here.
+
+_UNREADABLE = "x" * 1000
+
+
+def test_an_unread_holder_name_is_not_reported_as_does_not_hold(tmp_path: Path) -> None:
+    got = _logon_right_arms(tmp_path, holders=["*S-1-5-32-545", _UNREADABLE], sid="S-1-5-80-4001")
+    assert got["result"] is False, got
+    assert got["configureCalls"] == 0, "the policy was rewritten although nothing was proven held"
+    assert not any("does not hold" in s for s in got["said"]), got["said"]
+    assert any("Could not look up" in w and "may still hold" in w for w in got["warnings"]), got[
+        "warnings"
+    ]
+
+
+@_windows_only
+def test_a_holder_name_that_maps_to_no_account_still_reads_as_does_not_hold(
+    tmp_path: Path,
+) -> None:
+    """POSITIVE CONTROL: a well-formed name in a domain that does not exist maps to no account,
+    which is still "not this account"."""
+    got = _logon_right_arms(
+        tmp_path, holders=["*S-1-5-32-545", "NOSUCHDOMAINB532R\\nobody"], sid="S-1-5-80-4001"
+    )
+    assert got["result"] is False, got
+    assert any("does not hold" in s for s in got["said"]), got["said"]
+    assert not got["warnings"], got["warnings"]
+
+
+def test_a_removal_beside_an_unread_holder_is_not_reported_as_removed(tmp_path: Path) -> None:
+    """The SID token goes, but a name left in the row may still be the account, so the residue
+    notice must not be told the account no longer holds the right."""
+    got = _logon_right_arms(
+        tmp_path,
+        holders=["*S-1-5-80-4001", "*S-1-5-32-545", _UNREADABLE],
+        sid="S-1-5-80-4001",
+    )
+    assert got["configureCalls"] == 1, got
+    assert f"SeServiceLogonRight = *S-1-5-32-545,{_UNREADABLE} |" in got["configured"], got[
+        "configured"
+    ]
+    assert got["result"] is False, "a removal with an unproven holder left was reported as complete"
+    assert not any("removed SeServiceLogonRight" in s for s in got["said"]), got["said"]
+    assert any("may still hold" in w for w in got["warnings"]), got["warnings"]
+
+
+@_windows_only
+def test_the_grant_adds_the_sid_beside_an_unread_holder_and_says_so(tmp_path: Path) -> None:
+    """Install's safe direction: an unread holder is not counted as held, since a missed grant
+    fails the service with error 1069, so the SID is added and the grant it reports is real."""
+    assert _SCRIPT is not None
+    parent = tmp_path / "grant-parent"
+    parent.mkdir()
+    row = f"SeServiceLogonRight = {_UNREADABLE}"
+    inf = ["[Unicode]", "Unicode=yes", "[Privilege Rights]", row, "[Version]"]
+    inf_ps = "@(" + ", ".join(_psq(line) for line in inf) + ")"
+    body = rf"""
+{_workdir_seam(parent)}
+  $script:Configured = ''
+  function secedit {{
+    $a = @($args)
+    $cfg = $a[[array]::IndexOf($a, '/cfg') + 1]
+    if ($a -contains '/export') {{ Set-Content -LiteralPath $cfg -Value {inf_ps} -Encoding Unicode }}
+    elseif ($a -contains '/configure') {{
+      $script:Configured = ((Get-Content -LiteralPath $cfg) -join ' | ')
+    }}
+    $global:LASTEXITCODE = 0
+  }}
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $said = @({_GRANT_FN} -Account $me.Name 3>&1 6>&1 | ForEach-Object {{ "$_" }})
+  [pscustomobject]@{{ configured = $script:Configured; said = @($said); me = $me.User.Value }} |
+    ConvertTo-Json -Compress
+"""
+    got = json.loads(
+        _ok(_extract(_SCRIPT, [_GRANT_FN, _WORKDIR_FN], body), tmp_path).strip().splitlines()[-1]
+    )
+    said = " / ".join(got["said"] or [])
+    assert "already holds" not in said, said
+    assert "Could not look up" in said, said
+    assert "granted SeServiceLogonRight" in said, said
+    assert f"{row},*{got['me']} |" in got["configured"], got["configured"]

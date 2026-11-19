@@ -1748,18 +1748,35 @@ function Set-ServiceLogonRight {
             # An exported row can hold an account NAME rather than the '*SID' form (BACKLOG #5401), so
             # a name is resolved and its SID compared too; read by SID alone, a held name re-adds it.
             # SID tokens, and the account's own name as given, are compared first, so either needs no
-            # lookup. A name that does not resolve is not this account. uninstall-service.ps1's
+            # lookup. A name that maps to no account is not this account. uninstall-service.ps1's
             # Remove-ServiceLogonRight matches a holder the same ways, where the unresolved own-name
             # match matters most, because there the account may no longer translate.
             $held = @($holders | Where-Object { $_ -eq ("*" + $sid) -or $_ -eq $sid -or $_ -eq $Account })
             if (-not $held) {
-                # -First 1 stops at the first match, so later names cost no lookup.
-                $held = @($holders | Where-Object { -not $_.StartsWith('*') } | Where-Object {
+                # A lookup that could not be made, as against a domain controller that is down, is
+                # not "not this account". It is not counted as held either, since a missed grant
+                # fails the service with error 1069: the SID is added, and the warning says the
+                # row may then name the account twice. The loop stops at the first match, so later
+                # names cost no lookup.
+                $unread = @()
+                foreach ($name in @($holders | Where-Object { -not $_.StartsWith('*') })) {
                     try {
-                        ([Security.Principal.NTAccount]$_).Translate(
-                            [Security.Principal.SecurityIdentifier]).Value -eq $sid
-                    } catch { $false }
-                } | Select-Object -First 1)
+                        $nameSid = ([Security.Principal.NTAccount]$name).Translate(
+                            [Security.Principal.SecurityIdentifier]).Value
+                    } catch [System.Security.Principal.IdentityNotMappedException] {
+                        $nameSid = $null
+                    } catch {
+                        $unread += "'$name' ($($_.Exception.Message))"
+                        continue
+                    }
+                    if ($nameSid -eq $sid) { $held = @($name); break }
+                }
+                if (-not $held -and $unread) {
+                    Write-Warning ("Could not look up the 'Log on as a service' holder(s) " +
+                        "$($unread -join ', '), so whether one of them is '$Account' is unknown. " +
+                        "The account's SID is added anyway; if one of them is '$Account', the row " +
+                        "now names it twice.")
+                }
             }
             if ($held) {
                 Write-Host "  Right  : '$Account' already holds SeServiceLogonRight (Log on as a service)."

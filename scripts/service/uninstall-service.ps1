@@ -574,7 +574,8 @@ function Remove-ServiceLogonRight {
       could rewrite the policy between the export and the import and so change a machine-wide user
       right. New-SeceditWorkDirectory says where the folder goes and why.
 
-      Returns $true only when secedit reported the re-import succeeded.
+      Returns $true only when secedit reported the re-import succeeded and every holder name in
+      the row could be looked up.
     #>
     param(
         [Parameter(Mandatory)][string]$Account,
@@ -612,17 +613,34 @@ function Remove-ServiceLogonRight {
         # A holder can be written as an account NAME rather than the '*SID' form, and the installer
         # counts such a name as held (BACKLOG #5401), so a name is this account when it is the
         # account's own name or resolves to its SID. A '*SID' token and a name that does not
-        # resolve to this SID are kept.
-        $kept = @($held | Where-Object {
-            if ($_ -eq ("*" + $Sid) -or $_ -eq $Sid) { return $false }
-            if ($_.StartsWith('*')) { return $true }
-            if ($_ -eq $Account) { return $false }
+        # resolve to this SID are kept. A name whose lookup could not be made, as against a domain
+        # controller that is down, is kept too, and recorded: it may be this account, so neither
+        # "does not hold" nor a removal can be reported while one is left.
+        $unread = @()
+        $kept = @(foreach ($holder in $held) {
+            if ($holder -eq ("*" + $Sid) -or $holder -eq $Sid) { continue }
+            if ($holder.StartsWith('*')) { $holder; continue }
+            if ($holder -eq $Account) { continue }
             try {
-                ([Security.Principal.NTAccount]$_).Translate(
-                    [Security.Principal.SecurityIdentifier]).Value -ne $Sid
-            } catch { $true }
+                $nameSid = ([Security.Principal.NTAccount]$holder).Translate(
+                    [Security.Principal.SecurityIdentifier]).Value
+            } catch [System.Security.Principal.IdentityNotMappedException] {
+                $nameSid = $null
+            } catch {
+                $unread += "'$holder' ($($_.Exception.Message))"
+                $holder
+                continue
+            }
+            if ($nameSid -ne $Sid) { $holder }
         })
+        $unreadNote = ("Could not look up the 'Log on as a service' holder(s) " +
+            "$($unread -join ', '), so whether one of them is '$Account' is unknown; it was kept.")
         if ($kept.Count -eq $held.Count) {
+            if ($unread) {
+                Write-Warning ("$unreadNote Nothing was removed, and '$Account' may still hold the " +
+                    "right. Check it in secpol.msc under Local Policies, User Rights Assignment.")
+                return $false
+            }
             Write-Host "  Right  : '$Account' does not hold SeServiceLogonRight; nothing to remove."
             return $false
         }
@@ -649,6 +667,13 @@ function Remove-ServiceLogonRight {
             Write-Warning ("secedit configure failed (exit $LASTEXITCODE), so the 'Log on as a " +
                 "service' right for '$Account' was NOT removed. Clear it in secpol.msc under " +
                 "Local Policies, User Rights Assignment.")
+            return $false
+        }
+        if ($unread) {
+            # Something was removed, but a holder left in the row may still be this account, so
+            # the residue notice must not say it no longer holds the right.
+            Write-Warning ("$unreadNote The entries that are '$Account' were removed, but it may " +
+                "still hold the right. Check it in secpol.msc under Local Policies, User Rights Assignment.")
             return $false
         }
         Write-Host "  Right  : removed SeServiceLogonRight from '$Account'." -ForegroundColor Green
