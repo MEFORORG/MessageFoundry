@@ -2931,12 +2931,15 @@ default; where to put it is the platform's choice (ADR 0214, slice C).
 - **On Windows, a SYSTEM scheduled task is not offered.** A scheduled task or script running as
   SYSTEM that writes or copies the token into this directory is a LocalSystem writer by another
   name, on any install.
-- **When a replaced file is used**, whoever wrote it. The engine reads the file each time it builds
-  a Vault client. For the `vault` key provider that is at least every store open and every DR
-  backup pass, and for `[secrets].provider = "vault"` every secret read. The `vault_transit`
-  cipher builds its client once, when the store opens. A token replaced after that is not used
-  until the next start, and once the token it holds expires, every Transit call fails. So under
-  `vault_transit`, restart the engine after each replacement.
+- **When a replaced file is used**, whoever wrote it. For the `vault` key provider the engine reads
+  the file at least at every store open and every DR backup pass, and for
+  `[secrets].provider = "vault"` at every secret read. The `vault_transit` cipher reads it once,
+  when the store opens, and builds every one of its Vault clients from that token: one at the
+  store open, used by the thread that opened the store, then one for each other thread on its
+  first Transit call there, and a new one on any thread's next call after a store that holds the
+  cipher closes (BACKLOG #5963). None of those builds reads the file again, so a token replaced
+  after the store opens is not used until the next start, and once the token it holds expires,
+  every Transit call fails. So under `vault_transit`, restart the engine after each replacement.
 
 **A Vault Agent sink can write that file, where this route is offered.** A site running Vault
 Agent auto-auth points the agent's file sink at the file, and leaves the sink unwrapped and

@@ -211,11 +211,22 @@ def _build_client(
     # #1180 (ASVS 12.3.4) rides in the SAME dict: narrow the trust anchor when the operator named
     # one, omitting the keyword when they did not so the stock construction is unchanged. Putting it
     # here rather than at the call means the operator's CA is inside what the assertion below sees.
+    #
+    # A caller's ``ca_kwargs`` may carry ``verify`` alone, which is all _vault_ca_kwargs returns. Any
+    # other key is refused, and the mapping is spread BEFORE the fixed keys, so it can never replace
+    # the address, the token or the no-redirect policy (BACKLOG #5963).
+    if ca_kwargs is None:
+        ca_kwargs = _vault_ca_kwargs(addr)
+    elif not set(ca_kwargs) <= {"verify"}:
+        raise ValueError(
+            "a Vault client's ca_kwargs may carry only 'verify'; refused keys: "
+            + ", ".join(sorted(repr(key) for key in set(ca_kwargs) - {"verify"}))
+        )
     kwargs: dict[str, object] = {
+        **ca_kwargs,
         "url": addr,
         "token": token,
         "allow_redirects": False,
-        **(_vault_ca_kwargs(addr) if ca_kwargs is None else ca_kwargs),
     }
     if timeout is not None:
         # Omitted when unset, so the stock construction is unchanged (BACKLOG #5983).

@@ -1410,9 +1410,10 @@ def build_transit_cipher(
     key name, a missing extra, or an unreachable/unknown Transit key raises :class:`KeyProviderError` so
     ``open_store`` refuses to start rather than degrading to plaintext."""
     key_name, audit_key = _key_names()
-    # Read once, so this cipher's client keeps the token it was built with for the life of the
-    # process. A token replaced afterwards, in the environment or the secrets directory, is not
-    # seen until the store is opened again.
+    # Read once, and every client this cipher builds takes this token: the startup client below,
+    # each thread's own on its first call there, and each rebuild after close_connections (BACKLOG
+    # #5963). A token replaced afterwards, in the environment or the secrets directory, is not seen
+    # by any of them until the store is opened again.
     addr, token = store_vault_hop()
     # The CA anchor is read once too, like the address and token, and handed to every thread's own
     # client (BACKLOG #5963). Not everything is: each build still reads the settings object, and

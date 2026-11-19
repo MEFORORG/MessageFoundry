@@ -411,6 +411,36 @@ def test_a_real_client_takes_the_timeout_and_the_stock_build_keeps_hvacs() -> No
 
 @_vault_extra
 @pytest.mark.usefixtures("_no_proxy")
+@pytest.mark.parametrize(
+    "extra",
+    [{"allow_redirects": "yes"}, {"url": "https://other.example.test:8200"}, {"token": "x"}],
+)
+def test_ca_kwargs_cannot_replace_the_fixed_client_arguments(
+    tmp_path: Path, extra: dict[str, str]
+) -> None:
+    """BACKLOG #5963: a caller-supplied ``ca_kwargs`` may carry ``verify`` alone. Mutation: spread
+    it after the fixed keys and drop the refusal. Red: a mapping re-enables redirects, or swaps the
+    dialled address or the token, with nothing refusing it."""
+    from messagefoundry.store import keyprovider_vault
+
+    addr = "https://vault.example.test:8200"
+    ca = tmp_path / "ca.pem"
+    ca.write_text("synthetic", encoding="ascii")
+    with pytest.raises(ValueError, match="may carry only 'verify'"):
+        keyprovider_vault._build_client(
+            addr, _TOKEN, revocation_attested=True, ca_kwargs={"verify": str(ca), **extra}
+        )
+    client = keyprovider_vault._build_client(
+        addr, _TOKEN, revocation_attested=True, ca_kwargs={"verify": str(ca)}
+    )
+    assert client.adapter.allow_redirects is False
+    assert client.adapter.base_uri == addr
+    assert client.adapter.token == _TOKEN
+    assert client.adapter._kwargs["verify"] == str(ca)
+
+
+@_vault_extra
+@pytest.mark.usefixtures("_no_proxy")
 def test_real_thread_clients_hold_separate_sessions() -> None:
     from messagefoundry.store import keyprovider_vault
 
