@@ -322,7 +322,7 @@ async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
             process.kill()
         except ProcessLookupError:
             pass
-        except PermissionError as exc:
+        except OSError as exc:  # a refusal, or a handle already gone
             logger.warning(
                 "engine shard %r: could not kill its unresumed process (%s)", spec.shard, exc
             )
@@ -598,7 +598,7 @@ class Supervisor:
             await asyncio.wait_for(child.process.wait(), timeout=self.terminate_grace)
         except TimeoutError:
             logger.warning(
-                "shard %r did not exit in %.0fs — killing",
+                "engine shard %r did not exit in %.0fs — killing",
                 child.spec.shard,
                 self.terminate_grace,
             )

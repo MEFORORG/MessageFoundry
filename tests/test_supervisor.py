@@ -512,9 +512,12 @@ async def test_terminate_escalates_to_kill_after_grace() -> None:
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the suspended launch is Windows only")
+@pytest.mark.parametrize(
+    "refusal", [PermissionError("access denied"), OSError(6, "the handle is invalid")]
+)
 @pytest.mark.asyncio
 async def test_a_failed_resume_whose_kill_is_refused_does_not_hang_the_launch(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    refusal: OSError, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A suspended engine shard that cannot be resumed, and whose kill is refused with no job to
     end it, never exits. The launch still raises the resume error after a bounded wait, and says
@@ -524,7 +527,7 @@ async def test_a_failed_resume_whose_kill_is_refused_does_not_hang_the_launch(
         pid = 4242
 
         def kill(self) -> None:
-            raise PermissionError("access denied")
+            raise refusal
 
         async def wait(self) -> int:
             await asyncio.Event().wait()  # never exits
