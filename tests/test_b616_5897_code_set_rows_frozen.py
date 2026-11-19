@@ -139,6 +139,7 @@ def test_a_toml_value_exactly_at_the_freeze_bound_loads() -> None:
     for _ in range(_MAX_FREEZE_DEPTH - 1):
         assert type(inner) is _FrozenDict
         inner = inner["a"]
+    assert type(inner) is _FrozenDict
     assert inner == {"x": 1}
 
 
@@ -192,12 +193,33 @@ def _frames_below() -> int:
 def test_a_value_at_the_bound_freezes_from_a_deep_caller_stack() -> None:
     # The freeze walk is iterative, so a caller close to the limit can still freeze the table.
     def descend(remaining: int) -> CodeSet:
-        if remaining:
+        if remaining > 0:
             return descend(remaining - 1)
         return CodeSet("edge", {"K": _nested(_MAX_FREEZE_DEPTH)})
 
     headroom = 40  # the frames CodeSet and the freeze use, with margin
-    assert len(descend(sys.getrecursionlimit() - _frames_below() - headroom)) == 1
+    levels = sys.getrecursionlimit() - _frames_below() - headroom
+    assert levels > _MAX_FREEZE_DEPTH  # else the test would not show the walk is iterative
+    assert len(descend(levels)) == 1
+
+
+def test_a_value_at_the_bound_deep_copies_to_plain_containers() -> None:
+    cs = parse_code_set("deep.toml", _dotted(_MAX_FREEZE_DEPTH))
+    mine = copy.deepcopy(cs["K"])
+    inner: Any = mine
+    for _ in range(_MAX_FREEZE_DEPTH - 1):
+        assert type(inner) is dict
+        inner = inner["a"]
+    inner["x"] = 2  # the copy is mutable all the way down
+    assert cs["K"] == _dotted_value(_MAX_FREEZE_DEPTH)
+    assert type(copy.deepcopy(cs)["K"]) is _FrozenDict
+
+
+def _dotted_value(tables: int) -> Any:
+    value: Any = {"x": 1}
+    for _ in range(tables - 1):
+        value = {"a": value}
+    return value
 
 
 def test_a_recursion_error_while_freezing_is_a_code_set_error(

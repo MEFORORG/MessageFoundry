@@ -34,8 +34,8 @@ exactly like a missing ``env()`` key — surfaced by ``validate`` / ``check`` / 
 
 **Rows are read-only.** A multi-column CSV row, a nested TOML table and a TOML array are frozen once
 loaded: an ordinary edit raises :class:`TypeError`, and ``copy.deepcopy`` gives a copy to edit. One
-table serves every message until reload (BACKLOG #5897). :class:`_FrozenDict` names the C-level
-writers the guard does not stop.
+table serves every message until reload (BACKLOG #5897). The guard stops an accidental edit, not a
+C-level writer; :class:`_FrozenDict` and :class:`_FrozenList` name at least some that pass.
 
 **Resolution.** :func:`~messagefoundry.config.wiring.load_config` loads every code set into a registry
 and makes it the **active** set *before* importing config modules (so a module-top-level
@@ -47,6 +47,7 @@ active set; :func:`set_active` to publish one outside a ``with`` block.
 
 from __future__ import annotations
 
+import copy
 import csv
 import io
 import logging
@@ -337,8 +338,10 @@ def _drain_capture(buffer: UnmappedCapture, message_id: str | None) -> None:
 
 
 #: How many containers deep :func:`_freeze` walks. It equals the sandbox codec's ``_MAX_DEPTH`` (a
-#: test pins the two), so a table that loads also crosses into the sandbox child. The walk keeps its
-#: own stack, so the freeze adds no frame per level; ``tomllib`` still recurses while parsing a file.
+#: test pins the two), so a table a loader built (plain dicts and lists, ``str`` keys) that loads
+#: also crosses into the sandbox child; a directly built value the freeze stores as given, such as a
+#: dict subclass, is not counted the same way. The walk keeps its own stack, so the freeze adds no
+#: frame per level; ``tomllib`` still recurses while parsing a file.
 _MAX_FREEZE_DEPTH = 256
 
 
@@ -381,6 +384,10 @@ class _FrozenDict(dict[str, Any]):
         # Copy/pickle rebuild a plain dict: the default protocol would call the refused __setitem__.
         return (dict, (dict(self),))
 
+    def __deepcopy__(self, memo: dict[int, Any]) -> dict[str, Any]:
+        # Iterative, so a row the freeze accepted at its depth bound also deep-copies.
+        return _thaw(self, memo)  # type: ignore[no-any-return]
+
 
 class _FrozenList(list[Any]):
     """A code-set array value (a TOML array) that refuses mutation; see :class:`_FrozenDict`.
@@ -403,83 +410,92 @@ class _FrozenList(list[Any]):
     def __reduce__(self) -> tuple[Any, ...]:
         return (list, (list(self),))
 
+    def __deepcopy__(self, memo: dict[int, Any]) -> list[Any]:
+        return _thaw(self, memo)  # type: ignore[no-any-return]
 
-#: The container types :func:`_freeze` rebuilds. Matched by exact type, so a subclass a caller built
-#: on purpose (a ``defaultdict``, a ``NamedTuple``), a ``set`` and any other value are stored as
-#: given. The loaders produce only plain dicts and lists; a tuple arrives by direct construction.
-_FREEZABLE: frozenset[type] = frozenset({dict, list, tuple})
+
+#: The container types :func:`_freeze` rebuilds, and what each becomes. Matched by exact type, so a
+#: subclass a caller built on purpose (a ``defaultdict``, a ``NamedTuple``), a ``set`` and any other
+#: value are stored as given. The loaders produce only plain dicts and lists; a tuple arrives by
+#: direct construction.
+_FREEZERS: dict[type, Callable[[Any], Any]] = {dict: _FrozenDict, list: _FrozenList, tuple: tuple}
+_FREEZABLE: frozenset[type] = frozenset(_FREEZERS)
+#: The reverse, for ``copy.deepcopy``: a frozen value thaws back to plain containers.
+_THAWERS: dict[type, Callable[[Any], Any]] = {_FrozenDict: dict, _FrozenList: list, tuple: tuple}
 
 
 def _freeze(name: str, value: Any) -> Any:
-    """Freeze a loaded value all the way down, once at construction, so a lookup returns the stored
-    object at no per-call cost and the table it came from refuses an ordinary edit (BACKLOG #5897).
+    """Freeze ``value``, a container of a type in :data:`_FREEZABLE`, all the way down, once at
+    construction, so a lookup returns the stored object at no per-call cost and the table it came
+    from refuses an ordinary edit (BACKLOG #5897).
 
-    A plain dict or list becomes its read-only subclass and a tuple is rebuilt from frozen members.
+    A plain dict or list becomes its read-only subclass. A tuple holding a container is rebuilt from
+    frozen members; one holding none is kept as given, since it is already immutable. A value nesting
+    more than :data:`_MAX_FREEZE_DEPTH` containers raises :class:`CodeSetError` naming ``name``."""
+    children = value.values() if type(value) is dict else value
+    if _FREEZABLE.isdisjoint(map(type, children)):
+        # The common row shapes are flat: freeze in one step, skipping the walk's bookkeeping.
+        return value if type(value) is tuple else _FREEZERS[type(value)](value)
+    return _rebuild(value, _FREEZERS, _unchanged, bound_for=name)
+
+
+def _thaw(value: Any, memo: dict[int, Any]) -> Any:
+    """A plain, mutable deep copy of frozen ``value``; other leaves go through ``copy.deepcopy``."""
+    return _rebuild(value, _THAWERS, lambda leaf: copy.deepcopy(leaf, memo))
+
+
+def _unchanged(leaf: Any) -> Any:
+    return leaf
+
+
+def _rebuild(
+    value: Any,
+    builders: Mapping[type, Callable[[Any], Any]],
+    leaf: Callable[[Any], Any],
+    bound_for: str | None = None,
+) -> Any:
+    """Rebuild ``value`` bottom-up, each container whose exact type is in ``builders`` through its
+    builder and every other child through ``leaf``.
+
     The walk keeps its own stack rather than recursing, so it spends no interpreter frame per level.
-    A value nesting more than :data:`_MAX_FREEZE_DEPTH` containers raises :class:`CodeSetError`
-    naming code set ``name``."""
-    if type(value) not in _FREEZABLE:
-        return value
-    flat = _freeze_flat(value)
-    if flat is not None:
-        return flat
+    With ``bound_for`` set, a container deeper than :data:`_MAX_FREEZE_DEPTH` raises
+    :class:`CodeSetError` naming that code set."""
     stack = [_Frame(value, None)]
     while True:
         frame = stack[-1]
         for key, child in frame.children:
-            if type(child) in _FREEZABLE:
-                if len(stack) >= _MAX_FREEZE_DEPTH:
-                    raise CodeSetError(f"code set {name!r}: a value is nested too deeply to load")
-                flat = _freeze_flat(child)
-                if flat is None:
-                    stack.append(_Frame(child, key))
-                    break
-                child = flat
-            frame.add(key, child)
+            if type(child) in builders:
+                if bound_for is not None and len(stack) >= _MAX_FREEZE_DEPTH:
+                    raise CodeSetError(
+                        f"code set {bound_for!r}: a value is nested too deeply to load"
+                    )
+                stack.append(_Frame(child, key))
+                break
+            frame.add(key, leaf(child))
         else:
             stack.pop()
-            frozen = frame.build()
+            built = builders[type(frame.value)](frame.built)
             if not stack:
-                return frozen
-            stack[-1].add(frame.key, frozen)
-
-
-def _freeze_flat(value: Any) -> Any:
-    """Freeze a container none of whose children is a container in one step, else return None.
-
-    The common row shapes are flat, and this skips the walk's per-child bookkeeping for them."""
-    children = value.values() if type(value) is dict else value
-    if any(type(child) in _FREEZABLE for child in children):
-        return None
-    if type(value) is dict:
-        return _FrozenDict(value)
-    if type(value) is list:
-        return _FrozenList(value)
-    return value  # a tuple of non-containers is already immutable
+                return built
+            stack[-1].add(frame.key, built)
 
 
 class _Frame:
-    """One open container in :func:`_freeze`'s walk, with the frozen children built so far."""
+    """One open container in :func:`_rebuild`'s walk, with the rebuilt children so far."""
 
-    __slots__ = ("kind", "children", "built", "key")
+    __slots__ = ("value", "is_dict", "children", "built", "key")
 
     def __init__(self, value: Any, key: Any) -> None:
-        self.kind: type = type(value)
+        self.value = value
+        self.is_dict = isinstance(value, dict)
         self.children: Iterator[tuple[Any, Any]] = (
-            iter(value.items()) if self.kind is dict else enumerate(value)
+            iter(value.items()) if self.is_dict else enumerate(value)
         )
-        self.built: list[Any] = []
+        self.built: list[Any] = []  # (key, child) pairs for a dict, children otherwise
         self.key = key  # this container's key (or index) in its parent
 
     def add(self, key: Any, child: Any) -> None:
-        self.built.append((key, child) if self.kind is dict else child)
-
-    def build(self) -> Any:
-        if self.kind is dict:
-            return _FrozenDict(self.built)
-        if self.kind is list:
-            return _FrozenList(self.built)
-        return tuple(self.built)
+        self.built.append((key, child) if self.is_dict else child)
 
 
 class CodeSet(Mapping[str, Any]):

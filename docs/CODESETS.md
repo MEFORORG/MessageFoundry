@@ -24,8 +24,7 @@ code sets); the directory is created on the first `upsert`.
 **Rows are read-only.** A multi-column row, a nested TOML table and a TOML array come back from a
 lookup read-only: an ordinary edit such as `row["display"] = ...` raises `TypeError`, because one
 loaded table serves every message until reload. The guard stops an accidental edit, not every write:
-a C-level writer still gets through, such as an unbound `dict.__setitem__(row, ...)` on a row, or
-`heapq.heappush` and an unbound `list.append(...)` on an array. Take `copy.deepcopy(row)` to get a copy you can change;
+code that writes through Python's C-level container API directly still gets through. Take `copy.deepcopy(row)` to get a copy you can change;
 `dict(row)` is shallow, so its nested values stay read-only.
 
 Both editors — a hand edit and a GUI save — write the same `codesets/<name>.csv`, so they are
