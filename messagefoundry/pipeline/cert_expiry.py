@@ -200,7 +200,8 @@ def crls_from_settings(settings: ServiceSettings) -> list[MonitoredCert]:
     until a handshake or a context build failed on it.
 
     A knob is watched whenever it is set, even where no hop loads it (for example
-    ``[api].tls_client_crl_file`` with no client CA). That errs toward a spurious alert over a
+    ``[logging].forward_tls_crl_file`` on a verifying TLS forwarder with ``forward_enabled``
+    false). That errs toward a spurious alert over a
     missed one, and it keeps this list free of copies of each consumer's own conditions.
 
     The label is the setting's dotted name, such as ``"tls.crl_file"``. The labels stay injective:

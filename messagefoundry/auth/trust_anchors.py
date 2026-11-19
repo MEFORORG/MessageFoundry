@@ -2355,8 +2355,9 @@ def log_forward_anchor_spec(log_settings: LoggingSettings) -> AnchorSpec | None:
     trust it (vault BACKLOG #3188). ``serve`` builds the forwarder with ``forward_enabled`` and a
     ``forward_host``, and it reads the file only with ``forward_protocol = "tls"``. With
     ``forward_tls_verify=false`` it loads the file into a context that verifies nothing, so that
-    case is not checked either. The forwarder loads it with ``cafile=``, so the spec carries
-    ``loads_verified_bytes=False`` and no pin."""
+    case is not checked either. The settings load refuses the CA on both of those last two arms
+    (BACKLOG #5316); this skip covers a model built without validation. The forwarder loads it
+    with ``cafile=``, so the spec carries ``loads_verified_bytes=False`` and no pin."""
     from messagefoundry.config.settings import SyslogProtocol
 
     if not log_settings.forward_tls_ca_file:

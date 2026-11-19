@@ -3027,7 +3027,8 @@ class LoggingSettings(_Section):
     # #299). The syslog forwarder builds its own context and resolves no trust anchor, so
     # [tls].crl_file never reaches it -- this is its own knob rather than a silent inheritance, which
     # would be the per-hop scoping error that item warns about. Applies only with
-    # forward_tls_verify=true: the opt-out arm is CERT_NONE, where there is no chain to check against.
+    # forward_tls_verify=true: the opt-out arm is CERT_NONE, where there is no chain to check against,
+    # so the load refuses it there and on any forward_protocol but "tls" (BACKLOG #5316).
     # Same fail-closed refusals as every other CRL: absent, unloadable or past nextUpdate refuses at
     # startup rather than at the first collector handshake.
     forward_tls_crl_file: str | None = None
@@ -3173,19 +3174,22 @@ class LoggingSettings(_Section):
             raise ValueError(
                 "[logging].forward_protocol='tls' with certificate verification requires "
                 "[logging].forward_tls_ca_file (a PEM trust anchor for the collector); set "
-                "[logging].forward_tls_verify=false to accept an unverified server (insecure)"
+                "[logging].forward_tls_verify=false to accept an unverified server (insecure; "
+                "a forward_tls_crl_file must then be removed, since nothing would check it)"
             )
-        # The TLS-only settings, refused where nothing would apply them (BACKLOG #5316): a declared
-        # mTLS or revocation check for the SIEM hop would otherwise load and stay silently inactive.
-        # udp and tcp read none of the three. On the verify-off arm (CERT_NONE) the CA and the CRL
-        # have no chain to act on, but the client certificate is still loaded and presented to the
-        # collector (logging_setup._build_tls_context), so it is not refused there.
-        for name, needs_verify in (
-            ("forward_tls_ca_file", True),
-            ("forward_tls_client_cert", False),
-            ("forward_tls_crl_file", True),
+        # The TLS-only settings, refused where the forwarder's own protocol or verify setting means
+        # they could never take effect (BACKLOG #5316): a declared mTLS or revocation check for the
+        # SIEM hop would otherwise load and stay silently inactive. udp and tcp read none of the
+        # three. On the verify-off arm (CERT_NONE) the CA and the CRL have no chain to act on, but
+        # the client certificate is still loaded and presented to the collector
+        # (logging_setup._build_tls_context), so it is not refused there. A disabled forwarder is
+        # not what this check keys on: it refuses only on the protocol and verify settings.
+        for name, value, needs_verify in (
+            ("forward_tls_ca_file", self.forward_tls_ca_file, True),
+            ("forward_tls_client_cert", self.forward_tls_client_cert, False),
+            ("forward_tls_crl_file", self.forward_tls_crl_file, True),
         ):
-            if getattr(self, name) is None:
+            if value is None:
                 continue
             if self.forward_protocol is not SyslogProtocol.TLS:
                 raise ValueError(
