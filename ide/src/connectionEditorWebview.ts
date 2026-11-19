@@ -5,7 +5,13 @@
 // loaded without `vscode`. connectionEditor.ts builds the page and embeds this; the unit suite
 // evaluates the SAME source in a jsdom page (webview-receivers.test.ts), so what the tests exercise
 // is what ships.
-import { ENVREF_KEY_NAMES, FIELD_CONTROLS, PARAM_TYPES } from "./connectionForm";
+import {
+  ENVREF_KEY_NAMES,
+  FIELD_CONTROLS,
+  NON_FINITE_SPELLINGS,
+  NON_FINITE_TAG,
+  PARAM_TYPES,
+} from "./connectionForm";
 import {
   CHANNEL_FIELD,
   SHAPE_HELPERS,
@@ -79,9 +85,20 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       return Object.keys(val).every((k) => ENVREF_KEY_NAMES.includes(k));
     }
 
+    // A non-finite float arrives as the tag {"$toml": "inf"} (isNonFiniteTag in connectionForm.ts,
+    // whose names are embedded here). It is a leaf: shown as its spelling, passed through untouched.
+    const NON_FINITE_TAG = ${embedJson(NON_FINITE_TAG)};
+    const NON_FINITE_SPELLINGS = ${embedJson(NON_FINITE_SPELLINGS)};
+    function isNonFiniteTag(val) {
+      if (!val || typeof val !== 'object' || Array.isArray(val)) return false;
+      const keys = Object.keys(val);
+      return keys.length === 1 && keys[0] === NON_FINITE_TAG && NON_FINITE_SPELLINGS.includes(val[NON_FINITE_TAG]);
+    }
+
     // A value as a text input shows it: a table or array as JSON, never String(value), which shows
     // and saves '[object Object]' (BACKLOG #5565).
     function displayValue(value) {
+      if (isNonFiniteTag(value)) return value[NON_FINITE_TAG];
       return value == null ? '' : (typeof value === 'object' ? JSON.stringify(value) : String(value));
     }
 
@@ -416,7 +433,11 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       const pick = () => { const hit = choices.find((c) => String(c) === raw); return hit !== undefined ? hit : raw; };
       const scalarChoices = !choices.some((c) => c !== null && typeof c === 'object');
       if (f.control === 'select' && scalarChoices) return pick();
-      if (f.control === 'table' || (f.value !== null && typeof f.value === 'object')) return parseTable(raw);
+      // TOML's inf / -inf typed into a float field is carried as the tag the engine decodes; "nan"
+      // is posted as typed, for the engine to refuse.
+      if (f.type === 'float' && (raw === 'inf' || raw === '-inf')) return { [NON_FINITE_TAG]: raw };
+      const tableValued = f.value !== null && typeof f.value === 'object' && !isNonFiniteTag(f.value);
+      if (f.control === 'table' || tableValued) return parseTable(raw);
       if (f.control === 'select') return pick();
       // Only decimal text, the text a number box accepted: Number() also reads hex, binary, octal
       // and a leading '+', which would post a number the user never typed. An exponent that

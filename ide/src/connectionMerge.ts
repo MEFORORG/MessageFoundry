@@ -8,6 +8,8 @@
 // the full object a save-time fresh `connection list` returns, HERE, where it can be unit-tested
 // node-side (`npm run test:unit` is plain-node mocha — this module must never import vscode).
 
+import { isNonFiniteTag } from "./connectionForm";
+
 /** The connection object `connection upsert --data <json>` consumes and `connection list` returns
  *  (ADR 0007). Lives in this pure module (not connectionEditor.ts, which imports vscode) so the
  *  mocha-run tests can import it; connectionEditor.ts re-exports it for its existing consumers. */
@@ -102,8 +104,9 @@ export const READ_SCHEMA_KEYS: Record<Direction, ReadonlySet<string>> = {
   ]),
 };
 
+// A non-finite float tag ({"$toml": "inf"}) is a leaf value, never a table to merge into.
 function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
+  return value !== null && typeof value === "object" && !Array.isArray(value) && !isNonFiniteTag(value)
     ? (value as Record<string, unknown>)
     : undefined;
 }

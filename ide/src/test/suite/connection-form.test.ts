@@ -8,7 +8,9 @@ import {
   UNKNOWN_GROUP,
   buildForm,
   coerce,
+  isNonFiniteTag,
   isSupportedSchemaVersion,
+  NON_FINITE_TAG,
   type ConnectionSchema,
   type FieldDescriptor,
   type FieldGroup,
@@ -459,5 +461,64 @@ suite("connectionForm — an untouched form writes nothing", () => {
     assert.ok(flag);
     assert.strictEqual(flag.value, false);
     assert.strictEqual(coerce(flag, false), false, "an authored value is not silently dropped");
+  });
+});
+
+suite("connectionForm — the non-finite float tag (BACKLOG #5778)", () => {
+  test("isNonFiniteTag accepts only the exact shape", () => {
+    for (const spelling of ["inf", "-inf", "nan", "-nan"]) {
+      assert.ok(isNonFiniteTag({ [NON_FINITE_TAG]: spelling }), spelling);
+    }
+    assert.ok(!isNonFiniteTag({ [NON_FINITE_TAG]: "bogus" }));
+    assert.ok(!isNonFiniteTag({ [NON_FINITE_TAG]: "inf", other: 1 }));
+    assert.ok(!isNonFiniteTag("inf"));
+    assert.ok(!isNonFiniteTag([{ [NON_FINITE_TAG]: "inf" }]));
+  });
+
+  test("a tag-valued record field infers float and keeps the tag; a tag default shows its spelling", () => {
+    const fixture = schemaFixture();
+    const demo = fixture.transports.demo;
+    const schema: ConnectionSchema = {
+      ...fixture,
+      transports: {
+        demo: {
+          ...demo,
+          params: {
+            ...demo.params,
+            receive_timeout: param({ type: "float", default: { [NON_FINITE_TAG]: "inf" } }),
+          },
+        },
+      },
+    };
+    const groups = buildForm(schema, "demo", "outbound", {
+      opaque: { [NON_FINITE_TAG]: "inf" },
+      undescribed: { [NON_FINITE_TAG]: "-inf" },
+      receive_timeout: { [NON_FINITE_TAG]: "inf" },
+    });
+    const opaque = field(groups, "opaque");
+    assert.ok(opaque);
+    assert.strictEqual(opaque.type, "float");
+    assert.strictEqual(opaque.control, "number");
+    assert.deepStrictEqual(opaque.value, { [NON_FINITE_TAG]: "inf" });
+    const undescribed = field(groups, "undescribed");
+    assert.ok(undescribed);
+    assert.strictEqual(undescribed.type, "float");
+    assert.deepStrictEqual(undescribed.value, { [NON_FINITE_TAG]: "-inf" });
+    const timeout = field(groups, "receive_timeout");
+    assert.ok(timeout);
+    assert.strictEqual(timeout.placeholder, "inf");
+    assert.deepStrictEqual(timeout.value, { [NON_FINITE_TAG]: "inf" });
+  });
+
+  test("coerce writes the tag for inf / -inf typed into a float field; nan stays text", () => {
+    const groups = buildForm(schemaFixture(), "demo", "outbound", {});
+    const timeout = field(groups, "receive_timeout");
+    assert.ok(timeout);
+    assert.deepStrictEqual(coerce(timeout, "inf"), { [NON_FINITE_TAG]: "inf" });
+    assert.deepStrictEqual(coerce(timeout, " -inf "), { [NON_FINITE_TAG]: "-inf" });
+    assert.strictEqual(coerce(timeout, "nan"), "nan");
+    const port = field(groups, "port");
+    assert.ok(port);
+    assert.strictEqual(coerce(port, "inf"), "inf", "an int field never takes the tag");
   });
 });
