@@ -1512,7 +1512,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         except UsernameTaken as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
         except UnknownRoleError as exc:
-            # BACKLOG #5968: a role deleted after _validate_roles; the service removed the account.
+            # BACKLOG #5968: a role deleted after _validate_roles. The service removed the account
+            # its first write committed, or logged why it could not.
             raise _unknown_roles(exc.role_ids) from exc
         except (InvalidNotifyEmail, InvalidUsername) as exc:
             # BACKLOG #2018, #5521: raised before any write, as on PATCH /users/{id}. The message

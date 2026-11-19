@@ -171,14 +171,41 @@ async def test_ad_group_map_racing_a_role_delete_is_400_and_writes_nothing(
 
 def test_role_write_refusal_reads_both_store_refusals_and_nothing_else() -> None:
     unknown = UnknownRoleError(["custom:a"])
-    assert _role_write_refusal(unknown, ["custom:a"]) is unknown
-    # An integrity error names no role: the custom ids requested stand in for it.
+    assert _role_write_refusal(unknown, ["custom:a"], None) is unknown
+    # An integrity error names no key: it is a deleted role only for the requested custom ids the
+    # re-read no longer holds, and it names just those.
     fk = _role_write_refusal(
-        sqlite3.IntegrityError("FOREIGN KEY constraint failed"), ["viewer", "custom:b"]
+        sqlite3.IntegrityError("FOREIGN KEY constraint failed"),
+        ["viewer", "custom:b", "custom:c"],
+        ["custom:c"],
     )
     assert fk is not None and fk.role_ids == ("custom:b",)
-    only_builtin = _role_write_refusal(sqlite3.IntegrityError("x"), ["viewer"])
-    assert only_builtin is not None and only_builtin.role_ids == ("viewer",)
+    # Controls: with every requested custom role still present, with only built-ins, with no role
+    # at all, or with no re-read, the integrity error is something else, at least an audit-key
+    # collision, and the caller re-raises it.
+    integrity = sqlite3.IntegrityError("UNIQUE constraint failed: audit_log.seq")
+    assert _role_write_refusal(integrity, ["custom:b"], ["custom:b"]) is None
+    assert _role_write_refusal(integrity, ["viewer"], []) is None
+    assert _role_write_refusal(integrity, [], []) is None
+    assert _role_write_refusal(integrity, ["custom:b"], None) is None
     # Control: any other failure is not a role refusal and is re-raised by the caller.
-    assert _role_write_refusal(sqlite3.OperationalError("database is locked"), ["custom:a"]) is None
-    assert _role_write_refusal(RuntimeError("boom"), ["custom:a"]) is None
+    locked = sqlite3.OperationalError("database is locked")
+    assert _role_write_refusal(locked, ["custom:a"], []) is None
+    assert _role_write_refusal(RuntimeError("boom"), ["custom:a"], []) is None
+
+
+async def test_set_roles_integrity_error_with_the_role_present_is_not_a_400(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An integrity error from the role write while every role it names still exists, here a
+    staged audit-key collision, is not reported as an unknown role: the service re-raises it."""
+    service = await _service(engine)
+    target = await _make_user(service, "target", Role.VIEWER.value)
+    role_id = await _custom_role(service)
+
+    async def collide(*_args: Any, **_kwargs: Any) -> Any:
+        raise sqlite3.IntegrityError("UNIQUE constraint failed: audit_log.seq")
+
+    monkeypatch.setattr(service.store, "remove_unless_last_admin", collide)
+    with pytest.raises(sqlite3.IntegrityError):
+        await service.set_roles(target, [role_id], actor="test")

@@ -2389,7 +2389,9 @@ def _is_integrity_refusal(exc: BaseException) -> bool:
     return "Integrity" in mro or "UniqueViolation" in mro
 
 
-def _role_write_refusal(exc: BaseException, roles: Iterable[str]) -> UnknownRoleError | None:
+def _role_write_refusal(
+    exc: BaseException, roles: Iterable[str], existing_custom: Iterable[str] | None
+) -> UnknownRoleError | None:
     """The :class:`UnknownRoleError` a role write's failure means, or ``None`` when it means
     something else (BACKLOG #5968).
 
@@ -2397,16 +2399,21 @@ def _role_write_refusal(exc: BaseException, roles: Iterable[str]) -> UnknownRole
     between that read and the write's commit reaches the write. The store raises
     :class:`UnknownRoleError` when the role was already gone when its transaction read ``roles``,
     and the driver's integrity error when the delete commits after that read and the role foreign
-    key refuses the row. Both mean the same thing to the caller: a role it named no longer exists,
-    and nothing was written. An integrity error names no role, so the custom ids requested stand in
-    for it, as the ones a concurrent delete could have taken."""
+    key refuses the row. Both mean that a role the caller named no longer exists, and nothing was
+    written.
+
+    An integrity error names no key, and the same transaction writes other keyed rows, at least
+    its audit append, so it is read as a deleted role only for the requested custom ids that
+    ``existing_custom``, the custom roles read after the failure, no longer holds. Those are the
+    ids it reports. A built-in role cannot be deleted, so with no custom id requested, or every one
+    still present, the error is something else. ``existing_custom`` is ``None`` where the caller has
+    no such read, which only an integrity error needs."""
     if isinstance(exc, UnknownRoleError):
         return exc
-    if not _is_integrity_refusal(exc):
+    if not _is_integrity_refusal(exc) or existing_custom is None:
         return None
-    requested = set(roles)
-    custom = requested - {r.value for r in Role}
-    return UnknownRoleError(sorted(custom or requested))
+    gone = set(roles) - {r.value for r in Role} - set(existing_custom)
+    return UnknownRoleError(sorted(gone)) if gone else None
 
 
 def _reproof_refusal_reason(proof: _Reproof) -> str:
@@ -19819,7 +19826,7 @@ class AuthService:
                 ),
             )
         except Exception as exc:
-            role_refusal = _role_write_refusal(exc, roles)
+            role_refusal = await self._role_write_refusal(exc, roles)
             if role_refusal is None:
                 raise
             # BACKLOG #5968: a custom role deleted after the caller's check refused the role write,
@@ -19834,6 +19841,8 @@ class AuthService:
                 _log.exception(
                     "an account whose role write was refused could not be removed (BACKLOG #5968)"
                 )
+            if role_refusal is exc:
+                raise
             raise role_refusal from exc
         # The address create_user seeded. None means nobody to tell yet: the holder is asked for one
         # at first sign-in (the NOTIFY_EMAIL_SET path) rather than told about this afterwards. Only an
@@ -20087,8 +20096,8 @@ class AuthService:
             )
         except Exception as exc:
             # BACKLOG #5968: a role deleted after the caller's check; the write rolled back.
-            refusal = _role_write_refusal(exc, roles)
-            if refusal is None:
+            refusal = await self._role_write_refusal(exc, roles)
+            if refusal is None or refusal is exc:
                 raise
             raise refusal from exc
         if not written:
@@ -20104,6 +20113,20 @@ class AuthService:
             )
 
     # --- custom RBAC roles (ADR 0045, gated by USERS_MANAGE) -----------------
+
+    async def _role_write_refusal(
+        self, exc: BaseException, roles: Sequence[str]
+    ) -> UnknownRoleError | None:
+        """:func:`_role_write_refusal` for a role write that raised ``exc``, re-reading the custom
+        roles only for an integrity error, the one case that needs it (BACKLOG #5968). A failed
+        re-read is logged and reads as no refusal, so the caller re-raises ``exc``."""
+        existing: list[str] | None = None
+        if _is_integrity_refusal(exc):
+            try:
+                existing = [r.id for r in await self.list_custom_roles()]
+            except Exception:
+                _log.exception("the custom roles could not be re-read after a role write failed")
+        return _role_write_refusal(exc, roles, existing)
 
     async def list_custom_roles(self) -> list[CustomRoleInfo]:
         """Every admin-defined custom role with its (defensively-decoded) permission set. Built-in rows
@@ -21277,8 +21300,8 @@ class AuthService:
             await self._store.set_ad_group_role_map(entries)
         except Exception as exc:
             # BACKLOG #5968: a role deleted after the caller's check; the write rolled back.
-            refusal = _role_write_refusal(exc, (role for _, role in entries))
-            if refusal is None:
+            refusal = await self._role_write_refusal(exc, [role for _, role in entries])
+            if refusal is None or refusal is exc:
                 raise
             raise refusal from exc
         revoked = await self._revoke_ad_sessions(ended, change="ad_role_map_saved", actor=actor)
