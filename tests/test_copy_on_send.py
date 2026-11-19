@@ -258,3 +258,18 @@ def test_message_copy_sugar_is_independent() -> None:
     c2 = m2.copy()
     m2.set("PID-5.1", "ORIGONLY")
     assert c2.field("PID-5.1") != "ORIGONLY" and m2.field("PID-5.1") == "ORIGONLY"
+
+
+@pytest.mark.parametrize("flag", ["snapshot_on_send", "batch_handoff_statements"])
+def test_programmatic_entry_points_default_as_pipeline_settings(flag: str) -> None:
+    # BACKLOG #5794: serve passes [pipeline] values, but an embedder on keyword defaults reads the
+    # signature defaults, which were False while PipelineSettings defaults both to True.
+    import inspect
+
+    from messagefoundry.api.app import create_managed_app
+    from messagefoundry.config.settings import PipelineSettings
+    from messagefoundry.pipeline.engine import Engine
+
+    expected = getattr(PipelineSettings(), flag)
+    for fn in (create_managed_app, Engine.__init__, Engine.create):
+        assert inspect.signature(fn).parameters[flag].default is expected, fn.__qualname__
