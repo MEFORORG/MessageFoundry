@@ -18,7 +18,7 @@ import pytest
 
 from messagefoundry.config.impact import apply_rename, plan_rename
 from messagefoundry.config.reachability import Reference
-from messagefoundry.config.wiring import load_config
+from messagefoundry.config.wiring import WiringError, load_config
 from messagefoundry_toolkit.__main__ import main
 
 _HEAD = "from messagefoundry import MLLP, Send, code_set, handler, inbound, outbound, router\n\n"
@@ -839,3 +839,119 @@ def test_a_helper_referent_at_the_decorators_coordinates_in_another_file_is_coun
         apply_rename(plan)
         assert 'Send("OB_EPIC", msg)' in (d / "_epic.py").read_text(encoding="utf-8")
         assert '@handler("EPIC")' in _mod(d)
+
+
+def test_a_definition_whose_name_comes_from_a_loop_refuses_rather_than_half_renames(
+    tmp_path: Path,
+) -> None:
+    """The outbound's name reaches its declaring call through a comprehension, so no name argument
+    can be rewritten. Rewriting the handler's Send alone would leave it sending to an outbound that
+    is still declared under the old name, so the plan refuses and nothing is written."""
+    config_dir = _write_config(
+        tmp_path,
+        'inbound("IB_L", MLLP(port=2851), router="r_l")\n'
+        '[outbound(n, MLLP(host="127.0.0.1", port=p)) for n, p in (("OB_OLD", 7011), ("OB_X", 7012))]\n'
+        "\n"
+        '@router("r_l")\n'
+        "def r_l(msg):\n"
+        '    return ["h_l"]\n'
+        "\n"
+        '@handler("h_l")\n'
+        "def h_l(msg):\n"
+        '    return Send("OB_OLD", msg)\n',
+    )
+    before = _mod(config_dir)
+    with pytest.raises(WiringError, match="could not be located"):
+        plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert _mod(config_dir) == before
+
+
+@pytest.mark.parametrize(
+    ("kind", "old", "body", "left"),
+    [
+        (
+            "outbound",
+            "OB_OLD",
+            'inbound("IB_I", MLLP(port=2852), router="r_i")\n'
+            'outbound("OB_OLD", MLLP(host="127.0.0.1", port=7013))\n'
+            "\n"
+            "def _ident(x):\n"
+            "    return x\n"
+            "\n"
+            '@router("r_i")\n'
+            "def r_i(msg):\n"
+            '    return ["h_i"]\n'
+            "\n"
+            '@handler("h_i")\n'
+            "def h_i(msg):\n"
+            '    if str(msg) == _ident("OB_OLD"):\n'
+            "        return None\n"
+            '    return Send(_ident("OB_OLD"), msg)\n',
+            'if str(msg) == _ident("OB_OLD"):',
+        ),
+        (
+            "handler",
+            "h_old",
+            'inbound("IB_I", MLLP(port=2853), router="r_i")\n'
+            'outbound("OB_I", MLLP(host="127.0.0.1", port=7014))\n'
+            "\n"
+            "def _one(x):\n"
+            "    return [x]\n"
+            "\n"
+            '@router("r_i")\n'
+            "def r_i(msg):\n"
+            '    if _one("h_old") == [str(msg)]:\n'
+            "        return []\n"
+            '    return _one("h_old")\n'
+            "\n"
+            '@handler("h_old")\n'
+            "def h_old(msg):\n"
+            '    return Send("OB_I", msg)\n',
+            'if _one("h_old") == [str(msg)]:',
+        ),
+    ],
+)
+def test_a_pass_through_helper_call_outside_a_role_is_left_and_reported(
+    tmp_path: Path, kind: str, old: str, body: str, left: str
+) -> None:
+    """A helper that returns its parameter makes its argument a referent only where the call's
+    value reaches a role. The same helper called inside a comparison is not one, so its literal is
+    left, and since it still reads the old name, its referrer is reported."""
+    config_dir = _write_config(tmp_path, body)
+    plan = plan_rename(load_config(config_dir), config_dir, kind, old, old + "_NEW")
+    assert len(plan.unresolved) == 1, plan.unresolved
+    apply_rename(plan)
+    text = _mod(config_dir)
+    assert left in text, text
+    assert f'_ident("{old}_NEW"), msg)' in text or f'return _one("{old}_NEW")' in text, text
+
+
+def test_a_definition_on_line_one_of_a_bom_file_is_renamed(tmp_path: Path) -> None:
+    """The AST reads a BOM file without its mark and the tokenizer keeps it, so on line 1 the two
+    count columns one apart. The definition there must still be rewritten."""
+    d = tmp_path / "config"
+    d.mkdir()
+    (d / "mod.py").write_text(
+        "﻿import messagefoundry as mf; "
+        'mf.outbound("OB_OLD", mf.MLLP(host="127.0.0.1", port=7015))\n'
+        + _HEAD
+        + 'inbound("IB_B", MLLP(port=2854), router="r_b")\n'
+        "\n"
+        '@router("r_b")\n'
+        "def r_b(msg):\n"
+        '    return ["h_b"]\n'
+        "\n"
+        '@handler("h_b")\n'
+        "def h_b(msg):\n"
+        '    return Send("OB_OLD", msg)\n',
+        encoding="utf-8",
+        newline="",
+    )
+    plan = plan_rename(load_config(d), d, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    raw = (d / "mod.py").read_bytes()
+    assert raw.startswith(b"\xef\xbb\xbf"), raw[:8]
+    text = raw.decode("utf-8-sig")
+    assert 'mf.outbound("OB_NEW"' in text and 'return Send("OB_NEW", msg)' in text, text
+    load_config(d)

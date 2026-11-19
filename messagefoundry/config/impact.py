@@ -39,10 +39,11 @@ is skipped)."""
 from __future__ import annotations
 
 import ast
+import codecs
 import io
 import re
 import tokenize
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import FunctionType
@@ -284,13 +285,14 @@ def plan_rename(
     ref_sites = [site for _ref, sites, _complete in referrers for site in sites]
     edits: list[LiteralEdit] = []
     files = set(def_spans) | {site.file for site in ref_sites}
+    bom_files = frozenset(file for file in files if _has_bom(file))
     for file in sorted(files):
         file_def = def_spans.get(file, [])
         file_sites = [site for site in ref_sites if site.file == file]
         spans = file_def + [site.span for site in file_sites]
         kinds = sources.occurrences(file, old)
         for edit in _py_literal_edits(file, old, new, spans):
-            pos = (edit.start_line, edit.start_col)
+            pos = _source_position(edit, bom_files)
             if pos in def_positions.get(file, ()) or any(
                 site.rewrites(pos, kinds, shared_kind) for site in file_sites
             ):
@@ -301,7 +303,18 @@ def plan_rename(
     # Deterministic, de-duplicated (a literal reachable from two overlapping spans appears once).
     unique = {(e.file, e.start_line, e.start_col): e for e in edits}
     ordered = sorted(unique.values(), key=lambda e: (e.file, e.start_line, e.start_col))
-    unresolved = _unresolved_referrers(referrers, ordered, old, sources, shared_kind)
+    edited = {(e.file, *_source_position(e, bom_files)) for e in ordered}
+    # The definition's name literal must be among the edits, or --apply would rename every referent
+    # and leave the object under its old name: a name that reaches the call through a loop or a
+    # comprehension, say, or one the tokenizer refused. Refuse rather than plan half a rename.
+    wanted = {(file, *pos) for file, positions in def_positions.items() for pos in positions}
+    if def_spans and (not wanted or not wanted <= edited):
+        where = ", ".join(sorted(def_spans))
+        raise WiringError(
+            f"cannot rename {target_kind} {old!r}: the name literal of its definition in {where} "
+            "could not be located, so the rename would leave it under its old name; rename it by hand"
+        )
+    unresolved = _unresolved_referrers(referrers, edited, old, sources, shared_kind)
     return RenamePlan(
         target_kind=target_kind, old=old, new=new, edits=tuple(ordered), unresolved=unresolved
     )
@@ -516,7 +529,9 @@ def _referrer_sites(
             rewritable = set(scan.positions)
             # A non-table rename rewrites a default only for a parameter that reaches a referent
             # role; a table rename rewrites every default equal to the old name.
-            role_params = None if table_kind is not None else {name for _i, name in scan.slots}
+            role_params = (
+                None if table_kind is not None else {name for _i, name in scan.slots | scan.passes}
+            )
             rewritable |= _default_positions(sources, func, file, span, old, role_params)
             if table_kind is None or depth == 0:
                 # ``ignored`` holds bare positions in the decorator's own file; a helper elsewhere
@@ -641,6 +656,9 @@ class _Flow:
 
     params: frozenset[str] = frozenset()
     modules: frozenset[str] = frozenset()
+    # A pass-through helper's parameters that reach only its return value: a call to it carries
+    # those arguments only where the call itself is carried into a role.
+    passes: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
     consts: list[ast.Constant] = field(default_factory=list)
     unbound: set[str] = field(default_factory=set)
     attrs: set[str] = field(default_factory=set)
@@ -651,13 +669,15 @@ class _Flow:
 class _Scan:
     """One reached function's referent positions, the module names (bare, and as attributes of a
     module) its roles read, and the parameters (as ``(index, name)``, index -1 for keyword-only)
-    whose value reaches a role."""
+    whose value reaches a role. ``passes`` are the parameters whose value reaches only this
+    function's return value, which an argument fills only where the call is itself in a role."""
 
     positions: set[tuple[int, int]]
     globals: set[str]
     attrs: set[str]
     calls: set[str]
     slots: set[tuple[int, str]]
+    passes: set[tuple[int, str]] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -719,6 +739,7 @@ def _scan_referrer(
     send = table_kind is None and referrer_kind == "handler"
     returns: set[str] = set()
     slots: dict[str, set[tuple[int, str]]] = {}
+    passes: dict[str, set[tuple[int, str]]] = {}
     while True:
         scans: list[_Scan] = []
         for depth, func, file, span, node, values, names in prepared:
@@ -726,17 +747,21 @@ def _scan_referrer(
                 give_back = referrer_kind == "router" and table_kind is None
             else:
                 give_back = func.__name__ in returns
-            role = _Role(send, give_back, table_kind, slots, names)
+            role = _Role(send, give_back, table_kind, slots, names, passes)
             scans.append(_scan_function(sources, file, span, node, values, old, role))
         new_returns = returns | {name for scan in scans for name in scan.calls}
         new_slots = {name: set(found) for name, found in slots.items()}
-        for (_d, func, *_rest), scan in zip(prepared, scans, strict=True):
+        new_passes = {name: set(found) for name, found in passes.items()}
+        for (depth, func, *_rest), scan in zip(prepared, scans, strict=True):
             if scan.slots:
                 new_slots.setdefault(func.__name__, set()).update(scan.slots)
-        # Both only grow and are bounded by the helpers' names and parameters, so this ends.
-        if new_returns == returns and new_slots == slots:
+            # The referrer's own return is no helper's, so it gives no call a pass-through.
+            if scan.passes and depth > 0:
+                new_passes.setdefault(func.__name__, set()).update(scan.passes)
+        # All three only grow and are bounded by the helpers' names and parameters, so this ends.
+        if new_returns == returns and new_slots == slots and new_passes == passes:
             return scans
-        returns, slots = new_returns, new_slots
+        returns, slots, passes = new_returns, new_slots, new_passes
 
 
 @dataclass(frozen=True)
@@ -748,6 +773,7 @@ class _Role:
     accessor: str | None
     slots: Mapping[str, set[tuple[int, str]]]
     names: _Names
+    passes: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
 
 
 def _function_node(
@@ -794,12 +820,17 @@ def _scan_function(
     args = node.args
     positional = [a.arg for a in (*args.posonlyargs, *args.args)]
     keyword_only = {a.arg for a in args.kwonlyargs}
-    flow = _Flow(params=frozenset(positional) | keyword_only, modules=role.names.modules)
-    roots: list[ast.expr] = []
+    params = frozenset(positional) | keyword_only
+    # Two flows: what reaches a role inside this function (``sink``), and what reaches only its
+    # return value (``back``). A parameter in ``sink`` makes every call's argument a referent; one
+    # only in ``back`` does so only for a call that is itself carried into a role (BACKLOG #5980).
+    sink = _Flow(params=params, modules=role.names.modules, passes=role.passes)
+    back = _Flow(params=params, modules=role.names.modules, passes=role.passes)
+    returned: list[ast.expr] = []
     if role.give_back:
         if isinstance(node, ast.Lambda):
-            roots.append(node.body)
-        roots.extend(
+            returned.append(node.body)
+        returned.extend(
             child.value
             for child in _own_nodes(node)
             if isinstance(child, (ast.Return, ast.Yield, ast.YieldFrom)) and child.value is not None
@@ -808,23 +839,29 @@ def _scan_function(
     for stmt in body:
         for child in ast.walk(stmt):
             if isinstance(child, ast.Call):
-                roots.extend(_call_roots(child, role))
-    for root in roots:
-        _carried(root, values, set(), flow)
+                for root in _call_roots(child, role):
+                    _carried(root, values, set(), sink)
+    for root in returned:
+        _carried(root, values, set(), back)
     positions = {
         pos
-        for const in flow.consts
+        for const in (*sink.consts, *back.consts)
         if const.value == old
         and span.start <= (pos := sources.position(file, const))[0] <= span.end
     }
-    own_slots = {(positional.index(p), p) for p in flow.unbound if p in positional}
-    own_slots |= {(-1, p) for p in flow.unbound if p in keyword_only}
+
+    def slots_of(unbound: set[str]) -> set[tuple[int, str]]:
+        found = {(positional.index(p), p) for p in unbound if p in positional}
+        return found | {(-1, p) for p in unbound if p in keyword_only}
+
+    own_slots = slots_of(sink.unbound)
     return _Scan(
         positions,
-        flow.unbound - flow.params,
-        flow.attrs,
-        flow.calls,
+        (sink.unbound | back.unbound) - params,
+        sink.attrs | back.attrs,
+        sink.calls | back.calls,
         own_slots,
+        slots_of(back.unbound) - own_slots,
     )
 
 
@@ -846,11 +883,7 @@ def _call_roots(call: ast.Call, role: _Role) -> list[ast.expr]:
     ):
         out.append(table)
     helper = _helper_name(call.func, role.names.modules)
-    for index, name in role.slots.get(helper or "", ()):
-        if 0 <= index < len(call.args) and not isinstance(call.args[index], ast.Starred):
-            out.append(call.args[index])
-        else:
-            out.extend(kw.value for kw in call.keywords if kw.arg == name)
+    out.extend(_slot_arguments(call, role.slots.get(helper or "", ())))
     return out
 
 
@@ -995,6 +1028,20 @@ def _carried_call(
             _carried(call.args[1], values, seen, flow)
     elif (helper := _helper_name(call.func, flow.modules)) is not None:
         flow.calls.add(helper)
+        # This call's value is in a role, so a pass-through helper's argument is too.
+        for root in _slot_arguments(call, flow.passes.get(helper, ())):
+            _carried(root, values, seen, flow)
+
+
+def _slot_arguments(call: ast.Call, slots: Iterable[tuple[int, str]]) -> list[ast.expr]:
+    """The arguments ``call`` binds to ``slots``, each ``(index, name)``."""
+    out: list[ast.expr] = []
+    for index, name in slots:
+        if 0 <= index < len(call.args) and not isinstance(call.args[index], ast.Starred):
+            out.append(call.args[index])
+        else:
+            out.extend(kw.value for kw in call.keywords if kw.arg == name)
+    return out
 
 
 def _router_binding_positions(
@@ -1306,7 +1353,7 @@ def _call_name(func: ast.expr) -> str | None:
 
 def _unresolved_referrers(
     referrers: list[tuple[Reference, list[_Site], bool]],
-    edits: list[LiteralEdit],
+    edited: set[tuple[str, int, int]],
     old: str,
     sources: SourceCache,
     shared_kind: str | None,
@@ -1318,8 +1365,8 @@ def _unresolved_referrers(
     dangling referent.
 
     Coverage is per occurrence, not per span: every referent position at every site must carry an
-    edit (BACKLOG #5620), so one rewritten literal no longer vouches for a second one beside it."""
-    edited = {(e.file, e.start_line, e.start_col) for e in edits}
+    edit (BACKLOG #5620), so one rewritten literal no longer vouches for a second one beside it.
+    ``edited`` holds each edit's position as :func:`_source_position` gives it."""
     out: list[Reference] = []
     for ref, sites, complete in referrers:
         occurrences: set[tuple[str, int, int]] = set()
@@ -1331,6 +1378,24 @@ def _unresolved_referrers(
 
 
 # --- python literal rewriting (tokenize) -------------------------------------
+
+
+def _has_bom(file: str) -> bool:
+    """Whether ``file`` starts with a UTF-8 byte-order mark."""
+    try:
+        with open(file, "rb") as fh:
+            return fh.read(3) == codecs.BOM_UTF8
+    except OSError:
+        return False
+
+
+def _source_position(edit: LiteralEdit, bom_files: frozenset[str]) -> tuple[int, int]:
+    """``edit``'s position as the AST positions count it. An edit is tokenized from a plain UTF-8
+    read, which keeps a byte-order mark as the first character of line 1, while ``SourceCache``
+    reads ``utf-8-sig`` and drops it, so on line 1 of a BOM file the two differ by one column."""
+    if edit.start_line == 1 and edit.file in bom_files:
+        return 1, edit.start_col - 1
+    return edit.start_line, edit.start_col
 
 
 def _py_literal_edits(file: str, old: str, new: str, spans: list[_Span]) -> list[LiteralEdit]:
