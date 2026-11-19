@@ -2,6 +2,7 @@
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 
 using System;
+using System.ComponentModel;
 using System.IO;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
@@ -88,7 +89,8 @@ namespace MessageFoundry.NetHelper
         }
 
         // False means a caller connected and closed before this accept ran, so nobody is left to read a reply.
-        // Any bytes it wrote are discarded unread, as a request whose caller left before its reply is. A new
+        // Any bytes it wrote are discarded unread. That differs from a caller that closes after the accept, whose
+        // request is still read and applied, so only a reply tells a caller whether its request ran. A new
         // instance takes a caller before ConnectNamedPipe runs, so a caller that arrives as the helper starts and
         // closes at once leaves it closing, and ConnectNamedPipe fails with ERROR_NO_DATA. Left uncaught, that one
         // early close would stop the helper. Any other failure still propagates and stops it, as before.
@@ -109,8 +111,8 @@ namespace MessageFoundry.NetHelper
                 // kept, so the pipe name is never free for another process to take.
                 if (!DisconnectNamedPipe(pipe.SafePipeHandle))
                 {
-                    throw new IOException("cannot return the pipe to listening after a caller closed early: Win32 error " +
-                                          Marshal.GetLastPInvokeError());
+                    var failure = new Win32Exception(Marshal.GetLastPInvokeError());
+                    throw new IOException("cannot return the pipe to listening after a caller closed early: " + failure.Message, ex);
                 }
 
                 return false;

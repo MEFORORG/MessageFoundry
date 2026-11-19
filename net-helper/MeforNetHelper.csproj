@@ -46,7 +46,7 @@
       example and is now deleted, but the flag is not therefore vacuous: NetOps still calls
       System.Net.NetworkInformation, whose GetAdaptersAddresses IS an iphlpapi import, so the same planted
       IPHLPAPI.DLL is still what this flag refuses. Do not remove it on the grounds that the helper's own
-      P/Invokes are few: its one, DisconnectNamedPipe (BACKLOG #5974), is in kernel32, a KnownDLL.
+      P/Invokes, such as DisconnectNamedPipe (BACKLOG #5974), name KnownDLLs like kernel32.
     -->
     <LinkerArg Include="/DEPENDENTLOADFLAG:0x800" />
   </ItemGroup>
