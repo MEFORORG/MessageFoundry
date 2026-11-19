@@ -76,11 +76,18 @@
     "it is worthless". Read SUPERSEDED as a floor on what is safe to release, and every other verdict
     as a question this could not close.
 
+    WHERE THE LEDGER IS (BACKLOG #5480). The backlog ledger left this repository on 2026-09-13 for
+    the maintainer-internal repository (the vault), and docs/BACKLOG.md here is a stub that holds no
+    item. -LedgerRepo names a vault checkout. The namespace is then read there, at that checkout's
+    origin/main resolved once to a SHA, while the claims, the branch ahead counts and the delivery
+    citations stay this repository's. Without -LedgerRepo the namespace is read here, which refuses
+    on the stub.
+
 .EXAMPLE
-    pwsh -NoProfile -File scripts\coord\claim-adjudicate.ps1
-    pwsh -NoProfile -File scripts\coord\claim-adjudicate.ps1 -Json
-    pwsh -NoProfile -File scripts\coord\claim-adjudicate.ps1 -Key 1010
-    pwsh -NoProfile -File scripts\coord\claim-adjudicate.ps1 -IncludeHeld
+    pwsh -NoProfile -File scripts\coord\claim-adjudicate.ps1 -LedgerRepo <vault checkout>
+    pwsh -NoProfile -File scripts\coord\claim-adjudicate.ps1 -LedgerRepo <vault checkout> -Json
+    pwsh -NoProfile -File scripts\coord\claim-adjudicate.ps1 -LedgerRepo <vault checkout> -Key 1010
+    pwsh -NoProfile -File scripts\coord\claim-adjudicate.ps1 -LedgerRepo <vault checkout> -IncludeHeld
 #>
 [CmdletBinding()]
 param(
@@ -94,7 +101,10 @@ param(
     # Audit a claims set that is not the live registry -- the same escape hatch, and for the same
     # reason, as claim-reconcile.ps1's: replaying these rules over already-released claims lets a
     # release be cross-checked without a second copy of the rules existing anywhere.
-    [string]$ClaimsDir = ""
+    [string]$ClaimsDir = "",
+    # A checkout of the repository that holds the backlog ledger (the vault). Every backlog-namespace
+    # read runs there, pinned to its origin/main. See "WHERE THE LEDGER IS" in .NOTES.
+    [string]$LedgerRepo = ""
 )
 
 # A CLAUDE CODE CLOUD SESSION REACHES NO OTHER SESSION THROUGH THIS SCRIPT: its --git-common-dir is
@@ -158,27 +168,17 @@ if (-not (Test-Path -LiteralPath $claimsDir)) {
 # RESOLVED TO ONE SHA, ONCE. Every later read -- the ls-tree, each git show, the citation log and the
 # ahead count -- takes $mainSha, never the name, so a fetch landing mid-run cannot hand one read an
 # older tree and the next a newer one. $mainRef stays the name, for the prose.
-$mainRef = "origin/main"
-$mainSha = "$(& git -C $repo rev-parse --verify --quiet $mainRef 2>$null)".Trim()
-if (-not $mainSha) {
-    $mainRef = "main"
-    $mainSha = "$(& git -C $repo rev-parse --verify --quiet $mainRef 2>$null)".Trim()
-}
-if (-not $mainSha) {
-    throw "neither origin/main nor main resolves to a commit: cannot adjudicate any key against a namespace that was not read"
-}
-$mainIsRemote = ($mainRef -eq "origin/main")
-
 # ONE WRAPPER FOR THE NAMESPACE READS, so the exit check and the stderr carry cannot be dropped from
 # one of them. Both preferences are pinned in the function's own scope: under the script's "Stop",
 # with $PSNativeCommandUseErrorActionPreference true, git's first stderr line or its exit code throws
 # a generic error and the refusal below, with git's own words, never prints. alloc.ps1's
-# Invoke-SweepGit is the same shape for the same reason.
-function Invoke-NamespaceGit([string[]]$GitArgs, [string]$What, [string]$Why) {
+# Invoke-SweepGit is the same shape for the same reason. $In is the repository the read runs in:
+# this one, or the ledger checkout -LedgerRepo names.
+function Invoke-NamespaceGit([string]$In, [string[]]$GitArgs, [string]$What, [string]$Why) {
     $ErrorActionPreference = "Continue"
     $PSNativeCommandUseErrorActionPreference = $false
     $global:LASTEXITCODE = -1
-    $all = @(& git -C $repo @GitArgs 2>&1)
+    $all = @(& git -C $In @GitArgs 2>&1)
     $code = $LASTEXITCODE
     $detail = (@($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) -join "`n  ").Trim()
     if ($code -ne 0) {
@@ -192,43 +192,89 @@ function Invoke-NamespaceGit([string[]]$GitArgs, [string]$What, [string]$Why) {
     @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
 }
 
+# The reference of repository $In, pinned: origin/main, else local main. The last attempt runs through
+# the wrapper, so a ref that does not resolve refuses with git's own words.
+function Resolve-PinnedMain([string]$In) {
+    $ref = "origin/main"
+    $sha = "$(& git -C $In rev-parse --verify --quiet $ref 2>$null)".Trim()
+    if (-not $sha) {
+        $ref = "main"
+        $sha = (@(Invoke-NamespaceGit $In @('rev-parse', '--verify', $ref) "origin/main or main in $In" "not read") -join '').Trim()
+    }
+    [pscustomobject]@{ Ref = $ref; Sha = $sha; IsRemote = ($ref -eq "origin/main") }
+}
+
+$pinned = Resolve-PinnedMain $repo
+$mainRef = $pinned.Ref; $mainSha = $pinned.Sha; $mainIsRemote = $pinned.IsRemote
+
 # ---------------------------------------------------------------------------------------------
-# THE BACKLOG NAMESPACE ON $mainRef.
+# WHICH REPOSITORY HOLDS THE LEDGER (BACKLOG #5480).
+#
+# With -LedgerRepo every namespace read -- the rev-parse, the ls-tree and each git show -- runs in
+# that checkout, against ITS origin/main resolved to one SHA here, for the reason $mainSha is: a fetch
+# landing mid-run must not hand one read an older tree and the next a newer one. Local main is the
+# fallback only where origin/main is absent, as above. The claims, the ahead counts and the citations
+# stay this repository's: the branches and the landed commits live here, not in the ledger's history.
+# Without -LedgerRepo the namespace is read here, which refuses below on the stub.
+# ---------------------------------------------------------------------------------------------
+if ($LedgerRepo) {
+    $ledgerPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LedgerRepo)
+    $ledgerRoot = (@(Invoke-NamespaceGit $ledgerPath @('rev-parse', '--path-format=absolute', '--show-toplevel') "-LedgerRepo $ledgerPath as a git repository" "not read") -join '').Trim()
+    $ledgerPinned = Resolve-PinnedMain $ledgerRoot
+    # One token, so the why-strings below keep the shape the BLOCKING roll-up strips.
+    $ledgerAt = "ledger:$($ledgerPinned.Ref)@$($ledgerPinned.Sha.Substring(0, [Math]::Min(12, $ledgerPinned.Sha.Length)))"
+    $remedy = ""
+}
+else {
+    $ledgerRoot = $repo; $ledgerPinned = $pinned; $ledgerAt = $mainRef
+    $remedy = (" The ledger lives in the maintainer-internal repository (the vault) since " +
+        "2026-09-13, and docs/BACKLOG.md here is a stub: pass -LedgerRepo <vault checkout> to read it there.")
+}
+$ledgerRef = $ledgerPinned.Ref; $ledgerSha = $ledgerPinned.Sha
+
+# ---------------------------------------------------------------------------------------------
+# THE BACKLOG NAMESPACE ON $ledgerRef OF $ledgerRoot.
 #
 # It spans MORE THAN ONE FILE and always has: docs/BACKLOG.md carries open items, retired ones are
 # moved verbatim into docs/archive/backlog/. backlog_status_check.py parses every default source into
 # ONE namespace precisely so a number re-used across the two is detectable. Reading only BACKLOG.md
 # here would make every CLOSED item look like it had no item at all -- turning the safest releases
 # in the population into unreachable ones, silently.
+#
+# THOSE TWO PLACES AND NO OTHER. The ledger repository also carries plan and handoff files with
+# BACKLOG in their names and `## N.` headings of their own (measured 2026-11-19 on the vault's
+# origin/main: two such files, under docs/releases/ and docs/security/handoff/). Matching the word
+# anywhere under docs/ let those headings join the namespace as items, so a key the ledger lacks
+# would take a plan step's text as its banner. scripts/coord/owed_ledger_acts.py's LEDGER_SOURCES
+# names the same pair.
 # ---------------------------------------------------------------------------------------------
 #
 # `-z` because without it git QUOTES a path holding a non-ASCII byte or a control character, and a
 # quoted name is not a path git show can read. pwsh splits native output on newlines, so rejoin on
 # newline before splitting on NUL. A FAILED ls-tree REFUSES, for the reason a failed git show does.
-$treeNames = (@(Invoke-NamespaceGit @('ls-tree', '-r', '-z', '--name-only', $mainSha, '--', 'docs/') "the tree of $mainRef ($mainSha)" "not read") -join "`n") -split "`0"
-$backlogFiles = @($treeNames | Where-Object { $_ -match 'BACKLOG' -and $_ -like '*.md' })
+$treeNames = (@(Invoke-NamespaceGit $ledgerRoot @('ls-tree', '-r', '-z', '--name-only', $ledgerSha, '--', 'docs/BACKLOG.md', 'docs/archive/backlog/') "the tree of $ledgerRef ($ledgerSha) in $ledgerRoot" "not read") -join "`n") -split "`0"
+$backlogFiles = @($treeNames | Where-Object { $_ -cmatch 'BACKLOG' -and $_ -like '*.md' })
 if (-not $backlogFiles.Count) {
-    throw "no backlog file found on ${mainRef}: cannot adjudicate any key against a namespace that was not read"
+    throw "no backlog file found on $ledgerRef ($ledgerSha) in ${ledgerRoot}: cannot adjudicate any key against a namespace that was not read.$remedy"
 }
 
 # A FILE NAMED BACKLOG IS NOT A LEDGER (BACKLOG #5480). The ledger left this repository on
-# 2026-09-13 and docs/BACKLOG.md is now a stub that holds no item, while other docs carry the word
-# in their names. Counting files therefore passed on a namespace that holds nothing, and every
-# numeric key then read NO-ITEM -- the same never-looked report the check above refuses. So a file
-# joins the corpus only if it holds an item heading, in the shape Get-ItemBlock matches, and a
-# corpus left empty refuses. A stub is then never listed as a source either. A file that could not
-# be READ refuses too: dropping it silently would turn its items into NO-ITEM the same way.
+# 2026-09-13 and docs/BACKLOG.md is now a stub that holds no item. Counting files therefore passed on
+# a namespace that holds nothing, and every numeric key then read NO-ITEM -- the same never-looked
+# report the check above refuses. So a file joins the corpus only if it holds an item heading, in
+# the shape Get-ItemBlock matches, and a corpus left empty refuses. A stub is then never listed as a
+# source either. A file that could not be READ refuses too: dropping it silently would turn its
+# items into NO-ITEM the same way.
 $itemHeading = '(?m)^##\s+\d+\.\s'
 $corpus = @{}
 foreach ($bf in $backlogFiles) {
-    $text = (Invoke-NamespaceGit @('show', "${mainSha}:$bf") "${mainRef}:$bf" "only partly read") -join "`n"
+    $text = (Invoke-NamespaceGit $ledgerRoot @('show', "${ledgerSha}:$bf") "${ledgerRef}:$bf in $ledgerRoot" "only partly read") -join "`n"
     if ($text -match $itemHeading) { $corpus[$bf] = $text }
 }
 if (-not $corpus.Count) {
-    throw ("no backlog item heading found in the backlog-named file(s) on ${mainRef} " +
-        "($($backlogFiles -join ', ')), so there is no ledger here to adjudicate any key against. " +
-        "The ledger lives in the maintainer-internal repository (the vault) since 2026-09-13, and " +
-        "docs/BACKLOG.md here is a stub. Refusing rather than report every key NO-ITEM.")
+    throw ("no backlog item heading found in the backlog file(s) on $ledgerRef ($ledgerSha) in " +
+        "$ledgerRoot ($($backlogFiles -join ', ')), so there is no ledger there to adjudicate any " +
+        "key against. Refusing rather than report every key NO-ITEM.$remedy")
 }
 $corpusFiles = @($corpus.Keys | Sort-Object)
 
@@ -402,7 +448,7 @@ foreach ($f in $files) {
     if (-not $block) {
         $rows += [pscustomobject]@{ key = $k; holder = $holder; branch = $branch; note = $note
             item = ""; banner = ""; citations = $cites; verdict = "NO-ITEM"
-            why = "'$k' names no item in the backlog namespace on $mainRef -- this instrument does not reach it, which is not a finding about the work" }
+            why = "'$k' names no item in the backlog namespace on $ledgerAt -- this instrument does not reach it, which is not a finding about the work" }
         continue
     }
 
@@ -436,7 +482,7 @@ foreach ($f in $files) {
         $quote = if ($bannerWhy) { ": `"" + $bannerWhy.Substring(0, [Math]::Min(140, $bannerWhy.Length)) + "`"" } else { "" }
         $rows += [pscustomobject]@{ key = $k; holder = $holder; branch = $branch; note = $note
             item = $block.File; banner = $bannerState; citations = $cites; verdict = "SUPERSEDED"
-            why = "the item's banner on $mainRef already protects it ($bannerState)$quote -- that protection travels to every checkout and this machine-local claim does not" }
+            why = "the item's banner on $ledgerAt already protects it ($bannerState)$quote -- that protection travels to every checkout and this machine-local claim does not" }
     }
     else {
         $ahead = $null
@@ -452,7 +498,7 @@ foreach ($f in $files) {
                     else { "'$branch' carries $ahead commit(s) $mainRef lacks" }
         $rows += [pscustomobject]@{ key = $k; holder = $holder; branch = $branch; note = $note
             item = $block.File; banner = $bannerState; citations = $cites; verdict = "BLOCKING"
-            why = "item reads $bannerState on $mainRef and $aheadTxt -- so the key is unclaimable by any future session while nothing on $mainRef protects it" }
+            why = "item reads $bannerState on $ledgerAt and $aheadTxt -- so the key is unclaimable by any future session while nothing on $ledgerAt protects it" }
     }
 }
 
@@ -464,7 +510,13 @@ if ($Json) {
         scanned   = $true
         reference = $mainRef
         applied   = $false
-        sources   = [pscustomobject]@{ claims = $claimsDir; backlog = $corpusFiles }
+        sources   = [pscustomobject]@{
+            claims  = $claimsDir
+            backlog = $corpusFiles
+            # The repository, ref and pinned SHA every namespace read took, so a report names the
+            # ledger it was read against rather than leaving the reader to assume this repository.
+            ledger  = [pscustomobject]@{ repo = $ledgerRoot; reference = $ledgerRef; sha = $ledgerSha }
+        }
         counts    = [pscustomobject]@{
             total      = $rows.Count
             superseded = @($rows | Where-Object verdict -eq 'SUPERSEDED').Count
@@ -479,14 +531,18 @@ if ($Json) {
     exit 0
 }
 
-if (-not $mainIsRemote) {
-    Write-Host "WARNING: origin/main is not present on this clone; every verdict below was taken against LOCAL main." -ForegroundColor Yellow
+$localMain = @()
+if (-not $mainIsRemote) { $localMain += "on this clone" }
+if ($LedgerRepo -and -not $ledgerPinned.IsRemote) { $localMain += "in the ledger checkout" }
+foreach ($where in $localMain) {
+    Write-Host "WARNING: origin/main is not present $where; every verdict below that rests on it was taken against LOCAL main." -ForegroundColor Yellow
     Write-Host "         A banner that has landed but not been fetched reads as absent, which HOLDS releasable claims." -ForegroundColor Yellow
     Write-Host ""
 }
 
-Write-Host "CLAIM ADJUDICATION -- per key, against the durable protection on $mainRef" -ForegroundColor Cyan
+Write-Host "CLAIM ADJUDICATION -- per key, against the durable protection on $ledgerRef" -ForegroundColor Cyan
 Write-Host "  claims  : $claimsDir"
+Write-Host "  ledger  : $ledgerRoot at $ledgerRef $ledgerSha"
 Write-Host "  backlog : $($corpusFiles -join ', ')"
 Write-Host "  writes  : NONE. This tool has no -Apply. The release lines below are for you to run."
 Write-Host ""

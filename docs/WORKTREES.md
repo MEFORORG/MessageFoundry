@@ -1039,7 +1039,7 @@ Two sweeps read that population. They ask different questions and neither subsum
 
 ```
 scripts\coord\claim-reconcile.ps1        # did the BRANCH land?  -Apply releases what it proves
-scripts\coord\claim-adjudicate.ps1       # is the KEY protected on origin/main?  never writes
+scripts\coord\claim-adjudicate.ps1 -LedgerRepo <vault checkout>   # is the KEY protected?  never writes
 ```
 
 **`claim-reconcile.ps1` asks about the branch**. For a holder that is gone it has four arms:
@@ -1059,6 +1059,12 @@ Measured 2026-08-18 on the live registry: 20 stranded claims sat on **six** bran
 **nine** keys, and reconcile cleared **none** of them. That is not a defect in it — a seat branch
 accumulates commits from every item the seat ever touched, so branch containment can only ever clear
 a whole seat at once, and a long-lived seat branch never clears.
+
+**It reads the ledger from the checkout `-LedgerRepo` names (BACKLOG #5480).** The ledger moved to
+the vault on 2026-09-13 and `docs/BACKLOG.md` here is a stub, so without `-LedgerRepo` the tool
+refuses. With it, every banner is read from that checkout's `origin/main`, pinned to one SHA that
+the report prints beside the checkout's path. The claims, branches and citations stay this
+repository's. Fetch the vault checkout first: a banner it has not fetched reads as absent.
 
 ### The criterion is the project's own, and it is not "is the work done"
 
