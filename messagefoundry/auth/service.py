@@ -2455,12 +2455,17 @@ async def _sleep_until_write_point(deadline: float) -> None:
         await asyncio.sleep(remaining)
 
 
-async def _write_through_cancellation(writes: Sequence[Callable[[], Awaitable[None]]]) -> None:
+async def _write_through_cancellation(
+    writes: Sequence[Callable[[], Awaitable[None]]],
+    *,
+    what: str = "a refused sign-in's audit write",
+) -> None:
     """Run ``writes`` to completion even if the caller is cancelled, then re-raise the cancel.
 
     Shielded, and awaited again after each cancel, so a repeated cancellation neither abandons the
     writes nor lets the caller leave (and release the account's queue) before they finish. A write
-    that fails raises as it did when the rows were written inline."""
+    that fails raises as it did when the rows were written inline. ``what`` names the writes in
+    the ERROR line logged when one fails while the caller is cancelled."""
     task = asyncio.ensure_future(_run_in_order(writes))
     cancelled = False
     while not task.done():
@@ -2473,10 +2478,7 @@ async def _write_through_cancellation(writes: Sequence[Callable[[], Awaitable[No
     if cancelled:
         if not task.cancelled() and task.exception() is not None:
             # Nobody else will read it: the caller is leaving with the cancel.
-            _log.error(
-                "a refused sign-in's audit write failed while the request was cancelled",
-                exc_info=task.exception(),
-            )
+            _log.error("%s failed while the request was cancelled", what, exc_info=task.exception())
         raise asyncio.CancelledError
     task.result()
 
@@ -15683,18 +15685,21 @@ class AuthService:
                     type(revoke_exc).__name__,
                 )
 
-        await _write_through_cancellation([end_rotated])
+        await _write_through_cancellation(
+            [end_rotated], what="a re-auth's revoke of the session it rotated"
+        )
 
     async def _end_reauth_rotated_session(self, rotated_token: str, actor: str) -> bool:
         """Ask the store to end the session a re-auth rotated once :meth:`_clear_after_reauth`
-        answered ``"denied"`` or raised, or once the re-auth's hard ``auth.reauth`` row was refused
-        after a purpose grant was minted and then dropped (BACKLOG #5900), and say whether the
-        revoke landed, as far as this call saw. A refused revoke is tried once more, as
+        answered ``"denied"`` or raised, or once a re-auth that finished with a rotated token had
+        its hard ``auth.reauth`` row refused or its write cancelled, whether or not a clear was due,
+        any purpose grant minted for that token being dropped first (BACKLOG #5900), and say
+        whether the revoke landed, as far as this call saw. A refused revoke is tried once more, as
         ``confirm_mfa_enrollment`` tries its own (BACKLOG #3025). Refused twice, it is logged and
         answered False: the elevated session may then stay live, unreachable, because the caller
         answers ``session_lost`` or raises either way and its new token is never handed back. The
         caller records the answer on its ``auth.reauth`` row, or logs it when that row was
-        refused."""
+        refused or its write cancelled."""
         rotated = hash_token(rotated_token)
         for attempt in ("retrying", "and could not end the session it rotated"):
             ended = await write_audit_soft(
@@ -16022,25 +16027,33 @@ class AuthService:
                         detail=reauth_detail(interrupted=not finished),
                         client=client,
                     )
-                except (Exception, asyncio.CancelledError):
+                except (Exception, asyncio.CancelledError) as row_exc:
                     if finished and elevation.token is not None:
                         if purpose is not None:
                             # The grant is never handed back with its token; drop it.
                             self._action_step_up_grants.pop(
                                 (hash_token(elevation.token), purpose), None
                             )
+                        # A cancel can land after the row committed, so it says nothing about
+                        # whether the row is in; only a raise from the write is a refusal.
+                        row_cancelled = isinstance(row_exc, asyncio.CancelledError)
                         row_refused_ended: list[bool] = []
                         try:
                             await self._end_reauth_rotated_session_shielded(
                                 elevation.token,
                                 identity.username,
-                                "auth.reauth row was refused",
+                                "auth.reauth row write was cancelled"
+                                if row_cancelled
+                                else "auth.reauth row was refused",
                                 row_refused_ended,
                             )
                         finally:
-                            # No row records it, so the log does.
+                            # No row is known to record it, so the log does.
                             _log.warning(
-                                "a re-auth for %s whose auth.reauth row was refused %s the "
+                                "a re-auth for %s cancelled while its auth.reauth row was written "
+                                "%s the session it rotated; whether that row committed is not known"
+                                if row_cancelled
+                                else "a re-auth for %s whose auth.reauth row was refused %s the "
                                 "session it rotated",
                                 scrub_log_argument(identity.username),
                                 "ended"

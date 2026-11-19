@@ -1161,9 +1161,10 @@ async def test_a_cancel_during_the_clear_ends_the_rotated_session(
 async def test_an_outage_at_the_clear_and_a_refused_row_end_the_rotated_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A Transit Outage at the account record's seal answers refused, and the same Outage refuses
-    the hard ``auth.reauth`` row. The re-auth raises, its rotated token never handed back, and the
-    session it rotated is ended rather than left live with its purpose grant."""
+    """A Transit Outage at the account record's seal answers refused, and the store then refuses
+    the hard ``auth.reauth`` row with an ``OSError``. The re-auth raises, its rotated token never
+    handed back, and the session it rotated is ended rather than left live with its purpose
+    grant."""
     store = await MessageStore.open(":memory:")
     try:
         service, _, identity, token = await _setup(store)
@@ -1222,5 +1223,52 @@ async def test_a_refused_revoke_after_a_refused_row_logs_what_happened(
         assert "whose auth.reauth row was refused could not end the session it rotated" in text
         assert "granted nothing" not in text
         assert not service._action_step_up_grants
+    finally:
+        await store.close()
+
+
+async def test_a_cancel_after_the_reauth_row_committed_is_not_logged_as_a_refusal(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A cancel that lands once the hard ``auth.reauth`` row has committed still ends the rotated
+    session, and its log line says the write was cancelled and that whether the row committed is
+    not known, never that the row was refused."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, identity, token = await _setup(store)
+        real_audit = store.record_audit
+        committed = asyncio.Event()
+
+        async def outage(user_id: str, **kwargs: Any) -> None:
+            raise _outage(user_id)
+
+        async def commit_then_hang(action: str, **kwargs: Any) -> Any:
+            result = await real_audit(action, **kwargs)
+            if action == "auth.reauth":
+                committed.set()
+                await asyncio.Event().wait()
+            return result
+
+        monkeypatch.setattr(store, "record_login_success", outage)
+        monkeypatch.setattr(service, "_user_seal_outage", lambda refused: None)
+        monkeypatch.setattr(store, "record_audit", commit_then_hang)
+        caplog.set_level("WARNING", logger="messagefoundry.auth.service")
+        task = asyncio.ensure_future(
+            service.reauth(identity, GOOD, token=token, purpose=STEP_UP_ACTION_MFA_ENROLL)
+        )
+        await committed.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        rows = [json.loads(r["detail"]) for r in await store.list_audit(action="auth.reauth")]
+        assert [r for r in rows if r["ok"]], "the row did not commit"
+        assert await store.list_sessions("u-bob") == [], "the rotated session was left live"
+        assert not service._action_step_up_grants
+        text = caplog.text
+        assert (
+            "cancelled while its auth.reauth row was written ended the session it rotated; "
+            "whether that row committed is not known"
+        ) in text
+        assert "row was refused" not in text
     finally:
         await store.close()
