@@ -8546,16 +8546,20 @@ def _keyless_store_gate(settings: ServiceSettings) -> str | None:
     ``KEYLESS_REFUSED_BY_UNREAD_KEY`` before the opt-out is consulted (BACKLOG #2077). No opt-out
     waives it: the settings name a key, so a keyless open is not what anyone configured.
     ``open_store`` refuses the same case, through ``store.base._checked_active_key``. So does a
-    retired key with no active key, by the same return (BACKLOG #5310, #5308). That sentinel's
-    value names ``[store].key_provider``, which is not this case's setting, so no caller may print
-    the value: each prints :func:`_unread_key_text`, which names the cause."""
+    retired key with no active key, by the same return (BACKLOG #5310, #5308), an active key of
+    blanks only counting as none. That sentinel's value names ``[store].key_provider``, which is
+    not this case's setting, so no caller may print the value: each prints
+    :func:`_unread_key_text`, which names the cause."""
     from messagefoundry.config.settings import (
         KEYLESS_REFUSED_BY_UNREAD_KEY,
         keyless_opt_out_refusal,
     )
-    from messagefoundry.store.base import retired_without_active_refusal
+    from messagefoundry.store.base import blank_active_key, retired_without_active_refusal
     from messagefoundry.store.keyprovider import unread_key_refusal
 
+    if blank_active_key(settings.store) and retired_without_active_refusal(settings.store):
+        # A key of blanks only reads as configured below, but it is no key (BACKLOG #5310, #5308).
+        return KEYLESS_REFUSED_BY_UNREAD_KEY
     if _store_key_configured(settings):
         return None
     if (

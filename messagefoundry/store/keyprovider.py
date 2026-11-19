@@ -9,7 +9,8 @@ stored format, ``rotate-key``, and every backend are **byte-identical** when ``[
 unset/``auto``.
 
 A :class:`KeyProvider` returns exactly the bytes :func:`~messagefoundry.store.crypto.make_cipher` already
-consumes — ``active_key()`` is the base64 of a 32-byte DEK (or ``None`` → identity cipher) and
+consumes — ``active_key()`` is the base64 of a 32-byte DEK (or ``None``, which gives the identity
+cipher when no retired key is set and is refused when one is, BACKLOG #5310, #5308) and
 ``retired_keys()`` is the decrypt-only keyring for a rotation window. Because the provider returns the
 *same* key bytes, existing ``mfenc:v1`` rows decrypt with **no rotation**.
 
@@ -62,7 +63,8 @@ class KeyProvider(Protocol):
     """How the store's active/retired DEK bytes are provisioned (ADR 0019 §1).
 
     The contract is exactly what :func:`~messagefoundry.store.crypto.make_cipher` accepts:
-    ``active_key()`` returns the base64 of a 32-byte DEK (or ``None`` → identity cipher) and
+    ``active_key()`` returns the base64 of a 32-byte DEK (or ``None``: the identity cipher when no
+    retired key is set, and refused when one is, BACKLOG #5310, #5308) and
     ``retired_keys()`` returns the per-element decrypt-only keyring (default ``()``)."""
 
     def active_key(self) -> str | None: ...
@@ -96,7 +98,8 @@ class EnvKeyProvider:
 class DpapiKeyProvider:
     """``dpapi`` — the Windows DPAPI-protected ``encryption_key_file`` ``CryptUnprotectData``'d into the
     base64 store key (WP-11d). A configured-but-unreadable/foreign file raises ``DpapiError`` here
-    (fail-closed); an unset file yields ``None`` (→ identity cipher)."""
+    (fail-closed); an unset file yields ``None`` (the identity cipher, or refused beside a retired
+    key, BACKLOG #5310, #5308)."""
 
     def __init__(self, settings: StoreSettings) -> None:
         self._settings = settings

@@ -2287,17 +2287,32 @@ def _decode_key(key_b64: str, name: str) -> bytearray:
     return bytearray(decoded)
 
 
-#: Why a keyring with retired keys and no active key is refused (BACKLOG #5310, #5308). The text
-#: reads only which settings are set, never a key. :func:`make_cipher` raises it, and so does the
-#: store's key seam (``store.base._checked_active_key``, through
-#: ``store.base.retired_without_active_refusal``); both count an entry as a key when it is not
-#: blank once stripped, as ``keyprovider._split_retired`` reads the setting.
+#: Why a keyring with retired keys and no active key is refused (BACKLOG #5310, #5308), under
+#: ``[store].cipher_provider = "aesgcm"``. The text reads only which settings are set, never a key.
+#: :func:`make_cipher` raises it, and so do the store's key seam and start gate (through
+#: ``store.base.retired_without_active_refusal``); every one counts an entry as a key when it is not
+#: blank once stripped, as ``keyprovider._split_retired`` reads the setting, and an active key of
+#: blanks only as no active key.
 RETIRED_WITHOUT_ACTIVE = (
     "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED is set but no active store key resolved "
     "(MEFOR_STORE_ENCRYPTION_KEY, [store].encryption_key_file or the [store].key_provider). "
     "That is a rotation missing its new key, so it is refused rather than run keyless: a keyless "
-    "store writes new rows, and a keyless DR backup its archive, unencrypted. Set the active key; "
-    "a store meant to run keyless lists no retired keys."
+    "store would write new rows unencrypted. Set the active key; a store meant to run keyless "
+    "lists no retired keys."
+)
+
+#: The same refusal under ``[store].cipher_provider = "vault_transit"`` (BACKLOG #5310, #5308).
+#: Transit encrypts the store's rows there whatever the local keys are, so the text does not claim
+#: the store would write rows unencrypted; what reads the local keys there is the DR backup and
+#: restore, and with no active key they cannot read the active local key.
+RETIRED_WITHOUT_ACTIVE_TRANSIT = (
+    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED is set but no active store key resolved "
+    "(MEFOR_STORE_ENCRYPTION_KEY, [store].encryption_key_file or the [store].key_provider). "
+    'Under [store].cipher_provider = "vault_transit" Transit still encrypts the store rows, but '
+    "the DR backup and restore read the local store keys, and with no active key they cannot read "
+    "one: a restore would decrypt under the retired keys alone. That is a rotation missing its new "
+    "key, so it is refused. Set the active key; a store meant to run with no local key lists no "
+    "retired keys."
 )
 
 
@@ -2309,21 +2324,25 @@ def make_cipher(
     allow_unmarked: bool = False,
 ) -> Cipher:
     """Build the store cipher. ``key_b64`` is the active key (base64 32-byte); ``retired_b64`` are
-    decrypt-only keys to keep available during a rotation window. No active key and no retired key →
-    identity cipher (the keyless store). No active key WITH a retired key raises ``ValueError``
-    (:data:`RETIRED_WITHOUT_ACTIVE`, BACKLOG #5310): that is a rotation missing its new key, and the
-    identity cipher would write new rows unencrypted. ``write_v2`` selects the cell-bound writer,
+    decrypt-only keys to keep available during a rotation window. No active key and no retired key
+    gives the identity cipher (the keyless store). No active key WITH a retired key raises
+    ``ValueError`` (:data:`RETIRED_WITHOUT_ACTIVE`, BACKLOG #5310): that is a rotation missing its
+    new key, and the identity cipher would write new rows unencrypted. An active key of blanks only
+    counts as no active key there; with no retired key it is refused as a key that does not decode,
+    as before. A retired entry of blanks only is no key when there is no active key, and is refused
+    as a key that does not decode beside one. ``write_v2`` selects the cell-bound writer,
     ``mfenc:v4`` under the store data sub-key since ADR 0196; ``open_store`` passes
     ``[store].aad_bind``, which defaults ON. Off here, the frozen v1 writer (CRYPTO-1: v1
     byte-identical). ``allow_unmarked`` is ``[store].allow_unmarked_ciphertext``: off, a keyed cipher
     refuses a non-blank unmarked value."""
-    if not key_b64:
+    if not key_b64 or not key_b64.strip():
         if any(k.strip() for k in retired_b64):
             raise ValueError(RETIRED_WITHOUT_ACTIVE)
-        return IdentityCipher()
-    # Every key decoded so far is wiped if a later one fails to decode, or the cipher's own build
-    # fails (BACKLOG #5310): the cipher wipes them as it installs each, so a failure before then
-    # leaves nothing else to. A second wipe of a key the cipher already wiped is harmless.
+        if not key_b64:
+            return IdentityCipher()
+    # Every key decoded is wiped on every exit (BACKLOG #5310): on a failure, before the cipher
+    # took them; on success, after the cipher wiped each as it installed it, so the second wipe
+    # finds zeros. The cipher keeps no reference to a buffer.
     keys: list[bytearray] = []
     try:
         # Named by role, not by one variable: the active key may come from
@@ -2336,14 +2355,14 @@ def make_cipher(
                 "the [store].key_provider)",
             )
         )
+        # Every non-empty entry is decoded, so one of blanks only is refused as a bad key, as before.
         for k in retired_b64:
-            if k.strip():  # a blank entry is no key, by the test the refusal above applies
+            if k:
                 keys.append(_decode_key(k, "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"))
         return AesGcmCipher(keys[0], keys[1:], write_v2=write_v2, allow_unmarked=allow_unmarked)
-    except BaseException:
+    finally:
         for buf in keys:
             _secure_zero(buf)
-        raise
 
 
 def generate_key() -> str:

@@ -28,6 +28,7 @@ from messagefoundry.store.base import (
 )
 from messagefoundry.store.crypto import (
     RETIRED_WITHOUT_ACTIVE,
+    RETIRED_WITHOUT_ACTIVE_TRANSIT,
     AesGcmCipher,
     IdentityCipher,
     generate_key,
@@ -140,10 +141,8 @@ def test_resolve_decrypt_keys_still_returns_the_keyring_when_an_active_key_is_se
 
 
 def test_blank_retired_settings_are_no_retired_key_at_any_seam() -> None:
-    # The settings seam and make_cipher read a blank entry alike: no key, so keyless as before,
-    # and beside an active key a blank entry is skipped, not decoded as a bad key.
-    active = generate_key()
-    assert isinstance(make_cipher(active, ["  "]), AesGcmCipher)
+    # The settings seam and make_cipher read a blank entry alike when there is no active key: no
+    # key, so keyless as before.
     keyless = StoreSettings(encryption_keys_retired=" , ")
     assert resolve_active_key(keyless) is None
     assert resolve_decrypt_keys(keyless) == []
@@ -158,8 +157,76 @@ def test_under_vault_transit_the_dr_key_resolves_and_the_gate_still_refuse() -> 
     for resolve in (resolve_active_key, resolve_decrypt_keys):
         with pytest.raises(StoreCipherConfigError) as caught:
             resolve(store)
-        assert str(caught.value) == RETIRED_WITHOUT_ACTIVE
+        assert str(caught.value) == RETIRED_WITHOUT_ACTIVE_TRANSIT
     assert _keyless_store_gate(ServiceSettings(store=store)) == KEYLESS_REFUSED_BY_UNREAD_KEY
+
+
+def test_under_vault_transit_the_refusal_text_does_not_claim_unencrypted_rows() -> None:
+    # Transit encrypts the rows whatever the local keys are, so the text names what does read
+    # them there, the DR backup and restore, and keeps the refusal (BACKLOG #5310, #5308).
+    store = StoreSettings(cipher_provider="vault_transit", encryption_keys_retired=generate_key())
+    text = _unread_key_text(ServiceSettings(store=store))
+    assert "unencrypted" not in text
+    assert "vault_transit" in text and "DR backup and restore" in text
+    # The control: under aesgcm the text does name the unencrypted rows.
+    aesgcm = StoreSettings(encryption_keys_retired=generate_key())
+    assert "write new rows unencrypted" in _unread_key_text(ServiceSettings(store=aesgcm))
+
+
+# --- a path that skips the key seam keeps the text (BACKLOG #5310, #5308) ------------------------
+
+
+@pytest.mark.parametrize("host_key", ["", "   "])
+def test_a_host_key_that_is_no_key_beside_a_retired_key_keeps_the_text(host_key: str) -> None:
+    # A host key does not pass _checked_active_key, so the build records the refusal itself rather
+    # than letting make_cipher's unrecorded ValueError be replaced by the generic text.
+    settings = StoreSettings(encryption_keys_retired=generate_key())
+    with pytest.raises(StoreCipherConfigError) as caught:
+        build_store_cipher(settings, host_key=host_key)
+    assert str(caught.value) == RETIRED_WITHOUT_ACTIVE
+    assert caught.value.__cause__ is None
+
+
+# --- an active key of blanks only is no active key (BACKLOG #5310, #5308) ------------------------
+
+
+def test_make_cipher_reads_a_blank_active_key_as_no_key_beside_a_retired_key() -> None:
+    with pytest.raises(ValueError) as caught:
+        make_cipher("   ", [generate_key()])
+    assert str(caught.value) == RETIRED_WITHOUT_ACTIVE
+    # The control: with no retired key a blank active key is still refused as a bad key, never
+    # the identity cipher.
+    with pytest.raises(ValueError, match="must be valid base64") as bare:
+        make_cipher("   ")
+    assert str(bare.value) != RETIRED_WITHOUT_ACTIVE
+
+
+@pytest.mark.parametrize("provider", ["auto", "env"])
+def test_a_blank_active_key_beside_a_retired_key_is_refused_at_every_seam(provider: str) -> None:
+    store = StoreSettings(
+        key_provider=provider, encryption_key="   ", encryption_keys_retired=generate_key()
+    )
+    for resolve in (resolve_active_key, resolve_decrypt_keys, build_store_cipher):
+        with pytest.raises(StoreCipherConfigError) as caught:
+            resolve(store)
+        assert str(caught.value) == RETIRED_WITHOUT_ACTIVE
+    settings = ServiceSettings(store=store)
+    assert _keyless_store_gate(settings) == KEYLESS_REFUSED_BY_UNREAD_KEY
+    assert _unread_key_text(settings) == RETIRED_WITHOUT_ACTIVE
+    # The control: with no retired key the gate leaves a blank key to the open, as before.
+    blank_only = StoreSettings(key_provider=provider, encryption_key="   ")
+    assert _keyless_store_gate(ServiceSettings(store=blank_only)) is None
+
+
+# --- a blank retired entry beside an active key is still a bad key (BACKLOG #5310) ---------------
+
+
+def test_a_blank_retired_entry_beside_an_active_key_is_refused_as_before() -> None:
+    with pytest.raises(ValueError, match="MEFOR_STORE_ENCRYPTION_KEYS_RETIRED"):
+        make_cipher(generate_key(), ["  "])
+    # The control: the settings split drops it, so the store build beside an active key does not.
+    settings = StoreSettings(encryption_key=generate_key(), encryption_keys_retired=" , ")
+    assert isinstance(build_store_cipher(settings), AesGcmCipher)
 
 
 def test_the_start_gate_refuses_before_the_open_whatever_the_opt_out_says() -> None:

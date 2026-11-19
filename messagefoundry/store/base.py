@@ -71,6 +71,7 @@ from messagefoundry.store.content_search import (
 )
 from messagefoundry.store.crypto import (
     RETIRED_WITHOUT_ACTIVE,
+    RETIRED_WITHOUT_ACTIVE_TRANSIT,
     AuditMacFn,
     Cipher,
     CipherError,
@@ -3800,15 +3801,36 @@ def resolve_active_key(settings: StoreSettings, *, posture: HopPosture | None = 
 def retired_without_active_refusal(settings: StoreSettings) -> str | None:
     """Why a retired key with no active key is refused, or ``None`` when no retired key is set
     (BACKLOG #5310, #5308). The caller has found no active key: :func:`_checked_active_key` after
-    the provider resolved none, and the start gate after it found none configured. The text is
-    ``make_cipher``'s, and an entry counts as a key by the same test, not blank once stripped.
+    the provider resolved none or a key of blanks only, the cipher build after it was handed one,
+    and the start gate after it found none configured or :func:`blank_active_key`. An entry counts
+    as a key by ``make_cipher``'s test, not blank once stripped.
 
-    It applies under every ``cipher_provider``. Under ``vault_transit`` the store cipher reads no
-    local key and never reaches :func:`_checked_active_key`, so the store open does not refuse
-    there; what reads a local key there, the start gate and the DR backup and restore, does."""
+    It applies under every ``cipher_provider``, with the text for that provider:
+    :data:`~messagefoundry.store.crypto.RETIRED_WITHOUT_ACTIVE_TRANSIT` under ``vault_transit``,
+    where Transit encrypts the rows, else ``make_cipher``'s own. Under ``vault_transit`` the store
+    cipher reads no local key and never reaches :func:`_checked_active_key`, so the store open does
+    not refuse there; what reads a local key there, the start gate and the DR backup and restore,
+    does."""
     if not _split_retired(settings.encryption_keys_retired):
         return None
+    if settings.cipher_provider == "vault_transit":
+        return RETIRED_WITHOUT_ACTIVE_TRANSIT
     return RETIRED_WITHOUT_ACTIVE
+
+
+def blank_active_key(settings: StoreSettings) -> bool:
+    """Is ``MEFOR_STORE_ENCRYPTION_KEY`` set to blanks only, where the built-in provider reads it
+    (BACKLOG #5310, #5308)? ``auto`` and ``env`` return that value as the active key. Beside a
+    retired key it counts as no active key, so the start gate refuses it as
+    :func:`_checked_active_key` and ``make_cipher`` do; with no retired key it is left to the
+    open, which refuses it as a key that does not decode."""
+    key = settings.encryption_key
+    return (
+        key is not None
+        and key != ""
+        and not key.strip()
+        and settings.key_provider in ("auto", "env")
+    )
 
 
 def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
@@ -3823,8 +3845,11 @@ def _checked_active_key(key: str | None, settings: StoreSettings) -> str | None:
         unread_key_refusal,
     )
 
-    if key:
+    if key and key.strip():
         return key
+    # A key of blanks only falls through, so beside a retired key it is refused as no key, as
+    # ``make_cipher`` refuses it (BACKLOG #5310, #5308); with none it is returned below, and the
+    # cipher build refuses it as a key that does not decode, as before.
     # Each text is built from the settings alone, so it is recorded (:func:`_recorded`) and a site
     # that replaces the refusal keeps it.
     if settings.key_provider in _EXTERNAL_PROVIDERS:
@@ -4376,8 +4401,14 @@ def _build_store_cipher(
             "(expected 'aesgcm' or 'vault_transit')"
         )
     retired = _split_retired(settings.encryption_keys_retired)
+    active = host_key if host_key is not None else resolve_active_key(settings, posture=posture)
+    if retired and not (active and active.strip()):
+        # ``make_cipher`` refuses this too, but its ``ValueError`` is not recorded, so the build's
+        # fixed-text replacement would print :data:`_UNTEXTED` in its place. Refused here, recorded,
+        # for a key that did not pass :func:`_checked_active_key`: a host key (BACKLOG #5310, #5308).
+        raise _recorded(StoreCipherConfigError(RETIRED_WITHOUT_ACTIVE), RETIRED_WITHOUT_ACTIVE)
     return make_cipher(
-        host_key if host_key is not None else resolve_active_key(settings, posture=posture),
+        active,
         retired,
         write_v2=settings.aad_bind,
         allow_unmarked=settings.allow_unmarked_ciphertext,
