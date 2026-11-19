@@ -784,6 +784,24 @@ def _outbound_down_detail(rr: RegistryRunner, name: str) -> str:
     return f"outbound {name!r} is not running — start it before resending"
 
 
+def _inbound_down_detail(rr: RegistryRunner, name: str) -> str:
+    """The 409 reason for an upload resend into an inbound that is not running. As
+    :func:`_outbound_down_detail` does for an outbound, it names a downed graph (BACKLOG #5702) or
+    a node that lost its cluster lease (BACKLOG #5906) rather than pointing at a start the inbound
+    start door refuses there."""
+    if not rr.running:
+        return (
+            f"inbound {name!r} is not running because this engine's graph is not running "
+            "(stopped, or a demoted node); resend through the engine that runs the graph"
+        )
+    if not rr.coordinator.is_leader():
+        return (
+            f"inbound {name!r} is not running and this node no longer holds the cluster lease, so "
+            "it starts no connection; resend through the leader"
+        )
+    return f"inbound {name!r} is not running — start it before resending"
+
+
 def _live_outbound_status(rr: RegistryRunner, name: str) -> str:
     """One outbound's live display state, gated on the runner's own ``running`` flag.
 
@@ -9595,9 +9613,7 @@ def create_app(
             raise HTTPException(404, f"no such inbound connection: {body.to}")
         try:
             if not rr.inbound_running(body.to):
-                raise HTTPException(
-                    409, f"inbound {body.to!r} is not running — start it before resending"
-                )
+                raise HTTPException(409, _inbound_down_detail(rr, body.to))
         except KeyError:
             raise HTTPException(404, f"no such inbound connection: {body.to}") from None
         # Object-level authorization on the SOURCE file, in ADDITION to the target-channel check above.
