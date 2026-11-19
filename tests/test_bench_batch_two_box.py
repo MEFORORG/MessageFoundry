@@ -467,10 +467,10 @@ def _install_driver_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamesp
         argv: list[str], report_path: Path, cwd: Path, *, timeout: float
     ) -> dict[str, Any]:
         rec.spawned.append(list(argv))
-        # The drive bounds every band by its own hold and drain plus the slack (BACKLOG #5304).
+        # The drive bounds every band by its hold and both drain windows plus the slack (BACKLOG #5304).
         hold = float(argv[argv.index("--hold-seconds") + 1])
         drain = float(argv[argv.index("--drain-timeout") + 1])
-        assert timeout == hold + drain + bb._REMOTE_PROC_SLACK, timeout
+        assert timeout == hold + 2 * drain + bb._REMOTE_PROC_SLACK, timeout
         # The arm is recoverable from the per-proc report filename (it carries the cell id).
         b1 = "-bt1-" in report_path.name
         share = int(argv[argv.index("--count") + 1])
@@ -698,21 +698,39 @@ async def test_a_failed_remote_process_never_reads_an_earlier_runs_report(tmp_pa
 async def test_a_hung_remote_process_is_killed_and_fails_the_band(tmp_path: Path) -> None:
     """BACKLOG #5304: a ``connscale-remote`` child that never exits must not hang the driver. Past
     its bound it is killed and the band fails with a reason, even though it wrote a report."""
+    import asyncio
+
+    psutil = pytest.importorskip("psutil")
     report = tmp_path / "hung.json"
     marker = tmp_path / "hung.pid"
     child = (
-        "import os, time; "
-        f"open({str(marker)!r}, 'w').write(str(os.getpid())); "
+        "import os, sys, time; "
+        "sys.stderr.write('stuck in the port preflight'); sys.stderr.flush(); "
         f"open({str(report)!r}, 'w').write('{{\"sent\": 3}}'); "
+        f"open({str(marker)!r}, 'w').write(str(os.getpid())); "
         "time.sleep(120)"
     )
-    with pytest.raises(ConnScaleError, match="still running after 2s and was killed"):
-        await bb._run_remote_proc([sys.executable, "-c", child], report, tmp_path, timeout=2.0)
-    assert marker.exists()
-    # The child is gone, not orphaned: its pid no longer names a running process.
-    psutil = pytest.importorskip("psutil")
+    # A bound wide enough for a loaded runner to start the interpreter and reach the sleep.
+    with pytest.raises(
+        ConnScaleError, match="still running after 6s and was killed: stuck in the port preflight"
+    ):
+        await bb._run_remote_proc([sys.executable, "-c", child], report, tmp_path, timeout=6.0)
+    # The child is gone, not orphaned. Polled, because a venv launcher's interpreter is a
+    # grandchild that its job object ends just after the launcher is reaped.
     pid = int(marker.read_text(encoding="utf-8"))
-    assert not psutil.pid_exists(pid) or psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+
+    def gone() -> bool:
+        try:
+            return bool(psutil.Process(pid).status() == psutil.STATUS_ZOMBIE)
+        except psutil.NoSuchProcess:
+            return True
+
+    for _ in range(100):
+        if gone():
+            break
+        await asyncio.sleep(0.1)
+    else:
+        pytest.fail(f"the hung child {pid} outlived the kill")
     # CONTROL: the same bound admits a child that finishes inside it.
     quick = f"open({str(report)!r}, 'w').write('{{\"sent\": 4}}')"
     assert await bb._run_remote_proc(
@@ -746,8 +764,23 @@ async def test_a_remote_process_that_failed_after_writing_a_report_fails_the_ban
     assert await bb._run_remote_proc(child(verdict), report, tmp_path, timeout=60.0) == verdict
 
 
-def test_the_band_bound_is_hold_plus_drain_plus_the_slack() -> None:
-    assert bb._remote_proc_timeout(60.0, 300.0) == 360.0 + bb._REMOTE_PROC_SLACK
+def test_the_band_bound_covers_the_hold_and_both_drain_windows() -> None:
+    # The child awaits the drain and then samples until reconciled, each up to drain_timeout.
+    assert bb._remote_proc_timeout(60.0, 300.0) == 660.0 + bb._REMOTE_PROC_SLACK
+
+
+async def test_a_partial_report_fails_the_band_with_its_exit_and_reason(tmp_path: Path) -> None:
+    """A child that dies mid-write leaves a report that is not JSON. The band fails naming the exit
+    code and the stderr reason, not a bare JSONDecodeError."""
+    report = tmp_path / "partial.json"
+    child = (
+        f"import sys; open({str(report)!r}, 'w').write('{{\"sent\": '); "
+        "sys.stderr.write('OSError: no space left on device'); sys.exit(1)"
+    )
+    with pytest.raises(
+        ConnScaleError, match="exited 1 and its report .* is not JSON .*no space left"
+    ):
+        await bb._run_remote_proc([sys.executable, "-c", child], report, tmp_path, timeout=60.0)
 
 
 def test_batch_engine_cli_threads_flags(monkeypatch: pytest.MonkeyPatch) -> None:
