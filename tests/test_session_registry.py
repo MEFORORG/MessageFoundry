@@ -25,6 +25,7 @@ import os
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -583,12 +584,14 @@ def _fleet(
     raw_records: dict[str, str] | None = None,
     extra_seats: dict[str, str] | None = None,
     fleet_args: list[str] | None = None,
+    prepare: Callable[[Path], None] | None = None,
 ) -> tuple[subprocess.CompletedProcess[str], Path]:
     """Run fleet.ps1 -Json over one seat whose own registry record is DEAD, beside an optional
     registry record that names no session. The record's cwd is the seat's worktree, or another
     worktree, unless ``anonymous`` sets its own. ``raw_records`` maps more registry file names to
     their exact text, and ``extra_seats`` more seat boxes to the exact text of one seat record in
-    each. ``fleet_args`` replaces ``-Json``. Returns the run and the anonymous record's path."""
+    each. ``fleet_args`` replaces ``-Json``. ``prepare`` gets the repo after its first commit.
+    Returns the run and the anonymous record's path."""
     home = tmp_path / "home"
     root = home / ".claude"
     (root / "sessions").mkdir(parents=True)
@@ -609,6 +612,8 @@ def _fleet(
         + ["-m", "base"],
     ):
         subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    if prepare is not None:
+        prepare(repo)
     shared = tmp_path / "shared"
     seat_dir = shared / "seats" / "box-5491"
     seat_dir.mkdir(parents=True)
@@ -788,22 +793,41 @@ def _live_named_record(cwd: Path) -> str:
     )
 
 
+def _linked_worktree(repo: Path) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(repo.parent / "repo-wt")],
+        check=True,
+        capture_output=True,
+    )
+
+
+def _nested_repo(repo: Path) -> None:
+    (repo / "nested" / ".git").mkdir(parents=True)
+
+
 @pytest.mark.parametrize(
-    ("where", "counted"),
-    [("repo/sub/dir", 1), ("repo-other", 0)],
-    ids=["subdirectory", "sibling-prefix"],
+    ("where", "counted", "prepare"),
+    [
+        ("repo/sub/dir", 1, None),
+        ("repo-wt/sub", 1, _linked_worktree),
+        ("repo-other", 0, None),
+        ("repo/nested/sub", 0, _nested_repo),
+    ],
+    ids=["subdirectory", "linked-worktree-subdirectory", "sibling-prefix", "nested-repository"],
 )
 def test_fleet_counts_a_live_session_in_a_worktree_subdirectory_in_its_denominator(
-    tmp_path: Path, where: str, counted: int
+    tmp_path: Path, where: str, counted: int, prepare: Callable[[Path], None] | None
 ) -> None:
     """BACKLOG #5485. A live session whose cwd is a subdirectory of one of this repo's worktrees is
     a session in that worktree. Exact equality left it out of liveSessionsWithoutRecord, so the
     roster read complete without it. A sibling directory sharing the name as a prefix is not inside
-    the worktree, and stays out."""
-    # Not created: the denominator compares paths and never reads the directory, and _fleet makes
-    # the repo itself.
+    the worktree, and nor is a directory under another repository nested in it."""
+    # The cwd is not created: the denominator compares paths. A nested .git is what it reads.
     proc, _ = _fleet(
-        tmp_path, None, raw_records={"99485.json": _live_named_record(tmp_path / where)}
+        tmp_path,
+        None,
+        raw_records={"99485.json": _live_named_record(tmp_path / where)},
+        prepare=prepare,
     )
     j = _fleet_json(proc)
     assert j["receipt"]["liveSessionsWithoutRecord"] == counted, j["receipt"]

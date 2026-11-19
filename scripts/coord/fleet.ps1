@@ -127,9 +127,11 @@ if (Test-Path -LiteralPath $seatsDir) {
                 $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop
                 $records += [pscustomobject]@{ Rec = $j; File = $f.FullName; Box = $d.Name }
             } catch {
+                # Deleted between the listing and the read: a file that is gone holds no seat.
+                if (-not (Test-Path -LiteralPath $f.FullName)) { continue }
                 # A record being written RIGHT NOW has exactly this shape. Counted, never dropped:
                 # dropping turns an occupied seat into an absent one in the receipt's own numbers.
-                # It also fires a stop below: an unread seat is a seat the roster cannot show.
+                # It also fires a stop below: an unread record may be a seat the roster cannot show.
                 $unreadableRecordFiles += $f.FullName
             }
         }
@@ -162,16 +164,25 @@ if ($wtOut) {
     }
 }
 
-# True when a normalised cwd is one of this repo's worktrees or inside one, so a session in a
-# subdirectory counts in the denominator (BACKLOG #5485). The boundary is a separator, so `repo-other`
-# is not inside `repo`; both sides are lower-cased by ConvertTo-RegistryNormPath.
-function Test-CwdInRepoWorktree([string]$Cwd) {
-    if (-not $Cwd) { return $false }
-    foreach ($w in $repoWorktrees) {
-        if (-not $w) { continue }
-        if ($Cwd -ceq $w -or $Cwd.StartsWith($w + '\', [System.StringComparison]::Ordinal)) { return $true }
+# The worktree of this repo that holds a normalised cwd, or $null, so a session in a subdirectory
+# counts in the denominator (BACKLOG #5485). It walks up the cwd's ancestors to the nearest worktree
+# (the innermost, where worktrees nest), so the boundary is a separator and `repo-other` is not inside
+# `repo`. Both sides are lower-cased by ConvertTo-RegistryNormPath. A directory with its own .git
+# between the cwd and that worktree is another repository's tree, so the cwd is not this repo's.
+$repoWorktreeSet = [System.Collections.Generic.HashSet[string]]::new([string[]]@($repoWorktrees | Where-Object { $_ }), [System.StringComparer]::Ordinal)
+function Get-ContainingRepoWorktree([string]$Cwd) {
+    $below = @()
+    $p = $Cwd
+    while ($p) {
+        if ($repoWorktreeSet.Contains($p)) {
+            foreach ($b in $below) { if (Test-Path -LiteralPath "$b\.git") { return $null } }
+            return $p
+        }
+        $below += $p
+        $cut = $p.LastIndexOf('\')
+        $p = if ($cut -gt 0) { $p.Substring(0, $cut) } else { '' }
     }
-    return $false
+    return $null
 }
 
 # LIVE sessions sitting in this repo's worktrees. This is the denominator: a session here that has
@@ -183,7 +194,8 @@ foreach ($row in $sessionRows) {
     # properties, and `.PSObject.Properties.Name` on it throws under StrictMode (BACKLOG #5491).
     $rawCwd = [string](Get-RecordField $row.Record 'cwd')
     $cwd = Get-NormPath $rawCwd
-    if (-not (Test-CwdInRepoWorktree $cwd)) { continue }
+    $holder = Get-ContainingRepoWorktree $cwd
+    if (-not $holder) { continue }
     # A record that names no session is still a live session here, whatever its age, so it counts,
     # and it counts in liveWithoutRecord below too: no seat record can be matched to it, so the
     # roster is incomplete by it until it names its session.
@@ -194,7 +206,8 @@ foreach ($row in $sessionRows) {
         $liveInRepo += [pscustomobject]@{
             SessionId = $liveSid
             Cwd       = $cwd
-            Box       = (ConvertTo-BoxKey -Path $rawCwd)
+            # The worktree's box, not the cwd's: a subdirectory names a box no seat writes.
+            Box       = (ConvertTo-BoxKey -Path $holder)
             Root      = $row.Root
         }
     }
@@ -553,7 +566,7 @@ foreach ($r in $records) {
 # ---------------------------------------------------------------------------------------------
 
 $stops = @()
-if ($unreadableRecordFiles.Count -gt 0) { $stops += "recordsUnreadable=$($unreadableRecordFiles.Count) -- these seat record(s) could not be read or parsed, so the seats they hold are absent from the roster below and it is INCOMPLETE by them (a record being rewritten right now reads this way; run again): $($unreadableRecordFiles -join '; ')" }
+if ($unreadableRecordFiles.Count -gt 0) { $stops += "recordsUnreadable=$($unreadableRecordFiles.Count) -- these seat record(s) could not be read or parsed, so a seat they hold may be absent from the roster below and it may be INCOMPLETE by them (a record being rewritten right now reads this way; run again): $($unreadableRecordFiles -join '; ')" }
 if (-not $fenceAvailable) { $stops += 'fenceAvailable=false -- no config root with a sessions/ directory was found; every state below would be a guess' }
 if ($anonymousReadError) { $stops += "anonymousLiveRecords=UNREAD -- the scan for registry records that name no session failed ($anonymousReadError), so a relaunched seat could read INTERRUPTED below" }
 if ($anonymousNoCwd.Count -gt 0) { $stops += "anonymousLiveRecordsWithNoCwd=$($anonymousNoCwd.Count) -- registry record(s) name no session, are live or freshly written, and name no readable cwd ($($anonymousNoCwd -join '; ')), so no seat can be told apart from a relaunch of it" }
