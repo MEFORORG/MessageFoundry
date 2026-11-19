@@ -27,8 +27,9 @@ directory pytest runs in. The editable install gives that: it puts the checkout 
 The CI jobs that ran pytest when this was written installed editable, and so does
 ``scripts/worktree/ensure-venv.ps1``; a job that installs otherwise fails at startup. For a
 run that loads either conftest this is no new requirement, since both import ``tests`` already. A
-root-configured run that loads neither did not need it before, and under an install that does not
-put the checkout root on ``sys.path`` it now fails at startup.
+run under either config that loads neither, at least a root-configured one and a console-configured
+``--noconftest`` run, did not need it before, and under an install that does not put the checkout
+root on ``sys.path`` it now fails at startup.
 
 No repo-root ``conftest.py`` registers it: importing one under pytest's default ``prepend`` mode
 moves the repository root to the front of ``sys.path``, which silences the cross-checkout refusal
