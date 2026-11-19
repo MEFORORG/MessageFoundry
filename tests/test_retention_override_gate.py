@@ -202,13 +202,14 @@ def test_the_override_text_states_what_the_purge_keeps(
     text = verdict.refusal if enforcing and not acknowledged else verdict.report
     assert text is not None
     inbound_scope = (
-        "It does not keep their dead-lettered ingress, routed or outbound rows, or a streaming "
-        "attachment the purge of the last of those rows releases: a dead ingress or routed row is "
-        "purged on the global [retention].dead_letter_days window"
+        "It does not keep their dead-lettered rows at any stage, or a streaming attachment the "
+        "purge of the last of those rows releases: a dead row that names no outbound is purged on "
+        "the global [retention].dead_letter_days window"
     )
     outbound_scope = (
-        "It does not keep a reply that outbound captured, which is purged on the message-body "
-        "window of the inbound that received the message"
+        "It does not keep what the purge of message bodies holds for those messages, at least the "
+        "stored body, the delivered and cancelled payloads, the event detail and the replies that "
+        "outbound captured"
     )
     assert (inbound_scope in text) is inbound_named
     assert (outbound_scope in text) is outbound_named

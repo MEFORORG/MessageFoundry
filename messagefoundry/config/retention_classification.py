@@ -563,6 +563,11 @@ def keep_forever_overrides(registry: Registry) -> tuple[str, ...]:
     )
 
 
+def _window_setting(field: str) -> str:
+    """The service setting that holds the global PL-1 window whose field is ``field``."""
+    return next(w.setting for w in PHI_RETENTION_WINDOWS if w.field == field)
+
+
 def _override_scope(kept: tuple[str, ...]) -> str:
     """What each kind of override in ``kept`` keeps and does not keep, so the refusal and the
     ``AUDIT:`` line promise no more than the store does (BACKLOG #5967).
@@ -572,25 +577,30 @@ def _override_scope(kept: tuple[str, ...]) -> str:
     an outbound's ``dead_letter_days`` the cutoff of ``purge_dead_letters``, keyed on the dead
     row's outbound. Read their docstrings for what each blanks. The lists in the text say "at
     least", because a closed list here would go false when a purge gains a tier."""
+    dead_global = _window_setting("dead_letter_days")
+    body_global = _window_setting("messages_days")
     parts = []
     if any(entry.startswith("inbound ") for entry in kept):
         parts.append(
-            "An inbound override keeps forever at least what the purge of message bodies holds for "
-            "the messages that inbound received: each stored body, though the inbound's own "
-            "prune_documents_after, where set, still strips embedded documents from it; its "
-            "delivered and cancelled outbound payloads, its event detail and the replies captured "
-            "for it. It does not keep their dead-lettered ingress, routed or outbound rows, or a "
-            "streaming attachment the purge of the last of those rows releases: a dead ingress or "
-            "routed row is purged on the global [retention].dead_letter_days window and a dead "
-            "outbound row on that outbound's own dead-letter window, each where that window is "
-            "bounded."
+            "An inbound override keeps forever, while that inbound stays in the live graph with "
+            "it, at least what the purge of message bodies holds for the messages that inbound "
+            "received: each stored body, though the inbound's own prune_documents_after, where "
+            "set, still strips embedded documents from it; its delivered and cancelled outbound "
+            "payloads, its event detail and the replies captured for it. It does not keep their "
+            "dead-lettered rows at any stage, or a streaming attachment the purge of the last of "
+            "those rows releases: a dead row that names no outbound is purged on the global "
+            f"{dead_global} window, and a dead outbound row on that outbound's own override or "
+            "else the global window, each where that window is bounded."
         )
     if any(entry.startswith("outbound ") for entry in kept):
         parts.append(
-            "An outbound override keeps forever at least that outbound's own dead-lettered rows, "
-            "with their payloads, error text and any streaming attachment they still hold. It does "
-            "not keep a reply that outbound captured, which is purged on the message-body window "
-            "of the inbound that received the message, where that window is bounded."
+            "An outbound override keeps forever, while that outbound stays in the live graph with "
+            "it, at least that outbound's own dead-lettered rows, with their payloads, error text "
+            "and any streaming attachment they still hold. It does not keep what the purge of "
+            "message bodies holds for those messages, at least the stored body, the delivered and "
+            "cancelled payloads, the event detail and the replies that outbound captured: those "
+            "are purged on the body window of the inbound that received the message, its own "
+            f"override or else the global {body_global}, where that window is bounded."
         )
     return " ".join(parts)
 
@@ -635,8 +645,8 @@ def _override_audit_line(
 
     ``basis`` says why the gate passed it and ``status`` what that means. Every arm opens with the
     same sentence, so a search of the logs for a keep-forever override finds each of them; the
-    scope text of :func:`_override_scope` follows it, and under ``enforcement = warn`` the remedy
-    follows that. ``env_name`` is ``None`` where no environment is active, and the line then names
+    scope text of :func:`_override_scope` follows it, and where the graph passes under
+    ``enforcement = warn`` with no acknowledgement the remedy follows that. ``env_name`` is ``None`` where no environment is active, and the line then names
     none."""
     where = f" (environment {env_name!r})" if env_name is not None else ""
     return (

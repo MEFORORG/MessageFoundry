@@ -1325,9 +1325,7 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 >
 > **Under `enforce`, an override of `0` needs the same acknowledgement as a global `0`** (BACKLOG
 > #2368). It keeps that connection's PHI bodies forever, whatever the global window says, but not
-> every row about its messages: an inbound's `0` leaves their dead-lettered rows to the dead-letter
-> windows, and an outbound's `0` leaves the replies it captured to the receiving inbound's body
-> window (BACKLOG #5967). The refusal and the `AUDIT:` line state which. The
+> every row about its messages; the refusal and the `AUDIT:` line state which (BACKLOG #5967). The
 > overrides live in the graph, so `serve` checks them when it loads the graph, at least at startup
 > and on every config reload:
 >
