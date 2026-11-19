@@ -34,6 +34,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -42,6 +43,7 @@ from messagefoundry.config.settings import CertMonitorSettings
 from messagefoundry.config.wiring import MLLP, InboundConnection, Registry
 from messagefoundry.pipeline.alerts import crl_expiry_detail
 from messagefoundry.pipeline.cert_expiry import (
+    CertCheck,
     CertExpiryRunner,
     MonitoredCert,
     certs_from_registry,
@@ -93,11 +95,10 @@ def _pass(runner: CertExpiryRunner, caplog: pytest.LogCaptureFixture) -> None:
 def _scan(
     registry: Registry,
     caplog: pytest.LogCaptureFixture,
-    sink: _RecordingSink | None = None,
     extra: Sequence[MonitoredCert] = (),
 ) -> _RecordingSink:
     """One pass of a new monitor over the registry's rows."""
-    sink = sink or _RecordingSink()
+    sink = _RecordingSink()
     _pass(_runner(registry, sink, extra), caplog)
     return sink
 
@@ -272,47 +273,28 @@ def test_two_spellings_of_one_path_and_a_settings_row_fold_together(
     assert len(_mine(sink, site.crl)) == 3  # and still one alert for each row
 
 
-class _ReplacingSink(_RecordingSink):
-    """Makes the CRL file unparseable when the first row's alert arrives, so the rows after it
-    read other bytes: a file replaced part way through a pass."""
-
-    def __init__(self, crl: Path) -> None:
-        super().__init__()
-        self._crl = crl
-
-    def crl_expiry(
-        self,
-        name: str,
-        *,
-        path: str,
-        not_after: str,
-        days_remaining: int,
-        held_copy: bool = False,
-        detail: str = "",
-        shared_with: tuple[str, ...] = (),
-    ) -> None:
-        super().crl_expiry(
-            name,
-            path=path,
-            not_after=not_after,
-            days_remaining=days_remaining,
-            held_copy=held_copy,
-            detail=detail,
-            shared_with=shared_with,
-        )
-        self._crl.write_bytes(b"not a CRL\n")
-
-
 def test_a_file_replaced_part_way_through_a_pass_is_logged_again(
-    ca: _Ca, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ca: _Ca, tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Each row reads the file itself. The first row finds a pending reload; the file then changes
     # and the second finds one it cannot parse. That is another account of the file, so the fold
     # must not swallow it: it is logged, once, and the third row's copy of it is folded. Before the
     # fix this pass logged three lines.
     site = _site(ca, tmp_path, 3)
+    runner = _runner(site.registry, _RecordingSink())
+    inspect = runner._inspect
 
-    _scan(site.registry, caplog, _ReplacingSink(site.crl))
+    def replacing_inspect(cert: MonitoredCert, *args: Any, **kwargs: Any) -> CertCheck | None:
+        # The file is made unparseable once the first CRL row has read it, so the rows after it
+        # read other bytes: a file replaced part way through a pass. Hooked on the inspection, not
+        # an alert, because the alerts follow the whole collection (vault BACKLOG #5885).
+        check = inspect(cert, *args, **kwargs)
+        if cert.kind == "crl":
+            site.crl.write_bytes(b"not a CRL\n")
+        return check
+
+    monkeypatch.setattr(runner, "_inspect", replacing_inspect)
+    _pass(runner, caplog)
 
     lines = site.lines(caplog)
     assert len(lines) == 2
