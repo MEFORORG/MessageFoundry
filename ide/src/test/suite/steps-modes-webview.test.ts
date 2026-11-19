@@ -578,6 +578,22 @@ suite("Steps webview: a route row shows and edits its Handler names as a list", 
     assert.strictEqual(p.field(7, "handlers").querySelector("input.edit"), null);
   });
 
+  test("a cleared handlers field posts nothing and puts the names back", () => {
+    const p = loadPage([STATIC_ROUTE]);
+    const input = p.field(6, "handlers").querySelector("input.edit");
+    const before = p.posted.length;
+    change(p, input, " , ");
+    assert.deepStrictEqual(sent(p, before), [], "no write of return []");
+    assert.strictEqual(input.value, "adt_handler, oru_handler");
+  });
+
+  test("a Handler name the comma list cannot carry keeps the field read-only", () => {
+    for (const name of ["Lab, Results", " padded"]) {
+      const p = loadPage([{ ...STATIC_ROUTE, handlers: ["adt_handler", name] }]);
+      assert.strictEqual(p.field(6, "handlers").querySelector("input.edit"), null, name);
+    }
+  });
+
   test("a routed-nowhere route offers no handlers field (a bare return takes no list)", () => {
     const vm = buildRowViewModel({ ...STATIC_ROUTE, handlers: [], unrouted: true }, 0, LINES);
     assert.deepStrictEqual(vm.params, []);

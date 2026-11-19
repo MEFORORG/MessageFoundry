@@ -635,6 +635,14 @@ suite("Steps update-loop guard — a suppressed document change is DEFERRED, not
     rebaser.noteApplied(applied, kept);
     assert.strictEqual(rebaser.rebase(sameRow).expectSrc, "    a(1)");
     assert.strictEqual(rebaser.rebase(otherRow), otherRow);
+    // An edit posted after a re-projection mid-drain carries a text the row held after a write.
+    const reprojected: EditMessage = { ...sameRow, expectSrc: "    a(1)" };
+    rebaser.noteApplied({ ...sameRow, expectSrc: "    a(1)" }, {
+      before: kept.after,
+      after: "def h():\n    a(2)\n    b()",
+    });
+    assert.strictEqual(rebaser.rebase(reprojected).expectSrc, "    a(2)");
+    assert.strictEqual(rebaser.rebase(sameRow).expectSrc, "    a(2)");
     rebaser.noteApplied(applied, grown);
     assert.strictEqual(rebaser.rebase(sameRow), sameRow, "a line-count change drops every rebase");
   });

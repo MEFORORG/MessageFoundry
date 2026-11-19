@@ -552,9 +552,10 @@ export function isRowMovable(row: LensRow): boolean {
 
 /**
  * Whether a row can be DELETED. Mirrors the toolkit's delete gate (messagefoundry_toolkit/lens rewrite_source):
- * any lens-editable leaf (action/lookup/send/diagnostic), plus a whole `if`/`for` control BLOCK (its
- * header removes the block). A `raise`/`elif`/`else`/`code` row is NOT deletable — the engine refuses it
- * (so the webview greys the trash to avoid an error toast, F6).
+ * any {@link isRowMutable} row (action/lookup/send/diagnostic/note/route, a pragma note excepted) but a
+ * Read Field, plus a whole `if`/`for` control BLOCK (its header removes the block). A
+ * `raise`/`elif`/`else`/`code` row is NOT deletable — the engine refuses it (so the webview greys the
+ * trash to avoid an error toast, F6).
  */
 export function isRowDeletable(row: {
   kind: RowKind;
@@ -603,8 +604,14 @@ export function editableParamNames(row: LensRow): string[] {
   }
   // A route exposes its handler list — but only when the selection is STATIC. A dynamic return projects
   // `handlers: []` with no `unrouted`, and editing that would flatten real code to a literal list.
+  // The field shows the names comma-joined and the page posts them split on commas and trimmed, so a
+  // name holding a comma or edge whitespace would come back changed; such a list stays read-only.
   if (row.kind === "route") {
-    return (row.handlers ?? []).length > 0 || row.unrouted === true ? ["handlers"] : [];
+    const names = row.handlers ?? [];
+    if (names.some((h) => h.includes(",") || h.trim() !== h || h === "")) {
+      return [];
+    }
+    return names.length > 0 || row.unrouted === true ? ["handlers"] : [];
   }
   return [];
 }
@@ -2959,16 +2966,14 @@ export interface AppliedRewrite {
  * buffer. The page is not re-projected during a drain, so every edit it posts to a row the drain has
  * rewritten would be refused that way; {@link rebase} gives it the row's text as last written.
  *
- * Only an edit to a row the drain wrote, projected from the SAME text that row was projected from,
+ * Only an edit to a row the drain wrote, whose `expectSrc` is a text that row held during the drain,
  * is rebased, and only while every write kept the file's line count, so each coordinate still names
  * the row it named. Anything else is sent unchanged and the engine's stale check judges it, as before.
  * One instance serves one drain.
  */
 export class QueuedEditRebaser {
-  /** Per row written: the text it was projected with, and its text after the last write. */
-  private readonly rows = new Map<string, { projected: string; now: string }>();
-  /** The projected text of an edit {@link rebase} gave a new `expectSrc`. */
-  private readonly projectedOf = new WeakMap<EditMessage, string>();
+  /** Per row written: every text it has held in this drain, and its text after the last write. */
+  private readonly rows = new Map<string, { held: Set<string>; now: string }>();
 
   private static rowKey(msg: EditMessage): string {
     return `${msg.handler} ${msg.lineStart} ${msg.lineEnd}`;
@@ -2976,28 +2981,28 @@ export class QueuedEditRebaser {
 
   /** Record a param edit `lens rewrite` wrote. */
   noteApplied(msg: EditMessage, rewrite: AppliedRewrite): void {
-    const projected = this.projectedOf.get(msg) ?? msg.expectSrc;
     const after = physicalLines(rewrite.after);
     if (physicalLines(rewrite.before).length !== after.length) {
       this.rows.clear(); // every recorded coordinate may now name another row
       return;
     }
-    if (projected === undefined) {
-      return;
-    }
+    const key = QueuedEditRebaser.rowKey(msg);
+    const held = this.rows.get(key)?.held ?? new Set<string>();
+    held.add(physicalLines(rewrite.before).slice(msg.lineStart - 1, msg.lineEnd).join("\n"));
     const now = after.slice(msg.lineStart - 1, msg.lineEnd).join("\n");
-    this.rows.set(QueuedEditRebaser.rowKey(msg), { projected, now });
+    held.add(now);
+    this.rows.set(key, { held, now });
   }
 
   /** The edit to send for `msg`, taken from the queue. */
   rebase(msg: EditMessage): EditMessage {
     const row = this.rows.get(QueuedEditRebaser.rowKey(msg));
-    if (row === undefined || msg.expectSrc !== row.projected) {
+    // An edit projected before any of this drain's writes to the row, or after some of them (a
+    // re-projection mid-drain), holds one of the row's texts from this drain.
+    if (row === undefined || msg.expectSrc === undefined || !row.held.has(msg.expectSrc)) {
       return msg;
     }
-    const rebased = { ...msg, expectSrc: row.now };
-    this.projectedOf.set(rebased, row.projected);
-    return rebased;
+    return msg.expectSrc === row.now ? msg : { ...msg, expectSrc: row.now };
   }
 }
 
@@ -3224,7 +3229,7 @@ function renderLiteralInputHtml(
       `value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
   } else {
     // A route's handlers field takes comma-separated names, and `data-list` has the page post them as
-    // the list the engine's set_route takes (BACKLOG #5941). Cleared, it posts [] (routed nowhere).
+    // the list the engine's set_route takes (BACKLOG #5941). Cleared, it is put back unposted.
     const list = row.kind === "route" && p.name === "handlers" ? ` data-list="true"` : "";
     input =
       `<input type="text" class="edit" ${attrs}${list} ` +

@@ -136,7 +136,7 @@ suite("engineClient — POST deadline is wall-clock and on by default (BACKLOG #
     url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   });
 
-  teardown(() => {
+  teardown(async () => {
     for (const drip of drips) {
       clearInterval(drip);
     }
@@ -145,7 +145,7 @@ suite("engineClient — POST deadline is wall-clock and on by default (BACKLOG #
       s.destroy();
     }
     sockets.clear();
-    server.close();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   });
 
   test("postJson rejects at its deadline though the reply never goes idle", async () => {

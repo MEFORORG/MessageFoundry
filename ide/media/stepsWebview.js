@@ -182,12 +182,15 @@
     for (const inp of document.querySelectorAll('input.edit, select.edit')) {
       inp.addEventListener('change', () => {
         // A route's handlers field (data-list) posts its comma-separated names as a list, empties
-        // dropped, the shape the engine's set_route takes (BACKLOG #5941).
-        const value = inp.type === 'number'
-          ? numberEditValue(inp)
-          : inp.dataset.list === 'true'
-            ? inp.value.split(',').map((h) => h.trim()).filter((h) => h.length > 0)
-            : inp.value;
+        // dropped, the shape the engine's set_route takes (BACKLOG #5941). A field left with no name is
+        // put back unposted: writing `return []` would route nothing, and leave no field to undo it.
+        let value = inp.value;
+        if (inp.type === 'number') {
+          value = numberEditValue(inp);
+        } else if (inp.dataset.list === 'true') {
+          const names = inp.value.split(',').map((h) => h.trim()).filter((h) => h.length > 0);
+          value = names.length > 0 ? names : undefined;
+        }
         if (value === undefined) {
           inp.value = inp.defaultValue;
           return;
