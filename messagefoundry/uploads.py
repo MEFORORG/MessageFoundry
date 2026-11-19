@@ -2756,7 +2756,7 @@ class UploadStore:
             except OSError as exc:
                 # Only when it is the file's own refusal, such as a permission the engine lacks,
                 # which answered a server error (BACKLOG #5388 added item 2). Its own arm, so the
-                # Unicode error below is handed to nothing but codec_safe_str.
+                # Unicode error below is rendered only through codec_safe_str.
                 refused = _refused_read(exc)
                 if refused is None:
                     raise
@@ -2791,7 +2791,7 @@ class UploadStore:
                 raise UploadUnreadableError(str(exc)) from exc
             except OSError as exc:
                 # Refused on disk (BACKLOG #5388 added item 2). Its own arm, so the Unicode error
-                # below is handed to nothing but codec_safe_str.
+                # below is rendered only through codec_safe_str.
                 refused = _refused_read(exc)
                 if refused is None:
                     raise
@@ -2855,7 +2855,7 @@ class UploadStore:
                     # Only when it is the file's own refusal, such as a permission the engine
                     # lacks, which answered a server error (BACKLOG #5388 added item 2). It is
                     # never classed, and a permission refusal is not answered as damage. Its own
-                    # arm, so the Unicode error below is handed to nothing but codec_safe_str.
+                    # arm, so the Unicode error below is rendered only through codec_safe_str.
                     refused = _refused_read(exc)
                     if refused is None:
                         raise

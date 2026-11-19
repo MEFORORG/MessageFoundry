@@ -413,7 +413,7 @@ def test_rotate_key_output_over_only_a_refused_sidecar_advises_no_removal(
     fixed, and the skip error advised removing a damaged file's two files, whatever the skip."""
     assert _rotate_over_a_refused_sidecar(tmp_path, monkeypatch) == 1
     out = capsys.readouterr()
-    lines = (out.out + out.err).splitlines()
+    lines = out.out.splitlines() + out.err.splitlines()
     # The positive control: the scan below walks real output, the skip error and the closing note.
     assert len(lines) >= 2, lines
     assert any(line.startswith("error: 1 of those") for line in lines), lines

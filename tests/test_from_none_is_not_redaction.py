@@ -119,9 +119,12 @@ _UPLOAD_MISS = (
 #: _upload_refusal_kind in api/app.py. BACKLOG #5388 added the damaged and access refusals.
 _UPLOAD_REFUSAL = (
     "the 423 detail is the fixed text of the error's kind, read from its class, so from None "
-    "withholds nothing the response would carry; the caught error is either a damaged or access "
+    "withholds nothing the response would carry; the caught error is at least a damaged or access "
     "refusal whose message names only the part, raised after the store's handler with no read "
-    "error on its chain, or the cipher's refusal: " + _UPLOAD_MISS
+    "error on its chain, a fixed store refusal such as delete's not-never-sealable one, or the "
+    "cipher's own text (a type name, a reply refusal's fixed text, or the still-sealed text) with "
+    "the Transit exception from a READ below it, a decrypt whose request holds ciphertext and "
+    "never plaintext"
 )
 
 #: The four store refusal sites of engine PR 2818's eighth hold: each raises outside its own
