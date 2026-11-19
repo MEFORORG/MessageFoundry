@@ -61,7 +61,7 @@ import re
 import sys
 import threading
 from collections.abc import Iterable, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Protocol
@@ -135,13 +135,19 @@ class ServiceEnvPosture:
     status: ServiceEnvStatus
     #: The service whose lists were read, when one was found.
     service_name: str | None = None
-    #: Every variable name the service's environment lists set, upper-cased: each string's
-    #: first name, and a secret-class or ``MEFOR_VALUE_*`` name a later line of it starts. Empty
-    #: unless ``status`` is ``OBSERVED``.
-    listed: tuple[str, ...] = ()
+    #: The variable names the service's environment lists set that the refusal reads, upper-cased:
+    #: each secret-class or ``MEFOR_VALUE_*`` name, and ``MEFOR_SECRETS_DIRECTORY``. Any other
+    #: name is left out, since the text before an equals sign may be key material, such as a line
+    #: of padded base64 (vault BACKLOG #5394). Empty unless ``status`` is ``OBSERVED``. Left out
+    #: of the repr, with the other fields below that hold registry text: an operator may have
+    #: typed a value where a ``MEFOR_VALUE_*`` name goes.
+    listed: tuple[str, ...] = field(default=(), repr=False)
     #: ``(name, registry value)`` for each name in ``listed``, so a refusal can say which value
     #: to change.
-    sources: tuple[tuple[str, str], ...] = ()
+    sources: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+    #: ``(name, line)`` for each name in ``listed`` that is not on its registry string's first
+    #: line, so a refusal can say where in that string to look.
+    source_lines: tuple[tuple[str, int], ...] = field(default=(), repr=False)
     #: The key-class names set, and not empty, in THIS process's environment, wherever they came
     #: from. Empty when ``status`` is ``NOT_A_SERVICE``.
     keys_in_environment: tuple[str, ...] = ()
@@ -149,10 +155,11 @@ class ServiceEnvPosture:
     detail: str = ""
     #: The ``MEFOR_VALUE_*`` names in ``listed`` that an entry sets empty or blank, so the
     #: refusal can say to delete it rather than move it.
-    empty_value_names: tuple[str, ...] = ()
-    #: The ``MEFOR_VALUE_*`` names in ``listed`` that an entry spells, as written in the
-    #: registry, with a character the secrets directory refuses in a file name.
-    unplain_value_names: tuple[str, ...] = ()
+    empty_value_names: tuple[str, ...] = field(default=(), repr=False)
+    #: The ``MEFOR_VALUE_*`` names that an entry spells, as written in the registry, with a
+    #: character the secrets directory refuses in a file name. Most are in ``listed``; a name
+    #: holding a line break that is counted under a later line's name is not.
+    unplain_value_names: tuple[str, ...] = field(default=(), repr=False)
 
     @property
     def listed_keys(self) -> tuple[str, ...]:
@@ -174,14 +181,29 @@ class ServiceEnvPosture:
         return tuple(name for name in self.listed if name.startswith(_VALUE_PREFIX))
 
     def named_with_source(self, names: Sequence[str]) -> str:
-        """``names``, each with the registry value that sets it."""
+        """``names``, each with the registry value that sets it, and the line of its string when
+        that is not the first."""
         where = dict(self.sources)
-        return ", ".join(f"{name} (in {where[name]})" if name in where else name for name in names)
+        lines = dict(self.source_lines)
+
+        def located(name: str) -> str:
+            if name not in where:
+                return name
+            if name in lines:
+                return (
+                    f"{name} (in {where[name]}, line {lines[name]} of the registry string that "
+                    "sets it)"
+                )
+            return f"{name} (in {where[name]})"
+
+        return ", ".join(located(name) for name in names)
 
     def counted_with_source(self, names: Sequence[str]) -> str:
         """How many of ``names`` each registry value sets, with no name printed. The names were
         de-duplicated without regard to case as they were read, each credited to the first
-        registry value that sets it, so a name a later value also sets is counted there only."""
+        registry value that sets it, so a name a later value also sets is counted there only. The
+        count is per registry value, never per line, so the text does not grow with the number of
+        lines one string holds."""
         where = dict(self.sources)
         counts: dict[str, int] = {}
         for name in names:
@@ -303,9 +325,26 @@ _LINE_BREAK = re.compile(r"\r\n|[\r\n]")
 #: equals sign, then a value holding something other than equals signs and blanks. Such a line
 #: ends the variable above it. A line of base64 does not match, since its only equals signs are
 #: the padding at its end, and neither does a line of PEM armour, which holds no equals sign. So
-#: ``OTHER=`` with an empty value does not match either, and is read as part of the value above
-#: it: a store key left empty above it then reads as set, an error toward refusing.
-_ORDINARY_LINE = re.compile(r"\s*[^=\s][^=]*=(?!=*\s*\Z)")
+#: ``OTHER=`` with an empty value does not match either, nor does one whose value is only equals
+#: signs and blanks in any order, and each is read as part of the value above it: a store key
+#: left empty above it then reads as set, an error toward refusing.
+_ORDINARY_LINE = re.compile(r"\s*[^=\s][^=]*=(?![=\s]*\Z)")
+
+#: The text before the equals sign on a line that starts with a store key: 43 standard base64
+#: characters, the 32 bytes of a key less its one padding character. A retired-keys list,
+#: ``<key>,<key>``, therefore reads as ``NAME=value`` with this as the name. No ordinary
+#: variable is named like that, so such a line is read as key material, never as a variable
+#: that ends the value above it (vault BACKLOG #5394).
+_KEY_SHAPED_NAME = re.compile(r"[A-Za-z0-9+/]{43}")
+
+
+def _is_ordinary_line(line: str) -> bool:
+    """Whether ``line`` sets an ordinary variable (:data:`_ORDINARY_LINE`) and does not start
+    with a store key (:data:`_KEY_SHAPED_NAME`)."""
+    if not _ORDINARY_LINE.match(line):
+        return False
+    return not _KEY_SHAPED_NAME.fullmatch(line.partition("=")[0].strip())
+
 
 #: The secret-class names, the two lists above together, both taken from ``engine_secrets``.
 _REFUSED_CLASS_NAMES = frozenset((*KEY_CLASS_NAMES, *DIRECTORY_CLASS_NAMES))
@@ -326,14 +365,53 @@ class _Variable:
     """One variable as :func:`_variables` reads it from a registry string. Kept only while the
     read runs: :func:`_names` drops the value."""
 
-    #: The registry value, and the line when the variable is not on its string's first line.
+    #: The registry value that sets it.
     where: str
     #: The name as written, stripped.
     written: str
-    #: The rest of its line, and every line after it up to the next variable's.
-    value: str
+    #: The rest of its line, and every line after it up to the next variable's. Left out of the
+    #: repr, since it may hold the secret itself.
+    value: str = field(repr=False)
+    #: Its line on its registry string, counted from 1, when that is not the string's first.
+    line: int | None = None
     #: Whether NSSM may read the name with a line break in it.
     broken: bool = False
+    #: Whether :func:`_names` counts it. A variable the line reading also describes under another
+    #: name is not counted twice, but :func:`_value_entry_shapes` still reads its spelling.
+    counted: bool = True
+
+
+def _starts_variable(line: str) -> bool:
+    """Whether ``line`` starts a variable of its own when it follows another line: a name the
+    refusal is about, or an ordinary variable (:func:`_is_ordinary_line`)."""
+    written, equals, _rest = line.partition("=")
+    return bool(equals) and (_refused_name(written.strip().upper()) or _is_ordinary_line(line))
+
+
+class _Carry:
+    """A secret-class variable whose value may run on into the next strings of its registry
+    value. Their lines are gathered in one list and the variable is written once, so a long run
+    of strings is read in linear memory."""
+
+    __slots__ = ("parts", "slot", "variable")
+
+    def __init__(self, variable: _Variable) -> None:
+        self.variable = variable
+        self.parts = [variable.value]
+        self.slot: int | None = None
+
+    def extend(self, read: list[_Variable], lines: Sequence[str]) -> None:
+        """Add ``lines`` to the value, holding the variable's place in ``read``."""
+        if self.slot is None:
+            self.slot = len(read)
+            read.append(self.variable)  # replaced by :meth:`flush`
+        self.parts.extend(lines)
+
+    def flush(self, read: list[_Variable]) -> None:
+        """Write the variable, with every line gathered, into the place it holds."""
+        if self.slot is not None:
+            read[self.slot] = replace(self.variable, value="\n".join(self.parts))
+            self.slot = None
 
 
 def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
@@ -341,99 +419,133 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
 
     The reader cannot tell whether NSSM takes a line or the whole string as a variable, so it
     keeps what either reading would refuse. Each string's first non-blank line is a variable when
-    it holds an equals sign: blank lines above it are skipped, as ``main``'s strip of the name
-    skipped them, so a secrets directory set below a blank first line is still read as set. A
-    later line is one when it sets a name the refusal is about, so a store key on a later line
-    still refuses. A later line that sets an ordinary variable
-    (:data:`_ORDINARY_LINE`) ends the value above it under the line reading, and is not kept:
-    under the whole-string reading it sets nothing, so the secrets directory's name is never taken
-    as set by a later line. Any other line, such as one of key material, belongs to the value
-    above it, so a key whose value starts on the next line is not empty.
+    it holds an equals sign: blank lines above it are skipped, as the whole-string reading's strip
+    of the name skips them, so a secrets directory set below a blank first line is still read as
+    set. A later line is one when it sets a name the refusal is about, so a store key on a later
+    line still refuses. A later line that sets an ordinary variable (:func:`_is_ordinary_line`)
+    ends the value above it under the line reading, and is not kept: under the whole-string
+    reading it sets nothing, so the secrets directory's name is never taken as set by a later
+    line. Any other line, such as one of key material, belongs to the value above it, so a key
+    whose value starts on the next line is not empty.
 
-    Each string is also read whole, as ``main`` read it: the name before its first equals sign,
-    stripped, and everything after it as the value. That variable is kept when its name is one
-    the refusal is about. So ``KEY=`` above another variable's line, a path-form OIDC key above a
-    line holding PEM armour, a blank first line, or a line break before the equals sign refuses
-    as ``main`` refused it. Where that name still holds a line break, such as ``MEFOR_VALUE_A``
-    on a first line with no equals sign, the engine loads a variable whose name starts with it.
-    It is kept unless a later line sets a name :func:`_names` keeps, since both readings then
-    describe the same variable and it is counted once."""
+    The same holds from one string to the next string of one ``REG_MULTI_SZ`` value. When a
+    string's first non-blank line starts no variable of its own (:func:`_starts_variable`), it is
+    read as part of the secret-class variable the string above it ends on, if any. So
+    ``MEFOR_STORE_ENCRYPTION_KEY=`` as one item and the key as the next refuses, and an empty
+    store key above an item that sets an ordinary variable does not.
+
+    Each string is also read whole: the name before its first equals sign, stripped, and
+    everything after it as the value. That variable is kept when its name is one the refusal is
+    about. So ``KEY=`` above another variable's line, a path-form OIDC key above a line holding
+    PEM armour, a blank first line, or a line break before the equals sign refuses under that
+    reading. Where that name still holds a line break, such as ``MEFOR_VALUE_A`` on a first line
+    with no equals sign, the engine loads a variable whose name starts with it. It is counted
+    unless a later line sets a name :func:`_names` keeps, since both readings then describe the
+    same variable and it is counted once; its spelling is read either way."""
     read: list[_Variable] = []
+    # The secret-class variable whose value runs to the end of the string above, if any.
+    carry: _Carry | None = None
     for where, entry in entries:
         lines = _LINE_BREAK.split(entry)
+        if not any(line.strip() for line in lines):
+            continue  # a blank string sets nothing, and ends no value above it
+        if carry is not None and carry.variable.where != where:
+            carry.flush(read)
+            carry = None
         # ``skip`` keeps the later lines' numbers counted from the string's real first line.
-        skip = next((i for i, line in enumerate(lines) if line.strip()), len(lines) - 1)
+        skip = next(i for i, line in enumerate(lines) if line.strip())
         first, *rest_lines = lines[skip:]
         first_written, first_equals, first_rest = first.partition("=")
         first_written = first_written.strip()
+        # A string whose first line starts with an equals sign has the shape of Windows' own
+        # ``=C:=C:\x`` entries, a variable with an empty name, so it continues nothing.
+        continues = (
+            carry is not None and not first.lstrip().startswith("=") and not _starts_variable(first)
+        )
         first_parts = [first_rest]
         # A later line kept as a variable: its line number, name as written and value parts.
         later: list[tuple[int, str, list[str]]] = []
+        # What the string's last line belongs to: "first", "later" or "ordinary".
+        ends_in = "first"
         parts = first_parts  # the value the current line belongs to
         for number, line in enumerate(rest_lines, skip + 2):
             written, equals, rest = line.partition("=")
-            if not equals:
-                parts.append(line)
-                continue
             written = written.strip()
-            if _refused_name(written.upper()):
+            if equals and _refused_name(written.upper()):
                 parts = [rest]
                 later.append((number, written, parts))
-            elif _ORDINARY_LINE.match(line):
+                ends_in = "later"
+            elif equals and _is_ordinary_line(line):
                 parts = [rest]  # ends the value above, and is not kept
+                ends_in = "ordinary"
             else:
                 parts.append(line)
         later_variables = [
-            _Variable(
-                f"{where}, line {number} of a string whose first line is another entry",
-                written,
-                "\n".join(value_parts),
-            )
+            _Variable(where, written, "\n".join(value_parts), line=number)
             for number, written, value_parts in later
         ]
+        if continues and carry is not None:
+            # The lines above this string's first variable line belong to the value above.
+            carry.extend(read, [first, *first_parts[1:]])
+        first_variable: _Variable | None = None
         if first_equals:
-            read.append(_Variable(where, first_written, "\n".join(first_parts)))
-        # The whole-string reading, exactly as ``main`` read every entry: the name is everything
-        # before the first equals sign, stripped, and the value everything after it. Kept when that
-        # name is one the refusal is about, so a blank first line, a line break before the equals
-        # sign, or a value empty on its own line but not in its string refuses as ``main`` refused
-        # it. A name that still holds a line break is counted once: only when no later line sets a
-        # name :func:`_names` keeps, since both readings then describe the same variable.
+            first_variable = _Variable(
+                where, first_written, "\n".join(first_parts), line=skip + 1 if skip else None
+            )
+            read.append(first_variable)
+        # The whole-string reading: the name is everything before the first equals sign,
+        # stripped, and the value everything after it. Kept when that name is one the refusal is
+        # about, so a blank first line, a line break before the equals sign, or a value empty on
+        # its own line but not in its string refuses under that reading. A name that still holds
+        # a line break is counted only when no later line sets a name :func:`_names` keeps, since
+        # both readings then describe the same variable.
         whole_written, whole_equals, whole_value = entry.partition("=")
         whole_written = whole_written.strip()
         broken = _LINE_BREAK.search(whole_written) is not None
-        if (
-            whole_equals
-            and _refused_name(whole_written.upper())
-            and not (broken and _names(later_variables))
-        ):
+        if whole_equals and _refused_name(whole_written.upper()):
             # A broken name is kept under its first line, as the line reading names it.
             name = _LINE_BREAK.split(whole_written, 1)[0].rstrip() if broken else whole_written
-            read.append(_Variable(where, name, whole_value, broken=broken))
+            counted = not (broken and _names(later_variables))
+            read.append(_Variable(where, name, whole_value, broken=broken, counted=counted))
         read.extend(later_variables)
+        # What the next string of this value continues, when its first line starts nothing.
+        if continues and ends_in == "first":
+            continue  # the value above runs on through this string
+        if carry is not None:
+            carry.flush(read)
+        ends = later_variables[-1] if ends_in == "later" else None
+        if ends_in == "first":
+            ends = first_variable
+        carry = _Carry(ends) if ends and ends.written.upper() in _REFUSED_CLASS_NAMES else None
+    if carry is not None:
+        carry.flush(read)
     return read
 
 
-def _names(variables: Sequence[_Variable]) -> tuple[tuple[str, str], ...]:
-    """The upper-cased names of the variables set to a secret. The value is dropped here and
-    never kept. An empty value carries no secret, so its name is not kept, except a
-    ``MEFOR_VALUE_*`` name, which the owner's ruling refuses whatever it holds and whose empty
-    value the engine still overlays on the value file. A path in a name that takes either a key or
-    its path is not a secret, so that name is not kept either. Windows compares environment names
-    without case, so this does too. Each name is returned with the first registry value, and the
-    line, that sets it."""
-    names: dict[str, str] = {}
+def _names(variables: Sequence[_Variable]) -> tuple[tuple[str, str, int | None], ...]:
+    """The upper-cased names of the variables set to a secret that the refusal reads. The value
+    is dropped here and never kept. An empty value carries no secret, so its name is not kept,
+    except a ``MEFOR_VALUE_*`` name, which the owner's ruling refuses whatever it holds and whose
+    empty value the engine still overlays on the value file. A path in a name that takes either a
+    key or its path is not a secret, so that name is not kept either. Only a secret-class name, a
+    ``MEFOR_VALUE_*`` name and ``MEFOR_SECRETS_DIRECTORY`` are kept: the text before any other
+    line's equals sign may be key material (vault BACKLOG #5394). Windows compares environment
+    names without case, so this does too. Each name is returned with the first registry value,
+    and the line, that sets it."""
+    names: dict[str, tuple[str, int | None]] = {}
     for variable in variables:
         name = variable.written.upper()
         value = variable.value
+        if not variable.counted or not (_refused_name(name) or name == _DIRECTORY_VARIABLE):
+            continue
         # An ``env()`` value is kept even when empty: the engine overlays an empty one on the
         # value file, so it still decides what ``env()`` returns (vault BACKLOG #8212 item 7).
-        if not name or not ((value and not value.isspace()) or name.startswith(_VALUE_PREFIX)):
+        if not ((value and not value.isspace()) or name.startswith(_VALUE_PREFIX)):
             continue
         if name in _INLINE_PEM_NAMES and "-----BEGIN" not in value:
             continue
-        names.setdefault(name, variable.where)
-    return tuple(names.items())
+        names.setdefault(name, (variable.where, variable.line))
+    return tuple((name, where, line) for name, (where, line) in names.items())
 
 
 def _value_entry_shapes(
@@ -452,7 +564,7 @@ def _value_entry_shapes(
         name = written.upper()
         if not name.startswith(_VALUE_PREFIX) or name == _VALUE_PREFIX:
             continue
-        if not variable.value or variable.value.isspace():
+        if variable.counted and (not variable.value or variable.value.isspace()):
             empty[name] = None
         if variable.broken or not (written.isascii() and _setting_names.is_value_name(name)):
             unplain[name] = None
@@ -496,13 +608,14 @@ def read_service_env_posture(
             ),
         )
     variables = _variables(entries)
-    sources = _names(variables)
+    found = _names(variables)
     empty, unplain = _value_entry_shapes(variables)
     return ServiceEnvPosture(
         ServiceEnvStatus.OBSERVED,
         service_name=service,
-        listed=tuple(name for name, _where in sources),
-        sources=sources,
+        listed=tuple(name for name, _where, _line in found),
+        sources=tuple((name, where) for name, where, _line in found),
+        source_lines=tuple((name, line) for name, _where, line in found if line is not None),
         keys_in_environment=keys,
         empty_value_names=empty,
         unplain_value_names=unplain,

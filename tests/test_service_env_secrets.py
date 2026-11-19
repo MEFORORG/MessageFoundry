@@ -127,13 +127,14 @@ def test_the_nearest_nssm_ancestor_names_the_service_whose_list_is_read() -> Non
     probe = _Probe(
         ancestors=[(300, "python.exe"), (200, "python.exe"), (100, "NSSM.EXE")],
         services={100: "MessageFoundry-Test"},
-        entries=["MEFOR_AI_ENVIRONMENT=prod"],
+        entries=["MEFOR_AI_ENVIRONMENT=prod", "MEFOR_SECRETS_DIRECTORY=C:\\s"],
     )
     posture = read_service_env_posture(probe=probe, environ={})
     assert posture.status is ServiceEnvStatus.OBSERVED
     assert posture.service_name == "MessageFoundry-Test"
     assert probe.asked == ["MessageFoundry-Test"]
-    assert posture.listed == ("MEFOR_AI_ENVIRONMENT",)
+    # Vault BACKLOG #5394 item 2: only a name the refusal reads is listed.
+    assert posture.listed == ("MEFOR_SECRETS_DIRECTORY",)
 
 
 def test_the_reading_keeps_names_and_never_a_value() -> None:
@@ -366,10 +367,9 @@ def test_a_store_key_on_a_later_line_of_one_value_refuses(key: str, brk: str) ->
     assert posture.listed_keys == (key,)
     refusal = service_env_refusal(posture)
     assert refusal is not None
-    # The refusal says the name is not the string's first, so the operator looks below it.
+    # The refusal says which line of its string sets the name, so the operator looks below it.
     assert (
-        f"{key} (in Parameters\\AppEnvironmentExtra, line 2 of a string whose first line is "
-        "another entry)"
+        f"{key} (in Parameters\\AppEnvironmentExtra, line 2 of the registry string that sets it)"
     ) in refusal
     assert _KEY_VALUE not in refusal
 
@@ -391,7 +391,7 @@ def test_a_later_line_of_key_material_is_never_read_as_a_name() -> None:
 @pytest.mark.parametrize("entry", ["MEFOR_VALUE_A\nX=1", "MEFOR_VALUE_\nFOO=1"])
 def test_a_whole_string_whose_name_holds_a_line_break_still_refuses(entry: str) -> None:
     """NSSM may set the whole string as one variable, whose name then holds a line feed and
-    still starts ``MEFOR_VALUE_``, which the engine loads. ``main`` refused it, and so must this."""
+    still starts ``MEFOR_VALUE_``, which the engine loads. The whole-string reading refuses it."""
     assert service_env_refusal(_service([entry])) is not None
 
 
@@ -425,8 +425,9 @@ def test_a_secrets_directory_on_a_later_line_is_not_taken_as_set() -> None:
 
 
 def test_a_blank_first_line_still_reads_the_secrets_directory_below_it() -> None:
-    """``main`` stripped the name, so a blank first line moved the first name down. The secrets
-    directory below one is set, and the refusal must not tell the operator to add it."""
+    """The whole-string reading strips the name, so a blank first line moves the first name down.
+    The secrets directory below one is set, and the refusal must not tell the operator to add
+    it."""
     posture = _service(["\nMEFOR_SECRETS_DIRECTORY=C:\\s", "MEFOR_VALUE_X=1"])
     assert "MEFOR_SECRETS_DIRECTORY" in posture.listed
     refusal = service_env_refusal(posture)
@@ -437,7 +438,7 @@ def test_a_blank_first_line_still_reads_the_secrets_directory_below_it() -> None
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)
 def test_an_ordinary_name_windows_allows_ends_the_empty_value_above_it(key: str) -> None:
     """A name such as ``ProgramFiles(x86)`` is an ordinary variable's line, so an empty later
-    ``KEY=`` above it stays empty and nothing refuses, as on ``main``."""
+    ``KEY=`` above it stays empty and nothing refuses."""
     posture = _service([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\nProgramFiles(x86)=C:\\x"])
     assert posture.listed_keys == ()
     assert service_env_refusal(posture) is None
@@ -455,7 +456,7 @@ def test_a_secret_class_line_below_an_ordinary_name_windows_allows_still_refuses
 def test_an_empty_store_key_above_another_variable_still_refuses(key: str) -> None:
     """Vault BACKLOG #5394: an empty ``KEY=`` line, then another variable's line. The key is
     empty under the line reading, but NSSM may set the whole string as one variable, and then the
-    key holds the line below it. ``main`` refused this, and so must this."""
+    key holds the line below it, so this refuses."""
     posture = _service([f"{key}=\nMEFOR_AI_ENVIRONMENT=prod"])
     assert posture.listed_keys == (key,)
     assert service_env_refusal(posture) is not None
@@ -486,9 +487,10 @@ def test_a_first_name_whose_whole_string_holds_a_secret_refuses(entry: str) -> N
         "\nMEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\k.pem\nX=-----BEGIN x",
     ],
 )
-def test_every_string_main_refused_whole_still_refuses(entry: str) -> None:
-    """``main`` read each string whole: the stripped name before the first equals sign, and the
-    rest. A blank first line, or a line break before the equals sign, still names a secret-class
+def test_every_string_the_whole_string_reading_refuses_still_refuses(entry: str) -> None:
+    """The reader before vault BACKLOG #5394 read each string whole: the stripped name before the
+    first equals sign, and the rest. A blank first line, or a line break before the equals sign,
+    still names a secret-class
     variable under that reading, so the line reading must not let it through."""
     assert service_env_refusal(_service([entry])) is not None
 
@@ -536,17 +538,24 @@ def test_a_first_line_with_no_equals_sign_is_not_counted_twice() -> None:
 
 
 def test_a_long_multi_line_value_is_read_in_linear_memory() -> None:
-    """The head read the rest of the string again from every later line, about 160 MB for
-    4,000 lines. Each line is read once now."""
+    """A reader that read the rest of the string again from every later line took about 160 MB
+    for 4,000 lines. Each line is read once. The peak is measured from a reset, above what was
+    already allocated, and a trace someone else started, such as ``python -X tracemalloc``, is
+    left running."""
     entry = "\n".join(f"MEFOR_VALUE_K{n}=synthetic-value-{n}" for n in range(4000))
-    tracemalloc.start()
+    started_here = not tracemalloc.is_tracing()
+    if started_here:
+        tracemalloc.start()
     try:
+        tracemalloc.reset_peak()
+        before, _peak = tracemalloc.get_traced_memory()
         posture = _service([entry])
         _current, peak = tracemalloc.get_traced_memory()
     finally:
-        tracemalloc.stop()
+        if started_here:
+            tracemalloc.stop()
     assert len(posture.listed_value_names) == 4000
-    assert peak < 16 * 1024 * 1024, f"peak {peak} bytes"
+    assert peak - before < 16 * 1024 * 1024, f"peak {peak - before} bytes"
 
 
 def test_off_windows_the_host_reading_is_not_a_service() -> None:
@@ -802,7 +811,7 @@ async def test_an_embedded_app_names_a_key_from_elsewhere_in_its_posture(
 
 
 #: A console-script launcher between NSSM and the interpreter reads UNOBSERVABLE with no service,
-#: so ``serve`` does not refuse there (the ``uvicorn.exe`` test above), and an app builds as at main.
+#: so ``serve`` does not refuse there (the ``uvicorn.exe`` test above), and an app builds.
 _CONSOLE_SCRIPT_LAUNCHER = read_service_env_posture(
     probe=_console_script_probe(), environ={"MEFOR_STORE_ENCRYPTION_KEY": _KEY_VALUE}
 )
