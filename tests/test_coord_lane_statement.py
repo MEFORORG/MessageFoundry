@@ -329,3 +329,51 @@ def test_show_never_reuses_the_earlier_read_when_its_own_read_fails(repo: Path, 
     assert "not a JSON object" in str(rec["absent"]), rec
     assert set(rec) == _BLANK_KEYS | {"absent"}, rec
     assert rec["statedFree"] is None and rec["statedInFlight"] is None, rec
+
+
+# BACKLOG #5486: THE LANE IS KEYED ON THE WORK TREE ROOT, NOT THE CURRENT DIRECTORY. From a
+# subdirectory the current directory wrote a lane level under a box key no reader computes, and a
+# claim hash of `none` while the tree held claims.
+
+
+def _toplevel(repo: Path) -> str:
+    """git's own name for the work tree root, so a claim record matches the path the script reads."""
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--show-toplevel"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_a_statement_from_a_subdirectory_keys_on_the_work_tree_root(repo: Path) -> None:
+    """The control is the statement from the root: the one from a subdirectory must land in the same
+    record, name the same worktree, and carry the same claim hash, which is not `none`."""
+    claims = repo / ".git" / "mefor-coord" / "claims"
+    claims.mkdir(parents=True)
+    (claims / "BACKLOG-5486.json").write_text(
+        json.dumps({"worktree": _toplevel(repo)}), encoding="utf-8"
+    )
+    assert _pwsh(repo, "-Free", "1", "-InFlight", "1").returncode == 0
+    at_root = json.loads(_lane_record(repo).read_text(encoding="utf-8-sig"))
+    assert at_root["claimHashAtStated"] not in ("", "none"), at_root
+
+    sub = repo / "sub" / "dir"
+    sub.mkdir(parents=True)
+    proc = _pwsh(sub, "-Free", "2", "-InFlight", "0")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    # _lane_record asserts there is still exactly one record: a subdirectory key would add a second.
+    from_sub = json.loads(_lane_record(repo).read_text(encoding="utf-8-sig"))
+    assert from_sub["statedFree"] == 2, from_sub
+    assert from_sub["boxKey"] == at_root["boxKey"], (at_root, from_sub)
+    assert from_sub["worktree"] == at_root["worktree"], (at_root, from_sub)
+    assert from_sub["claimHashAtStated"] == at_root["claimHashAtStated"], (at_root, from_sub)
+
+
+def test_a_directory_with_no_work_tree_refuses_and_writes_nothing(repo: Path) -> None:
+    """Inside .git, git names a common dir but no work tree. The script used to key a lane on that
+    directory; it now refuses and writes no lane."""
+    proc = _pwsh(repo / ".git", "-Free", "1", "-InFlight", "0")
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "REFUSED" in proc.stderr and "work tree root" in proc.stderr, proc.stderr
+    assert not (repo / ".git" / "mefor-coord" / "lanes").exists()

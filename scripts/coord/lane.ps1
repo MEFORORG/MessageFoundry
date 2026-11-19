@@ -19,8 +19,9 @@
     not add a usage throttle here.
 
     THERE IS NO -Lane AND NO -BoxKey PARAMETER, AND ADDING ONE DEFEATS THE WHOLE DESIGN. The box key is
-    derived from $PWD, so a session can only ever state its OWN level. The failure this replaces is a
-    gauge that reported both lanes full while one sat idle, because it counted CLAIMS: measured
+    derived from the work tree root of $PWD, so a session can only ever state its OWN level. The
+    failure this replaces is a gauge that reported both lanes full while one sat idle, because it
+    counted CLAIMS: measured
     2026-08-23, one lane held nine claims and reported one active item and three free slots. Both
     numbers were honest. Only the lane knows which is which.
 
@@ -75,9 +76,21 @@ if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
 . $coordRootScript
 $thisHost = Get-CoordHost
 
+# The lane file and the claim hash are keyed on the WORK TREE ROOT, which is how the readers name the
+# tree; the current directory keyed a subdirectory run on a box nobody reads (BACKLOG #5486). Read
+# before the root is resolved, so a directory with no work tree (a .git directory) refuses first.
+# Interpolated, not cast: no output casts to $null, and .Trim() on that throws.
+$top = "$(& git rev-parse --path-format=absolute --show-toplevel 2>$null)".Trim()
+if ($LASTEXITCODE -ne 0 -or -not $top) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- git could not name the work tree root for $((Get-Location).Path), so the lane cannot be keyed and nothing was read or written.")
+    exit 2
+}
+# GetFullPath puts the separators in this platform's form, as (Get-Location).Path gave them.
+$worktree = [System.IO.Path]::GetFullPath($top)
+
 # Both kinds this writes or reads are fleet-wide, so both are resolved before anything is written,
 # and an error refuses rather than writing a level into a local copy nobody else reads.
-$sharedResolved = Resolve-CoordSharedRoot -From (Get-Location).Path
+$sharedResolved = Resolve-CoordSharedRoot -From $worktree
 if ($sharedResolved.Error) {
     [Console]::Error.WriteLine("lane.ps1: REFUSED -- the coordination root could not be resolved, so nothing was written: $($sharedResolved.Error)")
     exit 2
@@ -110,7 +123,6 @@ function Get-ClaimHash([string]$Worktree) {
     return (-join ($b[0..7] | ForEach-Object { $_.ToString('x2') }))
 }
 
-$worktree = (Get-Location).Path
 $boxKey   = ConvertTo-BoxKey -Path $worktree
 $lanesDir = Join-Path $sharedResolved.Path 'lanes'
 $tmpDir   = Join-Path $lanesDir '.tmp'
