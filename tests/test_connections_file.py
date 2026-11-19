@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import inspect
 import textwrap
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -226,6 +228,80 @@ def test_retention_override_rejects_negative_and_non_int(tmp_path: Path) -> None
                 """,
             )
         )
+
+
+# Each seconds key with a file that loads on its own, and how to read the loaded value back.
+_SECONDS_CASES: dict[str, tuple[str, Callable[[Any], float | None]]] = {
+    "strict_timeout_s": (
+        """
+        [[inbound]]
+        name = "IB"
+        transport = "mllp"
+        router = "r"
+        strict_timeout_s = {value}
+          [inbound.settings]
+          port = 2600
+
+        [[outbound]]
+        name = "OB"
+        transport = "mllp"
+          [outbound.settings]
+          host = "epic.example"
+          port = 2700
+        """,
+        lambda reg: reg.inbound["IB"].validation.strict_timeout_s,
+    ),
+    "waiting_display_delay": (
+        """
+        [[outbound]]
+        name = "OB"
+        transport = "mllp"
+        waiting_display_delay = {value}
+          [outbound.settings]
+          host = "epic.example"
+          port = 2700
+        """,
+        lambda reg: reg.outbound["OB"].waiting_display_delay,
+    ),
+}
+
+
+@pytest.mark.parametrize("key", sorted(_SECONDS_CASES))
+@pytest.mark.parametrize(
+    ("value", "reason"),
+    [
+        ("nan", "not a finite number"),
+        ("+nan", "not a finite number"),
+        ("inf", "not a finite number"),
+        ("-inf", "not a finite number"),
+        ("9" * 400, "too large for a float"),
+    ],
+)
+def test_seconds_key_refuses_a_non_finite_or_overflowing_value(
+    tmp_path: Path, key: str, value: str, reason: str
+) -> None:
+    """BACKLOG #5321: TOML spells nan and inf, and either compares false with ``<= 0``, so it would
+    load as a strict backstop that never fires, or a display delay that never ends. tomllib reads an
+    integer of any size, and float() of one past the float range raised a raw OverflowError that
+    named no connection."""
+    with pytest.raises(WiringError, match=rf"{key} is not a valid float value .*{reason}"):
+        load_config(_config(tmp_path, _SECONDS_CASES[key][0].format(value=value)))
+
+
+@pytest.mark.parametrize("key", sorted(_SECONDS_CASES))
+@pytest.mark.parametrize(("value", "expected"), [("5", 5.0), ("0.25", 0.25), ("0", 0.0)])
+def test_seconds_key_still_takes_a_finite_number(
+    tmp_path: Path, key: str, value: str, expected: float
+) -> None:
+    """The control: a finite number, and an int widened to a float, still load."""
+    toml, read_back = _SECONDS_CASES[key]
+    assert read_back(load_config(_config(tmp_path, toml.format(value=value)))) == expected
+
+
+def test_negative_strict_timeout_still_disables_the_backstop(tmp_path: Path) -> None:
+    """The control for the documented ``<= 0 disables`` spelling, which the finiteness rule keeps."""
+    toml, read_back = _SECONDS_CASES["strict_timeout_s"]
+    assert read_back(load_config(_config(tmp_path, toml.format(value=-1)))) == -1.0
 
 
 def test_timer_inbound_from_toml(tmp_path: Path) -> None:
