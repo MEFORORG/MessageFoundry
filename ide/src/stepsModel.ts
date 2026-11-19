@@ -445,6 +445,15 @@ function rowSubtitle(row: LensRow): string | undefined {
     const outs = row.outbounds ?? [];
     return outs.length > 0 ? outs.join(", ") : "(dynamic destination)";
   }
+  if (row.kind === "route") {
+    // The Handlers the router selects (BACKLOG #5941). A routed-nowhere return already reads
+    // "Unrouted" in its title; a dynamic one projects no names and has none to show.
+    const names = row.handlers ?? [];
+    if (row.unrouted) {
+      return undefined;
+    }
+    return names.length > 0 ? `→ ${names.join(", ")}` : "(dynamic selection)";
+  }
   if (row.kind === "diagnostic") {
     // The template (log_note) / label (checkpoint) literal — the one meaningful, editable field.
     const p = row.params ?? {};
@@ -460,11 +469,19 @@ function rowSubtitle(row: LensRow): string | undefined {
   return undefined;
 }
 
-/** The read-only param fields for a row (send rows surface their destinations as a `to` field). */
+/** The read-only param fields for a row (send rows surface their destinations as a `to` field, route
+ *  rows their Handlers as a `handlers` field, comma-separated). */
 function rowParams(row: LensRow): ParamField[] {
   if (row.kind === "send") {
     const outs = row.outbounds ?? [];
     return [{ name: "to", value: outs.length > 0 ? outs.join(", ") : "(dynamic destination)" }];
+  }
+  if (row.kind === "route") {
+    // BACKLOG #5941. editableParamNames offers it for editing only when the selection is static, so
+    // the dynamic placeholder is never sent back as a name.
+    const names = row.handlers ?? [];
+    const dynamic = names.length === 0 && row.unrouted !== true;
+    return [{ name: "handlers", value: dynamic ? "(dynamic selection)" : names.join(", ") }];
   }
   return paramsToFields(row.params);
 }
@@ -1191,8 +1208,9 @@ export interface EditMessage {
   // A {@link TemplateValue} writes the argument in templated mode (ADR 0076 Amendment E, #237): the
   // engine renders the parts to an f-string and checks it reads back. Offer it only for an argument
   // whose {@link paramWritableModes} include `templated`. `null` is a cleared number field of an
-  // `X | None` param, which the engine writes as None (BACKLOG #5942).
-  value: string | number | null | TemplateValue;
+  // `X | None` param, which the engine writes as None (BACKLOG #5942). A string list is a route row's
+  // `handlers`, which the engine's set_route takes as a list (BACKLOG #5941).
+  value: string | number | null | readonly string[] | TemplateValue;
   // The row's PROJECTION-TIME source text (the row as the user saw it when the lens projected the inputs),
   // echoed back from the webview's `data-expect-src` and carried to `lens rewrite` as `expect_src` (F7).
   // Optional so a hand-built message (tests / an older payload) may omit it — then no stale check is sent.
@@ -1207,9 +1225,9 @@ export interface EditRequest {
   op: "set_params";
   // A number-kind field carries a JS number so `JSON.stringify` emits a bare `6` (an int/float literal),
   // not `"6"` (a re-typed string literal) — BACKLOG #1760. A template is `{"parts": [...]}` (#237).
-  // A cleared nullable number field is `null`, rendered None (BACKLOG #5942). Every other param stays
-  // a string.
-  params: Record<string, string | number | null | TemplateValue>;
+  // A cleared nullable number field is `null`, rendered None (BACKLOG #5942), and a route's `handlers`
+  // a string list (BACKLOG #5941). Every other param stays a string.
+  params: Record<string, string | number | null | readonly string[] | TemplateValue>;
   // The projected row's source text from the LIVE buffer (no EOL). `lens rewrite` verifies it still
   // matches the row before splicing, so a stale coordinate (a coincidental same-shape row) is refused
   // instead of edited in the wrong place (F7). Omitted → no stale check (older/no-buffer callers).
@@ -1357,7 +1375,8 @@ export type EditMessageRead = { edit: EditMessage } | { refused: string };
  * `undefined` when it is not an `edit` message, or when its coordinates are not all present: that is
  * dropped silently, as it always was. An edit whose coordinates are present but whose value is not a
  * string, a finite number, `null` with `nullable: true` (a cleared nullable number field, BACKLOG
- * #5942) or a well-formed template ({@link isTemplateValue}) is REFUSED with a reason, never
+ * #5942), a list of strings for `handlers` (a route row, BACKLOG #5941) or a well-formed template
+ * ({@link isTemplateValue}) is REFUSED with a reason, never
  * repaired and never dropped silently: a template the webview built wrong must not become a partial
  * write. A template is copied part by part, so nothing later can change what the engine is sent.
  */
@@ -1372,7 +1391,7 @@ export function readEditMessage(m: unknown): EditMessageRead | undefined {
   const raw = m.value;
   // A template's parts, copied, or null when the value is not exactly a well-formed template.
   const parts = isTemplateValue(raw) ? readTemplateParts(raw.parts) : null;
-  let value: string | number | null | TemplateValue;
+  let value: EditMessage["value"];
   if (typeof raw === "number" && !Number.isFinite(raw)) {
     // JSON has no infinity or NaN: JSON.stringify sends each as null, which the engine would write
     // as None, a different argument from the one typed (BACKLOG #5942).
@@ -1385,6 +1404,13 @@ export function readEditMessage(m: unknown): EditMessageRead | undefined {
     // Only a cleared number field the page marked nullable (`data-nullable`) posts null; any other
     // null stays refused below, as it was before null could be sent at all.
     value = null;
+  } else if (
+    coords.name === "handlers" &&
+    Array.isArray(raw) &&
+    raw.every((h): h is string => typeof h === "string")
+  ) {
+    // A route row's handler list (BACKLOG #5941), copied so nothing later can change what is sent.
+    value = [...raw];
   } else if (parts !== null) {
     value = templateValue(parts);
   } else {
@@ -3170,8 +3196,11 @@ function renderLiteralInputHtml(
       `<input type="number" class="edit" ${attrs}${nullable} ` +
       `value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
   } else {
+    // A route's handlers field takes comma-separated names, and `data-list` has the page post them as
+    // the list the engine's set_route takes (BACKLOG #5941). Cleared, it posts [] (routed nowhere).
+    const list = row.kind === "route" && p.name === "handlers" ? ` data-list="true"` : "";
     input =
-      `<input type="text" class="edit" ${attrs} ` +
+      `<input type="text" class="edit" ${attrs}${list} ` +
       `value="${escapeHtml(p.value)}" placeholder="[blank]" />`;
   }
   // ADR 0104 §2.3: a pickable HL7 path/segment slot gets a picker button BESIDE its input. The input is

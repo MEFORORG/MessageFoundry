@@ -181,7 +181,13 @@
     }
     for (const inp of document.querySelectorAll('input.edit, select.edit')) {
       inp.addEventListener('change', () => {
-        const value = inp.type === 'number' ? numberEditValue(inp) : inp.value;
+        // A route's handlers field (data-list) posts its comma-separated names as a list, empties
+        // dropped, the shape the engine's set_route takes (BACKLOG #5941).
+        const value = inp.type === 'number'
+          ? numberEditValue(inp)
+          : inp.dataset.list === 'true'
+            ? inp.value.split(',').map((h) => h.trim()).filter((h) => h.length > 0)
+            : inp.value;
         if (value === undefined) {
           inp.value = inp.defaultValue;
           return;

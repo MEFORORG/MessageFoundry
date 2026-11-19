@@ -7,6 +7,7 @@ import * as path from "path";
 import {
   type LensRow,
   type OpSchema,
+  buildEditRequest,
   buildRowViewModel,
   readEditMessage,
   readPickPartMessage,
@@ -531,5 +532,68 @@ suite("Steps webview: a number field posts only a finite number, or null where n
     change(p, input, "");
     assert.deepStrictEqual(sent(p, before), [], "no write of 0");
     assert.strictEqual(input.value, "6", "the projected value is shown again");
+  });
+});
+
+// BACKLOG #5941: a Router's route row showed no target Handlers and had no handlers field, and the
+// edit reader refused the list the engine's set_route takes.
+suite("Steps webview: a route row shows and edits its Handler names as a list", () => {
+  const STATIC_ROUTE: LensRow = {
+    kind: "route",
+    handlers: ["adt_handler", "oru_handler"],
+    line_start: 6,
+    line_end: 6,
+    nesting: 0,
+    suite: "5",
+  };
+  const DYNAMIC_ROUTE: LensRow = { ...STATIC_ROUTE, handlers: [], line_start: 7, line_end: 7 };
+
+  teardown(() => {
+    for (const w of OPEN_WINDOWS.splice(0)) {
+      (w as unknown as { close(): void }).close();
+    }
+  });
+
+  test("a static route names its Handlers and posts an edit as a list", () => {
+    const vm = buildRowViewModel(STATIC_ROUTE, 0, LINES);
+    assert.strictEqual(vm.subtitle, "→ adt_handler, oru_handler");
+    const p = loadPage([STATIC_ROUTE]);
+    const input = p.field(6, "handlers").querySelector("input.edit");
+    assert.ok(input, "the handlers field is editable");
+    assert.strictEqual(input.value, "adt_handler, oru_handler");
+    const before = p.posted.length;
+    change(p, input, " adt_handler , rad_handler,, ");
+    const msgs = sent(p, before);
+    assert.strictEqual(msgs.length, 1);
+    assert.deepStrictEqual(msgs[0].value, ["adt_handler", "rad_handler"]);
+    const read = readEditMessage(msgs[0]);
+    assert.ok(read && "edit" in read, "the provider's guard accepts the list");
+    assert.deepStrictEqual(buildEditRequest(read.edit).params, { handlers: ["adt_handler", "rad_handler"] });
+  });
+
+  test("a dynamic route shows no editable field, so its placeholder is never sent as a name", () => {
+    const vm = buildRowViewModel(DYNAMIC_ROUTE, 0, LINES);
+    assert.strictEqual(vm.subtitle, "(dynamic selection)");
+    const p = loadPage([DYNAMIC_ROUTE]);
+    assert.strictEqual(p.field(7, "handlers").querySelector("input.edit"), null);
+  });
+
+  test("the reader takes a string list for handlers only", () => {
+    const base = {
+      command: "edit",
+      handler: "h",
+      lineStart: 6,
+      lineEnd: 6,
+      expectSrc: LINES[5],
+    };
+    const ok = readEditMessage({ ...base, name: "handlers", value: ["a", "b"] });
+    assert.ok(ok && "edit" in ok);
+    for (const bad of [
+      { ...base, name: "value", value: ["a"] },
+      { ...base, name: "handlers", value: ["a", 1] },
+    ]) {
+      const read = readEditMessage(bad);
+      assert.ok(read && "refused" in read, JSON.stringify(bad.value));
+    }
   });
 });
