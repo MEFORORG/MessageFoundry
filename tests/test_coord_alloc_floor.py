@@ -630,3 +630,168 @@ def test_the_allocator_does_not_speak_the_work_claim_register() -> None:
         "the success output no longer names the worktree the number is recorded against, so the "
         "absence check above would pass on a line that had simply been deleted"
     )
+
+
+# --- BACKLOG #5479: a failed plumbing call refuses rather than shrinking the sweep ------------
+
+
+def _failing_git_env(tmp_path: Path, subcommand: str) -> dict[str, str]:
+    """PATH with a ``git.cmd`` shim first that fails ONE git subcommand and passes the rest through.
+
+    alloc.ps1 spells every sweep call ``git -C <repo> <subcommand> ...``, so the subcommand is
+    ``%3``. ``tests/test_coord_unbacked_check.py`` uses the same shim shape for the same reason:
+    pwsh's command discovery finds a ``.cmd`` first on PATH.
+    """
+    real_git = shutil.which("git")
+    assert real_git is not None
+    shim = tmp_path / f"shim-{subcommand}"
+    shim.mkdir()
+    (shim / "git.cmd").write_text(
+        f'@echo off\r\nif "%3"=="{subcommand}" exit /b 128\r\n"{real_git}" %*\r\n',
+        encoding="ascii",
+        newline="",
+    )
+    return dict(os.environ, PATH=f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+
+def _repo_with_90_on_a_side_branch(path: Path) -> Path:
+    repo = _checkout(path, {"0001-first.md": "# First\n"})
+    _git("checkout", "-q", "-b", "side", cwd=repo)
+    (repo / "docs" / "adr" / "0090-only-on-a-branch.md").write_text("# Side\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-m", "side adr", "--no-verify", cwd=repo)
+    _git("checkout", "-q", "main", cwd=repo)
+    return repo
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the git.cmd shim needs cmd.exe")
+def test_the_failing_git_shim_passes_every_other_call_through(tmp_path: Path) -> None:
+    """THE CONTROL for the case below: a shim failing a subcommand alloc.ps1 never runs still lets
+    the floor read 90, so a refusal there is caused by the failing call and not by the shim."""
+    repo = _repo_with_90_on_a_side_branch(tmp_path / "repo")
+    assert _floor(repo, env=_failing_git_env(tmp_path, "never-run")) == 90
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the git.cmd shim needs cmd.exe")
+@pytest.mark.parametrize("subcommand", ["for-each-ref", "cat-file", "ls-tree"])
+def test_a_failed_sweep_call_refuses_instead_of_lowering_the_floor(
+    tmp_path: Path, subcommand: str
+) -> None:
+    """MUST TRIP. Each sweep call used to run with its exit code unread, so a failure shrank the set
+    of numbers seen and the floor fell below the 90 that sits on a side branch. The control is
+    ``test_the_failing_git_shim_passes_every_other_call_through``.
+    """
+    repo = _repo_with_90_on_a_side_branch(tmp_path / "repo")
+    env = _failing_git_env(tmp_path, subcommand)
+    shown = _run(repo, "-ShowFloor", "-Kind", "adr", env=env)
+    combined = shown.stdout + shown.stderr
+    assert shown.returncode != 0, f"a failed {subcommand} still printed a floor:\n{combined}"
+    assert f"git {subcommand}" in combined, combined
+    assert not re.search(r"^floor\s*:", shown.stdout, re.MULTILINE), combined
+
+    # The allocation path reaches the same sweep and the same throw whichever call failed, so one
+    # subcommand is enough to pin that it writes nothing; each pwsh spawn costs seconds.
+    if subcommand != "for-each-ref":
+        return
+    registry = repo / ".git" / "mefor-coord" / "alloc"
+    allocated = _run(repo, "-Kind", "adr", "-Title", "refusal probe", "-NoFetch", env=env)
+    combined = allocated.stdout + allocated.stderr
+    assert allocated.returncode != 0, f"a failed {subcommand} still allocated:\n{combined}"
+    assert "REFUSING TO ALLOCATE" in combined, combined
+    assert sorted(p.name for p in registry.rglob("*.json")) == [], (
+        "the refusal left a claimed number behind, so it does not fail closed"
+    )
+
+
+def _warning_git_env(tmp_path: Path, subcommand: str, warning: str) -> dict[str, str]:
+    """PATH with a ``git.cmd`` shim that writes ``warning`` to stderr before ONE subcommand runs.
+
+    The real git still runs and exits 0, so the sweep succeeds; only the stderr line is added.
+    """
+    real_git = shutil.which("git")
+    assert real_git is not None
+    shim = tmp_path / f"warn-{subcommand}"
+    shim.mkdir()
+    (shim / "git.cmd").write_text(
+        f'@echo off\r\nif "%3"=="{subcommand}" echo {warning} 1>&2\r\n"{real_git}" %*\r\n',
+        encoding="ascii",
+        newline="",
+    )
+    return dict(os.environ, PATH=f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the git.cmd shim needs cmd.exe")
+def test_a_warning_on_a_clean_sweep_call_is_echoed_not_swallowed(tmp_path: Path) -> None:
+    """MUST TRIP on the wrapper that captured stderr and dropped it on exit 0. Before the wrapper,
+    for-each-ref's stderr reached the console, so a ``warning: ignoring broken ref`` was seen. The
+    floor is still computed: a warning is echoed, never refused.
+
+    THE CONTROL is ``test_the_failing_git_shim_passes_every_other_call_through``: the same repo with
+    no warning reads 90, so the echo below is the shim's line and not some other stderr output.
+    """
+    repo = _repo_with_90_on_a_side_branch(tmp_path / "repo")
+    warning = "warning: ignoring broken ref refs/heads/synthetic-broken"
+    env = _warning_git_env(tmp_path, "for-each-ref", warning)
+    proc = _run(repo, "-ShowFloor", "-Kind", "adr", env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert re.search(r"^floor\s*:\s*90$", proc.stdout, re.MULTILINE), proc.stdout
+    assert warning in proc.stderr, f"git's warning was swallowed:\n{proc.stdout}\n{proc.stderr}"
+    assert "git for-each-ref exited 0" in proc.stderr, proc.stderr
+
+
+def _with_quoting_forced(env: dict[str, str]) -> dict[str, str]:
+    """``env`` with git's path quoting forced ON, appended after any inherited GIT_CONFIG_* entries.
+
+    A machine with ``core.quotePath=false`` never quotes a non-ASCII name, so the pre-``-z`` code
+    would pass the non-ASCII case there and it would no longer pin the regression. Appended at the
+    inherited count rather than overwriting index 0, so config a runner injects the same way stays.
+    """
+    out = dict(env)
+    n = int(out.get("GIT_CONFIG_COUNT", "0") or "0")
+    out[f"GIT_CONFIG_KEY_{n}"] = "core.quotePath"
+    out[f"GIT_CONFIG_VALUE_{n}"] = "true"
+    out["GIT_CONFIG_COUNT"] = str(n + 1)
+    return out
+
+
+def _quoting_git_env() -> dict[str, str]:
+    return _with_quoting_forced(dict(os.environ))
+
+
+def test_a_non_ascii_adr_name_on_a_branch_still_raises_the_floor(tmp_path: Path) -> None:
+    """MUST TRIP on ``ls-tree --name-only`` without ``-z``: git quotes a name holding a non-ASCII
+    byte, the leading quote defeats the four-digit ``^NNNN-`` anchor, and 95 would read FREE. The
+    control is the same shape with an ASCII name in ``test_a_side_branch_number_raises_the_floor``
+    below, which runs on every platform this one does.
+    """
+    repo = _checkout(tmp_path / "repo", {"0001-first.md": "# First\n"})
+    _git("checkout", "-q", "-b", "side", cwd=repo)
+    (repo / "docs" / "adr" / "0095-caf\N{LATIN SMALL LETTER E WITH ACUTE}.md").write_text(
+        "# Side\n", encoding="utf-8"
+    )
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-m", "side adr", "--no-verify", cwd=repo)
+    _git("checkout", "-q", "main", cwd=repo)
+    assert _floor(repo, env=_quoting_git_env()) == 95
+
+
+def test_a_side_branch_number_raises_the_floor(tmp_path: Path) -> None:
+    """THE CONTROL for the two non-ASCII cases: an ASCII name on an ASCII branch is swept, so a floor
+    of 1 there would be the fixture, not the name or the branch."""
+    repo = _repo_with_90_on_a_side_branch(tmp_path / "repo")
+    assert _floor(repo, env=_quoting_git_env()) == 90
+
+
+def test_a_number_on_a_non_ascii_branch_still_raises_the_floor(tmp_path: Path) -> None:
+    """A number on a non-ASCII branch is swept. Interactively, under an OEM console code page, a sweep
+    that decoded git's output with that page got the ref name back garbled, cat-file answered
+    ``missing`` for it and exited 0, and 90 read FREE. NOT A TRIPPING CONTROL: measured 2026-11-19,
+    this case also passes on the pre-decode wrapper when pytest runs pwsh with no console, so it
+    pins the outcome, not the UTF-8 decode itself."""
+    repo = _checkout(tmp_path / "repo", {"0001-first.md": "# First\n"})
+    _git("checkout", "-q", "-b", "caf\N{LATIN SMALL LETTER E WITH ACUTE}", cwd=repo)
+    (repo / "docs" / "adr" / "0090-only-on-a-branch.md").write_text("# Side\n", encoding="utf-8")
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-m", "side adr", "--no-verify", cwd=repo)
+    _git("checkout", "-q", "main", cwd=repo)
+    assert _floor(repo, env=_quoting_git_env()) == 90

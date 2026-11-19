@@ -489,23 +489,90 @@ function Get-Floor {
     #
     # `alloc_strand_sweep.py::numbers_on_refs` is the same sweep in Python and now the same shape.
     # Two implementations of one question drift; change one and read the other.
-    $refs = @("origin/main") + @(& git -C $repo for-each-ref --format='%(refname)' refs/heads refs/remotes)
-    $specs = foreach ($r in ($refs | Select-Object -Unique)) { "${r}:docs/adr" }
-
-    $trees = [System.Collections.Generic.HashSet[string]]::new()
-    foreach ($line in ($specs -join "`n" | & git -C $repo cat-file --batch-check='%(objectname) %(objecttype)' 2>$null)) {
-        $p = "$line".Split(' ')
-        if ($p.Count -ge 2 -and $p[1] -eq 'tree') { [void]$trees.Add($p[0]) }
+    #
+    # A FAILED PLUMBING CALL REFUSES, IT DOES NOT SHRINK THE SWEEP (BACKLOG #5479). Each of the three
+    # calls below used to run with its exit code unread, so a for-each-ref that failed left only
+    # origin/main, a cat-file that failed left no trees, and an ls-tree that failed dropped that
+    # tree's names. Each is a smaller set, so a lower floor, so a number already in use reading FREE.
+    # A legitimate absence is not a failure: cat-file reports a ref with no docs/adr as `missing` and
+    # still exits 0. -1 is the never-ran sentinel the pre-flight block below uses, for its reason.
+    #
+    # ONE WRAPPER, so a later sweep call cannot drop the reset or the check. The refusal phrase is
+    # the pre-flight block's, picked by the same switch (the call site passes -Peek:$ShowFloor).
+    $refusal = if ($Peek) { "REFUSING TO REPORT A FLOOR" } else { "REFUSING TO ALLOCATE" }
+    # Both preferences are pinned in this function's own scope, for the pre-flight block's reason:
+    # under "Stop", with $PSNativeCommandUseErrorActionPreference true, git's first stderr line or
+    # its exit code throws a generic error and the refusal below, with git's own words, never prints.
+    #
+    # DECODED AS UTF-8, because git writes names as UTF-8 bytes and pwsh otherwise decodes native
+    # output with the console's code page. Under the OEM page a non-ASCII ref name came back
+    # garbled, cat-file answered `missing` for it and exited 0, and that branch's numbers dropped out
+    # of the floor; under a DBCS page a trailing lead byte can swallow ls-tree's NUL terminator and
+    # glue two names together. unbacked_check.ps1's Invoke-Git records the same garbling (BACKLOG
+    # #5502). Set ONCE around the whole sweep, not per call, and restored in `finally`, so a refusal
+    # does not leave the console re-encoded. A setter that fails is reported, never assumed.
+    $sweepWarnings = [System.Collections.Generic.List[string]]::new()
+    function Invoke-SweepGit([string[]]$GitArgs, [string]$Stdin) {
+        $ErrorActionPreference = "Continue"
+        $PSNativeCommandUseErrorActionPreference = $false
+        $global:LASTEXITCODE = -1
+        $all = if ($PSBoundParameters.ContainsKey('Stdin')) {
+            @($Stdin | & git -C $repo @GitArgs 2>&1)
+        } else {
+            @(& git -C $repo @GitArgs 2>&1)
+        }
+        $code = $LASTEXITCODE
+        $detail = (@($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) -join "`n  ").Trim()
+        if ($code -ne 0) {
+            throw "alloc.ps1: $refusal -- git $($GitArgs[0]) exited $code while sweeping refs for the ADR floor. An incomplete sweep would understate the floor and could re-issue a number already in use, so nothing was read as a floor or allocated. Fix the clone and re-run. git said:`n  $detail"
+        }
+        # A CLEAN EXIT CAN STILL CARRY A WARNING, and capturing stderr must not swallow it. Before
+        # this wrapper, for-each-ref's stderr reached the console untouched, so a
+        # `warning: ignoring broken ref` was seen; 2>&1 alone would drop it. Echoed, not refused:
+        # git still answered, and the warning names a clone problem the operator should fix.
+        if ($detail) {
+            $w = "alloc.ps1: WARNING -- git $($GitArgs[0]) exited 0 but wrote to stderr while sweeping refs for the ADR floor. git said:`n  $detail"
+            if (-not $sweepWarnings.Contains($w)) { $sweepWarnings.Add($w) }
+        }
+        @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
     }
 
-    # Anchored at `^` because these are bare entry names, not the `docs/adr/NNNN-` paths the
-    # pre-dedupe spelling produced. `--name-only` yields one name per line and nothing else.
-    $rx = [regex]::new('^(\d{4})-')
-    foreach ($t in $trees) {
-        foreach ($n in (& git -C $repo ls-tree --name-only $t 2>$null)) {
-            $m = $rx.Match("$n")
-            if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
+    $previousEncoding = [Console]::OutputEncoding
+    try {
+        try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) }
+        catch { $sweepWarnings.Add("alloc.ps1: WARNING -- git's output could not be set to decode as UTF-8 ($($_.Exception.Message)), so a ref or ADR name holding a non-ASCII character may have been missed by the floor sweep.") }
+        $refs = @("origin/main") + @(Invoke-SweepGit @('for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes'))
+        $specs = foreach ($r in ($refs | Select-Object -Unique)) { "${r}:docs/adr" }
+
+        $trees = [System.Collections.Generic.HashSet[string]]::new()
+        $batch = Invoke-SweepGit @('cat-file', '--batch-check=%(objectname) %(objecttype)') -Stdin ($specs -join "`n")
+        foreach ($line in $batch) {
+            $p = "$line".Split(' ')
+            if ($p.Count -ge 2 -and $p[1] -eq 'tree') { [void]$trees.Add($p[0]) }
         }
+
+        # Anchored at `^` because these are bare entry names, not the `docs/adr/NNNN-` paths the
+        # pre-dedupe spelling produced. `-z` because without it git QUOTES a name holding a non-ASCII
+        # byte or a control character (an e-acute prints as `"0095-caf\303\251.md"`), the leading
+        # quote defeats the anchor, and that number reads FREE. With `-z` each name is NUL-terminated
+        # and never quoted; pwsh still splits native output on newlines, so rejoin on newline before
+        # splitting on NUL.
+        # `[0-9]`, not `\d`: .NET `\d` matches every Unicode decimal digit, `[int]` cannot parse those,
+        # and now that `-z` hands this regex unquoted non-ASCII names the cast would throw.
+        $rx = [regex]::new('^([0-9]{4})-')
+        foreach ($t in $trees) {
+            $names = ((Invoke-SweepGit @('ls-tree', '-z', '--name-only', $t)) -join "`n") -split "`0"
+            foreach ($n in $names) {
+                $m = $rx.Match("$n")
+                if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
+            }
+        }
+    } finally {
+        try { [Console]::OutputEncoding = $previousEncoding } catch { }
+        # Once per distinct text, at the end: a warning git prints on every call (a config
+        # deprecation, say) would otherwise repeat once per tree, hundreds of times on a big clone.
+        # In `finally`, so a later call's refusal does not discard a warning that may explain it.
+        foreach ($w in $sweepWarnings) { [Console]::Error.WriteLine($w) }
     }
 
 
