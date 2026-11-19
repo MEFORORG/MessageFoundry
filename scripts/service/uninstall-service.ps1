@@ -658,7 +658,8 @@ function Remove-AccountAce {
         [Parameter(Mandatory)][string]$Principal,
         [Parameter(Mandatory)][string]$What
     )
-    if (-not (Test-Path $Path)) {
+    # -LiteralPath: a '[' or '*' in -DataDir is part of the name, not a wildcard (BACKLOG #5402).
+    if (-not (Test-Path -LiteralPath $Path)) {
         Write-Host "  ACEs   : $What '$Path' is gone; nothing to remove."
         return $false
     }

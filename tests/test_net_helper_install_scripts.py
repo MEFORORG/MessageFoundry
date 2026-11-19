@@ -65,6 +65,7 @@ _SCRIPTS = (
     "uninstall-net-helper.ps1",
     "install-service.ps1",
     "uninstall-service.ps1",
+    "measure-store-access.ps1",
 )
 _SCRIPTS_PS = ", ".join(_psq(name) for name in _SCRIPTS)
 
@@ -265,12 +266,12 @@ def test_every_script_takes_the_same_service_names(ast_report: dict[str, object]
 
     ONE DEFINITION, ``messagefoundry/service_status.py``'s ``_SAFE_SERVICE_NAME``, and literal copies
     of it in ``param()`` blocks, ``install-service.ps1``'s ``-ServiceName`` among them (BACKLOG #1680)
-    and ``uninstall-service.ps1``'s (BACKLOG #5402),
+    and ``uninstall-service.ps1``'s and ``measure-store-access.ps1``'s (BACKLOG #5402),
     so the engine installer cannot register a name the helper scripts, the tray or the CLI refuse.
     The copies cannot be dot-sourced away: a PowerShell attribute argument must be a compile-time
     constant, and ``[ValidatePattern($pattern)]`` is refused at parse with
     *"Attribute argument must be a constant or a script block"*. So the copies are pinned here
-    instead, which is what makes them one definition rather than five.
+    instead, which is what makes them one definition rather than six.
 
     The pattern is there because the helper names are interpolated into a WQL filter, where a single
     quote ends the literal. A space cannot, and a space is legal in a Windows service name -- so an
@@ -291,6 +292,7 @@ def test_every_script_takes_the_same_service_names(ast_report: dict[str, object]
         "uninstall-net-helper.ps1::ServiceName",
         "install-service.ps1::ServiceName",
         "uninstall-service.ps1::ServiceName",
+        "measure-store-access.ps1::ServiceName",
     }, (
         "CONTROL FAILED: the harness found a different set of service-name parameters than this "
         f"guard was aimed at ({sorted(rows)}) -- re-aim it, do not relax it"

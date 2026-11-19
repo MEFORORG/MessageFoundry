@@ -4324,3 +4324,25 @@ def test_the_secrets_directory_refuses_residue_and_held_files(tmp_path: Path) ->
     )
     assert "MEFOR_PLANTED" in got["held"], got
     assert got["empty"] == "", f"CONTROL FAILED: an empty directory was refused: {got}"
+
+
+@pytest.mark.parametrize("leaf", ["data[1]", "data[a-z]"])
+def test_the_uninstall_ace_removal_reads_a_bracketed_data_dir_literally(
+    tmp_path: Path, leaf: str
+) -> None:
+    """BACKLOG #5402 item 2: ``Remove-AccountAce`` tested ``-DataDir`` with a plain ``Test-Path``,
+    which expands ``[...]`` as a wildcard, so an existing ``data[1]`` read as gone and its ACE
+    stayed. icacls is a stub here; no ACL is touched."""
+    assert _UNINSTALL is not None
+    target = tmp_path / leaf
+    target.mkdir()
+    body = rf"""
+  $script:Calls = @()
+  function icacls {{ $script:Calls += ,@($args); $global:LASTEXITCODE = 0 }}
+  $r = Remove-AccountAce -Path {_psq(str(target))} -Principal '*S-1-5-80-4001' -What 'data directory'
+  'OUT=' + $r + '|' + $script:Calls.Count + '|' + ($script:Calls[0] -join ' ')
+"""
+    out = _ok(_extract(_UNINSTALL, ["Remove-AccountAce"], body), tmp_path).strip()
+    result, count, call = out.splitlines()[-1].removeprefix("OUT=").split("|", 2)
+    assert (result, count) == ("True", "1"), f"the existing directory read as gone: {out}"
+    assert call.startswith(str(target)), call
