@@ -4225,3 +4225,64 @@ def test_a_powershell_source_root_with_a_stale_reading_still_warns_in_the_text_o
         f"the warning must carry the fix and name the root:\n{human}"
     )
     assert "Start a NEW session" not in human, human
+
+
+# --- BACKLOG #5955: the survey on this root's own early exits, and a future-dated row ------------
+
+
+def _row(doc: dict[str, Any], root: Path) -> dict[str, Any]:
+    row: dict[str, Any] = next(r for r in doc["roots"] if r["root"].lower() == str(root).lower())
+    return row
+
+
+@pytest.mark.parametrize("own_state", ["missing", "unavailable", "foreign"])
+def test_the_survey_runs_when_this_roots_own_read_exits_early(
+    fake_home: Path, own_state: str
+) -> None:
+    """Each of these exits used to come before the survey, so ``-AllRoots`` printed no other root on
+    exactly the runs where this root had nothing to offer.
+
+    Mutation: move the survey back below the early exits. Red: no ``roots`` key, no other row."""
+    own = fake_home / ".claude-account-1"
+    other = fake_home / ".claude-account-2"
+    publish(other / "mefor-usage", seven=37.0)
+    _stamp(other / "mefor-usage", other)
+    if own_state == "unavailable":
+        out = avail("-Mark", "-ConfigDir", str(own), "-Reason", "subscription cancelled")
+        assert out.returncode == 0, out.stdout
+    elif own_state == "foreign":
+        publish(own / "mefor-usage", seven=5.0)
+        _stamp(own / "mefor-usage", other)
+
+    code, doc, _ = reader("-AllRoots", "-Json", pin=own, home=fake_home)
+    assert code == (UNAVAILABLE if own_state == "unavailable" else UNKNOWN), doc
+    assert _row(doc, other)["seven"] == pytest.approx(37.0), doc
+    _, _, human = reader("-AllRoots", pin=own, home=fake_home)
+    assert "A survey" in human and "37%" in human, human
+
+
+def test_the_survey_does_not_render_a_future_dated_reading_as_fresh(fake_home: Path) -> None:
+    """A negative age passed ``age -gt max``, so a row dated an hour ahead read as confirmed.
+
+    Mutation: drop the dated-ahead term from ``stale``. Red: ``stale`` is False."""
+    pin = fake_home / ".claude-account-1"
+    publish(pin / "mefor-usage", seven=22.0, age_min=-60.0)
+    _stamp(pin / "mefor-usage", pin)
+    _, doc, _ = reader("-AllRoots", "-Json", pin=pin, home=fake_home)
+    row = _row(doc, pin)
+    assert row["stale"] is True, row
+    assert "FUTURE" in row["note"], row
+    _, _, human = reader("-AllRoots", pin=pin, home=fake_home)
+    line = next(x for x in human.splitlines() if str(pin) in x and "7d" in x)
+    assert "STALE" in line, human
+
+
+def test_the_survey_still_reads_a_fresh_row_as_fresh(fake_home: Path) -> None:
+    """The control for the bound above: a reading written just now is not dated ahead."""
+    pin = fake_home / ".claude-account-1"
+    publish(pin / "mefor-usage", seven=22.0)
+    _stamp(pin / "mefor-usage", pin)
+    _, doc, _ = reader("-AllRoots", "-Json", pin=pin, home=fake_home)
+    row = _row(doc, pin)
+    assert row["stale"] is False, row
+    assert "FUTURE" not in row["note"], row
