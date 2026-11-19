@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import uuid4
 
@@ -31,7 +30,7 @@ from fastapi import Request
 from messagefoundry.api import create_app
 from messagefoundry.api.auth_routes import _DIRECTORY_DEMOTED_DETAIL, _DIRECTORY_UNCONFIRMED_DETAIL
 from messagefoundry.auth import Role, totp
-from messagefoundry.auth.identity import AuthProvider, Identity
+from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import AuthService, DirectoryRefusal, Elevation
 from messagefoundry.auth.tokens import hash_token
@@ -1097,9 +1096,10 @@ _PENDING_REFUSED_POSTS = (
 )
 
 #: A password form that can never rotate: the two new passwords differ. On the password route it
-#: keeps a control from signing the session out. The code is for the TOTP verify route: an empty
-#: one is answered ahead of the gate (BACKLOG #5931), so a code keeps that case on the gate itself,
-#: and ``test_an_empty_verify_code_still_meets_the_gates_pending_refusal`` covers the empty one.
+#: keeps a control from signing the session out. The code is for the TOTP verify route: the gate
+#: sends an empty one to the re-auth before its proof check (BACKLOG #5931), so a code keeps that
+#: case on the proof check itself, and
+#: ``test_an_empty_verify_code_still_meets_the_gates_pending_refusal`` covers the empty one.
 #: Every other route ignores the body.
 _NO_ROTATION = {
     "current_password": PW,
@@ -1200,9 +1200,9 @@ async def test_a_satisfied_session_is_still_charged_on_the_same_posts(
 async def test_an_empty_verify_code_still_meets_the_gates_pending_refusal(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, pending: bool
 ) -> None:
-    """RED when: the empty-code check ahead of the verify gate (BACKLOG #5931) skips the gate's
-    base. A pending session on an account with a factor is refused, audited once and not charged;
-    a satisfied one is charged once and not audited. Both land on the confirm re-auth."""
+    """RED when: the verify gate's empty-code hook (BACKLOG #5931) runs ahead of the gate's base.
+    A pending session on an account with a factor is refused, audited once and not charged; a
+    satisfied one is charged once and not audited. Both land on the confirm re-auth."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     t0 = 1_000_000.0
@@ -1218,21 +1218,33 @@ async def test_an_empty_verify_code_still_meets_the_gates_pending_refusal(
             assert (
                 await c.post("/ui/mfa", data={"code": totp.totp(secret, now=t1)})
             ).status_code == 303
+        if not pending:
+            # The control: without a held proof the gate refuses an empty code for want of it, the
+            # same answer the hook gives. With one held, a hook that let the empty code through
+            # would spend it and the route would check "" (a 400).
+            from messagefoundry.auth.service import STEP_UP_ACTION_MFA_CONFIRM
+
+            tok = c.cookies.get("mf_session")
+            assert tok is not None
+            service._grant_action_step_up(hash_token(tok), STEP_UP_ACTION_MFA_CONFIRM)
         calls = _spy_admin_write(service, monkeypatch)
-        # The control: without it the gate itself gives the same answer, so count the copy's runs.
-        built: list[int] = []
-        real_base = account_routes._confirm_gate_base
+        # The gate's empty-code hook reads the body once, after the base; the base refuses a
+        # pending session before the hook runs.
+        parsed: list[int] = []
+        form_pairs = account_routes._form_pairs
 
-        def counting_base() -> Callable[[Request], Awaitable[Identity]]:
-            built.append(1)
-            return real_base()
+        async def counting_form_pairs(request: Request) -> list[tuple[str, str]]:
+            parsed.append(1)
+            return await form_pairs(request)
 
-        monkeypatch.setattr(account_routes, "_confirm_gate_base", counting_base)
+        monkeypatch.setattr(account_routes, "_form_pairs", counting_form_pairs)
         r = await c.post(path, data={"code": ""}, headers=SAME_ORIGIN)
         assert r.status_code == 303
         assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/confirm"
+        if not pending:
+            assert await service.holds_action_step_up(tok, STEP_UP_ACTION_MFA_CONFIRM)
 
-    assert built == [1], "the empty code did not take the pre-gate path"
+    assert parsed == ([] if pending else [1]), "the empty code did not stop at the gate's hook"
     assert len(calls) == (0 if pending else 1), f"allow_admin_write calls: {calls}"
     assert await _denials_for(engine, path) == (1 if pending else 0)
 

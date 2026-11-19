@@ -566,10 +566,10 @@ async def test_empty_code_continue_with_a_held_grant_spends_nothing(
         assert user is not None and user.totp_enabled
 
 
-def test_the_empty_code_check_runs_the_verify_gates_own_base(engine: Engine) -> None:
-    """RED when: the copy of the verify gate's base the empty-code check runs drifts from the base
-    ``require_ui_reauth_only_action`` builds for the gate (BACKLOG #5931). The seam digest hashes
-    source, not the values a gate closes over, so this compares those values directly."""
+def test_the_empty_code_check_is_the_verify_gates_own_hook(engine: Engine) -> None:
+    """RED when: the empty-code check runs anywhere but inside the verify gate, as its
+    ``before_spend`` hook (BACKLOG #5931). A check ahead of the gate needs its own copy of the
+    gate's base, which can drift from it, and resolves the session a second time."""
     app = create_app(engine, auth=None, serve_ui=True, webauthn_rp_from_request=True)
     route = next(
         r
@@ -578,20 +578,52 @@ def test_the_empty_code_check_runs_the_verify_gates_own_base(engine: Engine) -> 
         and "POST" in getattr(r, "methods", ())
     )
     calls = [d.call for d in route.dependant.dependencies]  # type: ignore[attr-defined]
-    gate = next(c for c in calls if is_route_gate(c))
-    assert calls.index(account_routes._empty_code_goes_to_reauth) < calls.index(gate)
-    gate_vars = inspect.getclosurevars(gate).nonlocals
-    real = inspect.getclosurevars(gate_vars["base"]).nonlocals
-    copy = inspect.getclosurevars(account_routes._confirm_gate_base()).nonlocals
-    assert real.keys() == copy.keys()
-    assert {k: v for k, v in real.items() if k != "pending_refusal"} == {
-        k: v for k, v in copy.items() if k != "pending_refusal"
-    }
-    real_pending = inspect.getclosurevars(real["pending_refusal"]).nonlocals
+    gates = [c for c in calls if is_route_gate(c)]
+    assert len(gates) == 1
+    # The endpoint itself declares the service and the gate and nothing else, read off its own
+    # parameters, so a dependency from any module ahead of the gate is caught.
+    declared = [
+        p.default.dependency
+        for p in inspect.signature(route.endpoint).parameters.values()  # type: ignore[attr-defined]
+        if hasattr(p.default, "dependency")
+    ]
+    assert declared == [account_routes._service, gates[0]], declared
+    gate_vars = inspect.getclosurevars(gates[0]).nonlocals
     assert gate_vars["action"] == STEP_UP_ACTION_MFA_CONFIRM
-    assert real_pending["action"] == STEP_UP_ACTION_MFA_CONFIRM
-    assert real_pending["reauth_next"](None) == "/ui/account/mfa/confirm"
-    assert copy["pending_refusal"] is account_routes._refuse_pending_confirm
+    assert gate_vars["before_spend"] is account_routes._no_code_posted
+    assert gate_vars["reauth_next"](None) == "/ui/account/mfa/confirm"
+
+
+async def test_a_verify_post_resolves_its_session_once(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One verify post resolves its session once, with a code or without (BACKLOG #5931).
+
+    RED when: a check ahead of the gate probes the session before the gate's base resolves it
+    again."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        await _mint_action(c, "/ui/account/mfa/enroll")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200
+        resolved: list[bool] = []
+        real = service.identity_for_token
+
+        async def counting(token: str | None, *, activity: bool = True) -> object:
+            resolved.append(activity)
+            return await real(token, activity=activity)
+
+        monkeypatch.setattr(service, "identity_for_token", counting)
+        for data, answer in (({"code": ""}, 303), ({"code": "badcod"}, 400)):
+            await _mint_action(c, "/ui/account/mfa/confirm")
+            resolved.clear()
+            r = await c.post(
+                "/ui/account/mfa/verify", data=data, headers={"Sec-Fetch-Site": "same-origin"}
+            )
+            assert r.status_code == answer, data
+            assert len(resolved) == 1, (data, resolved)
 
 
 async def test_an_empty_code_from_a_dead_cookie_gets_the_gates_login_redirect(

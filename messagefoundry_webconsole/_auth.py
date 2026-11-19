@@ -2078,13 +2078,20 @@ def require_ui_reauth_only_action(
     action: str,
     *permissions: Permission,
     reauth_next: Callable[[Request], str] | None = None,
+    before_spend: Callable[[Request], Awaitable[bool]] | None = None,
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Like :func:`require_ui_reauth_only` (password-only, **no MFA gate** so a required-but-unenrolled
     session can still enroll its first factor), but the step-up must be a fresh proof **bound to**
     ``action`` (single-use, ADR 0077 / ASVS 7.5.1). Used by the browser factor-binding enroll lanes
     and the session-terminate lanes. Falls back to the session window under
     ``[auth].require_action_step_up = false``. Same ``new_ip``-first short-circuit so a forced
-    new-IP step-up leaves the single-use grant UNCONSUMED."""
+    new-IP step-up leaves the single-use grant UNCONSUMED.
+
+    ``before_spend`` runs after the base and the new-IP check, just before the proof is spent, and
+    only while action binding is on. ``True`` sends the request to the same re-auth as a missing
+    proof, with the proof left unspent. It is for a route whose request can be known useless before
+    the spend, such as the TOTP verify post with no code (BACKLOG #5931), so the operator's proof is
+    not spent on it. Under the org opt-out there is no proof to keep, so it is not asked."""
 
     async def refuse_pending(
         request: Request, auth: AuthService, _identity: Identity
@@ -2122,8 +2129,16 @@ def require_ui_reauth_only_action(
         new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
         nxt = reauth_next(request) if reauth_next is not None else None
         # _ui_action_step_up_ok repeats the factor-binding check, so the refusal still holds if the
-        # base ever loses its hook.
-        if new_ip or not await _ui_action_step_up_ok(auth, token, action):
+        # base ever loses its pending_refusal (refuse_pending above).
+        if (
+            new_ip
+            or (
+                before_spend is not None
+                and auth.action_step_up_required
+                and await before_spend(request)
+            )
+            or not await _ui_action_step_up_ok(auth, token, action)
+        ):
             raise _reauth_redirect(request, nxt)
         return identity
 
