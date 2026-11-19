@@ -44,8 +44,8 @@ At least these settings change the size of the operator surface:
   `/openapi.json`.
 - `[security].serve_web_console = false` stops the engine from mounting `/ui`. Left unset, `/ui`
   also stays unmounted on at least a non-loopback bind.
-- Under `supervise`, each engine shard gets its own API port, counted up from `--base-port`. Count
-  one operator socket per engine shard.
+- Under `supervise`, each engine shard gets its own API port, counted up from `--base-port`, or
+  from `[api].port` when the flag is absent. Count one operator socket per engine shard.
 
 [ANTIVIRUS-FIREWALL.md](ANTIVIRUS-FIREWALL.md#windows-firewall) has a port table for at least the
 MLLP, DICOM and X12 listeners and the operator API. It has no row for some listeners on this page.

@@ -220,10 +220,13 @@ def _supervise_captured(
         pytest.param(
             ["--db", "flag.db", "--base-port", "9300"], {}, "flag.db", 9300, id="flags-override"
         ),
+        pytest.param(["--db", "flag.db"], {}, "flag.db", 9100, id="db-flag-only"),
+        pytest.param(["--base-port", "9300"], {}, "site.db", 9300, id="port-flag-only"),
     ],
 )
 def test_supervise_takes_store_path_and_api_port_from_settings_without_flags(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     flags: list[str],
     env: dict[str, str],
     db_name: str,
@@ -236,17 +239,68 @@ def test_supervise_takes_store_path_and_api_port_from_settings_without_flags(
     root.mkdir()
     svc = tmp_path / "messagefoundry.toml"
     svc.write_text('[store]\npath = "site.db"\n\n[api]\nport = 9100\n', encoding="utf-8")
-    monkey = pytest.MonkeyPatch()
-    try:
-        monkey.delenv("MEFOR_STORE_PATH", raising=False)
-        monkey.delenv("MEFOR_API_PORT", raising=False)
-        for name, value in env.items():
-            monkey.setenv(name, value)
-        argv = ["--service-config", str(svc), "--project-root", str(root), *flags]
-        captured = _supervise_captured(tmp_path, monkey, argv)
-    finally:
-        monkey.undo()
+    monkeypatch.delenv("MEFOR_STORE_PATH", raising=False)
+    monkeypatch.delenv("MEFOR_API_PORT", raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    argv = ["--service-config", str(svc), "--project-root", str(root), *flags]
+    captured = _supervise_captured(tmp_path, monkeypatch, argv)
     assert captured == {"db_base": str(root / db_name), "base_port": port}
+
+
+@pytest.mark.parametrize(
+    ("backend", "path", "base"),
+    [
+        pytest.param("sqlite", "site.db", "site.db", id="sqlite"),
+        pytest.param("postgres", "state/site.db", "state/site.db", id="server-file"),
+        pytest.param("postgres", "", "messagefoundry.db", id="server-empty"),
+        pytest.param("postgres", ".", "messagefoundry.db", id="server-dot"),
+    ],
+)
+def test_supervise_store_base_gives_a_server_directory_a_file_name(
+    backend: str, path: str, base: str
+) -> None:
+    """A server store's [store].path may name a directory, which has no stem for each engine
+    shard's ``<stem>_<shard>`` name; with --db no longer defaulted (BACKLOG #5817) the merged path
+    is the base, so the directory gets the default store name inside it."""
+    from messagefoundry.__main__ import _supervise_store_base
+    from messagefoundry.config.settings import StoreSettings
+
+    server = {"server": "db.example.invalid", "database": "mf", "username": "mefor"}
+    store = StoreSettings.model_validate(
+        {"backend": backend, "path": path, **(server if backend != "sqlite" else {})}
+    )
+    got = _supervise_store_base(store)
+    assert Path(got) == Path(base)
+    # Two engine shards, the only topology a server store is for, derive their paths from it.
+    specs = build_shard_specs(["a", "b"], config="c", db_base=got, base_port=8765)
+    assert [Path(s.db_path).name for s in specs] == [
+        f"{Path(base).stem}_a.db",
+        f"{Path(base).stem}_b.db",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("shards", "base_port", "refused"),
+    [
+        pytest.param(["a"], 0, False, id="one-shard-ephemeral"),
+        pytest.param(["a", "b"], 0, True, id="two-shards-from-zero"),
+        pytest.param(["a", "b"], 65534, False, id="last-port-65535"),
+        pytest.param(["a", "b"], 65535, True, id="past-65535"),
+        pytest.param(["a", "b"], 1, False, id="from-one"),
+    ],
+)
+def test_build_shard_specs_refuses_ports_no_engine_shard_can_bind(
+    shards: list[str], base_port: int, refused: bool
+) -> None:
+    """With [api].port now the default base (BACKLOG #5817), a value serve accepts for its one
+    socket, such as 0, would number several engine shards' ports from it."""
+    if refused:
+        with pytest.raises(ValueError, match="from 1 to 65535"):
+            build_shard_specs(shards, config="c", db_base="m.db", base_port=base_port)
+    else:
+        specs = build_shard_specs(shards, config="c", db_base="m.db", base_port=base_port)
+        assert [s.port for s in specs] == [base_port + i for i in range(len(shards))]
 
 
 # --- lifecycle (fake process) ------------------------------------------------

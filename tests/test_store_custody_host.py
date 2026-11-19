@@ -1789,9 +1789,8 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
         "parameter that goes only with it, at least -EngineWheelSha256, -RequirementsLock, "
         "-RequirementsLockSha256 and -BasePython, as for any re-run over the install root it "
         "built (`messagefoundry service install` cannot pass -DbPath, so never reinstall with "
-        "it), and supervise --db, which supervise passes to its engine shard as "
-        "messagefoundry.db, under --project-root if one is given, when its own command line "
-        "leaves it out"
+        "it), and supervise --db wherever a supervise command line passes one (without one, "
+        "supervise takes [store].path, as serve does)"
     )
     database = (
         ", once [store] names that new database, here and for the service (--db sets only "
@@ -1812,8 +1811,8 @@ def test_the_fallback_re_run_never_points_back_at_the_old_store(
 
 
 def test_the_service_commands_the_fallback_names_exist() -> None:
-    # PR 2804 eighth hold: the step names install-service.ps1's -DbPath and supervise's --db, which
-    # passes messagefoundry.db when left out. Tie both names to the real interfaces.
+    # PR 2804 eighth hold: the step names install-service.ps1's -DbPath and supervise's --db. Tie
+    # both names to the real interfaces.
     from messagefoundry.__main__ import _build_parser
 
     script = Path(__file__).resolve().parents[1] / "scripts" / "service" / "install-service.ps1"
@@ -1824,18 +1823,20 @@ def test_the_service_commands_the_fallback_names_exist() -> None:
     assert 'if (-not $DbPath) { $DbPath = Join-Path $DataDir "messagefoundry.db" }' in source
     assert "serve --config $(Format-QuotedPath $Config) --db $(Format-QuotedPath $DbPath)" in source
     parser, _ = _build_parser()
-    supervise = parser.parse_args(["supervise", "--config", "c"])
-    assert supervise.db == "messagefoundry.db"
-    # supervise forwards its --db to the one engine shard SQLite allows, bare.
+    supervise = parser.parse_args(["supervise", "--config", "c", "--db", "new.db"])
+    assert supervise.db == "new.db"
+    # supervise forwards a given --db to the one engine shard SQLite allows, bare. Without one it
+    # takes [store].path (BACKLOG #5817), so the step names only a supervise that passes one.
+    assert parser.parse_args(["supervise", "--config", "c"]).db is None
     from messagefoundry.pipeline.supervisor import build_shard_specs
 
     (spec,) = build_shard_specs(["a"], config="c", db_base=supervise.db, base_port=8765)
     argv = list(spec.argv)
-    assert argv[argv.index("--db") + 1] == "messagefoundry.db", argv
+    assert argv[argv.index("--db") + 1] == "new.db", argv
     step = custody_host.keep_the_key_step(
         StoreSettings(key_provider="host", cipher_provider="aesgcm"), new_store=True
     )
-    assert "-DbPath" in step and "supervise --db" in step and "messagefoundry.db" in step, step
+    assert "-DbPath" in step and "supervise --db" in step and "[store].path" in step, step
 
 
 def test_the_advised_reinstall_is_one_the_installer_accepts() -> None:

@@ -131,6 +131,14 @@ def build_shard_specs(
     """
     ordered = sorted(shard_list)
     single = len(ordered) <= 1
+    # A single engine shard binds base_port as `serve` binds [api].port, 0 included. Several count
+    # up from it, so 0 (one ephemeral port, then 1, 2, ...) or a last port past 65535 names no
+    # port each can bind; refused here rather than left to crash-loop.
+    if not single and not 1 <= base_port <= 65536 - len(ordered):
+        raise ValueError(
+            f"base port {base_port} gives {len(ordered)} engine shards ports "
+            f"{base_port}..{base_port + len(ordered) - 1}; each needs a port from 1 to 65535"
+        )
     specs: list[ShardSpec] = []
     for i, shard in enumerate(ordered):
         port = base_port + i
