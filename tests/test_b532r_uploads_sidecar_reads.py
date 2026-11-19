@@ -405,16 +405,16 @@ async def test_rotate_key_leaves_a_sidecar_that_would_seal_past_the_cap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     # Review round 2: sealing grows a sidecar by a third, so a plaintext one under the cap could be
-    # written past it, then refused by every read and aged out by the prune. Follow-up: it was then
-    # counted a skip, which failed every rotate-key run and held the rotation record open for good,
-    # though nothing of it is under the prior key. It is now its own terminal count.
+    # written past it, then refused by every read and aged out by the prune. It is a skip
+    # (BACKLOG #5387, fail-safe): rotate-key does not read inside it, so it may hold a value under
+    # a prior key, and the rotation stays open until it is fixed or deliberately removed.
     root = tmp_path / "uploads"
     meta = await _saved(_store(root))
     sidecar = root / f"{meta.file_id}.meta"
     plain = sidecar.read_text(encoding="utf-8")
     monkeypatch.setattr(uploads, "_PLAIN_SIDECAR_LIMIT", len(plain.encode("utf-8")) - 1)
     result = await _store(root, generate_key()).reseal_to_active()
-    assert (result.skipped, result.damaged) == (0, 1)
-    assert not result.incomplete
+    assert (result.skipped, result.sidecar_refused, result.damaged) == (1, 1, 0)
+    assert result.incomplete
     assert result.resealed == 1  # the body is still sealed
     assert sidecar.read_text(encoding="utf-8") == plain

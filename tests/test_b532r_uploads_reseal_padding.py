@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""``rotate-key`` over a sidecar padded past the cap, and the startup count over every kind of
-damaged sidecar (BACKLOG #5387). Synthetic data only.
+"""``rotate-key`` over a sidecar every reader refuses before decrypting, and the startup count over
+the same kinds (BACKLOG #5387). Synthetic data only.
 
 A sidecar sealed under a PRIOR key and padded past 128 KiB was classed damaged, so the rotation
 completed and the prior key read as safe to retire, though trimming the padding recovers the value
-with that key. It is now a skip. And the startup count skipped the body under an oversized sidecar
-while ``rotate-key`` sealed it, so the operator's cross-check of the two disagreed."""
+with that key. Marker scans of the refused bytes were tried next and each was defeated, by at least
+a cut at the read bound, stripped padding and a UTF-16 re-save. So the rule is fail-safe: a
+sidecar refused before decrypting is a skip, whatever it holds, and only one that provably holds
+nothing, read in full within the cap, is damaged. The startup count agrees with ``rotate-key``
+over every one of these kinds."""
 
 from __future__ import annotations
 
@@ -23,7 +26,8 @@ from messagefoundry.store.crypto import AesGcmCipher, generate_key, make_cipher
 from messagefoundry.uploads import ResealResult, UploadStore
 
 _BODY = b"synthetic diagnostic line\n"
-_OVER = uploads._SIDECAR_LIMIT + 1  # noqa: SLF001 - the test plants a file at the seam
+_LIMIT = uploads._SIDECAR_LIMIT  # noqa: SLF001 - the test plants a file at the seam
+_OVER = _LIMIT + 1
 
 
 def _aes(key: str, *retired: str) -> AesGcmCipher:
@@ -43,7 +47,19 @@ def _reseal(root: Path, cipher: AesGcmCipher) -> ResealResult:
     return asyncio.run(UploadStore(root, cipher, max_bytes=4096).reseal_to_active())
 
 
-# --- item 1: a padded sidecar under a prior key is a skip -----------------------------------------
+def _is_refused_skip(result: ResealResult) -> bool:
+    return (result.skipped, result.sidecar_refused, result.damaged) == (1, 1, 0) and (
+        result.incomplete
+    )
+
+
+def _padded_past_the_cap(sealed: bytes, where: str) -> bytes:
+    # Sized in bytes, so the file is over the cap whatever the sealed value's length.
+    pad = b" " * (_OVER - len(sealed))
+    return sealed + pad if where == "trailing" else pad + sealed
+
+
+# --- a refused sidecar is a skip, whatever it holds ----------------------------------------------
 
 
 @pytest.mark.parametrize("where", ["trailing", "leading"])
@@ -53,191 +69,115 @@ def test_a_prior_key_sidecar_padded_past_the_cap_is_a_skip(tmp_path: Path, where
     key_a, key_b = generate_key(), generate_key()
     fid = _save(tmp_path, key_a)
     sidecar = tmp_path / f"{fid}.meta"
-    sealed = sidecar.read_text(encoding="utf-8")
-    pad = " " * (_OVER - len(sealed))
-    sidecar.write_text(sealed + pad if where == "trailing" else pad + sealed, encoding="utf-8")
+    sealed = sidecar.read_bytes()
+    planted = _padded_past_the_cap(sealed, where)
+    sidecar.write_bytes(planted)
     rotated = _aes(key_b, key_a)
 
     result = _reseal(tmp_path, rotated)
-    assert (result.skipped, result.damaged) == (1, 0)
-    assert result.incomplete
-    assert sidecar.read_text(encoding="utf-8").strip() == sealed  # left as it is
+    assert _is_refused_skip(result)
+    assert sidecar.read_bytes() == planted  # left as it is
 
-    sidecar.write_text(sealed, encoding="utf-8")
+    sidecar.write_bytes(sealed)
     again = _reseal(tmp_path, rotated)
     assert (again.skipped, again.damaged) == (0, 0)
     assert not again.incomplete
     assert sidecar.read_text(encoding="utf-8").startswith(rotated.active_marker_prefix)
 
 
-def test_a_sidecar_that_is_padding_to_the_cap_is_a_skip(tmp_path: Path) -> None:
-    """The bounded head cannot see past the padding, so it cannot rule out a marker after it."""
+@pytest.mark.parametrize("codec", ["utf-16", "utf-16-le", "utf-16-be"])
+def test_a_utf16_resave_of_a_prior_key_value_is_a_skip(tmp_path: Path, codec: str) -> None:
+    """An editor that re-saves the value as UTF-16 hides its marker from any byte scan."""
     key_a, key_b = generate_key(), generate_key()
     fid = _save(tmp_path, key_a)
     sidecar = tmp_path / f"{fid}.meta"
-    sealed = sidecar.read_text(encoding="utf-8")
-    sidecar.write_text(" " * _OVER + sealed, encoding="utf-8")
+    text = sidecar.read_text(encoding="utf-8")
+    # With no byte-order mark, ASCII in UTF-16 is still valid UTF-8, so the BOM-less forms are
+    # given one; a BOM-less re-save reads as plaintext, the pre-existing stray-prefix case.
+    bom = {"utf-16": "", "utf-16-le": "﻿", "utf-16-be": "﻿"}[codec]
+    planted = (bom + text).encode(codec)
+    sidecar.write_bytes(planted)
     result = _reseal(tmp_path, _aes(key_b, key_a))
-    assert (result.skipped, result.damaged) == (1, 0)
+    assert _is_refused_skip(result)
+    assert sidecar.read_bytes() == planted
 
 
-def test_an_active_key_sidecar_padded_past_the_cap_is_damaged(tmp_path: Path) -> None:
-    """Control: under the active key, retiring the prior key loses nothing, so it stays terminal."""
+def test_an_active_key_sidecar_padded_past_the_cap_is_a_skip(tmp_path: Path) -> None:
+    """Replaces a damaged-outcome test that was about one percent flaky. Under the active key a
+    trim recovers nothing the prior key holds, but the pass does not read inside a refused
+    sidecar to tell, so it is a skip too."""
     cipher = _aes(generate_key())  # one instance: a cipher's marker carries its own store salt
     fid = _save(tmp_path, cipher)
     sidecar = tmp_path / f"{fid}.meta"
-    sealed = sidecar.read_text(encoding="utf-8")
-    sidecar.write_text(sealed + " " * (_OVER - len(sealed)), encoding="utf-8")
-    result = _reseal(tmp_path, cipher)
-    assert (result.skipped, result.damaged) == (0, 1)
-    assert not result.incomplete
+    sidecar.write_bytes(_padded_past_the_cap(sidecar.read_bytes(), "trailing"))
+    assert _is_refused_skip(_reseal(tmp_path, cipher))
 
 
-@pytest.mark.parametrize("prior", [True, False], ids=["prior-key", "active-key"])
-def test_a_sealed_sidecar_with_a_stray_non_utf8_byte_is_a_skip_only_under_a_prior_key(
-    tmp_path: Path, prior: bool
+@pytest.mark.parametrize("extra", [1, 4, 4096], ids=["one-over", "four-over", "page-over"])
+def test_an_over_cap_sidecar_whose_head_is_only_padding_is_a_skip(
+    tmp_path: Path, extra: int
 ) -> None:
-    """Trimming the stray byte recovers the value with the key its marker names, so under a prior
-    key it is a skip; under the active key, retiring the prior key loses nothing."""
-    key_a, key_b = generate_key(), generate_key()
-    fid = _save(tmp_path, key_a)
-    sidecar = tmp_path / f"{fid}.meta"
-    sidecar.write_bytes(sidecar.read_bytes() + b"\xff")
-    result = _reseal(tmp_path, _aes(key_b, key_a) if prior else _aes(key_a))
-    assert (result.skipped, result.damaged) == ((1, 0) if prior else (0, 1))
-
-
-def test_a_plaintext_sidecar_padded_past_the_cap_is_damaged(tmp_path: Path) -> None:
-    """Control: a plaintext one is under no key, so it is not a skip."""
-    fid = _save(tmp_path, None)
-    sidecar = tmp_path / f"{fid}.meta"
-    plain = sidecar.read_text(encoding="utf-8")
-    sidecar.write_text(plain + " " * (_OVER - len(plain)), encoding="utf-8")
-    result = _reseal(tmp_path, _aes(generate_key()))
-    assert (result.skipped, result.damaged) == (0, 1)
-
-
-# --- item 2: the startup count and rotate-key agree over every damage kind ------------------------
-
-
-def _oversized(sidecar: Path, plain: str) -> None:
-    sidecar.write_text(plain + " " * (_OVER - len(plain)), encoding="utf-8")
-
-
-def _too_long(sidecar: Path, plain: str) -> None:
-    # Past the plaintext seal bound and under the cap, with the bound lowered below the file.
-    sidecar.write_text(plain + " x" * 8, encoding="utf-8")
-
-
-def _blank(sidecar: Path, plain: str) -> None:
-    sidecar.write_text("  \n", encoding="utf-8")
-
-
-def _not_utf8(sidecar: Path, plain: str) -> None:
-    sidecar.write_bytes(b"\xff\xfe" + plain.encode("utf-8"))
+    """The pass reads no more than the cap, so it cannot see whether a value follows."""
+    cipher = _aes(generate_key())
+    fid = _save(tmp_path, cipher)
+    (tmp_path / f"{fid}.meta").write_bytes(b" " * (_LIMIT + extra))
+    assert _is_refused_skip(_reseal(tmp_path, cipher))
 
 
 @pytest.mark.parametrize(
-    "damage", [_oversized, _too_long, _blank, _not_utf8], ids=lambda f: f.__name__.strip("_")
+    "planted",
+    [b"\xff", b"\xff\xfe{}", b"\xa0" + b"x" * 64, b"\xc3"],
+    ids=["ff", "utf16-bom", "a0", "cut-sequence"],
 )
-def test_the_startup_count_matches_rotate_keys_sealed_count_over_a_damaged_sidecar(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: Callable[[Path, str], None]
-) -> None:
-    """Each sidecar is one ``rotate-key`` leaves as it is, while it seals the plaintext body under
-    it. At 18d2789dd0 the startup count stopped at the oversized and too-long kinds and counted
-    the blank and non-UTF-8 kinds, so the operator's cross-check disagreed on two of the four."""
+@pytest.mark.parametrize("prior", [True, False], ids=["prior-key", "active-key"])
+def test_a_sidecar_that_is_not_utf8_is_a_skip(tmp_path: Path, planted: bytes, prior: bool) -> None:
+    key_a, key_b = generate_key(), generate_key()
+    fid = _save(tmp_path, key_a)
+    sidecar = tmp_path / f"{fid}.meta"
+    sidecar.write_bytes(planted + sidecar.read_bytes())
+    assert _is_refused_skip(_reseal(tmp_path, _aes(key_b, key_a) if prior else _aes(key_a)))
+
+
+def test_a_plaintext_sidecar_padded_past_the_cap_is_a_skip(tmp_path: Path) -> None:
+    """Even one under no key: the pass does not read inside it to tell."""
     fid = _save(tmp_path, None)
     sidecar = tmp_path / f"{fid}.meta"
-    plain = sidecar.read_text(encoding="utf-8")
-    monkeypatch.setattr(uploads, "_PLAIN_SIDECAR_LIMIT", len(plain.encode("utf-8")))
-    damage(sidecar, plain)
-    cipher = _aes(generate_key())
-
-    counted = asyncio.run(UploadStore(tmp_path, cipher, max_bytes=4096).warn_if_unsealed())
-    result = _reseal(tmp_path, cipher)
-    assert (counted, result.sealed_plaintext) == (1, 1)
-    assert (result.damaged, result.skipped) == (1, 0)
+    sidecar.write_bytes(_padded_past_the_cap(sidecar.read_bytes(), "trailing"))
+    assert _is_refused_skip(_reseal(tmp_path, _aes(generate_key())))
 
 
-# --- review rounds 1 and 2: the marker is looked for anywhere in the bounded head -----------------
-
-
-@pytest.mark.parametrize("k", range(1, 7))
-def test_a_marker_straddling_the_read_bound_is_a_skip(tmp_path: Path, k: int) -> None:
-    """Only ``k`` bytes of ``mfenc:`` fall inside the head, so ``find`` alone misses it."""
-    key_a, key_b = generate_key(), generate_key()
-    fid = _save(tmp_path, key_a)
-    sidecar = tmp_path / f"{fid}.meta"
-    sidecar.write_bytes(b" " * (_OVER - k) + sidecar.read_bytes())
-    result = _reseal(tmp_path, _aes(key_b, key_a))
-    assert (result.skipped, result.damaged) == (1, 0)
-
-
-def test_mfenc_letters_in_a_plaintext_sidecar_are_not_a_marker(tmp_path: Path) -> None:
-    """A filename may carry the same letters; a plaintext sidecar under no key stays terminal."""
-    store = UploadStore(tmp_path, make_cipher(None), max_bytes=4096)
-    meta = asyncio.run(
-        store.save(data=_BODY, filename="mfenc:report.txt", uploader="op", uploader_id="u-op")
-    )
-    sidecar = tmp_path / f"{meta.file_id}.meta"
-    plain = sidecar.read_text(encoding="utf-8")
-    sidecar.write_text(plain + " " * (_OVER - len(plain)), encoding="utf-8")
-    result = _reseal(tmp_path, _aes(generate_key()))
-    assert (result.skipped, result.damaged) == (0, 1)
-
-
-def test_the_startup_count_skips_a_body_too_large_to_seal(tmp_path: Path) -> None:
-    """rotate-key skips a body larger than a body can be, so the count must not include it."""
-    cipher = _aes(generate_key())
-    fid = _save(tmp_path, cipher)
-    (tmp_path / f"{fid}.blob").write_bytes(b"p" * (2 * 4096 + 4096 + 10))
-    counted = asyncio.run(UploadStore(tmp_path, cipher, max_bytes=4096).warn_if_unsealed())
-    result = _reseal(tmp_path, cipher)
-    assert (counted, result.sealed_plaintext, result.skipped) == (0, 0, 1)
-
-
-@pytest.mark.parametrize("stray", [b"\xff", b"\xff\xfe", b"\xa0"], ids=["ff", "utf16-bom", "a0"])
-@pytest.mark.parametrize("over", [False, True], ids=["under-cap", "over-cap"])
-def test_a_stray_leading_byte_before_a_prior_key_value_is_a_skip(
-    tmp_path: Path, stray: bytes, over: bool
+def test_a_too_long_plaintext_sidecar_holding_a_prior_key_value_is_a_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The marker test read only the start of the unpadded head, so a byte before the value hid it
-    and the pair counted as damaged."""
     key_a, key_b = generate_key(), generate_key()
     fid = _save(tmp_path, key_a)
     sidecar = tmp_path / f"{fid}.meta"
-    sealed = sidecar.read_bytes()
-    pad = b" " * (_OVER - len(sealed) - len(stray)) if over else b""
-    sidecar.write_bytes(stray + sealed + pad)
-    result = _reseal(tmp_path, _aes(key_b, key_a))
-    assert (result.skipped, result.damaged) == (1, 0)
+    sealed = sidecar.read_text(encoding="utf-8")
+    sidecar.write_text("x" + sealed, encoding="utf-8")
+    monkeypatch.setattr(uploads, "_PLAIN_SIDECAR_LIMIT", len(sealed) - 1)
+    assert _is_refused_skip(_reseal(tmp_path, _aes(key_b, key_a)))
 
 
-def test_a_sidecar_that_is_only_padding_past_the_cap_is_a_skip(tmp_path: Path) -> None:
-    """The pass reads no more than the cap, so a file that is padding that far may hide a marker
-    after it: a skip, as the brief's bounded read requires, never damaged."""
-    cipher = _aes(generate_key())
-    fid = _save(tmp_path, cipher)
-    (tmp_path / f"{fid}.meta").write_bytes(b" " * (_OVER + 4))
-    result = _reseal(tmp_path, cipher)
-    assert (result.skipped, result.damaged) == (1, 0)
-
-
-def test_a_marker_cut_at_the_read_bound_is_a_skip(tmp_path: Path) -> None:
-    """A marker cut short names no key, so even one that would name the active key is a skip."""
-    cipher = _aes(generate_key())
-    fid = _save(tmp_path, cipher)
+@pytest.mark.parametrize("lost", [True, False], ids=["lost-body", "body"])
+def test_a_too_long_plaintext_sidecar_is_a_skip_over_any_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, lost: bool
+) -> None:
+    """Over a lost body it was the never-sealable kind, reported apart; it is refused before any
+    decrypt all the same, so it is a skip there too."""
+    fid = _save(tmp_path, None)
     sidecar = tmp_path / f"{fid}.meta"
-    sealed = sidecar.read_bytes()
-    sidecar.write_bytes(b" " * (_OVER - 10) + sealed)
-    result = _reseal(tmp_path, cipher)
-    assert (result.skipped, result.damaged) == (1, 0)
+    monkeypatch.setattr(uploads, "_PLAIN_SIDECAR_LIMIT", len(sidecar.read_bytes()) - 1)
+    if lost:
+        (tmp_path / f"{fid}.blob").unlink()
+    result = _reseal(tmp_path, _aes(generate_key()))
+    assert _is_refused_skip(result)
+    assert result.unsealable == 0
 
 
 def test_the_reseal_reads_no_more_than_the_cap_of_an_oversized_sidecar(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The head is read boundedly, however large the file."""
+    """However large the file, the pass reads at most the cap of it, and answers a skip."""
     key_a, key_b = generate_key(), generate_key()
     fid = _save(tmp_path, key_a)
     sidecar = tmp_path / f"{fid}.meta"
@@ -266,35 +206,169 @@ def test_the_reseal_reads_no_more_than_the_cap_of_an_oversized_sidecar(
 
     monkeypatch.setattr(uploads, "_open_plain", spy)
     result = _reseal(tmp_path, _aes(key_b, key_a))
-    assert taken and sum(taken) <= _OVER
-    # What lies past the read is not seen: a plaintext head with no marker is damaged.
-    assert (result.skipped, result.damaged) == (0, 1)
+    assert sum(taken) <= _OVER
+    assert _is_refused_skip(result)
 
 
-def test_a_too_long_plaintext_sidecar_holding_a_prior_key_value_is_a_skip(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+# --- the one damaged kind: a sidecar that provably holds nothing ---------------------------------
+
+
+@pytest.mark.parametrize(
+    "planted",
+    [b"", b"  \n", b"\t\r\n ", b"\xef\xbb\xbf", b"\xef\xbb\xbf \n", b" " * _LIMIT],
+    ids=["empty", "spaces", "whitespace", "bom", "bom-and-space", "padding-to-the-cap"],
+)
+@pytest.mark.parametrize("prior", [True, False], ids=["prior-key", "active-key"])
+def test_a_blank_sidecar_within_the_cap_is_damaged(
+    tmp_path: Path, planted: bytes, prior: bool
 ) -> None:
+    """Read in full within the cap, it holds nothing under any key, so retiring the prior key
+    loses nothing and the run completes."""
     key_a, key_b = generate_key(), generate_key()
     fid = _save(tmp_path, key_a)
     sidecar = tmp_path / f"{fid}.meta"
-    sealed = sidecar.read_text(encoding="utf-8")
-    sidecar.write_text("x" + sealed, encoding="utf-8")
-    monkeypatch.setattr(uploads, "_PLAIN_SIDECAR_LIMIT", len(sealed) - 1)
-    result = _reseal(tmp_path, _aes(key_b, key_a))
-    assert (result.skipped, result.damaged) == (1, 0)
+    sidecar.write_bytes(planted)
+    result = _reseal(tmp_path, _aes(key_b, key_a) if prior else _aes(key_a))
+    assert (result.skipped, result.sidecar_refused, result.damaged) == (0, 0, 1)
+    assert not result.incomplete
+    assert sidecar.read_bytes() == planted
 
 
-@pytest.mark.parametrize("damage", [_oversized, _blank], ids=["oversized", "blank"])
-def test_the_startup_count_skips_a_body_that_is_not_text_past_its_head(
-    tmp_path: Path, damage: Callable[[Path, str], None]
+# --- the startup count and rotate-key agree over every kind --------------------------------------
+
+
+def _oversized(sidecar: Path) -> None:
+    sidecar.write_bytes(_padded_past_the_cap(sidecar.read_bytes(), "trailing"))
+
+
+def _padding_past_the_cap(sidecar: Path) -> None:
+    sidecar.write_bytes(b" " * (_OVER + 8))
+
+
+def _too_long(sidecar: Path) -> None:
+    # Past the plaintext seal bound and under the cap, with the bound lowered below the file.
+    sidecar.write_bytes(sidecar.read_bytes() + b" x" * 8)
+
+
+def _blank(sidecar: Path) -> None:
+    sidecar.write_bytes(b"  \n")
+
+
+def _empty(sidecar: Path) -> None:
+    sidecar.write_bytes(b"")
+
+
+def _not_utf8(sidecar: Path) -> None:
+    sidecar.write_bytes(b"\xff\xfe" + sidecar.read_bytes())
+
+
+def _utf16(sidecar: Path) -> None:
+    sidecar.write_bytes(sidecar.read_text(encoding="utf-8").encode("utf-16"))
+
+
+_KINDS: list[Callable[[Path], None]] = [
+    _oversized,
+    _padding_past_the_cap,
+    _too_long,
+    _blank,
+    _empty,
+    _not_utf8,
+    _utf16,
+]
+
+
+# The plaintext seal bound holds only a plaintext sidecar, so the too-long kind is plaintext only.
+_PAIRS = [
+    pytest.param(
+        damage, sealed, id=f"{damage.__name__.strip('_')}-{'sealed' if sealed else 'plain'}"
+    )
+    for damage in _KINDS
+    for sealed in (False, True)
+    if not (sealed and damage is _too_long)
+]
+
+
+@pytest.mark.parametrize(("damage", "sidecar_sealed"), _PAIRS)
+@pytest.mark.parametrize("body", ["plaintext", "lost", "not-text", "too-large", "as-saved"])
+def test_the_startup_count_agrees_with_rotate_key_over_a_refused_or_blank_sidecar(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    damage: Callable[[Path], None],
+    body: str,
+    sidecar_sealed: bool,
 ) -> None:
-    """rotate-key counts such a body as lost and seals nothing of it, so the count must not send
-    the operator to run it."""
-    fid = _save(tmp_path, None)
-    sidecar = tmp_path / f"{fid}.meta"
-    damage(sidecar, sidecar.read_text(encoding="utf-8"))
-    (tmp_path / f"{fid}.blob").write_bytes(b"p" * 3000 + b"\xff")
+    """Both counts are driven over the same pair: the startup count's plaintext and never-sealable
+    totals must be ``rotate-key``'s ``sealed_plaintext`` and ``unsealable``. At 18d2789dd0 they
+    disagreed on at least the oversized and too-long kinds, and the startup count named an
+    oversized sidecar over a lost body as one ``rotate-key`` cannot seal while that pass skips it."""
     cipher = _aes(generate_key())
+    fid = _save(tmp_path, cipher if sidecar_sealed else None)
+    sidecar = tmp_path / f"{fid}.meta"
+    blob = tmp_path / f"{fid}.blob"
+    monkeypatch.setattr(uploads, "_PLAIN_SIDECAR_LIMIT", len(sidecar.read_bytes()))
+    damage(sidecar)
+    if body == "plaintext":
+        blob.write_bytes(_BODY)
+    elif body == "lost":
+        blob.unlink()
+    elif body == "not-text":
+        blob.write_bytes(b"p" * 3000 + b"\xff")
+    elif body == "too-large":
+        blob.write_bytes(b"p" * (2 * 4096 + 4096 + 10))
+    # "as-saved": the body as save wrote it, under the key when the sidecar was sealed.
+    store = UploadStore(tmp_path, cipher, max_bytes=4096)
+
+    counted, unsealable = store._count_unsealed_sync()  # noqa: SLF001 - both totals, unlogged
+    logged = asyncio.run(store.warn_if_unsealed())
+    result = _reseal(tmp_path, cipher)
+    assert logged == counted
+    assert (counted, unsealable) == (result.sealed_plaintext, result.unsealable)
+    assert result.unsealable == 0
+    blank = damage in (_blank, _empty)
+    # A skipped body takes the pair's one count, so a blank sidecar over it is not counted damaged.
+    assert result.damaged == int(blank and body != "too-large")
+    assert result.sidecar_refused == int(not blank)
+    assert result.incomplete == (not blank or body == "too-large")
+
+
+def test_the_startup_count_skips_a_body_too_large_to_seal(tmp_path: Path) -> None:
+    """rotate-key skips a body larger than a body can be, so the count must not include it."""
+    cipher = _aes(generate_key())
+    fid = _save(tmp_path, cipher)
+    (tmp_path / f"{fid}.blob").write_bytes(b"p" * (2 * 4096 + 4096 + 10))
     counted = asyncio.run(UploadStore(tmp_path, cipher, max_bytes=4096).warn_if_unsealed())
     result = _reseal(tmp_path, cipher)
-    assert (counted, result.sealed_plaintext, result.damaged) == (0, 0, 1)
+    assert (counted, result.sealed_plaintext, result.skipped) == (0, 0, 1)
+
+
+# --- the command's error over a refused sidecar ---------------------------------------------------
+
+
+def test_rotate_key_never_advises_deleting_a_refused_sidecar(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Deleting it could destroy a value under the prior key, so the error says it could not be
+    read, that it may hold such a value, and that the prior key stays until it is fixed or
+    deliberately removed."""
+    from messagefoundry.__main__ import main
+    from tests.test_cli import _rotate_env, _seed_store_and_upload
+
+    monkeypatch.chdir(tmp_path)
+    db, root = tmp_path / "rot.db", tmp_path / "uploads"
+    key_a, key_b = generate_key(), generate_key()
+    fid = _seed_store_and_upload(db, root, key_a)
+    sidecar = root / f"{fid}.meta"
+    sidecar.write_bytes(_padded_past_the_cap(sidecar.read_bytes(), "trailing"))
+    _rotate_env(monkeypatch, active=key_b, retired=key_a, uploads=root)
+    assert main(["rotate-key", "--db", str(db)]) == 1
+    err = capsys.readouterr().err
+    refused = [line for line in err.splitlines() if line.startswith("error: 1 of those")]
+    assert len(refused) == 1, err
+    line = refused[0]
+    assert "error: 1 of those uploaded file(s) have a sidecar that could not be read" in line
+    assert "It may hold a value under the prior key" in line
+    assert "Do not retire the prior key until each such sidecar is fixed" in line
+    assert "deliberately removed" in line
+    assert "delete" not in line.lower() and "two files" not in line
+    # The skip's generic advice to remove a damaged file's two files excludes this one.
+    assert "That does not apply to a sidecar that could not be read" in err

@@ -5,8 +5,8 @@
 
 A part the filesystem refuses the engine is answered as an access refusal, never as damage, by the
 store and by the API, whose 423 carries the kind as a typed signal. A plaintext sidecar too long to
-seal within the sidecar cap is refused as damaged by every reader and left by ``rotate-key`` as a
-terminal count, not a skip. The body check and the reseal open through ``_open_plain``. The session
+seal within the sidecar cap is refused as damaged by every reader, and ``rotate-key`` skips it,
+since it may hold a value under a prior key. The body check and the reseal open through ``_open_plain``. The session
 token a sign-in replaces is bounded where it enters ``AuthService``. Synthetic data only."""
 
 from __future__ import annotations
@@ -91,17 +91,17 @@ async def test_a_plaintext_sidecar_too_long_to_seal_is_damaged_on_every_read(
     assert await store.list_files() == []
 
 
-async def test_rotate_key_counts_a_too_long_plaintext_sidecar_apart_and_completes(
-    tmp_path: Path,
-) -> None:
+async def test_rotate_key_skips_a_too_long_plaintext_sidecar(tmp_path: Path) -> None:
+    # BACKLOG #5387, fail-safe: rotate-key does not read inside a sidecar it refuses, so it is a
+    # skip and the rotation stays open.
     root = tmp_path / "uploads"
     meta = await _saved(_store(root))
     sidecar = root / f"{meta.file_id}.meta"
     planted = _too_long(sidecar)
     sidecar.write_text(planted, encoding="utf-8")
     result = await _store(root, generate_key()).reseal_to_active()
-    assert (result.skipped, result.damaged) == (0, 1)
-    assert not result.incomplete
+    assert (result.skipped, result.sidecar_refused, result.damaged) == (1, 1, 0)
+    assert result.incomplete
     assert sidecar.read_text(encoding="utf-8") == planted
 
 
@@ -276,18 +276,18 @@ async def test_a_sidecar_that_grew_after_its_fstat_is_read_bounded(
 
     monkeypatch.setattr(uploads, "_open_plain", _stale)
     result = await _store(root, generate_key()).reseal_to_active()
-    assert result.damaged == 1 and not result.incomplete
+    assert (result.skipped, result.sidecar_refused, result.damaged) == (1, 1, 0)
     assert sum(read) <= uploads._SIDECAR_LIMIT + 1
 
 
 @pytest.mark.parametrize("lost_body", [True, False])
-@pytest.mark.parametrize("planted", [b" \r\n", b"", b'{"file_id": "\xff"}'])
-async def test_a_sidecar_every_reader_refuses_is_left_as_damaged(
+@pytest.mark.parametrize("planted", [b" \r\n", b"", b"\xef\xbb\xbf \t"])
+async def test_a_blank_sidecar_is_left_as_damaged(
     tmp_path: Path, planted: bytes, lost_body: bool
 ) -> None:
     # Review rounds 1 and 2: a padding-only sidecar was sealed as an empty value, or sealed as
-    # plaintext, with a fresh mtime that restarted the prune's window; one not UTF-8 was a skip
-    # that failed every run. Every reader refuses each of these, so none is written or skipped.
+    # plaintext, with a fresh mtime that restarted the prune's window. Read in full within the
+    # cap, it provably holds nothing, so it is neither written nor skipped (BACKLOG #5387).
     root = tmp_path / "uploads"
     meta = await _saved(_store(root))
     sidecar = root / f"{meta.file_id}.meta"
@@ -300,10 +300,11 @@ async def test_a_sidecar_every_reader_refuses_is_left_as_damaged(
     assert sidecar.read_bytes() == planted
 
 
-async def test_a_current_sidecar_padded_past_the_cap_is_damaged_not_current(
+async def test_a_current_sidecar_padded_past_the_cap_is_a_skip_not_current(
     tmp_path: Path,
 ) -> None:
-    # Review round 2: the active-marker test ran before the cap, so this read as CURRENT.
+    # Review round 2: the active-marker test ran before the cap, so this read as CURRENT. Every
+    # reader refuses it before decrypting, so it is a skip (BACKLOG #5387).
     key = generate_key()
     root = tmp_path / "uploads"
     meta = await _saved(_store(root, key))
@@ -311,7 +312,7 @@ async def test_a_current_sidecar_padded_past_the_cap_is_damaged_not_current(
     padded = sidecar.read_bytes() + b" " * (uploads._SIDECAR_LIMIT + 1)
     sidecar.write_bytes(padded)
     result = await _store(root, key).reseal_to_active()
-    assert result.damaged == 1 and not result.incomplete
+    assert (result.skipped, result.sidecar_refused, result.damaged) == (1, 1, 0)
     assert sidecar.read_bytes() == padded
 
 

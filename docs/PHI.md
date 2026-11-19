@@ -815,10 +815,12 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    prior key retired. If it warns that the audit chain's current range is keyed under a retired
    store key, the chain has not rolled, so you may put the prior key back, with the new key in
    `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` because values may already be under it, and re-run. If it
-   gives no such warning, or you cannot tell, do not put the prior key back: go forward. **Some skips need a person (BACKLOG #3737).** A sidecar that is not
-   UTF-8, or a sealed value the key it names does not open, is skipped on every run, because no
-   key will ever open it. Restore that upload, or remove its two files from the uploads directory.
-   The log names each skipped file, and says whether the key its marker names is configured. A file
+   gives no such warning, or you cannot tell, do not put the prior key back: go forward. **Some skips need a person (BACKLOG #3737).** A sealed value the
+   key it names does not open is skipped on every run, because no key will ever open it. Restore
+   that upload, or remove its two files from the uploads directory. A sidecar every reader refuses
+   before decrypting, as below, is skipped on every run too, but it is not opened, so it may hold a
+   value under the prior key: do not retire that key until the sidecar is fixed, as by restoring
+   it, or deliberately removed. The log names each skipped file, and says whether the key its marker names is configured. A file
    larger than an upload can be is skipped too, and only its first bytes are read. One that starts
    with the active key's marker reads as already current instead, and is not reported. If a skipped
    one is a real upload from before `[store].max_upload_bytes` came down, raise that setting for the
@@ -888,19 +890,23 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    **A UTF-8 byte-order mark and JSON whitespace around a sidecar's value are skipped (BACKLOG
    #5387).** Every reader skips them, `rotate-key` and the startup count included, so a sealed
    sidecar that gained them still reads as sealed under its key and is never taken for a damaged
-   one. A sidecar that holds nothing else is blank, the damaged kind. `rotate-key` leaves as it is
-   a sidecar every reader refuses before decrypting. At least one over 128 KiB, a plaintext one
-   past that seal bound, a blank one and one that is not UTF-8 are such. It counts each apart from
-   `skipped`, so none holds the rotation open, with exceptions. At least a sidecar over 128 KiB,
-   one too long to seal or one that is not UTF-8 is a skip instead when what `rotate-key` reads
-   of it, its first 128 KiB, holds a marker that names a key other than the active one or names
-   none, or, in a longer file, is only padding or ends on the first bytes of a marker or a
-   byte-order mark. Such a one may be a value
-   under a prior key that only its padding, a stray byte or text around it keeps from being read,
-   so the rotation stays open until it is repaired. A blank one is never such. `rotate-key` reads
-   no further into a sidecar, so a value hidden behind more than 128 KiB of other content would
-   not be found. The command's output does not report that count,
-   and the log names each such upload.
+   one. A sidecar that holds nothing else is blank, the damaged kind. **`rotate-key` skips a
+   sidecar every reader refuses before decrypting, whatever it holds (BACKLOG #5387).** At least
+   one over 128 KiB, one that is not UTF-8, such as a UTF-16 re-save with its byte-order mark,
+   and a plaintext one past that seal bound are such. `rotate-key` does not look inside it for
+   a key's marker, so padding, a stray byte, a re-encoding or text around a value sealed under a
+   prior key cannot make it read as holding nothing. Each is counted in `skipped`, so the run exits non-zero, writes no
+   rotation stamp, and the rotation stays open until the sidecar is fixed or deliberately
+   removed. That holds over any body, one that is missing or is not text included, so such a
+   plaintext sidecar is not the never-sealable kind `rotate-key` reports apart, though the prune
+   and the delete class it as that kind. The command's error names how many of its skips are
+   such a sidecar, says it may hold a value under the prior key, and does not advise deleting
+   it. The one sidecar `rotate-key` leaves as it is without a skip is one that provably holds
+   nothing: read in full within 128 KiB, it is empty, or only a byte-order mark and whitespace.
+   It counts that one apart from `skipped`, as `damaged`, so it does not hold the rotation open.
+   The command's output does not report that count, and the log names each such upload. The
+   startup count agrees with `rotate-key` over each of these kinds: it counts none of their
+   sidecars, and counts the plaintext body under one only where `rotate-key` would seal it.
    **A part the filesystem refuses the engine is not damaged (BACKLOG #5388).** At least a
    permission or an ACL the engine lacks, and on Windows a file another program holds open, are
    answered on a by-id read where a damaged file's 423 would be, with a 423 whose own text says
