@@ -94,6 +94,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -197,8 +198,8 @@ def newest_by_name(check_runs: list[dict[str, object]]) -> dict[str, dict[str, o
     same watched workflow -- measured 2026-09-17 on the head shared by PRs 1226 and 1241, which
     carried two CI runs created 35 seconds apart whose durations differed by 67, so the
     EARLIER-created one finished LAST. Picking "the newest" there can read a still-running leg as
-    green. Second, among runs in the same settled state, the greatest ``started_at`` wins; a run with
-    no timestamp loses to one that has a timestamp rather than winning by arriving last.
+    green. Second, among runs in the same settled state, the greatest ``started_at`` wins; on a tie
+    or an unreadable stamp the run that is not a success wins (:func:`_outranks`).
 
     LIST ORDER IS NEVER USED. The GraphQL ``statusCheckRollup`` sibling is measurably not ordered by
     ``startedAt`` -- on this repository's own PR 1226, a later entry carried an OLDER settled success
@@ -216,11 +217,41 @@ def newest_by_name(check_runs: list[dict[str, object]]) -> dict[str, dict[str, o
             continue
         run_unsettled = run.get("status") != "completed"
         held_unsettled = held.get("status") != "completed"
-        started_later = str(run.get("started_at") or "") > str(held.get("started_at") or "")
         unsettled_wins = run_unsettled and not held_unsettled
-        if unsettled_wins or (run_unsettled == held_unsettled and started_later):
+        if unsettled_wins or (run_unsettled == held_unsettled and _outranks(run, held)):
             speaks[name] = run
     return speaks
+
+
+def _started(run: dict[str, object]) -> datetime | None:
+    """``started_at`` as an aware datetime, or None when it is missing or does not parse."""
+    raw = run.get("started_at")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else None
+
+
+def _outranks(run: dict[str, object], held: dict[str, object]) -> bool:
+    """Whether ``run`` speaks over ``held``, two runs of one name in the same settled state.
+
+    A later start wins only when BOTH stamps parse and differ. On a tie -- one second is the API's
+    resolution, so a passing and a failing run can share it -- or when either stamp cannot be read,
+    order in time is unknown, and the run that is NOT a success wins: the answer fails CLOSED and
+    keeps the label rather than clearing it on whichever run was listed first (BACKLOG #5464). Only
+    when both runs agree on success does a stamped run beat an unstamped one.
+    """
+    run_at, held_at = _started(run), _started(held)
+    if run_at is not None and held_at is not None and run_at != held_at:
+        return run_at > held_at
+    run_fails = run.get("conclusion") != "success"
+    held_fails = held.get("conclusion") != "success"
+    if run_fails != held_fails:
+        return run_fails
+    return run_at is not None and held_at is None
 
 
 def unmet_contexts(speaks: dict[str, dict[str, object]], required: list[str]) -> list[str]:

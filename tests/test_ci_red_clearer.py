@@ -66,7 +66,7 @@ def _check(
     *,
     status: str = "completed",
     conclusion: str | None = "success",
-    started: str = "2026-09-15T03:00:00Z",
+    started: str | None = "2026-09-15T03:00:00Z",
     ident: int = 1,
 ) -> dict[str, object]:
     return {
@@ -292,6 +292,41 @@ def test_among_settled_runs_the_later_start_speaks() -> None:
     new = _check("CI gate", conclusion="success", started="2026-09-15T05:00:00Z", ident=2)
     assert mod.newest_by_name([old, new])["CI gate"]["id"] == 2
     assert mod.newest_by_name([new, old])["CI gate"]["id"] == 2
+
+
+@pytest.mark.parametrize(
+    ("pass_stamp", "fail_stamp"),
+    [
+        ("2026-09-15T05:00:00Z", "2026-09-15T05:00:00Z"),  # a one-second tie
+        ("2026-09-15T05:00:00Z", "2026-09-15T05:00:00+00:00"),  # the same instant, two spellings
+        ("2026-09-15T05:00:00Z", "not-a-time"),
+        ("2026-09-15T05:00:00Z", None),
+        ("not-a-time", "2026-09-15T04:00:00Z"),
+    ],
+)
+def test_a_tie_or_an_unreadable_stamp_lets_the_failing_run_speak(
+    pass_stamp: str | None, fail_stamp: str | None
+) -> None:
+    """BACKLOG #5464: with no readable order in time, the failing run keeps the label, in BOTH orders.
+
+    Before the fix a strict string ``>`` let whichever run was listed first speak, so a passing run
+    listed ahead of a failing one with the same ``started_at`` second cleared the label.
+    """
+    passing = _check("CI gate", conclusion="success", started=pass_stamp, ident=1)
+    failing = _check("CI gate", conclusion="failure", started=fail_stamp, ident=2)
+    assert mod.newest_by_name([passing, failing])["CI gate"]["id"] == 2
+    assert mod.newest_by_name([failing, passing])["CI gate"]["id"] == 2
+    assert mod.unmet_contexts(mod.newest_by_name([passing, failing]), ["CI gate"]) == [
+        "CI gate=failure"
+    ]
+
+
+def test_a_later_readable_stamp_still_outranks_a_failure() -> None:
+    """The control: the fail-closed tie rule does not let a stale failure outrank a later success."""
+    failing = _check("CI gate", conclusion="failure", started="2026-09-15T05:00:00Z", ident=1)
+    passing = _check("CI gate", conclusion="success", started="2026-09-15T05:00:01Z", ident=2)
+    assert mod.newest_by_name([failing, passing])["CI gate"]["id"] == 2
+    assert mod.newest_by_name([passing, failing])["CI gate"]["id"] == 2
 
 
 def test_head_seen_at_is_the_minimum_of_both_clocks() -> None:
