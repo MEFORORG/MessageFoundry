@@ -172,7 +172,7 @@ class LoginDialog(QDialog):
     def _on_login_error(self, exc: BaseException) -> None:
         if not isinstance(exc, ApiError):
             # An ApiError is the engine's answer and is shown below; anything else is a fault
-            # here, logged with its traceback as _on_providers_error logs its own, not only shown.
+            # here, logged with its traceback, not only shown.
             log.error("sign-in failed unexpectedly", exc_info=exc)
         self._idle()
         if self._close_requested:

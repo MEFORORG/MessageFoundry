@@ -101,8 +101,8 @@ def _ack_code(ack_text: str) -> str:
 _STOP_POLL_S = 0.1
 # What a non-blocking connect_ex returns while the dial is still in progress. Winsock says
 # WSAEWOULDBLOCK. On POSIX only EINPROGRESS means that: an EAGAIN or EWOULDBLOCK there is a dial
-# that failed (Linux, for one, when it has no local port to give), so it must surface as the error a
-# blocking dial would have raised, not be polled as if it were still connecting.
+# that failed, so it must surface as the error a blocking dial would have raised, not be polled as
+# if it were still connecting.
 _WSAEWOULDBLOCK = 10035
 _DIAL_IN_PROGRESS_POSIX = frozenset({errno.EINPROGRESS})
 _DIAL_IN_PROGRESS_WINDOWS = frozenset(

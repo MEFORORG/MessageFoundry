@@ -227,7 +227,7 @@ class ComposePanel(QWidget):
         self._send_btn.setEnabled(True)
         if failure:
             # A fault the worker's run() caught ended the send without a result row: say why,
-            # as the Send and File tabs do, rather than end it silently.
+            # rather than end it silently.
             transport = "MLLP" if isinstance(worker, SendWorker) else "File"
             self._append(transport, "—", "no", f"ended early: {failure}", expected="—")
 
