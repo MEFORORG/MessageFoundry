@@ -1,5 +1,5 @@
-- **A revocation attestation that does not read as true now stops a default `docker compose up`
-  before any engine starts.** The compose file required `MEFOR_TLS_REVOCATION_ATTESTED` but
+- **A revocation attestation that does not read as true now stops a `docker compose up` run
+  without `--no-deps` before any engine starts.** The compose file required `MEFOR_TLS_REVOCATION_ATTESTED` but
   refused only an unset or empty value, so a value such as `0` would have started engines that
   exit 2 at the API revocation gate and restart forever. A one-shot `revocation-attestation-check`
   service now reads the value with the engine's own parser, from the same image, and every serving

@@ -110,11 +110,11 @@ def test_the_check_comment_names_both_no_deps_skips() -> None:
     assert "At least" in comment
 
 
-def test_the_changelog_claims_only_a_default_up_and_names_the_skips() -> None:
+def test_the_changelog_claims_only_an_up_without_no_deps_and_names_the_skips() -> None:
     entry = _changelog_entry()
     headline = entry[: entry.index("**", len(_HEADLINE))]
     # The headline must not claim every `up`; `up --no-deps <engine>` skips the check.
-    assert "stops a default `docker compose up`" in headline, headline
+    assert "stops a `docker compose up` run without `--no-deps`" in headline, headline
     assert "At least `docker compose up --no-deps <engine>` and `docker compose run --no-deps`" in (
         entry
     ), entry
@@ -173,6 +173,7 @@ def test_the_readme_topology_a_bullet_names_the_skips() -> None:
 def test_the_check_comment_opens_with_what_runs_it() -> None:
     comment = _check_comment()
     assert comment.startswith(
-        "One-shot check that the attestation reads as TRUE. `up`, with or without the ha profile,"
-        " runs it before it starts any serving engine; the commands that skip it are below."
+        "One-shot check that the attestation reads as TRUE. An `up` without `--no-deps`, with or"
+        " without the ha profile, runs it before it starts any serving engine; at least the commands"
+        " listed below skip it."
     ), comment[:200]

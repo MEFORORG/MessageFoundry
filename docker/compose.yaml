@@ -208,18 +208,20 @@ services:
     # (BACKLOG #1179). MEFOR_API_PORT is 8443 here, so it probes 8443. There is no cleartext fallback:
     # a container whose TLS is broken now reports unhealthy instead of downgrading to http.
 
-  # One-shot check that the attestation reads as TRUE. `up`, with or without the ha profile, runs
-  # it before it starts any serving engine; the commands that skip it are below. The required
-  # substitution above refuses only an unset or empty value, and a value the engine reads as false,
-  # such as 0, would otherwise start an engine that exits 2 at the revocation gate and restarts
-  # forever. This reads the value with serve's own parser (tls_revocation_attested), in the same
-  # image, exits 1 naming the gate when it does not read as true, and `up` stops there. It does not read the bind, so it refuses a false value even where serve's gate
-  # would not apply. It has no profile, so the `ha` engines wait on it too. down and logs never
-  # run it, which keeps the =0 path above working. `docker compose run` of an engine service, for
-  # an admin command such as gen-key, does run it. At least two commands skip it:
-  # `docker compose run --no-deps` and `docker compose up --no-deps <engine>`. The second starts
-  # that engine with no check, so a false value there would exit 2 and restart forever; never
-  # use it to start a serving engine. It writes nothing and needs no network.
+  # One-shot check that the attestation reads as TRUE. An `up` without `--no-deps`, with or without
+  # the ha profile, runs it before it starts any serving engine; at least the commands listed below
+  # skip it. The required substitution above refuses only an unset or empty value, and a value the
+  # engine reads as false, such as 0, would otherwise start an engine that exits 2 at the
+  # revocation gate and restarts forever. This reads the value with serve's own parser
+  # (tls_revocation_attested), in the same image, exits 1 naming the gate when it does not read as
+  # true, and an `up` without `--no-deps` stops there. It does not read the bind, so it refuses a
+  # false value even where serve's gate would not apply. It has no profile, so the `ha` engines
+  # wait on it too. down and logs never run it, which keeps the =0 path above working.
+  # `docker compose run` of an engine service, for an admin command such as gen-key, does run it.
+  # At least two commands skip it: `docker compose run --no-deps` and
+  # `docker compose up --no-deps <engine>`. The second starts that engine with no check, so a false
+  # value there would exit 2 and restart forever; never use it to start a serving engine. It writes
+  # nothing and needs no network.
   revocation-attestation-check:
     image: *engine-image
     entrypoint:
