@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import inspect
 import json
 import ssl
@@ -17,6 +18,12 @@ import httpx
 import pytest
 
 from messagefoundry.tray import probe as probe_module
+from messagefoundry.tray.config import (
+    ServiceRegistryInfo,
+    TrayConfig,
+    build_engine_url,
+    load_config,
+)
 from messagefoundry.tray.probe import (
     ENGINE_HEALTH_KEYS,
     build_verify,
@@ -766,24 +773,31 @@ def test_the_guard_permits_classify_healths_own_signature_reading_the_status_val
 # --- The minted-certificate pin (ADR 0172) --------------------------------------------------------
 
 
-@pytest.fixture
-def minted_tls_engine(tmp_path: Path) -> Iterator[tuple[str, str]]:
-    """A loopback https server presenting a freshly minted self-signed pair, like a stock engine.
+@contextlib.contextmanager
+def _engine_minted_for(
+    bind_host: str, dial_host: str, tmp_path: Path, *, wildcard_only: bool = False
+) -> Iterator[tuple[int, str]]:
+    """An https server on ``dial_host`` presenting the pair the engine mints for a ``bind_host``
+    bind, through the engine's own minting path. Yields ``(port, cert_pem_path)``.
 
-    Yields ``(base_url, cert_pem_path)``. It answers ``GET /health`` with the stock body, so a
-    probe that completes the handshake classifies it as the engine.
-    """
+    ``wildcard_only`` presents a pair naming ``bind_host`` alone instead, for a control."""
     import http.server
+    import socket
     import threading
 
     from messagefoundry import pki
+    from messagefoundry.api.tls import ensure_api_tls_material
+    from messagefoundry.config.settings import ApiSettings
 
-    cert_pem, key_pem = pki.make_self_signed("127.0.0.1", ["127.0.0.1"], 1)
-    cert = tmp_path / "api-generated-cert.pem"
-    key = tmp_path / "api-generated-key.pem"
-    cert.write_bytes(cert_pem)
-    key.write_bytes(key_pem)
-
+    if wildcard_only:
+        cert_pem, key_pem = pki.make_self_signed(bind_host, [], 1)
+        cert, key = str(tmp_path / "only-cert.pem"), str(tmp_path / "only-key.pem")
+        Path(cert).write_bytes(cert_pem)
+        Path(key).write_bytes(key_pem)
+    else:
+        material = ensure_api_tls_material(ApiSettings(host=bind_host), state_dir=tmp_path)
+        assert material is not None and material[1] is not None
+        cert, key = material[0], material[1]
     body = json.dumps(STOCK_HEALTH_BODY).encode()
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -797,19 +811,36 @@ def minted_tls_engine(tmp_path: Path) -> Iterator[tuple[str, str]]:
         def log_message(self, format: str, *args: object) -> None:
             pass
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    class Server(http.server.ThreadingHTTPServer):
+        address_family = socket.AF_INET6 if ":" in dial_host else socket.AF_INET
+
+    try:
+        server = Server((dial_host, 0), Handler)
+    except OSError as exc:  # a runner with no IPv6 loopback
+        pytest.skip(f"cannot listen on {dial_host}: {exc}")
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     # The engine's own floor, and what CodeQL py/insecure-protocol asks of a server context.
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-    ctx.load_cert_chain(str(cert), str(key))
+    ctx.load_cert_chain(cert, key)
     server.socket = ctx.wrap_socket(server.socket, server_side=True)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"https://127.0.0.1:{server.server_address[1]}", str(cert)
+        yield server.server_address[1], cert
     finally:
         server.shutdown()
         server.server_close()
+
+
+@pytest.fixture
+def minted_tls_engine(tmp_path: Path) -> Iterator[tuple[str, str]]:
+    """A loopback https server presenting a freshly minted self-signed pair, like a stock engine.
+
+    Yields ``(base_url, cert_pem_path)``. It answers ``GET /health`` with the stock body, so a
+    probe that completes the handshake classifies it as the engine.
+    """
+    with _engine_minted_for("127.0.0.1", "127.0.0.1", tmp_path) as (port, cert):
+        yield f"https://127.0.0.1:{port}", cert
 
 
 def test_a_pinned_probe_reaches_an_engine_serving_its_minted_pair(
@@ -882,3 +913,83 @@ def test_build_verify_an_unloadable_pin_still_verifies(
     assert ctx.verify_mode is ssl.CERT_REQUIRED
     assert "truststore" in type(ctx).__module__
     assert str(missing) in caplog.text
+
+
+# --- A bind the tray dials on loopback (BACKLOG #5973) ---------------------------------------------
+
+
+_WILDCARDS = [
+    pytest.param("0.0.0.0", "127.0.0.1", id="ipv4-wildcard"),
+    pytest.param("::", "::1", id="ipv6-wildcard"),
+]
+
+
+def _load_tray_config(tmp_path: Path, bind_host: str, port: int, source: str) -> TrayConfig:
+    """The tray's config, discovered the way a real tray does (:func:`load_config`) for an engine
+    whose store, and so whose minted pair, is in ``tmp_path``."""
+    params = f'serve --db "{tmp_path / "messagefoundry.db"}"'
+    if source == "serve-flag":
+        params += f" --host {bind_host} --port {port}"
+    else:
+        (tmp_path / "messagefoundry.toml").write_text(
+            "[security]\nlocal_access_only = false\n"
+            f'listen_address = "{bind_host}"\n[api]\nport = {port}\n',
+            encoding="utf-8",
+        )
+    info = ServiceRegistryInfo(app_directory=str(tmp_path), app_parameters=params)
+
+    class _Reader:
+        def read_service_params(self, service_name: str) -> ServiceRegistryInfo | None:
+            return info
+
+    config_dir = tmp_path / "tray"
+    config_dir.mkdir()
+    return load_config(config_dir, _Reader())
+
+
+@pytest.mark.parametrize(("bind_host", "dial_host"), _WILDCARDS)
+@pytest.mark.parametrize("source", ["serve-flag", "settings-toml"])
+def test_a_pinned_probe_reads_an_engine_on_a_wildcard_bind_as_up(
+    bind_host: str, dial_host: str, source: str, tmp_path: Path
+) -> None:
+    """The fix end to end, over a real handshake and through the poller (BACKLOG #5973).
+
+    The engine mints its pair for a wildcard bind, the tray discovers the bind from the service's
+    registry entry or its settings TOML, dials the loopback of the bind's family, and verifies the
+    certificate against that address with the minted pair as its only trust anchor. Before the
+    change the URL named the wildcard itself, which no client on Windows can connect to, the
+    certificate named only the wildcard, and a bind set only in the settings TOML was not read."""
+    from messagefoundry.tray.poller import StatusPoller
+    from messagefoundry.tray.state import ScmState
+    from messagefoundry.tray.winsvc import ScmReading
+
+    with _engine_minted_for(bind_host, dial_host, tmp_path) as (port, cert):
+        cfg = _load_tray_config(tmp_path, bind_host, port, source)
+        assert cfg.engine_url == build_engine_url(dial_host, port, tls=True)
+        assert cfg.engine_cacert == cert
+        assert cfg.monitor_only is False  # a wildcard bind is still this box's engine
+        poller = StatusPoller(
+            cfg, on_update=lambda _r: None, scm_reader=lambda _n: ScmReading(ScmState.RUNNING)
+        )
+        poller._open_client()  # what start() does, minus the thread
+        try:
+            assert poller.poll_once(0.0).inputs.health is HealthProbe.OK
+        finally:
+            poller.stop()
+
+
+@pytest.mark.parametrize(("bind_host", "dial_host"), _WILDCARDS)
+def test_a_pair_naming_only_the_wildcard_still_fails_verification(
+    bind_host: str, dial_host: str, tmp_path: Path
+) -> None:
+    """The control: a pair that names only the wildcard, as the engine minted it before BACKLOG
+    #5973, is refused at the same loopback address with the same pin. So the test above passes
+    because the certificate names the dialled address, not because hostname checking went away."""
+    with _engine_minted_for(bind_host, dial_host, tmp_path, wildcard_only=True) as (port, cert):
+        url = build_engine_url(dial_host, port, tls=True) or ""
+        with make_probe_client(url, cacert=cert) as client:
+            assert probe_health(client) is HealthProbe.DOWN
+            # DOWN for the right reason: the handshake reached the server and the hostname check
+            # refused it, rather than a refused connection or a dead server thread.
+            with pytest.raises(httpx.ConnectError, match="IP address mismatch"):
+                client.get("/health")

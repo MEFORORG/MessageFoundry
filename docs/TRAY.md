@@ -117,6 +117,15 @@ registry entry (`AppParameters` → host/port and the `--project-root` repo path
 interactively-logged-on user can read without elevation. Registry values are treated as untrusted
 hints (validated, never executed).
 
+The host and port come from `serve --host`/`--port` in `AppParameters`, else from the engine's
+settings TOML (`[security].listen_address` once `local_access_only = false`, and `[api].port`), else
+from the engine's defaults. The tray does not see `MEFOR_*` variables in the service's environment,
+which outrank the TOML; set `engine_url` if you bind through one. A wildcard bind (`0.0.0.0` or `::`)
+is not an address a client can connect to, so the tray dials the loopback of the same family
+(`127.0.0.1` or `::1`). The certificate the engine mints for a wildcard bind names that loopback
+too. An operator certificate on a wildcard bind verifies only if it names that loopback; otherwise
+set `engine_url` to a name it carries.
+
 **What "View Service Log" will open.** Windows opens a file with whatever program owns its
 extension, so a `log_path` naming a `.bat` or `.lnk` would run it. The tray therefore opens
 `log_path` only when all of these hold. Otherwise it shows "Service log not opened" and opens
@@ -198,8 +207,8 @@ as down. See the ADR 0113 amendment.)
 The tray discovers the scheme the same way it discovers host and port — from the service's NSSM
 registry entry. There is no `serve` TLS flag, so it also reads the engine's own settings TOML
 (`serve --service-config`, or `messagefoundry.toml` under the service's `AppDirectory`) and takes
-two booleans from it: whether `[api].tls_cert_file` is set, and whether
-`[api].tls_terminated_upstream` is declared. That read is read-only and fail-soft — a missing or
+two facts about the scheme from it: whether `[api].tls_cert_file` is set, and whether
+`[api].tls_terminated_upstream` is declared. The bind it reads there is described above. That read is read-only and fail-soft — a missing or
 malformed file means the engine is running on its own defaults, which mint, so the tray assumes
 https. Setting `engine_url` in `tray.toml` overrides all of it.
 

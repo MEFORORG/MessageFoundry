@@ -26,6 +26,15 @@ with it. No trust store holds that certificate, so an https URL alone still fail
 renders a running engine as ``DOWN``. :func:`generated_cert_path` finds the minted certificate from
 the same registry hints and settings TOML the scheme comes from, and :class:`TrayConfig` carries it
 as ``engine_cacert`` for :mod:`messagefoundry.tray.probe` to pin.
+
+**The bind is not always a dialable URL host** (BACKLOG #5973). The tray takes the engine's bind
+from ``serve --host/--port``, else from its settings TOML (:func:`service_toml_bind`), else from the
+engine's defaults. It does not see the engine's environment layer (``MEFOR_*`` variables in the
+service's environment), which outranks the TOML; ``engine_url`` in ``tray.toml`` covers that. A
+wildcard bind (``0.0.0.0``, ``::``) is not an address a client can connect to, so
+:func:`dial_target` dials the loopback of its family instead, and the engine names that loopback in
+the certificate it mints for a wildcard bind (``api/tls.py``), so the probe verifies the certificate
+against the address it dials, as before.
 """
 
 from __future__ import annotations
@@ -44,12 +53,22 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
 
-from messagefoundry.api_tls_source import GENERATED_CERT_NAME, ApiTlsSource, api_tls_source
+from messagefoundry.api_tls_source import (
+    GENERATED_CERT_NAME,
+    ApiTlsSource,
+    api_tls_source,
+    wildcard_loopback,
+)
 from messagefoundry.service_status import is_safe_service_name
 
 # https because the engine serves TLS by default (ADR 0172). Plain http is right only behind a
 # declared upstream terminator, and the tray learns that from the engine's settings, not by default.
-DEFAULT_ENGINE_URL = "https://127.0.0.1:8765"
+# The engine's own [api] host and port defaults (config/settings.py ApiSettings, and
+# SecuritySettings.listen_address), copied because the tray may not import config/;
+# tests/test_tray_config.py pins them equal.
+_DEFAULT_API_HOST = "127.0.0.1"
+_DEFAULT_API_PORT = 8765
+DEFAULT_ENGINE_URL = f"https://{_DEFAULT_API_HOST}:{_DEFAULT_API_PORT}"
 DEFAULT_SERVICE_NAME = "MessageFoundry"
 DEFAULT_POLL_SECONDS = 5.0
 _POLL_MIN_S = 1.0
@@ -64,6 +83,8 @@ _MAX_PATH_LEN = 4096
 _DEFAULT_SERVICE_TOML = "messagefoundry.toml"
 # The engine's default [store].path, resolved the same way. The minted pair sits beside it.
 _DEFAULT_STORE_PATH = "messagefoundry.db"
+# The spellings of false the engine's settings model accepts for a bool (pydantic's lax mode).
+_FALSE_WORDS = frozenset({"0", "off", "f", "false", "n", "no"})
 
 
 @dataclass(frozen=True)
@@ -326,6 +347,52 @@ def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -
     return f"{'https' if tls else 'http'}://{authority}:{port}"
 
 
+def dial_target(bind_host: str) -> str:
+    """The address to dial for an engine bound to ``bind_host``. Pure.
+
+    A **wildcard** bind is dialled on the loopback of its family, the address the engine also names
+    in the certificate it mints for that bind (:func:`messagefoundry.api_tls_source.wildcard_loopback`).
+    Any other host is dialled as written.
+    """
+    return wildcard_loopback(bind_host) or bind_host
+
+
+def _is_false(value: object) -> bool:
+    """Whether the engine's settings model reads ``value`` as ``False`` for a bool field."""
+    if isinstance(value, bool):
+        return value is False
+    if isinstance(value, int):
+        return value == 0
+    return isinstance(value, str) and value.strip().lower() in _FALSE_WORDS
+
+
+def service_toml_bind(service_toml: dict[str, object] | None) -> tuple[str | None, int | None]:
+    """The API bind host and port that the engine's raw, untrusted settings TOML sets. Pure.
+
+    Mirrors the engine's own reading (``config/settings.py``, ``_desugar_security``): the TOML names
+    the host only through ``[security]``, as ``listen_address`` once ``local_access_only`` is
+    ``false``, and the engine refuses ``[api].host`` in the file. With ``local_access_only`` absent
+    or ``true`` the bind is loopback, which the default already says, so the host comes back
+    ``None``. ``local_access_only`` and ``[api].port`` are read with the engine's settings model's
+    coercions: a spelling of false such as ``"no"`` or ``0``, and a port given as a string of digits.
+    Each value comes back ``None`` when absent or not plausible.
+    """
+    toml = service_toml or {}
+    host: str | None = None
+    security = toml.get("security")
+    if isinstance(security, dict) and _is_false(security.get("local_access_only", True)):
+        raw_host = security.get("listen_address", _DEFAULT_API_HOST)
+        host = raw_host if isinstance(raw_host, str) and _valid_host(raw_host) else None
+    api = toml.get("api")
+    raw_port = api.get("port") if isinstance(api, dict) else None
+    port: int | None = None
+    if isinstance(raw_port, str) and raw_port.strip().isascii() and raw_port.strip().isdigit():
+        raw_port = int(raw_port.strip())
+    if isinstance(raw_port, int) and not isinstance(raw_port, bool) and 1 <= raw_port <= 65535:
+        port = raw_port
+    return host, port
+
+
 def _clean_path_hint(value: object) -> str | None:
     """Accept a plausible filesystem-path hint; reject non-strings, NUL, and oversized values."""
     if not isinstance(value, str):
@@ -432,8 +499,14 @@ def compose_config(
     *,
     engine_tls: bool = True,
     engine_cacert: str | None = None,
+    engine_bind: tuple[str | None, int | None] = (None, None),
 ) -> TrayConfig:
     """Merge built-in defaults ← registry hints ← TOML (TOML wins). Pure.
+
+    ``engine_bind`` is the host and port the engine's settings TOML sets (see
+    :func:`service_toml_bind`). A ``serve --host``/``--port`` flag overrides each, as ``serve`` does,
+    and the engine's own defaults fill whatever neither names. The host then goes through
+    :func:`dial_target`. An explicit ``engine_url`` in ``tray.toml`` still wins over all of it.
 
     ``engine_tls`` scheme-corrects the *registry-derived* URL only; an explicit ``engine_url`` in
     ``tray.toml`` already carries its own scheme and always wins. It defaults to True for the same
@@ -454,8 +527,11 @@ def compose_config(
 
     # Registry hints (untrusted; validated).
     if reg is not None:
-        host_hint, port_hint = parse_serve_args(reg.app_parameters or "")
-        url_hint = build_engine_url(host_hint, port_hint, tls=engine_tls)
+        flag_host, flag_port = parse_serve_args(reg.app_parameters or "")
+        toml_host, toml_port = engine_bind
+        dial_host = dial_target(flag_host or toml_host or _DEFAULT_API_HOST)
+        port = flag_port or toml_port or _DEFAULT_API_PORT
+        url_hint = build_engine_url(dial_host, port, tls=engine_tls)
         if url_hint is not None:
             engine_url = url_hint
         repo_path = (
@@ -536,9 +612,11 @@ def load_config(config_dir: Path, reader: RegistryReader | None = None) -> TrayC
     """Read ``<config_dir>/tray.toml`` (if present) and the service registry hints, then compose.
 
     Missing file → all defaults. A malformed TOML file is treated as absent (defaults + hints).
-    The engine's *own* settings TOML is also read — read-only, fail-soft — for the single fact
-    the registry cannot carry: which scheme the API bind serves. Since ADR 0172 that is no longer
-    the question "is a cert configured" — see :func:`engine_serves_https`.
+    The engine's *own* settings TOML is also read — read-only, fail-soft — for what the registry
+    cannot carry: which scheme the API bind serves (since ADR 0172 not the question "is a cert
+    configured", see :func:`engine_serves_https`), where the minted certificate is
+    (:func:`generated_cert_path`), and a bind ``serve`` flags do not name
+    (:func:`service_toml_bind`).
     """
     toml_data = _read_toml(config_dir / "tray.toml")
 
@@ -554,6 +632,7 @@ def load_config(config_dir: Path, reader: RegistryReader | None = None) -> TrayC
         reg,
         engine_tls=engine_serves_https(service_toml),
         engine_cacert=generated_cert_path(service_toml, reg),
+        engine_bind=service_toml_bind(service_toml),
     )
 
 
