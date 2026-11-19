@@ -773,37 +773,65 @@ async def test_stop_before_start_does_not_disarm_a_later_stop(tmp_path: Path) ->
         )
     )
     await relay.stop()  # nothing started yet
-    await relay.start()
-    worker = relay._mefor_worker  # noqa: SLF001
-    assert worker is not None
-    async with asyncio.timeout(5.0):
+    try:
+        await relay.start()
+        worker = relay._mefor_worker  # noqa: SLF001
+        assert worker is not None
+        async with asyncio.timeout(5.0):
+            await relay.stop()
+        assert worker.done()  # nothing start() opened is left running
+    finally:
         await relay.stop()
-    assert worker.done()  # the second stop() really tore down what start() opened
 
 
-async def test_start_after_an_early_stop_serves_messages(tmp_path: Path) -> None:
-    # A stop() before start() used to leave the shutdown flag set, so every connection the later
-    # start() accepted was dropped with no ACK.
-    corepoint = await FakeMllpServer().start()
-    mefor = await FakeMllpServer().start()
+async def test_stop_before_serve_forever_runs_still_stops_it(tmp_path: Path) -> None:
+    # A stop() issued before the serve_forever() task first ran found nothing started and
+    # returned; the start() that followed then served until the process died.
     relay = TeeRelay(
         RelayConfig(
             listen_epic=("127.0.0.1", 0),
-            corepoint=corepoint.address,
-            mefor=mefor.address,
+            corepoint=("127.0.0.1", 1),
+            mefor=("127.0.0.1", 2),
+            db_path=str(tmp_path / "tee.db"),
+        )
+    )
+    serving = asyncio.create_task(relay.serve_forever())
+    try:
+        await relay.stop()
+        async with asyncio.timeout(5.0):
+            await serving
+        epic_server = relay._epic_server  # noqa: SLF001
+        assert epic_server is not None and not epic_server.is_serving()
+        worker = relay._mefor_worker  # noqa: SLF001
+        assert worker is not None and worker.done()
+    finally:
+        serving.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await serving
+        await relay.stop()
+
+
+async def test_start_after_an_early_stop_serves_nothing(tmp_path: Path) -> None:
+    # A relay is single-use: a stop() before start() stays requested, so the later start() tears
+    # down what it opens instead of serving.
+    relay = TeeRelay(
+        RelayConfig(
+            listen_epic=("127.0.0.1", 0),
+            corepoint=("127.0.0.1", 1),
+            mefor=("127.0.0.1", 2),
             db_path=str(tmp_path / "tee.db"),
         )
     )
     await relay.stop()  # nothing started yet
-    await relay.start()
     try:
-        ack = await _send_from_epic(relay.epic_address, SAMPLE)
-        assert mllp.parse_ack(ack)[0] == "AA"
-        await corepoint.wait_for(1)
+        async with asyncio.timeout(5.0):
+            await relay.start()
+        epic_server = relay._epic_server  # noqa: SLF001
+        assert epic_server is not None and not epic_server.is_serving()
+        with pytest.raises(RuntimeError, match="already started"):
+            await relay.start()
     finally:
         await relay.stop()
-        await corepoint.stop()
-        await mefor.stop()
 
 
 async def test_stop_during_start_closes_listeners_bound_after_it(

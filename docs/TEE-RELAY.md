@@ -122,7 +122,9 @@ logged by control id and still gets a Corepoint row: a `transport_error` row (so
 while the forward is unfinished, or the forward's real outcome once it finished (a cut-off during
 that row's own write can leave the outcome recorded twice). A MEFOR copy dropped at the queue
 deadline, or a Corepoint-copy message cut off after its ACK, appears only in the log, by count.
-Keep twice the grace inside your service manager's stop timeout.
+Keep twice the grace inside your service manager's stop timeout. A relay object is single-use: a
+second `start()` is refused, and a `stop()` requested before or during `start()` stays in force,
+so that `start()` tears down what it opened and serves nothing, and `serve_forever()` returns.
 
 ## The SQLite log
 

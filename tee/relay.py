@@ -172,6 +172,8 @@ class TeeRelay:
         self.config = config
         self.store: RelayStore | None = None
         self._tripped = asyncio.Event()
+        # Set by the first stop(), even one before start(), and never cleared: a relay is
+        # single-use, so a requested stop stays requested.
         self._shutdown = asyncio.Event()
         self._epic_server: asyncio.Server | None = None
         self._copy_server: asyncio.Server | None = None
@@ -226,15 +228,15 @@ class TeeRelay:
 
     # -- lifecycle -----------------------------------------------------------
     async def start(self) -> None:
+        """Open the store and bind the listeners. A relay is single-use: a second start() is
+        refused, and a stop() requested before or during this start() stays in force, so this
+        start() finishes binding, tears everything down again and returns without serving."""
         # A start() that is running, or that ran at all, refuses: one that failed after opening the
         # store leaves it to stop(), whose teardown is memoized, so a second start() would open a
         # store and listeners that no later stop() closes.
         if self._start_done is not None or self._epic_server is not None:
             raise RuntimeError("relay already started")
         cfg = self.config
-        # A stop() before start() had nothing to tear down; its flag must not make this start()'s
-        # handlers drop every connection they accept.
-        self._shutdown.clear()
         self._start_done = asyncio.Event()
         logger.warning(
             "tee relay is a TEST-DATA-ONLY validation tool — do not carry production PHI through it"
@@ -250,6 +252,12 @@ class TeeRelay:
                 )
         finally:
             self._start_done.set()
+        if self._shutdown.is_set():
+            # A stop() came before or during this start(): it stays in force, so tear down what
+            # was just opened rather than serve. A stop() still waiting shares this teardown.
+            logger.info("tee relay stop requested before start() finished; tearing down")
+            await self.stop()
+            return
         logger.info(
             "tee relay started: epic=%s -> corepoint=%s + mefor=%s%s (db=%s, capture_bodies=%s,"
             " capture_corepoint_copy=%s)",
@@ -263,7 +271,8 @@ class TeeRelay:
         )
 
     async def serve_forever(self) -> None:
-        """Start, then run until :meth:`stop` (or cancellation), then tear down."""
+        """Start, then run until :meth:`stop` (or cancellation), then tear down. Returns once the
+        teardown is done when a stop() came before or during the start."""
         await self.start()
         try:
             await self._shutdown.wait()
@@ -274,9 +283,10 @@ class TeeRelay:
         """Tear the relay down. Runs once: a concurrent or repeated call (``serve_forever``'s own
         ``finally`` among them) waits for the same teardown rather than starting a second one.
         A stop() racing a start() waits for start() to finish binding, so the teardown covers every
-        listener it opens. Before start() there is nothing to tear down, so this returns without
-        memoizing anything (or setting the shutdown flag) and a later stop() still cleans up
-        whatever start() opened."""
+        listener it opens. A stop() before start() has nothing to tear down, so it returns at once,
+        but the stop stays requested: a later start() (or ``serve_forever()``) tears down what it
+        opens and serves nothing, and a later stop() still waits for that teardown."""
+        self._shutdown.set()
         if self._start_done is not None:
             await self._start_done.wait()
         if self.store is None:
@@ -286,7 +296,6 @@ class TeeRelay:
         await asyncio.shield(self._stop_task)
 
     async def _stop(self) -> None:
-        self._shutdown.set()
         await self._drain_listeners()
         if self._mefor_worker is not None:
             await self._drain_mefor_worker(self._mefor_worker)
