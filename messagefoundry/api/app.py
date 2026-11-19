@@ -1321,8 +1321,8 @@ def _purge_target_refusal(rr: RegistryRunner | None, name: str) -> HTTPException
     if not rr.coordinator.is_leader():
         return HTTPException(
             409,
-            f"this node does not hold the cluster lease, so purge outbound {name!r} on the "
-            "leader's API",
+            "this node does not hold the cluster lease, so stop and purge outbound "
+            f"{name!r} on the leader's API",
         )
     # require-stopped-before-purge (after the 404, before any approval is held for a doomed purge):
     # a running/still-"stopping" outbound may have a claimed INFLIGHT row cancel_queued cannot cancel,

@@ -586,7 +586,7 @@ async def test_a_released_purge_of_an_outbound_another_engine_shard_owns_cancels
 
 
 _NOT_LEADER = (
-    "this node does not hold the cluster lease, so purge outbound 'OB' on the leader's API"
+    "this node does not hold the cluster lease, so stop and purge outbound 'OB' on the leader's API"
 )
 
 
