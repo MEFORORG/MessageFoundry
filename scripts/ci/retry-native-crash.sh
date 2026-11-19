@@ -96,10 +96,11 @@ fi
 # ON A WINDOWS RUNNER THIS SCRIPT SEES A FOLDED CODE, NEVER AN NTSTATUS. The ci.yml callers at the
 # time of writing run it as `bash scripts/ci/retry-native-crash.sh ...` under `shell: bash`, which is
 # Git Bash there, and Git Bash's runtime folds a native child's 32-bit exit code into $? itself.
-# Measured 2026-11-18 under Git Bash 5.3.15 on Windows 11, with a child exiting os._exit(<code>):
+# Measured 2026-11-18 under Git Bash 5.3.15 on Windows 11, with a child exiting os._exit(<code>),
+# and with a child calling Python's os.abort(), which arrived as 127 like 0xC0000409:
 #   0xC0000005 (access violation)        -> 139, so a Windows segfault is already retried here
 #   0xC000001D (illegal instruction)     -> 132
-#   0xC0000409 (stack buffer overrun, and Python's own abort() on Windows), 0xC00000FD (stack
+#   0xC0000409 (stack buffer overrun), 0xC00000FD (stack
 #   overflow), 0xC0000374 (heap corruption), 0xC0000094 (divide by zero) and 0xC0000135 (DLL not
 #   found)                               -> 127
 # So 134 never arrives from a Windows child: an abort there arrives as 127 and is not retried. $? is
