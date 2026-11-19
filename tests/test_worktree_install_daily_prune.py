@@ -449,12 +449,12 @@ SLOW_PRUNE_STUB = (
 def test_a_hand_run_stopped_part_way_leaves_the_shells_prompt_variables_alone(
     tmp_path: Path,
 ) -> None:
-    """The prompt variables go on the child only, so a Ctrl+C cannot leave them in the operator's shell.
+    """A Ctrl+C part way must not leave the prompt variables set in the operator's shell.
 
     A hand run with ``&`` shares the caller's process. Here one pwsh stands in for that shell: the
     runner runs in a second runspace of it and is stopped, as Ctrl+C stops it, while the stub
-    prune-merged.ps1 is still running. Set in the runner's own process and restored only on its way
-    out, both variables stayed set; now neither is touched, and the child still saw both.
+    prune-merged.ps1 is still running. Restored only in Exit-Run, both variables stayed set; the
+    runner's `finally` now removes them, as they were unset before, and the child still saw both.
     """
     runner, log_dir, env = copy_runner(tmp_path, SLOW_PRUNE_STUB)
     started = tmp_path / "stub-started.txt"
@@ -504,44 +504,98 @@ REFUSING_PRUNE_STUB = (
     "exit 2\n"
 )
 
-# A finished-worktree-removal.ps1 stand-in: every path comes back REMOVED, and with $env:T_THROW set
-# the helper then throws, as an unexpected error after a removal would.
+# A finished-worktree-removal.ps1 stand-in: every path comes back with the outcome $env:T_OUTCOME
+# names, and with $env:T_THROW set the helper then throws, as an unexpected error part way would.
 REMOVING_HELPER_STUB = (
     "function Assert-NoGitRedirect([string]$Who) { }\n"
     "function Invoke-FinishedWorktreeRemoval {\n"
     "  param([string]$Primary, [string[]]$Paths, [double]$IdleHours, [string[]]$Protect,"
     " [switch]$Apply, $StopAt)\n"
     "  foreach ($p in $Paths) {"
-    " [pscustomobject]@{ Path = $p; Outcome = 'REMOVED'; Reason = 'stub'; Command = 'stub' } }\n"
-    "  if ($env:T_THROW) { throw 'stub failure after a removal' }\n"
+    " [pscustomobject]@{ Path = $p; Outcome = $env:T_OUTCOME; Reason = 'stub'; Command = 'stub' } }\n"
+    "  if ($env:T_THROW) { throw 'stub failure after a row' }\n"
     "}\n"
 )
 
 
 @requires_windows
-@pytest.mark.parametrize("throw", [False, True], ids=["normal-end", "error-after-removal"])
-def test_the_exit_code_never_says_nothing_was_attempted_after_a_removal(
-    tmp_path: Path, throw: bool
+@pytest.mark.parametrize(
+    ("apply", "outcome", "throw", "expected"),
+    [
+        (True, "REMOVED", False, 1),
+        (True, "REMOVED", True, 1),
+        (True, "FAILED", False, 1),
+        (True, "DECLINED", True, 1),
+        # Controls: nothing was attempted, so the prune's 2 stands.
+        (True, "REFUSED", False, 2),
+        (True, "REFUSED", True, 2),
+        (True, "NOT-REACHED", True, 2),
+        (False, "WOULD-REMOVE", False, 2),
+        (False, "WOULD-REMOVE", True, 2),
+    ],
+)
+def test_the_exit_code_says_nothing_was_attempted_only_when_that_is_true(
+    tmp_path: Path, apply: bool, outcome: str, throw: bool, expected: int
 ) -> None:
     """2 promises nothing was attempted. A refused prune returns 2, but the step may then remove trees.
 
     Before, the normal end passed the prune's 2 through, and the trap's Max kept it; either way a run
-    that removed a tree said it had attempted nothing. Now both end at 1.
+    that removed a tree said it had attempted nothing. Now a REMOVED, FAILED or DECLINED row makes it 1,
+    at the normal end and in the trap alike, and any other row leaves the 2.
     """
     proc, text = run_copied_runner(
         tmp_path,
         "-RepoRoot",
         str(tmp_path),
-        "-Apply",
+        *(["-Apply"] if apply else []),
         "-RemoveFinishedClaudeWorktrees",
         prune_stub=REFUSING_PRUNE_STUB,
         extra={"finished-worktree-removal.ps1": REMOVING_HELPER_STUB},
-        env_extra={"T_THROW": "1"} if throw else {},
+        env_extra={"T_OUTCOME": outcome, **({"T_THROW": "1"} if throw else {})},
     )
     assert text is not None, proc.stdout + proc.stderr
     assert "--- prune-merged.ps1 exit 2 at " in text, text
-    assert "REMOVED      X:/r/.claude/worktrees/a" in text, text
+    assert f"{outcome:<12} X:/r/.claude/worktrees/a" in text, text
     if throw:
-        assert "STOPPED on an unhandled error: stub failure after a removal" in text, text
-    assert proc.returncode == 1, proc.stdout + proc.stderr
-    assert re.match(r"=== exit 1 \(FAILED", text.splitlines()[-1]), text
+        assert "STOPPED on an unhandled error: stub failure after a row" in text, text
+    assert proc.returncode == expected, proc.stdout + proc.stderr
+    assert re.match(rf"=== exit {expected} \(", text.splitlines()[-1]), text
+
+
+# A stub that reports the location it ran in and what its -RepoRoot resolved to.
+WHERE_PRUNE_STUB = (
+    "param([string]$RepoRoot, [switch]$Apply, [double]$IdleHours)\n"
+    '"stub repo=$((Resolve-Path -LiteralPath $RepoRoot).ProviderPath)"\n'
+    "exit 0\n"
+)
+
+
+@requires_windows
+def test_a_relative_repo_root_resolves_against_the_callers_location(tmp_path: Path) -> None:
+    """A hand run after Set-Location resolves -RepoRoot . where the caller stands, not where pwsh began.
+
+    The prune child is started with `&`, which starts it in the caller's PowerShell location. A child
+    started any other way can start in the process directory and prune a different repository.
+    """
+    runner, log_dir, env = copy_runner(tmp_path, WHERE_PRUNE_STUB)
+    here = tmp_path / "here"
+    here.mkdir()
+    env.update({"T_RUNNER": str(runner), "T_LOGDIR": str(log_dir), "T_HERE": str(here)})
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "Set-Location -LiteralPath $env:T_HERE; & $env:T_RUNNER -LogDir $env:T_LOGDIR -RepoRoot .",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        cwd=tmp_path,
+        check=False,
+    )
+    text = read_log(log_dir)
+    assert text is not None, proc.stdout + proc.stderr
+    assert f"stub repo={here}" in text.splitlines(), text

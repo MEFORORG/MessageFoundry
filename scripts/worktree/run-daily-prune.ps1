@@ -82,8 +82,7 @@ $ErrorActionPreference = 'Stop'
 # Set here so the trap below never reads a caller's variable of the same name.
 $log = $null
 $code = $null
-$childExit = $null
-$removalStepStarted = $false
+$removalAttempted = $false
 $pruneStarted = $false
 # In UTC: Task Scheduler's limit counts elapsed time, and a local clock repeats an hour at the DST
 # fall-back, which would put this deadline an hour past the kill.
@@ -124,7 +123,7 @@ $mode = if ($Apply) { 'APPLY' } else { 'DRYRUN' }
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $log = Join-Path $LogDir ("prune-" + (Get-Date -Format 'yyyy-MM-dd') + ".log")
 
-# The one way out after the log exists, so every exit writes its meaning and trims the log directory.
+# Writes the exit line (while the log can be written), trims the log directory, and exits.
 function Exit-Run([int]$Code) {
     $meaning = if ($EXIT_MEANING.ContainsKey($Code)) { $EXIT_MEANING[$Code] } else { "UNKNOWN exit code $Code" }
     try { "=== exit $Code ($meaning) at $(Get-Date -Format 'HH:mm:ss') ===" | Add-Content -LiteralPath $log }
@@ -154,9 +153,10 @@ trap {
     # 2 promises nothing was removed: true before the prune started and on a dry run. Once an -Apply
     # prune has started, even if it has not exited, 1, the rule the step's own refusal follows. Never
     # below a code already set: an orphan's 3 must survive a later error. The one exception is a 2 the
-    # prune itself returned: once the -Apply step has started removing, that promise is false, so 1.
+    # prune itself returned, under the same rule as the normal end: once the step has a REMOVED, FAILED
+    # or DECLINED row, that promise is false, so 1.
     $trapCode = [math]::Max([int]$code, $(if (-not $pruneStarted -or -not $Apply) { 2 } else { 1 }))
-    if ($trapCode -eq 2 -and $removalStepStarted) { $trapCode = 1 }
+    if ($trapCode -eq 2 -and $removalAttempted) { $trapCode = 1 }
     Exit-Run $trapCode
 }
 
@@ -192,146 +192,122 @@ if (-not $RepoRoot) {
 
 $pruneArgs = @('-RepoRoot', $RepoRoot)
 if ($Apply) { $pruneArgs += '-Apply' }
-if ($PSBoundParameters.ContainsKey('IdleHours')) { $pruneArgs += @('-IdleHours', [string]$IdleHours) }
+if ($PSBoundParameters.ContainsKey('IdleHours')) { $pruneArgs += @('-IdleHours', $IdleHours) }
 
-# Runs prune-merged.ps1 in a child pwsh and emits each line it prints, as it prints it, as
-# @{ Err = <from stderr>; Text }; the child's exit code is left in $script:childExit.
-#
 # A scheduled task has nobody to answer an HTTPS credential prompt, in a terminal or in Git Credential
-# Manager's window, so the child's `git fetch` (and every git it starts, which inherit the child's
-# environment) must fail instead of waiting until the task's time limit kills the run. The two
-# variables are set on the CHILD's environment only, as claim.ps1 and enter-check.ps1 do: set in this
-# process, a hand run with `&` stopped by Ctrl+C would leave them set in the operator's shell.
-# hygiene-report.ps1 sets the same two. An SSH origin's passphrase or host-key prompt is not covered.
-# The 2026-11-17 log stops right after "Fetching origin (--prune)...", which a fetch waiting on a
-# prompt would explain; that is not established.
-function Invoke-PruneChild([string[]]$ChildArgs) {
-    $psi = [System.Diagnostics.ProcessStartInfo]::new((Get-Process -Id $PID).Path)
-    foreach ($a in @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $prune) + $ChildArgs) { $psi.ArgumentList.Add($a) }
-    $psi.UseShellExecute = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError = $true
-    # How PowerShell decodes a native command's output, so the log reads as it did under `&`.
-    $psi.StandardOutputEncoding = [Console]::OutputEncoding
-    $psi.StandardErrorEncoding = [Console]::OutputEncoding
-    $psi.Environment['GIT_TERMINAL_PROMPT'] = '0'
-    $psi.Environment['GCM_INTERACTIVE'] = 'never'
-    $p = [System.Diagnostics.Process]::Start($psi)
-    try {
-        # Both streams read at once, line by line, so neither pipe fills and blocks the child, and the
-        # log keeps the order the lines arrived in. The wait is bounded so a Ctrl+C is seen.
-        $reads = @($p.StandardOutput.ReadLineAsync(), $p.StandardError.ReadLineAsync())
-        while ($null -ne $reads[0] -or $null -ne $reads[1]) {
-            $live = [System.Threading.Tasks.Task[]]@($reads | Where-Object { $null -ne $_ })
-            if ([System.Threading.Tasks.Task]::WaitAny($live, 250) -lt 0) { continue }
-            foreach ($i in 0, 1) {
-                if ($null -eq $reads[$i] -or -not $reads[$i].IsCompleted) { continue }
-                $text = $reads[$i].GetAwaiter().GetResult()
-                if ($null -eq $text) { $reads[$i] = $null; continue }
-                [pscustomobject]@{ Err = ($i -eq 1); Text = $text }
-                $reads[$i] = if ($i -eq 0) { $p.StandardOutput.ReadLineAsync() } else { $p.StandardError.ReadLineAsync() }
-            }
-        }
-        $p.WaitForExit()
-        $script:childExit = $p.ExitCode
-    }
-    finally {
-        # Only when this run is stopped part way (Ctrl+C, a stop request): the child must not outlive it.
-        if (-not $p.HasExited) { try { $p.Kill($true) } catch [System.InvalidOperationException] { } }
-        $p.Dispose()
-    }
+# Manager's window, so make prune-merged.ps1's `git fetch` (and every git it starts, which inherit this)
+# fail instead of waiting until the task's time limit kills the run. hygiene-report.ps1 sets the same
+# two. An SSH origin's passphrase or host-key prompt is not covered. The 2026-11-17 log stops right
+# after "Fetching origin (--prune)...", which a fetch waiting on a prompt would explain; that is not
+# established. A hand run with `&` shares the caller's process, so the `finally` below puts both back
+# as they were, as alloc.ps1 does: it runs on Exit-Run's `exit`, after the trap, and on a stop (Ctrl+C).
+$hadPromptEnv = @{}
+foreach ($k in 'GIT_TERMINAL_PROMPT', 'GCM_INTERACTIVE') {
+    $hadPromptEnv[$k] = if (Test-Path -LiteralPath "Env:\$k") { [Environment]::GetEnvironmentVariable($k) } else { $null }
+    $hadPromptEnv["$k.exists"] = Test-Path -LiteralPath "Env:\$k"
 }
-
-$deadlineText = if ($deadline) { " stopAfter=$($deadline.ToLocalTime().ToString('HH:mm:ss'))" } else { '' }
-"=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode repo=$RepoRoot$deadlineText ===" | Add-Content -LiteralPath $log
-# A marker on each side of the prune-merged.ps1 run, which prints nothing between its fetch line and its
-# table. A log that ends after the first marker, with no exit marker, was stopped inside that run.
-"--- prune-merged.ps1 running ---" | Add-Content -LiteralPath $log
-$pruneStarted = $true
-Invoke-PruneChild $pruneArgs | ForEach-Object { $_.Text } | Add-Content -LiteralPath $log
-$code = $childExit
-"--- prune-merged.ps1 exit $code at $(Get-Date -Format 'HH:mm:ss') ---" | Add-Content -LiteralPath $log
-
-if ($RemoveFinishedClaudeWorktrees) { "--- finished .claude/worktrees: mode=$mode ---" | Add-Content -LiteralPath $log }
-# Read before the listing run too, which is itself a full prune-merged.ps1 run: started past the deadline
-# it could run into the task's kill, and every row it listed would come back NOT-REACHED anyway.
-if ($RemoveFinishedClaudeWorktrees -and $deadline -and [DateTime]::UtcNow -ge $deadline) {
-    "=== finished .claude/worktrees: SKIPPED, the run's deadline ($($deadlineText.Trim())) passed before the listing run; no .claude/worktrees tree was attempted ===" |
+$env:GIT_TERMINAL_PROMPT = '0'
+$env:GCM_INTERACTIVE = 'never'
+try {
+    $deadlineText = if ($deadline) { " stopAfter=$($deadline.ToLocalTime().ToString('HH:mm:ss'))" } else { '' }
+    "=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode repo=$RepoRoot$deadlineText ===" | Add-Content -LiteralPath $log
+    # A marker on each side of the prune-merged.ps1 run, which prints nothing between its fetch line and its
+    # table. A log that ends after the first marker, with no exit marker, was stopped inside that run.
+    "--- prune-merged.ps1 running ---" | Add-Content -LiteralPath $log
+    $pruneStarted = $true
+    & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $prune @pruneArgs *>&1 |
         Add-Content -LiteralPath $log
-}
-elseif ($RemoveFinishedClaudeWorktrees) {
-    # A FRESH list, from a second prune-merged.ps1 run in this invocation, after the prune above. Always
-    # a dry run (-Json without -Apply) and -SkipGh: the report-only set does not read merge signals.
-    $listArgs = @('-RepoRoot', $RepoRoot, '-Json', '-SkipGh')
-    if ($PSBoundParameters.ContainsKey('IdleHours')) { $listArgs += @('-IdleHours', [string]$IdleHours) }
-    $raw = @(Invoke-PruneChild $listArgs)
-    $listExit = $childExit
-    $stderrLines = @($raw | Where-Object { $_.Err } | ForEach-Object { "  stderr: $($_.Text)" })
-    if ($stderrLines.Count -gt 0) { $stderrLines | Add-Content -LiteralPath $log }
-    $listing = $null
-    try { $listing = (@($raw | Where-Object { -not $_.Err } | ForEach-Object { $_.Text }) -join "`n") | ConvertFrom-Json -ErrorAction Stop }
-    catch { "  could not parse the listing run's JSON (exit $listExit): $($_.Exception.Message)" | Add-Content -LiteralPath $log }
+    $code = $LASTEXITCODE
+    "--- prune-merged.ps1 exit $code at $(Get-Date -Format 'HH:mm:ss') ---" | Add-Content -LiteralPath $log
 
-    if ($null -eq $listing -or $null -eq $listing.fence -or $null -eq $listing.fence.idleHours) {
-        # Not a refusal of one tree but of the whole step. 2 promises nothing was removed, which holds
-        # only on a dry run: under -Apply the prune above may already have removed siblings, so the
-        # refusal is reported as 1, the same rule prune-merged.ps1 applies to its own refusals.
-        "=== finished .claude/worktrees: SKIPPED, the finished list could not be read; no .claude/worktrees tree was attempted ===" | Add-Content -LiteralPath $log
-        $code = [math]::Max($code, $(if ($Apply) { 1 } else { 2 }))
-    }
-    else {
-        $finished = @($listing.reportOnly | Where-Object { $_.claudeManaged -eq $true })
-        $outside = @($listing.reportOnly).Count - $finished.Count
-        "  listed finished: $($finished.Count) under .claude/worktrees; $outside elsewhere, left alone; $($listing.counts.reportOnlyHeld) withheld by prune-merged.ps1 (listing exit $listExit)" |
+    if ($RemoveFinishedClaudeWorktrees) { "--- finished .claude/worktrees: mode=$mode ---" | Add-Content -LiteralPath $log }
+    # Read before the listing run too, which is itself a full prune-merged.ps1 run: started past the deadline
+    # it could run into the task's kill, and every row it listed would come back NOT-REACHED anyway.
+    if ($RemoveFinishedClaudeWorktrees -and $deadline -and [DateTime]::UtcNow -ge $deadline) {
+        "=== finished .claude/worktrees: SKIPPED, the run's deadline ($($deadlineText.Trim())) passed before the listing run; no .claude/worktrees tree was attempted ===" |
             Add-Content -LiteralPath $log
+    }
+    elseif ($RemoveFinishedClaudeWorktrees) {
+        # A FRESH list, from a second prune-merged.ps1 run in this invocation, after the prune above. Always
+        # a dry run (-Json without -Apply) and -SkipGh: the report-only set does not read merge signals.
+        $listArgs = @('-RepoRoot', $RepoRoot, '-Json', '-SkipGh')
+        if ($PSBoundParameters.ContainsKey('IdleHours')) { $listArgs += @('-IdleHours', $IdleHours) }
+        $raw = @(& (Get-Process -Id $PID).Path -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $prune @listArgs 2>&1)
+        $listExit = $LASTEXITCODE
+        $stderrLines = @($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "  stderr: $_" })
+        if ($stderrLines.Count -gt 0) { $stderrLines | Add-Content -LiteralPath $log }
+        $listing = $null
+        try { $listing = (@($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n") | ConvertFrom-Json -ErrorAction Stop }
+        catch { "  could not parse the listing run's JSON (exit $listExit): $($_.Exception.Message)" | Add-Content -LiteralPath $log }
 
-        # Never the worktree this run executes from, nor the one the shell stands in. The scheduled task
-        # runs from the primary, which is refused anyway; a hand run from a worktree must not remove it.
-        $protect = @($PSScriptRoot, (Get-Location).Path) | ForEach-Object {
-            $top = & git -C $_ rev-parse --show-toplevel 2>$null
-            if ($LASTEXITCODE -eq 0 -and $top) { ([string]$top).Trim() }
+        if ($null -eq $listing -or $null -eq $listing.fence -or $null -eq $listing.fence.idleHours) {
+            # Not a refusal of one tree but of the whole step. 2 promises nothing was removed, which holds
+            # only on a dry run: under -Apply the prune above may already have removed siblings, so the
+            # refusal is reported as 1, the same rule prune-merged.ps1 applies to its own refusals.
+            "=== finished .claude/worktrees: SKIPPED, the finished list could not be read; no .claude/worktrees tree was attempted ===" | Add-Content -LiteralPath $log
+            $code = [math]::Max($code, $(if ($Apply) { 1 } else { 2 }))
         }
-        # The helper returns each input path unchanged, so the raw path is the key.
-        $why = @{}
-        foreach ($f in $finished) { $why[$f.path] = $f }
+        else {
+            $finished = @($listing.reportOnly | Where-Object { $_.claudeManaged -eq $true })
+            $outside = @($listing.reportOnly).Count - $finished.Count
+            "  listed finished: $($finished.Count) under .claude/worktrees; $outside elsewhere, left alone; $($listing.counts.reportOnlyHeld) withheld by prune-merged.ps1 (listing exit $listExit)" |
+                Add-Content -LiteralPath $log
 
-        # Logged per row as the helper emits it, not after it returns: a run killed part way still leaves
-        # the record of every tree it already removed.
-        $removalStepStarted = [bool]$Apply
-        $rows =@(Invoke-FinishedWorktreeRemoval -Primary $RepoRoot -Paths @($finished | ForEach-Object { $_.path }) `
-                -IdleHours ([double]$listing.fence.idleHours) -Protect $protect -Apply:$Apply -StopAt $deadline | ForEach-Object {
-                $f = $why[$_.Path]
-                $detail = if ($_.Outcome -in 'REMOVED', 'WOULD-REMOVE') { "$($_.Reason) [$($f.branch)]; listed because: $($f.whyFinished)" } else { $_.Reason }
-                $lines = @("  {0,-12} {1} -- {2}" -f $_.Outcome, $_.Path, $detail)
-                if ($_.Outcome -eq 'WOULD-REMOVE') { $lines += "               would run: $($_.Command)" }
-                $lines | Add-Content -LiteralPath $log
-                $_
-            })
+            # Never the worktree this run executes from, nor the one the shell stands in. The scheduled task
+            # runs from the primary, which is refused anyway; a hand run from a worktree must not remove it.
+            $protect = @($PSScriptRoot, (Get-Location).Path) | ForEach-Object {
+                $top = & git -C $_ rev-parse --show-toplevel 2>$null
+                if ($LASTEXITCODE -eq 0 -and $top) { ([string]$top).Trim() }
+            }
+            # The helper returns each input path unchanged, so the raw path is the key.
+            $why = @{}
+            foreach ($f in $finished) { $why[$f.path] = $f }
 
-        $byOutcome = @{}
-        foreach ($r in $rows) { $byOutcome[$r.Outcome] = 1 + [int]$byOutcome[$r.Outcome] }
-        $n = { param($o) [int]$byOutcome[$o] }
-        $free = 'unknown'
-        try {
-            $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($RepoRoot))
-            $free = "{0:N1} GB free on {1}" -f ($drive.AvailableFreeSpace / 1GB), $drive.Name
+            # Logged per row as the helper emits it, not after it returns: a run killed part way still leaves
+            # the record of every tree it already removed.
+            $rows = @(Invoke-FinishedWorktreeRemoval -Primary $RepoRoot -Paths @($finished | ForEach-Object { $_.path }) `
+                    -IdleHours ([double]$listing.fence.idleHours) -Protect $protect -Apply:$Apply -StopAt $deadline | ForEach-Object {
+                    $f = $why[$_.Path]
+                    $detail = if ($_.Outcome -in 'REMOVED', 'WOULD-REMOVE') { "$($_.Reason) [$($f.branch)]; listed because: $($f.whyFinished)" } else { $_.Reason }
+                    $lines = @("  {0,-12} {1} -- {2}" -f $_.Outcome, $_.Path, $detail)
+                    if ($_.Outcome -eq 'WOULD-REMOVE') { $lines += "               would run: $($_.Command)" }
+                    $lines | Add-Content -LiteralPath $log
+                    # Read by the trap too, so an error part way through still counts what was attempted.
+                    if ($_.Outcome -in 'REMOVED', 'FAILED', 'DECLINED') { $script:removalAttempted = $true }
+                    $_
+                })
+
+            $byOutcome = @{}
+            foreach ($r in $rows) { $byOutcome[$r.Outcome] = 1 + [int]$byOutcome[$r.Outcome] }
+            $n = { param($o) [int]$byOutcome[$o] }
+            $free = 'unknown'
+            try {
+                $drive = [System.IO.DriveInfo]::new([System.IO.Path]::GetPathRoot($RepoRoot))
+                $free = "{0:N1} GB free on {1}" -f ($drive.AvailableFreeSpace / 1GB), $drive.Name
+            }
+            catch [System.ArgumentException], [System.IO.IOException], [System.UnauthorizedAccessException] {
+                $free = "free space unreadable: $($_.Exception.Message)"
+            }
+            "=== finished .claude/worktrees: mode=$mode listed=$($finished.Count) removed=$(& $n 'REMOVED') wouldRemove=$(& $n 'WOULD-REMOVE') refused=$(& $n 'REFUSED') declined=$(& $n 'DECLINED') failed=$(& $n 'FAILED') orphaned=$(& $n 'ORPHANED') notReached=$(& $n 'NOT-REACHED'); $free ===" |
+                Add-Content -LiteralPath $log
+
+            # Refusals leave the code alone, as do trees the deadline left and git declining a tree every re-check passed: nothing
+            # changed, and the DECLINED line is there to be read. (A decline still turns the prune's 2 into 1, below.) A removal that failed is a failure, and a
+            # deregistered tree still on disk is an orphan -- the same severity order prune-merged.ps1 uses.
+            if ((& $n 'FAILED') -gt 0) { $code = [math]::Max($code, 1) }
+            if ((& $n 'ORPHANED') -gt 0) { $code = [math]::Max($code, 3) }
+            # A 2 from the prune says nothing was attempted. Once this step has run a removal, whether it
+            # removed, failed or git declined it, that is false; 1 says something was attempted and not all of
+            # it succeeded. (An orphan is already 3.)
+            if ($code -eq 2 -and $removalAttempted) { $code = 1 }
         }
-        catch [System.ArgumentException], [System.IO.IOException], [System.UnauthorizedAccessException] {
-            $free = "free space unreadable: $($_.Exception.Message)"
-        }
-        "=== finished .claude/worktrees: mode=$mode listed=$($finished.Count) removed=$(& $n 'REMOVED') wouldRemove=$(& $n 'WOULD-REMOVE') refused=$(& $n 'REFUSED') declined=$(& $n 'DECLINED') failed=$(& $n 'FAILED') orphaned=$(& $n 'ORPHANED') notReached=$(& $n 'NOT-REACHED'); $free ===" |
-            Add-Content -LiteralPath $log
+    }
 
-        # Refusals leave the code alone, as do trees the deadline left and git declining a tree every re-check passed: nothing
-        # changed, and the DECLINED line is there to be read. (A decline still turns the prune's 2 into 1, below.) A removal that failed is a failure, and a
-        # deregistered tree still on disk is an orphan -- the same severity order prune-merged.ps1 uses.
-        if ((& $n 'FAILED') -gt 0) { $code = [math]::Max($code, 1) }
-        if ((& $n 'ORPHANED') -gt 0) { $code = [math]::Max($code, 3) }
-        # A 2 from the prune says nothing was attempted. Once this step has run a removal, whether it
-        # removed, failed or git declined it, that is false; 1 says something was attempted and not all of
-        # it succeeded. (An orphan is already 3.)
-        if ($code -eq 2 -and ((& $n 'REMOVED') + (& $n 'FAILED') + (& $n 'DECLINED')) -gt 0) { $code = 1 }
+    Exit-Run $code
+}
+finally {
+    foreach ($k in 'GIT_TERMINAL_PROMPT', 'GCM_INTERACTIVE') {
+        if ($hadPromptEnv["$k.exists"]) { [Environment]::SetEnvironmentVariable($k, $hadPromptEnv[$k]) }
+        else { Remove-Item -LiteralPath "Env:\$k" -ErrorAction SilentlyContinue }
     }
 }
-
-Exit-Run $code
