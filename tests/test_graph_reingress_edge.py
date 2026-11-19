@@ -6,9 +6,13 @@ graph shows the response cycle and the reference index finds the loopback inboun
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
-from messagefoundry.config.graph import build_wiring_graph
+import pytest
+
+from messagefoundry.__main__ import main
+from messagefoundry.config.graph import DanglingRef, build_wiring_graph
 from messagefoundry.config.reachability import build_reference_index
 from messagefoundry.config.wiring import load_config
 
@@ -36,14 +40,19 @@ def to_result(msg):
     return Send("OB_RESULT", msg)
 """
 
-PY_CONNECTIONS = """\
+PY_CONNECTIONS_TEMPLATE = """\
 from messagefoundry import MLLP, File, Loopback, inbound, outbound
 
 inbound("IB_REQ", File(directory="in_req"), router="route_req")
 inbound("IB_LOOP", Loopback(), router="route_loop")
-outbound("OB_PARTNER", MLLP(host="127.0.0.1", port=2575, reingress_to="IB_LOOP"))
+outbound(
+    "OB_PARTNER",
+    MLLP(host="127.0.0.1", port=2575, reingress_to="{target}"),
+    deployed={deployed},
+)
 outbound("OB_RESULT", File(directory="out_result"))
 """
+PY_CONNECTIONS = PY_CONNECTIONS_TEMPLATE.format(target="IB_LOOP", deployed=True)
 
 # connections.toml has no loopback transport, so the Loopback inbound stays in a .py module.
 TOML_LOOPBACK = """\
@@ -96,7 +105,8 @@ def _assert_reingress_edge(config_dir: Path) -> None:
     # An outbound with no reingress_to carries no outgoing edge.
     assert graph.targets("outbound", "OB_RESULT") == []
     assert not graph.dangling
-    # The reference index (rename/delete impact) sees the outbound as the loopback's referrer.
+    # The reference index behind delete impact sees the outbound as the loopback's referrer. (A
+    # rename does not yet rewrite reingress_to: impact.py has no outbound referrer branch.)
     refs = build_reference_index(registry).referrers("inbound", "IB_LOOP")
     assert {(r.referrer_kind, r.referrer) for r in refs} == {("outbound", "OB_PARTNER")}
 
@@ -111,8 +121,35 @@ def test_toml_reingress_to_is_a_declared_outbound_to_inbound_edge(tmp_path: Path
     _assert_reingress_edge(config_dir)
 
 
-def test_reingress_to_naming_no_registered_inbound_emits_no_edge(tmp_path: Path) -> None:
-    typo = PY_CONNECTIONS.replace('reingress_to="IB_LOOP"', 'reingress_to="IB_NOPE"')
-    graph = build_wiring_graph(load_config(_config(tmp_path, "connections.py", typo)))
+@pytest.mark.parametrize(
+    ("target", "deployed"),
+    [
+        ("IB_NOPE", True),  # names no inbound
+        ("IB_REQ", True),  # names an inbound that is not a Loopback
+        ("IB_NOPE", False),  # build-check skips a not-deployed outbound; only the graph reports it
+    ],
+)
+def test_reingress_to_naming_no_loopback_is_dangling_not_an_edge(
+    tmp_path: Path, target: str, deployed: bool
+) -> None:
+    bad = PY_CONNECTIONS_TEMPLATE.format(target=target, deployed=deployed)
+    graph = build_wiring_graph(load_config(_config(tmp_path, "connections.py", bad)))
     assert graph.targets("outbound", "OB_PARTNER") == []
-    assert graph.referrers("inbound", "IB_NOPE") == []
+    assert graph.dangling == (DanglingRef("outbound", "OB_PARTNER", target, "loopback inbound"),)
+
+
+def test_graph_cli_carries_the_reingress_edge(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_dir = _config(tmp_path, "connections.py", PY_CONNECTIONS)
+    assert main(["graph", "--config", str(config_dir), "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    outbound = {o["name"]: o for o in data["outbound"]}
+    assert outbound["OB_PARTNER"]["edges"] == [
+        {"target": "IB_LOOP", "target_kind": "inbound", "provenance": "declared"}
+    ]
+    assert outbound["OB_RESULT"]["edges"] == []
+    inbound = {i["name"]: i for i in data["inbound"]}
+    assert inbound["IB_LOOP"]["reingressed_from"] == ["OB_PARTNER"]
+    assert inbound["IB_LOOP"]["receives_from"] == []  # handler senders only, unchanged
+    assert inbound["IB_REQ"]["reingressed_from"] == []
