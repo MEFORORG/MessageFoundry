@@ -174,10 +174,15 @@ def pki(tmp_path: Path) -> dict[str, Any]:
     written to PEM files under tmp_path. Returns the paths + the in-memory recipient key for decrypt."""
     ca_key, ca_cert = _mint_ca()
     signer_key, signer_cert = _mint_leaf("Sender Direct", ca_key, ca_cert)
-    # The dNSName covers the hospital.example recipients the envelope tests borrow from the Email
-    # destination's tests, as an organisation certificate would.
+    # An organisation certificate: no rfc822Name, so its dNSNames bind every mailbox at hisp.example
+    # and at the hospital.example recipients the envelope tests borrow from the Email destination's
+    # tests. A cert naming any rfc822Name would bind only that mailbox (BACKLOG #5631).
     recip_key, recip_cert = _mint_leaf(
-        "recipient@hisp.example", ca_key, ca_cert, dns_names=("hospital.example",)
+        "recipient@hisp.example",
+        ca_key,
+        ca_cert,
+        addresses=(),
+        dns_names=("hisp.example", "hospital.example"),
     )
 
     signing_cert_p = tmp_path / "signer.crt"
@@ -2165,6 +2170,25 @@ def test_a_cert_the_ca_issued_to_another_subscriber_is_refused(
     # Issued by the trusted CA, in its window, with no usage objection: only the binding fails.
     path = _recipient(pki, tmp_path, "other", addresses=addresses, dns_names=dns_names)
     assert "does not name recipient address 1 of 1" in _refusal(pki, recipient_cert=path)
+
+
+def test_a_dns_name_beside_an_rfc822_name_binds_no_other_mailbox_at_that_domain(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # A cert the CA issued to recipient@hisp.example that also names hisp.example is that
+    # subscriber's address-bound cert, not an organisation cert for every hisp.example mailbox
+    # (BACKLOG #5631).
+    path = _recipient(
+        pki,
+        tmp_path,
+        "address_bound",
+        addresses=("recipient@hisp.example",),
+        dns_names=("hisp.example",),
+    )
+    DirectDestination(_dest(pki, recipient_cert=path))
+    refusal = _refusal(pki, recipient_cert=path, recipients=["other@hisp.example"])
+    assert "does not name recipient address 1 of 1" in refusal
+    assert "on a cert that names no rfc822Name" in refusal
 
 
 def test_every_recipient_must_be_named_and_the_refusal_gives_the_position(
