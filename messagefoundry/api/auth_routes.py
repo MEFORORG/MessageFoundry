@@ -873,6 +873,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             # BACKLOG #5902: the caller's record fails its seal, so nothing was set. The admin
             # reads' 423, with the same fixed text, which names no field of the record.
             raise HTTPException(status.HTTP_423_LOCKED, str(exc)) from exc
+        except TransitSealUnavailableError as exc:
+            # A Vault transit Outage on the record's seal: nothing was set; retry once Vault answers.
+            raise _seal_outage_503() from exc
         except ValueError as exc:
             if str(exc) != "no such user":
                 raise

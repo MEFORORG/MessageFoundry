@@ -2272,8 +2272,10 @@ USER_SEAL_REFUSED: Final = "the user record fails its integrity check, so it was
 
 class UserSealRefused(RuntimeError):
     """:meth:`AuthService.checked_user` found the account's row, and its record fails its integrity
-    seal (BACKLOG #5520). The failure was handed to the seal-failure report, which writes the audit
-    row and raises the alert only for the first failure of the account in each report interval
+    seal (BACKLOG #5520). :meth:`AuthService.change_password` raises it too, from that read or
+    from the store write's own seal refusal, each reported the same way, and ``POST /me/password``
+    answers it 423 (BACKLOG #5902). The failure was handed to the seal-failure report, which
+    writes the audit row and raises the alert only for the first failure of the account in each report interval
     (:data:`~messagefoundry.store.row_seal.SEAL_FAILURE_REPORT_INTERVAL_SECONDS`) of this
     service's process, so a refusal inside that interval adds no row. Not "no such user": the row is there, and an administrator
     may still delete it. The admin routes answer it 423. A record Vault transit cannot verify is
@@ -16369,13 +16371,19 @@ class AuthService:
         Returns policy violations (empty list = changed). No-op-safe for AD identities at the API
         layer, which rejects password changes for AD users before calling this.
 
-        **A write that matched no row is never reported as a change** (BACKLOG #5902). It raises
-        ``ValueError("no such user")`` when a re-read finds the caller's row gone, as it does when
-        the row is gone before the write; :class:`FactorEnrolmentRequired` for a covered account
-        whose row is still there; and :class:`PasswordChangeNotApplied` otherwise. A deletion that
-        lands after the write has committed is not caught: that change is reported as made. A row
-        that fails its seal on two reads raises :class:`UserSealRefused` before the policy check,
-        and nothing is written.
+        **A write that matched no row is never reported as a change** (BACKLOG #5902). The
+        caller's record is read through :meth:`checked_user` before the policy check, so a gone row
+        raises ``ValueError("no such user")`` whatever password was typed, and a row whose record
+        fails its seal, or that Vault transit cannot verify, raises :class:`UserSealRefused` with
+        nothing written: with no checked record the MFA requirement's coverage cannot be judged,
+        and writing anyway would drop the way-past condition below. A Vault transit Outage raises
+        :class:`~messagefoundry.store.row_seal.TransitSealUnavailableError`. The store write's own
+        seal refusal is answered as the read's is. A write that matched no row re-reads the record:
+        gone is ``ValueError("no such user")``; a covered account with no way past left is
+        :class:`FactorEnrolmentRequired`; anything else is :class:`PasswordChangeNotApplied`. A
+        covered row deleted while the early way-past check runs is ``ValueError("no such user")``
+        too, not an enrolment refusal. A deletion that lands after the write has committed is not
+        caught: that change is reported as made.
         :class:`BreachCorpusUnavailable` propagates from the policy check unchanged: the password
         is refused, never accepted unscreened.
 
@@ -16397,41 +16405,59 @@ class AuthService:
         before the current password. Without the ``[webauthn]`` extra the write counts no passkey,
         as :meth:`_has_way_past` counts none.
         """
-        lookup = await self._lookup_user_settled(identity.user_id)
-        if not lookup.held:
+        user = await self.checked_user(identity.user_id)
+        if user is None:
             # BACKLOG #5902: the caller's row was deleted after its session was resolved. Asked
             # before the policy, so the answer does not depend on the password typed, and before the
             # hash, so no password_changed row is written for an absent account.
             raise ValueError("no such user")
-        user = lookup.user
-        if user is None:
-            # BACKLOG #5902: the row is there and fails its seal on a second read too. Refused, as
-            # every other read of such a row is: with no checked record, coverage by the MFA
-            # requirement cannot be judged, so writing would drop the way-past condition below.
-            raise UserSealRefused(USER_SEAL_REFUSED)
         violations = self._policy.violations(new_password, username=identity.username)
         if violations:
             return violations
         covered = self._covered_by_requirement(user, identity.roles)
         if covered:
-            await self._refuse_rotation_without_way_past(user)
-        written = await self._store.set_password(
-            identity.user_id,
-            password_hash=await self._argon2(hash_password, new_password),
-            must_change_password=must_change,
-            password_generated=False,
-            require_way_past=_opened_totp_state if covered else None,
-            # Without the [webauthn] extra no passkey can sign in, so the write counts none, as
-            # _has_way_past counts none (BACKLOG #3948).
-            passkey_counts=self._gate_counts if webauthn.available() else _passkey_counts_nothing,
-        )
+            try:
+                await self._refuse_rotation_without_way_past(user)
+            except FactorEnrolmentRequired:
+                # A row deleted meanwhile takes its factors with it, so it reads as one with no way
+                # past; it is answered as gone, not as an account that must enrol (BACKLOG #5902).
+                if await self.checked_user(identity.user_id) is None:
+                    raise ValueError("no such user") from None
+                raise
+        try:
+            written = await self._store.set_password(
+                identity.user_id,
+                password_hash=await self._argon2(hash_password, new_password),
+                must_change_password=must_change,
+                password_generated=False,
+                require_way_past=_opened_totp_state if covered else None,
+                # Without the [webauthn] extra no passkey can sign in, so the write counts none, as
+                # _has_way_past counts none (BACKLOG #3948).
+                passkey_counts=self._gate_counts
+                if webauthn.available()
+                else _passkey_counts_nothing,
+            )
+        except RowSealError as exc:
+            # The record passed its seal at the read above and failed it at the write, which wrote
+            # nothing: refused and reported as the read refuses and reports it (BACKLOG #5902).
+            if exc.kind != USER_KIND:
+                raise
+            await self._user_seal_failed(user.id)
+            raise UserSealRefused(USER_SEAL_REFUSED) from exc
+        except RowSealUnverifiableError as exc:
+            await self._user_seal_unverifiable(user.id, exc)
+            raise UserSealRefused(USER_SEAL_REFUSED) from exc
+        except TransitSealUnavailableError:
+            self._user_seal_outage("password change")
+            raise
         if not written:
             # A row deleted between the read above and the write is told apart from a lost way
-            # past, so neither a success nor an enrolment refusal is reported for an account that
-            # is gone (BACKLOG #5902).
-            if not (await self._lookup_user(identity.user_id)).held:
+            # past, and a covered account that still has a way past lost only a compare to another
+            # write, so neither a success nor a false enrolment refusal is reported (BACKLOG #5902).
+            after = await self.checked_user(identity.user_id)
+            if after is None:
                 raise ValueError("no such user")
-            if covered:
+            if covered and not await self._has_way_past(after):
                 raise FactorEnrolmentRequired()
             raise PasswordChangeNotApplied()
         await self._revoke_after_commit(

@@ -24,15 +24,19 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.auth.passwords import hash_password
 from messagefoundry.auth.service import (
+    AUTHORITY_SEAL_FAILED_ACTION,
+    USER_SEAL_REFUSED,
     AuthService,
+    FactorEnrolmentRequired,
     PasswordChangeNotApplied,
     UserSealRefused,
-    _UserLookup,
+    _SealCheck,
 )
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.store.base import Store
 from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.row_seal import USER_KIND, RowSealError
 from messagefoundry.store.store import MessageStore
 from tests.test_api_auth import _auth, _login
 from tests.test_password_corpus_guard import bundled_corpus as bundled_corpus  # noqa: F401
@@ -140,6 +144,14 @@ async def _signed_in(engine: Engine) -> tuple[httpx.AsyncClient, AuthService, di
     return c, service, _auth(login.json()["token"])
 
 
+async def _post_change(c: httpx.AsyncClient, headers: dict[str, str]) -> httpx.Response:
+    return await c.post(
+        "/me/password",
+        headers=headers,
+        json={"current_password": _PASSWORD, "new_password": _NEW_PASSWORD},
+    )
+
+
 async def test_an_unusable_corpus_is_a_named_503_and_no_change(
     engine: Engine,
     bundled_corpus: Callable[[Sequence[str] | None], None],  # noqa: F811
@@ -148,11 +160,7 @@ async def test_an_unusable_corpus_is_a_named_503_and_no_change(
     c, _service, headers = await _signed_in(engine)
     try:
         bundled_corpus(None)  # no corpus file at all: the screen cannot run
-        r = await c.post(
-            "/me/password",
-            headers=headers,
-            json={"current_password": _PASSWORD, "new_password": _NEW_PASSWORD},
-        )
+        r = await _post_change(c, headers)
     finally:
         await c.aclose()
     assert r.status_code == 503, r.text
@@ -169,11 +177,7 @@ async def test_a_deleted_account_is_a_401_not_a_success(
     # The row goes after the gate and the current-password check, as the store write starts.
     _delete_during_write(monkeypatch, engine.store, "u1")
     try:
-        r = await c.post(
-            "/me/password",
-            headers=headers,
-            json={"current_password": _PASSWORD, "new_password": _NEW_PASSWORD},
-        )
+        r = await _post_change(c, headers)
     finally:
         await c.aclose()
     assert r.status_code == 401, r.text
@@ -199,23 +203,13 @@ async def test_a_write_that_lost_a_race_is_not_reported_as_a_change(
     assert after is not None and after.password_hash == before.password_hash
 
 
-def _stored_hash(path: Path, user_id: str) -> str:
-    """The password hash as the file holds it, read on a keyless stdlib connection."""
-    conn = sqlite3.connect(path)
-    try:
-        row = conn.execute("SELECT password_hash FROM users WHERE id=?", (user_id,)).fetchone()
-    finally:
-        conn.close()
-    assert row is not None
-    return str(row[0])
-
-
 async def test_a_row_that_fails_its_seal_cannot_change_its_password(tmp_path: Path) -> None:
     path = tmp_path / "sealed.db"
     store = await MessageStore.open(path, cipher=make_cipher(generate_key(), write_v2=True))
     try:
         service, identity = await _account(store, require_mfa=True)
-        before = _stored_hash(path, "u1")
+        before = await store.get_user("u1")  # unchecked read: it still returns a bent row
+        assert before is not None
         # Bend a sealed field behind the store's back, so the record fails its seal on every read.
         conn = sqlite3.connect(path)
         try:
@@ -228,18 +222,102 @@ async def test_a_row_that_fails_its_seal_cannot_change_its_password(tmp_path: Pa
         # Refused before the policy check, so the password typed does not change the answer.
         with pytest.raises(UserSealRefused):
             await service.change_password(identity, "weak")
-        assert _stored_hash(path, "u1") == before
+        after = await store.get_user("u1")
+        assert after is not None and after.password_hash == before.password_hash
         assert await _changed_rows(store) == []
+        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
     finally:
         await store.close()
 
 
-async def _post_change(c: httpx.AsyncClient, headers: dict[str, str]) -> httpx.Response:
-    return await c.post(
-        "/me/password",
-        headers=headers,
-        json={"current_password": _PASSWORD, "new_password": _NEW_PASSWORD},
-    )
+async def test_a_raced_first_read_still_writes_with_the_way_past_condition(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A first check that races a write and settles nothing is read again, so a covered account is
+    still judged covered: the write carries ``require_way_past`` rather than running unconditioned."""
+    service, identity = await _account(store, require_mfa=True)
+    real_verified = service._verified
+    raced = [True]
+
+    async def verified(raw: Any) -> Any:
+        if raced:
+            raced.pop()
+            return _SealCheck()  # neither passes nor fails: a row re-keyed between its reads
+        return await real_verified(raw)
+
+    async def way_past(_user: Any) -> None:
+        return None  # stand in for a factor that passes the early refusal
+
+    seen: list[Any] = []
+    real_write = store.set_password
+
+    async def recording(uid: str, **kwargs: Any) -> bool:
+        seen.append(kwargs["require_way_past"])
+        return await real_write(uid, **kwargs)
+
+    monkeypatch.setattr(service, "_verified", verified)
+    monkeypatch.setattr(service, "_refuse_rotation_without_way_past", way_past)
+    monkeypatch.setattr(store, "set_password", recording)
+    # The account holds no factor, so the conditioned write declines and the change is refused.
+    with pytest.raises(FactorEnrolmentRequired):
+        await service.change_password(identity, _NEW_PASSWORD)
+    assert raced == [] and len(seen) == 1 and seen[0] is not None
+    assert await _changed_rows(store) == []
+
+
+async def test_a_covered_lost_write_is_an_enrolment_refusal_only_with_no_way_past(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, identity = await _account(store, require_mfa=True)
+
+    async def way_past(_user: Any) -> None:
+        return None
+
+    async def lost(_uid: str, **_kwargs: Any) -> bool:
+        return False
+
+    monkeypatch.setattr(service, "_refuse_rotation_without_way_past", way_past)
+    monkeypatch.setattr(store, "set_password", lost)
+    with pytest.raises(FactorEnrolmentRequired):
+        await service.change_password(identity, _NEW_PASSWORD)
+
+    async def still_has_one(_user: Any) -> bool:
+        return True  # the factor is still there: the write lost only a compare to another write
+
+    monkeypatch.setattr(service, "_has_way_past", still_has_one)
+    with pytest.raises(PasswordChangeNotApplied):
+        await service.change_password(identity, _NEW_PASSWORD)
+    assert await _changed_rows(store) == []
+
+
+async def test_a_covered_row_deleted_during_the_early_check_is_not_an_enrolment_refusal(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, identity = await _account(store, require_mfa=True)
+
+    async def deleted_meanwhile(_user: Any) -> None:
+        await store.delete_user("u1")  # its factors go with it, so it reads as having none
+        raise FactorEnrolmentRequired()
+
+    monkeypatch.setattr(service, "_refuse_rotation_without_way_past", deleted_meanwhile)
+    with pytest.raises(ValueError, match="no such user"):
+        await service.change_password(identity, _NEW_PASSWORD)
+    assert await _changed_rows(store) == []
+
+
+async def test_a_seal_refusal_at_the_write_is_refused_and_reported(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, identity = await _account(store)
+
+    async def refused(_uid: str, **_kwargs: Any) -> bool:
+        raise RowSealError(USER_KIND, "u1")  # the record failed its seal under the write's lock
+
+    monkeypatch.setattr(store, "set_password", refused)
+    with pytest.raises(UserSealRefused):
+        await service.change_password(identity, _NEW_PASSWORD)
+    assert await _changed_rows(store) == []
+    assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
 
 
 async def test_a_lost_write_is_a_409_on_the_route(
@@ -265,14 +343,16 @@ async def test_a_seal_refused_row_is_a_423_on_the_route(
 ) -> None:
     c, service, headers = await _signed_in(engine)
 
-    async def refused(_uid: str) -> _UserLookup:
-        return _UserLookup(None, True)  # the row is there and fails its seal on both reads
+    async def refused(_uid: str) -> Any:
+        raise UserSealRefused(USER_SEAL_REFUSED)
 
-    # Patched after sign-in, so the gate and the current-password check read the row as sealed.
-    monkeypatch.setattr(service, "_lookup_user_settled", refused)
+    # Only change_password reads through checked_user on this route; the gate and the
+    # current-password check read through _load_user, so they still pass.
+    monkeypatch.setattr(service, "checked_user", refused)
     try:
         r = await _post_change(c, headers)
     finally:
         await c.aclose()
     assert r.status_code == 423, r.text
+    assert r.json()["detail"] == USER_SEAL_REFUSED
     assert await _changed_rows(engine.store) == []
