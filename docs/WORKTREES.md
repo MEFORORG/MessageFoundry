@@ -754,21 +754,23 @@ line when the prune run was not started or was killed, when the deadline passed 
 run, or when the listing run was killed. Without a deadline both runs are started with `&`, unbounded,
 as before.
 
-**Every deadline stop exits `4`, DEADLINE**: a killed or unstarted run, a skipped step, or a
-`NOT-REACHED` tree. `4` is the runner's own code, not one `prune-merged.ps1` returns. It stands over a
-`1` or `2` the run earned, but an orphan's `3` stands over it, since a broken directory needs a human
-and a deadline stop resumes on the next run; the log's rows still carry the code a higher one hides. Before, a deadline stop left the code alone, so a run that skipped work
+**A deadline stop exits `4`, DEADLINE, where the run earned no other code**: a killed or unstarted
+run, a skipped step, or a `NOT-REACHED` tree. `4` is the runner's own code, not one `prune-merged.ps1`
+returns, and it replaces only a `0`. A `1`, `2` or `3` the run earned stays the exit code, because a
+real failure matters more than a partial run, and a deadline stop is expected most nights while a
+backlog drains; the log still records the stop. A child the kill could not end is logged as
+`kill FAILED`, with its pid, and may still be running. Before, a deadline stop left the code alone, so a run that skipped work
 exited as if it had finished it.
 
 The exit code starts as the prune's, and each row changes it as the row arrives, before the row's
-log line is written. A refusal leaves it alone; a tree the deadline left raises it to `4`. An orphan raises it to `3`
+log line is written. A refusal leaves it alone; a tree the deadline left marks a deadline stop. An orphan raises it to `3`
 and goes into `prune-merged.ps1`'s orphan ledger, so later runs keep reporting it. A `2` from the
 prune says nothing was attempted, so a `REMOVED`, `FAILED` or `DECLINED` row turns it into `1`; apart
 from that, a failure raises the code to at least `1`, and nothing lowers it. An unhandled error after
 the log path is set exits with at least `2` before the prune started or on a dry run, and at least `1`
 once an `-Apply` prune has started, never below the code the prune and the rows have set. A list that
 could not be read skips the step, raising the code to at least `2` on a dry run and at least `1` under
-`-Apply`, since the prune before it may have removed siblings. A deadline stop raises it to `4`. With `-Apply` the runner refuses to run
+`-Apply`, since the prune before it may have removed siblings. A deadline stop turns a `0` into `4`. With `-Apply` the runner refuses to run
 inside Claude Code. Tests:
 [`tests/test_worktree_finished_claude_removal.py`](../tests/test_worktree_finished_claude_removal.py)
 for the step, and

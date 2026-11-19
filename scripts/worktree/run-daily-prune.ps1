@@ -62,8 +62,9 @@
     The .claude/worktrees step is skipped with one SKIPPED line when the prune run was not started or
     was killed, when the deadline passed before the listing run, or when the listing run was killed.
     Inside the step, past the deadline no further tree is started, and each one left is logged as
-    NOT-REACHED (the next run lists them again). Every one of those stops still writes the exit line,
-    and exits 4, DEADLINE, unless the run found an orphan (3); see $CODE_RANK below.
+    NOT-REACHED (the next run lists them again). Every one of those stops still writes the exit line.
+    A run that stopped at the deadline and found nothing else exits 4, DEADLINE; see $EXIT_DEADLINE
+    below. A child that cannot be killed is logged as `kill FAILED` and may still be running.
 
 .PARAMETER KeepLogs
     How many dated logs to keep. Older ones are deleted after each run.
@@ -73,9 +74,9 @@
     there so the time limit is not reached.
 
     Exit codes: 0 to 3 are prune-merged.ps1's, passed through and explained by $EXIT_MEANING below. 4
-    is this runner's own: the run stopped at its -StopAfterMinutes deadline and left work for the next
-    run. Codes only ever rise, in $CODE_RANK's order, so a 4 stands over a 1 or 2 the run earned and a
-    3 stands over a 4; the log's rows still carry the code a higher one hides.
+    is this runner's own: the run stopped at its -StopAfterMinutes deadline, left work for the next
+    run, and earned no other code. It replaces only a 0: a 1, 2 or 3 the run earned is the exit code
+    even when the run also stopped at its deadline, and the log still records the stop.
 
 .EXAMPLE
     pwsh -File scripts\worktree\run-daily-prune.ps1 -LogDir C:\logs            # dry run, logged
@@ -99,6 +100,7 @@ $ErrorActionPreference = 'Stop'
 # Set here so the trap below never reads a caller's variable of the same name.
 $log = $null
 $code = $null
+$deadlineHit = $false
 $pruneStarted = $false
 # In UTC: Task Scheduler's limit counts elapsed time, and a local clock repeats an hour at the DST
 # fall-back, which would put this deadline an hour past the kill.
@@ -133,21 +135,12 @@ $EXIT_MEANING = @{
 }
 # The runner's own code, kept out of the table above because prune-merged.ps1 never returns it. A
 # deadline stop used to leave the code alone, which made a run that skipped work exit as if it had
-# finished it. tests/test_worktree_install_daily_prune.py::test_the_runners_own_exit_code_is_not_one_of_prune_merged
+# finished it. Exit-Run uses it only in place of a 0 (owner's Manager, 2026-11-19): a real failure
+# matters more than a partial run, and deadline stops are expected most nights while a backlog drains.
+# tests/test_worktree_install_daily_prune.py::test_the_runners_own_exit_code_is_not_one_of_prune_merged
 # holds it apart from prune-merged.ps1's.
 $EXIT_DEADLINE = 4
-$EXIT_DEADLINE_MEANING = 'DEADLINE -- the run reached its -StopAfterMinutes deadline and left work for the next run; a prune-merged.ps1 run still going then was killed'
-
-# Codes rank in this order, lowest first, and a code is only ever raised. 4 outranks 0 to 2, but not 3:
-# an orphan is a directory broken on disk that needs a human, and a deadline stop resumes on the next
-# run, so a deadline stop must not hide one. A code outside the list compares by number.
-$CODE_RANK = @(0, 1, 2, $EXIT_DEADLINE, 3)
-function Get-RaisedCode($Current, [int]$New) {
-    $c = $CODE_RANK.IndexOf([int]$Current)
-    $n = $CODE_RANK.IndexOf($New)
-    if ($c -lt 0 -or $n -lt 0) { return [math]::Max([int]$Current, $New) }
-    if ($n -gt $c) { $New } else { [int]$Current }
-}
+$EXIT_DEADLINE_MEANING = 'DEADLINE -- the run stopped at its -StopAfterMinutes deadline and left work for the next run; nothing else went wrong'
 
 $prune = Join-Path $PSScriptRoot 'prune-merged.ps1'
 if (-not (Test-Path -LiteralPath $prune)) { throw "prune-merged.ps1 not found beside this script: $prune" }
@@ -158,6 +151,8 @@ $log = Join-Path $LogDir ("prune-" + (Get-Date -Format 'yyyy-MM-dd') + ".log")
 
 # Writes the exit line (while the log can be written), trims the log directory, and exits.
 function Exit-Run([int]$Code) {
+    # Set by every deadline stop, before its log line, so a failed write still carries it here.
+    if ($deadlineHit -and $Code -eq 0) { $Code = $EXIT_DEADLINE }
     $meaning = if ($Code -eq $EXIT_DEADLINE) { $EXIT_DEADLINE_MEANING } elseif ($EXIT_MEANING.ContainsKey($Code)) { $EXIT_MEANING[$Code] } else { "UNKNOWN exit code $Code" }
     try { "=== exit $Code ($meaning) at $(Get-Date -Format 'HH:mm:ss') ===" | Add-Content -LiteralPath $log }
     catch [System.Management.Automation.RuntimeException], [System.IO.IOException], [System.UnauthorizedAccessException] {
@@ -179,14 +174,17 @@ function Exit-Run([int]$Code) {
 #
 # Its stdout and stderr go straight to two files beside the log, written by the child itself, so each
 # keeps its own order, and a run killed from outside still leaves on disk what the child printed (in
-# prune-child-<pid>.out.txt and .err.txt). Read back after the child ends: stdout's lines, then stderr's.
-# The one thing lost against `*>&1` is how the two streams interleaved. Lines collected from the
+# prune-child-<pid>.out.txt and .err.txt). Read back after the child ends and written to the log here:
+# stdout's lines (with -LogStdout), then stderr's, each prefixed with $StderrPrefix. The files are deleted
+# only once that write succeeded, so a throw or a Stop before it leaves them on disk instead. Returns
+# the stdout lines for a caller that parses them. The one thing lost against `*>&1` is how the two
+# streams interleaved. Lines collected from the
 # process's own stream events came back out of order even within one stream (156 of 20,000 measured
 # 2026-11-19), which scrambled the listing run's multi-line JSON.
 #
 # A child still running at the deadline is killed with its whole process tree, since a hung `git fetch`
 # under it is the likely hang.
-function Invoke-BoundedPrune([object[]]$ChildArgs) {
+function Invoke-BoundedPrune([object[]]$ChildArgs, [switch]$LogStdout, [string]$StderrPrefix = '') {
     # Start-Process joins its arguments with spaces and quotes none, so quote each as the C runtime
     # splits them: a run of backslashes before a quote, or at the end, is doubled.
     $argLine = (@('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $prune) + $ChildArgs | ForEach-Object {
@@ -201,6 +199,8 @@ function Invoke-BoundedPrune([object[]]$ChildArgs) {
     $timedOut = $false
     $killedAt = $null
     $killFault = $null
+    $stillRunning = $false
+    $logged = $false
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $p = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList $argLine -NoNewWindow -PassThru `
@@ -218,12 +218,15 @@ function Invoke-BoundedPrune([object[]]$ChildArgs) {
             # Bounded, so the run still reaches its exit line if the kill did not take.
             $null = $p.WaitForExit(15000)
             # A child that ended on its own between the last wait and the kill was not timed out, and its
-            # exit code is real. TerminateProcess, which Kill uses on Windows, leaves -1.
-            $timedOut = -not $p.HasExited -or $p.ExitCode -eq -1
+            # exit code is real. TerminateProcess, which Kill uses on Windows, leaves -1. Windows only, as
+            # the scheduled task is: elsewhere Kill sends SIGKILL, the code reads 137, and this would take
+            # a killed child for one that exited.
+            $stillRunning = -not $p.HasExited
+            $timedOut = $stillRunning -or $p.ExitCode -eq -1
             break
         }
         $sw.Stop()
-        $lines = foreach ($f in @(@{ Path = $out; Stderr = $false }, @{ Path = $err; Stderr = $true })) {
+        $lines = @(foreach ($f in @(@{ Path = $out; Stderr = $false }, @{ Path = $err; Stderr = $true })) {
             if (-not (Test-Path -LiteralPath $f.Path)) { continue }
             # ReadWrite sharing: a descendant the kill missed may still hold the file open for writing.
             $fs = [System.IO.FileStream]::new($f.Path, 'Open', 'Read', 'ReadWrite, Delete')
@@ -232,14 +235,19 @@ function Invoke-BoundedPrune([object[]]$ChildArgs) {
                 while ($null -ne ($line = $reader.ReadLine())) { [pscustomobject]@{ Stderr = $f.Stderr; Text = $line } }
             }
             finally { $fs.Dispose() }
-        }
+        })
+        $toLog = @($lines | Where-Object { $_.Stderr -or $LogStdout } | ForEach-Object { if ($_.Stderr) { "$StderrPrefix$($_.Text)" } else { $_.Text } })
+        if ($toLog.Count -gt 0) { $toLog | Add-Content -LiteralPath $log }
+        $logged = $true
         [pscustomobject]@{
-            TimedOut  = $timedOut
-            ExitCode  = if ($timedOut) { $null } else { $p.ExitCode }
-            Minutes   = $sw.Elapsed.TotalMinutes
-            KilledAt  = $killedAt
-            KillFault = $killFault
-            Lines     = @($lines)
+            TimedOut     = $timedOut
+            StillRunning = $stillRunning
+            Pid          = $p.Id
+            ExitCode     = if ($timedOut) { $null } else { $p.ExitCode }
+            Minutes      = $sw.Elapsed.TotalMinutes
+            KilledAt     = $killedAt
+            KillFault    = $killFault
+            Stdout       = @($lines | Where-Object { -not $_.Stderr } | ForEach-Object { $_.Text })
         }
     }
     finally {
@@ -251,17 +259,22 @@ function Invoke-BoundedPrune([object[]]$ChildArgs) {
             }
         }
         if ($null -ne $p) { $p.Dispose() }
-        Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue
+        if ($logged) { Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue }
     }
 }
 
-# The timed line a killed child leaves, after whatever it printed. Invariant culture, so the minutes read
-# the same under any locale.
+# The timed line a child still running at the deadline leaves, after whatever it printed. "killed" only
+# when the kill took; otherwise it says the child may still be running. Invariant culture, so the minutes
+# read the same under any locale.
 function Write-TimedOut([pscustomobject]$Run) {
-    $fault = if ($Run.KillFault) { "; the kill reported: $($Run.KillFault)" } else { '' }
     $minutes = $Run.Minutes.ToString('0.0', [cultureinfo]::InvariantCulture)
-    "--- prune-merged.ps1 TIMED OUT after $minutes min, killed at $($Run.KilledAt.ToString('HH:mm:ss'))$fault ---" |
-        Add-Content -LiteralPath $log
+    $at = $Run.KilledAt.ToString('HH:mm:ss')
+    $what = if ($Run.KillFault -or $Run.StillRunning) {
+        $fault = if ($Run.KillFault) { ": $($Run.KillFault)" } else { ': it had not exited 15 s later' }
+        "kill FAILED at $at, so it may still be running (pid $($Run.Pid))$fault"
+    }
+    else { "killed at $at" }
+    "--- prune-merged.ps1 TIMED OUT after $minutes min, $what ---" | Add-Content -LiteralPath $log
 }
 
 # A terminating error still leaves its reason and an exit line in the log, rather than only on a stderr
@@ -334,8 +347,10 @@ try {
     $deadlineText = if ($deadline) { " stopAfter=$($deadline.ToLocalTime().ToString('HH:mm:ss'))" } else { '' }
     "=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode repo=$RepoRoot$deadlineText ===" | Add-Content -LiteralPath $log
     # Why the run stopped short of its end, once it has; each stop below sets it and skips what follows.
+    # A deadline stop sets $deadlineHit BEFORE its log line, as the rows raise the code before theirs.
     $stopReason = $null
     if ($deadline -and [DateTime]::UtcNow -ge $deadline) {
+        $deadlineHit = $true
         "--- prune-merged.ps1 NOT STARTED, the run's deadline ($($deadlineText.Trim())) had passed ---" | Add-Content -LiteralPath $log
         $stopReason = "the run's deadline ($($deadlineText.Trim())) passed before the prune run"
     }
@@ -346,11 +361,11 @@ try {
         "--- prune-merged.ps1 running ---" | Add-Content -LiteralPath $log
         $pruneStarted = $true
         if ($deadline) {
-            $run = Invoke-BoundedPrune $pruneArgs
-            if ($run.Lines.Count -gt 0) { $run.Lines.Text | Add-Content -LiteralPath $log }
+            $run = Invoke-BoundedPrune $pruneArgs -LogStdout
             if ($run.TimedOut) {
+                $deadlineHit = $true
                 Write-TimedOut $run
-                $stopReason = "prune-merged.ps1 was killed at the run's deadline ($($deadlineText.Trim()))"
+                $stopReason = "prune-merged.ps1 was still running at the run's deadline ($($deadlineText.Trim()))"
             }
             else { $code = $run.ExitCode }
         }
@@ -366,6 +381,7 @@ try {
     # Read before the listing run too, which is itself a full prune-merged.ps1 run: started past the deadline
     # it would be killed at once, and every row it listed would come back NOT-REACHED anyway.
     if ($RemoveFinishedClaudeWorktrees -and -not $stopReason -and $deadline -and [DateTime]::UtcNow -ge $deadline) {
+        $deadlineHit = $true
         $stopReason = "the run's deadline ($($deadlineText.Trim())) passed before the listing run"
     }
     if ($RemoveFinishedClaudeWorktrees -and -not $stopReason) {
@@ -374,30 +390,29 @@ try {
         $listArgs = @('-RepoRoot', $RepoRoot, '-Json', '-SkipGh')
         if ($PSBoundParameters.ContainsKey('IdleHours')) { $listArgs += @('-IdleHours', $IdleHours) }
         if ($deadline) {
-            $run = Invoke-BoundedPrune $listArgs
+            $run = Invoke-BoundedPrune $listArgs -StderrPrefix '  stderr: '
             $listExit = $run.ExitCode
-            $listOut = @($run.Lines | Where-Object { -not $_.Stderr } | ForEach-Object { $_.Text })
-            $listErr = @($run.Lines | Where-Object { $_.Stderr } | ForEach-Object { $_.Text })
+            $listOut = $run.Stdout
         }
         else {
             $raw = @(& (Get-Process -Id $PID).Path -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $prune @listArgs 2>&1)
             $listExit = $LASTEXITCODE
             $listOut = @($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
             $listErr = @($raw | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] })
+            if ($listErr.Count -gt 0) { $listErr | ForEach-Object { "  stderr: $_" } | Add-Content -LiteralPath $log }
         }
-        if ($listErr.Count -gt 0) { $listErr | ForEach-Object { "  stderr: $_" } | Add-Content -LiteralPath $log }
         if ($deadline -and $run.TimedOut) {
+            $deadlineHit = $true
             Write-TimedOut $run
-            $stopReason = "the listing run was killed at the run's deadline ($($deadlineText.Trim()))"
+            $stopReason = "the listing run was still running at the run's deadline ($($deadlineText.Trim()))"
         }
     }
 
-    # Every deadline stop is logged and raises the code to DEADLINE; see $CODE_RANK for what it outranks.
+    # Every deadline stop has set $deadlineHit already; Exit-Run turns it into 4 where the code is still 0.
     if ($stopReason) {
         if ($RemoveFinishedClaudeWorktrees) {
             "=== finished .claude/worktrees: SKIPPED, $stopReason; no .claude/worktrees tree was attempted ===" | Add-Content -LiteralPath $log
         }
-        $code = Get-RaisedCode $code $EXIT_DEADLINE
     }
     elseif ($RemoveFinishedClaudeWorktrees) {
         $listing = $null
@@ -435,12 +450,12 @@ try {
                     $detail = if ($_.Outcome -in 'REMOVED', 'WOULD-REMOVE') { "$($_.Reason) [$($f.branch)]; listed because: $($f.whyFinished)" } else { $_.Reason }
                     # The code is raised here, per row and BEFORE the row's log line, so an error later in the
                     # run, a failed log write included, reaches the trap with it. A deregistered tree still on
-                    # disk is an orphan, 3. A tree the deadline left is a deadline stop, 4. A 2 from the
+                    # disk is an orphan, 3. A tree the deadline left marks a deadline stop. A 2 from the
                     # prune says nothing was attempted, which a REMOVED, FAILED or DECLINED row makes false,
                     # so 1. A failure is at least 1. Otherwise the code never goes lower, and a refusal
                     # changes nothing.
-                    if ($_.Outcome -eq 'ORPHANED') { $script:code = Get-RaisedCode $script:code 3 }
-                    elseif ($_.Outcome -eq 'NOT-REACHED') { $script:code = Get-RaisedCode $script:code $EXIT_DEADLINE }
+                    if ($_.Outcome -eq 'ORPHANED') { $script:code = [math]::Max([int]$script:code, 3) }
+                    elseif ($_.Outcome -eq 'NOT-REACHED') { $script:deadlineHit = $true }
                     elseif ($_.Outcome -in 'REMOVED', 'FAILED', 'DECLINED') {
                         if ([int]$script:code -eq 2) { $script:code = 1 }
                         elseif ($_.Outcome -eq 'FAILED') { $script:code = [math]::Max([int]$script:code, 1) }

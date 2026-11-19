@@ -50,8 +50,9 @@
     THE RUNNER STOPS ITSELF BEFORE THE LIMIT. A task killed at its limit writes nothing, so the task
     passes run-daily-prune.ps1 -StopAfterMinutes, the limit less the margin $STOP_MARGIN_MINUTES sets.
     Past that point the runner starts no further removal, kills a prune-merged.ps1 run still going (a
-    hung one included) with its process tree, logs it as TIMED OUT, writes its exit line and exits 4,
-    DEADLINE; run-daily-prune.ps1's header says how, and what that kill can leave half done. That margin covers one removal in flight, or the
+    hung one included) with its process tree, logs it as TIMED OUT and writes its exit line: 4,
+    DEADLINE, where the run earned no other code. run-daily-prune.ps1's header says how, and what that
+    kill can leave half done. That margin covers one removal in flight, or the
     kill of a prune-merged.ps1 run, and the closing lines.
 
 .PARAMETER Apply
