@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """BACKLOG #5395, last pass: when the harness scrub fails and a log handler's ``emit`` fails too,
-``logging``'s ``handleError`` prints the current exception chain to stderr. That chain must hold
-neither the scrub failure's text nor the text of the exception the row is about, whether the caller
-calls the scrub directly or from inside its own ``except`` block. The positive controls show that a
-log call inside the ``except`` block, and one outside it with no chain cut, both leak. All data here
-is synthetic, and the planted values are module constants so that no source line ``handleError``
-prints in its call stack spells them."""
+``logging``'s ``handleError`` prints the current exception chain to stderr. That output, and the
+chain object itself walked past ``__suppress_context__``, must hold neither the scrub failure's
+text nor the text of the exception the row is about, whether the caller calls the scrub directly
+or from inside its own ``except`` block. The positive controls show that a log call inside the
+``except`` block, and one outside it with no chain cut, both leak. All data here is synthetic, and
+the planted values are module constants so that no source line ``handleError`` prints in its call
+stack spells them."""
 
 from __future__ import annotations
 
@@ -32,13 +33,29 @@ class _FailingEmit(logging.Handler):
     def __init__(self) -> None:
         super().__init__(logging.DEBUG)
         self.calls = 0
+        self.failures: list[BaseException] = []
 
     def emit(self, record: logging.LogRecord) -> None:
         self.calls += 1
         try:
             raise OSError("Zqxemitfail")
-        except OSError:
+        except OSError as failure:
+            self.failures.append(failure)
             self.handleError(record)
+
+
+def _chain(exc: BaseException) -> list[BaseException]:
+    """Every exception reachable through ``__cause__`` and ``__context__``, ignoring
+    ``__suppress_context__``, as a chain walker that is not the default printer would."""
+    seen: list[BaseException] = []
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop()
+        if any(current is s for s in seen):
+            continue
+        seen.append(current)
+        pending.extend(e for e in (current.__cause__, current.__context__) if e is not None)
+    return seen
 
 
 def _broken(*_args: object, **_kwargs: object) -> str:
@@ -71,7 +88,9 @@ def stderr_of(monkeypatch: pytest.MonkeyPatch) -> Iterator[Callable[[Callable[[]
         assert handler.calls == before + 1
         text = buffer.getvalue()
         assert "Zqxemitfail" in text
-        return text
+        # The chain object too, not only what the default printer rendered from it.
+        linked = " | ".join(repr(e) for e in _chain(handler.failures[-1]))
+        return f"{text}\n{linked}"
 
     try:
         yield run

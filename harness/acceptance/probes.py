@@ -35,7 +35,7 @@ _DEFAULT_PORTS: dict[str, int] = {"MLLP": 2575, "DICOM": 11112, "API": 8765}
 
 class _ChainCut(Exception):
     """Current at :func:`scrubbed_exc`'s log call in place of any exception its caller is handling.
-    It is raised ``from None``, so a traceback printed through it does not reach the caller's."""
+    Its ``__context__`` is cleared there, so no chain through it reaches the caller's exception."""
 
 
 def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -> str:
@@ -50,10 +50,11 @@ def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -
     ``before`` and the text rather than printing either raw, and names the failure's type instead.
     That row then names no probe key or path the caller put in ``before``. The failure is logged at
     WARNING with the two exceptions' type names and no text, after the ``except`` block has ended,
-    and with :class:`_ChainCut` current, raised ``from None``. A handler whose ``emit`` fails and
-    calls ``logging``'s ``handleError`` prints the current chain to stderr; this way that chain
-    holds neither the scrub failure nor an exception the caller is handling, either of which could
-    quote the text. A log filter that raises is not swallowed here; its exception propagates. A1 exists to report an
+    and with :class:`_ChainCut` current, its ``__context__`` cleared. A handler whose ``emit``
+    fails and calls ``logging``'s ``handleError`` prints the current chain to stderr; this way
+    that chain reaches neither the scrub failure nor an exception the caller is handling, either
+    of which could quote the text. A log filter that raises is not swallowed here; its exception
+    propagates, and that exception's traceback frames still hold ``exc`` and ``before``. A1 exists to report an
     interpreter the engine cannot run on, and there the engine's modules may not even parse, so a
     scrub that fails to load must not take the runner down either."""
     try:
@@ -82,11 +83,13 @@ def scrubbed_exc(exc: BaseException, *, before: str = "", typed: bool = False) -
     exc_name = type(exc).__name__
     # Logged outside the except block, so the scrub failure is not current at the log call. A
     # caller that passes the exception it is handling still has that one current, and a handler
-    # whose emit fails would print it to stderr as the emit failure's __context__. Raising from
-    # None sets __suppress_context__, so the printed chain stops at _ChainCut.
+    # whose emit fails would print it to stderr as the emit failure's __context__. So _ChainCut is
+    # made current instead, with its own __context__ cleared: from None alone only hides the
+    # context from the default printer, and a chain walker would still reach the caller's text.
     try:
         raise _ChainCut from None
-    except _ChainCut:
+    except _ChainCut as cut:
+        cut.__context__ = None
         _log.warning(
             "the detail scrub failed with %s; a row's %s detail is withheld", failure_name, exc_name
         )
