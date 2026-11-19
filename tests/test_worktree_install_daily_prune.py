@@ -282,3 +282,138 @@ def test_json_is_exempt_from_the_guard() -> None:
         "-Json must stay usable inside Claude Code: it registers nothing"
     )
     assert "Refusing" not in allowed.stderr
+
+
+@requires_windows
+@pytest.mark.parametrize(("args", "hours"), [((), 4), (("-TimeLimitHours", "7"), 7)])
+def test_the_time_limit_reaches_the_plan_and_sets_the_runners_stop(
+    args: tuple[str, ...], hours: int
+) -> None:
+    """One hour never finished: measured 2026-11-18, the run was killed mid-list by the old fixed limit.
+
+    The default is 4. The runner's own stop must sit inside the limit, or the task is killed before the
+    runner writes its summary; and it must follow an explicit limit rather than stay at the default's.
+    """
+    p = plan(*args)
+    assert p["timeLimitHours"] == hours
+    stop = p["stopAfterMinutes"]
+    assert (hours - 1) * 60 < stop < hours * 60, "the runner must stop shortly before the limit"
+    assert f"-StopAfterMinutes {stop}" in p["argument"]
+
+
+@requires_windows
+@pytest.mark.parametrize("hours", ["0", "-1", "13"])
+def test_a_time_limit_out_of_range_is_refused(hours: str) -> None:
+    proc = run("-Json", "-TimeLimitHours", hours)
+    assert proc.returncode != 0, f"-TimeLimitHours {hours} was accepted: {proc.stdout}"
+    assert "TimeLimitHours" in proc.stderr
+    assert not proc.stdout.strip(), "a refused value must print no plan"
+
+
+def test_the_registration_uses_the_time_limit_the_plan_reports() -> None:
+    """Registration cannot be driven from a test, so the one line that builds its settings is read.
+
+    The plan is only a preview if the registration reads the same variable; the old literal one-hour
+    limit is the drift this pins shut.
+    """
+    src = INSTALLER.read_text(encoding="utf-8")
+    (settings,) = [line for line in src.splitlines() if "New-ScheduledTaskSettingsSet" in line]
+    assert "-ExecutionTimeLimit (New-TimeSpan -Hours $TimeLimitHours)" in settings, settings
+
+
+@requires_windows
+def test_the_plan_says_whether_the_primarys_runner_declares_the_stop() -> None:
+    """Registration refuses on a false here, since forwarding an undeclared parameter fails binding."""
+    p = plan()
+    runner = Path(p["runner"])
+    field = p["runnerDeclaresStopAfterMinutes"]
+    if not runner.is_file():
+        assert field is None
+    else:
+        assert field is ("StopAfterMinutes" in runner.read_text(encoding="utf-8"))
+
+
+# A prune-merged.ps1 stand-in that reports the credential-prompt variables it inherited.
+PRUNE_STUB = (
+    "param([string]$RepoRoot, [switch]$Apply, [double]$IdleHours)\n"
+    '"stub prompt=$env:GIT_TERMINAL_PROMPT gcm=$env:GCM_INTERACTIVE"\n'
+    "exit 0\n"
+)
+
+
+def run_copied_runner(
+    tmp_path: Path, *args: str
+) -> tuple[subprocess.CompletedProcess[str], str | None]:
+    """Run a copy of the runner outside any repository, beside ``PRUNE_STUB``.
+
+    Only the coord files the runner dot-sources without -RemoveFinishedClaudeWorktrees are copied.
+    Returns the process and the log text (None when no log was written). Nothing here reaches the real
+    repository: git discovery stops at ``tmp_path`` and no GIT_* variable is inherited.
+    """
+    scripts = tmp_path / "copy" / "scripts"
+    (scripts / "coord").mkdir(parents=True)
+    for name in ("occupancy.ps1", "session-registry.ps1"):
+        shutil.copy2(ROOT / "scripts" / "coord" / name, scripts / "coord" / name)
+    (scripts / "worktree").mkdir()
+    shutil.copy2(RUNNER, scripts / "worktree" / RUNNER.name)
+    (scripts / "worktree" / PRUNE.name).write_text(PRUNE_STUB, encoding="utf-8")
+    log_dir = tmp_path / "logs"
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "GCM_"))}
+    env.pop("CLAUDECODE", None)
+    env["GIT_CEILING_DIRECTORIES"] = str(tmp_path)
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(scripts / "worktree" / RUNNER.name),
+            "-LogDir",
+            str(log_dir),
+            *args,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        cwd=tmp_path,
+        check=False,
+    )
+    logs = list(log_dir.glob("prune-*.log"))
+    return proc, (logs[0].read_text(encoding="utf-8") if logs else None)
+
+
+@requires_windows
+def test_an_unhandled_error_in_the_runner_still_writes_an_exit_line(tmp_path: Path) -> None:
+    """A throw after the log directory exists used to end the run with nothing in the log.
+
+    Run without -RepoRoot outside any repository, resolving the primary throws. Before the trap no log
+    line was written at all; now the log must name the error and end with an exit line.
+    """
+    proc, text = run_copied_runner(tmp_path)
+    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert text is not None, f"the error left no log line: {proc.stderr}"
+    assert "STOPPED on an unhandled error: Not inside a git repository" in text, text
+    assert re.search(r"^=== exit 1 \(FAILED", text.splitlines()[-1]), text
+
+
+@requires_windows
+def test_the_prune_run_cannot_wait_on_a_credential_prompt_and_is_bracketed(
+    tmp_path: Path,
+) -> None:
+    """A scheduled run has nobody to answer a git credential prompt, so the child must not ask.
+
+    A stub prune-merged.ps1 reports what it inherited. The markers either side of it are what tells a
+    reader of a log that stops early whether it stopped inside that run.
+    """
+    proc, text = run_copied_runner(tmp_path, "-RepoRoot", str(tmp_path))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert text is not None, proc.stderr
+    lines = text.splitlines()
+    assert "stub prompt=0 gcm=never" in lines, text
+    stub_at = lines.index("stub prompt=0 gcm=never")
+    assert lines[stub_at - 1] == "--- prune-merged.ps1 running ---", text
+    assert re.match(r"--- prune-merged\.ps1 exit 0 at \d\d:\d\d:\d\d ---$", lines[stub_at + 1]), (
+        text
+    )
+    assert re.match(r"=== exit 0 \(OK\) at \d\d:\d\d:\d\d ===$", lines[-1]), text

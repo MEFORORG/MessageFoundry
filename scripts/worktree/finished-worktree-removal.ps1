@@ -323,7 +323,10 @@ function Invoke-FinishedWorktreeRemoval {
         [Parameter(Mandatory)][double]$IdleHours,
         # Worktrees that must never be removed whatever they look like: the one the caller runs from.
         [string[]]$Protect = @(),
-        [switch]$Apply
+        [switch]$Apply,
+        # Start no path once this time has passed (run-daily-prune.ps1 -StopAfterMinutes). Each path left
+        # gets a NOT-REACHED row; nothing was attempted on it.
+        [Nullable[datetime]]$StopAt
     )
     $ErrorActionPreference = 'Stop'
     $PSNativeCommandUseErrorActionPreference = $false
@@ -364,6 +367,12 @@ function Invoke-FinishedWorktreeRemoval {
 
     foreach ($path in @($Paths | Where-Object { $_ })) {
         $row = [pscustomobject]@{ Path = $path; Outcome = 'REFUSED'; Reason = ''; Command = "git -C `"$Primary`" worktree remove `"$path`"" }
+        if ($null -ne $StopAt -and (Get-Date) -ge $StopAt) {
+            $row.Outcome = 'NOT-REACHED'
+            $row.Reason = "the run's deadline ($($StopAt.ToString('HH:mm:ss'))) passed first; the next run lists it again"
+            $row
+            continue
+        }
         try {
             $refusal = if ($allRefusal) { $allRefusal } else {
                 Get-FinishedWorktreeRefusal -Primary $Primary -Path $path -IdleHours $IdleHours -ProtectNorm $protectNorm `

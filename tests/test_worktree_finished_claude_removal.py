@@ -492,6 +492,36 @@ def test_runner_apply_removes_the_finished_trees_and_logs_each(
     for name in UNSAFE:
         assert fx.tree(name).is_dir(), f"{name} was removed: {log}"
     assert re.search(r"mode=APPLY listed=\d+ removed=2 wouldRemove=0 ", log), log
+    assert "notReached=0;" in log, log
+
+
+def test_runner_past_its_deadline_starts_no_tree_and_still_writes_its_summary(
+    fx: Fx, tmp_path: Path, sleeper: int
+) -> None:
+    """The task's time limit kills the run with nothing written (2026-11-18), so the runner stops first.
+
+    A deadline already gone when the step starts: every finished tree must stay, be counted as not
+    reached, and the summary and exit line must still be written, with the exit code left alone.
+    """
+    _session(fx, sleeper, fx.tree("occupied"), "live0000-0000")
+    code, log = run_logged(
+        fx,
+        tmp_path / "logs-deadline",
+        "-Apply",
+        "-RemoveFinishedClaudeWorktrees",
+        "-StopAfterMinutes",
+        "0.0001",
+    )
+    for name in FINISHED:
+        assert fx.tree(name).is_dir(), f"{name} was removed past the deadline: {log}"
+        assert _outcome(log, "NOT-REACHED", fx.tree(name)), log
+    listed = re.search(r"mode=APPLY listed=(\d+) removed=0 wouldRemove=0 .* notReached=(\d+);", log)
+    assert listed, log
+    assert int(listed.group(1)) >= len(FINISHED)
+    assert listed.group(2) == listed.group(1), "every listed tree must be counted as not reached"
+    assert "--- prune-merged.ps1 exit " in log
+    assert re.search(r"^=== exit \d \(.*\) at \d\d:\d\d:\d\d ===$", log.splitlines()[-1]), log
+    assert code in (0, 2), log
 
 
 def test_runner_refuses_apply_with_the_step_inside_claude_code(fx: Fx, tmp_path: Path) -> None:

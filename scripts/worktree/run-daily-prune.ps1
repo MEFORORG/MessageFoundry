@@ -44,8 +44,22 @@
 .PARAMETER RemoveFinishedClaudeWorktrees
     Opt in to the .claude/worktrees step described above. Off by default.
 
+.PARAMETER StopAfterMinutes
+    Minutes after this run starts at which it stops starting removals. Optional; without it the run has
+    no deadline of its own. install-daily-prune.ps1 sets it inside the task's time limit; its header
+    says why. Past the deadline the .claude/worktrees step starts no further tree, logs each one left as
+    NOT-REACHED (the next run lists them again), and writes the summary and exit line as usual. A
+    deadline stop is not a failure and leaves the exit code alone. It does NOT bound the two
+    prune-merged.ps1 runs.
+
 .PARAMETER KeepLogs
     How many dated logs to keep. Older ones are deleted after each run.
+
+.NOTES
+    Every way out once the log directory exists writes a last line, "=== exit N (meaning) at HH:mm:ss
+    ===": the normal end, a refusal, and an unhandled error, which is logged and exits 1. Only a kill
+    from outside (Task Scheduler's time limit, a reboot) cannot, and -StopAfterMinutes is there so the
+    time limit is not reached.
 
 .EXAMPLE
     pwsh -File scripts\worktree\run-daily-prune.ps1 -LogDir C:\logs            # dry run, logged
@@ -61,10 +75,12 @@ param(
     [double]$IdleHours,
     [Parameter(Mandatory)][string]$LogDir,
     [string]$Label = 'MEFOR-Worktree-Prune',
-    [int]$KeepLogs = 30
+    [int]$KeepLogs = 30,
+    [ValidateRange(0.0001, 1440)][double]$StopAfterMinutes
 )
 
 $ErrorActionPreference = 'Stop'
+$deadline = if ($PSBoundParameters.ContainsKey('StopAfterMinutes')) { (Get-Date).AddMinutes($StopAfterMinutes) } else { $null }
 
 # The same refusal install-daily-prune.ps1 carries, for the one combination that removes Claude-managed
 # trees: a session that can run this from a checkout it can edit could remove other sessions'
@@ -77,6 +93,14 @@ if ($env:CLAUDECODE -eq '1' -and $Apply -and $RemoveFinishedClaudeWorktrees) {
 # prune-merged.ps1 reports its verdict through the exit code, so a non-zero exit is DATA here, not a
 # failure to be turned into a throw. Same reason that script sets this; the reason survives the call.
 $PSNativeCommandUseErrorActionPreference = $false
+
+# A scheduled task has nobody to answer a credential prompt, in a terminal or in Git Credential Manager's
+# window, so make prune-merged.ps1's `git fetch` (and every git it starts, which inherit this) fail
+# instead of waiting until the task's time limit kills the run with nothing logged. hygiene-report.ps1
+# sets the same two for the same reason. The 2026-11-17 log stops right after "Fetching origin
+# (--prune)...", which a fetch waiting on a prompt would explain; that is not established.
+$env:GIT_TERMINAL_PROMPT = '0'
+$env:GCM_INTERACTIVE = 'never'
 
 . "$PSScriptRoot\..\coord\occupancy.ps1"
 
@@ -104,7 +128,7 @@ $log = Join-Path $LogDir ("prune-" + (Get-Date -Format 'yyyy-MM-dd') + ".log")
 # The one way out after the log exists, so every exit writes its meaning and trims the log directory.
 function Exit-Run([int]$Code) {
     $meaning = if ($EXIT_MEANING.ContainsKey($Code)) { $EXIT_MEANING[$Code] } else { "UNKNOWN exit code $Code" }
-    "=== exit $Code ($meaning) ===" | Add-Content -LiteralPath $log
+    "=== exit $Code ($meaning) at $(Get-Date -Format 'HH:mm:ss') ===" | Add-Content -LiteralPath $log
     # Keep the log directory bounded. -ErrorAction SilentlyContinue because a log a human has open must
     # not turn a successful prune into a failed task run.
     Get-ChildItem -LiteralPath $LogDir -Filter 'prune-*.log' -ErrorAction SilentlyContinue |
@@ -112,6 +136,17 @@ function Exit-Run([int]$Code) {
         Select-Object -Skip $KeepLogs |
         Remove-Item -Force -ErrorAction SilentlyContinue
     exit $Code
+}
+
+# A terminating error still leaves its reason and an exit line in the log, rather than only on a stderr
+# nothing captures. A trap covers its whole scope, lines above it included, so a throw before the log
+# path exists (the CLAUDECODE refusal) is passed on unchanged by `break`.
+trap {
+    if (-not $log) { break }
+    $fault = "$($_.Exception.Message)"
+    "=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') STOPPED on an unhandled error: $fault ===" | Add-Content -LiteralPath $log
+    Write-Error -Message $fault -ErrorAction Continue
+    Exit-Run 1
 }
 
 # BEFORE ANYTHING ASKS GIT, the primary's resolution below included: the helper refuses these too, but
@@ -148,10 +183,15 @@ $pruneArgs = @('-RepoRoot', $RepoRoot)
 if ($Apply) { $pruneArgs += '-Apply' }
 if ($PSBoundParameters.ContainsKey('IdleHours')) { $pruneArgs += @('-IdleHours', $IdleHours) }
 
-"=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode repo=$RepoRoot ===" | Add-Content -LiteralPath $log
+$deadlineText = if ($deadline) { " stopAfter=$($deadline.ToString('HH:mm:ss'))" } else { '' }
+"=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode repo=$RepoRoot$deadlineText ===" | Add-Content -LiteralPath $log
+# A marker on each side of the prune-merged.ps1 run, which prints nothing between its fetch line and its
+# table. A log that ends after the first marker, with no exit marker, was stopped inside that run.
+"--- prune-merged.ps1 running ---" | Add-Content -LiteralPath $log
 & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $prune @pruneArgs *>&1 |
     Add-Content -LiteralPath $log
 $code = $LASTEXITCODE
+"--- prune-merged.ps1 exit $code at $(Get-Date -Format 'HH:mm:ss') ---" | Add-Content -LiteralPath $log
 
 if ($RemoveFinishedClaudeWorktrees) {
     "--- finished .claude/worktrees: mode=$mode ---" | Add-Content -LiteralPath $log
@@ -191,10 +231,10 @@ if ($RemoveFinishedClaudeWorktrees) {
         $why = @{}
         foreach ($f in $finished) { $why[$f.path] = $f }
 
-        # Logged per row as the helper emits it, not after it returns: a run killed part way (the task's
-        # one-hour limit, say) still leaves the record of every tree it already removed.
+        # Logged per row as the helper emits it, not after it returns: a run killed part way still leaves
+        # the record of every tree it already removed.
         $rows = @(Invoke-FinishedWorktreeRemoval -Primary $RepoRoot -Paths @($finished | ForEach-Object { $_.path }) `
-                -IdleHours ([double]$listing.fence.idleHours) -Protect $protect -Apply:$Apply | ForEach-Object {
+                -IdleHours ([double]$listing.fence.idleHours) -Protect $protect -Apply:$Apply -StopAt $deadline | ForEach-Object {
                 $f = $why[$_.Path]
                 $detail = if ($_.Outcome -in 'REMOVED', 'WOULD-REMOVE') { "$($_.Reason) [$($f.branch)]; listed because: $($f.whyFinished)" } else { $_.Reason }
                 $lines = @("  {0,-12} {1} -- {2}" -f $_.Outcome, $_.Path, $detail)
@@ -214,10 +254,10 @@ if ($RemoveFinishedClaudeWorktrees) {
         catch [System.ArgumentException], [System.IO.IOException], [System.UnauthorizedAccessException] {
             $free = "free space unreadable: $($_.Exception.Message)"
         }
-        "=== finished .claude/worktrees: mode=$mode listed=$($finished.Count) removed=$(& $n 'REMOVED') wouldRemove=$(& $n 'WOULD-REMOVE') refused=$(& $n 'REFUSED') declined=$(& $n 'DECLINED') failed=$(& $n 'FAILED') orphaned=$(& $n 'ORPHANED'); $free ===" |
+        "=== finished .claude/worktrees: mode=$mode listed=$($finished.Count) removed=$(& $n 'REMOVED') wouldRemove=$(& $n 'WOULD-REMOVE') refused=$(& $n 'REFUSED') declined=$(& $n 'DECLINED') failed=$(& $n 'FAILED') orphaned=$(& $n 'ORPHANED') notReached=$(& $n 'NOT-REACHED'); $free ===" |
             Add-Content -LiteralPath $log
 
-        # Refusals leave the code alone, and so does git declining a tree every re-check passed: nothing
+        # Refusals leave the code alone, as do trees the deadline left and git declining a tree every re-check passed: nothing
         # changed, and the DECLINED line is there to be read. A removal that failed is a failure, and a
         # deregistered tree still on disk is an orphan -- the same severity order prune-merged.ps1 uses.
         if ((& $n 'FAILED') -gt 0) { $code = [math]::Max($code, 1) }
