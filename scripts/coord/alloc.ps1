@@ -509,24 +509,19 @@ function Get-Floor {
     # garbled, cat-file answered `missing` for it and exited 0, and that branch's numbers dropped out
     # of the floor; under a DBCS page a trailing lead byte can swallow ls-tree's NUL terminator and
     # glue two names together. unbacked_check.ps1's Invoke-Git records the same garbling (BACKLOG
-    # #5502). Restored in `finally`, so a refusal does not leave the console re-encoded.
+    # #5502). Set ONCE around the whole sweep, not per call, and restored in `finally`, so a refusal
+    # does not leave the console re-encoded. A setter that fails is reported, never assumed.
     $sweepWarnings = [System.Collections.Generic.List[string]]::new()
     function Invoke-SweepGit([string[]]$GitArgs, [string]$Stdin) {
         $ErrorActionPreference = "Continue"
         $PSNativeCommandUseErrorActionPreference = $false
         $global:LASTEXITCODE = -1
-        $previousEncoding = [Console]::OutputEncoding
-        try {
-            try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) } catch { }
-            $all = if ($PSBoundParameters.ContainsKey('Stdin')) {
-                @($Stdin | & git -C $repo @GitArgs 2>&1)
-            } else {
-                @(& git -C $repo @GitArgs 2>&1)
-            }
-            $code = $LASTEXITCODE
-        } finally {
-            try { [Console]::OutputEncoding = $previousEncoding } catch { }
+        $all = if ($PSBoundParameters.ContainsKey('Stdin')) {
+            @($Stdin | & git -C $repo @GitArgs 2>&1)
+        } else {
+            @(& git -C $repo @GitArgs 2>&1)
         }
+        $code = $LASTEXITCODE
         $detail = (@($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) -join "`n  ").Trim()
         if ($code -ne 0) {
             throw "alloc.ps1: $refusal -- git $($GitArgs[0]) exited $code while sweeping refs for the ADR floor. An incomplete sweep would understate the floor and could re-issue a number already in use, so nothing was read as a floor or allocated. Fix the clone and re-run. git said:`n  $detail"
@@ -542,33 +537,43 @@ function Get-Floor {
         @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
     }
 
-    $refs = @("origin/main") + @(Invoke-SweepGit @('for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes'))
-    $specs = foreach ($r in ($refs | Select-Object -Unique)) { "${r}:docs/adr" }
+    $previousEncoding = [Console]::OutputEncoding
+    try {
+        try { [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false) }
+        catch { $sweepWarnings.Add("alloc.ps1: WARNING -- git's output could not be set to decode as UTF-8 ($($_.Exception.Message)), so a ref or ADR name holding a non-ASCII character may have been missed by the floor sweep.") }
+        $refs = @("origin/main") + @(Invoke-SweepGit @('for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes'))
+        $specs = foreach ($r in ($refs | Select-Object -Unique)) { "${r}:docs/adr" }
 
-    $trees = [System.Collections.Generic.HashSet[string]]::new()
-    $batch = Invoke-SweepGit @('cat-file', '--batch-check=%(objectname) %(objecttype)') -Stdin ($specs -join "`n")
-    foreach ($line in $batch) {
-        $p = "$line".Split(' ')
-        if ($p.Count -ge 2 -and $p[1] -eq 'tree') { [void]$trees.Add($p[0]) }
-    }
-
-    # Anchored at `^` because these are bare entry names, not the `docs/adr/NNNN-` paths the
-    # pre-dedupe spelling produced. `-z` because without it git QUOTES a name holding a non-ASCII
-    # byte or a control character (an e-acute prints as `"0095-caf\303\251.md"`), the leading
-    # quote defeats the anchor, and that number reads FREE. With `-z` each name is NUL-terminated
-    # and never quoted; pwsh still splits native output on newlines, so rejoin on newline before
-    # splitting on NUL.
-    $rx = [regex]::new('^(\d{4})-')
-    foreach ($t in $trees) {
-        $names = ((Invoke-SweepGit @('ls-tree', '-z', '--name-only', $t)) -join "`n") -split "`0"
-        foreach ($n in $names) {
-            $m = $rx.Match("$n")
-            if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
+        $trees = [System.Collections.Generic.HashSet[string]]::new()
+        $batch = Invoke-SweepGit @('cat-file', '--batch-check=%(objectname) %(objecttype)') -Stdin ($specs -join "`n")
+        foreach ($line in $batch) {
+            $p = "$line".Split(' ')
+            if ($p.Count -ge 2 -and $p[1] -eq 'tree') { [void]$trees.Add($p[0]) }
         }
+
+        # Anchored at `^` because these are bare entry names, not the `docs/adr/NNNN-` paths the
+        # pre-dedupe spelling produced. `-z` because without it git QUOTES a name holding a non-ASCII
+        # byte or a control character (an e-acute prints as `"0095-caf\303\251.md"`), the leading
+        # quote defeats the anchor, and that number reads FREE. With `-z` each name is NUL-terminated
+        # and never quoted; pwsh still splits native output on newlines, so rejoin on newline before
+        # splitting on NUL.
+        # `[0-9]`, not `\d`: .NET `\d` matches every Unicode decimal digit, `[int]` cannot parse those,
+        # and now that `-z` hands this regex unquoted non-ASCII names the cast would throw.
+        $rx = [regex]::new('^([0-9]{4})-')
+        foreach ($t in $trees) {
+            $names = ((Invoke-SweepGit @('ls-tree', '-z', '--name-only', $t)) -join "`n") -split "`0"
+            foreach ($n in $names) {
+                $m = $rx.Match("$n")
+                if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
+            }
+        }
+    } finally {
+        try { [Console]::OutputEncoding = $previousEncoding } catch { }
+        # Once per distinct text, at the end: a warning git prints on every call (a config
+        # deprecation, say) would otherwise repeat once per tree, hundreds of times on a big clone.
+        # In `finally`, so a later call's refusal does not discard a warning that may explain it.
+        foreach ($w in $sweepWarnings) { [Console]::Error.WriteLine($w) }
     }
-    # Once per distinct text, after the sweep: a warning git prints on every call (a config
-    # deprecation, say) would otherwise repeat once per tree, hundreds of times on a big clone.
-    foreach ($w in $sweepWarnings) { [Console]::Error.WriteLine($w) }
 
 
     foreach ($f in (Get-ChildItem $alloc -Filter *.json -EA SilentlyContinue)) {

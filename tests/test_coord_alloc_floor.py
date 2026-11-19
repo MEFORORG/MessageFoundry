@@ -739,18 +739,23 @@ def test_a_warning_on_a_clean_sweep_call_is_echoed_not_swallowed(tmp_path: Path)
     assert "git for-each-ref exited 0" in proc.stderr, proc.stderr
 
 
-def _quoting_git_env() -> dict[str, str]:
-    """The environment with git's path quoting forced ON, whatever the developer's global config.
+def _with_quoting_forced(env: dict[str, str]) -> dict[str, str]:
+    """``env`` with git's path quoting forced ON, appended after any inherited GIT_CONFIG_* entries.
 
     A machine with ``core.quotePath=false`` never quotes a non-ASCII name, so the pre-``-z`` code
-    would pass the case below there and it would no longer pin the regression.
+    would pass the non-ASCII case there and it would no longer pin the regression. Appended at the
+    inherited count rather than overwriting index 0, so config a runner injects the same way stays.
     """
-    return dict(
-        os.environ,
-        GIT_CONFIG_COUNT="1",
-        GIT_CONFIG_KEY_0="core.quotePath",
-        GIT_CONFIG_VALUE_0="true",
-    )
+    out = dict(env)
+    n = int(out.get("GIT_CONFIG_COUNT", "0") or "0")
+    out[f"GIT_CONFIG_KEY_{n}"] = "core.quotePath"
+    out[f"GIT_CONFIG_VALUE_{n}"] = "true"
+    out["GIT_CONFIG_COUNT"] = str(n + 1)
+    return out
+
+
+def _quoting_git_env() -> dict[str, str]:
+    return _with_quoting_forced(dict(os.environ))
 
 
 def test_a_non_ascii_adr_name_on_a_branch_still_raises_the_floor(tmp_path: Path) -> None:

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -478,6 +479,28 @@ def _failing_git_env(tmp_path: Path, subcommand: str, said: str) -> dict[str, st
     return dict(os.environ, PATH=f"{shim}{os.pathsep}{os.environ['PATH']}")
 
 
+def _with_quoting_forced(env: dict[str, str]) -> dict[str, str]:
+    """``env`` with git's path quoting forced ON, appended after any inherited GIT_CONFIG_* entries.
+
+    A machine with ``core.quotePath=false`` never quotes a non-ASCII name, so the pre-``-z`` code
+    would pass the non-ASCII case there and it would no longer pin the regression. Appended at the
+    inherited count rather than overwriting index 0, so config a runner injects the same way stays.
+    """
+    out = dict(env)
+    n = int(out.get("GIT_CONFIG_COUNT", "0") or "0")
+    out[f"GIT_CONFIG_KEY_{n}"] = "core.quotePath"
+    out[f"GIT_CONFIG_VALUE_{n}"] = "true"
+    out["GIT_CONFIG_COUNT"] = str(n + 1)
+    return out
+
+
+def _flat(text: str) -> str:
+    """pwsh's error view colours a thrown message and word-wraps it at the console width with a
+    ``|`` gutter, so a phrase can straddle a line. Strip both before matching a phrase."""
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+    return re.sub(r"\s*\n\s*\|?\s*", " ", text)
+
+
 def _adjudicate_env(
     repo: Path, env: dict[str, str], *args: str
 ) -> subprocess.CompletedProcess[str]:
@@ -524,7 +547,7 @@ def test_a_failed_namespace_read_refuses_and_carries_gits_own_words(
     backlog(repo, f"## 27. A real item\n\n> {SHIPPED} SHIPPED\n")
     said = f"fatal: synthetic {subcommand} failure"
     proc = _adjudicate_env(repo, _failing_git_env(tmp_path, subcommand, said))
-    combined = proc.stderr + proc.stdout
+    combined = _flat(proc.stderr + proc.stdout)
     assert proc.returncode != 0, f"a failed {subcommand} still produced a report:\n{combined}"
     assert f"git {subcommand} exited 128" in combined, combined
     assert phrase in combined, combined
@@ -547,12 +570,7 @@ def test_a_non_ascii_backlog_file_name_is_read_not_quoted_away(repo: Path, tmp_p
     unmerged_branch(repo, "seat")
     write_claim(repo, "11", tmp_path / "gone", "seat")
     # Quoting forced ON, so a developer's core.quotePath=false cannot hide the regression.
-    env = dict(
-        os.environ,
-        GIT_CONFIG_COUNT="1",
-        GIT_CONFIG_KEY_0="core.quotePath",
-        GIT_CONFIG_VALUE_0="true",
-    )
+    env = _with_quoting_forced(dict(os.environ))
     proc = _adjudicate_env(repo, env, "-Json")
     assert proc.returncode == 0, proc.stderr
     r = {c["key"]: c for c in json.loads(proc.stdout)["claims"]}["11"]
