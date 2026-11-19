@@ -114,8 +114,13 @@ class Citation:
 
     @property
     def bare(self) -> bool:
-        """A basename with no directory component -- it names no location by itself."""
-        return "/" not in self.file and "\\" not in self.file
+        """A basename with no directory component -- it names no location by itself.
+
+        A leading ``./`` or ``../`` is not a directory component: ``./service.py`` names no more
+        of a location than ``service.py`` does.
+        """
+        rest = re.sub(r"^(?:\.{1,2}[/\\])+", "", self.file)
+        return "/" not in rest and "\\" not in rest
 
     def key(self) -> str:
         """Baseline identity. Note the ABSENCE of the line number: see the module docstring."""

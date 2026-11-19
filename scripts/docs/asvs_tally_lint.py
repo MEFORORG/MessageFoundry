@@ -37,16 +37,17 @@ is held to.
 EXAMINING NOTHING, OR A BASELINE THAT DOES NOT LOAD, IS EXIT 2, never a clean run and never the
 exit 1 a finding gets (BACKLOG #5469). At least these:
 
-  * a scan that read ZERO Markdown files, or zero characters in the files it read -- a root that
-    moved, was misspelt, is wholly allowlisted or holds only empty files. "no new tally" and
-    "nothing was read" must not share an exit code;
+  * a root that yields ZERO Markdown files, or only blank ones, after the allowlist -- a root that
+    moved, was misspelt, is wholly allowlisted or holds only empty files. Checked per root, so a
+    misspelt root beside a good one is not hidden. "no new tally" and "nothing was read" must not
+    share an exit code;
   * a ``--baseline`` that names no file. Read as empty, it reclassifies every grandfathered tally
     as NEW, and the cause reads as a finding rather than as a wrong path;
   * a ``--baseline`` file with no content at all. The generating command below redirects stdout,
     and the shell truncates the target before this program starts, so a generating run that
     refused leaves exactly that file behind;
-  * a baseline that is malformed, UTF-16 (what a Windows PowerShell 5.1 redirect writes) or not
-    UTF-8.
+  * a baseline that cannot be read, is malformed, is UTF-16 (what a Windows PowerShell 5.1
+    redirect writes) or is not UTF-8.
 
 Scanning with no baseline is allowed and explicit: omit ``--baseline``. That is the form the
 generating command uses. A baseline that holds a ``#`` header and zero claims is the ratchet's end
@@ -58,15 +59,17 @@ Under ``--print-keys`` stdout carries a ``#`` header and baseline lines, as UTF-
 the inventory and the verdict go to stderr, still printed for a person to read but not swallowed
 into the artifact. The output therefore loads as a baseline as written. The generating run exits 1
 whenever the tree holds a tally, because against no baseline every tally is NEW; verify the result
-by re-running with ``--baseline <baseline.txt>`` and requiring exit 0. Under Windows PowerShell 5.1
-the ``>`` redirect re-encodes to UTF-16, which the loader refuses; pipe through
-``Out-File -Encoding utf8`` there, or run the command from a POSIX shell.
+by re-running with ``--baseline <baseline.txt>`` and requiring exit 0. Windows PowerShell 5.1
+re-encodes a native command's output on ``>`` and on a pipe, so run the generating command from a
+POSIX shell or ``cmd``, not from PowerShell. The loader refuses the UTF-16 file a 5.1
+redirect writes rather than reading it as empty.
 """
 
 from __future__ import annotations
 
 import argparse
 import re
+import shlex
 import sys
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -301,25 +304,36 @@ def load_baseline(path: Path | None) -> dict[str, int]:
             f"baseline {path} {what}. Read as empty, it would report every grandfathered tally as "
             f"NEW. Omit --baseline to scan without one deliberately."
         )
-    data = path.read_bytes()
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        raise ValueError(f"baseline {path} could not be read: {exc}") from exc
     if data.startswith((b"\xff\xfe", b"\xfe\xff")):
         raise ValueError(
             f"baseline {path} is UTF-16, which a Windows PowerShell 5.1 redirect writes. "
             f"Regenerate it as UTF-8 (see the module docstring)."
         )
-    if not data.strip():
+    # utf-8-sig, so a BOM some editors and shells add cannot fuse onto the first key -- and so a
+    # file holding only a BOM reads as the empty file it is.
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"baseline {path} is not UTF-8: {exc}") from exc
+    if not text.strip():
         raise EmptyScan(
             f"baseline {path} is empty. A generating run redirects stdout and the shell truncates "
             f"the target before this program starts, so a refused generation leaves exactly this "
             f"file behind. Omit --baseline to scan without one deliberately."
         )
-    # utf-8-sig, so a BOM some editors and shells add cannot fuse onto the first key.
-    for line in data.decode("utf-8-sig").splitlines():
+    for line in text.splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         key, _, count = line.rpartition("\t")
-        if not key or not count.isdigit():
-            raise ValueError(f"malformed baseline line (expected 'key<TAB>count'): {line!r}")
+        if not key or not count.isascii() or not count.isdigit() or key.count("\t") != 2:
+            raise ValueError(
+                f"malformed baseline line in {path} "
+                f"(expected 'path<TAB>idiom<TAB>token<TAB>count'): {line!r}"
+            )
         out[key] = int(count)
     return out
 
@@ -385,7 +399,8 @@ def main(argv: list[str] | None = None) -> int:
         reconfigure = getattr(sys.stdout, "reconfigure", None)
         if reconfigure is not None:
             try:  # noqa: SIM105
-                reconfigure(encoding="utf-8")
+                # errors= again, or reconfigure resets it to 'strict' and undoes _harden_stdout.
+                reconfigure(encoding="utf-8", errors="replace")
             except (ValueError, OSError):
                 pass
 
@@ -397,21 +412,29 @@ def main(argv: list[str] | None = None) -> int:
         say(f"FAIL: {exc}")
         return 2
 
-    docs = list(iter_markdown([Path(r) for r in args.roots], args.repo))
     allow = tuple(args.allow)
 
     scanned = 0
     skipped = 0
     n_chars = 0
+    # Roots that yielded no non-blank file after the allowlist. Per root, so a misspelt root beside
+    # a good one cannot hide behind the good one's characters.
+    unread: list[str] = []
     hits: list[Hit] = []
-    for rel, p in docs:
-        if rel.startswith(allow):
-            skipped += 1
-            continue
-        scanned += 1
-        text = p.read_text(encoding="utf-8", errors="replace")
-        n_chars += len(text.strip())
-        hits.extend(scan_text(rel, text))
+    for root in args.roots:
+        root_read = False
+        for rel, p in iter_markdown([Path(root)], args.repo):
+            if rel.startswith(allow):
+                skipped += 1
+                continue
+            scanned += 1
+            text = p.read_text(encoding="utf-8", errors="replace")
+            n_chars += len(text)
+            # "".isspace() is False, hence the explicit empty check.
+            root_read = root_read or (text != "" and not text.isspace())
+            hits.extend(scan_text(rel, text))
+        if not root_read:
+            unread.append(root)
 
     observed = counted(hits)
     new = [h for h in hits if observed[h.key()] > baseline.get(h.key(), 0)]
@@ -425,12 +448,12 @@ def main(argv: list[str] | None = None) -> int:
         f"SCANNED: baseline {args.baseline} carries {len(baseline)} grandfathered claims "
         f"({sum(baseline.values())} occurrences)"
     )
-    if n_chars == 0:
+    if unread:
         say(
-            f"FAIL: scanned {scanned} markdown files and ZERO characters under "
-            f"{[str(r) for r in args.roots]} (repo {args.repo}). That is a root that moved, is "
-            f"misspelt, is wholly allowlisted or holds only empty files, not a clean tree: "
-            f"'no new tally' and 'nothing was read' must not share an exit code."
+            f"FAIL: root(s) {unread} yielded ZERO non-blank markdown files (repo {args.repo}). "
+            f"That is a root that moved, is misspelt, is wholly allowlisted or holds only empty "
+            f"files, not a clean tree: 'no new tally' and 'nothing was read' must not share an "
+            f"exit code."
         )
         return 2
     say(
@@ -450,10 +473,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.print_keys:
         # A `#` line is skipped by load_baseline, so the artifact describes itself, and a tree with
         # every tally retired still generates a non-empty baseline that loads (as empty).
-        roots = " ".join(str(r) for r in args.roots)
+        # The provenance line spells out every flag that changes the result, so it reproduces the
+        # file; --repo is left out because it names a machine path, not a choice.
+        flags = [*args.roots, *(f for a in args.allow for f in ("--allow", a)), "--print-keys"]
         print("# Grandfathered ASVS tallies -- FROZEN, and this list may only SHRINK.")
         print("# Format:  <path> TAB <idiom> TAB <tally token> TAB <occurrence count>")
-        print(f"# Produced by:  python scripts/docs/asvs_tally_lint.py {roots} --print-keys")
+        print(f"# Produced by:  python scripts/docs/asvs_tally_lint.py {shlex.join(flags)}")
         print("# To retire one: delete the tally from the document AND lower or delete its line")
         print("# here, in the same change. A line left behind over-counts the tree and FAILS.")
         for key in sorted(observed):

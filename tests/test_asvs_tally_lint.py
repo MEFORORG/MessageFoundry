@@ -266,7 +266,7 @@ def test_a_scan_of_zero_files_is_an_error_not_a_clean_run(
 ) -> None:
     (tmp_path / "docs").mkdir()
     assert main(["docs", "--repo", str(tmp_path)]) == 2, "an empty root must not pass"
-    assert "ZERO characters" in capsys.readouterr().out
+    assert "ZERO non-blank markdown files" in capsys.readouterr().out
     # Control: the same tree with one tally-free document is a clean run, exit 0.
     _tree(tmp_path)
     assert main(["docs", "--repo", str(tmp_path)]) == 0
@@ -275,6 +275,12 @@ def test_a_scan_of_zero_files_is_an_error_not_a_clean_run(
 def test_a_root_that_does_not_exist_is_an_error_not_a_clean_run(tmp_path: Path) -> None:
     _tree(tmp_path)
     assert main(["doc", "--repo", str(tmp_path)]) == 2, "a misspelt root must not pass"
+
+
+def test_a_misspelt_root_beside_a_good_one_is_still_an_error(tmp_path: Path) -> None:
+    _tree(tmp_path)
+    assert main(["docs", "--repo", str(tmp_path)]) == 0, "control: the good root alone passes"
+    assert main(["docs", "doc-typo", "--repo", str(tmp_path)]) == 2
 
 
 def test_a_wholly_allowlisted_scan_is_an_error_not_a_clean_run(tmp_path: Path) -> None:
@@ -330,6 +336,48 @@ def test_a_malformed_baseline_is_exit_2_not_the_exit_1_of_a_finding(tmp_path: Pa
     base = tmp_path / "b.txt"
     base.write_text("x\n", encoding="utf-8")
     assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 2
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["docs/d.md\t1", "docs/d.md\tSLASH_RUN\t212/0/0/133\textra\t1", "docs/d.md\tSLASH_RUN\t²"],
+    ids=["too-few-fields", "too-many-fields", "non-ascii-digit"],
+)
+def test_a_baseline_line_with_the_wrong_shape_is_refused(tmp_path: Path, line: str) -> None:
+    base = tmp_path / "b.txt"
+    base.write_text(line + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="malformed baseline line"):
+        load_baseline(base)
+
+
+def test_an_unreadable_baseline_is_exit_2(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _tree(tmp_path)
+    base = tmp_path / "b.txt"
+    base.write_text("docs/d.md\tSLASH_RUN\t212/0/0/133\t1\n", encoding="utf-8")
+
+    def refuse(self: Path) -> bytes:
+        raise PermissionError(13, "Permission denied", str(self))
+
+    monkeypatch.setattr(Path, "read_bytes", refuse)
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 2
+
+
+def test_a_bom_only_baseline_is_empty_not_a_loaded_baseline(tmp_path: Path) -> None:
+    """What a PowerShell `Out-File -Encoding utf8` writes when its pipeline was empty."""
+    _tree(tmp_path)
+    base = tmp_path / "b.txt"
+    base.write_bytes(b"\xef\xbb\xbf\r\n")
+    with pytest.raises(EmptyScan, match="is empty"):
+        load_baseline(base)
+
+
+def test_the_generated_header_names_the_flags_that_reproduce_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _tree(tmp_path)
+    allow = "docs/security/ASVS-CURRENT.md"
+    main(["docs", "--repo", str(tmp_path), "--allow", allow, "--print-keys"])
+    assert f"asvs_tally_lint.py docs --allow {allow} --print-keys" in capsys.readouterr().out
 
 
 def test_a_utf16_baseline_is_refused_as_exit_2(

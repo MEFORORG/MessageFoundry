@@ -158,6 +158,11 @@ def test_the_detector_is_live_and_the_negative_control_is_a_real_zero() -> None:
 def test_a_bare_basename_is_flagged_as_naming_no_location() -> None:
     assert Citation("1.1.1", "residual", "settings.py", 5).bare is True
     assert Citation("1.1.1", "residual", "messagefoundry/config/settings.py", 5).bare is False
+    # A relative prefix adds no directory (BACKLOG #5468 widened the pattern to admit it).
+    assert Citation("1.1.1", "residual", "./settings.py", 5).bare is True
+    assert Citation("1.1.1", "residual", r"..\settings.py", 5).bare is True
+    assert Citation("1.1.1", "residual", "./messagefoundry/settings.py", 5).bare is False
+    assert Citation("1.1.1", "residual", ".github/ci.yml", 5).bare is False
 
 
 # --------------------------------------------------------------------------------------------
