@@ -49,6 +49,7 @@ from messagefoundry.config.settings import (
     _RENEW_CLAMP_CEILING_SECONDS,
     _RENEW_CLAMP_FLOOR_SECONDS,
     ClusterSettings,
+    StoreBackend,
     _detection_margin_seconds,
     _fence_tick_seconds,
     load_settings,
@@ -368,6 +369,10 @@ def test_a_shipped_failover_configuration_loads_through_the_real_node_env(
     s = load_settings(config_path=cfg, environ=env)
 
     assert s.cluster.enabled
+    # Aim check on the backend: an exported MEFOR_STORE_BACKEND would override the TOML and leave
+    # the sqlserver case loading Postgres, which never runs the SQL Server refusal.
+    expected = StoreBackend.SQLSERVER if store is _MSSQL else StoreBackend.POSTGRES
+    assert s.store.backend == expected
     assert s.cluster.leader_fence_timeout_seconds == fo.leader_fence_timeout_seconds
     assert s.cluster.leader_lease_ttl_seconds == fo.leader_lease_ttl_seconds
     margin = _detection_margin_seconds(

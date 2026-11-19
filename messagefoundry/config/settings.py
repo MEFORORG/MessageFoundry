@@ -6583,11 +6583,11 @@ _RENEW_CLAMP_CEILING_SECONDS = 5.0
 #: Server the borrow and the statement each get the full clamp (``SqlServerStore._fetchone_clamped``),
 #: plus a COMMIT the clamp does not bound, so the derived default is NOT safe by construction there.
 #: At the shipped 10/20/30 the clamp is 4.5, which runs as a 4.5 s borrow plus a 4 s statement: about
-#: 8.5 s of the 9.0 s margin. At the failover profile (fence 4.0 / TTL 6.0, margin 1.2 s) the floor
-#: makes the clamp 1.0, which runs as about 2 s, past the margin.
-#: ``ServiceSettings._sqlserver_renew_bounds`` refuses a config whose borrow and statement
-#: windows together (:func:`_sqlserver_renew_reach_seconds`) reach the margin, so the fence 4.0 /
-#: TTL 6.0 pair does not load on SQL Server; the shipped failover profiles were retuned to fit
+#: 8.5 s of the 9.0 s margin. At fence 4.0 / TTL 6.0 (margin 1.2 s) the floor makes the clamp 1.0,
+#: which runs as about 2 s, past the margin.
+#: ``ServiceSettings._sqlserver_renew_bounds`` checks the borrow and statement windows together
+#: (:func:`_sqlserver_renew_reach_seconds`) against the margin: it steps a derived clamp down to a
+#: whole second that fits, and refuses a set clamp, or a pair no clamp fits, such as 4.0 / 6.0
 #: (BACKLOG #5979).
 #: ``ServiceSettings.sqlserver_renew_bound_warning`` names, for ``serve`` to log at start-up, a config
 #: that passes the refusal but where ``2 * clamp >= margin``.
@@ -6605,6 +6605,10 @@ _RENEW_CLAMP_MARGIN_FRACTION = 0.5
 #: single-row UPSERT. A pair whose margin cannot fit even this is refused by the check below rather
 #: than run with a clamp that would fence it; see :meth:`ClusterSettings._renew_fits_the_margin`.
 _RENEW_CLAMP_FLOOR_SECONDS = 1.0
+
+#: The remedy both SQL Server renew messages name (ServiceSettings._sqlserver_renew_bounds and
+#: sqlserver_renew_bound_warning), written once so their wording cannot drift.
+_FENCE_TTL_GAP = "the gap between leader_fence_timeout_seconds and leader_lease_ttl_seconds"
 
 
 def _clamped_statement_timeout(clamp_seconds: float, command_timeout: int) -> int:
@@ -6769,9 +6773,11 @@ class ClusterSettings(_Section):
     # REFUSED at config load (_renew_fits_the_margin below). Silently shrinking an operator's number to
     # fit would make the check unfalsifiable -- it would accept everything. Must be > 0.
     lease_renew_timeout_seconds: float | None = None
-    # True when _renew_fits_the_margin filled lease_renew_timeout_seconds in, so the SQL Server
-    # start-up warning names the fence/TTL pair rather than a value the operator never set. A
-    # private attribute because the validator's own assignment adds the field to model_fields_set.
+    # True when _renew_fits_the_margin filled lease_renew_timeout_seconds in. On SQL Server it
+    # decides whether ServiceSettings._sqlserver_renew_bounds may step the clamp down rather than
+    # refuse it, and lets that refusal and the start-up warning name the fence/TTL pair rather than
+    # a value the operator never set. A private attribute because the validator's own assignment
+    # adds the field to model_fields_set.
     _renew_clamp_derived: bool = PrivateAttr(default=False)
     # Leader-PREFERENCE handicap (ADR 0096). Seconds this node waits — MEASURED AGAINST THE LEASE-EXPIRY
     # TIME on the DB clock — before it may claim an EXPIRED leadership lease. 0.0 (default) = no handicap
@@ -8213,6 +8219,11 @@ class ServiceSettings(_InputHidingModel):
         # Positive tests, so a NaN margin is refused too, as in _renew_fits_the_margin.
         if reach < margin:
             return self
+        floor_reach = _sqlserver_renew_reach_seconds(1.0, acquire, command)
+        # Only a 1 s clamp's own pool wait can still shrink once the clamp is at the floor.
+        shorter_wait = (
+            " or shorten [store].acquire_timeout, which bounds every pooled-connection wait"
+        )
         if self.cluster._renew_clamp_derived:
             # The derivation does not know the backend, so on SQL Server its value can fit the
             # margin alone and not the two windows: an even margin m derives m / 2, which runs as
@@ -8223,23 +8234,22 @@ class ServiceSettings(_InputHidingModel):
                 if _sqlserver_renew_reach_seconds(whole, acquire, command) < margin:
                     self.cluster.lease_renew_timeout_seconds = float(whole)
                     return self
-        floor_reach = _sqlserver_renew_reach_seconds(1.0, acquire, command)
-        gap = "the gap between leader_fence_timeout_seconds and leader_lease_ttl_seconds"
-        if self.cluster._renew_clamp_derived:
             cause = (
                 "lease_renew_timeout_seconds is not set, and no clamp of at least 1 s, the SQL"
                 f" Server floor, fits: even 1 s runs its pool wait and statement for {floor_reach:g} s"
             )
-            remedy = f"Widen {gap}"
+            remedy = f"Widen {_FENCE_TTL_GAP},{shorter_wait}"
         else:
             cause = (
                 f"lease_renew_timeout_seconds = {clamp:g} runs the lease claim's pool wait and its"
                 f" statement for up to {reach:g} s"
             )
             remedy = (
-                f"Lower lease_renew_timeout_seconds or unset it to derive one that fits, or widen {gap}"
+                "Lower lease_renew_timeout_seconds or unset it to derive one that fits, or widen"
+                f" {_FENCE_TTL_GAP}"
                 if floor_reach < margin
-                else f"Widen {gap}: even a 1 s clamp, the SQL Server floor, runs for {floor_reach:g} s"
+                else f"Widen {_FENCE_TTL_GAP},{shorter_wait}: even a 1 s clamp, the SQL Server"
+                f" floor, runs for {floor_reach:g} s"
             )
         raise ValueError(
             f"[cluster] on [store].backend = 'sqlserver': {cause}, which reaches the demotion"
@@ -8273,7 +8283,7 @@ class ServiceSettings(_InputHidingModel):
         # A clamp left unset was derived from the fence/TTL pair, so "lower it" would name a value
         # the operator never wrote. The set-it remedy is offered only while a clamp both under half
         # the margin and at the 1 s SQL Server floor exists; below that only widening helps.
-        gap = "the gap between leader_fence_timeout_seconds and leader_lease_ttl_seconds"
+        gap = _FENCE_TTL_GAP
         half = margin / 2
         if self.cluster._renew_clamp_derived:
             cause = (

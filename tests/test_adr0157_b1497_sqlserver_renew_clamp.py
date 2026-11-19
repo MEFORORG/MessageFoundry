@@ -34,6 +34,7 @@ from pydantic import ValidationError
 from messagefoundry.config.settings import (
     ClusterSettings,
     StoreSettings,
+    _clamped_statement_timeout,
     _detection_margin_seconds,
     _sqlserver_renew_reach_seconds,
     load_settings,
@@ -41,7 +42,6 @@ from messagefoundry.config.settings import (
 from messagefoundry.pipeline.cluster import build_coordinator
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
-from messagefoundry.store.sqlserver import _clamped_statement_timeout
 from tests._log_absence import assert_capture_sees
 
 # --- the whole-second conversion ---------------------------------------------
