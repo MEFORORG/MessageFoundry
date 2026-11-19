@@ -413,6 +413,95 @@ def test_list_emits_standard_json_for_an_infinite_alert_age(
     assert after.stall is not None and after.stall.max_oldest_seconds is None
 
 
+_INF_ROUND_TRIP_FILE = """\
+[[inbound]]
+name = "IB"
+transport = "mllp"
+router = "r"
+{inbound_extra}  [inbound.settings]
+  port = 2600
+
+[[outbound]]
+name = "OB"
+transport = "mllp"
+cleartext_accepted = true
+cleartext_reason = "legacy partner has no MLLP-over-TLS listener"
+{outbound_extra}  [outbound.settings]
+  host = "epic.example"
+  port = 2700
+{outbound_tables}"""
+
+#: Each case sets one field to TOML `inf`, with a trailing comment a rewrite would lose.
+_INF_CASES = {
+    "strict_timeout_s": {"inbound_extra": "strict_timeout_s = inf  # backstop off\n"},
+    "waiting_display_delay": {"outbound_extra": "waiting_display_delay = inf  # never show\n"},
+    "buildup.max_oldest_seconds": {
+        "outbound_tables": "  [outbound.buildup]\n  max_oldest_seconds = inf  # age off\n"
+    },
+    "stall.max_oldest_seconds": {
+        "outbound_tables": "  [outbound.stall]\n  max_oldest_seconds = inf  # age off\n"
+    },
+}
+
+
+def _inf_file(cfg: Path, case: str) -> bytes:
+    parts = {"inbound_extra": "", "outbound_extra": "", "outbound_tables": ""} | _INF_CASES[case]
+    data = _INF_ROUND_TRIP_FILE.format(**parts).encode("utf-8")
+    (cfg / "connections.toml").write_bytes(data)
+    return data
+
+
+def _listed(cfg: Path, capsys: pytest.CaptureFixture[str]) -> dict[str, dict]:
+    rc = main(["connection", "list", "--config", str(cfg), "--json"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    entries = _strict_json(out)
+    assert isinstance(entries, list)
+    return {entry["name"]: entry for entry in entries}
+
+
+@pytest.mark.parametrize("case", sorted(_INF_CASES))
+def test_infinite_value_list_upsert_round_trip_is_byte_identical(
+    case: str, cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5778: `connection list` prints a non-finite float as the string "inf". Sending the
+    listed entry straight back through `connection upsert` (the GUI's no-op save) must leave the
+    file byte-identical, keeping the float -- not rewrite it as the string "inf", which the read
+    schema refuses for strict_timeout_s and waiting_display_delay."""
+    before = _inf_file(cfg, case)
+    svc = _svc(cfg, _EPIC_EGRESS)
+    for entry in _listed(cfg, capsys).values():
+        rc, out = _upsert(cfg, entry, capsys, svc=svc)
+        assert rc == 0, out
+    assert (cfg / "connections.toml").read_bytes() == before
+    load_config(cfg)  # still loads
+
+
+@pytest.mark.parametrize("case", sorted(_INF_CASES))
+def test_infinite_value_edited_to_a_finite_value_is_written(
+    case: str, cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The negative arm: the "inf" match covers only the unchanged value, so an edit still lands."""
+    _inf_file(cfg, case)
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entries = _listed(cfg, capsys)
+    path = case.split(".")
+    entry = entries["IB" if case == "strict_timeout_s" else "OB"]
+    target = entry
+    for key in path[:-1]:
+        target = target[key]
+    assert target[path[-1]] == "inf"
+    target[path[-1]] = 30.0
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 0, out
+    value: object = _listed(cfg, capsys)["IB" if case == "strict_timeout_s" else "OB"]
+    for key in path:
+        assert isinstance(value, dict)
+        value = value[key]
+    assert value == 30.0
+    assert "inf" not in (cfg / "connections.toml").read_text(encoding="utf-8")
+
+
 def test_upsert_rejects_unknown_key_and_writes_nothing(
     cfg: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

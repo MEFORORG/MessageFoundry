@@ -189,8 +189,8 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, float) and not math.isfinite(value):
         # TOML's inf / -inf / nan have no JSON literal: json.dumps would print a bare Infinity or
         # NaN token a strict parser (the IDE's JSON.parse) refuses. The string form survives the
-        # GUI's list -> upsert re-save, and the read schema parses it back to the same float; a
-        # null instead would drop the key on re-save, turning an `inf` (off) alert age back into
+        # GUI's list -> upsert re-save: _same_value matches it to the untouched float, so the file
+        # keeps `inf`; a null instead would drop the key on re-save, turning an `inf` (off) alert age back into
         # its default (BACKLOG #5778).
         return str(value)
     return value
@@ -355,9 +355,26 @@ def _plain(item: Any) -> Any:
 def _same_value(current: Any, new: Any) -> bool:
     """Compare a tomlkit item against a freshly built one by VALUE, ignoring formatting."""
     try:
-        return bool(_plain(current) == _plain(new))
+        return _same_plain(_plain(current), _plain(new))
     except Exception:  # pragma: no cover - defensive: an exotic item type compares as "changed"
         return False
+
+
+def _same_plain(current: Any, new: Any) -> bool:
+    """Plain-value equality, except that the string :func:`_jsonable` lists a non-finite float as
+    (``"inf"``) equals that float. The GUI sends the listed string back on a re-save, so without this
+    an untouched ``inf`` compares as changed and is rewritten as the string ``"inf"``, which the read
+    schema refuses for ``strict_timeout_s`` / ``waiting_display_delay`` (BACKLOG #5778). Only the
+    unchanged case is matched: the file keeps its float, and no new string form reaches the file."""
+    if isinstance(current, dict) and isinstance(new, dict):
+        return current.keys() == new.keys() and all(
+            _same_plain(current[key], new[key]) for key in current
+        )
+    if isinstance(current, list) and isinstance(new, list):
+        return len(current) == len(new) and all(map(_same_plain, current, new))
+    if isinstance(current, float) and not math.isfinite(current) and isinstance(new, str):
+        return new == str(current)  # the string _jsonable lists it as
+    return bool(current == new)
 
 
 def _is_table_like(item: Any) -> bool:
