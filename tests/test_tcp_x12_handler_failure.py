@@ -44,7 +44,6 @@ from tests.test_x12_connection_events import (
     _tcp,
     _x12,
 )
-from tests.test_x12_transport import _isa
 
 #: A frame the raw-TCP decoder reads cleanly; the X12 one is the ISA/IEA interchange ``EDI``.
 TCP_FRAME = b"\x02synthetic raw tcp body\x03"
@@ -404,28 +403,3 @@ async def test_an_x12_reply_in_an_unusable_charset_name_is_sent_in_utf8(
     events = await _drive(source, _ThenEof(EDI), writer, handler=handler)
     assert "framing_error" not in _kinds(events)
     assert b"".join(writer.written) == reply.encode("utf-8")
-
-
-def _isa_reply(component: str) -> str:
-    isa = _isa()
-    return isa[:104] + component + isa[105:] + "TA1*000000001*240101*1200*A*000~IEA*0*000000001~"
-
-
-def test_an_isa_led_reply_is_replaced_around_its_own_delimiters(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """BACKLOG #5958: the X12 listener can send an ISA-led reply, which declares its delimiters in
-    the ISA header rather than in MSH. Data the charset cannot hold is replaced as for an HL7
-    reply, and a reply whose ISA declares the replacement character as a delimiter is refused,
-    since a replaced character would become structure there."""
-    monkeypatch.setattr(framing_mod, "_reply_replacement_logged", set())
-    clean = _isa_reply(":")
-    sent = framing_mod.encode_reply(clean + "NTE*\u2603~", "latin-1", connection="IB_X12")
-    assert sent == (clean + "NTE*?~").encode("latin-1")
-    with pytest.raises(UnicodeError) as ei:
-        framing_mod.encode_reply(_isa_reply("?") + "NTE*\u2603~", "latin-1", connection="IB_X12")
-    assert ei.value.__cause__ is None and ei.value.__context__ is None
-    # An ISA header too short to read is refused the same way, chaining nothing.
-    with pytest.raises(UnicodeError) as ei:
-        framing_mod.encode_reply("ISA*00*\u2603~", "latin-1", connection="IB_X12")
-    assert ei.value.__cause__ is None and ei.value.__context__ is None

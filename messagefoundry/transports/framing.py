@@ -128,9 +128,9 @@ def _refuse_more_than_one_message(payload: str, transport: str) -> None:
 def declared_encoding(declared: object) -> str:
     """The charset name an inbound's ``encoding`` setting declares (default ``utf-8``).
 
-    The one rule for the name, read by the MLLP and TCP listeners for their replies, by the sources
-    that encode or decode with the setting themselves (at least the file, remote-file, timer, X12
-    and database sources), and by :func:`~messagefoundry.pipeline.ingress_guards.ingress_encoding`
+    The one rule for the name, read by the MLLP, TCP and X12 listeners for their replies, by the
+    sources that encode or decode with the setting themselves (at least the file, remote-file,
+    timer, X12 and database sources), and by :func:`~messagefoundry.pipeline.ingress_guards.ingress_encoding`
     for the decode (BACKLOG #2431).
     An explicit ``None`` or empty value means "not declared", so it falls back as an absent key does.
     Config load refuses an inbound ``env()`` reference, every non-``str`` value but ``None`` and any
@@ -138,7 +138,7 @@ def declared_encoding(declared: object) -> str:
     sees a ``str`` or ``None``. The ``str()`` stays as a
     backstop: a value that got past load anyway is never a ``TypeError`` out of ``encode`` or
     ``decode``. Its ``str()`` either names a codec (``1252`` reads as ``cp1252``) or fails as a
-    ``LookupError`` the decode refuses and :func:`frame_reply` falls back from."""
+    ``LookupError`` the decode refuses and :func:`encode_reply` falls back from."""
     return str(declared) if declared else "utf-8"
 
 
@@ -173,10 +173,10 @@ def encode_reply(reply: str, encoding: str, *, connection: str = "") -> bytes:
     ``utf-8``: it stays in the declared charset, and each character the charset cannot hold becomes
     the codec's replacement character, for the same reason :func:`frame_reply` turns a frame byte
     into a space (BACKLOG #5799). Before, that reply raised to the listener's last-resort arm, which
-    closed the connection unanswered, so the sender resent a message already stored. A codec that
-    cannot replace, such as ``idna``, or an ``MSH``-led reply whose own delimiters include the
-    replacement ``?`` (:func:`_encode_replacing`), still raises, with a fixed ``UnicodeError`` that
-    chains nothing, since the strict encode's error holds the whole reply. Usable is decided by
+    closed the connection unanswered, so the sender resent a message already stored. At least a
+    codec that cannot replace, such as ``idna``, and an ``MSH``-led reply whose own delimiters
+    include the replacement ``?`` still raise (:func:`_encode_replacing` names more), with a fixed
+    ``UnicodeError`` that chains nothing, since the strict encode's error holds the whole reply. Usable is decided by
     probing the NAME, as ``decode_body`` decides it: a usable codec can also raise a bare
     ``UnicodeError`` for one reply, which still raises here. ``connection`` names the listener in
     the warning each fallback logs, once per connection for each, since a narrow charset meets the
