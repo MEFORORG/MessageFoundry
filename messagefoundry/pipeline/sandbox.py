@@ -840,10 +840,12 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None, inbound: 
 
     Windows: terminate the kill-on-close job the worker was assigned to (falling back to a
     single-process kill when none was assigned). POSIX: ``SIGKILL`` the worker's own process group,
-    which ``start_new_session=True`` made it the leader of — guarded on ``pgid == proc.pid`` so this
-    signals only the group ``proc.pid`` leads and never the caller's (e.g. the engine/pytest group).
-    That is the worker's own group unless the pid was freed by a reap elsewhere and reused, which
-    :func:`_posix_child_state` describes.
+    which ``start_new_session=True`` made it the leader of. The first try is guarded on
+    ``pgid == proc.pid`` so it signals only the group ``proc.pid`` leads and never the caller's
+    (e.g. the engine/pytest group). That is the worker's own group unless the pid was freed by a
+    reap elsewhere and reused, which :func:`_posix_child_state` describes. The two paragraphs below
+    say when group ``proc.pid`` is signalled through the reuse-safe path instead, without that
+    guard; that path never signals the caller's group either.
 
     A POSIX worker that :func:`_posix_child_state` reads as already reaped is the exception (vault
     BACKLOG #3135): its group is signalled only through :func:`proctree.kill_reaped_leader_group`,
@@ -864,8 +866,10 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None, inbound: 
     pid-reuse gap :func:`proctree.kill_reaped_leader_group` states, now for a reap in the moment
     after the state check too; a group the guarded kill found empty never takes it. Only when that
     signal also sends nothing and members may remain is a single-process kill tried, under a
-    WARNING naming ``inbound``. It signals a worker still running, only reaps a zombie, and does
-    nothing to a worker already reaped."""
+    WARNING naming ``inbound``. It signals a worker still running and only reaps a zombie. For a
+    worker already reaped it does nothing, unless the pid was given to another child of this
+    engine in the meantime, which it then signals: the limit :func:`_posix_child_state` states.
+    ``_kill_single`` swallows a failed signal, so the WARNING says the kill is tried, not done."""
     if sys.platform == "win32":
         if job is not None:
             proctree.terminate_job(job)
@@ -890,8 +894,8 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None, inbound: 
         )
         return
     log.warning(
-        "inbound %r: the process group of sandbox worker pid %d could not be signalled, so only "
-        "the worker itself is killed, if it is still running, and a process it started may survive",
+        "inbound %r: the process group of sandbox worker pid %d could not be signalled, so only a "
+        "kill of the worker itself is tried, and a process the worker started may survive",
         inbound,
         proc.pid,
     )

@@ -2701,7 +2701,7 @@ def _single_kill_warnings(caplog: pytest.LogCaptureFixture) -> list[object]:
     return [
         r.args
         for r in caplog.records
-        if r.name == sandbox_mod.log.name and "only the worker itself is killed" in r.getMessage()
+        if r.name == sandbox_mod.log.name and "kill of the worker itself is tried" in r.getMessage()
     ]
 
 
@@ -2730,6 +2730,7 @@ def _single_kill_warnings(caplog: pytest.LogCaptureFixture) -> list[object]:
         # WARNING, pinned elsewhere, is not the single kill's.
         ("reaped", None, True, ["reaped"], False),
         ("reaped", None, None, ["reaped"], False),
+        ("reaped", None, False, ["reaped"], False),
     ],
 )
 def test_the_posix_reap_reaches_the_group_before_any_single_kill(
@@ -2795,7 +2796,8 @@ def test_kill_process_group_tells_an_empty_group_from_a_failed_signal(
     failure reads as nothing sent, under the module's WARNING; only a sent signal is truthy, so
     the DR hook's bool test of the result is unchanged. The process calls are replaced, so this
     runs on every host. FALSIFICATION: drop the ``ProcessLookupError`` arm in
-    :func:`proctree.kill_process_group`, and the ``ESRCH`` case returns ``NOT_SENT`` and logs."""
+    ``proctree._killpg``, and the ``ESRCH`` case returns ``NOT_SENT`` and logs, here and in
+    :func:`proctree.kill_reaped_leader_group` (which then returns ``None``, not ``False``)."""
     sent: list[int] = []
 
     def _killpg(pgid: int, sig: int) -> None:
@@ -2825,6 +2827,47 @@ def test_kill_process_group_tells_an_empty_group_from_a_failed_signal(
             if logged
             else []
         )
+    # The reuse-safe signal shares the helper, so it maps the same outcomes to True/False/None.
+    fake_os.getpgid = _no_such_pid
+    caplog.clear()
+    sent.clear()
+    reaped_result = proctree.kill_reaped_leader_group(4242)
+    assert reaped_result is {_SENT: True, _EMPTY: False, _NOT_SENT: None}[expected]
+    assert sent == [4242]
+
+
+def _no_such_pid(pid: int) -> int:
+    raise ProcessLookupError(3, "No such process")
+
+
+@pytest.mark.parametrize(
+    ("getpgid", "started_as_leader"),
+    [
+        (_no_such_pid, False),  # the group cannot be read
+        (lambda pid: pid + 1, False),  # pid leads no group of its own
+        (lambda pid: pid, True),  # the caller's own group, with started_as_leader=True
+    ],
+)
+def test_kill_process_group_refuses_before_any_signal_and_logs_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    getpgid: Callable[[int], int],
+    started_as_leader: bool,
+) -> None:
+    """Each refusal before the signal returns ``NOT_SENT``, not ``EMPTY``, and logs nothing: the
+    group may still have members, so the sandbox must go on to its next step."""
+    sent: list[int] = []
+    fake_os = SimpleNamespace(
+        getpgid=getpgid, getpgrp=lambda: 4242, killpg=lambda pgid, sig: sent.append(pgid)
+    )
+    monkeypatch.setattr(proctree, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(proctree, "os", fake_os)
+    monkeypatch.setattr(proctree, "signal", SimpleNamespace(SIGKILL=9))
+    caplog.set_level(logging.WARNING, logger=proctree.log.name)
+    assert proctree.kill_process_group(4242, started_as_leader=started_as_leader) is _NOT_SENT
+    assert sent == []
+    assert_capture_sees(caplog, proctree.log)  # so an empty scan below means nothing logged
+    assert [r for r in caplog.records if r.name == proctree.log.name] == []
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="the POSIX process-group reap")
@@ -2851,6 +2894,7 @@ def test_a_worker_reaped_after_the_state_check_still_has_its_group_killed(
     )
     proc = subprocess.Popen([sys.executable, "-c", script], start_new_session=True)
     grandchild_pid: int | None = None
+    grandchild_dead = False
     try:
         os.waitpid(proc.pid, 0)  # the leader exited and was reaped; Popen does not know
         grandchild_pid = int(pidfile.read_text())
@@ -2862,13 +2906,16 @@ def test_a_worker_reaped_after_the_state_check_still_has_its_group_killed(
         assert _wait_until_not_running(grandchild_pid, timeout=5.0) is False, (
             "the grandchild of a worker reaped after the state check survived the reap"
         )
+        grandchild_dead = True  # its pid may be reused now, so the cleanup below must not kill it
         assert_capture_sees(caplog, sandbox_mod.log)  # so an empty scan below means nothing logged
         assert _single_kill_warnings(caplog) == [], (
             "the reap fell back to a single-process kill though the group was signalled"
         )
     finally:
         if grandchild_pid is not None:
-            _best_effort_kill_pid(grandchild_pid)
+            if not grandchild_dead:
+                _best_effort_kill_pid(grandchild_pid)
+
         elif proc.poll() is not None:  # a leader that failed before writing the sleeper's pid
             proctree.kill_reaped_leader_group(proc.pid)
         proc.poll()  # already reaped: this only records it, so Popen does not warn on collection

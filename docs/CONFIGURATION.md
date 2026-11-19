@@ -1451,15 +1451,21 @@ after a reap that is not a kill, such as closing a session whose worker had alre
 line comes before it; and when the signal itself failed, for example for want of permission, a line
 naming the process group and the system's error text, but not the inbound, comes before it. A
 worker not yet reaped whose group is found empty gets nothing more and no line. One whose group
-gets no signal for another reason takes the same reuse-safe group signal next, so a group that
-cannot be read because the worker is gone is still reached. When that also sends nothing and the
-group may still have members, as for a worker that does not lead its group or a signal that
-failed, a second `WARNING` naming the inbound and the pid says only the worker itself is killed,
-if it is still running, and a process it started may survive; when that signal finds the group
-empty, no such line is written. Each failed signal, to the group or by the reuse-safe path, writes
-an unattributed line naming the process group and the system's error text, which says a process in
-it may survive and does not say what the reap does next. That single-process kill signals a running
-worker, only reaps one that has exited and not been reaped, and does nothing to one already reaped.
+gets no signal for another reason takes the same group signal the already-reaped case uses next.
+That signal is sent only while no live process has the worker's pid, so it reaches the group when
+the read failed because the worker is gone. It is not proof against reuse: a pid taken by a new
+group leader between that check and the signal would have that group signalled, which needs the
+worker's group to be empty already. It reaches nothing when the system refuses the read for
+another reason, such as permission. When it also sends nothing and the group may still have
+members, as for a worker that does not lead its group or a signal that failed, a `WARNING` naming
+the inbound and the pid says a kill of the worker itself is tried and a process it started may
+survive; when that signal finds the group empty, no such line is written. Each failed signal, to
+the group or by that second path, writes an unattributed line naming the process group and the
+system's error text, which says a process in it may survive and does not say what the reap does
+next. That single-process kill signals a running worker and only reaps one that has exited and not
+been reaped. For one already reaped it does nothing, unless the pid was given to another process
+the engine started, which it would then signal.
+
 **Read once at engine start — a `/config/reload` does NOT re-read it (restart to change).**
 
 **`mode` is engine-wide — there is no per-connection sandbox setting.** One policy is rendered for the
