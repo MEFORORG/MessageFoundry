@@ -92,7 +92,7 @@ so the task cannot hang a lane.
 
 The action fires at most once per `realert_seconds` (or the rule's `cooldown_seconds`) per
 `(event_type, connection)`, on a throttle of its own (amended below, owner ruling 2026-11-19), so a
-flapping lane cannot trigger a restart storm. It is **independent of transport suppression**: a rule
+flapping lane cannot trigger a restart storm while the cooldown is above zero. It is **independent of transport suppression**: a rule
 may set `transports=[]` to auto-remediate **quietly** (restart, no page) or fire alongside a page. The control action requires the
 **notifier** to be active (≥1 transport configured), since it is a notifier outcome; a deployment that
 wants transportless remediation configures at least one transport (documented; a transportless-notifier
@@ -116,7 +116,7 @@ once per cooldown for each of them. The time is recorded only when the sink sche
 task: an emit whose action the sink skips (for example: no control callback wired, the engine
 shutting down, or an event that is not about a connection) records nothing. A scheduled task records
 the time even when the callback then restarts nothing. A restart can therefore fire on a throttled
-alert when an earlier alert in the window ran no restart. The notification throttle is unchanged, and a
+alert when no restart task was scheduled for an earlier alert in the window. The notification throttle is unchanged, and a
 `connection_error` of kind `config_fault` keeps its own notification throttle (ADR 0095 Amendment
 B.2) while sharing the `connection_error` control throttle with the transport kind. The
 `connection_started` clear above ends both windows, and a failed resolve restores both.
@@ -137,7 +137,7 @@ B.2) while sharing the `connection_error` control throttle with the transport ki
 
 **Positive** — the common "just restart the wedged lane" case is auto-remediated at alert latency with a
 human still paged (or deliberately quiet); additive, off by default, no new dependency, no layering
-change. Throttled per cooldown so it can't storm.
+change. Throttled per cooldown.
 
 **Negative / residual** — auto-restarting a lane wedged on a *persistent* fault will restart-loop it (once
 per cooldown) until an operator intervenes — the same class of caveat as retry-forever; an operator scopes
