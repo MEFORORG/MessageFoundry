@@ -39,3 +39,10 @@ def test_a_collector_address_still_loads(host: str) -> None:
     """The negative control: a name, a host address, and an address that only looks like a
     directed subnet broadcast, which this check does not read, all load as before."""
     assert LoggingSettings(forward_host=host).forward_host == host
+
+
+def test_the_broadcast_address_loads_while_forwarding_is_off() -> None:
+    """Code review round 2: with forwarding off no socket opens, so a config that loaded before
+    #5923 still loads."""
+    settings = LoggingSettings(forward_host="255.255.255.255", forward_enabled=False)
+    assert settings.forward_enabled is False
