@@ -3135,15 +3135,18 @@ def _logon_right_arms(
     $global:LASTEXITCODE = 0
   }}
   $warnings = @()
+  $said = @()
   $result = $null
   $outputs = 0
-  $emitted = & {{ {_SECEDIT_FN} -Account 'NT SERVICE\MessageFoundry' -Sid {_psq(sid)} }} 3>&1 6>$null
+  $emitted = & {{ {_SECEDIT_FN} -Account 'NT SERVICE\MessageFoundry' -Sid {_psq(sid)} }} 3>&1 6>&1
   foreach ($o in @($emitted)) {{
     if ($o -is [System.Management.Automation.WarningRecord]) {{ $warnings += "$o" }}
+    elseif ($o -is [System.Management.Automation.InformationRecord]) {{ $said += "$o" }}
     else {{ $result = $o; $outputs++ }}
   }}
   [pscustomobject]@{{
-    result = [bool]$result; outputs = $outputs; warnings = @($warnings)
+    result = [bool]$result; outputs = $outputs; warnings = @($warnings); said = @($said)
+    unproven = [bool]$script:LogonRightUnproven
     exportCalls = $script:ExportCalls; configureCalls = $script:ConfigureCalls
     configured = $script:Configured; cfg = $script:Cfg; db = $script:Db; folder = $script:Folder
     left = @(Get-ChildItem -LiteralPath {_psq(str(parent))} -Force | ForEach-Object {{ $_.Name }})
@@ -3157,6 +3160,7 @@ def _logon_right_arms(
         .splitlines()[-1]
     )
     parsed["warnings"] = [w for w in (parsed.get("warnings") or []) if w]
+    parsed["said"] = [s for s in (parsed.get("said") or []) if s]
     return parsed
 
 
@@ -3207,6 +3211,27 @@ def test_the_logon_right_switch_refuses_to_empty_the_right_for_everyone(tmp_path
     assert any("ONLY account" in w for w in got["warnings"]), (
         f"the refusal must say why, or it reads as a silent failure; got {got['warnings']}"
     )
+
+
+def test_the_logon_right_switch_removes_the_account_written_by_its_name(tmp_path: Path) -> None:
+    """The installer counts a holder written as the account's name as held (BACKLOG #5401), so
+    the removal must take that name out too, or it reports 'does not hold' and leaves the right."""
+    got = _logon_right_arms(
+        tmp_path, holders=["*S-1-5-32-545", "NT SERVICE\\MessageFoundry"], sid="S-1-5-80-4001"
+    )
+    assert got["result"] is True, got
+    assert "SeServiceLogonRight = *S-1-5-32-545 |" in got["configured"], got["configured"]
+
+
+@_windows_only
+def test_the_logon_right_switch_removes_a_name_that_resolves_to_the_sid(tmp_path: Path) -> None:
+    # BUILTIN\Administrators resolves to S-1-5-32-544 on an English-language Windows host (a
+    # localized host names the group differently); BUILTIN\Users does not, and must stay.
+    got = _logon_right_arms(
+        tmp_path, holders=["BUILTIN\\Users", "BUILTIN\\Administrators"], sid="S-1-5-32-544"
+    )
+    assert got["result"] is True, got
+    assert "SeServiceLogonRight = BUILTIN\\Users |" in got["configured"], got["configured"]
 
 
 def test_a_right_the_account_does_not_hold_is_a_no_op(tmp_path: Path) -> None:
@@ -3277,6 +3302,27 @@ def test_the_grant_keeps_every_holder_and_a_dollar_in_a_held_name(tmp_path: Path
         tmp_path, "SeServiceLogonRight = *S-1-5-80-4001,CONTOSO\\svc$0,CONTOSO\\svc$&"
     )
     want = "SeServiceLogonRight = *S-1-5-80-4001,CONTOSO\\svc$0,CONTOSO\\svc$&,*S-1-5-32-544 |"
+    assert want in configured, configured
+
+
+@_windows_only
+@pytest.mark.parametrize("holder", ["BUILTIN\\Administrators", "Administrators"])
+def test_a_holder_written_as_a_name_is_already_granted(tmp_path: Path, holder: str) -> None:
+    """BACKLOG #5401 item 1: an exported row can name a holder rather than give its ``*SID``.
+    Compared by SID alone, the account written as a name read as missing, and the grant
+    re-imported the policy with the account added a second time. Nothing may be configured."""
+    configured = _grant_configured(tmp_path, f"SeServiceLogonRight = *S-1-5-80-4001,{holder}")
+    assert configured == "", f"the policy was re-imported for a held account: {configured}"
+
+
+@_windows_only
+def test_a_name_that_resolves_to_another_account_still_grants(tmp_path: Path) -> None:
+    """POSITIVE CONTROL for the name case: a name resolving to some other SID, and one that does
+    not resolve, are not this account, so the grant still writes it."""
+    configured = _grant_configured(
+        tmp_path, "SeServiceLogonRight = BUILTIN\\Users,NO-SUCH-DOMAIN-b532r\\nobody"
+    )
+    want = "SeServiceLogonRight = BUILTIN\\Users,NO-SUCH-DOMAIN-b532r\\nobody,*S-1-5-32-544 |"
     assert want in configured, configured
 
 
@@ -3806,6 +3852,9 @@ def test_the_notice_and_the_removal_agree_on_the_principal(tmp_path: Path) -> No
 def test_a_holder_with_a_dollar_sign_survives_the_policy_rewrite(tmp_path: Path) -> None:
     """secedit can export a holder by NAME, and a gMSA or computer account name ends in '$'.
 
+    The name is looked up. Off Windows that lookup throws, which reads as a holder that may be this
+    account (BACKLOG #5401), so the row is still rewritten but the result is not a removal there.
+
     '$' is a .NET substitution metacharacter in a -replace REPLACEMENT operand, so building the
     rewritten row that way re-reads a holder as $&, $+ or $$ and feeds a mangled machine-wide
     user-right row straight into `secedit /configure`.
@@ -3815,7 +3864,9 @@ def test_a_holder_with_a_dollar_sign_survives_the_policy_rewrite(tmp_path: Path)
         holders=["*S-1-5-80-4001", r"DOMAIN\ws-host$", "*S-1-5-32-544"],
         sid="S-1-5-80-4001",
     )
-    assert got["result"] is True, f"the removal did not run; warnings {got['warnings']}"
+    assert got["configureCalls"] == 1, f"the removal did not run; warnings {got['warnings']}"
+    if sys.platform.startswith("win"):
+        assert got["result"] is True, f"the removal was not reported; warnings {got['warnings']}"
     assert r"DOMAIN\ws-host$" in got["configured"], (
         "a holder whose name ends in '$' was mangled or dropped by the rewrite -- the replacement "
         f"operand is being read as substitution syntax:\n{got['configured']}"
@@ -4303,3 +4354,143 @@ def test_the_secrets_directory_refuses_residue_and_held_files(tmp_path: Path) ->
     )
     assert "MEFOR_PLANTED" in got["held"], got
     assert got["empty"] == "", f"CONTROL FAILED: an empty directory was refused: {got}"
+
+
+@pytest.mark.parametrize("leaf", ["data[1]", "data[a-z]"])
+def test_the_uninstall_ace_removal_reads_a_bracketed_data_dir_literally(
+    tmp_path: Path, leaf: str
+) -> None:
+    """BACKLOG #5402 item 2: ``Remove-AccountAce`` tested ``-DataDir`` with a plain ``Test-Path``,
+    which expands ``[...]`` as a wildcard, so an existing ``data[1]`` read as gone and its ACE
+    stayed. icacls is a stub here; no ACL is touched."""
+    assert _UNINSTALL is not None
+    target = tmp_path / leaf
+    target.mkdir()
+    body = rf"""
+  $script:Calls = @()
+  function icacls {{ $script:Calls += ,@($args); $global:LASTEXITCODE = 0 }}
+  $r = Remove-AccountAce -Path {_psq(str(target))} -Principal '*S-1-5-80-4001' -What 'data directory'
+  'OUT=' + $r + '|' + $script:Calls.Count + '|' + ($script:Calls[0] -join ' ')
+"""
+    out = _ok(_extract(_UNINSTALL, ["Remove-AccountAce"], body), tmp_path).strip()
+    result, count, call = out.splitlines()[-1].removeprefix("OUT=").split("|", 2)
+    assert (result, count) == ("True", "1"), f"the existing directory read as gone: {out}"
+    assert call.startswith(str(target)), call
+
+
+# --- a holder-name lookup that could not be made is not "not this account" (BACKLOG #5401) --------
+# Both scripts used `catch { $true }` / `catch { $false }` around Translate, so ANY lookup failure
+# read as "this holder is some other account", and the uninstaller then printed "does not hold" for
+# an account that may hold the right. Only IdentityNotMappedException means "no such account" now.
+# The tests below that use `_UNREADABLE` cover a lookup that throws something other than "not
+# mapped". They stand in for that failure with a 1000-character holder name: on Windows the
+# NTAccount cast throws for a name over 512 characters (measured 2026-11-19: 513 throws, 512 does
+# not). Off Windows the cast may throw for any name (unmeasured). They do not model an
+# unreachable domain controller. Whether LSA reports a domain it cannot reach as "not mapped",
+# which this fix would still read as "no such account", is unmeasured.
+
+_UNREADABLE = "x" * 1000
+
+
+def test_an_unread_holder_name_is_not_reported_as_does_not_hold(tmp_path: Path) -> None:
+    got = _logon_right_arms(tmp_path, holders=["*S-1-5-32-545", _UNREADABLE], sid="S-1-5-80-4001")
+    assert got["result"] is False, got
+    assert got["unproven"] is True, "the residue notice is not told the right is unproven"
+    assert got["configureCalls"] == 0, "the policy was rewritten although nothing was proven held"
+    assert not any("does not hold" in s for s in got["said"]), got["said"]
+    assert any("Could not look up" in w and "may still hold" in w for w in got["warnings"]), got[
+        "warnings"
+    ]
+
+
+@_windows_only
+def test_a_holder_name_that_maps_to_no_account_still_reads_as_does_not_hold(
+    tmp_path: Path,
+) -> None:
+    """POSITIVE CONTROL: a well-formed name in a domain that does not exist maps to no account,
+    which is still "not this account"."""
+    got = _logon_right_arms(
+        tmp_path, holders=["*S-1-5-32-545", "NOSUCHDOMAINB532R\\nobody"], sid="S-1-5-80-4001"
+    )
+    assert got["result"] is False, got
+    assert any("does not hold" in s for s in got["said"]), got["said"]
+    assert not got["warnings"], got["warnings"]
+    assert got["unproven"] is False, got
+
+
+def test_a_removal_beside_an_unread_holder_is_not_reported_as_removed(tmp_path: Path) -> None:
+    """The SID token goes, but a name left in the row may still be the account, so the residue
+    notice must not be told the account no longer holds the right."""
+    got = _logon_right_arms(
+        tmp_path,
+        holders=["*S-1-5-80-4001", "*S-1-5-32-545", _UNREADABLE],
+        sid="S-1-5-80-4001",
+    )
+    assert got["configureCalls"] == 1, got
+    assert f"SeServiceLogonRight = *S-1-5-32-545,{_UNREADABLE} |" in got["configured"], got[
+        "configured"
+    ]
+    assert got["result"] is False, "a removal with an unproven holder left was reported as complete"
+    assert got["unproven"] is True, "the residue notice is not told the right is unproven"
+    assert not any("removed SeServiceLogonRight" in s for s in got["said"]), got["said"]
+    assert any("may still hold" in w for w in got["warnings"]), got["warnings"]
+
+
+@_windows_only
+def test_the_grant_adds_the_sid_beside_an_unread_holder_and_says_so(tmp_path: Path) -> None:
+    """Install's safe direction: an unread holder is not counted as held, since a missed grant
+    fails the service with error 1069, so the SID is added and the grant it reports is real."""
+    assert _SCRIPT is not None
+    parent = tmp_path / "grant-parent"
+    parent.mkdir()
+    row = f"SeServiceLogonRight = {_UNREADABLE}"
+    inf = ["[Unicode]", "Unicode=yes", "[Privilege Rights]", row, "[Version]"]
+    inf_ps = "@(" + ", ".join(_psq(line) for line in inf) + ")"
+    body = rf"""
+  # A regression to the old TEMP-based secedit files lands in the test's own folder.
+  $env:TEMP = {_psq(str(tmp_path))}
+{_workdir_seam(parent)}
+  $script:Configured = ''
+  function secedit {{
+    $a = @($args)
+    $cfg = $a[[array]::IndexOf($a, '/cfg') + 1]
+    if ($a -contains '/export') {{ Set-Content -LiteralPath $cfg -Value {inf_ps} -Encoding Unicode }}
+    elseif ($a -contains '/configure') {{
+      $script:Configured = ((Get-Content -LiteralPath $cfg) -join ' | ')
+    }}
+    $global:LASTEXITCODE = 0
+  }}
+  $me = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $said = @({_GRANT_FN} -Account $me.Name 3>&1 6>&1 | ForEach-Object {{ "$_" }})
+  [pscustomobject]@{{ configured = $script:Configured; said = @($said); me = $me.User.Value }} |
+    ConvertTo-Json -Compress
+"""
+    got = json.loads(
+        _ok(_extract(_SCRIPT, [_GRANT_FN, _WORKDIR_FN], body), tmp_path).strip().splitlines()[-1]
+    )
+    said = " / ".join(got["said"] or [])
+    assert "already holds" not in said, said
+    assert "Could not look up" in said, said
+    assert "granted SeServiceLogonRight" in said, said
+    assert f"{row},*{got['me']} |" in got["configured"], got["configured"]
+
+
+def test_an_unproven_logon_right_is_reported_as_unknown(tmp_path: Path) -> None:
+    """Neither "REMOVED" nor "still holds ... Next time, pass -RemoveLogonRight" is true when the
+    switch ran and a holder name could not be looked up (BACKLOG #5401)."""
+    facts = dict(_FULL_FACTS)
+    facts["LogonRightUnproven"] = True
+    text = _notice(tmp_path, facts)
+    assert "UNPROVEN" in text and "may still hold" in text, text
+    assert "-RemoveLogonRight" not in text and "still holds the" not in text, text
+    # POSITIVE CONTROL: without the flag the notice still offers the switch.
+    assert "-RemoveLogonRight" in _notice(tmp_path, _FULL_FACTS)
+
+
+def test_the_uninstaller_hands_the_unproven_state_to_the_notice() -> None:
+    """The helper and the notice are tested apart, so the call site is pinned here: a correct
+    helper proves nothing if the script never passes its outcome on (#1699)."""
+    assert _UNINSTALL is not None
+    text = _UNINSTALL.read_text(encoding="utf-8")
+    assert "\n$script:LogonRightUnproven = $false" in text.replace("\r\n", "\n")
+    assert "-LogonRightUnproven:$script:LogonRightUnproven `" in text

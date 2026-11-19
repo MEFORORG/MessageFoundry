@@ -1741,11 +1741,45 @@ function Set-ServiceLogonRight {
             # Compare against exact SID tokens, not a raw substring: a SID that is a string prefix of an
             # already-granted SID (RID 110 vs 1100) would false-positive under -match and skip the grant,
             # so the service could fail to start (error 1069). Split the value on ',' and match each
-            # trimmed entry exactly (secedit writes SIDs in the leading-'*' form). Blank tokens are
+            # trimmed entry exactly (secedit writes most holders in the leading-'*' form). Blank tokens are
             # dropped, so an empty row or a stray comma writes no empty holder (BACKLOG #5401).
             $value = $lines[$at] -replace '^\s*SeServiceLogonRight\s*=', ''
             $holders = @($value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-            if ($holders | Where-Object { $_ -eq ("*" + $sid) -or $_ -eq $sid }) {
+            # An exported row can hold an account NAME rather than the '*SID' form (BACKLOG #5401), so
+            # a name is resolved and its SID compared too; read by SID alone, a held name re-adds it.
+            # SID tokens, and the account's own name as given, are compared first, so either needs no
+            # lookup. A name that maps to no account is not this account. uninstall-service.ps1's
+            # Remove-ServiceLogonRight matches a holder the same ways, where the unresolved own-name
+            # match matters most, because there the account may no longer translate.
+            $held = @($holders | Where-Object { $_ -eq ("*" + $sid) -or $_ -eq $sid -or $_ -eq $Account })
+            if (-not $held) {
+                # A lookup that fails with anything other than IdentityNotMappedException, a trust
+                # failure for example, is not "not this account". It is not counted as held either,
+                # since a missed grant fails the service with error 1069: the SID is added, and the
+                # warning says the row may then name the account twice. An unreachable domain is
+                # not shown to land here: LSA may report its names as not mapped. The loop stops at
+                # the first match, so later names cost no lookup.
+                $unread = @()
+                foreach ($name in @($holders | Where-Object { -not $_.StartsWith('*') })) {
+                    try {
+                        $nameSid = ([Security.Principal.NTAccount]$name).Translate(
+                            [Security.Principal.SecurityIdentifier]).Value
+                    } catch [System.Security.Principal.IdentityNotMappedException] {
+                        $nameSid = $null
+                    } catch {
+                        $unread += "'$name' ($($_.Exception.Message))"
+                        continue
+                    }
+                    if ($nameSid -eq $sid) { $held = @($name); break }
+                }
+                if (-not $held -and $unread) {
+                    Write-Warning ("Could not look up the 'Log on as a service' holder(s) " +
+                        "$($unread -join ', '), so whether one of them is '$Account' is unknown. " +
+                        "The account's SID will be added anyway; if one of them is '$Account', the " +
+                        "row would then name it twice.")
+                }
+            }
+            if ($held) {
                 Write-Host "  Right  : '$Account' already holds SeServiceLogonRight (Log on as a service)."
                 return
             }

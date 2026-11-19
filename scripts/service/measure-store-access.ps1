@@ -89,7 +89,7 @@
 param(
     [Parameter(Mandatory)][ValidateSet("ProvisionFirst", "StartFirst", "StartFirstEndToEnd")][string]$Order,
     [Parameter(Mandatory)][string]$DataDir,
-    [string]$ServiceName = "MessageFoundry",
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9 ._-]*\z', Options = 'None')][string]$ServiceName = "MessageFoundry",
     [string]$AppExe,
     [int]$Port = 8765,
     [int]$MllpPort = 2699,

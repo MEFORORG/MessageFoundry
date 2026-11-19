@@ -291,6 +291,9 @@ function Get-UninstallResidueNotice {
         # What -RemoveLogonRight / -RemoveAccountAces already took back, so the notice reports the
         # host as it now IS rather than listing a residue this run just cleared.
         [switch]$LogonRightRemoved,
+        # -RemoveLogonRight ran but could not look up a holder name, so whether the account still
+        # holds the right is unknown: neither REMOVED nor "still holds" is true of it.
+        [switch]$LogonRightUnproven,
         [switch]$DataAceRemoved,
         [switch]$ConfigAceRemoved,
         [switch]$SecretsAceRemoved,
@@ -381,6 +384,11 @@ function Get-UninstallResidueNotice {
 
         if ($LogonRightRemoved) {
             $lines += "  Logon right      REMOVED - '$ServiceAccount' no longer holds 'Log on as a service'."
+        } elseif ($LogonRightUnproven) {
+            $lines += "  Logon right      UNPROVEN - a holder name of 'Log on as a service' could not be"
+            $lines += "                   looked up, so '$ServiceAccount' may still hold the right."
+            $lines += "                   Check it in secpol.msc under Local Policies, User Rights"
+            $lines += "                   Assignment."
         } else {
             # NOT "re-run this script". The registration is gone by the time these lines print, and a
             # second run exits at the "is not installed - nothing to do" guard, so the switch has to
@@ -553,13 +561,16 @@ function Remove-ServiceLogonRight {
       Take SeServiceLogonRight back off $Sid, mirroring install-service.ps1's Set-ServiceLogonRight
       in reverse: export USER_RIGHTS, drop the SID from the row, re-import.
 
-      IT TAKES A SID, NOT A NAME, and the caller resolves it BEFORE the registration is removed. A
+      IT TAKES THE ACCOUNT'S SID, which the caller resolves BEFORE the registration is removed. A
       per-service virtual account is named by the service; with the service gone the name no longer
-      translates, and a resolve attempted here would fail on exactly the default install.
+      translates, so resolving $Account here would fail on exactly the default install. $Account is
+      only compared as text with holder names; other holder names are resolved, as below.
 
       EXACT TOKEN MATCHING, for the reason the installer's grant states: a SID that is a string
       prefix of another (RID 110 against 1100) would make a substring test drop the wrong account's
-      right.
+      right. A holder written as a NAME (BACKLOG #5401) is dropped when it is $Account itself, or
+      when it resolves to $Sid; every other holder name is looked up, and one that does not
+      resolve is kept.
 
       IT REFUSES TO EMPTY THE ROW. If this SID is the only holder, writing back an empty
       SeServiceLogonRight takes the right away from every account the row covers, which on a real
@@ -571,7 +582,8 @@ function Remove-ServiceLogonRight {
       could rewrite the policy between the export and the import and so change a machine-wide user
       right. New-SeceditWorkDirectory says where the folder goes and why.
 
-      Returns $true only when secedit reported the re-import succeeded.
+      Returns $true only when secedit reported the re-import succeeded and every holder name in
+      the row could be looked up.
     #>
     param(
         [Parameter(Mandatory)][string]$Account,
@@ -606,8 +618,40 @@ function Remove-ServiceLogonRight {
         }
         $value = ($row -replace '^\s*SeServiceLogonRight\s*=', '')
         $held = @($value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-        $kept = @($held | Where-Object { $_ -ne ("*" + $Sid) -and $_ -ne $Sid })
+        # A holder can be written as an account NAME rather than the '*SID' form, and the installer
+        # counts such a name as held (BACKLOG #5401), so a name is this account when it is the
+        # account's own name or resolves to its SID. A '*SID' token and a name that does not
+        # resolve to this SID are kept. A name whose lookup fails with anything other than
+        # IdentityNotMappedException, a trust failure for example, is kept too, and recorded: it
+        # may be this account, so neither "does not hold" nor a removal can be reported while one
+        # is left. $script:LogonRightUnproven tells the residue notice so. An unreachable domain
+        # is not shown to land here: LSA may report its names as not mapped.
+        $unread = @()
+        $kept = @(foreach ($holder in $held) {
+            if ($holder -eq ("*" + $Sid) -or $holder -eq $Sid) { continue }
+            if ($holder.StartsWith('*')) { $holder; continue }
+            if ($holder -eq $Account) { continue }
+            try {
+                $nameSid = ([Security.Principal.NTAccount]$holder).Translate(
+                    [Security.Principal.SecurityIdentifier]).Value
+            } catch [System.Security.Principal.IdentityNotMappedException] {
+                $nameSid = $null
+            } catch {
+                $unread += "'$holder' ($($_.Exception.Message))"
+                $holder
+                continue
+            }
+            if ($nameSid -ne $Sid) { $holder }
+        })
+        $unreadNote = ("Could not look up the 'Log on as a service' holder(s) " +
+            "$($unread -join ', '), so whether one of them is '$Account' is unknown; it was kept.")
         if ($kept.Count -eq $held.Count) {
+            if ($unread) {
+                $script:LogonRightUnproven = $true
+                Write-Warning ("$unreadNote Nothing was removed, and '$Account' may still hold the " +
+                    "right. Check it in secpol.msc under Local Policies, User Rights Assignment.")
+                return $false
+            }
             Write-Host "  Right  : '$Account' does not hold SeServiceLogonRight; nothing to remove."
             return $false
         }
@@ -636,6 +680,14 @@ function Remove-ServiceLogonRight {
                 "Local Policies, User Rights Assignment.")
             return $false
         }
+        if ($unread) {
+            # Something was removed, but a holder left in the row may still be this account, so
+            # the residue notice must not say it no longer holds the right.
+            $script:LogonRightUnproven = $true
+            Write-Warning ("$unreadNote The entries that are '$Account' were removed, but it may " +
+                "still hold the right. Check it in secpol.msc under Local Policies, User Rights Assignment.")
+            return $false
+        }
         Write-Host "  Right  : removed SeServiceLogonRight from '$Account'." -ForegroundColor Green
         return $true
     } finally {
@@ -658,7 +710,9 @@ function Remove-AccountAce {
         [Parameter(Mandatory)][string]$Principal,
         [Parameter(Mandatory)][string]$What
     )
-    if (-not (Test-Path $Path)) {
+    # -LiteralPath: a character PowerShell would read as wildcard syntax, at least '[', ']' and the
+    # backtick escape, is part of the -DataDir name, not a pattern (BACKLOG #5402).
+    if (-not (Test-Path -LiteralPath $Path)) {
         Write-Host "  ACEs   : $What '$Path' is gone; nothing to remove."
         return $false
     }
@@ -780,7 +834,7 @@ $acePrincipal = $accountSpec.Principal
 $configProtected = $false
 if ($configDir) {
     try {
-        $configProtected = [bool](Get-Acl -Path $configDir -ErrorAction Stop).AreAccessRulesProtected
+        $configProtected = [bool](Get-Acl -LiteralPath $configDir -ErrorAction Stop).AreAccessRulesProtected
     } catch {
         $unreadable += ("the permissions of the config directory '$configDir' " +
             "($($_.Exception.Message))")
@@ -876,6 +930,7 @@ for ($i = 0; $registrationPending -and $i -lt 10; $i++) {
 # them - so a "restore" would be inventing a state, not returning to one. The notice names those and
 # gives the command, which leaves the choice with the operator who knows the host.
 $logonRightRemoved = $false
+$script:LogonRightUnproven = $false
 $dataAceRemoved = $false
 $configAceRemoved = $false
 $secretsAceRemoved = $false
@@ -929,6 +984,7 @@ Get-UninstallResidueNotice `
     -WerImages $werImages `
     -WerLocalDumps $werLocalDumps `
     -LogonRightRemoved:$logonRightRemoved `
+    -LogonRightUnproven:$script:LogonRightUnproven `
     -DataAceRemoved:$dataAceRemoved `
     -ConfigAceRemoved:$configAceRemoved `
     -SecretsAceRemoved:$secretsAceRemoved `

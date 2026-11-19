@@ -11,19 +11,31 @@
 
 # The API revocation attestation every serving engine below needs, as a required compose
 # substitution with no default. The default `engine` service's comment says why; this key only
-# holds the value once so the three engines alias one copy.
-x-revocation-attested: &revocation-attested "${MEFOR_TLS_REVOCATION_ATTESTED:?required. serve refuses in-process TLS off loopback until you attest that your PKI enforces revocation for the certificates the engine serves and accepts (docs/SECURITY.md, API revocation gate). Set it to 1 only if that holds, in the shell environment or a .env beside compose.yaml -- an env_file: does NOT feed it}"
+# holds the value once so every service that reads it, at least the three engines and the
+# revocation-attestation-check service, aliases one copy.
+# The required substitutions in this file, at least this one and the Postgres password, read the
+# same sources, and their messages name them in the same words. Supply them from one place:
+# --env-file replaces the .env beside compose.yaml, so a value kept in that .env goes unread once
+# you pass it.
+x-revocation-attested: &revocation-attested "${MEFOR_TLS_REVOCATION_ATTESTED:?required. serve refuses in-process TLS off loopback until you attest that your PKI enforces revocation for the certificates the engine serves and accepts (docs/SECURITY.md, API revocation gate). Set it to 1 only if that holds. Compose SUBSTITUTION reads at least the shell environment and the project .env, the .env beside compose.yaml unless --project-directory moves it; passing --env-file reads the named file INSTEAD of that .env -- an env_file: does NOT feed it}"
+
+# The engine image, named once: the revocation-attestation-check service must run the same image
+# as the engines so it reads the value with the same parser. Change it here, for example to
+# messagefoundry:sqlserver or a config-baked derived image.
+x-engine-image: &engine-image messagefoundry:latest
 
 # Shared config for the `ha`-profile clustered-engine PAIR (engine-ha + engine-standby), top-level
 # extension keys (`x-*`) so the two stay byte-identical (ADR 0017). These are NOT services — Compose
 # ignores `x-` keys. They are merged into the two services below via the `<<:` merge key.
 x-ha-engine: &ha-engine
   profiles: ["ha"]
-  image: messagefoundry:latest
+  image: *engine-image
   depends_on:
     postgres:
       condition: service_healthy
     schema-provision:
+      condition: service_completed_successfully
+    revocation-attestation-check:
       condition: service_completed_successfully
   command: ["serve", "--config", "/config", "--env", "prod"]
   env_file:
@@ -78,9 +90,10 @@ x-ha-engine-env: &ha-engine-env
 services:
   engine:
     # Build locally:  docker build -f docker/Dockerfile -t messagefoundry:latest ..
+    # The image is set once, in x-engine-image at the top, so the attestation check runs it too.
     # (Use messagefoundry:sqlserver — built with `--target runtime-sqlserver` — for the SQL Server
     # store or the DATABASE/db_lookup connectors.)
-    image: messagefoundry:latest
+    image: *engine-image
 
     # serve loads the config modules from /config and runs the 'prod' environment (production posture:
     # PHI-at-rest fail-closed, deny-by-default egress, MFA on for every account). env() value files resolve
@@ -99,9 +112,10 @@ services:
       # otherwise; a container cannot bind loopback and still be reached on a published port. So
       # this variable is REQUIRED, with NO DEFAULT: unset or empty, every `docker compose` command
       # (up, down, logs, config) refuses at load, rather than the engine exiting 2 and restarting
-      # forever. A value the engine reads as false, such as 0, passes this check and still loops,
-      # so set 1 only if you attest. Without an attestation, run a command that starts no engine
-      # (down, logs) as MEFOR_TLS_REVOCATION_ATTESTED=0 docker compose down, never with 1 exported.
+      # forever. A false value, such as 0, is caught by the revocation-attestation-check service
+      # below instead. Set 1 only if you attest. Without an attestation, run a command that starts
+      # no engine as MEFOR_TLS_REVOCATION_ATTESTED=0 docker compose down, never with 1 exported;
+      # that service's comment says which commands it does not stop.
       # The attestation is yours, so this file never writes it. Outbound hops read the same
       # variable with a different effect (docs/DEPLOYMENT.md, "Revocation-guard behavior"). Like
       # the Postgres password below, this is COMPOSE SUBSTITUTION.
@@ -122,7 +136,10 @@ services:
 
     # Secrets via env_file (gitignored). Each line: MEFOR_STORE_ENCRYPTION_KEY=..., MEFOR_API_TLS_KEY_PASSWORD=...
     # Plain env is visible in `docker inspect` + image-less but on the host — for stricter handling use a
-    # secrets manager or the k8s manifests (secretKeyRef). Mint the store key with `messagefoundry gen-key`.
+    # secrets manager or the k8s manifests (secretKeyRef). Mint the store key with `messagefoundry gen-key`;
+    # through compose, before you attest, run it as
+    #     MEFOR_TLS_REVOCATION_ATTESTED=0 docker compose run --rm --no-deps engine gen-key
+    # since without --no-deps the revocation-attestation-check service runs first and refuses 0.
     env_file:
       - path: ./secrets.env       # copy docker/secrets.env.example -> docker/secrets.env and fill it in
         required: false
@@ -182,10 +199,53 @@ services:
     # this for many-listener graphs (the per-listener drains are additive, not bounded).
     stop_grace_period: 30s
 
+    depends_on:
+      revocation-attestation-check:
+        condition: service_completed_successfully
+
     restart: unless-stopped
     # The image HEALTHCHECK is a SINGLE https arm, `https://127.0.0.1:${MEFOR_API_PORT}/health` with -k
     # (BACKLOG #1179). MEFOR_API_PORT is 8443 here, so it probes 8443. There is no cleartext fallback:
     # a container whose TLS is broken now reports unhealthy instead of downgrading to http.
+
+  # One-shot check that the attestation reads as TRUE. An `up` without `--no-deps`, with or without
+  # the ha profile, runs it before it starts any serving engine; at least the commands listed below
+  # skip it. The required substitution above refuses only an unset or empty value, and a value the
+  # engine reads as false, such as 0, would otherwise start an engine that exits 2 at the
+  # revocation gate and restarts forever. This reads the value with serve's own parser
+  # (tls_revocation_attested), in the same image, exits 1 naming the gate when it does not read as
+  # true, and an `up` without `--no-deps` stops there. It does not read the bind, so it refuses a
+  # false value even where serve's gate would not apply. It has no profile, so the `ha` engines
+  # wait on it too. down and logs never run it, which keeps the =0 path above working.
+  # `docker compose run` of an engine service, for an admin command such as gen-key, does run it.
+  # At least two commands skip it: `docker compose run --no-deps` and
+  # `docker compose up --no-deps <engine>`. The second starts that engine with no check, so a false
+  # value there would exit 2 and restart forever; never use it to start a serving engine. It writes
+  # nothing and needs no network.
+  revocation-attestation-check:
+    image: *engine-image
+    entrypoint:
+      - "tini"
+      - "--"
+      - "/opt/venv/bin/python"
+      - "-I"
+      - "-X"
+      - "disable-remote-debug"
+      - "-B"
+      - "-c"
+      - "import sys; from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV as V, tls_revocation_attested as ok; sys.exit(0 if ok() else 'error: refusing to start the engines: ' + V + ' does not read as true, so serve would refuse in-process TLS off loopback and restart forever (docs/SECURITY.md, API revocation gate). Set it to 1 only if your PKI enforces revocation for the certificates the engines serve and accept.')"
+    environment:
+      MEFOR_TLS_REVOCATION_ATTESTED: *revocation-attested
+    network_mode: none
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # The image HEALTHCHECK probes the engine API, which this one-shot never serves.
+    healthcheck:
+      disable: true
+    restart: "no"
 
   # --- Multi-node-ready local HA backend (OPT-IN; profile "ha") ------------------------------------
   # A local Postgres + a PAIR of clustered engines so you can exercise the ACTIVE-PASSIVE HA shape
@@ -213,7 +273,7 @@ services:
       # yaml, gitleaks' generic rule is entropy-gated. NOTE this is COMPOSE SUBSTITUTION, which is a
       # different mechanism from the `env_file:` the other services use: env_file sets variables
       # INSIDE the container and does not feed substitution at all.
-      POSTGRES_PASSWORD: "${MEFOR_STORE_PASSWORD:?required. Compose SUBSTITUTION reads the shell environment or a .env beside compose.yaml -- an env_file: does NOT feed it. Export it, or pass --env-file docker/secrets.env}"
+      POSTGRES_PASSWORD: "${MEFOR_STORE_PASSWORD:?required. Compose SUBSTITUTION reads at least the shell environment and the project .env, the .env beside compose.yaml unless --project-directory moves it; passing --env-file reads the named file INSTEAD of that .env -- an env_file: does NOT feed it}"
     volumes:
       - mefor-pg:/var/lib/postgresql/data
     healthcheck:

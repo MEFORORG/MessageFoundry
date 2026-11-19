@@ -366,13 +366,24 @@ TLS-terminating collector).
    and push it to your private registry.
 3. **Create the Secret** ([`docker/k8s/secret.example.yaml`](../docker/k8s/secret.example.yaml)) with
    `store-encryption-key`, `store-password`, and the API TLS cert/key (and optional `api-tls-key-password`).
-4. **Apply** [`docker/k8s/ha-postgres.yaml`](../docker/k8s/ha-postgres.yaml) with all three `image:` fields
+4. **Create the revocation attestation ConfigMap, or the pods never start.** Both manifests,
+   `ha-postgres.yaml` and `statefulset.yaml`, read `MEFOR_TLS_REVOCATION_ATTESTED` from the ConfigMap
+   `mefor-revocation-attestation`, key `attested`, with no default and not optional. Until it exists
+   the kubelet refuses each engine container with `CreateContainerConfigError`, naming the ConfigMap.
+   No manifest here writes it, because the attestation is yours
+   ([SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate)). Create it only if your PKI
+   enforces revocation for the certificates the engine serves and accepts:
+   `kubectl create configmap mefor-revocation-attestation --from-literal=attested=1`.
+   The value must read as true to the engine (`1`, `true`, `yes` or `on`, in any case). A value that
+   does not, such as `0`, passes the kubelet and the engine then exits 2 at the revocation gate, so
+   the pod crash-loops. Neither Kubernetes manifest checks the value before the engine starts.
+5. **Apply** [`docker/k8s/ha-postgres.yaml`](../docker/k8s/ha-postgres.yaml) with all three `image:` fields
    (`tls-dir`, `copy-tls` and `engine`) set to your baked image and `MEFOR_STORE_SERVER` set to the managed-PG endpoint.
-5. **Stand up the L4 NLB** (one listener per MLLP port, primary-only TCP-connect health check at a ~10s
+6. **Stand up the L4 NLB** (one listener per MLLP port, primary-only TCP-connect health check at a ~10s
    interval, deregistration delay ~60s) per [§3](#3-mllp-exposure--an-operator-built-l4-load-balancer-that-follows-failover).
-6. **Verify HA:** `GET /cluster/nodes` shows 3 nodes + one `leader_node_id`; delete the leader pod and
+7. **Verify HA:** `GET /cluster/nodes` shows 3 nodes + one `leader_node_id`; delete the leader pod and
    confirm a standby is promoted (`/cluster/status` `role` flips to `primary`) and the NLB VIP follows.
-7. **Read [`CLOUD-PHI-HIPAA.md`](CLOUD-PHI-HIPAA.md)** and complete the BAA / KMS / PrivateLink posture
+8. **Read [`CLOUD-PHI-HIPAA.md`](CLOUD-PHI-HIPAA.md)** and complete the BAA / KMS / PrivateLink posture
    before any PHI flows.
 
 ---
