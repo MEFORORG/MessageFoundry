@@ -124,7 +124,8 @@ that row's own write can leave the outcome recorded twice). A MEFOR copy dropped
 deadline, or a Corepoint-copy message cut off after its ACK, appears only in the log, by count.
 Keep twice the grace inside your service manager's stop timeout. A relay object is single-use: a
 second `start()` is refused, and a `stop()` requested before or during `start()` stays in force,
-so that `start()` tears down what it opened and serves nothing, and `serve_forever()` returns.
+so `serve_forever()` returns: a `start()` after the `stop()` opens nothing, and one the `stop()`
+interrupts tears down what it opened and serves nothing.
 
 ## The SQLite log
 

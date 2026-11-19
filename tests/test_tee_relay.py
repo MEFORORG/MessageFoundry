@@ -775,11 +775,12 @@ async def test_stop_before_start_does_not_disarm_a_later_stop(tmp_path: Path) ->
     await relay.stop()  # nothing started yet
     try:
         await relay.start()
-        worker = relay._mefor_worker  # noqa: SLF001
-        assert worker is not None
+        # The early stop stays in force, so start() opened nothing a later stop() could miss.
+        assert relay.store is None
+        assert relay._mefor_worker is None  # noqa: SLF001
+        assert relay._epic_server is None  # noqa: SLF001
         async with asyncio.timeout(5.0):
             await relay.stop()
-        assert worker.done()  # nothing start() opened is left running
     finally:
         await relay.stop()
 
@@ -800,10 +801,8 @@ async def test_stop_before_serve_forever_runs_still_stops_it(tmp_path: Path) -> 
         await relay.stop()
         async with asyncio.timeout(5.0):
             await serving
-        epic_server = relay._epic_server  # noqa: SLF001
-        assert epic_server is not None and not epic_server.is_serving()
-        worker = relay._mefor_worker  # noqa: SLF001
-        assert worker is not None and worker.done()
+        # The stop came first, so serve_forever()'s start() bound nothing.
+        assert relay._epic_server is None  # noqa: SLF001
     finally:
         serving.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -812,8 +811,8 @@ async def test_stop_before_serve_forever_runs_still_stops_it(tmp_path: Path) -> 
 
 
 async def test_start_after_an_early_stop_serves_nothing(tmp_path: Path) -> None:
-    # A relay is single-use: a stop() before start() stays requested, so the later start() tears
-    # down what it opens instead of serving.
+    # A relay is single-use: a stop() before start() stays requested, so the later start() opens
+    # nothing, and a further start() is refused like any second start().
     relay = TeeRelay(
         RelayConfig(
             listen_epic=("127.0.0.1", 0),
@@ -826,8 +825,7 @@ async def test_start_after_an_early_stop_serves_nothing(tmp_path: Path) -> None:
     try:
         async with asyncio.timeout(5.0):
             await relay.start()
-        epic_server = relay._epic_server  # noqa: SLF001
-        assert epic_server is not None and not epic_server.is_serving()
+        assert relay._epic_server is None  # noqa: SLF001
         with pytest.raises(RuntimeError, match="already started"):
             await relay.start()
     finally:

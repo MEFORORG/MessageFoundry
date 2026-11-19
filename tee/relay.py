@@ -229,8 +229,9 @@ class TeeRelay:
     # -- lifecycle -----------------------------------------------------------
     async def start(self) -> None:
         """Open the store and bind the listeners. A relay is single-use: a second start() is
-        refused, and a stop() requested before or during this start() stays in force, so this
-        start() finishes binding, tears everything down again and returns without serving."""
+        refused, and a stop() requested before or during this start() stays in force. One
+        requested before it opens nothing and returns; one requested during it lets it finish
+        binding, then tears everything down again, and it returns without serving."""
         # A start() that is running, or that ran at all, refuses: one that failed after opening the
         # store leaves it to stop(), whose teardown is memoized, so a second start() would open a
         # store and listeners that no later stop() closes.
@@ -238,6 +239,11 @@ class TeeRelay:
             raise RuntimeError("relay already started")
         cfg = self.config
         self._start_done = asyncio.Event()
+        if self._shutdown.is_set():
+            # Stopped before it started: open nothing, so no port is bound even briefly.
+            self._start_done.set()
+            logger.info("tee relay stop requested before start(); not starting")
+            return
         logger.warning(
             "tee relay is a TEST-DATA-ONLY validation tool — do not carry production PHI through it"
         )
@@ -253,8 +259,8 @@ class TeeRelay:
         finally:
             self._start_done.set()
         if self._shutdown.is_set():
-            # A stop() came before or during this start(): it stays in force, so tear down what
-            # was just opened rather than serve. A stop() still waiting shares this teardown.
+            # A stop() came during this start(): it stays in force, so tear down what was just
+            # opened rather than serve. A stop() still waiting shares this teardown.
             logger.info("tee relay stop requested before start() finished; tearing down")
             await self.stop()
             return
@@ -284,8 +290,8 @@ class TeeRelay:
         ``finally`` among them) waits for the same teardown rather than starting a second one.
         A stop() racing a start() waits for start() to finish binding, so the teardown covers every
         listener it opens. A stop() before start() has nothing to tear down, so it returns at once,
-        but the stop stays requested: a later start() (or ``serve_forever()``) tears down what it
-        opens and serves nothing, and a later stop() still waits for that teardown."""
+        but the stop stays requested: a later start() (or ``serve_forever()``) opens nothing and
+        serves nothing."""
         self._shutdown.set()
         if self._start_done is not None:
             await self._start_done.wait()
