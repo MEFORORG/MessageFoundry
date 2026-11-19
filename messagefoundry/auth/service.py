@@ -3070,6 +3070,19 @@ class _CodeMatch:
     matched: bool = False
 
 
+@dataclass(frozen=True)
+class _OpenedTotp:
+    """One open of an account's TOTP cell (BACKLOG #5781), from
+    :meth:`AuthService._opened_totp_enrolment`: the checked record whose cell was opened, its
+    :data:`_TotpEnrolment` reading, and the opened secret. :meth:`AuthService._verify_second_factor` checks a code against ``secret`` only for the
+    record named ``holder``, so the secret it checks is still the one that record's seal covered
+    (BACKLOG #3510). The secret is kept out of the repr."""
+
+    holder: VerifiedUser
+    enrolment: _TotpEnrolment
+    secret: str | None = field(repr=False)
+
+
 def _log_totp_undecryptable(username: str) -> None:
     """Log an account whose TOTP cell does not open under this store key, naming the account and
     never the value."""
@@ -13587,9 +13600,7 @@ class AuthService:
             _log_totp_refused(user.username)
         return secret
 
-    async def _opened_totp_enrolment(
-        self, user: VerifiedUser
-    ) -> tuple[_TotpEnrolment, str | None] | None:
+    async def _opened_totp_enrolment(self, user: VerifiedUser) -> _OpenedTotp | None:
         """From ONE open of ``user``'s TOTP cell, the one its seal covered: the enrolment reading
         (the enrolment stamp and a digest of the opened secret) and the opened secret itself. ``None``
         when the cell does not open, logged by :func:`_log_totp_undecryptable`. :meth:`verify_mfa`
@@ -13600,7 +13611,8 @@ class AuthService:
         except CipherError:
             _log_totp_undecryptable(user.username)
             return None
-        return (user.totp_enrolled_at, None if secret is None else hash_token(secret)), secret
+        enrolment = (user.totp_enrolled_at, None if secret is None else hash_token(secret))
+        return _OpenedTotp(user, enrolment, secret)
 
     async def _totp_enrolment(self, user: VerifiedUser) -> _TotpEnrolment | None:
         """The enrolment reading of :meth:`_opened_totp_enrolment` alone (BACKLOG #3068): the
@@ -13608,7 +13620,7 @@ class AuthService:
         the cell does not open, logged by :func:`_log_totp_undecryptable`. :meth:`verify_mfa`'s
         after-check comparison reads a moved row's enrolment through it."""
         opened = await self._opened_totp_enrolment(user)
-        return None if opened is None else opened[0]
+        return None if opened is None else opened.enrolment
 
     async def _totp_enrolment_moved(
         self, verified: _TotpEnrolment, current: VerifiedUser, *, checked: VerifiedUser
@@ -17431,11 +17443,11 @@ class AuthService:
                     client=client,
                 )
                 return Elevation()
-            verified_enrolment, secret = opened
+            verified_enrolment = opened.enrolment
             match = _CodeMatch()
             try:
                 proved = await self._verify_second_factor(
-                    user, code, totp_secret=secret, client=client, arrived=arrived, match=match
+                    user, code, opened=opened, client=client, arrived=arrived, match=match
                 )
             except CipherError:
                 # The check opens no cell: it is handed the secret opened above. A CipherError from
@@ -17448,7 +17460,7 @@ class AuthService:
                     client=client,
                 )
                 return Elevation()
-            del secret, opened  # the plaintext is not held past the check it was opened for
+            del opened  # the plaintext is not held past the check it was opened for
             if proved:
                 # BACKLOG #3068: the verify awaited (a recovery-code walk is argon2 work off the
                 # loop), and a revocation or a disable needs no queue to land. So the session, the
@@ -18103,7 +18115,7 @@ class AuthService:
         user: VerifiedUser,
         code: str,
         *,
-        totp_secret: str | None,
+        opened: _OpenedTotp,
         client: str | None = None,
         arrived: float | None = None,
         match: _CodeMatch | None = None,
@@ -18113,19 +18125,22 @@ class AuthService:
         replay still pays the recovery-code walk (ADR 0170). Recovery codes are argon2id-hashed and
         single-use. Codes never collide (TOTP is 6 digits; recovery codes are dashed alphanumerics).
 
-        ``totp_secret`` is ``user``'s TOTP secret, opened from the cell its seal covered
-        (:meth:`_opened_totp_enrolment`) by the caller, so this check opens no cell of its own
-        (BACKLOG #5781).
+        ``opened`` is the caller's one open of ``user``'s TOTP cell, the one its seal covered
+        (:meth:`_opened_totp_enrolment`), so this check opens no cell of its own (BACKLOG #5781).
+        An ``opened`` whose holder is not ``user`` raises ``ValueError``: its secret is not one
+        ``user``'s seal covered (BACKLOG #3510).
 
         ``client`` is the caller's address, carried onto the recovery-code audit row and notice
         (BACKLOG #1139) so the holder can tell their own use from someone else's. ``match``, when
         given, is marked when the code matched a factor, so :meth:`verify_mfa` can tell a code that
         only failed its spend from a wrong one (BACKLOG #3780 item 1)."""
+        if opened.holder is not user:
+            raise ValueError("the opened TOTP cell is not this account's checked record")
         code = code.strip()
         if not code:
             return False
         totp_refused = False
-        secret = totp_secret
+        secret = opened.secret
         if secret:
             # Clock-skew window is operator-configurable (BACKLOG #187; ASVS 6.5.5). Default
             # totp_skew_steps=0 accepts only the current 30 s step (strict, tightest replay window);

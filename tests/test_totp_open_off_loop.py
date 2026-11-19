@@ -26,7 +26,7 @@ from messagefoundry.auth import totp
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, VerifiedUser
 from tests._admin_account import ADMIN_USERNAME, login_admin
 from tests._totp_clock import pin_totp_clock
 
@@ -329,6 +329,58 @@ async def test_a_verify_checks_its_code_against_the_one_open_of_the_cell(
         monkeypatch.setattr(store, "open_totp_secret", only_the_first_opens)
         assert (await service.verify_mfa(pending.token, steps.next_code())).ok
         assert opens[0] == 1, f"the verify opened the cell {opens[0]} times"
+    finally:
+        await store.close()
+
+
+async def test_a_cell_re_encrypted_during_the_check_is_opened_and_refuses_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5781: the after-check comparison opens nothing for an unmoved row, and DOES open a
+    row whose cell moved. A store-key rotation landing during the check rewrites the cell to other
+    bytes that open to the same secret under the same stamp, so the comparison opens it, finds the
+    enrolment the code proved, and the verify succeeds. The rotation is stood in for on the first
+    holder re-read, with an opener that reads the rewritten cell. RED when a moved cell that opens
+    is refused without comparing its secret, or when it is never opened."""
+    from dataclasses import replace
+
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _identity, password, steps, _codes = await _totp_admin(
+            store, monkeypatch, before_confirm=lambda: None
+        )
+        rotated = "rotated:"
+        real_open = store.open_totp_secret
+        opened_rotated: list[str] = []
+
+        def open_rotated(user_id: str, cell: str | None) -> str | None:
+            if cell is not None and cell.startswith(rotated):
+                opened_rotated.append(user_id)
+                cell = cell.removeprefix(rotated)
+            return real_open(user_id, cell)
+
+        real_current = service._factor_holder_current
+        rewrites: list[bool] = []
+
+        async def rotation_lands_meanwhile(*args: Any, **kwargs: Any) -> Any:
+            held = await real_current(*args, **kwargs)
+            if (
+                rewrites
+                or not isinstance(held, VerifiedUser)
+                or held.row is None
+                or held.row.totp_secret is None
+            ):
+                return held
+            rewrites.append(True)
+            return replace(held, row=replace(held.row, totp_secret=rotated + held.row.totp_secret))
+
+        monkeypatch.setattr(store, "open_totp_secret", open_rotated)
+        monkeypatch.setattr(service, "_factor_holder_current", rotation_lands_meanwhile)
+        pending = await service.login(ADMIN_USERNAME, password)
+        assert pending.ok and pending.token is not None
+        assert (await service.verify_mfa(pending.token, steps.next_code())).ok
+        assert rewrites, "no holder re-read ran, so no rotation landed"
+        assert opened_rotated, "the moved cell was never opened"
     finally:
         await store.close()
 

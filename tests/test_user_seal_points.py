@@ -25,11 +25,11 @@ from messagefoundry.__main__ import main
 from messagefoundry.auth import totp
 from messagefoundry.auth.identity import Identity
 from messagefoundry.auth.passwords import hash_password
-from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthService
+from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthService, _OpenedTotp
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.crypto import cell_aad, generate_key, make_cipher
 from messagefoundry.store.row_seal import USER_KIND, RowSealError
-from messagefoundry.store.store import MessageStore
+from messagefoundry.store.store import MessageStore, VerifiedUser
 from tests._admin_account import ADMIN_USERNAME, login_admin
 from tests.test_user_seal import _raw_for
 
@@ -72,6 +72,13 @@ def _swap_the_stored_secret(monkeypatch: pytest.MonkeyPatch, store: MessageStore
     monkeypatch.setattr(store, "get_totp_secret", swapped)
 
 
+async def _opened(service: AuthService, user: VerifiedUser) -> _OpenedTotp:
+    """``user``'s TOTP cell, opened once as ``verify_mfa`` opens it for its check (BACKLOG #5781)."""
+    opened = await service._opened_totp_enrolment(user)
+    assert opened is not None
+    return opened
+
+
 async def _enrolled(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> tuple[AuthService, Identity, str, str, _Clock]:
@@ -100,10 +107,10 @@ async def test_the_second_step_checks_the_secret_the_seal_covered(
     _swap_the_stored_secret(monkeypatch, store)
     assert await store.get_totp_secret(identity.user_id) == _ATTACKER  # the swap is live
     assert not await service._verify_second_factor(
-        user, clock.code(_ATTACKER), totp_secret=await service._totp_secret(user)
+        user, clock.code(_ATTACKER), opened=await _opened(service, user)
     )
     assert await service._verify_second_factor(
-        user, clock.code(secret), totp_secret=await service._totp_secret(user)
+        user, clock.code(secret), opened=await _opened(service, user)
     )  # control
 
 
@@ -121,7 +128,7 @@ async def test_a_secret_written_into_the_cell_after_the_load_is_not_used(
     await _raw_for(path)("UPDATE users SET totp_secret=? WHERE id=?", (cell, identity.user_id))
     assert await store.get_totp_secret(identity.user_id) == _ATTACKER  # the cell is the attacker's
     assert not await service._verify_second_factor(
-        user, clock.code(_ATTACKER), totp_secret=await service._totp_secret(user)
+        user, clock.code(_ATTACKER), opened=await _opened(service, user)
     )
 
 
