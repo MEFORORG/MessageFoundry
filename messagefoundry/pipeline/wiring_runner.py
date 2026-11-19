@@ -144,6 +144,7 @@ from messagefoundry.netaddr import (
     ALLOWLIST_MIN_PREFIX_V4,
     ALLOWLIST_MIN_PREFIX_V6,
     allowlist_restricts,
+    allowlist_rule_text,
 )
 from messagefoundry.parsing import (
     HL7PeekError,
@@ -16165,12 +16166,8 @@ def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | N
         f"inbound connection {name!r} binds non-loopback host {host!r} with no effective peer "
         "control: anyone who can reach the socket can submit a message. Set intake_auth "
         "(api_key/bearer with intake_api_key, or mtls_subject with tls_ca_file + "
-        "intake_client_subjects), or narrow source_ip_allowlist so every entry is at least a "
-        f"/{_INTAKE_ALLOWLIST_MIN_PREFIX_V4} (IPv4) or /{_INTAKE_ALLOWLIST_MIN_PREFIX_V6} (IPv6). "
-        "An IPv6 entry inside a prefix the gate reads as carrying IPv4 addresses (at least "
-        "::ffff:0:0/96, 64:ff9b::/96 and 2001::/32) must also be at least a "
-        f"/{96 + _INTAKE_ALLOWLIST_MIN_PREFIX_V4}, and an IPv6 entry that holds such a prefix, "
-        "such as 64:ff9b::/32, does not count. "
+        "intake_client_subjects), or narrow source_ip_allowlist until it counts: "
+        f"{allowlist_rule_text()}. "
         "Note that tls + tls_ca_file alone does NOT satisfy this: it accepts any certificate that CA "
         "ever signed, which binds no subject. TLS is confidentiality; this gate is authentication."
     )

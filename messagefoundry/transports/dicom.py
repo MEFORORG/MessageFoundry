@@ -94,11 +94,7 @@ from messagefoundry.config.tls_policy import (
     skips_validity_period,
 )
 from messagefoundry.keywrap import load_connection_cert_chain
-from messagefoundry.netaddr import (
-    ALLOWLIST_MIN_PREFIX_V4,
-    ALLOWLIST_MIN_PREFIX_V6,
-    allowlist_restricts,
-)
+from messagefoundry.netaddr import allowlist_restricts, allowlist_rule_text
 from messagefoundry.parsing.binary import BinaryCarriageError
 from messagefoundry.parsing.binary import decode as _carriage_decode
 from messagefoundry.parsing.dicom import _inflate as _dicom_inflate
@@ -1995,14 +1991,9 @@ class DicomScpSource(SourceConnector):
                 else ""
             )
             too_wide = (
-                " You set source_ip_allowlist, but an entry in it is wider than"
-                f" /{ALLOWLIST_MIN_PREFIX_V4} (IPv4) or /{ALLOWLIST_MIN_PREFIX_V6} (IPv6), is an"
-                " IPv6 entry inside a prefix the gate reads as carrying IPv4 addresses (at least"
-                " ::ffff:0:0/96, 64:ff9b::/96 and 2001::/32) that is wider than"
-                f" /{96 + ALLOWLIST_MIN_PREFIX_V4}, is an IPv6 entry that holds such a prefix,"
-                " such as 64:ff9b::/32, or does not parse, so it"
-                " restricts nobody it can be shown to and does not count (vault"
-                " BACKLOG #2622, #5393). Narrow every entry."
+                " You set source_ip_allowlist, but it restricts nobody it can be shown to, so it"
+                f" does not count. It counts only when {allowlist_rule_text()} (vault BACKLOG"
+                " #2622, #5393). Narrow every entry, or list fewer."
                 if self._source_ip_allowlist
                 else ""
             )
