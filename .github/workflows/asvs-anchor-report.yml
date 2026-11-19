@@ -62,8 +62,10 @@ name: ASVS anchor report
 
 on:
   pull_request:
-    # The filter MUST include this file and the tool, or the gate cannot observe changes to itself:
-    # a broken reporter would merge green and be found later by an unrelated engine edit.
+    # The job never runs on a pull request (BACKLOG #5476; see its `if:`), so on one it reports
+    # SKIPPED. The filter still names this file and the tool so that skip is visible on every pull
+    # request that could change what the report does; the first real run of such a change is the
+    # push to main that merges it.
     paths: &anchor_paths
       - 'messagefoundry/**'
       - 'messagefoundry_webconsole/**'
@@ -83,7 +85,10 @@ permissions: {}
 
 concurrency:
   group: asvs-anchor-report-${{ github.ref }}
-  cancel-in-progress: true
+  # Only pull request runs, which skip the job anyway, are superseded. A push run is the only one
+  # that attributes breakage to its range (github.event.before), so a cancelled push run would lose
+  # that range for good.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   report:
@@ -95,10 +100,13 @@ jobs:
     # variable alone would let a pull request's code run with the private scorecard checked out, on
     # a runner whose logs are public, the moment the vault variable and read token were configured.
     # An ALLOWLIST of events rather than `!= 'pull_request'`, so a trigger added later is refused
-    # until someone decides it may reach the record. The `pull_request` trigger above stays: on a
-    # pull request this job reports SKIPPED, which is the visible not-run the block above asks for.
+    # until someone decides it may reach the record. And main only: a dispatch on another branch
+    # would run that branch's copy of this file and of scripts/asvs/, the same exposure. The
+    # `pull_request` trigger above stays: on a pull request this job reports SKIPPED, which is the
+    # visible not-run the block above asks for.
     if: >-
       ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
       && vars.ASVS_VAULT_REPO != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10

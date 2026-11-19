@@ -29,9 +29,6 @@ from pathlib import Path
 
 import pytest
 
-from tests._workflow_contexts import load_workflow
-from tests.test_dependabot_automerge_guardrails import _evaluate_expression
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts" / "asvs"))
 
@@ -502,15 +499,22 @@ def test_it_runs_on_a_bare_interpreter_from_an_unrelated_directory(tmp_path: Pat
 # --------------------------------------------------------------------------------------------
 
 
-def _evaluate_job_if(expression: str, *, event_name: str, vault_repo: str) -> bool:
+def _evaluate_job_if(
+    expression: str, *, event_name: str, vault_repo: str, ref: str = "refs/heads/main"
+) -> bool:
     """Evaluate the report job's ``if:`` for one event, without a runner, through the evaluator
     tests/test_dependabot_automerge_guardrails.py already holds (it refuses any construct it does
     not understand, so an edit reaching for one fails here instead of reading as true)."""
+    # Imported here, not at module scope, so the stdlib instrument tests above never depend on that
+    # module's imports.
+    from tests.test_dependabot_automerge_guardrails import _evaluate_expression
+
     body = expression.strip()
     if body.startswith("${{") and body.endswith("}}"):
         body = body[3:-2]
     return _evaluate_expression(
-        body, {"github.event_name": event_name, "vars.ASVS_VAULT_REPO": vault_repo}
+        body,
+        {"github.event_name": event_name, "github.ref": ref, "vars.ASVS_VAULT_REPO": vault_repo},
     )
 
 
@@ -537,13 +541,31 @@ def test_the_report_job_never_runs_for_a_pull_request(
     A ``pull_request`` run executes the pull request's own workflow and scripts, so a variable-only
     gate would hand that code a checkout of the private scorecard on a runner whose logs are public.
     """
+    from tests._workflow_contexts import load_workflow
+
     job = load_workflow("asvs-anchor-report.yml")["jobs"]["report"]
     assert _evaluate_job_if(str(job["if"]), event_name=event_name, vault_repo=vault_repo) is runs
 
 
+@pytest.mark.parametrize("event_name", ["push", "workflow_dispatch"])
+def test_the_report_job_runs_only_on_main(event_name: str) -> None:
+    """RED when: a dispatch (or push) on another branch can reach the record. That branch's copy of
+    the workflow and of scripts/asvs/ would run with the scorecard checked out, as a pull request's
+    would."""
+    from tests._workflow_contexts import load_workflow
+
+    expression = str(load_workflow("asvs-anchor-report.yml")["jobs"]["report"]["if"])
+    assert not _evaluate_job_if(
+        expression, event_name=event_name, vault_repo="owner/vault", ref="refs/heads/feature"
+    )
+
+
 def test_every_step_reading_the_vault_sits_behind_the_job_gate() -> None:
-    """RED when: a second job reads the vault token. The event allowlist is on the ``report`` job, so
-    a vault read moved into any other job would not be covered by it."""
+    """RED when: a second job names the vault repository or its token. The event allowlist is on the
+    ``report`` job, so a vault read moved into any other job would not be covered by it."""
+    from tests._workflow_contexts import load_workflow
+
     jobs = load_workflow("asvs-anchor-report.yml")["jobs"]
-    readers = [key for key, job in jobs.items() if "ASVS_VAULT_READ_TOKEN" in repr(job)]
-    assert readers == ["report"], f"jobs reading the vault token: {readers}"
+    # Any ASVS_VAULT_* name: the repository variable that names the vault and the read token both.
+    readers = [key for key, job in jobs.items() if "ASVS_VAULT" in repr(job)]
+    assert readers == ["report"], f"jobs naming the vault: {readers}"
