@@ -209,6 +209,8 @@ class MonitorPanel(QWidget):
         self._poll_client: EngineClient | None = None
         self._thread: QThread | None = None
         self._poller: MonitorPoller | None = None
+        # True while a step-up password prompt is up (see _step_up).
+        self._step_up_open = False
 
         # Sub-widgets of the connected view (rebuilt per connect, so they bind the live client).
         self._stats: QLabel | None = None
@@ -403,12 +405,23 @@ class MonitorPanel(QWidget):
         # which has no handler, so this is a second guard: refuse rather than build Qt off-thread.
         if client is None or QThread.currentThread() is not self.thread():
             return False
-        password, ok = QInputDialog.getText(
-            self,
-            "Confirm it's you",
-            "This action needs your password again:",
-            QLineEdit.EchoMode.Password,
-        )
+        if self._step_up_open:
+            # The open prompt's nested event loop delivered a second step-up, such as a refused
+            # message search arriving while a Purge prompt is up. Its reauth would post the action
+            # the first refusal stashed (X-Step-Up-Action), minting that action's grant from a
+            # password typed for this one, and leave the first action's own reauth with none. So
+            # it is declined; re-running it once the open prompt closes prompts then.
+            return False
+        self._step_up_open = True
+        try:
+            password, ok = QInputDialog.getText(
+                self,
+                "Confirm it's you",
+                "This action needs your password again:",
+                QLineEdit.EchoMode.Password,
+            )
+        finally:
+            self._step_up_open = False
         if not ok or not password:
             return False
         # A refused re-proof raises out of the action that asked for it, so the action's own error

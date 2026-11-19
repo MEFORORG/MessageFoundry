@@ -290,6 +290,58 @@ def test_the_step_up_handler_re_proves_and_restarts_the_poller(
         panel.shutdown()
 
 
+def test_a_search_step_up_during_a_purge_prompt_mints_no_purge_grant(
+    qapp: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused message search can reach the GUI thread through the Purge prompt's nested event
+    loop. Its re-proof must not post the purge action the client stashed for that prompt, which
+    would mint a purge grant from a password typed for the search and leave the purge's own reauth
+    with no purpose."""
+    import json
+
+    bodies: list[dict[str, object]] = []
+    purges: list[int] = []
+
+    def _send(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        if request.url.path == "/me/reauth":
+            bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={"token": "rotated"}, request=request)
+        purges.append(1)
+        if len(purges) == 1:
+            headers = {"X-Step-Up-Required": "1", "X-Step-Up-Action": "purge"}
+            return httpx.Response(403, json={"detail": "refused"}, headers=headers, request=request)
+        return httpx.Response(200, json={}, request=request)
+
+    client = EngineClient("http://127.0.0.1:8765")
+    client._http.send = _send  # type: ignore[method-assign]
+    panel = MonitorPanel()
+    panel._client = client
+    client.set_step_up_handler(panel._step_up)
+    monkeypatch.setattr(MonitorPanel, "_stop_poller", lambda self: None)
+    monkeypatch.setattr(MonitorPanel, "_start_poller", lambda self: None)
+    prompts: list[int] = []
+    nested: list[bool] = []
+
+    def prompt(*_a: object, **_k: object) -> tuple[str, bool]:
+        prompts.append(1)
+        if len(prompts) == 1:
+            # The search's step-up, as the messages panel would call it from inside this prompt.
+            nested.append(panel._step_up())
+        return ("typed-pw", True)
+
+    monkeypatch.setattr(QInputDialog, "getText", prompt)
+    try:
+        client._request("POST", "/connections/c/purge")
+        assert nested == [False]
+        assert len(prompts) == 1
+        assert [b.get("purpose") for b in bodies] == ["purge"]
+        assert len(purges) == 2  # the purge's own re-proof carried its grant, and the retry ran
+    finally:
+        panel._client = None
+        panel.shutdown()
+        client.close()
+
+
 def test_the_step_up_handler_refuses_off_the_gui_thread(
     qapp: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
