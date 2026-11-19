@@ -248,6 +248,45 @@ def test_supervise_takes_store_path_and_api_port_from_settings_without_flags(
     assert captured == {"db_base": str(root / db_name), "base_port": port}
 
 
+#: The no-stem refusal's text, matched whole so a reworded message that no longer says what the
+#: check tests fails here.
+_NO_STEM = (
+    r"^--db or \[store\]\.path is empty, ends in a '\.' or '\.\.' part, or names only a drive, "
+    r"root or share \(value withheld\); several engine shards each derive their file name from "
+    r"its last part, so name a file, e.g\. 'messagefoundry\.db'$"
+)
+
+_BS = "\\"
+_ROOTS = ["/", "//"] + (
+    [
+        "C:/",
+        "C:",
+        "C:" + _BS,
+        "//srv/share/",
+        "//srv/share",
+        _BS * 2 + "srv" + _BS + "share" + _BS,
+        _BS * 2 + "srv" + _BS + "share",
+    ]
+    if sys.platform == "win32"
+    else []
+)
+
+
+@pytest.mark.parametrize("db_base", _ROOTS)
+def test_build_shard_specs_refuses_a_drive_root_or_share_with_the_value_withheld(
+    db_base: str,
+) -> None:
+    """A drive, root or share has an empty pathlib name, so ``Path.with_name`` would raise its own
+    ValueError, which quotes the path, and supervise would log it. It is refused first, with the
+    value withheld (BACKLOG #5817)."""
+    with pytest.raises(ValueError, match=_NO_STEM) as refused:
+        build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
+    # The match is anchored, so the message is the fixed text; this also pins that the path's own
+    # text, and pathlib's error quoting it, appear nowhere in what supervise would log.
+    assert db_base not in str(refused.value)
+    assert refused.value.__context__ is None and refused.value.__cause__ is None
+
+
 @pytest.mark.parametrize("db_base", ["", ".", "..", "data/..", "data/.", "C:/srv/repo/."])
 def test_build_shard_specs_refuses_a_base_with_no_stem_for_several_engine_shards(
     db_base: str,
@@ -256,7 +295,7 @@ def test_build_shard_specs_refuses_a_base_with_no_stem_for_several_engine_shards
     #5817) that path is the base, and "" or a last part of "." or ".." has no stem for each engine
     shard's ``<stem>_<shard>`` name, so several engine shards are refused; one keeps the bare
     base, as a plain `serve` does."""
-    with pytest.raises(ValueError, match="names a directory"):
+    with pytest.raises(ValueError, match=_NO_STEM):
         build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
     (single,) = build_shard_specs(["a"], config="c", db_base=db_base, base_port=8765)
     assert single.db_path == db_base
@@ -381,7 +420,7 @@ def test_supervise_keeps_a_directory_shaped_store_path_through_the_root_join(
     # "" and "." join to the root itself; the base still names no stem, so several engine
     # shards are refused, and one engine shard's --db still names the root.
     assert Path(db_base) == root, db_base
-    with pytest.raises(ValueError, match="names a directory"):
+    with pytest.raises(ValueError, match=_NO_STEM):
         build_shard_specs(["a", "b"], config="c", db_base=db_base, base_port=8765)
 
 
