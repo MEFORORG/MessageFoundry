@@ -139,14 +139,38 @@ def test_a_rest_a_pass_could_read_differently_stays_as_main_left_it(text: str) -
     assert redaction._redact_xml_elements(text) == main
 
 
-def test_a_field_run_that_takes_the_end_tag_prints_the_rest_as_main_did() -> None:
-    """A STATED RESIDUAL (code review round 3): the flat passes run before the XML pass, so a field
-    run that takes the end tag's name leaves a rest no end tag owns, and it prints, as on main."""
-    for text in ("a|b|<family>Smith</family Zqxdoe>", "<given>A^B^C</given Zqxdoe>"):
-        with _main():
-            main = redact(text)
-        assert redact(text) == main
-        assert "Zqxdoe" in main  # the residual, named so a fix to it is seen here
+@pytest.mark.parametrize(
+    ("text", "want"),
+    [
+        ("a|b|<family>Smith</family Zqxdoe>", "[redacted] Xxxxxx>"),
+        ("<given>A^B^C</given Zqxdoe>", "[redacted] Xxxxxx>"),
+        ("a|b|</family Zqxdoe>", "[redacted] Xxxxxx>"),
+        ("a|b|<ns:family>Smith</ns:family Zqxdoe", "[redacted] Xxxxxx"),
+    ],
+)
+def test_a_field_run_that_takes_the_end_tag_has_the_rest_masked(text: str, want: str) -> None:
+    """BACKLOG #5925 item 1: the flat passes run before the XML pass, so a field run that took the
+    end tag's name left a rest no end tag owned, and it printed on main. The run now masks it under
+    the end tag's rules (:func:`redaction._glued_end_tag_rest`)."""
+    with _main():
+        main = redact(text)
+    assert "Zqxdoe" in main  # the premise: main printed it
+    assert redact(text) == want
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "a|b|<family>Smith</family ZqMSH>",  # a head of a word read with no boundary
+        "a|b|<family>Smith</family Kim",  # an end-of-text refusal, as in the walk
+        "a|b|<family>Smith</family userPwd>",  # a camel credential label
+        "a|b|<other>Smith</other Zqxdoe>",  # no vocabulary end tag
+    ],
+)
+def test_a_field_run_rest_the_end_tag_rules_refuse_stays_as_main_left_it(text: str) -> None:
+    with _main():
+        main = redact(text)
+    assert redact(text) == main
 
 
 @pytest.mark.parametrize(
