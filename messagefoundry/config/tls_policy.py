@@ -656,22 +656,22 @@ _CRL_UNCONFIRMED = (
     "signature failure' or 'unable to get certificate CRL', check this file first"
 )
 
-#: The fix a leaf hop's WARNING gives for a CRL from a CA without cRLSign.
+#: The fix a leaf hop's WARNING gives for a CRL from a CA without cRLSign. Another CA's CRL is
+#: no fix: OpenSSL judges a peer by a CRL from the peer's own issuer.
 _CRL_SIGN_REMEDY = (
-    "Give this setting a CRL signed by a CA whose key usage includes cRLSign, or reissue that CA "
-    "with it"
+    "Reissue that CA with cRLSign in its key usage and give this setting a CRL it signs, or "
+    "remove this CRL if no peer this hop meets was issued by that CA"
 )
 
-#: The fix a whole-chain refusal gives for it. Another CA's CRL is no fix there: the own-CRL rule
-#: wants a CRL that CA's own key signed.
+#: The fix a whole-chain refusal gives for it. The own-CRL rule also wants a CRL that CA's own
+#: key signed, so removing the CRL alone is no fix there.
 _CRL_SIGN_REMEDY_CHAIN = (
     "Reissue that CA with cRLSign in its key usage and give this setting a CRL it signs, or, where "
     "no peer's chain runs through it, remove it from this hop's CA setting"
 )
 
-#: Added to a refusal reached after the signature judgment failed part way, so the failure is
-#: reported with the refusal rather than in a line of its own. Arguments: how many CRLs were
-#: judged, the exception type.
+#: What :func:`_judgment_failed_too` adds where some CRLs were judged before the failure.
+#: Arguments: how many CRLs were judged, the exception type.
 _CRL_JUDGMENT_FAILED_TOO = (
     ". The engine could not check the signatures of the CRL(s) after the first %d (%s), so that "
     "is no verdict on them"
@@ -754,26 +754,34 @@ def _check_crl_signatures(
         # The hop's CA list can hold anything OpenSSL loads, and ``cryptography`` refuses some of
         # that with exception types of its own. The handshake still checks every signature.
         failure = exc
-    too = (
-        "" if failure is None else _CRL_JUDGMENT_FAILED_TOO % (len(judged), type(failure).__name__)
-    )
+    refused: str | None = None
     if (bad := next((s for s in judged if s.state == "bad"), None)) is not None:
-        raise ValueError(
-            f"{label}: {bad.where} {PROVEN_BAD_SIGNATURE}. Give this setting the CRL that CA "
-            f"signed, or remove this CRL if a good one from that issuer is already in the file{too}"
-        ) from failure
-    if chain and (unable := next((s for s in judged if s.without_crl_sign), None)) is not None:
-        raise ValueError(
-            f"{label}: {unable.where} {NO_CRL_SIGN}. {_CRL_SIGN_REMEDY_CHAIN}{too}"
-        ) from failure
-    if refusal is not None:
-        raise ValueError(f"{label}: {refusal}{too}") from failure
+        refused = (
+            f"{bad.where} {PROVEN_BAD_SIGNATURE}. Give this setting the CRL that CA signed, or "
+            "remove this CRL if a good one from that issuer is already in the file"
+        )
+    elif chain and (unable := next((s for s in judged if s.without_crl_sign), None)) is not None:
+        refused = f"{unable.where} {NO_CRL_SIGN}. {_CRL_SIGN_REMEDY_CHAIN}"
+    elif refusal is not None:
+        refused = refusal
     try:
-        return _CrlSignatureFindings(crl_fingerprint(pem), tuple(judged), failure)
+        if refused is None:
+            return _CrlSignatureFindings(crl_fingerprint(pem), tuple(judged), failure)
+        if failure is not None:
+            refused += _judgment_failed_too(len(judged), failure)
+        raise ValueError(f"{label}: {refused}") from failure
     finally:
         # The failure's traceback holds this frame, so the frame must not hold the failure: the
         # two would make a cycle keeping ``pem`` and ``anchors`` alive until the collector runs.
         del failure
+
+
+def _judgment_failed_too(judged: int, failure: Exception) -> str:
+    """What a refusal reached after the signature judgment failed adds, so the failure is
+    reported with the refusal rather than in a line of its own."""
+    if judged == 0:
+        return f". The engine could not check the signature of any CRL in it ({type(failure).__name__})"
+    return _CRL_JUDGMENT_FAILED_TOO % (judged, type(failure).__name__)
 
 
 def _log_crl_signature_findings(
