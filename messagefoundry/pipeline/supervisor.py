@@ -273,6 +273,9 @@ SpawnFn = Callable[["ShardSpec"], Awaitable["asyncio.subprocess.Process"]]
 #: (:func:`_release_shard_job`).
 _SHARD_JOBS: dict[asyncio.subprocess.Process, int] = {}
 
+#: How long a failed Windows launch waits for the unresumed child it killed to exit.
+_UNRESUMED_EXIT_WAIT = 5.0
+
 
 async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
     """Launch one shard subprocess from its argv (inherits stdout/stderr → NSSM/console).
@@ -310,7 +313,7 @@ async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
         env=env,
     )
     try:
-        job = proctree.resume_into_job(process.pid, who=f"shard {spec.shard!r}")
+        job = proctree.resume_into_job(process.pid, who=f"engine shard {spec.shard!r}")
     except BaseException:
         # Suspended, it would never run; ending it here keeps a failed launch from leaving it behind.
         # resume_into_job may already have ended it through its job, and killing a process that is
@@ -323,7 +326,18 @@ async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
             logger.warning(
                 "engine shard %r: could not kill its unresumed process (%s)", spec.shard, exc
             )
-        await process.wait()
+        # Bounded: a refused kill with no job to end it leaves a suspended process that never
+        # exits, and an unbounded wait would hang this launch and the shutdown behind it.
+        try:
+            await asyncio.wait_for(process.wait(), timeout=_UNRESUMED_EXIT_WAIT)
+        except TimeoutError:
+            logger.warning(
+                "engine shard %r: its unresumed process %s did not exit in %.0fs and is left"
+                " behind",
+                spec.shard,
+                process.pid,
+                _UNRESUMED_EXIT_WAIT,
+            )
         raise
     if job is not None:
         _SHARD_JOBS[process] = job

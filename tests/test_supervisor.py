@@ -511,12 +511,47 @@ async def test_terminate_escalates_to_kill_after_grace() -> None:
 # --- BACKLOG #5978: the drain waits once, and a Windows engine shard ends with its supervisor ----
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="the suspended launch is Windows only")
+@pytest.mark.asyncio
+async def test_a_failed_resume_whose_kill_is_refused_does_not_hang_the_launch(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A suspended engine shard that cannot be resumed, and whose kill is refused with no job to
+    end it, never exits. The launch still raises the resume error after a bounded wait, and says
+    the process was left behind."""
+
+    class _Stuck:
+        pid = 4242
+
+        def kill(self) -> None:
+            raise PermissionError("access denied")
+
+        async def wait(self) -> int:
+            await asyncio.Event().wait()  # never exits
+            return 0
+
+    async def fake_exec(*argv: str, **kwargs: Any) -> _Stuck:
+        return _Stuck()
+
+    def fake_resume(pid: int, *, who: str) -> None:
+        raise OSError("resume refused")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(proctree, "resume_into_job", fake_resume)
+    monkeypatch.setattr(supervisor_mod, "_UNRESUMED_EXIT_WAIT", 0.05)
+    caplog.set_level(logging.WARNING, logger=supervisor_mod.logger.name)
+    with pytest.raises(OSError, match="resume refused"):
+        await asyncio.wait_for(_default_spawn(_spec("a")), timeout=5.0)
+    assert "could not kill its unresumed process" in caplog.text
+    assert "4242 did not exit" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_hung_children_wait_out_one_grace_together_not_one_each() -> None:
     """Every hung child's grace wait starts before any child is forced.
 
     Waiting for each in turn made a drain take one grace period per hung child, so a service
-    manager's stop timeout could run out with shards still up. Read by event order, not by time."""
+    manager's stop timeout could run out with engine shards still up. Read by event order, not by time."""
     events: list[str] = []
     asked: set[int] = set()
 
@@ -562,12 +597,13 @@ async def test_hung_children_wait_out_one_grace_together_not_one_each() -> None:
 
 
 @pytest.mark.asyncio
-async def test_an_exited_shards_job_is_released_and_a_forced_ones_after_its_exit(
+async def test_an_exited_engine_shards_job_is_released_and_a_forced_ones_after_its_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A shard that exits on its own has its job released before the relaunch, and a shard forced
-    on the drain has its job released once it is gone. Released, not ended: what a shard left
-    running on purpose outlives the shard as it did before the job existed (BACKLOG #5978)."""
+    """An engine shard that exits on its own has its job released before the relaunch, and an
+    engine shard forced on the drain has its job released once it is gone. Released, not ended:
+    what an engine shard left running on purpose outlives it as it did before the job existed
+    (BACKLOG #5978)."""
     released: list[int] = []
     monkeypatch.setattr(proctree, "release_job", released.append)
     spawned: list[_FakeProcess] = []
@@ -593,7 +629,7 @@ async def test_an_exited_shards_job_is_released_and_a_forced_ones_after_its_exit
             break
         await asyncio.sleep(0)
     assert len(spawned) == 2
-    assert released == [7001]  # the exited shard's job, before the relaunch's
+    assert released == [7001]  # the exited engine shard's job, before the relaunch's
 
     sup.stop()
     await asyncio.wait_for(run, timeout=5.0)
@@ -606,7 +642,7 @@ async def test_an_exited_shards_job_is_released_and_a_forced_ones_after_its_exit
 #: that escaped every cleanup still goes by itself.
 _TREE_SLEEP = 90
 
-#: The shard child for the Windows job tests: it starts a grandchild, then writes both pids to the
+#: The engine shard child for the Windows job tests: it starts a grandchild, then writes both pids to the
 #: marker (renamed into place, so a reader never sees half of it), then sleeps.
 _SHARD_WITH_GRANDCHILD = (
     "import os, subprocess, sys, time\n"
@@ -618,9 +654,9 @@ _SHARD_WITH_GRANDCHILD = (
     f"time.sleep({_TREE_SLEEP})\n"
 )
 
-#: A stand-in supervisor: it launches one shard through the REAL ``_default_spawn``, then idles
-#: until the test hard-kills it. ``argv[3] == "nojob"`` resumes the shard without a job: the
-#: control.
+#: A stand-in supervisor: it launches one engine shard through the REAL ``_default_spawn``, then
+#: idles until the test hard-kills it. ``argv[3] == "nojob"`` resumes the engine shard without a
+#: job: the control.
 _SUPERVISOR_STAND_IN = (
     "import asyncio, os, sys\n"
     "import psutil\n"
@@ -642,8 +678,8 @@ _SUPERVISOR_STAND_IN = (
 
 
 def _hard_kill_a_stand_in(tmp_path: Path, mode: str) -> tuple[list[Any], list[Any]]:
-    """Start a stand-in supervisor in ``mode``, hard-kill it once its shard tree is up, and return
-    the shard tree and every process this started, the stand-in's own included, for cleanup.
+    """Start a stand-in supervisor in ``mode``, hard-kill it once its engine shard tree is up, and
+    return the engine shard tree and every process this started, the stand-in's own included, for cleanup.
 
     Every process here is this test's own, and each is killed by its pid, never by image name. The
     stand-in's whole chain is killed (the venv launcher and the interpreter under it), with no
@@ -666,9 +702,9 @@ def _hard_kill_a_stand_in(tmp_path: Path, mode: str) -> tuple[list[Any], list[An
         deadline = time.monotonic() + 60.0
         while not marker.exists():
             assert stand_in.poll() is None, (
-                "the stand-in supervisor exited before its shard started"
+                "the stand-in supervisor exited before its engine shard started"
             )
-            assert time.monotonic() < deadline, "the shard never wrote its pids"
+            assert time.monotonic() < deadline, "the engine shard never wrote its pids"
             time.sleep(0.05)
         supervisor_pid = int(Path(f"{marker}.sup").read_text())
         # The stand-in's own chain: the venv launcher where there is one, and its interpreter.
@@ -688,7 +724,7 @@ def _hard_kill_a_stand_in(tmp_path: Path, mode: str) -> tuple[list[Any], list[An
         wait_until(settled, 10.0)
         started += tree
         reported = {int(pid) for pid in marker.read_text().split()}
-        assert reported <= {p.pid for p in tree}, "the shard tree is not under the stand-in"
+        assert reported <= {p.pid for p in tree}, "the engine shard tree is not under the stand-in"
         kill_all(chain)
         stand_in.wait(timeout=10)
         return tree, started
@@ -698,10 +734,10 @@ def _hard_kill_a_stand_in(tmp_path: Path, mode: str) -> tuple[list[Any], list[An
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the kill-on-close job is a Windows job object")
-def test_control_without_the_job_a_shard_tree_outlives_its_hard_killed_supervisor(
+def test_control_without_the_job_an_engine_shard_tree_outlives_its_hard_killed_supervisor(
     tmp_path: Path,
 ) -> None:
-    """The control that arms the test below: with the job left out, the shard and its child must
+    """The control that arms the test below: with the job left out, the engine shard and its child must
     SURVIVE their killed supervisor. Otherwise a pass below could come from something else ending
     the tree, such as a job the test runner sits in, and would show nothing about this one."""
     import time
@@ -719,9 +755,9 @@ def test_control_without_the_job_a_shard_tree_outlives_its_hard_killed_superviso
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="the kill-on-close job is a Windows job object")
-def test_a_hard_killed_windows_supervisor_takes_its_shards_with_it(tmp_path: Path) -> None:
-    """Hard-kill a supervisor process, as a service manager's forced stop would, and its shard and
-    the shard's own child must end too. Without the job both outlive it (BACKLOG #5978)."""
+def test_a_hard_killed_windows_supervisor_takes_its_engine_shards_with_it(tmp_path: Path) -> None:
+    """Hard-kill a supervisor process, as a service manager's forced stop would, and its engine
+    shard and that engine shard's own child must end too. Without the job both outlive it (BACKLOG #5978)."""
     from tests._proc_tree import alive, describe, kill_all, wait_until
 
     tree, started = _hard_kill_a_stand_in(tmp_path, "job")
