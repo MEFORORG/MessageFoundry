@@ -230,8 +230,9 @@ jobs:
           # and base64 reads stdin, so the token is in no command's argv. It IS in this step's
           # environment (APP_TOKEN, and the encoded header in git's), which any process running as the
           # runner user can read while the step runs; the step-level env keeps it out of every other
-          # step's environment, not out of reach of the user. The encoded form is masked too, since
-          # the runner masks only the raw token.
+          # step's environment, not out of reach of the user. The whole encoded header is masked too,
+          # by hand, so its masking does not rest on which encoded forms of the token the runner's own
+          # secret masker happens to register.
           auth="$(printf 'x-access-token:%s' "${APP_TOKEN}" | base64 -w0)"
           echo "::add-mask::${auth}"
           # Fully qualified: the checkout is a detached SHA, so HEAD has no branch to infer a name from.

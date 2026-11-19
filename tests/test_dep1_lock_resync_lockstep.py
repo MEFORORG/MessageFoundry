@@ -295,6 +295,42 @@ def _steps_using(prefix: str) -> list[dict[str, Any]]:
     return [s for s in _resync_steps() if str(s.get("uses", "")).startswith(prefix)]
 
 
+# What hands a step the minted token or the App key, in any spelling a step could use: the dotted or
+# indexed reference (both name the step id or the secret), or a dump of the whole context.
+_TOKEN_NEEDLES = ("steps.app-token", "steps['app-token']", 'steps["app-token"]', "tojson(steps")
+_KEY_NEEDLES = ("lock_resync_app_private_key", "tojson(secrets")
+
+
+def _strings_in(value: object) -> list[str]:
+    if isinstance(value, dict):
+        return [s for k, v in value.items() for s in _strings_in(k) + _strings_in(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in _strings_in(v)]
+    return [str(value)]
+
+
+def _normalised(value: object) -> str:
+    return " | ".join(_strings_in(value)).casefold().replace(" ", "")
+
+
+def _steps_naming(needles: tuple[str, ...]) -> list[str]:
+    """Steps whose text (their own ``id`` aside) names any needle, case and spacing ignored."""
+    named = []
+    for s in _resync_steps():
+        text = _normalised({k: v for k, v in s.items() if k != "id"})
+        if any(n in text for n in needles):
+            named.append(str(s.get("id") or s.get("name") or s.get("uses")))
+    return named
+
+
+def test_the_resync_job_env_hands_out_no_credential() -> None:
+    """RED when: the job's own ``env:`` names the token or the key, which hands it to every step."""
+    job_env = _normalised(load_workflow(_RESYNC.name)["jobs"]["resync"].get("env") or {})
+    assert not any(n in job_env for n in _TOKEN_NEEDLES + _KEY_NEEDLES), (
+        "the resync job's env names the App token or key"
+    )
+
+
 def test_the_resync_checkout_persists_no_credential() -> None:
     """RED when: the checkout writes a credential into .git/config (BACKLOG #5477).
 
@@ -317,14 +353,10 @@ def test_the_resync_checkout_persists_no_credential() -> None:
 def test_only_the_push_step_receives_the_app_token() -> None:
     """RED when: a step other than the push names the minted token's output (BACKLOG #5477).
 
-    This pins the expression reference only. The token is live on the runner from the mint step on;
-    what this holds is that no other step is handed it.
+    This pins the expression reference only, dotted, indexed or as a ``toJSON(steps)`` dump. The token
+    is live on the runner from the mint step on; what this holds is that no other step is handed it.
     """
-    readers = [
-        str(s.get("name") or s.get("uses"))
-        for s in _resync_steps()
-        if "steps.app-token.outputs.token" in repr(s)
-    ]
+    readers = _steps_naming(_TOKEN_NEEDLES)
     assert readers == ["Commit and push the resynced locks"], (
         f"steps reading the App token: {readers}"
     )
@@ -368,9 +400,5 @@ def test_the_app_key_is_used_before_any_step_runs_on_the_pr_tree() -> None:
     position = {str(s.get("id") or s.get("name")): i for i, s in enumerate(steps)}
     checkout = position["Check out the PR head"]
     assert position["app-token"] < checkout, "the App private key is used after the PR checkout"
-    key_readers = [
-        str(s.get("id") or s.get("name"))
-        for s in steps
-        if "secrets.LOCK_RESYNC_APP_PRIVATE_KEY" in repr(s)
-    ]
+    key_readers = _steps_naming(_KEY_NEEDLES)
     assert key_readers == ["app-token"], f"steps handed the App private key: {key_readers}"

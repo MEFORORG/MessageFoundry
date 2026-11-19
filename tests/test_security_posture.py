@@ -487,6 +487,8 @@ def test_advisory_security_jobs_keep_continue_on_error() -> None:
         f"{sorted(step_graded - _ADVISORY_SECURITY_JOBS)} is step-advisory in _STEP_ADVISORY_JOBS "
         "but not advisory here; classify it in one posture, not two."
     )
+    # Since BACKLOG #5475 every advisory job is step-graded, so this loop runs over no job today. It
+    # stays for a job later added to the advisory set with its flag on the job.
     for key in sorted(_ADVISORY_SECURITY_JOBS - step_graded):
         assert jobs[key].get("continue-on-error") is True, (
             f"security.yml job {key!r} is advisory by design but no longer declares "

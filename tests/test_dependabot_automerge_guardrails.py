@@ -48,8 +48,6 @@ import pytest
 import yaml
 from _bash_resolver import bash_candidates, probe_env, require_bash
 
-from tests._workflow_contexts import evaluate_if_expression
-
 _ROOT = Path(__file__).resolve().parent.parent
 _WORKFLOW = _ROOT / ".github" / "workflows" / "dependabot-auto-merge.yml"
 _DEPENDABOT = _ROOT / ".github" / "dependabot.yml"
@@ -416,10 +414,99 @@ def test_enable_automerge_gates_on_all_three_guards_and_preserves_auto_merge() -
 # THE SUBSTRING CHECKS ABOVE CANNOT SEE THE OPERATORS BETWEEN THE GUARDS (BACKLOG #5605). Swap one
 # `&&` for `||`, drop the dev-only scoping of a minor bump, or move a parenthesis, and every substring
 # is still present. So the merge condition is EVALUATED, over every combination of the outputs it
-# reads, and compared with the policy stated once in `_merge_policy`. The evaluator
-# (tests/_workflow_contexts.py, `evaluate_if_expression`) covers only the expression subset GitHub
-# documents and this workflow uses; anything else fails the parse, so a condition rewritten in
-# another form has to extend it there rather than pass unread.
+# reads, and compared with the policy stated once in `_merge_policy`. The evaluator covers only the
+# expression subset GitHub documents and this workflow uses; anything else fails the parse, so a
+# condition rewritten in another form has to extend it here rather than pass unread.
+
+_EXPR_TOKEN = re.compile(
+    r"\s*(?:(?P<op>==|!=|&&|\|\||[()!])|'(?P<str>(?:[^']|'')*)'|(?P<ref>[A-Za-z_][\w.\-]*))"
+)
+
+
+@functools.cache
+def _tokenize_expression(text: str) -> tuple[tuple[str, str], ...]:
+    tokens: list[tuple[str, str]] = []
+    pos = 0
+    text = text.strip()
+    while pos < len(text):
+        m = _EXPR_TOKEN.match(text, pos)
+        assert m and m.end() > pos, f"unparsed expression text at {text[pos:]!r}"
+        pos = m.end()
+        if m.group("op"):
+            tokens.append(("op", m.group("op")))
+        elif m.group("str") is not None:
+            tokens.append(("str", m.group("str").replace("''", "'")))
+        else:
+            ref = m.group("ref")
+            assert ref not in {"true", "false", "null"}, f"unsupported literal {ref!r}"
+            tokens.append(("ref", ref))
+    return tuple(tokens)
+
+
+def _evaluate_expression(text: str, context: dict[str, str]) -> bool:
+    """Evaluate an Actions ``if:`` as GitHub does for this subset: ``==``/``!=`` compare strings
+    case-insensitively, ``&&``/``||``/``!`` coerce to truthiness, and an output that is not set (its
+    step was skipped) reads as the empty string, which is falsy."""
+    tokens = _tokenize_expression(text)
+    at = 0
+
+    def peek() -> tuple[str, str] | None:
+        return tokens[at] if at < len(tokens) else None
+
+    def take(expected: str | None = None) -> tuple[str, str]:
+        nonlocal at
+        tok = peek()
+        assert tok is not None, f"expression ended early: {text!r}"
+        if expected is not None:
+            assert tok == ("op", expected), f"expected {expected!r}, got {tok!r} in {text!r}"
+        at += 1
+        return tok
+
+    def primary() -> str | bool:
+        tok = take()
+        if tok == ("op", "("):
+            value = disjunction()
+            take(")")
+            return value
+        if tok == ("op", "!"):
+            return not bool(primary())
+        if tok[0] == "str":
+            return tok[1]
+        if tok[0] == "ref":
+            return context.get(tok[1], "")
+        raise AssertionError(f"unexpected token {tok!r} in {text!r}")
+
+    def comparison() -> str | bool:
+        left = primary()
+        tok = peek()
+        if tok in (("op", "=="), ("op", "!=")):
+            take()
+            right = primary()
+            assert isinstance(left, str) and isinstance(right, str), f"non-string compare: {text!r}"
+            equal = left.casefold() == right.casefold()
+            return equal if tok[1] == "==" else not equal
+        return left
+
+    def conjunction() -> str | bool:
+        value = comparison()
+        while peek() == ("op", "&&"):
+            take()
+            right = comparison()
+            value = bool(value) and bool(right)
+        return value
+
+    def disjunction() -> str | bool:
+        value = conjunction()
+        while peek() == ("op", "||"):
+            take()
+            right = conjunction()
+            value = bool(value) or bool(right)
+        return value
+
+    result = disjunction()
+    assert at == len(tokens), f"trailing tokens {tokens[at:]!r} in {text!r}"
+    return bool(result)
+
 
 _TRI = ("true", "false", "")
 
@@ -561,10 +648,10 @@ def test_the_merge_condition_evaluates_to_the_policy_over_every_input() -> None:
     # product would leave `wrong` empty and pass the absence assertion below on nothing.
     contexts = _merge_contexts()
     assert len(contexts) >= 2916, f"only {len(contexts)} merge contexts; expected 2916"
-    wrong = [c for c in contexts if evaluate_if_expression(cond, c) != _merge_policy(c)]
+    wrong = [c for c in contexts if _evaluate_expression(cond, c) != _merge_policy(c)]
     assert not wrong, (
         f"the merge condition disagrees with the policy on {len(wrong)} input combinations; "
-        f"first: {wrong[0]} (condition says {evaluate_if_expression(cond, wrong[0])})"
+        f"first: {wrong[0]} (condition says {_evaluate_expression(cond, wrong[0])})"
     )
 
 
@@ -592,7 +679,7 @@ def test_the_expression_evaluator_can_tell_a_loosened_condition_apart() -> None:
     contexts = _merge_contexts()
     for label, variant in loosened.items():
         assert variant != cond, f"the {label} mutation no longer applies to the condition text"
-        assert any(evaluate_if_expression(variant, c) != _merge_policy(c) for c in contexts), (
+        assert any(_evaluate_expression(variant, c) != _merge_policy(c) for c in contexts), (
             f"the evaluator could not tell the {label} condition from the policy"
         )
 
@@ -602,7 +689,7 @@ def test_the_job_runs_only_for_dependabot_authored_prs() -> None:
     cond = str(job.get("if", ""))
     assert cond, "the auto-merge job has no if:, so it runs for every pull request"
     for login, expected in (("dependabot[bot]", True), ("someone", False), ("", False)):
-        got = evaluate_if_expression(cond, {"github.event.pull_request.user.login": login})
+        got = _evaluate_expression(cond, {"github.event.pull_request.user.login": login})
         assert got is expected, f"job if: {cond!r} gives {got} for author {login!r}"
 
 

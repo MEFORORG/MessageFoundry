@@ -102,7 +102,9 @@ jobs:
     # a runner whose logs are public, the moment the vault variable and read token were configured.
     # An ALLOWLIST of events rather than `!= 'pull_request'`, so a trigger added later is refused
     # until someone decides it may reach the record. And main only: a dispatch on another branch
-    # would run that branch's copy of this file and of scripts/asvs/, the same exposure. The
+    # would run that branch's copy of this file and of scripts/asvs/, the same exposure. Actions
+    # compares strings case-insensitively, so a branch whose name is `main` in another case (`Main`)
+    # also passes the ref test; only someone able to push a branch can make one. The
     # `pull_request` trigger above stays: on a pull request this job reports SKIPPED, which is the
     # visible not-run the block above asks for.
     #

@@ -190,8 +190,9 @@ jobs:
           # PersistKeySet, not EphemeralKeySet: signtool is another process and reaches the key through the
           # certificate store, which an ephemeral key never enters. So the key is written to this user's key
           # store, and the finally block below deletes the imported certificate's key again (BACKLOG #5478).
-          # Everything from the import on sits inside that try. Not covered: a key the import persists and
-          # then fails before returning a certificate, or the key of a second certificate in the same PFX.
+          # Everything from the import on sits inside that try. Not covered, at least: a key the import
+          # persists and then fails before returning a certificate, the key of a second certificate in the
+          # same PFX, and a step killed outright (a hard cancel or timeout), where no finally block runs.
           $flags = [System.Security.Cryptography.X509Certificates.X509KeyStorageFlags]'PersistKeySet, UserKeySet'
           $pfx = [System.Convert]::FromBase64String($env:SIGNING_PFX_BASE64)
           $pfxPassword = $env:SIGNING_PFX_PASSWORD

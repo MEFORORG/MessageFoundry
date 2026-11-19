@@ -502,6 +502,14 @@ def test_it_runs_on_a_bare_interpreter_from_an_unrelated_directory(tmp_path: Pat
 _PR_EVENTS = frozenset({"pull_request", "pull_request_target"})
 
 
+def _if_body(expression: str) -> str:
+    """The expression inside an ``if:``'s ``${{ ... }}`` wrapper, or the text itself if unwrapped."""
+    body = expression.strip()
+    if body.startswith("${{") and body.endswith("}}"):
+        body = body[3:-2]
+    return body.strip()
+
+
 def _evaluate_job_if(
     expression: str,
     *,
@@ -510,9 +518,9 @@ def _evaluate_job_if(
     ref: str = "refs/heads/main",
     extra: dict[str, str] | None = None,
 ) -> bool:
-    """Evaluate the report job's ``if:`` for one event, without a runner, through the shared
-    evaluator in tests/_workflow_contexts.py. It refuses any construct it does not understand, so an
-    edit reaching for one fails here instead of reading as true.
+    """Evaluate the report job's ``if:`` for one event, without a runner, through the evaluator
+    tests/test_dependabot_automerge_guardrails.py already holds. It refuses any construct it does not
+    understand, so an edit reaching for one fails here instead of reading as true.
 
     ITS LIMIT: a context name not seeded here reads as the empty string, so this sees a term only on
     a name it seeds. It seeds the event name, the ref, the vault variable and, on a pull request
@@ -522,11 +530,8 @@ def _evaluate_job_if(
     """
     # Imported here, not at module scope, so the stdlib instrument tests above never depend on that
     # module's imports.
-    from tests._workflow_contexts import evaluate_if_expression
+    from tests.test_dependabot_automerge_guardrails import _evaluate_expression
 
-    body = expression.strip()
-    if body.startswith("${{") and body.endswith("}}"):
-        body = body[3:-2]
     context = {
         "github.event_name": event_name,
         "github.ref": ref,
@@ -535,7 +540,7 @@ def _evaluate_job_if(
     if event_name in _PR_EVENTS:
         context |= {"github.head_ref": "feature", "github.base_ref": "main"}
     context |= extra or {}
-    return evaluate_if_expression(body, context)
+    return _evaluate_expression(_if_body(expression), context)
 
 
 @pytest.mark.parametrize(
@@ -594,8 +599,7 @@ def test_a_pull_request_with_a_head_ref_never_runs_the_report_job() -> None:
     assert not _evaluate_job_if(
         expression, event_name="pull_request", vault_repo="owner/vault", extra=seeded
     )
-    body = expression.strip().removeprefix("${{").removesuffix("}}")
-    loosened = f"({body}) || github.head_ref != ''"
+    loosened = f"({_if_body(expression)}) || github.head_ref != ''"
     assert _evaluate_job_if(
         loosened, event_name="pull_request", vault_repo="owner/vault", extra=seeded
     ), "control: the loosened condition must read as a run once head_ref is seeded"
