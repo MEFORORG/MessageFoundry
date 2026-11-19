@@ -388,13 +388,15 @@ def test_an_unhandled_error_in_the_runner_still_writes_an_exit_line(tmp_path: Pa
     """A throw after the log directory exists used to end the run with nothing in the log.
 
     Run without -RepoRoot outside any repository, resolving the primary throws. Before the trap no log
-    line was written at all; now the log must name the error and end with an exit line.
+    line was written at all; now the log must name the error and its line, and end with an exit line.
+    Nothing was attempted, so the code is 2, whose meaning promises that, not 1 ("attempted").
     """
     proc, text = run_copied_runner(tmp_path)
-    assert proc.returncode == 1, proc.stdout + proc.stderr
+    assert proc.returncode == 2, proc.stdout + proc.stderr
     assert text is not None, f"the error left no log line: {proc.stderr}"
     assert "STOPPED on an unhandled error: Not inside a git repository" in text, text
-    assert re.search(r"^=== exit 1 \(FAILED", text.splitlines()[-1]), text
+    assert re.search(r"\(at .*run-daily-prune\.ps1:\d+\)", text), text
+    assert re.search(r"^=== exit 2 \(REFUSED", text.splitlines()[-1]), text
 
 
 @requires_windows

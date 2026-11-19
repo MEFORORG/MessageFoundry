@@ -313,6 +313,7 @@ Command.
                            cannot be re-read
              ORPHANED      deregistered, but the directory is still on disk or cannot be read; needs a
                            human
+             NOT-REACHED   -StopAt had passed before this path was started; nothing was attempted
     Command  the exact removal command, run or (in a dry run) not run. Never carries --force.
 #>
 function Invoke-FinishedWorktreeRemoval {
@@ -367,9 +368,9 @@ function Invoke-FinishedWorktreeRemoval {
 
     foreach ($path in @($Paths | Where-Object { $_ })) {
         $row = [pscustomobject]@{ Path = $path; Outcome = 'REFUSED'; Reason = ''; Command = "git -C `"$Primary`" worktree remove `"$path`"" }
-        if ($null -ne $StopAt -and (Get-Date) -ge $StopAt) {
+        if ($null -ne $StopAt -and [DateTime]::UtcNow -ge $StopAt.ToUniversalTime()) {
             $row.Outcome = 'NOT-REACHED'
-            $row.Reason = "the run's deadline ($($StopAt.ToString('HH:mm:ss'))) passed first; the next run lists it again"
+            $row.Reason = "the run's deadline ($($StopAt.ToLocalTime().ToString('HH:mm:ss'))) passed first; nothing was attempted"
             $row
             continue
         }

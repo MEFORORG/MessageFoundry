@@ -38,11 +38,14 @@
     nothing. Registering this to run whether-or-not-logged-on would quietly convert the safest check in
     the script into a no-op, so it is deliberately registered -RunLevel Limited under the calling user.
 
-    THE TIME LIMIT IS 4 HOURS BY DEFAULT, AND 1 HOUR NEVER FINISHED. Measured 2026-11-18 on the owner's
-    PC: 1,633 registered worktrees, about 157 removed per hour by the .claude/worktrees step, and the run
-    that started at 03:00 was killed by the old hard-coded one-hour limit mid-list (task result 0x41306),
-    so it never wrote its summary or its exit line. Four hours from a 03:00 or 03:30 start ends by 07:00
-    or 07:30, still outside working hours (see -At for why that matters). -TimeLimitHours changes it.
+    THE TIME LIMIT IS 4 HOURS BY DEFAULT, BECAUSE 1 HOUR DID NOT FINISH ON 2026-11-18. Measured on the
+    owner's PC that day: 1,633 registered worktrees, 698 of them listed as finished under
+    .claude/worktrees, about 157 removed per hour, and the run that started at 03:00 was killed by the old
+    hard-coded one-hour limit mid-list (task result 0x41306), so it never wrote its summary or its exit
+    line. Four hours from a 03:00 or 03:30 start ends by 07:00 or 07:30, outside working hours (see -At
+    for why that matters). A catch-up run is not bound by that: -StartWhenAvailable starts a missed run
+    whenever the machine is next available, and it may now run up to the full limit at any hour.
+    -TimeLimitHours changes it.
 
     THE RUNNER STOPS ITSELF BEFORE THE LIMIT. A task killed at its limit writes nothing, so the task
     passes run-daily-prune.ps1 -StopAfterMinutes, the limit less the margin $STOP_MARGIN_MINUTES sets.
@@ -107,9 +110,10 @@ param(
 $ErrorActionPreference = 'Stop'
 
 # How long before the task's limit the runner stops starting removals. It has to cover one removal in
-# flight (about 23 s on average on 2026-11-18, 157 an hour) or a listing run that straddles the deadline
-# (the whole 2026-11-16 run, both prune-merged.ps1 runs and 633 rows, took 17 minutes), then the
-# closing lines.
+# flight (about 23 s on average on 2026-11-18, 157 an hour) or a listing run started just before the
+# deadline, then the closing lines. The only timing on record for a listing run is a bound: the whole
+# 2026-11-16 run, both prune-merged.ps1 runs and 633 listed rows, took 17 minutes. Larger populations
+# have not been timed, so 20 is a judgement on that one figure, not a measurement at today's count.
 $STOP_MARGIN_MINUTES = 20
 
 # Same refusal its sibling installers carry, and for a stronger reason than either of them. This one
@@ -169,15 +173,21 @@ $runLevel  = 'Limited'      # never Highest: see the header on why SYSTEM/elevat
 $logonType = 'Interactive'
 $userId    = "$env:USERDOMAIN\$env:USERNAME"
 
-# Quoted because a path with a space would otherwise split into two arguments and silently prune, or fail
-# to prune, somewhere nobody is looking. $forwarded names every runner parameter the argument carries, so
-# registration can check the primary's runner declares each one.
-$taskArgument = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$runner`" -LogDir `"$LogDir`" -Label `"$TaskName`""
-$forwarded = @('LogDir', 'Label', 'StopAfterMinutes')
-if ($Apply) { $taskArgument += ' -Apply'; $forwarded += 'Apply' }
-if ($RemoveFinishedClaudeWorktrees) { $taskArgument += ' -RemoveFinishedClaudeWorktrees'; $forwarded += 'RemoveFinishedClaudeWorktrees' }
-if ($PSBoundParameters.ContainsKey('IdleHours')) { $taskArgument += " -IdleHours $IdleHours"; $forwarded += 'IdleHours' }
-$taskArgument += " -StopAfterMinutes $stopAfterMinutes"
+# Every runner parameter the task passes, in order: its argument text, or $true for a switch. The task
+# argument and the declared-parameter check are both built from this one map, so neither can name a
+# parameter the other lacks. Paths are quoted because one with a space would otherwise split into two
+# arguments and silently prune, or fail to prune, somewhere nobody is looking.
+$runnerArgs = [ordered]@{ LogDir = "`"$LogDir`""; Label = "`"$TaskName`"" }
+if ($Apply) { $runnerArgs.Apply = $true }
+if ($RemoveFinishedClaudeWorktrees) { $runnerArgs.RemoveFinishedClaudeWorktrees = $true }
+if ($PSBoundParameters.ContainsKey('IdleHours')) { $runnerArgs.IdleHours = "$IdleHours" }
+$runnerArgs.StopAfterMinutes = "$stopAfterMinutes"
+$taskArgument = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$runner`""
+foreach ($k in $runnerArgs.Keys) { $taskArgument += if ($runnerArgs[$k] -is [bool]) { " -$k" } else { " -$k $($runnerArgs[$k])" } }
+# $null when there is no runner to ask; registration refuses on any name listed.
+# Assigned in a statement, not from an `if` expression, which would unroll a one-name array to a string.
+$runnerUndeclared = $null
+if ($null -ne $runnerParams) { $runnerUndeclared = @($runnerArgs.Keys | Where-Object { $runnerParams -notcontains $_ }) }
 
 $plan = [ordered]@{
     taskName   = $TaskName
@@ -188,6 +198,7 @@ $plan = [ordered]@{
     runnerExists = $runnerExists
     runnerDeclaresRemoveFinishedClaudeWorktrees = if ($null -ne $runnerParams) { $runnerParams -contains 'RemoveFinishedClaudeWorktrees' } else { $null }
     runnerDeclaresStopAfterMinutes = if ($null -ne $runnerParams) { $runnerParams -contains 'StopAfterMinutes' } else { $null }
+    runnerUndeclared = $runnerUndeclared
     argument   = $taskArgument
     at         = $At
     timeLimitHours   = $TimeLimitHours
@@ -219,9 +230,8 @@ if (-not $runnerExists) {
     throw "run-daily-prune.ps1 is not in the primary checkout: $runner`nIf it exists in the worktree you are standing in, the change has not landed yet -- merge it before scheduling it. A task pointed at a worktree copy dies with that worktree."
 }
 
-$undeclared = @($forwarded | Where-Object { $runnerParams -notcontains $_ })
-if ($undeclared.Count -gt 0) {
-    throw "The primary's run-daily-prune.ps1 does not declare $(($undeclared | ForEach-Object { "-$_" }) -join ', '): $runner`nThe change has not landed on the primary checkout yet. Update the primary before registering, or every nightly run fails parameter binding with no log line."
+if ($runnerUndeclared.Count -gt 0) {
+    throw "The primary's run-daily-prune.ps1 does not declare $(($runnerUndeclared | ForEach-Object { "-$_" }) -join ', '): $runner`nThe change has not landed on the primary checkout yet. Update the primary before registering, or every nightly run fails parameter binding with no log line."
 }
 
 $action    = New-ScheduledTaskAction -Execute $pwshExe -Argument $taskArgument -WorkingDirectory $repoRoot

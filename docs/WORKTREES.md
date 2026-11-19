@@ -734,8 +734,9 @@ says what else the step does not see.
 The removal is a plain `git -C <primary> worktree remove <path>` with **no `--force`**, so git's own
 refusal on a locked or dirty tree stays a last fence. The branch survives it. Each path is logged as it
 is decided, as `REMOVED`, `WOULD-REMOVE` (without `-Apply`), `REFUSED`, `DECLINED` (every re-check
-passed and git still refused), `FAILED` or `ORPHANED`, with its reason, then a summary line with the
-counts and the drive's free space. A refusal or a decline is data and leaves the exit code alone; a
+passed and git still refused), `FAILED`, `ORPHANED` or `NOT-REACHED` (the runner's
+`-StopAfterMinutes` deadline passed before that tree was started), with its reason, then a summary
+line with the counts and the drive's free space. A refusal or a decline is data and leaves the exit code alone; a
 failure raises it to `1`, and an orphan raises it to `3` and goes into `prune-merged.ps1`'s orphan
 ledger, so later runs keep reporting it. A list that could not be read skips the step, raising the
 code to `2` on a dry run and to `1` under `-Apply`, since the prune before it may have removed

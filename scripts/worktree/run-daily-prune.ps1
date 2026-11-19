@@ -56,10 +56,11 @@
     How many dated logs to keep. Older ones are deleted after each run.
 
 .NOTES
-    Every way out once the log directory exists writes a last line, "=== exit N (meaning) at HH:mm:ss
-    ===": the normal end, a refusal, and an unhandled error, which is logged and exits 1. Only a kill
-    from outside (Task Scheduler's time limit, a reboot) cannot, and -StopAfterMinutes is there so the
-    time limit is not reached.
+    Once the log directory exists, at least these ways out write a last line, "=== exit N (meaning) at
+    HH:mm:ss ===", while the log can be written: the normal end, a refusal, and an unhandled error, which
+    is logged with its script line and exits 2 before the prune ran or on a dry run, 1 after an -Apply
+    prune, never below a code already set. A kill from outside (Task Scheduler's time limit, a reboot)
+    writes nothing; -StopAfterMinutes is there so the time limit is not reached.
 
 .EXAMPLE
     pwsh -File scripts\worktree\run-daily-prune.ps1 -LogDir C:\logs            # dry run, logged
@@ -80,7 +81,13 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$deadline = if ($PSBoundParameters.ContainsKey('StopAfterMinutes')) { (Get-Date).AddMinutes($StopAfterMinutes) } else { $null }
+# Set here so the trap below never reads a caller's variable of the same name.
+$log = $null
+$code = $null
+$savedPromptEnv = $null
+# In UTC: Task Scheduler's limit counts elapsed time, and a local clock repeats an hour at the DST
+# fall-back, which would put this deadline an hour past the kill.
+$deadline = if ($PSBoundParameters.ContainsKey('StopAfterMinutes')) { [DateTime]::UtcNow.AddMinutes($StopAfterMinutes) } else { $null }
 
 # The same refusal install-daily-prune.ps1 carries, for the one combination that removes Claude-managed
 # trees: a session that can run this from a checkout it can edit could remove other sessions'
@@ -93,14 +100,6 @@ if ($env:CLAUDECODE -eq '1' -and $Apply -and $RemoveFinishedClaudeWorktrees) {
 # prune-merged.ps1 reports its verdict through the exit code, so a non-zero exit is DATA here, not a
 # failure to be turned into a throw. Same reason that script sets this; the reason survives the call.
 $PSNativeCommandUseErrorActionPreference = $false
-
-# A scheduled task has nobody to answer a credential prompt, in a terminal or in Git Credential Manager's
-# window, so make prune-merged.ps1's `git fetch` (and every git it starts, which inherit this) fail
-# instead of waiting until the task's time limit kills the run with nothing logged. hygiene-report.ps1
-# sets the same two for the same reason. The 2026-11-17 log stops right after "Fetching origin
-# (--prune)...", which a fetch waiting on a prompt would explain; that is not established.
-$env:GIT_TERMINAL_PROMPT = '0'
-$env:GCM_INTERACTIVE = 'never'
 
 . "$PSScriptRoot\..\coord\occupancy.ps1"
 
@@ -128,13 +127,18 @@ $log = Join-Path $LogDir ("prune-" + (Get-Date -Format 'yyyy-MM-dd') + ".log")
 # The one way out after the log exists, so every exit writes its meaning and trims the log directory.
 function Exit-Run([int]$Code) {
     $meaning = if ($EXIT_MEANING.ContainsKey($Code)) { $EXIT_MEANING[$Code] } else { "UNKNOWN exit code $Code" }
-    "=== exit $Code ($meaning) at $(Get-Date -Format 'HH:mm:ss') ===" | Add-Content -LiteralPath $log
+    try { "=== exit $Code ($meaning) at $(Get-Date -Format 'HH:mm:ss') ===" | Add-Content -LiteralPath $log }
+    catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+        Write-Error -Message "exit $Code ($meaning); the log could not take this line: $($_.Exception.Message)" -ErrorAction Continue
+    }
     # Keep the log directory bounded. -ErrorAction SilentlyContinue because a log a human has open must
     # not turn a successful prune into a failed task run.
     Get-ChildItem -LiteralPath $LogDir -Filter 'prune-*.log' -ErrorAction SilentlyContinue |
         Sort-Object LastWriteTime -Descending |
         Select-Object -Skip $KeepLogs |
         Remove-Item -Force -ErrorAction SilentlyContinue
+    # A hand run with `&` shares this process, so the operator's shell gets its prompts back.
+    if ($savedPromptEnv) { foreach ($k in $savedPromptEnv.Keys) { [Environment]::SetEnvironmentVariable($k, $savedPromptEnv[$k]) } }
     exit $Code
 }
 
@@ -143,10 +147,16 @@ function Exit-Run([int]$Code) {
 # path exists (the CLAUDECODE refusal) is passed on unchanged by `break`.
 trap {
     if (-not $log) { break }
-    $fault = "$($_.Exception.Message)"
-    "=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') STOPPED on an unhandled error: $fault ===" | Add-Content -LiteralPath $log
+    $fault = "$($_.Exception.Message) (at $($_.InvocationInfo.ScriptName):$($_.InvocationInfo.ScriptLineNumber))"
+    try { "=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') STOPPED on an unhandled error: $fault ===" | Add-Content -LiteralPath $log }
+    catch [System.IO.IOException], [System.UnauthorizedAccessException] {
+        Write-Error -Message "the log could not take the STOPPED line either: $($_.Exception.Message)" -ErrorAction Continue
+    }
     Write-Error -Message $fault -ErrorAction Continue
-    Exit-Run 1
+    # 2 promises nothing was removed: true before the prune ran ($code unset) and on a dry run. After an
+    # -Apply prune, 1, the rule the step's own refusal follows. Never below a code already set: an
+    # orphan's 3 must survive a later error.
+    Exit-Run ([math]::Max([int]$code, $(if ($null -eq $code -or -not $Apply) { 2 } else { 1 })))
 }
 
 # BEFORE ANYTHING ASKS GIT, the primary's resolution below included: the helper refuses these too, but
@@ -183,7 +193,17 @@ $pruneArgs = @('-RepoRoot', $RepoRoot)
 if ($Apply) { $pruneArgs += '-Apply' }
 if ($PSBoundParameters.ContainsKey('IdleHours')) { $pruneArgs += @('-IdleHours', $IdleHours) }
 
-$deadlineText = if ($deadline) { " stopAfter=$($deadline.ToString('HH:mm:ss'))" } else { '' }
+# A scheduled task has nobody to answer an HTTPS credential prompt, in a terminal or in Git Credential
+# Manager's window, so make prune-merged.ps1's `git fetch` (and every git it starts, which inherit this)
+# fail instead of waiting until the task's time limit kills the run. hygiene-report.ps1 sets the same
+# two. An SSH origin's passphrase or host-key prompt is not covered. The 2026-11-17 log stops right
+# after "Fetching origin (--prune)...", which a fetch waiting on a prompt would explain; that is not
+# established. Exit-Run restores both.
+$savedPromptEnv = @{ GIT_TERMINAL_PROMPT = $env:GIT_TERMINAL_PROMPT; GCM_INTERACTIVE = $env:GCM_INTERACTIVE }
+$env:GIT_TERMINAL_PROMPT = '0'
+$env:GCM_INTERACTIVE = 'never'
+
+$deadlineText = if ($deadline) { " stopAfter=$($deadline.ToLocalTime().ToString('HH:mm:ss'))" } else { '' }
 "=== $Label $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') mode=$mode repo=$RepoRoot$deadlineText ===" | Add-Content -LiteralPath $log
 # A marker on each side of the prune-merged.ps1 run, which prints nothing between its fetch line and its
 # table. A log that ends after the first marker, with no exit marker, was stopped inside that run.
@@ -193,9 +213,14 @@ $deadlineText = if ($deadline) { " stopAfter=$($deadline.ToString('HH:mm:ss'))" 
 $code = $LASTEXITCODE
 "--- prune-merged.ps1 exit $code at $(Get-Date -Format 'HH:mm:ss') ---" | Add-Content -LiteralPath $log
 
-if ($RemoveFinishedClaudeWorktrees) {
-    "--- finished .claude/worktrees: mode=$mode ---" | Add-Content -LiteralPath $log
-
+if ($RemoveFinishedClaudeWorktrees) { "--- finished .claude/worktrees: mode=$mode ---" | Add-Content -LiteralPath $log }
+# Read before the listing run too, which is itself a full prune-merged.ps1 run: started past the deadline
+# it could run into the task's kill, and every row it listed would come back NOT-REACHED anyway.
+if ($RemoveFinishedClaudeWorktrees -and $deadline -and [DateTime]::UtcNow -ge $deadline) {
+    "=== finished .claude/worktrees: SKIPPED, the run's deadline ($($deadlineText.Trim())) passed before the listing run; no .claude/worktrees tree was attempted ===" |
+        Add-Content -LiteralPath $log
+}
+elseif ($RemoveFinishedClaudeWorktrees) {
     # A FRESH list, from a second prune-merged.ps1 run in this invocation, after the prune above. Always
     # a dry run (-Json without -Apply) and -SkipGh: the report-only set does not read merge signals.
     $listArgs = @('-RepoRoot', $RepoRoot, '-Json', '-SkipGh')
