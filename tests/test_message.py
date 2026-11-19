@@ -148,9 +148,31 @@ def test_a_write_that_changes_a_delimiter_field_is_refused(
 def test_a_repetition_scoped_delimiter_write_is_refused() -> None:
     m = Message.parse(ADT)
     with pytest.raises(ValueError, match="holds the message's delimiters"):
-        m.set("MSH-2", m["MSH-2"] or "", repetition=1)
+        m.set("MSH-2", "#~\\&", repetition=1)
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        m.set("MSH-2", m["MSH-2"] or "", repetition=2)
     with pytest.raises(ValueError, match="holds the message's delimiters"):
         m.add_repetition("MSH-2", "x")
+
+
+def test_a_repetition_1_passthrough_of_a_delimiter_field_changes_nothing() -> None:
+    """A copy loop that passes ``repetition=1`` writes the same bytes as one that passes none."""
+    m = Message.parse(ADT)
+    before = m.encode()
+    m.set("MSH-2", m["MSH-2"] or "", repetition=1)
+    assert m.encode() == before
+
+
+def test_msh_2_past_its_four_encoding_characters_can_change() -> None:
+    """The delimiters do not move, so a v2.7 truncation character may be added or dropped."""
+    m = Message.parse(ADT.replace("MSH|^~\\&|", "MSH|^~\\&#|", 1))
+    m.set("MSH-2", "^~\\&")
+    assert m.encode() == ADT
+    m.set("MSH-2", "^~\\&#")
+    assert Message.parse(m.encode())["MSH-2"] == "^~\\&#"
+    assert m["PID-5.2"] == "JANE"
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        m.set("MSH-2", "^~\\&|")
 
 
 def test_a_delimiter_write_of_the_text_already_there_changes_nothing() -> None:
@@ -162,14 +184,26 @@ def test_a_delimiter_write_of_the_text_already_there_changes_nothing() -> None:
     assert m.encode() == before
 
 
-@pytest.mark.parametrize("path", ["BHS-1", "BHS-2", "MSH-2"])
-def test_a_batch_header_delimiter_write_is_refused(path: str) -> None:
-    """BHS fields 1 and 2 hold the delimiters the whole batch is split on, and an inner MSH-2 that
-    differed from them would contradict the body it heads."""
-    m = Message.parse(_BATCH)
+@pytest.mark.parametrize(
+    ("raw", "path", "occurrence"),
+    [
+        (_BATCH, "BHS-1", 1),
+        (_BATCH, "BHS-2", 1),
+        (_BATCH, "MSH-2", 1),
+        ("FHS|^~\\&|A\r" + _BATCH, "FHS-2", 1),
+        ("FHS|^~\\&|A\r" + _BATCH, "BHS-1", 1),
+        (_BATCH + "MSH|^~\\&|A|B\rPID|2\r", "MSH-2", 2),
+    ],
+)
+def test_a_batch_header_delimiter_write_is_refused(raw: str, path: str, occurrence: int) -> None:
+    """BHS and FHS fields 1 and 2 hold the delimiters the whole batch or file is split on, and an
+    inner MSH-1 or MSH-2, at any occurrence, that differed from them would contradict its body."""
+    m = Message.parse(raw)
     before = m.encode()
     with pytest.raises(ValueError, match="holds the message's delimiters"):
-        m.set(path, "#")
+        m.set(path, "#", occurrence=occurrence)
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        m.add_repetition(path, "x", occurrence=occurrence)
     assert m.encode() == before
 
 

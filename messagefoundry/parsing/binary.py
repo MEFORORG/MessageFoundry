@@ -1148,8 +1148,8 @@ async def reattach_documents_in_hl7(
     message, handles, markers, separators = scanned
 
     def _splice(occ: int, verbatim: str) -> None:
-        # The detach checks a value under the delimiters it arrived with; a Handler that moved
-        # MSH-1 or MSH-2 since reaches this instead. Message.set would escape a character the value holds,
+        # The detach checks a value under the delimiters it arrived with; MSH-1 or MSH-2 rewritten
+        # below the Message API since, which refuses such a write (BACKLOG #5972), reaches this instead. Message.set would escape a character the value holds,
         # so the partner would not get the sender's document.
         if _splice_alters(verbatim, separators):
             # Scanned only on this refusal path. The detach refuses a control character under any

@@ -63,6 +63,13 @@ _SEG_ID_RE = re.compile(r"^[A-Z][A-Z0-9]{2}$")
 _STRUCTURE_REFUSED = ("\x0b", "\x1c", "\x00")
 
 
+def _builtin_hl7_order(m: _builtin_hl7.ParsedMessage) -> tuple[str, str, str, str, str]:
+    """The parsed separators in :meth:`Message._encoding_chars` order, ``(field, component,
+    repetition, escape, subcomponent)``; the parser stores them ``(..., subcomponent, escape)``."""
+    field_sep, comp_sep, rep_sep, sub_sep, esc = _builtin_hl7.separators(m)
+    return field_sep, comp_sep, rep_sep, esc, sub_sep
+
+
 def _refuse_frame_bytes(value: str) -> None:
     """Raise ``ValueError`` if ``value`` holds an MLLP frame byte or NUL (ADR 0205 rule 3)."""
     for char in _STRUCTURE_REFUSED:
@@ -312,11 +319,13 @@ class Message:
         ``KeyError`` if the target segment (occurrence) isn't present.
 
         ``MSH-1`` and ``MSH-2``, and fields 1 and 2 of a ``BHS`` or ``FHS`` header, are the message's
-        delimiters, which the parser read once and every other line is written in. A write that
-        would change one raises ``ValueError``, so no write can emit a message whose header
-        advertises delimiters its body is not written in (BACKLOG #5972); a whole-field write of the
-        text already there is accepted and changes nothing. To send under other delimiters,
-        re-encode the whole message, as a per-outbound ``encoding_characters`` does."""
+        delimiters, which the parser read once from the first line and every other line is written
+        in. A write to one of them that would change a delimiter raises ``ValueError``, so a write
+        there cannot leave a header advertising delimiters its body is not written in (BACKLOG
+        #5972). Accepted there: the text the field already holds, and, at field 2, a whole-field
+        value that keeps the four encoding characters and changes only what follows them (a v2.7
+        truncation character, say). To send under other delimiters, re-encode the whole message, as
+        a per-outbound ``encoding_characters`` does."""
         self._write(path, value, occurrence, repetition, as_data=False)
 
     def _write(
@@ -325,8 +334,7 @@ class Message:
         """The one write behind :meth:`set` and :meth:`set_data`, so both check the same things in
         the same order and fail the same way. ``as_data`` escapes a whole-field value as one leaf
         once the target is known to exist. ``MSH-1`` and ``MSH-2`` (and ``BHS``/``FHS`` fields 1 and
-        2) hold the delimiters themselves, so they take only a whole-field write of the text they
-        already hold, and that write changes nothing."""
+        2) hold the delimiters themselves, so :meth:`_write_delimiter_field` takes them, unescaped."""
         if "\r" in value or "\n" in value:
             raise ValueError("HL7 field value may not contain a segment separator (CR/LF)")
         if occurrence < 1:
@@ -338,14 +346,7 @@ class Message:
             where = f"{seg!r}" + (f" occurrence {occurrence}" if occurrence > 1 else "")
             raise KeyError(f"cannot set absent segment {where}")
         if _builtin_hl7.is_delimiter_field(seg, fld):
-            # Only a whole-field write of the text already there passes, so a passthrough copy of
-            # the header still works; any other write would leave the cached separators stale.
-            if (
-                comp is not None
-                or repetition is not None
-                or value != self._raw_field(seg, fld, occurrence)
-            ):
-                raise self._delimiter_write_refusal(seg, fld)
+            self._write_delimiter_field(seg, fld, occurrence, value, comp, repetition)
             return
 
         field_sep, comp_sep, rep_sep, esc, sub_sep = self._encoding_chars()
@@ -419,9 +420,10 @@ class Message:
 
         It raises exactly what :meth:`set` raises for the same arguments, ``ValueError`` on a CR or
         LF and ``KeyError`` on an absent segment among them, because both are one implementation.
-        ``MSH-1`` and ``MSH-2`` hold the delimiters themselves, have no escaped form, and are refused
-        as :meth:`set` refuses them. A dry-run trace records the value as passed here, as it records
-        the value passed to :meth:`set`, never the escaped text."""
+        ``MSH-1`` and ``MSH-2``, and ``BHS``/``FHS`` fields 1 and 2, hold the delimiters themselves,
+        have no escaped form, and are written, or refused, exactly as :meth:`set` writes them. A
+        dry-run trace records the value as passed here, as it records the value passed to
+        :meth:`set`, never the escaped text."""
         self._write(path, value, occurrence, repetition, as_data=True)
 
     def __setitem__(self, path: str, value: str) -> None:
@@ -435,7 +437,8 @@ class Message:
         intent), so it may not contain the field or repetition separator or a CR/LF. If the field is
         currently empty the value becomes its first repetition. ``occurrence`` selects the segment.
         Raises ``KeyError`` if the segment (occurrence) is absent, ``ValueError`` on a component path,
-        an illegal separator in ``value``, or a header's delimiter field (``MSH-1``/``MSH-2``)."""
+        an illegal separator in ``value``, or a header's delimiter field (``MSH-1``/``MSH-2``, or
+        field 1 or 2 of ``BHS``/``FHS``)."""
         if "\r" in value or "\n" in value:
             raise ValueError("HL7 field value may not contain a segment separator (CR/LF)")
         if occurrence < 1:
@@ -482,12 +485,15 @@ class Message:
         segment_id = tokens[0]
         if not _SEG_ID_RE.match(segment_id):
             raise ValueError(f"segment must begin with a 3-char segment id, got {segment_id!r}")
-        if segment_id == "MSH":
-            raise ValueError("refusing to add a second MSH segment")
         if segment_id in _builtin_hl7.HEADER_IDS:
-            # A header line keeps its delimiters in fields 1 and 2, where a line split on the field
-            # separator puts MSH-3's numbering, so it would encode as a garbled line (BACKLOG #5972).
-            raise ValueError(f"refusing to add a {segment_id} header segment")
+            # There is exactly one MSH; and any header line keeps its delimiters in fields 1 and 2,
+            # where a line split on the field separator puts MSH-3's numbering, so it would encode
+            # as a garbled line (BACKLOG #5972).
+            raise ValueError(
+                "refusing to add a second MSH segment"
+                if segment_id == "MSH"
+                else f"refusing to add a {segment_id} header segment"
+            )
         # A bare segment id (no field separator -> a single token) would graft a fieldless segment,
         # which no read, count or write numbers as an occurrence (BACKLOG #5917), so a later set()
         # would raise "cannot set absent segment". Normalize a bare id to a settable empty segment
@@ -648,6 +654,33 @@ class Message:
         """The component/subcomponent value within a single repetition's text, unescaped, or None
         if that part is absent. Reads the message's own separators."""
         return _builtin_hl7.extract_part(rep_text, comp, sub, _builtin_hl7.separators(self._m))
+
+    def _write_delimiter_field(
+        self,
+        seg: str,
+        fld: int,
+        occurrence: int,
+        value: str,
+        comp: int | None,
+        repetition: int | None,
+    ) -> None:
+        """Write a header's field 1 or 2, or refuse a write that would change a delimiter.
+
+        The text the field already holds passes, as a no-op, at any repetition 1 path, so a
+        passthrough copy of the header still works. At field 2, a whole-field value whose first four
+        characters are the message's own encoding characters is assigned: the separators the parser
+        read do not move, so the rest of the message stays written in them. Anything else raises."""
+        current = self._raw_field(seg, fld, occurrence)
+        if comp is None and repetition in (None, 1):
+            if value == current:
+                return
+            if fld == 2:
+                field_sep, comp_sep, rep_sep, esc, sub_sep = _builtin_hl7_order(self._m)
+                if value[:4] == comp_sep + rep_sep + esc + sub_sep and field_sep not in value:
+                    _refuse_frame_bytes(value)
+                    self._assign_field(seg, fld, occurrence, value)
+                    return
+        raise self._delimiter_write_refusal(seg, fld)
 
     @staticmethod
     def _delimiter_write_refusal(seg: str, fld: int) -> ValueError:

@@ -1394,10 +1394,10 @@ def _decline_reason(operands: tuple[Operand, ...], subject: frozenset[str]) -> s
     if any(o.kind == "variable" for o in operands):
         return "operand is a Corepoint $variable, which has no Handler equivalent"
     resolved = [p for p in (_corepoint_path(o.text) for o in paths) if p is not None]
-    if any(p in _FRAMING_PATHS for p in resolved):
+    if any(_is_framing_path(p) for p in resolved):
         return (
-            "targets MSH-1/MSH-2 (field separator / encoding characters) — Message.set accepts the "
-            "path but rewrites one glyph and leaves the rest of the line on the old one"
+            "targets MSH-1/MSH-2 (field separator / encoding characters) — Message.set refuses "
+            "a write that would change a delimiter there"
         )
     if any(p.split("-", 1)[0].upper() not in _SINGLE_OCCURRENCE for p in resolved):
         return (
@@ -1416,10 +1416,16 @@ _SINGLE_OCCURRENCE = frozenset(
     {"MSH", "EVN", "PID", "PD1", "PV1", "PV2", "MRG", "ACC", "UB1", "UB2"}
 )
 
+
 # ``MSH-1``/``MSH-2`` are the field separator and the encoding characters. A write that changed either
 # would leave the rest of the message on the old delimiters, so ``Message.set`` now refuses one
 # (BACKLOG #5972); an emitted write would fail in the Handler at run time. Never emit a write to either.
-_FRAMING_PATHS = frozenset({"MSH-1", "MSH-2"})
+def _is_framing_path(path: str) -> bool:
+    """Whether ``path`` is MSH-1 or MSH-2 or a component of either (``MSH-2.1``), or field 1 or 2
+    of a ``BHS``/``FHS`` header: the delimiter fields ``Message.set`` guards."""
+    seg, _, rest = path.upper().partition("-")
+    return seg in ("MSH", "BHS", "FHS") and rest.split(".", 1)[0] in ("1", "2")
+
 
 # The connectives each mappable verb is allowed to carry. Anything outside its set means the statement
 # said something the mapping does not model, so the statement is declined rather than approximated.
@@ -1432,7 +1438,7 @@ _VERB_CONNECTIVES = {
 
 def _writable(path: str | None) -> bool:
     """Whether a resolved path may be *written* — single-occurrence segment, never the framing fields."""
-    if path is None or path in _FRAMING_PATHS:
+    if path is None or _is_framing_path(path):
         return False
     return path.split("-", 1)[0].upper() in _SINGLE_OCCURRENCE
 
@@ -2451,7 +2457,7 @@ def _understood_statement(data: str) -> _Statement | None:
                 return None
         elif want == "F":
             path = _corepoint_path(text) if cls == "path" and _FIELD_PATH.fullmatch(text) else None
-            if not _writable(path) or (path or "").split(".", 1)[0] in _FRAMING_PATHS:
+            if not _writable(path):
                 return None
         elif want == "L":
             if cls != "literal" or len(text) < 2 or text[0] != '"' or text[-1] != '"':

@@ -2948,10 +2948,36 @@ def test_declines_name_the_cause_rather_than_a_generic_hand_finish() -> None:
 
 
 def test_a_repeating_segment_and_the_framing_fields_are_never_written() -> None:
-    """``Message.set`` writes occurrence 1 and accepts MSH-1/MSH-2 — both corrupt silently."""
+    """``Message.set`` writes occurrence 1, which would corrupt silently, and refuses a delimiter
+    change to MSH-1/MSH-2 (BACKLOG #5972), which would fail the Handler at run time."""
     body = _role_handler()
     assert 'set_field(msg, "OBX-11"' not in body
     assert 'set_field(msg, "MSH-1"' not in body
+
+
+@pytest.mark.parametrize(
+    ("path", "framing"),
+    [
+        ("MSH-1", True),
+        ("MSH-2", True),
+        ("MSH-2.1", True),
+        ("msh-1.1", True),
+        ("BHS-2", True),
+        ("FHS-1", True),
+        ("MSH-3", False),
+        ("MSH-12", False),
+        ("MSH-21.1", False),
+        ("PID-1", False),
+    ],
+)
+def test_a_framing_path_covers_components_and_batch_headers(path: str, framing: bool) -> None:
+    """BACKLOG #5972: ``Message.set`` refuses a delimiter change at a component of MSH-1/MSH-2 and
+    at a BHS/FHS header's fields 1 and 2 too, so the importer never emits a write to any of them."""
+    from messagefoundry_toolkit.corepoint_import import _is_framing_path, _writable
+
+    assert _is_framing_path(path) is framing
+    if framing:
+        assert not _writable(path)
 
 
 def test_a_declined_statement_emits_no_live_stub() -> None:
