@@ -63,8 +63,10 @@
     was killed, when the deadline passed before the listing run, or when the listing run was killed.
     Inside the step, past the deadline no further tree is started, and each one left is logged as
     NOT-REACHED (the next run lists them again). Every one of those stops still writes the exit line.
-    A run that stopped at the deadline and found nothing else exits 4, DEADLINE; see $EXIT_DEADLINE
-    below. A child that cannot be killed is logged as `kill FAILED` and may still be running.
+    A run that stopped at the deadline and earned no other code exits 4, DEADLINE; see $EXIT_DEADLINE
+    below. Two deadline stops exit 1 instead: an -Apply prune run killed part way, the same rule the
+    trap applies to an -Apply prune that started and did not exit, and a child the kill could not end,
+    logged as `kill FAILED`, which may still be running.
 
 .PARAMETER KeepLogs
     How many dated logs to keep. Older ones are deleted after each run.
@@ -140,7 +142,7 @@ $EXIT_MEANING = @{
 # tests/test_worktree_install_daily_prune.py::test_the_runners_own_exit_code_is_not_one_of_prune_merged
 # holds it apart from prune-merged.ps1's.
 $EXIT_DEADLINE = 4
-$EXIT_DEADLINE_MEANING = 'DEADLINE -- the run stopped at its -StopAfterMinutes deadline and left work for the next run; nothing else went wrong'
+$EXIT_DEADLINE_MEANING = 'DEADLINE -- the run stopped at its -StopAfterMinutes deadline and left work for the next run; it earned no other code, and no killed run was an -Apply prune or survived its kill'
 
 $prune = Join-Path $PSScriptRoot 'prune-merged.ps1'
 if (-not (Test-Path -LiteralPath $prune)) { throw "prune-merged.ps1 not found beside this script: $prune" }
@@ -193,8 +195,10 @@ function Invoke-BoundedPrune([object[]]$ChildArgs, [switch]$LogStdout, [string]$
         }) -join ' '
     # Absolute: the FileStream below resolves a relative path against the process directory.
     $logDirFull = (Resolve-Path -LiteralPath $LogDir).ProviderPath
-    $out = Join-Path $logDirFull "prune-child-$PID.out.txt"
-    $err = Join-Path $logDirFull "prune-child-$PID.err.txt"
+    # Unique per call: a descendant of an earlier run that still holds its file must not write into this one.
+    $tag = "$PID-$([guid]::NewGuid().ToString('N'))"
+    $out = Join-Path $logDirFull "prune-child-$tag.out.txt"
+    $err = Join-Path $logDirFull "prune-child-$tag.err.txt"
     $p = $null
     $timedOut = $false
     $killedAt = $null
@@ -261,6 +265,11 @@ function Invoke-BoundedPrune([object[]]$ChildArgs, [switch]$LogStdout, [string]$
         if ($null -ne $p) { $p.Dispose() }
         if ($logged) { Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue }
     }
+}
+
+# A child the kill could not end may still be running, unobserved, so the run is a failure: at least 1.
+function Set-KillFailedCode([pscustomobject]$Run) {
+    if ($Run.KillFault -or $Run.StillRunning) { $script:code = [math]::Max([int]$script:code, 1) }
 }
 
 # The timed line a child still running at the deadline leaves, after whatever it printed. "killed" only
@@ -364,6 +373,10 @@ try {
             $run = Invoke-BoundedPrune $pruneArgs -LogStdout
             if ($run.TimedOut) {
                 $deadlineHit = $true
+                # An -Apply prune killed part way attempted something and did not finish: 1, as the trap
+                # rules for an -Apply prune that started and did not exit. Set before the line, as the rows do.
+                if ($Apply) { $code = [math]::Max([int]$code, 1) }
+                Set-KillFailedCode $run
                 Write-TimedOut $run
                 $stopReason = "prune-merged.ps1 was still running at the run's deadline ($($deadlineText.Trim()))"
             }
@@ -403,6 +416,7 @@ try {
         }
         if ($deadline -and $run.TimedOut) {
             $deadlineHit = $true
+            Set-KillFailedCode $run
             Write-TimedOut $run
             $stopReason = "the listing run was still running at the run's deadline ($($deadlineText.Trim()))"
         }

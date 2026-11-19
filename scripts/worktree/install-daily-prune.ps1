@@ -51,7 +51,8 @@
     passes run-daily-prune.ps1 -StopAfterMinutes, the limit less the margin $STOP_MARGIN_MINUTES sets.
     Past that point the runner starts no further removal, kills a prune-merged.ps1 run still going (a
     hung one included) with its process tree, logs it as TIMED OUT and writes its exit line: 4,
-    DEADLINE, where the run earned no other code. run-daily-prune.ps1's header says how, and what that
+    DEADLINE, where the run earned no other code and no killed run was an -Apply prune or survived
+    its kill (those exit 1). run-daily-prune.ps1's header says how, and what that
     kill can leave half done. That margin covers one removal in flight, or the
     kill of a prune-merged.ps1 run, and the closing lines.
 
@@ -112,8 +113,8 @@ $ErrorActionPreference = 'Stop'
 
 # How long before the task's limit the runner stops starting removals. It has to cover one removal in
 # flight (about 23 s on average on 2026-11-18, 157 an hour) or the kill of a prune-merged.ps1 run still
-# going at the deadline (the runner waits at most 15 s for the killed tree's output), then the closing
-# lines. Before the runner bounded those runs, the margin also had to cover a listing run started just
+# going at the deadline (the runner waits up to 15 s for the killed child to exit, then copies its
+# output into the log, which is not bounded), then the closing lines. Before the runner bounded those runs, the margin also had to cover a listing run started just
 # before the deadline; 20 was set then and is kept. The only timing on record for a listing run is a bound: the whole
 # 2026-11-16 run, both prune-merged.ps1 runs and 633 listed rows, took 17 minutes. Larger populations
 # have not been timed, so 20 is a judgement on that one figure, not a measurement at today's count.

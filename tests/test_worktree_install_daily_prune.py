@@ -722,15 +722,20 @@ def _kill_if_alive(pid_file: Path, since: float) -> bool:
 
 
 @requires_windows
-@pytest.mark.parametrize("step", [False, True], ids=["prune-only", "with-step"])
+@pytest.mark.parametrize(
+    ("step", "apply", "expected"),
+    [(False, False, 4), (True, False, 4), (False, True, 1)],
+    ids=["prune-only", "with-step", "apply"],
+)
 def test_a_prune_run_past_the_deadline_is_killed_with_its_tree_and_the_run_still_exits(
-    tmp_path: Path, step: bool
+    tmp_path: Path, step: bool, apply: bool, expected: int
 ) -> None:
     """A hung prune-merged.ps1 used to run on into Task Scheduler's kill, which writes nothing.
 
     With a 12-second deadline the stub is killed with its grandchild, the log keeps what it printed
-    before the hang, then the TIMED OUT line, any later step's SKIPPED line, and the exit line, and the
-    run exits 4, DEADLINE. On origin/main the child ran its full 40 seconds and the run exited 0.
+    before the hang, then the TIMED OUT line, any later step's SKIPPED line, and the exit line. A dry
+    run exits 4, DEADLINE. An -Apply prune killed part way attempted something and did not finish, so
+    it exits 1, as the trap does for one. On origin/main the child ran its full 40 seconds and exited 0.
     """
     grandchild = tmp_path / "grandchild.pid"
     since = time.time() - 1
@@ -742,6 +747,7 @@ def test_a_prune_run_past_the_deadline_is_killed_with_its_tree_and_the_run_still
             "-StopAfterMinutes",
             "0.2",
             *(["-RemoveFinishedClaudeWorktrees"] if step else []),
+            *(["-Apply"] if apply else []),
             prune_stub=HANGING_PRUNE_STUB,
             extra={"finished-worktree-removal.ps1": REMOVING_HELPER_STUB} if step else None,
             env_extra={"T_GRANDCHILD": str(grandchild), "T_OUTCOME": "REMOVED"},
@@ -763,8 +769,10 @@ def test_a_prune_run_past_the_deadline_is_killed_with_its_tree_and_the_run_still
             "deadline (stopAfter="
         ) in text, text
         assert "listed finished:" not in text, text
-    assert re.match(r"=== exit 4 \(DEADLINE -- .*\) at \d\d:\d\d:\d\d ===$", lines[-1]), text
-    assert proc.returncode == 4, proc.stdout + proc.stderr
+    assert re.match(rf"=== exit {expected} \(.*\) at \d\d:\d\d:\d\d ===$", lines[-1]), text
+    if expected == 4:
+        assert lines[-1].startswith("=== exit 4 (DEADLINE -- "), text
+    assert proc.returncode == expected, proc.stdout + proc.stderr
     assert not list((tmp_path / "logs").glob("prune-child-*")), "the logged output files were left"
 
 

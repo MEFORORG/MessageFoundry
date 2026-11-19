@@ -758,8 +758,9 @@ as before.
 run, a skipped step, or a `NOT-REACHED` tree. `4` is the runner's own code, not one `prune-merged.ps1`
 returns, and it replaces only a `0`. A `1`, `2` or `3` the run earned stays the exit code, because a
 real failure matters more than a partial run, and a deadline stop is expected most nights while a
-backlog drains; the log still records the stop. A child the kill could not end is logged as
-`kill FAILED`, with its pid, and may still be running. Before, a deadline stop left the code alone, so a run that skipped work
+backlog drains; the log still records the stop. Two deadline stops exit `1` instead: an `-Apply`
+prune run killed part way, which attempted something and did not finish, and a child the kill could
+not end, logged as `kill FAILED` with its pid, which may still be running. Before, a deadline stop left the code alone, so a run that skipped work
 exited as if it had finished it.
 
 The exit code starts as the prune's, and each row changes it as the row arrives, before the row's
