@@ -2222,16 +2222,16 @@ def _run(
     pre-camelCase reading otherwise. Its last argument names the group a replacement writes back
     masked at its end, which only the tracing reads.
 
-    ``wide`` False leaves out the widened DSN pass (BACKLOG #5386). Nothing in this module passes
-    it. :func:`_union` runs its reading before with the widened pass, so the pass also runs where
-    the union returns that reading whole: on a line where the shipped reading would hide a member
-    key's ";", and on an untraceable one. The widened pattern holds no camelCase fragment, so
+    ``wide`` False leaves out the widened DSN pass (BACKLOG #5386). :func:`_union` passes it only
+    on the probe its shortcut is decided on, and says why there. THE UNION RUNS THE WIDENED PASS on
+    both of its readings otherwise, so the pass also runs where the union returns its reading before
+    whole: on a line where the shipped reading would hide a member key's ";", and on an
+    untraceable one. The widened pattern holds no camelCase fragment, so
     :func:`_pre_camel` leaves it as it is and both readings apply the same pattern. Its run does not
     cross a camelCase label only the shipped reading reads, because every segment of the widened
     match stops at a label word (``_DSN_RUN_STOP``): on ``redis://:pw@h?accessToken=Tail@Sec`` and
     ``redis://:pw@h;userPassword=Tail@Sec`` the reading before, widened or not, differs only in
-    ``pw``, which the pass hides. The flag stays for tests that rebuild the reading as it stood
-    before BACKLOG #5545, which had no widened pass."""
+    ``pw``, which the pass hides."""
     apply = _plain_sub if sub is None else sub
     if _admits(folded, _ENV_HINT):
         text = apply(_MEFOR_SECRET, lambda m: _keep_label(m, placeholder), text, _BRACED)
@@ -2454,10 +2454,18 @@ def _union(text: str, placeholder: str, folded: str | None) -> str:
     before = _Trace(len(text), _pre_camel)
     shipped = _Trace(len(text), lambda pattern: pattern)
     try:
-        old = _run(text, placeholder, folded, before.sub)
-        if old is text:
-            # The reading before hid nothing, so the shipped one alone needs no trace.
+        # The shortcut is decided on the reading before WITHOUT the widened DSN pass, as origin/main
+        # decided it (BACKLOG #5386). Decided on the widened one, a line where that pass is the
+        # only change, ``redis://:Pw@h failed; userPwd='Sec;PWD='``, left the shortcut, reached the
+        # member-key branch below and kept the reading before whole, which reads no camelCase label,
+        # so ``Sec`` printed where the shipped reading hid it. Unchanged, the shipped reading,
+        # which runs the widened pass itself, is the whole answer, as it was on origin/main.
+        # A trace, not a plain sub, because only a trace returns the very text where no pattern
+        # matched, so a replacement that writes back what it read still counts as a change.
+        probe = _Trace(len(text), _pre_camel)
+        if _run(text, placeholder, folded, probe.sub, wide=False) is text:
             return _run(text, placeholder, folded)
+        old = _run(text, placeholder, folded, before.sub)
         new = _run(text, placeholder, folded, shipped.sub)
     except _Untraceable:
         return _run(text, placeholder, folded, _pre_camel_sub)

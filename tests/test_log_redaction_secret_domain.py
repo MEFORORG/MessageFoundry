@@ -1508,7 +1508,8 @@ def test_an_empty_user_dsn_hides_an_equals_sign_and_states_its_residual() -> Non
     assert "Zq7-" in chained and "-Kv9x" in chained, chained
     assert "p%40Kv9x" in scrub_credentials("redis://:p%40Kv9x@host")
     # A line where the union keeps the reading before whole is no longer a residual (BACKLOG #5386,
-    # added item 2); tests/test_b532r_redaction_dsn.py holds it.
+    # added item 2); tests/test_b532r_redaction_dsn.py holds it. The control takes no union.
+    assert "Zq-Pw_1" not in scrub_credentials("connect redis://:Zq-Pw_1@h failed")
 
 
 def _one_handler(text: str) -> str:
