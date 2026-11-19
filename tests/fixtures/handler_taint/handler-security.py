@@ -11,6 +11,7 @@ import shutil
 import sys
 import tempfile
 from builtins import open as bopen
+from os import popen as osp
 from pathlib import Path
 from pickle import loads as pk
 from subprocess import run as r
@@ -61,6 +62,8 @@ def h_aliased(msg):
     eval(msg.text)
     # ruleid: mf-handler-ambient-os-exec
     os.system(msg.raw)
+    # ruleid: mf-handler-ambient-os-exec
+    osp(msg.text)
     return Send("OB", msg)  # noqa: F821
 
 

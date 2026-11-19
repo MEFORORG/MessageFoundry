@@ -32,7 +32,7 @@ _EXPECTED: collections.Counter[str] = collections.Counter(
     {
         "mf-handler-phi-to-log": 9,
         "mf-handler-ambient-subprocess": 1,
-        "mf-handler-ambient-os-exec": 1,
+        "mf-handler-ambient-os-exec": 2,
         "mf-handler-ambient-deserialization": 1,
         "mf-handler-ambient-eval-exec": 1,
         "mf-handler-sqli-db-lookup": 10,
@@ -60,8 +60,7 @@ def main() -> int:
         payload = None
     failure = check(payload, read_fixture())
     if failure is not None:
-        if payload is None:
-            failure += f" (rc={proc.returncode}):\n{proc.stderr[:2000]}"
+        failure += f" (rc={proc.returncode}):\n{proc.stderr[:2000]}"
         print(failure, file=sys.stderr)
         return 1
     got = collections.Counter(_rule(r) for r in payload["results"])
@@ -75,16 +74,21 @@ def check(payload: object, fixture: str) -> str | None:
     A non-empty ``errors`` array fails it even though JSON parsed (BACKLOG #5463): semgrep reports a
     rule it could not load, or a file it could not parse, there and still exits with results, so a
     broken rule would otherwise read as one that matched nothing it was not annotated for."""
-    if not isinstance(payload, dict) or not isinstance(payload.get("results"), list):
-        return "semgrep produced no JSON results"
+    if not isinstance(payload, dict):
+        return "semgrep produced no JSON object"
     errors = payload.get("errors")
     if errors:
         return f"semgrep reported errors, so its results prove nothing: {json.dumps(errors)[:2000]}"
-    results = payload["results"]
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return "semgrep produced no JSON results"
     # Every finding must sit on the line its `# ruleid:` annotation names, checked first so a failure
     # names the line. Equal counts alone could hide a miss offset by an over-match elsewhere.
     want, _ok = annotated_findings(fixture)
-    hit = {(_rule(r), r["start"]["line"]) for r in results}
+    try:
+        hit = {(_rule(r), int(r["start"]["line"])) for r in results}
+    except (KeyError, TypeError, ValueError) as exc:
+        return f"semgrep produced a result this gate cannot read: {exc!r}"
     if hit != want:
         return (
             f"handler-taint rules REGRESSED: missed {sorted(want - hit)}, "

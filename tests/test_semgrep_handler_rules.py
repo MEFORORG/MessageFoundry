@@ -87,7 +87,9 @@ def test_rules_are_wellformed_yaml() -> None:
     yaml = pytest.importorskip("yaml")  # in requirements.lock; NO new dep
     doc = yaml.safe_load(handler_semgrep_rules().read_text(encoding="utf-8"))
     rules = {r["id"]: r for r in doc["rules"]}
-    assert set(rules) >= _EXPECTED
+    # Equal, not a superset (BACKLOG #5463): a rule added to the file must join _EXPECTED, which
+    # test_fixture_annotations_match_the_pinned_counts then requires a fixture case for.
+    assert set(rules) == _EXPECTED
     for r in doc["rules"]:
         assert r["languages"] == ["python"] and r["message"].strip()
         assert r["severity"] in {"WARNING", "ERROR", "INFO"}
@@ -141,6 +143,7 @@ _POSITIVE_CASES: tuple[tuple[str, str], ...] = (
     ("mf-handler-ambient-eval-exec", "eval(msg.text)"),
     # BACKLOG #5463: the os.system/os.popen rule had no case, so a regressed rule passed the gate.
     ("mf-handler-ambient-os-exec", "os.system(msg.raw)"),
+    ("mf-handler-ambient-os-exec", "osp(msg.text)"),  # os.popen through an import alias
     ("mf-handler-sqli-db-lookup", 'db_lookup("MPI", "select * from p where mrn = \'" + mrn'),
     ("mf-handler-sqli-db-lookup", 'db_lookup("MPI", f"select * from p'),
     # BACKLOG #5381: connection= keyword, module alias, import alias, FhirRaw, FhirToken system.
@@ -274,3 +277,14 @@ def test_gate_fails_on_a_payload_without_results() -> None:
     gate = _load_gate()
     assert gate.check(None, gate.read_fixture()) is not None
     assert gate.check({"errors": []}, gate.read_fixture()) is not None
+    # Errors with no results name the errors, not only the missing key.
+    failure = gate.check({"errors": [{"message": "bad rule"}]}, gate.read_fixture())
+    assert failure is not None and "bad rule" in failure
+
+
+def test_gate_reports_a_malformed_result_instead_of_raising() -> None:
+    gate = _load_gate()
+    text, payload = _canned(gate)
+    del payload["results"][0]["start"]
+    failure = gate.check(payload, text)
+    assert failure is not None and "cannot read" in failure
