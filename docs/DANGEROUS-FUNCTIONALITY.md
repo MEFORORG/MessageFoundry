@@ -1153,8 +1153,10 @@ names, meant to be de-identified first, and `reconcile/capture.py` records whate
 sends it. So what the harness carries is only as clean as what its operator gives it.
 
 It holds at least four of the classes above, and one of its own. This section is a floor, not a
-full list. No harness module imports `ctypes`, or an archive or compression library, itself. That
-is a claim about imports only. At least `sinks/dimse.py` inflates a compressed data set a peer
+full list. One harness module imports `ctypes`: `mllp.py`, on Windows only, calls
+`ctypes.FormatError` to turn the Winsock error code of a failed non-blocking dial into the message
+text a blocking connect would have raised. It calls nothing else through `ctypes`. No harness module
+imports an archive or compression library itself. That is a claim about imports only. At least `sinks/dimse.py` inflates a compressed data set a peer
 sends it, through the engine's own bounded inflate helper.
 
 **Process starts.** 7 harness modules start a process, each from an argument list:
@@ -1339,8 +1341,8 @@ reads the code and fails when one of these no longer matches it:
 - section 10: the count of HTML writes. It also checks that the console's Python starts no
   process, imports no `ctypes` or archive library, and imports nothing by name;
 - section 11: the harness's process-start table and its form column, the import-by-name list and
-  the config-loader list, each with its count, and the parser table. A new `ctypes` or archive
-  import under `harness/` fails too. So does a new assignment to an attribute of an imported
+  the config-loader list, each with its count, and the parser table. A `ctypes` import under
+  `harness/` in a module other than `mllp.py`, or any archive import there, fails too. So does a new assignment to an attribute of an imported
   module, or one the section does not name.
 
 The checks read TypeScript and JavaScript by pattern, so a call named in a trailing comment counts.

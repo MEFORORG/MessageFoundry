@@ -41,8 +41,9 @@ that exists and does.
 
 Section 11 holds the test harness, ``harness/**``, to its own lists (BACKLOG #2883). The same
 detectors read it: its process-start table and form column, the modules that import by name or
-call the engine's config loader, and the parse sites the six patterns find. It must import no
-``ctypes`` and no archive library. One detector is the harness's own: an assignment to an attribute
+call the engine's config loader, and the parse sites the six patterns find. It must import
+``ctypes`` only in the modules registered in ``_REVIEWED_HARNESS_CTYPES`` and named on the page,
+and no archive library. One detector is the harness's own: an assignment to an attribute
 of something a module imported, which is how its provision path replaces the shipped command's
 terminal read. Each such assignment is registered in ``_REVIEWED_HARNESS_SWAPS`` and named on the
 page. That detector sees a plain assignment and a ``setattr`` on an imported name, at least; it
@@ -1934,6 +1935,10 @@ _HARNESS_PARSE_HEADER = "| What it reads | Where it comes from | Harness modules
 #: The engine's config loader, which executes every module in the folder it is given (section 2).
 _CONFIG_LOADERS = frozenset({"load_config"})
 
+#: Harness modules reviewed to import ``ctypes``. ``mllp.py`` calls ``ctypes.FormatError`` on
+#: Windows to turn a failed non-blocking dial's Winsock code into a blocking connect's error text.
+_REVIEWED_HARNESS_CTYPES = frozenset({"mllp.py"})
+
 #: Reviewed assignments to an attribute of something a harness module imported, by module, each as
 #: the dotted name assigned. Section 11's swap paragraph names each module and each attribute.
 _REVIEWED_HARNESS_SWAPS: dict[str, tuple[str, ...]] = {
@@ -2085,9 +2090,21 @@ def _harness_parse_drift(text: str, live: set[str]) -> list[str]:
     )
 
 
-def _harness_absent_problems(sources: Mapping[str, str]) -> list[str]:
-    """Section 11 says the harness imports no ``ctypes`` and no archive library."""
-    problems = [f"harness/{rel} imports ctypes" for rel in sorted(_ctypes_modules(sources))]
+def _harness_absent_problems(text: str, sources: Mapping[str, str]) -> list[str]:
+    """Section 11 says the harness imports ``ctypes`` only in the reviewed modules, which it names,
+    and no archive library."""
+    live = _ctypes_modules(sources)
+    problems = [f"harness/{rel} imports ctypes" for rel in sorted(live - _REVIEWED_HARNESS_CTYPES)]
+    problems += [
+        f"harness/{rel} is registered as a ctypes importer but imports no ctypes"
+        for rel in sorted(_REVIEWED_HARNESS_CTYPES - live)
+    ]
+    section = _section(text, 11)
+    problems += [
+        f"section 11 does not name `{rel}` as a ctypes importer"
+        for rel in sorted(_REVIEWED_HARNESS_CTYPES)
+        if f"`{rel}`" not in section
+    ]
     return problems + [
         f"harness/{rel} imports an archive library" for rel in sorted(_archive_modules(sources))
     ]
@@ -2103,7 +2120,7 @@ def _harness_drift(text: str, sources: Mapping[str, str]) -> list[str]:
         *_harness_list_drift(text, _HARNESS_LOADS_LEAD, _modules_calling(sources, _CONFIG_LOADERS)),
         *_harness_swap_drift(text, _harness_swaps(sources)),
         *_harness_parse_drift(text, _parse_sites(sources)),
-        *_harness_absent_problems(sources),
+        *_harness_absent_problems(text, sources),
     ]
 
 
@@ -2215,6 +2232,13 @@ def test_harness_drift_is_reported() -> None:
     assert sources["load/rigadmin.py"].count(swap) == 1, "fixture drifted from load/rigadmin.py"
     gone = {**sources, "load/rigadmin.py": sources["load/rigadmin.py"].replace(swap, "pass")}
     assert _harness_drift(text, gone)
+    # The reviewed ctypes module dropped from the page, and a registered one that imports none.
+    named = "imports `ctypes`: `mllp.py`, on Windows only"
+    assert text.count(named) == 1, "re-anchor on section 11's naming of the ctypes module"
+    assert _harness_drift(text.replace(named, "imports `ctypes`: mllp, on Windows only"), sources)
+    assert sources["mllp.py"].count("import ctypes") == 1, "fixture drifted from mllp.py"
+    no_ctypes = {**sources, "mllp.py": sources["mllp.py"].replace("import ctypes", "pass")}
+    assert _harness_drift(text, no_ctypes)
 
     # The page, one break at a time: a dropped row or bullet, a wrong count, a wrong form, a name
     # the swap paragraph loses, and a module dropped from or added to the parser table.

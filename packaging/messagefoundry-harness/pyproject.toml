@@ -118,6 +118,7 @@ Contributing = "https://github.com/MEFORORG/MessageFoundry/blob/main/CONTRIBUTIN
 "../../harness/README.md" = "harness/README.md"
 "../../harness/__main__.py" = "harness/__main__.py"
 "../../harness/_async.py" = "harness/_async.py"
+"../../harness/_batch.py" = "harness/_batch.py"
 "../../harness/_console_widgets.py" = "harness/_console_widgets.py"
 "../../harness/_discover.py" = "harness/_discover.py"
 "../../harness/_login.py" = "harness/_login.py"
