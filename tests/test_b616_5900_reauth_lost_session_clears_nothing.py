@@ -263,19 +263,18 @@ def _outage(user_id: str) -> Exception:
     [
         (_forged, AUTHORITY_SEAL_FAILED_ACTION),
         (_unverifiable, AUTHORITY_SEAL_UNVERIFIABLE_ACTION),
-        (_outage, None),
     ],
-    ids=["forged", "unverifiable", "outage"],
+    ids=["forged", "unverifiable"],
 )
 async def test_a_refused_record_at_the_deferred_clear_is_reported_and_grants_nothing(
     monkeypatch: pytest.MonkeyPatch,
     raised: Callable[[str], Exception],
     reported: str | None,
 ) -> None:
-    """The clear's write is refused because the account's record fails its seal, cannot be
-    verified, or Vault transit does not answer. Before the clear was deferred that raise granted
-    nothing; now the answer is reported, the rotated session is ended, and the caller is told to
-    sign in again, with no token handed back. An Outage pages and writes no seal row."""
+    """The clear's write is refused because the account's record fails its seal or cannot be
+    verified. Before the clear was deferred that raise granted nothing; now the answer is reported,
+    the rotated session is ended, and the caller is told to sign in again, with no token handed
+    back."""
     store = await MessageStore.open(":memory:")
     try:
         service, notifier, identity, token = await _setup(store)
@@ -290,10 +289,37 @@ async def test_a_refused_record_at_the_deferred_clear_is_reported_and_grants_not
             assert len(await store.list_audit(action=action)) == (action == reported)
         assert await store.list_sessions("u-bob") == [], "the rotated session was left live"
         rows = [str(dict(r)["detail"]) for r in await store.list_audit(action="auth.reauth")]
-        refused_rows = [json.loads(d) for d in rows if "account_refused" in d]
+        refused_rows = [json.loads(d) for d in rows if "clear_denied" in d]
         assert len(refused_rows) == 1
         assert refused_rows[0]["session_lost"] is True
         assert refused_rows[0]["session_ended"] is True
+        user = await store.get_user("u-bob")
+        assert user is not None and user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
+        assert not [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
+    finally:
+        await store.close()
+
+
+async def test_an_outage_at_the_deferred_clear_pages_and_ends_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Vault transit Outage at the clear's write ends nothing (ADR 0217's Outage row): it is
+    paged, no seal row is written, nothing is cleared, and the caller keeps its rotated token."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, notifier, identity, token = await _setup(store)
+        paged: list[str] = []
+
+        async def outage(user_id: str, **kwargs: Any) -> None:
+            raise _outage(user_id)
+
+        monkeypatch.setattr(store, "record_login_success", outage)
+        monkeypatch.setattr(service, "_user_seal_outage", paged.append)
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.ok and out.token is not None
+        assert paged == ["re-auth's lockout reset"]
+        for action in (AUTHORITY_SEAL_FAILED_ACTION, AUTHORITY_SEAL_UNVERIFIABLE_ACTION):
+            assert await store.list_audit(action=action) == []
         user = await store.get_user("u-bob")
         assert user is not None and user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
         assert not [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
@@ -334,11 +360,11 @@ async def test_a_reread_the_checked_read_fails_grants_nothing(
         await store.close()
 
 
-async def test_a_reread_that_finds_no_account_clears_nothing_and_says_missing(
+async def test_a_reread_that_finds_no_account_grants_nothing_and_says_missing(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """No account at the re-read, one deleted meanwhile: logged as missing, not as a changed
-    lockout state, and nothing is written."""
+    lockout state, nothing is written, and the re-auth is told to grant nothing."""
     store = await MessageStore.open(":memory:")
     try:
         service, notifier, _, _ = await _setup(store)
@@ -354,7 +380,7 @@ async def test_a_reread_that_finds_no_account_clears_nothing_and_says_missing(
         monkeypatch.setattr(service, "_checked_by_id", gone)
         monkeypatch.setattr(store, "record_login_success", never)
         with caplog.at_level(logging.INFO, logger="messagefoundry.auth.service"):
-            assert await service._clear_after_reauth(decided) == "kept"
+            assert await service._clear_after_reauth(decided) == "denied"
         assert "found the account missing" in caplog.text
         assert "lockout state changed" not in caplog.text
         assert not [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]

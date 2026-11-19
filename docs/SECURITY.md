@@ -3772,11 +3772,12 @@ has a narrower window of the same kind (BACKLOG #5900): its clear runs once the 
 rotated, re-reads the account and writes only when no lockout column changed since the proof. It
 holds the account's per-process re-proof lock, which at least these factor legs' and the sign-in
 leg's lockout writes do not take and no other engine shard sees, so a failure or lock one of them
-writes between that re-read and the write is cleared by it. An account record that fails its
-seal, that Vault transit cannot verify, or that Vault transit does not answer for at that re-read
-or write is reported, the store is asked to end the rotated session, and the re-auth answers
-`session_lost`. Its `auth.reauth` row then carries `account_refused` and `session_ended`, which
-says whether that revoke landed as far as the re-auth saw.
+writes between that re-read and the write is cleared by it. An account record that fails its seal,
+or that Vault transit cannot verify, at that re-read or write is reported, and an account gone by
+then is logged. Either way the store is asked to end the rotated session, and the re-auth answers
+`session_lost`. Its `auth.reauth` row then carries `clear_denied` and `session_ended`, which says
+whether that revoke landed as far as the re-auth saw; when it did not, the rotated session may
+still exist, its token never handed back. A Vault transit Outage there is paged and ends nothing.
 
 **A directory step-up or enrolment leg refuses a present account that lost a role in the directory
 (BACKLOG #2240).** At least the code and passkey legs above, the two enrolment legs, the IdP
