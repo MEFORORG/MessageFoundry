@@ -2722,7 +2722,7 @@ def _single_kill_warnings(caplog: pytest.LogCaptureFixture) -> list[object]:
         # The reuse-safe signal found the group empty: nothing is left to kill.
         ("zombie", _NOT_SENT, False, ["group", "reaped"], False),
         ("running", _NOT_SENT, False, ["group", "reaped"], False),
-        # Neither sent anything and members may remain, as for a live pid that left its group:
+        # Neither sent anything and members may remain, as for a reused pid that leads no group:
         # the single kill is the fallback, under a WARNING.
         ("running", _NOT_SENT, None, ["group", "reaped"], True),
         ("zombie", _NOT_SENT, None, ["group", "reaped"], True),
@@ -2883,8 +2883,9 @@ def test_a_worker_reaped_after_the_state_check_still_has_its_group_killed(
     The state check is replaced to return what it read before the reap, so the window is
     deterministic. POSIX with ``/proc`` only, without which :func:`_pid_running` cannot tell a
     running grandchild from a zombie, so it is NOT RUN on the Windows host this was written on; the
-    Linux CI leg runs it. FALSIFICATION: as in the test above, and the grandchild survives, since
-    the single-process kill that follows sends nothing to a reaped child."""
+    Linux CI leg runs it. FALSIFICATION: as in
+    :func:`test_the_posix_reap_reaches_the_group_before_any_single_kill`, and the grandchild
+    survives, since the single-process kill that follows sends nothing to a reaped child."""
     pidfile = tmp_path / "grandchild.pid"
     script = (
         "import subprocess, sys\n"

@@ -868,7 +868,9 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None, inbound: 
     signal also sends nothing and members may remain is a single-process kill tried, under a
     WARNING naming ``inbound``. It signals a worker still running and only reaps a zombie. For a
     worker already reaped it does nothing, unless the pid was given to another child of this
-    engine in the meantime, which it then signals: the limit :func:`_posix_child_state` states.
+    engine in the meantime, which it then signals, or reaps if that child has exited: the limit
+    :func:`_posix_child_state` states. The worker leads its own session, so it cannot leave its
+    group; a live pid that leads no group here is such a reused pid.
     ``_kill_single`` swallows a failed signal, so the WARNING says the kill is tried, not done."""
     if sys.platform == "win32":
         if job is not None:
