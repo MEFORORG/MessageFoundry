@@ -36,6 +36,7 @@ from messagefoundry.store.cell_tag import (
     dead_letter_on_cell_tag,
     dead_letters_on_cell_tag,
     message_cell_aad,
+    open_listed_cell,
     open_message_cell,
     open_preset_criteria,
     open_tagged_cell,
@@ -45,6 +46,7 @@ from messagefoundry.store.cell_tag import (
     row_tag_aad,
     row_tag_columns,
     withhold_message_cells,
+    withhold_refused_cell,
 )
 from messagefoundry.store.cipher_cells import SQLITE_CIPHER_CELLS
 from messagefoundry.store.crypto import (
@@ -977,6 +979,9 @@ async def test_the_scoped_message_read_hides_a_failed_row_out_of_scope() -> None
     audits: list[str] = []
 
     class _Store:
+        async def message_channel_id(self, message_id: str) -> str:
+            return "IB_SECRET"
+
         async def get_message(self, message_id: str) -> None:
             raise CellTagError("messages", "raw", message_id, "IB_SECRET")
 
@@ -996,6 +1001,378 @@ async def test_the_scoped_message_read_hides_a_failed_row_out_of_scope() -> None
         await get_scoped_message(engine, inside, "m-scope", request)
     assert refused.value.status_code == 423
     assert await read_scoped_message(engine, inside, "m-scope", request) is None  # export skips
+
+
+@pytest.mark.parametrize(
+    ("raised", "status"),
+    [
+        (CipherError("retired key"), 423),
+        (UnauthenticatedCipherError("no key verified"), 423),
+        (CipherUnavailableError("vault down"), 503),
+    ],
+)
+async def test_the_scoped_message_read_checks_scope_before_it_decrypts(
+    raised: CipherError, status: int
+) -> None:
+    """BACKLOG #5969, #5981: the scope is checked on the plaintext channel before any cell is
+    opened. Out of scope, a message whose cells the cipher refuses is the uniform 404, audited,
+    and ``get_message`` never runs; in scope a plain cipher error is a 423 and an outage a 503,
+    never a 500. Before the fix ``get_message`` ran first and only a tag failure was caught."""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    from messagefoundry.api.message_scope import get_scoped_message, read_scoped_message
+
+    audits: list[str] = []
+    opened: list[str] = []
+
+    class _Store:
+        async def message_channel_id(self, message_id: str) -> str | None:
+            return None if message_id == "m-none" else "IB_SECRET"
+
+        async def get_message(self, message_id: str) -> None:
+            opened.append(message_id)
+            raise raised
+
+        async def record_audit(self, action: str, **_: object) -> None:
+            audits.append(action)
+
+    engine: Any = SimpleNamespace(store=_Store())
+    request = Request({"type": "http", "client": ("127.0.0.1", 1), "headers": []})
+    out: Any = SimpleNamespace(username="u", can_access_channel=lambda c: c != "IB_SECRET")
+    inside: Any = SimpleNamespace(username="u", can_access_channel=lambda c: True)
+    with pytest.raises(HTTPException) as hidden:
+        await get_scoped_message(engine, out, "m-scope", request)
+    assert hidden.value.status_code == 404
+    assert audits == ["auth.channel_denied"] and opened == []
+    with pytest.raises(HTTPException) as absent:  # control: a missing id is the same 404
+        await get_scoped_message(engine, inside, "m-none", request)
+    assert absent.value.status_code == 404 and opened == []
+    with pytest.raises(HTTPException) as refused:
+        await get_scoped_message(engine, inside, "m-scope", request)
+    assert refused.value.status_code == status and opened == ["m-scope"]
+    if status == 503:
+        assert refused.value.headers is not None and "Retry-After" in refused.value.headers
+    # The export stream does not skip such a row, which would leave a gap nothing records; it
+    # stops on a fresh error of the same kind that carries no chain.
+    with pytest.raises(CipherError) as stopped:
+        await read_scoped_message(engine, inside, "m-scope", request)
+    assert stopped.value is not raised and not isinstance(stopped.value, CellTagError)
+    assert isinstance(stopped.value, CipherUnavailableError) == (status == 503)
+    assert stopped.value.__cause__ is None and stopped.value.__context__ is None
+
+
+async def test_a_tag_failure_on_a_row_moved_between_the_reads_is_the_uniform_404() -> None:
+    """The tag is built from the channel the store read. If that is out of scope although the
+    channel read first was in scope, the answer is the audited 404, never a 423 that would say the
+    message exists."""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    from messagefoundry.api.message_scope import get_scoped_message
+
+    audits: list[str] = []
+
+    class _Store:
+        async def message_channel_id(self, message_id: str) -> str:
+            return "IB_OPEN"
+
+        async def get_message(self, message_id: str) -> None:
+            raise CellTagError("messages", "raw", message_id, "IB_SECRET")
+
+        async def record_audit(self, action: str, **_: object) -> None:
+            audits.append(action)
+
+    engine: Any = SimpleNamespace(store=_Store())
+    request = Request({"type": "http", "client": ("127.0.0.1", 1), "headers": []})
+    who: Any = SimpleNamespace(username="u", can_access_channel=lambda c: c == "IB_OPEN")
+    with pytest.raises(HTTPException) as hidden:
+        await get_scoped_message(engine, who, "m-moved", request)
+    assert hidden.value.status_code == 404 and audits == ["auth.channel_denied"]
+
+
+def test_a_list_read_withholds_a_cell_the_cipher_refuses() -> None:
+    """BACKLOG #5970: a list-shaped read withholds a cell under a key the store does not hold,
+    where the plain CipherError used to fail the page; an outage still raises, and a good cell
+    opens (control)."""
+    cipher = make_cipher(generate_key(), write_v2=True)
+    foreign = make_cipher(generate_key(), write_v2=True).encrypt("SYNTH")
+    aad = cell_aad("connection_event", "reason", "IB_A", 1.0, "closed")
+    assert open_listed_cell(cipher, cipher.encrypt("SYNTH", aad=aad), aad, table="x") == "SYNTH"
+    assert open_listed_cell(cipher, foreign, aad, table="connection_event") is None
+    assert open_listed_cell(cipher, None, aad, table="connection_event") is None
+
+    class _Down:
+        def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+            raise CipherUnavailableError("vault down")
+
+    down: Any = _Down()
+    with pytest.raises(CipherUnavailableError):
+        open_listed_cell(down, "mf:v2:x", aad, table="connection_event")
+    record: dict[str, Any] = {"error": None, "summary": "mf:v2:x"}
+    with pytest.raises(CipherUnavailableError):
+        withhold_message_cells(
+            down, record, ("error", "summary"), message_id="m", channel_id="IB_A", failures=[]
+        )
+    failures: list[CellTagError] = []
+    row = {
+        "error": cipher.encrypt(
+            "E", aad=message_cell_aad("error", message_id="m", channel_id="IB_A")
+        ),
+        "summary": foreign,
+    }
+    withhold_message_cells(
+        cipher, row, ("error", "summary"), message_id="m", channel_id="IB_A", failures=failures
+    )
+    assert row == {"error": None, "summary": None} and failures == []
+
+
+def test_a_substituted_cell_whose_key_id_was_rewritten_out_of_shape_still_fails_a_list() -> None:
+    """BACKLOG #5970, owner ruling 2026-11-19: a sibling's cell copied in with its marker's key id
+    rewritten to text no key id has (``zz``) names no key, so it is not a key the store does not
+    hold: the list read fails, on every table, and a messages list does not withhold it. A marker
+    rewritten to a well-shaped key id outside the keyring cannot be told from a retired key, so it
+    is withheld (the residual ``refused_for_key`` names)."""
+    cipher = make_cipher(generate_key(), write_v2=True)
+    aad = cell_aad("connection_event", "reason", "IB_A", 1.0, "closed")
+    sibling = cipher.encrypt(
+        "SYNTH", aad=cell_aad("connection_event", "reason", "IB_B", 2.0, "closed")
+    )
+    parts = sibling.split(":")
+    assert len(parts[3]) == 16, sibling  # mfenc:v4:<alg>:<key id>:<salt>:<blob>
+    out_of_shape = ":".join([*parts[:3], "zz", *parts[4:]])
+    well_shaped = ":".join([*parts[:3], "0" * 16, *parts[4:]])
+    for table in ("queue", "connection_event", "alert_instance"):
+        with pytest.raises(CipherError) as loud:
+            open_listed_cell(cipher, out_of_shape, aad, table=table)
+        assert not isinstance(loud.value, CellTagError)
+        assert open_listed_cell(cipher, well_shaped, aad, table=table) is None
+    record: dict[str, Any] = {"error": None, "summary": out_of_shape}
+    with pytest.raises(CipherError):
+        withhold_message_cells(
+            cipher, record, ("error", "summary"), message_id="m", channel_id="IB_A", failures=[]
+        )
+
+
+def test_a_list_read_still_refuses_a_tag_failure_under_a_held_key() -> None:
+    """BACKLOG #5970 withholds only a cell under a key the store does not hold (owner ruling
+    2026-11-19). A cell sealed under the store's own key for another cell, a substitution, fails
+    its tag: on a table with no tag-failed audit or alert the cipher's error still fails the read,
+    as before #5970, and is never withheld. So does a malformed or truncated cell, and an unmarked
+    value."""
+    cipher = make_cipher(generate_key(), write_v2=True)
+    aad = cell_aad("connection_event", "reason", "IB_A", 1.0, "closed")
+    moved = cipher.encrypt(
+        "SYNTH", aad=cell_aad("connection_event", "reason", "IB_B", 2.0, "closed")
+    )
+    for table in ("queue", "connection_event", "alert_instance"):
+        with pytest.raises(UnauthenticatedCipherError) as refused:
+            open_listed_cell(cipher, moved, aad, table=table)
+        assert not isinstance(refused.value, CellTagError)
+    sealed = cipher.encrypt("SYNTH", aad=aad)
+    for bad in (sealed[:-8], sealed[: sealed.rindex(":") + 3], "mfenc:v9:x", "SYNTH-UNMARKED"):
+        with pytest.raises(CipherError) as loud:
+            open_listed_cell(cipher, bad, aad, table="connection_event")
+        assert not isinstance(loud.value, CellTagError), bad
+    assert open_listed_cell(cipher, sealed, aad, table="connection_event") == "SYNTH"  # control
+
+
+def _transit_refusing(text: str) -> Any:
+    """A Vault Transit cipher whose every ``decrypt`` gets Vault's HTTP 400 with ``text``."""
+    from hvac.exceptions import InvalidRequest
+
+    from messagefoundry.store.crypto_transit import TransitCipher
+
+    class _Transit:
+        def decrypt_data(self, **_kw: Any) -> Any:
+            raise InvalidRequest(errors=[text])
+
+    client = type("C", (), {"secrets": type("S", (), {"transit": _Transit()})()})()
+    return TransitCipher(client, "mefor-store")
+
+
+#: Vault's 400 texts for a Transit data-key decrypt that name a retired or unknown key version,
+#: read 2026-11-19 from Vault ``main`` (``sdk/helper/keysutil/policy.go``).
+_TRANSIT_KEY_REFUSALS = (
+    "ciphertext or signature version is disallowed by policy (too old)",
+    "invalid ciphertext: version is too new",
+    "no such key version",
+    " Invalid Ciphertext: Version Is Too New ",
+)
+#: Its 400 texts for a malformed, truncated or rewritten cell and for a missing configured key,
+#: from the same source and ``builtin/logical/transit/path_decrypt.go``, and wording that names no
+#: key version.
+_TRANSIT_LOUD_REFUSALS = (
+    "encryption key not found",
+    # A reason that only mentions a version is not one: matched whole, never as a substring.
+    "encryption key not found (no such key version)",
+    "no hmac key exists for that key version",
+    "invalid ciphertext: no prefix",
+    "invalid ciphertext: wrong number of fields",
+    "invalid ciphertext: version number could not be decoded",
+    "invalid ciphertext: could not decode base64",
+    "invalid ciphertext length",
+    "missing ciphertext to decrypt",
+    "some wording no release has used",
+)
+
+
+@pytest.mark.parametrize("text", _TRANSIT_LOUD_REFUSALS)
+def test_a_transit_list_read_fails_on_a_refusal_that_does_not_name_the_key(text: str) -> None:
+    """BACKLOG #5970, owner ruling 2026-11-19: under Transit, which names no keys, a refused cell
+    other than one Vault refuses for its key, an invalid or truncated ciphertext say, fails every
+    list-shaped read loudly, exactly as a tag failure under a held key does. Before the fix every
+    such 400 was withheld with one WARNING."""
+    pytest.importorskip("hvac")
+    cipher = _transit_refusing(text)
+    stored = "mfenc:v3:vault:v1:AAAA"
+    aad = cell_aad("connection_event", "reason", "IB_A", 1.0, "closed")
+    for table in ("queue", "connection_event", "alert_instance"):
+        with pytest.raises(CipherError) as refused:
+            open_listed_cell(cipher, stored, aad, table=table)
+        assert not isinstance(refused.value, CellTagError | UnauthenticatedCipherError)
+    record: dict[str, Any] = {"error": None, "summary": stored}
+    with pytest.raises(CipherError) as listed:
+        withhold_message_cells(
+            cipher, record, ("error", "summary"), message_id="m", channel_id="IB_A", failures=[]
+        )
+    assert not isinstance(listed.value, CellTagError)
+    try:
+        open_message_cell(cipher, "summary", stored, message_id="m", channel_id="IB_A")
+    except CipherError as exc:
+        with pytest.raises(CipherError):  # the content search's path
+            withhold_refused_cell(cipher, "messages", exc, stored)
+    else:
+        raise AssertionError("the refusing cipher opened the cell")
+
+
+@pytest.mark.parametrize("text", _TRANSIT_KEY_REFUSALS)
+def test_a_transit_list_read_withholds_a_cell_vault_refuses_for_its_key(text: str) -> None:
+    """BACKLOG #5970, owner ruling 2026-11-19 (the control): under Transit a cell Vault refuses
+    for a retired or unknown key version is withheld from a list."""
+    pytest.importorskip("hvac")
+    cipher = _transit_refusing(text)
+    stored = "mfenc:v3:vault:v9:AAAA"
+    aad = cell_aad("connection_event", "reason", "IB_A", 1.0, "closed")
+    for table in ("queue", "connection_event", "alert_instance"):
+        assert open_listed_cell(cipher, stored, aad, table=table) is None
+    record: dict[str, Any] = {"error": None, "summary": stored}
+    failures: list[CellTagError] = []
+    withhold_message_cells(
+        cipher, record, ("error", "summary"), message_id="m", channel_id="IB_A", failures=failures
+    )
+    assert record == {"error": None, "summary": None} and failures == []
+
+
+def test_a_transit_refusal_that_names_the_key_beside_another_reason_fails_loudly() -> None:
+    """Every reason must name a key version; one that does not fails the read."""
+    pytest.importorskip("hvac")
+    from hvac.exceptions import InvalidRequest
+
+    from messagefoundry.store.cell_tag import refused_for_key
+    from messagefoundry.store.crypto_transit import _transit_failure
+
+    cipher = _transit_refusing("no such key version")
+    cases: tuple[list[object], ...] = (
+        ["no such key version", "invalid ciphertext length"],
+        [],
+        [7],
+    )
+    for errors in cases:
+        exc = InvalidRequest()
+        exc.errors = errors  # hvac's constructor joins the list, so a non-text entry is set here
+        assert not refused_for_key(
+            cipher, _with_cause(_transit_failure("decrypt", "k", exc), exc), _V3
+        )
+    exc = InvalidRequest(errors=["no such key version"])
+    assert refused_for_key(cipher, _with_cause(_transit_failure("decrypt", "k", exc), exc), _V3)
+
+
+_V3 = "mfenc:v3:vault:v1:AAAA"
+
+
+@pytest.mark.parametrize("fault", [MemoryError, RecursionError])
+@pytest.mark.parametrize("log_faults", [False, True])
+def test_a_memory_fault_reading_a_transit_400_fails_the_list_read(
+    monkeypatch: pytest.MonkeyPatch, fault: type[BaseException], log_faults: bool
+) -> None:
+    """A memory or stack fault while the 400 is read is not a key refusal, so the list read fails
+    with the cipher's own error. A second such fault while logging that is suppressed, and the
+    read still fails with the cipher's error, never the fault."""
+    pytest.importorskip("hvac")
+    from messagefoundry.store import cell_tag, crypto_transit
+
+    cipher = _transit_refusing("no such key version")
+    aad = cell_aad("connection_event", "reason", "IB_A", 1.0, "closed")
+
+    def faulting(*_a: Any, **_kw: Any) -> Any:
+        raise fault
+
+    monkeypatch.setattr(crypto_transit, "_reply_errors", faulting)
+    if log_faults:
+        monkeypatch.setattr(cell_tag._log, "warning", faulting)
+    with pytest.raises(CipherError) as refused:
+        open_listed_cell(cipher, _V3, aad, table="connection_event")
+    assert not isinstance(refused.value, CellTagError)
+
+
+def test_another_fault_reading_a_transit_400_propagates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only a memory or stack fault is caught while the 400 is read; any other propagates, so the
+    list read fails with it rather than withholding the cell."""
+    pytest.importorskip("hvac")
+    from messagefoundry.store import crypto_transit
+
+    cipher = _transit_refusing("no such key version")
+    aad = cell_aad("connection_event", "reason", "IB_A", 1.0, "closed")
+    assert open_listed_cell(cipher, _V3, aad, table="connection_event") is None  # control
+
+    def faulting(*_a: Any, **_kw: Any) -> Any:
+        raise TypeError("synthetic reader fault")
+
+    monkeypatch.setattr(crypto_transit, "_reply_errors", faulting)
+    with pytest.raises(TypeError, match="synthetic reader fault"):
+        open_listed_cell(cipher, _V3, aad, table="connection_event")
+
+
+def _with_cause(error: CipherError, cause: BaseException) -> CipherError:
+    error.__cause__ = cause
+    return error
+
+
+async def test_get_message_opens_its_cells_off_the_event_loop(tmp_path: pathlib.Path) -> None:
+    """BACKLOG #5981: under vault_transit each open is a blocking Vault call, so ``get_message``
+    opens its four cells in a worker thread, never on the loop's own thread."""
+    import threading
+
+    store = await MessageStore.open(
+        tmp_path / "off-loop.db", cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    real = store._cipher
+    try:
+        mid = await store.record_received(
+            channel_id="IB_A", raw=_RAW, status=MessageStatus.ERROR, summary="S"
+        )
+        threads: list[int] = []
+
+        class _Watch:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real, name)
+
+            def decrypt(self, stored: str, **kw: Any) -> str:
+                threads.append(threading.get_ident())
+                return real.decrypt(stored, **kw)
+
+        store._cipher = _Watch()
+        row = await store.get_message(mid)
+        assert row is not None and row["raw"] == _RAW and row["summary"] == "S"
+        assert threads and threading.get_ident() not in threads
+    finally:
+        store._cipher = real
+        await store.close()
 
 
 _STORE_DIR = pathlib.Path(messagefoundry.__file__).resolve().parent / "store"

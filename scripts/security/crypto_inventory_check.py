@@ -580,8 +580,17 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/store/queue_tag.py": frozenset({"messagefoundry.store.crypto"}),
     # BACKLOG #2593: builds the AES-GCM associated data a message cell (bound to its channel) and a
     # preset's criteria (bound to its owner) are sealed under, and opens those cells through the store
-    # cipher seam. No key of its own.
-    "messagefoundry/store/cell_tag.py": frozenset({"messagefoundry.store.crypto"}),
+    # cipher seam. No key of its own. BACKLOG #5970: to tell a Transit decrypt 400 that names the
+    # key version (retired or unknown) from any other, it reads the reply with
+    # crypto_transit's bounded reader and its fault set and keyprovider_vault's 400 test; it makes
+    # no Transit call of its own.
+    "messagefoundry/store/cell_tag.py": frozenset(
+        {
+            "messagefoundry.store.crypto",
+            "messagefoundry.store.crypto_transit",
+            "messagefoundry.store.keyprovider_vault",
+        }
+    ),
     # BACKLOG #5651: the embedded-document strip's shared batch transform opens each candidate's raw
     # cell through cell_tag and re-seals the stripped body through the store cipher, under the row's
     # tag. From store.crypto it takes at least the Cipher type, CipherError, gave_no_verdict (to tell
@@ -921,6 +930,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/api/app.py": frozenset(
         {"messagefoundry.config.tls_policy", "messagefoundry.store.crypto"}
     ),
+    # BACKLOG #5969: the by-id message read imports at least CipherError, CipherUnavailableError
+    # and gave_no_verdict from store.crypto, to answer a cell the store's keys refused (423) apart
+    # from a key service that gave no verdict (503), and subclasses CipherError and
+    # CipherUnavailableError to raise a fresh refusal of a row's cells to the export stream, which
+    # tells it from any other CipherError (BACKLOG #5970). It opens no cell and calls no cipher.
+    "messagefoundry/api/message_scope.py": frozenset({"messagefoundry.store.crypto"}),
     "messagefoundry/api/security.py": frozenset({"messagefoundry.config.tls_policy"}),
     # reach the seam to parse and bound it rather than to open a connection.
     "messagefoundry/config/models.py": frozenset({"messagefoundry.config.tls_policy"}),
@@ -980,6 +995,12 @@ INVENTORY: dict[str, frozenset[str]] = {
 #: limits, and they are the most useful lines in this table: each is a first-party crypto decision
 #: that no call-pattern instrument can see.
 IMPORT_ONLY: dict[str, str] = {
+    "messagefoundry/api/message_scope.py": (
+        "names at least store.crypto's CipherError, CipherUnavailableError and gave_no_verdict, "
+        "to classify a refused read of a message's cells, and subclasses CipherError and "
+        "CipherUnavailableError to raise a fresh refusal of a row's cells for the export stream; "
+        "it calls no cipher, and the cells are opened in the store backends"
+    ),
     "messagefoundry/tls_handshake_failures.py": (
         "subclasses ssl.SSLObject to observe a failed handshake and re-raise it, and sets a "
         "server context's sslobject_class; the contexts it watches are built in transports/mllp.py "

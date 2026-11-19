@@ -34,6 +34,9 @@ _HELPER = Path(message_scope.__file__).resolve()
 
 #: ``(path relative to messagefoundry/api, enclosing function)`` -> why it may read by id itself.
 _ALLOWED: dict[tuple[str, str], str] = {}
+#: The by-id message reads the guard covers. ``message_channel_id`` names a message's channel
+#: without a scope check, so it is the same read for this purpose (BACKLOG #5969).
+_GUARDED: frozenset[str] = frozenset({"get_message", "message_channel_id"})
 
 
 def _get_message_calls(tree: ast.AST) -> list[tuple[str, int]]:
@@ -50,15 +53,13 @@ def _get_message_calls(tree: ast.AST) -> list[tuple[str, int]]:
                 inner = child.name
             if (
                 isinstance(child, ast.Attribute)
-                and child.attr == "get_message"
+                and child.attr in _GUARDED
                 and isinstance(child.ctx, ast.Load)
             ) or (
                 isinstance(child, ast.Call)
                 and isinstance(child.func, ast.Name)
                 and child.func.id == "getattr"
-                and any(
-                    isinstance(a, ast.Constant) and a.value == "get_message" for a in child.args
-                )
+                and any(isinstance(a, ast.Constant) and a.value in _GUARDED for a in child.args)
             ):
                 found.append((func, child.lineno))
             visit(child, inner)
@@ -95,7 +96,7 @@ def test_the_helper_holds_the_one_read() -> None:
     """The positive control: the walk finds the helper's own call, so a clean result elsewhere is
     the absence of calls and not a walk that finds nothing."""
     sites = _api_sites()
-    assert [func for func, _line in sites[_HELPER]] == ["read_scoped_message"]
+    assert [func for func, _line in sites[_HELPER]] == ["read_scoped_message"] * 3
     assert len(sites) > 10, "the API package walk found almost no modules"
 
 
@@ -118,9 +119,15 @@ async def route(engine, other):
     row = await engine.store.get_message("m")
     s = other
     fetch = s.get_message
-    return await getattr(s, "get_message")("n")
+    await getattr(s, "get_message")("n")
+    return await engine.store.message_channel_id("o")
 '''
-    assert _get_message_calls(ast.parse(planted)) == [("route", 5), ("route", 7), ("route", 8)]
+    assert _get_message_calls(ast.parse(planted)) == [
+        ("route", 5),
+        ("route", 7),
+        ("route", 8),
+        ("route", 9),
+    ]
 
 
 #: The store reads whose ``allowed_channels`` is required (store/base.py). ``Identity.build`` also

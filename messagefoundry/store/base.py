@@ -1314,6 +1314,12 @@ class QueueStore(StoreLifecycle, Protocol):
     # type (e.g. aiosqlite.Row) — list[Row] would be invariant and reject that.
     async def get_message(self, message_id: str) -> dict[str, Any] | None: ...
 
+    async def message_channel_id(self, message_id: str) -> str | None:
+        """The message's ``channel_id``, or ``None`` when no such message exists. Plaintext only:
+        it opens no cell, so a by-id read can check the caller's channel scope before
+        :meth:`get_message` decrypts anything (BACKLOG #5969, #5981)."""
+        ...
+
     async def message_metadata_json(self, message_id: str) -> str | None:
         """The message's **decrypted** ``metadata`` JSON (ADR 0081), or ``None`` when absent/unknown.
 
