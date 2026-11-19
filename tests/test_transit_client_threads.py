@@ -12,9 +12,11 @@ Synthetic data only: the token, key names and plaintext are made up.
 
 from __future__ import annotations
 
+import base64
 import gc
 import threading
 import time
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -310,6 +312,92 @@ def test_a_thread_that_exits_closes_its_own_client() -> None:
     assert [client.adapter.closed for client in built] == [0, 1]
     cipher.close_connections()
     assert [client.adapter.closed for client in built] == [1, 1]  # closed once each
+
+
+def test_a_cipher_collected_on_another_thread_leaves_a_threads_client_open() -> None:
+    """BACKLOG #5963. Mutation: let a client's release close it on any thread. Red: collecting the
+    cipher on thread U closes thread T's client while T's request is in flight on it."""
+    transit = _FakeTransit()
+    entered, release = threading.Event(), threading.Event()
+    clients: list[_SlowClient] = []
+
+    def build() -> _SlowClient:
+        client = _SlowClient(transit, entered, release)
+        clients.append(client)
+        return client
+
+    box = [TransitCipher(_FakeClient(transit), _KEY_NAME, client_factory=build)]
+    probe = weakref.ref(box[0])
+    sealed = transit.encrypt_data(name=_KEY_NAME, plaintext=base64.b64encode(b"synthetic").decode())
+    held = threading.Event()
+    opened: list[str] = []
+    failures: list[BaseException] = []
+
+    def on_t() -> None:
+        try:
+            client = box[0]._client  # T's own client, held in the cipher's thread-local
+            held.set()
+            reply = client.secrets.transit.decrypt_data(
+                name=_KEY_NAME, ciphertext=sealed["data"]["ciphertext"]
+            )
+            opened.append(base64.b64decode(reply["data"]["plaintext"]).decode())
+        except BaseException as exc:  # noqa: BLE001 -- re-raised on the test's thread
+            failures.append(exc)
+
+    t = threading.Thread(target=on_t)
+    t.start()
+    try:
+        assert held.wait(timeout=10) and entered.wait(timeout=10)
+
+        def collect_on_u() -> None:
+            box.clear()
+            gc.collect()
+
+        _in_thread(collect_on_u)  # thread U
+        assert probe() is None, "the cipher must be collected for this test to mean anything"
+        assert [client.adapter.closed for client in clients] == [0]
+    finally:
+        release.set()
+        t.join(timeout=10)
+    assert not t.is_alive()
+    if failures:
+        raise failures[0]
+    assert opened == ["synthetic"]
+
+
+def test_a_stale_client_is_closed_even_when_its_rebuild_raises() -> None:
+    """BACKLOG #5963. Mutation: build the new client before dropping the stale one. Red: the
+    factory raises, and the stale client stays open on the thread."""
+    cipher, built = _cipher()
+    go, ready = threading.Event(), threading.Event()
+    seen: list[object] = []
+
+    def work() -> None:
+        cipher.encrypt("synthetic")  # builds built[1], this thread's own
+        ready.set()
+        assert go.wait(timeout=10)
+        try:
+            cipher.encrypt("synthetic")  # stale now, and the rebuild raises
+        except CipherError as exc:
+            seen.append(exc)
+        seen.append(built[1].adapter.closed)  # read before the thread ends
+
+    worker = threading.Thread(target=work)
+    worker.start()
+    try:
+        assert ready.wait(timeout=10)
+        cipher.close_connections()
+
+        def refuse() -> _TrackedClient:
+            raise ConnectionError("synthetic: Vault unreachable at build")
+
+        cipher._client_factory = refuse
+    finally:
+        go.set()
+        worker.join(timeout=10)
+    assert not worker.is_alive()
+    assert len(seen) == 2 and isinstance(seen[0], CipherError)
+    assert seen[1] == 1
 
 
 def test_a_cipher_without_a_factory_keeps_its_one_client_across_close() -> None:
