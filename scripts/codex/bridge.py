@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import argparse
 import base64
+import functools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import time
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -35,6 +39,13 @@ EVENTS = (
     "SubagentStop",
 )
 POINTER_MARKER = "<!-- codex-claude-skill-pointer -->"
+# Codex kills the whole bridge at its own per-event timeout (.codex/config.toml), and the bridge runs
+# an event's hooks one after another, so they all share that one budget. The margin leaves time for
+# the launcher, the interpreter and the reply.
+DEFAULT_OUTER_TIMEOUT = 90.0
+GIT_REPOSITORY_VARIABLES = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE")
+OUTER_TIMEOUT_MARGIN = 10.0
+KILL_DRAIN_TIMEOUT = 3.0
 
 
 def user_skill_directory() -> Path:
@@ -42,10 +53,50 @@ def user_skill_directory() -> Path:
     return (Path(config_root) if config_root else Path.home() / ".claude") / "skills"
 
 
+@functools.cache
+def repo_skill_directories(root: Path) -> tuple[Path, ...]:
+    """This checkout's skills, then the primary checkout's for a linked worktree.
+
+    .gitignore keeps .claude/skills out of git, so a linked worktree holds none of its own. Cached,
+    because sync_skills resolves every pointer through source_skill and each would ask git again.
+    """
+    own = (root / ".claude/skills",)
+    top = root.resolve()
+    query = ["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"]
+    try:
+        lines = subprocess.run(  # nosec B603 B607 - fixed git query, no shell
+            ["git", "-C", str(root), *query],
+            env={k: v for k, v in os.environ.items() if k not in GIT_REPOSITORY_VARIABLES},
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=10,
+            check=True,
+        ).stdout.splitlines()
+    except (OSError, subprocess.SubprocessError) as exc:
+        # On stderr, so source-skill's stdout stays one path line. Silence would hide the primary
+        # checkout's skills with no trace. Outside any repository this is expected.
+        detail = str(exc)
+        if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+            detail += f": {exc.stderr.strip()}"
+        message = f"git query failed, primary checkout's skills not searched: {detail}"
+        print(f"Codex bridge: warning: {message}", file=sys.stderr)
+        return own
+    # Only for a checkout's own top level, never a directory nested in some other repository. A bare
+    # repository has no primary checkout; its common dir is not named .git.
+    if len(lines) != 2 or Path(lines[0]).resolve() != top:
+        return own
+    common = Path(lines[1])
+    if common.name == ".git" and common.parent.resolve() != top:
+        return (*own, common.parent / ".claude/skills")
+    return own
+
+
 def source_skill(root: Path, name: str, *, user_skills: Path | None = None) -> Path:
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         raise ValueError("Skill name must be a single directory name")
-    for directory in (root / ".claude/skills", user_skills or user_skill_directory()):
+    for directory in (*repo_skill_directories(root), user_skills or user_skill_directory()):
         source = directory / name / "SKILL.md"
         if source.is_file():
             return source
@@ -59,9 +110,9 @@ def sync_skills(
     sources_by_name = {}
     if user_skills is not None:
         sources_by_name.update((path.parent.name, path) for path in user_skills.glob("*/SKILL.md"))
-    sources_by_name.update(
-        (path.parent.name, path) for path in (root / ".claude/skills").glob("*/SKILL.md")
-    )
+    # Later updates win, so the order runs from lowest precedence to highest.
+    for directory in reversed(repo_skill_directories(root)):
+        sources_by_name.update((path.parent.name, path) for path in directory.glob("*/SKILL.md"))
     sources = [sources_by_name[name] for name in sorted(sources_by_name)]
     if not sources:
         raise FileNotFoundError("No skill sources found under .claude/skills")
@@ -122,6 +173,116 @@ class HookBlocked(Exception):
     """A hook exited 2."""
 
 
+def outer_timeout(root: Path, event: str) -> float:
+    """The timeout .codex/config.toml gives the bridge's own entry for this event, or the default."""
+    try:
+        config = tomllib.loads((root / ".codex/config.toml").read_text(encoding="utf-8-sig"))
+        timeouts = [
+            float(hook["timeout"])
+            for group in config.get("hooks", {}).get(event, [])
+            for hook in group.get("hooks", [])
+            if "scripts/codex/invoke.ps1" in str(hook.get("command", ""))
+            and isinstance(hook.get("timeout"), int | float)
+            and not isinstance(hook.get("timeout"), bool)
+        ]
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError, AttributeError) as exc:
+        # The bridge never needed this file before; an unreadable one must not fail every event.
+        print(
+            f"Codex bridge: .codex/config.toml unreadable, using the default: {exc}",
+            file=sys.stderr,
+        )
+        return DEFAULT_OUTER_TIMEOUT
+    return min(timeouts, default=DEFAULT_OUTER_TIMEOUT)
+
+
+def find_bash() -> str:
+    """Claude Code runs a `shell: bash` hook under Git Bash on Windows; find that one, never WSL's."""
+    found = shutil.which("bash")
+    if os.name != "nt":
+        if found:
+            return found
+        raise FileNotFoundError("bash not found for a shell: bash hook")
+    candidates = []
+    if configured := os.environ.get("CLAUDE_CODE_GIT_BASH_PATH"):
+        candidates.append(Path(configured))
+    if git := shutil.which("git"):
+        # git.exe sits at several depths. bin/bash.exe first: it is the wrapper Git for Windows
+        # launches, which puts /usr/bin on PATH. usr/bin/bash.exe started directly does not, so a
+        # hook's own `bash` or coreutils could then resolve elsewhere, WSL's bash.exe included.
+        # Up to the install root only; a walk to the drive root would try C:\bin, which any user
+        # may create.
+        for parent in Path(git).resolve().parents[:3]:
+            candidates += [parent / "bin/bash.exe", parent / "usr/bin/bash.exe"]
+    # System32's and WindowsApps' bash.exe launch WSL, which does not see this environment.
+    if found and not re.search(r"[\\/](system32|windowsapps)[\\/]", found, re.IGNORECASE):
+        candidates.append(Path(found))
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    raise FileNotFoundError("Git Bash not found for a shell: bash hook")
+
+
+def hook_argv(root: Path, hook: dict) -> list[str]:
+    command = hook["command"]
+    if "args" in hook:
+        return [
+            command,
+            *[str(arg).replace("${CLAUDE_PROJECT_DIR}", str(root)) for arg in hook["args"]],
+        ]
+    # A command-only source runs in the shell it names, as in Claude Code; with none, in the current
+    # platform's shell. Environment expansion belongs to that shell.
+    shell = hook.get("shell")
+    if shell == "bash":
+        return [find_bash(), "-c", command]
+    if shell == "powershell" or (shell is None and os.name == "nt"):
+        command = command.replace("${CLAUDE_PROJECT_DIR}", "$env:CLAUDE_PROJECT_DIR")
+        return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command]
+    if shell is None:
+        return ["sh", "-c", command]
+    raise ValueError(f"Unsupported Claude hook shell: {shell}")
+
+
+def run_hook(
+    argv: list[str], payload: dict, root: Path, env: dict[str, str], timeout: float | None
+) -> subprocess.CompletedProcess[str]:
+    """subprocess.run, except a timeout never waits unbounded on the hook's descendants.
+
+    On Windows subprocess.run kills only the direct child, then waits with no limit for any
+    grandchild still holding the pipes, so a timeout kills the tree with taskkill /T. Whatever still
+    holds the pipes after that gets a short drain, and is then abandoned to the bridge's own exit.
+    """
+    process = subprocess.Popen(  # nosec B603 - trusted repo hook; event data is stdin only
+        argv,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        cwd=root,
+        env=env,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    try:
+        stdout, stderr = process.communicate(json.dumps(payload), timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if os.name == "nt":
+            subprocess.run(  # nosec B603 B607 - fixed command, our own child's pid
+                ["taskkill", "/F", "/T", "/PID", str(process.pid)],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        process.kill()
+        try:
+            process.communicate(timeout=KILL_DRAIN_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            print(
+                "Codex bridge: a timed-out hook's descendant still holds its pipes", file=sys.stderr
+            )
+        raise
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+
+
 def child_environment(root: Path, session_id: str) -> dict[str, str]:
     if not session_id:
         raise ValueError("Codex session id missing; pass --session-id or set CODEX_THREAD_ID")
@@ -174,6 +335,7 @@ def dispatch(root: Path, payload: dict) -> dict:
     if config.get("disableAllHooks"):
         return {}
     result: dict = {}
+    deadline: float | None = None
     if event == "SessionStart":
         unknown = set(config.get("hooks", {})) - set(EVENTS)
         context = (
@@ -217,41 +379,38 @@ def dispatch(root: Path, payload: dict) -> dict:
                 raise ValueError(
                     f"Unsupported Claude hook transport: {hook.get('type')}, async={hook.get('async', False)}"
                 )
-            command = hook["command"]
-            if "args" in hook:
-                argv = [
-                    command,
-                    *[str(arg).replace("${CLAUDE_PROJECT_DIR}", str(root)) for arg in hook["args"]],
-                ]
-            else:
-                # Command-only sources use the current platform's shell. Environment expansion
-                # belongs to that shell; structured args above need no shell parsing.
-                command = command.replace(
-                    "${CLAUDE_PROJECT_DIR}",
-                    "$env:CLAUDE_PROJECT_DIR" if os.name == "nt" else "${CLAUDE_PROJECT_DIR}",
+            if deadline is None:
+                # Read only once a hook will run, so an event with none skips the file. The margin
+                # never takes more than half the budget, or a short cap would run nothing.
+                cap = outer_timeout(root, event)
+                deadline = time.monotonic() + cap - min(OUTER_TIMEOUT_MARGIN, cap / 2)
+            try:
+                argv = hook_argv(root, hook)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(argv, 0)
+                limit = hook.get("timeout", 30)
+                completed = run_hook(
+                    argv, payload, root, env, remaining if limit is None else min(limit, remaining)
                 )
-                argv = (
-                    ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command]
-                    if os.name == "nt"
-                    else ["sh", "-c", command]
-                )
-            completed = subprocess.run(  # nosec B603 - trusted repo hook; event data is stdin only
-                argv,
-                input=json.dumps(payload),
-                cwd=root,
-                env=env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=hook.get("timeout", 30),
-                check=False,
-            )
-            if completed.stderr:
-                print(completed.stderr, file=sys.stderr, end="")
-            if completed.returncode == 2:
-                raise HookBlocked(completed.stderr or "Claude hook blocked this event")
-            completed.check_returncode()
+                if completed.stderr:
+                    print(completed.stderr, file=sys.stderr, end="")
+                if completed.returncode == 2:
+                    raise HookBlocked(completed.stderr or "Claude hook blocked this event")
+                completed.check_returncode()
+            except (OSError, ValueError, subprocess.SubprocessError, HookBlocked) as exc:
+                # A failed SessionStart hook, exit 2 included, is a non-blocking error in Claude
+                # Code: the session starts with every other hook's context. Elsewhere it propagates.
+                # Run as `python bridge.py hook` or `pwsh -File invoke.ps1 hook`, a hook's exit 2
+                # and a fault `__main__` catches both exit 2, with no deny or block output.
+                # docs/CODEX.md states what the registered line returns.
+                if event != "SessionStart":
+                    raise
+                label = " ".join(str(part) for part in (hook["command"], *hook.get("args", [])))
+                message = f"Codex bridge: SessionStart hook {label!r} failed: {exc}"
+                print(message, file=sys.stderr)
+                merge_output(result, {"systemMessage": message})
+                continue
             output = completed.stdout.strip()
             if not output:
                 continue
@@ -269,7 +428,12 @@ def dispatch(root: Path, payload: dict) -> dict:
                     "hookSpecificOutput": {"hookEventName": event, "additionalContext": output}
                 }
             if not isinstance(update, dict):
-                raise ValueError("Hook JSON output must be an object")
+                if event != "SessionStart":
+                    raise ValueError("Hook JSON output must be an object")
+                message = "Codex bridge: a SessionStart hook printed JSON that is not an object"
+                print(message, file=sys.stderr)
+                merge_output(result, {"systemMessage": message})
+                continue
             merge_output(result, update)
     return result
 
@@ -324,7 +488,10 @@ def main() -> int:
             if not (ROOT / path).is_file():
                 raise FileNotFoundError(path)
             print(f"source: {path}")
-        print("Skills: .agents pointers read the current repo and user-level Claude sources.")
+        print(
+            "Skills: .agents pointers read the current repo, the primary checkout of a linked "
+            "worktree, and user-level Claude sources."
+        )
         print("Hook activation still requires Codex project and hook trust.")
         return 0
     if not rest:

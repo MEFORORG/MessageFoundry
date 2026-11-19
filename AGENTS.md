@@ -11,12 +11,13 @@ Use the current scripts, checks, and gates referenced by CLAUDE.md. Claude's
 `.claude/settings.json` supplies repo hook policy through the Codex bridge.
 Never edit Claude settings, credentials, or session markers to configure Codex.
 
-When a repo skill applies, read its current `.claude/skills/<name>/SKILL.md`.
-The entries under `.agents/skills/` are discovery pointers only. If a requested
-skill is not listed there, check `.claude/skills/` before reporting it missing.
+When a repo skill applies, read its current source `SKILL.md`, which
+`scripts/codex/invoke.ps1 source-skill <name>` prints. The entries under
+`.agents/skills/` are discovery pointers only; run `source-skill` before
+reporting a skill missing. It reads this checkout's `.claude/skills/`, then the
+primary checkout's, which git does not carry into a linked worktree, then
+Claude's user-level skills; the first that holds the name wins.
 Resolve linked resources from the source skill's directory.
-Also check Claude's user-level skills through
-`scripts/codex/invoke.ps1 source-skill <name>`. Repo names take precedence.
 Treat an explicit `$<name>` Codex invocation as the source's `/<name>` invocation.
 
 Use native Codex task and usage tools for Codex identity, liveness, and usage.
