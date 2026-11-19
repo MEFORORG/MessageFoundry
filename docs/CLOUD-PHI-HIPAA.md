@@ -145,8 +145,7 @@ PHI at rest is protected in **two layers**, and the engine layer is **fail-close
   **native TLS-syslog forwarder** (`[logging].forward_protocol = "tls"`, RFC 5425 — ADR 0080), which
   anchors the collector's cert to `[logging].forward_tls_ca_file` and verifies by default
   ([§7](#7-known-residuals)). A plaintext UDP/TCP forwarder is also available but must **not** carry
-  PHI-adjacent log metadata across the wire — pin `forward_protocol = "tls"` (or, cloud-native, use the
-  container log driver to a TLS-terminating collector for ephemeral pods).
+  PHI-adjacent log metadata across the wire — pin `forward_protocol = "tls"`.
 - **Least-privilege IAM** for the pods (the DB login, the secret-manager reads, the KMS decrypt grant) —
   scope each to exactly what it needs.
 
@@ -157,9 +156,10 @@ PHI at rest is protected in **two layers**, and the engine layer is **fail-close
 - **Off-box syslog is a required input that the HA manifest names but ships commented out.** An enforcing
   `--env prod` start refuses until `[logging].forward_*` is configured with verified TLS
   (`forward_protocol = "tls"`, `SyslogProtocol.TLS`, RFC 5425, ADR 0080) to a collector that is not on
-  this host, so a loopback TLS sidecar does not pass; [`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md)
-  section 6 says what to set. The HA manifest's `log-spool` emptyDir keeps redacted log records the
-  collector has not yet taken on the node's disk, so node disk encryption applies to it.
+  this host; [`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md) section 6 says what to set. The HA
+  manifest's `log-spool` emptyDir holds the records the collector has not yet taken, as plaintext on
+  the node's disk. Their redaction is best-effort, so they may hold PHI, and the engine's at-rest
+  encryption does not cover them ([`PHI.md`](PHI.md) §2, the spool row).
 - **In-engine TLS revocation is delegated** ([ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md)).
   For enforced OCSP/CRL revocation, terminate with an **OCSP-must-staple** proxy in front of a
   loopback-bound engine (the same-pod sidecar in [`../docker/README.md`](../docker/README.md)). An
@@ -188,8 +188,8 @@ PHI at rest is protected in **two layers**, and the engine layer is **fail-close
 - [ ] **Region-pinned**: DB, compute, KMS keys, backups, secrets all in the approved region.
 - [ ] **MFA** left on (sign-in is always on); egress allow-lists populated (egress denies by default).
 - [ ] **Audit + logs to the SIEM** over **TLS** — the native TLS-syslog forwarder
-      (`[logging].forward_protocol = "tls"` + `forward_tls_ca_file`, RFC 5425) or a TLS-terminating
-      collector; **not** the plaintext UDP/TCP forwarder as-is.
+      (`[logging].forward_protocol = "tls"` + `forward_tls_ca_file` + `forward_tls_crl_file`, RFC 5425);
+      **not** the plaintext UDP/TCP forwarder as-is.
 - [ ] Least-privilege IAM for the pods (DB / secrets / KMS-decrypt grants scoped tight).
 - [ ] *(NPRM-anticipated, forward-looking)* mandatory encryption, network segmentation, and an asset
       inventory documented — confirm whether the 2025 Security Rule NPRM has been finalized at deploy time.

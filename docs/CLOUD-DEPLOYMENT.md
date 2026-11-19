@@ -344,13 +344,13 @@ durability (the WAN buffer) requires the store volume to **persist** like any at
 
 An enforcing `serve --env prod` start, which is what the HA manifest runs, refuses until off-box log
 forwarding is configured: verified TLS (`forward_protocol = "tls"`, RFC 5425, ADR 0080, with a CA anchor
-in `forward_tls_ca_file`) to a collector that is not on this host, and on the `[egress].allowed_syslog`
-list. A loopback collector, such as a TLS-forwarding sidecar in the same pod, does not pass that gate.
+in `forward_tls_ca_file` and a revocation check in `forward_tls_crl_file`) to a collector that is not
+on this host, and on the `[egress].allowed_syslog` list.
 The HA manifest names these inputs in its block *what an enforcing start needs*, but ships them
 commented out, so an unedited manifest is refused rather than started with a placeholder collector.
-Uncomment them with your own collector. The `log-spool` emptyDir that holds records the collector has
-not yet taken keeps those redacted log records on the node's disk, so the node disk encryption your
-platform provides applies to it.
+Uncomment them with your own collector. The `log-spool` emptyDir holds the records the collector has
+not yet taken, as plaintext on the node's disk. Their redaction is best-effort, so they may hold PHI,
+and the engine's at-rest encryption does not cover them ([`PHI.md`](PHI.md) §2, the spool row).
 
 ---
 
