@@ -272,12 +272,16 @@ def _files_under(root: Path, suffix: str = ".py") -> tuple[Path, ...]:
     out from under a sibling test that has not run yet. A tracked file deleted from the working tree
     is left out: there is nothing on disk to read.
 
-    ``root`` must be a DIRECTORY BELOW the repository root. The repository root itself is refused
-    rather than silently matching nothing, because ``"."`` is not a prefix any listed path carries.
+    ``root`` is a directory below the repository root, or the repository root itself. The root
+    yields only its OWN files, not a recursive walk, because every directory below it has its own
+    row; a naive prefix match would match nothing, since ``"./"`` is not a prefix any listed path
+    carries.
     """
-    rel_root = root.relative_to(_ROOT).as_posix()
-    assert rel_root != ".", "walk a directory below the repository root, not the root itself"
-    prefix = rel_root + "/"
+    if root == _ROOT:
+        return tuple(
+            _ROOT / rel for rel in _listed(suffix) if "/" not in rel and (_ROOT / rel).is_file()
+        )
+    prefix = root.relative_to(_ROOT).as_posix() + "/"
     return tuple(
         _ROOT / rel for rel in _listed(suffix) if rel.startswith(prefix) and (_ROOT / rel).is_file()
     )
@@ -1366,6 +1370,9 @@ _REACH_ROOTS: tuple[tuple[str, Path, int, tuple[str, ...]], ...] = (
         2,
         ("benchmarks/results/2026-07-04-adr0071-b5-executor-marshaling/b5_microbench.py",),
     ),
+    # The repository root's OWN files, not a recursive walk (see `_files_under`). conftest.py is
+    # there because pytest-xdist's `-n auto` hook must be registered from the rootdir.
+    ("root-files", _ROOT, 1, ("conftest.py",)),
 )
 
 _REACH_ROOT_IDS = [label for label, _root, _floor, _pins in _REACH_ROOTS]
@@ -1443,7 +1450,7 @@ def test_a_glyph_planted_in_a_real_file_of_each_root_is_caught(
     """
     arrow = chr(0x2192)
     for pin in pins:
-        rel = f"{root.relative_to(_ROOT).as_posix()}/{pin}"
+        rel = (root / pin).relative_to(_ROOT).as_posix()
         real = (root / pin).read_text(encoding="utf-8")
         # real + "\n" puts a blank line after the file's last line, so the print is two lines on.
         planted_line = real.count("\n") + 2
@@ -1465,8 +1472,11 @@ def test_every_root_holding_tracked_python_is_gated() -> None:
     rooted at a subdirectory cannot claim a directory it does not walk.
     """
     for label, root, *_rest in _REACH_ROOTS:
-        assert root.parent == _ROOT, f"row {label} must walk a whole top-level directory: {root}"
-    gated = {root.name for _label, root, *_rest in _REACH_ROOTS} | {_SCRIPTS.name}
+        assert root.parent == _ROOT or root == _ROOT, (
+            f"row {label} must walk a whole top-level directory, or the root's own files: {root}"
+        )
+    gated = {root.name for _label, root, *_rest in _REACH_ROOTS if root != _ROOT} | {_SCRIPTS.name}
+    root_files_gated = any(root == _ROOT for _label, root, *_rest in _REACH_ROOTS)
     tracked = _listed(".py", untracked=False)
     roots = {rel.split("/", 1)[0] if "/" in rel else "." for rel in tracked}
     print(f"top-level roots holding tracked python: {sorted(roots)}")
@@ -1476,13 +1486,13 @@ def test_every_root_holding_tracked_python_is_gated() -> None:
     # The control above already fails on an empty listing. This names `tracked`, which the absence
     # check below walks, because that is the guard the vacuous-absence lint can read.
     assert tracked, "git listed no tracked python at all -- the census read nothing"
-    # A .py at the repository root has no row to go in: `_files_under` walks directories.
+    # A .py at the repository root is walked only by the row rooted at _ROOT itself.
     at_root = sorted(rel for rel in tracked if "/" not in rel)
-    assert not at_root, (
-        f"tracked python at the repository root, which no walk here can reach: {at_root} -- move "
-        f"it into a directory, or teach _files_under to walk the root's own files"
+    assert root_files_gated or not at_root, (
+        f"tracked python at the repository root, which no row walks: {at_root} -- add the "
+        f"root-files row back to _REACH_ROOTS"
     )
-    assert roots <= gated, (
+    assert roots - {"."} <= gated, (
         f"roots holding tracked python that no gate walks: {sorted(roots - gated)} -- add a row "
         f"to _REACH_ROOTS, with a floor and pins, rather than widening this set"
     )
