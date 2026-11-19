@@ -18,7 +18,7 @@ import io
 import urllib.request
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 
@@ -31,6 +31,7 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
+from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore, OutboxStatus
@@ -38,6 +39,10 @@ from messagefoundry.transports.base import DeliveryError, DestinationConnector, 
 from messagefoundry.transports.http_auth import OAuth2ClientCredentialsProvider
 from tests._mllp_recorder import run_one_batch
 from tests._refusal_log_capture import until
+from tests.test_alert_control import _drain as _drain_pages
+from tests.test_alert_control import _RecordingTransport
+from tests.test_alert_state import _drain as _drain_state
+from tests.test_alert_state import _RecordingStore
 
 OUT = "OB_TOKEN"
 
@@ -119,7 +124,7 @@ class _RecordsStops(LoggingAlertSink):
         super().__init__()
         self.stopped: list[tuple[str, str]] = []
         self.errors: list[tuple[str, str, str | None]] = []
-        self.restored: list[str] = []
+        self.restored: list[tuple[str, str]] = []
 
     def connection_stopped(self, name: str, *, detail: str) -> None:
         self.stopped.append((name, detail))
@@ -129,8 +134,8 @@ class _RecordsStops(LoggingAlertSink):
     ) -> None:
         self.errors.append((name, kind, error_class))
 
-    def connection_restored(self, name: str) -> None:
-        self.restored.append(name)
+    def connection_restored(self, name: str, *, kind: str = "connection_lost") -> None:
+        self.restored.append((name, kind))
 
 
 #: The one alert a dead-lettering configuration fault raises for its lane (ADR 0095 B.2).
@@ -469,7 +474,7 @@ async def test_a_delivery_clears_the_config_fault_edge_and_a_new_episode_alerts_
         await _one(_MintsThroughACodedTokenEndpoint(), 2)
         assert sink.errors == [_CONFIG_FAULT_ALERT] and sink.restored == []
         await _one(_Delivers(), 3)  # the fix
-        assert sink.restored == [OUT]  # the open alert resolves
+        assert sink.restored == [(OUT, "config_fault")]  # its own alert resolves
         await _one(_MintsThroughACodedTokenEndpoint(), 4)  # the fault comes back
         assert sink.errors == [_CONFIG_FAULT_ALERT, _CONFIG_FAULT_ALERT]
     finally:
@@ -529,3 +534,32 @@ async def test_under_the_dead_letter_policy_a_retired_connectors_config_fault_do
     finally:
         await runner.stop()
         await connector.aclose()
+
+
+@pytest.mark.parametrize("first", ["connection_lost", None], ids=["after-transport-alert", "alone"])
+async def test_on_the_notifier_a_config_fault_alert_keeps_its_own_throttle_and_instance(
+    first: str | None,
+) -> None:
+    # The real sink, not a recorder: a transport alert inside the cooldown must neither throttle
+    # the config_fault page nor take its instance, and each clear resolves only its own instance.
+    pages = _RecordingTransport()
+    state = _RecordingStore()
+    sink = NotifierAlertSink([pages], store=cast(Any, state), realert_seconds=300.0)
+    if first is not None:
+        sink.connection_error(OUT, kind=first, detail="unreachable", error_class="DeliveryError")
+    sink.connection_error(OUT, kind="config_fault", detail="coded", error_class="NegativeAckError")
+    await _drain_state(sink)
+    sink.connection_restored(OUT, kind="config_fault")
+    sink.connection_restored(OUT)
+    await _drain_state(sink)
+    await _drain_pages(sink)
+
+    expected = ([first] if first is not None else []) + ["config_fault"]
+    assert [e.get("kind") for e in pages.events] == expected
+    instances = [(u["event_type"], u["reason"]) for u in state.upserts]
+    transport = [("connection_error", "unreachable")] if first is not None else []
+    assert instances == [*transport, ("connection_error.config_fault", "coded")]
+    assert [r["event_type"] for r in state.resolves] == [
+        "connection_error.config_fault",
+        "connection_error",
+    ]

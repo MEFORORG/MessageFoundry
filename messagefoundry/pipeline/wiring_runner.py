@@ -3195,7 +3195,7 @@ class RegistryRunner:
             return
         self._lane_config_fault.discard(name)
         try:
-            self._alert_sink.connection_restored(name)
+            self._alert_sink.connection_restored(name, kind="config_fault")
         except Exception:
             log.warning("alert sink raised on connection_restored for %r", name)
 

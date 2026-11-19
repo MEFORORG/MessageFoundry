@@ -295,7 +295,7 @@ class _ResolveFence:
 #: only for an operator's start or restart (``AlertSink.connection_started``, BACKLOG #1741), clears a
 #: ``connection_stopped``. Keyed by the inverse event's ``type`` → the failure event ``type`` it resolves.
 _AUTO_RESOLVE: dict[str, str] = {
-    "connection_restored": "connection_error",
+    "connection_restored": "connection_error",  # kind config_fault: _CONFIG_FAULT_INSTANCE
     "connection_started": "connection_stopped",
     # #145: a leadership step-down / clean release / self-fence resolves this node's open leadership_acquired
     # instance; a DR fail-back resolves the open dr_activated. The open set then tracks the live leaders.
@@ -321,6 +321,22 @@ _AUTO_RESOLVE: dict[str, str] = {
     # the same posture:start key, so for the same engine process.
     "posture_restored": "posture_loosened",
 }
+
+
+#: The alert instance of a ``connection_error`` of kind ``config_fault`` (ADR 0095 Amendment B.2):
+#: its own throttle, escalation count and instance, apart from a transport ``connection_error``, so
+#: neither suppresses the other or replaces its reason. ``connection_restored`` of the same kind
+#: resolves it.
+_CONFIG_FAULT_INSTANCE = "connection_error.config_fault"
+
+
+def _instance_type(event: dict[str, Any]) -> str:
+    """The event type an alert instance, and the sink's per-key state, is keyed on."""
+    etype = str(event.get("type", ""))
+    if etype == "connection_error" and event.get("kind") == "config_fault":
+        return _CONFIG_FAULT_INSTANCE
+    return etype
+
 
 _T = TypeVar("_T")
 
@@ -2117,12 +2133,14 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             if until is not None and until > now:
                 self._suspended[f"{a.event_type}:{a.connection}"] = float(until)
 
-    def connection_restored(self, name: str) -> None:
-        """An outbound lane recovered (the inverse of ``connection_error``/``connection_lost``). Records
+    def connection_restored(self, name: str, *, kind: str = "connection_lost") -> None:
+        """An outbound lane recovered (the inverse of ``connection_error`` of the same ``kind``). Records
         NO notification (a recovery needs no page — the runner only stores the lifecycle row) but, when
         alert-state is wired (ADR 0044), **auto-resolves** the matching open ``connection_error`` instance
         so the dashboard clears. A no-op when no store is set (byte-identical to pre-#56)."""
-        self._record_state({"type": "connection_restored", "connection": name}, "info")
+        self._record_state(
+            {"type": "connection_restored", "connection": name, "kind": kind}, "info"
+        )
 
     def connection_started(self, name: str) -> None:
         """The inverse of ``connection_stopped`` (BACKLOG #1741; the Protocol says when it fires: only
@@ -2215,7 +2233,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         now_wall = time.time()
         # #81: schedule-aware decide is time-dependent, so pass the wall clock.
         decision = self._rules.decide(event, now_wall)
-        key = f"{event['type']}:{event['connection']}"
+        key = f"{_instance_type(event)}:{event['connection']}"
         # #81 (ADR 0133): occurrence-driven escalation. The in-memory occurrence count mirrors the store's
         # `count` (both bump once per emit); apply the highest tier the count has crossed. tier is persisted
         # to alert_instance.escalation_tier via _record_state below.
@@ -2321,9 +2339,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         store = self._store
         if store is None:
             return
-        etype = str(event.get("type", ""))
+        etype = _instance_type(event)
         connection = str(event.get("connection", ""))
         inverse_of = _AUTO_RESOLVE.get(etype)
+        if etype == "connection_restored" and event.get("kind") == "config_fault":
+            inverse_of = _CONFIG_FAULT_INSTANCE
         # The instance key both writes touch: an upsert's own type, or the failure type a clear resolves.
         key = f"{inverse_of or etype}:{connection}"
         # Stamp the row with the emit time: a write may now wait behind a slow one for the same key,

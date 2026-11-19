@@ -896,8 +896,8 @@ class AlertSink(Protocol):
         :class:`~messagefoundry.pipeline.update_check.UpdateCheckRunner` (the no-network local diff)."""
         ...
 
-    def connection_restored(self, name: str) -> None:
-        """An outbound lane recovered — the **inverse** of :meth:`connection_error` (``connection_lost``).
+    def connection_restored(self, name: str, *, kind: str = "connection_lost") -> None:
+        """An outbound lane recovered — the **inverse** of :meth:`connection_error` of the same ``kind``.
         Emits **no** notification (a recovery needs no page); it exists so durable alert-state (ADR 0044,
         #56) can **auto-resolve** the matching open ``connection_error`` instance when wired. The default
         :class:`LoggingAlertSink` and any state-less sink treat it as a no-op. ``name`` is the connection
@@ -1543,7 +1543,7 @@ class LoggingAlertSink:
             pinned_version,
         )
 
-    def connection_restored(self, name: str) -> None:
+    def connection_restored(self, name: str, *, kind: str = "connection_lost") -> None:
         # State-less sink: a recovery needs no page and there is no instance to auto-resolve, so this is
         # a no-op (the connection_event lifecycle row is recorded by the runner, not here). ADR 0044 #56.
         return
