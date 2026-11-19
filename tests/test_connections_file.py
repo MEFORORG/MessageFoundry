@@ -263,6 +263,18 @@ _SECONDS_CASES: dict[str, tuple[str, Callable[[Any], float | None]]] = {
         """,
         lambda reg: reg.outbound["OB"].waiting_display_delay,
     ),
+    "send_min_interval_seconds": (
+        """
+        [[outbound]]
+        name = "OB"
+        transport = "mllp"
+          [outbound.settings]
+          host = "epic.example"
+          port = 2700
+          send_min_interval_seconds = {value}
+        """,
+        lambda reg: reg.outbound["OB"].spec.settings["send_min_interval_seconds"],
+    ),
 }
 
 
@@ -312,6 +324,9 @@ def test_negative_strict_timeout_still_disables_the_backstop(tmp_path: Path) -> 
         'inbound("IB", MLLP(port=2600), router="r", strict_timeout_s=10**400)',
         'outbound("OB2", MLLP(host="epic.example", port=2701), waiting_display_delay=float("nan"))',
         'outbound("OB2", MLLP(host="epic.example", port=2701), waiting_display_delay=float("inf"))',
+        'outbound("OB2", MLLP(host="epic.example", port=2701, send_min_interval_seconds=float("nan")))',
+        'outbound("OB2", MLLP(host="epic.example", port=2701, send_min_interval_seconds=float("inf")))',
+        'outbound("OB2", MLLP(host="epic.example", port=2701, send_min_interval_seconds=10**400))',
     ],
 )
 def test_code_first_seconds_keys_refuse_a_non_finite_value(tmp_path: Path, call: str) -> None:

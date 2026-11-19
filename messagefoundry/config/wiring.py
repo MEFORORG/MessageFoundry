@@ -8826,8 +8826,8 @@ def _coerce_content_type(name: str, content_type: ContentType | str) -> ContentT
 
 
 def finite_seconds(value: object, *, key: str, where: str) -> float:
-    """A connection-level number of seconds, ``strict_timeout_s`` or ``waiting_display_delay``, as a
-    finite float, or a :class:`WiringError` naming ``where`` and ``key`` with the value withheld
+    """A connection-level number of seconds, ``strict_timeout_s``, ``waiting_display_delay`` or
+    ``send_min_interval_seconds``, as a finite float, or a :class:`WiringError` naming ``where`` and ``key`` with the value withheld
     (BACKLOG #5321). Both authoring surfaces read it here: the connections.toml reader and the shared
     build_inbound_connection / build_outbound_connection choke points.
 
@@ -9373,6 +9373,13 @@ def build_outbound_connection(
             f"(env {send_pace.key!r}) — it is a plain pacing interval in seconds, not a "
             "per-environment or secret value. Give it a plain number (0.5), or omit it "
             "for no pacing."
+        )
+    if send_pace is not None:
+        # BACKLOG #5321: held to the finite rule both surfaces share. An infinity would stall the lane
+        # after its first send, a NaN would turn pacing off, and an integer too large for a float
+        # would raise OverflowError at lane setup rather than at load.
+        send_pace = finite_seconds(
+            send_pace, key="send_min_interval_seconds", where=f"outbound connection {name!r}"
         )
     if send_pace is not None and send_pace < 0:
         # BACKLOG #82: per-connection egress send pacing (min seconds between sends on this lane). A
