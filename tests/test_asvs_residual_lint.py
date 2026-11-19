@@ -75,6 +75,13 @@ residual = "The gate reads messagefoundry/__main__.py:1125 but the prose says __
         ("a lockfile", "requirements.lock:961 pins it", [("requirements.lock", "961")]),
         ("spaced colon", "settings.py : 1359", [("settings.py", "1359")]),
         ("two on one line", "a.py:1 and b/c.py:22", [("a.py", "1"), ("b/c.py", "22")]),
+        # Matched before BACKLOG #5468 as well, because a dot inside a path was always allowed;
+        # kept so the leading-dot change cannot lose it.
+        (
+            "a dot-directory below a plain one",
+            "see tools/.config/x.toml:3",
+            [("tools/.config/x.toml", "3")],
+        ),
         # BACKLOG #5468: each shape below passed the lint unseen before the fix.
         (
             "a dot-directory",
@@ -87,10 +94,12 @@ residual = "The gate reads messagefoundry/__main__.py:1125 but the prose says __
             [(".pre-commit-config.yaml", "40")],
         ),
         (
-            "a dot-directory below a plain one",
-            "see tools/.config/x.toml:3",
-            [("tools/.config/x.toml", "3")],
+            "a relative ./ prefix",
+            "see ./messagefoundry/auth/service.py:724",
+            [("./messagefoundry/auth/service.py", "724")],
         ),
+        ("a relative ../ prefix", "see ../x/y.py:12", [("../x/y.py", "12")]),
+        (r"a relative .\ prefix", r"see .\scripts\foo.ps1:3", [(r".\scripts\foo.ps1", "3")]),
         (
             "a dot-directory, windows separator",
             r"see .github\workflows\ci.yml:12",
