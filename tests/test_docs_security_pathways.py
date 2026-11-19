@@ -521,7 +521,9 @@ def test_the_intake_numbers_the_doc_quotes_match_the_code() -> None:
         f"count at most {netaddr.ALLOWLIST_MAX_IPV4_ADDRESSES:,} IPv4 addresses",
     ):
         assert part in rule, f"the rule text no longer holds {part!r}; restate the Table B HTTP row"
-    assert "a cap on the IPv4 addresses" in table_b, "the Table B HTTP row no longer names the cap"
+    assert "caps the IPv4 address count that `ALLOWLIST_RULE_TEXT`" in table_b, (
+        "the Table B HTTP row no longer names the cap"
+    )
 
 
 def test_the_one_switch_that_flattens_three_pathways_is_named_in_each_row() -> None:

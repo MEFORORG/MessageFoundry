@@ -219,8 +219,8 @@ def test_nonloopback_scp_with_a_too_wide_allowlist_fails_closed(
     with pytest.raises(ValueError) as exc:
         _scp("0.0.0.0", source_ip_allowlist=allowlist)
     msg = str(exc.value)
-    # It names the part the list failed. The rule text is quoted in every refusal, so only the
-    # shortfall's own reason can tell a regressed shortfall from a working one.
+    # It names the part the list failed. Every refusal of a set list quotes the rule text, so only
+    # the shortfall's own reason can tell a regressed shortfall from a working one.
     assert f"does not count as a peer control: {reason}." in msg
     assert "Narrow every entry" in msg
 
