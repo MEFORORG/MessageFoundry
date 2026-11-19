@@ -133,7 +133,8 @@ _BEARER_TOKEN_CHARS = re.compile(r"[\x21-\x7e]+")
 # no helper ever sees the credential or the query string.
 
 
-#: The ``code`` of the permanent refusal of a token reply in a content coding (BACKLOG #5910).
+#: The ``code`` of the permanent refusal of a coded 2xx token reply, as :func:`request_token`
+#: scopes it (BACKLOG #5910).
 TOKEN_REPLY_CODED_CODE = "token-reply-coded"  # nosec B105 -- a refusal code, not a credential
 #: Where an operator fixes it: the engine sends ``Accept-Encoding: identity``, so the coding is the
 #: endpoint's, or a proxy's in front of it (ADR 0095 Amendment B.2).
@@ -160,14 +161,19 @@ def request_token(
     ``rest.auth_challenge_refused`` builds (BACKLOG #2989); no built provider's hop reaches that
     handler, since a Digest proxy in front of an https token endpoint is refused at build.
 
-    A 2xx reply that :func:`~messagefoundry.transports.bounded_read.reply_framing_fault` refuses
-    for its content coding is a permanent
+    The reply is checked in this order, and a reply refused at one step takes that step's refusal.
+    Every token opener is built by
+    :func:`~messagefoundry.transports.bounded_read.build_strict_opener`, so a bare CR in the status
+    line or header block is refused first, inside ``opener.open``, as
+    :class:`~messagefoundry.transports.bounded_read.MalformedReplyHeadError`. A non-2xx reply then
+    never reaches a body read: it is handled as the paragraph above says. On a 2xx reply,
+    :func:`~messagefoundry.transports.bounded_read.reply_framing_fault` checks the header block,
+    then the ``Transfer-Encoding`` and ``Content-Length`` framing, and only then the content
+    coding. A reply it refuses for its content coding is a permanent
     :class:`~messagefoundry.transports.base.NegativeAckError` coded
-    :data:`TOKEN_REPLY_CODED_CODE`. That is a reply whose ``Content-Encoding`` names any coding but
-    ``identity``, unless it is a ``204`` or carries ``Content-Length: 0``; an empty chunked or
-    close-framed coded reply is refused too. A reply that check refuses first for its header block
-    or framing takes that refusal instead, and a non-2xx reply is the retryable mint failure above.
-    The coded refusal is a configuration fault: every queued row mints through the
+    :data:`TOKEN_REPLY_CODED_CODE`: a reply whose ``Content-Encoding`` names any coding but
+    ``identity``, unless it is a ``204`` or carries ``Content-Length: 0``. An empty chunked or
+    close-framed coded reply is refused too. The coded refusal is a configuration fault: every queued row mints through the
     same endpoint and would meet the same refusal, so it is not retried, and under the default
     ``credential_fault_policy`` the delivery worker stops the lane and keeps the queue. Owner ruling
     2026-11-18 on PR 3069, in the owner's words: "Stop the lane."
