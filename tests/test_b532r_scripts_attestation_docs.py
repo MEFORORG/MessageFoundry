@@ -109,3 +109,40 @@ def test_the_changelog_claims_only_a_default_up_and_names_the_skips() -> None:
     assert "At least `docker compose up --no-deps <engine>` and `docker compose run --no-deps`" in (
         entry
     ), entry
+
+
+_SKIPS = "At least `docker compose up --no-deps <engine>` and `docker compose run --no-deps` skip"
+_QUALIFIED_DOCS = (_REPO / "docs" / "CLOUD-DEPLOYMENT.md", _REPO / "docker" / "README.md")
+
+
+@pytest.mark.parametrize("doc", _QUALIFIED_DOCS, ids=lambda p: p.name)
+def test_each_doc_qualifies_the_compose_check_and_names_the_skips(doc: Path) -> None:
+    # BACKLOG #5400: the check runs on a default `up`, at least two commands skip it, and no k8s
+    # manifest checks the value. An unqualified "refused before any engine starts" would be a
+    # false control claim, so each doc must name the default `up` and both skips.
+    text = " ".join(doc.read_text(encoding="utf-8").split())
+    assert "on a default `docker compose up`" in text, doc.name
+    assert _SKIPS.casefold() in text.casefold(), doc.name
+    assert "checks the value before the engine starts" in text, doc.name
+    for stale in (
+        "is refused by the `revocation-attestation-check` service before any engine starts",
+        "`docker/compose.yaml` does, with its `revocation-attestation-check` service",
+        "as `compose.yaml` does with its `revocation-attestation-check` service",
+    ):
+        assert stale not in text, f"{doc.name} still carries the unqualified claim: {stale}"
+
+
+def test_the_readme_topology_a_text_names_a_default_up() -> None:
+    text = " ".join((_REPO / "docker" / "README.md").read_text(encoding="utf-8").split())
+    assert (
+        "stops a default `docker compose up` at the `revocation-attestation-check` service" in text
+    )
+
+
+def test_the_check_comment_opens_with_a_default_up() -> None:
+    compose = (_REPO / "docker" / "compose.yaml").read_text(encoding="utf-8")
+    start = compose.index("# One-shot check that the attestation reads as TRUE")
+    words = compose[start : compose.index("revocation-attestation-check:", start)].split()
+    comment = " ".join(w for w in words if w != "#")
+    assert "run by a default `up` before it starts any serving engine" in comment
+    assert "run before any serving engine starts" not in comment

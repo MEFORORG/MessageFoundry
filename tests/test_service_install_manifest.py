@@ -4379,13 +4379,14 @@ def test_the_uninstall_ace_removal_reads_a_bracketed_data_dir_literally(
 
 
 # --- a holder-name lookup that could not be made is not "not this account" (BACKLOG #5401) --------
-# Both scripts used `catch { $true }` / `catch { $false }` around Translate, so ANY failure, a domain
-# controller that cannot be reached for example, read as "this holder is some other account". The
-# uninstaller then printed "does not hold" for an account that may hold the right. Only
-# IdentityNotMappedException means "no such account" now. A holder longer than any account name
-# (512 characters) makes the NTAccount cast throw, which is a failure other than "not mapped" on
-# every platform. It is a stand-in for that branch, not a model of any one outage: what LSA reports
-# for a domain it cannot reach is not measured here, and may be "not mapped".
+# Both scripts used `catch { $true }` / `catch { $false }` around Translate, so ANY lookup failure
+# read as "this holder is some other account", and the uninstaller then printed "does not hold" for
+# an account that may hold the right. Only IdentityNotMappedException means "no such account" now.
+# These tests cover a lookup that throws something other than "not mapped", and nothing else. They
+# stand in for that failure with a 1000-character holder name: a name longer than any account name
+# (512 characters) makes the NTAccount cast throw on every platform. They do not model an
+# unreachable domain controller. Whether LSA reports a domain it cannot reach as "not mapped", which
+# this fix would still read as "no such account", is unmeasured.
 
 _UNREADABLE = "x" * 1000
 

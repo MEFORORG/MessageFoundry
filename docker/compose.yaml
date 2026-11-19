@@ -208,8 +208,9 @@ services:
     # (BACKLOG #1179). MEFOR_API_PORT is 8443 here, so it probes 8443. There is no cleartext fallback:
     # a container whose TLS is broken now reports unhealthy instead of downgrading to http.
 
-  # One-shot check that the attestation reads as TRUE, run before any serving engine starts. The
-  # required substitution above refuses only an unset or empty value, and a value the engine reads
+  # One-shot check that the attestation reads as TRUE, run by a default `up` before it starts any
+  # serving engine; the commands that skip it are named below. The required substitution above
+  # refuses only an unset or empty value, and a value the engine reads
   # as false, such as 0, would otherwise start an engine that exits 2 at the revocation gate and
   # restarts forever. This reads the value with serve's own parser (tls_revocation_attested), in
   # the same image, exits 1 naming the gate when it does not read as true, and a default `up`

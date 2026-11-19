@@ -146,8 +146,10 @@ against one case that matters, described under
   revocation ([SECURITY.md, API revocation gate](../docs/SECURITY.md#api-revocation-gate)):
   `kubectl create configmap mefor-revocation-attestation --from-literal=attested=1`. The value must
   read as true (`1`, `true`, `yes` or `on`). A value such as `0` passes the kubelet, and the engine
-  then exits 2 and the pod crash-loops: neither manifest checks the value before the engine starts,
-  as `compose.yaml` does with its `revocation-attestation-check` service.
+  then exits 2 and the pod crash-loops: nothing in either manifest checks the value before the
+  engine starts. In `compose.yaml` the `revocation-attestation-check` service checks it on a
+  default `docker compose up`; at least `docker compose up --no-deps <engine>` and
+  `docker compose run --no-deps` skip that check, as the comment on that service says.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
   Postgres-backed `replicas: 3` Deployment with `[cluster].enabled`, a PodDisruptionBudget, and
   lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)
@@ -168,8 +170,11 @@ against one case that matters, described under
   feed substitution, and passing `--env-file` reads the named file instead of that `.env`, so keep
   every substituted value, at least this one and the Postgres password, in the file substitution
   reads; the `ha` engines still read their own store password from `secrets.env`). A value that does
-  not read as true, such as `0`, is refused by the `revocation-attestation-check` service before any
-  engine starts, and `docker compose logs revocation-attestation-check` shows why. Set it only if
+  not read as true, such as `0`, stops a default `docker compose up` at the
+  `revocation-attestation-check` service before any engine starts, and
+  `docker compose logs revocation-attestation-check` shows why. At least
+  `docker compose up --no-deps <engine>` and `docker compose run --no-deps` skip that check, as the
+  comment on that service in `compose.yaml` says. Set it only if
   your PKI enforces revocation; the file never sets it for you.
 - **(B) Reverse-proxy / same-pod sidecar — k8s-preferred.** Engine stays on loopback behind the
   sidecar, declared with `tls_terminated_upstream=true` + `trusted_proxies=[…]` +
