@@ -2298,18 +2298,20 @@ RETIRED_WITHOUT_ACTIVE = (
     "(MEFOR_STORE_ENCRYPTION_KEY, [store].encryption_key_file or the [store].key_provider). "
     "That is a rotation missing its new key, so it is refused rather than run keyless: a keyless "
     "store would write new rows unencrypted. Set the active key; a store meant to run keyless "
-    "lists no retired keys. A MEFOR_STORE_ENCRYPTION_KEY of blanks only counts as no key, and "
-    "under the default key_provider it hides [store].encryption_key_file: unset it."
+    "lists no retired keys. A key of blanks only counts as no key: if MEFOR_STORE_ENCRYPTION_KEY "
+    "is blanks, unset that variable."
 )
 
 #: The same refusal under ``[store].cipher_provider = "vault_transit"`` (BACKLOG #5310, #5308).
 #: Transit encrypts the store's rows there whatever the local keys are, so the text does not claim
 #: the store would write rows unencrypted; what reads the local keys there is the DR backup and
-#: restore. Kept under 200 characters, because the DR backup, its one runtime reader, cuts a
-#: refusal's text there, and the cause and remedy must survive the cut.
+#: restore. Kept short, because what renders it under Transit, at least the DR backup, the CLI
+#: ``backup`` and DR activation's seed verify, renders it through ``safe_exc``, which cuts a long
+#: text, and the cause and remedy must survive the cut.
 RETIRED_WITHOUT_ACTIVE_TRANSIT = (
-    "Retired store keys are set with no active local key. Under vault_transit the DR backup and "
-    "restore read the local keys, so they refuse. Set the active key, or list no retired keys."
+    "Retired store keys are set with no active local key (blanks count as none). Under "
+    "vault_transit DR backup and restore read local keys, so they refuse. Set the key, or list no "
+    "retired keys."
 )
 
 

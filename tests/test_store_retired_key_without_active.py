@@ -269,3 +269,19 @@ def test_the_transit_refusal_survives_the_dr_backup_text_cut() -> None:
     # safe_exc, which cuts a long text; the cause and the remedy must survive.
     rendered = safe_exc(StoreCipherConfigError(RETIRED_WITHOUT_ACTIVE_TRANSIT))
     assert rendered.endswith(RETIRED_WITHOUT_ACTIVE_TRANSIT)
+    # The control: safe_exc does cut a text as long as the aesgcm one, so the test above measures.
+    assert not safe_exc(StoreCipherConfigError(RETIRED_WITHOUT_ACTIVE)).endswith(
+        RETIRED_WITHOUT_ACTIVE
+    )
+
+
+def test_under_vault_transit_an_active_local_key_beside_a_retired_key_passes() -> None:
+    # The control for the Transit refusals: with the active local key set, the DR key resolves
+    # and the gate lets the start through.
+    active, retired = generate_key(), generate_key()
+    store = StoreSettings(
+        cipher_provider="vault_transit", encryption_key=active, encryption_keys_retired=retired
+    )
+    assert resolve_active_key(store) == active
+    assert resolve_decrypt_keys(store) == [active, retired]
+    assert _keyless_store_gate(ServiceSettings(store=store)) is None
