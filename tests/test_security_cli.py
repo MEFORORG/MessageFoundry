@@ -94,18 +94,22 @@ def test_null_reset_of_an_unknown_key_is_refused_and_leaves_the_loosening(
     assert toml.read_bytes() == before  # nothing written; the loosening is still there
 
 
-def test_set_security_writes_nothing_when_no_reset_finds_its_key(tmp_path: Path) -> None:
+def test_set_security_reports_a_reset_that_finds_nothing_as_unchanged(tmp_path: Path) -> None:
     """BACKLOG #5327, the editor itself: a reset that finds nothing is reported apart from a key
-    it wrote, and an edit that changes nothing creates no file."""
+    it wrote, and the edit is still validated like any other."""
     from messagefoundry.config import security_edit
 
-    def refuse(candidate: Path) -> None:
-        raise AssertionError("an edit that changes nothing must not validate or write")
-
+    seen: list[Path] = []
     toml = tmp_path / "mf.toml"
-    result = security_edit.set_security(toml, {"require_mfa": None}, validate=refuse)
+    result = security_edit.set_security(toml, {"require_mfa": None}, validate=seen.append)
     assert result == {"op": "unchanged", "keys": [], "unchanged": ["require_mfa"]}
-    assert not toml.exists()
+    assert len(seen) == 1
+    # A value equal in Python but of another type is a change, not the value the file holds.
+    toml.write_text("[security]\nsign_out_after_idle_minutes = 1\n", encoding="utf-8")
+    result = security_edit.set_security(
+        toml, {"sign_out_after_idle_minutes": True}, validate=lambda _c: None
+    )
+    assert result["op"] == "set"
 
 
 def test_null_reset_of_a_removed_key_offers_no_spelling(
@@ -151,8 +155,8 @@ def test_null_reset_refusal_names_every_unknown_key(
 def test_an_edit_that_changes_nothing_still_refuses_a_file_the_engine_refuses(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """An edit that writes nothing must not report a file the whole-file load refuses as fine:
-    before BACKLOG #5327 every set ran that load, so the no-op path keeps running it."""
+    """An edit that changes nothing must not report a file the whole-file load refuses as fine:
+    before BACKLOG #5327 every set ran that load, and it still does."""
     toml = tmp_path / "mf.toml"
     toml.write_text("[auth]\nenabled = false\n", encoding="utf-8")
     before = toml.read_bytes()
@@ -206,7 +210,7 @@ def test_null_reset_of_an_absent_known_key_reports_nothing_changed(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """BACKLOG #5327: resetting a known key the file does not set changes nothing, so the result
-    says so instead of reporting it as set, and the file is not written."""
+    says so instead of reporting it as set, and the file's text is as it was."""
     toml = tmp_path / "mf.toml"
     toml.write_text("# keep\n[api]\nport = 9000\n", encoding="utf-8")
     before = toml.read_bytes()

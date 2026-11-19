@@ -61,9 +61,9 @@ def set_security(
 
     The result says what changed (BACKLOG #5327): ``keys`` lists the keys written or removed, and
     ``unchanged`` the keys the edit left as they were, a ``None`` reset that found no such key or a
-    value the file already holds. When nothing changed, ``op`` is ``"unchanged"`` and the file is not
-    written; an existing file is still validated as it stands, so a file the engine would refuse is
-    refused here too, as it was before an edit that changes nothing skipped the write. This module cannot tell a known
+    value the file already holds. When nothing changed, ``op`` is ``"unchanged"``. The file still
+    goes through the same validated replace, so a file the engine would refuse, or a link, is refused
+    as it is for any edit, and the replace's housekeeping still runs. This module cannot tell a known
     ``[security]`` key from a misspelled one, since it stays outside the settings import graph,
     so refusing a reset of an unknown key is the caller's job; the ``security`` CLI does it."""
     if not isinstance(updates, Mapping):
@@ -88,26 +88,32 @@ def set_security(
                 else:
                     # Reporting this as set would claim a reset that did not happen.
                     unchanged.append(key)
-            elif key in current and type(current[key]) is type(value) and current[key] == value:
+            elif key in current and _same(current[key], value):
                 unchanged.append(key)
             else:
                 sec[key] = value
                 changed.append(key)
-        if not changed:
-            # Nothing to write, and a file that did not exist is not created. One that exists is
-            # still checked, so this path cannot report a file the engine refuses as fine.
-            if original is not None:
-                _checked(validate)(path)
-            return {"op": "unchanged", "keys": [], "unchanged": unchanged}
         # Drop an emptied [security] table so a full reset-to-defaults leaves no bare header behind.
         if not len(sec):
             del doc["security"]
 
         _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
-    return {"op": "set", "keys": changed, "unchanged": unchanged}
+    return {"op": "set" if changed else "unchanged", "keys": changed, "unchanged": unchanged}
 
 
 # --- internals ---------------------------------------------------------------
+
+
+def _same(held: Any, value: Any) -> bool:
+    """Whether ``value`` is exactly what the file holds, type by type all the way down, since
+    ``True == 1`` and ``1.0 == 1`` would otherwise call a different value the same."""
+    if type(held) is not type(value):
+        return False
+    if isinstance(value, list):
+        return len(held) == len(value) and all(map(_same, held, value))
+    if isinstance(value, dict):
+        return held.keys() == value.keys() and all(_same(held[k], value[k]) for k in value)
+    return bool(held == value)
 
 
 def _write_validated(path: Path, data: bytes, validate: Validate) -> None:
@@ -124,12 +130,6 @@ def _write_validated(path: Path, data: bytes, validate: Validate) -> None:
     ``settings_error_detail``: this module stays outside the settings import graph, so it cannot
     render one, and the ``str(exc)`` below is only for an error the callback did not anticipate."""
 
-    atomic_edit.replace_validated(path, data, _checked(validate), refused_error=SecurityEditError)
-
-
-def _checked(validate: Validate) -> Validate:
-    """``validate``, with any refusal it did not word itself raised as :class:`SecurityEditError`."""
-
     def checked(candidate: Path) -> None:
         try:
             validate(candidate)
@@ -138,4 +138,4 @@ def _checked(validate: Validate) -> Validate:
         except Exception as exc:
             raise SecurityEditError(str(exc)) from exc
 
-    return checked
+    atomic_edit.replace_validated(path, data, checked, refused_error=SecurityEditError)
