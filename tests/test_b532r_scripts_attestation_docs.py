@@ -83,7 +83,7 @@ def _changelog_entry() -> str:
         at = text.find(_HEADLINE)
         if at >= 0:
             # The entry ends at the next bullet or heading, so a neighbour's text cannot pass.
-            ends = [e for e in (text.find(m, at + 1) for m in (" - ", " #")) if e >= 0]
+            ends = [e for e in (text.find(m, at + 1) for m in (" - **", " ## ", " ### ")) if e >= 0]
             return text[at : min(ends, default=len(text))]
     raise AssertionError("no changelog entry starts with " + _HEADLINE)
 

@@ -3849,12 +3849,11 @@ def test_the_notice_and_the_removal_agree_on_the_principal(tmp_path: Path) -> No
     )
 
 
-@_windows_only
 def test_a_holder_with_a_dollar_sign_survives_the_policy_rewrite(tmp_path: Path) -> None:
     """secedit can export a holder by NAME, and a gMSA or computer account name ends in '$'.
 
-    Windows only: the name is looked up, and off Windows that lookup throws, which now reads as a
-    holder that may be this account (BACKLOG #5401) rather than as a removal.
+    The name is looked up. Off Windows that lookup throws, which reads as a holder that may be this
+    account (BACKLOG #5401), so the row is still rewritten but the result is not a removal there.
 
     '$' is a .NET substitution metacharacter in a -replace REPLACEMENT operand, so building the
     rewritten row that way re-reads a holder as $&, $+ or $$ and feeds a mangled machine-wide
@@ -3865,7 +3864,9 @@ def test_a_holder_with_a_dollar_sign_survives_the_policy_rewrite(tmp_path: Path)
         holders=["*S-1-5-80-4001", r"DOMAIN\ws-host$", "*S-1-5-32-544"],
         sid="S-1-5-80-4001",
     )
-    assert got["result"] is True, f"the removal did not run; warnings {got['warnings']}"
+    assert got["configureCalls"] == 1, f"the removal did not run; warnings {got['warnings']}"
+    if sys.platform.startswith("win"):
+        assert got["result"] is True, f"the removal was not reported; warnings {got['warnings']}"
     assert r"DOMAIN\ws-host$" in got["configured"], (
         "a holder whose name ends in '$' was mangled or dropped by the rewrite -- the replacement "
         f"operand is being read as substitution syntax:\n{got['configured']}"
@@ -4482,3 +4483,12 @@ def test_an_unproven_logon_right_is_reported_as_unknown(tmp_path: Path) -> None:
     assert "-RemoveLogonRight" not in text and "still holds the" not in text, text
     # POSITIVE CONTROL: without the flag the notice still offers the switch.
     assert "-RemoveLogonRight" in _notice(tmp_path, _FULL_FACTS)
+
+
+def test_the_uninstaller_hands_the_unproven_state_to_the_notice() -> None:
+    """The helper and the notice are tested apart, so the call site is pinned here: a correct
+    helper proves nothing if the script never passes its outcome on (#1699)."""
+    assert _UNINSTALL is not None
+    text = _UNINSTALL.read_text(encoding="utf-8")
+    assert "\n$script:LogonRightUnproven = $false" in text.replace("\r\n", "\n")
+    assert "-LogonRightUnproven:$script:LogonRightUnproven `" in text
