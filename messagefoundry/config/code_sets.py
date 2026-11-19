@@ -72,6 +72,8 @@ __all__ = [
     "set_active",
     "activated",
     "CodeSetError",
+    "CodeSetKeyError",
+    "CodeSetMissError",
     # --- #162: declared unmapped-value policy + re-run-safe capture ---
     "UnmappedKind",
     "UnmappedPolicy",
@@ -104,6 +106,35 @@ class CodeSetError(ValueError):
     A subclass of :class:`ValueError`; :func:`messagefoundry.config.wiring.code_set` re-raises these
     as :class:`~messagefoundry.config.wiring.WiringError` so a bad/missing code set is surfaced by
     ``validate`` / ``check`` / reload exactly like a missing ``env()`` key (fail loud)."""
+
+
+class _MissFields(Exception):
+    """A lookup miss's ``code_set`` and ``key``, as attributes for a caller that needs them; the
+    message never quotes the key (BACKLOG #5320, see :func:`_miss_text`). Both default, so a copy or
+    a pickle, which rebuilds from the message alone and then restores the attributes, still works."""
+
+    def __init__(self, message: str, *, code_set: str | None = None, key: object = None) -> None:
+        super().__init__(message)
+        self.code_set = code_set
+        self.key = key
+
+
+class CodeSetMissError(_MissFields, CodeSetError):
+    """:meth:`CodeSet.translate` missed and the code set declares no unmapped-value policy."""
+
+
+class CodeSetKeyError(_MissFields, KeyError):
+    """``cs[key]`` missed: a :class:`KeyError`, so ``cs.get()`` and ``except KeyError`` still work."""
+
+
+def _miss_text(code_set: str, key: object) -> str:
+    """The message for a lookup miss: the code set and the key's length, never the key (BACKLOG
+    #5320). The key is usually a message field, so it may carry PHI, and a raised error's text goes
+    at least to the error columns, the events and the log, all outside the secured message store
+    (CLAUDE.md section 9). A short code is not hidden by a digest, which a lookup over the possible
+    values reverses, so no digest is given."""
+    shape = f"{len(key)} characters" if isinstance(key, str) else f"type {type(key).__name__}"
+    return f"a key of {shape} is not in code set {code_set!r}"
 
 
 # --- #162: declared unmapped-value policy -------------------------------------
@@ -388,18 +419,22 @@ class CodeSet(Mapping[str, Any]):
             return key
         if kind is UnmappedKind.FLAG:
             return Flagged(self._name, key)
-        raise CodeSetError(
-            f"key {key!r} not in code set {self._name!r} and no unmapped_policy is declared — "
+        raise CodeSetMissError(
+            f"{_miss_text(self._name, key)} and no unmapped_policy is declared — "
             f"declare one (default/passthrough/flag) in codesets/{self._name}{POLICY_SIDECAR_SUFFIX}, "
-            "or use .get()/[] for the None/KeyError behavior"
+            "or use .get()/[] for the None/KeyError behavior",
+            code_set=self._name,
+            key=key,
         )
 
     def __getitem__(self, key: str) -> Any:
         try:
             return self._data[key]
         except KeyError:
-            # Name the code set so a miss is self-explanatory in a transform traceback.
-            raise KeyError(f"key {key!r} not in code set {self._name!r}") from None
+            pass
+        # Name the code set so a miss is self-explanatory in a transform traceback. Raised outside
+        # the handler, so the dict's own KeyError, whose text is the key, is not even __context__.
+        raise CodeSetKeyError(_miss_text(self._name, key), code_set=self._name, key=key)
 
     def __contains__(self, key: object) -> bool:
         return key in self._data
