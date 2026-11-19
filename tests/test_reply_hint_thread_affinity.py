@@ -29,7 +29,8 @@ _OFF_LOOP_FUNCTIONS = ("_run_fused_route", "_run_fused_transform")
 
 #: Any reference to the rendezvous. Deliberately broad — the point is that the object must not be
 #: reachable from these frames at all, not that one particular method is avoided.
-_FORBIDDEN_NAMES = ("_reply_rendezvous", "ReplyRendezvous", "reply_rendezvous")
+#: ``reply_scope`` is a listener's scope of it (BACKLOG #5893), which shares its waiter table.
+_FORBIDDEN_NAMES = ("_reply_rendezvous", "ReplyRendezvous", "reply_rendezvous", "reply_scope")
 
 
 def test_the_off_loop_functions_exist() -> None:
