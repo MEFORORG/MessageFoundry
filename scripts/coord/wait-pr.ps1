@@ -170,10 +170,10 @@
     pwsh 7 on Windows and on a Linux cloud VM.
 
     IT DOES NOT TRIP block-api-burn.ps1, READ 2026-10-21. That guard inspects the COMMAND LINE a
-    session types. Its first test requires `gh` in command position (at the start, after a shell
-    separator, or behind `bash -c` / `pwsh -Command` / `cmd /c`), and exits 0 with no decision when
-    there is none. `pwsh -NoProfile -File scripts/coord/wait-pr.ps1 ...` has no `gh` token, so none
-    of its three deny rules (`gh run watch`, `--watch`, a hand-rolled loop with a sleep) is reached.
+    session types. Its first test requires `gh` in command position, as that script's $GH0 and
+    $GHN define it, and exits 0 with no decision when there is none.
+    `pwsh -NoProfile -File scripts/coord/wait-pr.ps1 ...` has no `gh` token, so none of its three
+    deny rules (`gh run watch`, `--watch`, a hand-rolled poll loop) is reached.
     The guard cannot see inside this script, and THE GUARD DOES NOT SANCTION IT: its loop rule
     denies bounded sleeping loops typed at the prompt too, and tells a session to read once per
     turn. What sanctions this one is the owner-approved plan (section 6.2 asks for exactly this
