@@ -16,6 +16,7 @@ and the AI broker's ``endpoint_host_allowed``; the rest run on the arm they name
 from __future__ import annotations
 
 import ipaddress
+import logging
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
@@ -217,15 +218,37 @@ def test_database_ipv6_server_is_unlisted_saying_why(server: str, dialect: str) 
         _check_db(server, "db.example.org", dialect=dialect)
 
 
-@pytest.mark.parametrize(
-    "entry", ["[::1]", "[::1]:6432", "[FE80::1]:6432", "[2001:db8::5]", "::1", "fe80::1:443"]
-)
+@pytest.mark.parametrize("entry", ["[::1]", "[::1]:6432", "[FE80::1]:6432", "[2001:db8::5]"])
 def test_database_ipv6_entry_is_refused_at_load(entry: str) -> None:
     # On origin/main such an entry loaded and could never admit a server. The remedy names a host
     # name and never the bracketed forms this list refuses.
     with pytest.raises(ValueError, match=r"\[egress\]\.allowed_db entry 1 .* IPv6 address") as e:
         EgressSettings(allowed_db=[entry])
     assert "[v6]" not in str(e.value)
+
+
+@pytest.mark.parametrize("entry", ["::1", "fe80::1:443", "db.example.org:5432:x"])
+def test_database_multi_colon_entry_is_not_called_ipv6(entry: str) -> None:
+    with pytest.raises(ValueError, match=r"entry 1 is refused: it holds more than one ':'") as e:
+        EgressSettings(allowed_db=[entry])
+    assert "IPv6" not in str(e.value) and "[v6]" not in str(e.value)
+
+
+def test_database_url_entry_is_named_a_url() -> None:
+    with pytest.raises(ValueError, match="is a URL or a path"):
+        EgressSettings(allowed_db=["postgres://svc:pw@db.example.org:5432"])
+
+
+@pytest.mark.parametrize("dialect", _DIALECTS)
+def test_database_colon_refusal_does_not_quote_the_server(
+    dialect: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A ':' in server is where a pasted "user:password@host" lands; the refusal names the setting.
+    with caplog.at_level(logging.DEBUG), pytest.raises(WiringError, match=_COLON) as e:
+        _check_db("svcuser:FAKEPW@db.example.org", "db.example.org", dialect=dialect)
+    assert "FAKEPW" not in str(e.value)
+    assert "FAKEPW" not in caplog.text
+    assert any("allowed_db" in r.getMessage() for r in caplog.records)
 
 
 def test_database_ipv6_entry_refusal_counts_its_position() -> None:

@@ -4950,16 +4950,22 @@ def _host_list_entries(
 def _db_entry_problem(entry: str) -> str | None:
     """:func:`~messagefoundry.hostlist.allow_entry_problem`, and an ``[egress].allowed_db`` entry
     that names an IPv6 address or holds more than one ``:``, which no DATABASE server can match
-    (BACKLOG #5915). The IPv6 reason comes first, so it is never told to write ``[v6]``."""
-    parsed = parse_allow_entry(entry)
-    if entry.count(":") > 1 or (
-        parsed is not None and isinstance(parsed[0], ipaddress.IPv6Address)
-    ):
-        return (
-            "it names an IPv6 address, and while this list is set a DATABASE server holding a ':' "
-            "is refused whatever the entries say, so name the server by a host name and list that"
-        )
-    return allow_entry_problem(entry)
+    (BACKLOG #5915). Those two reasons come before the generic one, which would tell the operator
+    to write ``[v6]``; a URL or a path keeps the generic reason, which names it as one."""
+    text = entry.strip()
+    if "://" in text or "@" in text or "/" in text:
+        return allow_entry_problem(text)
+    parsed = parse_allow_entry(text)
+    if parsed is not None and isinstance(parsed[0], ipaddress.IPv6Address):
+        what = "it names an IPv6 address"
+    elif text.count(":") > 1:
+        what = "it holds more than one ':'"
+    else:
+        return allow_entry_problem(text)
+    return (
+        f"{what}, and while this list is set a DATABASE server holding a ':' is refused whatever "
+        "the entries say, so name the server by a host name and list that"
+    )
 
 
 class AiSettings(_Section):

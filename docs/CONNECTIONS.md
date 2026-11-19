@@ -157,9 +157,9 @@ transport = "mllp"
   A connector reads its `port` one way too: a whole number from 0 to 65535, as a number or in
   digits. A bool, a fraction or anything else is refused when the connector is built (BACKLOG
   #1650). That read sees what a `cast` left, so `cast = "int"` has already read `true` as 1 and cut
-  a fraction. At least the host-and-port `[egress]` lists that pin a port, such as `allowed_mllp`,
-  compare the setting's text with the pin before the connector is built; `allowed_db` compares
-  numbers.
+  a fraction. Every host-and-port `[egress]` list that pins a port, `allowed_mllp` and `allowed_db`
+  among them, compares the port as a number before the connector is built, so the text `"06661"`
+  matches a pin of `6661` (BACKLOG #5915).
   **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a
   cap documents `None`/`0` as "disabled" or "unlimited", `"0"` and an empty value disable it too. On
   those caps, and on the pacing rates and bursts, a negative or `nan` is refused at load in either
@@ -2205,8 +2205,9 @@ A `server` holding a colon is never a listed host, and is refused as unlisted. A
 `[v6]:port` `server` names no entry, since an entry's host holds no port. An IPv6 `server`,
 bracketed or not, such as `::1` or `[::1]`, is refused too, on both dialects: how a driver reads
 an IPv6 literal in `SERVER` is unverified, and the SQL Server preset would send `SERVER=::1,1433`.
-In an entry, an unbracketed host with more than one colon, such as `::1` or `fe80::1:443`, matches
-nothing, and so does an entry with a colon and no port after it (BACKLOG #5915).
+An entry that names an IPv6 address, such as `[::1]`, or holds more than one colon, such as `::1`
+or `fe80::1:443`, is refused at config load, and so is an entry with a colon and no port after it
+(BACKLOG #5915).
 
 `db_lookup` and `DatabaseRef` always build the SQL Server preset, so their `port` setting is the
 port compared, and the preset's driver rule above applies to them.

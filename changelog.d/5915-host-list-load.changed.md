@@ -3,8 +3,9 @@
   `[egress]` `allowed_mllp`, `allowed_tcp`, `allowed_http`, `allowed_db`, `allowed_remote`,
   `allowed_smtp`, `allowed_direct`, `allowed_proxy`, `allowed_syslog` and `[ai].allowed_endpoints`
   now refuse such an entry, a URL or a `*` pattern included, naming the list and the entry's
-  position and never its text; in the shipped code it loaded and admitted nothing. A blank entry is
-  refused too, and so is a JSON list given in one of those `[egress]` lists' environment variables:
+  position and never its text; in the shipped code it loaded and admitted nothing. A blank entry in
+  a TOML list is refused too; the comma-separated environment form of the `[egress]` lists still
+  drops blank items, as before. A JSON list given in one of those environment variables is refused:
   write it comma-separated. An `allowed_db` entry naming an IPv6 address is refused too, and a
   DATABASE `server` holding a colon is still refused as unlisted, now saying why. A port that
   reaches the check as text, such as `06661`, matches `host:6661`, and `host:443` admits

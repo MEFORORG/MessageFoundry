@@ -930,9 +930,10 @@ def _database_refusal(
     # Unverified driver reads fail closed; docs/CONNECTIONS.md says why (BACKLOG #5915).
     if ":" in host:
         # Refused as unlisted, saying why, since an entry naming the address looks like it lists it.
+        # The server text is not quoted: a ':' is where a pasted "user:password@host" lands.
         where = "the PORT keyword in odbc_params" if dialect == "generic" else "the port setting"
         return (
-            f"server {host!r} is not in the [egress].allowed_db allowlist: a server holding a "
+            "the server setting is not in the [egress].allowed_db allowlist: a server holding a "
             f"':' is never listed, so give a port in {where}, not in server, and name an IPv6 "
             "server by host name"
         )
