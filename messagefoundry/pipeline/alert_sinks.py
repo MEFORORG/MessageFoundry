@@ -1342,6 +1342,10 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._realert_seconds = realert_seconds
         self._rules = AlertRuleSet(rules or [])
         self._last_sent: dict[str, float] = {}
+        # ADR 0128: when a fired control action's (type, connection) is not its notification key (a
+        # config_fault connection_error), the time it fired, so the rule still fires at most once per
+        # cooldown per (event_type, connection).
+        self._last_control: dict[str, float] = {}
         # Durable alert-state (ADR 0044, #56): when wired, every emit upserts a resolvable instance on
         # the (type, connection) key BEFORE the throttle, and an inverse signal auto-resolves it. None =
         # state tracking off (byte-identical to pre-#56 — fire-and-forget only).
@@ -2204,6 +2208,22 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         if not queue:
             self._pending_clears.pop(key, None)
 
+    def _control_throttled(
+        self, event: dict[str, Any], key: str, now: float, cooldown: float
+    ) -> bool:
+        """Whether a rule's control action already fired inside ``cooldown`` for this event's
+        ``(event_type, connection)``, which a kind-split notification ``key`` does not share
+        (ADR 0128). Records the fire when it does not."""
+        rule_key = f"{event['type']}:{event['connection']}"
+        fired = [self._last_control.get(rule_key)]
+        if rule_key != key:
+            fired.append(self._last_sent.get(rule_key))
+        if any(t is not None and now - t < cooldown for t in fired):
+            return True
+        if rule_key != key:
+            self._last_control[rule_key] = now
+        return False
+
     @staticmethod
     def _apply_escalation(
         decision: _RuleDecision, occurrences: int
@@ -2257,7 +2277,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         # #144 (ADR 0128): fire the auto-remediation control action on a fresh (non-throttled) alert —
         # BEFORE the transport-suppression return, so a rule may auto-remediate QUIETLY (transports=[]) or
         # alongside a page. Dispatched off-worker + never-raise (see _dispatch_control).
-        if decision.control_action is not None:
+        if decision.control_action is not None and not self._control_throttled(
+            event, key, now, cooldown
+        ):
             subject = str(event["connection"])
             if event["type"] not in _ALERT_CONTROL_EVENT_TYPES:
                 # BACKLOG #1898: AlertRule refuses this pair at load, so a loaded rule never reaches

@@ -228,6 +228,26 @@ async def test_control_throttled_with_notification() -> None:
     assert cb.calls == [("restart_outbound", "OB_X")]  # exactly once per cooldown
 
 
+@pytest.mark.parametrize(
+    "kinds", [("connection_lost", "config_fault"), ("config_fault", "connection_lost")]
+)
+async def test_control_fires_once_per_event_type_across_connection_error_kinds(
+    kinds: tuple[str, str],
+) -> None:
+    # A config_fault connection_error has its own notification key (ADR 0095 B.2), but the rule's
+    # control action stays bounded per (event_type, connection) (ADR 0128).
+    cb = _Control()
+    t = _RecordingTransport()
+    rule = AlertRule(event_type="connection_error", control_action="restart_outbound")
+    sink = NotifierAlertSink([t], realert_seconds=10_000.0, rules=[rule])
+    sink.set_control_callback(cb)
+    for kind in kinds:
+        sink.connection_error("OB_X", kind=kind, detail="boom", error_class="DeliveryError")
+    await _drain(sink)
+    assert cb.calls == [("restart_outbound", "OB_X")]
+    assert [e.get("kind") for e in t.events] == list(kinds)  # both pages still go out
+
+
 async def test_control_fires_even_when_notification_suppressed() -> None:
     # transports=[] = QUIET auto-remediation: restart, no page.
     cb = _Control()

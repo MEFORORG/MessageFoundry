@@ -579,7 +579,7 @@ PENDING un-errored; under `"dead_letter"` the row, or every member of a batch, d
 
 Under `"dead_letter"` a configuration fault a send raises now also alerts the lane, on an edge of
 its own, apart from transport health. With `[diagnostics].connection_events` on, its default,
-`connection_error` of kind `config_fault` fires once for the lane. For `token-reply-coded` this follows the owner's
+`connection_error` of kind `config_fault` fires. For `token-reply-coded` this follows the owner's
 ruling of 2026-11-18 on PR 3069: "Yes, keep one connection_error alert on that path." The worker
 reads `config_fault`, never the code, so this is not only `token-reply-coded`. In at least these
 cases it does not alert: a configuration fault from a connector a reload has
