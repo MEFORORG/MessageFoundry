@@ -54,6 +54,10 @@ _BACKOFF_MAX = 5.0
 _STOP_HARD_MARGIN_S = 10.0
 
 
+class AckTimeoutError(Exception):
+    """The oldest in-flight send went unanswered past the connection's ACK timeout."""
+
+
 def _ack_code(payload: bytes) -> str:
     """MSA-1 from an ACK frame via a cheap segment scan (no full parse on the hot path)."""
     head_end = payload.find(b"\r")
@@ -83,8 +87,15 @@ class PersistentConnection:
         tracker: FailoverTracker | None = None,
         ledger: IntakeLedger | None = None,
         on_strand: Callable[[int], None] | None = None,
+        ack_timeout: float | None = None,
     ) -> None:
         self._host = host
+        # BACKLOG #5952: the target's ``ack_timeout_s``. When the oldest in-flight send has waited
+        # this long with no reply, the connection is closed, its in-flight sends are counted as
+        # timeouts, and it reconnects. None waits for ever, as every direct caller did before.
+        if ack_timeout is not None and not ack_timeout > 0:
+            raise ValueError(f"ack_timeout must be positive, got {ack_timeout!r}")
+        self._ack_timeout_ns = None if ack_timeout is None else int(ack_timeout * 1e9)
         self._port = port
         self._correlator = correlator
         self._m = metrics
@@ -230,6 +241,10 @@ class PersistentConnection:
                 dropped = not self._stop.is_set()
             except (OSError, ConnectionError):
                 dropped = not self._stop.is_set()
+            except AckTimeoutError as exc:
+                # This side closed the socket, so it is not a drop. Its in-flight sends are released
+                # as timeouts below, like any other close, and the connection reopens.
+                log.warning("load connection %s:%d: %s; reconnecting", self._host, self._port, exc)
             except MLLPFrameError as exc:
                 # A reply frame over the cap: refused, counted as a transport error, and the socket
                 # closed rather than the frame buffered whole. Its in-flight sends are released as
@@ -343,7 +358,25 @@ class PersistentConnection:
         # `_run` refuses it; ACKs earlier in the same read were already handled (the feed is lazy).
         decoder = MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES)
         while True:
-            chunk = await reader.read(_READ_BYTES)
+            if self._ack_timeout_ns is None:
+                chunk = await reader.read(_READ_BYTES)
+            else:
+                # Wake at the oldest send's deadline, or one timeout from now when nothing is in
+                # flight, since a send made meanwhile starts its own clock.
+                wait_ns = self._ack_timeout_ns
+                if self._inflight:
+                    oldest_ns = self._inflight[0][1]
+                    wait_ns = oldest_ns + self._ack_timeout_ns - time.perf_counter_ns()
+                    if wait_ns <= 0:
+                        raise AckTimeoutError(
+                            f"no reply to seq={self._inflight[0][0]} within "
+                            f"{self._ack_timeout_ns / 1e9:g}s"
+                        )
+                try:
+                    async with asyncio.timeout(wait_ns / 1e9):
+                        chunk = await reader.read(_READ_BYTES)
+                except TimeoutError:
+                    continue  # re-check the oldest send against its deadline
             if not chunk:
                 return  # peer closed
             for ack in decoder.feed(chunk):
@@ -407,6 +440,8 @@ class ConnectionPool:
     ) -> None:
         if size <= 0:
             raise ValueError("pool size must be positive")
+        # The target's ACK timeout reaches each connection only when an ACK is expected; with none
+        # expected nothing is ever in flight to time.
         self._conns = [
             PersistentConnection(
                 target.host,
@@ -416,6 +451,7 @@ class ConnectionPool:
                 expect_ack=target.expect_ack,
                 queue_max=queue_max,
                 tracker=tracker,
+                ack_timeout=target.ack_timeout_s if target.expect_ack else None,
             )
             for _ in range(size)
         ]
