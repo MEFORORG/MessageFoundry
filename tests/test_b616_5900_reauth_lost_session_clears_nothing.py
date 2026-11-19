@@ -679,6 +679,45 @@ async def test_a_commit_made_visible_late_still_reads_as_cleared(
         await store.close()
 
 
+async def test_a_partial_read_back_is_unknown_not_cleared(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The reset and both rows committed, then the store raised, and the read-back finds the
+    ``auth.reauth`` row but not the ``auth.login_after_failures`` row. Not every row matched, so
+    the outcome is unknown and answered as refused: the re-auth writes its own row, and neither a
+    notice nor a tee is sent on the strength of half a match."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, notifier, identity, token = await _setup(store)
+        before = len(await store.list_audit(action="auth.reauth"))
+        real_write = store.record_login_success
+        real_read = store.list_audit
+        teed = _record_tees(monkeypatch)
+
+        async def committed_then_lost(user_id: str, **kwargs: Any) -> Any:
+            with monkeypatch.context() as m:
+                m.setattr("messagefoundry.store.store.tee_audits", lambda *a, **k: None)
+                await real_write(user_id, **kwargs)
+            raise OSError("synthetic connection lost after the commit")
+
+        async def hides_the_flag_row(**kwargs: Any) -> Any:
+            if kwargs.get("action") == "auth.login_after_failures":
+                return []
+            return await real_read(**kwargs)
+
+        monkeypatch.setattr(store, "record_login_success", committed_then_lost)
+        monkeypatch.setattr(store, "list_audit", hides_the_flag_row)
+        caplog.set_level("WARNING", logger="messagefoundry.auth.service")
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.ok and out.token is not None
+        assert len(await real_read(action="auth.reauth")) == before + 2
+        assert not [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
+        assert not [t for t in teed if t["action"] == "auth.login_after_failures"]
+        assert "outcome is unknown" in caplog.text
+    finally:
+        await store.close()
+
+
 async def test_a_failed_read_back_logs_the_outcome_as_unknown(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

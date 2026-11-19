@@ -3791,7 +3791,7 @@ no such check:
   `auth.reauth` row carries `clear_denied` and `session_ended`, which says whether that revoke
   landed as far as the re-auth saw; when it did not, the rotated session may still exist, its
   token never handed back.
-- A store refusal, or a Vault transit Outage, which is paged, clears nothing and ends nothing. The
+- A Vault transit Outage, which is paged, clears nothing and ends nothing. The
   re-auth then writes its `auth.reauth` row hard: refused too, the re-auth raises and its rotated
   token is never handed back.
 - The `auth.reauth` row, and the `auth.login_after_failures` row when the clear ends a run of
