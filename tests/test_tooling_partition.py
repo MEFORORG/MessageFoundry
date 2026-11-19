@@ -115,6 +115,8 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # dependency diff the tooling path gate does not see.
         "test_api_listener_ipv6_only.py",
         "test_asvs_apply.py",
+        # The same writer as test_asvs_apply.py, so it stays where that file stays (BACKLOG #5455).
+        "test_asvs_apply_header_splice.py",
         "test_asvs_residual_lint.py",
         # Reads changelog.d/ and CHANGELOG.md (BACKLOG #2080). A changelog fragment arrives on an
         # ENGINE pull request -- that is where every entry is written -- and does not trip the tooling
@@ -360,10 +362,25 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # change, and on no queue run for any change. It spawns no subprocess, so staying on the
         # engine legs costs them almost nothing.
         "test_windows_lock_install.py",
+        # Imports its receipt and policy helpers from tests/test_dast_auth_sweep.py, an engine-tier
+        # test that reads messagefoundry/api/** through the sweep (BACKLOG #5443). A change to
+        # those helpers arrives as a test diff the tooling path gate does not see.
+        "test_dast_policy_shape_5443.py",
         # Reads messagefoundry/auth/oidc/claims.py off disk: the one comment line the leak gate's
         # OIDC core allowlist entry excuses, as the control that the line stays clean (BACKLOG
         # #5445). A reworded comment arrives as an ENGINE diff the tooling path gate does not see.
         "test_scan_allowlist_whole_line_5445.py",
+        # NOT engine source, so this entry widens the list's stated rule, as
+        # test_windows_lock_install.py above does and for the same reason (the path gate).
+        # Pins the cap on the workers `pytest -n auto` starts: tests/_xdist_worker_cap.py and at
+        # least the four places that register it, the `addopts` of pyproject.toml and of the web
+        # console's pyproject.toml, tests/conftest.py and the web console suite's conftest. ci.yml's
+        # `tooling=` path predicate matches both pyproject.toml files and tests/conftest.py but not
+        # tests/_xdist_worker_cap.py or the console conftest, so an edit to one of those two alone
+        # does not trip the tooling path gate; listed as tooling this
+        # guard would not run on the change that breaks it. It starts two child pytest processes,
+        # each stopped before any worker spawns.
+        "test_xdist_auto_worker_cap.py",
     }
 )
 

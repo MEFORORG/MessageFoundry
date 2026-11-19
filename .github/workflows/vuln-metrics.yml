@@ -34,6 +34,9 @@ jobs:
           # Stdlib + gh only — no install. Writes the CSV + appends the table to the run summary.
           python scripts/security/vuln_metrics.py --csv vuln-metrics.csv --summary "$GITHUB_STEP_SUMMARY"
       - name: Upload the metrics CSV
+        # Also when the run exits 2 for an unread source: its CSV records that source's metrics
+        # as n/a, which is the week's evidence (BACKLOG #5447).
+        if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: vuln-metrics

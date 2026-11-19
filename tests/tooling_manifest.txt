@@ -39,7 +39,9 @@ tests/test_asvs_anchor_report.py
 tests/test_asvs_restatement_report.py
 tests/test_asvs_file_surface_doc_drift.py
 tests/test_asvs_prove_absences_wiring.py
+tests/test_asvs_prove_report_failclosed.py
 tests/test_asvs_scorecard.py
+tests/test_asvs_scorecard_failclosed.py
 tests/test_asvs_tally_lint.py
 tests/test_asvs_verifier_vault_contract.py
 tests/test_bash_probe_path.py
@@ -78,6 +80,7 @@ tests/test_coord_alloc_reentrancy.py
 tests/test_coord_alloc_retired_tombstone.py
 tests/test_coord_fleet_fetch_clock.py
 tests/test_coord_host_box_key.py
+tests/test_coord_owner_log_pipes.py
 tests/test_coord_root.py
 tests/test_coord_shared_root_claims.py
 tests/test_coord_shared_root_seats_mail.py
@@ -168,6 +171,7 @@ tests/test_install_guide_verify_gate.py
 tests/test_installed_coord_hooks.py
 tests/test_key_usage_scope_inventory.py
 tests/test_ledger_check.py
+tests/test_ledger_check_renames.py
 tests/test_link_resolution.py
 tests/test_lint_scope_parity.py
 tests/test_measure_store_access_exit_code.py
@@ -224,6 +228,7 @@ tests/test_fs_scan_escaped_quotes.py
 tests/test_unbounded_fs_scan_guard.py
 tests/test_shell_guard_dispatch.py
 tests/test_api_burn_guard.py
+tests/test_vuln_metrics_fetch_failure_5447.py
 tests/test_block_api_burn_loops.py
 tests/test_webconsole_engine_floor.py
 tests/test_wheel_license_files.py

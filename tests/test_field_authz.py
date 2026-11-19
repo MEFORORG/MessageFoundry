@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
+
 from messagefoundry.api.field_authz import (
     ERROR_TEXT_MASKED_UNTIL_REVEALED,
     MASKED_UNTIL_REVEALED,
@@ -272,7 +274,8 @@ def test_known_phi_fields_are_mapped() -> None:
 
 
 def test_metadata_is_masked_on_a_list_surface_and_complete_on_a_reveal() -> None:
-    """``metadata`` is display-masked like ``summary``, not returned complete beside a masked field.
+    """``metadata`` is display-masked, as ``summary`` is, not returned complete beside a masked
+    field. It is masked whole, not through ``summary``'s grammar (BACKLOG #5786).
 
     ``PHI_FIELDS`` rates ``metadata`` on the same view_summary tier as ``summary``, for the same
     reason: it carries ingest-derived MRN and patient-name PHI. Before BACKLOG #1187 only ``summary``
@@ -301,9 +304,9 @@ def test_metadata_with_an_unknown_grammar_fails_closed() -> None:
     """``mask_for_display`` reads the composed-summary grammar; ``metadata`` need not follow it.
 
     Its values are code- and operator-attached and its mechanism is documented as TBD, so the mask
-    must not pass an unrecognized shape through. It degrades to the whole-part mask instead. This is
-    asserted rather than left to the summary tests, because it is the case that decides whether
-    extending the mask set to ``metadata`` is safe at all.
+    must not pass an unrecognized shape through. Since BACKLOG #5786 ``metadata`` never goes through
+    that grammar and is masked whole. This is asserted rather than left to the summary tests,
+    because it is the case that decides whether extending the mask set to ``metadata`` is safe.
     """
     holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
     blob = '{"user": {"note": "MRN 100001 attached by a handler"}}'
@@ -311,6 +314,51 @@ def test_metadata_with_an_unknown_grammar_fails_closed() -> None:
     assert masked is not None and "100001" not in masked, (
         f"an unrecognized metadata shape leaked an identifier through the mask: {masked!r}"
     )
+
+
+@pytest.mark.parametrize(
+    "blob",
+    [
+        '{"family": "DOE", "given": "JANE", "mrn": "100001"}',
+        "DOE, JANE",
+        "MRN 100001",
+    ],
+)
+def test_metadata_is_masked_whole_on_both_models(blob: str) -> None:
+    """BACKLOG #5786: metadata went through ``mask_for_display``, which reads any comma as a
+    ``FAMILY, GIVEN`` name, so JSON came back as its initials, digits and structure. It is masked
+    whole now, as the error text is, while ``summary`` keeps its grammar."""
+    holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
+    assert redact_unauthorized(_summary(metadata=blob), holder).metadata == "****"
+    detail = MessageDetail(
+        id="m1",
+        channel_id="IB",
+        received_at=0.0,
+        source_type="mllp",
+        control_id="c1",
+        message_type="ADT^A01",
+        status="PROCESSED",
+        error=None,
+        metadata=blob,
+        outbox=[],
+        events=[],
+    )
+    assert redact_unauthorized(detail, holder).metadata == "****"
+    summary = redact_unauthorized(_summary(summary="MRN 100001 · DOE, JANE"), holder).summary
+    assert summary == "MRN ****0001 · D**, J**"  # the control: summary still keeps its shape
+
+
+def test_error_text_is_masked_whole_even_if_its_name_is_grammar_masked(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Error text keeps the whole mask it had before BACKLOG #5786 split out GRAMMAR_MASKED: a name
+    in both sets is free text, so it never goes through the summary grammar."""
+    import messagefoundry.api.field_authz as field_authz
+
+    monkeypatch.setattr(field_authz, "GRAMMAR_MASKED", frozenset({"summary", "error"}))
+    holder = _identity(Permission.MESSAGES_VIEW_SUMMARY)
+    masked = redact_unauthorized(_summary(error="DOE, JANE MRN 100001"), holder)
+    assert masked.error == "****"
 
 
 def test_the_reveal_set_on_the_detail_route_covers_every_masked_property() -> None:

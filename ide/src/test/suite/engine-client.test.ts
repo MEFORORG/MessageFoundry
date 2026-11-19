@@ -11,6 +11,7 @@ import {
   HeldError,
   HttpError,
   NetworkError,
+  POST_TIMEOUT_MS,
   TIMEOUT_CODE,
   approvalText,
   classifyApprovable,
@@ -104,6 +105,69 @@ suite("engineClient — getJson timeout (F2)", () => {
     assert.notStrictEqual(hung.reason, dead.reason);
     assert.ok(/hung/i.test(hung.reason ?? ""));
     assert.ok(/nothing is listening/i.test(dead.reason ?? ""));
+  });
+});
+
+// BACKLOG #5938: a POST against an engine or proxy that trickles its reply must still end. The idle
+// timeout `req.setTimeout` never fired while bytes kept arriving, and postApprovable passed none.
+suite("engineClient — POST deadline is wall-clock and on by default (BACKLOG #5938)", () => {
+  let server: http.Server;
+  let url: string;
+  const sockets = new Set<Socket>();
+  const drips = new Set<ReturnType<typeof setInterval>>();
+
+  setup(async () => {
+    // Headers at once, then one byte every 20 ms, forever: never idle, never finished.
+    server = http.createServer((_req, res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.write(" ");
+      const drip = setInterval(() => res.write(" "), 20);
+      drips.add(drip);
+      res.on("close", () => {
+        clearInterval(drip);
+        drips.delete(drip);
+      });
+    });
+    server.on("connection", (s) => {
+      sockets.add(s);
+      s.on("close", () => sockets.delete(s));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  });
+
+  teardown(async () => {
+    for (const drip of drips) {
+      clearInterval(drip);
+    }
+    drips.clear();
+    for (const s of sockets) {
+      s.destroy();
+    }
+    sockets.clear();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+
+  test("postJson rejects at its deadline though the reply never goes idle", async () => {
+    const started = Date.now();
+    await assert.rejects(
+      () => postJson(url, "/auth/logout", {}, "tok", 200),
+      (e: unknown) => e instanceof NetworkError && e.code === TIMEOUT_CODE,
+    );
+    assert.ok(Date.now() - started < 4000, "rejects promptly at the deadline");
+  });
+
+  test("postApprovable takes a deadline and rejects at it", async () => {
+    const started = Date.now();
+    await assert.rejects(
+      () => postApprovable(url, "/config/reload", { dry_run: false }, "tok", 200),
+      (e: unknown) => e instanceof NetworkError && e.code === TIMEOUT_CODE,
+    );
+    assert.ok(Date.now() - started < 4000, "rejects promptly at the deadline");
+  });
+
+  test("the POST default deadline outlasts the engine's 120 s request deadline", () => {
+    assert.ok(POST_TIMEOUT_MS > 120_000 && POST_TIMEOUT_MS <= 300_000);
   });
 });
 

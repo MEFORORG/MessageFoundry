@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 
@@ -663,3 +666,42 @@ async def test_a_link_inside_seed_dir_that_leaves_it_is_refused(tmp_path: Path) 
         assert not coord.active
     finally:
         await store.close()
+
+
+def test_the_dr_hook_kill_warns_when_the_group_is_empty(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The takeover hook's kill logs the same WARNING it logged before ``proctree.GroupKill``
+    existed when ``killpg`` finds its group empty (``ESRCH``), and the sandbox path stays silent
+    for that case. The shell has exited, so no single-process kill follows. The process calls are
+    replaced, so this runs on every host. FALSIFICATION: drop ``warn_empty=True`` from
+    ``dr._kill_hook``'s call, and no line is logged."""
+    sent: list[int] = []
+
+    def _killpg(pgid: int, sig: int) -> None:
+        sent.append(pgid)
+        raise ProcessLookupError(3, "No such process")
+
+    fake_os = SimpleNamespace(getpgid=lambda pid: pid, getpgrp=lambda: 1, killpg=_killpg)
+    monkeypatch.setattr(proctree, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(proctree, "os", fake_os)
+    monkeypatch.setattr(proctree, "signal", SimpleNamespace(SIGKILL=9))
+    monkeypatch.setattr(proctree, "ADOPT_NEW_SESSION", True)
+    caplog.set_level(logging.WARNING)
+    proc = cast(Any, SimpleNamespace(pid=4242, returncode=0))
+    dr_module._kill_hook(proc, None)
+    assert sent == [4242]
+    lines = [(r.name, r.levelno, r.getMessage()) for r in caplog.records]
+    assert lines == [
+        (
+            proctree.log.name,
+            logging.WARNING,
+            "could not signal process group 4242 (No such process); kill degrades to a "
+            "single-process kill",
+        )
+    ]
+    # The control: the same empty group, killed without the DR hook's flag, logs nothing.
+    caplog.clear()
+    assert proctree.kill_process_group(4242, started_as_leader=True) is proctree.GroupKill.EMPTY
+    assert sent == [4242, 4242]
+    assert caplog.records == []

@@ -19,9 +19,9 @@
     not add a usage throttle here.
 
     THERE IS NO -Lane AND NO -BoxKey PARAMETER, AND ADDING ONE DEFEATS THE WHOLE DESIGN. The box key is
-    derived from $PWD, so a session can only ever state its OWN level. The failure this replaces is a
-    gauge that reported both lanes full while one sat idle, because it counted CLAIMS: measured
-    2026-08-23, one lane held nine claims and reported one active item and three free slots. Both
+    derived from git's resolved work tree root of $PWD, so a session can only ever state its OWN
+    level. The failure this replaces is a gauge that reported both lanes full while one sat idle,
+    because it counted CLAIMS: measured 2026-08-23, one lane held nine claims and reported one active item and three free slots. Both
     numbers were honest. Only the lane knows which is which.
 
     FREE MEANS BY WORK, NOT BY CLAIMS. Built-and-awaiting-land is FREE. Blocked is FREE. Parked on a
@@ -75,9 +75,26 @@ if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
 . $coordRootScript
 $thisHost = Get-CoordHost
 
+# The lane file and the claim hash are keyed on the WORK TREE ROOT; the current directory keyed a
+# subdirectory run on a box nobody reads (BACKLOG #5486). Read before the root is resolved, so a
+# directory with no work tree (a .git directory) refuses before anything is read or written.
+# ProviderPath, not Path: on a UNC location Path carries a provider prefix git cannot read.
+$here = (Get-Location).ProviderPath
+function Write-RootRefusal([string]$Why) {
+    [Console]::Error.WriteLine("lane.ps1: REFUSED -- $Why, so the lane cannot be keyed and nothing was read or written.")
+    exit 2
+}
+# The keying rule is lane-root.ps1's, shared with scripts/hooks/lane-level.ps1 so both key one box.
+$laneRootScript = Join-Path $PSScriptRoot 'lane-root.ps1'
+if (-not (Test-Path -LiteralPath $laneRootScript -PathType Leaf)) { Write-RootRefusal "$laneRootScript is missing" }
+. $laneRootScript
+$root = Resolve-LaneWorktreeRoot -From $here
+if ($root.Error) { Write-RootRefusal $root.Error }
+$worktree = $root.Path
+
 # Both kinds this writes or reads are fleet-wide, so both are resolved before anything is written,
 # and an error refuses rather than writing a level into a local copy nobody else reads.
-$sharedResolved = Resolve-CoordSharedRoot -From (Get-Location).Path
+$sharedResolved = Invoke-GitUtf8 { Resolve-CoordSharedRoot -From $worktree }
 if ($sharedResolved.Error) {
     [Console]::Error.WriteLine("lane.ps1: REFUSED -- the coordination root could not be resolved, so nothing was written: $($sharedResolved.Error)")
     exit 2
@@ -110,7 +127,6 @@ function Get-ClaimHash([string]$Worktree) {
     return (-join ($b[0..7] | ForEach-Object { $_.ToString('x2') }))
 }
 
-$worktree = (Get-Location).Path
 $boxKey   = ConvertTo-BoxKey -Path $worktree
 $lanesDir = Join-Path $sharedResolved.Path 'lanes'
 $tmpDir   = Join-Path $lanesDir '.tmp'

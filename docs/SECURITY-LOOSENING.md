@@ -525,7 +525,8 @@ false premise.
   two session limits get this: a `MEFOR_SECURITY_*` variable for another switch, at least
   `require_mfa` and `block_unlisted_outbound`, is not named. It needs a whole-file load that ran
   and succeeded, so a report the failed load left partial names none, and so does `security show` on a file that does
-  not exist yet; `security set` on a new file loads what it wrote, and names it. The variable also
+  not exist yet; `security set` on a new file loads what it wrote, and names it, except a `set`
+  that changed no key where no file exists, which writes none and names none. The variable also
   feeds that load, so one the load refuses makes the report partial, or refuses the edit. The IDE
   security editor marks a value above the default it is shown.
 

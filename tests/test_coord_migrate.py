@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -395,8 +396,26 @@ def test_a_start_time_in_the_past_is_refused(tmp_path: Path) -> None:
     assert list(d.iterdir()) == []
 
 
-def test_two_real_processes_race_clean(tmp_path: Path) -> None:
-    d = _dst(tmp_path, "race")
+_RACE_TAGS = ("P1", "P2")
+_RACE_ATTEMPTS = 3
+# The harness's own verdict that one side started too late for the run to count as a race.
+_LATE_START = re.compile(
+    rf"(?:{'|'.join(map(re.escape, _RACE_TAGS))}) started \d+ ms late, past the \d+ ms limit"
+)
+
+
+def _only_started_late(proc: subprocess.CompletedProcess[str], summary: Any) -> bool:
+    """True only when the run is invalid for start lateness and nothing else."""
+    return (
+        proc.returncode == 2
+        and summary is not None
+        and not (summary["doubleWinners"] or summary["emptySlots"] or summary["mismatches"])
+        and bool(summary["invalid"])
+        and all(_LATE_START.fullmatch(i) for i in summary["invalid"])
+    )
+
+
+def _race_two_processes(d: Path) -> tuple[subprocess.CompletedProcess[str], Any]:
     start = _soon(8)
     procs = [
         subprocess.Popen(
@@ -422,16 +441,63 @@ def test_two_real_processes_race_clean(tmp_path: Path) -> None:
             stderr=subprocess.PIPE,
             text=True,
         )
-        for tag in ("P1", "P2")
+        for tag in _RACE_TAGS
     ]
     for p in procs:
         out, err = p.communicate(timeout=TIMEOUT)
         assert p.returncode == 0, (out, err)
+    return _compare(d)
+
+
+@pytest.mark.parametrize(
+    ("p1_won", "p2_won", "retry"),
+    [
+        ([1], [2], True),  # late, and nothing else wrong
+        ([1, 2], [2], False),  # late, and slot 2 has two winners
+        ([1, 2], [], False),  # late, and P2 won no slot
+    ],
+)
+def test_only_a_race_invalid_for_lateness_alone_is_re_raced(
+    tmp_path: Path, p1_won: list[int], p2_won: list[int], retry: bool
+) -> None:
+    """Planted results through the real -Compare: a control that the retry predicate still
+    matches the harness's wording, and refuses at least a double winner and a side that won
+    nothing."""
+    d = _dst(tmp_path, "race")
+    for n in (1, 2):
+        (d / f"slot-{n}").write_text("P1" if n in p1_won else "P2", encoding="utf-8")
+    _result(d, "P1", p1_won, 2)
+    _result(d, "P2", p2_won, 2, start="2026-10-21T10:00:00.024Z")
     proc, summary = _compare(d)
-    assert proc.returncode == 0, (proc.stdout, proc.stderr)
-    assert summary["doubleWinners"] == [] and summary["emptySlots"] == []
-    assert summary["invalid"] == []
-    assert sum(s["won"] for s in summary["sides"]) == 50
+    assert any(_LATE_START.fullmatch(i) for i in summary["invalid"]), summary
+    assert _only_started_late(proc, summary) is retry, (proc.returncode, summary)
+
+
+# Each attempt costs the 8 s start lead plus three pwsh launches, so the default per-test timeout
+# would cut the last attempt short on the loaded runner the retry exists for. Kept under the tooling
+# leg's 150 s faulthandler_timeout, so the per-test bound still fires first (ci.yml).
+@pytest.mark.timeout(140)
+def test_two_real_processes_race_clean(tmp_path: Path) -> None:
+    # A loaded runner can overshoot the harness's 20 ms start limit. That makes the run invalid
+    # rather than wrong, so the test re-races in a fresh directory instead of failing. Only a run
+    # whose every invalid reason is start lateness is re-raced: double winners, empty slots,
+    # mismatches and any other invalid reason are asserted on the attempt that produced them.
+    # Not pytest-rerunfailures: it decides by matching failure text, and this decides on the
+    # -Compare JSON, which is exact.
+    late: list[list[str]] = []
+    for attempt in range(_RACE_ATTEMPTS):
+        d = _dst(tmp_path, f"race{attempt}")
+        proc, summary = _race_two_processes(d)
+        if not _only_started_late(proc, summary):
+            break
+        late.append(summary["invalid"])
+    else:
+        pytest.fail(f"every attempt was invalid for start lateness: {late}")
+    # `late` names any earlier attempts discarded as late: the hint that the runner was loaded.
+    assert proc.returncode == 0, (proc.stdout, proc.stderr, late)
+    assert summary["doubleWinners"] == [] and summary["emptySlots"] == [], (summary, late)
+    assert summary["invalid"] == [], (summary, late)
+    assert sum(s["won"] for s in summary["sides"]) == 50, (summary, late)
     # A rerun in the same directory is refused: a stale slot would read as a loss for both sides.
     again = _pwsh(RACE, "-Dir", str(d), "-Tag", "P3", "-StartAtUtc", _soon(30), cwd=d)
     assert again.returncode == 2, (again.stdout, again.stderr)

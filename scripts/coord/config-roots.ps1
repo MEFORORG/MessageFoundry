@@ -238,6 +238,36 @@ function ConvertTo-UtcDateTime {
     try { return ([System.DateTimeOffset]::Parse([string]$Value)).UtcDateTime } catch { return $null }
 }
 
+function Test-MarkerRecordsCancellation {
+    <#
+    .SYNOPSIS
+        Did the marker at this path read as UNAVAILABLE under the reader as it stood before BACKLOG #5305?
+    .DESCRIPTION
+        THE COLLECTOR'S SUPPRESSION SET, FROZEN. #5305 made Get-RootUnavailability report more damaged
+        markers as MALFORMED, which is right for the reader. But the collector suppresses publishing on
+        a recorded cancellation, and many of those markers -- an array-wrapped marker, an agreeing
+        repeated key, a flag of "yes" or "1", an empty file, a bare scalar -- read as UNAVAILABLE
+        before, so the collector suppressed on them. Reading them as MALFORMED alone would let an
+        account its operator meant to cancel publish again. This is the old reader's verdict logic.
+        Do not tidy it into the new reader's rules; that changes the set.
+        Never throws: a throw in the old reader reached the collector's catch, which published.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
+        $doc = $null
+        try { $doc = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+        catch { return $false }
+        if ($doc.PSObject.Properties.Name -contains 'unavailable' -and -not [bool]$doc.unavailable) { return $false }
+        $eff = ConvertTo-UtcDateTime $doc.effective_from
+        if ($eff) {
+            if ($eff -gt (Get-Date).ToUniversalTime()) { return $false }
+        }
+        return $true
+    }
+    catch { return $false }
+}
+
 function Get-RootUnavailability {
     <#
     .SYNOPSIS
@@ -277,19 +307,91 @@ function Get-RootUnavailability {
         marked_by      = $null
         effective_from = $null
         marker_path    = $path
+        # The collector's suppression bit, separate from the state: see Test-MarkerRecordsCancellation.
+        # It can be true on a MALFORMED marker, which the reader still refuses as damaged.
+        records_cancellation = $false
     }
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $o }
+    if (-not (Test-Path -LiteralPath $path)) { return $o }
+    $o.records_cancellation = Test-MarkerRecordsCancellation -Path $path
 
+    # One cause per damaged shape, so the operator is told what to fix. Every one reads MALFORMED.
+    $damage = $null
     $doc = $null
-    try { $doc = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
-    catch {
+    $repeated = $null
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        # A DIRECTORY AT THE MARKER PATH IS NOT AN ABSENT MARKER. Somebody put something there, so it
+        # takes the damaged-marker verdict rather than the silent AVAILABLE arm.
+        $damage = 'is a directory, not a file; remove it by hand'
+    }
+    else {
+        try {
+            $raw = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
+            # -NoEnumerate: unrolled, a one-element array would reach the object check below as its element.
+            $doc = $raw | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
+            # A REPEATED VERDICT KEY IS DAMAGED TOO. ConvertFrom-Json keeps the last value silently, so
+            # `{"unavailable": true, "unavailable": false}` read as AVAILABLE, and a repeated
+            # `effective_from` picks PENDING or UNAVAILABLE by order alone. Newtonsoft's reader is the
+            # grammar ConvertFrom-Json parses with, so it accepts exactly what that accepted, and it yields
+            # every property name; depth 1 is the marker's own keys. A case-variant repeat already throws
+            # in ConvertFrom-Json. Only the two keys that pick the verdict count: a repeated `reason`
+            # changes no verdict.
+            if ($doc -is [System.Management.Automation.PSCustomObject]) {
+                $readerType = 'Newtonsoft.Json.JsonTextReader' -as [type]
+                if (-not $readerType) { $damage = 'could not be checked for a repeated key, because Newtonsoft.Json is not loaded' }
+                else {
+                    $r = $readerType::new([System.IO.StringReader]::new([string]$raw))
+                    $r.MaxDepth = $null
+                    $r.DateParseHandling = 'None'
+                    $seen = @{}
+                    while ($r.Read()) {
+                        if ($r.TokenType -eq 'PropertyName' -and $r.Depth -eq 1 -and $r.Value -in 'unavailable', 'effective_from') {
+                            if ($seen[$r.Value]) { $repeated = $r.Value } else { $seen[$r.Value] = $true }
+                        }
+                    }
+                }
+            }
+        }
+        catch {
+            # Capped: a deeply nested marker makes the parser name a path thousands of characters long.
+            $m = $_.Exception.Message -replace '\s+', ' '
+            if ($m.Length -gt 200) { $m = $m.Substring(0, 200) + '...' }
+            $damage = "could not be read as JSON ($m)"
+        }
+    }
+    # A MARKER THAT PARSES TO ANYTHING BUT AN OBJECT IS DAMAGED TOO. An empty or whitespace-only file
+    # and JSON null parse to $null without throwing, and an array or a scalar parses cleanly, so the
+    # catch alone let all of them fall through to UNAVAILABLE. An array holding
+    # `{"unavailable": false}` even read as AVAILABLE. Only an object can say anything here.
+    #
+    # ITS `unavailable` FLAG IS A JSON BOOLEAN, OR A TRUTHY STAND-IN FOR ONE. A [bool] cast read null,
+    # "", 0 or [] as AVAILABLE and the string "false" as UNAVAILABLE. A truthy non-boolean -- a non-zero
+    # number, or the string "true" in any case -- still reads UNAVAILABLE: whoever wrote it most likely
+    # meant a cancellation. Every other non-boolean is MALFORMED.
+    $flag = $null
+    if (-not $damage) {
+        if ($doc -isnot [System.Management.Automation.PSCustomObject]) { $damage = 'is not a JSON object' }
+        elseif ($repeated) { $damage = "repeats the '$repeated' key" }
+        else { $flag = $doc.PSObject.Properties['unavailable'] }
+    }
+    if ($flag) {
+        $v = $flag.Value
+        # A JSON boolean is the answer as written; `false` is the explicit all-clear below.
+        if ($v -is [bool]) { if (-not $v) { return $o } }
+        # The three types ConvertFrom-Json gives a JSON number.
+        elseif ($v -is [long] -or $v -is [double] -or $v -is [System.Numerics.BigInteger]) {
+            if ($v -eq 0) { $damage = "carries an 'unavailable' flag of 0, which is no JSON boolean" }
+        }
+        elseif ($v -is [string] -and $v -ieq 'true') { }
+        else { $damage = "carries an 'unavailable' flag that is no JSON boolean" }
+    }
+    # A MARKER SAYING `unavailable: false` IS AN ANSWER, not a broken file, which is why it returned
+    # AVAILABLE above. It is what -Clear could leave behind, and honouring it is what lets an operator
+    # record "checked, still live" explicitly.
+    if ($damage) {
         $o.state = 'MALFORMED'
-        $o.reason = "the availability marker at $path is not readable JSON, so this account is treated as UNAVAILABLE rather than assumed spendable"
+        $o.reason = "the availability marker at $path $damage, so this account is treated as UNAVAILABLE rather than assumed spendable"
         return $o
     }
-    # A MARKER SAYING `unavailable: false` IS AN ANSWER, not a broken file. It is what -Clear could
-    # leave behind, and honouring it is what lets an operator record "checked, still live" explicitly.
-    if ($doc.PSObject.Properties.Name -contains 'unavailable' -and -not [bool]$doc.unavailable) { return $o }
 
     $o.reason = [string]$doc.reason
     if (-not $o.reason) { $o.reason = 'no reason recorded in the marker' }

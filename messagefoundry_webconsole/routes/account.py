@@ -9,7 +9,6 @@ import json
 import logging
 import time
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
@@ -50,7 +49,6 @@ from .._auth import (
     ENROL_FIRST_PAGE,
     WEBAUTHN_EXTRA_MISSING_NOTICE,
     WEBAUTHN_RP_MISSING_NOTICE,
-    _reauth_redirect,
     allow_reauth_attempt,
     assert_same_origin,
     clear_session_cookie,
@@ -116,66 +114,31 @@ async def _confirm_proof_held(request: Request) -> bool:
     staging the secret, and the verify gate spends the confirm proof before it checks the code, so a
     code form rendered after either would post into the gate with no grant and the typed code would
     be lost. While this is False a page renders a code-less Continue button in the form's place.
-    :func:`_empty_code_goes_to_reauth` answers that post, ahead of the gate, with the re-auth that
-    lands the operator on the confirm form with the proof held. Peeks only; the gate still spends
+    :func:`_no_code_posted` has the gate answer that post with the re-auth that lands the
+    operator on the confirm form with the proof held. Peeks only; the gate still spends
     the proof."""
     return await ui_action_proof_held(request, STEP_UP_ACTION_MFA_CONFIRM)
 
 
-async def _refuse_pending_confirm(
-    request: Request, auth: AuthService, _identity: Identity
-) -> HTTPException | None:
-    # A copy of the pending refusal require_ui_reauth_only_action keeps in a closure, for the verify
-    # gate's action and re-auth target: a pending session on an account that HAS a factor goes to
-    # the re-auth, which the base records as an auth.mfa_denied row before the admin-write charge.
-    # test_the_empty_code_check_runs_the_verify_gates_own_base pins only the ARGUMENTS of this copy
-    # and of _confirm_gate_base to the gate's. A change to refuse_pending's logic, or a step the gate
-    # adds between its base and its spend, must be mirrored here by hand.
-    token = session_token(request)
-    if not await auth.factor_binding_is_blocked(token, STEP_UP_ACTION_MFA_CONFIRM):
-        return None
-    await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
-    return _reauth_redirect(request, "/ui/account/mfa/confirm")
+def _posted_code(form: dict[str, str]) -> str:
+    """The TOTP code a verify post carries. Stripped once, and that value is both the one measured
+    and the one sent, as at /ui/login: a correct code with surrounding space still counts. The
+    gate's empty-code hook and the route read the code through this one helper, so they cannot
+    disagree on whether a post carries one."""
+    return form.get("code", "").strip()
 
 
-def _confirm_gate_base() -> Callable[[Request], Awaitable[Identity]]:
-    """The verify gate's base, built with the gate's own arguments, for the empty-code path."""
-    return require_ui(
-        allow_mfa_pending=True, pending_refusal=_refuse_pending_confirm, new_address_check=False
-    )
-
-
-async def _empty_code_goes_to_reauth(
-    request: Request, auth: AuthService = Depends(_service)
-) -> None:
-    """Send a code-less post to ``/ui/account/mfa/verify`` to the gate's own re-auth, before the
-    gate can spend a grant.
+async def _no_code_posted(request: Request) -> bool:
+    """The verify gate's ``before_spend`` hook: a post to ``/ui/account/mfa/verify`` with no code
+    goes to the gate's re-auth with the confirm proof unspent (BACKLOG #5931).
 
     The Continue button posts no code. With the confirm grant already held (another tab, or Back),
     the gate would spend it and ``""`` would be checked, writing a false ``auth.mfa_failed`` row
-    and drawing the attempt budget (BACKLOG #5931). Declared ahead of the gate, so it runs first.
-
-    A post under the opt-out (no grant to spend), or whose cookie signs nothing in, returns at once
-    and the gate answers as before; the session is resolved before the body is read, the console's
-    sign-in-before-body order. A post with a code returns too, before the base, so the gate's base
-    runs once and charges the admin-write budget once. Otherwise the gate's base runs, so at least
-    sign-in, must-change, the origin check, the pending refusal with its audit row and the
-    admin-write charge apply, in the order :func:`require_ui` gives them, before anything here
-    can refuse. The route's own inline origin check is repeated after it, as the route repeats it;
-    the base has already checked the origin, so it refuses nothing new. The new-address signal is recorded as the gate would. The post then goes to the re-auth with no
-    grant spent and no code checked. That re-auth is still asked for when a grant was held, and
-    mints a fresh grant over it. Starlette caches the body, so the route reads it again."""
-    if not auth.action_step_up_required:
-        return
-    # activity=False: a probe, not the request's use of the session; the base refreshes the clock.
-    if await auth.identity_for_token(session_token(request), activity=False) is None:
-        return
-    if dict(await _form_pairs(request)).get("code", "").strip():
-        return
-    await _confirm_gate_base()(request)
-    assert_same_origin(request)
-    await auth.flag_new_client_ip(session_token(request), client_ip(request), path=request.url.path)
-    raise _reauth_redirect(request, "/ui/account/mfa/confirm")
+    and drawing the attempt budget. When the gate asks this, and what it has already checked, is
+    stated once, on :func:`require_ui_reauth_only_action`. The re-auth is still asked for when a
+    grant was held, and mints a fresh grant over it. Starlette caches the body, so the route reads
+    it again."""
+    return not _posted_code(dict(await _form_pairs(request)))
 
 
 # --- L5a: WebAuthn passkeys (ADR 0068, WP-14b) -------------------------------
@@ -647,11 +610,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_mfa_verify(
         request: Request,
         service: AuthService = Depends(_service),
-        # Declared before the gate so it runs first: an empty code must not spend the grant.
-        _empty: None = Depends(_empty_code_goes_to_reauth),
         identity: Identity = Depends(
             require_ui_reauth_only_action(
-                STEP_UP_ACTION_MFA_CONFIRM, reauth_next=lambda _r: "/ui/account/mfa/confirm"
+                STEP_UP_ACTION_MFA_CONFIRM,
+                reauth_next=lambda _r: "/ui/account/mfa/confirm",
+                # An empty code must not spend the grant.
+                before_spend=_no_code_posted,
             )
         ),
     ) -> Response:
@@ -667,9 +631,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if not token:  # pragma: no cover - require_ui already authenticated this cookie
             return RedirectResponse("/ui/login", status_code=303)
         form = dict(await _form_pairs(request))
-        # Stripped once, and that value is both the one measured and the one sent, as at
-        # /ui/login: a correct code with surrounding space still counts.
-        code = form.get("code", "").strip()
+        code = _posted_code(form)
         enrolment_code = form.get("enrolment_code", "")
         try:
             # The JSON MfaConfirmRequest's bound, by length only: an oversized code is refused,

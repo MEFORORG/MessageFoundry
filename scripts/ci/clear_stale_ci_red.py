@@ -94,6 +94,7 @@ import json
 import re
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -197,8 +198,8 @@ def newest_by_name(check_runs: list[dict[str, object]]) -> dict[str, dict[str, o
     same watched workflow -- measured 2026-09-17 on the head shared by PRs 1226 and 1241, which
     carried two CI runs created 35 seconds apart whose durations differed by 67, so the
     EARLIER-created one finished LAST. Picking "the newest" there can read a still-running leg as
-    green. Second, among runs in the same settled state, the greatest ``started_at`` wins; a run with
-    no timestamp loses to one that has a timestamp rather than winning by arriving last.
+    green. Second, among runs in the same settled state, the greatest ``started_at`` wins; on a tie
+    or an unreadable stamp the run that is not a success wins (:func:`_rank`).
 
     LIST ORDER IS NEVER USED. The GraphQL ``statusCheckRollup`` sibling is measurably not ordered by
     ``startedAt`` -- on this repository's own PR 1226, a later entry carried an OLDER settled success
@@ -211,16 +212,43 @@ def newest_by_name(check_runs: list[dict[str, object]]) -> dict[str, dict[str, o
         if not name:
             continue
         held = speaks.get(name)
-        if held is None:
-            speaks[name] = run
-            continue
-        run_unsettled = run.get("status") != "completed"
-        held_unsettled = held.get("status") != "completed"
-        started_later = str(run.get("started_at") or "") > str(held.get("started_at") or "")
-        unsettled_wins = run_unsettled and not held_unsettled
-        if unsettled_wins or (run_unsettled == held_unsettled and started_later):
+        if held is None or _rank(run) > _rank(held):
             speaks[name] = run
     return speaks
+
+
+def _started(run: dict[str, object]) -> datetime | None:
+    """``started_at`` as an aware datetime, or None when it is missing or does not parse."""
+    raw = run.get("started_at")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        stamp = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return stamp if stamp.tzinfo is not None else None
+
+
+_NEVER = datetime.min.replace(tzinfo=UTC)
+
+
+def _rank(run: dict[str, object]) -> tuple[bool, bool, datetime, bool, str]:
+    """The key the run that speaks for a name maximizes. A TOTAL order, so list order cannot decide.
+
+    In order: an unsettled run first; then a non-success whose start cannot be placed in time, since
+    it may be the newest and failing closed keeps the label; then the later readable start, an
+    unreadable one counting as earliest; then, on a tie -- one second is the API's resolution, so a
+    passing and a failing run can share it -- the non-success (BACKLOG #5464). The run id last only
+    makes equal-verdict picks deterministic. A pairwise "does this run outrank that one" folded over
+    the list was not transitive across three runs, so it is a key and not a comparison.
+
+    The cost is deliberate and is named: a failed run whose start cannot be read speaks over every
+    later passing re-run of its name, so that context keeps the label until the head moves.
+    """
+    unsettled = run.get("status") != "completed"
+    fails = run.get("conclusion") != "success"
+    started = _started(run)
+    return (unsettled, fails and started is None, started or _NEVER, fails, str(run.get("id")))
 
 
 def unmet_contexts(speaks: dict[str, dict[str, object]], required: list[str]) -> list[str]:

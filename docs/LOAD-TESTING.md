@@ -240,7 +240,13 @@ and a per-SLO pass/fail block ending in `RESULT: PASS|FAIL → exit N`.
 
 `--report-json` / `--report-csv` write a machine-readable artifact (git-ignored `out/load/`) for trend
 tracking. `--baseline run.json --tolerance 0.1` flags regressions (throughput below
-`baseline*(1−tol)`, p99 above `baseline*(1+tol)`, or any worsening of loss).
+`baseline*(1−tol)`, p99 above `baseline*(1+tol)`, errors, NAKs, timeouts or dead letters per
+message sent above `baseline*(1+tol)`, or a loss the baseline did not have). It fails closed. At
+least these are each flagged as a regression: a baseline phase the current run lacks, a phase whose
+e2e histogram is empty where the baseline's was not, a report that is not a JSON object or has no
+readable phases, a negative throughput, p99, e2e count, sent or compared counter, and a compared
+metric that is missing, boolean or not finite. With `--baseline`, a `--tolerance` outside `[0, 1)`
+refuses before the run, exit 2.
 
 **No-loss reconciliation** (the headline check) asserts, within a small in-flight tolerance:
 
