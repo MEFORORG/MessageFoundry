@@ -23,11 +23,12 @@
 //      side by side, both would name the same old token, and the first new session would be left live
 //      and unreachable.
 //   3. Nothing may wait forever. auth.ts sends the sign-in with SIGN_IN_TIMEOUT_MS, so every attempt
-//      settles, and each wait here is bounded by the longer SIGN_IN_WAIT_MS as well. At least two
-//      things can still make an attempt outlast a wait: an engine that trickles bytes slower than
-//      the timeout, and a slow TCP connect, which the timeout does not time (see SIGN_IN_TIMEOUT_MS)
-//      and which then eats into the 5 s between the two. A reader would then see the
-//      old token, and a later sign-in would name it again and could be overwritten by the late reply.
+//      settles, and each wait here is bounded by the longer SIGN_IN_WAIT_MS as well. The timeout is
+//      a wall-clock deadline that covers the connect and a trickled reply (BACKLOG #5938). At least
+//      one thing can still make a sign-in outlast a wait: after a TLS trust failure, engineClient.ts
+//      `withRenewalRetry` awaits the trust-failure handler before the sign-in settles. A reader would
+//      then see the old token, and a later sign-in would name it again and could be overwritten by
+//      the late reply.
 //   4. The tracking lives in one extension host, which is one VS Code window, while SecretStorage is
 //      shared by every window. A sign-in in one window is NOT waited for in another. A call there on
 //      the old token can get a 401 and prompt for a sign-in the user already made. Its `withAuth`
@@ -46,20 +47,19 @@ export interface TokenCache {
   store(key: string, value: string): PromiseLike<void>;
 }
 
-/** How long the sign-in request may go silent, in ms. It runs the engine's password hash and its
+/** How long the sign-in request may take, in ms. It runs the engine's password hash and its
  *  per-account queue, so it gets far more than a status read, and outlasts the engine's default
  *  request deadline (vault BACKLOG #2950). Matches the Python client's `SIGN_IN_TIMEOUT_SECONDS`
  *  (`messagefoundry/apiclient/client.py`, which says why); `tests/test_apiclient_sign_in_timeout.py`
  *  pins both. The match is for the reply wait only: the Python client raises just its read phase,
- *  while this one idle timeout also bounds the TLS handshake, though not the TCP connect, which
- *  Node starts timing only once the socket connects (`ClientRequest.setTimeout`). The IDE has one
- *  idle timeout per request and no separate read phase, so raising it for the whole request is the
- *  only way to give the reply the same wait. Every cache reader waits behind a sign-in for up to
- *  SIGN_IN_WAIT_MS. */
+ *  while this one wall-clock deadline (engineClient.ts `postReply`, BACKLOG #5938) bounds the
+ *  whole request, the TCP connect and the TLS handshake included. The IDE has one deadline per
+ *  request and no separate read phase, so raising it for the whole request is the only way to give
+ *  the reply the same wait. Every cache reader waits behind a sign-in for up to SIGN_IN_WAIT_MS. */
 export const SIGN_IN_TIMEOUT_MS = 150_000;
 
-/** The longest any wait here lasts, in ms: past the request timeout, so a waiter outlasts an attempt
- *  whose connect was prompt. Point 3 above names what it does not cover. */
+/** The longest any wait here lasts, in ms: past the request timeout, so a waiter outlasts an
+ *  attempt. Point 3 above names what it does not cover. */
 export const SIGN_IN_WAIT_MS = SIGN_IN_TIMEOUT_MS + 5_000;
 
 /** Sign-ins between "request about to leave" and "new token stored", by cache key. Never rejects. */
