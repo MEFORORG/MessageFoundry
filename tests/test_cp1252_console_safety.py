@@ -265,7 +265,8 @@ def _listed(suffix: str, *, untracked: bool = True) -> tuple[str, ...]:
 
 @functools.cache
 def _files_under(root: Path, suffix: str = ".py") -> tuple[Path, ...]:
-    """Every listed ``suffix`` file under ``root``, recursively. THE ONE WALK in this module.
+    """Every listed ``suffix`` file under ``root``: recursive, except at the repository root. THE ONE
+    WALK in this module.
 
     Every surface -- both scripts halves and every reach root -- goes through this, so no two can
     disagree about what "under a root" means. Cached, and a TUPLE, so the result cannot be mutated
@@ -1371,7 +1372,8 @@ _REACH_ROOTS: tuple[tuple[str, Path, int, tuple[str, ...]], ...] = (
         ("benchmarks/results/2026-07-04-adr0071-b5-executor-marshaling/b5_microbench.py",),
     ),
     # The repository root's OWN files, not a recursive walk (see `_files_under`). conftest.py is
-    # there because pytest-xdist's `-n auto` hook must be registered from the rootdir.
+    # there because the `-n auto` worker cap must be registered from an initial conftest, and the
+    # rootdir's is the one every run configured by the root pyproject.toml loads.
     ("root-files", _ROOT, 1, ("conftest.py",)),
 )
 
@@ -1493,7 +1495,7 @@ def test_every_root_holding_tracked_python_is_gated() -> None:
         f"root-files row back to _REACH_ROOTS"
     )
     assert roots - {"."} <= gated, (
-        f"roots holding tracked python that no gate walks: {sorted(roots - gated)} -- add a row "
+        f"roots holding tracked python that no gate walks: {sorted(roots - {'.'} - gated)} -- add a row "
         f"to _REACH_ROOTS, with a floor and pins, rather than widening this set"
     )
 

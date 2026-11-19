@@ -367,8 +367,8 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # Pins the cap on the workers `pytest -n auto` starts: tests/_xdist_worker_cap.py and the
         # two conftests that register it, the repo-root one and the web console suite's. ci.yml's
         # `tooling=` path predicate matches none of those three paths, so an edit to one alone does
-        # not trip the tooling path gate; listed as tooling this guard would not run on the change that breaks it. It spawns
-        # no subprocess.
+        # not trip the tooling path gate; listed as tooling this guard would not run on the change
+        # that breaks it.
         "test_xdist_auto_worker_cap.py",
     }
 )

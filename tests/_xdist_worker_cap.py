@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Cap the worker count ``pytest -n auto`` starts, for every testpath.
 
-Two conftests register the hook below, because no single one is loaded for every invocation:
+Two conftests register the hook below, because neither is loaded for every invocation:
 
 * the repo-root ``conftest.py``, which pytest loads for any run configured by the root
   ``pyproject.toml``, under either testpath;
@@ -18,7 +18,11 @@ already capped count changes nothing, and an override passes through both.
 Both import it package-qualified, the house idiom ``tests/test_conftest_name_collision_guard.py``
 describes; the web console suite already reaches ``tests/_deadline_capture.py`` the same way.
 
-The cap is per run, not per machine: seven concurrent runs can still start 56 workers.
+At least these runs stay uncapped: ``--noconftest``, a ``--confcutdir`` below the conftest that
+would register the hook (measured: ``--confcutdir=tests`` gave 16 workers), a ``-c`` naming a config
+whose rootdir loads neither conftest, and the console tree tested where the engine's ``tests/`` is
+not importable (that conftest warns). The cap is per run, not per machine: seven concurrent runs can
+still start seven times ``MAX_AUTO_WORKERS``.
 
 WHY NOT xdist's ``--maxprocesses`` IN ``addopts``. It would cap without code, but it also caps an
 explicit ``-n N``, which this cap deliberately leaves alone, and a run under ``-p no:xdist`` (the web

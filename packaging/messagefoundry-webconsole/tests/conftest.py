@@ -31,6 +31,7 @@ import functools
 import inspect
 import logging
 import sys
+import warnings
 from collections.abc import AsyncIterator, Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,7 @@ try:
 except ModuleNotFoundError as exc:
     if exc.name not in ("tests", "tests._xdist_worker_cap"):
         raise
+    warnings.warn(f"pytest -n auto runs uncapped: {exc}", stacklevel=1)
 
 # The engine suite's request-deadline helper, which test_ui_dr_outlive.py imports. pytest rewrites
 # asserts only in test modules unless told, and the engine conftest that tells it may not be loaded.

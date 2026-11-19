@@ -53,24 +53,61 @@ def test_the_root_conftest_registers_the_cap_in_this_run(pytestconfig: pytest.Co
     pytest.fail(f"{_ROOT_CONFTEST} is not registered in this run, so -n auto is uncapped")
 
 
+def _binds_the_cap(source: str) -> bool:
+    """Whether ``source`` imports the cap hook at module level, bare or as the body of a ``try``
+    whose only handler catches ``ModuleNotFoundError`` and re-raises some other missing module."""
+    tree = ast.parse(source)
+
+    def imports_it(stmts: list[ast.stmt]) -> bool:
+        return any(
+            isinstance(node, ast.ImportFrom)
+            and node.module == "tests._xdist_worker_cap"
+            and any(
+                a.name == "pytest_xdist_auto_num_workers" and a.asname is None for a in node.names
+            )
+            for node in stmts
+        )
+
+    for stmt in tree.body:
+        if imports_it([stmt]):
+            return True
+        if isinstance(stmt, ast.Try) and imports_it(stmt.body):
+            handlers = stmt.handlers
+            narrow = (
+                len(handlers) == 1
+                and isinstance(handlers[0].type, ast.Name)
+                and handlers[0].type.id == "ModuleNotFoundError"
+                and any(isinstance(n, ast.Raise) for n in ast.walk(handlers[0]))
+            )
+            if narrow:
+                return True
+    return False
+
+
 def test_the_console_conftest_registers_the_cap_too() -> None:
     """A run naming only the console tree never loads the root conftest; its own must bind the hook.
 
     Read by AST, not run: importing that conftest here would load the console suite's fixtures. It
-    proves the import is written at module level (inside its ModuleNotFoundError guard), not that a
-    console-rooted run resolves it; the smoke run recorded in the PR measured that.
+    proves the import is written, not that a console-rooted run resolves it; the smoke run recorded
+    in the PR measured that.
     """
-    tree = ast.parse(_CONSOLE_CONFTEST.read_text(encoding="utf-8"))
-    top = [
-        n for stmt in tree.body for n in ([stmt] if not isinstance(stmt, ast.Try) else stmt.body)
-    ]
-    bound = {
-        (node.module, alias.name, alias.asname)
-        for node in top
-        if isinstance(node, ast.ImportFrom)
-        for alias in node.names
-    }
-    assert ("tests._xdist_worker_cap", "pytest_xdist_auto_num_workers", None) in bound
+    assert _binds_the_cap(_CONSOLE_CONFTEST.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import os\n",
+        "try:\n    from tests._xdist_worker_cap import pytest_xdist_auto_num_workers\n"
+        "except ImportError:\n    pass\n",
+        "def f():\n    from tests._xdist_worker_cap import pytest_xdist_auto_num_workers\n",
+        "from tests._xdist_worker_cap import pytest_xdist_auto_num_workers as other\n",
+    ],
+    ids=["absent", "swallows-every-import-error", "not-module-level", "renamed"],
+)
+def test_the_console_binding_check_goes_red_without_the_binding(source: str) -> None:
+    """Negative control: the check above must be able to fail."""
+    assert not _binds_the_cap(source)
 
 
 @pytest.fixture
@@ -79,7 +116,8 @@ def hook_with_cpus(
 ) -> Callable[[int], int]:
     """Call the registered hook chain with psutil reporting ``n`` CPUs for that call only.
 
-    Patched only around the call, so no other thread in this worker reads the fake count.
+    Patched only around the call, which shortens, but does not close, the window in which
+    another thread in this worker could read the fake count.
     """
     # Installed is not enough: under `-p no:xdist` the hook has no spec and returns a list.
     if not pytestconfig.pluginmanager.hasplugin("xdist"):

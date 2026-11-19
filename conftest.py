@@ -8,9 +8,12 @@ this file under the bare name ``conftest``, which no module should import (the d
 not this file).
 
 A side effect of the file existing: under pytest's default ``prepend`` import mode, importing it
-puts the repository root at the front of ``sys.path`` for the whole run. The engine's editable
-install already puts the root on ``sys.path``; this moves it ahead of the standard library and
-site-packages, so a root-level module named like an installed one would shadow it in tests.
+puts the repository root at the front of ``sys.path`` for every run the root ``pyproject.toml``
+configures. The engine's editable install already puts the root on ``sys.path``; this moves it ahead
+of the standard library and site-packages. At least one package already resolves differently:
+``messagefoundry_webconsole`` now imports from the tree in those runs, while a run naming only the
+console tree (its own rootdir) still imports the copy its editable install placed in site-packages.
+The two agree until the tree is edited without reinstalling the console package.
 """
 
 from __future__ import annotations
