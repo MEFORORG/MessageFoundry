@@ -665,11 +665,14 @@ class FileDestination(DestinationConnector):
         The syscall count on the default path is unchanged: ``mkdir(parents=True, exist_ok=True)``
         already probed ``is_dir()`` on its ``FileExistsError`` branch, which is the common one."""
         if self.validate_directory:
-            if not self.directory.is_dir():
-                # An errno, so send keeps these words; send adds the directory itself. Short, so the
-                # stored text's length bound leaves room for that directory after them.
-                raise FileNotFoundError(
-                    errno.ENOENT, "missing, and validate_directory never creates it"
+            # stat, not is_dir(): is_dir() is False for a missing directory, a refused one and an
+            # unreachable share alike, so its answer cannot name the cause. A failed stat propagates
+            # with its own errno and OS text, which send keeps (dropping the path it quotes) before
+            # adding the directory itself. Only a stat that succeeds on a non-directory is named here,
+            # in short words, so the stored text's length bound leaves room for that directory.
+            if not stat.S_ISDIR(self.directory.stat().st_mode):
+                raise NotADirectoryError(
+                    errno.ENOTDIR, "not a directory, and validate_directory never creates it"
                 )
             return
         try:

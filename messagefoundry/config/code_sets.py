@@ -109,14 +109,14 @@ class CodeSetError(ValueError):
 
 
 class _MissFields(Exception):
-    """A lookup miss's ``code_set`` and ``key``, as attributes for a caller that needs them; the
-    message never quotes the key (BACKLOG #5320, see :func:`_miss_text`). Both default, so a copy or
-    a pickle, which rebuilds from the message alone and then restores the attributes, still works."""
+    """A lookup miss's ``code_set``, as an attribute for a caller that needs it. The key is kept
+    nowhere on the error, neither in its message nor on an attribute (BACKLOG #5320, see
+    :func:`_miss_text`). ``code_set`` defaults, so a copy or a pickle, which rebuilds from the
+    message alone and then restores the attributes, still works."""
 
-    def __init__(self, message: str, *, code_set: str | None = None, key: object = None) -> None:
+    def __init__(self, message: str, *, code_set: str | None = None) -> None:
         super().__init__(message)
         self.code_set = code_set
-        self.key = key
 
 
 class CodeSetMissError(_MissFields, CodeSetError):
@@ -127,17 +127,18 @@ class CodeSetKeyError(_MissFields, KeyError):
     """``cs[key]`` missed: a :class:`KeyError`, so ``cs.get()`` and ``except KeyError`` still work."""
 
 
-def _miss_text(code_set: str, key: object) -> str:
-    """The message for a lookup miss: the code set and the key's length, never the key (BACKLOG
-    #5320). The key is usually a message field, so it may carry PHI, and a raised error's text goes
-    at least to the error columns, ciphered only when a store key is set, and to the events and the
-    log, which are outside the store (CLAUDE.md section 9). A short code is not hidden by a digest,
-    which a lookup over the possible values reverses, so no digest is given."""
+def _miss_text(name: str, key: object, *, kind: str = "code set") -> str:
+    """The message for a lookup miss in a code set or a reference set: the set and the key's
+    length, never the key (BACKLOG #5320). The key is usually a message field, so it may carry PHI.
+    A raised error's text goes at least to the store's error columns and message events, which are
+    ciphered at rest only when a store key is set, and to the log and the alert sinks, which are
+    outside the secured store (CLAUDE.md section 9). A short code is not hidden by a digest, which a
+    lookup over the possible values reverses, so no digest is given."""
     if isinstance(key, str):
         shape = f"{len(key)} character" if len(key) == 1 else f"{len(key)} characters"
     else:
         shape = f"type {type(key).__name__}"
-    return f"a key of {shape} is not in code set {code_set!r}"
+    return f"a key of {shape} is not in {kind} {name!r}"
 
 
 # --- #162: declared unmapped-value policy -------------------------------------
@@ -427,7 +428,6 @@ class CodeSet(Mapping[str, Any]):
             f"declare one (default/passthrough/flag) in codesets/{self._name}{POLICY_SIDECAR_SUFFIX}, "
             "or use .get()/[] for the None/KeyError behavior",
             code_set=self._name,
-            key=key,
         )
 
     def __getitem__(self, key: str) -> Any:
@@ -437,7 +437,7 @@ class CodeSet(Mapping[str, Any]):
             pass
         # Name the code set so a miss is self-explanatory in a transform traceback. Raised outside
         # the handler, so the dict's own KeyError, whose text is the key, is not even __context__.
-        raise CodeSetKeyError(_miss_text(self._name, key), code_set=self._name, key=key)
+        raise CodeSetKeyError(_miss_text(self._name, key), code_set=self._name)
 
     def get(self, key: str, default: Any = None) -> Any:
         # Straight to the dict, so a miss builds no CodeSetKeyError only to discard it.
