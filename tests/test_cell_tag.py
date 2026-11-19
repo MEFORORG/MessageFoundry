@@ -1138,11 +1138,11 @@ async def test_get_message_opens_its_cells_off_the_event_loop(tmp_path: pathlib.
     store = await MessageStore.open(
         tmp_path / "off-loop.db", cipher=make_cipher(generate_key(), write_v2=True)
     )
+    real = store._cipher
     try:
         mid = await store.record_received(
             channel_id="IB_A", raw=_RAW, status=MessageStatus.ERROR, summary="S"
         )
-        real = store._cipher
         threads: list[int] = []
 
         class _Watch:

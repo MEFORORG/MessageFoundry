@@ -8010,8 +8010,23 @@ def create_app(
                 # access-denied burst signal against an operator who did nothing. A widening stops
                 # rather than streaming rows from a scope the caller did not hold when it proved
                 # the export, which no audit row would name.
+                reason: str | None = None
                 if current is None or current.allowed_channels != identity.allowed_channels:
                     reason = "standing_changed" if current is None else "scope_changed"
+                else:
+                    # Per-row channel scope on EVERY streamed body (load-bearing for the ids path);
+                    # an out-of-scope id is skipped + audited, never exposed (ADR 0131 §3, mirrors
+                    # get_message). Read with THIS row's identity, whose scope the check above held
+                    # to the starting one, so a row streams only on the scope the export was proved
+                    # and audited for. A row the store's keys cannot open stops the export, as a
+                    # recorded stop, rather than leaving a gap nothing names (BACKLOG #5969).
+                    try:
+                        row = await read_scoped_message(engine, current, mid, request)
+                    except CipherUnavailableError:
+                        reason = "key_service_unavailable"
+                    except CipherError:
+                        reason = "cipher_refused"
+                if reason is not None:
                     # Counts only, never an id or a body.
                     _log.warning(
                         "message export stopped after %d of %d rows: %s",
@@ -8029,11 +8044,6 @@ def create_app(
                         client=client_ip(request),
                     )
                     raise ExportStopped(f"export stopped after {streamed} of {len(selected)} rows")
-                # Per-row channel scope on EVERY streamed body (load-bearing for the ids path); an
-                # out-of-scope id is skipped + audited, never exposed (ADR 0131 §3, mirrors get_message).
-                # Read with THIS row's identity, whose scope the check above held to the starting
-                # one, so a row streams only on the scope the export was proved and audited for.
-                row = await read_scoped_message(engine, current, mid, request)
                 if row is None:
                     continue
                 streamed += 1
@@ -12263,7 +12273,8 @@ async def _open_reconcile_instances(store: Store) -> dict[int, tuple[str, str]] 
 
     Catches ``Exception``, on purpose and only around this one read. Its failures are no closed
     family: each backend's driver errors, the engine's own ``RuntimeError``, aiosqlite's
-    ``ValueError`` on a closed connection, and a cipher error opening a stored ``reason``. One
+    ``ValueError`` on a closed connection, and a key-service outage opening a stored ``reason``
+    (any other cipher refusal withholds that reason, BACKLOG #5970). One
     that escaped would cost the pass's pages, or the whole pass, through the loop's own catch. Any
     failure here only drops a clear, which is a missed clear, never a false one."""
     try:

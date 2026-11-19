@@ -96,7 +96,7 @@ def test_the_helper_holds_the_one_read() -> None:
     """The positive control: the walk finds the helper's own call, so a clean result elsewhere is
     the absence of calls and not a walk that finds nothing."""
     sites = _api_sites()
-    assert [func for func, _line in sites[_HELPER]] == ["read_scoped_message"] * 2
+    assert [func for func, _line in sites[_HELPER]] == ["read_scoped_message"] * 3
     assert len(sites) > 10, "the API package walk found almost no modules"
 
 

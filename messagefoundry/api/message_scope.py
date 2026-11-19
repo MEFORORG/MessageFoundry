@@ -13,7 +13,8 @@ which skips a refused row rather than failing the whole response. Both audit a r
 ``auth.channel_denied`` before they answer.
 
 ``tests/test_api_scoped_message_reads.py`` fails if any other module under ``messagefoundry/api/``
-loads a ``.get_message`` attribute itself, or reaches it through ``getattr``.
+loads a ``.get_message`` or ``.message_channel_id`` attribute itself, or reaches it through
+``getattr``.
 
 Why 404 and not 403: a 403 would tell a scoped caller that a message exists in another channel. The
 404 detail names only the id the caller sent.
@@ -144,14 +145,23 @@ async def read_scoped_message(
             return None
         refusal = HTTPException(423, _INTEGRITY_REFUSED)
     except CipherError as exc:
+        # A plain cipher error names no channel, so the scope is read again: a row that changed
+        # channel between the two reads is the uniform refusal, never a 423 or 503 that would say
+        # it exists.
+        now_in = await engine.store.message_channel_id(message_id)
+        if now_in is None:
+            return None
+        if not identity.can_access_channel(now_in):
+            await audit_channel_denied(engine, identity, now_in, client_ip(request))
+            return None
         no_verdict = gave_no_verdict(exc)
         # The class name only: the cipher's text can echo fields cut from the stored value.
         cause = f"message {message_id} could not be opened: {type(exc).__name__}"
         _log.warning("%s", cause)
         if not refuse_integrity:
             # The export stream does not skip such a row: an export that leaves out rows nothing
-            # records would read as complete. A fresh error, so no frame holding opened cells rides
-            # on it.
+            # records would read as complete, so it records a stop instead. A fresh error, so no
+            # frame holding opened cells rides on it.
             refusal = CipherUnavailableError(cause) if no_verdict else CipherError(cause)
         elif no_verdict:
             refusal = HTTPException(
