@@ -720,6 +720,32 @@ async def test_a_hung_remote_process_is_killed_and_fails_the_band(tmp_path: Path
     ) == {"sent": 4}
 
 
+async def test_a_remote_process_that_failed_after_writing_a_report_fails_the_band(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5304: a report on disk used to mean success whatever the child's exit code. A child
+    that wrote a report and then exited with a code that report does not record fails the band, with
+    its stderr reason."""
+    report = tmp_path / "written.json"
+
+    def child(payload: dict[str, Any], stderr: str = "") -> list[str]:
+        script = (
+            f"import json, sys; json.dump({payload!r}, open({str(report)!r}, 'w')); "
+            f"sys.stderr.write({stderr!r}); sys.exit(1)"
+        )
+        return [sys.executable, "-c", script]
+
+    for payload in ({"sent": 3}, {"sent": 3, "exit_code": 0}, {"sent": 3, "exit_code": True}):
+        with pytest.raises(ConnScaleError, match="exited 1, but its report records.*the reason"):
+            await bb._run_remote_proc(
+                child(payload, "Traceback: the reason"), report, tmp_path, timeout=60.0
+            )
+    # CONTROL: a child whose own FAIL verdict is in its report (exit 1, "exit_code": 1) is read, so
+    # the aggregation still judges a measured failing band from its counts.
+    verdict = {"sent": 3, "exit_code": 1}
+    assert await bb._run_remote_proc(child(verdict), report, tmp_path, timeout=60.0) == verdict
+
+
 def test_the_band_bound_is_hold_plus_drain_plus_the_slack() -> None:
     assert bb._remote_proc_timeout(60.0, 300.0) == 360.0 + bb._REMOTE_PROC_SLACK
 

@@ -1056,6 +1056,11 @@ def _remote_proc_timeout(hold_seconds: float, drain_timeout: float) -> float:
     return hold_seconds + drain_timeout + _REMOTE_PROC_SLACK
 
 
+def _stderr_reason(said: bytes) -> str:
+    """The tail of what a ``connscale-remote`` child wrote to stderr, as the reason its band failed."""
+    return said.decode("utf-8", "replace").strip()[-600:] or "it said nothing on stderr"
+
+
 # Module-level so a structural test can monkeypatch the subprocess spawn (no real connscale-remote runs).
 async def _run_remote_proc(
     argv: list[str], report_path: Path, cwd: Path, *, timeout: float
@@ -1091,13 +1096,23 @@ async def _run_remote_proc(
         # The process writes its report only when it ran. One that could not start (a band layout
         # it refused, a sign-in the engine refused) says why on stderr and writes nothing, and that
         # reason used to be discarded, leaving a bare FileNotFoundError.
-        reason = said.decode("utf-8", "replace").strip()[-600:] or "it said nothing on stderr"
         raise ConnScaleError(
-            f"connscale-remote exited {proc.returncode} and wrote no report: {reason}"
+            f"connscale-remote exited {proc.returncode} and wrote no report: {_stderr_reason(said)}"
         )
     data = json.loads(report_path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ConnScaleError(f"connscale-remote report {report_path} is not a JSON object")
+    # A report on disk does not by itself mean the child finished cleanly, so its exit code is read
+    # too. A child that ran exits with the code its report records: 0 on PASS, 1 on its own FAIL
+    # verdict, whose counts the aggregation judges again. Any other exit, or one the report does
+    # not record, fails the band with the child's stderr reason rather than reading the report
+    # as if nothing had gone wrong.
+    recorded = data.get("exit_code")
+    if proc.returncode != 0 and not (type(recorded) is int and recorded == proc.returncode):
+        raise ConnScaleError(
+            f"connscale-remote exited {proc.returncode}, but its report records exit code "
+            f"{recorded!r}: {_stderr_reason(said)}"
+        )
     return data
 
 
