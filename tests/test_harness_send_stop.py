@@ -11,6 +11,7 @@ dial here never settles, standing in for an unreachable host.
 from __future__ import annotations
 
 import errno
+import socket
 import sys
 import threading
 import time
@@ -183,6 +184,23 @@ def test_a_windows_dial_is_in_progress_only_on_wouldblock(monkeypatch: pytest.Mo
     assert mllp._dial_in_progress(mllp._WSAEWOULDBLOCK)
     # On Windows errno.EINPROGRESS is WSAEINPROGRESS, a connect failure, not a dial in progress.
     assert not mllp._dial_in_progress(10036)
+
+
+def test_a_windows_dial_failure_names_its_code_without_ctypes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: the Windows path builds its text another way than ``socket.errorTab``, such as
+    ``ctypes.FormatError``, which section 11 of DANGEROUS-FUNCTIONALITY.md says no harness module
+    imports, or drops the ``winerror`` that picks the subclass."""
+    real_windows = sys.platform == "win32"
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(socket, "errorTab", {10061: "Connection refused."}, raising=False)
+    refused = mllp._socket_error(10061)
+    assert refused.strerror == "Connection refused."
+    assert mllp._socket_error(99999).strerror == "Winsock error 99999"
+    if real_windows:  # only Windows maps winerror to the subclass and errno
+        assert isinstance(refused, ConnectionRefusedError)
+        assert getattr(refused, "winerror", None) == 10061 and refused.errno == 10061
 
 
 def test_the_pause_between_messages_keeps_a_fine_rate() -> None:

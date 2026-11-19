@@ -137,11 +137,12 @@ def pause_unless_stopped(stop: threading.Event, seconds: float) -> bool:
 
 
 def _socket_error(code: int) -> OSError:
-    """The OSError subclass and text a blocking connect would have raised for ``code``."""
+    """The OSError for a failed dial's ``code``. On Windows the ``winerror`` argument picks the
+    subclass a blocking connect raises, such as ``ConnectionRefusedError`` for 10061, and the text
+    comes from ``socket.errorTab``, the standard library's table of Winsock messages."""
     if sys.platform == "win32":
-        import ctypes
-
-        return OSError(None, ctypes.FormatError(code), None, code)
+        table: dict[int, str] = getattr(socket, "errorTab", {})
+        return OSError(None, table.get(code, f"Winsock error {code}"), None, code)
     return OSError(code, os.strerror(code))
 
 

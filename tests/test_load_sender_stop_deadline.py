@@ -144,12 +144,22 @@ async def test_a_grace_longer_than_the_margin_is_not_cut_short(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """After a long drain, the ACK grace still runs in full. The window used to drop to the bare
-    margin once the queue had moved, so a grace longer than the margin was cut short."""
+    margin once the queue had moved, so a grace longer than the margin was cut short.
+
+    Buffer premise: the peer's slow read must be drain progress the sender can see, so both socket
+    buffers are sized small here. The grace starts when the writer finishes, which is when the
+    kernel has taken the bytes, not when the peer has read them. Default buffers on Linux can hold
+    megabytes, so the peer is still reading when the grace starts and its late ACKs miss it.
+    """
+    import socket
+
     from messagefoundry.mllpcodec import frame
 
     monkeypatch.setattr(sender, "_STOP_HARD_MARGIN_S", 0.3)
     count = 200  # read slowly: a drain of a couple of seconds, past grace plus the margin
     ack = frame("MSH|^~\\&|B|A|C|D|20260101||ACK|A1|P|2.5.1\rMSA|AA|X1\r")
+    peer_rcvbuf = 64 * 1024  # the kernel may double it; still a few messages, not megabytes
+    sender_sndbuf = 64 * 1024
 
     async def slow_then_late_acks(
         reader: asyncio.StreamReader, writer: asyncio.StreamWriter
@@ -167,6 +177,8 @@ async def test_a_grace_longer_than_the_margin_is_not_cut_short(
         await reader.read()
 
     server = await asyncio.start_server(slow_then_late_acks, "127.0.0.1", 0)
+    # Set on the listener, before any connection, so the accepted socket inherits it.
+    server.sockets[0].setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, peer_rcvbuf)
     port = server.sockets[0].getsockname()[1]
     metrics = LiveMetrics(Counters(), Histogram(), Histogram())
     conn = sender.PersistentConnection(
@@ -174,12 +186,17 @@ async def test_a_grace_longer_than_the_margin_is_not_cut_short(
     )
     try:
         conn.start()
-        for seq in range(1, count + 1):
-            assert conn.submit_nowait(Outgoing(seq, "ADT", f"X{seq}", _MSG))
         for _ in range(100):
             if conn.up:
                 break
             await asyncio.sleep(0.02)
+        assert conn.up and conn._writer is not None
+        # Sized before anything is queued, so no write reaches a larger default buffer.
+        conn._writer.get_extra_info("socket").setsockopt(
+            socket.SOL_SOCKET, socket.SO_SNDBUF, sender_sndbuf
+        )
+        for seq in range(1, count + 1):
+            assert conn.submit_nowait(Outgoing(seq, "ADT", f"X{seq}", _MSG))
         await asyncio.wait_for(conn.stop(1.0), timeout=60.0)
         assert metrics.counters.sent == count
         assert metrics.counters.acked == count
