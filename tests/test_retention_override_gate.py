@@ -177,10 +177,13 @@ def test_the_audit_line_names_no_environment_when_none_is_active(
     ("inbound_days", "outbound_days", "inbound_named", "outbound_named"),
     [(0, None, True, False), (None, 0, False, True), (0, 0, True, True)],
 )
-@pytest.mark.parametrize("acknowledged", [True, False])
+@pytest.mark.parametrize(
+    ("acknowledged", "enforcing"), [(True, True), (False, True), (False, False)]
+)
 def test_the_override_text_states_what_the_purge_keeps(
     tmp_path: Path,
     acknowledged: bool,
+    enforcing: bool,
     inbound_days: int | None,
     outbound_days: int | None,
     inbound_named: bool,
@@ -189,21 +192,23 @@ def test_the_override_text_states_what_the_purge_keeps(
     """BACKLOG #5967: an inbound ``messages_days = 0`` does not keep its dead-lettered rows, which
     the dead-letter purge keys on the row's outbound, and an outbound ``dead_letter_days = 0`` does
     not keep its captured replies, which the body purge keys on the receiving inbound. The refusal
-    and every AUDIT line say so, for the kinds of override the graph holds and no other.
-    ``tests/test_per_connection_retention.py`` pins the store behaviour these words describe."""
+    and the AUDIT line of each arm (acknowledged, enforced refusal, warn) say so, for the kinds of
+    override the graph holds and no other. ``tests/test_per_connection_retention.py`` pins the store
+    behaviour these words describe."""
     registry = _graph(tmp_path / "cfg", inbound_days=inbound_days, outbound_days=outbound_days)
     verdict = judge_keep_forever_overrides(
-        registry, acknowledged=acknowledged, enforcing=True, env_name="prod"
+        registry, acknowledged=acknowledged, enforcing=enforcing, env_name="prod"
     )
-    text = verdict.report if acknowledged else verdict.refusal
+    text = verdict.refusal if enforcing and not acknowledged else verdict.report
     assert text is not None
     inbound_scope = (
-        "Their dead-lettered rows are not covered: an ingress or routed one is purged on the "
-        "global [retention].dead_letter_days window"
+        "It does not keep their dead-lettered ingress, routed or outbound rows, or a streaming "
+        "attachment the purge of the last of those rows releases: a dead ingress or routed row is "
+        "purged on the global [retention].dead_letter_days window"
     )
     outbound_scope = (
-        "An outbound override keeps forever only that outbound's own dead-lettered delivery "
-        "payloads; a reply it captured is purged on the message-body window of the inbound"
+        "It does not keep a reply that outbound captured, which is purged on the message-body "
+        "window of the inbound that received the message"
     )
     assert (inbound_scope in text) is inbound_named
     assert (outbound_scope in text) is outbound_named

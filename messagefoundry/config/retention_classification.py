@@ -538,8 +538,8 @@ def keep_forever_overrides(registry: Registry) -> tuple[str, ...]:
     A connection may override either PL-1 body window (ADR 0027): an inbound sets ``messages_days``,
     an outbound sets ``dead_letter_days``. ``None`` inherits the global window and a positive number
     bounds it. ``0`` keeps that connection's bodies forever, whatever the global window says, so it
-    is the same choice as a global ``0`` made for one connection. Which bodies each kind reaches,
-    and which it does not, is stated once, on :func:`_override_scope`. The global windows live in the
+    is the same choice as a global ``0`` made for one connection. Which bodies each kind keeps,
+    and which it does not, is stated on :func:`_override_scope`. The global windows live in the
     service settings, where :func:`unbounded_windows` reads them; these live in the graph, so the
     start gate cannot see them and a registry guard must (vault BACKLOG #2368).
 
@@ -564,32 +564,33 @@ def keep_forever_overrides(registry: Registry) -> tuple[str, ...]:
 
 
 def _override_scope(kept: tuple[str, ...]) -> str:
-    """What the purge keeps forever for each kind of override in ``kept``, so the refusal and the
+    """What each kind of override in ``kept`` keeps and does not keep, so the refusal and the
     ``AUDIT:`` line promise no more than the store does (BACKLOG #5967).
 
-    An inbound's ``messages_days`` is the cutoff of ``purge_message_bodies``, keyed on the
-    message's receiving inbound. That purge also blanks the message's delivered and cancelled
-    outbound payloads, its event detail and its captured replies, and it leaves every dead row to
-    ``purge_dead_letters``. That purge keys on the dead row's outbound, so an ingress or routed dead
-    row, which names none, takes the global dead-letter window on every backend. An outbound's
-    ``dead_letter_days`` therefore reaches only its own dead rows, and a reply it captured follows
-    the receiving inbound's window. The store's purges are the record of this; the text here
-    follows them."""
+    The store's purges are the record of this, and the words here follow them: an inbound's
+    ``messages_days`` is the cutoff of ``purge_message_bodies``, keyed on the receiving inbound, and
+    an outbound's ``dead_letter_days`` the cutoff of ``purge_dead_letters``, keyed on the dead
+    row's outbound. Read their docstrings for what each blanks. The lists in the text say "at
+    least", because a closed list here would go false when a purge gains a tier."""
     parts = []
     if any(entry.startswith("inbound ") for entry in kept):
         parts.append(
-            "An inbound override keeps forever what the purge of message bodies holds for the "
-            "messages that inbound received: each stored body, its delivered and cancelled outbound "
-            "payloads, its event detail and the replies captured for it. Their dead-lettered rows "
-            "are not covered: an ingress or routed one is purged on the global "
-            "[retention].dead_letter_days window where that window is bounded, and an outbound one "
-            "on that outbound's own dead-letter window."
+            "An inbound override keeps forever at least what the purge of message bodies holds for "
+            "the messages that inbound received: each stored body, though the inbound's own "
+            "prune_documents_after, where set, still strips embedded documents from it; its "
+            "delivered and cancelled outbound payloads, its event detail and the replies captured "
+            "for it. It does not keep their dead-lettered ingress, routed or outbound rows, or a "
+            "streaming attachment the purge of the last of those rows releases: a dead ingress or "
+            "routed row is purged on the global [retention].dead_letter_days window and a dead "
+            "outbound row on that outbound's own dead-letter window, each where that window is "
+            "bounded."
         )
     if any(entry.startswith("outbound ") for entry in kept):
         parts.append(
-            "An outbound override keeps forever only that outbound's own dead-lettered delivery "
-            "payloads; a reply it captured is purged on the message-body window of the inbound "
-            "that received the message."
+            "An outbound override keeps forever at least that outbound's own dead-lettered rows, "
+            "with their payloads, error text and any streaming attachment they still hold. It does "
+            "not keep a reply that outbound captured, which is purged on the message-body window "
+            "of the inbound that received the message, where that window is bounded."
         )
     return " ".join(parts)
 
@@ -632,9 +633,11 @@ def _override_audit_line(
 ) -> str:
     """The ``AUDIT:`` line for a graph the gate passes with ``kept`` keeping bodies forever.
 
-    ``basis`` says why the gate passed it and ``status`` what that means. One sentence for every
-    arm, so a search of the logs for a keep-forever override finds each of them. ``env_name`` is
-    ``None`` where no environment is active, and the line then names none."""
+    ``basis`` says why the gate passed it and ``status`` what that means. Every arm opens with the
+    same sentence, so a search of the logs for a keep-forever override finds each of them; the
+    scope text of :func:`_override_scope` follows it, and under ``enforcement = warn`` the remedy
+    follows that. ``env_name`` is ``None`` where no environment is active, and the line then names
+    none."""
     where = f" (environment {env_name!r})" if env_name is not None else ""
     return (
         f"AUDIT: the retention gate on a PHI instance{where} passed a graph "

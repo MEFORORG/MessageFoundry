@@ -386,6 +386,24 @@ async def test_an_inbound_keep_forever_override_leaves_its_dead_rows_to_the_dead
     assert await _payload(store, mid) == ""  # the dead row took OB_SLOW's (global) window
 
 
+async def test_an_inbound_keep_forever_override_leaves_a_dead_ingress_row_to_the_global_window(
+    store: MessageStore,
+) -> None:
+    """BACKLOG #5967: a dead ingress row names no outbound, so the dead-letter purge takes the
+    global window for it even with the receiving inbound's keep-forever override in the cutoff map,
+    while the body purge keeps that message's body. ``_override_scope`` states this."""
+    mid = await store.enqueue_ingress(channel_id="IB_KEEP", raw=RAW, control_id="K-ING", now=0.0)
+    item = await store.claim_next_fifo("IB_KEEP", stage="ingress", now=0.0)
+    assert item is not None
+    await store.dead_letter_now(item.id, "router error: boom", now=0.0)
+    keep = {"IB_KEEP": float("-inf")}
+
+    await store.purge_message_bodies(older_than=10 * DAY, connection_cutoffs=keep)
+    assert await _raw(store, mid) == RAW  # the inbound override keeps the stored body
+    purged = await store.purge_dead_letters(older_than=10 * DAY, connection_cutoffs=keep)
+    assert purged.bodies == 1  # the dead ingress row took the global window
+
+
 async def test_runner_without_registry_is_global_only(store: MessageStore) -> None:
     """No registry_source wired → no overrides → a single global cutoff (byte-identical to the global
     runner), and the audit records empty override maps."""
