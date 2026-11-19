@@ -87,7 +87,8 @@ namespace MessageFoundry.NetHelper
             }
         }
 
-        // False means a caller connected and closed before this accept ran, so nobody is there to serve. A new
+        // False means a caller connected and closed before this accept ran, so nobody is left to read a reply.
+        // Any bytes it wrote are discarded unread, as a request whose caller left before its reply is. A new
         // instance takes a caller before ConnectNamedPipe runs, so a caller that arrives as the helper starts and
         // closes at once leaves it closing, and ConnectNamedPipe fails with ERROR_NO_DATA. Left uncaught, that one
         // early close would stop the helper. Any other failure still propagates and stops it, as before.
@@ -116,6 +117,7 @@ namespace MessageFoundry.NetHelper
             }
         }
 
+        // kernel32 is a KnownDLL, so it loads from System32 however NativeAOT binds this import.
         [DllImport("kernel32.dll", SetLastError = true)]
         [DefaultDllImportSearchPaths(DllImportSearchPath.System32)]
         [return: MarshalAs(UnmanagedType.Bool)]

@@ -19,6 +19,16 @@ $server = $assembly.GetType('MessageFoundry.NetHelper.PipeServer', $true)
 $accept = $server.GetMethod('Accept', [System.Reflection.BindingFlags]'NonPublic, Static')
 if (-not $accept) { throw 'PipeServer.Accept was not found' }
 
+# This script drives Accept, not Run, which serves a fixed pipe name forever. So it pins, as text, that Run
+# reaches WaitForConnection only through Accept and goes back to accepting when Accept returns false.
+$text = Get-Content -Raw -LiteralPath (Join-Path (Split-Path -Parent $PSScriptRoot) 'PipeServer.cs')
+if ($text -notmatch 'if \(!Accept\(pipe\)\)\s*\{\s*continue;\s*\}') { throw 'PipeServer.Run no longer continues when Accept returns false' }
+if (([regex]::Matches($text, 'WaitForConnection\(')).Count -ne 1) { throw 'WaitForConnection is called outside PipeServer.Accept' }
+
+# Log writes to Console.Out, so capture it to check the drop is logged.
+$logged = [System.IO.StringWriter]::new()
+$stdout = [Console]::Out
+
 $name = 'mefor-net-helper-test-' + [guid]::NewGuid().ToString('N')
 $pipe = [System.IO.Pipes.NamedPipeServerStream]::new($name, [System.IO.Pipes.PipeDirection]::InOut, 1,
     [System.IO.Pipes.PipeTransmissionMode]::Byte, [System.IO.Pipes.PipeOptions]'Asynchronous, FirstPipeInstance')
@@ -27,17 +37,23 @@ try {
     $early.Connect(5000)
     $early.Dispose()
 
-    # Before the fix this call threw "The pipe is being closed."
-    $first = $accept.Invoke($null, @($pipe))
+    # Without the fix, the WaitForConnection here threw "The pipe is being closed."
+    [Console]::SetOut($logged)
+    try { $first = $accept.Invoke($null, @($pipe)) } finally { [Console]::SetOut($stdout) }
     if ($first -ne $false) { throw "the accept after an early close returned '$first', not False" }
+    if ($logged.ToString() -notmatch 'WARN outcome=dropped reason="caller closed before it was accepted') {
+        throw "the early close was not logged: '$logged'"
+    }
 
     # Without a disconnect the instance stays closing and every later accept fails the same way.
     $next = [System.IO.Pipes.NamedPipeClientStream]::new('.', $name, [System.IO.Pipes.PipeDirection]::InOut)
     try {
+        # Accept runs on the thread pool so that a regression fails here, bounded, instead of blocking forever.
+        $accepting = [System.Threading.Tasks.Task]::Run([Func[bool]][Delegate]::CreateDelegate([Func[bool]], $pipe, $accept))
         $connecting = $next.ConnectAsync(5000)
-        $second = $accept.Invoke($null, @($pipe))
-        if ($second -ne $true -or -not $pipe.IsConnected) {
-            throw "the next caller was not accepted: Accept returned '$second', IsConnected is $($pipe.IsConnected)"
+        if (-not $accepting.Wait(10000)) { throw 'the next caller was not accepted within 10 seconds' }
+        if ($accepting.Result -ne $true -or -not $pipe.IsConnected) {
+            throw "the next caller was not accepted: Accept returned '$($accepting.Result)', IsConnected is $($pipe.IsConnected)"
         }
         if (-not $connecting.Wait(5000)) { throw 'the next caller did not finish connecting' }
     } finally {
