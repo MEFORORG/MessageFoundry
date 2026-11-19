@@ -236,12 +236,19 @@ $seatsDir = $null
 $lanesDir = $null
 $laneFault = ''
 $coordRootScript = Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\coord-root.ps1'
+# lane-root.ps1 holds the rule lane.ps1 keys a lane on, and the UTF-8 wrapper it reads git through.
+$laneRootScript = Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\lane-root.ps1'
 if (-not (Test-Path -LiteralPath $coordRootScript -PathType Leaf)) {
     $laneFault = 'scripts/coord/coord-root.ps1 is missing'
+} elseif (-not (Test-Path -LiteralPath $laneRootScript -PathType Leaf)) {
+    $laneFault = 'scripts/coord/lane-root.ps1 is missing'
 } else {
     try {
         . $coordRootScript
-        $sr = Resolve-CoordSharedRoot -From (Get-Location).Path
+        . $laneRootScript
+        # Through UTF-8, as lane.ps1 resolves it: a non-ASCII path read in the OEM code page names a
+        # root lane.ps1 never writes under.
+        $sr = Invoke-GitUtf8 { Resolve-CoordSharedRoot -From (Get-Location).Path }
         if ($sr.Error) { $laneFault = $sr.Error }
         else {
             $seatsDir = Join-Path $sr.Path 'seats'
@@ -280,15 +287,13 @@ function Read-LaneFor([string]$Worktree, [string]$HostName) {
 $cwd = (Get-Location).Path
 $leaf = (Split-Path $cwd -Leaf)
 $branch = (& git rev-parse --abbrev-ref HEAD 2>$null)
-# THE READ KEYS ON THE ROOT lane.ps1 WRITES UNDER, by the same rule in lane-root.ps1. Keyed on the
-# current directory, a lane stated through a junction read as unstated every turn (BACKLOG #5486).
-# Where that rule names no root, this hook only reads, so it keys on the current directory as it
-# always has rather than refuse.
-. (Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\lane-root.ps1')
-$laneRoot = Resolve-LaneWorktreeRoot -From $cwd
-$laneKeyPath = if ($laneRoot.Error) { $cwd } else { $laneRoot.Path }
 
 if ($leaf -match '^builder') {
+    # THE READ KEYS ON THE ROOT lane.ps1 WRITES UNDER (lane-root.ps1). Keyed on the current
+    # directory, a lane stated through a junction read as unstated every turn (BACKLOG #5486). Where
+    # no root is named, this hook only reads, so it keys on the current directory as it always has.
+    $laneRoot = Resolve-LaneWorktreeRoot -From (Get-Location).ProviderPath
+    $laneKeyPath = if ($laneRoot.Error) { $cwd } else { $laneRoot.Path }
     $rec = Read-LaneFor $laneKeyPath (Get-CoordHost)
     # BOTH NAGS NAME THE lane.ps1 BESIDE THIS HOOK. The copy in this worktree may be the older one,
     # and a restatement through it writes a level the OLD-WRITER nag below then asks about again.

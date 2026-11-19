@@ -50,6 +50,7 @@ SCRIPTS = (
     "claim-adjudicate.ps1",
     "alloc.ps1",
     "lane.ps1",
+    "lane-root.ps1",
     "mail-key.ps1",
     "coord-root.ps1",
     "occupancy.ps1",

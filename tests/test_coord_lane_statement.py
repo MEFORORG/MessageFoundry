@@ -510,10 +510,25 @@ def test_the_hook_reads_a_lane_stated_through_a_junction_through_either_path(
         for where in (link, target):
             after = _hook(where)
             assert after.returncode == 0, after.stdout + after.stderr
-            assert _UNSTATED not in after.stdout, (where, after.stdout)
+            # Silent: no nag, and no SKIPPED or COULD NOT READ line in its place.
+            assert after.stdout == "", (where, after.stdout)
     finally:
         # rmdir removes the junction itself and leaves its target alone.
         os.rmdir(link)
+
+
+def test_the_hook_reads_a_lane_stated_at_a_non_ascii_path(tmp_path: Path) -> None:
+    """lane.ps1 reads git's paths as UTF-8; the hook read the coordination root in the console's
+    OEM code page, so at a non-ASCII path it looked in a directory lane.ps1 never wrote and nagged.
+    The control is the nag before the statement."""
+    target = _init_repo(tmp_path / "builder-ü")
+    before = _hook(target)
+    assert before.returncode == 0 and _UNSTATED in before.stdout, before.stdout + before.stderr
+    stated = _pwsh(target, "-Free", "1", "-InFlight", "1")
+    assert stated.returncode == 0, stated.stdout + stated.stderr
+    after = _hook(target)
+    assert after.returncode == 0, after.stdout + after.stderr
+    assert after.stdout == "", after.stdout
 
 
 def test_a_non_ascii_path_keys_on_the_root_git_names(tmp_path: Path) -> None:

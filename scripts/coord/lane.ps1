@@ -78,15 +78,16 @@ $thisHost = Get-CoordHost
 # The lane file and the claim hash are keyed on the WORK TREE ROOT; the current directory keyed a
 # subdirectory run on a box nobody reads (BACKLOG #5486). Read before the root is resolved, so a
 # directory with no work tree (a .git directory) refuses before anything is read or written.
-$here = (Get-Location).Path
+# ProviderPath, not Path: on a UNC location Path carries a provider prefix git cannot read.
+$here = (Get-Location).ProviderPath
 function Write-RootRefusal([string]$Why) {
     [Console]::Error.WriteLine("lane.ps1: REFUSED -- $Why, so the lane cannot be keyed and nothing was read or written.")
     exit 2
 }
-# The rule lives in lane-root.ps1, which scripts/hooks/lane-level.ps1 also dot-sources, so the
-# writer and the reader always key the same box: git's resolved root, UTF-8 decoded, refusing a
-# directory with no work tree and a removed worktree under the primary's container.
-. (Join-Path $PSScriptRoot 'lane-root.ps1')
+# The keying rule is lane-root.ps1's, shared with scripts/hooks/lane-level.ps1 so both key one box.
+$laneRootScript = Join-Path $PSScriptRoot 'lane-root.ps1'
+if (-not (Test-Path -LiteralPath $laneRootScript -PathType Leaf)) { Write-RootRefusal "$laneRootScript is missing" }
+. $laneRootScript
 $root = Resolve-LaneWorktreeRoot -From $here
 if ($root.Error) { Write-RootRefusal $root.Error }
 $worktree = $root.Path
