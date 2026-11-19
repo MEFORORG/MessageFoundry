@@ -492,3 +492,84 @@ def test_it_runs_on_a_bare_interpreter_from_an_unrelated_directory(tmp_path: Pat
     )
     assert proc.returncode == 0, f"rc={proc.returncode}\n--- stderr ---\n{proc.stderr}"
     assert "--scorecard" in proc.stdout, proc.stdout[:400]
+
+
+# --------------------------------------------------------------------------------------------
+# The workflow never reads the record for a pull request (BACKLOG #5476).
+# --------------------------------------------------------------------------------------------
+
+
+def _evaluate_job_if(expression: str, *, event_name: str, vault_repo: str) -> bool:
+    """Evaluate the report job's ``if:`` for one event, without a runner.
+
+    Only the shapes that expression uses are understood -- ``==``/``!=`` between a context and a
+    string literal, joined by ``&&``/``||`` and parentheses. Anything else raises, so an edit that
+    reaches for a new construct fails here loudly instead of being read as true.
+    """
+    import ast
+
+    body = expression.strip()
+    if body.startswith("${{") and body.endswith("}}"):
+        body = body[3:-2]
+    contexts = {"github.event_name": event_name, "vars.ASVS_VAULT_REPO": vault_repo}
+    for name, value in contexts.items():
+        body = body.replace(name, repr(value))
+    body = body.replace("&&", " and ").replace("||", " or ")
+    tree = ast.parse(" ".join(body.split()), mode="eval")
+
+    def walk(node: ast.AST) -> object:
+        if isinstance(node, ast.Expression):
+            return walk(node.body)
+        if isinstance(node, ast.BoolOp):
+            values = [bool(walk(v)) for v in node.values]
+            return all(values) if isinstance(node.op, ast.And) else any(values)
+        if isinstance(node, ast.Compare) and len(node.ops) == 1:
+            left, right = walk(node.left), walk(node.comparators[0])
+            if isinstance(node.ops[0], ast.Eq):
+                return left == right
+            if isinstance(node.ops[0], ast.NotEq):
+                return left != right
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        raise AssertionError(f"unsupported construct in the report job's if: {ast.dump(node)}")
+
+    return bool(walk(tree))
+
+
+@pytest.mark.parametrize(
+    ("event_name", "vault_repo", "runs"),
+    [
+        # The defect: with the variable configured, a pull request ran the job.
+        ("pull_request", "owner/vault", False),
+        ("pull_request_target", "owner/vault", False),
+        ("merge_group", "owner/vault", False),
+        ("pull_request", "", False),
+        # The admitted events still run, once the record is configured, and skip without it.
+        ("push", "owner/vault", True),
+        ("workflow_dispatch", "owner/vault", True),
+        ("push", "", False),
+        ("workflow_dispatch", "", False),
+    ],
+)
+def test_the_report_job_never_runs_for_a_pull_request(
+    event_name: str, vault_repo: str, runs: bool
+) -> None:
+    """RED when: the job's ``if:`` admits a pull_request run once the vault variable is set.
+
+    A ``pull_request`` run executes the pull request's own workflow and scripts, so a variable-only
+    gate would hand that code a checkout of the private scorecard on a runner whose logs are public.
+    """
+    from tests._workflow_contexts import load_workflow
+
+    job = load_workflow("asvs-anchor-report.yml")["jobs"]["report"]
+    assert _evaluate_job_if(str(job["if"]), event_name=event_name, vault_repo=vault_repo) is runs
+
+
+def test_every_step_reading_the_vault_sits_behind_the_job_gate() -> None:
+    """RED when: a second job reads the vault token. The event allowlist is on the ``report`` job, so
+    a vault read moved into any other job would not be covered by it."""
+    from tests._workflow_contexts import load_workflow
+
+    jobs = load_workflow("asvs-anchor-report.yml")["jobs"]
+    readers = [key for key, job in jobs.items() if "ASVS_VAULT_READ_TOKEN" in repr(job)]
+    assert readers == ["report"], f"jobs reading the vault token: {readers}"

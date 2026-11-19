@@ -89,7 +89,17 @@ jobs:
   report:
     name: anchors that no longer resolve (advisory)
     # SKIPPED, not absent, when there is no record to read. See the block above on why those differ.
-    if: vars.ASVS_VAULT_REPO != ''
+    #
+    # NEVER ON A PULL REQUEST, whatever the variable says (BACKLOG #5476). A `pull_request` run
+    # executes the pull request's own copy of this file and of scripts/asvs/, so gating on the
+    # variable alone would let a pull request's code run with the private scorecard checked out, on
+    # a runner whose logs are public, the moment the vault variable and read token were configured.
+    # An ALLOWLIST of events rather than `!= 'pull_request'`, so a trigger added later is refused
+    # until someone decides it may reach the record. The `pull_request` trigger above stays: on a
+    # pull request this job reports SKIPPED, which is the visible not-run the block above asks for.
+    if: >-
+      ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && vars.ASVS_VAULT_REPO != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -131,9 +141,10 @@ jobs:
         working-directory: engine
         env:
           SCORECARD: ${{ github.workspace }}/vault/docs/security/asvs-scorecard.toml
-          # The base of the range to attribute breakage to. Empty on workflow_dispatch, where there
-          # is no range and the whole-record totals are the answer.
-          SINCE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          # The base of the range to attribute breakage to: the push's previous tip. Empty on
+          # workflow_dispatch, where there is no range and the whole-record totals are the answer.
+          # No pull request base here, because the job's `if:` never admits a pull_request run.
+          SINCE: ${{ github.event.before }}
         run: |
           set -euo pipefail
           # An ARRAY, not a string: an unquoted expansion would rely on word splitting (SC2086, and
