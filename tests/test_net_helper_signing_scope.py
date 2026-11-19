@@ -22,7 +22,7 @@ from typing import Any
 
 import pytest
 
-from tests._workflow_contexts import jobs_of
+from tests._workflow_contexts import jobs_of, step_script
 
 _WORKFLOW = "net-helper.yml"
 _ENVIRONMENT = "net-helper-signing"
@@ -74,9 +74,8 @@ def test_the_build_job_names_no_environment() -> None:
 
 
 def _sign_script() -> str:
-    steps = [s for s in jobs_of(_WORKFLOW)["sign"].get("steps", []) if s.get("id") == "sign"]
-    assert len(steps) == 1, "expected exactly one step with id: sign"
-    return str(steps[0]["run"])
+    # Comment lines stripped, so no needle below can be met by prose.
+    return step_script(_WORKFLOW, "sign", "Sign (signtool")[1]
 
 
 def test_the_key_import_sits_inside_the_try_whose_finally_deletes_it() -> None:

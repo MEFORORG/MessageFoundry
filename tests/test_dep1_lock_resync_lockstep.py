@@ -21,6 +21,7 @@ import ast
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 from tests._workflow_contexts import load_workflow
 
@@ -187,8 +188,7 @@ def test_the_resync_checks_out_the_triggering_sha() -> None:
     The closure step runs a repository script from this checkout. Pinned to the SHA, a commit
     pushed after the trigger never runs, and the push is refused if the branch has moved.
     """
-    steps = load_workflow(_RESYNC.name)["jobs"]["resync"]["steps"]
-    checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@")]
+    checkouts = _steps_using("actions/checkout@")
     assert len(checkouts) == 1, f"expected one checkout step, found {len(checkouts)}"
     assert checkouts[0]["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
 
@@ -285,10 +285,14 @@ def test_the_resync_gate_keeps_its_immutable_author_conjunct() -> None:
     )
 
 
-def _resync_steps() -> list[dict[str, object]]:
+def _resync_steps() -> list[dict[str, Any]]:
     steps = load_workflow(_RESYNC.name)["jobs"]["resync"]["steps"]
     assert isinstance(steps, list) and steps, "the resync job parsed to no steps"
     return steps
+
+
+def _steps_using(prefix: str) -> list[dict[str, Any]]:
+    return [s for s in _resync_steps() if str(s.get("uses", "")).startswith(prefix)]
 
 
 def test_the_resync_checkout_persists_no_credential() -> None:
@@ -298,9 +302,7 @@ def test_the_resync_checkout_persists_no_credential() -> None:
     contents-write App token would sit on disk for both; the push step takes it from its own
     environment instead.
     """
-    checkouts = [
-        s for s in _resync_steps() if str(s.get("uses", "")).startswith("actions/checkout@")
-    ]
+    checkouts = _steps_using("actions/checkout@")
     assert len(checkouts) == 1, f"expected one checkout step, found {len(checkouts)}"
     with_ = checkouts[0].get("with") or {}
     assert isinstance(with_, dict)
@@ -337,9 +339,7 @@ def test_the_resync_installs_the_uv_the_gate_pins() -> None:
     """
     gate_pins = set(_GATE_UV_PIN_RE.findall(_GATE.read_text(encoding="utf-8")))
     assert len(gate_pins) == 1, f"security.yml pins uv at {sorted(gate_pins)}; expected one version"
-    setups = [
-        s for s in _resync_steps() if str(s.get("uses", "")).startswith("astral-sh/setup-uv@")
-    ]
+    setups = _steps_using("astral-sh/setup-uv@")
     assert len(setups) == 1, f"expected one setup-uv step, found {len(setups)}"
     with_ = setups[0].get("with") or {}
     assert isinstance(with_, dict)

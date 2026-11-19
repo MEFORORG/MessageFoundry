@@ -247,12 +247,10 @@ jobs:
           }
 
           # Checked without chain trust: a certificate from an internal CA is not trusted by this runner, and
-          # whether to trust it is the deploying site's decision. What is asserted (BACKLOG #5478): the binary
-          # is signed and timestamped, the signer is the certificate imported above, and the signature itself
-          # verifies. Status Valid passes. UnknownError is what an untrusted root reports, so it passes only
-          # when the signer's chain builds for code signing with the unknown-CA fault alone ignored. Every
-          # other status fails, at least NotSigned, HashMismatch, NotTrusted (explicitly distrusted),
-          # Incompatible and NotSupportedFileFormat. Revocation is not checked here, as Valid does not either.
+          # whether to trust it is the deploying site's decision. Asserted (BACKLOG #5478): signed and
+          # timestamped, by the certificate imported above, with status Valid, or UnknownError (what an
+          # untrusted root reports) only when the signer's chain builds for code signing with the unknown-CA
+          # fault alone ignored. Any other status fails. Revocation is not checked, as Valid does not either.
           $signature = Get-AuthenticodeSignature -FilePath $exe
           if (-not $signature.SignerCertificate -or -not $signature.TimeStamperCertificate) {
             throw 'the binary is not both signed and timestamped'
@@ -260,10 +258,7 @@ jobs:
           if ($signature.SignerCertificate.Thumbprint -ne $thumbprint) {
             throw "the binary is signed by $($signature.SignerCertificate.Thumbprint), not by the imported certificate $thumbprint"
           }
-          if ($signature.Status -ne 'Valid') {
-            if ($signature.Status -ne 'UnknownError') {
-              throw "the signature's status is $($signature.Status): $($signature.StatusMessage)"
-            }
+          if ($signature.Status -eq 'UnknownError') {
             $chain = [System.Security.Cryptography.X509Certificates.X509Chain]::new()
             try {
               $chain.ChainPolicy.RevocationMode = 'NoCheck'
@@ -277,6 +272,8 @@ jobs:
             } finally {
               $chain.Dispose()
             }
+          } elseif ($signature.Status -ne 'Valid') {
+            throw "the signature's status is $($signature.Status): $($signature.StatusMessage)"
           }
           Write-Host "signed by $($signature.SignerCertificate.Subject); timestamped by $($signature.TimeStamperCertificate.Subject)"
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $exe).Hash
