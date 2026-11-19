@@ -40,6 +40,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import annotationlib
 from pydantic import BaseModel
 from pydantic_core import PydanticUndefined
 
@@ -231,10 +232,16 @@ def _named_annotations(dto: type) -> list[tuple[str, object]]:
     else:
         # Reached only for a dataclass DTO -- _is_dto() gates every caller, and mypy cannot carry
         # that narrowing across the call boundary.
+        #
+        # FORWARDREF format: an annotation that does not resolve comes back as a ForwardRef instead
+        # of raising, so a ClassVar or other non-field annotation naming a TYPE_CHECKING-only import
+        # does not refuse the DTO; _refuse_unresolved below still refuses one in a FIELD. Annotated
+        # metadata is stripped, as Pydantic strips it from a field's annotation, because it is data
+        # rather than a type position and the walkers below would otherwise read it as one.
         try:
             # The defining module's globals are get_type_hints' default namespace for a class.
-            hints = typing.get_type_hints(dto, include_extras=True)
-        except Exception as exc:  # NameError on an unresolvable string annotation, typically
+            hints = typing.get_type_hints(dto, format=annotationlib.Format.FORWARDREF)
+        except (NameError, AttributeError, TypeError, SyntaxError) as exc:
             raise SeamDiscoveryError(
                 f"{dto.__module__}.{dto.__qualname__}: field annotations are unresolvable "
                 f"({exc}); the closure cannot be completed, so the surface would be under-covered"
@@ -268,15 +275,17 @@ def _refuse_unresolved(dto: type, annotations: list[object]) -> None:
             current = stack.pop()
             if isinstance(current, typing.ForwardRef | str):
                 raise SeamDiscoveryError(
-                    f"{dto.__module__}.{dto.__qualname__}: field annotation {current!r} is an "
-                    "UNRESOLVED ForwardRef, so the nested-model closure cannot see through it and "
-                    "the contract would be silently under-covered. Define the referenced model "
-                    "BEFORE this one, or call model_rebuild() on it."
+                    f"{dto.__module__}.{dto.__qualname__}: field annotation {current!r} is "
+                    "UNRESOLVED (a ForwardRef or a bare string), so the nested-model closure "
+                    "cannot see through it and the contract would be silently under-covered. "
+                    "Define or import the referenced type where the annotation can resolve it "
+                    "(for a Pydantic model, define it BEFORE this one or call model_rebuild())."
                 )
             if current is PydanticUndefined:
                 raise SeamDiscoveryError(
-                    f"{dto.__module__}.{dto.__qualname__}: a computed field has no return type, so "
-                    "the nested-model closure cannot see through it"
+                    f"{dto.__module__}.{dto.__qualname__}: a computed field's return type is not "
+                    "resolved yet (a deferred build or a pending forward reference), so the "
+                    "nested-model closure cannot see through it. Call model_rebuild() on the model."
                 )
             origin = typing.get_origin(current)
             if origin is typing.Literal:

@@ -603,9 +603,12 @@ from __future__ import annotations
 
 import dataclasses
 import enum
-from typing import Literal
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal
 
-from pydantic import BaseModel, computed_field
+from pydantic import BaseModel, ConfigDict, computed_field
+
+if TYPE_CHECKING:
+    from somewhere import Registry
 
 
 class Colour(enum.Enum):
@@ -644,6 +647,30 @@ class WithComputed(BaseModel):
     @property
     def tone(self) -> Literal["light", "heavy"] | Shade:
         return "light"
+
+
+class Marker(BaseModel):
+    z: int = 0
+
+
+@dataclasses.dataclass
+class WithClassVar:
+    name: str = ""
+    registry: ClassVar[Registry | None] = None
+
+
+@dataclasses.dataclass
+class WithMetadata:
+    v: Annotated[int, Marker] = 0
+
+
+class Deferred(BaseModel):
+    model_config = ConfigDict(defer_build=True)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def leaf(self) -> Leaf:
+        return Leaf()
 
 
 @dataclasses.dataclass
@@ -691,8 +718,23 @@ def test_a_computed_field_return_type_is_walked(postponed: types.ModuleType) -> 
 
 def test_an_unresolvable_dataclass_annotation_fails_loud(postponed: types.ModuleType) -> None:
     """A skip here would be indistinguishable from full coverage, so it refuses instead."""
-    with pytest.raises(sd.SeamDiscoveryError, match="unresolvable"):
+    with pytest.raises(sd.SeamDiscoveryError, match="UNRESOLVED"):
         sd._closure({"Broken"}, postponed, "synthetic")
+
+
+def test_an_unresolvable_classvar_does_not_refuse_the_dto(postponed: types.ModuleType) -> None:
+    """A ClassVar is not a field, so a TYPE_CHECKING-only name in one is not a coverage hole."""
+    assert _names(sd._closure({"WithClassVar"}, postponed, "synthetic")) == {"WithClassVar"}
+
+
+def test_annotated_metadata_is_not_walked_as_a_type(postponed: types.ModuleType) -> None:
+    """A model used as ``Annotated`` metadata is data; nothing renders its fields."""
+    assert _names(sd._closure({"WithMetadata"}, postponed, "synthetic")) == {"WithMetadata"}
+
+
+def test_a_deferred_computed_field_return_type_fails_loud(postponed: types.ModuleType) -> None:
+    with pytest.raises(sd.SeamDiscoveryError, match="not resolved yet"):
+        sd._closure({"Deferred"}, postponed, "synthetic")
 
 
 def test_a_string_annotation_left_unresolved_fails_loud() -> None:
