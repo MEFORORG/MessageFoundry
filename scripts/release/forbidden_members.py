@@ -18,10 +18,10 @@ TWO PROPERTIES MAKE THIS A DIFFERENT CHECK, NOT A SECOND COPY OF THE ALLOWLIST.
    root and strips it, because ``docs/messagefoundry/security/PRIVATE.md`` inside a
    ``messagefoundry-0.3.0/`` root laundered itself into an allowlisted path. A basename is the same
    string wherever the member sits, so those two rules have no prefix to launder and nothing to
-   strip. The third rule, the engine and toolkit split, is the exception: its toolkit half reads a
-   member's FIRST component, so it does derive the archive's root from the listing, as the leak gate
-   does, refuses any archive but a wheel that lacks exactly one, and tests each member both with and
-   without that root (:func:`_archive_root`, :func:`_split_candidates`).
+   strip. The third rule, the engine and toolkit split, is the exception: its half for every
+   distribution but the engine reads a member's FIRST component, so it does derive the archive's
+   root from the listing, as the leak gate does, refuses any archive but a wheel that lacks exactly
+   one, and tests each member both with and without that root (:func:`_archive_root`, :func:`_split_candidates`).
 
 2. It covers the distributions the allowlist never reached. The allowlist runs on ``dist/*.tar.gz``
    alone. The engine WHEEL, the console wheel and the harness wheel had no member gate at all -- and
@@ -169,6 +169,14 @@ RETIRED_ENGINE_PATHS: tuple[tuple[str, ...], ...] = (
     ("messagefoundry", "hl7structures.py"),
 )
 
+
+_ASCII_DIGITS = frozenset("0123456789")
+
+#: The shape of a Windows 8.3 short name, matched on a normalised component: at most six
+#: characters, ``~``, digits, and an optional extension of at most three characters
+#: (``messag~1``, ``messag~1.py``). A ``~<digit>`` elsewhere in a longer name (``b~1c.txt``) is
+#: not one, because Windows does not open a file under it.
+_SHORT_NAME = re.compile(r"[^.]{1,6}~\d+(\.[^.]{0,3})?")
 
 _SPECIAL = "a link or special file; a published distribution carries regular files only"
 
@@ -369,10 +377,12 @@ def _name_version(stem: str) -> str | None:
 
     The version is the first hyphen-separated segment, after the first, that starts with a digit,
     which is where the wheel and sdist rules end a name. Splitting at the first hyphen instead
-    read ``messagefoundry-toolkit-0.4.0.tar.gz`` as the engine (BACKLOG #5470)."""
+    read ``messagefoundry-toolkit-0.4.0.tar.gz`` as the engine (BACKLOG #5470). The digit must be
+    ASCII: ``str.isdigit`` also accepts other scripts' digits, which no version scheme writes, so a
+    segment starting with one is part of the name and the name is then refused as unknown."""
     segments = stem.split("-")
     for i in range(1, len(segments)):
-        if segments[i][:1].isdigit():
+        if segments[i][:1] in _ASCII_DIGITS:
             return "-".join(segments[:i])
     return None
 
@@ -413,7 +423,7 @@ def escapes_root(member: str) -> str | None:
     for part in _parts(member):
         if ":" in part:
             return f"component {part!r} names a drive or an alternate data stream"
-        if re.search(r"~\d", part):
+        if _SHORT_NAME.fullmatch(_normalise(part)):
             return f"component {part!r} has the shape of a Windows 8.3 short name"
     return None
 
@@ -462,25 +472,28 @@ def _split_rule(parts: list[str], dist: str) -> str | None:
         for retired in RETIRED_ENGINE_PATHS:
             if _has_retired_run(parts, retired):
                 return f"{'/'.join(retired)} moved to the toolkit distribution (ADR 0201)"
-    elif dist == TOOLKIT_DISTRIBUTION:
+    else:
+        # EVERY other distribution installs beside the engine, so none may install over it: the
+        # harness and web console are as able to write a messagefoundry/ tree or a .pth as the
+        # toolkit is (BACKLOG #5470).
         first = parts[0]
         if _versioned_as(first, ENGINE_DISTRIBUTION):
-            return "the toolkit may not carry an engine <name>-<version> entry (ADR 0201)"
+            return f"{dist} may not carry an engine <name>-<version> entry (ADR 0201)"
         # A directory named for the engine, or a top-level file Python could import as it. A
         # documentation or configuration file of that name is neither (_INERT_SUFFIXES).
         if _stem(first) == ENGINE_DISTRIBUTION and (
             len(parts) > 1 or first.partition(".")[2] not in _INERT_SUFFIXES
         ):
-            return "the toolkit may not write into the engine's package directory (ADR 0201)"
+            return f"{dist} may not write into the engine's package directory (ADR 0201)"
         # A top-level .pth of ANY name runs its import lines at every interpreter start, where it
         # can rebind engine modules: the split-package override ADR 0201 rejects. So does a
         # top-level sitecustomize or usercustomize module or package, which `site` imports.
         if len(parts) == 1 and first.endswith(".pth"):
-            return "the toolkit ships no top-level .pth, which runs code at interpreter start"
+            return f"{dist} ships no top-level .pth, which runs code at interpreter start"
         if _stem(first) in _STARTUP_MODULES:
-            return f"the toolkit ships no top-level {_stem(first)}, which runs at interpreter start"
+            return f"{dist} ships no top-level {_stem(first)}, which runs at interpreter start"
         if first.endswith(".data"):
-            return "the toolkit ships no wheel .data tree, which installs outside its package"
+            return f"{dist} ships no wheel .data tree, which installs outside its package"
     return None
 
 
@@ -489,19 +502,18 @@ def split_violation(member: str, dist: str, root: str | None = None) -> str | No
 
     An engine archive may carry nothing named for the toolkit, as a directory, a module or a
     ``.pth`` (any component whose stem is ``messagefoundry_toolkit`` in any PEP 503 spelling), or a
-    toolkit ``<name>-<version>`` entry, and no retired engine path. A toolkit archive may carry no
-    first component that installs as the engine: a ``messagefoundry`` directory, a top-level
-    ``messagefoundry`` file other than documentation or configuration (:data:`_INERT_SUFFIXES`), or
-    an engine ``<name>-<version>`` entry. Nor may it carry a ``<name>.data/`` tree at all: PEP 427
-    installs ``purelib``, ``platlib``, ``scripts`` and
+    toolkit ``<name>-<version>`` entry, and no retired engine path. Every other archive, the
+    toolkit, harness and web console alike, may carry no first component that installs as the
+    engine: a ``messagefoundry`` directory, a top-level ``messagefoundry`` file other than
+    documentation or configuration (:data:`_INERT_SUFFIXES`), an engine ``<name>-<version>`` entry,
+    or a top-level ``.pth``, ``sitecustomize`` or ``usercustomize``. Nor may it carry a
+    ``<name>.data/`` tree at all: PEP 427 installs ``purelib``, ``platlib``, ``scripts`` and
     ``data`` outside the package, where each can overwrite the engine's package or its console
-    script. The toolkit has no reason to ship one, so refusing the whole class is simpler than
-    modelling each scheme. That is the split-package shape ADR 0201 rejects. Every other
-    distribution passes. Split and normalised exactly as :func:`forbidden` is, and tested in every
+    script. None of them has a reason to ship one, so refusing the whole class is simpler than
+    modelling each scheme. That is the split-package shape ADR 0201 rejects. Split and normalised
+    exactly as :func:`forbidden` is, and tested in every
     reading :func:`_split_candidates` names.
     """
-    if dist not in (ENGINE_DISTRIBUTION, TOOLKIT_DISTRIBUTION):
-        return None
     for parts in _split_candidates(member, root):
         why = _split_rule(parts, dist)
         if why is not None:
@@ -555,6 +567,15 @@ def filename_problem(archive: Path) -> str | None:
             "its filename has no <name>-<version> shape, so the distribution, and the engine and "
             "toolkit split rule that applies to it, cannot be read"
         )
+    # A wheel filename writes its name with underscores (the wheel spec escapes every run of
+    # ``-``, ``_`` and ``.`` to ``_``), so a hyphen in it is no wheel any build writes. Placing it
+    # by its canonical name gave ``messagefoundry-webconsole-0.4.0-...whl`` the console's (empty)
+    # split rule where the engine rule used to run on it.
+    if archive.suffix.lower() == ".whl" and "-" in _declared_name(archive):
+        return (
+            "it is a wheel whose distribution name contains a hyphen, which no wheel build writes, "
+            "so the engine and toolkit split rule that applies to it cannot be read"
+        )
     dist = distribution(archive)
     if dist not in KNOWN_DISTRIBUTIONS:
         return f"its filename names {dist!r}, which is no distribution this repository publishes"
@@ -594,11 +615,13 @@ def inspect(archives: Iterable[Path]) -> tuple[int, list[str]]:
         )
         names = [name for name, _special in entries]
         root: str | None = None
+        refused = problem is not None
         if archive.suffix.lower() != ".whl":
             # A wheel installs at the top level and has no root. Every other archive is an sdist,
             # zip or tar, whose one root the split rule must know to read a first component.
             root, root_problem = _archive_root(names)
             if root_problem is not None:
+                refused = True
                 errors.append(
                     f"::error::member gate refuses {archive.name}: {root_problem}, not the one "
                     f"<name>-<version>/ root an sdist has, so no first component can be read"
@@ -618,6 +641,10 @@ def inspect(archives: Iterable[Path]) -> tuple[int, list[str]]:
         errors.extend(f"::error::{archive.name} ships {name} -- {why}" for name, why in hits)
         total += len(entries)
         verdict = f"{len(hits)} forbidden" if hits else "none forbidden"
+        if refused:
+            # A member count of zero must not read as a clean archive when the archive itself was
+            # refused, by its filename or its root.
+            verdict = f"ARCHIVE REFUSED, {len(hits)} members forbidden"
         print(f"member gate: inspected {len(entries)} members in {archive.name}, {verdict}")
         if tooling:
             # Said in the log every time, so the exemption is visible where the verdict is read.

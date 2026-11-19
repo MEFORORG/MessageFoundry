@@ -1151,6 +1151,135 @@ def test_the_cli_passes_a_toolkit_sdist_with_an_engine_named_config_file(
     assert main([str(sdist)]) == 0, capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "messagefoundry-webconsole-0.4.0-py3-none-any.whl",
+        "messagefoundry-harness-0.4.0-py3-none-any.whl",
+        "messagefoundry-toolkit-0.4.0-py3-none-any.whl",
+    ],
+)
+def test_the_cli_refuses_a_hyphenated_wheel_and_applies_both_split_rules(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], filename: str
+) -> None:
+    """A wheel name is written with underscores, so a hyphen places nothing. Before this the
+    console spelling got the console's rule, where reading up to the first hyphen gave it the
+    engine's."""
+    assert filename_problem(Path(filename)) is not None
+    wheel = _write_wheel(
+        tmp_path / "dist" / filename,
+        ("messagefoundry_toolkit/__init__.py", "messagefoundry/__init__.py"),
+    )
+    assert main([str(wheel)]) == 1
+    err = capsys.readouterr().err
+    assert f"refuses {filename}: it is a wheel whose distribution name contains a hyphen" in err
+    assert "ships messagefoundry_toolkit/__init__.py" in err
+    assert "ships messagefoundry/__init__.py" in err
+
+
+def test_a_hyphenated_sdist_name_is_still_placed() -> None:
+    """The hyphen refusal is the wheel spec's; an sdist built by an older backend may carry one."""
+    assert filename_problem(Path("messagefoundry-toolkit-0.4.0.tar.gz")) is None
+
+
+_NON_ENGINE_WHEELS = {
+    "messagefoundry-toolkit": "messagefoundry_toolkit-0.4.0-py3-none-any.whl",
+    "messagefoundry-harness": "messagefoundry_harness-0.4.0-py3-none-any.whl",
+    "messagefoundry-webconsole": "messagefoundry_webconsole-0.4.0-py3-none-any.whl",
+}
+
+
+@pytest.mark.parametrize("dist", sorted(_NON_ENGINE_WHEELS))
+@pytest.mark.parametrize(
+    "member",
+    [
+        "messagefoundry/__init__.py",
+        "messagefoundry.py",
+        "zz.pth",
+        "sitecustomize.py",
+        "usercustomize/__init__.py",
+        "x-0.4.0.data/purelib/messagefoundry/x.py",
+        "messagefoundry-0.4.0.dist-info/METADATA",
+    ],
+)
+def test_no_non_engine_distribution_may_install_over_the_engine(dist: str, member: str) -> None:
+    assert split_violation(member, dist) is not None
+
+
+@pytest.mark.parametrize("dist", sorted(_NON_ENGINE_WHEELS))
+def test_the_cli_refuses_any_non_engine_wheel_writing_into_the_engine(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], dist: str
+) -> None:
+    wheel = _write_wheel(
+        tmp_path / "dist" / _NON_ENGINE_WHEELS[dist], ("messagefoundry/__init__.py", "zz.pth")
+    )
+    assert main([str(wheel)]) == 1
+    err = capsys.readouterr().err
+    assert "ships messagefoundry/__init__.py" in err
+    assert "ships zz.pth" in err
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "harness/__init__.py",
+        "harness/load/profile.toml",
+        "messagefoundry_harness-0.4.0.dist-info/METADATA",
+        "messagefoundry_webconsole/static/app.js",
+        "messagefoundry_webconsole-0.4.0.dist-info/RECORD",
+    ],
+)
+def test_harness_and_console_members_pass_the_split_rule(member: str) -> None:
+    for dist in ("messagefoundry-harness", "messagefoundry-webconsole"):
+        assert split_violation(member, dist) is None, dist
+
+
+@pytest.mark.parametrize(
+    "member",
+    [
+        "MESSAG~1/__init__.py",
+        "messag~1.py",
+        "MESSAG~12.PY",
+        "a~1",
+        "MES~1234/x.py",
+        "MESSAG~1.PY./x",
+        "x/MESSAG~1.HTM",
+    ],
+)
+def test_an_8_3_short_name_is_refused(member: str) -> None:
+    assert escapes_root(member) is not None
+
+
+@pytest.mark.parametrize(
+    "member",
+    ["b~1c.txt", "messagefoundry~1/x.py", "messag~1.html", "x~/y.py", "a.b~1"],
+)
+def test_a_tilde_digit_outside_the_8_3_shape_is_not_an_alias(member: str) -> None:
+    assert escapes_root(member) is None
+
+
+def test_a_version_must_start_with_an_ascii_digit() -> None:
+    """U+0663 (ARABIC-INDIC DIGIT THREE) passes ``str.isdigit``. It is named by escape rather than
+    written, because the cp1252 console gate refuses the literal."""
+    assert filename_problem(Path("messagefoundry_toolkit-٣.0-py3-none-any.whl")) is not None
+
+
+def test_the_per_archive_line_says_an_archive_level_refusal(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A refused filename or root with no forbidden member must not print "none forbidden"."""
+    wheel = _write_wheel(
+        tmp_path / "w" / "messagefoundry-webconsole-0.4.0-py3-none-any.whl",
+        ("messagefoundry_webconsole/a.py",),
+    )
+    rootless = _write_tar(tmp_path / "s" / _TK_SDIST, _files("a.py", "b.py"))
+    for archive in (wheel, rootless):
+        assert main([str(archive)]) == 1
+        out = capsys.readouterr().out
+        assert f"in {archive.name}, ARCHIVE REFUSED, 0 members forbidden" in out
+        assert "none forbidden" not in out
+
+
 # --------------------------------------------------------------------------------------------------
 # The wiring. A gate no publishing job calls is the gap that was reported.
 # --------------------------------------------------------------------------------------------------
