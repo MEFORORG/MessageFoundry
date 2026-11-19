@@ -1493,12 +1493,9 @@ def test_a_label_glued_after_a_dsn_is_masked_and_main_did_no_better(
 
 
 def test_an_empty_user_dsn_hides_an_equals_sign_and_states_its_residual() -> None:
-    """The residuals secretscrub's ``_WIDE_DSN_PASSWORD`` comment states, pinned both ways. A
-    password-only DSN whose value holds "=" is read; one holding ";", "|" or an encoded HL7
-    separator is not, and prints whole; and with a user, a password that starts with "@" prints,
-    as it did before #5386. Where a "%" is read and where it is not is that comment's to state;
-    tests/test_b532r_redaction_segments.py pins both. A red on a residual line means the comment
-    is stale, not that a leak opened."""
+    """Lines the comment on secretscrub's ``_WIDE_DSN_PASSWORD`` states the outcome of, pinned
+    both ways; that comment states the rule, and tests/test_b532r_redaction_segments.py pins more
+    of its lines. A red on a residual line means the comment is stale, not that a leak opened."""
     for line in ("redis://:pw=Eq_Sec-81@host", "ws://:8765=accessToken=Tail@Tok_Sec-82"):
         for out in (redact_log_line(line), scrub_credentials(line)):
             assert "Eq_Sec-81" not in out and "Tok_Sec-82" not in out, out

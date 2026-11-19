@@ -1359,10 +1359,9 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # BUT A "%" THAT OPENS NEITHER AN ENCODED HL7 SEPARATOR (``%7C``, ``%7E``, ``%5E``, ``%26``) NOR
 # THE ENCODED FORM OF A CHARACTER IT STOPS AT FOR STRUCTURE (``%2C``, ``%3B``, ``%3F``, ``%23``, a
 # quote or a parenthesis), either case. That "%" it takes (BACKLOG #5386, added item 3), so
-# ``redis://:p%40Kv9x@host`` is hidden. It is taken there alone: the run after the first segment,
-# past its first "=" or a further "@", still stops at every "%", so a percent-encoded password is
-# read only where every "%" it holds is in its first segment, and the rest are residuals, stated
-# with the others below. An encoded separator still stops the first segment, for the reason a
+# ``redis://:p%40Kv9x@host`` is hidden. The run after an empty user's first segment still stops at
+# every "%", so a "%" there ends the reading as any stop does; the residuals below say what that
+# leaves printed. An encoded separator still stops the first segment, for the reason a
 # literal "|" does, below, and an encoded "," for the reason a literal one does: taken, it read
 # ``smtp://:587%2Ccc=admin@corp`` as a password and named the wrong host (code review). It still
 # stops at "[" and "]", so it never crosses a placeholder: taking them was tried and declined,
@@ -1373,17 +1372,21 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # label to the member pass. And a "|" it took, as in ``redis://:Tk|mrn@h``, was a separator the PHI
 # pass of a second handler no longer read, so an unlabelled value elsewhere in the token, which that
 # pass had hidden, printed (code review, round 4). The lookbehind ``(?<=//:)`` is what tells the two
-# cases apart. Residuals, at least these: a password whose own "@" is followed, before the host's
-# "@", by a character the run after the first segment stops at (the class above: at least
-# ``; ? # & , ( ) | ^ ~ { } < > [ ] %`` and a quote, not "=") is cut at that "@" and its tail
-# prints, as the whole tail did before, so ``postgres://svc:Kv9x@Zq7;w@db`` prints ``Zq7;w`` and
-# ``redis://:p%40s@Kv9x%41@host`` prints ``Kv9x%41``; and an empty user's password holding one of
-# those, other than a "%" in its first segment, or holding an encoded HL7 separator, is not read at
-# all, as before #5386, so ``redis://:p;ss@host``, ``redis://:p%7Css@host`` and
-# ``redis://:p=s%40Kv9x@host`` print whole. An "=" is not one of those: the run after the first
-# segment may hold it, so ``redis://:p=ss@host`` is read and hidden. Both count a character an
-# earlier filter wrote: on the log chain the PHI pass runs first, so a password holding a date- or
-# name-shaped run reaches this pass holding ``[redacted]``, and
+# cases apart. THE RESIDUALS FOLLOW FROM ONE RULE. The first segment, then the run after it, each
+# take characters up to the first one their class stops at, and the match ends at the last "@"
+# taken; where none was taken, nothing is read. An empty user's first segment hands over to the
+# run at "=" or "@"; at any other character it stops at, the run, whose class stops there too,
+# takes nothing. The run's class is the one above: at least ``; ? # & , ( ) | ^ ~ { } < > [ ] %``
+# and a quote, not "=". So, at least: a stop character after the password's own "@" cuts the
+# password at the last "@" before it, and the rest prints, so ``postgres://svc:Kv9x@Zq7;w@db``
+# prints ``Zq7;w`` and ``redis://:p%40s@Kv9x%41@host`` prints ``Kv9x%41``. With a user the narrow
+# pass made that same cut before #5386; an empty user's password printed whole. And an empty
+# user's password with a stop character before its first "@" is not read at all, a "%" counting
+# there once past an "=", so ``redis://:p;ss@host``, ``redis://:p%7Css@host``,
+# ``redis://:p;x@y;z@host`` and ``redis://:p=s%40Kv9x@host`` print whole, as before #5386. An "="
+# alone stops nothing, so ``redis://:p=ss@host`` is read and hidden. Both cases count a character
+# an earlier filter wrote: on the log chain the PHI pass runs first, so a password holding a
+# date- or name-shaped run reaches this pass holding ``[redacted]``, and
 # ``redis://:Zq7-19800505-Kv9x@host`` prints ``Zq7-`` and ``-Kv9x`` (code review, round 4).
 #
 # AN EMPTY USER'S FIRST SEGMENT MAY BE EMPTY (``*+``), so ``redis://:=Pw@db`` and ``redis://:@Pw@db``
@@ -2242,12 +2245,13 @@ def _run(
     masked at its end, which only the tracing reads.
 
     ``wide`` False leaves out the widened DSN pass (BACKLOG #5386). :func:`_union` passes it only
-    on the probe its shortcut is decided on, and says why there. EVERY OTHER RUN THE UNION MAKES
-    TAKES THE WIDENED PASS: the shipped reading alone, where the probe matched nothing and the
-    shortcut returns it; both traced readings, where the probe matched; and the reading before
-    alone, on an untraceable line. :func:`scrub_credentials`'s own run, on a line it sends to no
-    union, takes it too. So the pass also runs where the union returns its reading before whole:
-    on a line where the shipped reading would hide a member key's ";", and on an untraceable one.
+    on the probe its shortcut is decided on, and says why there. Every other run the union makes
+    today takes the widened pass wherever ``_DSN_HINT`` admits the line: at least the shipped
+    reading alone, where the probe matched nothing and the shortcut returns it; both traced
+    readings, where the probe matched; and the reading before alone, on an untraceable line.
+    :func:`scrub_credentials`'s own run, on a line it sends to no union, takes it too. So the pass
+    also runs where the union returns its reading before whole: on a line where the shipped
+    reading would hide a member key's ";", and on an untraceable one.
     The widened pattern holds no camelCase fragment, so :func:`_pre_camel` leaves it as it is and
     both readings apply the same pattern. Its run does not cross a camelCase label only the shipped
     reading reads, because every segment of the widened match stops at a label word

@@ -19,8 +19,8 @@ import pytest
 
 from messagefoundry import secretscrub as scrub_mod
 from messagefoundry.logging_setup import scrub_log_text
-from messagefoundry.secretscrub import scrub_credentials
-from messagefoundry.support.redact import redact_log_line
+from messagefoundry.secretscrub import CREDENTIAL_PLACEHOLDER, scrub_credentials
+from messagefoundry.support.redact import REDACTION_PLACEHOLDER, redact_log_line
 
 _ENTRY_POINTS: tuple[Callable[[str], str], ...] = (
     scrub_credentials,
@@ -101,22 +101,24 @@ def test_the_bundle_reading_the_log_hides_the_value_the_declined_semicolon_readi
     assert secret not in redact_log_line(scrub_log_text(line))
 
 
-#: KNOWN RESIDUALS, pinned as printed so the comment on ``secretscrub._WIDE_DSN_PASSWORD`` cannot
-#: drift back to saying a percent-encoded password-only DSN is read wherever its "%" sits; that
-#: comment states the rule. Each line with what an entry point prints of it, ``{placeholder}``
-#: standing for that entry point's own. A red here means the reading changed: fix the comment
-#: with it.
+@pytest.mark.parametrize("tail", ["", ";UID=u;PWD=p"])
+def test_known_residual_a_value_after_a_dsn_label_with_no_semicolon_in_the_password(
+    tail: str,
+) -> None:
+    """The residual the test above names, pinned as printed, as it printed on ``origin/main``."""
+    line = "cfg accessToken=redis://:Kv9@cache,userPwd='Sec_77;PWD='" + tail
+    assert "Sec_77" in redact_log_line(scrub_log_text(line))
+
+
+#: KNOWN RESIDUALS: the two "%" lines the comment on ``secretscrub._WIDE_DSN_PASSWORD`` quotes,
+#: each with what an entry point prints of it, ``{placeholder}`` standing for that entry point's
+#: own. This pins the outputs, not the comment's text: a red means the reading changed, and the
+#: comment must change with it.
 _PERCENT_AFTER_FIRST_SEGMENT = (
-    (
-        "connect redis://:p=s%40Kv9x@db.invalid failed",
-        "connect redis://:p=s%40Kv9x@db.invalid failed",
-    ),
-    (
-        "connect redis://:p%40s@Kv9x%41@db.invalid failed",
-        "connect redis://:{placeholder}@Kv9x%41@db.invalid failed",
-    ),
+    ("redis://:p=s%40Kv9x@host", "redis://:p=s%40Kv9x@host"),
+    ("redis://:p%40s@Kv9x%41@host", "redis://:{placeholder}@Kv9x%41@host"),
 )
-_PLACEHOLDERS = ("<redacted>", "<redacted>", "[REDACTED]")
+_PLACEHOLDERS = (CREDENTIAL_PLACEHOLDER, CREDENTIAL_PLACEHOLDER, REDACTION_PLACEHOLDER)
 
 
 @pytest.mark.parametrize(
@@ -126,7 +128,7 @@ _PLACEHOLDERS = ("<redacted>", "<redacted>", "[REDACTED]")
 def test_known_residual_a_percent_after_the_first_segment_is_printed(
     line: str, printed: str, call: Callable[[str], str], placeholder: str
 ) -> None:
-    assert call(line) == printed.format(placeholder=placeholder)
+    assert call(line) == printed.replace("{placeholder}", placeholder)
 
 
 def test_a_semicolon_separated_address_list_keeps_its_host() -> None:
