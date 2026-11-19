@@ -252,15 +252,16 @@ $ledgerRef = $ledgerPinned.Ref; $ledgerSha = $ledgerPinned.Sha
 # BACKLOG in their names and `## N.` headings of their own (measured 2026-11-19 on the vault's
 # origin/main: two such files, under docs/releases/ and docs/security/handoff/). Matching the word
 # anywhere under docs/ let those headings join the namespace as items, so a key the ledger lacks
-# would take a plan step's text as its banner. Every .md file under docs/archive/backlog/ is read,
-# whatever its name: dropping an archive file would turn its CLOSED items into NO-ITEM silently.
+# would take a plan step's text as its banner. Under docs/archive/backlog/ a file is read when its
+# name matches BACKLOG*.md, the vault checker's own location glob; a README or notes file there is
+# not a ledger, and since the archive sorts first, its headings would shadow live items.
 # ---------------------------------------------------------------------------------------------
 #
 # `-z` because without it git QUOTES a path holding a non-ASCII byte or a control character, and a
 # quoted name is not a path git show can read. pwsh splits native output on newlines, so rejoin on
 # newline before splitting on NUL. A FAILED ls-tree REFUSES, for the reason a failed git show does.
 $treeNames = (@(Invoke-NamespaceGit $ledgerRoot @('ls-tree', '-r', '-z', '--name-only', $ledgerSha, '--', 'docs/BACKLOG.md', 'docs/archive/backlog/') "the tree of $ledgerRef ($ledgerSha) in $ledgerRoot" "not read") -join "`n") -split "`0"
-$backlogFiles = @($treeNames | Where-Object { $_ -like '*.md' })
+$backlogFiles = @($treeNames | Where-Object { ($_ -split '/')[-1] -clike 'BACKLOG*.md' })
 if (-not $backlogFiles.Count) {
     throw "no backlog file found on $ledgerRef ($ledgerSha) in ${ledgerRoot}: cannot adjudicate any key against a namespace that was not read.$remedy"
 }
@@ -295,9 +296,18 @@ $OPEN_GLYPH = [ordered]@{}
 $OPEN_GLYPH[[char]::ConvertFromUtf32(0x1F522)] = "prioritized"
 $OPEN_GLYPH[[char]::ConvertFromUtf32(0x1F6A7)] = "in progress"
 
+# A STATUS IS A LINE THAT OPENS WITH ONE: `> `, the glyph, an optional variation selector, a space --
+# owed_ledger_acts.py's `_BANNER`, restating the vault ledger's grammar. A glyph anywhere else in the
+# banner run is decoration or prose, and the vault ledger uses the declined glyph that way inside
+# items that are open (measured 2026-11-19: "not started. <declined glyph> OPEN ON EVERY GATE
+# MEASURED"). Matching it anywhere read those items CLOSED and printed a release line for open work.
+$STATUS_LINE = [regex]('(?m)^>\s(?<g>' + ((@($CLOSED_GLYPH.Keys) + @($OPEN_GLYPH.Keys) | ForEach-Object { [regex]::Escape($_) }) -join '|') + ')\uFE0F?\s')
+
 # A do-not-rebuild banner is prose, so it is matched on the few phrasings that assert the LANDING
 # ITSELF. A bare "do not build" is deliberately absent: a note reading "DO NOT BUILD half B" is
-# scope, not a landing, and #340's claim says exactly that about work nobody has done.
+# scope, not a landing, and #340's claim says exactly that about work nobody has done. CASE MATTERS:
+# the landing banners are written in capitals, while the vault ledger carries "do not rebuild the
+# endpoint" and "do not rebuild them" as SCOPE inside open items (measured 2026-11-19).
 $LANDED_BANNER = @(
     'DO NOT REBUILD'
     'THE BUILD HAS LANDED'
@@ -461,28 +471,29 @@ foreach ($f in $files) {
 
     $lead = Get-LeadingQuote $block.Text
     $bannerState = ""; $bannerWhy = ""
+    $status = @([regex]::Matches($lead, $STATUS_LINE) | ForEach-Object { $_.Groups['g'].Value })
+    $openAt = @($status | Where-Object { $OPEN_GLYPH.Contains($_) })
 
-    foreach ($g in $CLOSED_GLYPH.Keys) {
-        if ($lead.Contains($g)) { $bannerState = "CLOSED/" + $CLOSED_GLYPH[$g]; break }
+    # CLOSED only where a closed status line stands and no open one does -- the vault's own verdict.
+    if (-not $openAt.Count) {
+        foreach ($g in $CLOSED_GLYPH.Keys) {
+            if ($status -contains $g) { $bannerState = "CLOSED/" + $CLOSED_GLYPH[$g]; break }
+        }
     }
     if (-not $bannerState) {
         foreach ($p in $LANDED_BANNER) {
-            if ([regex]::IsMatch($lead, $p, 'IgnoreCase')) {
+            if ([regex]::IsMatch($lead, $p)) {
                 $bannerState = "LANDED-BANNER"
                 # Quote the banner's own sentence back, so the verdict carries the observation it
                 # rests on rather than a label the reader must take on trust.
-                $line = ($lead -split "`n" | Where-Object { [regex]::IsMatch($_, $p, 'IgnoreCase') } | Select-Object -First 1)
+                $line = ($lead -split "`n" | Where-Object { [regex]::IsMatch($_, $p) } | Select-Object -First 1)
                 $bannerWhy = ($line -replace '^\s*>\s*', '') -replace '\*', ''
                 $bannerWhy = $bannerWhy.Trim()
                 break
             }
         }
     }
-    if (-not $bannerState) {
-        foreach ($g in $OPEN_GLYPH.Keys) {
-            if ($lead.Contains($g)) { $bannerState = "OPEN/" + $OPEN_GLYPH[$g]; break }
-        }
-    }
+    if (-not $bannerState -and $openAt.Count) { $bannerState = "OPEN/" + $OPEN_GLYPH[$openAt[0]] }
     if (-not $bannerState) { $bannerState = "NO-BANNER" }
 
     if ($bannerState -like 'CLOSED/*' -or $bannerState -eq 'LANDED-BANNER') {
@@ -539,8 +550,14 @@ if ($Json) {
 }
 
 if (-not $mainIsRemote) {
-    Write-Host "WARNING: origin/main is not present on this clone; every verdict below that rests on it was taken against LOCAL main." -ForegroundColor Yellow
-    Write-Host "         A banner that has landed but not been fetched reads as absent, which HOLDS releasable claims." -ForegroundColor Yellow
+    if ($LedgerRepo) {
+        # The banners came from the ledger checkout's origin/main, which has no fallback.
+        Write-Host "WARNING: origin/main is not present on this clone; the ahead counts and citations below were taken against LOCAL main." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "WARNING: origin/main is not present on this clone; every verdict below was taken against LOCAL main." -ForegroundColor Yellow
+        Write-Host "         A banner that has landed but not been fetched reads as absent, which HOLDS releasable claims." -ForegroundColor Yellow
+    }
     Write-Host ""
 }
 

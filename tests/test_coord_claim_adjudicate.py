@@ -805,7 +805,9 @@ def test_a_ledger_repo_that_is_not_a_git_repository_refuses(repo: Path, tmp_path
     write_claim(repo, "60", tmp_path / "gone", "seat")
     plain = tmp_path / "not-a-repo"
     plain.mkdir()
-    proc = adjudicate(repo, "-Json", "-LedgerRepo", str(plain))
+    # A ceiling, so an ancestor of the temp directory that is itself a repository cannot answer.
+    env = dict(os.environ, GIT_CEILING_DIRECTORIES=str(tmp_path))
+    proc = _adjudicate_env(repo, env, "-Json", "-LedgerRepo", str(plain))
     combined = _flat(proc.stderr + proc.stdout)
     assert proc.returncode != 0, combined
     assert "git rev-parse exited" in combined, combined
@@ -854,20 +856,43 @@ def test_the_blocking_roll_up_strips_a_banner_state_holding_a_space(
     assert "item reads" not in proc.stdout, proc.stdout
 
 
-def test_an_archive_file_without_backlog_in_its_name_is_still_read(
-    repo: Path, vault: Path, tmp_path: Path
+def test_an_archive_file_not_named_backlog_does_not_shadow_the_ledger(
+    repo: Path, tmp_path: Path
 ) -> None:
-    """A guard on the narrowing, not a trip on origin/main (which read it too): every .md file under
-    docs/archive/backlog/ belongs to the namespace, so its CLOSED items are never silently NO-ITEM."""
-    backlog(repo, STUB)
-    unmerged_branch(repo, "seat")
-    write_claim(repo, "66", tmp_path / "gone", "seat")
+    """MUST TRIP on origin/main, which read every docs/ file whose path held the word. The archive
+    sorts before docs/BACKLOG.md, so a README there numbering its own sections would shadow live
+    items. Only BACKLOG*.md, the vault checker's own glob, is a ledger file; the archived
+    BACKLOG-CLOSED.md is still read (test_the_archived_backlog_file_is_read_too)."""
     _publish(
-        vault,
-        "docs/archive/backlog/closed-2026-12.md",
-        f"# Closed\n\n## 66. Archived later\n\n> {RETIRED} retired\n\nbody\n",
+        repo,
+        "docs/archive/backlog/README.md",
+        f"# How to archive\n\n## 68. Archive procedure\n\n> {SHIPPED} done\n",
     )
-    assert verdicts(repo, "-LedgerRepo", str(vault))["66"] == "SUPERSEDED"
+    backlog(repo, f"## 68. Live open item\n\n> {PRIORITIZED} open\n\nbody\n")
+    unmerged_branch(repo, "seat")
+    write_claim(repo, "68", tmp_path / "gone", "seat")
+    assert verdicts(repo)["68"] == "BLOCKING"
+
+
+@pytest.mark.parametrize(
+    "lead",
+    [
+        # The declined glyph as decoration mid-line inside an item whose status line reads OPEN.
+        f"> {IN_PROGRESS} in progress\n> **Filed -- not started. {DECLINED} OPEN ON EVERY GATE.**",
+        # "do not rebuild" as SCOPE, in lower case, inside an open item.
+        f"> {PRIORITIZED} open\n> Build the pane; do not rebuild the endpoint.",
+    ],
+)
+def test_vault_banner_shapes_that_are_not_a_closure_stay_blocking(
+    repo: Path, tmp_path: Path, lead: str
+) -> None:
+    """MUST TRIP on origin/main, which matched a CLOSED glyph anywhere in the banner run and the
+    landing phrases in any case. Both shapes stand in the vault ledger inside open items (measured
+    2026-11-19), and each read SUPERSEDED there: a printed release line for open, unbuilt work."""
+    backlog(repo, f"## 69. Open thing\n\n{lead}\n\nbody\n")
+    unmerged_branch(repo, "seat")
+    write_claim(repo, "69", tmp_path / "gone", "seat")
+    assert verdicts(repo)["69"] == "BLOCKING"
 
 
 def test_a_ledger_repo_with_no_item_heading_refuses(

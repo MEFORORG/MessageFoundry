@@ -1061,8 +1061,8 @@ accumulates commits from every item the seat ever touched, so branch containment
 a whole seat at once, and a long-lived seat branch never clears.
 
 **It reads the ledger from the checkout `-LedgerRepo` names (BACKLOG #5480),** because the ledger
-is in the vault (`CLAUDE.md` section 5); without `-LedgerRepo` the tool refuses. Every banner is
-read from that checkout's `origin/main`, pinned to one SHA that the report prints beside the
+is in the vault (`CLAUDE.md` section 5). Without `-LedgerRepo` it reads this repository's stub,
+which holds no item, and refuses. With it, every banner is read from that checkout's `origin/main`, pinned to one SHA that the report prints beside the
 checkout's path, and a checkout with no `origin/main` refuses rather than read its local `main`. The
 claims, branches and citations stay this repository's. Fetch the vault checkout first: a banner it
 has not fetched reads as absent.
