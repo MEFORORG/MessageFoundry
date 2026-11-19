@@ -460,10 +460,12 @@ async def test_x12_a_clean_read_reports_nothing_unhandled(caplog: pytest.LogCapt
 async def test_x12_a_reply_its_charset_cannot_hold_is_replaced_and_sent(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # The engine's own reply is the fault here, not the partner's bytes. In the shipped code it
-    # fell to the last-resort arm and would have read as `framing_error`, closing unanswered, so a
-    # sender waiting for the reply would resend an interchange already stored. The shared reply
-    # policy (BACKLOG #5799) replaces the character and sends, as MLLP and raw TCP do.
+    # The engine's own reply is the fault here, not the partner's bytes. Before BACKLOG #5958 it
+    # fell to the last-resort arm and read as `framing_error`, closing unanswered, so a sender
+    # waiting for the reply would resend an interchange already stored. The shared reply policy
+    # (BACKLOG #5799) replaces the character and sends, as MLLP and raw TCP do. Beside the #5958
+    # test above, this one pins that a pipelined second interchange is still handled and that
+    # nothing logs at ERROR.
     source = _replying(lambda: _x12(encoding="ascii"))
     seen: list[bytes] = []
 
