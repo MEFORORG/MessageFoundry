@@ -2,7 +2,14 @@
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 import * as assert from "assert";
 
-import { diffMessages, parseEncoding, parseMessage, type DiffCell } from "../../hl7diff";
+import {
+  MAX_LCS_CELLS,
+  diffMessages,
+  lcsAlign,
+  parseEncoding,
+  parseMessage,
+  type DiffCell,
+} from "../../hl7diff";
 
 // Segments joined by \r (the real HL7 terminator) — diffMessages must tolerate this and \n / \r\n.
 function hl7(...segments: string[]): string {
@@ -142,5 +149,60 @@ suite("hl7diff.diffMessages — deletion and non-HL7 fallback", () => {
     // No shared identity → the line is removed and the placeholder added.
     assert.ok(diff.before.some((c) => c.seg && c.status === "removed"));
     assert.ok(diff.after.some((c) => c.seg && c.status === "added"));
+  });
+});
+
+// BACKLOG #5940: the alignment ran a dense (n+1) by (m+1) table on the Extension Host thread, so a
+// large multi-segment sample could freeze VS Code or exhaust its memory. Each large case below
+// would have needed hundreds of millions of cells.
+suite("hl7diff.lcsAlign stays bounded on large inputs (BACKLOG #5940)", () => {
+  test("a local edit in a large message costs only the edited middle, and aligns exactly", () => {
+    const n = 30_000;
+    const keys = Array.from({ length: n }, (_, k) => `OBX:${k + 1}`);
+    const after = [...keys.slice(0, n / 2), "NTE", ...keys.slice(n / 2)];
+    const started = Date.now();
+    const ops = lcsAlign(keys, after);
+    assert.ok(Date.now() - started < 2000, "trimmed alignment is linear");
+    assert.strictEqual(ops.length, n + 1);
+    assert.deepStrictEqual(ops[n / 2], { a: null, b: n / 2 });
+    assert.deepStrictEqual(ops[n / 2 + 1], { a: n / 2, b: n / 2 + 1 });
+    assert.strictEqual(ops.filter((op) => op.a !== null && op.b !== null).length, n);
+  });
+
+  test("two long, wholly different lists fall back to a linear alignment past the cap", () => {
+    const n = 20_000;
+    assert.ok((n + 1) * (n + 1) > MAX_LCS_CELLS);
+    const a = Array.from({ length: n }, (_, k) => `ZA:${k + 1}`);
+    const b = Array.from({ length: n + 1 }, (_, k) => (k === 7 ? "ZA:8" : `ZB:${k + 1}`));
+    const started = Date.now();
+    const ops = lcsAlign(a, b);
+    assert.ok(Date.now() - started < 2000, "fallback alignment is linear");
+    // Every index on each side appears exactly once, in order, and a match is only of equal keys.
+    assert.deepStrictEqual(
+      ops.filter((op) => op.a !== null).map((op) => op.a),
+      a.map((_, k) => k),
+    );
+    assert.deepStrictEqual(
+      ops.filter((op) => op.b !== null).map((op) => op.b),
+      b.map((_, k) => k),
+    );
+    for (const op of ops) {
+      if (op.a !== null && op.b !== null) {
+        assert.strictEqual(a[op.a], b[op.b]);
+      }
+    }
+    assert.ok(ops.some((op) => op.a === 7 && op.b === 7), "an equal key at one position still matches");
+  });
+
+  test("under the cap the LCS still aligns an insert and a delete as add and remove", () => {
+    const ops = lcsAlign(["MSH", "PID", "OBX:1", "OBX:2"], ["MSH", "PID", "NTE", "OBX:2", "ZZZ"]);
+    assert.deepStrictEqual(ops, [
+      { a: 0, b: 0 },
+      { a: 1, b: 1 },
+      { a: 2, b: null },
+      { a: null, b: 2 },
+      { a: 3, b: 3 },
+      { a: null, b: 4 },
+    ]);
   });
 });
