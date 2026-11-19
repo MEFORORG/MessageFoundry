@@ -1409,6 +1409,7 @@ def test_a_failure_part_way_keeps_a_bad_verdict_already_reached(
     # with the refusal, as its cause, instead.
     assert not [r for r in caplog.records if "could not check the signatures" in r.getMessage()]
     assert isinstance(refused.value.__cause__, RuntimeError)
+    assert "after the first 1 (RuntimeError)" in str(refused.value)
 
     # Control: the same failure with no proof reached first still loads, with the ERROR.
     calls = 0

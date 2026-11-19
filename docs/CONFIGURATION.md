@@ -2450,9 +2450,11 @@ OpenSSL refuses to take a CRL from such a CA, so every handshake judged by that 
 with `key usage does not include CRL signing`. A CA with no key usage extension is not refused.
 A hop that checks only the peer's own certificate does not refuse that CRL. There, a root that
 signs only intermediates is never judged by its own CRL, so the file can still pass. Where the
-build succeeds, it logs a WARNING that names the first such CRL in the file. Sign the CRL with a
-CA whose key usage includes `cRLSign`, or reissue the CA with it. The running-hop reload and the
-expiry scan do not make this check.
+build succeeds, it logs a WARNING that names the first such CRL in the file. On a whole-chain
+hop, reissue that CA with `cRLSign` and give the setting a CRL it signs, or, where no peer's chain
+runs through it, remove it from the hop's CA setting. On a leaf hop, a CRL signed by a CA whose
+key usage includes `cRLSign` also does. The running-hop reload and the expiry scan do not make
+this check.
 
 A CRL whose signature the engine can neither confirm nor prove bad is not refused for its
 signature. Where the build succeeds, the engine logs one WARNING for the file, which names the
@@ -2515,7 +2517,7 @@ before the failure still count. These refusals apply in this order, and the firs
 wins: a CRL proved badly signed; on a hop that checks the whole chain, at least
 `[api].tls_client_crl_file` and an inbound listener's `tls_crl_file`, a CRL from a CA whose key
 usage lacks `cRLSign`, as above; and on such a hop, the rule that each loaded CA has a CRL of its
-own. Where none applies and the build
+own. A refusal reached after the failure also says the check failed. Where none applies and the build
 succeeds, the engine logs an ERROR that says the check failed and how many CRLs it judged, and the
 WARNING above reports the CRLs it judged and could not confirm.
 

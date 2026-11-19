@@ -656,10 +656,25 @@ _CRL_UNCONFIRMED = (
     "signature failure' or 'unable to get certificate CRL', check this file first"
 )
 
-#: The fix a whole-chain refusal and a leaf hop's WARNING give for a CRL from a CA without cRLSign.
+#: The fix a leaf hop's WARNING gives for a CRL from a CA without cRLSign.
 _CRL_SIGN_REMEDY = (
     "Give this setting a CRL signed by a CA whose key usage includes cRLSign, or reissue that CA "
     "with it"
+)
+
+#: The fix a whole-chain refusal gives for it. Another CA's CRL is no fix there: the own-CRL rule
+#: wants a CRL that CA's own key signed.
+_CRL_SIGN_REMEDY_CHAIN = (
+    "Reissue that CA with cRLSign in its key usage and give this setting a CRL it signs, or, where "
+    "no peer's chain runs through it, remove it from this hop's CA setting"
+)
+
+#: Added to a refusal reached after the signature judgment failed part way, so the failure is
+#: reported with the refusal rather than in a line of its own. Arguments: how many CRLs were
+#: judged, the exception type.
+_CRL_JUDGMENT_FAILED_TOO = (
+    ". The engine could not check the signatures of the CRL(s) after the first %d (%s), so that "
+    "is no verdict on them"
 )
 
 
@@ -697,7 +712,8 @@ def _check_crl_signatures(
     CRL from a CA whose key usage lacks ``cRLSign``, and a whole-chain check judges each listed CA
     by its own CRL, so every handshake through that CA would fail. Third, ``refusal``, the caller's
     own reason, where given (vault BACKLOG #5511). Where the judgment failed part way, each refusal
-    is raised from that failure, so the defect still shows in the traceback. OpenSSL checks a CRL's
+    says so (:data:`_CRL_JUDGMENT_FAILED_TOO`) and is raised from that failure, so the defect is
+    reported with it. OpenSSL checks a CRL's
     signature only at the handshake. Before #2905 a badly signed file built clean and then failed
     every handshake it judged, with a TLS error that does not name the CRL.
 
@@ -738,16 +754,26 @@ def _check_crl_signatures(
         # The hop's CA list can hold anything OpenSSL loads, and ``cryptography`` refuses some of
         # that with exception types of its own. The handshake still checks every signature.
         failure = exc
+    too = (
+        "" if failure is None else _CRL_JUDGMENT_FAILED_TOO % (len(judged), type(failure).__name__)
+    )
     if (bad := next((s for s in judged if s.state == "bad"), None)) is not None:
         raise ValueError(
             f"{label}: {bad.where} {PROVEN_BAD_SIGNATURE}. Give this setting the CRL that CA "
-            "signed, or remove this CRL if a good one from that issuer is already in the file"
+            f"signed, or remove this CRL if a good one from that issuer is already in the file{too}"
         ) from failure
     if chain and (unable := next((s for s in judged if s.without_crl_sign), None)) is not None:
-        raise ValueError(f"{label}: {unable.where} {NO_CRL_SIGN}. {_CRL_SIGN_REMEDY}") from failure
+        raise ValueError(
+            f"{label}: {unable.where} {NO_CRL_SIGN}. {_CRL_SIGN_REMEDY_CHAIN}{too}"
+        ) from failure
     if refusal is not None:
-        raise ValueError(f"{label}: {refusal}") from failure
-    return _CrlSignatureFindings(crl_fingerprint(pem), tuple(judged), failure)
+        raise ValueError(f"{label}: {refusal}{too}") from failure
+    try:
+        return _CrlSignatureFindings(crl_fingerprint(pem), tuple(judged), failure)
+    finally:
+        # The failure's traceback holds this frame, so the frame must not hold the failure: the
+        # two would make a cycle keeping ``pem`` and ``anchors`` alive until the collector runs.
+        del failure
 
 
 def _log_crl_signature_findings(
@@ -775,7 +801,7 @@ def _log_crl_signature_findings(
             label,
             type(failure).__name__,
             len(judged),
-            exc_info=(type(failure), failure, failure.__traceback__),
+            exc_info=failure,
         )
     unable = next((s for s in judged if s.without_crl_sign), None)
     if unable is not None and first(("no-crl-sign", unable.where)):

@@ -62,6 +62,7 @@ _TLS_LOGGER = "messagefoundry.config.tls_policy"
 def _fresh_registry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(loaded_crls, "_HELD", weakref.WeakKeyDictionary())
     monkeypatch.setattr(loaded_crls, "_UNCONFIRMED", {})
+    monkeypatch.setattr(pki_module, "_ENTRY_VERDICTS", {})
 
 
 def _ku(*, crl_sign: bool) -> x509.KeyUsage:
@@ -465,6 +466,8 @@ def test_a_whole_chain_crl_sign_refusal_after_a_failure_logs_no_error(
     ):
         harden_crl_check(whole_chain, str(crl), setting=_SETTING, chain=True)
     assert isinstance(refused.value.__cause__, RuntimeError)
+    assert "after the first 1 (RuntimeError)" in str(refused.value)
+    assert "remove it from this hop's CA setting" in str(refused.value)
     assert not [r for r in caplog.records if r.name == _TLS_LOGGER]
 
     with caplog.at_level(logging.WARNING, logger=_TLS_LOGGER):
