@@ -94,7 +94,8 @@ async def test_a_demoted_runner_refuses_every_run_state_door(
         assert runner._outbound_paused == set()
         # A resend refusal names the downed graph, not the start it refuses.
         assert "graph is not running" in _outbound_down_detail(runner, _OUT)
-        assert "graph is not running" in _inbound_down_detail(runner, _IN)
+        inbound = _inbound_down_detail(runner, _IN)
+        assert "graph is not running" in inbound and "resend through" not in inbound
         # An inbound stop has nothing to undo on a downed graph, so it is not refused.
         await runner.stop_inbound(_IN)
         # The pause the old stop_outbound recorded here outlived the teardown that had already
@@ -413,9 +414,14 @@ async def test_a_lease_lost_node_names_the_lease_in_its_alert_log_and_resend_ref
         await runner.stop_inbound(
             _IN
         )  # an operator-stopped inbound, so an upload resend is refused
-        for detail in (_outbound_down_detail(runner, _OUT), _inbound_down_detail(runner, _IN)):
-            assert "lease" in detail and "leader" in detail
-            assert "graph is not running" not in detail and "start it" not in detail
+        detail = _outbound_down_detail(runner, _OUT)
+        assert "lease" in detail and "leader" in detail
+        assert "graph is not running" not in detail and "start it" not in detail
+        # An uploaded file lives in this node's uploads_dir, so the upload resend names no remedy:
+        # the leader would not hold the file.
+        detail = _inbound_down_detail(runner, _IN)
+        assert "lease" in detail and "refused here" in detail
+        assert "leader" not in detail and "start it" not in detail
         caplog.set_level("INFO")
         await _alert_control_action(engine, "restart_inbound", _IN, default_target=False)
         await _alert_control_action(engine, "restart_outbound", _OUT, default_target=False)
