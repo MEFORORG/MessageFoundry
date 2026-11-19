@@ -13,9 +13,10 @@
 # substitution with no default. The default `engine` service's comment says why; this key only
 # holds the value once so every service that reads it, at least the three engines and the
 # revocation-attestation-check service, aliases one copy.
-# Both required substitutions in this file (this one and the Postgres password) read the same
-# sources, and their messages name them in the same words. Supply both from one place: --env-file
-# replaces the .env beside compose.yaml, so a value kept in that .env goes unread once you pass it.
+# The required substitutions in this file, at least this one and the Postgres password, read the
+# same sources, and their messages name them in the same words. Supply them from one place:
+# --env-file replaces the .env beside compose.yaml, so a value kept in that .env goes unread once
+# you pass it.
 x-revocation-attested: &revocation-attested "${MEFOR_TLS_REVOCATION_ATTESTED:?required. serve refuses in-process TLS off loopback until you attest that your PKI enforces revocation for the certificates the engine serves and accepts (docs/SECURITY.md, API revocation gate). Set it to 1 only if that holds. Compose SUBSTITUTION reads at least the shell environment and the project .env, the .env beside compose.yaml unless --project-directory moves it; passing --env-file reads the named file INSTEAD of that .env -- an env_file: does NOT feed it}"
 
 # The engine image, named once: the revocation-attestation-check service must run the same image
@@ -234,6 +235,9 @@ services:
       - ALL
     security_opt:
       - no-new-privileges:true
+    # The image HEALTHCHECK probes the engine API, which this one-shot never serves.
+    healthcheck:
+      disable: true
     restart: "no"
 
   # --- Multi-node-ready local HA backend (OPT-IN; profile "ha") ------------------------------------

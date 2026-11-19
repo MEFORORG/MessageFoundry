@@ -1747,10 +1747,10 @@ function Set-ServiceLogonRight {
             $holders = @($value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
             # An exported row can hold an account NAME rather than the '*SID' form (BACKLOG #5401), so
             # a name is resolved and its SID compared too; read by SID alone, a held name re-adds it.
-            # SID tokens are compared first, so an already-held SID needs no lookup. A name that does
-            # not resolve is not this account. uninstall-service.ps1's Remove-ServiceLogonRight
-            # resolves a name the same way, and also matches the account's own name unresolved,
-            # because there the account may no longer translate.
+            # SID tokens, and the account's own name as given, are compared first, so either needs no
+            # lookup. A name that does not resolve is not this account. uninstall-service.ps1's
+            # Remove-ServiceLogonRight matches a holder the same ways, where the unresolved own-name
+            # match matters most, because there the account may no longer translate.
             $held = @($holders | Where-Object { $_ -eq ("*" + $sid) -or $_ -eq $sid -or $_ -eq $Account })
             if (-not $held) {
                 # -First 1 stops at the first match, so later names cost no lookup.

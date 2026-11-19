@@ -140,6 +140,14 @@ against one case that matters, described under
   and read topology A below for the revocation attestation `docker compose` requires.
 - **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
   — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set all three `image:` fields (`tls-dir`, `copy-tls` and `engine`) to your config-baked image.
+- **Both Kubernetes manifests need a ConfigMap you create:** `mefor-revocation-attestation`, key
+  `attested`, which feeds `MEFOR_TLS_REVOCATION_ATTESTED` with no default. Without it the kubelet
+  refuses the engine container with `CreateContainerConfigError`. Create it only if your PKI enforces
+  revocation ([SECURITY.md, API revocation gate](../docs/SECURITY.md#api-revocation-gate)):
+  `kubectl create configmap mefor-revocation-attestation --from-literal=attested=1`. The value must
+  read as true (`1`, `true`, `yes` or `on`). A value such as `0` passes the kubelet, and the engine
+  then exits 2 and the pod crash-loops: only `compose.yaml` checks the value before an engine starts,
+  with its `revocation-attestation-check` service.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
   Postgres-backed `replicas: 3` Deployment with `[cluster].enabled`, a PodDisruptionBudget, and
   lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)
