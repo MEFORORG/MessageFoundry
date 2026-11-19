@@ -16,6 +16,7 @@ All credentials here are synthetic.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -29,9 +30,20 @@ from messagefoundry.auth.notifications import (
     SecurityEvent,
 )
 from messagefoundry.auth.passwords import hash_password
-from messagefoundry.auth.service import AUTHORITY_SEAL_FAILED_ACTION, AuthService, _UserLookup
+from messagefoundry.auth.service import (
+    AUTHORITY_SEAL_FAILED_ACTION,
+    AUTHORITY_SEAL_UNVERIFIABLE_ACTION,
+    AuthService,
+    _SealCheck,
+)
 from messagefoundry.config.settings import AuthSettings
-from messagefoundry.store.row_seal import SESSION_KIND, USER_KIND, RowSealError
+from messagefoundry.store.row_seal import (
+    SESSION_KIND,
+    USER_KIND,
+    RowSealError,
+    RowSealUnverifiableError,
+    TransitSealUnavailableError,
+)
 from messagefoundry.store.store import MessageStore
 
 GOOD = "Synth3tic-Pass-Phrase!!"
@@ -234,24 +246,54 @@ async def test_two_concurrent_correct_reauths_flag_one_run_of_failures_once() ->
         await store.close()
 
 
-async def test_a_record_failing_its_seal_at_the_deferred_clear_is_reported_and_grants_nothing(
+def _forged(user_id: str) -> Exception:
+    return RowSealError(USER_KIND, user_id)
+
+
+def _unverifiable(user_id: str) -> Exception:
+    return RowSealUnverifiableError(USER_KIND, user_id)
+
+
+def _outage(user_id: str) -> Exception:
+    return TransitSealUnavailableError("synthetic outage")
+
+
+@pytest.mark.parametrize(
+    ("raised", "reported"),
+    [
+        (_forged, AUTHORITY_SEAL_FAILED_ACTION),
+        (_unverifiable, AUTHORITY_SEAL_UNVERIFIABLE_ACTION),
+        (_outage, None),
+    ],
+    ids=["forged", "unverifiable", "outage"],
+)
+async def test_a_refused_record_at_the_deferred_clear_is_reported_and_grants_nothing(
     monkeypatch: pytest.MonkeyPatch,
+    raised: Callable[[str], Exception],
+    reported: str | None,
 ) -> None:
-    """The clear's write is refused because the account's record fails its seal. Before the clear
-    was deferred that raise granted nothing; now it is reported as a seal failure, the rotated
-    session is ended, and the caller is told to sign in again, with no token handed back."""
+    """The clear's write is refused because the account's record fails its seal, cannot be
+    verified, or Vault transit does not answer. Before the clear was deferred that raise granted
+    nothing; now the answer is reported, the rotated session is ended, and the caller is told to
+    sign in again, with no token handed back. An Outage pages and writes no seal row."""
     store = await MessageStore.open(":memory:")
     try:
         service, notifier, identity, token = await _setup(store)
 
-        async def forged(user_id: str, **kwargs: Any) -> None:
-            raise RowSealError(USER_KIND, user_id)
+        async def refused(user_id: str, **kwargs: Any) -> None:
+            raise raised(user_id)
 
-        monkeypatch.setattr(store, "record_login_success", forged)
+        monkeypatch.setattr(store, "record_login_success", refused)
         out = await service.reauth(identity, GOOD, token=token)
         assert out.session_lost and not out.ok and out.token is None
-        assert len(await store.list_audit(action=AUTHORITY_SEAL_FAILED_ACTION)) == 1
+        for action in (AUTHORITY_SEAL_FAILED_ACTION, AUTHORITY_SEAL_UNVERIFIABLE_ACTION):
+            assert len(await store.list_audit(action=action)) == (action == reported)
         assert await store.list_sessions("u-bob") == [], "the rotated session was left live"
+        rows = [str(dict(r)["detail"]) for r in await store.list_audit(action="auth.reauth")]
+        refused_rows = [json.loads(d) for d in rows if "account_refused" in d]
+        assert len(refused_rows) == 1
+        assert refused_rows[0]["session_lost"] is True
+        assert refused_rows[0]["session_ended"] is True
         user = await store.get_user("u-bob")
         assert user is not None and user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
         assert not [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
@@ -259,26 +301,30 @@ async def test_a_record_failing_its_seal_at_the_deferred_clear_is_reported_and_g
         await store.close()
 
 
-async def test_a_reread_the_checked_loader_refuses_grants_nothing(
+async def test_a_reread_the_checked_read_fails_grants_nothing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The re-read finds a row there that the checked loader refuses, which that loader reports.
-    The re-auth grants nothing, as when the write is refused."""
+    """The re-read's checked read fails the account's record, which that read reports. The
+    re-auth grants nothing, as when the write is refused, and writes nothing."""
     store = await MessageStore.open(":memory:")
     try:
         service, _, identity, token = await _setup(store)
 
-        async def refused(user_id: str) -> _UserLookup:
-            return _UserLookup(None, True)
+        async def failed(user_id: str, listed: Any = None) -> _SealCheck:
+            return _SealCheck(failed=True)
+
+        async def never(user_id: str, **kwargs: Any) -> None:
+            raise AssertionError("the clear wrote over a record its re-read failed")
 
         real_elevated: Callable[..., Awaitable[Any]] = service._elevated
 
-        async def refuse_after_rotation(*args: Any, **kwargs: Any) -> Any:
+        async def fail_after_rotation(*args: Any, **kwargs: Any) -> Any:
             out = await real_elevated(*args, **kwargs)
-            monkeypatch.setattr(service, "_lookup_user", refused)
+            monkeypatch.setattr(service, "_checked_by_id", failed)
+            monkeypatch.setattr(store, "record_login_success", never)
             return out
 
-        monkeypatch.setattr(service, "_elevated", refuse_after_rotation)
+        monkeypatch.setattr(service, "_elevated", fail_after_rotation)
         out = await service.reauth(identity, GOOD, token=token)
         assert out.session_lost and not out.ok and out.token is None
         assert await store.list_sessions("u-bob") == []
@@ -288,10 +334,10 @@ async def test_a_reread_the_checked_loader_refuses_grants_nothing(
         await store.close()
 
 
-async def test_a_reread_that_finds_no_row_clears_nothing_and_says_missing(
+async def test_a_reread_that_finds_no_account_clears_nothing_and_says_missing(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """No row at the re-read is an account deleted meanwhile: logged as missing, not as a changed
+    """No account at the re-read, one deleted meanwhile: logged as missing, not as a changed
     lockout state, and nothing is written."""
     store = await MessageStore.open(":memory:")
     try:
@@ -299,13 +345,13 @@ async def test_a_reread_that_finds_no_row_clears_nothing_and_says_missing(
         decided = await store.get_user("u-bob")
         assert decided is not None
 
-        async def gone(user_id: str) -> _UserLookup:
-            return _UserLookup(None, False)
+        async def gone(user_id: str, listed: Any = None) -> _SealCheck:
+            return _SealCheck()
 
         async def never(user_id: str, **kwargs: Any) -> None:
             raise AssertionError("the clear wrote over an account the re-read did not find")
 
-        monkeypatch.setattr(service, "_lookup_user", gone)
+        monkeypatch.setattr(service, "_checked_by_id", gone)
         monkeypatch.setattr(store, "record_login_success", never)
         with caplog.at_level(logging.INFO, logger="messagefoundry.auth.service"):
             assert await service._clear_after_reauth(decided) == "kept"
