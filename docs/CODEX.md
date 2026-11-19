@@ -19,7 +19,11 @@ A link into that folder would break in every other clone.
 `scripts/codex/bridge.py` reads `.claude/settings.json` on **each event**.
 Matching command hooks run from their current source paths, with their arguments
 and timeouts. Removing or changing a source handler affects the next call.
-The bridge combines context and keeps a denial over an allowance.
+The bridge combines context. Among the hooks of one event that complete, it keeps
+a `hookSpecificOutput.permissionDecision` of deny over ask or allow, and a
+top-level `decision: block` or `continue: false` over later hooks. Every other
+`hookSpecificOutput` key but `additionalContext`, PermissionRequest's `decision`
+included, takes the last hook's value. The known gap below covers a fault.
 
 Codex calls shell hooks `Bash`, including PowerShell commands. The bridge also
 matches Claude's `PowerShell` name. Patch calls match `apply_patch`, `Edit`, and
@@ -31,14 +35,19 @@ failed commands report errors. The bridge does not silently claim they ran.
 A failed SessionStart hook, exit 2 included, is reported in `systemMessage` and
 the other hooks' context is kept, as in Claude Code.
 
-A fault is not fail-closed; this is a known gap. On every other event, at
-least a hook that crashes or times out, unreadable settings, a bad payload or a
-missing `.venv` end the bridge or its launcher with a non-zero exit that the
-registered line delivers to Codex as 1. Codex treats an exit other than 0 or 2
-as a non-blocking error, so the tool runs: the faulting guard does not block
-it, and a deny an earlier guard of the same event returned is lost with the
-bridge's output. A hook's deliberate exit 2 leaves the registered line as 2
-when it is run directly, because `invoke.ps1` ends its process with 2 for it.
+The bridge does not fail closed on a fault; this is a known gap. At least these
+end the bridge or its launcher with a non-zero exit, and no deny or block
+output, which the registered line delivers to Codex as 1: a hook that exits
+non-zero other than 2, or times out, on any event but SessionStart, and, on any
+event, unreadable settings, a bad payload or a missing `.venv`. The bridge then
+prints none of the event's output, so what earlier hooks returned, a deny
+included, is lost, and later hooks of the event do not run. How Codex handles
+that 1 is not measured here. The assumed behaviour is that Codex treats an exit
+other than 0 or 2 as a non-blocking error, so the event is not blocked: a
+PreToolUse fault lets the tool run, a PostToolUse fault loses the event's
+feedback, and an event with no tool, such as Stop or UserPromptSubmit, proceeds.
+A hook's deliberate exit 2 leaves the registered line as 2 when it is run
+directly, because `invoke.ps1` ends its process with 2 for it.
 Whether Codex's own launcher keeps that 2 is unverified; an outer
 `pwsh -Command` shell would report it as 1.
 

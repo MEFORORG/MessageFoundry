@@ -400,8 +400,9 @@ def dispatch(root: Path, payload: dict) -> dict:
                 completed.check_returncode()
             except (OSError, ValueError, subprocess.SubprocessError, HookBlocked) as exc:
                 # A failed SessionStart hook, exit 2 included, is a non-blocking error in Claude
-                # Code: the session starts with every other hook's context. Elsewhere it propagates,
-                # which is not fail-closed in Codex: docs/CODEX.md states the known gap.
+                # Code: the session starts with every other hook's context. Elsewhere it propagates:
+                # exit 2 becomes the block exit, and any other fault ends the bridge with no deny,
+                # which does not fail closed. docs/CODEX.md states the known gap.
                 if event != "SessionStart":
                     raise
                 label = " ".join(str(part) for part in (hook["command"], *hook.get("args", [])))
