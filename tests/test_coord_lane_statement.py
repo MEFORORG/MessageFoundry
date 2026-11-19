@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -70,9 +71,12 @@ def _env(root: Path | str | None = None) -> dict[str, str]:
 
 
 def _pwsh(
-    repo: Path, *args: str, root: Path | str | None = None
+    repo: Path, *args: str, root: Path | str | None = None, path_first: Path | None = None
 ) -> subprocess.CompletedProcess[str]:
-    """Run lane.ps1 in ``repo``, under ``_env(root)``."""
+    """Run lane.ps1 in ``repo``, under ``_env(root)``, with ``path_first`` put first on PATH."""
+    env = _env(root)
+    if path_first is not None:
+        env["PATH"] = str(path_first) + os.pathsep + env.get("PATH", "")
     return subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(_SCRIPT), *args],
         capture_output=True,
@@ -83,16 +87,15 @@ def _pwsh(
         encoding="utf-8",
         errors="replace",
         cwd=repo,
-        env=_env(root),
+        env=env,
         # Under pyproject's 60 s pytest-timeout, so a hung pwsh fails this test by name.
         timeout=45,
     )
 
 
-@pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    """A throwaway git repo with one commit, so ``git rev-parse`` answers."""
-    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+def _init_repo(path: Path) -> Path:
+    """A throwaway git repo at ``path`` with one commit, so ``git rev-parse`` answers."""
+    subprocess.run(["git", "init", "-q", str(path)], check=True)
     # Maintenance off for the reason test_coord_cloud_refusal.py's _template gives: the -Show test
     # otherwise sees the commit's background maintenance.lock vanish between its two snapshots
     # (CI run 44211257229, repo harness tests ubuntu-latest). It removes the writer, not a path.
@@ -102,11 +105,17 @@ def repo(tmp_path: Path) -> Path:
         ("maintenance.auto", "false"),
         ("gc.auto", "0"),
     ):
-        subprocess.run(["git", "-C", str(tmp_path), "config", k, v], check=True)
-    (tmp_path / "seed.txt").write_text("seed\n", encoding="utf-8")
-    subprocess.run(["git", "-C", str(tmp_path), "add", "seed.txt"], check=True)
-    subprocess.run(["git", "-C", str(tmp_path), "commit", "-qm", "seed"], check=True)
-    return tmp_path
+        subprocess.run(["git", "-C", str(path), "config", k, v], check=True)
+    (path / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(path), "add", "seed.txt"], check=True)
+    subprocess.run(["git", "-C", str(path), "commit", "-qm", "seed"], check=True)
+    return path
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> Path:
+    """A throwaway git repo with one commit, so ``git rev-parse`` answers."""
+    return _init_repo(tmp_path)
 
 
 def _lane_record(repo: Path) -> Path:
@@ -342,7 +351,8 @@ def _toplevel(repo: Path) -> str:
         ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--show-toplevel"],
         check=True,
         capture_output=True,
-        text=True,
+        # git writes UTF-8 whatever the locale, and a non-ASCII root must compare as git names it.
+        encoding="utf-8",
     ).stdout.strip()
 
 
@@ -379,26 +389,80 @@ def test_a_directory_with_no_work_tree_refuses_and_writes_nothing(repo: Path) ->
     assert not (repo / ".git" / "mefor-coord" / "lanes").exists()
 
 
-def test_a_directory_the_tree_ignores_refuses_and_writes_nothing(repo: Path) -> None:
-    """A removed worktree under the primary (.claude/worktrees/<name>, its .git gone) has git walk up
-    to the primary, so keying on that root would overwrite the primary's level. The directory is
-    ignored by the tree, so it refuses. The control is the tracked subdirectory test above."""
-    (repo / ".gitignore").write_text(".claude/worktrees/\n", encoding="utf-8")
+def _removed_worktree(repo: Path) -> Path:
+    """A folder under the primary's ignored .claude/worktrees/ container with no .git left."""
+    (repo / ".gitignore").write_text("/.claude/worktrees/\n", encoding="utf-8")
     stale = repo / ".claude" / "worktrees" / "gone"
     stale.mkdir(parents=True)
+    return stale
+
+
+def test_a_removed_worktree_under_the_container_refuses_and_writes_nothing(repo: Path) -> None:
+    """A removed worktree under the primary (.claude/worktrees/<name>, its .git gone) has git walk up
+    to the primary, so keying on that root would overwrite the primary's level. It refuses. The
+    controls are the tracked subdirectory test above and the ignored .venv test below."""
+    stale = _removed_worktree(repo)
     proc = _pwsh(stale, "-Free", "1", "-InFlight", "0")
     assert proc.returncode == 2, proc.stdout + proc.stderr
     assert "REFUSED" in proc.stderr and "ignored" in proc.stderr, proc.stderr
     assert not (repo / ".git" / "mefor-coord" / "lanes").exists()
 
 
-def test_a_tree_reached_through_a_junction_keys_on_the_path_the_caller_used(
+def test_an_ignored_directory_of_a_live_tree_keys_on_its_root(repo: Path) -> None:
+    """A session in .venv/Scripts is in the tree, ignored or not. It used to refuse as if it were a
+    removed worktree; it now lands in the same record as a statement from the root."""
+    (repo / ".gitignore").write_text(".venv/\n", encoding="utf-8")
+    assert _pwsh(repo, "-Free", "1", "-InFlight", "0").returncode == 0
+    at_root = json.loads(_lane_record(repo).read_text(encoding="utf-8-sig"))
+    scripts = repo / ".venv" / "Scripts"
+    scripts.mkdir(parents=True)
+    proc = _pwsh(scripts, "-Free", "3", "-InFlight", "0")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rec = json.loads(_lane_record(repo).read_text(encoding="utf-8-sig"))
+    assert rec["statedFree"] == 3 and rec["boxKey"] == at_root["boxKey"], (at_root, rec)
+
+
+def test_a_failed_check_ignore_refuses_rather_than_reading_not_ignored(
+    repo: Path, tmp_path_factory: pytest.TempPathFactory
+) -> None:
+    """git check-ignore exits 128 on an error, which is neither ignored (0) nor not ignored (1). It
+    used to read as not ignored, so the statement keyed the primary. A git shim first on PATH fails
+    check-ignore alone and passes every other call to the real git."""
+    if os.name != "nt":
+        pytest.skip("the git shim is a .cmd file")
+    real = shutil.which("git")
+    assert real, "git is not on PATH"
+    shim = tmp_path_factory.mktemp("gitshim")
+    (shim / "git.cmd").write_text(
+        "@echo off\r\n"
+        'echo %* | findstr /c:"check-ignore" >nul && exit /b 128\r\n'
+        f'"{real}" %*\r\n'
+        "exit /b %ERRORLEVEL%\r\n",
+        encoding="ascii",
+    )
+    stale = _removed_worktree(repo)
+    proc = _pwsh(stale, "-Free", "1", "-InFlight", "0", path_first=shim)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert "REFUSED" in proc.stderr and "check-ignore failed" in proc.stderr, proc.stderr
+    assert not (repo / ".git" / "mefor-coord" / "lanes").exists()
+
+
+def test_a_junction_and_its_target_key_the_same_lane_and_claim_hash(
     repo: Path, tmp_path: Path
 ) -> None:
-    """The readers key on Get-Location, so the root is the caller's own path walked up, not git's
-    resolved one. From a junction's subdirectory, the record names the junction."""
+    """The lane is keyed on git's resolved root, which claim.ps1 records and seat records carry. A
+    statement from a junction's subdirectory must land in the target's record with the target's
+    claim hash, which is not `none`. The control is the statement from the target itself."""
     if os.name != "nt":
         pytest.skip("a directory junction is a Windows mount point")
+    claims = repo / ".git" / "mefor-coord" / "claims"
+    claims.mkdir(parents=True)
+    (claims / "BACKLOG-5486.json").write_text(
+        json.dumps({"worktree": _toplevel(repo)}), encoding="utf-8"
+    )
+    assert _pwsh(repo, "-Free", "1", "-InFlight", "1").returncode == 0
+    at_target = json.loads(_lane_record(repo).read_text(encoding="utf-8-sig"))
+    assert at_target["claimHashAtStated"] not in ("", "none"), at_target
     link = tmp_path.parent / f"{tmp_path.name}-junction"
     subprocess.run(
         ["cmd", "/c", "mklink", "/J", str(link), str(repo)], check=True, capture_output=True
@@ -406,10 +470,29 @@ def test_a_tree_reached_through_a_junction_keys_on_the_path_the_caller_used(
     try:
         sub = link / "sub"
         sub.mkdir()
-        proc = _pwsh(sub, "-Free", "1", "-InFlight", "0")
+        proc = _pwsh(sub, "-Free", "2", "-InFlight", "0")
         assert proc.returncode == 0, proc.stdout + proc.stderr
+        # _lane_record asserts one record: a junction key would add a second.
         rec = json.loads(_lane_record(repo).read_text(encoding="utf-8-sig"))
-        assert rec["worktree"].lower() == str(link).lower(), rec
+        assert rec["statedFree"] == 2, rec
+        assert rec["boxKey"] == at_target["boxKey"], (at_target, rec)
+        assert rec["worktree"] == at_target["worktree"], (at_target, rec)
+        assert rec["claimHashAtStated"] == at_target["claimHashAtStated"], (at_target, rec)
     finally:
         # rmdir removes the junction itself and leaves its target alone.
         os.rmdir(link)
+
+
+def test_a_non_ascii_path_keys_on_the_root_git_names(tmp_path: Path) -> None:
+    """git writes UTF-8 and PowerShell decoded it with the console's OEM code page, so a non-ASCII
+    segment came back mangled and keyed a worktree that does not exist. From a non-ASCII
+    subdirectory of a non-ASCII root, the record must name the root as git names it."""
+    root = tmp_path / "repo-ü"
+    root.mkdir()
+    _init_repo(root)
+    sub = root / "sub-é"
+    sub.mkdir()
+    proc = _pwsh(sub, "-Free", "1", "-InFlight", "0")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    rec = json.loads(_lane_record(root).read_text(encoding="utf-8-sig"))
+    assert Path(rec["worktree"]) == Path(_toplevel(root)), rec

@@ -19,10 +19,9 @@
     not add a usage throttle here.
 
     THERE IS NO -Lane AND NO -BoxKey PARAMETER, AND ADDING ONE DEFEATS THE WHOLE DESIGN. The box key is
-    derived from the work tree root of $PWD, so a session can only ever state its OWN level. The
-    failure this replaces is a gauge that reported both lanes full while one sat idle, because it
-    counted CLAIMS: measured
-    2026-08-23, one lane held nine claims and reported one active item and three free slots. Both
+    derived from git's resolved work tree root of $PWD, so a session can only ever state its OWN
+    level. The failure this replaces is a gauge that reported both lanes full while one sat idle,
+    because it counted CLAIMS: measured 2026-08-23, one lane held nine claims and reported one active item and three free slots. Both
     numbers were honest. Only the lane knows which is which.
 
     FREE MEANS BY WORK, NOT BY CLAIMS. Built-and-awaiting-land is FREE. Blocked is FREE. Parked on a
@@ -84,31 +83,51 @@ function Write-RootRefusal([string]$Why) {
     [Console]::Error.WriteLine("lane.ps1: REFUSED -- $Why, so the lane cannot be keyed and nothing was read or written.")
     exit 2
 }
-try { $revParse = @(& git rev-parse --path-format=absolute --show-toplevel --show-prefix 2>$null) }
-catch { Write-RootRefusal "git could not be run in $here ($($_.Exception.Message))" }
+# git writes UTF-8; PowerShell decodes a native command's output with [Console]::OutputEncoding,
+# which is an OEM code page on a stock console, so a non-ASCII path segment would come back mangled
+# and key a box nobody reads. Every git call that reads a path (here and in Resolve-CoordSharedRoot,
+# which reads --git-common-dir) runs inside this; the caller's encoding is put back afterwards.
+function Invoke-GitUtf8([scriptblock]$Action) {
+    $saved = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        & $Action
+    } finally {
+        [Console]::OutputEncoding = $saved
+    }
+}
+$revParse = @()
+$revParseExit = -1
+try {
+    Invoke-GitUtf8 {
+        $script:revParse = @(& git -c core.quotePath=false rev-parse --path-format=absolute --show-toplevel --show-prefix 2>$null)
+        $script:revParseExit = $LASTEXITCODE
+    }
+} catch {
+    Write-RootRefusal "git could not be run in $here ($($_.Exception.Message))"
+}
 $top = if ($revParse.Count -ge 1) { ([string]$revParse[0]).Trim() } else { '' }
-if ($LASTEXITCODE -ne 0 -or -not $top) { Write-RootRefusal "git could not name the work tree root for $here" }
+if ($revParseExit -ne 0 -or -not $top) { Write-RootRefusal "git could not name the work tree root for $here" }
 $prefix = if ($revParse.Count -ge 2) { ([string]$revParse[1]).Trim().TrimEnd('/') } else { '' }
-# A directory the tree ignores is not part of the tree's work: it is the shape of a removed worktree
-# under the primary checkout (.claude/worktrees/<name> with no .git left), which git walks up to the
-# primary from. Keying it there would overwrite the primary's level.
-if ($prefix) {
+# A removed worktree under the primary checkout (.claude/worktrees/<name> with no .git left) has git
+# walk up to the primary, so keying there would overwrite the primary's level. That container is the
+# population the worktree tooling names (scripts/worktree/find-emptied-worktrees.ps1), and the
+# primary ignores it, so a directory in it that git places in the primary is no live tree's. Any
+# other ignored directory of a live tree, such as .venv\Scripts, is still that tree's work and keys
+# on its root. A check-ignore that fails refuses: an unanswered question is not a "not ignored".
+if ("$prefix/" -like '.claude/worktrees/*') {
     & git check-ignore -q -- . 2>$null
-    if ($LASTEXITCODE -eq 0) { Write-RootRefusal "$here is ignored by the work tree at $top (a removed worktree reads this way)" }
+    $ignoreExit = $LASTEXITCODE
+    if ($ignoreExit -eq 0) { Write-RootRefusal "$here is an ignored directory under the worktree container of $top (a removed worktree reads this way)" }
+    if ($ignoreExit -ne 1) { Write-RootRefusal "git check-ignore failed (exit $ignoreExit) for $here under the worktree container of $top" }
 }
-# The root as the caller's own path names it, by walking up the prefix's depth, so a tree reached
-# through a junction or a subst drive keys where the readers, which read Get-Location, key it. git's
-# --show-toplevel is the resolved path. It is used only where the walk does not retrace the prefix.
-$worktree = $here
-foreach ($seg in @(if ($prefix) { $prefix -split '/' })) {
-    if ((Split-Path -Leaf $worktree) -ne $seg) { $worktree = $null; break }
-    $worktree = Split-Path -Parent $worktree
-}
-if (-not $worktree) { $worktree = [System.IO.Path]::GetFullPath($top) }
+# git's resolved root, the path claim.ps1 records and seat records carry, so a tree reached through
+# a junction keys the same lane and claim hash as its target.
+$worktree = [System.IO.Path]::GetFullPath($top)
 
 # Both kinds this writes or reads are fleet-wide, so both are resolved before anything is written,
 # and an error refuses rather than writing a level into a local copy nobody else reads.
-$sharedResolved = Resolve-CoordSharedRoot -From $worktree
+$sharedResolved = Invoke-GitUtf8 { Resolve-CoordSharedRoot -From $worktree }
 if ($sharedResolved.Error) {
     [Console]::Error.WriteLine("lane.ps1: REFUSED -- the coordination root could not be resolved, so nothing was written: $($sharedResolved.Error)")
     exit 2

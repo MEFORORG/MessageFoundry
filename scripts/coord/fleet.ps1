@@ -126,12 +126,16 @@ if (Test-Path -LiteralPath $seatsDir) {
             try {
                 $j = Read-CoordText $f.FullName | ConvertFrom-Json -EA Stop
                 $records += [pscustomobject]@{ Rec = $j; File = $f.FullName; Box = $d.Name }
+            } catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] {
+                # Deleted between the listing and the read: a file that is gone holds no seat. Only
+                # the read's own not-found says so; a later Test-Path could not tell a vanished file
+                # from one whose read failed for another reason and then moved.
+                continue
             } catch {
-                # Deleted between the listing and the read: a file that is gone holds no seat.
-                if (-not (Test-Path -LiteralPath $f.FullName)) { continue }
-                # A record being written RIGHT NOW has exactly this shape. Counted, never dropped:
-                # dropping turns an occupied seat into an absent one in the receipt's own numbers.
-                # It also fires a stop below: an unread record may be a seat the roster cannot show.
+                # Counted, never dropped: dropping turns an occupied seat into an absent one in the
+                # receipt's own numbers. seat.ps1 writes a record by one atomic rename and the read
+                # retries a sharing violation, so a record that still fails is damaged, not busy.
+                # It fires a stop below: an unread record may be a seat the roster cannot show.
                 $unreadableRecordFiles += $f.FullName
             }
         }
@@ -566,7 +570,7 @@ foreach ($r in $records) {
 # ---------------------------------------------------------------------------------------------
 
 $stops = @()
-if ($unreadableRecordFiles.Count -gt 0) { $stops += "recordsUnreadable=$($unreadableRecordFiles.Count) -- these seat record(s) could not be read or parsed, so a seat they hold may be absent from the roster below and it may be INCOMPLETE by them (a record being rewritten right now reads this way; run again): $($unreadableRecordFiles -join '; ')" }
+if ($unreadableRecordFiles.Count -gt 0) { $stops += "recordsUnreadable=$($unreadableRecordFiles.Count) -- these seat record(s) could not be read or parsed, so a seat they hold may be absent from the roster below and it may be INCOMPLETE by them. A record is written by one atomic rename, so one that still fails to read is damaged: read it, and move it out of the seats directory by hand:$($unreadableRecordFiles -join '; ')" }
 if (-not $fenceAvailable) { $stops += 'fenceAvailable=false -- no config root with a sessions/ directory was found; every state below would be a guess' }
 if ($anonymousReadError) { $stops += "anonymousLiveRecords=UNREAD -- the scan for registry records that name no session failed ($anonymousReadError), so a relaunched seat could read INTERRUPTED below" }
 if ($anonymousNoCwd.Count -gt 0) { $stops += "anonymousLiveRecordsWithNoCwd=$($anonymousNoCwd.Count) -- registry record(s) name no session, are live or freshly written, and name no readable cwd ($($anonymousNoCwd -join '; ')), so no seat can be told apart from a relaunch of it" }
