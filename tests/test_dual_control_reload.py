@@ -1505,8 +1505,10 @@ async def test_an_ungated_reload_takes_no_request_time_digest(
 async def test_an_unreadable_vcs_head_does_not_refuse_an_unchanged_release(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The approval binds content. A git HEAD that cannot be read loses the whole fingerprint
-    detail, so the binding must not rest on that detail, or every held reload would be refused."""
+    """The approval binds content. A VCS head read that raises loses the whole fingerprint detail,
+    so the binding must not rest on that detail, or every held reload would be refused. The read
+    now reads a non-UTF-8 HEAD as unknown rather than raise (vault BACKLOG #5325); this keeps the
+    binding off the detail should any fault still raise."""
     import messagefoundry.config.fingerprint as fp_mod
 
     def _bad_head(_start: Path) -> str | None:

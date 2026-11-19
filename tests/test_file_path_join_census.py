@@ -603,8 +603,13 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/config/fingerprint.py::_git_head": Site(
         7,
-        OPERATOR,
-        "Reads the git metadata of the operator's own config checkout; read only, to a commit hash.",
+        GUARDED,
+        "Reads the git metadata of the operator's own config checkout, read only, to an object id. "
+        "The symbolic ref HEAD names is joined only once _confined_ref holds it, lexically, under "
+        "refs/ of the root it joins (vault BACKLOG #5325). The other joins are fixed names, or the "
+        "checkout's own .git and commondir pointers, which are not confined.",
+        "messagefoundry/config/fingerprint.py::_confined_ref",
+        called=True,
     ),
     "messagefoundry/config/impact.py::_validate_new_name": Site(1, OPERATOR, _CODESETS),
     "messagefoundry/config/snapshot.py::ConfigSnapshot._folder_of": Site(
