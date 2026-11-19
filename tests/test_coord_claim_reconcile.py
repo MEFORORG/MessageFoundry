@@ -977,6 +977,21 @@ def test_apply_releases_a_finished_present_holder_and_leaves_the_worktree(
     assert Path(records[0]["invoked_from"]).resolve() == repo.resolve()
 
 
+def test_a_claim_stamp_with_no_offset_cannot_be_ordered(
+    repo: Path, tmp_path: Path, sleeper: int
+) -> None:
+    """Read as text, an offset-less stamp is local or UTC by guess, hours apart. It holds."""
+    wt, tip = present_holder(repo, "no-offset")
+    p = write_claim(repo, "9126", wt, "no-offset")
+    claim = json.loads(p.read_bytes())
+    claim["claimed"] = "2026-08-12T12:00:00"
+    p.write_bytes(json.dumps(claim).encode("utf-8"))
+    cfg = fence_root(tmp_path, sleeper, repo)
+    verdict, why = present(repo, cfg, gh_router(tmp_path, head=json.dumps(pr_at(tip, "9126"))))
+    assert verdict["9126"] == "MERGED-HELD", why
+    assert "timestamp is unreadable" in why["9126"]
+
+
 def test_apply_releases_a_present_holder_claim_with_no_key_field(
     repo: Path, tmp_path: Path, sleeper: int
 ) -> None:

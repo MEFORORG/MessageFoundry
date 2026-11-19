@@ -233,7 +233,7 @@ function Get-KeyFileName([string]$Key) {
 function Get-ClaimKey([object]$Claim, [string]$BaseName) {
     $key = if ($Claim.key) { [string]$Claim.key } else { $BaseName }
     $keyFile = Get-KeyFileName $key
-    return [pscustomobject]@{ Key = $key; KeyFile = $keyFile; NamesFile = ($keyFile -ceq $BaseName) }
+    return [pscustomobject]@{ Key = $key; KeyFile = $keyFile; NamesFile = ($keyFile -and $keyFile -ceq $BaseName) }
 }
 
 function ConvertTo-Norm([string]$Path) {
@@ -341,6 +341,10 @@ function Test-LandedByPullRequest {
 function ConvertTo-Instant($Value) {
     if ($Value -is [datetimeoffset]) { return $Value }
     if ($Value -is [datetime]) { return [datetimeoffset]$Value }
+    # A claim stamp now arrives as text (-DateKind String). One with no offset is ambiguous: the
+    # default parse read it as local time, AssumeUniversal as UTC, hours apart, and the ordering
+    # against a merge rests on it. It is unreadable, so the caller holds.
+    if ($Value -and [string]$Value -notmatch '(?:Z|[+-]\d{2}:?\d{2})\s*$') { return $null }
     $parsed = [datetimeoffset]::MinValue
     if ($Value -and [datetimeoffset]::TryParse([string]$Value, [Globalization.CultureInfo]::InvariantCulture,
             [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$parsed)) { return $parsed }
@@ -532,7 +536,8 @@ function Test-StillReleasable([object]$Row) {
     try { $c = Read-CoordText $file | ConvertFrom-Json -DateKind String -EA Stop }
     catch { return "the claim file no longer parses" }
     $k = Get-ClaimKey $c ([IO.Path]::GetFileNameWithoutExtension($file))
-    if (-not $k.NamesFile -or $k.Key -cne $Row.key) { return "the claim file's key no longer names that file" }
+    if (-not $k.NamesFile) { return "the claim file's key no longer names that file" }
+    if ($k.Key -cne $Row.key) { return "the claim was re-taken under another spelling of its key" }
     if ((ConvertTo-Norm ([string]$c.worktree)) -ne $Row.holder) { return "the claim is now held by another worktree" }
     if (-not (Test-CoordRecordIsHere $c)) { return "the claim is now held on $(Get-CoordRecordHost $c)" }
     $fresh = Read-WorktreeRegistry
@@ -684,7 +689,9 @@ foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA 
             else {
                 $rows += [pscustomobject]@{ key = $key; holder = $holder; branch = $branch; note = $note; verdict = "HOLD"
                     why = "$ahead commit(s) not on $mainRef; PR #$($pr.Number) merged but this tip is not its head and " +
-                        $(if ($listed) { "the branch files differ from the landing commit" } else { "the files this branch touched could NOT be listed" }) }
+                        $(if (-not $listed) { "the files this branch touched could NOT be listed" }
+                        elseif (-not $touched.Count) { "the branch changes no file against the merge-base, so nothing could be compared" }
+                        else { "the branch files differ from the landing commit" }) }
             }
         }
         elseif ($pr -is [pscustomobject]) {
