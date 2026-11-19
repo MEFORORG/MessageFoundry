@@ -19,10 +19,7 @@ x-revocation-attested: &revocation-attested "${MEFOR_TLS_REVOCATION_ATTESTED:?re
 # ignores `x-` keys. They are merged into the two services below via the `<<:` merge key.
 x-ha-engine: &ha-engine
   profiles: ["ha"]
-  # The Postgres variant: the slim messagefoundry:latest carries no asyncpg, so the Postgres store
-  # below could not open on it. Build it from the repository root with:
-  #   docker build -f docker/Dockerfile --target runtime-postgres -t messagefoundry:postgres .
-  image: messagefoundry:postgres
+  image: messagefoundry:latest
   depends_on:
     postgres:
       condition: service_healthy

@@ -36,9 +36,8 @@ establishes that the off-loopback security controls are already built; this is p
 |---|---|---|
 | **slim (default)** | `docker build -f docker/Dockerfile -t messagefoundry .` | Core engine + SQLite store. The build's default target. |
 | **`-sqlserver`** | `docker build -f docker/Dockerfile --target runtime-sqlserver -t messagefoundry:sqlserver .` | Adds the OS-level Microsoft ODBC Driver 18 + `[sqlserver]` extra — needed **only** for the SQL Server store or the DATABASE / `db_lookup` connectors. |
-| **`-postgres`** | `docker build -f docker/Dockerfile --target runtime-postgres -t messagefoundry:postgres .` | Adds the `[postgres]` extra (`asyncpg`), which the Postgres store needs. The `ha` compose profile and [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) run that store, so they need this variant; the slim default carries no `asyncpg`. |
 
-Each is multi-stage, run as **non-root uid 10001**, install from per-profile **hash-locked**
+Both are multi-stage, run as **non-root uid 10001**, install from per-profile **hash-locked**
 requirements (`docker/locks/*.lock`, kept in sync with `uv.lock` by the DEP-1 step in
 `.github/workflows/security.yml`), and are based on `python:3.14-slim-bookworm`, pinned by digest
 (see the [`Dockerfile`](Dockerfile) header). The pin freezes the base's OS packages, so rebuilding
@@ -156,8 +155,6 @@ against one case that matters, described under
   For a local taste of the HA shape: `docker compose --profile ha up` (adds a Postgres + a PAIR of
   clustered engines — `engine-ha` + `engine-standby` — that share one leader lease, so you can stop the
   leader and watch the other promote; the default `docker compose up` stays single-node SQLite, unchanged).
-  Build the `-postgres` variant first (see *Image variants*): the `ha` engines run
-  `messagefoundry:postgres`, and compose has no `build:` key to make it for you.
 
 ## Exposure topologies (see the evaluation §1)
 

@@ -220,10 +220,8 @@ def image_problems(text: str) -> list[str]:
     if parsed != [_IMAGE_ENTRYPOINT]:
         problems.append(f"ENTRYPOINT is {parsed}, not exactly {[_IMAGE_ENTRYPOINT]}")
     copies = re.findall(r"^COPY (.*) /opt/venv /opt/venv[ \t]*$", text, re.M)
-    if len(copies) != 3:
-        problems.append(
-            f"expected the venv to be copied in three final stages, found {len(copies)}"
-        )
+    if len(copies) != 2:
+        problems.append(f"expected the venv to be copied in two final stages, found {len(copies)}")
     for flags in copies:
         owners = re.findall(r"--chown=(\S+)", flags)
         if owners != ["0:0"]:
@@ -269,7 +267,6 @@ def test_the_installer_reader_objects_to_a_planted_violation(old: str, new: str)
         ('"/opt/venv/bin/python"', '"python"'),
         ("COPY --from=builder --chown=0:0", "COPY --from=builder --chown=10001:10001"),
         ("COPY --from=builder-sqlserver --chown=0:0", "COPY --from=builder-sqlserver"),
-        ("COPY --from=builder-postgres --chown=0:0", "COPY --from=builder-postgres"),
     ],
 )
 def test_the_image_reader_objects_to_a_planted_violation(old: str, new: str) -> None:

@@ -362,10 +362,8 @@ and the engine's at-rest encryption does not cover them ([`PHI.md`](PHI.md) §2,
    ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.2, posture B). Run
    `messagefoundry store provision-schema` as the provisioning role before the first start. The
    engine runs no schema DDL and refuses to start until it has (BACKLOG #305).
-2. **Build a config-baked image** (`FROM messagefoundry:postgres; COPY config /config`, root-owned files)
-   and push it to your private registry. Base it on the `runtime-postgres` variant
-   ([`docker/README.md`](../docker/README.md), "Image variants"): the slim default carries no `asyncpg`,
-   so the Postgres store cannot open on it. Bake the syslog CA and CRL and the store CRL the
+2. **Build a config-baked image** (`FROM messagefoundry:<version>; COPY config /config`, root-owned files)
+   and push it to your private registry. Bake the syslog CA and CRL and the store CRL the
    manifest names under `/config/pki/` into the same image.
 3. **Create the Secret** ([`docker/k8s/secret.example.yaml`](../docker/k8s/secret.example.yaml)) with
    `store-encryption-key`, `store-password`, `tls-revocation-attested`, and the API TLS cert/key (and

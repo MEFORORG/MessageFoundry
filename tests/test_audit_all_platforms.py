@@ -36,7 +36,6 @@ _AUDITED = (
 _SUBSET_LOCKS = (
     "docker/locks/requirements-core.lock",
     "docker/locks/requirements-sqlserver.lock",
-    "docker/locks/requirements-postgres.lock",
     "security/locks/requirements-harness.lock",
 )
 _TREE_LOCKS = (*_AUDITED, *_SUBSET_LOCKS)

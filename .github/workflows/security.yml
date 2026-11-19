@@ -143,9 +143,8 @@ jobs:
     # Wheels only (vault BACKLOG #3861): pip, the auditor's dry-runs included, builds no pinned sdist
     # in this job. uv reads no PIP_* variable, so it takes its own switch, for `uv lock --check` and
     # the exports. Measured 2026-10-26 on Windows with uv 0.12.0 and an empty cache: the lock check and
-    # the eight exports below at that date pass under it, unchanged, and a lock needing an sdist-only
-    # pin fails "building from source is disabled". The postgres image export came later and was not
-    # part of that measurement.
+    # all eight exports below pass under it, unchanged, and a lock needing an sdist-only pin fails
+    # "building from source is disabled".
     env:
       PIP_ONLY_BINARY: ":all:"
       UV_NO_BUILD: "1"
@@ -180,7 +179,6 @@ jobs:
           # match the header recorded in each committed file, so re-export is byte-identical when in sync.
           uv export --no-emit-project --no-dev --format requirements.txt -o docker/locks/requirements-core.lock
           uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock
-          uv export --no-emit-project --no-dev --extra postgres --format requirements.txt -o docker/locks/requirements-postgres.lock
           # Not an image lock: the harness closure (security/runtime-closure-harness.txt) copies it.
           uv export --no-emit-project --no-dev --extra harness --format requirements.txt -o security/locks/requirements-harness.lock
           # CI's own installs pass `--constraint constraints.lock` (see ci.yml): a HASHLESS export of this
@@ -189,7 +187,7 @@ jobs:
           uv export --all-extras --no-emit-project --no-hashes --format requirements.txt -o constraints.lock
           # The CI TOOLCHAIN locks (ADR 0034 §3): PEP 735 `[dependency-groups]`, so the scanners and the
           # quality tools flow through uv.lock and are consumed HASH-PINNED. Non-default groups, so they
-          # stay out of the exports above (and out of the SBOM / image locks / audited runtime).
+          # stay out of the five exports above (and out of the SBOM / image locks / audited runtime).
           uv export --only-group ci-scanners --format requirements.txt -o ci/locks/ci-scanners.lock
           uv export --only-group ci-quality --format requirements.txt -o ci/locks/ci-quality.lock
           # The RELEASE SIGNING toolchain (BACKLOG #332). Same mechanism as the two above, and it is
@@ -197,7 +195,7 @@ jobs:
           # drift that lived there would first be observed during a release. Exported on every
           # security run instead, where it is cheap to catch.
           uv export --only-group release-tools --format requirements.txt -o ci/locks/release-tools.lock
-          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
+          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
       - name: Install from the hashed lockfile (DEP-1)
         run: |
           # --require-hashes enforces a hash for every requirement (the lockfile carries them): a
@@ -799,8 +797,6 @@ jobs:
           python -m pip --python "$RUNNER_TEMP/winlockcheck/Scripts/python.exe" install --require-hashes --only-binary :all: -r docker/locks/requirements-core.lock
           python -m venv --clear --without-pip "$RUNNER_TEMP/winlockcheck"
           python -m pip --python "$RUNNER_TEMP/winlockcheck/Scripts/python.exe" install --require-hashes --only-binary :all: -r docker/locks/requirements-sqlserver.lock
-          python -m venv --clear --without-pip "$RUNNER_TEMP/winlockcheck"
-          python -m pip --python "$RUNNER_TEMP/winlockcheck/Scripts/python.exe" install --require-hashes --only-binary :all: -r docker/locks/requirements-postgres.lock
           python -m venv --clear --without-pip "$RUNNER_TEMP/winlockcheck"
           python -m pip --python "$RUNNER_TEMP/winlockcheck/Scripts/python.exe" install --require-hashes --only-binary :all: -r security/locks/requirements-harness.lock
           python -m venv --clear --without-pip "$RUNNER_TEMP/winlockcheck"
@@ -1744,7 +1740,6 @@ jobs:
           # match the header recorded in each committed file, so re-export is byte-identical when in sync.
           uv export --no-emit-project --no-dev --format requirements.txt -o docker/locks/requirements-core.lock
           uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock
-          uv export --no-emit-project --no-dev --extra postgres --format requirements.txt -o docker/locks/requirements-postgres.lock
           # Not an image lock: the harness closure (security/runtime-closure-harness.txt) copies it.
           uv export --no-emit-project --no-dev --extra harness --format requirements.txt -o security/locks/requirements-harness.lock
           # CI's own installs pass `--constraint constraints.lock` (see ci.yml): a HASHLESS export of this
@@ -1753,7 +1748,7 @@ jobs:
           uv export --all-extras --no-emit-project --no-hashes --format requirements.txt -o constraints.lock
           # The CI TOOLCHAIN locks (ADR 0034 §3): PEP 735 `[dependency-groups]`, so the scanners and the
           # quality tools flow through uv.lock and are consumed HASH-PINNED. Non-default groups, so they
-          # stay out of the exports above (and out of the SBOM / image locks / audited runtime).
+          # stay out of the five exports above (and out of the SBOM / image locks / audited runtime).
           uv export --only-group ci-scanners --format requirements.txt -o ci/locks/ci-scanners.lock
           uv export --only-group ci-quality --format requirements.txt -o ci/locks/ci-quality.lock
           # The RELEASE SIGNING toolchain (BACKLOG #332). Same mechanism as the two above, and it is
@@ -1761,7 +1756,7 @@ jobs:
           # drift that lived there would first be observed during a release. Exported on every
           # security run instead, where it is cheap to catch.
           uv export --only-group release-tools --format requirements.txt -o ci/locks/release-tools.lock
-          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock docker/locks/requirements-postgres.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
+          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock security/locks/requirements-harness.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock ci/locks/release-tools.lock
       - name: Install from the hashed lockfile (DEP-1)
         if: ${{ !cancelled() }}
         run: |

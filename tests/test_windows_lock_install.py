@@ -25,7 +25,6 @@ _RUNTIME_LOCKS = (
     "requirements.lock",
     "docker/locks/requirements-core.lock",
     "docker/locks/requirements-sqlserver.lock",
-    "docker/locks/requirements-postgres.lock",
     "security/locks/requirements-harness.lock",
     # Not a runtime lock, but release.yml's `sbom-windows` job installs it on Windows.
     "ci/locks/release-tools.lock",
