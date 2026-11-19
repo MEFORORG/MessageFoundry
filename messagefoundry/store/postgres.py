@@ -5833,7 +5833,10 @@ class PostgresStore:
         raises :class:`QueueTagError`, since no claim on this backend dereferences one (#2593)."""
         opened = open_queue_cell(self._cipher, row)
         if row["body_ref"] is not None:
-            raise QueueTagError("integrity: a store-once row is not delivered on this backend")
+            raise QueueTagError(
+                "integrity: a store-once row is not delivered on this backend",
+                cause="ref-not-delivered",
+            )
         return opened
 
     async def dead_letter_now(self, outbox_id: str, error: str, now: float | None = None) -> None:
