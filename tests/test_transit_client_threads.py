@@ -85,6 +85,21 @@ def _cipher() -> tuple[TransitCipher, list[_TrackedClient]]:
     return TransitCipher(build(), _KEY_NAME, client_factory=build), built
 
 
+@pytest.fixture
+def _no_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The real-client tests must not depend on the runner's proxy settings: the hop guard
+    refuses a loopback Vault reached through a proxy."""
+    for name in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _in_thread(fn: Callable[[], object]) -> None:
     failures: list[BaseException] = []
 
@@ -184,7 +199,11 @@ def test_a_thread_that_exits_closes_its_own_client() -> None:
     so threads that come and go do not each leave a Vault socket open."""
     cipher, built = _cipher()
     _in_thread(lambda: cipher.encrypt("synthetic"))
-    gc.collect()
+    # The thread's locals are torn down as it ends, which can land just after join() returns.
+    deadline = time.monotonic() + 10
+    while built[1].adapter.closed == 0 and time.monotonic() < deadline:
+        gc.collect()
+        time.sleep(0.01)
     assert [client.adapter.closed for client in built] == [0, 1]
     cipher.close_connections()
     assert [client.adapter.closed for client in built] == [1, 1]  # closed once each
@@ -288,6 +307,7 @@ async def test_every_store_close_releases_the_clients_even_when_a_close_step_rai
 
 
 @_vault_extra
+@pytest.mark.usefixtures("_no_proxy")
 def test_a_real_client_takes_the_timeout_and_the_stock_build_keeps_hvacs() -> None:
     from messagefoundry.store import keyprovider_vault
 
@@ -301,6 +321,7 @@ def test_a_real_client_takes_the_timeout_and_the_stock_build_keeps_hvacs() -> No
 
 
 @_vault_extra
+@pytest.mark.usefixtures("_no_proxy")
 def test_real_thread_clients_hold_separate_sessions() -> None:
     from messagefoundry.store import keyprovider_vault
 
@@ -317,6 +338,7 @@ def test_real_thread_clients_hold_separate_sessions() -> None:
 
 
 @_vault_extra
+@pytest.mark.usefixtures("_no_proxy")
 def test_a_vault_that_never_answers_ends_in_the_timeout_as_an_outage() -> None:
     """A Transit request to a Vault that accepts and never replies ends at the read timeout as a
     no-verdict CipherUnavailableError, rather than holding the caller until hvac's 30 seconds."""

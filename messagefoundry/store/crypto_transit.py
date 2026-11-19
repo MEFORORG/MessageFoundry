@@ -440,9 +440,11 @@ class TransitCipher(_UnmarkedPolicy):
         self._shared_client = client
         self._thread_clients = threading.local()
         self._clients_lock = threading.Lock()
-        #: The live per-thread clients, so :meth:`close_connections` can release their sockets. Held
-        #: weakly: a thread that exits drops its own, which closes that client's connections.
-        self._held: weakref.WeakSet[_ThreadClient] = weakref.WeakSet()
+        #: The release of each per-thread client, so :meth:`close_connections` can close their
+        #: sockets. Only the finalizers are kept, never the holders: a thread that exits drops its
+        #: own holder, which closes that client's connections. A plain list under the lock, because
+        #: a WeakSet's callbacks run on whichever thread drops an entry, unlocked.
+        self._releases: list[weakref.finalize[Any, Any]] = []
         #: Bumped by :meth:`close_connections`, so a thread holding an older client builds anew.
         self._generation = 0
         if client_factory is not None:
@@ -460,9 +462,9 @@ class TransitCipher(_UnmarkedPolicy):
     @property
     def _client(self) -> Any:
         """The hvac client the calling thread uses (BACKLOG #5963), built on its first use there
-        when this cipher has a factory. Every caller reads it inside the handler that turns a
-        failed Transit request into the cipher's own error, so a build that raises is refused the
-        same way."""
+        when this cipher has a factory. The cipher's request paths read it inside the handler that
+        turns a failed Transit request into the cipher's own error, so a build that raises reaches
+        that handler too. A failed build is not cached: the thread's next call builds again."""
         if self._client_factory is None:
             return self._shared_client
         held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
@@ -472,8 +474,9 @@ class TransitCipher(_UnmarkedPolicy):
         try:
             client = self._client_factory()
         except Exception as exc:
-            # Read as a connection that could not be made: an outage that gave no verdict on any
-            # value, unless its chain carries a refusal of the hop (is_vault_unavailable).
+            # Raised as a connection that could not be made, so it reads as an outage that gave no
+            # verdict on any value, except where its chain carries a refusal of the hop, which
+            # is_vault_unavailable reads as a refusal.
             import requests  # noqa: PLC0415 -- the [vault] extra, present wherever a factory is
 
             raise requests.exceptions.ConnectionError(
@@ -486,13 +489,16 @@ class TransitCipher(_UnmarkedPolicy):
         :meth:`close_connections` runs, whichever is first."""
         held = _ThreadClient(client, generation)
         with self._clients_lock:
-            self._held.add(held)
+            self._releases = [release for release in self._releases if release.alive]
+            self._releases.append(held.release)
         self._thread_clients.held = held
         return client
 
     def close_connections(self) -> None:
-        """Close the pooled Vault connections of every client this cipher has built (BACKLOG #5963).
-        The stores call it from their own ``close``. The cipher stays usable, because more than one
+        """Close the pooled Vault connections of the clients this cipher holds (BACKLOG #5963). At
+        least a client whose build was still running when this ran is missed; its thread replaces
+        it on its next call, and closes it when it exits. The stores call it from their own
+        ``close``, and nothing calls it for a cipher no store holds. The cipher stays usable, because more than one
         store can share it: a later call on any thread builds a fresh client when this cipher has a
         factory, and otherwise reuses the one client, whose session opens a new connection. A client
         whose close raises is logged by the exception's type and the rest are still closed."""
@@ -500,11 +506,10 @@ class TransitCipher(_UnmarkedPolicy):
             _close_client(self._shared_client)
             return
         with self._clients_lock:
-            held = list(self._held)
-            self._held.clear()
+            releases, self._releases = self._releases, []
             self._generation += 1
-        for each in held:
-            each.release()
+        for release in releases:
+            release()  # once each: a finalizer that already ran does nothing
 
     @property
     def transit_key_name(self) -> str:
@@ -1223,8 +1228,9 @@ def build_transit_cipher(
     # process. A token replaced afterwards, in the environment or the secrets directory, is not
     # seen until the store is opened again.
     addr, token = store_vault_hop()
-    # Read once too, like the address and token, so a thread's own client is built from the same
-    # inputs as the first (BACKLOG #5963). A refused CA anchor raises here, before any client.
+    # The CA anchor is read once too, like the address and token, and handed to every thread's own
+    # client (BACKLOG #5963). Not everything is: each build still reads the settings object, and
+    # hvac and requests read their own environment (at least proxies) as each client is made.
     ca_kwargs = _vault_ca_kwargs(addr)
 
     def build_client() -> Any:
