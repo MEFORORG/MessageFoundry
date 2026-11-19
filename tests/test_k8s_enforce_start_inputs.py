@@ -91,7 +91,7 @@ def _site_entries(name: str) -> dict[str, str]:
     text = (_K8S / name).read_text(encoding="utf-8")
     start = text.index(_BLOCK)
     end = text.index("\n            - ", start)  # the first live entry after the block
-    found = dict(_COMMENTED_ENTRY.findall(text[start:end]))
+    found: dict[str, str] = dict(_COMMENTED_ENTRY.findall(text[start:end]))
     assert found, f"{name}: the enforcing-start block holds no commented entries"
     return {key: _FILLED.get(value, value) for key, value in found.items()}
 
