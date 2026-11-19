@@ -553,9 +553,13 @@ async def test_a_connection_lost_after_the_clear_committed_reads_as_cleared(
         service, notifier, identity, token = await _setup(store)
         before = len(await store.list_audit(action="auth.reauth"))
         real = store.record_login_success
+        teed = _record_tees(monkeypatch)
 
         async def committed_then_lost(user_id: str, **kwargs: Any) -> Any:
-            await real(user_id, **kwargs)
+            # The raise comes at the commit, so the store's own tee after it never runs.
+            with monkeypatch.context() as m:
+                m.setattr("messagefoundry.store.store.tee_audits", lambda *a, **k: None)
+                await real(user_id, **kwargs)
             raise OSError("synthetic connection lost after the commit")
 
         monkeypatch.setattr(store, "record_login_success", committed_then_lost)
@@ -566,6 +570,139 @@ async def test_a_connection_lost_after_the_clear_committed_reads_as_cleared(
         assert user is not None and user.failed_attempts == 0
         assert len(await store.list_audit(action="auth.login_after_failures")) == 1
         assert len([e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]) == 1
+        # The committed rows are teed off-box once each, by their own anchors, so the off-box log
+        # has no gap where the store's tee did not run.
+        committed = [
+            dict(r)
+            for action in ("auth.reauth", "auth.login_after_failures")
+            for r in (await store.list_audit(action=action, limit=1))
+        ]
+        wanted = sorted(
+            (r["action"], r["actor"], r["detail"], r["ts"], r["id"], r["seq"], r["row_hash"])
+            for r in committed
+        )
+        got = sorted(
+            (t["action"], t["actor"], t["detail"], t["ts"], t["row_id"], t["seq"], t["row_hash"])
+            for t in teed
+            if t["action"] in ("auth.reauth", "auth.login_after_failures")
+        )
+        assert got == wanted
+    finally:
+        await store.close()
+
+
+def _record_tees(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
+    teed: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "messagefoundry.store.store.emit_audit_tee", lambda **kwargs: teed.append(kwargs)
+    )
+    return teed
+
+
+async def test_a_decoy_row_at_the_same_instant_does_not_read_as_cleared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The write raised with nothing committed, but rows another writer committed share its
+    timestamp and action: one with the same actor and another detail, as another engine shard's
+    re-auth writes, and one with a case-variant actor and the very detail. Neither is this write's
+    row, so the clear reads as refused and the re-auth writes its own row."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, notifier, identity, token = await _setup(store)
+
+        async def decoys_then_lost(user_id: str, **kwargs: Any) -> Any:
+            now = kwargs["now"]
+            mine = kwargs["audits"][0]
+            await store.record_audit(
+                mine.action, actor=mine.actor, detail='{"another": "shard"}', now=now
+            )
+            await store.record_audit(mine.action, actor="BOB", detail=mine.detail, now=now)
+            raise OSError("synthetic connection lost before the commit")
+
+        real_read = store.list_audit
+
+        async def loose_actor_filter(**kwargs: Any) -> Any:
+            # SQL Server's collation compares the actor case-insensitively; this drops the filter
+            # so the case-variant decoy reaches the service's own comparison on SQLite too.
+            kwargs.pop("actor", None)
+            return await real_read(**kwargs)
+
+        monkeypatch.setattr(store, "record_login_success", decoys_then_lost)
+        monkeypatch.setattr(store, "list_audit", loose_actor_filter)
+        monkeypatch.setattr("messagefoundry.auth.service._REAUTH_READBACK_PAUSES", (0.0,))
+        before = len(await store.list_audit(action="auth.reauth"))
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.ok and out.token is not None
+        # The two decoys and the re-auth's own hard row.
+        assert len(await store.list_audit(action="auth.reauth")) == before + 3
+        user = await store.get_user("u-bob")
+        assert user is not None and user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
+        assert not [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
+    finally:
+        await store.close()
+
+
+async def test_a_commit_made_visible_late_still_reads_as_cleared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The write raised and its commit is not yet visible at the first read-back; it lands before
+    a later one. The read-back is retried, so it still reads as cleared: one row, one notice."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, notifier, identity, token = await _setup(store)
+        before = len(await store.list_audit(action="auth.reauth"))
+        real_write = store.record_login_success
+        real_read = store.list_audit
+        pending: dict[str, Any] = {}
+
+        async def lost(user_id: str, **kwargs: Any) -> Any:
+            pending.update(user_id=user_id, kwargs=kwargs)
+            raise OSError("synthetic connection lost during the commit")
+
+        async def commit_lands_after_first_read(**kwargs: Any) -> Any:
+            rows = await real_read(**kwargs)
+            if pending:
+                found = dict(pending)
+                pending.clear()
+                await real_write(found["user_id"], **found["kwargs"])
+            return rows
+
+        monkeypatch.setattr(store, "record_login_success", lost)
+        monkeypatch.setattr(store, "list_audit", commit_lands_after_first_read)
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.ok and out.token is not None
+        assert len(await real_read(action="auth.reauth")) == before + 1
+        user = await store.get_user("u-bob")
+        assert user is not None and user.failed_attempts == 0
+        assert len([e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]) == 1
+    finally:
+        await store.close()
+
+
+async def test_a_failed_read_back_logs_the_outcome_as_unknown(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The write raised and the read-back raised too, so whether the reset committed is unknown.
+    The answer stays refused, and the log says the outcome is unknown, never that the reset was
+    refused and wrote nothing."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, identity, token = await _setup(store)
+
+        async def lost(user_id: str, **kwargs: Any) -> Any:
+            raise OSError("synthetic connection lost")
+
+        async def unreadable(**kwargs: Any) -> Any:
+            raise OSError("synthetic read refused")
+
+        monkeypatch.setattr(store, "record_login_success", lost)
+        monkeypatch.setattr(store, "list_audit", unreadable)
+        caplog.set_level("WARNING", logger="messagefoundry.auth.service")
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.ok and out.token is not None
+        text = caplog.text
+        assert "outcome is unknown" in text
+        assert "wrote nothing" not in text
     finally:
         await store.close()
 
