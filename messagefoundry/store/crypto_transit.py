@@ -543,8 +543,10 @@ def _close_client(client: object) -> None:
 
 class _ThreadClient:
     """One thread's own hvac client, from :class:`TransitCipher`'s factory (BACKLOG #5963). Its
-    connections are closed once, on that thread: by :attr:`release`, or when the thread drops it,
-    as it does on exit and when it replaces a stale client."""
+    connections are closed once: by :attr:`release`, which only that thread calls, or when the
+    holder is dropped, as the thread does on exit and when it replaces a stale client. A holder
+    dropped with the cipher itself, or one still alive at interpreter exit, is closed on whichever
+    thread does that."""
 
     __slots__ = ("__weakref__", "client", "generation", "release")
 

@@ -2921,8 +2921,9 @@ class PostgresStore:
         try:
             await self._close_handles()
         finally:
-            # BACKLOG #5963: release the pooled Vault sockets of a cipher that holds some (the
-            # Transit cipher), even when a step above raised. Read by name, so the store takes no
+            # BACKLOG #5963: let a cipher that holds Vault sockets (the Transit cipher) release
+            # them, even when a step above raised. It closes this thread's own and marks the rest
+            # for their threads to close (close_connections). Read by name, so the store takes no
             # import of the cipher's module.
             release = getattr(self._cipher, "close_connections", None)
             if callable(release):
