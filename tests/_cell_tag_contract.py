@@ -22,8 +22,13 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import uuid4
 
-from messagefoundry.store.cell_tag import MESSAGE_TAG_FAILED_ACTION, PRESET_TAG_FAILED_ACTION
+from messagefoundry.store.cell_tag import (
+    MESSAGE_TAG_FAILED_ACTION,
+    PRESET_TAG_FAILED_ACTION,
+    CellTagError,
+)
 from messagefoundry.store.content_search import make_spec
+from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
 from messagefoundry.store.store import MessageStatus, OutboxStatus, Stage
 from tests._store_audit import no_operator_audit
 
@@ -191,6 +196,83 @@ async def assert_cell_tag_contract(store: Any, raw: RawSql, fetch: RawFetch) -> 
 
     # --- presets: one moved to another owner is refused ----------------------------------------
     await _assert_presets(store, raw, fetch, hook)
+
+    # --- a cell under a key the store does not hold is withheld from a list --------------------
+    await _assert_foreign_key_cells(store, raw)
+
+
+async def _assert_foreign_key_cells(store: Any, raw: RawSql) -> None:
+    """BACKLOG #5969, #5970: a cell sealed under a key the store does not hold raises a plain
+    :class:`CipherError`, not a tag failure. A by-id read still raises it, for the API to answer;
+    a list withholds that row's cell and lists the rest, where it used to fail the whole page.
+    Each list has an untouched row beside the planted one as its control."""
+    foreign = make_cipher(generate_key(), write_v2=True).encrypt("SYNTH-FOREIGN")
+    ch = f"IB_CT_F_{_RUN}"
+
+    # The scope read opens no cell, so it answers for a message whose cells cannot be opened.
+    fm = await _message(store, ch)
+    fctl = await _message(store, ch)
+    assert await store.message_channel_id(fm) == ch
+    assert await store.message_channel_id(f"no-such-{_RUN}") is None
+    await raw("UPDATE messages SET summary=? WHERE id=?", (foreign, fm))
+    try:
+        await store.get_message(fm)
+    except CellTagError as exc:
+        raise AssertionError("a foreign-key cell read as a tag failure") from exc
+    except CipherError:
+        pass
+    else:
+        raise AssertionError("a foreign-key cell was opened")
+    listed = {r["id"]: r for r in await store.list_messages(channel_id=ch, allowed_channels=None)}
+    assert listed[fctl]["summary"] == "SYNTH-SUMMARY"  # control
+    assert listed[fm]["summary"] is None and listed[fm]["error"] is None
+    assert listed[fm]["metadata"] is None
+    # Content search leaves the row out, as it does a failed tag, and still finds its sibling.
+    found = await store.search_messages(
+        make_spec(content="SYNTH-200", field_path=None, field_value=None),
+        channel_id=ch,
+        allowed_channels=None,
+    )
+    assert {r["id"] for r in found.rows} == {fctl}
+
+    # Dead letters: a foreign last_error is withheld; the row and its sibling still list.
+    out = f"OB_CT_F_{_RUN}"
+    for _ in range(2):
+        await store.enqueue_message(channel_id=ch, raw=_RAW, deliveries=[(out, "B")])
+        item = await store.claim_next_fifo(out)
+        assert item is not None
+        await store.dead_letter_now(item.id, "synthetic permanent reject")
+    dead = await store.list_dead(destination_name=out, allowed_channels=None)
+    assert len(dead) == 2
+    await raw("UPDATE queue SET last_error=? WHERE id=?", (foreign, dead[0]["outbox_id"]))
+    reread = {
+        r["outbox_id"]: r
+        for r in await store.list_dead(destination_name=out, allowed_channels=None)
+    }
+    assert reread[dead[0]["outbox_id"]]["last_error"] is None
+    assert reread[dead[1]["outbox_id"]]["last_error"] is not None  # control
+
+    # Connection events and alert instances: a foreign reason is withheld, its sibling reads.
+    planted, kept = f"IB_CT_G_{_RUN}", f"IB_CT_H_{_RUN}"
+    for conn in (planted, kept):
+        await store.record_connection_event(
+            connection=conn, transport="mllp", direction="in", kind="closed", reason="SYNTH-REASON"
+        )
+        await store.upsert_alert_instance(
+            event_type="connection_error", connection=conn, severity="warning", reason="SYNTH-ALERT"
+        )
+    await raw("UPDATE connection_event SET reason=? WHERE connection=?", (foreign, planted))
+    await raw("UPDATE alert_instance SET reason=? WHERE connection=?", (foreign, planted))
+    for conn, want in ((planted, None), (kept, "SYNTH-REASON")):
+        [event] = await store.list_connection_events(connection=conn, allowed_channels=None)
+        assert event.reason == want, conn
+    alerts = {
+        a.connection: a
+        for a in await store.list_active_alert_instances(allowed_channels=None)
+        if a.connection in (planted, kept)
+    }
+    assert alerts[planted].reason is None
+    assert alerts[kept].reason == "SYNTH-ALERT"  # control
 
 
 async def _routed(store: Any, fetch: RawFetch, channel_id: str) -> tuple[str, str]:

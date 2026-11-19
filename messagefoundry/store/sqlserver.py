@@ -114,13 +114,16 @@ from messagefoundry.store.cell_tag import (
     dead_letters_on_cell_tag,
     is_row_tagged,
     message_cell_aad,
+    open_listed_cell,
     open_message_cell,
+    open_message_record,
     open_preset_criteria,
     preset_criteria_aad,
     report_cell_tag_failures,
     row_tag_aad,
     row_tag_columns,
     withhold_message_cells,
+    withhold_refused_cell,
 )
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
@@ -8631,9 +8634,12 @@ class SqlServerStore:
                 kind=r["kind"],
                 peer_host=r["peer_host"],
                 message_id=r["message_id"],
-                reason=self._dec(
+                # BACKLOG #5970: a reason the cipher refuses is withheld, not a 500 page.
+                reason=open_listed_cell(
+                    self._cipher,
                     r["reason"],
-                    aad=cell_aad("connection_event", "reason", r["connection"], r["ts"], r["kind"]),
+                    cell_aad("connection_event", "reason", r["connection"], r["ts"], r["kind"]),
+                    table="connection_event",
                 ),
             )
             for r in rows
@@ -8792,9 +8798,12 @@ class SqlServerStore:
             first_seen=float(r["first_seen"]),
             last_seen=float(r["last_seen"]),
             count=int(r["count"]),
-            reason=self._dec(
+            # BACKLOG #5970: a reason the cipher refuses is withheld, not a 500 page.
+            reason=open_listed_cell(
+                self._cipher,
                 r["reason"],
-                aad=cell_aad("alert_instance", "reason", r["event_type"], r["connection"]),
+                cell_aad("alert_instance", "reason", r["event_type"], r["connection"]),
+                table="alert_instance",
             ),
             acked_by=r["acked_by"],
             acked_at=r["acked_at"],
@@ -13552,18 +13561,14 @@ class SqlServerStore:
     async def get_message(self, message_id: str) -> dict[str, Any] | None:
         record = await self._fetchone("SELECT * FROM messages WHERE id=?", (message_id,))
         if record is not None:
-            # Decrypt for display: raw (the body), error (may embed raw HL7 fragments, H4), summary
-            # and metadata (EF-3 PHI). Each cell is bound to the row's id and channel (ASVS 11.3.3,
-            # BACKLOG #2593), so a cell that fails that tag refuses the whole read.
-            for column in ("raw", "error", "summary", "metadata"):
-                record[column] = open_message_cell(
-                    self._cipher,
-                    column,
-                    record[column],
-                    message_id=record["id"],
-                    channel_id=record["channel_id"],
-                )
+            # Off the event loop (BACKLOG #5981): under vault_transit each open is a blocking Vault
+            # call.
+            await asyncio.to_thread(open_message_record, self._cipher, record)
         return record
+
+    async def message_channel_id(self, message_id: str) -> str | None:
+        record = await self._fetchone("SELECT channel_id FROM messages WHERE id=?", (message_id,))
+        return None if record is None else str(record["channel_id"])
 
     @audits_cell_tag
     async def message_metadata_json(self, message_id: str) -> str | None:
@@ -13718,6 +13723,11 @@ class SqlServerStore:
             except CellTagError as err:
                 failures.append(err)
                 continue
+            except CipherError as exc:
+                # BACKLOG #5970: a candidate the store's keys cannot open is left out, as a failed
+                # tag is, rather than failing the whole search; an outage still raises.
+                withhold_refused_cell("messages", exc)
+                continue
             out.append(d)
             if len(out) >= limit:
                 break
@@ -13747,8 +13757,12 @@ class SqlServerStore:
             # Mixed-table join: last_error is queue's (o.id → outbox_id), summary is the messages
             # row's (keyed by message_id and bound to the message's own channel, BACKLOG #2593) —
             # each binds to its own cell (ASVS 11.3.3).
-            r["last_error"] = self._dec(
-                r["last_error"], aad=cell_aad("queue", "last_error", r["outbox_id"])
+            # BACKLOG #5970: a last_error the cipher refuses is withheld, not a 500 page.
+            r["last_error"] = open_listed_cell(
+                self._cipher,
+                r["last_error"],
+                cell_aad("queue", "last_error", r["outbox_id"]),
+                table="queue",
             )
             withhold_message_cells(
                 self._cipher,

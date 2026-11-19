@@ -36,6 +36,7 @@ from messagefoundry.store.cell_tag import (
     dead_letter_on_cell_tag,
     dead_letters_on_cell_tag,
     message_cell_aad,
+    open_listed_cell,
     open_message_cell,
     open_preset_criteria,
     open_tagged_cell,
@@ -977,6 +978,9 @@ async def test_the_scoped_message_read_hides_a_failed_row_out_of_scope() -> None
     audits: list[str] = []
 
     class _Store:
+        async def message_channel_id(self, message_id: str) -> str:
+            return "IB_SECRET"
+
         async def get_message(self, message_id: str) -> None:
             raise CellTagError("messages", "raw", message_id, "IB_SECRET")
 
@@ -996,6 +1000,132 @@ async def test_the_scoped_message_read_hides_a_failed_row_out_of_scope() -> None
         await get_scoped_message(engine, inside, "m-scope", request)
     assert refused.value.status_code == 423
     assert await read_scoped_message(engine, inside, "m-scope", request) is None  # export skips
+
+
+@pytest.mark.parametrize(
+    ("raised", "status"),
+    [
+        (CipherError("retired key"), 423),
+        (UnauthenticatedCipherError("no key verified"), 423),
+        (CipherUnavailableError("vault down"), 503),
+    ],
+)
+async def test_the_scoped_message_read_checks_scope_before_it_decrypts(
+    raised: CipherError, status: int
+) -> None:
+    """BACKLOG #5969, #5981: the scope is checked on the plaintext channel before any cell is
+    opened. Out of scope, a message whose cells the cipher refuses is the uniform 404, audited,
+    and ``get_message`` never runs; in scope a plain cipher error is a 423 and an outage a 503,
+    never a 500. Before the fix ``get_message`` ran first and only a tag failure was caught."""
+    from types import SimpleNamespace
+
+    from fastapi import HTTPException
+    from starlette.requests import Request
+
+    from messagefoundry.api.message_scope import get_scoped_message, read_scoped_message
+
+    audits: list[str] = []
+    opened: list[str] = []
+
+    class _Store:
+        async def message_channel_id(self, message_id: str) -> str | None:
+            return None if message_id == "m-none" else "IB_SECRET"
+
+        async def get_message(self, message_id: str) -> None:
+            opened.append(message_id)
+            raise raised
+
+        async def record_audit(self, action: str, **_: object) -> None:
+            audits.append(action)
+
+    engine: Any = SimpleNamespace(store=_Store())
+    request = Request({"type": "http", "client": ("127.0.0.1", 1), "headers": []})
+    out: Any = SimpleNamespace(username="u", can_access_channel=lambda c: c != "IB_SECRET")
+    inside: Any = SimpleNamespace(username="u", can_access_channel=lambda c: True)
+    with pytest.raises(HTTPException) as hidden:
+        await get_scoped_message(engine, out, "m-scope", request)
+    assert hidden.value.status_code == 404
+    assert audits == ["auth.channel_denied"] and opened == []
+    with pytest.raises(HTTPException) as absent:  # control: a missing id is the same 404
+        await get_scoped_message(engine, inside, "m-none", request)
+    assert absent.value.status_code == 404 and opened == []
+    with pytest.raises(HTTPException) as refused:
+        await get_scoped_message(engine, inside, "m-scope", request)
+    assert refused.value.status_code == status and opened == ["m-scope"]
+    if status == 503:
+        assert refused.value.headers is not None and "Retry-After" in refused.value.headers
+        with pytest.raises(CipherUnavailableError):  # the export stream does not skip an outage
+            await read_scoped_message(engine, inside, "m-scope", request)
+    else:
+        assert await read_scoped_message(engine, inside, "m-scope", request) is None  # skipped
+
+
+def test_a_list_read_withholds_a_cell_the_cipher_refuses() -> None:
+    """BACKLOG #5970: a list-shaped read withholds a cell under a key the store does not hold,
+    where the plain CipherError used to fail the page; an outage still raises, and a good cell
+    opens (control)."""
+    cipher = make_cipher(generate_key(), write_v2=True)
+    foreign = make_cipher(generate_key(), write_v2=True).encrypt("SYNTH")
+    aad = cell_aad("connection_event", "reason", "IB_A", 1.0, "closed")
+    assert open_listed_cell(cipher, cipher.encrypt("SYNTH", aad=aad), aad, table="x") == "SYNTH"
+    assert open_listed_cell(cipher, foreign, aad, table="connection_event") is None
+    assert open_listed_cell(cipher, None, aad, table="connection_event") is None
+
+    class _Down:
+        def decrypt(self, stored: str, *, aad: bytes | None = None) -> str:
+            raise CipherUnavailableError("vault down")
+
+    down: Any = _Down()
+    with pytest.raises(CipherUnavailableError):
+        open_listed_cell(down, "mf:v2:x", aad, table="connection_event")
+    record: dict[str, Any] = {"error": None, "summary": "mf:v2:x"}
+    with pytest.raises(CipherUnavailableError):
+        withhold_message_cells(
+            down, record, ("error", "summary"), message_id="m", channel_id="IB_A", failures=[]
+        )
+    failures: list[CellTagError] = []
+    row = {
+        "error": cipher.encrypt(
+            "E", aad=message_cell_aad("error", message_id="m", channel_id="IB_A")
+        ),
+        "summary": foreign,
+    }
+    withhold_message_cells(
+        cipher, row, ("error", "summary"), message_id="m", channel_id="IB_A", failures=failures
+    )
+    assert row == {"error": None, "summary": None} and failures == []
+
+
+async def test_get_message_opens_its_cells_off_the_event_loop(tmp_path: pathlib.Path) -> None:
+    """BACKLOG #5981: under vault_transit each open is a blocking Vault call, so ``get_message``
+    opens its four cells in a worker thread, never on the loop's own thread."""
+    import threading
+
+    store = await MessageStore.open(
+        tmp_path / "off-loop.db", cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    try:
+        mid = await store.record_received(
+            channel_id="IB_A", raw=_RAW, status=MessageStatus.ERROR, summary="S"
+        )
+        real = store._cipher
+        threads: list[int] = []
+
+        class _Watch:
+            def __getattr__(self, name: str) -> Any:
+                return getattr(real, name)
+
+            def decrypt(self, stored: str, **kw: Any) -> str:
+                threads.append(threading.get_ident())
+                return real.decrypt(stored, **kw)
+
+        store._cipher = _Watch()
+        row = await store.get_message(mid)
+        assert row is not None and row["raw"] == _RAW and row["summary"] == "S"
+        assert threads and threading.get_ident() not in threads
+    finally:
+        store._cipher = real
+        await store.close()
 
 
 _STORE_DIR = pathlib.Path(messagefoundry.__file__).resolve().parent / "store"

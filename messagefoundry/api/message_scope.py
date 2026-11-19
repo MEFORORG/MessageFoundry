@@ -22,6 +22,7 @@ Why 404 and not 403: a 403 would tell a scoped caller that a message exists in a
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import HTTPException, Request
@@ -29,11 +30,14 @@ from fastapi import HTTPException, Request
 from messagefoundry.api.security import client_ip
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.store.cell_tag import CellTagError
+from messagefoundry.store.crypto import CipherError, gave_no_verdict
+from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
 
 if TYPE_CHECKING:
     from messagefoundry.auth import Identity
     from messagefoundry.pipeline import Engine
 
+_log = logging.getLogger(__name__)
 
 #: The detail of the one 403 a channel-scoped caller gets for a connection it may not reach
 #: (BACKLOG #2551). Held here, beside the audit it follows, so the API's per-name routes and the web
@@ -89,6 +93,11 @@ async def audit_channel_denied(
 _INTEGRITY_REFUSED = (
     "this message's stored contents failed their integrity check and cannot be shown"
 )
+#: A cell the cipher refused for a reason other than its tag (BACKLOG #5969): the message exists
+#: and needs an operator, as for an upload the store key cannot read.
+_KEYS_REFUSED = "this message's stored contents cannot be opened with the store's keys"
+#: The key service gave no verdict, so a later try may succeed (BACKLOG #3734, #5969).
+_KEY_SERVICE_UNAVAILABLE = "the store's key service could not open this message. Try again shortly"
 
 
 async def read_scoped_message(
@@ -100,31 +109,59 @@ async def read_scoped_message(
     refuse_integrity: bool = False,
 ) -> dict[str, Any] | None:
     """The message row, or ``None`` when it does not exist, sits outside the caller's channels, or
-    its cells fail their channel tag.
+    its cells cannot be opened.
 
-    An out-of-scope row is audited as ``auth.channel_denied`` before ``None`` comes back, so a caller
-    that skips it (the export stream) still leaves the refusal on the record. A row whose cells fail
-    their tag, or are corrupt, was refused by the store, which alerts and audits drift and logs a
-    corrupt cell (BACKLOG #2593). Out of scope it reads as
-    any other refused row, so the answer never says the message exists. In scope it is ``None`` for
-    a caller that skips (the export stream), or, with ``refuse_integrity``, a 423."""
-    integrity_refused = False
+    The channel scope is checked on the row's plaintext ``channel_id`` BEFORE any cell is opened
+    (BACKLOG #5969, #5981), so an out-of-scope message decrypts nothing, and whatever its cells
+    hold it reads as any other refused row: audited as ``auth.channel_denied``, then ``None``, so
+    a caller that skips it (the export stream) still leaves the refusal on the record, and the
+    answer never says the message exists.
+
+    In scope, a row whose cells fail their tag, or are corrupt, was refused by the store, which
+    alerts and audits drift and logs a corrupt cell (BACKLOG #2593); a cell the cipher refuses for
+    another reason (a retired key not supplied, a Transit refusal other than the tag) is logged
+    here by its error class. Either is ``None`` for a caller that skips (the export stream), or,
+    with ``refuse_integrity``, a 423. With ``refuse_integrity``, a key service that gave no verdict
+    answers 503 with ``Retry-After``; a caller that skips gets that error raised."""
+    channel_id = await engine.store.message_channel_id(message_id)
+    if channel_id is None:
+        return None
+    if not identity.can_access_channel(channel_id):
+        await audit_channel_denied(engine, identity, channel_id, client_ip(request))
+        return None
+    refusal: HTTPException | None = None
     try:
         row = await engine.store.get_message(message_id)
-    except CellTagError as err:
-        if not identity.can_access_channel(err.channel_id):
-            await audit_channel_denied(engine, identity, err.channel_id, client_ip(request))
-            return None
+    except CellTagError:
         if not refuse_integrity:
             return None
-        integrity_refused = True
-    if integrity_refused:
-        # Raised after the handler, so the 423 chains nothing (BACKLOG #1796). Inside it, even with
-        # `from None`, __context__ would keep the CellTagError, the cipher's error under it, and
-        # through their tracebacks the store frame holding the cells it had already opened.
-        raise HTTPException(423, _INTEGRITY_REFUSED)
+        refusal = HTTPException(423, _INTEGRITY_REFUSED)
+    except CipherError as exc:
+        no_verdict = gave_no_verdict(exc)
+        if no_verdict and not refuse_integrity:
+            raise
+        # The class name only: the cipher's text can echo fields cut from the stored value.
+        _log.warning("message %s could not be opened: %s", message_id, type(exc).__name__)
+        if not refuse_integrity:
+            return None
+        refusal = (
+            HTTPException(
+                503,
+                _KEY_SERVICE_UNAVAILABLE,
+                headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
+            )
+            if no_verdict
+            else HTTPException(423, _KEYS_REFUSED)
+        )
+    if refusal is not None:
+        # Raised after the handler, so the refusal chains nothing (BACKLOG #1796). Inside it, even
+        # with `from None`, __context__ would keep the cipher's error and, through its traceback,
+        # the store frame holding the cells it had already opened.
+        raise refusal
     if row is None:
         return None
+    # Checked again on the row itself: the channel is an immutable column, so this differs from
+    # the check above only if the id was deleted and reused between the two reads.
     if not identity.can_access_channel(row["channel_id"]):
         await audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
         return None
@@ -138,7 +175,8 @@ async def get_scoped_message(
 
     The same 404 covers a missing message and one outside the caller's channel scope, so the answer
     never says which. The refusal is audited first, by :func:`read_scoped_message`. An in-scope
-    message whose cells fail their integrity tag answers 423 (BACKLOG #2593)."""
+    message whose cells fail their integrity tag (BACKLOG #2593), or that the store's keys cannot
+    open (BACKLOG #5969), answers 423; one the key service gave no verdict on answers 503."""
     row = await read_scoped_message(engine, identity, message_id, request, refuse_integrity=True)
     if row is None:
         raise HTTPException(404, f"no such message: {message_id}")

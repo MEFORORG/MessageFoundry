@@ -83,6 +83,7 @@ from messagefoundry.store.backup_codec import MAGIC, BackupCodecError, read_head
 from messagefoundry.store.cell_tag import CellTagError
 from messagefoundry.store.crypto import (
     CipherError,
+    CipherUnavailableError,
     StoreKeylessError,
     decrypt_json_cell,
     generate_key,
@@ -977,7 +978,12 @@ async def test_an_integrity_refused_message_423_carries_no_chain(
         except CipherError as exc:
             raise CellTagError("messages", "summary", "m-1", "IB_A") from exc
 
-    engine: Any = SimpleNamespace(store=SimpleNamespace(get_message=_get_message))
+    async def _channel(_message_id: str) -> str:
+        return "IB_A"
+
+    engine: Any = SimpleNamespace(
+        store=SimpleNamespace(get_message=_get_message, message_channel_id=_channel)
+    )
     identity: Any = SimpleNamespace(can_access_channel=lambda _channel: True)
     request: Any = None
     with pytest.raises(HTTPException) as caught:
@@ -999,6 +1005,33 @@ async def test_an_integrity_refused_message_423_carries_no_chain(
         await read_scoped_message(engine, outsider, "m-1", request, refuse_integrity=True) is None
     )
     assert denied == ["IB_A"]
+
+
+@pytest.mark.parametrize(
+    ("raised", "status"),
+    [(CipherError(_PLANTED), 423), (CipherUnavailableError(_PLANTED), 503)],
+)
+async def test_a_cipher_refused_message_refusal_carries_no_chain(
+    raised: CipherError, status: int
+) -> None:
+    """BACKLOG #5969: a plain cipher error (423) and an outage (503) are each raised after the
+    handler too, so neither carries the cipher's error, or its planted text, on its chain."""
+
+    async def _get_message(_message_id: str) -> dict[str, Any] | None:
+        raise raised
+
+    async def _channel(_message_id: str) -> str:
+        return "IB_A"
+
+    engine: Any = SimpleNamespace(
+        store=SimpleNamespace(get_message=_get_message, message_channel_id=_channel)
+    )
+    identity: Any = SimpleNamespace(can_access_channel=lambda _channel: True)
+    request: Any = None
+    with pytest.raises(HTTPException) as caught:
+        await read_scoped_message(engine, identity, "m-1", request, refuse_integrity=True)
+    assert caught.value.status_code == status
+    _assert_bare(caught.value)
 
 
 # ---- store/store.py WebAuthnCredential.from_mapping: a malformed passkey row (BACKLOG #3937) ------

@@ -78,7 +78,9 @@ __all__ = [
     "dead_letters_on_cell_tag",
     "is_row_tagged",
     "message_cell_aad",
+    "open_listed_cell",
     "open_message_cell",
+    "open_message_record",
     "open_preset_criteria",
     "open_tagged_cell",
     "preset_criteria_aad",
@@ -87,6 +89,7 @@ __all__ = [
     "row_tag_aad",
     "row_tag_columns",
     "withhold_message_cells",
+    "withhold_refused_cell",
 ]
 
 _log = logging.getLogger(__name__)
@@ -395,6 +398,25 @@ def open_message_cell(
     )
 
 
+#: The ``messages`` cells a by-id read opens: raw (the body), error (may embed raw HL7 fragments),
+#: summary and metadata (PHI).
+_MESSAGE_RECORD_CELLS: Final = ("raw", "error", "summary", "metadata")
+
+
+def open_message_record(cipher: Cipher, record: dict[str, Any]) -> None:
+    """Open a whole ``messages`` row's cells in place, each under the tag its row's id and channel
+    build (ASVS 11.3.3, BACKLOG #2593), so a cell that fails that tag refuses the whole read. Every
+    backend's ``get_message`` runs it through ``asyncio.to_thread`` (BACKLOG #5981)."""
+    for column in _MESSAGE_RECORD_CELLS:
+        record[column] = open_message_cell(
+            cipher,
+            column,
+            record[column],
+            message_id=record["id"],
+            channel_id=record["channel_id"],
+        )
+
+
 def open_preset_criteria(
     cipher: Cipher, stored: object, *, preset_id: str, owner_user_id: str
 ) -> str:
@@ -444,11 +466,18 @@ def withhold_message_cells(
                 record[col] = open_message_cell(
                     cipher, col, record[col], message_id=message_id, channel_id=channel_id
                 )
-    except CellTagError as err:
+    except CipherError as exc:
+        # BACKLOG #5970: besides a tag failure, a key or format problem the cipher raises as is (a
+        # retired key not supplied, a corrupt value, a Transit refusal other than the tag)
+        # withholds the row's cells too, so one such cell cannot fail the whole page. An outage
+        # still raises: every row would fail alike, and withholding them all would hide it.
+        if isinstance(exc, CellTagError):
+            failures.append(exc)
+        else:
+            withhold_refused_cell("messages", exc)
         for col in columns:
             if col in record:
                 record[col] = None
-        failures.append(err)
 
 
 #: How long one cell's failure is reported once per process. A list view or a retention pass meets
@@ -457,7 +486,7 @@ def withhold_message_cells(
 _REPORT_INTERVAL_S: Final = 3600.0
 #: The most cells remembered; the oldest is forgotten first.
 _REPORTED_MAX: Final = 4096
-type _Key = tuple[str, str, str, type[CellTagError]]
+type _Key = tuple[str, str, str, type[CipherError]]
 type _Memo = dict[_Key, float]
 _reported: _Memo = {}
 _reported_audit: _Memo = {}
@@ -501,6 +530,42 @@ def _first_in_interval(memo: _Memo, err: CellTagError, key: _Key | None = None) 
             return False
         _remember(memo, key, now)
     return True
+
+
+#: One WARNING per (table, error class) per interval for a cell a list-shaped read withheld on a
+#: plain cipher error; a list view meets the same cells on every refresh.
+_withheld: _Memo = {}
+
+
+def withhold_refused_cell(table: str, exc: CipherError) -> None:
+    """For a list-shaped read that met a plain cipher error on a ``table`` cell (BACKLOG #5970):
+    re-raise an outage (:func:`~messagefoundry.store.crypto.gave_no_verdict`), a store-wide fault
+    that withholding every row would hide; otherwise log that the cell was withheld, once per table
+    and error class per interval. The class name only: the cipher's text can echo fields cut from
+    the stored value."""
+    if gave_no_verdict(exc):
+        raise exc
+    key, now = (table, "", "", type(exc)), time.monotonic()
+    with _reported_lock:
+        if _is_recent(_withheld, key, now):
+            return
+        _remember(_withheld, key, now)
+    _log.warning(
+        "a %s cell could not be opened (%s), so a list read withheld it", table, type(exc).__name__
+    )
+
+
+def open_listed_cell(cipher: Cipher, stored: str | None, aad: bytes, *, table: str) -> str | None:
+    """Open one cell for a list-shaped read, or ``None`` when the cipher refuses it (BACKLOG
+    #5970), so one unreadable cell withholds that cell rather than failing the page. An outage
+    (:func:`~messagefoundry.store.crypto.gave_no_verdict`) still raises, as a store-wide fault."""
+    if stored is None:
+        return None
+    try:
+        return cipher.decrypt(stored, aad=aad)
+    except CipherError as exc:
+        withhold_refused_cell(table, exc)
+        return None
 
 
 def _alert(cipher: object, err: CellTagError) -> None:

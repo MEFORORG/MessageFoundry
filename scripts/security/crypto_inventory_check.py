@@ -921,6 +921,10 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/api/app.py": frozenset(
         {"messagefoundry.config.tls_policy", "messagefoundry.store.crypto"}
     ),
+    # BACKLOG #5969: the by-id message read imports CipherError and gave_no_verdict from
+    # store.crypto only to answer a cell the store's keys refused (423) apart from a key service
+    # that gave no verdict (503). Calls no crypto itself.
+    "messagefoundry/api/message_scope.py": frozenset({"messagefoundry.store.crypto"}),
     "messagefoundry/api/security.py": frozenset({"messagefoundry.config.tls_policy"}),
     # reach the seam to parse and bound it rather than to open a connection.
     "messagefoundry/config/models.py": frozenset({"messagefoundry.config.tls_policy"}),
@@ -980,6 +984,10 @@ INVENTORY: dict[str, frozenset[str]] = {
 #: limits, and they are the most useful lines in this table: each is a first-party crypto decision
 #: that no call-pattern instrument can see.
 IMPORT_ONLY: dict[str, str] = {
+    "messagefoundry/api/message_scope.py": (
+        "names store.crypto's CipherError and gave_no_verdict only to classify a refused read of "
+        "a message's cells, calling no cipher; the cells are opened in the store backends"
+    ),
     "messagefoundry/tls_handshake_failures.py": (
         "subclasses ssl.SSLObject to observe a failed handshake and re-raise it, and sets a "
         "server context's sslobject_class; the contexts it watches are built in transports/mllp.py "
