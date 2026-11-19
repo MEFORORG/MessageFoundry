@@ -160,11 +160,13 @@ class _Part:
         )
 
 
-#: What may follow a boundary on its delimiter line (RFC 2046): an optional close marker ``--``,
-#: optional transport padding (spaces and tabs), then the line break. The end of the body stands in
-#: for the line break, so a body cut short right after a delimiter is refused as unclosed, not read
-#: as content.
-_DELIMITER_TAIL = re.compile(rb"(?:--)?[ \t]*(?:\r?\n|\Z)")
+#: What may follow a boundary on its delimiter line (RFC 2046): the close marker ``--``, after
+#: which anything is the ignorable epilogue (a stray CR, padding, text), as before BACKLOG #5787;
+#: or optional transport padding (spaces and tabs), then the line break. The end of the body stands
+#: in for the line break, so a body cut short right after a delimiter is refused as unclosed, not
+#: read as content. The padding run is possessive: a backtracking one gave the run back one byte at
+#: a time on a failed match, about 0.3 s for 25 MiB of padding, with the GIL held throughout.
+_DELIMITER_TAIL = re.compile(rb"--|[ \t]*+(?:\r?\n|\Z)")
 
 
 def _next_delimiter(body: bytes, delim: bytes, start: int) -> int:
@@ -174,7 +176,8 @@ def _next_delimiter(body: bytes, delim: bytes, start: int) -> int:
     body or after a line feed (a CRLF, or the bare LF a non-conforming client sends), and followed
     by what :data:`_DELIMITER_TAIL` admits. The boundary text anywhere else is part content, not a
     split point. A content line that only starts with the boundary costs a ``find``, so more than
-    ``_MAX_PARTS`` of them in a row are refused, as more parts would be: the walk stays bounded."""
+    ``_MAX_PARTS`` of them between one delimiter and the next, adjacent or not, are refused, as
+    more parts would be: the walk stays bounded."""
     if start == 0 and body.startswith(delim) and _DELIMITER_TAIL.match(body, len(delim)):
         return 0
     line_delim = b"\n" + delim
@@ -187,8 +190,8 @@ def _next_delimiter(body: bytes, delim: bytes, start: int) -> int:
         skipped += 1
         if skipped > _MAX_PARTS:
             raise MultipartError(
-                f"multipart body has more than {_MAX_PARTS} lines in a row that start with the "
-                "boundary but are not delimiters"
+                f"multipart body has more than {_MAX_PARTS} lines between two delimiters that "
+                "start with the boundary but are not delimiters"
             )
         found = body.find(line_delim, pos)
     return -1
@@ -298,13 +301,15 @@ def parse_multipart_form(
 ) -> MultipartForm:
     """Parse a ``multipart/form-data`` body into file parts + text fields.
 
-    Raises :class:`MultipartError` if the Content-Type is not multipart, the body is malformed, or it
-    holds more than ``_MAX_PARTS`` parts, or a part with no header block exceeds ``_MAX_FIELD_BYTES``
-    (all HTTP 400 at the route), and :class:`MultipartTooLargeError` if a file part exceeds
-    ``max_file_bytes`` or a non-file part with a header block exceeds ``_MAX_FIELD_BYTES`` (HTTP 413
-    at the route), and :class:`MultipartError` if the body has no closing delimiter. A delimiter
-    counts only at the start of a line, and the boundary is trusted not to start a line inside a
-    part body (the RFC-2046 invariant every multipart parser relies on).
+    Raises :class:`MultipartError` (HTTP 400 at the route) if the Content-Type is not multipart, the
+    body is malformed, it holds more than ``_MAX_PARTS`` parts, a part with no header block exceeds
+    ``_MAX_FIELD_BYTES``, the body has no delimiter for the Content-Type's boundary, it has no
+    closing delimiter, or more than ``_MAX_PARTS`` lines between two delimiters start with the
+    boundary without being delimiters (BACKLOG #5787); and :class:`MultipartTooLargeError` if a file
+    part exceeds ``max_file_bytes`` or a non-file part with a header block exceeds
+    ``_MAX_FIELD_BYTES`` (HTTP 413 at the route). A delimiter counts only at the start of a line,
+    and the boundary is trusted not to start a line inside a part body (the RFC-2046 invariant every
+    multipart parser relies on).
 
     The function is synchronous and walks the whole body. The upload route keeps one file and no
     field, so it calls :func:`parse_upload_off_loop`, which runs :func:`parse_single_file_upload`

@@ -510,12 +510,39 @@ def test_a_line_that_only_starts_with_the_boundary_is_content() -> None:
     """BACKLOG #5787: a delimiter is the boundary alone on its line, or the close marker. A content
     line that merely starts with the boundary text used to split the file part, cutting it short
     while the body still closed, so the cut file was kept as if whole."""
-    content = f"line1\r\n--{_B}x more\r\n--{_B}\tpadded-not\r\n--{_B}--not-a-close\r\nend".encode()
+    content = f"line1\r\n--{_B}x more\r\n--{_B}\tpadded-not\r\nend".encode()
     body = _body([_FILE_PART_HEAD + content])
     file = parse_single_file_upload(
         f"multipart/form-data; boundary={_B}", body, max_file_bytes=1024
     )
     assert file.data == content
+
+
+@pytest.mark.parametrize(
+    "after_close", [b"", b"\r", b" \t", b"epilogue", b"\r\nepilogue"], ids=repr
+)
+def test_a_close_marker_followed_by_anything_closes_the_body(after_close: bytes) -> None:
+    """RFC 2046 makes everything after the close delimiter an ignorable epilogue, so ``--B--``
+    closes the body whatever follows it, as on main before BACKLOG #5787."""
+    body = f"--{_B}\r\n".encode() + _FILE_PART + f"\r\n--{_B}--".encode() + after_close
+    file = parse_single_file_upload(
+        f"multipart/form-data; boundary={_B}", body, max_file_bytes=1024
+    )
+    assert file.data == b"MSH|body"
+
+
+def test_a_long_padding_run_after_a_boundary_is_scanned_once() -> None:
+    """A backtracking padding match gave a 25 MiB run of spaces back one byte at a time on a
+    failed match, about 0.3 s with the GIL held. The possessive match scans it once."""
+    content = b"a\r\n--" + _B.encode() + b" " * (25 * 1024 * 1024) + b"x"
+    body = _body([_FILE_PART_HEAD + content])
+    started = time.perf_counter()
+    file = parse_single_file_upload(
+        f"multipart/form-data; boundary={_B}", body, max_file_bytes=len(body)
+    )
+    elapsed = time.perf_counter() - started
+    assert file.data == content
+    assert elapsed < 0.1, f"the parse took {elapsed:.3f} s"
 
 
 def test_transport_padding_after_a_delimiter_still_delimits() -> None:
@@ -743,5 +770,7 @@ def test_many_lines_that_only_start_with_the_boundary_are_refused() -> None:
     at_cap = _body([_FILE_PART_HEAD + b"a" + lines * multipart._MAX_PARTS])
     assert parse_single_file_upload(ct, at_cap, max_file_bytes=4096).data.startswith(b"a\r\n")
     over = _body([_FILE_PART_HEAD + b"a" + lines * (multipart._MAX_PARTS + 1)])
-    with pytest.raises(MultipartError, match="lines in a row that start with the boundary"):
+    with pytest.raises(
+        MultipartError, match="lines between two delimiters that start with the boundary"
+    ):
         parse_single_file_upload(ct, over, max_file_bytes=4096)
