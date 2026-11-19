@@ -157,6 +157,7 @@ implements vault BACKLOG #2773.
 
 **Note (2026-11-18, BACKLOG #5894):** `supervise` now also returns 3, which outranks 0 and 1, when
 the shutdown drain may have left an engine shard's child running: a child the force could not end,
-or a launch abandoned at shutdown. So a non-zero exit no longer means only that every engine shard
-tripped the breaker. The `supervise` docstring in `messagefoundry/pipeline/supervisor.py` lists
-every code.
+or a launch still running `terminate_grace` seconds after the drain cancelled it. It joins the
+existing non-zero codes, 1 when every engine shard tripped the breaker and 2 on a config or
+discovery error. The `supervise` docstring in `messagefoundry/pipeline/supervisor.py` lists every
+code.
