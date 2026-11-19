@@ -247,7 +247,7 @@ async def test_a_fatal_watcher_exit_is_not_replaced_by_a_cancel_during_the_drain
 @pytest.mark.asyncio
 async def test_a_cancel_during_a_launch_that_never_returns_still_ends_run() -> None:
     # Engine shard "b"'s spawn never returns. A shutdown signal must still end run() once the
-    # grace runs out, and drain the sibling "a" that did start.
+    # grace runs out, drain the sibling "a" that did start, and report "b" as possibly stranded.
     a = _Proc(exit_on_terminate=True)
     hung = asyncio.Event()
 
@@ -262,10 +262,36 @@ async def test_a_cancel_during_a_launch_that_never_returns_still_ends_run() -> N
     await asyncio.wait_for(a.waiting.wait(), 5)
     await asyncio.wait_for(hung.wait(), 5)
     runner.cancel()
-    with pytest.raises(asyncio.CancelledError):
+    with pytest.raises(ShardDrainError, match="launch abandoned"):
         await asyncio.wait_for(runner, 5)
     assert a.terminated.is_set()
     assert a.returncode == -15
+
+
+@pytest.mark.asyncio
+async def test_an_abandoned_launch_that_returns_late_has_its_child_killed() -> None:
+    late = _Proc()
+    hung = asyncio.Event()
+
+    async def spawn(spec: ShardSpec) -> _Proc:
+        hung.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0.05)  # a spawn that finishes its fork despite the cancel
+        return late
+
+    sup = Supervisor([_spec("default")], spawn=_spawner(spawn), terminate_grace=0.1)
+    runner = asyncio.create_task(sup.run())
+    await asyncio.wait_for(hung.wait(), 5)
+    runner.cancel()
+    with pytest.raises(ShardDrainError):
+        await asyncio.wait_for(runner, 5)
+    for _ in range(50):
+        if late.killed:
+            break
+        await asyncio.sleep(0.02)
+    assert late.killed
 
 
 @pytest.mark.asyncio
@@ -279,6 +305,41 @@ async def test_a_failed_drain_exits_3_not_the_crash_loop_code() -> None:
     sup = Supervisor(specs, spawn=_spawner(spawn), terminate_grace=0.1)
     code = asyncio.create_task(_run_supervisor(sup, specs, install_signal_handlers=False))
     await asyncio.wait_for(proc.waiting.wait(), 5)
+    sup.stop()
+    assert await asyncio.wait_for(code, 5) == 3
+
+
+async def _no_wait(delay: float) -> None:
+    pass
+
+
+@pytest.mark.asyncio
+async def test_a_failed_drain_outranks_every_engine_shard_crash_looping() -> None:
+    # Engine shard "a" trips the crash-loop breaker; "b" stays up and cannot be stopped. With both
+    # counted as tripped the crash-loop code 1 is due, and the drain failure's 3 must still win.
+    stuck = _Proc(terminate_error=PermissionError("refused"), kill_error=PermissionError("refused"))
+    tripped = asyncio.Event()
+
+    async def spawn(spec: ShardSpec) -> _Proc:
+        if spec.shard == "a":
+            crash = _Proc()
+            crash._finish(1)
+            return crash
+        return stuck
+
+    specs = [_spec("a"), _spec("b", 1)]
+    sup = Supervisor(
+        specs, spawn=_spawner(spawn), terminate_grace=0.1, crash_loop_limit=1, sleep=_no_wait
+    )
+    code = asyncio.create_task(_run_supervisor(sup, specs, install_signal_handlers=False))
+    await asyncio.wait_for(stuck.waiting.wait(), 5)
+    for _ in range(100):
+        if sup.crash_looped:
+            tripped.set()
+            break
+        await asyncio.sleep(0.01)
+    assert tripped.is_set()
+    sup.crash_looped.add("b")  # as if "b" had tripped too
     sup.stop()
     assert await asyncio.wait_for(code, 5) == 3
 
