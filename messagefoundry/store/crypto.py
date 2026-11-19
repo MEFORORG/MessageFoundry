@@ -114,7 +114,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, Self, runtime_checkable
 
 from messagefoundry.redaction import json_loads_or_refusal
 
@@ -354,34 +354,35 @@ def cell_aad(table: str, column: str, *pk: object) -> bytes:
     refused where the AAD is bound, not here: the value returned is an :class:`UnboundAAD`, and a
     cipher that binds it into a seal or an open raises :class:`AADComponentError`, a
     :class:`CipherError` naming the table and column, so a read path contains it like any cell that
-    does not open. Building one never raises, because a store builds the AAD for a row's cells before
-    it knows whether any is sealed: a NULL cell, a keyless store, or a v1 cell sealed with no AAD
-    binds nothing, and reads as it did before BACKLOG #5962."""
-    fields = (
-        _AAD_SCHEME,
-        table.encode("utf-8"),
-        column.encode("utf-8"),
-        *(_aad_component(p) for p in pk),
-    )
+    does not open. A ``None`` or ``bool`` component never makes the build raise, because a store
+    builds the AAD for a row's cells before it knows whether any is sealed: a NULL cell, a keyless
+    store, or a v1 cell sealed with no AAD binds nothing, and reads as it did before BACKLOG #5962."""
+    components: list[bytes] = []
+    refusal: str | None = None
+    for p in pk:
+        if refusal is None and (p is None or isinstance(p, bool)):
+            refusal = f"{table}.{column}: cell_aad key component must not be {p!r}"
+        components.append(_aad_component(p))
+    fields = (_AAD_SCHEME, table.encode("utf-8"), column.encode("utf-8"), *components)
     aad = b"".join(len(f).to_bytes(4, "big") + f for f in fields)
-    refused = [p for p in pk if p is None or isinstance(p, bool)]
-    if not refused:
-        return aad
-    unbound = UnboundAAD(aad)
-    unbound.refusal = f"{table}.{column}: cell_aad key component must not be {refused[0]!r}"
-    return unbound
+    return aad if refusal is None else UnboundAAD(aad, refusal)
 
 
 class UnboundAAD(bytes):
     """A :func:`cell_aad` whose key holds a ``None`` or ``bool`` component (BACKLOG #5962).
 
-    Its bytes are the ``str()`` spelling every component had before #5962, so ``None`` and the
-    string ``"None"`` give equal bytes. That is why no cipher may bind it: :func:`require_bound_aad`
-    raises :class:`AADComponentError` with ``refusal`` as its message, and each cipher calls it
-    before an AAD reaches AES-GCM or Transit. Concatenating one gives a plain ``bytes``; the two
+    Its ``None`` or ``bool`` component is spelled by ``str()``, so ``None`` and the string
+    ``"None"`` give equal bytes. That is why no cipher may bind it: :func:`require_bound_aad` raises
+    :class:`AADComponentError` with ``refusal`` as its message, and each cipher calls it before an
+    AAD reaches AES-GCM or Transit. Concatenating or slicing one gives a plain ``bytes``; the two
     builders that append to a :func:`cell_aad` append to the keyless frame, which is never one."""
 
     refusal: str
+
+    def __new__(cls, aad: bytes, refusal: str) -> Self:
+        unbound = super().__new__(cls, aad)
+        unbound.refusal = refusal
+        return unbound
 
 
 def require_bound_aad(aad: bytes | None) -> None:
@@ -407,8 +408,9 @@ def _aad_component(value: object) -> bytes:
     damaged or planted row leaves NULL. A string is UTF-8 with ``surrogatepass``, so a lone surrogate
     binds bytes no valid string produces instead of raising here; the backend's own write still
     refuses one. Any other type, such as a BLOB a damaged SQLite row hands back, keeps its ``str()``
-    spelling. No spelling raises, so a keyless open or a read whose cell is NULL does not fail on
-    its key.
+    spelling. None of these cases raises, so a keyless open or a read whose cell is NULL does not
+    fail on such a key; an int too long for ``int.__repr__`` or an object whose ``__str__`` raises
+    still does.
 
     Not covered, at least: a float bound into a TEXT-affinity key column comes back as the text
     ``"1000.0"``; an int past 2**53 written to a float column comes back rounded; and a ``Decimal``
@@ -2186,14 +2188,13 @@ class AesGcmCipher(_UnmarkedPolicy):
         return write
 
     def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
-        if self._write_v2:
-            require_bound_aad(aad)  # before the invocation is charged, so nothing is sealed
-        write = self._count_invocation()  # fail-closed before 2**32 (#190-F); no-op cost otherwise
-        nonce = os.urandom(_NONCE_BYTES)
         # Cell-bound AAD (ASVS 11.3.3) is bound ONLY on the cell-bound (v4) writer. The v1 writer is FROZEN (CRYPTO-1):
         # it always encrypts with None AAD so its output stays byte-identical even if a caller passes
         # `aad`. So `aad` takes effect iff write_v2 is set (the [store].aad_bind knob).
         gcm_aad = aad if self._write_v2 else None
+        require_bound_aad(gcm_aad)  # before the invocation is charged, so nothing is sealed
+        write = self._count_invocation()  # fail-closed before 2**32 (#190-F); no-op cost otherwise
+        nonce = os.urandom(_NONCE_BYTES)
         # Own the encoded plaintext in a mutable buffer so it can be wiped once the AEAD has consumed it.
         # RESIDUAL (documented): the source `plaintext` str and the returned marker str are immutable —
         # CPython gives no hook to wipe a str — and `bytes(pt)` is a transient immutable copy AESGCM

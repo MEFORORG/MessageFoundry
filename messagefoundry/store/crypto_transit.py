@@ -607,6 +607,10 @@ class TransitCipher(_UnmarkedPolicy):
         this cipher then sends every later value alone. Vault's 400 to a batch, or a failure the
         classifier could not read (:func:`_classify_batch_failure`), seals that batch alone and
         leaves batching on. A batch of one is a single request."""
+        for _, aad in items:
+            # Refused before any request: in a batch the refusal would read as Transit's, and the
+            # values ahead of it would each be sealed alone first (BACKLOG #5962).
+            require_bound_aad(aad)
         costs = [
             b64_chars(len(plaintext.encode("utf-8"))) + batch_chars("", aad)
             for plaintext, aad in items
