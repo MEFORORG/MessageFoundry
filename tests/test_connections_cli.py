@@ -502,6 +502,128 @@ def test_infinite_value_edited_to_a_finite_value_is_written(
     assert "inf" not in (cfg / "connections.toml").read_text(encoding="utf-8")
 
 
+def _table_text(cfg: Path, name: str) -> str:
+    """The text of connection ``name``'s table, up to the next connection header."""
+    text = (cfg / "connections.toml").read_text(encoding="utf-8")
+    start = text.index(f'name = "{name}"')
+    ends = [i for i in (text.find("[[inbound]]", start), text.find("[[outbound]]", start)) if i > 0]
+    return text[start : min(ends)] if ends else text[start:]
+
+
+@pytest.mark.parametrize("case", sorted(_INF_CASES))
+def test_infinite_value_clone_writes_a_bare_inf(
+    case: str, cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A clone (the IDE's clone, and rename = clone + remove) appends a table with no same-named
+    entry to match against. A float-typed field still gets the float back from the schema, so the
+    clone carries a bare `inf`, not the string "inf" the read schema refuses (BACKLOG #5778)."""
+    _inf_file(cfg, case)
+    svc = _svc(cfg, _EPIC_EGRESS)
+    source = "IB" if case == "strict_timeout_s" else "OB"
+    entry = _listed(cfg, capsys)[source]
+    entry["name"] = source + "2"
+    entry["settings"]["port"] += 10
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 0, out
+    clone = _table_text(cfg, source + "2")
+    assert f"{case.split('.')[-1]} = inf" in clone
+    assert '"inf"' not in clone
+    load_config(cfg)
+
+
+def test_sibling_edit_in_buildup_keeps_the_untouched_inf(
+    cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (cfg / "connections.toml").write_text(
+        _INF_ROUND_TRIP_FILE.format(
+            inbound_extra="",
+            outbound_extra="",
+            outbound_tables=(
+                "  [outbound.buildup]\n  max_depth = 10\n  max_oldest_seconds = inf  # age off\n"
+            ),
+        ),
+        encoding="utf-8",
+    )
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entry = _listed(cfg, capsys)["OB"]
+    entry["buildup"]["max_depth"] = 20
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 0, out
+    text = (cfg / "connections.toml").read_text(encoding="utf-8")
+    assert "max_depth = 20" in text
+    assert "max_oldest_seconds = inf  # age off" in text
+
+
+def test_untouched_inf_in_an_edited_array_stays_a_float(
+    cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`metadata` is untyped, so the element is decoded only because the file held that float at
+    that position: the operator edited limits[0], never limits[1]."""
+    (cfg / "connections.toml").write_text(
+        _INF_ROUND_TRIP_FILE.format(
+            inbound_extra="", outbound_extra="", outbound_tables=""
+        ).replace(
+            "  [inbound.settings]", "  metadata = { limits = [1.0, inf] }\n  [inbound.settings]"
+        ),
+        encoding="utf-8",
+    )
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entry = _listed(cfg, capsys)["IB"]
+    assert entry["metadata"]["limits"] == [1.0, "inf"]
+    entry["metadata"]["limits"][0] = 2.0
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 0, out
+    assert load_config(cfg).inbound["IB"].metadata == {"limits": [2.0, float("inf")]}
+
+
+def test_negative_infinity_round_trips_and_clones(
+    cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    before = _INF_ROUND_TRIP_FILE.format(
+        inbound_extra="strict_timeout_s = -inf  # backstop off\n",
+        outbound_extra="",
+        outbound_tables="",
+    ).encode("utf-8")
+    (cfg / "connections.toml").write_bytes(before)
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entry = _listed(cfg, capsys)["IB"]
+    assert entry["strict_timeout_s"] == "-inf"
+    assert _upsert(cfg, entry, capsys, svc=svc)[0] == 0
+    assert (cfg / "connections.toml").read_bytes() == before
+    entry["name"] = "IB2"
+    entry["settings"]["port"] = 2610
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 0, out
+    assert "strict_timeout_s = -inf" in _table_text(cfg, "IB2")
+    assert load_config(cfg).inbound["IB2"].validation.strict_timeout_s == float("-inf")
+
+
+def test_a_string_field_holding_inf_stays_a_string(
+    cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The control arm: a string-typed field (`cleartext_reason`) and an untyped one whose file
+    value is already a string (`metadata.tag`) are never decoded, on a re-save or on a clone."""
+    (cfg / "connections.toml").write_text(
+        _INF_ROUND_TRIP_FILE.format(
+            inbound_extra="", outbound_extra="", outbound_tables=""
+        ).replace(
+            'cleartext_reason = "legacy partner has no MLLP-over-TLS listener"',
+            'cleartext_reason = "inf"\nmetadata = { tag = "inf" }',
+        ),
+        encoding="utf-8",
+    )
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entry = _listed(cfg, capsys)["OB"]
+    assert _upsert(cfg, entry, capsys, svc=svc)[0] == 0
+    entry["name"] = "OB2"
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 0, out
+    reg = load_config(cfg)
+    for name in ("OB", "OB2"):
+        assert reg.outbound[name].cleartext_reason == "inf"
+        assert reg.outbound[name].metadata == {"tag": "inf"}
+
+
 def test_upsert_rejects_unknown_key_and_writes_nothing(
     cfg: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

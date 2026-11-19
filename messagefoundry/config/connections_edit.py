@@ -26,22 +26,34 @@ silently deleted by the next GUI/CLI save (the #234 data-loss bug this closes).
 from __future__ import annotations
 
 import contextlib
+import inspect
 import math
 from collections.abc import Callable, Iterator
 from datetime import date, datetime, time
+from functools import cache
 from pathlib import Path
 from typing import Any
 
 import tomlkit
+from pydantic import BaseModel
 
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.connections_file import (
     _INBOUND_KEYS,
     _OUTBOUND_KEYS,
+    _TRANSPORTS,
     CONNECTIONS_FILE_NAME,
+    _classify,
     validating_candidate,
 )
-from messagefoundry.config.wiring import WiringError
+from messagefoundry.config.models import (
+    BatchConfig,
+    BuildupThreshold,
+    RetryPolicy,
+    Schedule,
+    StallThreshold,
+)
+from messagefoundry.config.wiring import WiringError, inbound, outbound
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
 
 # Scalar (and array — TOML requires a table's key-values before its sub-table headers) fields,
@@ -188,10 +200,10 @@ def _jsonable(value: Any) -> Any:
         return value.isoformat()
     if isinstance(value, float) and not math.isfinite(value):
         # TOML's inf / -inf / nan have no JSON literal: json.dumps would print a bare Infinity or
-        # NaN token a strict parser (the IDE's JSON.parse) refuses. The string form survives the
-        # GUI's list -> upsert re-save: _same_value matches it to the untouched float, so the file
-        # keeps `inf`; a null instead would drop the key on re-save, turning an `inf` (off) alert age back into
-        # its default (BACKLOG #5778).
+        # NaN token a strict parser (the IDE's JSON.parse) refuses. On the way back in,
+        # _decode_non_finite turns the string into the float again before upsert compares and
+        # writes, so a re-save or a clone writes `inf`, not "inf". A null instead would drop the key
+        # on re-save, turning an `inf` (off) alert age back into its default (BACKLOG #5778).
         return str(value)
     return value
 
@@ -220,7 +232,10 @@ def upsert_connection(
         if aot is None:
             aot = tomlkit.aot()
             doc[direction] = aot
-        new_table = _build_table(obj)
+        existing = next((table for table in aot if table.get("name") == obj["name"]), None)
+        new_table = _build_table(
+            _decode_non_finite(obj, existing.unwrap() if existing is not None else None)
+        )
         for index in range(len(aot)):
             if aot[index].get("name") == obj["name"]:
                 # Update the EXISTING table object key-wise. Assigning ``aot[index] = new_table``
@@ -311,6 +326,106 @@ def _validate_input(obj: Any) -> None:
             )
 
 
+#: The strings :func:`_jsonable` lists a non-finite float as, mapped back to the float.
+_NON_FINITE: dict[str, float] = {str(value): value for value in (math.inf, -math.inf, math.nan)}
+
+#: The sub-tables whose keys a pydantic model types. ``settings`` is typed by the transport factory,
+#: and ``metadata`` by nothing.
+_POLICY_MODELS: dict[str, type[BaseModel]] = {
+    "retry": RetryPolicy,
+    "buildup": BuildupThreshold,
+    "stall": StallThreshold,
+    "batch": BatchConfig,
+    "schedule": Schedule,
+}
+
+
+@cache
+def _parameter_annotations(factory: Callable[..., Any]) -> dict[str, Any]:
+    """``factory``'s keyword annotations, resolved; empty when they will not resolve. Cached on a
+    closed key set: ``inbound``, ``outbound`` and the transport factories, all module-level."""
+    try:
+        signature = inspect.signature(factory, eval_str=True)
+    except (NameError, AttributeError, SyntaxError, TypeError):
+        return {}  # an unresolvable annotation types nothing, so no string is decoded by type
+    return {name: param.annotation for name, param in signature.parameters.items()}
+
+
+def _field_annotations(key: str, transport: Any) -> dict[str, Any]:
+    """The annotation of each key inside sub-table ``key``, from the schema that reads it."""
+    if key in _POLICY_MODELS:
+        return {name: field.annotation for name, field in _POLICY_MODELS[key].model_fields.items()}
+    if key == "settings" and isinstance(transport, str) and transport in _TRANSPORTS:
+        return _parameter_annotations(_TRANSPORTS[transport])
+    return {}
+
+
+def _admits_float(annotation: Any) -> bool:
+    accepted = _classify(annotation) if annotation is not None else None
+    return accepted is not None and float in accepted.scalars
+
+
+def _item_annotation(annotation: Any) -> Any:
+    """The element annotation of an array-typed field, or ``None`` when it is not one."""
+    accepted = _classify(annotation) if annotation is not None else None
+    if accepted is None or len(accepted.sequence_items) != 1:
+        return None
+    return accepted.sequence_items[0]
+
+
+def _decode_non_finite(obj: dict[str, Any], existing: dict[str, Any] | None) -> dict[str, Any]:
+    """``obj`` with each ``"inf"`` / ``"-inf"`` / ``"nan"`` that :func:`_jsonable` listed for a
+    float decoded back to that float, so upsert compares and writes the float (BACKLOG #5778).
+
+    A string is decoded only where the schema types the field as a float -- the ``inbound()`` /
+    ``outbound()`` keyword, the policy model field, or the transport's settings parameter -- or, in
+    an untyped place such as ``metadata`` or an array element, where ``existing`` (the same-named
+    table already in the file) holds that very float at the same position. So a clone or rename
+    writes ``inf`` for a typed field, a real string field holding "inf" stays a string, and the read
+    schema accepts nothing it did not accept before."""
+    direction = obj["direction"]
+    top = _parameter_annotations(inbound if direction == "inbound" else outbound)
+    prior = existing or {}
+    out: dict[str, Any] = {}
+    for key, value in obj.items():
+        if key in _SUB_TABLES and isinstance(value, dict):
+            fields = _field_annotations(key, obj.get("transport"))
+            prior_sub = prior.get(key)
+            prior_sub = prior_sub if isinstance(prior_sub, dict) else {}
+            out[key] = {
+                name: _decode_value(item, fields.get(name), prior_sub.get(name))
+                for name, item in value.items()
+            }
+        else:
+            out[key] = _decode_value(value, top.get(key), prior.get(key))
+    return out
+
+
+def _decode_value(value: Any, annotation: Any, prior: Any) -> Any:
+    if isinstance(value, str):
+        if value in _NON_FINITE and (_admits_float(annotation) or _is_listed_as(prior, value)):
+            return _NON_FINITE[value]
+        return value
+    if isinstance(value, list):
+        item = _item_annotation(annotation)
+        prior_items = prior if isinstance(prior, list) else []
+        return [
+            _decode_value(element, item, prior_items[i] if i < len(prior_items) else None)
+            for i, element in enumerate(value)
+        ]
+    if isinstance(value, dict):
+        prior_map = prior if isinstance(prior, dict) else {}
+        return {
+            name: _decode_value(item, None, prior_map.get(name)) for name, item in value.items()
+        }
+    return value
+
+
+def _is_listed_as(prior: Any, value: str) -> bool:
+    """Is ``value`` the string :func:`_jsonable` lists the non-finite float ``prior`` as?"""
+    return isinstance(prior, float) and not math.isfinite(prior) and str(prior) == value
+
+
 def _build_table(obj: dict[str, Any]) -> Any:
     # ``direction`` is used by the caller to pick the [[inbound]]/[[outbound]] array and is never
     # emitted as a key — it is in neither tuple (see the note above the tuples).
@@ -355,26 +470,9 @@ def _plain(item: Any) -> Any:
 def _same_value(current: Any, new: Any) -> bool:
     """Compare a tomlkit item against a freshly built one by VALUE, ignoring formatting."""
     try:
-        return _same_plain(_plain(current), _plain(new))
+        return bool(_plain(current) == _plain(new))
     except Exception:  # pragma: no cover - defensive: an exotic item type compares as "changed"
         return False
-
-
-def _same_plain(current: Any, new: Any) -> bool:
-    """Plain-value equality, except that the string :func:`_jsonable` lists a non-finite float as
-    (``"inf"``) equals that float. The GUI sends the listed string back on a re-save, so without this
-    an untouched ``inf`` compares as changed and is rewritten as the string ``"inf"``, which the read
-    schema refuses for ``strict_timeout_s`` / ``waiting_display_delay`` (BACKLOG #5778). Only the
-    unchanged case is matched: the file keeps its float, and no new string form reaches the file."""
-    if isinstance(current, dict) and isinstance(new, dict):
-        return current.keys() == new.keys() and all(
-            _same_plain(current[key], new[key]) for key in current
-        )
-    if isinstance(current, list) and isinstance(new, list):
-        return len(current) == len(new) and all(map(_same_plain, current, new))
-    if isinstance(current, float) and not math.isfinite(current) and isinstance(new, str):
-        return new == str(current)  # the string _jsonable lists it as
-    return bool(current == new)
 
 
 def _is_table_like(item: Any) -> bool:
