@@ -122,14 +122,17 @@ $unreadableRecordFiles = @()
 if (Test-Path -LiteralPath $seatsDir) {
     foreach ($d in @(Get-ChildItem -LiteralPath $seatsDir -Directory -EA SilentlyContinue |
                      Where-Object { $_.Name -notlike '.*' })) {
-        foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -Filter *.json -EA SilentlyContinue)) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $d.FullName -Filter *.json -File -EA SilentlyContinue)) {
             try {
                 $j = Read-CoordText $f.FullName -AllowAccessDenied | ConvertFrom-Json -EA Stop
                 $records += [pscustomobject]@{ Rec = $j; File = $f.FullName; Box = $d.Name }
             } catch [System.IO.FileNotFoundException], [System.IO.DirectoryNotFoundException] {
                 # Deleted between the listing and the read: a file that is gone holds no seat. Only
                 # the read's own not-found says so; a later Test-Path could not tell a vanished file
-                # from one whose read failed for another reason and then moved.
+                # from one whose read failed for another reason and then moved. A seats directory that
+                # is itself gone (a dropped share) is not a deleted record: every read after it would
+                # be skipped and the roster would come out smaller, so that counts as unreadable.
+                if (-not (Test-Path -LiteralPath $seatsDir -PathType Container)) { $unreadableRecordFiles += $f.FullName }
                 continue
             } catch {
                 # Counted, never dropped: dropping turns an occupied seat into an absent one in the
@@ -571,7 +574,7 @@ foreach ($r in $records) {
 # ---------------------------------------------------------------------------------------------
 
 $stops = @()
-if ($unreadableRecordFiles.Count -gt 0) { $stops += "recordsUnreadable=$($unreadableRecordFiles.Count) -- these seat record(s) could not be read or parsed, so a seat they hold may be absent from the roster below and it may be INCOMPLETE by them. A record is written by one atomic rename, and the read retries a sharing violation and a pending delete, so one that still fails is damaged or its share is unreachable: read it, and if it is damaged move it out of the seats directory by hand: $($unreadableRecordFiles -join '; ')" }
+if ($unreadableRecordFiles.Count -gt 0) { $stops += "recordsUnreadable=$($unreadableRecordFiles.Count) -- these seat record(s) could not be read or parsed, so a seat they hold may be absent from the roster below and it may be INCOMPLETE by them. Causes include at least a damaged record, an unreachable share and an access denial: read each first, and move it out of the seats directory by hand only if it is damaged: $($unreadableRecordFiles -join '; ')" }
 if (-not $fenceAvailable) { $stops += 'fenceAvailable=false -- no config root with a sessions/ directory was found; every state below would be a guess' }
 if ($anonymousReadError) { $stops += "anonymousLiveRecords=UNREAD -- the scan for registry records that name no session failed ($anonymousReadError), so a relaunched seat could read INTERRUPTED below" }
 if ($anonymousNoCwd.Count -gt 0) { $stops += "anonymousLiveRecordsWithNoCwd=$($anonymousNoCwd.Count) -- registry record(s) name no session, are live or freshly written, and name no readable cwd ($($anonymousNoCwd -join '; ')), so no seat can be told apart from a relaunch of it" }

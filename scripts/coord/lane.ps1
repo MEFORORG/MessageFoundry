@@ -111,15 +111,13 @@ if ($revParseExit -ne 0 -or -not $top) { Write-RootRefusal "git could not name t
 $prefix = if ($revParse.Count -ge 2) { ([string]$revParse[1]).Trim().TrimEnd('/') } else { '' }
 # A removed worktree under the primary checkout (.claude/worktrees/<name> with no .git left) has git
 # walk up to the primary, so keying there would overwrite the primary's level. That container is the
-# population the worktree tooling names (scripts/worktree/find-emptied-worktrees.ps1), and the
-# primary ignores it, so a directory in it that git places in the primary is no live tree's. Any
-# other ignored directory of a live tree, such as .venv\Scripts, is still that tree's work and keys
-# on its root. A check-ignore that fails refuses: an unanswered question is not a "not ignored".
+# population the worktree tooling names (scripts/worktree/find-emptied-worktrees.ps1). A live
+# worktree there is its own toplevel, so a directory in it that git places in the primary is no live
+# tree's, whether or not the primary ignores the container: it refuses without asking check-ignore,
+# whose answer could only let it through. Any other directory of a live tree, ignored or not (such as
+# .venv\Scripts), is still that tree's work and keys on its root.
 if ("$prefix/" -like '.claude/worktrees/*') {
-    & git check-ignore -q -- . 2>$null
-    $ignoreExit = $LASTEXITCODE
-    if ($ignoreExit -eq 0) { Write-RootRefusal "$here is an ignored directory under the worktree container of $top (a removed worktree reads this way)" }
-    if ($ignoreExit -ne 1) { Write-RootRefusal "git check-ignore failed (exit $ignoreExit) for $here under the worktree container of $top" }
+    Write-RootRefusal "$here is under the worktree container of $top but is no worktree of its own (a removed worktree reads this way)"
 }
 # git's resolved root, the path claim.ps1 records and seat records carry, so a tree reached through
 # a junction keys the same lane and claim hash as its target.

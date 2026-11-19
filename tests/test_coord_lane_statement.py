@@ -48,7 +48,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import socket
 import subprocess
 from datetime import UTC, datetime, timedelta
@@ -71,12 +70,9 @@ def _env(root: Path | str | None = None) -> dict[str, str]:
 
 
 def _pwsh(
-    repo: Path, *args: str, root: Path | str | None = None, path_first: Path | None = None
+    repo: Path, *args: str, root: Path | str | None = None
 ) -> subprocess.CompletedProcess[str]:
-    """Run lane.ps1 in ``repo``, under ``_env(root)``, with ``path_first`` put first on PATH."""
-    env = _env(root)
-    if path_first is not None:
-        env["PATH"] = str(path_first) + os.pathsep + env.get("PATH", "")
+    """Run lane.ps1 in ``repo``, under ``_env(root)``."""
     return subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(_SCRIPT), *args],
         capture_output=True,
@@ -87,7 +83,7 @@ def _pwsh(
         encoding="utf-8",
         errors="replace",
         cwd=repo,
-        env=env,
+        env=_env(root),
         # Under pyproject's 60 s pytest-timeout, so a hung pwsh fails this test by name.
         timeout=45,
     )
@@ -404,7 +400,7 @@ def test_a_removed_worktree_under_the_container_refuses_and_writes_nothing(repo:
     stale = _removed_worktree(repo)
     proc = _pwsh(stale, "-Free", "1", "-InFlight", "0")
     assert proc.returncode == 2, proc.stdout + proc.stderr
-    assert "REFUSED" in proc.stderr and "ignored" in proc.stderr, proc.stderr
+    assert "REFUSED" in proc.stderr and "removed worktree" in proc.stderr, proc.stderr
     assert not (repo / ".git" / "mefor-coord" / "lanes").exists()
 
 
@@ -422,28 +418,15 @@ def test_an_ignored_directory_of_a_live_tree_keys_on_its_root(repo: Path) -> Non
     assert rec["statedFree"] == 3 and rec["boxKey"] == at_root["boxKey"], (at_root, rec)
 
 
-def test_a_failed_check_ignore_refuses_rather_than_reading_not_ignored(
-    repo: Path, tmp_path_factory: pytest.TempPathFactory
-) -> None:
-    """git check-ignore exits 128 on an error, which is neither ignored (0) nor not ignored (1). It
-    used to read as not ignored, so the statement keyed the primary. A git shim first on PATH fails
-    check-ignore alone and passes every other call to the real git."""
-    if os.name != "nt":
-        pytest.skip("the git shim is a .cmd file")
-    real = shutil.which("git")
-    assert real, "git is not on PATH"
-    shim = tmp_path_factory.mktemp("gitshim")
-    (shim / "git.cmd").write_text(
-        "@echo off\r\n"
-        'echo %* | findstr /c:"check-ignore" >nul && exit /b 128\r\n'
-        f'"{real}" %*\r\n'
-        "exit /b %ERRORLEVEL%\r\n",
-        encoding="ascii",
-    )
-    stale = _removed_worktree(repo)
-    proc = _pwsh(stale, "-Free", "1", "-InFlight", "0", path_first=shim)
+def test_a_removed_worktree_refuses_where_the_container_is_not_ignored(repo: Path) -> None:
+    """A directory under .claude/worktrees that git places in the primary is no live tree's, whether
+    or not the primary ignores the container. Gating the refusal on check-ignore let it through, and
+    the statement overwrote the primary's level, where the container was not ignored."""
+    stale = repo / ".claude" / "worktrees" / "gone"
+    stale.mkdir(parents=True)
+    proc = _pwsh(stale, "-Free", "1", "-InFlight", "0")
     assert proc.returncode == 2, proc.stdout + proc.stderr
-    assert "REFUSED" in proc.stderr and "check-ignore failed" in proc.stderr, proc.stderr
+    assert "REFUSED" in proc.stderr and "removed worktree" in proc.stderr, proc.stderr
     assert not (repo / ".git" / "mefor-coord" / "lanes").exists()
 
 
