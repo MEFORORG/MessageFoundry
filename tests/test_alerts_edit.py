@@ -123,6 +123,49 @@ def test_comments_and_siblings_survive_add(
     assert len(loaded.rules) == 1 and loaded.rules[0].event_type == "storage_threshold"
 
 
+def test_add_into_an_inline_rules_array_writes_toml_that_loads(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5774: ``rules = [{...}]`` is valid TOML, and the add appended a table into the
+    inline array, which wrote text that did not parse, so the add was refused for the file. The
+    inline rules become an array of tables, each kept whole and in order, a nested tier included."""
+    svc = _svc(tmp_path)
+    svc.write_text(
+        textwrap.dedent(
+            """
+            # keep this header comment
+            [alerts]
+            rules = [
+                {event_type = "queue_buildup", min_depth = 50, escalate = [{after_count = 3, severity = "critical"}]},
+                {connection = "IB_*", transports = []},
+            ]
+            realert_seconds = 120
+            """
+        ),
+        encoding="utf-8",
+    )
+    rc, out = _add(svc, {"event_type": "connection_stopped"}, capsys)
+    assert rc == 0, out
+    assert "# keep this header comment" in svc.read_text(encoding="utf-8")
+    loaded = load_settings(config_path=svc).alerts
+    assert loaded.realert_seconds == 120
+    assert [r.event_type for r in loaded.rules] == ["queue_buildup", "any", "connection_stopped"]
+    assert loaded.rules[0].min_depth == 50
+    assert [(t.after_count, t.severity) for t in loaded.rules[0].escalate] == [(3, "critical")]
+    assert loaded.rules[1].connection == "IB_*" and loaded.rules[1].transports == []
+    assert [r["index"] for r in _list(svc, capsys)] == [0, 1, 2]
+
+
+def test_add_into_an_inline_rules_array_holding_a_non_table_is_refused(tmp_path: Path) -> None:
+    """No array of tables can hold a bare value, so the add says why and writes nothing."""
+    svc = _svc(tmp_path)
+    original = "[alerts]\nrules = [1]\n"
+    svc.write_text(original, encoding="utf-8")
+    with pytest.raises(alerts_edit.AlertRuleError, match="must hold only tables"):
+        alerts_edit.add_rule(svc, {"event_type": "connection_stopped"}, validate=lambda _p: None)
+    assert svc.read_text(encoding="utf-8") == original
+
+
 def test_failed_add_rolls_back_byte_stable(tmp_path: Path) -> None:
     # Directly exercise the rollback path: a validate callback that raises must restore the prior
     # file byte-for-byte (the connections editor guarantees the same for connections.toml).
