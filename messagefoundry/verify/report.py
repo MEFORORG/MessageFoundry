@@ -4,15 +4,20 @@
 :mod:`messagefoundry.terminal_text`, itself standard-library only, for the peer-text escape, and
 :func:`~messagefoundry.verify.model.scrub_report_text` for the credential pass.
 
-Every renderer scrubs every field of every row for credentials (:func:`_scrubbed`), so the three
-reports are one sink: a check's arm that quotes an exception raw cannot put a credential into a
-report that an operator pastes into a ticket (BACKLOG #5395)."""
+Every renderer scrubs every text field of every row for credentials (:func:`_scrubbed`), so the
+three reports are one sink, and a check's arm that quotes an exception raw no longer puts a
+labelled credential, such as a ``password=`` or ``PWD=`` value or a DSN password, into a report that
+an operator pastes into a ticket (BACKLOG #5395). It is a backstop, not a replacement for an arm's
+own redaction: it has the credential pass's residuals, at least a credential with no label it
+reads, and it runs no PHI pass."""
 
 from __future__ import annotations
 
 import json
 from collections import Counter
 from collections.abc import Sequence
+from dataclasses import fields, replace
+from typing import Any
 
 from messagefoundry.terminal_text import escape_for_markdown_cell, escape_for_terminal
 from messagefoundry.verify.model import FAILING, CheckResult, Status, scrub_report_text
@@ -30,14 +35,14 @@ def exit_code(results: Sequence[CheckResult]) -> int:
 
 def _scrubbed(r: CheckResult) -> CheckResult:
     """``r`` with every text field through the credential pass. Before any escape, so an escape
-    cannot split a ``password=`` label from its value."""
-    return CheckResult(
-        scrub_report_text(r.id),
-        scrub_report_text(r.title),
-        r.status,
-        scrub_report_text(r.detail),
-        evidence=scrub_report_text(r.evidence),
-    )
+    cannot split a ``password=`` label from its value. The fields are read off the dataclass, so a
+    text field added later is scrubbed too; ``type is str`` leaves the ``str``-mixin status alone."""
+    changes: dict[str, Any] = {
+        f.name: scrub_report_text(getattr(r, f.name))
+        for f in fields(r)
+        if type(getattr(r, f.name)) is str
+    }
+    return replace(r, **changes)
 
 
 def _shown(text: str) -> str:

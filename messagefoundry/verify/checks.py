@@ -371,8 +371,9 @@ _FAMILY_NOT_ENABLED = frozenset({errno.EADDRNOTAVAIL, errno.EAFNOSUPPORT})
 
 
 def port_state(port: object) -> str:
-    """Report whether a listener could take ``port``: ``free``, ``in use/bound``, ``not bindable by
-    this user``, ``could not be probed``, or ``invalid port``.
+    """Report whether a listener could take ``port``: ``free``, ``in use/bound``, ``in use/bound or
+    reserved`` (Windows), ``not bindable by this user``, ``could not be probed``, or ``invalid
+    port``.
 
     The probe binds the IPv4 wildcard and the IPv6 wildcard (BACKLOG #5389). A wildcard bind
     conflicts with a listener on any address of its family, so a loopback, one-interface or
@@ -388,9 +389,10 @@ def port_state(port: object) -> str:
     listening socket still refuses it. Elsewhere (BSD, macOS) it lets a wildcard bind succeed beside
     a listener on one address, so the probe sets neither, and a TIME_WAIT port may read held there.
 
-    Only ``EADDRINUSE`` reads as in use. Any other bind error, at least an IPv4 family error, is
-    ``could not be probed``, so a probe that failed for another reason does not read as a held port
-    (BACKLOG #5389). The harness A5 probe calls this function too, so the two cannot drift apart.
+    Of the bind errors that are not a permission refusal, only ``EADDRINUSE`` reads as in use. Any
+    other, at least an IPv4 family error, is ``could not be probed``, so a probe that failed for
+    another reason does not read as a held port (BACKLOG #5389). A permission refusal keeps its own
+    two states above. The harness A5 probe calls this function too, so the two cannot drift apart.
 
     The answer is for the account running verify, which may not be the service account. A free
     result says nothing about an external firewall.

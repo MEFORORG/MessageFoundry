@@ -116,7 +116,10 @@ def _config_rows(settings: ServiceSettings) -> list[CheckResult]:
             "confirm these pinned endpoints are the intended identity provider",
             evidence=(
                 f"issuer={auth.oidc_issuer}; client_id={auth.oidc_client_id}; "
-                f"authorize={auth.oidc_authorization_endpoint}; token={auth.oidc_token_endpoint}; "
+                # token_endpoint, not token: the report sink's credential pass reads a bare
+                # ``token=`` label as a credential and would blank the URL (BACKLOG #5395).
+                f"authorize={auth.oidc_authorization_endpoint}; "
+                f"token_endpoint={auth.oidc_token_endpoint}; "
                 f"jwks={auth.oidc_jwks_uri}; redirect={settings.api.public_origin or '<unset>'}"
                 f"{auth.oidc_redirect_path}"
             ),

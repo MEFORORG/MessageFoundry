@@ -397,6 +397,12 @@ def test_a_password_glued_to_punctuation_is_hidden_at_every_occurrence(text: str
     [
         "Login Password: Kv9x7Qz3 then token=tk-1,mrn: Kv9x7Qz3",
         "Login Password: Kv9x7Qz3 retry token=tk-1,mrn: Kv9x7Qz3 now",
+        # Code review round 1: the clauses swapped, so a placeholder that hid several source
+        # tokens left a forward-only walk behind and placed the password on the earlier copy.
+        "token=tk-1,mrn: Kv9x7Qz3 Login Password: Kv9x7Qz3",
+        "token=tk-1,mrn: Kv9x7Qz3 Svc Account Login Password: Kv9x7Qz3",
+        # ...and placeholders the source already held, which the walk did not count as slots.
+        "[redacted] [redacted] Login Password: Kv9x7Qz3 then token=tk-1,mrn: Kv9x7Qz3",
     ],
 )
 def test_a_password_each_order_prints_at_a_different_place_is_hidden(text: str) -> None:
@@ -643,3 +649,43 @@ def test_the_report_sink_leaves_a_row_with_no_credential_alone() -> None:
     payload = json.loads(_rendered(row)["json"])["results"][0]
     assert payload["detail"] == row.detail
     assert payload["evidence"] == row.evidence
+
+
+def test_the_report_sink_leaves_the_federation_rows_alone() -> None:
+    """Code review round 1: ``fed.enabled`` labelled the IdP token endpoint ``token=``, which the
+    credential pass reads as a credential label, so the sink blanked the URL the row asks an
+    operator to confirm. JSON is the only report that prints evidence. Every federation row a
+    configured deployment emits must render as the row holds it."""
+    import json
+
+    from messagefoundry.config.settings import ServiceSettings
+    from messagefoundry.verify.federation import run_federation_checks
+
+    settings = ServiceSettings.model_validate(
+        {
+            "auth": {
+                "ad_enabled": True,
+                "ad_server": "ldaps://x",
+                "ad_user_search_base": "DC=x",
+                "ad_bind_dn": "CN=svc,DC=x",
+                "ad_bind_password": "x",
+                "ad_domain": "corp.example",
+                "oidc_enabled": True,
+                "oidc_issuer": "https://idp.example",
+                "oidc_client_id": "mefor-console",
+                "oidc_client_secret": "synthetic-client-secret",
+                "oidc_authorization_endpoint": "https://idp.example/authorize",
+                "oidc_token_endpoint": "https://idp.example/token",
+                "oidc_jwks_uri": "https://idp.example/jwks",
+                "oidc_allowed_endpoints": ["idp.example"],
+            },
+            "api": {"public_origin": "https://ops.example"},
+        }
+    )
+    rows = run_federation_checks(settings)
+    rendered = json.loads(render_json(rows))["results"]
+    assert len(rows) > 1
+    for row, out in zip(rows, rendered, strict=True):
+        assert (out["detail"], out["evidence"]) == (row.detail, row.evidence), row.id
+    enabled = next(out for out in rendered if out["id"] == "fed.enabled")
+    assert "https://idp.example/token" in enabled["evidence"]

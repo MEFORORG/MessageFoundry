@@ -43,8 +43,14 @@ def test_a5_reads_a_non_exclusive_windows_listener_as_in_use(
 
 
 def test_a5_reads_a_released_port_as_free(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Positive control: a probe that reads every port as in use would pass the tests above.
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
-        held.bind(("127.0.0.1", 0))
-        port = held.getsockname()[1]
-    assert _evidence_for(monkeypatch, port) == "free"
+    # Positive control: a probe that reads every port as in use would pass the tests above. Another
+    # process can take a released port before the probe runs, so a few fresh ports are tried.
+    seen: list[str] = []
+    for _ in range(5):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as held:
+            held.bind(("127.0.0.1", 0))
+            port = held.getsockname()[1]
+        seen.append(_evidence_for(monkeypatch, port))
+        if seen[-1] == "free":
+            break
+    assert seen[-1] == "free", seen
