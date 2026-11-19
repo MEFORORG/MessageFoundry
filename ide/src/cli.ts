@@ -143,12 +143,25 @@ export function writerCheckSetting(key: PathSettingKey): ContainedPathSetting {
  * out of the folder. The repository supplies the link whichever scope named the path, so the
  * manifest default and a relative user value are checked too. A value spelled outside the folder can
  * only be the operator's own user value, theirs to point anywhere, so it is not checked, and the
- * spelling test runs first, with no I/O. The real-path reads are synchronous, as every writer's
- * caller is, and they touch only the folder the operator opened and paths spelled inside it.
+ * spelling test runs first, with no I/O.
+ *
+ * A value with a `..` component is refused outright: the check collapses `..` by spelling, but on
+ * POSIX the CLI's kernel follows a link before it applies the `..` after it, so `link/../x` could
+ * land outside the folder although its spelling is `x`.
+ *
+ * Open limits. The check reads the named path only: a link BELOW it, such as a linked `codesets`
+ * folder under `configDir`, is not caught here. The real-path reads are synchronous, as every
+ * writer's caller is, so a workspace on a slow share stalls the extension host for each writer
+ * command, and a link inside the folder is followed wherever it leads while its real path is read.
+ * Only a trusted window runs the check (see {@link writerSetting}), where the repository's own code
+ * already runs.
  */
 function escapesByLink(ws: string | undefined, value: string): boolean {
   if (ws === undefined || committedRelativePath(ws, value) === undefined) {
     return false;
+  }
+  if (value.split(/[\\/]/).includes("..")) {
+    return true;
   }
   return resolveInsideWorkspace(ws, value) === undefined;
 }
@@ -158,19 +171,25 @@ function escapesByLink(ws: string | undefined, value: string): boolean {
 export function linkEscapeRefusal(key: PathSettingKey): string {
   return (
     `MessageFoundry: messagefoundry.${key} names a path inside the workspace folder that a symbolic link ` +
-    "or junction leads out of, or whose real path cannot be read, so nothing was written or started. " +
-    "Remove the link, or set the path in user settings."
+    "or junction leads out of, that climbs with '..', or whose real path cannot be read, so nothing was " +
+    "written or started. Remove the link or the '..', or name the folder the link leads to with an " +
+    "absolute path in user settings."
   );
 }
 
-/** {@link writerPathSetting}'s reading with its scope, or undefined after the refusal is shown. */
+/**
+ * {@link writerPathSetting}'s reading with its scope, or undefined after the refusal is shown. The
+ * link check runs only in a trusted window, so an untrusted one touches no file before its own trust
+ * refusal: there the writer's CLI call is refused by the exec gate ({@link isExecGated}), and the
+ * writers that write without the CLI refuse an untrusted window themselves.
+ */
 function writerSetting(key: PathSettingKey): ContainedPathSetting | undefined {
   const s = writerCheckSetting(key);
   if (s.dropped !== false) {
     void vscode.window.showErrorMessage(writerRefusal(key, s.dropped));
     return undefined;
   }
-  if (escapesByLink(workspaceDir(), s.value)) {
+  if (!isExecGated() && escapesByLink(workspaceDir(), s.value)) {
     void vscode.window.showErrorMessage(linkEscapeRefusal(key));
     return undefined;
   }

@@ -79,12 +79,16 @@ suite("b532r: writers check the real path of a path setting (BACKLOG #5404 item 
   test("writerSetting refuses a link escape after the spelling check", () => {
     const cli = code("cli.ts");
     const writer = body(cli, "function writerSetting(");
-    assert.ok(/if \(escapesByLink\(workspaceDir\(\), s\.value\)\)/.test(writer), writer);
+    // Only a trusted window reads a real path, so an untrusted one touches no file before its refusal.
+    assert.ok(writer.includes("if (!isExecGated() && escapesByLink(workspaceDir(), s.value))"), writer);
     assert.ok(writer.includes("linkEscapeRefusal(key)"), writer);
     assert.ok(writer.indexOf("s.dropped !== false") < writer.indexOf("escapesByLink"), writer);
     const escapes = body(cli, "function escapesByLink(");
     // The spelling test runs first, with no I/O, so a path spelled outside the folder is never opened.
     assert.ok(escapes.indexOf("committedRelativePath(ws, value)") < escapes.indexOf("resolveInsideWorkspace"), escapes);
+    // A `..` component is refused before the real-path read, which collapses it by spelling.
+    assert.ok(escapes.includes('value.split(/[\\\\/]/).includes("..")'), escapes);
+    assert.ok(escapes.indexOf('includes("..")') < escapes.indexOf("resolveInsideWorkspace"), escapes);
     assert.ok(escapes.includes("resolveInsideWorkspace(ws, value) === undefined"), escapes);
     // writerPathSetting and writerConfigTarget both go through writerSetting.
     assert.ok(body(cli, "export function writerPathSetting(").includes("writerSetting(key)"));
@@ -126,16 +130,18 @@ suite("b532r: sameDir does not block the extension host (BACKLOG #5404 item 1)",
     const fn = body(sc, "async function sameDir(");
     assert.ok(!fn.includes("realpathSync"), fn);
     assert.ok(fn.includes("fs.promises.realpath("), fn);
-    assert.ok(fn.indexOf("isUncSpelling(") < fn.indexOf("fs.promises.realpath("), fn);
+    // The repository's side, spelled as a share, is compared by spelling and never opened.
+    assert.ok(fn.includes("isUncSpelling(spelledTheirs) ? Promise.resolve(fold(spelledTheirs)) : real(spelledTheirs)"), fn);
     assert.ok(!sc.includes("realpathSync"), "no synchronous realpath anywhere in sourceControl.ts");
   });
 
-  test("every call site awaits it", () => {
+  test("every call site awaits it, with the extension's own path first", () => {
     const calls = sc.match(/sameDir\(/g) ?? [];
     const awaited = sc.match(/await sameDir\(/g) ?? [];
     // One extra match is the declaration.
     assert.strictEqual(awaited.length, calls.length - 1, sc);
-    assert.ok(awaited.length >= 2);
+    assert.ok(sc.includes("await sameDir(ws, topDir)"), sc);
+    assert.ok(sc.includes("await sameDir(path.join(ws, HOOKS_DIR), path.resolve(topDir, current))"), sc);
   });
 });
 

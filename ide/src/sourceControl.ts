@@ -294,32 +294,36 @@ function isUncSpelling(p: string): boolean {
 }
 
 /**
- * Whether `a` and `b` name one directory, compared by real path (case-folded on Windows).
+ * Whether `ours` and `theirs` name one directory, compared by real path (case-folded on Windows).
  *
  * Asynchronous, so a slow or unreachable share cannot block the extension host (BACKLOG #5404 item
- * 1); the synchronous realpath did. `b` can come from the repository's own `core.hooksPath`, so a
- * path spelled as a UNC share is compared by spelling alone, with no file-system call: a crafted
- * value cannot make the extension open a remote share. A UNC folder spelled two ways, or a mapped
- * drive against its UNC spelling, then reads as two folders, and the hook is left unwired.
+ * 1); the synchronous realpath did. `ours` is a path the extension derives from the workspace
+ * folder, and its real path is always read. `theirs` can come from the repository's own
+ * `core.hooksPath` or from git's answer, so when it is SPELLED as a UNC share it is compared by
+ * spelling alone, with no file-system call on it: a value written as a share is not opened. A
+ * workspace on a mapped drive still matches its UNC spelling, through the real path of `ours`.
+ * Open limit: a `theirs` spelled locally that reaches a share through a link is still followed when
+ * its real path is read; setup runs only in a trusted window, where the repository's code runs.
  */
-async function sameDir(a: string, b: string): Promise<boolean> {
+async function sameDir(ours: string, theirs: string): Promise<boolean> {
   const fold = (p: string): string => (process.platform === "win32" ? p.toLowerCase() : p);
-  const spelledA = path.resolve(a);
-  const spelledB = path.resolve(b);
-  if (fold(spelledA) === fold(spelledB)) {
-    return true;
-  }
-  if (isUncSpelling(spelledA) || isUncSpelling(spelledB)) {
-    return false;
-  }
-  const norm = async (p: string): Promise<string> => {
+  const real = async (p: string): Promise<string> => {
     try {
       return fold(await fs.promises.realpath(p));
     } catch {
       return fold(p); // a folder that cannot be read: compare its spelling instead
     }
   };
-  return (await norm(spelledA)) === (await norm(spelledB));
+  const spelledOurs = path.resolve(ours);
+  const spelledTheirs = path.resolve(theirs);
+  if (fold(spelledOurs) === fold(spelledTheirs)) {
+    return true;
+  }
+  const [a, b] = await Promise.all([
+    real(spelledOurs),
+    isUncSpelling(spelledTheirs) ? Promise.resolve(fold(spelledTheirs)) : real(spelledTheirs),
+  ]);
+  return a === b;
 }
 
 /**
@@ -331,7 +335,7 @@ async function sameDir(a: string, b: string): Promise<boolean> {
 async function wireHooksPath(bin: string, ws: string): Promise<{ note: string; wired: boolean }> {
   const top = await git(bin, ["rev-parse", "--show-toplevel"], ws);
   const topDir = top.code === 0 ? top.stdout.trim() : "";
-  if (!topDir || !(await sameDir(topDir, ws))) {
+  if (!topDir || !(await sameDir(ws, topDir))) {
     return {
       note: "not set (git resolves core.hooksPath from the repository's top level, which is not this workspace folder)",
       wired: false,

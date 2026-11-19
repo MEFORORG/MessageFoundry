@@ -200,11 +200,11 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     // Records and refuses every call, never reaching the real filesystem: a stat of the UNC value
     // would otherwise go to the network on Windows.
     for (const name of SPIED) {
-      FS_MODULE[name] = (p: fs.PathLike): boolean | string => {
+      const spy = (p: fs.PathLike): boolean | string => {
         // A writer's link check (cli.ts escapesByLink, BACKLOG #5404 item 1) reads the real path of
         // the workspace folder and of a path spelled inside it. Those are answered as a folder with
-        // no links and kept apart, so `statted` still records every other call; the UNC value is not
-        // inside the folder, so a realpath of it is still recorded and refused.
+        // no links and kept apart, so `statted` still records every other call, a realpath of any
+        // path outside the folder included.
         if (name === "realpathSync" && isWithinWorkspace(String(p))) {
           resolved.push(String(p));
           return String(p);
@@ -215,6 +215,8 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
         }
         throw Object.assign(new Error(`ENOENT: stubbed ${name} '${String(p)}'`), { code: "ENOENT" });
       };
+      // workspaceContainment calls `realpathSync.native`; the spy answers it too.
+      FS_MODULE[name] = Object.assign(spy, { native: spy });
     }
     let pending: Promise<void>;
     try {
