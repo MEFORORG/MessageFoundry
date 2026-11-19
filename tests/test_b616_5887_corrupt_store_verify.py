@@ -283,10 +283,12 @@ async def test_a_volume_fault_in_a_backups_verify_fails_the_run_naming_the_archi
             secure=False,
         )
     assert caught.value.kind == "write"
-    assert "left at a.mfbak.part" in str(caught.value)
-    assert "disk I/O error" in str(caught.value)
-    # The directory the verify's teardown left, which may hold decrypted bytes, leads the message.
-    assert str(caught.value).startswith("staging directory mefor-verify-x could not be removed; ")
+    # The archive's location leads, and the directory the verify's teardown left, which may hold
+    # decrypted bytes, is named after it rather than dropped.
+    assert str(caught.value).startswith("archive written but not verified, left at a.mfbak.part: ")
+    assert str(caught.value).endswith(
+        "disk I/O error; staging directory mefor-verify-x could not be removed"
+    )
     assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
 
 

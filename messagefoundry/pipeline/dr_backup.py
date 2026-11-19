@@ -990,9 +990,10 @@ class BackupRunner:
                     f"{_sqlite_error_reason(exc)}"
                 )
                 # A verify staging directory its teardown could not clear rides on the exception
-                # as a note. It may hold decrypted bytes, so it leads, as `_do_backup` puts it.
-                for note in reversed(getattr(exc, "__notes__", None) or []):
-                    message = join_before_checks(str(note), "; ", message)
+                # as a note, and may hold decrypted bytes, so it joins the message rather than
+                # being lost. The archive's location still leads, as in the arm above.
+                for note in getattr(exc, "__notes__", None) or []:
+                    message = join_before_checks(message, "; ", str(note))
                 raise BackupError("write", message) from exc
             if not verify.ok:
                 # A verify FAIL means the archive is unusable, so it never earns the canonical name
@@ -4499,19 +4500,21 @@ def _check_snapshot(snap: Path) -> _SnapshotCheck:
             raise
         return _SnapshotCheck(False, f"the file could not be read: {_sqlite_error_reason(exc)}", {})
     try:
-        return _SnapshotCheck(ok, msg, _count_tables(snap))
-    except (sqlite3.Error, UnicodeDecodeError) as exc:
-        reason = (
-            _sqlite_error_reason(exc) if isinstance(exc, sqlite3.Error) else _UNDECODABLE_SCHEMA
-        )
-        if not ok:
-            # integrity_check already judged the file, so that verdict stands; the count's error
-            # goes to the log rather than nowhere.
-            log.warning("snapshot row count failed after a failed integrity_check: %s", reason)
-            return _SnapshotCheck(False, msg, {})
-        if isinstance(exc, sqlite3.Error) and not _is_snapshot_fault(exc):
+        counts = _count_tables(snap)
+    except UnicodeDecodeError:
+        reason = _UNDECODABLE_SCHEMA
+    except sqlite3.Error as exc:
+        reason = _sqlite_error_reason(exc)
+        if ok and not _is_snapshot_fault(exc):
             raise
-        return _SnapshotCheck(True, msg, {}, f"its tables could not be counted: {reason}")
+    else:
+        return _SnapshotCheck(ok, msg, counts)
+    if not ok:
+        # integrity_check already judged the file, so that verdict stands; the count's error goes
+        # to the log rather than nowhere.
+        log.warning("snapshot row count failed after a failed integrity_check: %s", reason)
+        return _SnapshotCheck(False, msg, {})
+    return _SnapshotCheck(True, msg, {}, f"its tables could not be counted: {reason}")
 
 
 def _full_open_check(
