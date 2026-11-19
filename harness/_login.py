@@ -133,9 +133,10 @@ class LoginDialog(QDialog):
         self._sign_in.setEnabled(True)
 
     def done(self, result: int) -> None:
-        # While a call is in flight the dialog does not close: a sign-in may come back as a live
-        # session, which closing now would drop unseen, and the client must not be closed under a
-        # worker still using it. The close is remembered and taken when the call answers.
+        # While a call is in flight the dialog does not close: the client must not be closed under
+        # a worker still using it. The close is remembered and taken when the call answers, as a
+        # rejection even when the sign-in succeeded; the caller ends a session a rejected dialog's
+        # client holds.
         if self._busy and result != QDialog.DialogCode.Accepted:
             self._close_requested = True
             self._error.setText("Waiting for the engine to answer; the dialog then closes.")
@@ -185,6 +186,10 @@ class LoginDialog(QDialog):
 
     def _on_login(self, result: LoginResponse, password: str) -> None:
         self._idle()
+        if self._close_if_requested():
+            # Cancelled while the sign-in was in flight: the cancel wins, so the dialog is
+            # rejected and the caller does not connect with the session.
+            return
         self._error.setText("")
         if result.must_change_password and result.user.auth_provider == "ad":
             # The harness can't rotate AD passwords (the server rejects /me/password for AD

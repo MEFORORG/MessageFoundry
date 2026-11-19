@@ -92,7 +92,8 @@ def test_the_provider_read_and_the_sign_in_run_off_the_gui_thread(qapp: Any) -> 
         assert client.login_threads[0] is not threading.main_thread()
         assert not dialog._sign_in.isEnabled()
 
-        # Closing while the sign-in is in flight would drop a session the engine may have made.
+        # A close while the sign-in is in flight is held until it answers, then taken: the cancel
+        # wins over a sign-in that succeeded, so the dialog is rejected, not accepted.
         finished: list[int] = []
         dialog.finished.connect(finished.append)
         dialog.reject()
@@ -100,7 +101,8 @@ def test_the_provider_read_and_the_sign_in_run_off_the_gui_thread(qapp: Any) -> 
         assert dialog._signing_in
 
         client.login_gate.set()
-        assert _until(qapp, lambda: finished == [dialog.DialogCode.Accepted.value])
+        assert _until(qapp, lambda: finished == [dialog.DialogCode.Rejected.value])
+        assert dialog.entered_password == ""  # nothing handed back to the caller
     finally:
         client.providers_gate.set()
         client.login_gate.set()

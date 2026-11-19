@@ -542,6 +542,87 @@ def _settle_login(qapp: Any, dialog: Any) -> None:
     assert not dialog._busy
 
 
+def test_a_cancel_during_sign_in_wins_and_the_monitor_does_not_connect(
+    qapp: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Cancel pressed while the sign-in is in flight is held until it answers. If the sign-in
+    then succeeds, the dialog is still rejected: the monitor does not connect, and it ends the
+    session the client was handed."""
+    from harness import _login
+
+    login_gate = threading.Event()
+
+    class _Client:
+        def __init__(self, *_a: object, **_k: object) -> None:
+            self.token: str | None = None
+            self.logouts = 0
+            self.polled = 0
+
+        def health(self) -> None:
+            pass
+
+        def me(self) -> None:
+            raise ApiError("sign in", status=401)
+
+        def providers(self) -> None:
+            raise ApiError("unreachable", status=503)
+
+        def login(self, *_a: object, **_k: object) -> LoginResponse:
+            if not login_gate.wait(10):
+                raise TimeoutError("login gate never opened")
+            self.token = "t"
+            return LoginResponse(
+                token="t",
+                must_change_password=False,
+                user=CurrentUser(
+                    user_id="u", username="op", auth_provider="local", roles=[], permissions=[]
+                ),
+            )
+
+        def logout(self) -> None:
+            self.logouts += 1
+            self.token = None
+
+        def for_polling(self) -> Any:
+            self.polled += 1
+            raise ApiError("must not be reached", status=None)
+
+        def close(self) -> None:
+            pass
+
+    clients: list[_Client] = []
+
+    def make_client(*a: object, **k: object) -> _Client:
+        clients.append(_Client(*a, **k))
+        return clients[-1]
+
+    class _CancellingDialog(_login.LoginDialog):
+        def exec(self) -> int:
+            # Stands in for the operator: sign in, press Cancel while it is in flight, and the
+            # sign-in then succeeds.
+            _settle_login(qapp, self)
+            self._username.setText("op")
+            self._password.setText("pw")
+            self._attempt()
+            self.reject()
+            login_gate.set()
+            _settle_login(qapp, self)
+            return int(self.result())
+
+    monkeypatch.setattr(monitor, "EngineClient", make_client)
+    monkeypatch.setattr(monitor, "LoginDialog", _CancellingDialog)
+    panel = MonitorPanel()
+    try:
+        panel._connect()
+        assert panel._client is None
+        assert panel._status.text() == "sign-in cancelled"
+        assert clients and clients[0].polled == 0
+        assert clients[0].logouts == 1 and clients[0].token is None
+    finally:
+        login_gate.set()
+        panel.shutdown()
+
+
 def test_the_login_dialog_carries_the_deadline_the_engine_returned(qapp: Any) -> None:
     # The monitor states only what the dialog hands back, so the hand-off is its own link.
     from harness._login import LoginDialog
