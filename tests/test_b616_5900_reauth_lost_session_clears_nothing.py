@@ -353,9 +353,14 @@ async def _rebind_provider(store: MessageStore) -> None:
     await _rebind(store, "auth_provider", "ad")
 
 
+async def _end_every_session(store: MessageStore) -> None:
+    # An end-every-session raise moves the account's session epoch.
+    await _rebind(store, "session_epoch", 7)
+
+
 @pytest.mark.parametrize(
     "change",
-    [_delete, _disable, _rebind_directory, _rebind_provider],
+    [_delete, _disable, _rebind_directory, _rebind_provider, _end_every_session],
     ids=lambda f: f.__name__.lstrip("_"),
 )
 async def test_an_account_changed_between_proof_and_clear_is_denied(
@@ -427,7 +432,9 @@ async def test_a_cleared_reauth_writes_its_row_once() -> None:
         assert out.ok
         rows = await store.list_audit(action="auth.reauth")
         assert len(rows) == before + 1
-        assert json.loads(str(dict(rows[0])["detail"]))["ok"] is True
+        detail = json.loads(str(dict(rows[0])["detail"]))
+        assert detail["ok"] is True and detail["session_lost"] is False
+        assert "interrupted" not in detail, "a re-auth that finished reads as interrupted"
         assert len(await store.list_audit(action="auth.login_after_failures")) == 1
     finally:
         await store.close()
@@ -471,5 +478,62 @@ async def test_a_raise_after_the_rotation_still_writes_the_reauth_row(
         assert detail["ok"] is True and detail["interrupted"] is True
         user = await store.get_user("u-bob")
         assert user is not None and user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
+    finally:
+        await store.close()
+
+
+async def test_a_refused_clear_writes_the_reauth_row_softly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The store refuses the clear and then the row too, as one fault would. The row is written
+    softly, so the rotated token still reaches the caller rather than a 500."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, identity, token = await _setup(store)
+        real_audit = store.record_audit
+
+        async def refused(user_id: str, **kwargs: Any) -> None:
+            raise OSError("synthetic store refusal")
+
+        async def refuse_reauth_row(action: str, **kwargs: Any) -> Any:
+            if action == "auth.reauth":
+                raise OSError("synthetic store refusal")
+            return await real_audit(action, **kwargs)
+
+        monkeypatch.setattr(store, "record_login_success", refused)
+        monkeypatch.setattr(store, "record_audit", refuse_reauth_row)
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.ok and out.token is not None
+        user = await store.get_user("u-bob")
+        assert user is not None and user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
+    finally:
+        await store.close()
+
+
+async def test_a_raise_after_a_committed_clear_adds_an_interrupted_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The clear and its rows committed, then the address record raises. The notice was already
+    sent with the rows, and an interrupted ``auth.reauth`` row records the raise."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, notifier, identity, token = await _setup(store)
+        before = len(await store.list_audit(action="auth.reauth"))
+
+        async def defect(*args: Any, **kwargs: Any) -> None:
+            raise KeyError("synthetic-defect-5900")
+
+        monkeypatch.setattr(service, "_mark_login_address_known", defect)
+        with pytest.raises(KeyError, match="synthetic-defect-5900"):
+            await service.reauth(identity, GOOD, token=token)
+        rows = [
+            json.loads(str(dict(r)["detail"])) for r in await store.list_audit(action="auth.reauth")
+        ]
+        assert len(rows) == before + 2
+        assert sorted(bool(r.get("interrupted")) for r in rows[:2]) == [False, True]
+        user = await store.get_user("u-bob")
+        assert user is not None and user.failed_attempts == 0
+        assert len(await store.list_audit(action="auth.login_after_failures")) == 1
+        assert len([e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]) == 1
     finally:
         await store.close()

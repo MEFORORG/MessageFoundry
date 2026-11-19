@@ -2545,10 +2545,11 @@ def _holds_lockout_state(user: UserRecord) -> bool:
     )
 
 
-#: What :meth:`AuthService._clear_after_reauth` did: wrote the reset, wrote nothing, or found the
-#: account gone, disabled, re-bound or failing its seal, so the re-auth must grant nothing
-#: (BACKLOG #5900).
-_ReauthClear = Literal["cleared", "kept", "denied"]
+#: What :meth:`AuthService._clear_after_reauth` did: wrote the reset with its rows, found only a
+#: lockout column changed, was refused by the store or a Vault transit Outage (so the caller's own
+#: row is written softly), or found the account gone, disabled, re-bound, its sessions ended or its
+#: record failing its seal, so the re-auth must grant nothing (BACKLOG #5900).
+_ReauthClear = Literal["cleared", "kept", "refused", "denied"]
 
 
 #: How the reconciler reads each directory refusal (ADR 0195 rule item 1). FOUND is absent on
@@ -7963,8 +7964,9 @@ class AuthService:
         was lost at the rotation itself, the lapse check or the re-key (decision
         d20261110T004916856-814db8, Q1), and when the re-auth's deferred lockout clear could not
         establish the account and asked the store to end the rotated session, whether or not that
-        revoke landed, and when the password re-auth raised before its row was written (BACKLOG
-        #5900), so the row never replaces the exception propagating. Never for a failed re-proof
+        revoke landed, when the password re-auth raised after its proof (BACKLOG #5900), so the
+        row never replaces the exception propagating, and when that re-auth's clear was refused by
+        the store or an Outage, whose fault may refuse this row too. Never for a failed re-proof
         that finished, whose row stays hard."""
 
         async def row() -> None:
@@ -15466,18 +15468,24 @@ class AuthService:
 
         ``"cleared"`` when the reset and its rows landed. ``"kept"`` when only a lockout column
         changed, so the success clears nothing and the session is kept. ``"denied"`` when the
-        account cannot be established: no row, its enablement, provider or directory id changed,
-        or its record fails its seal or Vault transit cannot verify it, which is reported. The
-        caller then grants nothing, as the same seal answer did when it raised inside the re-proof.
+        account cannot be established: no row, its enablement, provider, directory id or session
+        epoch changed, or its record fails its seal or Vault transit cannot verify it, which is
+        reported. The caller then grants nothing, as the same seal answer did when it raised inside
+        the re-proof.
 
-        A store refusal is logged and answered ``"kept"``, because the session has already rotated
-        and its new token must still reach the caller; nothing was written. So is a Vault transit
-        Outage, which is paged (ADR 0217's Outage row ends nothing). A defect still raises."""
+        A store refusal is logged and answered ``"refused"``: the session has already rotated and
+        its new token must still reach the caller, nothing was written, and the caller writes its
+        own row softly, since the fault that refused these rows may refuse that one too. So is a
+        Vault transit Outage, which is paged (ADR 0217's Outage row ends nothing). A seal refusal
+        of another kind than the account's record raises, as on the login leg, and so does a
+        defect."""
         try:
             answer = await self._store.record_login_success(
                 decided.id, expected=full_authentication_snapshot(decided), audits=audits
             )
-        except RowSealError:
+        except RowSealError as exc:
+            if exc.kind != USER_KIND:
+                raise
             _log.warning(
                 "a re-auth of account id %r found the account's record failing its integrity seal "
                 "at its lockout reset, so it grants nothing",
@@ -15486,6 +15494,8 @@ class AuthService:
             await self._user_seal_failed(decided.id)
             return "denied"
         except RowSealUnverifiableError as exc:
+            if exc.kind != USER_KIND:
+                raise
             _log.warning(
                 "a re-auth of account id %r could not have the account's record verified at its "
                 "lockout reset, so it grants nothing",
@@ -15495,7 +15505,7 @@ class AuthService:
             return "denied"
         except TransitSealUnavailableError:
             self._user_seal_outage("re-auth's lockout reset")
-            return "kept"
+            return "refused"
         except audit_write_errors() as exc:
             if isinstance(exc, AUDIT_WRITE_DEFECTS):
                 raise
@@ -15505,7 +15515,7 @@ class AuthService:
                 decided.id,
                 type(exc).__name__,
             )
-            return "kept"
+            return "refused"
         if answer == "written":
             return "cleared"
         if answer == "lockout_changed":
@@ -15519,7 +15529,7 @@ class AuthService:
             "a re-auth of account id %r found the account %s after the rotation, so it grants "
             "nothing",
             decided.id,
-            "missing" if answer == "gone" else "disabled or re-bound",
+            "missing" if answer == "gone" else "changed",
         )
         return "denied"
 
@@ -15662,8 +15672,10 @@ class AuthService:
         # #5900), as confirm_mfa_enrollment writes its refusal row.
         row_written = False
         finished = False
+        # The clear was refused by the store or an Outage: the row is then written softly.
+        clear_refused = False
 
-        def reauth_detail() -> str:
+        def reauth_detail(*, interrupted: bool = False) -> str:
             return _json(
                 {
                     "ok": ok,
@@ -15693,7 +15705,7 @@ class AuthService:
                     ),
                     # The ceremony raised before its row was written (BACKLOG #5900), so the
                     # caller was answered nothing and no rotated token was handed back.
-                    **({} if finished else {"interrupted": True}),
+                    **({"interrupted": True} if interrupted else {}),
                 }
             )
 
@@ -15761,6 +15773,17 @@ class AuthService:
                         )
                     clear = await self._clear_after_reauth(proof.user, audits)
                     cleared = row_written = clear == "cleared"
+                    clear_refused = clear == "refused"
+                    if cleared and flag:
+                        # The rows went in with the clear; the notice follows them at once, the
+                        # order _record_suspicious_login keeps, so a later raise cannot skip it.
+                        await self._notify_security(
+                            LOGIN_AFTER_FAILURES,
+                            username=proof.user.username,
+                            email=proof.user.notify_email,
+                            client=client,
+                            detail={"failed_attempts": prior_failures},
+                        )
                     if clear == "denied":
                         rotated_token = elevation.token
                         lost = True
@@ -15784,12 +15807,14 @@ class AuthService:
                     self._grant_action_step_up(hash_token(elevation.token), purpose)
             finished = True
         finally:
-            if not row_written:
-                # Soft on a raise, so the row never replaces the exception propagating.
+            # A raise after a row that went in with the clear still writes one interrupted row.
+            if not row_written or not finished:
+                # Soft on a raise, so the row never replaces the exception propagating, and soft
+                # after a refused clear, whose fault may refuse this row too.
                 await self._write_reauth_row(
-                    lost=lost or not finished,
+                    lost=lost or clear_refused or not finished,
                     actor=identity.username,
-                    detail=reauth_detail(),
+                    detail=reauth_detail(interrupted=not finished),
                     client=client,
                 )
         await self._record_reproof_lockout(proof, client=client, audit_detail=provider_detail)
@@ -15798,16 +15823,8 @@ class AuthService:
         # Flagged only on the success that CLEARED the counter. On a session still owing its second
         # factor nothing clears, so flagging there would repeat the row and the notice on every
         # re-auth. That session's clear happens later in verify_mfa, which flags nothing: the gap
-        # BACKLOG #1138 already records for a success after second-factor failures. The row went
-        # in with the clear; the notice follows it, the order _record_suspicious_login keeps.
-        if cleared and flag and proof.user is not None:
-            await self._notify_security(
-                LOGIN_AFTER_FAILURES,
-                username=proof.user.username,
-                email=proof.user.notify_email,
-                client=client,
-                detail={"failed_attempts": prior_failures},
-            )
+        # BACKLOG #1138 already records for a success after second-factor failures. The flag's row
+        # and notice are written at the clear, above.
         return elevation
 
     #: The step-up actions a pending session may NOT be granted once its account HAS a factor. Every

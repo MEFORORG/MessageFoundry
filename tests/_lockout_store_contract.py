@@ -51,11 +51,13 @@ webauthn nor the harness extra.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
 
+from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.service import _opened_totp_state
 from messagefoundry.auth.tokens import credential_id_hash
 from messagefoundry.store.store import (
@@ -1365,7 +1367,17 @@ async def _assert_conditional_full_authentication(store: Any) -> None:
     assert await columns() == held and await _reset_rows(store) == rows
     await store.set_user_disabled(uid, disabled=False, now=t0 + 5.0)
     fresh = await snapshot()
-    for column, value in (("directory_object_id", "synthetic-guid-0002"), ("auth_provider", "ad")):
+    # The provider as the enum member reads as its stored value, not as the member's name.
+    held_user = await store.get_user(uid)
+    assert held_user is not None
+    assert full_authentication_snapshot(
+        dataclasses.replace(held_user, auth_provider=AuthProvider.LOCAL)
+    ) == full_authentication_snapshot(held_user)
+    for column, value in (
+        ("directory_object_id", "synthetic-guid-0002"),
+        ("auth_provider", "ad"),
+        ("session_epoch", 99),
+    ):
         rebound = list(fresh)
         rebound[FULL_AUTHENTICATION_GUARD.index(column)] = value
         answer = await store.record_login_success(

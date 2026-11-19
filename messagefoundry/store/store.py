@@ -3330,9 +3330,10 @@ SignCountAnswer = Literal["moved", "mismatch", "gone"]
 
 #: What :meth:`MessageStore.record_login_success` did (BACKLOG #5900), decided under the write's
 #: own lock: ``"written"`` (the reset landed), ``"lockout_changed"`` (only a lockout column differs
-#: from the ``expected`` snapshot), ``"account_changed"`` (the account's enablement, provider or
-#: directory id differs, or a concurrent write won the compare on its seal, so what changed is not
-#: known) or ``"gone"`` (no such account). Nothing is written but on ``"written"``.
+#: from the ``expected`` snapshot), ``"account_changed"`` (the account's enablement, provider,
+#: directory id or session epoch differs, or a concurrent write won the compare on its seal, so
+#: what changed is not known) or ``"gone"`` (no such account). Nothing is written but on
+#: ``"written"``.
 LoginSuccessAnswer = Literal["written", "lockout_changed", "account_changed", "gone"]
 
 
@@ -10354,9 +10355,15 @@ LOCKOUT_COLUMNS: Mapping[LockoutCounter, tuple[str, str, str]] = MappingProxyTyp
 )
 
 #: The columns a conditional full-authentication reset must find unchanged (BACKLOG #5900): both
-#: counters' lockout columns, whether the account is enabled, and the identity a re-proof judged.
+#: counters' lockout columns, whether the account is enabled, the identity a re-proof judged, and
+#: the account's session epoch, which an end-every-session raise moves.
 #: Code-controlled names, read off :class:`UserRecord` and :class:`UserRow` alike.
-_FULL_AUTHENTICATION_ACCOUNT: Final = ("disabled", "auth_provider", "directory_object_id")
+_FULL_AUTHENTICATION_ACCOUNT: Final = (
+    "disabled",
+    "auth_provider",
+    "directory_object_id",
+    "session_epoch",
+)
 FULL_AUTHENTICATION_GUARD: Final[tuple[str, ...]] = (
     *(col for cols in LOCKOUT_COLUMNS.values() for col in cols),
     *_FULL_AUTHENTICATION_ACCOUNT,
@@ -10369,7 +10376,12 @@ def full_authentication_snapshot(user: UserRecord | UserRow) -> tuple[object, ..
     equal tuples for one stored row (BACKLOG #5900)."""
     values = {col: getattr(user, col) for col in FULL_AUTHENTICATION_GUARD}
     values["disabled"] = bool(values["disabled"])
-    values["auth_provider"] = str(values["auth_provider"])
+    # ``getattr``: a record may carry the provider as the ``AuthProvider`` member, whose ``str()``
+    # is its qualified name, not the stored value.
+    values["auth_provider"] = str(
+        getattr(values["auth_provider"], "value", values["auth_provider"])
+    )
+    values["session_epoch"] = int(values["session_epoch"])
     values["directory_object_id"] = _opt_str(values["directory_object_id"])
     return tuple(values[col] for col in FULL_AUTHENTICATION_GUARD)
 
@@ -20571,12 +20583,22 @@ class MessageStore:
         :func:`full_authentication_snapshot`), only while the row still holds it, decided in the
         write's own transaction (BACKLOG #5900). ``audits`` are appended in that transaction only
         when the reset is written, so a refused append rolls the reset back; a reset that writes
-        nothing appends nothing. ``BEGIN IMMEDIATE`` when ``expected`` is given, so a writer in
-        another process cannot commit between the read the compare uses and the write."""
+        nothing appends nothing.
+
+        The conditional form runs in one deferred writer transaction, so the compare and the write
+        see one snapshot: a writer in another process that commits between them fails this write
+        with ``SQLITE_BUSY_SNAPSHOT``, which raises and writes nothing. Deferred rather than
+        ``IMMEDIATE`` so the file's write lock is not held across the seal's Vault transit round
+        trips. The plain form stays a short writer, as every login leg has always called it."""
         now = time.time() if now is None else now
         write = FullAuthenticationWrite(now, expected)
+        if expected is None and not audits:
+            async with _writer_guard(self._db, self._lock):
+                written = await self._write_user(user_id, write)
+                await self._commit()
+            return write.answer(written)
         appended: list[AppendedAuditRow] = []
-        async with _writer_txn(self._db, self._lock, immediate=expected is not None):
+        async with _writer_txn(self._db, self._lock):
             written = await self._write_user(user_id, write)
             if written is not None and audits:
                 appended = await self._append_audits(audits, now=now)

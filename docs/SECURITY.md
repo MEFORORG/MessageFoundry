@@ -3770,26 +3770,34 @@ Closing the window would take store writes conditional on the state the re-read 
 neither factor leg makes. The re-read narrows it from the whole proof check to those writes.
 
 **The password re-auth leg's lockout clear is a compare-and-set (BACKLOG #5900).** The re-proof
-decides the clear, and the clear is written only once the session has rotated, so a correct password
-on a session the ceremony lost clears nothing and raises no `auth.login_after_failures`. The write
-is `record_login_success` with an expected snapshot. On every backend it writes only while the
-account row, read under the write's own lock, still holds the six lockout columns, `disabled`,
-`auth_provider` and `directory_object_id` of the row the proof decided on. So a failure, a lock, a
-disable or a re-bind that any writer commits after that read, on this engine shard or another,
-leaves the counters as they are. At least these outcomes follow:
+decides whether a clear is due: the account holds lockout state, no lock is live, and the session
+has met its second-factor requirement. A due clear is written only once the session has rotated, so
+a correct password on a session the ceremony lost clears nothing and raises no
+`auth.login_after_failures`. The write is `record_login_success` with an expected snapshot. On
+every backend it writes only while the account row, read inside the write's own transaction, still
+holds the six lockout columns, `disabled`, `auth_provider`, `directory_object_id` and
+`session_epoch` of the row the proof decided on. So a failure, a lock, a disable, a re-bind or an
+end-every-session raise that any writer commits after that read, on this engine shard or another,
+leaves the counters as they are. A SQLite writer in another process that commits between the
+compare and the write makes the write fail, which is answered as a refusal below. At least these
+outcomes follow, and **only on a re-auth whose clear is due**; a re-auth with nothing to clear makes
+no such check:
 
 - A changed lockout column clears nothing, and the re-auth keeps its rotated session.
-- An account gone, disabled or re-bound, or whose record fails its seal or cannot be verified by
-  Vault transit, is granted nothing. A failing record is reported, the store is asked to end the
-  rotated session, and the re-auth answers `session_lost`. Its `auth.reauth` row carries
-  `clear_denied` and `session_ended`, which says whether that revoke landed as far as the re-auth
-  saw; when it did not, the rotated session may still exist, its token never handed back.
-- A Vault transit Outage at the write is paged, clears nothing and ends nothing.
+- An account gone, disabled, re-bound or with its sessions ended, or whose record fails its seal
+  or cannot be verified by Vault transit, is granted nothing. A failing record is reported, the
+  store is asked to end the rotated session, and the re-auth answers `session_lost`. Its
+  `auth.reauth` row carries `clear_denied` and `session_ended`, which says whether that revoke
+  landed as far as the re-auth saw; when it did not, the rotated session may still exist, its
+  token never handed back.
+- A store refusal, or a Vault transit Outage, which is paged, clears nothing and ends nothing; the
+  re-auth keeps its rotated session and writes its `auth.reauth` row softly.
 - The `auth.reauth` row, and the `auth.login_after_failures` row when the clear ends a run of
   failures, are appended in the reset's own transaction, so the counters are not reset without
-  them, and a refused append rolls the reset back. The out-of-band notice is sent after the commit.
-- A raise between a correct proof and its row still writes the `auth.reauth` row, softly and
-  marked `interrupted`.
+  them, and a refused append rolls the reset back. The out-of-band notice is sent right after
+  that commit.
+- A raise after a correct proof writes an `auth.reauth` row marked `interrupted`, softly, beside
+  any row the clear already committed.
 
 **A directory step-up or enrolment leg refuses a present account that lost a role in the directory
 (BACKLOG #2240).** At least the code and passkey legs above, the two enrolment legs, the IdP
