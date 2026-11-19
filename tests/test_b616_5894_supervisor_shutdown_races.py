@@ -13,7 +13,12 @@ from collections.abc import Awaitable, Callable
 
 import pytest
 
-from messagefoundry.pipeline.supervisor import ShardSpec, Supervisor
+from messagefoundry.pipeline.supervisor import (
+    ShardDrainError,
+    ShardSpec,
+    Supervisor,
+    _run_supervisor,
+)
 from tests.test_supervisor import _spec
 
 
@@ -152,8 +157,9 @@ async def test_a_failed_drain_is_raised_and_still_stops_the_siblings() -> None:
     await asyncio.wait_for(a.waiting.wait(), 5)
     await asyncio.wait_for(b.waiting.wait(), 5)
     sup.stop()
-    with pytest.raises(PermissionError):
+    with pytest.raises(ShardDrainError) as caught:
         await asyncio.wait_for(runner, 5)
+    assert isinstance(caught.value.__cause__, PermissionError)
     assert b.terminated.is_set()
     assert b.returncode == -15
 
@@ -236,6 +242,45 @@ async def test_a_fatal_watcher_exit_is_not_replaced_by_a_cancel_during_the_drain
     with pytest.raises(_Fatal):
         await asyncio.wait_for(runner, 5)
     assert proc.killed
+
+
+@pytest.mark.asyncio
+async def test_a_cancel_during_a_launch_that_never_returns_still_ends_run() -> None:
+    # Engine shard "b"'s spawn never returns. A shutdown signal must still end run() once the
+    # grace runs out, and drain the sibling "a" that did start.
+    a = _Proc(exit_on_terminate=True)
+    hung = asyncio.Event()
+
+    async def spawn(spec: ShardSpec) -> _Proc:
+        if spec.shard == "b":
+            hung.set()
+            await asyncio.Event().wait()
+        return a
+
+    sup = Supervisor([_spec("a"), _spec("b", 1)], spawn=_spawner(spawn), terminate_grace=0.2)
+    runner = asyncio.create_task(sup.run())
+    await asyncio.wait_for(a.waiting.wait(), 5)
+    await asyncio.wait_for(hung.wait(), 5)
+    runner.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(runner, 5)
+    assert a.terminated.is_set()
+    assert a.returncode == -15
+
+
+@pytest.mark.asyncio
+async def test_a_failed_drain_exits_3_not_the_crash_loop_code() -> None:
+    proc = _Proc(terminate_error=PermissionError("refused"), kill_error=PermissionError("refused"))
+
+    async def spawn(spec: ShardSpec) -> _Proc:
+        return proc
+
+    specs = [_spec("default")]
+    sup = Supervisor(specs, spawn=_spawner(spawn), terminate_grace=0.1)
+    code = asyncio.create_task(_run_supervisor(sup, specs, install_signal_handlers=False))
+    await asyncio.wait_for(proc.waiting.wait(), 5)
+    sup.stop()
+    assert await asyncio.wait_for(code, 5) == 3
 
 
 def test_a_non_finite_terminate_grace_is_refused() -> None:

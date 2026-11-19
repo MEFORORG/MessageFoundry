@@ -286,6 +286,12 @@ async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
     return await asyncio.create_subprocess_exec(*spec.argv, env=env)
 
 
+class ShardDrainError(RuntimeError):
+    """The shutdown drain left at least one engine shard's child running.
+
+    :func:`supervise` maps it to exit code 3, apart from the crash-loop code 1."""
+
+
 @dataclass
 class _Child:
     spec: ShardSpec
@@ -347,9 +353,10 @@ class Supervisor:
         """Spawn every shard, then watch them until cancelled or :meth:`stop` is called.
 
         Each shard runs under its own watcher task that relaunches it on an unexpected exit (when
-        ``restart``). Either route drains all children cleanly: :meth:`stop` ends the watchers so
-        ``gather`` returns and the ``else`` branch drains, and a cancellation or a watcher that
-        raised takes the branch above, so no failure leaves sibling shards running undrained.
+        ``restart``). Every route drains all children the same way: :meth:`stop` ending the
+        watchers, a cancellation, or a watcher that raised, so no failure leaves sibling shards
+        running undrained. A drain that could not stop a child raises :class:`ShardDrainError`,
+        which outranks the other outcomes.
         """
         self._stopping.clear()
         self.crash_looped.clear()
@@ -370,7 +377,10 @@ class Supervisor:
             w.cancel()
         drain, cancelled = await _finish_despite_cancel(self._drain(watchers, raised))
         if (failure := drain.exception()) is not None:
-            raise failure from raised  # a failed drain left a child running, which outranks it
+            # A failed drain left a child running, which outranks ``raised``; kept as its context.
+            if raised is not None:
+                failure.__context__ = raised
+            raise failure
         if raised is None:
             if cancelled:
                 raise asyncio.CancelledError
@@ -484,8 +494,20 @@ class Supervisor:
         A launch's child can exist before its await returns. asyncio's own launch kills that child
         when cancelled mid-spawn, which skips the graceful stop, and an injected spawn need not
         clean up at all. So the spawn is let finish, the child registered and logged, and only
-        then is the cancellation raised, leaving :meth:`_terminate_all` to stop the child."""
-        launch, cancelled = await _finish_despite_cancel(self.spawn(spec))
+        then is the cancellation raised, leaving :meth:`_terminate_all` to stop the child. A spawn
+        still running ``terminate_grace`` after the cancellation is cancelled and abandoned, so a
+        launch that never returns cannot keep the supervisor from stopping its siblings."""
+        launch, cancelled = await _finish_despite_cancel(
+            self.spawn(spec), grace=self.terminate_grace
+        )
+        if not launch.done():
+            logger.error(
+                "engine shard %r: the launch had not returned %.0fs into shutdown; abandoned",
+                spec.shard,
+                self.terminate_grace,
+            )
+            launch.add_done_callback(_retrieve)
+            raise asyncio.CancelledError
         failure = None if launch.cancelled() else launch.exception()
         if failure is None and not launch.cancelled():
             process = launch.result()
@@ -598,24 +620,45 @@ class Supervisor:
                     logger.error("%s; leaving it", message)
                     stranded.append(RuntimeError(message))
         if stranded:
-            raise stranded[0]
+            raise ShardDrainError(
+                f"{len(stranded)} engine shard child(ren) could not be stopped: {stranded[0]}"
+            ) from stranded[0]
 
 
-async def _finish_despite_cancel[T](aw: Awaitable[T]) -> tuple[asyncio.Future[T], bool]:
+def _retrieve[T](fut: asyncio.Future[T]) -> None:
+    """Read an abandoned future's outcome, so asyncio does not report it as never retrieved."""
+    if not fut.cancelled():
+        fut.exception()
+
+
+async def _finish_despite_cancel[T](
+    aw: Awaitable[T], *, grace: float | None = None
+) -> tuple[asyncio.Future[T], bool]:
     """Await ``aw`` to completion however often the caller is cancelled meanwhile.
 
-    Returns the finished future, which the caller reads, and whether a cancellation arrived. The
-    caller owes that cancellation: it raises it once its own cleanup is done. This never cancels
-    ``aw``, so cancelling the CALLER cannot cut a drain or a spawn short, which is how the POSIX
-    signal handlers stop the supervisor. A cancel aimed at ``aw``'s own task is not absorbed: on
-    Windows a second Ctrl-C makes ``asyncio.run``'s teardown cancel every task, this one too."""
+    Returns the future, which the caller reads, and whether a cancellation arrived. The caller
+    owes that cancellation: it raises it once its own cleanup is done. Without ``grace`` this never
+    cancels ``aw``, so cancelling the CALLER cannot cut a drain or a spawn short, which is how the
+    POSIX signal handlers stop the supervisor. With ``grace``, ``aw`` still running ``grace``
+    seconds after the first cancellation is cancelled and returned NOT done, for the caller to
+    abandon. A cancel aimed at ``aw``'s own task is not absorbed: on Windows a second Ctrl-C makes
+    ``asyncio.run``'s teardown cancel every task, this one too."""
     fut = asyncio.ensure_future(aw)
+    loop = asyncio.get_running_loop()
     cancelled = False
+    deadline: float | None = None
     while not fut.done():
+        timeout = None if deadline is None else max(0.0, deadline - loop.time())
         try:
-            await asyncio.wait({fut})
+            await asyncio.wait({fut}, timeout=timeout)
         except asyncio.CancelledError:
             cancelled = True
+            if grace is not None and deadline is None:
+                deadline = loop.time() + grace
+            continue
+        if deadline is not None and not fut.done():
+            fut.cancel()
+            break
     return fut, cancelled
 
 
@@ -637,8 +680,9 @@ async def supervise(
 
     Installs SIGINT/SIGTERM handlers (when ``install_signal_handlers``) that trigger a clean drain.
     Runs while any engine shard is alive. Returns 0 on a clean shutdown, 1 when every engine shard
-    tripped the crash-loop breaker, and 2 on a config/discovery error, which includes a graph
-    ``registry_guard`` refuses (:func:`discover_shard_specs`).
+    tripped the crash-loop breaker, 2 on a config/discovery error, which includes a graph
+    ``registry_guard`` refuses (:func:`discover_shard_specs`), and 3 when the shutdown drain left an
+    engine shard's child running (:class:`ShardDrainError`), which outranks 0 and 1.
 
     While the engine shards run, a :class:`~messagefoundry.pipeline.crl_reload.CrlReloadRunner`
     applies a replaced CRL file to this process's own TLS contexts, as an engine process's runner
@@ -795,6 +839,9 @@ async def _run_supervisor(
         await runner
     except asyncio.CancelledError:
         logger.info("supervise: shutting down")
+    except ShardDrainError as exc:
+        logger.error("supervise: the shutdown drain failed: %s; check for a stranded process", exc)
+        return 3
     except KeyboardInterrupt:  # pragma: no cover - interactive Ctrl-C on Windows
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
