@@ -508,7 +508,7 @@ async def test_terminate_escalates_to_kill_after_grace() -> None:
     assert proc.terminated and proc.killed  # escalated to kill after the grace elapsed
 
 
-# --- BACKLOG #5978: the drain waits once, and a Windows shard ends with its supervisor -----------
+# --- BACKLOG #5978: the drain waits once, and a Windows engine shard ends with its supervisor ----
 
 
 @pytest.mark.asyncio
@@ -579,7 +579,8 @@ async def test_an_exited_shards_job_is_released_and_a_forced_ones_after_its_exit
     async def spawn(spec: ShardSpec) -> _FakeProcess:
         p = _FakeProcess() if not spawned else _Hung()
         spawned.append(p)
-        supervisor_mod._SHARD_JOBS[p] = 7000 + len(spawned)  # type: ignore[index]
+        # setitem, so the module-wide map holds none of these fakes after the test, pass or fail.
+        monkeypatch.setitem(supervisor_mod._SHARD_JOBS, p, 7000 + len(spawned))  # type: ignore[misc]
         return p
 
     sup = Supervisor([_spec("a")], spawn=_spawner(spawn), terminate_grace=0.05, sleep=_no_wait)
@@ -651,7 +652,7 @@ def _hard_kill_a_stand_in(tmp_path: Path, mode: str) -> tuple[list[Any], list[An
 
     import psutil
 
-    from tests._proc_tree import kill_all, tree_of
+    from tests._proc_tree import kill_all, tree_of, wait_until
 
     root = Path(__file__).resolve().parents[1]
     marker = tmp_path / f"pids-{mode}.txt"
@@ -670,15 +671,24 @@ def _hard_kill_a_stand_in(tmp_path: Path, mode: str) -> tuple[list[Any], list[An
             assert time.monotonic() < deadline, "the shard never wrote its pids"
             time.sleep(0.05)
         supervisor_pid = int(Path(f"{marker}.sup").read_text())
-        # The shard's own launcher (where there is one), its interpreter, and the grandchild.
-        tree = tree_of(supervisor_pid)[1:]
+        # The stand-in's own chain: the venv launcher where there is one, and its interpreter.
+        chain = [psutil.Process(pid) for pid in dict.fromkeys((stand_in.pid, supervisor_pid))]
+        started += chain
+        # The engine shard's own launcher (where there is one), its interpreter, and the grandchild
+        # with its launcher. A venv launcher starts its interpreter a moment later, so the tree is
+        # read until two reads agree; otherwise a late interpreter would escape the census.
+        tree: list[Any] = []
+
+        def settled() -> bool:
+            nonlocal tree
+            before = {p.pid for p in tree}
+            tree = tree_of(supervisor_pid)[1:]
+            return bool(before) and before == {p.pid for p in tree}
+
+        wait_until(settled, 10.0)
         started += tree
         reported = {int(pid) for pid in marker.read_text().split()}
         assert reported <= {p.pid for p in tree}, "the shard tree is not under the stand-in"
-        # The stand-in's own chain: the venv launcher where there is one, and its interpreter.
-        in_tree = {p.pid for p in tree}
-        chain = [p for p in tree_of(stand_in.pid) if p.pid not in in_tree]
-        started += chain
         kill_all(chain)
         stand_in.wait(timeout=10)
         return tree, started
