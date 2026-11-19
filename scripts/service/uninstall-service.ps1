@@ -559,7 +559,9 @@ function Remove-ServiceLogonRight {
 
       EXACT TOKEN MATCHING, for the reason the installer's grant states: a SID that is a string
       prefix of another (RID 110 against 1100) would make a substring test drop the wrong account's
-      right.
+      right. A holder written as a NAME (BACKLOG #5401) is dropped when it is $Account itself, or
+      when it resolves to $Sid; every other holder name is looked up, and one that does not
+      resolve is kept.
 
       IT REFUSES TO EMPTY THE ROW. If this SID is the only holder, writing back an empty
       SeServiceLogonRight takes the right away from every account the row covers, which on a real

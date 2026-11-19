@@ -22,13 +22,12 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
-from unittest import mock
 
 import pytest
 import yaml
 
 from messagefoundry.config.settings import _LOOPBACK_HOSTS
-from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV, tls_revocation_attested
+from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV
 
 _COMPOSE = Path(__file__).resolve().parents[1] / "docker" / "compose.yaml"
 _FALSE = {"false", "0", "no", "off", "n", "f"}
@@ -36,11 +35,15 @@ _REQUIRED = re.compile(r"^\$\{" + TLS_REVOCATION_ATTESTED_ENV + r":\?[^}]+\}$")
 
 
 @functools.cache
-def _serving_engines() -> dict[str, dict[str, Any]]:
-    """Every service whose command is ``serve``, merge keys resolved."""
+def _all_services() -> dict[str, dict[str, Any]]:
+    """Every compose service, merge keys resolved."""
     doc = yaml.safe_load(_COMPOSE.read_text(encoding="utf-8"))
-    services = doc.get("services") or {}
-    return {n: s for n, s in services.items() if (s.get("command") or [])[:1] == ["serve"]}
+    return dict(doc.get("services") or {})
+
+
+def _serving_engines() -> dict[str, dict[str, Any]]:
+    """Every service whose command is ``serve``."""
+    return {n: s for n, s in _all_services().items() if (s.get("command") or [])[:1] == ["serve"]}
 
 
 def _env(svc: dict[str, Any]) -> dict[str, Any]:
@@ -106,12 +109,6 @@ def test_a_gated_engine_requires_the_operators_attestation(service: str) -> None
 _CHECK = "revocation-attestation-check"
 
 
-@functools.cache
-def _all_services() -> dict[str, dict[str, Any]]:
-    doc = yaml.safe_load(_COMPOSE.read_text(encoding="utf-8"))
-    return dict(doc.get("services") or {})
-
-
 def _check_argv() -> list[str]:
     """The check service's argv after the image's interpreter, to run with this interpreter."""
     entry = [str(a) for a in _all_services()[_CHECK]["entrypoint"]]
@@ -146,28 +143,11 @@ def test_the_check_runs_the_engines_image() -> None:
         assert svc["image"] == image, f"{name} runs {svc['image']!r}, the check {image!r}"
 
 
-def test_the_check_uses_the_parser_serve_calls() -> None:
-    # The values in-process, against the function serve's gate calls; the shipped command is run
-    # for one value each way below, which is what proves it calls that function.
-    assert "tls_revocation_attested" in " ".join(_check_argv())
-    for value, passes in [
-        ("1", True),
-        ("true", True),
-        (" Yes ", True),
-        ("on", True),
-        ("0", False),
-        ("false", False),
-        ("no", False),
-        ("attested", False),
-        ("", False),
-    ]:
-        with mock.patch.dict(os.environ, {TLS_REVOCATION_ATTESTED_ENV: value}):
-            assert tls_revocation_attested() is passes, value
-
-
 @pytest.mark.parametrize(("value", "passes"), [("1", True), ("0", False)])
 def test_the_shipped_check_command_runs(value: str, passes: bool) -> None:
     # Run the check's own command with this interpreter, so the shipped text is what is tested.
+    # It must call serve's parser; tests/test_tls_policy.py holds that parser's value table.
+    assert "tls_revocation_attested" in " ".join(_check_argv())
     env = {k: v for k, v in os.environ.items() if k != TLS_REVOCATION_ATTESTED_ENV}
     env[TLS_REVOCATION_ATTESTED_ENV] = value
     done = subprocess.run(

@@ -3221,8 +3221,8 @@ def test_the_logon_right_switch_removes_the_account_written_by_its_name(tmp_path
 
 @_windows_only
 def test_the_logon_right_switch_removes_a_name_that_resolves_to_the_sid(tmp_path: Path) -> None:
-    # BUILTIN\Administrators resolves to S-1-5-32-544 on every Windows host; BUILTIN\Users does
-    # not, and must stay.
+    # BUILTIN\Administrators resolves to S-1-5-32-544 on an English-language Windows host (a
+    # localized host names the group differently); BUILTIN\Users does not, and must stay.
     got = _logon_right_arms(
         tmp_path, holders=["BUILTIN\\Users", "BUILTIN\\Administrators"], sid="S-1-5-32-544"
     )

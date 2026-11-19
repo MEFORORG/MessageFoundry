@@ -1741,7 +1741,7 @@ function Set-ServiceLogonRight {
             # Compare against exact SID tokens, not a raw substring: a SID that is a string prefix of an
             # already-granted SID (RID 110 vs 1100) would false-positive under -match and skip the grant,
             # so the service could fail to start (error 1069). Split the value on ',' and match each
-            # trimmed entry exactly (secedit writes SIDs in the leading-'*' form). Blank tokens are
+            # trimmed entry exactly (secedit writes most holders in the leading-'*' form). Blank tokens are
             # dropped, so an empty row or a stray comma writes no empty holder (BACKLOG #5401).
             $value = $lines[$at] -replace '^\s*SeServiceLogonRight\s*=', ''
             $holders = @($value -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
@@ -1749,8 +1749,9 @@ function Set-ServiceLogonRight {
             # a name is resolved and its SID compared too; read by SID alone, a held name re-adds it.
             # SID tokens are compared first, so an already-held SID needs no lookup. A name that does
             # not resolve is not this account. uninstall-service.ps1's Remove-ServiceLogonRight
-            # matches a holder the same way.
-            $held = @($holders | Where-Object { $_ -eq ("*" + $sid) -or $_ -eq $sid })
+            # resolves a name the same way, and also matches the account's own name unresolved,
+            # because there the account may no longer translate.
+            $held = @($holders | Where-Object { $_ -eq ("*" + $sid) -or $_ -eq $sid -or $_ -eq $Account })
             if (-not $held) {
                 # -First 1 stops at the first match, so later names cost no lookup.
                 $held = @($holders | Where-Object { -not $_.StartsWith('*') } | Where-Object {
