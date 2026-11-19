@@ -1797,7 +1797,7 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
 
     # The Recovery paragraph's "a good password re-proof clears neither lock" and "nothing reaches it
     # under a live second-step lock" rest on this guard, the only decision of the re-proof's clear.
-    # The write, _clear_after_reauth, runs only when the row still holds the state decided on
+    # The write, _clear_after_reauth, is the store's compare-and-set against the state decided on
     # (BACKLOG #5900).
     reproof = _service_func("_reproof_serialized")
     cleared = [
@@ -1811,7 +1811,7 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
     assert isinstance(guard, ast.BoolOp) and isinstance(guard.op, ast.And), (
         "_reproof_serialized no longer decides its lockout clear in one `clear_due = ... and ...`."
     )
-    assert _called(_service_func("_clear_after_reauth"), "_clear_snapshot"), (
+    assert _called(_service_func("_clear_after_reauth"), "full_authentication_snapshot"), (
         "_clear_after_reauth no longer checks the row against the state its clear was decided on."
     )
     terms = [ast.unparse(v) for v in guard.values]

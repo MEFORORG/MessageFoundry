@@ -3766,18 +3766,30 @@ unconditionally. A change landing there is not seen: for example, a run of wrong
 session of the same account can set the second-step lock there, and the passkey leg, which takes
 no account queue, would then clear it. The re-read does not check the session's expiry either;
 the rotation that follows refuses an expired session, but only after the counters are cleared.
-Closing the window would take store writes conditional on the state the re-read saw, which no leg
-has. The re-read narrows it from the whole proof check to those writes. The password re-auth leg
-has a narrower window of the same kind (BACKLOG #5900): its clear runs once the session has
-rotated, re-reads the account and writes only when no lockout column changed since the proof. It
-holds the account's per-process re-proof lock, which at least these factor legs' and the sign-in
-leg's lockout writes do not take and no other engine shard sees, so a failure or lock one of them
-writes between that re-read and the write is cleared by it. An account record that fails its seal,
-or that Vault transit cannot verify, at that re-read or write is reported, and an account gone by
-then is logged. Either way the store is asked to end the rotated session, and the re-auth answers
-`session_lost`. Its `auth.reauth` row then carries `clear_denied` and `session_ended`, which says
-whether that revoke landed as far as the re-auth saw; when it did not, the rotated session may
-still exist, its token never handed back. A Vault transit Outage there is paged and ends nothing.
+Closing the window would take store writes conditional on the state the re-read saw, which
+neither factor leg makes. The re-read narrows it from the whole proof check to those writes.
+
+**The password re-auth leg's lockout clear is a compare-and-set (BACKLOG #5900).** The re-proof
+decides the clear, and the clear is written only once the session has rotated, so a correct password
+on a session the ceremony lost clears nothing and raises no `auth.login_after_failures`. The write
+is `record_login_success` with an expected snapshot. On every backend it writes only while the
+account row, read under the write's own lock, still holds the six lockout columns, `disabled`,
+`auth_provider` and `directory_object_id` of the row the proof decided on. So a failure, a lock, a
+disable or a re-bind that any writer commits after that read, on this engine shard or another,
+leaves the counters as they are. At least these outcomes follow:
+
+- A changed lockout column clears nothing, and the re-auth keeps its rotated session.
+- An account gone, disabled or re-bound, or whose record fails its seal or cannot be verified by
+  Vault transit, is granted nothing. A failing record is reported, the store is asked to end the
+  rotated session, and the re-auth answers `session_lost`. Its `auth.reauth` row carries
+  `clear_denied` and `session_ended`, which says whether that revoke landed as far as the re-auth
+  saw; when it did not, the rotated session may still exist, its token never handed back.
+- A Vault transit Outage at the write is paged, clears nothing and ends nothing.
+- The `auth.reauth` row, and the `auth.login_after_failures` row when the clear ends a run of
+  failures, are appended in the reset's own transaction, so the counters are not reset without
+  them, and a refused append rolls the reset back. The out-of-band notice is sent after the commit.
+- A raise between a correct proof and its row still writes the `auth.reauth` row, softly and
+  marked `interrupted`.
 
 **A directory step-up or enrolment leg refuses a present account that lost a role in the directory
 (BACKLOG #2240).** At least the code and passkey legs above, the two enrolment legs, the IdP
@@ -7293,15 +7305,11 @@ only as a combined sign-in with both factors right. A session holder reaches it 
 TOTP or recovery code (`verify_mfa`) or a good passkey assertion (`finish_webauthn_assertion`),
 because the sign-in lock refuses neither leg and each success makes that write. Nothing reaches the
 successful-login write under a live second-step lock, which refuses every sign-in and both of those
-legs. A good password re-proof or IdP step-up clears neither lock, with one window: the re-auth
-leg's clear (BACKLOG #5900) waits for the session's rotation, then re-reads the account and skips
-the write when any lockout column changed since the proof. That re-read and write run under the
-account's per-process re-proof lock. At least the sign-in leg's and the two factor legs' lockout
-writes do not take it, and no other engine shard sees it, so a lock one of them sets between the
-re-read and the write is cleared by it, as in the factor legs' accepted window under
-[Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753). At
-least three routes reach
-`set_password` while a local account is locked,
+legs. A good password re-proof or IdP step-up clears neither lock: the re-auth leg's clear is
+decided only with neither lock live and written only while the row still holds what the proof
+read, so a lock set after the proof is kept (BACKLOG #5900, under
+[Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)).
+At least three routes reach `set_password` while a local account is locked,
 and **each of these issues a new password rather than merely lifting the lock**: the holder's own
 `POST /me/password`, reachable only while they still have a live session (session validation
 consults neither lock, neither lock refuses this re-proof, and that route is exempt from the

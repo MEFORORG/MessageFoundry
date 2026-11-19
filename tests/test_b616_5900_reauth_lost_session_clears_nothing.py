@@ -10,6 +10,11 @@ revoked underneath the ceremony, one whose stamp failed its seal, and one whose 
 still cleared the counters and raised the notice, though the caller was told to sign in again. Each
 arm below must leave the counter where the failures put it and raise no notice.
 
+On a kept session the clear is the store's compare-and-set (``record_login_success`` with
+``expected``), carrying the ``auth.reauth`` row in its own transaction: an account changed between
+the proof and the clear is kept or denied, and a raise after the proof still writes that row. The
+compare itself, on all three backends, is ``tests/_lockout_store_contract.py``.
+
 All credentials here are synthetic.
 """
 
@@ -17,7 +22,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from collections.abc import Awaitable, Callable
 from typing import Any
 
@@ -34,7 +38,6 @@ from messagefoundry.auth.service import (
     AUTHORITY_SEAL_FAILED_ACTION,
     AUTHORITY_SEAL_UNVERIFIABLE_ACTION,
     AuthService,
-    _SealCheck,
 )
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.row_seal import (
@@ -327,62 +330,146 @@ async def test_an_outage_at_the_deferred_clear_pages_and_ends_nothing(
         await store.close()
 
 
-async def test_a_reread_the_checked_read_fails_grants_nothing(
-    monkeypatch: pytest.MonkeyPatch,
+async def _rebind(store: MessageStore, column: str, value: object) -> None:
+    """Write one column straight to the row: the store here is keyless, so the seal is empty and the
+    write stands for a re-bind another writer committed."""
+    await store._db.execute(f"UPDATE users SET {column}=? WHERE id='u-bob'", (value,))
+    await store._db.commit()
+
+
+async def _delete(store: MessageStore) -> None:
+    await store.delete_user("u-bob")
+
+
+async def _disable(store: MessageStore) -> None:
+    await store.set_user_disabled("u-bob", disabled=True)
+
+
+async def _rebind_directory(store: MessageStore) -> None:
+    await _rebind(store, "directory_object_id", "synthetic-guid-0001")
+
+
+async def _rebind_provider(store: MessageStore) -> None:
+    await _rebind(store, "auth_provider", "ad")
+
+
+@pytest.mark.parametrize(
+    "change",
+    [_delete, _disable, _rebind_directory, _rebind_provider],
+    ids=lambda f: f.__name__.lstrip("_"),
+)
+async def test_an_account_changed_between_proof_and_clear_is_denied(
+    monkeypatch: pytest.MonkeyPatch, change: Callable[[MessageStore], Awaitable[None]]
 ) -> None:
-    """The re-read's checked read fails the account's record, which that read reports. The
-    re-auth grants nothing, as when the write is refused, and writes nothing."""
+    """The account is deleted, disabled or re-bound once the session has rotated and before the
+    clear. The store's compare-and-set finds the row gone or changed, so nothing is cleared, the
+    rotated session is asked to end, and the re-auth grants nothing."""
     store = await MessageStore.open(":memory:")
     try:
-        service, _, identity, token = await _setup(store)
-
-        async def failed(user_id: str, listed: Any = None) -> _SealCheck:
-            return _SealCheck(failed=True)
-
-        async def never(user_id: str, **kwargs: Any) -> None:
-            raise AssertionError("the clear wrote over a record its re-read failed")
-
+        service, notifier, identity, token = await _setup(store)
         real_elevated: Callable[..., Awaitable[Any]] = service._elevated
 
-        async def fail_after_rotation(*args: Any, **kwargs: Any) -> Any:
+        async def change_after_rotation(*args: Any, **kwargs: Any) -> Any:
             out = await real_elevated(*args, **kwargs)
-            monkeypatch.setattr(service, "_checked_by_id", failed)
-            monkeypatch.setattr(store, "record_login_success", never)
+            await change(store)
             return out
 
-        monkeypatch.setattr(service, "_elevated", fail_after_rotation)
+        monkeypatch.setattr(service, "_elevated", change_after_rotation)
         out = await service.reauth(identity, GOOD, token=token)
         assert out.session_lost and not out.ok and out.token is None
-        assert await store.list_sessions("u-bob") == []
+        assert await store.list_sessions("u-bob") == [], "the rotated session was left live"
         user = await store.get_user("u-bob")
-        assert user is not None and user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
+        if user is not None:
+            assert user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
+        rows = [
+            json.loads(str(dict(r)["detail"])) for r in await store.list_audit(action="auth.reauth")
+        ]
+        denied = [r for r in rows if r.get("clear_denied")]
+        assert len(denied) == 1 and denied[0]["session_lost"] is True
+        assert not await store.list_audit(action="auth.login_after_failures")
+        assert not [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
     finally:
         await store.close()
 
 
-async def test_a_reread_that_finds_no_account_grants_nothing_and_says_missing(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """No account at the re-read, one deleted meanwhile: logged as missing, not as a changed
-    lockout state, nothing is written, and the re-auth is told to grant nothing."""
+async def test_the_clear_and_its_rows_commit_together(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ``auth.reauth`` row and the ``auth.login_after_failures`` row are appended in the reset's
+    own transaction. Refused there, the reset rolls back, so the counters are never reset with no
+    row; the re-auth keeps its token and writes its row itself."""
     store = await MessageStore.open(":memory:")
     try:
-        service, notifier, _, _ = await _setup(store)
-        decided = await store.get_user("u-bob")
-        assert decided is not None
+        service, notifier, identity, token = await _setup(store)
+        reauth_rows = len(await store.list_audit(action="auth.reauth"))
 
-        async def gone(user_id: str, listed: Any = None) -> _SealCheck:
-            return _SealCheck()
+        async def refuse_append(*_a: object, **_k: object) -> object:
+            raise RuntimeError("synthetic audit append refusal")
 
-        async def never(user_id: str, **kwargs: Any) -> None:
-            raise AssertionError("the clear wrote over an account the re-read did not find")
-
-        monkeypatch.setattr(service, "_checked_by_id", gone)
-        monkeypatch.setattr(store, "record_login_success", never)
-        with caplog.at_level(logging.INFO, logger="messagefoundry.auth.service"):
-            assert await service._clear_after_reauth(decided) == "denied"
-        assert "found the account missing" in caplog.text
-        assert "lockout state changed" not in caplog.text
+        monkeypatch.setattr(store, "_append_audits", refuse_append)
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.ok and out.token is not None
+        user = await store.get_user("u-bob")
+        assert user is not None and user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
+        assert len(await store.list_audit(action="auth.reauth")) == reauth_rows + 1
+        assert not await store.list_audit(action="auth.login_after_failures")
         assert not [e for e in notifier.events if e.event_type == LOGIN_AFTER_FAILURES]
+    finally:
+        await store.close()
+
+
+async def test_a_cleared_reauth_writes_its_row_once() -> None:
+    """The control for the transaction arm: a clear that lands writes exactly one ``auth.reauth``
+    row, the one committed with the reset, and one ``auth.login_after_failures`` row after it."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, identity, token = await _setup(store)
+        before = len(await store.list_audit(action="auth.reauth"))
+        out = await service.reauth(identity, GOOD, token=token)
+        assert out.ok
+        rows = await store.list_audit(action="auth.reauth")
+        assert len(rows) == before + 1
+        assert json.loads(str(dict(rows[0])["detail"]))["ok"] is True
+        assert len(await store.list_audit(action="auth.login_after_failures")) == 1
+    finally:
+        await store.close()
+
+
+async def _clear_raises(service: AuthService, store: MessageStore, mp: pytest.MonkeyPatch) -> None:
+    async def defect(user_id: str, **kwargs: Any) -> Any:
+        raise KeyError("synthetic-defect-5900")
+
+    mp.setattr(store, "record_login_success", defect)
+
+
+async def _revoke_raises(service: AuthService, store: MessageStore, mp: pytest.MonkeyPatch) -> None:
+    async def denied(decided: Any, audits: Any) -> str:
+        return "denied"
+
+    async def defect(rotated_token: str, actor: str) -> bool:
+        raise KeyError("synthetic-defect-5900")
+
+    mp.setattr(service, "_clear_after_reauth", denied)
+    mp.setattr(service, "_end_reauth_rotated_session", defect)
+
+
+@pytest.mark.parametrize("fault", [_clear_raises, _revoke_raises], ids=lambda f: f.__name__)
+async def test_a_raise_after_the_rotation_still_writes_the_reauth_row(
+    monkeypatch: pytest.MonkeyPatch,
+    fault: Callable[[AuthService, MessageStore, pytest.MonkeyPatch], Awaitable[None]],
+) -> None:
+    """A defect raised by the clear or by the revoke of a denied clear propagates, and the rotated
+    session's ``auth.reauth`` row is still written, marked interrupted, with nothing cleared."""
+    store = await MessageStore.open(":memory:")
+    try:
+        service, _, identity, token = await _setup(store)
+        before = len(await store.list_audit(action="auth.reauth"))
+        await fault(service, store, monkeypatch)
+        with pytest.raises(KeyError, match="synthetic-defect-5900"):
+            await service.reauth(identity, GOOD, token=token)
+        rows = await store.list_audit(action="auth.reauth")
+        assert len(rows) == before + 1, "a raise after the rotation skipped the auth.reauth row"
+        detail = json.loads(str(dict(rows[0])["detail"]))
+        assert detail["ok"] is True and detail["interrupted"] is True
+        user = await store.get_user("u-bob")
+        assert user is not None and user.failed_attempts == SUSPICIOUS_LOGIN_FAILURE_THRESHOLD
     finally:
         await store.close()

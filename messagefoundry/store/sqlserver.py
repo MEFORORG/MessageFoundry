@@ -279,11 +279,13 @@ from messagefoundry.store.store import (
     EpochRaise,
     FailOutcome,
     FederatedUnbind,
+    FullAuthenticationWrite,
     InboundMetrics,
     KeptSessionRestamp,
     LatencyHistogram,
     LockoutCounter,
     LockoutIncrement,
+    LoginSuccessAnswer,
     MessageOrigin,
     MessageSearchResult,
     MessageStatus,
@@ -362,7 +364,6 @@ from messagefoundry.store.store import (
     federated_unbind,
     first_admin_grant,
     first_sealed_approval_async,
-    full_authentication_clear,
     global_epoch_or_refuse,
     global_epoch_raise,
     global_epoch_unmoved,
@@ -16056,9 +16057,38 @@ class SqlServerStore:
         await cur.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
         await cur.execute("DELETE FROM users WHERE id=?", (user_id,))
 
-    async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
+    async def record_login_success(
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        expected: tuple[object, ...] | None = None,
+        audits: Sequence[AuditAppend] = (),
+    ) -> LoginSuccessAnswer:
+        """See the SQLite twin (BACKLOG #5900): the compare with ``expected`` reads the row
+        ``_write_user`` holds under ``UPDLOCK``, and ``audits`` share the reset's transaction. This
+        leg is CI-only, so a divergence from the SQLite and Postgres bodies surfaces first in CI.
+        Same lock order as ``clear_lockout``: the in-process gate, then the connection."""
         now = time.time() if now is None else now
-        await self._write_user_txn(user_id, lambda r: full_authentication_clear(r, now))
+        write = FullAuthenticationWrite(now, expected)
+        if not audits:
+            return write.answer(await self._write_user_txn(user_id, write))
+        appended: list[AppendedAuditRow] = []
+        async with self._audit_lock:  # noqa: SIM117
+            async with self._acquire() as conn:
+                try:
+                    async with self._cursor(conn) as cur:
+                        written = await self._write_user(cur, user_id, write)
+                        if written is not None:
+                            appended = await self._append_audits(cur, audits, now=now)
+                        await self._commit(conn)
+                except Exception:
+                    # BACKLOG #1940: see _rollback_or_discard, as clear_lockout does.
+                    await self._rollback_or_discard(conn)
+                    raise
+        if appended:
+            tee_audits(audits, appended, ts=now)
+        return write.answer(written)
 
     async def clear_lockout(
         self,

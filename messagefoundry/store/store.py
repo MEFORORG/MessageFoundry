@@ -3328,6 +3328,13 @@ class SessionRecord:
 #: passkey). Either miss is a clone signal (ADR 0068 decision 4); the answer only says which.
 SignCountAnswer = Literal["moved", "mismatch", "gone"]
 
+#: What :meth:`MessageStore.record_login_success` did (BACKLOG #5900), decided under the write's
+#: own lock: ``"written"`` (the reset landed), ``"lockout_changed"`` (only a lockout column differs
+#: from the ``expected`` snapshot), ``"account_changed"`` (the account's enablement, provider or
+#: directory id differs, or a concurrent write won the compare on its seal, so what changed is not
+#: known) or ``"gone"`` (no such account). Nothing is written but on ``"written"``.
+LoginSuccessAnswer = Literal["written", "lockout_changed", "account_changed", "gone"]
+
 
 @dataclass(frozen=True)
 class WebAuthnCredential:
@@ -10345,6 +10352,57 @@ LOCKOUT_COLUMNS: Mapping[LockoutCounter, tuple[str, str, str]] = MappingProxyTyp
         ),
     }
 )
+
+#: The columns a conditional full-authentication reset must find unchanged (BACKLOG #5900): both
+#: counters' lockout columns, whether the account is enabled, and the identity a re-proof judged.
+#: Code-controlled names, read off :class:`UserRecord` and :class:`UserRow` alike.
+_FULL_AUTHENTICATION_ACCOUNT: Final = ("disabled", "auth_provider", "directory_object_id")
+FULL_AUTHENTICATION_GUARD: Final[tuple[str, ...]] = (
+    *(col for cols in LOCKOUT_COLUMNS.values() for col in cols),
+    *_FULL_AUTHENTICATION_ACCOUNT,
+)
+
+
+def full_authentication_snapshot(user: UserRecord | UserRow) -> tuple[object, ...]:
+    """The :data:`FULL_AUTHENTICATION_GUARD` columns of ``user``, normalised so a
+    :class:`UserRecord` read by the service and the :class:`UserRow` the store's write reads give
+    equal tuples for one stored row (BACKLOG #5900)."""
+    values = {col: getattr(user, col) for col in FULL_AUTHENTICATION_GUARD}
+    values["disabled"] = bool(values["disabled"])
+    values["auth_provider"] = str(values["auth_provider"])
+    values["directory_object_id"] = _opt_str(values["directory_object_id"])
+    return tuple(values[col] for col in FULL_AUTHENTICATION_GUARD)
+
+
+class FullAuthenticationWrite:
+    """The change :meth:`MessageStore.record_login_success` hands its backend's ``_write_user``
+    (BACKLOG #5900): :func:`full_authentication_clear`, declined when ``expected`` is given and the
+    row the write read under its lock no longer holds it. :meth:`answer` then says what happened."""
+
+    def __init__(self, now: float, expected: tuple[object, ...] | None) -> None:
+        self._now = now
+        self._expected = expected
+        self._found: LoginSuccessAnswer = "gone"
+
+    def __call__(self, r: UserAuthzRecord) -> UserAuthzRecord | None:
+        # A concurrent write that wins the compare on the seal leaves this answer standing, and
+        # what it changed is unknown, so it reads as the account changing.
+        self._found = "account_changed"
+        expected = self._expected
+        if expected is not None:
+            found = full_authentication_snapshot(r.row)
+            if found != expected:
+                split = len(FULL_AUTHENTICATION_GUARD) - len(_FULL_AUTHENTICATION_ACCOUNT)
+                if found[split:] == expected[split:]:
+                    self._found = "lockout_changed"
+                return None
+        return full_authentication_clear(r, self._now)
+
+    def answer(self, written: UserAuthzRecord | None) -> LoginSuccessAnswer:
+        """``"written"`` when ``_write_user`` wrote the reset, else what the change found: ``"gone"``
+        when it never ran because there was no row."""
+        return "written" if written is not None else self._found
+
 
 #: The largest exponent the escalation ever computes. 2**64 lock lengths are far past any ceiling an
 #: operator can configure, so capping here changes no answer and keeps a huge stored count finite.
@@ -20501,11 +20559,31 @@ class MessageStore:
         await self._db.execute("DELETE FROM search_presets WHERE owner_user_id=?", (user_id,))
         await self._db.execute("DELETE FROM users WHERE id=?", (user_id,))
 
-    async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
+    async def record_login_success(
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        expected: tuple[object, ...] | None = None,
+        audits: Sequence[AuditAppend] = (),
+    ) -> LoginSuccessAnswer:
+        """Write a full authentication (:func:`full_authentication_clear`). With ``expected`` (a
+        :func:`full_authentication_snapshot`), only while the row still holds it, decided in the
+        write's own transaction (BACKLOG #5900). ``audits`` are appended in that transaction only
+        when the reset is written, so a refused append rolls the reset back; a reset that writes
+        nothing appends nothing. ``BEGIN IMMEDIATE`` when ``expected`` is given, so a writer in
+        another process cannot commit between the read the compare uses and the write."""
         now = time.time() if now is None else now
-        async with _writer_guard(self._db, self._lock):
-            await self._write_user(user_id, lambda r: full_authentication_clear(r, now))
+        write = FullAuthenticationWrite(now, expected)
+        appended: list[AppendedAuditRow] = []
+        async with _writer_txn(self._db, self._lock, immediate=expected is not None):
+            written = await self._write_user(user_id, write)
+            if written is not None and audits:
+                appended = await self._append_audits(audits, now=now)
             await self._commit()
+        if appended:
+            tee_audits(audits, appended, ts=now)
+        return write.answer(written)
 
     async def clear_lockout(
         self,
