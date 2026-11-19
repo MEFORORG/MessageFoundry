@@ -2934,10 +2934,10 @@ default; where to put it is the platform's choice (ADR 0214, slice C).
 - **When a replaced file is used**, whoever wrote it. For the `vault` key provider the engine reads
   the file at least at every store open and every DR backup pass, and for
   `[secrets].provider = "vault"` at every secret read. The `vault_transit` cipher reads it once,
-  when the store opens, and builds every one of its Vault clients from that token: one at the
-  store open, used by the thread that opened the store, then one for each other thread on its
-  first Transit call there, and a new one on any thread's next call after a store that holds the
-  cipher closes (BACKLOG #5963). None of those builds reads the file again, so a token replaced
+  when the store opens, and builds every one of its Vault clients from that token: one used by
+  the thread that builds the cipher, one for any other thread when it first needs one, and a new
+  one on a thread's next Transit request after a store that holds the cipher closes
+  (BACKLOG #5963). None of those builds reads the file again, so a token replaced
   after the store opens is not used until the next start, and once the token it holds expires,
   every Transit call fails. So under `vault_transit`, restart the engine after each replacement.
 

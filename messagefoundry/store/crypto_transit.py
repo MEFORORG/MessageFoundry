@@ -532,7 +532,8 @@ def _build_failure(op: str, key: str, exc: Exception) -> CipherError:
 def _close_client(client: object, owner: int) -> None:
     """Close an hvac client's pooled connections, best-effort, only on ``owner``, the thread that
     holds the client (BACKLOG #5963). On any other thread it does nothing, and the client is left
-    to garbage collection. A close that raises is logged by the exception's type alone."""
+    to garbage collection. A close that raises is logged by the exception's type alone, through
+    :func:`_warn_quietly`, so a failing log handler does not raise out of here either."""
     if threading.get_ident() != owner:
         return
     closer = getattr(getattr(client, "adapter", None), "close", None)
@@ -541,7 +542,8 @@ def _close_client(client: object, owner: int) -> None:
     try:
         closer()
     except Exception as exc:  # noqa: BLE001 -- a close is best-effort; logged, not raised
-        log.warning("closing a Transit client's connections raised %s", type(exc).__name__)
+        name = type(exc).__name__
+        _warn_quietly(lambda: ("closing a Transit client's connections raised %s", name))
 
 
 class _ThreadClient:
@@ -632,20 +634,20 @@ class TransitCipher(_UnmarkedPolicy):
         return client
 
     def _drop_held(self, held: _ThreadClient) -> None:
-        """Detach the calling thread's ``held`` client, then close it here. The close is called
-        directly rather than through the finalizer, which does nothing once weakref's exit hook
-        has run."""
+        """Detach the calling thread's ``held`` client, then close it here, under the owner the
+        finalizer recorded. The close is called directly rather than through the finalizer,
+        which does nothing once weakref's exit hook has run."""
         del self._thread_clients.held
-        if held.release.detach() is not None:
-            _close_client(held.client, threading.get_ident())
+        if (parts := held.release.detach()) is not None:
+            _close_client(*parts[2])
 
     def close_connections(self) -> None:
         """Close the calling thread's client and mark every other thread's stale (BACKLOG #5963).
 
         This cipher never closes a thread's client from another thread. Each other thread releases
         its own at least on its next Transit request, which builds a fresh client, or when it ends
-        before interpreter shutdown; until then a stale client stays open. The cipher stays usable,
-        since stores can share it. Without a factory, the one shared client is left open."""
+        before interpreter shutdown. The cipher stays usable, since stores can share it. Without a
+        factory, the one shared client is left open."""
         if self._client_factory is None:
             return
         self._generation += 1

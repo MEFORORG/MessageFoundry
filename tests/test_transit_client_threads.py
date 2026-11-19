@@ -315,8 +315,10 @@ def test_a_thread_that_exits_closes_its_own_client() -> None:
 
 
 def test_a_cipher_collected_on_another_thread_leaves_a_threads_client_open() -> None:
-    """BACKLOG #5963. Mutation: let a client's release close it on any thread. Red: collecting the
-    cipher on thread U closes thread T's client while T's request is in flight on it."""
+    """BACKLOG #5963. The owner check in a client's release, which guards future code: no cipher
+    method can be mid-request while the cipher is collected, since its frame holds the cipher, so
+    the test calls T's client directly. Mutation: let a release close a client on any thread.
+    Red: collecting the cipher on thread U closes the client T is using."""
     transit = _FakeTransit()
     entered, release = threading.Event(), threading.Event()
     clients: list[_SlowClient] = []
@@ -447,6 +449,26 @@ def test_a_client_close_that_raises_is_logged_and_the_cipher_stays_usable(
     assert len(built) == 2
     gc.collect()
     assert built[1].adapter.closed == 0  # the release ran once; nothing closes the new client
+
+
+def test_a_failing_log_handler_does_not_escape_a_client_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5963. Mutation: log a failed close with a bare log.warning. Red: a log handler
+    that raises escapes close_connections, so it would replace a store close step's own error."""
+    cipher, built = _cipher()
+
+    def boom() -> None:
+        raise OSError("synthetic")
+
+    def broken_warning(*_: object, **__: object) -> None:
+        raise RuntimeError("synthetic: the log handler failed")
+
+    built[0].adapter.close = boom  # type: ignore[method-assign]
+    monkeypatch.setattr(crypto_transit.log, "warning", broken_warning)
+    cipher.close_connections()  # must not raise
+    cipher.encrypt("synthetic")
+    assert len(built) == 2
 
 
 def _encrypt_in_a_thread(factory: Callable[[], Any]) -> list[BaseException]:

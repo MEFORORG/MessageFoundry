@@ -5,8 +5,8 @@
   client from another thread. Closing a SQLite, SQL Server or Postgres store, even after an
   earlier close step raised, closes the closing thread's client and marks the others stale. Each
   other thread releases its own at least on its next Transit request, which builds a fresh client,
-  or when it ends before interpreter shutdown; until then a stale client stays open. The cipher
-  stays usable, since stores can share it.
+  or when it ends before interpreter shutdown. The cipher stays usable, since stores can share
+  it.
   Where a thread's client cannot be built, a data-key decrypt gets the no-verdict outage error and
   a data-key encrypt the error the cipher's failure classifier reads the build failure as.
   (`BACKLOG #5963`)
