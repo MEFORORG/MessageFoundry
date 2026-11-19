@@ -415,10 +415,12 @@ def test_an_item_that_sets_the_secrets_directory_is_not_taken_into_the_value_abo
 #: Each reads as a name set to equals signs alone. The item rule of 3085e1d5c55 took that as the
 #: empty value's continuation; the one of 99cc2f7c260 did not.
 _PADDED_OUTSIDE_STANDARD = (
-    "ab-c_dEf==",  # base64url with two ``=`` of padding
+    "ab-c_dEf==",  # base64url letters before two ``=``, too short to decode
     "abc.def==",  # a dot, in no base64 alphabet
     base64.urlsafe_b64encode(b"\xfb\xff\xfe-tok-0017x").decode(),  # base64url with ``-`` and ``_``
-    "ProgramFiles(x86)= =",  # a name with a blank inside its padding
+    "ab-c_dEf==\xa0",  # a no-break space after the padding, as a paste from a web page brings
+    "ab-c_dEf==\x0b",  # a vertical tab: whitespace, but not a space or a tab
+    "ProgramFiles(x86)= =",  # not a secret: a Windows name whose value is ``=`` beside a blank
 )
 
 
