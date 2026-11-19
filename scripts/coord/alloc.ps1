@@ -513,9 +513,16 @@ function Get-Floor {
             @(& git -C $repo @GitArgs 2>&1)
         }
         $code = $LASTEXITCODE
+        $detail = (@($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) -join "`n  ").Trim()
         if ($code -ne 0) {
-            $detail = (@($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) -join "`n  ").Trim()
             throw "alloc.ps1: $refusal -- git $($GitArgs[0]) exited $code while sweeping refs for the ADR floor. An incomplete sweep would understate the floor and could re-issue a number already in use, so nothing was read as a floor or allocated. Fix the clone and re-run. git said:`n  $detail"
+        }
+        # A CLEAN EXIT CAN STILL CARRY A WARNING, and capturing stderr must not swallow it. Before
+        # this wrapper, for-each-ref's stderr reached the console untouched, so a
+        # `warning: ignoring broken ref` was seen; 2>&1 alone would drop it. Echoed, not refused:
+        # git still answered, and the warning names a clone problem the operator should fix.
+        if ($detail) {
+            [Console]::Error.WriteLine("alloc.ps1: WARNING -- git $($GitArgs[0]) exited 0 but wrote to stderr while sweeping refs for the ADR floor. git said:`n  $detail")
         }
         @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
     }
@@ -531,10 +538,14 @@ function Get-Floor {
     }
 
     # Anchored at `^` because these are bare entry names, not the `docs/adr/NNNN-` paths the
-    # pre-dedupe spelling produced. `--name-only` yields one name per line and nothing else.
+    # pre-dedupe spelling produced. `-z` because without it git QUOTES a name holding a non-ASCII
+    # byte or a control character (an e-acute prints as `"0095-caf\303\251.md"`), the leading
+    # quote defeats the anchor,
+    # and that number reads FREE. With `-z` each name is NUL-terminated and never quoted; pwsh still
+    # splits native output on newlines, so rejoin on newline before splitting on NUL.
     $rx = [regex]::new('^(\d{4})-')
     foreach ($t in $trees) {
-        $names = Invoke-SweepGit @('ls-tree', '--name-only', $t)
+        $names = ((Invoke-SweepGit @('ls-tree', '-z', '--name-only', $t)) -join "`n") -split "`0"
         foreach ($n in $names) {
             $m = $rx.Match("$n")
             if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }

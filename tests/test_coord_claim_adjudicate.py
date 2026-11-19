@@ -455,6 +455,101 @@ def test_a_backlog_named_file_with_no_item_refuses_rather_than_reporting_no_item
     assert report["sources"]["backlog"] == ["docs/BACKLOG.md"], report["sources"]
 
 
+def _failing_git_env(tmp_path: Path, subcommand: str, said: str) -> dict[str, str]:
+    """PATH with a ``git.cmd`` shim first that fails ONE git subcommand, writing ``said`` to stderr.
+
+    The script spells every namespace read ``git -C <repo> <subcommand> ...``, so the subcommand is
+    ``%3``; every other call passes through to the real git. pwsh finds a ``.cmd`` first on PATH.
+    """
+    real_git = shutil.which("git")
+    assert real_git is not None
+    shim = tmp_path / f"shim-{subcommand}"
+    shim.mkdir()
+    (shim / "git.cmd").write_text(
+        "@echo off\r\n"
+        f'if "%3"=="{subcommand}" (\r\n'
+        f"  echo {said} 1>&2\r\n"
+        "  exit /b 128\r\n"
+        ")\r\n"
+        f'"{real_git}" %*\r\n',
+        encoding="ascii",
+        newline="",
+    )
+    return dict(os.environ, PATH=f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+
+def _adjudicate_env(
+    repo: Path, env: dict[str, str], *args: str
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(repo / "scripts" / "coord" / "claim-adjudicate.ps1"),
+            *args,
+        ],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        timeout=TIMEOUT,
+        env=env,
+    )
+
+
+def test_the_failing_git_shim_passes_every_other_call_through(repo: Path, tmp_path: Path) -> None:
+    """THE CONTROL for the refusals below: a shim failing a subcommand the script never runs still
+    lets the claim be adjudicated, so a refusal there is the failing call and not the shim."""
+    write_claim(repo, "27", tmp_path / "gone", "seat")
+    backlog(repo, f"## 27. A real item\n\n> {SHIPPED} SHIPPED\n")
+    proc = _adjudicate_env(repo, _failing_git_env(tmp_path, "never-run", "fatal: unused"), "-Json")
+    assert proc.returncode == 0, proc.stderr
+    assert {c["key"] for c in json.loads(proc.stdout)["claims"]} == {"27"}
+
+
+@pytest.mark.parametrize(
+    "subcommand,phrase",
+    [("show", "only partly read"), ("ls-tree", "not read")],
+)
+def test_a_failed_namespace_read_refuses_and_carries_gits_own_words(
+    repo: Path, tmp_path: Path, subcommand: str, phrase: str
+) -> None:
+    """MUST TRIP. A git show or ls-tree that fails must refuse the whole run rather than drop a file
+    (its items would read NO-ITEM) or read an empty tree, and the refusal must carry git's own stderr
+    so the operator sees why. The control is the pass-through case above.
+    """
+    write_claim(repo, "27", tmp_path / "gone", "seat")
+    backlog(repo, f"## 27. A real item\n\n> {SHIPPED} SHIPPED\n")
+    said = f"fatal: synthetic {subcommand} failure"
+    proc = _adjudicate_env(repo, _failing_git_env(tmp_path, subcommand, said))
+    combined = proc.stderr + proc.stdout
+    assert proc.returncode != 0, f"a failed {subcommand} still produced a report:\n{combined}"
+    assert f"git {subcommand} exited 128" in combined, combined
+    assert phrase in combined, combined
+    assert said in combined, f"the refusal dropped git's stderr:\n{combined}"
+    assert "NO-ITEM" not in proc.stdout, combined
+
+
+def test_a_non_ascii_backlog_file_name_is_read_not_quoted_away(repo: Path, tmp_path: Path) -> None:
+    """MUST TRIP on ``ls-tree`` without ``-z``: git quotes a path holding a non-ASCII byte, and the
+    quoted spelling is not a path git show can read. The control is
+    ``test_the_archived_backlog_file_is_read_too``, the same shape with an ASCII name.
+    """
+    name = "BACKLOG-CLOS\N{LATIN CAPITAL LETTER E WITH ACUTE}.md"
+    p = repo / "docs" / "archive" / "backlog" / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        f"# Closed\n\n## 11. Retired thing\n\n> {RETIRED} retired\n\nbody\n", encoding="utf-8"
+    )
+    backlog(repo, f"## 12. Something else\n\n> {PRIORITIZED} open\n\nbody\n")
+    unmerged_branch(repo, "seat")
+    write_claim(repo, "11", tmp_path / "gone", "seat")
+    r = rows(repo)["11"]
+    assert r["verdict"] == "SUPERSEDED", r
+
+
 def test_the_script_carries_no_control_characters() -> None:
     """An escape that collapses into a control byte is invisible in every normal view -- see the
     2026-08-16 `\\b`-as-backspace incident recorded in test_coord_claim_reconcile.py. This file

@@ -154,8 +154,38 @@ if (-not (Test-Path -LiteralPath $claimsDir)) {
 # origin/main is the reference, never local main: measured 2026-08-16, local main was 24 commits
 # behind on this clone. Here the staleness bites in a specific way -- a banner that has landed but
 # not been fetched reads as ABSENT, which holds a claim that is safe to release.
-$mainRef = if ((& git -C $repo rev-parse --verify --quiet "origin/main")) { "origin/main" } else { "main" }
+#
+# RESOLVED TO ONE SHA, ONCE. Every later read -- the ls-tree, each git show, the citation log and the
+# ahead count -- takes $mainSha, never the name, so a fetch landing mid-run cannot hand one read an
+# older tree and the next a newer one. $mainRef stays the name, for the prose.
+$mainRef = "origin/main"
+$mainSha = "$(& git -C $repo rev-parse --verify --quiet $mainRef 2>$null)".Trim()
+if (-not $mainSha) {
+    $mainRef = "main"
+    $mainSha = "$(& git -C $repo rev-parse --verify --quiet $mainRef 2>$null)".Trim()
+}
+if (-not $mainSha) {
+    throw "neither origin/main nor main resolves to a commit: cannot adjudicate any key against a namespace that was not read"
+}
 $mainIsRemote = ($mainRef -eq "origin/main")
+
+# ONE WRAPPER FOR THE NAMESPACE READS, so the exit check and the stderr carry cannot be dropped from
+# one of them. Both preferences are pinned in the function's own scope: under the script's "Stop",
+# with $PSNativeCommandUseErrorActionPreference true, git's first stderr line or its exit code throws
+# a generic error and the refusal below, with git's own words, never prints. alloc.ps1's
+# Invoke-SweepGit is the same shape for the same reason.
+function Invoke-NamespaceGit([string[]]$GitArgs, [string]$What, [string]$Why) {
+    $ErrorActionPreference = "Continue"
+    $PSNativeCommandUseErrorActionPreference = $false
+    $global:LASTEXITCODE = -1
+    $all = @(& git -C $repo @GitArgs 2>&1)
+    $code = $LASTEXITCODE
+    if ($code -ne 0) {
+        $detail = (@($all | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { "$_" }) -join "`n  ").Trim()
+        throw "could not read $What (git $($GitArgs[0]) exited $code): cannot adjudicate any key against a namespace that was $Why. git said:`n  $detail"
+    }
+    @($all | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] })
+}
 
 # ---------------------------------------------------------------------------------------------
 # THE BACKLOG NAMESPACE ON $mainRef.
@@ -166,8 +196,12 @@ $mainIsRemote = ($mainRef -eq "origin/main")
 # here would make every CLOSED item look like it had no item at all -- turning the safest releases
 # in the population into unreachable ones, silently.
 # ---------------------------------------------------------------------------------------------
-$backlogFiles = @(& git -C $repo ls-tree -r --name-only $mainRef -- docs/ 2>$null |
-    Where-Object { $_ -match 'BACKLOG' -and $_ -like '*.md' })
+#
+# `-z` because without it git QUOTES a path holding a non-ASCII byte or a control character, and a
+# quoted name is not a path git show can read. pwsh splits native output on newlines, so rejoin on
+# newline before splitting on NUL. A FAILED ls-tree REFUSES, for the reason a failed git show does.
+$treeNames = (@(Invoke-NamespaceGit @('ls-tree', '-r', '-z', '--name-only', $mainSha, '--', 'docs/') "the tree of $mainRef ($mainSha)" "not read") -join "`n") -split "`0"
+$backlogFiles = @($treeNames | Where-Object { $_ -match 'BACKLOG' -and $_ -like '*.md' })
 if (-not $backlogFiles.Count) {
     throw "no backlog file found on ${mainRef}: cannot adjudicate any key against a namespace that was not read"
 }
@@ -182,11 +216,7 @@ if (-not $backlogFiles.Count) {
 $itemHeading = '(?m)^##\s+\d+\.\s'
 $corpus = @{}
 foreach ($bf in $backlogFiles) {
-    $global:LASTEXITCODE = -1
-    $text = (& git -C $repo show "${mainRef}:$bf" 2>$null) -join "`n"
-    if ($LASTEXITCODE -ne 0) {
-        throw "could not read ${mainRef}:$bf (git show exited $LASTEXITCODE): cannot adjudicate any key against a namespace that was only partly read"
-    }
+    $text = (Invoke-NamespaceGit @('show', "${mainSha}:$bf") "${mainRef}:$bf" "only partly read") -join "`n"
     if ($text -match $itemHeading) { $corpus[$bf] = $text }
 }
 if (-not $corpus.Count) {
@@ -280,7 +310,7 @@ function Get-LeadingQuote([string]$Block) {
 function Get-Citations([string]$ItemKey) {
     if ($ItemKey -notmatch '^\d+$') { return @() }
     # Candidates: any subject naming this number at all. Deliberately broader than the old query.
-    $raw = @(& git -C $repo log --format="%h%x09%s" --grep="#$ItemKey([^0-9]|`$)" -E --max-count=40 $mainRef 2>$null)
+    $raw = @(& git -C $repo log --format="%h%x09%s" --grep="#$ItemKey([^0-9]|`$)" -E --max-count=40 $mainSha 2>$null)
     # Inside a `(BACKLOG #... )` group, or after a bare `BACKLOG #` token with no parenthetical, and
     # not labelled `PR #N`. The token is `BACKLOG #`, never the bare word: `docs(backlog): file #1754`
     # cites nothing a `BACKLOG #1754` grep can find. scripts/hooks/claim_check.py counts a subject's
@@ -410,7 +440,7 @@ foreach ($f in $files) {
             foreach ($cand in @($branch, "origin/$branch")) {
                 if (& git -C $repo rev-parse --verify --quiet $cand) { $ref = $cand; break }
             }
-            if ($ref) { $ahead = [int](& git -C $repo rev-list --count "$mainRef..$ref") }
+            if ($ref) { $ahead = [int](& git -C $repo rev-list --count "$mainSha..$ref") }
         }
         $aheadTxt = if ($null -eq $ahead) { "branch '$branch' is on neither this clone nor origin" }
                     elseif ($ahead -eq 0) { "'$branch' carries no commit $mainRef lacks" }

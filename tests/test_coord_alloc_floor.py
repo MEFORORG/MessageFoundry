@@ -701,3 +701,55 @@ def test_a_failed_sweep_call_refuses_instead_of_lowering_the_floor(
     assert sorted(p.name for p in registry.rglob("*.json")) == [], (
         "the refusal left a claimed number behind, so it does not fail closed"
     )
+
+
+def _warning_git_env(tmp_path: Path, subcommand: str, warning: str) -> dict[str, str]:
+    """PATH with a ``git.cmd`` shim that writes ``warning`` to stderr before ONE subcommand runs.
+
+    The real git still runs and exits 0, so the sweep succeeds; only the stderr line is added.
+    """
+    real_git = shutil.which("git")
+    assert real_git is not None
+    shim = tmp_path / f"warn-{subcommand}"
+    shim.mkdir()
+    (shim / "git.cmd").write_text(
+        f'@echo off\r\nif "%3"=="{subcommand}" echo {warning} 1>&2\r\n"{real_git}" %*\r\n',
+        encoding="ascii",
+        newline="",
+    )
+    return dict(os.environ, PATH=f"{shim}{os.pathsep}{os.environ['PATH']}")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the git.cmd shim needs cmd.exe")
+def test_a_warning_on_a_clean_sweep_call_is_echoed_not_swallowed(tmp_path: Path) -> None:
+    """MUST TRIP on the wrapper that captured stderr and dropped it on exit 0. Before the wrapper,
+    for-each-ref's stderr reached the console, so a ``warning: ignoring broken ref`` was seen. The
+    floor is still computed: a warning is echoed, never refused.
+
+    THE CONTROL is ``test_the_failing_git_shim_passes_every_other_call_through``: the same repo with
+    no warning reads 90, so the echo below is the shim's line and not some other stderr output.
+    """
+    repo = _repo_with_90_on_a_side_branch(tmp_path / "repo")
+    warning = "warning: ignoring broken ref refs/heads/synthetic-broken"
+    env = _warning_git_env(tmp_path, "for-each-ref", warning)
+    proc = _run(repo, "-ShowFloor", "-Kind", "adr", env=env)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert re.search(r"^floor\s*:\s*90$", proc.stdout, re.MULTILINE), proc.stdout
+    assert warning in proc.stderr, f"git's warning was swallowed:\n{proc.stdout}\n{proc.stderr}"
+    assert "git for-each-ref exited 0" in proc.stderr, proc.stderr
+
+
+def test_a_non_ascii_adr_name_on_a_branch_still_raises_the_floor(tmp_path: Path) -> None:
+    """MUST TRIP on ``ls-tree --name-only`` without ``-z``: git quotes a name holding a non-ASCII byte,
+    the leading quote defeats the four-digit ``^NNNN-`` anchor, and 95 would read FREE. The control is the
+    same shape with an ASCII name in ``test_the_failing_git_shim_passes_every_other_call_through``.
+    """
+    repo = _checkout(tmp_path / "repo", {"0001-first.md": "# First\n"})
+    _git("checkout", "-q", "-b", "side", cwd=repo)
+    (repo / "docs" / "adr" / "0095-caf\N{LATIN SMALL LETTER E WITH ACUTE}.md").write_text(
+        "# Side\n", encoding="utf-8"
+    )
+    _git("add", "-A", cwd=repo)
+    _git("commit", "-m", "side adr", "--no-verify", cwd=repo)
+    _git("checkout", "-q", "main", cwd=repo)
+    assert _floor(repo) == 95
