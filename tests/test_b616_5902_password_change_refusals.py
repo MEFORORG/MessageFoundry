@@ -368,29 +368,34 @@ async def test_an_outage_at_the_write_propagates_and_changes_nothing(
     assert await _changed_rows(store) == []
 
 
-def _after_commit(monkeypatch: pytest.MonkeyPatch, store: Store) -> list[bool]:
-    """Run the store's real password write, then mark it committed in the list returned."""
-    real = store.set_password
+def _reads_refused_after_commit(
+    monkeypatch: pytest.MonkeyPatch, store: Store, service: AuthService, refusal: Exception
+) -> list[bool]:
+    """Run the store's real password write; once it has written, any read of the account's record
+    through ``checked_user`` or ``_load_user`` raises ``refusal``. Returns the committed marks."""
     committed: list[bool] = []
+    real_write = store.set_password
 
     async def write(uid: str, **kwargs: Any) -> bool:
-        written = await real(uid, **kwargs)
-        committed.append(written)
+        written = await real_write(uid, **kwargs)
+        if written:
+            committed.append(True)
         return written
 
     monkeypatch.setattr(store, "set_password", write)
+    for name in ("checked_user", "_load_user"):
+        real_read = getattr(service, name)
+
+        def guarded(real: Any) -> Any:
+            async def read(uid: str) -> Any:
+                if committed:
+                    raise refusal
+                return await real(uid)
+
+            return read
+
+        monkeypatch.setattr(service, name, guarded(real_read))
     return committed
-
-
-def _unverifiable_once_committed(service: AuthService, committed: list[bool]) -> Any:
-    real = service.checked_user
-
-    async def checked(uid: str) -> Any:
-        if committed:
-            raise TransitSealUnverifiableError(USER_KIND, 1, 2)
-        return await real(uid)
-
-    return checked
 
 
 async def test_a_transit_unverifiable_after_the_commit_still_reports_the_change(
@@ -399,16 +404,8 @@ async def test_a_transit_unverifiable_after_the_commit_still_reports_the_change(
     """After the write has committed, a record read that Vault transit cannot verify does not turn
     a made change into a refusal: no read after the commit is made at all."""
     service, identity = await _account(store)
-    committed = _after_commit(monkeypatch, store)
-    real_load = service._load_user
-
-    async def load(uid: str) -> Any:
-        if committed:
-            raise TransitSealUnverifiableError(USER_KIND, 1, 2)
-        return await real_load(uid)
-
-    monkeypatch.setattr(service, "_load_user", load)
-    monkeypatch.setattr(service, "checked_user", _unverifiable_once_committed(service, committed))
+    refusal = TransitSealUnverifiableError(USER_KIND, 1, 2)
+    committed = _reads_refused_after_commit(monkeypatch, store, service, refusal)
     assert await service.change_password(identity, _NEW_PASSWORD) == []
     assert committed == [True]
     assert len(await _changed_rows(store)) == 1
@@ -418,52 +415,36 @@ async def test_the_notice_goes_to_the_checked_address(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     service, identity = await _account(store)
-    committed = _after_commit(monkeypatch, store)
+    refusal = AssertionError("the record was read again after the commit")
+    _reads_refused_after_commit(monkeypatch, store, service, refusal)
     sent: list[tuple[str, str | None]] = []
 
     async def notify(event_type: str, *, email: str | None, **_kwargs: Any) -> bool:
         sent.append((event_type, email))
         return True
 
-    async def no_read(_uid: str) -> Any:
-        raise AssertionError("the record was read again after the commit")
-
-    real_checked = service.checked_user
-
-    async def checked(uid: str) -> Any:
-        if committed:
-            return await no_read(uid)
-        return await real_checked(uid)
-
     monkeypatch.setattr(service, "_notify_security", notify)
-    monkeypatch.setattr(service, "checked_user", checked)
-    real_load = service._load_user
-
-    async def load(uid: str) -> Any:
-        if committed:
-            return await no_read(uid)
-        return await real_load(uid)
-
-    monkeypatch.setattr(service, "_load_user", load)
     assert await service.change_password(identity, _NEW_PASSWORD) == []
     assert sent == [(PASSWORD_CHANGED, "bob@example.org")]
 
 
-@pytest.mark.parametrize("refusal", [CipherError, TransitSealUnavailableError])
+@pytest.mark.parametrize(
+    "refusal",
+    [CipherError("transit down"), sqlite3.OperationalError("database is locked"), RuntimeError()],
+)
 async def test_a_refused_audit_row_after_the_commit_still_reports_the_change(
     store: MessageStore,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    refusal: type[Exception],
+    refusal: Exception,
 ) -> None:
     service, identity = await _account(store)
     sent: list[str | None] = []
-
     real_audit = service._audit
 
     async def refused(action: str, **kwargs: Any) -> None:
         if action == "auth.password_changed":
-            raise refusal()
+            raise refusal
         await real_audit(action, **kwargs)
 
     async def notify(_event_type: str, *, email: str | None, **_kwargs: Any) -> bool:
@@ -475,7 +456,7 @@ async def test_a_refused_audit_row_after_the_commit_still_reports_the_change(
     with caplog.at_level(logging.ERROR, logger="messagefoundry.auth.service"):
         assert await service.change_password(identity, _NEW_PASSWORD) == []
     assert sent == ["bob@example.org"]
-    assert any("audit row was refused" in r.getMessage() for r in caplog.records)
+    assert any("auth.password_changed row" in r.getMessage() for r in caplog.records)
     assert (await service.login("bob", _NEW_PASSWORD)).ok
 
 

@@ -16385,7 +16385,9 @@ class AuthService:
         covered row deleted while either way-past check runs is ``ValueError("no such user")``
         too, not an enrolment refusal. A deletion that lands after the write has committed is not
         caught: that change is reported as made. So is one whose ``auth.password_changed`` row the
-        audit MAC refuses, logged at ERROR; the notice goes to the address the checked read held.
+        store refuses (:func:`~messagefoundry.store.base.audit_write_errors`), logged at ERROR. A
+        session revoke that fails past its retries still raises, as :meth:`_revoke_after_commit`
+        says. The notice goes to the address the checked read held.
         :class:`BreachCorpusUnavailable` propagates from the policy check unchanged: the password
         is refused, never accepted unscreened.
 
@@ -16480,17 +16482,20 @@ class AuthService:
         await self._revoke_after_commit(
             identity.user_id, change="password_changed", actor=identity.username, client=client
         )
-        try:
+
+        async def row() -> None:
             await self._audit("auth.password_changed", actor=identity.username, client=client)
-        except (CipherError, TransitSealUnavailableError) as exc:
-            # The change has committed, so a refused audit MAC must not report it as failed
-            # (BACKLOG #5902). The class name only: a CipherError's text can quote Vault's reply.
-            _log.error(
-                "auth: the password change of account %s committed, but its"
-                " auth.password_changed audit row was refused (%s)",
-                identity.user_id,
-                type(exc).__name__,
-            )
+
+        # The change has committed, so a store refusal of its row must not report it as failed
+        # (BACKLOG #5902); the loss is logged, and a defect still raises.
+        await write_audit_soft(
+            row,
+            log=_log,
+            message="the auth.password_changed row of a committed password change could not be"
+            " written",
+            errors=audit_write_errors(),
+            defects=AUDIT_WRITE_DEFECTS,
+        )
         # The address the checked read above held: a re-read after the commit could only turn a
         # committed change into a refusal (BACKLOG #5902).
         await self._notify_security(
