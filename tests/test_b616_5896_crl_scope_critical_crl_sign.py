@@ -531,31 +531,108 @@ def test_the_ca_file_scan_still_alerts_on_a_ca_file_start_up_refuses(tmp_path: P
     assert verdict[1].startswith(("Replace the CRL in the CA file", "Fix the CA file"))
 
 
-@pytest.mark.parametrize("shape", ["some-reasons", "indirect"])
-def test_the_ca_file_scan_alerts_where_a_crl_setting_names_the_ca_file_too(
-    tmp_path: Path, shape: str
+_CRL_ISSUER = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "mefor-5896-crl-issuer")])
+
+
+def _indirect_from_a_crl_issuer(pki: _Pki) -> tuple[bytes, bytes]:
+    """A dedicated CRL issuer's certificate, issued by ``pki``'s CA with cRLSign only, and an
+    indirect CRL that issuer signs: out of scope, since the engine turns on no extended CRL
+    support."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    usage = x509.KeyUsage(
+        digital_signature=False,
+        key_cert_sign=False,
+        crl_sign=True,
+        content_commitment=False,
+        key_encipherment=False,
+        data_encipherment=False,
+        key_agreement=False,
+        encipher_only=False,
+        decipher_only=False,
+    )
+    issuer = (
+        x509.CertificateBuilder()
+        .subject_name(_CRL_ISSUER)
+        .issuer_name(_NAME)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(_NOW - _DAY)
+        .not_valid_after(_NOW + 365 * _DAY)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), False)
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(pki.key.public_key()), False
+        )
+        .add_extension(usage, critical=True)
+        .sign(pki.key, hashes.SHA256())
+    )
+    crl = (
+        x509.CertificateRevocationListBuilder()
+        .issuer_name(_CRL_ISSUER)
+        .last_update(_NOW - _DAY)
+        .next_update(_NOW + 7 * _DAY)
+        .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(key.public_key()), False)
+        .add_extension(x509.CRLNumber(1), False)
+        .add_extension(_idp(indirect_crl=True), True)
+        .sign(key, hashes.SHA256())
+        .public_bytes(_PEM)
+    )
+    return issuer.public_bytes(_PEM), crl
+
+
+def _shape(tmp_path: Path, shape: str) -> tuple[_Pki, bytes, bytes]:
+    """``(pki, extra certificates, CRL)`` for one of three shapes a start refuses since vault
+    BACKLOG #5896 and the expiry scan judges as it did before that item."""
+    if shape == "indirect-crl-issuer":
+        pki = _Pki(tmp_path)
+        extra, crl = _indirect_from_a_crl_issuer(pki)
+        return pki, extra, crl
+    if shape == "critical-extension":
+        pki = _Pki(tmp_path)
+        private = x509.UnrecognizedExtension(_PRIVATE, b"\x05\x00")
+        return pki, b"", _crl(pki.key, extensions=[(private, True)])
+    pki = _Pki(tmp_path, crl_sign=False)
+    return pki, b"", _crl(pki.key)
+
+
+_SHAPES = ["indirect-crl-issuer", "critical-extension", "no-crl-sign"]
+
+
+@pytest.mark.parametrize("ca_file_only", [True, False], ids=["ca-file-only", "crl-setting-too"])
+@pytest.mark.parametrize("shape", _SHAPES)
+def test_the_ca_file_scan_judges_these_shapes_as_main_did(
+    tmp_path: Path, shape: str, ca_file_only: bool
 ) -> None:
-    """Finding 1 of the review of the first repair of engine PR 3099. Where a CRL setting also
-    names the CA file, as ``[store].ssl_crl_file`` can, a start judges that file as a CRL setting
-    and refuses the out-of-scope CRL. So the scan, asked with ``ca_file_only=False``, must still
-    say to replace it before restarting."""
+    """The expiry scan of a CA file does not apply vault BACKLOG #5896's refusals (the decision
+    on engine PR 3099's hold). Its verdict on each shape is pinned to the one origin/main's scan
+    gives the same fixture: no alert, whether or not a CRL setting names the file."""
     from messagefoundry.pipeline.cert_expiry import _ca_file_crl_refusal
 
-    pki = _Pki(tmp_path)
-    idp, words = _OUT_OF_SCOPE[shape]
-    bundle = pki.crl_file(
-        pki.ca_file.read_bytes() + _crl(pki.key) + _crl(pki.key, extensions=[(idp, True)]),
-        "bundle.pem",
-    )
-
-    # The start that names the bundle as a CRL setting refuses it.
-    with pytest.raises(ValueError, match=words):
-        _hop(bundle, bundle)
-
+    pki, extra, crl = _shape(tmp_path, shape)
+    bundle = pki.crl_file(pki.ca_file.read_bytes() + extra + crl, "bundle.pem")
     verdict = _ca_file_crl_refusal(
-        bundle.read_bytes(), time.time(), None, ca_file_only=False, on_unchecked=lambda: None
+        bundle.read_bytes(),
+        time.time(),
+        None,
+        ca_file_only=ca_file_only,
+        on_unchecked=lambda: None,
     )
-    assert verdict is not None
-    assert verdict[1].startswith(
-        "Replace the CRL in the CA file with one the engine can judge before restarting"
-    )
+    assert verdict is None
+
+
+@pytest.mark.parametrize("shape", _SHAPES)
+def test_a_start_still_refuses_each_shape_the_scan_passes(tmp_path: Path, shape: str) -> None:
+    """The control for the test above: as a whole-chain CRL setting, each shape still refuses a
+    start. The cRLSign refusal applies to a whole-chain hop only."""
+    pki, extra, crl = _shape(tmp_path, shape)
+    ca_file = pki.crl_file(pki.ca_file.read_bytes() + extra, "cas.pem")
+    whole_chain = ssl.create_default_context(cafile=str(ca_file))
+    words = {
+        "indirect-crl-issuer": "is an indirect CRL",
+        "critical-extension": f"critical extension {_PRIVATE.dotted_string}",
+        "no-crl-sign": "does not include cRLSign",
+    }[shape]
+    with pytest.raises(ValueError, match=words):
+        harden_crl_check(
+            whole_chain, str(pki.crl_file(crl, "setting.pem")), setting=_SETTING, chain=True
+        )

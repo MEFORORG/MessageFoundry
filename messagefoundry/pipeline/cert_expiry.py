@@ -724,7 +724,11 @@ def _ca_file_crl_refusal(
     check raises on a later CRL, after one in :data:`_UNCONFIRMED`, whatever the error's type.
     The file is then unjudged. ``on_unchecked`` must not raise: an error from it leaves this
     function. :meth:`_HeldCopyLog.unchecked_later_crl` logs its own failure instead. Each remedy
-    leads, because the alert instance keeps only the start of it."""
+    leads, because the alert instance keeps only the start of it.
+
+    **It does not apply vault BACKLOG #5896's refusals**: an out-of-scope CRL, a CRL with a
+    critical extension OpenSSL does not handle, or a CRL from a CA without ``cRLSign``. So a start
+    can refuse a CA file this passes."""
     if not crl_pem_blocks(pem):
         return None  # the CRL was moved out, and a CA file with none starts
     unjudged = (
@@ -733,14 +737,14 @@ def _ca_file_crl_refusal(
         "restart loads the CA file whole",
     )
     try:
-        # The time a CRL takes effect is asked below, for its own remedy. The out-of-scope refusal
-        # applies only where a CRL setting names this file too (pki.judge_every_crl).
+        # The time a CRL takes effect is asked below, for its own remedy. Vault BACKLOG #5896's
+        # refusals are off, so this judges the CRLs as it did before them (pki.judge_every_crl).
         _, blocks = judge_crl_bytes(
             pem,
             label="the CA file",
             now=now,
             require_in_effect=False,
-            refuse_out_of_scope=not ca_file_only,
+            refuse_fail_closed=False,
         )
     except ValueError:
         if file_facts is not None and file_facts.expired:
@@ -920,7 +924,7 @@ def _judge_crl(
     account: _HeldCopyAccount | None = None
     try:
         copies = held.copies(cert.path)
-        # BACKLOG #3512: whether a CRL setting names this file: a start
+        # BACKLOG #3512: whether a CRL setting names this file, for the wording alone: a start
         # judges that setting, so the CA-file step says "before restarting" rather than ordering a
         # restart. Any row but a held-crl one is a CRL setting, and so is a held copy from one,
         # stale or not: a store hop records none. Whether a restart waits for the reload is a

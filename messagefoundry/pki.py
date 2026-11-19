@@ -335,7 +335,7 @@ def judge_every_crl(
     *,
     now: float,
     refuse_unread_extensions: bool = False,
-    refuse_out_of_scope: bool = True,
+    refuse_fail_closed: bool = True,
 ) -> list[tuple[CrlFacts, CrlBlock]]:
     """The facts and the :class:`CrlBlock` of EVERY CRL in ``pem``, in file order, refusing any block
     it cannot judge. One parse per block.
@@ -373,9 +373,9 @@ def judge_every_crl(
     extensions do not read is skipped), which refuses every peer OpenSSL judges by it. Both started
     clean before, and the handshake error does not name the file.
 
-    **The out-of-scope refusal is skipped where ``refuse_out_of_scope`` is False.** A start and the
-    running-hop reload keep the default. The expiry scan's check of a CRL in a CA file passes
-    False where no CRL setting names that file (finding 2 of engine PR 3099)."""
+    **Both are skipped where ``refuse_fail_closed`` is False.** A start and the running-hop reload
+    keep the default. The expiry scan's check of a CRL in a CA file passes False, so it judges
+    those CRLs as it did before #5896, and a start can refuse a CA file that scan passed."""
     blocks = list(_crl_blocks(pem))
     # Refused, never skipped, even when the uncounted marker is only text in a comment line and
     # OpenSSL loads the file (vault BACKLOG #2866, decided 2026-10-12). Two reasons. The engine
@@ -416,10 +416,13 @@ def judge_every_crl(
                     "From that fix on it rejects a delta as a complete CRL and loses the delta's "
                     "revocations. Give base CRLs only"
                 )
-            if refuse_out_of_scope and (why := _out_of_scope(extensions)) is not None:
+            if refuse_fail_closed and (why := _out_of_scope(extensions)) is not None:
                 raise ValueError(why)
             fingerprint = crl.fingerprint(hashes.SHA256())
-            if (critical := _unhandled_critical(crl, extensions, fingerprint)) is not None:
+            if (
+                refuse_fail_closed
+                and (critical := _unhandled_critical(crl, extensions, fingerprint)) is not None
+            ):
                 raise ValueError(
                     f"it carries the critical extension {critical}, which OpenSSL does not "
                     "handle, so OpenSSL refuses every peer it judges by this CRL with "

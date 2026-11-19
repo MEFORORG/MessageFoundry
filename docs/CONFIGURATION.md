@@ -2721,7 +2721,9 @@ that sets `tls_allow_expired`, as **CRL files** above says. The expiry scan watc
 each one in a row labelled `held-crl:` and the CA file's path. The reload does not apply a changed CA
 file, so a refreshed CRL inside one needs a restart, and the expiry alert's `detail` says so. The scan
 judges the CA file's CRL (BACKLOG #3176). It checks each CRL's
-signature against the CA the file lists for its issuer. In at least these cases `detail` says to fix the CRL in the CA file before restarting.
+signature against the CA the file lists for its issuer. It judges the CA file's CRLs as it did
+before vault BACKLOG #5896 and does not apply that item's refusals, so a start can refuse a CA file
+the scan passed. In at least these cases `detail` says to fix the CRL in the CA file before restarting.
 The CRL is expired, not yet in effect, a delta CRL, unreadable, or proven badly signed. For a CRL
 not yet in effect, `detail` offers a wait too. The hop's copy of that issuer's CRL may lapse before
 the new one takes effect. Then waiting refuses that issuer's peers in between, so replace the CRL
