@@ -3146,6 +3146,10 @@ class LoggingSettings(_Section):
             raise ValueError(
                 "[logging].forward_enabled requires [logging].forward_host (the syslog/SIEM collector)"
             )
+        if self.forward_enabled and _is_limited_broadcast(self.forward_host or ""):
+            raise ValueError(
+                "[logging].forward_host is the broadcast address, which names no collector"
+            )
         # Native TLS-syslog: verifying the collector needs an explicit CA anchor (see forward_tls_ca_file
         # above). Only enforced when forwarding is actually on and verification is not opted out.
         if (
@@ -5197,6 +5201,24 @@ def _fail_open_note(note: str) -> None:
         _log.warning("%s", note)
     else:
         held.append(note)
+
+
+#: The IPv4 limited broadcast address (RFC 919), which ``[logging].forward_host`` refuses (BACKLOG #5923).
+_LIMITED_BROADCAST = ipaddress.IPv4Address("255.255.255.255")
+
+
+def _is_limited_broadcast(host: str) -> bool:
+    """Whether ``host`` is the IPv4 limited broadcast address, in any spelling
+    :func:`_host_ip_literal` reads, its IPv4-mapped IPv6 form included. No DNS.
+
+    BACKLOG #5923: with forwarding on, such a ``[logging].forward_host`` names no collector. The
+    forwarder never sets ``SO_BROADCAST``, so the OS refuses each UDP send there (EACCES on Linux)
+    and a spool would hold every record behind it; a stream connect to it fails too. A directed
+    subnet broadcast cannot be told from a host address without the netmask, so it is not read."""
+    addr = _host_ip_literal(_bare_host(host))
+    if isinstance(addr, ipaddress.IPv6Address):
+        addr = addr.ipv4_mapped  # ::ffff:255.255.255.255 is the same IPv4 send
+    return addr == _LIMITED_BROADCAST
 
 
 def _host_ip_literal(h: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:

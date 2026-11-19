@@ -22,7 +22,11 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
-from messagefoundry.api.app import _alert_control_action, _outbound_down_detail
+from messagefoundry.api.app import (
+    _alert_control_action,
+    _inbound_down_detail,
+    _outbound_down_detail,
+)
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.cluster import NullCoordinator
@@ -90,6 +94,8 @@ async def test_a_demoted_runner_refuses_every_run_state_door(
         assert runner._outbound_paused == set()
         # A resend refusal names the downed graph, not the start it refuses.
         assert "graph is not running" in _outbound_down_detail(runner, _OUT)
+        inbound = _inbound_down_detail(runner, _IN)
+        assert "graph is not running" in inbound and "resend through" not in inbound
         # An inbound stop has nothing to undo on a downed graph, so it is not refused.
         await runner.stop_inbound(_IN)
         # The pause the old stop_outbound recorded here outlived the teardown that had already
@@ -391,5 +397,52 @@ async def test_an_outbound_stop_still_pauses_a_lane_a_failed_teardown_left(
         assert _OUT in runner._outbound_paused
         with pytest.raises(RunnerNotRunningError):
             await runner.start_outbound(_OUT)  # a start is still refused there
+    finally:
+        await runner.stop()
+
+
+async def test_a_lease_lost_node_names_the_lease_in_its_alert_log_and_resend_refusal(
+    store: MessageStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5906: on a node that lost its lease the graph still runs, so the alert action's log
+    line and the resend 409 must not say the graph is down, and the 409 must not send the operator
+    to a start the lease-lost door refuses."""
+    runner, _ = await _lease_lost_runner(store, tmp_path, "pooled")
+    engine: Any = SimpleNamespace(registry_runner=runner)
+    try:
+        await runner.stop_outbound(_OUT)  # an operator-paused lane, so a resend is refused
+        await runner.stop_inbound(
+            _IN
+        )  # an operator-stopped inbound, so an upload resend is refused
+        detail = _outbound_down_detail(runner, _OUT)
+        assert "lease" in detail and "leader" in detail
+        assert "graph is not running" not in detail and "start it" not in detail
+        # An uploaded file lives in this node's uploads_dir, so the upload resend names no remedy:
+        # the leader would not hold the file.
+        detail = _inbound_down_detail(runner, _IN)
+        assert "lease" in detail and "refused here" in detail
+        assert "leader" not in detail and "start it" not in detail
+        caplog.set_level("INFO")
+        await _alert_control_action(engine, "restart_inbound", _IN, default_target=False)
+        await _alert_control_action(engine, "restart_outbound", _OUT, default_target=False)
+        lines = [r.getMessage() for r in caplog.records if "alert control_action" in r.getMessage()]
+        assert len(lines) == 2, lines
+        assert all("cluster lease" in m and "graph is not running" not in m for m in lines)
+        assert _IN not in runner._sources and _OUT in runner._outbound_paused  # nothing acted
+    finally:
+        await runner.stop()
+
+
+async def test_a_leader_resend_refusal_still_says_start_it(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """The negative control: with the lease held, an operator-paused lane's 409 is unchanged."""
+    runner, coordinator = await _lease_lost_runner(store, tmp_path, "pooled")
+    coordinator.leader = True
+    try:
+        await runner.stop_outbound(_OUT)
+        await runner.stop_inbound(_IN)
+        assert "start it before resending" in _outbound_down_detail(runner, _OUT)
+        assert "start it before resending" in _inbound_down_detail(runner, _IN)
     finally:
         await runner.stop()
