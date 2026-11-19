@@ -466,6 +466,56 @@ def test_a_junction_and_its_target_key_the_same_lane_and_claim_hash(
         os.rmdir(link)
 
 
+_HOOK = Path(__file__).resolve().parents[1] / "scripts" / "hooks" / "lane-level.ps1"
+_UNSTATED = "Your lane level is unstated or stale"
+
+
+def _hook(cwd: Path) -> subprocess.CompletedProcess[str]:
+    """Run the lane-level Stop hook in ``cwd`` with no ``cwd`` field, so it reads where it runs."""
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(_HOOK)],
+        input=json.dumps({"hook_event_name": "Stop"}),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        cwd=cwd,
+        env=_env(),
+        timeout=45,
+    )
+
+
+def test_the_hook_reads_a_lane_stated_through_a_junction_through_either_path(
+    tmp_path: Path,
+) -> None:
+    """lane.ps1 keys on git's resolved root and the hook keyed on the current directory, so a lane
+    stated through a junction read as unstated every turn there (BACKLOG #5486). The hook now keys
+    on the same root. The control is the hook's nag before anything is stated, through both paths:
+    it shows the hook would say so, and that both names are builder lanes it answers for."""
+    if os.name != "nt":
+        pytest.skip("a directory junction is a Windows mount point")
+    target = _init_repo(tmp_path / "builder-target")
+    link = tmp_path / "builder-link"
+    subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True
+    )
+    try:
+        for where in (link, target):
+            before = _hook(where)
+            assert before.returncode == 0, before.stdout + before.stderr
+            assert _UNSTATED in before.stdout, (where, before.stdout)
+        stated = _pwsh(link, "-Free", "1", "-InFlight", "1", "-Note", "through the junction")
+        assert stated.returncode == 0, stated.stdout + stated.stderr
+        _lane_record(target)  # exactly one record, under the resolved root
+        for where in (link, target):
+            after = _hook(where)
+            assert after.returncode == 0, after.stdout + after.stderr
+            assert _UNSTATED not in after.stdout, (where, after.stdout)
+    finally:
+        # rmdir removes the junction itself and leaves its target alone.
+        os.rmdir(link)
+
+
 def test_a_non_ascii_path_keys_on_the_root_git_names(tmp_path: Path) -> None:
     """git writes UTF-8 and PowerShell decoded it with the console's OEM code page, so a non-ASCII
     segment came back mangled and keyed a worktree that does not exist. From a non-ASCII

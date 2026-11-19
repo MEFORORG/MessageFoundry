@@ -83,45 +83,13 @@ function Write-RootRefusal([string]$Why) {
     [Console]::Error.WriteLine("lane.ps1: REFUSED -- $Why, so the lane cannot be keyed and nothing was read or written.")
     exit 2
 }
-# git writes UTF-8; PowerShell decodes a native command's output with [Console]::OutputEncoding,
-# which is an OEM code page on a stock console, so a non-ASCII path segment would come back mangled
-# and key a box nobody reads. Every git call that reads a path (here and in Resolve-CoordSharedRoot,
-# which reads --git-common-dir) runs inside this; the caller's encoding is put back afterwards.
-function Invoke-GitUtf8([scriptblock]$Action) {
-    $saved = [Console]::OutputEncoding
-    try {
-        [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
-        & $Action
-    } finally {
-        [Console]::OutputEncoding = $saved
-    }
-}
-$revParse = @()
-$revParseExit = -1
-try {
-    Invoke-GitUtf8 {
-        $script:revParse = @(& git -c core.quotePath=false rev-parse --path-format=absolute --show-toplevel --show-prefix 2>$null)
-        $script:revParseExit = $LASTEXITCODE
-    }
-} catch {
-    Write-RootRefusal "git could not be run, or its output could not be decoded as UTF-8, in $here ($($_.Exception.Message))"
-}
-$top = if ($revParse.Count -ge 1) { ([string]$revParse[0]).Trim() } else { '' }
-if ($revParseExit -ne 0 -or -not $top) { Write-RootRefusal "git could not name the work tree root for $here" }
-$prefix = if ($revParse.Count -ge 2) { ([string]$revParse[1]).Trim().TrimEnd('/') } else { '' }
-# A removed worktree under the primary checkout (.claude/worktrees/<name> with no .git left) has git
-# walk up to the primary, so keying there would overwrite the primary's level. That container is the
-# population the worktree tooling names (scripts/worktree/find-emptied-worktrees.ps1). A live
-# worktree there is its own toplevel, so a directory in it that git places in the primary is no live
-# tree's, whether or not the primary ignores the container: it refuses without asking check-ignore,
-# whose answer could only let it through. Any other directory of a live tree, ignored or not (such as
-# .venv\Scripts), is still that tree's work and keys on its root.
-if ("$prefix/" -like '.claude/worktrees/*') {
-    Write-RootRefusal "$here is under the worktree container of $top but is no worktree of its own (a removed worktree reads this way)"
-}
-# git's resolved root, the path claim.ps1 records and seat records carry, so a tree reached through
-# a junction keys the same lane and claim hash as its target.
-$worktree = [System.IO.Path]::GetFullPath($top)
+# The rule lives in lane-root.ps1, which scripts/hooks/lane-level.ps1 also dot-sources, so the
+# writer and the reader always key the same box: git's resolved root, UTF-8 decoded, refusing a
+# directory with no work tree and a removed worktree under the primary's container.
+. (Join-Path $PSScriptRoot 'lane-root.ps1')
+$root = Resolve-LaneWorktreeRoot -From $here
+if ($root.Error) { Write-RootRefusal $root.Error }
+$worktree = $root.Path
 
 # Both kinds this writes or reads are fleet-wide, so both are resolved before anything is written,
 # and an error refuses rather than writing a level into a local copy nobody else reads.

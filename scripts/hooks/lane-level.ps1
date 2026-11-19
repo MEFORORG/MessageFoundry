@@ -280,9 +280,16 @@ function Read-LaneFor([string]$Worktree, [string]$HostName) {
 $cwd = (Get-Location).Path
 $leaf = (Split-Path $cwd -Leaf)
 $branch = (& git rev-parse --abbrev-ref HEAD 2>$null)
+# THE READ KEYS ON THE ROOT lane.ps1 WRITES UNDER, by the same rule in lane-root.ps1. Keyed on the
+# current directory, a lane stated through a junction read as unstated every turn (BACKLOG #5486).
+# Where that rule names no root, this hook only reads, so it keys on the current directory as it
+# always has rather than refuse.
+. (Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\lane-root.ps1')
+$laneRoot = Resolve-LaneWorktreeRoot -From $cwd
+$laneKeyPath = if ($laneRoot.Error) { $cwd } else { $laneRoot.Path }
 
 if ($leaf -match '^builder') {
-    $rec = Read-LaneFor $cwd (Get-CoordHost)
+    $rec = Read-LaneFor $laneKeyPath (Get-CoordHost)
     # BOTH NAGS NAME THE lane.ps1 BESIDE THIS HOOK. The copy in this worktree may be the older one,
     # and a restatement through it writes a level the OLD-WRITER nag below then asks about again.
     $current = Join-Path (Split-Path $PSScriptRoot -Parent) 'coord\lane.ps1'
