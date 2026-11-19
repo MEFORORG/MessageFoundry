@@ -481,7 +481,9 @@ _MORE_BROAD_GROUP_SIDS: frozenset[str] = frozenset(
         "S-1-5-65-1",  # This Organization Certificate
         "S-1-5-90-0",  # Window Manager\Window Manager Group
         "S-1-5-9",  # Enterprise Domain Controllers
-        "S-1-5-22",  # Enterprise Read-only Domain Controllers
+        # Legacy Enterprise Read-only Domain Controllers Beta; the real enterprise RODC group
+        # (RID 498) is not screened by this entry.
+        "S-1-5-22",
         "S-1-5-32-554",  # BUILTIN\Pre-Windows 2000 Compatible Access
         "S-1-5-64-36",  # Cloud Account Authentication
         "S-1-5-83-0",  # NT VIRTUAL MACHINE\Virtual Machines
