@@ -850,7 +850,14 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None, inbound: 
     which sends nothing when the pid may name another process now or the signal fails. Then a
     WARNING names ``inbound``, and a process the worker started may survive. When the signal
     failed, :mod:`messagefoundry.proctree` has already written its own line, which names the group
-    but not the inbound."""
+    but not the inbound.
+
+    A worker read as running or a zombie whose group that guarded kill sends nothing to takes the
+    same reuse-safe signal next, unguarded by a read of its group (vault BACKLOG #5314). Its pid
+    named this engine's own child a moment earlier, so it can name another process only after a
+    reap in that moment, the limit :func:`_posix_child_state` describes. Only when that signal also
+    sends nothing and members may remain does the worker get a single-process kill, under a WARNING
+    naming ``inbound``."""
     if sys.platform == "win32":
         if job is not None:
             proctree.terminate_job(job)
@@ -862,7 +869,7 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None, inbound: 
         # ``SIG_IGN``. A running or zombie child's pid cannot have been given to another process,
         # so only this state needs the reuse-safe signal, as far as the state check can tell; its
         # pid-reuse limit is in :func:`_posix_child_state`. A zombie reaped between the state
-        # check and the signal reaches the same signal through ``kill_process_group`` below.
+        # check and the signal takes the same signal after ``kill_process_group`` below.
         if proctree.kill_reaped_leader_group(proc.pid) is None:
             log.warning(
                 "inbound %r: sandbox worker pid %d was already reaped and its process group could "
@@ -871,7 +878,19 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None, inbound: 
                 proc.pid,
             )
         return
-    if not proctree.kill_process_group(proc.pid):
+    if proctree.kill_process_group(proc.pid):
+        return
+    # Nothing was sent. A worker reaped since the state check, or a zombie whose group the kernel
+    # will not read by its pid, fails that read, and a single-process kill would reach nothing; the
+    # reuse-safe signal reaches its group while no live process has the pid (vault BACKLOG #5314).
+    # ``False`` from it means the group is empty, so nothing is left to kill.
+    if proctree.kill_reaped_leader_group(proc.pid) is None:
+        log.warning(
+            "inbound %r: the process group of sandbox worker pid %d could not be signalled, so it "
+            "gets a single-process kill and a process the worker started may survive",
+            inbound,
+            proc.pid,
+        )
         _kill_single(proc)
 
 
