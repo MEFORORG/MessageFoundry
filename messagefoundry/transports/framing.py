@@ -48,6 +48,7 @@ __all__ = [
     "check_frame_bytes",
     "codec_for",
     "declared_encoding",
+    "encode_reply",
     "frame_for_delivery",
     "frame_reply",
 ]

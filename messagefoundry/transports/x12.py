@@ -707,7 +707,8 @@ class X12Source(SourceConnector):
     """Listen for inbound raw-TCP connections, reassemble each ``ISA…IEA`` interchange, and hand its
     **raw bytes** to the pipeline handler. No HL7/X12 ACK: if that *pipeline* handler
     (:data:`~messagefoundry.transports.base.InboundHandler`) returns a non-``None`` reply it is written
-    back verbatim on the same connection; the engine's returns ``None`` for every non-HL7 content type,
+    back on the same connection, in the inbound's charset under the shared reply policy
+    (:func:`~messagefoundry.transports.framing.encode_reply`); the engine's returns ``None`` for every non-HL7 content type,
     so an X12 intake is fire-and-forget in practice. A config **Handler**'s return never reaches here —
     see this module's docstring."""
 
@@ -864,12 +865,15 @@ class X12Source(SourceConnector):
             )
             raise
 
-    def _report_unhandled(self, frames: Iterator[bytes], peer: object) -> None:
+    def _report_unhandled(
+        self, frames: Iterator[bytes], decoder: X12FrameReader | None, peer: object
+    ) -> None:
         """Count, and log, the complete interchanges of the last read that a close leaves unhandled
         (BACKLOG #5971).
 
         A sender may pipeline several interchanges into one read. When the connection closes part
-        way through them (a handler fault, a failed reply, a stop or a reset), the rest were taken
+        way through them (at least a handler fault, a failed reply, an unexpected error, a stop or a
+        reset), the rest were taken
         off the socket but never handed to the pipeline, so nothing records them. Draining the
         decoder's generator only reassembles bytes already in memory; it does no I/O and hands
         nothing on. The count is the record: no frame content is logged. A sender waiting for a
@@ -890,18 +894,20 @@ class X12Source(SourceConnector):
             logger.warning(
                 "X12 count of unhandled interchanges from %s cut short: %s", peer, safe_exc(exc)
             )
-        if not left and not over_cap:
+        # An interchange still arriving is lost with the connection too, and is named, not counted.
+        partial = not over_cap and decoder is not None and decoder.in_frame
+        if not left and not over_cap and not partial:
             return
         resends = owes_hl7_reply(self.ack_mode, self.content_type)
         logger.log(
             logging.WARNING if resends else logging.ERROR,
             "X12 connection from %s closed with %d complete interchange(s) from its last read not "
-            "handed to the pipeline%s; they are not recorded, %s",
+            "handed to the pipeline%s; none of it is recorded, %s",
             peer,
             left,
             ", then an over-cap interchange that discarded the rest of the read"
             if over_cap
-            else "",
+            else (", and a partial interchange still arriving" if partial else ""),
             "and the sender resends what it sent unanswered"
             if resends
             else "and this inbound's sender does not resend, so they are lost",
@@ -928,13 +934,14 @@ class X12Source(SourceConnector):
             epoch = self._admission.admit(peer_host)
             # The interchanges of the read in hand; whatever a close leaves in it is counted below.
             frames: Iterator[bytes] = iter(())
-            peer = writer.get_extra_info("peername")  # fixed for the connection
+            decoder: X12FrameReader | None = None
             try:
                 # Inside the try whose finally releases the slot, so a cancellation delivered at
                 # this await cannot leak a per-host count.
                 established = True
                 await self._emit_event("established", peer_host=peer_host)
                 decoder = X12FrameReader(max_interchange_bytes=self.max_interchange_bytes)
+                peer = writer.get_extra_info("peername")  # fixed for the connection
                 pacer = _MessagePacer.for_rate(
                     self.max_messages_per_second, self.message_burst, name=self._pacing_name
                 )
@@ -1023,7 +1030,7 @@ class X12Source(SourceConnector):
                                         "handler_error", peer_host=peer_host, reason=reply_fault
                                     )
                                     break
-                                writer.write(wire)  # verbatim reply
+                                writer.write(wire)  # unframed: the interchange is the frame
                                 await self._drain_reply(writer)
                         if failed:
                             break
@@ -1070,7 +1077,7 @@ class X12Source(SourceConnector):
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
             finally:
                 try:
-                    self._report_unhandled(frames, peer)
+                    self._report_unhandled(frames, decoder, writer.get_extra_info("peername"))
                 finally:
                     self._admission.release(peer_host, epoch)
         finally:

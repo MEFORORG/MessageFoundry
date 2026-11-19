@@ -429,7 +429,25 @@ async def test_x12_a_reply_its_charset_cannot_hold_is_replaced_and_sent(
     assert seen == [EDI] * 2
     assert writer.written == [b"synthetic reply ?"] * 2
     assert _kinds(events) == ["established", "closed"]
+    assert_capture_sees(caplog, "messagefoundry.transports.x12")
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+async def test_x12_a_partial_interchange_left_by_a_close_is_named(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # An interchange still arriving when the connection closes is lost with it too. It is not a
+    # complete interchange, so it is named rather than counted.
+    seen: list[bytes] = []
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(
+            _replying(_x12), _ThenEof(EDI * 2 + EDI[:200]), _Peer(), handler=_failing_for(99, seen)
+        )
+    assert seen == [EDI]
+    assert _kinds(events) == ["established", "handler_error"]
+    lines = _unhandled_lines(caplog)
+    assert len(lines) == 1 and "closed with 1 complete interchange(s)" in lines[0]
+    assert "and a partial interchange still arriving" in lines[0]
 
 
 async def test_x12_a_reply_the_policy_still_refuses_is_a_handler_error_not_a_framing_error(
