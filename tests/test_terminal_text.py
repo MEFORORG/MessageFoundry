@@ -253,6 +253,8 @@ def test_a_load_runs_engine_setup_error_prints_escaped(
     monkeypatch.setattr(harness.load.runner, "run_load", refused)
     args = argparse.Namespace(
         load="any",
+        baseline=None,
+        tolerance=0.1,
         engine="https://127.0.0.1:9",
         token=None,
         sink_port=None,

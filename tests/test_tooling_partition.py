@@ -115,6 +115,8 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # dependency diff the tooling path gate does not see.
         "test_api_listener_ipv6_only.py",
         "test_asvs_apply.py",
+        # The same writer as test_asvs_apply.py, so it stays where that file stays (BACKLOG #5455).
+        "test_asvs_apply_header_splice.py",
         "test_asvs_residual_lint.py",
         # Reads changelog.d/ and CHANGELOG.md (BACKLOG #2080). A changelog fragment arrives on an
         # ENGINE pull request -- that is where every entry is written -- and does not trip the tooling
@@ -360,6 +362,10 @@ _STAYS_WITHOUT_IMPORTING = frozenset(
         # change, and on no queue run for any change. It spawns no subprocess, so staying on the
         # engine legs costs them almost nothing.
         "test_windows_lock_install.py",
+        # Imports its receipt and policy helpers from tests/test_dast_auth_sweep.py, an engine-tier
+        # test that reads messagefoundry/api/** through the sweep (BACKLOG #5443). A change to
+        # those helpers arrives as a test diff the tooling path gate does not see.
+        "test_dast_policy_shape_5443.py",
         # Reads messagefoundry/auth/oidc/claims.py off disk: the one comment line the leak gate's
         # OIDC core allowlist entry excuses, as the control that the line stays clean (BACKLOG
         # #5445). A reworded comment arrives as an ENGINE diff the tooling path gate does not see.

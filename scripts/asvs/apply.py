@@ -20,6 +20,7 @@ goes stale silently, and the field list is the thing that must not be re-enumera
 from __future__ import annotations
 
 import argparse
+import bisect
 import datetime
 import json
 import os
@@ -527,7 +528,9 @@ def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
     # `id` and `verdict` share the line, but `main`'s checks on them are STILL NEEDED: an id that
     # `toml_str` had to escape would not be found again by `block_spans`'s plain regex, so the record
     # could not be rewritten on the next run. Quoting keeps a bad id out of the TOML structure; it
-    # does not make one usable.
+    # does not make one usable. A literal-string id the regex does read is escaped here too, so
+    # `main` re-reads the spliced text's blocks and refuses a write that would lose one (BACKLOG
+    # #5455).
     out = ["[[cell]]"]
     for key in _ORDERED:
         if key == "level":
@@ -613,6 +616,73 @@ def render(cell: dict[str, Any], live: dict[str, Any] | None = None) -> str:
     return "\n".join(out) + "\n"
 
 
+#: A top-level cell header: unindented, as `render` writes it, with trailing whitespace or a comment
+#: allowed (BACKLOG #5455).
+_HEADER_RE = re.compile(r"^\[\[cell\]\][ \t]*(?:#.*)?$", re.M)
+#: A cell's id line, in a basic string without escapes or a literal string. Indentation, a quoted
+#: key, trailing whitespace and a comment are allowed. Any other spelling reads as no id, refused.
+_ID_RE = re.compile(
+    r"""^[ \t]*(?:id|"id"|'id')[ \t]*=[ \t]*(?:"([^"\\\n]+)"|'([^'\n]+)')[ \t]*(?:#.*)?$""", re.M
+)
+#: A header of a cell's own sub-table, such as `[[cell.evidence]]`. A cell's id is read only above
+#: the first one, so an `id` key in an evidence or absence entry never stands in for the cell's own.
+#: It names `cell.` because a bare `[` also opens an element line of a multi-line array of arrays,
+#: and no array element can begin `[cell.`, since a bare word is not a TOML value.
+_SUBTABLE_RE = re.compile(r"""^[ \t]*\[\[?[ \t]*(?:cell|"cell"|'cell')[ \t]*\.""", re.M)
+
+
+def _lines_in_strings(text: str) -> set[int]:
+    """Indices of the lines of `text` that begin inside a multi-line string (BACKLOG #5455).
+
+    A header- or id-shaped line there is prose, not structure. The string tracking is
+    `_comment_lines`'s, with every newline counted, an escaped one included.
+    """
+    inside: set[int] = set()
+    i, n, line = 0, len(text), 0
+    quote: str | None = None
+    while i < n:
+        ch = text[i]
+        if ch == "\n":
+            line += 1
+            if quote is not None:
+                inside.add(line)
+            i += 1
+        elif quote is None:
+            if ch == "#":
+                j = text.find("\n", i)
+                i = n if j < 0 else j
+            elif ch in "\"'":
+                quote = ch * 3 if text.startswith(ch * 3, i) else ch
+                i += len(quote)
+            else:
+                i += 1
+        elif ch == "\\" and quote[0] == '"':
+            # An escape never closes the string. A line-ending backslash is followed by a newline,
+            # which the branch above must still count, so step over the backslash alone.
+            i += 1 if text.startswith("\n", i + 1) else 2
+        elif text.startswith(quote, i):
+            run = len(quote)
+            while len(quote) == 3 and run < 5 and text.startswith(quote[0], i + run):
+                run += 1
+            i += run
+            quote = None
+        else:
+            i += 1
+    return inside
+
+
+#: How to write an id line `_ID_RE` reads, for the refusals' fix hints. Indentation is allowed.
+_ID_HINT = 'an id = "..." line in a basic string with no escapes, or in a literal string'
+
+
+class BlockSpanError(ValueError):
+    """A record `block_spans` cannot divide into cells, with the fix that applies (BACKLOG #5455)."""
+
+    def __init__(self, message: str, hint: str) -> None:
+        super().__init__(message)
+        self.hint = hint
+
+
 def block_spans(text: str) -> dict[str, tuple[int, int]]:
     """Map cell id -> (start, end) character offsets of its whole top-level [[cell]] block.
 
@@ -622,14 +692,48 @@ def block_spans(text: str) -> dict[str, tuple[int, int]]:
     indented comment there belongs to the cell's last entry, so it stays in the span, where `main`
     refuses to drop it. Only a comment `_comment_lines` finds outside a string is trimmed, so a
     multi-line string's last line stays in.
+
+    A HEADER OR ID LINE MAY CARRY TRAILING WHITESPACE OR A COMMENT (BACKLOG #5455). The exact-line
+    pattern this replaced missed `[[cell]]` followed by a space, so the cell before it owned that
+    cell's text and a rewrite of it deleted both. A line that begins inside a multi-line string is
+    prose and is never taken as a header or an id. A header spelling still out of reach, such as an
+    indented or quoted one, is caught by `main`, which refuses when these spans and the parsed
+    record name different cells. A block with no readable id, or a repeated id, raises
+    BlockSpanError, which `main` reports as a refusal with the error's own fix hint.
     """
-    starts = [m.start() for m in re.finditer(r"^\[\[cell\]\]$", text, re.M)]
+    in_string = _lines_in_strings(text)
+    newlines = [m.start() for m in re.finditer("\n", text)]
+
+    def structural(offset: int) -> bool:
+        return bisect.bisect_left(newlines, offset) not in in_string
+
+    starts = [m.start() for m in _HEADER_RE.finditer(text) if structural(m.start())]
     spans: dict[str, tuple[int, int]] = {}
     for i, s in enumerate(starts):
         e = starts[i + 1] if i + 1 < len(starts) else len(text)
-        m = re.search(r'^id = "([^"]+)"$', text[s:e], re.M)
+        # The cell's own keys end at its first sub-table header. Searched to `e`, an entry's `id`
+        # keyed a cell whose own id was unreadable, and the refusal named the wrong fix.
+        body = text.find("\n", s, e)
+        own_end = (
+            next(
+                (x.start() for x in _SUBTABLE_RE.finditer(text, body, e) if structural(x.start())),
+                e,
+            )
+            if body >= 0
+            else e
+        )
+        m = next((x for x in _ID_RE.finditer(text, s, own_end) if structural(x.start())), None)
         if not m:
-            raise SystemExit(f"a [[cell]] block at offset {s} has no id")
+            raise BlockSpanError(
+                f"the [[cell]] block at line {text.count(chr(10), 0, s) + 1} has no id",
+                f"Write the cell's id as {_ID_HINT}, then re-run.",
+            )
+        cell_id = m.group(1) if m.group(1) is not None else m.group(2)
+        if cell_id in spans:
+            raise BlockSpanError(
+                f"two [[cell]] blocks carry id {cell_id!r}",
+                "Give each cell a distinct id, or remove the repeated block, then re-run.",
+            )
         lines = text[s:e].split("\n")
         keep = len(lines)
         while keep > 1 and (not lines[keep - 1].strip() or lines[keep - 1].startswith("#")):
@@ -644,7 +748,7 @@ def block_spans(text: str) -> dict[str, tuple[int, int]]:
             ):
                 keep -= 1
         # Every kept line ends with its newline, which `render`'s output ends with too.
-        spans[m.group(1)] = (s, min(e, s + sum(len(line) + 1 for line in lines[:keep])))
+        spans[cell_id] = (s, min(e, s + sum(len(line) + 1 for line in lines[:keep])))
     return spans
 
 
@@ -853,7 +957,11 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     live_text = SCORECARD.read_text(encoding="utf-8")
-    live_cells = {x["id"]: x for x in tomllib.loads(live_text)["cell"]}
+    live_doc = tomllib.loads(live_text)
+    live_list = live_doc["cell"]
+    live_cells = {x["id"]: x for x in live_list}
+    # Every cell the record holds, in order: the splice below must keep exactly this list.
+    live_ids = [x["id"] for x in live_list]
 
     problems: list[str] = []
     for c in payload:
@@ -1111,7 +1219,34 @@ def main(argv: list[str] | None = None) -> int:
     # THE SAME READ THE GUARDS ABOVE PARSED, not a second one. The vault tree is shared, so a
     # re-read could splice into text another session changed after the guards looked at it.
     text = live_text
-    spans = block_spans(text)
+    try:
+        spans = block_spans(text)
+    except BlockSpanError as exc:
+        print(f"REFUSING: {_printable(str(exc))}")
+        print(f"  {exc.hint}")
+        return 1
+
+    # THE SPANS MUST NAME EVERY CELL THE RECORD HOLDS, CHECKED BEFORE THE SPLICE (BACKLOG #5455). A
+    # header `block_spans` does not recognise leaves its cell inside the span of the cell before it,
+    # so rewriting that one deletes both. The count check after the splice compared against the
+    # SPANS, which had already lost the cell, so it agreed with the loss. Compare against TOML's own
+    # reading of the record instead.
+    if list(spans) != live_ids:
+        print(
+            f"REFUSING: the record holds {len(live_ids)} cells but the writer found "
+            f"{len(spans)} [[cell]] blocks that do not name them in order; a rewrite could "
+            "splice away a cell it cannot see"
+        )
+        # `key=str`: TOML allows an id of any type, and a mixed list does not sort without one.
+        if unseen := sorted(set(live_ids) - set(spans), key=str):
+            print(f"  cells with no block of their own: {_printable(str(unseen))}")
+        if stray := sorted(set(spans) - set(live_ids), key=str):
+            print(f"  blocks naming no cell of the record: {_printable(str(stray))}")
+        print(
+            f"  Write each cell's header as an unindented [[cell]] line and its id as {_ID_HINT}, "
+            "then re-run."
+        )
+        return 1
 
     # A COMMENT IN A CELL WOULD BE LOST, SO THE WRITE STOPS (BACKLOG #2865). `render` builds the
     # cell from its parsed form, which keeps no comment. Carrying them over is not attempted: a
@@ -1192,15 +1327,63 @@ def main(argv: list[str] | None = None) -> int:
 
     # Parse before writing: a scorecard that does not load is worse than one not updated.
     parsed = tomllib.loads(new_text)
+
+    # EVERYTHING THE PAYLOAD DOES NOT WRITE IS UNCHANGED, read by TOML on both sides (BACKLOG
+    # #5455). The check this replaced compared the cell count against the span count, and the spans
+    # are what could have lost a cell, so it agreed with the loss. Comparing the whole document
+    # outside the payload's cells also catches a non-cell table, such as [[reviewer_exception]],
+    # that sat inside a rewritten span.
+    #
+    # `repr`, not `==`: a TOML `nan` never equals itself, and `1 == True`. Untouched cells are
+    # paired by id, so one lost cell does not report every later cell as changed.
+    payload_ids_written = {c["id"] for c in payload}
+    after_list = parsed.get("cell", [])
+    after_ids = [c.get("id") for c in after_list]
+    after_by_id = {c.get("id"): c for c in after_list}
+    drift = []
+    if after_ids != live_ids:
+        drift.append(
+            f"the cell list ({len(live_ids)} -> {len(after_ids)} cells; lost "
+            f"{_printable(str(sorted(set(live_ids) - set(after_ids), key=str)))}, gained "
+            f"{_printable(str(sorted(set(after_ids) - set(live_ids), key=str)))}, or reordered)"
+        )
+    # THE NEXT RUN MUST STILL FIND EVERY CELL'S BLOCK. `render` writes an id through `toml_str`,
+    # which escapes a backslash or a quote that a literal-string id carried, and `block_spans` reads
+    # no escaped id. TOML reads the written id as the same one, so every check above agreed, and the
+    # next run then refused every write to the record.
+    try:
+        fault = "" if list(block_spans(new_text)) == live_ids else "they name other cells"
+    except BlockSpanError as exc:
+        fault = str(exc)
+    if fault:
+        drift.append(
+            f"the cell blocks a later run reads ({_printable(fault)}); a payload id with a "
+            "backslash or a quote is written escaped, which the writer cannot read back"
+        )
+    drift += [
+        f"untouched cell {_printable(str(x['id']))}"
+        for x in live_list
+        if x["id"] not in payload_ids_written
+        and x["id"] in after_by_id
+        and repr(x) != repr(after_by_id[x["id"]])
+    ]
+    drift += [
+        f"top-level key {_printable(k)}"
+        for k in sorted({*live_doc, *parsed} - {"cell"})
+        if repr(live_doc.get(k)) != repr(parsed.get(k))
+    ]
+    if drift:
+        print("REFUSING: the splice changed what the payload does not write:")
+        for what in drift:
+            print(f"  {what}")
+        return 1
+
     by_id = {c["id"]: c for c in parsed["cell"]}
     for c in payload:
         got = by_id[c["id"]]["verdict"]
         if got != c["verdict"]:
             print(f"REFUSING: round-trip mismatch on {c['id']}: {got!r} != {c['verdict']!r}")
             return 1
-    if len(parsed["cell"]) != len(spans):
-        print(f"REFUSING: cell count changed {len(spans)} -> {len(parsed['cell'])}")
-        return 1
 
     # FIELD-PRESERVATION INVARIANT. A rewrite must never silently DROP a key, and the anchor gate
     # cannot see that: an absent `decision_closed` is a valid False, so un-closing an owner-closed
