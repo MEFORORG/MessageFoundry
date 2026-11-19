@@ -58,7 +58,10 @@ def test_the_tests_conftest_registers_the_cap_in_this_run(pytestconfig: pytest.C
             hook = plugin.pytest_xdist_auto_num_workers
             assert hook is cap.pytest_xdist_auto_num_workers
             return
-    pytest.fail(f"{_TESTS_CONFTEST} is not registered in this run, so -n auto is uncapped")
+    pytest.fail(
+        f"{_TESTS_CONFTEST} is not registered in this run, so a run that overrides addopts is "
+        "uncapped; tests/_xdist_worker_cap.py says what each registration covers"
+    )
 
 
 def _binds_the_cap(source: str) -> bool:
@@ -171,20 +174,33 @@ def test_the_real_hook_chain_caps_xdists_count(
     assert hook_with_cpus(cpus) == expected
 
 
-def _loads_the_cap(addopts: str) -> bool:
-    """Whether ``addopts`` holds ``-p tests._xdist_worker_cap``, in either spelling pytest accepts."""
-    words = shlex.split(addopts)
-    return any(
-        (word == "-p" and words[i + 1 : i + 2] == [_PLUGIN_ARG]) or word == f"-p{_PLUGIN_ARG}"
-        for i, word in enumerate(words)
-    )
+def _loads_the_cap(addopts: str | list[str]) -> bool:
+    """Whether ``addopts`` loads ``tests._xdist_worker_cap`` with ``-p`` and does not block it.
+
+    Takes the string form or the list form. Both ``-p NAME`` and ``-pNAME`` count.
+    """
+    words = shlex.split(addopts) if isinstance(addopts, str) else list(addopts)
+    names = [
+        nxt if word == "-p" else word[2:]
+        for word, nxt in zip(words, [*words[1:], ""], strict=True)
+        if word == "-p" or (word.startswith("-p") and len(word) > 2)
+    ]
+    return _PLUGIN_ARG in names and f"no:{_PLUGIN_ARG}" not in names
 
 
-def test_the_root_addopts_loads_the_cap_as_a_plugin() -> None:
-    """The registration that reaches the runs neither conftest is loaded in time for."""
-    cfg = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+@pytest.mark.parametrize(
+    "config",
+    [
+        _ROOT / "pyproject.toml",
+        _ROOT / "packaging" / "messagefoundry-webconsole" / "pyproject.toml",
+    ],
+    ids=["root", "console"],
+)
+def test_each_pytest_config_loads_the_cap_as_a_plugin(config: Path) -> None:
+    """The registration that reaches the runs no conftest is loaded in time for."""
+    cfg = tomllib.loads(config.read_text(encoding="utf-8"))
     addopts = cfg["tool"]["pytest"]["ini_options"]["addopts"]
-    assert _loads_the_cap(addopts), f"root addopts no longer loads {_PLUGIN_ARG}: {addopts!r}"
+    assert _loads_the_cap(addopts), f"{config} addopts no longer loads {_PLUGIN_ARG}: {addopts!r}"
 
 
 @pytest.mark.parametrize(
@@ -194,20 +210,36 @@ def test_the_root_addopts_loads_the_cap_as_a_plugin() -> None:
         "-p no:tests._xdist_worker_cap",
         "-p tests._xdist_worker",
         "tests._xdist_worker_cap",
+        "-p tests._xdist_worker_cap -p no:tests._xdist_worker_cap",
+        ["--timeout=60", "-p"],
     ],
+    ids=["absent", "blocked", "other-module", "no-flag", "loaded-then-blocked", "list-dangling-p"],
 )
-def test_the_addopts_check_goes_red_without_the_plugin(addopts: str) -> None:
+def test_the_addopts_check_goes_red_without_the_plugin(addopts: str | list[str]) -> None:
     """Negative control: the check above must be able to fail."""
     assert not _loads_the_cap(addopts)
+
+
+@pytest.mark.parametrize(
+    "addopts",
+    ["-p tests._xdist_worker_cap", "-ptests._xdist_worker_cap", ["-p", "tests._xdist_worker_cap"]],
+    ids=["spaced", "joined", "list"],
+)
+def test_the_addopts_check_accepts_each_spelling(addopts: str | list[str]) -> None:
+    """Positive control: a spelling pytest accepts must pass, so a green above is not vacuous."""
+    assert _loads_the_cap(addopts)
 
 
 #: What the child's xdist reports as the machine's count: more than the cap, so a capped run differs.
 _FAKE_CPUS = 32
 
 # Loaded into the child with `-p`. It answers xdist's own hook ahead of xdist (tryfirst), so the count
-# the cap's wrapper sees is this fixed number rather than the host's cores, then prints what xdist
-# resolved `-n auto` to and ends the run inside pytest_cmdline_main, before any worker is started.
+# the cap's wrapper sees is this fixed number rather than the host's cores. It then prints what xdist
+# resolved `-n auto` to, and the file the cap module came from, and ends the run inside
+# pytest_cmdline_main, before any worker is started.
 _PROBE = f"""\
+import sys
+
 import pytest
 
 
@@ -217,6 +249,8 @@ def pytest_xdist_auto_num_workers(config):
 
 
 def pytest_cmdline_main(config):
+    module = sys.modules.get("{_PLUGIN_ARG}")
+    print(f"CAP_MODULE={{getattr(module, '__file__', None)}}", flush=True)
     print(f"RESOLVED_WORKERS={{config.option.numprocesses}}", flush=True)
     return 0
 """
@@ -226,14 +260,15 @@ def pytest_cmdline_main(config):
     ("args", "expected"),
     [
         # Root-configured, and it collects only the console suite, whose conftest loads after xdist
-        # has sized the run. Uncapped (32) before the root addopts loaded the cap.
+        # has sized the run. Uncapped (32) before the root addopts loaded the cap. The module's
+        # docstring records the other rows measured by hand, `--noconftest` among them; each child
+        # costs a pytest startup, so only this one and its control run here.
         (["packaging"], cap.MAX_AUTO_WORKERS),
-        (["--noconftest"], cap.MAX_AUTO_WORKERS),
         # Control: block the plugin and the same run is uncapped, so the probe's count reaches xdist
-        # and the cap in the rows above comes from the addopts plugin, not from something else.
+        # and the cap in the row above comes from the addopts plugin, not from something else.
         (["-p", f"no:{_PLUGIN_ARG}", "packaging"], _FAKE_CPUS),
     ],
-    ids=["packaging-from-root", "noconftest", "control-plugin-blocked"],
+    ids=["packaging-from-root", "control-plugin-blocked"],
 )
 def test_a_root_configured_run_resolves_auto_to_the_cap(
     tmp_path: Path, args: list[str], expected: int
@@ -241,8 +276,10 @@ def test_a_root_configured_run_resolves_auto_to_the_cap(
     """Run a child pytest from the repository root and read the count xdist resolved ``-n auto`` to.
 
     ``-P`` keeps the working directory off the child's ``sys.path``, as the ``pytest`` console script
-    does, so ``tests`` must import the way a real run imports it: through the editable install.
+    does, so ``tests`` must import the way a real run imports it: through the editable install. That
+    install may name another checkout, so the child also reports where the cap module came from.
     """
+    pytest.importorskip("xdist", reason="the child needs pytest-xdist to resolve -n auto")
     assert _FAKE_CPUS > cap.MAX_AUTO_WORKERS
     (tmp_path / "_mf_worker_count_probe.py").write_text(_PROBE, encoding="utf-8")
     env = {
@@ -274,5 +311,11 @@ def test_a_root_configured_run_resolves_auto_to_the_cap(
     assert proc.returncode == 0 and found, (
         f"the child did not report a count (exit {proc.returncode}):\n"
         f"{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
+    )
+    sources = re.findall(r"^CAP_MODULE=(.+)$", proc.stdout, re.MULTILINE)
+    assert sources and sources[0] != "None", f"the child never imported {_PLUGIN_ARG}"
+    assert Path(sources[0]).resolve() == Path(cap.__file__).resolve(), (
+        f"the child imported {_PLUGIN_ARG} from {sources[0]}, not this checkout's "
+        f"{cap.__file__}: the editable install names another checkout"
     )
     assert found == [str(expected)], f"{shlex.join(argv[3:])} resolved -n auto to {found}"
