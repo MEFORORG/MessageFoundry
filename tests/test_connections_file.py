@@ -304,6 +304,28 @@ def test_negative_strict_timeout_still_disables_the_backstop(tmp_path: Path) -> 
     assert read_back(load_config(_config(tmp_path, toml.format(value=-1)))) == -1.0
 
 
+@pytest.mark.parametrize(
+    "call",
+    [
+        'inbound("IB", MLLP(port=2600), router="r", strict_timeout_s=float("nan"))',
+        'inbound("IB", MLLP(port=2600), router="r", strict_timeout_s=float("inf"))',
+        'inbound("IB", MLLP(port=2600), router="r", strict_timeout_s=10**400)',
+        'outbound("OB2", MLLP(host="epic.example", port=2701), waiting_display_delay=float("nan"))',
+        'outbound("OB2", MLLP(host="epic.example", port=2701), waiting_display_delay=float("inf"))',
+    ],
+)
+def test_code_first_seconds_keys_refuse_a_non_finite_value(tmp_path: Path, call: str) -> None:
+    """BACKLOG #5321 at the shared choke point: connections.toml desugars through the same
+    build_inbound_connection / build_outbound_connection, so a code-first module is held to the
+    same rule. A NaN strict_timeout_s would have disabled the strict-validation backstop."""
+    (tmp_path / "logic.py").write_text(
+        f"{LOGIC_PY}\nfrom messagefoundry import MLLP, inbound, outbound\n{call}\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match="is not a valid float value"):
+        load_config(tmp_path)
+
+
 def test_timer_inbound_from_toml(tmp_path: Path) -> None:
     # A timer source (ADR 0011) is connection transport config, so it is declarable as data too —
     # transport = "timer" desugars through the same Timer() factory as code-first inbound(..., Timer()).
