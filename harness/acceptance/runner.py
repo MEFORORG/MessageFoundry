@@ -28,6 +28,7 @@ from xml.etree import ElementTree
 
 from harness.acceptance.matrix import MATRIX, Coverage, MatrixRow, Status
 from harness.acceptance.probes import run_probe
+from messagefoundry.verify_leaf import safe_exc_text
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -211,7 +212,7 @@ def default_pytest_runner(node_ids: Sequence[str], *, timeout: float = 1800.0) -
         try:
             by_file, unattributed, counts = _parse_junit_by_file(junit)
         except (ElementTree.ParseError, OSError) as exc:
-            return PytestRun({}, f"unreadable JUnit XML ({exc})")
+            return PytestRun({}, f"unreadable JUnit XML ({safe_exc_text(exc)})")
         error = _judge_run(node_ids, proc.returncode, by_file, unattributed)
         return PytestRun(by_file, error, counts)
 

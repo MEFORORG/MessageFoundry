@@ -22,6 +22,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from harness.acceptance.matrix import Status
+from messagefoundry.verify_leaf import (
+    DRIVER_DETAIL_LIMIT,
+    port_state,
+    safe_exc_detail,
+    safe_exc_text,
+)
 
 #: Repo root (…/harness/acceptance/probes.py → parents[2]).
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -100,7 +106,8 @@ def probe_sqlserver_odbc_driver() -> ProbeResult:
         pyodbc = importlib.import_module("pyodbc")
         drivers = list(pyodbc.drivers())
     except Exception as exc:  # pyodbc surfaces driver-manager errors as bare Exception
-        return ProbeResult(Status.ERROR, f"pyodbc.drivers() failed: {exc}")
+        # Driver-manager text can quote a DSN or a credential, as the verifier's copy found.
+        return ProbeResult(Status.ERROR, safe_exc_text(exc, before="pyodbc.drivers() failed: "))
     target = "ODBC Driver 18 for SQL Server"
     if target in drivers:
         return ProbeResult(Status.PASS, f"{target} present", evidence=", ".join(drivers))
@@ -131,9 +138,9 @@ def probe_firewall_ports() -> ProbeResult:
 
     Each port's state is the verifier's own ``host.ports`` probe, so the two read a port the same
     way. The copy this replaced bound 127.0.0.1 with ``SO_REUSEADDR`` and so would have read a held
-    port as free on Windows (BACKLOG #5389)."""
-    from messagefoundry.verify.checks import port_state
-
+    port as free on Windows (BACKLOG #5389). It comes from the stdlib-only leaf
+    :mod:`messagefoundry.verify_leaf`, never :mod:`messagefoundry.verify`, whose runner loads the
+    engine's transports and config."""
     parts = [f"{name} {port}: {port_state(port)}" for name, port in _DEFAULT_PORTS.items()]
     return ProbeResult(
         Status.MANUAL,
@@ -149,7 +156,9 @@ def probe_writable_dirs() -> ProbeResult:
         with tempfile.NamedTemporaryFile(dir=cwd, prefix="._mefor_probe_", delete=True):
             pass
     except OSError as exc:
-        return ProbeResult(Status.FAIL, f"cannot write working dir {cwd}: {exc}")
+        return ProbeResult(
+            Status.FAIL, safe_exc_text(exc, before=f"cannot write working dir {cwd}: ")
+        )
     return ProbeResult(
         Status.MANUAL,
         "working dir writable by this user; confirm the NSSM service account's ACLs on store/config/log",
@@ -207,4 +216,5 @@ def run_probe(key: str) -> ProbeResult:
     try:
         return probe()
     except Exception as exc:  # a probe must never take the runner down
-        return ProbeResult(Status.ERROR, f"probe {key!r} raised: {exc!r}")
+        detail = safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)
+        return ProbeResult(Status.ERROR, f"probe {key!r} raised {detail}")

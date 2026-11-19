@@ -205,6 +205,7 @@ def smoke_self(
         AmbiguousInboundError,
         NoInboundError,
         UnknownInboundError,
+        _inbound_names,
         dry_run,
     )
     from messagefoundry.redaction import codec_safe_str
@@ -242,19 +243,30 @@ def smoke_self(
     msg = synthetic_message()  # a module constant since #1192 — cannot fail
     try:
         result = dry_run(reg, msg, inbound=inbound, snapshot_on_send=snapshot_on_send)
-    except AmbiguousInboundError as exc:
+    except AmbiguousInboundError:
         # The only selection failure that SKIPs: nothing is wrong, the operator has a choice to make.
         # An unknown `--inbound` name or a config with no inbound is a defect, so it FAILs below.
         # `_classify_self_smoke` tells an operator to re-point `--inbound`, so a typo in that remedy
         # must not read green (BACKLOG #1707). The detail names the flag, or the operator is told to
         # choose with no word on how. NAME, not `<name>`, so a viewer that renders the detail as
         # HTML cannot read it as a tag; the Markdown report escapes `<` now, but other sinks may not.
-        return CheckResult(
-            rid, title, Status.SKIP, safe_exc_text(exc) + "; pass --inbound NAME to pick one"
-        )
-    except (UnknownInboundError, NoInboundError) as exc:
-        # Connection names and operator input only, never message content; scrubbed all the same,
-        # as every arm quoting an exception is (BACKLOG #5395 added item 1).
+        #
+        # The names are built here from the graph rather than quoted from the exception: they are the
+        # operator's own config, held by the loader's connection-name rule to a charset with no
+        # whitespace, and
+        # the PHI pass read a capitalized pair of them as a name ("[redacted], ORU"), which hid the
+        # very choice this row asks for (BACKLOG #5395).
+        detail = f"config has multiple inbound connections; choose one: {_inbound_names(reg)}"
+        return CheckResult(rid, title, Status.SKIP, f"{detail}; pass --inbound NAME to pick one")
+    except UnknownInboundError:
+        # The names unscrubbed, as above; the typed `--inbound` value is free text, so it is scrubbed.
+        asked = safe_detail_text(repr(inbound))
+        detail = f"no such inbound connection: {asked}; the config has: {_inbound_names(reg)}"
+        return CheckResult(rid, title, Status.FAIL, detail)
+    except NoInboundError as exc:
+        # The engine's own words only today. Scrubbed all the same, as each arm in this package that
+        # quotes an exception's text is: tests/test_b532r_verify_exc_census.py refuses at least the
+        # raw shapes it names, so a shape it does not name is not proven scrubbed (BACKLOG #5395).
         return CheckResult(rid, title, Status.FAIL, safe_exc_text(exc))
     except Exception as exc:
         # Raised while the message was in flight, so its text can quote the message (BACKLOG #1779).

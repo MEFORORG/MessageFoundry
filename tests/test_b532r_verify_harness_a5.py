@@ -54,3 +54,34 @@ def test_a5_reads_a_released_port_as_free(monkeypatch: pytest.MonkeyPatch) -> No
         if seen[-1] == "free":
             break
     assert seen[-1] == "free", seen
+
+
+_ISOLATION_PROBE = """
+import sys
+import harness.acceptance.probes as probes
+probes.probe_firewall_ports()
+probes.run_probe("writable_dirs")
+loaded = sorted(m for m in sys.modules if m.split(".")[:2] in (
+    ["messagefoundry", "transports"], ["messagefoundry", "config"],
+    ["messagefoundry", "verify"], ["messagefoundry", "pipeline"], ["messagefoundry", "store"]))
+print("LOADED=" + ",".join(loaded))
+print("LEAF=" + str("messagefoundry.verify_leaf" in sys.modules))
+"""
+
+
+def test_the_harness_probes_load_no_engine_runtime_package() -> None:
+    # The A5 probe once imported messagefoundry.verify.checks, which loads the verify runner and,
+    # through it, transports and config (136 modules). The leaf must keep that from coming back.
+    import subprocess
+    from pathlib import Path
+
+    out = subprocess.run(
+        [sys.executable, "-c", _ISOLATION_PROBE],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=True,
+    ).stdout
+    assert "LEAF=True" in out, out  # positive control: the probes did reach the leaf
+    assert "LOADED=\n" in out, out

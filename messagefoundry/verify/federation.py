@@ -411,7 +411,8 @@ def _tls_row(
         spec = oidc_anchor_spec(ca, pin) if ca else None
         verdict = evaluate_anchor(spec) if spec is not None else None
     except Exception as exc:
-        fail = f"the context built, but re-reading the anchor for this report failed: {safe_exc_text(exc)}"
+        detail = safe_exc_detail(exc, limit=DRIVER_DETAIL_LIMIT)
+        fail = f"the context built, but re-reading the anchor for this report failed: {detail}"
         return CheckResult(rid, title, Status.ERROR, fail), opener
     if verdict is None:
         return CheckResult(

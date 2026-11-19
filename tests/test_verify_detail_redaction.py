@@ -335,9 +335,9 @@ def test_a_password_equal_to_another_printed_word_is_hidden_at_every_occurrence(
     set the code used before prints the word twice."""
     import re
 
+    from messagefoundry import verify_leaf as model
     from messagefoundry.redaction import redact
     from messagefoundry.secretscrub import scrub_credentials
-    from messagefoundry.verify import model
 
     def count(out: str) -> int:
         return len(re.findall(r"\bsvcadmin\b", out))
@@ -370,9 +370,9 @@ def test_a_password_glued_to_punctuation_is_hidden_at_every_occurrence(text: str
     import re
     from collections import Counter
 
+    from messagefoundry import verify_leaf as model
     from messagefoundry.redaction import redact
     from messagefoundry.secretscrub import scrub_credentials
-    from messagefoundry.verify import model
 
     ph = model._PLACEHOLDER
     detail = model.safe_detail_text(text)
@@ -416,9 +416,9 @@ def test_a_password_each_order_prints_at_a_different_place_is_hidden(text: str) 
     import re
     from collections import Counter
 
+    from messagefoundry import verify_leaf as model
     from messagefoundry.redaction import redact
     from messagefoundry.secretscrub import scrub_credentials
-    from messagefoundry.verify import model
 
     detail = model.safe_detail_text(text)
     assert "Kv9x7Qz3" not in detail, detail
@@ -439,7 +439,7 @@ def test_a_password_each_order_prints_at_a_different_place_is_hidden(text: str) 
 def test_a_word_either_order_hid_a_copy_of_is_hidden_everywhere() -> None:
     """Each order hid a different copy of ``X X``, so the counts are equal and both orders print
     one copy. The test is against the source, which holds two."""
-    from messagefoundry.verify import model
+    from messagefoundry import verify_leaf as model
 
     ph = model._PLACEHOLDER
     assert model._printed_by_both(f"{ph} Kv9x7Qz3", f"Kv9x7Qz3 {ph}", "Kv9x7Qz3 Kv9x7Qz3") == (
@@ -476,9 +476,9 @@ def test_placeholders_past_the_window_do_not_call_scanned_text_unscanned() -> No
     """An input inside the window whose placeholders push the cleaned text past it: every character
     was scanned, so the detail carries no unscanned note, and what the length bound held back is
     counted. Control: ``safe_text`` over that cleaned text at its default window writes the note."""
+    from messagefoundry import verify_leaf as model
     from messagefoundry.redaction import _REDACT_WINDOW, safe_text
     from messagefoundry.secretscrub import scrub_credentials
-    from messagefoundry.verify import model
 
     text = "PWD=x; " * (_REDACT_WINDOW // 8)
     assert len(text) < _REDACT_WINDOW

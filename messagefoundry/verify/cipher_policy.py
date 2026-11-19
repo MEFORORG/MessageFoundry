@@ -38,7 +38,13 @@ from pathlib import Path
 from messagefoundry.childenv import system_tool_environment
 from messagefoundry.redaction import codec_safe_str
 from messagefoundry.service_status import _NO_WINDOW, _system_exe
-from messagefoundry.verify.model import CheckResult, Status
+from messagefoundry.verify.model import (
+    DRIVER_DETAIL_LIMIT,
+    CheckResult,
+    Status,
+    safe_detail_text,
+    safe_exc_text,
+)
 
 RID = "host.ciphers"
 TITLE = "Host cipher policy (ODBC hops)"
@@ -596,13 +602,19 @@ def _openssl_policy_lines(path: Path) -> tuple[Path, str | None, list[tuple[str,
 def _taken[T](what: str, probe: Callable[[], T], hint: str = "") -> T | _Reading:
     """``probe()``, or the reading that says why it was not taken: MANUAL where the probe cannot
     run here, ERROR where it ran and gave no usable reading. Every probe's two exceptions become
-    readings here and nowhere else (BACKLOG #3803 item 9)."""
+    readings here and nowhere else (BACKLOG #3803 item 9).
+
+    The exception's text goes through the verifier's detail scrub (BACKLOG #5395): it quotes at
+    least a path ``OPENSSL_CONF`` names, an OS error and a line ``openssl`` printed, any of which
+    the row would otherwise carry raw into a report that leaves the box. ``what`` is each call
+    site's fixed words and is left out of the scrub, whose name pass read ``Group Policy`` as a
+    name."""
     try:
         return probe()
     except ProbeUnavailable as exc:
-        return _Reading(Status.MANUAL, f"{what} not read ({exc}){hint}")
+        return _Reading(Status.MANUAL, f"{what} not read ({safe_exc_text(exc)}){hint}")
     except ProbeFailed as exc:
-        return _Reading(Status.ERROR, f"{what} not read: {exc}")
+        return _Reading(Status.ERROR, f"{what} not read: {safe_exc_text(exc)}")
 
 
 def _suite_reading(
@@ -705,7 +717,9 @@ def _linux_policy_readings() -> list[_Reading]:
         system = [
             _Reading(
                 Status.ERROR,
-                f"OpenSSL file not read: {_SYSTEM_CNF} could not be read: {codec_safe_str(exc)}",
+                safe_exc_text(
+                    exc, before=f"OpenSSL file not read: {_SYSTEM_CNF} could not be read: "
+                ),
             )
         ]
     else:
@@ -742,11 +756,12 @@ def _policy_reading(path: Path, missing: Status = Status.FAIL) -> _Reading:
     try:
         taken = _taken("OpenSSL file", partial(_openssl_policy_lines, path), _BY_HAND)
     except FileNotFoundError as exc:
+        # The path is the exception's, at least one OPENSSL_CONF names, so it is scrubbed as its
+        # text is (BACKLOG #5395).
+        where = safe_detail_text(f"no file at {exc.filename}", limit=DRIVER_DETAIL_LIMIT)
         if missing is not Status.FAIL:
-            return _Reading(missing, f"OpenSSL file not read (no file at {exc.filename}){_BY_HAND}")
-        return _Reading(
-            Status.FAIL, f"no file at {exc.filename}, so openssl applies no system-default policy"
-        )
+            return _Reading(missing, f"OpenSSL file not read ({where}){_BY_HAND}")
+        return _Reading(Status.FAIL, f"{where}, so openssl applies no system-default policy")
     if isinstance(taken, _Reading):
         return taken
     path, section, settings = taken
