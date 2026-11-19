@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The stdlib-only half of the deployment verifier: the listener-port probe and the detail scrub.
+"""The half of the deployment verifier a client may import: the listener-port probe and the detail
+scrub.
 
 **Why this module exists (BACKLOG #5389, #5395).** The acceptance harness (``harness/acceptance``)
 reports the same port bindability and quotes the same kind of untrusted exception text as
@@ -12,8 +13,11 @@ call time only :mod:`messagefoundry.redaction` and :mod:`messagefoundry.secretsc
 ``tests/test_b532r_verify_harness_a5.py`` pins, in a fresh interpreter, that the harness probes
 load none of ``messagefoundry.transports``, ``config``, ``verify``, ``pipeline`` and ``store``,
 through the A5 probe and through an error arm that runs the scrub. They do load ``redaction`` and
-``secretscrub``, which the scrub needs. :mod:`messagefoundry.verify.model` and
-:mod:`messagefoundry.verify.checks` re-export what they used to define.
+``secretscrub``, which the scrub needs. :mod:`messagefoundry.verify.model` re-exports the public
+names it used to define, ``DRIVER_DETAIL_LIMIT``, ``safe_detail_text`` and ``safe_exc_detail``, and
+also ``safe_exc_text``. Its private helpers, at least ``_PLACEHOLDER``, live only here now.
+:mod:`messagefoundry.verify.checks` imports :func:`port_state`, which replaced its private
+``_port_state``, and keeps no name of its own for it.
 """
 
 from __future__ import annotations
