@@ -1179,13 +1179,16 @@ IDE_SITES: dict[str, Site] = {
         "The rules are in the securityConfigTarget docblock (BACKLOG #5411).",
     ),
     "ide/src/sourceControl.ts": Site(
-        10,
+        11,
         OPERATOR,
         _IDE_WORKSPACE
-        + " Three more resolve the repository's top level and its core.hooksPath, both "
-        "read from the operator's own git, only to compare them with the hook's folder. sameDir "
-        "resolves each with realpath, which opens the path (a UNC path opens an SMB connection); "
-        "nothing is read or written at them.",
+        + " Three more only compare paths with the hook's folder: wireHooksPath resolves "
+        "core.hooksPath against the repository's top level, both read from the operator's own git, "
+        "and sameDir resolves its two arguments, one the extension derives from the workspace "
+        "folder and one that top level or that core.hooksPath. sameDir reads the real path of the "
+        "first, and of the second unless it is spelled as a UNC share, which it compares by "
+        "spelling alone (BACKLOG #5404); a realpath opens the path, and one that reaches a share "
+        "opens an SMB connection. Nothing is read or written at them.",
     ),
     "ide/src/statusBar.ts": Site(
         5,
