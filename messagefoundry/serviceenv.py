@@ -407,14 +407,20 @@ class _Variable:
     runs_on: bool = False
 
 
-def _read_string(where: str, entry: str) -> tuple[list[_Variable], bool]:
-    """The variables one registry string sets, and whether the string ends on a name the refusal
-    is about whose value is empty or blank. :func:`_variables` says how a string is read."""
+def _read_string(
+    where: str, entry: str, own_lines: int | None = None
+) -> tuple[list[_Variable], _Variable | None]:
+    """The variables one registry string sets, and the one it ends on when that is a name the
+    refusal is about whose value is empty or blank. :func:`_variables` says how a string is read.
+
+    ``own_lines`` is for strings joined from several: the number of lines the first of them
+    holds. A broken whole-string name is then counted once only against a later line of that
+    first string, since NSSM reads each string of the group as its own variable."""
     lines = _LINE_BREAK.split(entry)
     # ``skip`` keeps the later lines' numbers counted from the string's real first line.
     skip = next((i for i, line in enumerate(lines) if line.strip()), None)
     if skip is None:
-        return [], False  # a blank string sets nothing
+        return [], None  # a blank string sets nothing
     first, *rest_lines = lines[skip:]
     first_written, first_equals, first_rest = first.partition("=")
     first_written = first_written.strip()
@@ -457,7 +463,10 @@ def _read_string(where: str, entry: str) -> tuple[list[_Variable], bool]:
     if whole_equals and _refused_name(whole_written.upper()):
         # A broken name is kept under its first line, as the line reading names it.
         name = _LINE_BREAK.split(whole_written, 1)[0].rstrip() if broken else whole_written
-        counted = not (broken and _names(later_variables))
+        same_string = [
+            v for v in later_variables if own_lines is None or (v.line or 1) <= own_lines
+        ]
+        counted = not (broken and _names(same_string))
         read.append(
             _Variable(where, name, whole_value, line=first_line, broken=broken, counted=counted)
         )
@@ -469,10 +478,9 @@ def _read_string(where: str, entry: str) -> tuple[list[_Variable], bool]:
     read.extend(later_variables)
     if later and parts is later[-1][2]:
         ending = later_variables[-1]
-    ends_empty = (
-        ending is not None and _refused_name(ending.written.upper()) and not ending.value.strip()
-    )
-    return read, ends_empty
+    if ending is None or not _refused_name(ending.written.upper()) or ending.value.strip():
+        ending = None
+    return read, ending
 
 
 def _continues_string(entry: str) -> bool:
@@ -482,30 +490,24 @@ def _continues_string(entry: str) -> bool:
     ``MEFOR_VALUE_A<LF>X=1``, and its first non-blank line starts no variable under
     :func:`_line_start`, the rule :func:`_read_string` applies to a later line of one string.
 
-    One shape differs from that rule: a first line whose name is empty, as in Windows' own
-    ``=C:=C:\\x`` entries, ends the value above, since NSSM reads each item as its own variable.
-    As a later line of one string it belongs to the value above, as it always has.
+    Two shapes of first line differ from that rule, since NSSM reads each item as its own
+    variable, and each ends the value above: one whose name is empty, as in Windows' own
+    ``=C:=C:\\x`` entries, and one that sets ``MEFOR_SECRETS_DIRECTORY``, which read alone the
+    refusal takes as set. As a later line of one string each belongs to the value above.
 
-    So, on a first line not shaped like that, no equals sign, a padded base64 secret with one
-    ``=`` of padding or two, ``NAME=`` with an empty value or a value of only equals signs and
-    blanks, and a name holding a store-key-sized base64 run each continue the value, an error
-    toward refusing, unless the name is one the refusal is about. A name the refusal is about,
-    or an ordinary variable set to a value, ends it. Only the first non-blank line decides: the
-    item's later lines are read when the strings are joined, as later lines of one string."""
+    So, on a first line of neither shape, no equals sign, a padded base64 secret with one ``=``
+    of padding or two, ``NAME=`` with an empty value or a value of only equals signs and blanks,
+    and a name holding a store-key-sized base64 run each continue the value, an error toward
+    refusing, unless the name is one the refusal is about. A name the refusal is about, or an
+    ordinary variable set to a value, ends it. Only the first non-blank line decides: the item's
+    later lines are read when the strings are joined, as later lines of one string."""
     first = next((line for line in _LINE_BREAK.split(entry) if line.strip()), None)
     if first is None or _refused_name(entry.partition("=")[0].strip().upper()):
         return False
-    return _line_start(first) is None and not first.lstrip().startswith("=")
-
-
-def _item_line(starts: Sequence[int], line: int | None) -> int | None:
-    """``line`` of a string joined from several, counted again on its own string instead:
-    ``starts`` holds the joined line each string starts on. A string's first line is ``None``."""
-    if line is None:
-        return None
-    start = starts[bisect.bisect_right(starts, line) - 1]
-    local = line - start + 1
-    return None if local == 1 else local
+    written, equals, _rest = first.partition("=")
+    if equals and written.strip().upper() in ("", _DIRECTORY_VARIABLE):
+        return False
+    return _line_start(first) is None
 
 
 def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
@@ -536,48 +538,48 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     whose value is empty or blank, and the next non-blank string of the same registry value may
     continue it (:func:`_continues_string`), the two are joined and read as one string, so
     ``MEFOR_STORE_ENCRYPTION_KEY=`` as one item and the key as the next refuses, as ``nssm set``
-    writes a key split from its name. An empty store key above an item whose first line sets an
-    ordinary variable to a value, or a name the refusal is about, does not, and a value that is
-    not empty in its own string does not run on, so
-    a path-form OIDC key above an item of PEM armour is still a path. Each string is read alone
+    writes a key split from its name. An empty store key above an item whose first line ends it
+    under :func:`_continues_string`, such as one that sets an ordinary variable to a value, does
+    not, and a value that is not empty in its own string does not run on, so a path-form OIDC
+    key above an item of PEM armour is still a path. Each string is read alone
     first to decide this, and a joined group is read once more, so the work stays linear."""
-    # Each group: its registry value, its strings, and each string's variables read alone.
-    groups: list[tuple[str, list[str], list[list[_Variable]]]] = []
-    ends_empty = False
+    # Each group: its registry value, its strings, its first string read alone, and for each
+    # string but the last the variable it ends on, whose empty value the next string continues.
+    groups: list[tuple[str, list[str], list[_Variable], list[_Variable]]] = []
+    ending: _Variable | None = None
     for where, entry in entries:
         alone, ends = _read_string(where, entry)
         if not entry.strip():
             continue  # a blank string sets nothing, and ends no value above it
-        if groups and ends_empty and groups[-1][0] == where and _continues_string(entry):
+        if groups and ending is not None and groups[-1][0] == where and _continues_string(entry):
             groups[-1][1].append(entry)
-            groups[-1][2].append(alone)
+            groups[-1][3].append(ending)
         else:
-            groups.append((where, [entry], [alone]))
-        ends_empty = ends
+            groups.append((where, [entry], alone, []))
+        ending = ends
     read: list[_Variable] = []
-    for where, strings, alones in groups:
+    for where, strings, alone, endings in groups:
         if len(strings) == 1:
-            read.extend(alones[0])
+            read.extend(alone)
             continue
         starts: list[int] = []
         line = 1
         for string in strings:
             starts.append(line)
             line += len(_LINE_BREAK.split(string))
-        # A variable ran on when its value is blank read alone and not blank joined: only then
-        # does the refusal's remedy say to remove the strings after it with it.
-        blank_alone = {
-            (index, variable.written, variable.line, variable.broken)
-            for index, string_alone in enumerate(alones)
-            for variable in string_alone
-            if not variable.value.strip()
-        }
-        joined, _ends = _read_string(where, "\n".join(strings))
+        # The variables that ran on: each string's ending, and its whole-string twin, which has
+        # the same name, line and spelling and was as empty. Only these make the refusal say to
+        # remove the strings after them.
+        ran = {(i, v.written, v.line, v.broken) for i, v in enumerate(endings)}
+        # ``\r\n`` between strings: a string ending in a lone ``\r`` then still ends a line of
+        # its own, so each line keeps the number ``starts`` gives it.
+        joined, _ends = _read_string(where, "\r\n".join(strings), own_lines=starts[1] - 1)
         for variable in joined:
             index = bisect.bisect_right(starts, variable.line or 1) - 1
-            line_on_string = _item_line(starts, variable.line)
+            local = (variable.line or 1) - starts[index] + 1
+            line_on_string = None if local == 1 else local
             ran_on = bool(variable.value.strip()) and (
-                (index, variable.written, line_on_string, variable.broken) in blank_alone
+                (index, variable.written, line_on_string, variable.broken) in ran
             )
             read.append(replace(variable, line=line_on_string, runs_on=ran_on))
     return read

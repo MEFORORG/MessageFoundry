@@ -83,7 +83,7 @@ def test_an_empty_store_key_item_above_an_ordinary_item_does_not_refuse(key: str
     """The control: an empty key is harmless when the next item's first line sets an ordinary
     variable to a value, or is empty-named like Windows' own ``=C:`` entries. An item whose first
     line sets a variable to nothing continues the key, as the same line would below it in one
-    string (tests/test_b532r_serviceenv_classifier.py)."""
+    string (the one-line-rule tests below)."""
     followers = (
         "MEFOR_AI_ENVIRONMENT=prod",
         "ProgramFiles(x86)=C:\\x",
@@ -324,3 +324,120 @@ def test_the_module_names_no_branch_or_head_as_its_baseline() -> None:
     assert _STALE_BASELINE.search("refused as on main")
     assert not _STALE_BASELINE.search("the head of the walk")
     assert not _STALE_BASELINE.search(inspect.getsource(serviceenv))
+
+
+# --- one line rule for a later line and for the next item (review of 3085e1d5c55) -------------
+
+#: A secret whose base64 carries exactly one ``=`` of padding: 17 bytes make 24 characters.
+_ONE_PAD = base64.b64encode(b"synthetic-tok-017").decode()
+_KEY_RUN = "A" * 43
+_RUNS_ON = "runs on into the strings after it in the same registry value"
+
+
+def test_the_one_pad_stand_in_has_one_padding_character() -> None:
+    assert _ONE_PAD.endswith("=") and not _ONE_PAD.endswith("==")
+    assert not serviceenv._holds_key_run(_ONE_PAD)
+
+
+@pytest.mark.parametrize("name", ["MEFOR_STORE_PASSWORD", "MEFOR_AUTH_OIDC_CLIENT_SECRET"])
+def test_a_one_padded_secret_split_into_the_next_item_refuses(name: str) -> None:
+    """Its text reads as ``NAME=`` with an empty value. Below the name in one string that line
+    already continued the value; as the next item it now does too."""
+    one_string = _read([f"MEFOR_AI_ENVIRONMENT=prod\n{name}=\n{_ONE_PAD}"])
+    assert one_string.listed_directory_names == (name,)
+    split = _read([f"{name}=", _ONE_PAD])
+    assert split.listed_directory_names == (name,)
+    assert service_env_refusal(split) is not None
+
+
+#: Items, each read as the next item below an empty store key and as the lines below it in one
+#: string. None has a first line of the two shapes the readings differ on.
+_FOLLOWERS = (
+    _ONE_PAD,
+    base64.b64encode(b"synthetic-tok-16").decode(),  # two ``=`` of padding
+    "HTTP_PROXY=",
+    "X= =",
+    f"{_KEY_RUN}=x",
+    f"{_KEY_RUN},x\nPATH=C:\\x",
+    "foo",
+    "foo\nPATH=C:\\x",
+    "\n-----BEGIN " + "PRIVATE KEY-----",
+    "PATH=C:\\x",
+    "ProgramFiles(x86)=C:\\x",
+    "MEFOR_AI_ENVIRONMENT=prod",
+    "A" * 42 + "_B=1",
+    "MEFOR_VALUE_B=1",
+    "foo\nMEFOR_VALUE_B=1",
+)
+
+
+@pytest.mark.parametrize("follower", _FOLLOWERS)
+def test_the_next_item_is_read_as_the_same_lines_below_the_key_in_one_string(
+    follower: str,
+) -> None:
+    """The prefix line keeps the whole-string reading of the one string off the key, so only the
+    line rule decides there, as it does for the joined items."""
+    one_string = _read([f"MEFOR_AI_ENVIRONMENT=prod\n{KEY_CLASS_NAMES[0]}=\n{follower}"])
+    split = _read([f"{KEY_CLASS_NAMES[0]}=", follower])
+    assert split.listed == one_string.listed, follower
+
+
+@pytest.mark.parametrize("item", ["=C:=C:\\x", "MEFOR_SECRETS_DIRECTORY="])
+def test_the_two_first_line_shapes_the_readings_differ_on(item: str) -> None:
+    """Below the key in one string each line belongs to the key's value, so it refuses; as the
+    next item each ends the value above, since read alone the item is a variable of its own."""
+    key = KEY_CLASS_NAMES[0]
+    assert _read([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\n{item}"]).listed_keys == (key,)
+    assert _read([f"{key}=", item]).listed_keys == ()
+
+
+def test_an_item_that_sets_the_secrets_directory_is_not_taken_into_the_value_above() -> None:
+    posture = _read(["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=\nC:\\s"])
+    assert posture.listed == ("MEFOR_SECRETS_DIRECTORY",)
+    assert "The service's lists set no" not in str(service_env_refusal(posture))
+
+
+def test_a_key_shaped_item_with_an_ordinary_later_line_continues_the_empty_key() -> None:
+    key = KEY_CLASS_NAMES[0]
+    posture = _read([f"{key}=", f"{_KEY_RUN},x\nPATH=C:\\x"])
+    assert posture.listed_keys == (key,)
+    assert service_env_refusal(posture) is not None
+
+
+# --- the runs-on remedy step follows only the variable that ran on -------------------------------
+
+
+@pytest.mark.parametrize("value", ["x", ""])
+def test_no_runs_on_step_when_the_variable_that_ran_on_is_not_refused(value: str) -> None:
+    """The path-form OIDC key runs on into a path, which is not a secret, so only the
+    ``MEFOR_VALUE_A`` above it refuses, and its value did not run on, empty or not."""
+    entries = [f"MEFOR_VALUE_A={value}\nMEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=", "C:\\k.pem"]
+    posture = _read(entries)
+    assert posture.listed == ("MEFOR_VALUE_A",)
+    assert not posture.value_runs_on
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert _RUNS_ON not in refusal
+
+
+def test_a_broken_value_name_whose_value_is_the_next_item_says_to_remove_it() -> None:
+    """``MEFOR_VALUE_A<LF>X=`` is one variable under the whole-string reading, empty in its own
+    string, so the next item is its value and the step says to remove that item too."""
+    posture = _read(["MEFOR_VALUE_A\nX=", "synthetic"])
+    assert posture.listed_value_names == ("MEFOR_VALUE_A",)
+    assert posture.empty_value_names == ()
+    assert posture.value_runs_on
+    assert _RUNS_ON in str(service_env_refusal(posture))
+
+
+def test_a_broken_name_is_not_counted_away_by_a_name_in_the_next_item() -> None:
+    """Read alone the first item counts ``MEFOR_VALUE_A``; joined, a name the next item sets
+    does not describe the same variable, so it is still counted, and its value ran on."""
+    posture = _read(["MEFOR_VALUE_A\nX=", "foo\nMEFOR_VALUE_B=1"])
+    assert posture.listed_value_names == ("MEFOR_VALUE_A", "MEFOR_VALUE_B")
+    assert posture.value_runs_on
+
+
+def test_a_string_ending_in_a_lone_carriage_return_keeps_the_next_items_line_numbers() -> None:
+    posture = _read(["MEFOR_VALUE_A=\r", "abc\nq\nMEFOR_STORE_PASSWORD=x"])
+    assert dict(posture.source_lines) == {"MEFOR_STORE_PASSWORD": 3}
