@@ -34,27 +34,33 @@ nothing cannot be mistaken for a run that found nothing. Stdlib only, so it can 
 assessment repo and run there without an install -- the same property ``scripts/asvs/scorecard.py``
 is held to.
 
-THREE WAYS TO EXAMINE NOTHING ARE ERRORS, exit 2, not a clean run (BACKLOG #5469):
+EXAMINING NOTHING, OR A BASELINE THAT DOES NOT LOAD, IS EXIT 2, never a clean run and never the
+exit 1 a finding gets (BACKLOG #5469). At least these:
 
-  * a scan that read ZERO Markdown files -- a root that moved, was misspelt, or is wholly
-    allowlisted. "no new tally" and "nothing was read" must not share an exit code;
+  * a scan that read ZERO Markdown files, or zero characters in the files it read -- a root that
+    moved, was misspelt, is wholly allowlisted or holds only empty files. "no new tally" and
+    "nothing was read" must not share an exit code;
   * a ``--baseline`` that names no file. Read as empty, it reclassifies every grandfathered tally
     as NEW, and the cause reads as a finding rather than as a wrong path;
-  * a ``--baseline`` file carrying zero claims. The generating command below redirects stdout, and
-    the shell truncates the target before this program starts, so a generating run that refused
-    leaves exactly that file behind.
+  * a ``--baseline`` file with no content at all. The generating command below redirects stdout,
+    and the shell truncates the target before this program starts, so a generating run that
+    refused leaves exactly that file behind;
+  * a baseline that is malformed, UTF-16 (what a Windows PowerShell 5.1 redirect writes) or not
+    UTF-8.
 
-Scanning with no baseline is still allowed, and it is explicit: omit ``--baseline``. That is the
-form the generating command uses.
+Scanning with no baseline is allowed and explicit: omit ``--baseline``. That is the form the
+generating command uses. A baseline that holds a ``#`` header and zero claims is the ratchet's end
+state -- every tally retired -- and loads as empty; only a file with nothing in it is refused.
 
     python scripts/docs/asvs_tally_lint.py docs --print-keys > <baseline.txt>
 
-Under ``--print-keys`` stdout carries baseline lines and nothing else; the inventory and the verdict
-go to stderr, still printed for a person to read but not swallowed into the artifact. The output
-therefore loads as a baseline as written. The generating run exits 1 whenever the tree holds a
-tally, because against no baseline every tally is NEW; verify the result by re-running with
-``--baseline <baseline.txt>`` and requiring exit 0. The checked-in baseline carries a hand-written
-``#`` header that a regeneration does not reproduce, so carry it over by hand.
+Under ``--print-keys`` stdout carries a ``#`` header and baseline lines, as UTF-8, and nothing else;
+the inventory and the verdict go to stderr, still printed for a person to read but not swallowed
+into the artifact. The output therefore loads as a baseline as written. The generating run exits 1
+whenever the tree holds a tally, because against no baseline every tally is NEW; verify the result
+by re-running with ``--baseline <baseline.txt>`` and requiring exit 0. Under Windows PowerShell 5.1
+the ``>`` redirect re-encodes to UTF-16, which the loader refuses; pipe through
+``Out-File -Encoding utf8`` there, or run the command from a POSIX shell.
 """
 
 from __future__ import annotations
@@ -282,31 +288,39 @@ def load_baseline(path: Path | None) -> dict[str, int]:
     high, which fails and forces the entry down. The list can only shrink.
 
     ``None`` -- no ``--baseline`` given -- is the one explicit way to scan without a baseline. A
-    path that names no file, or a file carrying zero claims, raises :class:`EmptyScan`; see the
-    module docstring.
+    path that is not a file, or a file with no content, raises :class:`EmptyScan`; a file that does
+    not decode or holds a malformed line raises ``ValueError``. A ``#`` header with zero claims
+    loads as empty: see the module docstring.
     """
     out: dict[str, int] = {}
     if path is None:
         return out
     if not path.is_file():
+        what = "is a directory, not a file" if path.is_dir() else "does not exist"
         raise EmptyScan(
-            f"baseline {path} does not exist. Read as empty, it would report every grandfathered "
-            f"tally as NEW. Omit --baseline to scan without one deliberately."
+            f"baseline {path} {what}. Read as empty, it would report every grandfathered tally as "
+            f"NEW. Omit --baseline to scan without one deliberately."
         )
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.rstrip("\n")
+    data = path.read_bytes()
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        raise ValueError(
+            f"baseline {path} is UTF-16, which a Windows PowerShell 5.1 redirect writes. "
+            f"Regenerate it as UTF-8 (see the module docstring)."
+        )
+    if not data.strip():
+        raise EmptyScan(
+            f"baseline {path} is empty. A generating run redirects stdout and the shell truncates "
+            f"the target before this program starts, so a refused generation leaves exactly this "
+            f"file behind. Omit --baseline to scan without one deliberately."
+        )
+    # utf-8-sig, so a BOM some editors and shells add cannot fuse onto the first key.
+    for line in data.decode("utf-8-sig").splitlines():
         if not line.strip() or line.lstrip().startswith("#"):
             continue
         key, _, count = line.rpartition("\t")
         if not key or not count.isdigit():
             raise ValueError(f"malformed baseline line (expected 'key<TAB>count'): {line!r}")
         out[key] = int(count)
-    if not out:
-        raise EmptyScan(
-            f"baseline {path} carries zero claims. A generating run redirects stdout and the "
-            f"shell truncates the target before this program starts, so a refused generation "
-            f"leaves exactly this file behind. Omit --baseline to scan without one deliberately."
-        )
     return out
 
 
@@ -366,10 +380,20 @@ def main(argv: list[str] | None = None) -> int:
     # baseline lines themselves. Under --print-keys stdout is the artifact, so the inventory and the
     # verdict move to stderr rather than being mixed into a file that then cannot load.
     say = partial(print, file=sys.stderr if args.print_keys else sys.stdout)
+    if args.print_keys:
+        # The artifact is read back as UTF-8, so write it as UTF-8 whatever the console's code page.
+        reconfigure = getattr(sys.stdout, "reconfigure", None)
+        if reconfigure is not None:
+            try:  # noqa: SIM105
+                reconfigure(encoding="utf-8")
+            except (ValueError, OSError):
+                pass
 
     try:
         baseline = load_baseline(args.baseline)
-    except EmptyScan as exc:
+    except (EmptyScan, ValueError) as exc:
+        # ValueError covers a malformed line and an undecodable file. Exit 2, not the 1 a finding
+        # gets, so a broken baseline never reads as "the docs carry a new tally".
         say(f"FAIL: {exc}")
         return 2
 
@@ -378,30 +402,35 @@ def main(argv: list[str] | None = None) -> int:
 
     scanned = 0
     skipped = 0
+    n_chars = 0
     hits: list[Hit] = []
     for rel, p in docs:
         if rel.startswith(allow):
             skipped += 1
             continue
         scanned += 1
-        hits.extend(scan_text(rel, p.read_text(encoding="utf-8", errors="replace")))
+        text = p.read_text(encoding="utf-8", errors="replace")
+        n_chars += len(text.strip())
+        hits.extend(scan_text(rel, text))
 
     observed = counted(hits)
     new = [h for h in hits if observed[h.key()] > baseline.get(h.key(), 0)]
     grandfathered = sum(min(n, baseline.get(k, 0)) for k, n in observed.items())
 
     say(
-        f"SCANNED: {scanned} markdown files ({skipped} allowlisted) under {[str(r) for r in args.roots]}"
+        f"SCANNED: {scanned} markdown files ({skipped} allowlisted), {n_chars} characters, "
+        f"under {[str(r) for r in args.roots]}"
     )
     say(
         f"SCANNED: baseline {args.baseline} carries {len(baseline)} grandfathered claims "
         f"({sum(baseline.values())} occurrences)"
     )
-    if scanned == 0:
+    if n_chars == 0:
         say(
-            f"FAIL: scanned ZERO markdown files under {[str(r) for r in args.roots]} "
-            f"(repo {args.repo}). That is a root that moved, is misspelt or is wholly allowlisted, "
-            f"not a clean tree: 'no new tally' and 'nothing was read' must not share an exit code."
+            f"FAIL: scanned {scanned} markdown files and ZERO characters under "
+            f"{[str(r) for r in args.roots]} (repo {args.repo}). That is a root that moved, is "
+            f"misspelt, is wholly allowlisted or holds only empty files, not a clean tree: "
+            f"'no new tally' and 'nothing was read' must not share an exit code."
         )
         return 2
     say(
@@ -419,6 +448,14 @@ def main(argv: list[str] | None = None) -> int:
         say(f"         {per_file[path]:4d}  {path}")
 
     if args.print_keys:
+        # A `#` line is skipped by load_baseline, so the artifact describes itself, and a tree with
+        # every tally retired still generates a non-empty baseline that loads (as empty).
+        roots = " ".join(str(r) for r in args.roots)
+        print("# Grandfathered ASVS tallies -- FROZEN, and this list may only SHRINK.")
+        print("# Format:  <path> TAB <idiom> TAB <tally token> TAB <occurrence count>")
+        print(f"# Produced by:  python scripts/docs/asvs_tally_lint.py {roots} --print-keys")
+        print("# To retire one: delete the tally from the document AND lower or delete its line")
+        print("# here, in the same change. A line left behind over-counts the tree and FAILS.")
         for key in sorted(observed):
             print(f"{key}\t{observed[key]}")
 

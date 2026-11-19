@@ -266,7 +266,7 @@ def test_a_scan_of_zero_files_is_an_error_not_a_clean_run(
 ) -> None:
     (tmp_path / "docs").mkdir()
     assert main(["docs", "--repo", str(tmp_path)]) == 2, "an empty root must not pass"
-    assert "scanned ZERO markdown files" in capsys.readouterr().out
+    assert "ZERO characters" in capsys.readouterr().out
     # Control: the same tree with one tally-free document is a clean run, exit 0.
     _tree(tmp_path)
     assert main(["docs", "--repo", str(tmp_path)]) == 0
@@ -291,21 +291,72 @@ def test_a_missing_baseline_file_is_an_error_not_an_empty_baseline(
     assert "does not exist" in capsys.readouterr().out
 
 
-@pytest.mark.parametrize(
-    "content",
-    ["", "\n\n", "# a header and nothing else\n# Format: path TAB idiom TAB token TAB count\n"],
-    ids=["zero-byte", "blank-lines", "header-only"],
-)
-def test_a_baseline_carrying_zero_claims_is_an_error(tmp_path: Path, content: str) -> None:
+@pytest.mark.parametrize("content", ["", "\n\n", "  \n"], ids=["zero-byte", "blank", "spaces"])
+def test_a_baseline_with_no_content_is_an_error(tmp_path: Path, content: str) -> None:
     """The zero-byte case is what a refused generating run leaves behind, since the shell truncates
     the redirect target before the program starts. Omitting --baseline is the explicit form."""
     _tree(tmp_path)
     base = tmp_path / "b.txt"
     base.write_text(content, encoding="utf-8")
-    with pytest.raises(EmptyScan, match="zero claims"):
+    with pytest.raises(EmptyScan, match="is empty"):
         load_baseline(base)
     assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 2
     assert main(["docs", "--repo", str(tmp_path)]) == 0, "omitting --baseline still scans"
+
+
+def test_a_header_only_baseline_is_the_ratchets_end_state_and_loads(tmp_path: Path) -> None:
+    """Every tally retired leaves a `#` header and zero claims. That must stay a passing gate, or
+    following the shrink rule to its end would red a clean tree."""
+    _tree(tmp_path)
+    base = tmp_path / "b.txt"
+    base.write_text("# Grandfathered ASVS tallies\n# Format: path TAB idiom TAB token\n", "utf-8")
+    assert load_baseline(base) == {}
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 0
+    # Control: the same baseline against a tree that holds a tally fails as NEW, exit 1.
+    _tree(tmp_path, "score 212/0/0/133 here\n")
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 1
+
+
+def test_a_baseline_path_that_is_a_directory_says_so(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _tree(tmp_path)
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(tmp_path / "docs")]) == 2
+    assert "is a directory, not a file" in capsys.readouterr().out
+
+
+def test_a_malformed_baseline_is_exit_2_not_the_exit_1_of_a_finding(tmp_path: Path) -> None:
+    _tree(tmp_path)
+    base = tmp_path / "b.txt"
+    base.write_text("x\n", encoding="utf-8")
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 2
+
+
+def test_a_utf16_baseline_is_refused_as_exit_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """What a Windows PowerShell 5.1 `>` redirect writes."""
+    _tree(tmp_path, "score 212/0/0/133 here\n")
+    base = tmp_path / "b.txt"
+    base.write_text("docs/d.md\tSLASH_RUN\t212/0/0/133\t1\n", encoding="utf-16")
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 2
+    assert "UTF-16" in capsys.readouterr().out
+
+
+def test_a_utf8_bom_does_not_fuse_onto_the_first_key(tmp_path: Path) -> None:
+    _tree(tmp_path, "score 212/0/0/133 here\n")
+    base = tmp_path / "b.txt"
+    base.write_text("docs/d.md\tSLASH_RUN\t212/0/0/133\t1\n", encoding="utf-8-sig")
+    assert load_baseline(base) == {"docs/d.md\tSLASH_RUN\t212/0/0/133": 1}
+    assert main(["docs", "--repo", str(tmp_path), "--baseline", str(base)]) == 0
+
+
+def test_a_tree_of_empty_files_is_an_error_not_a_clean_run(tmp_path: Path) -> None:
+    _tree(tmp_path, "")
+    assert main(["docs", "--repo", str(tmp_path)]) == 2
+    # Control: one character of prose makes it a clean run.
+    _tree(tmp_path, "x\n")
+    assert main(["docs", "--repo", str(tmp_path)]) == 0
 
 
 def test_print_keys_stdout_loads_as_a_baseline_and_round_trips(
@@ -317,7 +368,8 @@ def test_print_keys_stdout_loads_as_a_baseline_and_round_trips(
     assert rc == 1, "against no baseline every tally is NEW, so the generating run exits 1"
     assert "SCANNED:" in captured.err and "FOUND:" in captured.err, "the inventory still prints"
     assert "SCANNED" not in captured.out and "FOUND" not in captured.out
-    assert captured.out.splitlines() == [
+    assert captured.out.startswith("# "), "the artifact describes itself"
+    assert [ln for ln in captured.out.splitlines() if not ln.startswith("#")] == [
         "docs/d.md\tSLASH_RUN\t212/0/0/133\t2",
         "docs/d.md\tTABLE_ROW\t179|51|5|110\t1",
     ]
@@ -332,8 +384,12 @@ def test_print_keys_stdout_loads_as_a_baseline_and_round_trips(
     assert "OK: no new" in capsys.readouterr().out, "the gate run still reports on stdout"
 
 
-def test_print_keys_round_trips_through_a_real_shell_redirect(tmp_path: Path) -> None:
-    """The documented command, as a subprocess whose stdout is the file, then the gate run on it."""
+def test_print_keys_round_trips_through_a_subprocess_stdout_file(tmp_path: Path) -> None:
+    """The documented command as a child whose stdout IS the file, then the gate run on it.
+
+    No shell is involved, so this does not measure a shell's own re-encoding of a redirect; the
+    UTF-16 case a Windows PowerShell 5.1 redirect produces is pinned separately above.
+    """
     _tree(tmp_path, "score 212/0/0/133 here\n")
     base = tmp_path / "b.txt"
     lint = str(REPO_ROOT / LINT_REL)
