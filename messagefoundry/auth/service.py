@@ -16513,8 +16513,9 @@ class AuthService:
         read, and elsewhere it reads the set through :meth:`_verified_passkeys`, so a row that does
         not parse is no exception and a set that fails its seal is reported. Such a set counts for
         nothing, and so does one with a cell the driver cannot decode while fetching
-        (:func:`passkey_cell_undecodable`), as the census counts it. Any other read error raises,
-        before the hash. Where the TOTP counts, the store's write confirms it under its lock and
+        (:func:`passkey_cell_undecodable`), as the census counts it. A record that Vault transit
+        cannot verify when that read re-reads it raises :class:`UserSealRefused`, reported. Any
+        other read error raises, before the hash. Where the TOTP counts, the store's write confirms it under its lock and
         reads no passkey (:func:`~messagefoundry.store.store.way_past_passkeys`); where it no
         longer counts there, the write reads the set, and one that cannot be read counts for
         nothing, so the write declines after the hash and ``change_password`` raises the
@@ -16525,6 +16526,12 @@ class AuthService:
         try:
             if await self._holds_gate_passkey(user):
                 return
+        except TransitSealUnverifiableError as exc:
+            # _verified_passkeys re-reads the record on a digest mismatch, and Vault transit may
+            # not verify it then: refused and reported as checked_user refuses and reports it, so
+            # the change answers the 423 rather than an unhandled error (BACKLOG #5902).
+            await self._user_seal_unverifiable(user.id, exc)
+            raise UserSealRefused(USER_SEAL_REFUSED) from exc
         except UnicodeDecodeError:
             # The class name only: a decode error's message quotes the cell, so the arm binds no
             # name. Throttled per account, as _verified_passkeys throttles a row that does not parse.

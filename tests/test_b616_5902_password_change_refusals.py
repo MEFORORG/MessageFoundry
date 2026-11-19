@@ -316,6 +316,40 @@ async def test_a_covered_row_deleted_during_the_early_check_is_not_an_enrolment_
     assert await _changed_rows(store) == []
 
 
+async def test_an_unverifiable_record_at_the_passkey_re_read_is_the_seal_refusal(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The early way-past check reads the passkeys through ``_verified_passkeys``, which re-reads
+    the record when the set does not match its digest. Vault transit failing to verify it on that
+    re-read is the seal refusal (the route's 423), reported, with nothing written, not an
+    unhandled error (BACKLOG #5902)."""
+    service, identity = await _account(store, require_mfa=True)
+    reported: list[str] = []
+
+    async def unverifiable(_uid: str) -> Any:
+        raise TransitSealUnverifiableError(USER_KIND, 1, 2)
+
+    async def held_gate_passkey(user: Any) -> bool:
+        # The real passkey read, made to take its re-read branch: a sealed store whose set does
+        # not match the digest the record holds.
+        monkeypatch.setattr(store, "row_sealer", lambda: object())
+        monkeypatch.setattr("messagefoundry.auth.service.passkey_digest", lambda _creds: "moved")
+        monkeypatch.setattr(service, "_load_user", unverifiable)
+        return bool(await service._verified_passkeys(user))
+
+    async def report(user_id: str, _exc: Any) -> None:
+        reported.append(user_id)
+
+    monkeypatch.setattr(service, "_holds_gate_passkey", held_gate_passkey)
+    monkeypatch.setattr(service, "_user_seal_unverifiable", report)
+    with pytest.raises(UserSealRefused):
+        await service.change_password(identity, _NEW_PASSWORD)
+    assert reported == ["u1"]
+    monkeypatch.undo()
+    assert await _changed_rows(store) == []
+    assert (await service.login("bob", _PASSWORD)).ok
+
+
 async def test_a_seal_refusal_at_the_write_is_refused_and_reported(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
