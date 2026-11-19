@@ -99,6 +99,7 @@ __all__ = [
     "DEFAULT_LOCK_TIMEOUT_S",
     "LOCK_FILE_NAME",
     "READ_STEP",
+    "candidate_dir",
     "edit_lock",
     "encode_text",
     "is_candidate_dir_name",
@@ -107,8 +108,12 @@ __all__ = [
     "is_file",
     "read_text",
     "read_text_if_present",
+    "refuse_a_link",
     "refused_as",
+    "remove_stale_candidates",
     "replace_validated",
+    "restrict_in_place",
+    "restrict_to_owner",
 ]
 
 _log = logging.getLogger(__name__)
@@ -434,13 +439,14 @@ def restrict_to_owner(path: Path, *, live: _LiveSecurity | None = None) -> None:
     """Restrict ``path`` to its owner, the step :func:`replace_validated` ends with.
 
     ``live`` is whose the file must stay, read before :func:`replace_validated` renamed its
-    candidate into place. With none, ``path`` is a file left where it is, such as one an edit
-    that changed nothing kept byte for byte (BACKLOG #5327), and its owner is read from it now:
-    its bytes are not rewritten, and it is narrowed exactly as a replaced file would be, so an
-    edit that changes nothing still leaves the file owner-only. On POSIX that is mode 0600 with
-    the owner unchanged; on Windows it is the owner-and-editor list for a file another account
-    owns and the editing account's own list otherwise (the module docstring says why each).
-    Best-effort as the replace's own step is: a failure is logged, not raised."""
+    candidate into place. With none, ``path`` is a file left where it is, and its owner is read
+    from it now; :func:`restrict_in_place` is the caller for that, and its bytes are not
+    rewritten. On POSIX the result is mode 0600 with the owner unchanged. On Windows a file another
+    account owns gets the owner-and-editor list, the editor at read only; a file left in place
+    keeps the owner it never lost, which is what the replace leaves where its ownership hand-back
+    succeeds, and where that hand-back is refused the replace instead leaves the editor owning the
+    file at full control. Any other file gets the editing account's own list (the module docstring
+    says why each). Best-effort as the replace's own step is: a failure is logged, not raised."""
     if live is None:
         live = _live_security(path)
     if live.windows_owner is not None and _restrict_to_owner_and_editor(path, live.windows_owner):
@@ -453,6 +459,27 @@ def restrict_to_owner(path: Path, *, live: _LiveSecurity | None = None) -> None:
     _secure_file(path)
 
 
+def restrict_in_place(path: Path, refused_error: Callable[[str], Exception]) -> None:
+    """Restrict a file an edit left where it is to its owner (:func:`restrict_to_owner`), without
+    rewriting its bytes, as an edit that changed nothing does in place of the replace (BACKLOG
+    #5327).
+
+    The replace renames a new file over the name, so it never changes another file. A restriction
+    by name does, so the path is refused as ``refused_error(message)`` when it is now a link
+    (:func:`refuse_a_link`), or holds anything but a regular file with one name: restricting a hard
+    link would also restrict the file behind its other name."""
+    refuse_a_link(path, refused_error)
+    with refused_as(path, refused_error, _STAT_STEP):
+        info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise refused_error(
+            f"{path.name} was not changed: it is not a regular file with one name, and restricting "
+            "it to its owner would also restrict the file behind its other name. Replace it with a "
+            "file of its own"
+        )
+    restrict_to_owner(path)
+
+
 @contextlib.contextmanager
 def candidate_dir(path: Path, refused_error: Callable[[str], Exception] | None) -> Iterator[Path]:
     """A private directory beside ``path`` to build an edit candidate in, removed on exit.
@@ -460,7 +487,7 @@ def candidate_dir(path: Path, refused_error: Callable[[str], Exception] | None) 
     A stale one a killed editor of ``path`` left behind is removed first, and a refusal creating it
     is raised as ``refused_error(message)`` (:func:`refused_as`). Its removal logs rather than raises,
     so a cleanup fault never hides the edit's own outcome."""
-    _remove_stale_candidates(path)
+    remove_stale_candidates(path)
     with refused_as(path, refused_error, "create its edit candidate"):
         private = Path(
             tempfile.mkdtemp(dir=path.parent, prefix=f".{path.name}.", suffix=CANDIDATE_DIR_SUFFIX)
@@ -852,7 +879,7 @@ def _fsync_dir(directory: Path) -> None:
         os.close(fd)
 
 
-def _remove_stale_candidates(path: Path) -> None:
+def remove_stale_candidates(path: Path) -> None:
     """Remove candidate directories for ``path`` that a killed editor left behind.
 
     Each caller holds the edit lock, and only a directory older than ``_STALE_CANDIDATE_S`` is

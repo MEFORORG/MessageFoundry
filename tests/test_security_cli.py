@@ -1275,3 +1275,28 @@ def test_an_edit_that_changes_nothing_keeps_a_foreign_owners_grant_on_windows(
     assert written and not any(sddl.startswith("O:") for sddl in written), written
     assert toml.read_bytes() == before
     assert atomic_edit._owner_of(toml) == owner
+
+
+def test_an_edit_that_changes_nothing_refuses_a_hard_link_and_leaves_its_other_name(
+    tmp_path: Path,
+) -> None:
+    """The replace renames a new file over the name, so it never changes the file behind another
+    name. Restricting in place would, so a settings path with a second name is refused, and the
+    other name's file keeps its bytes and its permissions."""
+    import os
+
+    from messagefoundry.config import security_edit
+
+    other = tmp_path / "elsewhere.toml"
+    other.write_bytes(b"[security]\nrequire_mfa = false\n")
+    toml = tmp_path / "mf.toml"
+    try:
+        os.link(other, toml)
+    except OSError as exc:
+        pytest.skip(f"cannot create a hard link here: {exc}")
+    if sys.platform != "win32":
+        os.chmod(other, 0o644)
+    before = (other.read_bytes(), os.stat(other).st_mode)
+    with pytest.raises(security_edit.SecurityEditError, match="not a regular file with one name"):
+        security_edit.set_security(toml, {"require_mfa": False}, validate=lambda _c: None)
+    assert (other.read_bytes(), os.stat(other).st_mode) == before

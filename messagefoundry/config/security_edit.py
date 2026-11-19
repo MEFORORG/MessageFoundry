@@ -55,8 +55,8 @@ def read_security(service_config: str | Path) -> dict[str, Any]:
 def set_security(
     service_config: str | Path, updates: Mapping[str, Any], *, validate: Validate
 ) -> dict[str, Any]:
-    """Merge ``updates`` into the ``[security]`` table (creating the file + table if needed), validate the
-    whole file still loads, then write comment-preservingly. A value of ``None`` **removes** that key
+    """Merge ``updates`` into the ``[security]`` table (creating the file + table when a key
+    changes), validate the whole file still loads, then write comment-preservingly. A value of ``None`` **removes** that key
     (resets it to its secure default). Raises :class:`SecurityEditError` if the result wouldn't load —
     leaving the TOML untouched. Only the ``[security]`` table is edited; other sections are byte-stable.
 
@@ -133,7 +133,8 @@ def _check_unchanged(path: Path, *, exists: bool, validate: Validate) -> None:
     other than a regular file, which the replace could not have replaced, is refused too. A file
     that is there is checked as it stands, under the edit lock the caller holds, so a file the
     engine would refuse is never reported as left fine, and one that passes is then restricted to
-    its owner as the replace restricts the file it writes, without its bytes being rewritten. With
+    its owner as the replace restricts the file it writes, without its bytes being rewritten; a
+    file with a second name is refused rather than restricted through it. With
     nothing at the path, none is created: an empty file is checked instead, as the replace would have checked the empty file it wrote, in
     a private directory beside the path that the replace's own stale-candidate sweep recognises and
     its own cleanup removes, logging rather than raising so a cleanup fault never hides the check's
@@ -142,8 +143,10 @@ def _check_unchanged(path: Path, *, exists: bool, validate: Validate) -> None:
     atomic_edit.refuse_a_link(path, SecurityEditError)
     if exists:
         _checked(validate)(path)
-        # The replace ends by restricting the file to its owner, so skipping it must not skip that.
-        atomic_edit.restrict_to_owner(path)
+        # The replace sweeps stale candidates and ends by restricting the file to its owner, so
+        # skipping it must skip neither.
+        atomic_edit.remove_stale_candidates(path)
+        atomic_edit.restrict_in_place(path, SecurityEditError)
         return
     if os.path.lexists(path):
         raise SecurityEditError(
