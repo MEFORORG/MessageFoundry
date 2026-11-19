@@ -246,8 +246,14 @@ def test_null_reset_in_a_missing_folder_is_refused_and_creates_nothing(
     toml = tmp_path / "missing" / "mf.toml"
     rc, err = _set(toml, {"require_mfa": None}, capsys)
     assert rc != 0
-    assert "does not exist" in err["error"] and "missing" in err["error"]
+    assert f"{tmp_path / 'missing'} is not a folder that exists" in err["error"]
     assert list(tmp_path.iterdir()) == []
+    # A parent that is a regular file is the same mistake, refused the same way.
+    (tmp_path / "notes.txt").write_text("", encoding="utf-8")
+    rc, err = _set(tmp_path / "notes.txt" / "mf.toml", {"require_mfa": None}, capsys)
+    assert rc != 0 and "is not a folder that exists" in err["error"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["notes.txt"]
+    (tmp_path / "notes.txt").unlink()
     # In a folder that exists, no lock file is left beside the absent settings file.
     toml = tmp_path / "mf.toml"
     rc, res = _set(toml, {"require_mfa": None}, capsys)
@@ -267,6 +273,12 @@ def test_null_reset_where_the_stat_is_refused_is_not_reported_absent(
         raise security_edit.SecurityEditError(f"could not stat {path.name}")
 
     monkeypatch.setattr(atomic_edit, "is_file", refuse)
+    with pytest.raises(security_edit.SecurityEditError, match="could not stat"):
+        security_edit.set_security(
+            tmp_path / "mf.toml", {"require_mfa": None}, validate=lambda _c: None
+        )
+    # A folder whose stat is refused is refused in the gate's words, not called missing.
+    monkeypatch.setattr(atomic_edit, "is_dir", refuse)
     with pytest.raises(security_edit.SecurityEditError, match="could not stat"):
         security_edit.set_security(
             tmp_path / "mf.toml", {"require_mfa": None}, validate=lambda _c: None

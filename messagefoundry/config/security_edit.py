@@ -81,12 +81,13 @@ def set_security(
     if not isinstance(updates, Mapping):
         raise SecurityEditError("security updates must be a JSON object of {key: value}")
     path = Path(service_config)
-    if all(value is None for value in updates.values()):
-        if not os.path.lexists(path.parent):
-            # A mistyped path must not read as a successful reset.
+    if updates and all(value is None for value in updates.values()):
+        # A mistyped path must not read as a successful reset. The shared stat gate tells a
+        # folder that is not there from one it could not stat, which it refuses in its own words.
+        if not atomic_edit.is_dir(path.parent, refused_error=SecurityEditError):
             raise SecurityEditError(
-                f"refused, nothing written: the folder {path.parent} does not exist, so there is "
-                "no settings file to reset; check the --service-config path"
+                f"refused, nothing written: {path.parent} is not a folder that exists, so there "
+                f"is no settings file {path.name} to reset; check the settings file path"
             )
         if _nothing_at(path):
             # Only resets, and no file to reset them in: nothing can change, so take no lock,
