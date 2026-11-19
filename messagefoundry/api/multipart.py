@@ -199,7 +199,10 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             first = _NOT_CRLF.search(body, start, end)
             start = end if first is None else first.start()
         if nxt == -1 and start == end:
-            break  # a last delimiter line with no close marker and nothing after it: not a part
+            # A last delimiter line with nothing after it is not a part. Not counting it keeps an
+            # unterminated body at the part cap refused below for its missing terminator rather
+            # than for the part cap, which is the refusal that names the cause.
+            break
         # A part with no header separator is skipped below, but it is counted: each one costs a
         # find, so the cap has to bound them too, or a body of empty parts would walk unbounded.
         count += 1
@@ -249,11 +252,13 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
                 f"{_FILE_AS_FIELD_HINT}"
             )
         parts.append(_Part(name=name, filename=filename, start=content_start, end=content_end))
-    # BACKLOG #5787: a body with no closing delimiter is refused, since a truncated upload is one, and
-    # it would otherwise be taken as a whole one. Last, so a body refused for anything above keeps
-    # that refusal. Where the walk did not stop on a close marker, one is looked for anywhere: this
-    # refuses only a body that carries none, and every body that carries one parses as it did before.
-    # Where a delimiter may sit (line start or not) is unchanged.
+    # BACKLOG #5787: a body in which the closing delimiter appears nowhere is refused, because a body
+    # cut short in transit is one, and its last part would otherwise run to the end of the body and
+    # be taken as complete. Checked last, so a body that fails a check above gets that refusal. A
+    # close marker the walk did not stop on still counts wherever it sits, so this refuses only a
+    # body that carries none. It does not catch a cut-short body whose content holds the close
+    # marker text: the walk takes that text as the close wherever it sits (delimiters are not
+    # anchored to a line start), and the part ends there.
     if not closed:
         if not seen:
             # No delimiter at all: an empty body, or one built with another boundary than the

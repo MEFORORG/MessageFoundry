@@ -667,7 +667,9 @@ def test_a_text_field_at_the_cap_still_parses() -> None:
 # changes nothing about how delimiters are found. The differential arm below pins that: every body
 # in the corpus that carries a close marker must parse exactly as origin/main parsed it, outcome for
 # outcome. The outcomes were recorded by running origin/main's parser (at ec75a5f61bf) over this same
-# corpus, so a change that moves any of them, accept or refuse, shows here.
+# corpus, so a change that moves any of them, accept or refuse, shows here. The record says what
+# main did, not that each outcome is right: the mid-line rows are delimiters not anchored to a line
+# start, the other half of #5787, which is not built here and would move those rows when it is.
 
 _CT_B = "multipart/form-data; boundary=B"
 _CT_WK = f"multipart/form-data; boundary={_B}"
@@ -825,31 +827,36 @@ _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
 }
 
 
+_CORPUS = _corpus()
+_MULTIPART_CORPUS = [c for c in _CORPUS if c[1] != "application/json"]
+
+
 def _close_marker(content_type: str) -> bytes:
     boundary = parse_boundary(content_type) or b"B"
     return b"--" + boundary + b"--"
 
 
-@pytest.mark.parametrize(("case", "content_type", "body"), _corpus(), ids=[c[0] for c in _corpus()])
+@pytest.mark.parametrize(("case", "content_type", "body"), _CORPUS, ids=[c[0] for c in _CORPUS])
 def test_a_body_with_a_close_marker_parses_exactly_as_main_did(
     case: str, content_type: str, body: bytes
 ) -> None:
     """#5787 differential arm: the refusal of an unterminated body moves no body that carries a
     close marker, whatever its shape (a CR run after a delimiter, a close marker after a bare CR,
-    anything after the close marker, a delimiter not at a line start)."""
+    anything after the close marker, a delimiter not at a line start). It pins
+    ``parse_multipart_form``; ``parse_single_file_upload`` shares the same walk and terminator check."""
     assert _close_marker(content_type) in body, "the corpus holds terminated bodies only"
     assert _outcome(content_type, body) == _MAIN_OUTCOMES[case]
 
 
 def test_the_recorded_outcomes_cover_the_whole_corpus() -> None:
     """The record and the corpus must name the same bodies, or a body could go uncompared."""
-    assert [case for case, _, _ in _corpus()] == list(_MAIN_OUTCOMES)
+    assert [case for case, _, _ in _CORPUS] == list(_MAIN_OUTCOMES)
 
 
 @pytest.mark.parametrize(
     ("case", "content_type", "body"),
-    [c for c in _corpus() if c[1] != "application/json"],
-    ids=[c[0] for c in _corpus() if c[1] != "application/json"],
+    _MULTIPART_CORPUS,
+    ids=[c[0] for c in _MULTIPART_CORPUS],
 )
 def test_the_same_body_without_its_close_marker_is_refused(
     case: str, content_type: str, body: bytes
@@ -857,7 +864,9 @@ def test_the_same_body_without_its_close_marker_is_refused(
     """#5787: each corpus body with its close marker turned into a plain delimiter is refused. A body
     origin/main parsed is refused for the missing terminator (or, for the epilogue body, for the part
     cap, since the walk now runs on into the delimiter text that sat after the close marker). A body
-    main refused keeps main's refusal, class and all, because the terminator check runs last."""
+    main refused keeps main's refusal from ``parse_multipart_form``, class and all, because the
+    terminator check runs last. (``parse_single_file_upload`` refuses a no-file or two-file body
+    after the walk, so an unterminated one of those now gets the terminator refusal there.)"""
     marker = _close_marker(content_type)
     unterminated = body.replace(marker, marker[:-2])
     assert marker not in unterminated
@@ -894,11 +903,14 @@ def test_a_body_with_no_delimiter_at_all_is_not_called_truncated(
         parse_single_file_upload(content_type, body, max_file_bytes=1024)
 
 
-@pytest.mark.parametrize("cut", [3, 4, 7, 12, 30])
+_TAIL = len(f"\r\n--{_B}--\r\n")
+
+
+@pytest.mark.parametrize("cut", [3, 4, 7, 12, 30, _TAIL, _TAIL + 3, _TAIL + 10])
 def test_a_truncated_upload_is_refused_not_ingested(cut: int) -> None:
     """#5787: an upload cut short before its close marker is complete was taken as a whole file of
-    whatever bytes arrived. It is refused now, by both entry points. (A cut of one or two bytes
-    leaves the whole ``--boundary--`` in place, so that body still parses.)"""
+    whatever bytes arrived. It is refused now, by both entry points, whether the cut falls in the
+    close marker or in the file's own bytes (the last cuts lose ``MRN`` and more)."""
     body = _body([_FILE_PART + b"\r\nPID|1||MRN"])
     truncated = body[:-cut]
     assert f"--{_B}--".encode() not in truncated
@@ -907,3 +919,12 @@ def test_a_truncated_upload_is_refused_not_ingested(cut: int) -> None:
             parse(_CT_WK, truncated, max_file_bytes=1024)
     # Positive control: the whole body parses.
     assert parse_single_file_upload(_CT_WK, body, max_file_bytes=1024).data.endswith(b"MRN")
+
+
+@pytest.mark.parametrize("cut", [1, 2])
+def test_a_cut_that_leaves_the_close_marker_whole_still_parses(cut: int) -> None:
+    """Losing only the CRLF after ``--boundary--`` leaves the close marker whole, so the body parses
+    as it did before #5787."""
+    body = _body([_FILE_PART + b"\r\nPID|1||MRN"])
+    file = parse_single_file_upload(_CT_WK, body[:-cut], max_file_bytes=1024)
+    assert file.data == b"MSH|body\r\nPID|1||MRN"
