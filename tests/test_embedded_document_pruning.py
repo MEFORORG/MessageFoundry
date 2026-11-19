@@ -401,9 +401,21 @@ async def _run_sql_on_server(store: Any, sql: str, params: tuple[Any, ...]) -> N
         if type(store).__name__ == "PostgresStore":
             await conn.execute(sql.replace("?", "$1", 1).replace("?", "$2", 1), *params)
             return
+        # Closed and, on a failure, rolled back here: the connection goes back to the shared pool.
         cur = await conn.cursor()
-        await cur.execute(sql, params)
-        await conn.commit()
+        try:
+            await cur.execute(sql, params)
+            await conn.commit()
+        except BaseException:
+            try:
+                await conn.rollback()
+            except Exception as rollback_exc:  # the writer's own error is the one to raise
+                logging.getLogger(__name__).warning(
+                    "the concurrent writer's rollback failed too: %r", rollback_exc
+                )
+            raise
+        finally:
+            await cur.close()
 
 
 def _concurrent_writer(
@@ -441,6 +453,7 @@ async def test_a_write_between_the_strips_read_and_write_back_wins(
     store: MessageStore,
     tmp_path: Any,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
     kind: str,
     raw_after: str,
 ) -> None:
@@ -455,11 +468,14 @@ async def test_a_write_between_the_strips_read_and_write_back_wins(
         monkeypatch, _concurrent_writer(store, tmp_path, sql, params, asyncio.get_running_loop())
     )
 
-    result = await store.strip_embedded_documents(
-        older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
-    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.document_strip"):
+        result = await store.strip_embedded_documents(
+            older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
+        )
 
     assert result == StripResult()
+    # The guard refused the write; no batch failed and was contained with the same end state.
+    assert not [r for r in caplog.records if "passed over a batch" in r.getMessage()]
     rec = await _get(store, mid)
     assert rec["raw"] == raw_after  # the other writer's state stands
     assert rec["documents_pruned"] is None
@@ -564,7 +580,7 @@ async def test_a_write_that_fails_rolls_back_its_batch_and_the_scan_goes_on(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5651: a batch whose write fails is rolled back whole and counts nothing; the
-    keyset moves past it and the next batch is stripped. The WARNING names the error's type, and
+    keyset moves past it and the next batch is stripped. The ERROR names the error's type, and
     the traceback goes to DEBUG."""
     if not isinstance(store, MessageStore) or type(store) is not MessageStore:
         pytest.skip("drives the SQLite write path")
@@ -595,6 +611,7 @@ async def test_a_write_that_fails_rolls_back_its_batch_and_the_scan_goes_on(
     assert binary.is_document_tombstone((await _get(store, second))["raw"])
     warned = [r for r in caplog.records if "passed over a batch" in r.getMessage()]
     assert len(warned) == 1 and "RuntimeError" in warned[0].getMessage()
+    assert warned[0].levelno == logging.ERROR
     assert any(r.levelno == logging.DEBUG and r.exc_info for r in caplog.records)
 
 
@@ -628,7 +645,7 @@ async def test_a_batch_with_any_verdict_does_not_end_the_call(
 ) -> None:
     """BACKLOG #5651: the call ends early only when every row of a batch got no verdict. A batch
     where some rows got one (here refused cells) is not an outage: its no-verdict rows are skipped,
-    as on origin/main, and the scan goes on."""
+    and the scan goes on."""
     ids = [
         await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=float(i), control=f"C-RS{i}")
         for i in range(5)
@@ -738,8 +755,8 @@ async def test_one_row_the_key_service_gives_no_verdict_on_is_skipped(
 async def test_a_row_refused_alone_in_its_batch_is_skipped_and_does_not_end_the_call(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #5651: a row the key service always gives no verdict on is skipped, as on
-    origin/main, even when it is the only row of its batch to reach the service. Fewer than
+    """BACKLOG #5651: a row the key service always gives no verdict on is skipped, even when it is
+    the only row of its batch to reach the service. Fewer than
     ``OUTAGE_MIN_ROWS`` such rows are not an outage, so the scan goes on to the rows after it."""
     monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
     bad = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-AL1")
@@ -766,7 +783,7 @@ async def test_a_store_wide_cipher_error_from_encrypt_propagates(
 ) -> None:
     """BACKLOG #5651: a store-wide fail-closed :class:`CipherError` from ``encrypt``, the AES-GCM
     invocation ceiling here, is not swallowed as one row's failure: it propagates out of the strip,
-    as on origin/main, so its instruction to rotate the store key reaches the operator."""
+    so its instruction to rotate the store key reaches the operator."""
     from messagefoundry.store.crypto import CipherError
 
     mid = await _delivered(store, channel_id="IB", raw=MFB64_BODY, now=0.0, control="C-CEIL")
@@ -894,6 +911,188 @@ async def test_an_outage_alone_writes_no_retention_audit_row(
     assert not [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
 
 
+def _plain_rows(n: int) -> list[dict[str, Any]]:
+    return [
+        {"id": f"M-{i}", "channel_id": "IB", "raw": MFB64_BODY, "received_at": float(i)}
+        for i in range(n)
+    ]
+
+
+def _keyset_fetch(rows: list[dict[str, Any]]) -> Callable[..., Any]:
+    async def fetch(_cutoff: float, after: Any, limit: int) -> list[dict[str, Any]]:
+        start = 0 if after is None else [r["id"] for r in rows].index(after[1]) + 1
+        return rows[start : start + limit]
+
+    return fetch
+
+
+async def _run_pass(fetch: Any, write: Any, report: Any, cipher: Any = None) -> StripResult:
+    return await document_strip.run_strip_pass(
+        IdentityCipher() if cipher is None else cipher,
+        fetch=fetch,
+        write=write,
+        report=report,
+        now=PRUNED_AT,
+        older_than=float("-inf"),
+        connection_cutoffs={"IB": 4 * DAY},
+        min_bytes=0,
+        content_types={},
+    )
+
+
+async def _no_report(_failures: Any) -> None:
+    return None
+
+
+async def test_two_adjacent_batches_whose_writes_fail_do_not_stop_the_rows_after_them(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5651: writes that fail for reasons of their own rows (a lock timeout on the two
+    oldest batches, say) are passed over, and the pass still strips the rows after them: a fault on
+    particular rows cannot stop the rows after the failing batch, so a fault at the head of the
+    keyset cannot stop every pass at the same place. Each failure is logged at
+    ERROR with its type only, and the call is flagged ``write_failed``."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    writes: list[str] = []
+
+    async def locked_head(updates: Any) -> list[Any]:
+        writes.append(updates[0].message_id)
+        if updates[0].message_id in ("M-0", "M-1"):
+            raise sqlite3.OperationalError("lock timeout on this row SECRET-TEXT")
+        return list(updates)
+
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.store.document_strip"):
+        result = await _run_pass(_keyset_fetch(_plain_rows(5)), locked_head, _no_report)
+
+    assert writes == ["M-0", "M-1", "M-2", "M-3", "M-4"]
+    assert result == StripResult(
+        messages_stripped=3,
+        documents_stripped=3,
+        bytes_reclaimed=result.bytes_reclaimed,
+        write_failed=True,
+    )
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 2
+    assert all("OperationalError" in r.getMessage() for r in errors)
+    assert not any("SECRET-TEXT" in r.getMessage() for r in caplog.records)
+
+
+async def test_a_cipher_error_from_a_batch_write_propagates() -> None:
+    """BACKLOG #5651: a store-wide :class:`CipherError` raised by a backend's write is not passed
+    over as a failed write: it propagates, so its instruction reaches the operator."""
+    from messagefoundry.store.crypto import CipherError
+
+    async def sealing_write(_updates: Any) -> list[Any]:
+        raise CipherError("AES-GCM invocation ceiling reached; rotate the store key")
+
+    with pytest.raises(CipherError, match="rotate the store key"):
+        await _run_pass(_keyset_fetch(_plain_rows(2)), sealing_write, _no_report)
+
+
+async def test_a_write_that_returns_none_is_passed_over(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5651: a backend write that returns something malformed is passed over like any
+    other failed batch, and the scan goes on, rather than failing the whole pass."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    writes: list[int] = []
+
+    async def none_once(updates: Any) -> Any:
+        writes.append(len(updates))
+        return None if len(writes) == 1 else list(updates)
+
+    result = await _run_pass(_keyset_fetch(_plain_rows(3)), none_once, _no_report)
+
+    assert len(writes) == 3
+    assert (result.messages_stripped, result.ended_early) == (2, False)
+
+
+async def test_a_failed_batch_write_is_flagged_but_is_not_audited_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5651: a failed write is passed over and the scan goes on, but the call says a write
+    failed. A retention pass records the flag in an audit row it writes, but does not write one for
+    it alone: on a read-only store or a full disk that row's insert would fail too."""
+    from messagefoundry.pipeline.retention import RetentionPass
+
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    writes: list[int] = []
+
+    async def failing_once(updates: Any) -> list[Any]:
+        writes.append(len(updates))
+        if len(writes) == 1:
+            raise RuntimeError("synthetic write failure")
+        return list(updates)
+
+    result = await _run_pass(_keyset_fetch(_plain_rows(3)), failing_once, _no_report)
+
+    assert len(writes) == 3
+    assert (result.messages_stripped, result.ended_early, result.write_failed) == (2, False, True)
+    quiet: dict[str, Any] = {
+        "messages_purged": 0,
+        "dead_purged": 0,
+        "state_purged": 0,
+        "conn_events_purged": 0,
+        "wal_checkpointed": False,
+        "vacuumed": False,
+        "size_bytes": None,
+        "over_limit": False,
+    }
+    assert not RetentionPass(**quiet, documents_strip_write_failed=True).did_work
+
+
+async def test_refused_cells_of_a_batch_whose_transform_raises_are_still_audited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5651: a refused cell found before a store-wide cipher error in the same batch is
+    still handed to the audit, not lost with the batch."""
+    from messagefoundry.store.crypto import CipherError
+
+    def first_refused(
+        _cipher: Any, _column: str, stored: Any, *, message_id: str, channel_id: str
+    ) -> str:
+        if message_id == "M-0":
+            raise CellTagError("messages", "raw", message_id, channel_id)
+        return str(stored)
+
+    class Ceiling(IdentityCipher):
+        def encrypt(self, *_args: Any, **_kwargs: Any) -> str:
+            raise CipherError("AES-GCM invocation ceiling reached; rotate the store key")
+
+    monkeypatch.setattr(document_strip, "open_message_cell", first_refused)
+    reported: list[list[Any]] = []
+
+    async def report(failures: list[Any]) -> None:
+        reported.append(list(failures))
+
+    async def never(_updates: Any) -> list[Any]:
+        raise AssertionError("no batch to write")
+
+    with pytest.raises(CipherError, match="rotate the store key"):
+        await _run_pass(_keyset_fetch(_plain_rows(2)), never, report, cipher=Ceiling())
+
+    assert [[f.row_ref for f in r] for r in reported] == [["M-0"]]
+
+
+async def test_a_failed_batch_read_logs_its_traceback_at_debug(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """BACKLOG #5651: the early end on a failed read names the error's type at WARNING, and its
+    traceback goes to DEBUG for diagnosis, as a failed batch write's does."""
+
+    async def fetch(*_args: Any) -> list[Any]:
+        raise RuntimeError("synthetic read failure")
+
+    async def never(_updates: Any) -> list[Any]:
+        raise AssertionError("no batch to write")
+
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.store.document_strip"):
+        result = await _run_pass(fetch, never, _no_report)
+
+    assert result.read_failed
+    assert any(r.levelno == logging.DEBUG and r.exc_info for r in caplog.records)
+
+
 _LOCK_ROW = {"id": "M-LOCK", "channel_id": "IB", "raw": MFB64_BODY, "received_at": 0.0}
 
 
@@ -994,7 +1193,7 @@ async def test_the_sqlserver_write_rolls_back_the_whole_batch_on_a_failure() -> 
         older_than=float("-inf"), now=PRUNED_AT, connection_cutoffs={"IB": 4 * DAY}
     )
 
-    assert result == StripResult()
+    assert result == StripResult(write_failed=True)
     assert len(events) == 2 and events[0].startswith("UPDATE messages") and events[1] == "ROLLBACK"
 
 
@@ -1043,6 +1242,42 @@ def _registry(min_bytes: int | None = None) -> Registry:
     )
     reg.add_inbound(build_inbound_connection("IB_KEEP", MLLP(port=2701), router="r"))  # never
     return reg
+
+
+async def test_a_failed_strip_write_reaches_the_audit_row_across_threshold_groups(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5651: ``write_failed`` from any strip call of the pass, not only the last, reaches
+    the pass result and the audit row it writes."""
+    parts = iter(
+        [StripResult(messages_stripped=1, documents_stripped=1, write_failed=True), StripResult()]
+    )
+
+    async def strip(**_kwargs: Any) -> StripResult:
+        return next(parts)
+
+    monkeypatch.setattr(store, "strip_embedded_documents", strip)
+    reg = Registry()
+    for port, (name, min_bytes) in enumerate((("IB_A", 0), ("IB_B", 10)), start=2702):
+        reg.add_inbound(
+            build_inbound_connection(
+                name,
+                MLLP(port=port),
+                router="r",
+                prune_documents_after=1,
+                prune_documents_min_bytes=min_bytes,
+            )
+        )
+    runner = RetentionRunner(
+        store, RetentionSettings(), clock=lambda: 5 * DAY, registry_source=lambda: reg
+    )
+
+    result = await runner.run_once()
+
+    assert result.documents_strip_write_failed
+    audit = [r for r in await store.list_audit(limit=10) if r["action"] == "retention_purge"]
+    assert len(audit) == 1
+    assert json.loads(audit[0]["detail"])["documents_strip_write_failed"] is True
 
 
 async def test_audit_records_strip_counts(store: MessageStore) -> None:
