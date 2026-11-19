@@ -352,11 +352,42 @@ def test_a_cycle_closed_by_a_recorded_row_copies_through_a_tuple() -> None:
     dict.__setitem__(pair[0], "back", pair)
     mine = copy.deepcopy(pair[0])  # the row is recorded first, so the tuple's member resolves
     assert mine["back"][0] is mine
-    assert copy.deepcopy(pair)[0]["back"][0]["back"] is not pair
+    result = copy.deepcopy(pair)
+    assert result is not pair
+    assert result[0]["back"] is result
 
 
 def test_a_cycle_back_into_an_open_tuple_fails_fast() -> None:
     row = CodeSet("cyclic", {"K": {"t": ({"a": 1},)}})["K"]
     dict.__setitem__(row["t"][0], "back", row["t"])
-    with pytest.raises(RecursionError, match="tuple"):
+    with pytest.raises(ValueError, match="tuple"):
         copy.deepcopy(row)
+
+
+class _Leaf:
+    ref: Any = None
+
+
+def test_a_tuple_a_leaf_reaches_during_its_copy_is_copied_once() -> None:
+    leaf = _Leaf()
+    row = CodeSet("x", {"K": {"t": ({"obj": leaf},)}})["K"]
+    leaf.ref = row["t"]
+    mine = copy.deepcopy(row)
+    assert mine["t"] is mine["t"][0]["obj"].ref
+
+
+@pytest.mark.parametrize("first", [True, False])
+def test_an_atomic_tuple_stays_shared_whichever_is_reached_first(first: bool) -> None:
+    row = CodeSet("y", {"K": {"t": (1, 2), "l": [1]}})["K"]
+    if first:
+        mine_row, mine_t = copy.deepcopy([row, row["t"]])
+    else:
+        mine_t, mine_row = copy.deepcopy([row["t"], row])
+    assert mine_t is mine_row["t"] is row["t"]
+
+
+def test_a_frozen_dict_subclass_deep_copies_to_a_dict() -> None:
+    class _Sub(_FrozenDict):
+        __slots__ = ()
+
+    assert copy.deepcopy(_Sub({"a": 1, "b": 2})) == {"a": 1, "b": 2}

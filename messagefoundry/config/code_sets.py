@@ -431,8 +431,8 @@ def _freeze(name: str, value: Any) -> Any:
     from refuses an ordinary edit (BACKLOG #5897).
 
     A plain dict or list becomes its read-only subclass. A tuple is rebuilt from frozen members; only
-    a top-level tuple holding no container is kept as given, since it is already immutable, while a
-    nested tuple is always rebuilt into an equal new tuple. A value nesting more than
+    a top-level tuple holding no dict, list or tuple is kept as given, while a nested tuple is always
+    rebuilt into an equal new tuple. A value nesting more than
     :data:`_MAX_FREEZE_DEPTH` containers raises :class:`CodeSetError` naming ``name``."""
     children = value.values() if type(value) is dict else value
     if _FREEZABLE.isdisjoint(map(type, children)):
@@ -446,9 +446,11 @@ def _thaw(value: Any, memo: dict[int, Any]) -> Any:
 
     It honours ``memo`` as ``copy.deepcopy`` does: each new dict or list is recorded under the
     original's id before it is filled, so a sub-object reached twice is copied once and a cycle
-    through dicts and lists copies as a cycle. A tuple cannot be recorded before it is filled, so a
-    cycle that runs back through a tuple still being copied raises :class:`RecursionError` at once.
-    The walk keeps its own stack, so a value at :data:`_MAX_FREEZE_DEPTH` copies without recursing."""
+    through dicts and lists copies as a cycle. A tuple cannot be recorded before it is filled: if a
+    leaf's own deep copy records it first, that copy is kept, and a cycle that runs back through
+    thawable children into a tuple still being copied raises :class:`ValueError` at once rather than
+    copy it twice. The walk keeps its own stack, so a value at :data:`_MAX_FREEZE_DEPTH` copies
+    without recursing."""
     keep_alive: list[Any] = memo.setdefault(id(memo), [])
     open_tuples: set[int] = set()
 
@@ -456,7 +458,7 @@ def _thaw(value: Any, memo: dict[int, Any]) -> Any:
         if type(original) is tuple:
             open_tuples.add(id(original))
             return _ThawFrame(original, [])
-        target: Any = {} if type(original) is _FrozenDict else []
+        target: Any = {} if isinstance(original, dict) else []
         memo[id(original)] = target
         keep_alive.append(original)
         return _ThawFrame(original, target)
@@ -465,24 +467,31 @@ def _thaw(value: Any, memo: dict[int, Any]) -> Any:
     while True:
         frame = stack[-1]
         for key, child in frame.children:
+            new_key = copy.deepcopy(key, memo) if frame.is_dict else None
             if type(child) not in _THAWABLE:
-                frame.add(copy.deepcopy(key, memo), copy.deepcopy(child, memo))
+                frame.add(new_key, copy.deepcopy(child, memo))
             elif id(child) in memo:
-                frame.add(copy.deepcopy(key, memo), memo[id(child)])
+                frame.add(new_key, memo[id(child)])
             elif id(child) in open_tuples:
-                raise RecursionError("a code-set value holds a cycle through a tuple")
+                raise ValueError("a code-set value holds a cycle back into a tuple")
             else:
-                frame.pending_key = copy.deepcopy(key, memo)
+                frame.pending_key = new_key
                 stack.append(start(child))
                 break
         else:
             stack.pop()
             built = frame.target
-            if type(frame.original) is tuple:
-                built = tuple(built)
-                open_tuples.discard(id(frame.original))
-                memo[id(frame.original)] = built
-                keep_alive.append(frame.original)
+            original = frame.original
+            if type(original) is tuple:
+                open_tuples.discard(id(original))
+                if id(original) in memo:
+                    built = memo[id(original)]  # a leaf's deep copy reached it first; keep that one
+                else:
+                    # As copy.deepcopy does, a tuple whose members all copy to themselves is reused.
+                    same = all(new is old for new, old in zip(built, original, strict=True))
+                    built = original if same else tuple(built)
+                    memo[id(original)] = built
+                    keep_alive.append(original)
             if not stack:
                 return built
             parent = stack[-1]
@@ -492,18 +501,19 @@ def _thaw(value: Any, memo: dict[int, Any]) -> Any:
 class _ThawFrame:
     """One open container in :func:`_thaw`'s walk: the original and the copy being filled."""
 
-    __slots__ = ("original", "target", "children", "pending_key")
+    __slots__ = ("original", "target", "is_dict", "children", "pending_key")
 
     def __init__(self, original: Any, target: Any) -> None:
         self.original = original
         self.target = target
+        self.is_dict = isinstance(original, dict)
         self.children: Iterator[tuple[Any, Any]] = (
-            iter(original.items()) if isinstance(original, dict) else enumerate(original)
+            iter(original.items()) if self.is_dict else enumerate(original)
         )
-        self.pending_key: Any = None  # the key the child being copied goes under
+        self.pending_key: Any = None
 
     def add(self, key: Any, child: Any) -> None:
-        if isinstance(self.target, dict):
+        if self.is_dict:
             self.target[key] = child
         else:
             self.target.append(child)
