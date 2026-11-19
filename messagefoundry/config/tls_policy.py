@@ -2134,13 +2134,14 @@ class Ldap3ContextFactory:
 #: The ``hvac.Client`` keyword arguments :func:`assert_hvac_tls_suites` admits UNCONDITIONALLY.
 #:
 #: Not one of them reaches the TLS context: ``url`` becomes the request URL, ``token`` an
-#: ``X-Vault-Token`` header, and ``allow_redirects`` is a requests-level policy the adapter applies
-#: after the handshake. ``verify`` is admitted separately, and only when its value is a CA bundle path
+#: ``X-Vault-Token`` header, and ``allow_redirects`` and ``timeout`` are requests-level policies the
+#: adapter applies to each request, never to the context (``timeout``: BACKLOG #5983). ``verify``
+#: is admitted separately, and only when its value is a CA bundle path
 #: — see :data:`_HVAC_CLIENT_CA_BUNDLE_KWARG`. Every OTHER ``Client`` argument is REFUSED rather
 #: than ignored — ``session``, ``adapter``, ``cert`` and ``proxies`` each redirect where the context
 #: comes from, and the function's docstring says why ``session=`` in particular must never be quietly
 #: accepted.
-_HVAC_CLIENT_REPLICABLE_KWARGS = frozenset({"url", "token", "allow_redirects"})
+_HVAC_CLIENT_REPLICABLE_KWARGS = frozenset({"url", "token", "allow_redirects", "timeout"})
 
 #: The one ``hvac.Client`` argument admitted CONDITIONALLY, on the TYPE of the value it carries.
 #:

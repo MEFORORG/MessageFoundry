@@ -5804,6 +5804,17 @@ class SqlServerStore:
         return bool(row is not None and row[0] == expected)
 
     async def close(self) -> None:
+        try:
+            await self._close_handles()
+        finally:
+            # BACKLOG #5963: tell a cipher holding Vault sockets (the Transit cipher) the store is
+            # closing, even when a step above raised. close_connections says what it closes, and
+            # that is not every thread's. Read by name: the store does not import the cipher.
+            release = getattr(self._cipher, "close_connections", None)
+            if callable(release):
+                release()
+
+    async def _close_handles(self) -> None:
         # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:

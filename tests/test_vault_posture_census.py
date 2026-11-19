@@ -377,7 +377,12 @@ _CENSUS: list[Row] = sorted(
         ("store/base.py", "open_store", "build_store_cipher", "posture"),
         ("store/base.py", "resolve_active_key", "resolve_key_provider", "posture"),
         ("store/base.py", "resolve_decrypt_keys", "resolve_key_provider", "posture"),
-        ("store/crypto_transit.py", "build_transit_cipher", "_build_client", "posture"),
+        (
+            "store/crypto_transit.py",
+            "build_transit_cipher.build_client",
+            "_build_client",
+            "posture",
+        ),
         ("store/keyprovider.py", "_load_external_provider", "build_provider", "posture"),
         ("store/keyprovider.py", "resolve_key_provider", "_load_external_provider", "posture"),
         (

@@ -53,6 +53,7 @@ import logging
 import os
 import threading
 import time
+import weakref
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -79,6 +80,7 @@ from messagefoundry.store.crypto import (
     b64_chars,
     batch_chars,
     decrypt_or_error,
+    detached,
     gave_no_verdict,
     require_bound_aad,
 )
@@ -89,6 +91,7 @@ from messagefoundry.store.keyprovider_vault import (
     TRANSIT_KEY_TYPES_DATA,
     TRANSIT_MOUNT,
     _build_client,
+    _vault_ca_kwargs,
     checked_transit_key_name,
     is_vault_bad_request,
     is_vault_forbidden,
@@ -108,6 +111,17 @@ log = logging.getLogger(__name__)
 
 #: The `[store].cipher_provider` value that selects this cipher.
 PROVIDER_NAME = "vault_transit"
+
+#: The (connect, read) timeout, in seconds, of every Transit request this cipher sends (BACKLOG
+#: #5983). It is the engine's own figure rather than hvac's 30-second default. The store calls the
+#: cipher on the event loop, and this does NOT bound how long a stalled Vault can hold the loop:
+#: at least name resolution is not timed, the connect figure applies to each address tried, the
+#: read figure to each socket read rather than the whole reply, and one cipher call can send
+#: several requests (one audit MAC check was measured sending eight, so at least eight). The read
+#: figure is hvac's own 30 seconds kept as it was; the connect figure is the engine's tighter one.
+#: A request it ends raises a requests timeout, which :func:`_transit_failure` reads as an outage
+#: that gave no verdict on the value.
+TRANSIT_REQUEST_TIMEOUT_S: tuple[float, float] = (5.0, 30.0)
 
 # Connection reuses the shared Vault wiring (a deployment runs one Vault): the address and token are read
 # through keyprovider_vault.store_vault_hop, which refuses either one unset rather
@@ -500,6 +514,54 @@ def _transit_failure(op: str, key: str, exc: Exception) -> CipherError:
     return UnauthenticatedCipherError(refused) if unauthenticated else CipherError(refused)
 
 
+def _build_failure(op: str, key: str, exc: Exception) -> CipherError:
+    """The error a data-key ``encrypt`` or ``decrypt`` gives when the calling thread's client
+    could not be built (BACKLOG #5963), its text the one :func:`_transit_failure` gives ``exc``.
+
+    For a ``decrypt`` it is always :class:`CipherUnavailableError`: Transit was never asked, so it
+    gave no verdict on the value, and a cell walk that reads :func:`gave_no_verdict` would stop as
+    could-not-run rather than mark every cell damaged. For an ``encrypt`` it stays what
+    :func:`_transit_failure` reads ``exc`` as, so a build failure that classifier does not read as
+    an outage is not raised as :class:`CipherUnavailableError`. :func:`gave_no_verdict` also reads
+    the cause, so a build failure whose cause is an ``OSError`` still reads as no verdict there. A
+    stage handoff does not read the class at all."""
+    error = _transit_failure(op, key, exc)
+    if op == "decrypt" and not isinstance(error, CipherUnavailableError):
+        error = CipherUnavailableError(str(error))
+    return error
+
+
+def _close_client(client: object, owner: int) -> None:
+    """Close an hvac client's pooled connections, best-effort, only on ``owner``, the thread that
+    holds the client (BACKLOG #5963). On any other thread it does nothing, and the client is left
+    to garbage collection. A close that raises is logged by the exception's type alone, through
+    :func:`_warn_quietly`, so a failing log handler does not raise out of here either."""
+    if threading.get_ident() != owner:
+        return
+    closer = getattr(getattr(client, "adapter", None), "close", None)
+    if not callable(closer):
+        return
+    try:
+        closer()
+    except Exception as exc:  # noqa: BLE001 -- a close is best-effort; logged, not raised
+        name = type(exc).__name__
+        _warn_quietly(lambda: ("closing a Transit client's connections raised %s", name))
+
+
+class _ThreadClient:
+    """One thread's own hvac client (BACKLOG #5963). :attr:`release` closes it only when it runs
+    on that thread. Run on any other thread, as when the cipher is collected there, it leaves the
+    client to garbage collection. weakref's exit hook does not run it."""
+
+    __slots__ = ("__weakref__", "client", "generation", "release")
+
+    def __init__(self, client: Any, generation: int) -> None:
+        self.client = client
+        self.generation = generation
+        self.release = weakref.finalize(self, _close_client, client, threading.get_ident())
+        self.release.atexit = False
+
+
 class TransitCipher(_UnmarkedPolicy):
     """Bulk at-rest cipher whose crypto runs inside Vault/OpenBao Transit — the DEK never enters heap."""
 
@@ -516,8 +578,20 @@ class TransitCipher(_UnmarkedPolicy):
         audit_key: str | None = None,
         *,
         allow_unmarked: bool = False,
+        client_factory: Callable[[], Any] | None = None,
     ) -> None:
-        self._client = client
+        # BACKLOG #5963: requests does not document its Session as thread-safe, and this cipher is
+        # called on the event loop and in worker threads. With a ``client_factory`` each thread
+        # keeps its own client, ``client`` serving the thread that builds the cipher, and this
+        # cipher never closes a thread's client from another thread. Without one, every thread
+        # shares ``client``.
+        self._client_factory = client_factory
+        self._shared_client = client
+        self._thread_clients = threading.local()
+        #: Bumped by :meth:`close_connections`; a thread holding an older one replaces its client.
+        self._generation = 0
+        if client_factory is not None:
+            self._hold(client, 0)
         self._key = key_name
         # The same unmarked-value refusal as the in-process cipher (BACKLOG #1169, ASVS 11.3.3).
         self._init_unmarked_policy(allow_unmarked)
@@ -527,6 +601,61 @@ class TransitCipher(_UnmarkedPolicy):
         # Set once Transit refused a batch, or answered one without a `reference`, and then
         # served its values alone: every later value goes alone too (BACKLOG #6706).
         self._batch_alone = False
+
+    @property
+    def _client(self) -> Any:
+        """The hvac client the calling thread uses (BACKLOG #5963). With a factory, a thread with no
+        current client of its own builds one. A build failure propagates unchanged and is not
+        cached: the thread's next call builds again. The data-key paths, ``encrypt`` and
+        ``decrypt`` single and batch, read it through :meth:`_thread_client` before their request's
+        handler, which turns a build failure into :func:`_build_failure`'s error. The audit-key
+        paths read it where they send their request, so a build failure there meets the handling
+        a failed request does."""
+        if self._client_factory is None:
+            return self._shared_client
+        held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
+        if held is not None:
+            if held.generation == self._generation:
+                return held.client
+            # Stale: close it before the build, so a build that raises cannot leave it open.
+            self._drop_held(held)
+        generation = self._generation
+        return self._hold(self._client_factory(), generation)
+
+    def _thread_client(self, op: str) -> Any:
+        """:attr:`_client` for a data-key ``op``, a build failure raised as
+        :func:`_build_failure`'s error with the failure as its cause (BACKLOG #5963)."""
+        try:
+            return self._client
+        except Exception as exc:
+            raise _build_failure(op, self._key, exc) from exc
+
+    def _hold(self, client: Any, generation: int) -> Any:
+        """Keep ``client`` as the calling thread's own; this cipher closes it only on this thread."""
+        self._thread_clients.held = _ThreadClient(client, generation)
+        return client
+
+    def _drop_held(self, held: _ThreadClient) -> None:
+        """Detach the calling thread's ``held`` client, then close it here, under the owner the
+        finalizer recorded. The close is called directly rather than through the finalizer,
+        which does nothing once weakref's exit hook has run."""
+        del self._thread_clients.held
+        if (parts := held.release.detach()) is not None:
+            _close_client(*parts[2])
+
+    def close_connections(self) -> None:
+        """Close the calling thread's client and mark every other thread's stale (BACKLOG #5963).
+
+        This cipher never closes a thread's client from another thread. Each other thread releases
+        its own at least on its next Transit request, which builds a fresh client, or when it ends
+        before interpreter shutdown. The cipher stays usable, since stores can share it. Without a
+        factory, the one shared client is left open."""
+        if self._client_factory is None:
+            return
+        self._generation += 1
+        held: _ThreadClient | None = getattr(self._thread_clients, "held", None)
+        if held is not None:
+            self._drop_held(held)
 
     @property
     def transit_key_name(self) -> str:
@@ -543,11 +672,12 @@ class TransitCipher(_UnmarkedPolicy):
     def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
         pt_b64 = base64.b64encode(plaintext.encode("utf-8")).decode("ascii")
         assoc = self._associated_data(aad)
+        client = self._thread_client("encrypt")
         try:
             kwargs: dict[str, Any] = {"name": self._key, "plaintext": pt_b64}
             if assoc is not None:
                 kwargs["associated_data"] = assoc
-            response: Any = self._client.secrets.transit.encrypt_data(**kwargs)
+            response: Any = client.secrets.transit.encrypt_data(**kwargs)
             ciphertext = response["data"]["ciphertext"]  # "vault:v1:…" — no plaintext, no key
         except Exception as exc:
             # Type-only message: the plaintext going in is PHI; never surface it or the key material.
@@ -577,11 +707,12 @@ class TransitCipher(_UnmarkedPolicy):
             )
         ciphertext = stored[len(_V3_PREFIX) :]  # the full "vault:v1:…" blob (may contain ':')
         assoc = self._associated_data(aad)
+        client = self._thread_client("decrypt")
         try:
             kwargs: dict[str, Any] = {"name": self._key, "ciphertext": ciphertext}
             if assoc is not None:
                 kwargs["associated_data"] = assoc
-            response: Any = self._client.secrets.transit.decrypt_data(**kwargs)
+            response: Any = client.secrets.transit.decrypt_data(**kwargs)
             plaintext_b64 = response["data"]["plaintext"]
         except Exception as exc:
             # Covers a failed AEAD tag (wrong cell AAD / corrupt blob) AND transport failure — both fail
@@ -682,11 +813,20 @@ class TransitCipher(_UnmarkedPolicy):
         """One batch request of :meth:`decrypt_many`, every value ``mfenc:v3``: the results in
         its order."""
         sent = [(stored[len(_V3_PREFIX) :], aad) for stored, aad in batch]
+        try:
+            # Outside the batch handler: a thread whose client could not be built never asked
+            # Transit, so it must not read as Transit refusing the batch, which turns batching off.
+            client = self._thread_client("decrypt")
+        except CipherError as failure:
+            # Detached as every returned error is: the cause's traceback reaches decrypt_many's
+            # frame, which holds the plaintext of the values already opened (BACKLOG #6706). The
+            # copies share that one cause.
+            return _unasked(detached(failure), len(batch))
         response: Any = None
         failed = unavailable = bad_request = False
         failure_type = ""
         try:
-            response = self._client.secrets.transit.decrypt_data(
+            response = client.secrets.transit.decrypt_data(
                 name=self._key, batch_input=self._batch_input("ciphertext", sent)
             )
         except Exception as exc:
@@ -765,11 +905,13 @@ class TransitCipher(_UnmarkedPolicy):
             (base64.b64encode(plaintext.encode("utf-8")).decode("ascii"), aad)
             for plaintext, aad in batch
         ]
+        # Raised as encrypt raises it, outside the batch handler (see _decrypt_batch).
+        client = self._thread_client("encrypt")
         response: Any = None
         failed = unavailable = bad_request = False
         failure_type = ""
         try:
-            response = self._client.secrets.transit.encrypt_data(
+            response = client.secrets.transit.encrypt_data(
                 name=self._key, batch_input=self._batch_input("plaintext", sent)
             )
         except Exception as exc:
@@ -1280,22 +1422,36 @@ def build_transit_cipher(
     key name, a missing extra, or an unreachable/unknown Transit key raises :class:`KeyProviderError` so
     ``open_store`` refuses to start rather than degrading to plaintext."""
     key_name, audit_key = _key_names()
-    # Read once, so this cipher's client keeps the token it was built with for the life of the
-    # process. A token replaced afterwards, in the environment or the secrets directory, is not
-    # seen until the store is opened again.
+    # Read once, and every client this cipher builds takes this token: the startup client below,
+    # each thread's own on its first call there, and each rebuild after close_connections (BACKLOG
+    # #5963). A token replaced afterwards, in the environment or the secrets directory, is not seen
+    # by any of them until the store is opened again.
     addr, token = store_vault_hop()
+    # The CA anchor is read once too, like the address and token, and handed to every thread's own
+    # client (BACKLOG #5963). Not everything is: each build still reads the settings object, and
+    # hvac and requests read their own environment (at least proxies) as each client is made.
+    ca_kwargs = _vault_ca_kwargs(addr)
+
+    def build_client() -> Any:
+        # One construction for the first client and for each thread's own (BACKLOG #5963), so every
+        # client asserts the same TLS suites, mounts the same strict reader and carries the
+        # engine's request timeout (BACKLOG #5983).
+        return _build_client(
+            addr,
+            token,
+            revocation_attested=settings.vault_revocation_attested,
+            posture=posture,
+            revocation_reason=settings.vault_revocation_attested_reason,
+            timeout=TRANSIT_REQUEST_TIMEOUT_S,
+            ca_kwargs=ca_kwargs,
+        )
+
     # OUTSIDE the try on purpose. `_build_client` asserts this hop's TLS suites (ADR 0180) and raises
     # ValueError; the `except Exception` below would relabel that "could not reach a Vault Transit
     # key", turning a configuration refusal into what reads as a connectivity failure. Fail-closed is
     # unchanged either way: both paths propagate and the cipher provider refuses to come up.
     # lazy hvac import; fails closed naming the [vault] extra
-    client = _build_client(
-        addr,
-        token,
-        revocation_attested=settings.vault_revocation_attested,
-        posture=posture,
-        revocation_reason=settings.vault_revocation_attested_reason,
-    )
+    client = build_client()
     try:
         # Startup connectivity + key-existence + key-TYPE check: read the key metadata (no crypto, no
         # secrets). This turns a mis-provisioned Vault into a refuse-to-start rather than a first-write
@@ -1342,7 +1498,11 @@ def build_transit_cipher(
             f"(data={key_name!r}, audit={audit_key!r}, extra {_EXTRA!r}): {vault_failure_text(exc)}."
         ) from exc
     return TransitCipher(
-        client, key_name, audit_key=audit_key, allow_unmarked=settings.allow_unmarked_ciphertext
+        client,
+        key_name,
+        audit_key=audit_key,
+        allow_unmarked=settings.allow_unmarked_ciphertext,
+        client_factory=build_client,
     )
 
 
