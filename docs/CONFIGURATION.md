@@ -763,8 +763,8 @@ crash-re-run — the same accepted caveat as a code-set hot-reload).
   is the lookup key; `value_column` (if set) is the value, else the value is a dict of the other columns.
   The statement must pass the `db_lookup` read-only statement test, so a stored procedure is refused,
   `max_rows` (default `100000`, `0` = off) refuses a larger result, `statement_timeout` (whole
-  seconds, default `30`, `0` = no limit) bounds the statement, and a result that does not fit its
-  columns, at least a missing or doubled column, a NULL key or a duplicate key, fails the sync rather than replacing the last-good snapshot; see
+  seconds, default `30`, `0` = no limit) bounds each call, the execute and each fetch, and a result
+  that does not fit its columns, at least a missing or doubled column, a NULL key or a duplicate key, fails the sync rather than replacing the last-good snapshot; see
   [`CONNECTIONS.md`](CONNECTIONS.md) §*A `DatabaseRef` statement passes the same gate, and a row ceiling*.
 - **Sync.** The engine's `ReferenceSyncRunner` materializes each set once at startup (before listeners
   serve, so `reference(...)` resolves on the first message) and every `refresh_seconds`. A source

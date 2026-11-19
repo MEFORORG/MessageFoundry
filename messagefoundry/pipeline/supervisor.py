@@ -19,8 +19,8 @@ trip the crash-loop breaker for THAT shard: it is not relaunched again, the ERRO
 its exit history, and it stays listed in :attr:`Supervisor.crash_looped`. The other shards keep
 running, so one shard's start-up failure is not a fleet outage (a crash in one supervised task stays
 isolated). Of the crash-loop outcomes, only every engine shard having tripped makes ``supervise`` return
-non-zero (1); a shutdown drain that may have left a child running returns 3 (:func:`supervise`
-lists every code). The supervisor has
+non-zero (1); ``supervise`` returns 3 when it returns with :attr:`Supervisor.drain_failure` set
+(:func:`supervise` lists every code). The supervisor has
 no store and so no alert store; the ERROR log is its alert, and its CRL reload's only sink logs
 (:func:`_supervisor_crl_alert_sink`). A child that ran for ``stable_uptime``
 resets both. Without this a start-up failure neither config load reproduces (a
