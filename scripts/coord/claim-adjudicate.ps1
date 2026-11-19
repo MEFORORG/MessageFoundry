@@ -178,6 +178,19 @@ foreach ($bf in $backlogFiles) {
     if ($text) { $corpus[$bf] = $text }
 }
 
+# A FILE NAMED BACKLOG IS NOT A LEDGER (BACKLOG #5480). The ledger left this repository on
+# 2026-09-13 and docs/BACKLOG.md is now a stub that holds no item, while other docs carry the word
+# in their names. Counting files therefore passed on a namespace that holds nothing, and every
+# numeric key then read NO-ITEM -- the same never-looked report the check above refuses. So the
+# test is the one Get-ItemBlock depends on: at least one item heading, in its own pattern.
+$itemHeading = '(?m)^##\s+\d+\.\s'
+if (-not @($corpus.Values | Where-Object { $_ -match $itemHeading }).Count) {
+    throw ("no backlog item heading found in the $($backlogFiles.Count) backlog-named file(s) on ${mainRef}, " +
+        "so there is no ledger here to adjudicate any key against. The ledger lives in the " +
+        "maintainer-internal repository (the vault) since 2026-09-13, and docs/BACKLOG.md here is a " +
+        "stub. Refusing rather than report every key NO-ITEM.")
+}
+
 # The status vocabulary is backlog_status_check.py's, not this file's. Held as codepoints so the
 # source stays readable on a console that cannot render them.
 $CLOSED_GLYPH = [ordered]@{}

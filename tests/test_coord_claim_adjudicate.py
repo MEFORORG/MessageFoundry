@@ -418,6 +418,38 @@ def test_a_backlog_that_could_not_be_read_refuses_rather_than_reporting_nothing(
     assert "no backlog file found" in (proc.stderr + proc.stdout)
 
 
+def test_a_backlog_named_file_with_no_item_refuses_rather_than_reporting_no_item(
+    repo: Path, tmp_path: Path
+) -> None:
+    """BACKLOG #5480. The ledger left this repository and docs/BACKLOG.md became a stub with no item
+    heading, while other docs carry BACKLOG in their names. A file-name match then passed the check
+    above and every numeric key read NO-ITEM over a namespace that holds nothing.
+
+    THE CONTROL is the same claim against a ledger holding one item: it is adjudicated, so the
+    refusal is caused by the missing item heading and not by the fixture.
+    """
+    write_claim(repo, "26", tmp_path / "gone", "seat")
+    stub = (
+        "Planning and the backlog for this project are maintained privately.\n\n"
+        "## How to contribute\n\nOpen a pull request.\n\n"
+        "## Why `BACKLOG #N` does not resolve here\n\nThose numbers index the private ledger.\n"
+    )
+    proposals = repo / "docs" / "backlog-proposals" / "packet.md"
+    proposals.parent.mkdir(parents=True)
+    proposals.write_text("# Proposal\n\n## Item 26 would be this\n", encoding="utf-8")
+    backlog(repo, stub)
+
+    proc = adjudicate(repo)
+    combined = proc.stderr + proc.stdout
+    assert proc.returncode != 0, f"a ledger with no item still produced a report:\n{combined}"
+    assert "no backlog item heading found" in combined, combined
+    assert "vault" in combined, combined
+    assert "NO-ITEM" not in proc.stdout, combined
+
+    backlog(repo, f"## 26. A real item\n\n> {SHIPPED} SHIPPED\n")
+    assert set(verdicts(repo)) == {"26"}
+
+
 def test_the_script_carries_no_control_characters() -> None:
     """An escape that collapses into a control byte is invisible in every normal view -- see the
     2026-08-16 `\\b`-as-backspace incident recorded in test_coord_claim_reconcile.py. This file
