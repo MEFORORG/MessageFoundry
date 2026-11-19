@@ -862,7 +862,7 @@ def _reap_process_tree(proc: subprocess.Popen[bytes], job: int | None, inbound: 
         # ``SIG_IGN``. A running or zombie child's pid cannot have been given to another process,
         # so only this state needs the reuse-safe signal, as far as the state check can tell; its
         # pid-reuse limit is in :func:`_posix_child_state`. A zombie reaped between the state
-        # check and the signal is missed too: its group is not signalled, and nothing is logged.
+        # check and the signal reaches the same signal through ``kill_process_group`` below.
         if proctree.kill_reaped_leader_group(proc.pid) is None:
             log.warning(
                 "inbound %r: sandbox worker pid %d was already reaped and its process group could "

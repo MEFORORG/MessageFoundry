@@ -275,7 +275,10 @@ def kill_process_group(pid: int, *, started_as_leader: bool = False) -> bool:
     its group cannot be read, or when the signal fails. The caller then kills the one process.
 
     The leadership check reads ``pid``'s group, so it needs ``pid`` to still be a live process.
-    ``started_as_leader=True`` is for a caller that started ``pid`` with
+    When no live process has ``pid``, as for a leader reaped since the caller last looked or a
+    zombie whose group the kernel will not read by its pid, the group it led is signalled through
+    :func:`kill_reaped_leader_group` instead, so its members do not outlive it behind a
+    single-process kill that reaches nothing (vault BACKLOG #5314). ``started_as_leader=True`` is for a caller that started ``pid`` with
     :data:`ADOPT_NEW_SESSION` itself and so knows the group is ``pid``'s. It skips the check, so it
     still reaches the group's other members after the leader has exited and been reaped. Either way
     this never signals the caller's own group (the engine's, or pytest's)."""
@@ -288,6 +291,8 @@ def kill_process_group(pid: int, *, started_as_leader: bool = False) -> bool:
     else:
         try:
             pgid = os.getpgid(pid)
+        except ProcessLookupError:
+            return kill_reaped_leader_group(pid) is True
         except OSError:
             return False
         if pgid != pid:

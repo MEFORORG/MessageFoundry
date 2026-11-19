@@ -2685,6 +2685,101 @@ def test_a_worker_reaped_elsewhere_has_its_group_signalled_only_while_its_pid_is
         session.close()
 
 
+# --- vault BACKLOG #5314: a failed group read does not drop to a single-process kill -----------
+
+
+_PID: int = 4242
+
+
+@pytest.mark.parametrize(
+    ("lookup", "reaped", "sent", "calls"),
+    [
+        # A live leader of its own group: the ordinary signal, and nothing else.
+        (_PID, None, True, [("getpgid", _PID), ("killpg", _PID)]),
+        # No live process has the pid: the group it led gets the reuse-safe signal...
+        (ProcessLookupError(), True, True, [("getpgid", _PID), ("reaped", _PID)]),
+        # ...which finds the group empty, or cannot signal it safely; nothing was sent either way.
+        (ProcessLookupError(), False, False, [("getpgid", _PID), ("reaped", _PID)]),
+        (ProcessLookupError(), None, False, [("getpgid", _PID), ("reaped", _PID)]),
+        # Any other lookup failure is still a refusal with nothing sent.
+        (PermissionError(), None, False, [("getpgid", _PID)]),
+    ],
+)
+def test_a_group_whose_leader_is_gone_is_still_signalled(
+    monkeypatch: pytest.MonkeyPatch,
+    lookup: int | OSError,
+    reaped: bool | None,
+    sent: bool,
+    calls: list[tuple[str, int]],
+) -> None:
+    """:func:`proctree.kill_process_group`'s decision table, with the process calls replaced so it
+    runs on every host. A pid that names no live process (a leader reaped since the caller looked,
+    or a zombie whose group the kernel will not read) no longer reads as a refusal, after which the
+    sandbox's single-process kill would reach nothing and the group would outlive its leader.
+
+    FALSIFICATION: return ``False`` on every ``getpgid`` failure again, and the
+    ``ProcessLookupError`` arms red."""
+    seen: list[tuple[str, int]] = []
+
+    def _getpgid(pid: int) -> int:
+        seen.append(("getpgid", pid))
+        if isinstance(lookup, OSError):
+            raise lookup
+        return lookup
+
+    def _reaped(pid: int) -> bool | None:
+        seen.append(("reaped", pid))
+        return reaped
+
+    # ``os`` and ``signal`` are the modules proctree calls; the POSIX-only names are added here.
+    monkeypatch.setattr(proctree, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(os, "getpgid", _getpgid, raising=False)
+    monkeypatch.setattr(os, "getpgrp", lambda: 1, raising=False)
+    monkeypatch.setattr(
+        os, "killpg", lambda pgid, sig: seen.append(("killpg", pgid)), raising=False
+    )
+    monkeypatch.setattr(signal, "SIGKILL", 9, raising=False)
+    monkeypatch.setattr(proctree, "kill_reaped_leader_group", _reaped)
+    assert proctree.kill_process_group(_PID) is sent
+    assert seen == calls
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the POSIX process-group reap")
+def test_a_worker_reaped_after_the_state_check_still_has_its_group_killed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A group leader that starts a grandchild, then exits and is reaped by something other than
+    ``Popen`` AFTER the reap read it as a zombie, still has its group killed: the grandchild dies.
+
+    The state check is replaced to return what it read before the reap, so the window is
+    deterministic. POSIX-only, so NOT RUN on the Windows host this was written on; the Linux CI
+    leg runs it. FALSIFICATION: as in the test above, and the grandchild survives, since the
+    single-process kill that follows sends nothing to a reaped child."""
+    pidfile = tmp_path / "grandchild.pid"
+    script = (
+        "import subprocess, sys\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"with open({str(pidfile)!r}, 'w') as f:\n"
+        "    f.write(str(p.pid))\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", script], start_new_session=True)
+    grandchild_pid: int | None = None
+    try:
+        os.waitpid(proc.pid, 0)  # the leader exited and was reaped; Popen does not know
+        grandchild_pid = int(pidfile.read_text())
+        assert proc.returncode is None
+        assert _pid_running(grandchild_pid) is not False  # the control: it outlived the leader
+        monkeypatch.setattr(sandbox_mod, "_posix_child_state", lambda p: "zombie")
+        sandbox_mod._reap_process_tree(proc, None, "IB_T")
+        assert _wait_until_not_running(grandchild_pid, timeout=5.0) is not True, (
+            "the grandchild of a worker reaped after the state check survived the reap"
+        )
+    finally:
+        if grandchild_pid is not None:
+            _best_effort_kill_pid(grandchild_pid)
+        proc.poll()  # already reaped: this only records it, so Popen does not warn on collection
+
+
 def test_a_fresh_worker_exited_before_its_eof_is_queued_is_respawned(
     graph: tuple[Registry, str], monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
