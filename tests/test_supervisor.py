@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import logging
 import subprocess
 import sys
@@ -20,7 +21,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry import redaction
+from messagefoundry import proctree, redaction
 from messagefoundry.childenv import python_child_argv
 from messagefoundry.config.settings import StoreBackend
 from messagefoundry.pipeline import supervisor as supervisor_mod
@@ -397,18 +398,28 @@ async def test_default_spawn_gives_windows_children_their_own_process_group(
     """
     captured: dict[str, Any] = {}
 
+    class _Started:
+        pid = 4242
+
     async def fake_exec(*argv: str, **kwargs: Any) -> object:
         captured["argv"] = argv
         captured["kwargs"] = kwargs
-        return object()
+        return _Started()
+
+    def fake_resume(pid: int, *, who: str) -> None:
+        captured["resumed"] = pid
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(proctree, "resume_into_job", fake_resume)
     await _default_spawn(_spec("a"))
 
     assert captured["argv"] == ("python", "a")
     flags = captured["kwargs"].get("creationflags")
     if sys.platform == "win32":
-        assert flags == subprocess.CREATE_NEW_PROCESS_GROUP
+        # Suspended too, so the child is in its kill-on-close job before it runs (BACKLOG #5978).
+        assert flags == subprocess.CREATE_NEW_PROCESS_GROUP | proctree.ADOPT_CREATIONFLAGS
+        assert proctree.ADOPT_CREATIONFLAGS
+        assert captured["resumed"] == 4242
     else:
         assert flags is None  # POSIX terminate() is already SIGTERM — no flag needed
 
@@ -495,6 +506,124 @@ async def test_terminate_escalates_to_kill_after_grace() -> None:
     with pytest.raises(asyncio.CancelledError):
         await run
     assert proc.terminated and proc.killed  # escalated to kill after the grace elapsed
+
+
+# --- BACKLOG #5978: the drain waits once, and a Windows shard ends with its supervisor -----------
+
+
+@pytest.mark.asyncio
+async def test_hung_children_wait_out_one_grace_together_not_one_each() -> None:
+    """Every hung child's grace wait starts before any child is forced.
+
+    Waiting for each in turn made a drain take one grace period per hung child, so a service
+    manager's stop timeout could run out with shards still up. Read by event order, not by time."""
+    events: list[str] = []
+    asked: set[int] = set()
+
+    class _Hung(_FakeProcess):
+        def __init__(self, name: str) -> None:
+            super().__init__()
+            self.name = name
+
+        def terminate(self) -> None:  # the cooperative request, ignored
+            asked.add(self.pid)
+            self.terminated = True
+
+        async def wait(self) -> int:
+            if self.pid in asked and self.returncode is None:
+                events.append(f"wait {self.name}")
+            return await super().wait()
+
+        def kill(self) -> None:
+            events.append(f"force {self.name}")
+            super().kill()
+
+    procs = {"a": _Hung("a"), "b": _Hung("b")}
+
+    async def spawn(spec: ShardSpec) -> _Hung:
+        return procs[spec.shard]
+
+    sup = Supervisor(
+        [_spec("a", 8765), _spec("b", 8766)], spawn=_spawner(spawn), terminate_grace=0.05
+    )
+    run = asyncio.create_task(sup.run())
+    for _ in range(50):
+        if len(sup._children) == 2:
+            break
+        await asyncio.sleep(0)
+    assert len(sup._children) == 2
+
+    sup.stop()
+    await asyncio.wait_for(run, timeout=5.0)
+    first_force = min(i for i, e in enumerate(events) if e.startswith("force"))
+    waits_before = {e for e in events[:first_force] if e.startswith("wait")}
+    assert waits_before == {"wait a", "wait b"}, events
+    assert all(p.killed for p in procs.values())
+
+
+#: The shard child for the Windows job test: it starts a grandchild, writes both pids to the marker,
+#: then sleeps. Both sleeps are bounded, so a failed run leaks nothing for long.
+_SHARD_WITH_GRANDCHILD = (
+    "import os, subprocess, sys, time, pathlib\n"
+    "g = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(90)'])\n"
+    "pathlib.Path(sys.argv[1]).write_text(f'{os.getpid()} {g.pid}')\n"
+    "time.sleep(90)\n"
+)
+
+#: A stand-in supervisor: it launches one shard through the REAL ``_default_spawn``, then idles
+#: until the test hard-kills it.
+_SUPERVISOR_STAND_IN = (
+    "import asyncio, sys\n"
+    "from messagefoundry.pipeline.supervisor import ShardSpec, _default_spawn\n"
+    "async def main():\n"
+    "    argv = (sys.executable, '-c', sys.argv[1], sys.argv[2])\n"
+    "    await _default_spawn(ShardSpec(shard='s', db_path='unused', port=0, argv=argv))\n"
+    "    await asyncio.sleep(120)\n"
+    "asyncio.run(main())\n"
+)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the kill-on-close job is a Windows job object")
+def test_a_hard_killed_windows_supervisor_takes_its_shards_with_it(tmp_path: Path) -> None:
+    """Hard-kill a supervisor process, as a service stop that timed out would, and its shard and
+    the shard's own child must end too. Without the job both outlive it (BACKLOG #5978).
+
+    Every process here is this test's own, and each is killed by its pid, never by image name."""
+    import time
+
+    import psutil
+
+    marker = tmp_path / "pids.txt"
+    stand_in = subprocess.Popen(
+        [sys.executable, "-c", _SUPERVISOR_STAND_IN, _SHARD_WITH_GRANDCHILD, str(marker)]
+    )
+    pids: list[int] = []
+    try:
+        deadline = time.monotonic() + 60.0
+        while not marker.exists() or not marker.read_text().strip():
+            assert stand_in.poll() is None, (
+                "the stand-in supervisor exited before its shard started"
+            )
+            assert time.monotonic() < deadline, "the shard never wrote its pids"
+            time.sleep(0.05)
+        pids = [int(x) for x in marker.read_text().split()]
+        assert all(psutil.pid_exists(pid) for pid in pids)
+
+        stand_in.kill()  # TerminateProcess: no cleanup code in the supervisor runs
+        stand_in.wait(timeout=10)
+
+        deadline = time.monotonic() + 10.0
+        while any(psutil.pid_exists(pid) for pid in pids) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        survivors = [pid for pid in pids if psutil.pid_exists(pid)]
+        assert not survivors, f"processes outlived their supervisor: {survivors}"
+    finally:
+        if stand_in.poll() is None:
+            stand_in.kill()
+            stand_in.wait(timeout=10)
+        for pid in pids:
+            with contextlib.suppress(psutil.Error):
+                psutil.Process(pid).kill()
 
 
 # --- vault BACKLOG #2773: restart backoff and the crash-loop breaker -------------------------------

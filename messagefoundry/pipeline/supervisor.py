@@ -50,11 +50,13 @@ import signal
 import subprocess
 import sys
 import time
+import weakref
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from messagefoundry import proctree
 from messagefoundry.childenv import engine_environment, python_child_argv
 from messagefoundry.config.settings import StoreBackend
 from messagefoundry.config.wiring import Registry, load_config
@@ -262,6 +264,16 @@ async def preflight_shard_config(config: str) -> str | None:
 SpawnFn = Callable[["ShardSpec"], Awaitable["asyncio.subprocess.Process"]]
 
 
+#: The kill-on-close job each Windows shard child runs in, keyed by its process (BACKLOG #5978).
+#: Holding the handle here is what ties the shard's lifetime to the supervisor's: when the
+#: supervisor exits by any route, a hard kill or a service-stop timeout included, Windows closes the
+#: handle and ends the shard and every process it started. Weak keys, so a process nobody holds
+#: drops its entry; the handle then stays open, which still ends the shard with the supervisor.
+_SHARD_JOBS: weakref.WeakKeyDictionary[asyncio.subprocess.Process, int] = (
+    weakref.WeakKeyDictionary()
+)
+
+
 async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
     """Launch one shard subprocess from its argv (inherits stdout/stderr → NSSM/console).
 
@@ -275,15 +287,51 @@ async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
     The new group also stops the console's own Ctrl-C from reaching the child, which is why
     :meth:`Supervisor._request_stop` has to deliver the break explicitly on every shutdown path.
 
+    On Windows the child also starts suspended and is put in a kill-on-close job before it runs
+    (:func:`messagefoundry.proctree.resume_into_job`), so it and everything it starts end when the
+    supervisor does, however the supervisor ends (BACKLOG #5978). Without the job a supervisor that
+    was hard-killed, or that a service stop timed out on, would leave its shards running, holding
+    their ports and the store. A job that cannot be set up is logged and the shard still runs,
+    without that guarantee. A child that cannot be resumed is killed and the launch raises
+    :class:`OSError`, which the restart path counts as a fast exit.
+
     The child is a whole engine, so it gets the whole environment, secrets included, and gets it
     by name (:func:`messagefoundry.childenv.engine_environment`, vault BACKLOG #2587).
     """
     env = engine_environment()
-    if sys.platform == "win32":
-        return await asyncio.create_subprocess_exec(
-            *spec.argv, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, env=env
-        )
-    return await asyncio.create_subprocess_exec(*spec.argv, env=env)
+    if sys.platform != "win32":
+        return await asyncio.create_subprocess_exec(*spec.argv, env=env)
+    process = await asyncio.create_subprocess_exec(
+        *spec.argv,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | proctree.ADOPT_CREATIONFLAGS,
+        env=env,
+    )
+    try:
+        job = proctree.resume_into_job(process.pid, who=f"shard {spec.shard!r}")
+    except OSError:
+        # Suspended, it would never run; ending it here keeps a failed launch from leaving it behind.
+        try:  # noqa: SIM105
+            process.kill()
+        except ProcessLookupError:
+            pass
+        await process.wait()
+        raise
+    if job is not None:
+        _SHARD_JOBS[process] = job
+    return process
+
+
+def _end_shard_job(process: asyncio.subprocess.Process) -> bool:
+    """End the kill-on-close job of a shard ``process``, killing whatever is still in it, and close
+    the handle. Returns whether there was a job (only a Windows :func:`_default_spawn` makes one).
+
+    Called once the shard has exited, or to force it. Its leftovers are killed rather than released:
+    the shard is about to be relaunched on the same port and store, or the fleet is stopping."""
+    job = _SHARD_JOBS.pop(process, None)
+    if job is None:
+        return False
+    proctree.terminate_job(job)
+    return True
 
 
 @dataclass
@@ -401,6 +449,7 @@ class Supervisor:
                 exit_rc = await self._unless_stopped(process.wait())
                 if exit_rc is None:
                     return  # shutdown — leave the child for _terminate_all to drain
+                _end_shard_job(process)  # what the exited shard left running would hold its port
                 rc = exit_rc
                 if not self.restart:
                     logger.info("shard %r exited rc=%s (restart disabled)", spec.shard, rc)
@@ -499,24 +548,35 @@ class Supervisor:
             pass  # already gone
 
     async def _terminate_all(self) -> None:
-        """Ask every live child to stop, then force what is still running after ``terminate_grace``."""
+        """Ask every live child to stop, then force what is still running after ``terminate_grace``.
+
+        The children wait out the grace together, so a drain takes one grace period however many
+        hang, rather than one per hung child (BACKLOG #5978). A service manager that stops waiting
+        before then would leave the rest running for its own force."""
         live = [c for c in self._children.values() if c.process.returncode is None]
         for child in live:
             self._request_stop(child)
-        for child in live:
-            try:
-                await asyncio.wait_for(child.process.wait(), timeout=self.terminate_grace)
-            except TimeoutError:
-                logger.warning(
-                    "shard %r did not exit in %.0fs — killing",
-                    child.spec.shard,
-                    self.terminate_grace,
-                )
+        await asyncio.gather(*(self._drain(child) for child in live))
+        for child in self._children.values():
+            _end_shard_job(child.process)
+
+    async def _drain(self, child: _Child) -> None:
+        """Wait ``terminate_grace`` for one asked child, then force it: its whole job on Windows,
+        the one process otherwise."""
+        try:
+            await asyncio.wait_for(child.process.wait(), timeout=self.terminate_grace)
+        except TimeoutError:
+            logger.warning(
+                "shard %r did not exit in %.0fs — killing",
+                child.spec.shard,
+                self.terminate_grace,
+            )
+            if not _end_shard_job(child.process):
                 try:  # noqa: SIM105
                     child.process.kill()
                 except ProcessLookupError:
                     pass
-                await child.process.wait()
+            await child.process.wait()
 
 
 async def supervise(
