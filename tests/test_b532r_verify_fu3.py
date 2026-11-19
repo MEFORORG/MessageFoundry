@@ -120,7 +120,7 @@ def test_harness_scrub_failure_logs_the_type_names_only(
     logger = logging.getLogger(probes.__name__)
     collect = _Collect()
     monkeypatch.setattr(logger, "disabled", False)
-    monkeypatch.setattr(logger, "level", logging.NOTSET)
+    monkeypatch.setattr(logger, "level", logging.DEBUG)
     logger.addHandler(collect)
     previous = logging.root.manager.disable
     logging.disable(logging.NOTSET)
@@ -140,21 +140,32 @@ def test_harness_scrub_failure_logs_the_type_names_only(
         assert fragment not in logged
 
 
-def test_a_raising_log_filter_does_not_escape_the_harness_scrub(
+def test_a_raising_log_filter_propagates_from_the_harness_scrub(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """A raising filter is not silently swallowed (CLAUDE.md section 6). ``ran`` is the positive
+    control: the ValueError is the filter's, not one raised before the log call."""
+
     def broken(*_args: object, **_kwargs: object) -> str:
         raise RuntimeError("Zqxscrubtext")
 
-    def refuse(_record: logging.LogRecord) -> bool:
+    ran: list[str] = []
+
+    def refuse(record: logging.LogRecord) -> bool:
+        ran.append(record.getMessage())
         raise ValueError("the filter refuses")
 
     monkeypatch.setattr(verify_leaf, "safe_exc_text", broken)
     logger = logging.getLogger(probes.__name__)
     monkeypatch.setattr(logger, "disabled", False)
+    monkeypatch.setattr(logger, "level", logging.DEBUG)
+    previous = logging.root.manager.disable
+    logging.disable(logging.NOTSET)
     logger.addFilter(refuse)
     try:
-        row = probes.scrubbed_exc(OSError("Zqxdetail"))
+        with pytest.raises(ValueError, match="the filter refuses"):
+            probes.scrubbed_exc(OSError("Zqxdetail"))
     finally:
         logger.removeFilter(refuse)
-    assert "withheld" in row and "Zqxdetail" not in row
+        logging.disable(previous)
+    assert len(ran) == 1 and "RuntimeError" in ran[0] and "Zqxdetail" not in ran[0]
