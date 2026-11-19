@@ -888,7 +888,10 @@ SITES: dict[str, Site] = {
         "#5221).",
     ),
     "messagefoundry/pipeline/supervisor.py::_shard_db_path": Site(
-        1, OPERATOR, "A shard tag from the operator's config on the operator's --db path."
+        1,
+        OPERATOR,
+        "An engine shard tag from the operator's config on the base store path, --db or the merged "
+        "[store].path (BACKLOG #5817).",
     ),
     "messagefoundry_toolkit/scaffold.py::<module>": Site(1, INTERNAL, "Package resource literal."),
     "messagefoundry_toolkit/scaffold.py::scaffold": Site(

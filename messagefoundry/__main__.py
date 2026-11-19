@@ -366,15 +366,16 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     supervise.add_argument(
         "--db",
-        default="messagefoundry.db",
-        help="base store path; each shard gets <stem>_<shard>.db (a single default shard keeps the "
-        "bare path)",
+        default=None,
+        help="base store path (overrides [store].path, whose default is messagefoundry.db); each "
+        "engine shard gets <stem>_<shard>.db (a single default engine shard keeps the bare path)",
     )
     supervise.add_argument(
         "--base-port",
         type=int,
-        default=8765,
-        help="API port for the first shard; subsequent shards get base+1, base+2, ... (sorted order)",
+        default=None,
+        help="API port for the first engine shard (overrides [api].port, whose default is 8765); "
+        "subsequent engine shards get base+1, base+2, ... (sorted order)",
     )
     supervise.add_argument(
         "--env",
@@ -1979,8 +1980,9 @@ def _supervisor_forward_spool_dir(settings: ServiceSettings, db_base: str) -> st
     """The supervisor process's own spool directory, beside its engine shards' (BACKLOG #2356).
 
     Its own for the reason :func:`_forward_spool_dir` gives: the spool locks its directory. The
-    default root is beside ``--db``, because each engine shard's ``[store].path`` is derived from
-    that flag, so the supervisor's directory lands next to theirs. ``db_base`` is anchored only by
+    default root is beside ``db_base``, because each engine shard's ``[store].path`` is derived
+    from it (the supervisor's merged ``[store].path``, from ``--db`` or the settings), so the
+    supervisor's directory lands next to theirs. ``db_base`` is anchored only by
     ``--project-root`` here, so a base_dir set in the file or the environment is applied too, as
     each engine shard's ``serve`` applies it to its own ``[store].path``. No engine shard's
     directory can take the name: those are ``engine`` or start ``shard-``."""
@@ -5529,18 +5531,16 @@ def _supervise(args: argparse.Namespace) -> int:
     # forwarder (BACKLOG #2356).
     configure_logging("INFO")
 
-    # ADR 0050 AC-9: anchor the discovery --config and the --db base under the project root HERE, before
-    # discover_shard_specs runs load_config() — so `supervise --project-root R --config <relative>` from a
-    # non-root CWD discovers shards under R, and each shard's <stem>_<shard>.db composes under R in the
-    # supervisor (not only via each child re-anchoring a relative --db). --service-config is forwarded raw
-    # and each child serve resolves it under the forwarded --project-root (same precedence as serve).
+    # ADR 0050 AC-9: anchor the discovery --config here, and the db base once the settings load
+    # below has merged it, both before discover_shard_specs runs load_config() — so `supervise
+    # --project-root R --config <relative>` from a non-root CWD discovers engine shards under R, and
+    # each engine shard's <stem>_<shard>.db composes under R in the supervisor (not only via each
+    # child re-anchoring a relative --db). --service-config is forwarded raw and each child serve
+    # resolves it under the forwarded --project-root (same precedence as serve).
     cwd = Path.cwd()
     root = resolve_project_root(args.project_root, cwd=cwd)
     config = anchor_under_root(args.config, root, cwd=cwd)
     assert config is not None  # args.config always has a string default
-    db_base = anchor_under_root(args.db, root, cwd=cwd)
-    assert db_base is not None  # supervise --db has a string default ("messagefoundry.db")
-
     # Resolve the store backend up front so the no-split-store guard (ADR 0063) can refuse a >1-shard
     # config on SQLite BEFORE any subprocess is spawned. --service-config is anchored the same way each
     # child resolves it; --db only sets the SQLite path, never the backend.
@@ -5559,8 +5559,14 @@ def _supervise(args: argparse.Namespace) -> int:
     # here. Each engine shard is still started with the flag itself.
     # --db goes in as [store].path, as the offline commands merge it (BACKLOG #5926): every engine
     # shard is started with a --db derived from it, which overrides the file's value, so the load
-    # judges the path the shards use rather than one none of them reads.
-    supervise_cli: dict[str, dict[str, object]] = {"store": {"path": args.db}}
+    # judges the path the shards use rather than one none of them reads. --db and --base-port go in
+    # only when given, as `serve` passes its flags, so [store].path, [api].port and their MEFOR_
+    # variables reach the engine shards when the flags are absent (BACKLOG #5817).
+    supervise_cli: dict[str, dict[str, object]] = {}
+    if args.db is not None:
+        supervise_cli["store"] = {"path": args.db}
+    if args.base_port is not None:
+        supervise_cli["api"] = {"port": args.base_port}
     if args.env is not None:
         supervise_cli["ai"] = {"environment": args.env}
     settings, detail = _load_service_settings(service_config, cli=supervise_cli)
@@ -5568,16 +5574,31 @@ def _supervise(args: argparse.Namespace) -> int:
         # Same rendering as `serve`, for the same reason: this is the stream NSSM captures to a file.
         print(f"error: {detail}", file=sys.stderr)
         return 2
-    # BACKLOG #5926: each engine shard's store path is derived from the --db base, so test it the
-    # way [store].path is tested at load. A SQLite store only: a server backend opens no file at
-    # that path.
-    from messagefoundry.config.settings import StoreBackend, store_path_refusal
+    # Each engine shard's store path is derived from the merged [store].path, from --db or the
+    # settings (BACKLOG #5817). The load already refused a SQLite path no anchor can place
+    # (BACKLOG #5926): the raw --db went in unanchored, so the load tested the value itself.
+    from messagefoundry.pipeline.supervisor import base_names_no_stem
 
-    if settings.store.backend == StoreBackend.SQLITE:
-        db_refusal = store_path_refusal(args.db, name="--db")
-        if db_refusal is not None:
-            print(f"error: {db_refusal}", file=sys.stderr)
-            return 2
+    db_base = anchor_under_root(settings.store.path, root, cwd=cwd)
+    assert db_base is not None  # [store].path is a str, never None
+    if base_names_no_stem(settings.store.path) and not base_names_no_stem(db_base):
+        # Joining "" or "." under the root gives the root itself, whose own name would become
+        # each engine shard's stem (<root>_a, beside the root). A trailing "." names the same
+        # directory, so the supervisor still refuses several engine shards, as it would the value
+        # written, and one engine shard's --db still names the root.
+        db_base += "/."
+    # BACKLOG #5817: [api].port has no range check at load, and every engine shard's port counts
+    # up from it, so a value no socket takes is refused here, before the TLS renewal below writes
+    # anything. How many engine shards the graph has is known only once the supervisor loads it,
+    # so the range several of them need is checked there.
+    if not 0 <= settings.api.port <= 65535:
+        source = "--base-port" if args.base_port is not None else "[api].port"
+        print(
+            f"error: {source} {settings.api.port} is not a port from 0 to 65535; refusing to "
+            "start the fleet.",
+            file=sys.stderr,
+        )
+        return 2
 
     # BACKLOG #1120: the protocol floor each shard's `serve` builds, for the same reason as the gate
     # below: every shard would refuse, and the supervisor would only restart them.
@@ -5854,7 +5875,7 @@ def _supervise(args: argparse.Namespace) -> int:
             config,
             store_backend=settings.store.backend,
             db_base=db_base,
-            base_port=args.base_port,
+            base_port=settings.api.port,
             env=args.env,
             service_config=args.service_config,
             project_root=args.project_root,

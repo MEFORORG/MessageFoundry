@@ -762,6 +762,15 @@ def _check_revocation_attestation_pair(
 _SCHEMA_LOCK_TIMEOUT_MAX: Final[float] = float((2**31 - 1) // 1000)
 
 
+def store_path_names_a_directory(value: str) -> bool:
+    """Whether ``value``'s last part, as written, is empty, ``.`` or ``..``, so the path names a
+    directory rather than a file (``""``, ``data/``, ``data/..``). On Windows a backslash also
+    separates parts. The test :func:`store_path_refusal` applies, shared with ``supervise``, which
+    derives each engine shard's file name from the path's stem (BACKLOG #5817)."""
+    last = re.split(r"[\\/]", value)[-1] if os.name == "nt" else value.split("/")[-1]
+    return last in ("", ".", "..")
+
+
 def store_path_refusal(
     value: str, *, name: str = "[store].path (from the settings file, MEFOR_STORE_PATH or --db)"
 ) -> str | None:
@@ -791,7 +800,7 @@ def store_path_refusal(
     windows = os.name == "nt"
     # The last part as written: Win32 trims a trailing dot or space, so it is tested unstripped.
     last = re.split(r"[\\/]", value)[-1] if windows else value.split("/")[-1]
-    if last in ("", ".", ".."):
+    if store_path_names_a_directory(value):
         return (
             f"{name} names no file (value withheld); name the SQLite file, e.g. 'messagefoundry.db'"
         )
