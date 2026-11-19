@@ -586,11 +586,12 @@ SITES: dict[str, Site] = {
     ),
     "messagefoundry/config/environments.py::values_file_path": Site(
         1,
-        REVIEWED,
-        "The guard itself: it refuses a [environments].dir with a drive, a root or a '..' part, "
-        "and an environment name outside the [ai].environment validator's alphabet, before it "
-        "joins them under the base (BACKLOG #5322). Every caller that names a value file goes "
-        "through it.",
+        GUARDED,
+        "It refuses a [environments].dir with a drive, a root or a '..' part, and an environment "
+        "name outside the [ai].environment validator's alphabet, before it joins them under the "
+        "base (BACKLOG #5322). Every caller that names a value file goes through it.",
+        "messagefoundry/config/environments.py::_leaves_base",
+        called=True,
     ),
     "messagefoundry/config/environments.py::resolve_values_base_dir": Site(
         1, OPERATOR, "The operator's [environments].base_dir under the working directory."

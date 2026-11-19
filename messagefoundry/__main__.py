@@ -1438,6 +1438,8 @@ def _resolve_offline_anchor(
     service config is given); an absolute one is used as-is. The fail-loud trigger (AC-3) fires ONLY
     when an *explicit* ``--project-root`` is set AND the loaded graph references ``env()`` AND the
     selected ``<env>.toml`` is absent — a zero-``env()`` deployment, or a no-root launch, never trips it.
+    Under the same two conditions it also fails when ``[environments].dir`` or ``--env`` is one
+    :func:`~messagefoundry.config.environments.values_file_path` refuses (BACKLOG #5322).
     """
     from messagefoundry.config.anchor import anchor_under_root, resolve_project_root
 
@@ -2704,7 +2706,12 @@ def _read_environment_values(
     from messagefoundry.engine_secrets import SecretsDirectoryError
     from messagefoundry.redaction import safe_exc
 
-    env_file = values_file_path(base_dir, dir_name, environment)
+    try:
+        env_file = values_file_path(base_dir, dir_name, environment)
+    except ValueError as exc:
+        # A WiringError, the type this function's callers arm (BACKLOG #5322). The start check and
+        # the reader's own constructor refuse these inputs first, so this is the backstop.
+        raise WiringError(str(exc)) from None
     if snapshot is not None and not snapshot.covers_environment_file(env_file):
         # Before the vetting below, so the plain read the engine then makes vets the file once.
         raise NotInSnapshot(f"{env_file} is not a value file the config snapshot read")
@@ -2760,8 +2767,9 @@ def _value_file_or_refusal(
     """The value file a command reads, or ``None`` with the refusal printed when
     :func:`~messagefoundry.config.environments.values_file_path` refuses ``[environments].dir`` or
     the environment name because the file would sit outside ``base_dir`` (BACKLOG #5322). ``serve``
-    and ``supervise`` call it ahead of :func:`_start_files_refused`, and the ``--project-root``
-    check with no ``lead``; ``fleet`` says the supervisor refuses for its engine shards."""
+    and ``supervise`` call it ahead of :func:`_start_files_refused`, and so does the
+    ``--project-root`` check. ``supervise`` passes no ``lead`` and a ``fleet`` sentence that already
+    says it refuses to start, and the ``--project-root`` check passes no ``lead``."""
     from messagefoundry.config.environments import values_file_path
 
     try:
@@ -5652,7 +5660,7 @@ def _supervise(args: argparse.Namespace) -> int:
     fleet_refusal = "Every engine shard would refuse to start; refusing to start the fleet."
     env_base = resolve_values_base_dir(args.project_root or settings.environments.base_dir, cwd=cwd)
     env_file = _value_file_or_refusal(
-        env_base, settings.environments.dir, env_name, fleet=fleet_refusal
+        env_base, settings.environments.dir, env_name, lead="", fleet=fleet_refusal
     )
     if env_file is None or _start_files_refused(service_config, env_file, fleet=fleet_refusal):
         return 2

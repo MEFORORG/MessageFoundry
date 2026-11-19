@@ -112,6 +112,9 @@ class EnvironmentValuesReader(SnapshotEnvValuesProvider):
     def __init__(
         self, read: ValuesRead, *, base_dir: Path, dir_name: str, environment: str
     ) -> None:
+        # Refused here, once, so value_file, which the engine reads on every reload, cannot raise
+        # later (BACKLOG #5322).
+        values_file_path(base_dir, dir_name, environment)
         self._read = read
         self.base_dir = base_dir
         self.dir_name = dir_name
@@ -191,8 +194,9 @@ def _leaves_base(value: str) -> bool:
     """Whether joining ``value`` under a base directory could name a path outside it: a drive, a root
     (``/x``, ``\\x``, ``C:x``, ``C:/x``, a UNC share), or a part of only dots and spaces other than
     ``.``, such as ``..``. Read under the Windows rules on every host, which split on both
-    separators, so one settings file means the same folder wherever it runs. Windows strips the
-    trailing dots and spaces of a part, so ``...`` and ``.. `` are refused with ``..``."""
+    separators, so a value Windows would read as leaving the base is refused on POSIX too. The join
+    itself uses the host's rules, so on POSIX a backslash stays part of a folder name. Windows strips
+    the trailing dots and spaces of a part, so ``...`` and ``.. `` are refused with ``..``."""
     path = PureWindowsPath(value)
     return bool(path.drive or path.root) or any(
         part != "." and not part.strip(". ") for part in path.parts
@@ -205,25 +209,28 @@ def values_file_path(base_dir: str | Path, dir_name: str, environment: str) -> P
     One rule, so the ``serve`` and ``supervise`` start checks vet the file the load reads (vault
     BACKLOG #2626).
 
-    Raises ``ValueError`` when ``dir_name`` would leave ``base_dir`` (:func:`_leaves_base`), or when
-    ``environment`` is not a name ``[ai].environment`` admits, so the value file is always under
-    ``base_dir`` (BACKLOG #5322). That covers a caller that never ran the settings validator, such as
-    the ``--project-root`` check of a raw ``--env``. The check is on the text, so a link inside
-    ``base_dir`` that leads out is not refused here: the ``serve`` start check walks the file's
-    links."""
+    Raises ``ValueError``, withholding the value, when ``dir_name`` would leave ``base_dir``
+    (:func:`_leaves_base`), or when ``environment`` is not a name ``[ai].environment`` admits, so the
+    path's text names a file under ``base_dir`` (BACKLOG #5322). The name check covers a caller that
+    never ran the settings validator, such as the ``--project-root`` check of a raw ``--env``.
+
+    It checks the text and nothing else. At least two cases still reach outside ``base_dir`` and are
+    not refused anywhere: a link inside ``base_dir`` that leads out, since the ``serve`` start check
+    vets the owners along a link chain but not where it ends; and on Windows a reserved device name
+    such as ``NUL``, which the alphabet admits and the system opens as the device."""
     # Imported here, so importing this module does not load the settings model.
     from messagefoundry.config.settings import _ENV_NAME_ALLOWED
 
     if _leaves_base(dir_name):
         raise ValueError(
-            f"[environments].dir {dir_name!r} must be a folder under the environments base "
-            "directory: no drive, no leading slash and no '..'"
+            "[environments].dir must be a folder under the environments base directory: no drive, "
+            "no leading slash and no '..' (value withheld)"
         )
     # The validator's own alphabet has no separator and no ':', so the file name is one plain part.
     if not environment or not set(environment) <= _ENV_NAME_ALLOWED:
         raise ValueError(
-            f"environment name {environment!r} must be a non-empty name of letters, digits, '.', "
-            "'_' or '-'"
+            "the environment name must be a non-empty name of letters, digits, '.', '_' or '-' "
+            "(value withheld)"
         )
     return Path(base_dir) / dir_name / f"{environment}.toml"
 

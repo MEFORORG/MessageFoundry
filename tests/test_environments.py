@@ -582,8 +582,9 @@ _DIRS_THAT_LEAVE_THE_BASE = [
 
 @pytest.mark.parametrize("dir_name", _DIRS_THAT_LEAVE_THE_BASE)
 def test_values_file_path_refuses_a_dir_that_leaves_the_base(tmp_path: Path, dir_name: str) -> None:
-    with pytest.raises(ValueError, match=r"\[environments\]\.dir .* must be a folder under"):
+    with pytest.raises(ValueError, match=r"\[environments\]\.dir must be a folder under") as caught:
         values_file_path(tmp_path, dir_name, "dev")
+    assert "elsewhere" not in str(caught.value)  # the value is withheld (R12)
 
 
 def test_load_environment_values_refuses_a_dir_that_leaves_the_base(tmp_path: Path) -> None:
@@ -602,8 +603,9 @@ def test_values_file_path_refuses_an_environment_the_validator_would_refuse(
 ) -> None:
     """The name is held to the ``[ai].environment`` alphabet, so a raw ``--env`` that never met the
     settings validator cannot carry a separator, a drive or a stream name into the join."""
-    with pytest.raises(ValueError, match="must be a non-empty name of letters"):
+    with pytest.raises(ValueError, match="must be a non-empty name of letters") as caught:
         values_file_path(tmp_path, "environments", environment)
+    assert "(value withheld)" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -633,7 +635,7 @@ def test_serve_and_supervise_refuse_a_dir_that_leaves_the_base(
 
     assert _value_file_or_refusal(tmp_path, "../elsewhere", "dev", fleet="Fleet refused.") is None
     err = capsys.readouterr().err
-    assert err.startswith("error: refusing to start: [environments].dir '../elsewhere'")
+    assert err.startswith("error: refusing to start: [environments].dir must be a folder under")
     assert err.rstrip().endswith("Fleet refused.")
     assert _value_file_or_refusal(tmp_path, "environments", "dev") == (
         tmp_path / "environments" / "dev.toml"
@@ -657,6 +659,39 @@ def test_project_root_env_file_check_refuses_a_dir_that_leaves_the_root(
     )
     assert _check_env_file_present(str(config), tmp_path, "dev", "../elsewhere") == 2
     assert "must be a folder under" in capsys.readouterr().err
+
+
+def test_serve_and_supervise_name_the_value_file_through_the_refusing_helper() -> None:
+    """``_serve`` and ``_supervise`` take their start-check value file from
+    ``_value_file_or_refusal`` and stop on its ``None``, and neither calls ``values_file_path``
+    itself, so a refused dir exits 2 with the reason rather than a traceback."""
+    import ast
+    import inspect
+
+    import messagefoundry.__main__ as cli
+
+    for command in (cli._serve, cli._supervise):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(command)))
+        called = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert "_value_file_or_refusal" in called, command.__name__
+        assert "values_file_path" not in called, command.__name__
+        source = ast.unparse(tree)
+        assert "if env_file is None or _start_files_refused(" in source, command.__name__
+
+
+def test_the_reader_refuses_a_dir_that_leaves_the_base_when_it_is_built(tmp_path: Path) -> None:
+    """Built once, refused once, so ``value_file``, which the engine reads on every reload, never
+    raises later; and serve's read turns a refusal into the WiringError its callers arm."""
+    from messagefoundry.__main__ import _environment_values_reader, _read_environment_values
+
+    with pytest.raises(ValueError, match="must be a folder under"):
+        _environment_values_reader(base_dir=tmp_path, dir_name="../elsewhere", environment="dev")
+    with pytest.raises(WiringError, match="must be a folder under"):
+        _read_environment_values(base_dir=tmp_path, dir_name="../elsewhere", environment="dev")
 
 
 # --- WS-1: anchoring environments/<env>.toml to a project root (ADR 0017) --------------------------
