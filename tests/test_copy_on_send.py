@@ -110,8 +110,8 @@ def _fanout_registry_with_inbound() -> Registry:
 
 def test_dry_run_previews_copy_on_send_only_when_opted_in() -> None:
     """Preview fidelity (adversarial-review fix): ``dry_run``/Test Bench previews the copy-on-Send
-    divergence when ``snapshot_on_send=True`` and collapses to last-write by default (the default engine
-    posture) — closing the preview/live gap where the shared ``RunContext`` had pinned the flag OFF."""
+    divergence when ``snapshot_on_send=True`` and collapses to last-write by default (``dry_run``'s
+    own default; the engine's is copy-on-Send ON, BACKLOG #5794) — closing the preview/live gap where the shared ``RunContext`` had pinned the flag OFF."""
     reg = _fanout_registry_with_inbound()
     off = dry_run(reg, _ADT, inbound="IB")
     assert {d.to: Message.parse(d.payload).field("MSH-5") for d in off.deliveries} == {

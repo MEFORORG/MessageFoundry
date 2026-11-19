@@ -204,7 +204,7 @@ def test_model_validation() -> None:
 def test_model_refuses_offset_bearing_times(start: time | str, end: time | str) -> None:
     # BACKLOG #5779: an aware start/end used to load, then contains() compared it with a naive local
     # time and raised TypeError at every schedule tick. It is now refused at load.
-    with pytest.raises(ValueError, match="no UTC offset"):
+    with pytest.raises(ValueError, match="no tzinfo or UTC offset"):
         ActiveWindow.model_validate(
             {"days": frozenset({MON}), "start": start, "end": end, "timezone": "UTC"}
         )

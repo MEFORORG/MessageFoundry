@@ -676,13 +676,14 @@ class ActiveWindow(BaseModel):
     @field_validator("start", "end")
     @classmethod
     def _check_naive(cls, value: time) -> time:
-        # The window's zone is ``timezone``; an offset on the time itself would be a second, conflicting
-        # zone, and :meth:`contains` compares naive local times, so an aware value would raise
-        # TypeError at every schedule tick rather than at load (BACKLOG #5779).
+        # The window's zone is ``timezone``; a tzinfo on the time itself would be a second, conflicting
+        # zone. :meth:`contains` compares naive local times, so an offset-bearing value would raise
+        # TypeError at every schedule tick rather than at load (BACKLOG #5779), and any other tzinfo
+        # would be ignored there unseen.
         if value.tzinfo is not None:
             raise ValueError(
-                "active-window start/end must be a wall-clock time with no UTC offset (set the "
-                "window's zone with `timezone`)"
+                "active-window start/end must be a wall-clock time with no tzinfo or UTC offset "
+                "(set the window's zone with `timezone`)"
             )
         return value
 

@@ -102,8 +102,8 @@ def test_stall_threshold_default_off_and_toml_override(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("value", [0, -1, float("nan"), True])
 def test_buildup_and_stall_thresholds_refuse_non_positive_nan_or_bool(value: float) -> None:
-    # BACKLOG #5778: zero or below is crossed by every lane holding a message (an alert per queued
-    # message); NaN is never crossed (the alert silently off); a boolean would read as 1. Each is
+    # BACKLOG #5778: zero or below is crossed by every lane holding a message (a page for each such
+    # lane, at the re-alert interval); NaN is never crossed (the alert silently off); a boolean would read as 1. Each is
     # refused at load, on the per-connection models and on the [delivery] keys that mirror them.
     with pytest.raises(ValueError):
         BuildupThreshold(max_oldest_seconds=value)
