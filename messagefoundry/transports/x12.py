@@ -31,7 +31,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.parsing.x12.delimiters import (
@@ -866,6 +866,76 @@ class X12Source(SourceConnector):
             )
             raise
 
+    def _report_unhandled(
+        self,
+        frames: Iterator[bytes],
+        decoder: X12FrameReader | None,
+        peer: object,
+        *,
+        listener_cut: bool,
+    ) -> None:
+        """Count, and log, the complete interchanges of the last read that a close leaves unhandled
+        (BACKLOG #5971).
+
+        A sender may pipeline several interchanges into one read. When the connection closes part
+        way through them (at least a handler fault, a reply that will not encode, an unexpected
+        error, a stop or a reset), the rest were taken off the socket but never handed to the
+        pipeline, so nothing records them. Draining the
+        decoder's generator only reassembles bytes already in memory; it does no I/O and hands
+        nothing on. The count is the record: no frame content is logged. A sender waiting for a
+        reply resends on the close; one that waits for none never does (``hold_and_retry``), so for
+        it the loss of a complete interchange, an over-cap one included, is final and is logged at
+        ERROR. A remainder that is only a partial interchange is logged at WARNING where the
+        listener cut it off (``listener_cut``: a stop, inside its grace or past it, or a fault on
+        the listener's side), and at DEBUG otherwise: EOF, an idle or frame-deadline close, a
+        reset, or a reply the peer did not drain in time, which arrives as a reset. There nothing
+        complete was lost, so line noise or connection churn cannot flood the log.
+        """
+        left = 0
+        over_cap = False
+        try:
+            for _ in frames:
+                left += 1
+        except X12FrameError:
+            # The decoder discards its whole buffer at an over-cap interchange, so anything behind
+            # it in the read is gone uncounted.
+            over_cap = True
+        except Exception as exc:  # noqa: BLE001 -- this runs in a finally, maybe on a cancel
+            # Nothing raised here may replace the exception the close is already handling.
+            logger.warning(
+                "X12 count of unhandled interchanges from %s cut short: %s", peer, safe_exc(exc)
+            )
+        # An interchange still arriving is lost with the connection too, and is named, not counted.
+        partial = not over_cap and decoder is not None and decoder.in_frame
+        if not left and not over_cap and not partial:
+            return
+        resends = owes_hl7_reply(self.ack_mode, self.content_type)
+        # ERROR only for complete interchanges a non-resending sender has lost. A partial-only
+        # remainder on a close the peer made (EOF, idle, frame deadline, reset) or from line noise
+        # such as a stray "ISA" lost nothing complete, and a line per close at WARNING could be
+        # flooded by connection churn, so it stays at DEBUG.
+        if left or over_cap:
+            level = logging.WARNING if resends else logging.ERROR
+        elif listener_cut:
+            level = logging.WARNING
+        else:
+            level = logging.DEBUG
+        logger.log(
+            level,
+            "X12 connection from %s closed with %d complete interchange(s) from its last read not "
+            "handed to the pipeline%s; none of it is recorded, %s",
+            peer,
+            left,
+            ", then an over-cap interchange that discarded the rest of the read"
+            if over_cap
+            else (", and a partial interchange still arriving" if partial else ""),
+            "but nothing complete was lost"
+            if level == logging.DEBUG
+            else "and the sender resends what it sent unanswered"
+            if resends
+            else "and this inbound's sender does not resend, so they are lost",
+        )
+
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
         task = asyncio.current_task()
@@ -885,12 +955,17 @@ class X12Source(SourceConnector):
                     await self._emit_event(refusal.kind, peer_host=peer_host, reason=refusal.reason)
                 return  # closed in the outer finally
             epoch = self._admission.admit(peer_host)
+            # The interchanges of the read in hand; whatever a close leaves in it is counted below.
+            frames: Iterator[bytes] = iter(())
+            decoder: X12FrameReader | None = None
+            cancelled = reset = False  # who ended the connection, for the remainder's log level
             try:
                 # Inside the try whose finally releases the slot, so a cancellation delivered at
                 # this await cannot leak a per-host count.
                 established = True
                 await self._emit_event("established", peer_host=peer_host)
                 decoder = X12FrameReader(max_interchange_bytes=self.max_interchange_bytes)
+                peer = writer.get_extra_info("peername")  # fixed for the connection
                 pacer = _MessagePacer.for_rate(
                     self.max_messages_per_second, self.message_burst, name=self._pacing_name
                 )
@@ -899,7 +974,6 @@ class X12Source(SourceConnector):
                     max_frame_seconds=self.max_frame_seconds,
                     receive_timeout=self.receive_timeout,
                 )
-                peer = writer.get_extra_info("peername")  # fixed for the connection
                 while True:
                     # ASVS 2.4.1 / 15.2.2 — the wait is BEFORE the read, never around the handler.
                     # The engine's own waits (pacing, an intake pause) do not spend the frame budget.
@@ -922,7 +996,8 @@ class X12Source(SourceConnector):
                         break
                     try:
                         decoded = 0
-                        for interchange in decoder.feed(chunk):
+                        frames = decoder.feed(chunk)
+                        for interchange in frames:
                             decoded += 1
                             fault: str | None = None
                             try:
@@ -953,11 +1028,46 @@ class X12Source(SourceConnector):
                                     break  # handler_error is recorded; close
                                 failed = False
                             if reply is not None:
-                                # BACKLOG #5958: encoded as the MLLP and TCP listeners encode
-                                # theirs, since this write follows the commit.
-                                writer.write(
-                                    encode_reply(reply, self.encoding, connection=self._pacing_name)
-                                )
+                                # BACKLOG #5958: encoded as the MLLP and TCP listeners encode theirs,
+                                # since this write follows the commit.
+                                # BACKLOG #5971: the reply is the engine's, so a charset that cannot
+                                # hold it is the engine's fault. The shared policy replaces what it
+                                # can (BACKLOG #5799); what it still refuses is `handler_error`,
+                                # never `framing_error`. The interchange is already recorded. The
+                                # event is sent outside the except clause, so nothing chains the
+                                # encode error, whose `object` is the whole reply.
+                                reply_fault: str | None = None
+                                wire = b""
+                                try:
+                                    wire = encode_reply(
+                                        reply, self.encoding, connection=self._pacing_name
+                                    )
+                                except (LookupError, UnicodeError) as exc:
+                                    reply_fault = safe_exc(exc)
+                                if reply_fault is not None:
+                                    # A sender owed a reply waits on it, so close and let it
+                                    # resend. One owed none waits on nothing: closing would only
+                                    # drop the interchanges behind this one, so skip the reply and
+                                    # carry on. The shipped runner returns no reply where none is
+                                    # owed, so only a pipeline handler that replies anyway gets here.
+                                    owed = owes_hl7_reply(self.ack_mode, self.content_type)
+                                    logger.error(
+                                        "X12 reply to %s could not be encoded: %s; the interchange "
+                                        "is recorded, %s",
+                                        peer,
+                                        reply_fault,
+                                        "closing the connection"
+                                        if owed
+                                        else "no reply is owed, so none is sent",
+                                    )
+                                    failed = owed
+                                    await self._emit_event(
+                                        "handler_error", peer_host=peer_host, reason=reply_fault
+                                    )
+                                    if owed:
+                                        break
+                                    continue
+                                writer.write(wire)  # unframed: the interchange is the frame
                                 await self._drain_reply(writer)
                         if failed:
                             break
@@ -979,9 +1089,10 @@ class X12Source(SourceConnector):
                     except OSError:
                         raise  # peer reset / write failure → handled by the outer OSError catch (quiet)
                     except Exception as exc:
-                        # Last-resort (ASVS 16.5.4): an unexpected codec or reply-encoding error must
-                        # not let the per-connection task die silently or leak detail. Log redacted;
-                        # drop the conn. A handler fault is caught above and is `handler_error`.
+                        # Last-resort (ASVS 16.5.4): an unexpected codec error must not let the
+                        # per-connection task die silently or leak detail. Log redacted; drop the
+                        # conn. A handler fault and a reply that will not encode are caught above
+                        # and are `handler_error`.
                         logger.error(
                             "X12 connection from %s failed unexpectedly: %s", peer, safe_exc(exc)
                         )
@@ -999,10 +1110,25 @@ class X12Source(SourceConnector):
                         trailer_only=decoder.trailer_only,
                     )
             except OSError as exc:
-                failed = True  # peer reset; nothing to do but drop the connection
+                failed = reset = True  # peer reset; nothing to do but drop the connection
                 await self._emit_event("peer_reset", peer_host=peer_host, reason=safe_exc(exc))
+            except asyncio.CancelledError:
+                cancelled = True  # a stop past its grace
+                raise
             finally:
-                self._admission.release(peer_host, epoch)
+                try:
+                    self._report_unhandled(
+                        frames,
+                        decoder,
+                        writer.get_extra_info("peername"),
+                        # A stop inside its grace closes the writer, so the read sees EOF and
+                        # neither `cancelled` nor `failed` is set; `stopping` names that cut.
+                        listener_cut=cancelled
+                        or self._admission.stopping
+                        or (failed and not reset),
+                    )
+                finally:
+                    self._admission.release(peer_host, epoch)
         finally:
             self._clients.discard(writer)
             if task is not None:

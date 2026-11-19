@@ -913,7 +913,7 @@ def test_the_engine_homes_still_export_the_moved_names() -> None:
     # with the harness; the permanent NegativeAckError and the warning log stay engine-side.
     for name in framing.__all__:
         assert getattr(tframing, name) is getattr(framing, name), name
-    for name in ("frame_for_delivery", "frame_reply", "check_frame_bytes"):
+    for name in ("frame_for_delivery", "frame_reply", "encode_reply", "check_frame_bytes"):
         assert name in tframing.__all__, name
         assert not hasattr(framing, name), name
 
