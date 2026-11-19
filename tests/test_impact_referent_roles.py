@@ -955,3 +955,53 @@ def test_a_definition_on_line_one_of_a_bom_file_is_renamed(tmp_path: Path) -> No
     text = raw.decode("utf-8-sig")
     assert 'mf.outbound("OB_NEW"' in text and 'return Send("OB_NEW", msg)' in text, text
     load_config(d)
+
+
+@pytest.mark.parametrize(
+    ("kind", "old", "body"),
+    [
+        (
+            "outbound",
+            "OB_OLD",
+            'OB_ADT = "OB_OLD"\n'
+            'inbound("IB_K", MLLP(port=2855), router="r_k")\n'
+            'outbound(OB_ADT, MLLP(host="127.0.0.1", port=7016))\n'
+            "\n"
+            '@router("r_k")\n'
+            "def r_k(msg):\n"
+            '    return ["h_k"]\n'
+            "\n"
+            '@handler("h_k")\n'
+            "def h_k(msg):\n"
+            "    return Send(OB_ADT, msg)\n",
+        ),
+        (
+            "handler",
+            "h_old",
+            'H = "h_old"\n'
+            'inbound("IB_K", MLLP(port=2856), router="r_k")\n'
+            'outbound("OB_K", MLLP(host="127.0.0.1", port=7017))\n'
+            "\n"
+            '@router("r_k")\n'
+            "def r_k(msg):\n"
+            '    return ["h_old"]\n'
+            "\n"
+            "@handler(H)\n"
+            "def h_k(msg):\n"
+            '    return Send("OB_K", msg)\n',
+        ),
+    ],
+)
+def test_a_definition_named_through_a_module_constant_is_renamed(
+    tmp_path: Path, kind: str, old: str, body: str
+) -> None:
+    """The definition's name is a module constant, so the constant's literal is its name literal:
+    renamed, never refused as not located."""
+    config_dir = _write_config(tmp_path, body)
+    plan = plan_rename(load_config(config_dir), config_dir, kind, old, old + "_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert f' = "{old}_NEW"\n' in _mod(config_dir)
+    reg = load_config(config_dir)
+    table = reg.outbound if kind == "outbound" else reg.handlers
+    assert old + "_NEW" in table and old not in table

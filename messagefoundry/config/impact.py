@@ -41,6 +41,7 @@ from __future__ import annotations
 import ast
 import codecs
 import io
+import logging
 import re
 import tokenize
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -65,6 +66,8 @@ from messagefoundry.config.wiring import Registry, WiringError, config_py_files
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.redaction import safe_exc
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "LiteralEdit",
@@ -253,6 +256,10 @@ def plan_rename(
         if resolved is not None:
             def_spans.setdefault(resolved, []).append(span)
             def_positions.setdefault(resolved, set()).update(positions)
+            # A name given through a module constant sits on that constant's line, outside the span.
+            def_spans[resolved].extend(
+                _Span(line, line) for line, _col in positions if not span.start <= line <= span.end
+            )
 
     # The object's own definition (so the name is actually changed, not only its referents).
     _add_definition_span(
@@ -1078,8 +1085,48 @@ def _definition_positions(
     when none is spelled ``kind`` (an aliased import)."""
     named = [call for call in calls if _call_name(call.func) == kind] or calls
     return frozenset(
-        pos for call in named if (pos := _name_argument_position(sources, file, call, old))
+        pos
+        for call in named
+        if (
+            pos := _name_argument_position(sources, file, call, old)
+            or _module_constant_position(sources, file, call, old)
+        )
     )
+
+
+def _module_constant_position(
+    sources: SourceCache, file: str, call: ast.Call, old: str
+) -> tuple[int, int] | None:
+    """Where a name argument spelled as a module constant (``outbound(OB_ADT, ...)``) is given
+    ``old``: the literal of the module's one top-level ``OB_ADT = "old"``. A name bound any other
+    way, or more than once, gives ``None``, so the definition counts as not located."""
+    arg = _first_or_keyword(call, "name")
+    parsed = sources.parse(file)
+    if not isinstance(arg, ast.Name) or parsed is None:
+        return None
+    values: list[ast.expr | None] = []
+    for stmt in parsed[0].body:
+        if isinstance(stmt, ast.Assign):
+            values.extend(
+                stmt.value for t in stmt.targets if isinstance(t, ast.Name) and t.id == arg.id
+            )
+            if any(not isinstance(t, ast.Name) for t in stmt.targets):
+                # A tuple or attribute target may bind it too; do not guess which element.
+                values.extend(
+                    None
+                    for t in stmt.targets
+                    for n in ast.walk(t)
+                    if isinstance(n, ast.Name) and n.id == arg.id and n is not t
+                )
+        elif isinstance(stmt, (ast.AnnAssign, ast.AugAssign)):
+            if isinstance(stmt.target, ast.Name) and stmt.target.id == arg.id:
+                values.append(None)
+        elif isinstance(stmt, (ast.Import, ast.ImportFrom)):
+            if any((a.asname or a.name) == arg.id for a in stmt.names):
+                values.append(None)
+    if len(values) == 1 and isinstance(values[0], ast.Constant) and values[0].value == old:
+        return sources.position(file, values[0])
+    return None
 
 
 def _decorator_positions(
@@ -1385,7 +1432,9 @@ def _has_bom(file: str) -> bool:
     try:
         with open(file, "rb") as fh:
             return fh.read(3) == codecs.BOM_UTF8
-    except OSError:
+    except OSError as exc:
+        # The tokenizer cannot read it either, so it yields no edit for the shift to apply to.
+        _log.debug("rename could not read %s for a byte-order mark: %s", file, type(exc).__name__)
         return False
 
 
