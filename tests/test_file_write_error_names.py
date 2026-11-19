@@ -220,7 +220,7 @@ async def test_send_reports_a_missing_validated_directory_in_words(tmp_path: Pat
         f"validate_directory never creates it (directory {out})"
     )
     assert raised.value.__cause__ is None and raised.value.__context__ is None
-    # The directory survives safe_exc's length bound even when the path is long.
+    # The directory survives safe_exc's length bound for a share path of this length (63 characters).
     long_out = Path(r"\\hl7-share01.corp.example\interfaces\outbound\OB_ACME_ADT\drop")
     assert str(long_out) in safe_exc(
         DeliveryError(str(raised.value).replace(str(out), str(long_out)))
@@ -304,3 +304,40 @@ async def test_send_never_carries_a_raw_os_error_text(
     assert kept in text and text.endswith(f"(directory {tmp_path / 'out'})")
     assert MRN not in text and MRN not in _traceback(caught.value)
     assert MRN not in safe_exc(caught.value)
+
+
+def _share_not_found() -> FileNotFoundError:
+    """What a stat of an unreachable UNC share raises on Windows (Win32 53), built on any platform."""
+    exc = FileNotFoundError(errno.ENOENT, "The network path was not found", "out")
+    exc.winerror = 53  # type: ignore[attr-defined,unused-ignore]
+    return exc
+
+
+@pytest.mark.parametrize(
+    ("raised", "kept"),
+    [
+        (_share_not_found(), f"[Errno {errno.ENOENT}] The network path was not found"),
+        (ValueError("embedded null character in path"), "[Errno {}] not a valid path"),
+    ],
+    ids=["share-not-found", "nul"],
+)
+async def test_a_validated_directory_stat_fault_is_not_called_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raised: Exception, kept: str
+) -> None:
+    # A Win32 share fault surfaces as a FileNotFoundError too, and keeps the OS's own words; a path
+    # the OS cannot take is a ValueError, which still leaves send as a DeliveryError.
+    out = tmp_path / "out"
+    dest = _file_destination(out)
+    dest.validate_directory = True
+    real_stat = Path.stat
+
+    def refuse(self: Path, *args: object, **kwargs: object) -> os.stat_result:
+        if self == out:
+            raise raised
+        return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", refuse)
+    with pytest.raises(DeliveryError) as caught:
+        await dest.send(BODY)
+    text = str(caught.value)
+    assert kept.format(errno.EINVAL) in text and "not found, and" not in text

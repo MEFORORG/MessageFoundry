@@ -109,10 +109,11 @@ class CodeSetError(ValueError):
 
 
 class _MissFields(Exception):
-    """A lookup miss's ``code_set``, as an attribute for a caller that needs it. The key is kept
-    nowhere on the error, neither in its message nor on an attribute (BACKLOG #5320, see
-    :func:`_miss_text`). ``code_set`` defaults, so a copy or a pickle, which rebuilds from the
-    message alone and then restores the attributes, still works."""
+    """A lookup miss's ``code_set``, as an attribute for a caller that needs it. The key is in
+    neither the error's message nor its attributes (BACKLOG #5320, see :func:`_miss_text`). It is
+    still a local of the raising frame, which the error's ``__traceback__`` reaches, so a sink that
+    captures frame locals would read it. ``code_set`` defaults, so a copy or a pickle, which
+    rebuilds from the message alone and then restores the attributes, still works."""
 
     def __init__(self, message: str, *, code_set: str | None = None) -> None:
         super().__init__(message)
