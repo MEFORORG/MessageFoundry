@@ -33,6 +33,9 @@ _BAD_NAMES = [
     "Name\u2028",
     "Lab\u2029Ops",
     "Lab\u202dOps",
+    "Lab\u061cOps",
+    "Lab\u200eOps",
+    "Lab\u200fOps",
 ]
 
 

@@ -281,9 +281,14 @@ class ChannelScope(RequestModel):
 #: Categories a name may not hold anywhere: a line or paragraph separator, a lone surrogate, a
 #: private-use or an unassigned code point (BACKLOG #5784).
 _NAME_REFUSED_CATEGORIES = frozenset({"Zl", "Zp", "Cs", "Co", "Cn"})
-#: The bidi embeddings, overrides and isolates, which reorder how a name and the text beside it
-#: display, so a reversed spelling could render as a built-in role's name (BACKLOG #5785).
-_BIDI_CONTROLS = frozenset(range(0x202A, 0x202F)) | frozenset(range(0x2066, 0x206A))
+#: Unicode's Bidi_Control characters: the embeddings, overrides and isolates, which reorder how a
+#: name and the text beside it display, so a reversed spelling could render as a built-in role's
+#: name, and the marks U+061C, U+200E and U+200F (BACKLOG #5785).
+_BIDI_CONTROLS = (
+    frozenset(range(0x202A, 0x202F))
+    | frozenset(range(0x2066, 0x206A))
+    | frozenset({0x061C, 0x200E, 0x200F})
+)
 
 
 def visible_text(value: str) -> str:

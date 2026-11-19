@@ -4143,7 +4143,7 @@ class AuthSettings(_Section):
         # And for the MFA floor: at or past the idle timeout, every pending session would idle out
         # before its code could be accepted, so no account with a factor could finish signing in.
         idle_seconds = self.session_idle_timeout_minutes * 60
-        if idle_seconds > 0 and self.mfa_verify_min_elapsed_seconds >= idle_seconds:
+        if self.mfa_verify_min_elapsed_seconds >= idle_seconds:
             raise ValueError(
                 "mfa_verify_min_elapsed_seconds must be shorter than session_idle_timeout_minutes"
             )
