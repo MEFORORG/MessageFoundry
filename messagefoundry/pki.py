@@ -331,7 +331,11 @@ class CrlBlock:
 
 
 def judge_every_crl(
-    pem: bytes, *, now: float, refuse_unread_extensions: bool = False
+    pem: bytes,
+    *,
+    now: float,
+    refuse_unread_extensions: bool = False,
+    refuse_out_of_scope: bool = True,
 ) -> list[tuple[CrlFacts, CrlBlock]]:
     """The facts and the :class:`CrlBlock` of EVERY CRL in ``pem``, in file order, refusing any block
     it cannot judge. One parse per block.
@@ -367,7 +371,14 @@ def judge_every_crl(
     and one carrying a critical extension OpenSSL does not handle, on the CRL or on an entry
     whose extensions ``cryptography`` reads (:func:`_unhandled_critical`; an entry whose
     extensions do not read is skipped), which refuses every peer OpenSSL judges by it. Both started
-    clean before, and the handshake error does not name the file."""
+    clean before, and the handshake error does not name the file.
+
+    **The out-of-scope refusal is skipped where ``refuse_out_of_scope`` is False.** A start and the
+    running-hop reload keep the default. The expiry scan's check of a CRL in a CA file passes
+    False, because nothing judges a CA file's CRLs at start: a restart loads such a CRL, and beside
+    a usable CRL from its issuer OpenSSL judges peers by that one. Refusing it there made the scan
+    call the file one to replace before restarting, a report it had not made before (finding 2 of
+    engine PR 3099, the same class as the PR 2566 hold above)."""
     blocks = list(_crl_blocks(pem))
     # Refused, never skipped, even when the uncounted marker is only text in a comment line and
     # OpenSSL loads the file (vault BACKLOG #2866, decided 2026-10-12). Two reasons. The engine
@@ -408,7 +419,7 @@ def judge_every_crl(
                     "From that fix on it rejects a delta as a complete CRL and loses the delta's "
                     "revocations. Give base CRLs only"
                 )
-            if (why := _out_of_scope(extensions)) is not None:
+            if refuse_out_of_scope and (why := _out_of_scope(extensions)) is not None:
                 raise ValueError(why)
             fingerprint = crl.fingerprint(hashes.SHA256())
             if (critical := _unhandled_critical(crl, extensions, fingerprint)) is not None:

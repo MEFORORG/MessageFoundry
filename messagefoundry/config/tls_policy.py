@@ -879,6 +879,7 @@ def judge_crl_bytes(
     now: float,
     require_in_effect: bool = True,
     refuse_unread_extensions: bool = False,
+    refuse_out_of_scope: bool = True,
 ) -> tuple[CrlFacts, tuple[CrlBlock, ...]]:
     """Refuse CRL bytes no context may load. Return the facts of the soonest-expiring block, and
     every block, which a context that records its copy needs (BACKLOG #299).
@@ -893,8 +894,8 @@ def judge_crl_bytes(
     ``require_in_effect`` is False: the reload asks :func:`crl_not_in_effect` itself, because a file
     to fix outranks a file to wait for. Raises ``ValueError`` led by ``label``, except for a CRL
     whose extensions ``cryptography`` cannot read: without ``refuse_unread_extensions`` its own
-    error, which is no ``ValueError``, raises as it is. That flag goes to
-    :func:`~messagefoundry.pki.judge_every_crl`, which says who passes it.
+    error, which is no ``ValueError``, raises as it is. That flag and ``refuse_out_of_scope`` go
+    to :func:`~messagefoundry.pki.judge_every_crl`, which says who passes each.
 
     No signature is checked here, because this has no CA list. A start checks it in
     :func:`_check_crl_signatures`, and the reload in
@@ -902,7 +903,12 @@ def judge_crl_bytes(
     from messagefoundry.pki import judge_every_crl, soonest_crl
 
     try:
-        judged = judge_every_crl(pem, now=now, refuse_unread_extensions=refuse_unread_extensions)
+        judged = judge_every_crl(
+            pem,
+            now=now,
+            refuse_unread_extensions=refuse_unread_extensions,
+            refuse_out_of_scope=refuse_out_of_scope,
+        )
     except ValueError as exc:
         raise ValueError(f"{label}: {exc}") from exc
     facts = soonest_crl([every for every, _ in judged])

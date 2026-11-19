@@ -734,8 +734,16 @@ def _ca_file_crl_refusal(
         "restart loads the CA file whole",
     )
     try:
-        # As the reload does: the time a CRL takes effect is asked below, for its own remedy.
-        _, blocks = judge_crl_bytes(pem, label="the CA file", now=now, require_in_effect=False)
+        # As the reload does: the time a CRL takes effect is asked below, for its own remedy. An
+        # out-of-scope CRL is not refused: a start loads a CA file's CRLs unjudged, and beside a
+        # usable CRL from its issuer such a one refuses no peer (pki.judge_every_crl says more).
+        _, blocks = judge_crl_bytes(
+            pem,
+            label="the CA file",
+            now=now,
+            require_in_effect=False,
+            refuse_out_of_scope=False,
+        )
     except ValueError:
         if file_facts is not None and file_facts.expired:
             return (

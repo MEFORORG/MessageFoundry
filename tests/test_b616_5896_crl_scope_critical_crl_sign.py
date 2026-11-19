@@ -478,3 +478,55 @@ def test_a_whole_chain_crl_sign_refusal_after_a_failure_logs_no_error(
     assert "after judging 1 of them" in error.getMessage()
     assert _LOADED in error.getMessage()
     assert len(_lines(caplog, _CRL_SIGN_MISSING_ON_LEAF)) == 1
+
+
+def _scan(ca_file: Path) -> tuple[str, str] | None:
+    """The expiry scan's verdict on the CA file ``ca_file``, which no CRL setting names."""
+    from messagefoundry.pipeline.cert_expiry import _ca_file_crl_refusal
+
+    return _ca_file_crl_refusal(
+        ca_file.read_bytes(), time.time(), None, ca_file_only=True, on_unchecked=lambda: None
+    )
+
+
+@pytest.mark.parametrize("shape", ["some-reasons", "indirect"])
+def test_the_ca_file_scan_passes_an_out_of_scope_crl_beside_a_usable_one(
+    tmp_path: Path, shape: str
+) -> None:
+    """Finding 2 of engine PR 3099, the Lander's hold. A CA file holds its CA, a usable CRL and a
+    reason-scoped or indirect CRL from the same issuer. Nothing judges a CA file's CRLs at start,
+    so a start loads it and OpenSSL judges peers by the usable CRL. The scan must not call it a
+    file to replace before restarting, which is what it said once ``judge_every_crl`` refused the
+    out-of-scope CRL for every caller. The same bytes in a CRL setting still refuse that start."""
+    pki = _Pki(tmp_path)
+    idp, words = _OUT_OF_SCOPE[shape]
+    out_of_scope = _crl(pki.key, extensions=[(idp, True)])
+    bundle = pki.crl_file(pki.ca_file.read_bytes() + _crl(pki.key) + out_of_scope, "bundle.pem")
+
+    # Start-up accepts the CA file: a hop built on it, with a usable CRL setting, starts, and its
+    # handshake passes with the CA file's CRLs loaded beside the setting's.
+    hop = _hop(bundle, pki.crl_file(_crl(pki.key)))
+    _handshake(hop, pki.server())
+
+    assert _scan(bundle) is None
+
+    # Control: as a CRL setting, the out-of-scope CRL still refuses a start.
+    with pytest.raises(ValueError, match=words):
+        pki.hop(pki.crl_file(out_of_scope, "scoped.pem"))
+
+
+def test_the_ca_file_scan_still_alerts_on_a_ca_file_start_up_refuses(tmp_path: Path) -> None:
+    """The control for the test above: a CA file whose CRL block OpenSSL cannot load refuses a
+    start, and the scan still calls it one to fix before restarting."""
+    pki = _Pki(tmp_path)
+    good = _crl(pki.key)
+    lines = good.splitlines(keepends=True)
+    broken = b"".join([lines[0], b"bm90IGEgQ1JM\n", lines[-1]])
+    bundle = pki.crl_file(pki.ca_file.read_bytes() + broken, "bundle.pem")
+
+    with pytest.raises((ssl.SSLError, ValueError)):
+        _hop(bundle, pki.crl_file(good))
+
+    verdict = _scan(bundle)
+    assert verdict is not None
+    assert verdict[1].startswith(("Replace the CRL in the CA file", "Fix the CA file"))
