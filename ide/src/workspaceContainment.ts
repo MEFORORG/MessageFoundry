@@ -91,6 +91,109 @@ export function committedRelativePath(ws: string, value: string): string | undef
   return rel === "" ? "." : rel.split(path.sep).join("/");
 }
 
+/**
+ * Whether `rel`, a path relative to a folder with its `..` components already collapsed, has a folder
+ * or file name ending in a dot or a space, when `win32` (by default, on Windows). A `.` component,
+ * the folder itself, is not such a name. Node reads the name as written and, finding no such entry,
+ * reports a missing path, while the CLI's open goes through Windows path normalization, which can
+ * drop the ending: it opens `cfg` for `cfg.`. A check Node makes on the name then says nothing of
+ * what the CLI opens, a link out of the folder included. Either separator splits `rel`, since Windows
+ * takes both. Spelling only, with no I/O. Shared by {@link escapesByLink} and securityConfigTarget.
+ *
+ * Open limit: at least a reserved device name such as `nul` is not refused here. A name holding a
+ * colon is refused by {@link hasColonInName}.
+ */
+export function hasTrailingDotOrSpaceName(rel: string, win32: boolean = path.sep === "\\"): boolean {
+  return win32 && rel.split(/[\\/]/).some((part) => part !== "." && (part.endsWith(".") || part.endsWith(" ")));
+}
+
+/**
+ * Whether `rel`, a path relative to a folder, has a folder or file name holding a colon, when `win32`
+ * (by default, on Windows). Both callers pass the part below the workspace folder, so the drive is
+ * not in it. Pass no absolute path: its drive colon would count, and a leading `x:` in `rel` is a
+ * one-letter name, not a drive, so it is not skipped. A Win32 open reads
+ * `name:stream` as an NTFS alternate data stream on the entry `name`. With `cfg` a junction out of
+ * the folder, Python's open of `cfg:x` wrote a stream on the folder outside (measured in review, 2026-11-19),
+ * while Node's real-path read finds no such entry and the real-path check passes the name. Behind a
+ * file symbolic link Node can resolve the stream, so the real-path check may refuse that case
+ * itself; this refuses either before any read. Either separator splits `rel`. Spelling only, with no
+ * I/O. Shared by {@link escapesByLink} and securityConfigTarget (BACKLOG #5404 item 1).
+ */
+export function hasColonInName(rel: string, win32: boolean = path.sep === "\\"): boolean {
+  return win32 && rel.split(/[\\/]/).some((part) => part.includes(":"));
+}
+
+/** The workspace-relative path settings a writer checks. */
+export type PathSettingKey = "configDir" | "serviceConfig" | "messageSetsDir";
+
+/**
+ * Whether a writer must refuse `value`, a path setting's value, because though its spelling lies
+ * inside the workspace folder `ws`, the file the CLI or the writer would open may not (BACKLOG #5404
+ * item 1). {@link containedPathSetting} compares spellings only, so without this a writer would follow
+ * a symlink or junction inside the folder out of it, a dangling one included, or act on a path whose
+ * real path cannot be read. The repository supplies the link whichever scope named the path, so the
+ * manifest default and a relative user value are checked too. A value spelled outside the folder can
+ * only be the operator's own user value, theirs to point anywhere, so it is not checked, and the
+ * spelling test runs first, with no I/O.
+ *
+ * At least these spellings are refused outright, before any I/O. A `..` component: the real-path check collapses
+ * `..` by spelling, but on POSIX the CLI's kernel follows a link before it applies the `..` after it,
+ * so `link/../x` could land outside the folder although its spelling is `x`. And, on Windows, a name
+ * {@link hasTrailingDotOrSpaceName} or {@link hasColonInName} names, which the real-path check can
+ * pass although the CLI's Win32 open reaches another entry.
+ *
+ * Open limits. The check reads the named path only: a link BELOW it, such as a linked `codesets`
+ * folder under `configDir`, is not caught here. The real-path reads are synchronous, because cli.ts
+ * `writerPathSetting` answers synchronously to its many callers, so a workspace on a slow share stalls
+ * the extension host for each writer command, and a link inside the folder is followed wherever it
+ * leads while its real path is read. Only a trusted window runs the check (cli.ts `writerSetting`),
+ * where the repository's own code already runs.
+ */
+export function escapesByLink(ws: string | undefined, value: string, win32: boolean = path.sep === "\\"): boolean {
+  if (ws === undefined) {
+    return false;
+  }
+  const rel = committedRelativePath(ws, value);
+  if (rel === undefined) {
+    return false;
+  }
+  // A backslash separates components on Windows only; on POSIX it is part of a name.
+  if (value.split(win32 ? /[\\/]/ : /[/]/).includes("..")) {
+    return true;
+  }
+  if (hasTrailingDotOrSpaceName(rel, win32) || hasColonInName(rel, win32)) {
+    return true;
+  }
+  return resolveInsideWorkspace(ws, value) === undefined;
+}
+
+/**
+ * The refusal a writer shows when {@link escapesByLink} holds. It names the setting, never the value
+ * or the link's target (docs/REVIEW-STANDARDS.md R12). Its first remedy works for every writer. The
+ * second, an absolute path in user settings, which {@link escapesByLink} does not check, is named
+ * with the two writers that decline one: the New Route wizard writes only inside the workspace
+ * folder, and version-control setup commits no hook for a folder outside it. It also says to remove
+ * the workspace value, since a value the workspace sets inside the folder wins over the user's. `fallback` names the
+ * file checked in place of a blank value, which the CLI opens then (cli.ts `writerSetting`).
+ */
+export function linkEscapeRefusal(key: PathSettingKey, fallback?: string): string {
+  const subject =
+    fallback === undefined
+      ? `messagefoundry.${key} names a path`
+      : `messagefoundry.${key} is blank, so the CLI opens ${fallback}, a path`;
+  return (
+    `MessageFoundry: nothing was written or started. ${subject} inside the workspace folder that may ` +
+    "lead out of it, or that Windows may open as another name. At least one of these holds: a symbolic " +
+    "link or junction on the path leads out, the path climbs with '..', a folder or file name on it " +
+    "ends in a dot or a space or holds a colon, or its real path cannot be read. Remove the link, the " +
+    "'..' or the colon, rename the folder or file, correct the setting value, or make the workspace " +
+    "folder readable, so the path is a plain " +
+    "folder or file inside the workspace folder. Commands other than New Route and the commit hook " +
+    "also take the target of a link, named with an absolute path in user settings, once any value " +
+    "for the setting in workspace settings is removed, since a workspace value wins over a user value."
+  );
+}
+
 function isWithin(root: string, target: string): boolean {
   const rel = path.relative(root, target);
   return !(path.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${path.sep}`));
@@ -127,9 +230,10 @@ export interface PathSettingScopes {
  * act on the one used in its place, and shows {@link writerRefusal} (cli.ts `writerPathSetting`).
  *
  * Open limit: this compares spellings only, with no file-system call, because every CLI call reads
- * these settings. It does not catch a link or junction inside the folder that leads out of it, or a
- * Windows name ending in a dot or a space. A writer that needs those checks makes them itself
- * ({@link resolveInsideWorkspace}, securityConfigTarget).
+ * these settings. It does not catch at least a link or junction inside the folder that leads out of
+ * it, a Windows name ending in a dot or a space, or a Windows name holding a colon. A writer that
+ * needs those checks makes them itself
+ * ({@link escapesByLink}, {@link resolveInsideWorkspace}, securityConfigTarget).
  */
 export function containedPathSetting(
   seen: PathSettingScopes | undefined,

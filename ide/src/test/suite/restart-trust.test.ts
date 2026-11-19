@@ -164,10 +164,19 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     "realpathSync",
   ];
 
-  /** What one Restart did: each `fs` call as "<function> <path>", and whether it stopped or started
-   *  the engine. */
-  async function restart(url: string): Promise<{ statted: string[]; stopped: boolean; started: boolean }> {
+  /** Whether `p` is the workspace folder or spelled inside it. */
+  function isWithinWorkspace(p: string): boolean {
+    const rel = path.relative(ws, path.resolve(p));
+    return !(path.isAbsolute(rel) || rel === ".." || rel.startsWith(`..${path.sep}`));
+  }
+
+  /** What one Restart did: each `fs` call as "<function> <path>", each real path its link check
+   *  read inside the folder, and whether it stopped or started the engine. */
+  async function restart(
+    url: string,
+  ): Promise<{ statted: string[]; resolved: string[]; stopped: boolean; started: boolean }> {
     const statted: string[] = [];
+    const resolved: string[] = [];
     let stopped = false;
     let started = false;
     // A running engine this IDE owns, so a Restart that got past its checks would stop it.
@@ -191,13 +200,24 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     // Records and refuses every call, never reaching the real filesystem: a stat of the UNC value
     // would otherwise go to the network on Windows.
     for (const name of SPIED) {
-      FS_MODULE[name] = (p: fs.PathLike): boolean => {
+      const spy = (p: fs.PathLike): boolean | string => {
+        // A writer's link check (workspaceContainment.ts escapesByLink, which cli.ts writerSetting
+        // calls, BACKLOG #5404 item 1) reads the real path of
+        // the workspace folder and of a path spelled inside it. Those are answered as a folder with
+        // no links and kept apart, so `statted` still records every other call, a realpath of any
+        // path outside the folder included.
+        if (name === "realpathSync" && isWithinWorkspace(String(p))) {
+          resolved.push(String(p));
+          return String(p);
+        }
         statted.push(`${name} ${String(p)}`);
         if (name === "existsSync") {
           return false;
         }
         throw Object.assign(new Error(`ENOENT: stubbed ${name} '${String(p)}'`), { code: "ENOENT" });
       };
+      // workspaceContainment calls `realpathSync.native`; the spy answers it too.
+      FS_MODULE[name] = Object.assign(spy, { native: spy });
     }
     let pending: Promise<void>;
     try {
@@ -210,7 +230,7 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
       }
     }
     await pending;
-    return { statted, stopped, started };
+    return { statted, resolved, stopped, started };
   }
 
   test("an untrusted workspace: Restart refuses, and the configured path is never statted", async () => {
@@ -219,6 +239,7 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
 
     // Nothing statted at all, so not the configured path either.
     assert.deepStrictEqual(run.statted, [], "Restart touched the filesystem before its trust check");
+    assert.deepStrictEqual(run.resolved, [], "Restart read a real path before its trust check");
     assert.deepStrictEqual(notices, [TRUST_REFUSAL]);
     assert.strictEqual(run.stopped, false, "a refused Restart must not stop the engine");
     assert.strictEqual(run.started, false);
@@ -228,6 +249,7 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     const run = await restart(REMOTE);
 
     assert.deepStrictEqual(run.statted, [], "Restart touched the filesystem before its target check");
+    assert.deepStrictEqual(run.resolved, [], "Restart read a real path before its target check");
     assert.deepStrictEqual(notices, [REMOTE_REFUSAL]);
     assert.strictEqual(run.stopped, false);
     assert.strictEqual(run.started, false);
@@ -251,9 +273,43 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
     assert.strictEqual(notices.length, 1, JSON.stringify(notices));
     assert.ok(!notices[0].includes("[x](command:foo)"), notices[0]);
     assert.ok(!notices[0].includes("command:"), notices[0]);
-    // Control: the refusal fired for this value and names the setting.
-    assert.match(notices[0], /^MessageFoundry: messagefoundry\.serviceConfig names a path which is not a file in this workspace/);
+    // Control: the refusal fired for this value and names the setting. On Windows the writer's link
+    // check refuses the colon in the name, an NTFS stream spelling, before any file-system call
+    // (BACKLOG #5404 item 1); elsewhere a colon is part of a name and the later no-file refusal fires.
+    if (process.platform === "win32") {
+      assert.match(
+        notices[0],
+        /^MessageFoundry: nothing was written or started\. messagefoundry\.serviceConfig names a path inside the workspace folder/,
+      );
+      assert.ok(notices[0].includes("holds a colon"), notices[0]);
+      assert.deepStrictEqual(run.statted, [], "the colon refusal came after a file-system call");
+      // configDir is checked first and is read; the serviceConfig value never is.
+      assert.ok(run.resolved.length > 0, "the configDir link check did not run, so the spy is unwired");
+      assert.ok(
+        run.resolved.every((p) => !p.includes("command")),
+        `the colon refusal came after a real-path read: ${JSON.stringify(run.resolved)}`,
+      );
+    } else {
+      assert.match(notices[0], /^MessageFoundry: messagefoundry\.serviceConfig names a path which is not a file in this workspace/);
+    }
     assert.strictEqual(run.stopped, false);
+    assert.strictEqual(run.started, false);
+  });
+
+  test("a command-link value the colon refusal does not stop reaches the no-file refusal, and is not echoed", async () => {
+    // A user value outside the folder on Windows, which the link check does not read, and a plain
+    // name inside it elsewhere, which it reads and passes: neither is stopped by the colon refusal,
+    // so the no-file refusal's own no-echo is still driven on both legs.
+    stubSetting = "\\\\attacker.invalid\\share\\[x](command:foo)";
+    const run = await restart(LOOPBACK);
+
+    assert.strictEqual(notices.length, 1, JSON.stringify(notices));
+    assert.ok(!notices[0].includes("[x](command:foo)"), notices[0]);
+    assert.ok(!notices[0].includes("command:"), notices[0]);
+    assert.match(notices[0], /^MessageFoundry: messagefoundry\.serviceConfig names a path which is not a file in this workspace/);
+    assert.deepStrictEqual(run.statted, [`statSync ${path.resolve(ws, stubSetting)}`]);
+    assert.strictEqual(run.stopped, false);
+    assert.strictEqual(run.started, false);
   });
 
   test("no folder open: Restart gives Start's folder refusal and does not stop the engine", async () => {
@@ -321,6 +377,8 @@ restartSuite("Restart refuses before it stats the service config (BACKLOG #5566)
 
     assert.deepStrictEqual(run.statted, []);
     assert.deepStrictEqual(notices, []);
+    // Positive control for the stub above: the link check ran, on the folder itself.
+    assert.ok(run.resolved.includes(ws), JSON.stringify(run.resolved));
     assert.strictEqual(run.stopped, true);
     assert.strictEqual(run.started, true);
   });
