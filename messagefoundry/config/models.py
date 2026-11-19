@@ -533,6 +533,13 @@ class RetryPolicy(BaseModel):
             return self.max_backoff_seconds
 
 
+def _refuse_bool_threshold(value: object) -> object:
+    """Refuse a boolean alert threshold, which pydantic would otherwise read as 1 (BACKLOG #5778)."""
+    if isinstance(value, bool):
+        raise ValueError("an alert threshold must be a number or None, not a boolean")
+    return value
+
+
 class BuildupThreshold(BaseModel):
     """When to raise a ``queue_buildup`` alert for a lane whose backlog is not draining. An outbound
     lane is the classic case: a head retrying its way toward :attr:`RetryPolicy.max_attempts`. The cap
@@ -546,12 +553,17 @@ class BuildupThreshold(BaseModel):
     over five minutes is a problem in any environment); depth is opt-in (a healthy ceiling depends on
     the connection's throughput, so there's no safe universal default).
 
-    A set dimension must be a positive, finite number (BACKLOG #5778): a depth or age of zero (or
-    below) is crossed by every lane at all times, and NaN or infinity is never crossed, which
-    silently disables the alert that ``None`` disables on purpose."""
+    A set dimension must be greater than zero (BACKLOG #5778): a depth below one, or an age of zero
+    or below, is crossed by every lane that holds a message, so it pages on each one; NaN is never
+    crossed, so it would turn the alert off unseen. A boolean is refused rather than read as 1."""
 
     max_depth: int | None = Field(default=None, ge=1)
-    max_oldest_seconds: float | None = Field(default=300.0, gt=0, allow_inf_nan=False)
+    max_oldest_seconds: float | None = Field(default=300.0, gt=0)
+
+    @field_validator("max_depth", "max_oldest_seconds", mode="before")
+    @classmethod
+    def _refuse_bool(cls, value: object) -> object:
+        return _refuse_bool_threshold(value)
 
 
 class StallThreshold(BaseModel):
@@ -566,10 +578,15 @@ class StallThreshold(BaseModel):
     double-paging by default). Resolution mirrors the other per-lane policies: per-connection
     ``stall=`` override > the ``[delivery]`` global default > built-in (off).
 
-    A set threshold must be positive and finite, for the reasons :class:`BuildupThreshold` gives
-    (BACKLOG #5778)."""
+    A set threshold must be greater than zero, and not a boolean, for the reasons
+    :class:`BuildupThreshold` gives (BACKLOG #5778)."""
 
-    max_oldest_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    max_oldest_seconds: float | None = Field(default=None, gt=0)
+
+    @field_validator("max_oldest_seconds", mode="before")
+    @classmethod
+    def _refuse_bool(cls, value: object) -> object:
+        return _refuse_bool_threshold(value)
 
 
 #: BACKLOG #5768: the rise, in messages, a lane's backlog must clear before saturation fires.
@@ -664,8 +681,8 @@ class ActiveWindow(BaseModel):
         # TypeError at every schedule tick rather than at load (BACKLOG #5779).
         if value.tzinfo is not None:
             raise ValueError(
-                f"active-window start/end must be a wall-clock time with no UTC offset; got "
-                f"{value.isoformat()!r} (set the window's zone with `timezone`)"
+                "active-window start/end must be a wall-clock time with no UTC offset (set the "
+                "window's zone with `timezone`)"
             )
         return value
 

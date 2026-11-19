@@ -2507,11 +2507,11 @@ class DeliverySettings(_Section):
     # queue_buildup alert thresholds for every outbound. Mirror BuildupThreshold (a test guards the
     # sync); buildup_max_depth unset = depth dimension off; per-connection buildup= overrides.
     buildup_max_depth: int | None = Field(default=None, ge=1)
-    buildup_max_oldest_seconds: float | None = Field(default=300.0, gt=0, allow_inf_nan=False)
+    buildup_max_oldest_seconds: float | None = Field(default=300.0, gt=0)
     # message_stall alert threshold (Corepoint "Max Message Stall") for every outbound. Mirror
     # StallThreshold (a test guards the sync); None (the default) = the stall alert is OFF — deny-by-
     # default, opt-in because it overlaps queue_buildup's age dimension. Per-connection stall= overrides.
-    stall_max_oldest_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    stall_max_oldest_seconds: float | None = Field(default=None, gt=0)
     # saturation alert threshold (#93, ADR 0014 amendment): fire when a lane's backlog is RISING
     # SUSTAINED over this many samples (the DERIVATIVE signal, distinct from buildup/stall's absolute
     # ceilings). None (the default) = OFF — deny-by-default, opt-in because it overlaps queue_buildup's

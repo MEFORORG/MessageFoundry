@@ -190,7 +190,8 @@ def _mapping_values(settings: Mapping[str, Any]) -> Iterable[Any]:
 
 
 def referenced_env_keys_in_graph(registry: Registry) -> list[str]:
-    """The sorted, de-duplicated ``env()`` keys the whole loaded graph references.
+    """The sorted, de-duplicated ``env()`` keys the loaded graph references, leaving out a
+    ``deployed=False`` connection's (see :func:`_iter_settings_values`).
 
     The graph-wide analogue of :func:`messagefoundry.config.wiring.referenced_env_keys` (which is
     per-settings-dict). Empty ⇒ a zero-``env()`` deployment — the case ADR 0050 AC-3 must never
@@ -200,7 +201,8 @@ def referenced_env_keys_in_graph(registry: Registry) -> list[str]:
 
 
 def graph_references_env(registry: Registry) -> bool:
-    """Whether the loaded graph contains at least one ``env()`` reference (ADR 0050 §2 / AC-3 gate).
+    """Whether the loaded graph contains at least one ``env()`` reference outside a
+    ``deployed=False`` connection (ADR 0050 §2 / AC-3 gate).
 
     This is the precondition that — together with an *explicit* project root and an absent
     ``<env>.toml`` — turns a missing value file into a hard startup failure. A graph with **zero**

@@ -136,6 +136,10 @@ def test_graph_references_env_skips_not_deployed_connection(tmp_path: Path) -> N
     assert "OB_OFF" in reg.outbound
     assert graph_references_env(reg) is False
     assert referenced_env_keys_in_graph(reg) == []
+    # Positive control: the same connection, deployed, is counted.
+    on = load_config(_config_dir(tmp_path, body.replace(", deployed=False", ""), name="config_on"))
+    assert graph_references_env(on) is True
+    assert referenced_env_keys_in_graph(on) == ["off_host"]
 
 
 # --- AC-3: scoped fail-loud through the offline `validate` subcommand ----------------------------

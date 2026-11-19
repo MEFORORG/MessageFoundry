@@ -100,11 +100,11 @@ def test_stall_threshold_default_off_and_toml_override(tmp_path: Path) -> None:
     assert st.max_oldest_seconds == 120.0
 
 
-@pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf")])
-def test_buildup_and_stall_thresholds_refuse_non_positive_or_non_finite(value: float) -> None:
-    # BACKLOG #5778: zero or below is crossed by every lane at all times (an alert per queued
-    # message); NaN or infinity is never crossed (the alert silently off). Both are refused at load,
-    # on the per-connection models and on the [delivery] keys that mirror them.
+@pytest.mark.parametrize("value", [0, -1, float("nan"), True])
+def test_buildup_and_stall_thresholds_refuse_non_positive_nan_or_bool(value: float) -> None:
+    # BACKLOG #5778: zero or below is crossed by every lane holding a message (an alert per queued
+    # message); NaN is never crossed (the alert silently off); a boolean would read as 1. Each is
+    # refused at load, on the per-connection models and on the [delivery] keys that mirror them.
     with pytest.raises(ValueError):
         BuildupThreshold(max_oldest_seconds=value)
     with pytest.raises(ValueError):
@@ -115,7 +115,17 @@ def test_buildup_and_stall_thresholds_refuse_non_positive_or_non_finite(value: f
         DeliverySettings(stall_max_oldest_seconds=value)
 
 
-@pytest.mark.parametrize("depth", [0, -5])
+def test_infinite_age_threshold_still_loads() -> None:
+    # Not refused: an infinite age is never crossed, and TOML has no null, so it is a spelling
+    # a settings file has for leaving a default-on age dimension quiet. Refusing it is a separate
+    # decision from BACKLOG #5778's zero, negative and NaN refusals.
+    assert BuildupThreshold(max_oldest_seconds=float("inf")).max_oldest_seconds == float("inf")
+    assert DeliverySettings(
+        stall_max_oldest_seconds=float("inf")
+    ).stall_max_oldest_seconds == float("inf")
+
+
+@pytest.mark.parametrize("depth", [0, -5, True])
 def test_buildup_depth_refuses_below_one(depth: int) -> None:
     with pytest.raises(ValueError):
         BuildupThreshold(max_depth=depth)
