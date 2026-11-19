@@ -314,9 +314,6 @@ def test_a_payload_with_neither_list_refuses_even_when_empty_is_allowed() -> Non
 
 def test_the_frozen_live_payload_still_reads(payload: dict[str, Any]) -> None:
     """The positive control on the real shape: enforced, both lists populated, nothing refused."""
-    assert set(_reader()(payload)) == set(_contexts_of(payload))
-
-
-def _contexts_of(d: dict[str, Any]) -> list[str]:
-    rsc = d["protection"]["required_status_checks"]
-    return [*rsc["contexts"], *(c["context"] for c in rsc["checks"])]
+    rsc = payload["protection"]["required_status_checks"]
+    expected = {*rsc["contexts"], *(c["context"] for c in rsc["checks"])}
+    assert set(_reader()(payload)) == expected
