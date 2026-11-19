@@ -1251,9 +1251,11 @@ def _shell_lines(step: dict) -> str:
 
 def _sbomqs_split_offences(job: dict, soft_step: str) -> list[str]:
     """Why ``job``'s sbomqs checksum could end green, or never run; empty when a failed check fails
-    the job. The same rules as tests/test_release_pipeline.py's release twin, except two this job
-    needs: its install step may run on ``always()`` (so the IDE SBOM is still scored after a failed
-    Python one), and it may name ``shell: bash``, which keeps errexit (GitHub runs it as ``bash -e``).
+    the job. Modelled on tests/test_release_pipeline.py's release twin, which it does not share code
+    with. Two rules differ for this job: its install step may run on ``always()`` (so the IDE SBOM is
+    still scored after a failed Python one) or ``success()``, absent or written out, and the step may
+    name ``shell: bash``, which keeps errexit (GitHub runs it as ``bash -e``). It does not check the
+    score step's own flag; test_step_advisory_jobs_soften_only_their_named_step does.
     """
     from tests._verify_softeners import verification_softeners
 
@@ -1272,10 +1274,15 @@ def _sbomqs_split_offences(job: dict, soft_step: str) -> list[str]:
         offences.append(f"the softened step {soft_step!r} downloads or verifies sbomqs")
     if install.get("continue-on-error") not in (None, False):
         offences.append(f"the checksum step {name!r} carries continue-on-error")
-    if str(install.get("if") or "always()").strip() != "always()":
+    if job.get("continue-on-error") not in (None, False):
+        offences.append("the job carries continue-on-error, which turns a failed check green")
+    if str(install.get("if") or "success()").strip() not in ("always()", "success()"):
         offences.append(f"the checksum step {name!r} can be skipped: if: {install.get('if')!r}")
-    if install.get("shell") not in (None, "bash"):
-        offences.append(f"the checksum step {name!r} runs under shell {install.get('shell')!r}")
+    # A step with no `shell:` takes the job's `defaults.run.shell`, which can drop errexit.
+    default_shell = ((job.get("defaults") or {}).get("run") or {}).get("shell")
+    shell = install.get("shell", default_shell)
+    if shell not in (None, "bash"):
+        offences.append(f"the checksum step {name!r} runs under shell {shell!r}")
     if "||" in body:
         offences.append(f"the checksum step {name!r} carries a `||` fallback")
     offences.extend(
@@ -1342,6 +1349,33 @@ def test_the_sbomqs_split_check_reds_on_each_loosening(
     verify = next(s for s in steps if "sha256sum -c" in _shell_lines(s))
     assert steps[steps.index(verify) + 1].get("name") == soft, "the score no longer follows"
     offences = _sbomqs_split_offences({**job, "steps": mutate(steps, verify)}, soft)
+    assert any(needle in o for o in offences), offences
+
+
+@pytest.mark.parametrize("key", _SBOMQS_SPLIT_JOBS)
+@pytest.mark.parametrize(
+    ("job_edit", "needle"),
+    [
+        ({"defaults": {"run": {"shell": "bash {0}"}}}, "runs under shell"),
+        ({"continue-on-error": True}, "job carries continue-on-error"),
+    ],
+    ids=["job-default-shell", "job-continue-on-error"],
+)
+def test_the_sbomqs_split_check_reds_on_a_job_level_loosening(
+    key: str, job_edit: dict, needle: str
+) -> None:
+    """The controls for the job-level rules: a default shell without errexit, which a step naming no
+    ``shell:`` inherits, and a job-level flag. The Windows install names ``shell: bash`` itself, so
+    the default-shell arm plants it on a copy whose install names none."""
+    soft = {k: step for wf, k, _, step in _STEP_ADVISORY_JOBS if wf == _SECURITY}[key]
+    job = jobs_of(_SECURITY)[key]
+    steps = [
+        {k: v for k, v in s.items() if k != "shell"} if "sha256sum -c" in _shell_lines(s) else s
+        for s in job["steps"]
+        if isinstance(s, dict)
+    ]
+    assert not _sbomqs_split_offences({**job, "steps": steps}, soft)
+    offences = _sbomqs_split_offences({**job, "steps": steps, **job_edit}, soft)
     assert any(needle in o for o in offences), offences
 
 

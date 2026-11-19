@@ -209,10 +209,12 @@ crypto-operations (TypeScript/JavaScript + PowerShell, ASVS 11.1.3)
 # `continue-on-error: true`. There are now THREE reasons a security.yml job is absent from this list,
 # and only the first is about the job's own posture:
 #
-#   * `sbom`, `sbom-windows`,     -- advisory BY DESIGN; schedule/dispatch-only, so none can report
-#     `trivy`                        on a pull request, and each declares `continue-on-error: true` on
-#                                    ONE step, never the job (the sbomqs score step on the two SBOM
-#                                    jobs, the scan step on `trivy`; BACKLOG #5475).
+#   * `sbom`, `sbom-windows`,     -- advisory BY DESIGN; schedule/dispatch-only, so none RUNS on a
+#     `trivy`                        pull request (each reports SKIPPED there, which a required check
+#                                    reads as passing, so requiring one would gate nothing), and each
+#                                    declares `continue-on-error: true` on ONE step, never the job
+#                                    (the sbomqs score step on the two SBOM jobs, the scan step on
+#                                    `trivy`; BACKLOG #5475).
 #   * `released-line-audit`,      -- advisory BY PLACEMENT; schedule/dispatch-only, so neither can
 #     `cla-action-audit`             report on a pull request. Each still goes red on a finding.
 #   * the SEVEN original scans    -- SUPERSEDED. See the block below. They hard-fail and they report
