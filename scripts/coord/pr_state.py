@@ -221,7 +221,7 @@ def contexts_query(heads: dict[int, str]) -> str:
             f'p{n}: object(oid: "{oid}") {{ ... on Commit {{ oid '
             f"statusCheckRollup {{ contexts(first: {CONTEXT_PAGE}) {{ pageInfo {{ hasNextPage }} nodes {{ "
             f"__typename "
-            f"... on CheckRun {{ name status conclusion startedAt isRequired(pullRequestNumber: {n}) }} "
+            f"... on CheckRun {{ name status conclusion startedAt completedAt isRequired(pullRequestNumber: {n}) }} "
             f"... on StatusContext {{ context state createdAt isRequired(pullRequestNumber: {n}) }} "
             f"}} }} }} }} }}"
         )
@@ -397,7 +397,9 @@ def required_verdict(
 def _speaker(runs: list[Any]) -> Any:
     """The run that speaks for one name: modelled on clear_stale_ci_red.newest_by_name, on GraphQL
     fields. It differs from it in at least these ways: on equal timestamps the worse verdict wins
-    (failing, then STALE, then unsettled), where newest_by_name has no tie-break; it falls back to a
+    (failing, then STALE, then unsettled), where newest_by_name has no tie-break; it compares stamps
+    as parsed times and ranks an unstamped run fail-closed (below), where newest_by_name compares
+    text and lets an unstamped run lose; it falls back to a CheckRun's completedAt and a
     StatusContext's createdAt; and it reads StatusContexts at all.
 
     A run still IN PROGRESS beats a finished one outright; a head can carry two concurrent runs of
@@ -408,12 +410,15 @@ def _speaker(runs: list[Any]) -> Any:
     Stamps are compared as aware datetimes, never as strings: a fractional-second stamp sorts
     BEFORE the same second without one as text ('.' < 'Z'), and an empty stamp sorted before every
     real one, so a later failing run could lose to an older success and a failing head read green.
-    FAIL-CLOSED RULE: a run whose stamp is missing or unparseable could be the newest, so it ranks
-    as TIED with the newest parseable stamp, and the tie-break then lets the worse verdict win. An
+    A run that never started (cancelled while queued) has no startedAt but does have a completedAt,
+    so it is ranked by that: a re-run started after it still speaks.
+
+    FAIL-CLOSED RULE: a run with no usable stamp at all could be the newest, so it ranks as TIED
+    with the newest parseable stamp, and the tie-break then lets the worse verdict win. An
     unstamped failure therefore beats any success, and an unstamped success never beats a newer
     failure. The cost is deliberate: an unstamped failure also beats a later stamped re-run that
-    passed, so that name reads red until the unstamped run leaves the head. GitHub stamps every
-    started check run, so this is an anomaly, and reading it red is the fail-closed answer.
+    passed, so that name reads red on this head until a new push. A finished run with no stamp of
+    any kind is an anomaly, and reading it red is the fail-closed answer.
     """
     earliest = datetime.min.replace(tzinfo=UTC)
     newest = max((s for s in map(_stamp, runs) if s is not None), default=earliest)
@@ -433,10 +438,15 @@ def _speaker(runs: list[Any]) -> Any:
 
 
 def _stamp(run: Any) -> datetime | None:
-    """A run's start (a StatusContext's createdAt), or None when it is missing or unparseable."""
+    """A run's start, else its completion, else a StatusContext's createdAt; None when none of them
+    parses."""
     if not isinstance(run, dict):
         return None
-    return parse_iso(run.get("startedAt") or run.get("createdAt"))
+    for field in ("startedAt", "completedAt", "createdAt"):
+        stamp = parse_iso(run.get(field))
+        if stamp is not None:
+            return stamp
+    return None
 
 
 def _known(value: object) -> str | None:

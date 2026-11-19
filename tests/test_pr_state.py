@@ -999,3 +999,19 @@ def test_a_status_context_is_ranked_by_its_created_at_as_a_time(tmp_path: Path) 
     later_green = status("SUCCESS", "2026-10-22T10:00:01Z")
     for order in ((later_green, red), (red, later_green)):
         assert _required(tmp_path, *order)["state"] == "SUCCESS"
+
+
+def test_a_run_cancelled_while_queued_is_ranked_by_its_completion(tmp_path: Path) -> None:
+    """No startedAt, but a completedAt: a re-run started after it still speaks, either order."""
+    cancelled = {
+        **_run("test", "CANCELLED"),
+        "startedAt": None,
+        "completedAt": "2026-10-22T10:00:00Z",
+    }
+    rerun = {**_run("test"), "startedAt": "2026-10-22T11:00:00Z"}
+    for order in ((cancelled, rerun), (rerun, cancelled)):
+        assert _required(tmp_path, *order)["state"] == "SUCCESS"
+
+
+def test_the_contexts_query_asks_for_completed_at() -> None:
+    assert "completedAt" in ps.contexts_query({1: _sha(1)})
