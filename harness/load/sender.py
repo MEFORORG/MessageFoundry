@@ -52,6 +52,8 @@ _BACKOFF_MAX = 5.0
 # cancelled (BACKLOG #5951). A peer that stalls a connect, a drain or a close would otherwise hold
 # the run's shutdown for good. The margin leaves a healthy peer room to take what is still queued.
 _STOP_HARD_MARGIN_S = 10.0
+# The longest single wait in an ACK-timed read before it re-checks the oldest send's deadline.
+_ACK_WAIT_CAP_S = 60.0
 
 
 class AckTimeoutError(Exception):
@@ -95,7 +97,7 @@ class PersistentConnection:
         # timeouts, and it reconnects. None waits for ever, as every direct caller did before.
         if ack_timeout is not None and not ack_timeout > 0:
             raise ValueError(f"ack_timeout must be positive, got {ack_timeout!r}")
-        self._ack_timeout_ns = None if ack_timeout is None else int(ack_timeout * 1e9)
+        self._ack_timeout = ack_timeout  # seconds; float math, so inf or a huge value is fine
         self._port = port
         self._correlator = correlator
         self._m = metrics
@@ -242,8 +244,11 @@ class PersistentConnection:
             except (OSError, ConnectionError):
                 dropped = not self._stop.is_set()
             except AckTimeoutError as exc:
-                # This side closed the socket, so it is not a drop. Its in-flight sends are released
-                # as timeouts below, like any other close, and the connection reopens.
+                # This side closes the socket, so it is not a drop. Aborted, not closed: a peer that
+                # stopped answering may have stopped reading too, and a graceful close would wait on
+                # it to take the unsent buffer. Its in-flight sends are released as timeouts below,
+                # like any other close, and the connection reopens.
+                writer.transport.abort()
                 log.warning("load connection %s:%d: %s; reconnecting", self._host, self._port, exc)
             except MLLPFrameError as exc:
                 # A reply frame over the cap: refused, counted as a transport error, and the socket
@@ -254,13 +259,14 @@ class PersistentConnection:
                 log.warning("MLLP reply frame over cap; closing connection: %s", exc)
             finally:
                 self._up = False
-                self._writer = None
                 if dropped:
                     self._drops += 1
                 self._fail_inflight()
                 writer.close()
                 with contextlib.suppress(ConnectionError, OSError):
                     await writer.wait_closed()
+                # Cleared only once closed, so a hard stop can still abort a close that stalls.
+                self._writer = None
             if self._stop.is_set():
                 return
             if await self._wait_backoff(backoff):  # brief pause before reconnect
@@ -358,24 +364,29 @@ class PersistentConnection:
         # `_run` refuses it; ACKs earlier in the same read were already handled (the feed is lazy).
         decoder = MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES)
         while True:
-            if self._ack_timeout_ns is None:
+            if self._ack_timeout is None:
                 chunk = await reader.read(_READ_BYTES)
             else:
                 # Wake at the oldest send's deadline, or one timeout from now when nothing is in
-                # flight, since a send made meanwhile starts its own clock.
-                wait_ns = self._ack_timeout_ns
+                # flight, since a send made meanwhile starts its own clock. Capped, so a huge
+                # timeout never reaches the event loop's own wait.
+                wait = self._ack_timeout
                 if self._inflight:
-                    oldest_ns = self._inflight[0][1]
-                    wait_ns = oldest_ns + self._ack_timeout_ns - time.perf_counter_ns()
-                    if wait_ns <= 0:
+                    oldest = self._inflight[0][1] / 1e9
+                    wait = oldest + self._ack_timeout - time.perf_counter_ns() / 1e9
+                    if wait <= 0:
                         raise AckTimeoutError(
-                            f"no reply to seq={self._inflight[0][0]} within "
-                            f"{self._ack_timeout_ns / 1e9:g}s"
+                            f"no reply to seq={self._inflight[0][0]} within {self._ack_timeout:g}s"
                         )
+                window = asyncio.timeout(min(wait, _ACK_WAIT_CAP_S))
                 try:
-                    async with asyncio.timeout(wait_ns / 1e9):
+                    async with window:
                         chunk = await reader.read(_READ_BYTES)
                 except TimeoutError:
+                    # Only this window's expiry: a socket ETIMEDOUT is a TimeoutError too, and the
+                    # reader raises it again on every read, so swallowing it would spin the loop.
+                    if not window.expired():
+                        raise
                     continue  # re-check the oldest send against its deadline
             if not chunk:
                 return  # peer closed

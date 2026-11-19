@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (
 
 from harness._async import AsyncRunner
 from messagefoundry.api.models import MessageDetail, MessageSummary
-from messagefoundry.apiclient import ApiError, EngineClient, IdpStepUpRequired
+from messagefoundry.apiclient import ApiError, EngineClient, StepUpRequired
 from messagefoundry.parsing import HL7PeekError, parse_tree
 
 #: Shared "error red" for inline error text — the message-detail error, the auth dialogs'
@@ -431,8 +431,9 @@ class _MessagesSnapshot:
     count_text: str
     truncated: bool
     error: str | None
-    # A content search refused with 403. The polling client has no step-up handler, so the
-    # refusal surfaces here instead of prompting; the panel answers it on the GUI thread.
+    # A content search refused for want of a fresh step-up. The polling client has no step-up
+    # handler, so the refusal surfaces here instead of prompting; the panel answers it on the GUI
+    # thread.
     search_refused: bool = False
 
 
@@ -473,8 +474,9 @@ class MessagesPanel(QWidget):
         self._client = client
         self._poll = poll_client or client  # message-list read — runs off the main thread
         # The content search is step-up gated, and the worker's polling client cannot prompt. A
-        # search refused with 403 calls this on the GUI thread (it prompts and re-proves) and, if
-        # it returns True, resubmits the same refresh once. None: the refusal is reported as is.
+        # search refused for a step-up (StepUpRequired) calls this on the GUI thread (it prompts
+        # and re-proves) and, if it returns True, resubmits the same refresh once. None: the
+        # refusal is reported as is.
         self._step_up = step_up
         self._stepped_up = False  # the in-flight read is the one retry after a step-up
         self._runner = AsyncRunner(self)
@@ -564,6 +566,7 @@ class MessagesPanel(QWidget):
         # Belt-and-suspenders: list_messages raises only ApiError (handled via the snapshot in _apply),
         # but an unexpected error must still clear the in-flight guard or the panel wedges forever.
         self._loading = False
+        self._stepped_up = False
         self.error.emit(str(exc))
         self._drain_pending()
 
@@ -610,24 +613,27 @@ class MessagesPanel(QWidget):
                 False,
                 None,
             )
-        except IdpStepUpRequired as exc:
-            # Only the web console can step up at the IdP, so a password prompt would not help.
-            return _MessagesSnapshot(None, "", False, str(exc))
+        except StepUpRequired as exc:
+            # Not IdpStepUpRequired, which only the web console can answer, and not a role, scope
+            # or second-factor refusal, which a password would not clear.
+            return _MessagesSnapshot(None, "", False, str(exc), search_refused=True)
         except ApiError as exc:
-            refused = bool(field_path or content) and exc.status == 403
-            return _MessagesSnapshot(None, "", False, str(exc), search_refused=refused)
+            return _MessagesSnapshot(None, "", False, str(exc))
 
     def _apply(self, snap: _MessagesSnapshot, *, autosize: bool = False) -> None:
         """Runs on the main thread (result slot) — safe to touch widgets."""
-        self._loading = False
         retried, self._stepped_up = self._stepped_up, False
         if snap.search_refused and not retried and self._step_up is not None:
+            # _loading stays set while the prompt is up: its nested event loop may deliver a
+            # refresh, which must latch rather than start a second search and a second prompt.
             try:
                 proved = self._step_up()
             except ApiError as exc:
                 # A refused re-proof: report its own cause, not the original 403.
                 snap = _MessagesSnapshot(None, "", False, str(exc))
                 proved = False
+            finally:
+                self._loading = False
             if proved:
                 # Re-proved on the GUI thread; the polling client reads the rotated token through
                 # the shared cell, so the resubmitted search carries the fresh grant. One retry
@@ -636,6 +642,7 @@ class MessagesPanel(QWidget):
                 self._stepped_up = True
                 self.refresh(autosize=autosize)
                 return
+        self._loading = False
         if snap.error is not None:
             self.error.emit(snap.error)
             self._drain_pending()

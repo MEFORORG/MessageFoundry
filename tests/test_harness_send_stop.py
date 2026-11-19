@@ -92,6 +92,47 @@ def test_a_dial_still_times_out_at_the_connect_timeout(unreachable: list[_NeverC
     assert res.error == "timed out"
 
 
+def test_a_socket_that_cannot_be_made_moves_on_to_the_next_address(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # As socket.create_connection does: an address family the host lacks (IPv6 disabled, say) is
+    # skipped, and the next address is dialled.
+    import socket as socket_mod
+
+    v6 = (socket_mod.AF_INET6, socket_mod.SOCK_STREAM, 0, "", ("::1", 9, 0, 0))
+    v4 = (socket_mod.AF_INET, socket_mod.SOCK_STREAM, 0, "", ("127.0.0.1", 9))
+    monkeypatch.setattr(socket_mod, "getaddrinfo", lambda *_a, **_kw: [v6, v4])
+    tried: list[int] = []
+
+    def open_socket(family: int, *_a: object) -> _NeverConnects:
+        tried.append(family)
+        if family == socket_mod.AF_INET6:
+            raise OSError(97, "Address family not supported by protocol")
+        return _NeverConnects()
+
+    monkeypatch.setattr(mllp, "_open_socket", open_socket)
+    monkeypatch.setattr(mllp, "_dial_settled", lambda _sock, _wait_s: True)
+    monkeypatch.setattr(_NeverConnects, "getsockopt", lambda *_a: 0, raising=False)
+    monkeypatch.setattr(_NeverConnects, "settimeout", lambda *_a: None, raising=False)
+    worker = SendWorker("localhost", 9, [], timeout=1.0, rate=0.0)
+    assert isinstance(worker._connect(), _NeverConnects)
+    assert tried == [socket_mod.AF_INET6, socket_mod.AF_INET]
+
+
+def test_the_pause_between_messages_keeps_a_fine_rate() -> None:
+    # Event.wait rounds up to the Windows timer tick, about 15 ms, which capped 1000 msg/s at
+    # about 65; the pause sleeps instead and still returns at once on stop.
+    stop = threading.Event()
+    started = time.perf_counter()
+    for _ in range(20):
+        assert mllp.pause_unless_stopped(stop, 0.001) is False
+    assert (time.perf_counter() - started) / 20 < 0.010
+    stop.set()
+    started = time.perf_counter()
+    assert mllp.pause_unless_stopped(stop, 30.0) is True
+    assert time.perf_counter() - started < 0.5
+
+
 def test_compose_shutdown_joins_a_dialling_send_without_terminate(
     qapp: Any, unreachable: list[_NeverConnects], monkeypatch: pytest.MonkeyPatch
 ) -> None:

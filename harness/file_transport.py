@@ -26,7 +26,7 @@ from PySide6.QtCore import QFileSystemWatcher, QObject, QTimer, Signal
 
 from harness.bounded_file import read_capped
 from harness.drivers.file import drop_atomic, drop_name
-from harness.mllp import Received, SendItem
+from harness.mllp import Received, SendItem, pause_unless_stopped
 from messagefoundry.parsing import HL7PeekError, Peek, normalize
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 
@@ -69,6 +69,8 @@ class FileDropWorker(QObject):
         # here; finished is emitted whatever happens, or the tab would wait on it for good.
         try:
             self._drop_all()
+        except Exception:
+            log.exception("harness file drop batch ended early")
         finally:
             self.finished.emit()
 
@@ -86,7 +88,7 @@ class FileDropWorker(QObject):
             if self._stop.is_set():
                 break
             self.result.emit(self._write_one(item))
-            if delay and self._stop.wait(delay):
+            if delay and pause_unless_stopped(self._stop, delay):
                 break
 
     def _write_one(self, item: SendItem) -> DropResult:

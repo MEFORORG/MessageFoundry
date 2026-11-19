@@ -20,7 +20,7 @@ import pytest
 pytest.importorskip("PySide6")
 
 from harness._console_widgets import MessagesPanel  # noqa: E402
-from messagefoundry.apiclient import ApiError, IdpStepUpRequired  # noqa: E402
+from messagefoundry.apiclient import ApiError, IdpStepUpRequired, StepUpRequired  # noqa: E402
 
 
 @pytest.fixture(scope="module")
@@ -49,7 +49,7 @@ class _SearchClient:
 
     def __init__(self, *, refusals: int, error: ApiError | None = None) -> None:
         self._refusals = refusals
-        self._error = error or ApiError("step-up required", status=403)
+        self._error = error or StepUpRequired("step-up required", status=403)
         self.searches = 0
 
     def list_messages(self, **_kw: Any) -> Any:
@@ -146,6 +146,19 @@ def test_an_idp_step_up_is_not_answered_with_a_password_prompt(qapp: Any) -> Non
         _settle(qapp, panel, client, 1)
         assert step_up.calls == 0
         assert errors == ["use the web console"]
+    finally:
+        panel.stop()
+
+
+def test_a_403_that_is_not_a_step_up_is_not_answered_with_a_password_prompt(qapp: Any) -> None:
+    # A role or scope refusal carries no X-Step-Up-Required, so the client raises a plain ApiError.
+    client = _SearchClient(refusals=1, error=ApiError("forbidden", status=403))
+    step_up = _StepUp(True)
+    panel, errors = _search(qapp, client, step_up)
+    try:
+        _settle(qapp, panel, client, 1)
+        assert step_up.calls == 0
+        assert errors == ["forbidden"]
     finally:
         panel.stop()
 

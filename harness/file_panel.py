@@ -180,7 +180,8 @@ class FilePanel(QWidget):
         if self._worker is not None:
             self._worker.stop()
         if self._thread is not None:
-            # stop() also ends a pause between files, so this join never needs terminate.
+            # stop() also ends a pause between files, so this join is normally prompt. A file write
+            # that blocks is waited out, never terminated.
             join_worker_thread(self._thread)
             self._thread = None
         self._worker = None

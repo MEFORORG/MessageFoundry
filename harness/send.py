@@ -174,7 +174,8 @@ class SendPanel(QWidget):
     def shutdown(self) -> None:
         """Stop and join the send thread so the window can close without destroying a running
         QThread. stop() interrupts an in-flight recv, a dial and a pause between messages, so the
-        join is prompt and never needs terminate."""
+        join is normally prompt. What it cannot interrupt, a name lookup or a send to a peer that
+        stopped reading, is waited out, never terminated."""
         if self._worker is not None:
             self._worker.stop()
         if self._thread is not None:

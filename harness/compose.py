@@ -229,8 +229,9 @@ class ComposePanel(QWidget):
         if self._worker is not None:
             self._worker.stop()
         if self._thread is not None:
-            # The send worker sees stop() while dialling too, so this join is prompt and never
-            # needs QThread.terminate (BACKLOG #5947).
+            # The send worker sees stop() while dialling too, so this join is normally prompt.
+            # What stop() cannot interrupt, a name lookup say, is waited out, never terminated
+            # (BACKLOG #5947).
             join_worker_thread(self._thread)
             self._thread = None
         self._worker = None

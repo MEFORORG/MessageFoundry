@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import errno
+import logging
 import os
 import select
 import socket
@@ -107,6 +108,23 @@ _DIAL_IN_PROGRESS = frozenset(
 # The socket constructor the dial uses; a seam for a test that needs a dial which never settles.
 _open_socket = socket.socket
 
+log = logging.getLogger(__name__)
+
+
+def pause_unless_stopped(stop: threading.Event, seconds: float) -> bool:
+    """Sleep ``seconds``, or less if ``stop`` is set meanwhile; return True if it is set.
+
+    ``time.sleep`` in :data:`_STOP_POLL_S` slices rather than one ``Event.wait``: on Windows an
+    ``Event.wait`` rounds up to the system timer tick, about 15 ms, which would cap a rate of
+    1000 messages a second at about 65."""
+    deadline = time.monotonic() + seconds
+    while not stop.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(remaining, _STOP_POLL_S))
+    return True
+
 
 def _socket_error(code: int) -> OSError:
     """The OSError subclass and text a blocking connect would have raised for ``code``."""
@@ -182,29 +200,34 @@ class SendWorker(QObject):
                 if self._stop.is_set():
                     break
                 self.result.emit(self._send_one(item))
-                if delay and self._stop.wait(delay):
+                if delay and pause_unless_stopped(self._stop, delay):
                     break
+        except Exception:
+            log.exception("harness send batch ended early")
         finally:
             self.finished.emit()
 
     def _connect(self) -> socket.socket:
-        """``socket.create_connection`` with the same timeout, but each dial is a non-blocking
-        connect polled in :data:`_STOP_POLL_S` slices, so :meth:`stop` aborts it. A blocking dial
-        could not be interrupted, and held a window close for the whole connect timeout."""
-        deadline = time.monotonic() + self._timeout
+        """``socket.create_connection`` with the same timeout for each address, but each dial is
+        a non-blocking connect polled in :data:`_STOP_POLL_S` slices, so :meth:`stop` aborts it. A
+        blocking dial could not be interrupted, and held a window close for the whole connect
+        timeout. The name lookup before it still blocks."""
         last: OSError | None = None
         for family, kind, proto, _name, addr in socket.getaddrinfo(
             self._host, self._port, type=socket.SOCK_STREAM
         ):
-            sock = _open_socket(family, kind, proto)
+            sock: socket.socket | None = None
             try:
-                self._dial(sock, addr, deadline)
+                sock = _open_socket(family, kind, proto)
+                self._dial(sock, addr, time.monotonic() + self._timeout)
             except OSError as exc:
-                sock.close()
+                if sock is not None:
+                    sock.close()
                 last = exc
                 if self._stop.is_set():
                     break
                 continue
+            last = None  # an earlier address's error holds this frame in its traceback: a cycle
             return sock
         if last is None:
             raise OSError("getaddrinfo returned no address")

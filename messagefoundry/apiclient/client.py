@@ -91,7 +91,7 @@ from messagefoundry.keywrap import KeyWrapRefused, load_checked_cert_chain
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.tls_sigalgs import NarrowerRefused, narrow_signature_algorithms
 
-__all__ = ["EngineClient", "ApiError", "IdpStepUpRequired", "MfaConfirmed"]
+__all__ = ["EngineClient", "ApiError", "IdpStepUpRequired", "MfaConfirmed", "StepUpRequired"]
 
 _log = logging.getLogger(__name__)
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -219,6 +219,17 @@ class IdpStepUpRequired(ApiError):
     cannot perform it: that leg needs a browser and
     re-keys the session it steps up. A subclass of :class:`ApiError`, so a caller that catches only
     that still sees the refusal."""
+
+
+class StepUpRequired(ApiError):
+    """The engine refused the call with 403 + ``X-Step-Up-Required``, and no registered step-up
+    handler answered it: there was none, as on a :meth:`EngineClient.for_polling` client, or it
+    declined, or the retry after it was refused again (BACKLOG #5945).
+
+    A caller holding such a client can re-prove the password on its own GUI thread and retry, rather
+    than guess from the status alone, which a role or scope refusal shares. A subclass of
+    :class:`ApiError`, so a caller that catches only that still sees the refusal. A refusal that
+    carries ``X-Step-Up-Via: idp`` raises :class:`IdpStepUpRequired` instead."""
 
 
 def _buffer_bounded(streaming: httpx.Response, *, limit: int) -> httpx.Response:
@@ -1237,7 +1248,15 @@ class EngineClient:
             # handler runs so the reauth() it calls binds the fresh proof to that action. A plain
             # session-window step-up omits the header → None → reauth() posts no purpose (unchanged).
             self._pending_step_up_action = response.headers.get("X-Step-Up-Action")
-            if self._step_up_handler():
+            proved = False
+            try:
+                proved = self._step_up_handler()
+            finally:
+                if not proved:
+                    # Declined: drop the stash, or a later reauth() made for another reason would
+                    # post this action as its purpose and mint a grant nobody proved for.
+                    self._pending_step_up_action = None
+            if proved:
                 return self._request(
                     method,
                     path,
@@ -1247,6 +1266,8 @@ class EngineClient:
                     _bearer=_bearer,  # always None here; kept for mypy, as in the MFA retry above
                     **kw,
                 )
+        if response.status_code == 403 and response.headers.get("X-Step-Up-Required"):
+            raise StepUpRequired(_error_detail(response), status=response.status_code)
         if response.status_code >= 400:
             raise ApiError(_error_detail(response), status=response.status_code)
         return response

@@ -68,7 +68,7 @@ async def test_no_timeout_is_passed_when_no_ack_is_expected() -> None:
     metrics = LiveMetrics(Counters(), Histogram(), Histogram())
     target = Target(name="t", expect_ack=False, ack_timeout_s=0.3)
     pool = sender.ConnectionPool(target, 1, Correlator(10, metrics), metrics)
-    assert pool._conns[0]._ack_timeout_ns is None
+    assert pool._conns[0]._ack_timeout is None
 
 
 @pytest.mark.parametrize("bad", [0.0, -1.0, float("nan")])
@@ -78,3 +78,63 @@ def test_a_non_positive_ack_timeout_is_refused(bad: float) -> None:
         sender.PersistentConnection(
             "127.0.0.1", 1, Correlator(10, metrics), metrics, ack_timeout=bad
         )
+
+
+async def test_a_target_that_stops_reading_too_still_reconnects() -> None:
+    """The timed-out socket is aborted: a graceful close would wait on a peer that reads nothing to
+    take the unsent buffer, and the connection would never come back."""
+    held: list[asyncio.StreamWriter] = []
+
+    async def deaf(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        held.append(writer)
+
+    server = await asyncio.start_server(deaf, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    metrics = LiveMetrics(Counters(), Histogram(), Histogram())
+    target = Target(name="t", host="127.0.0.1", port=port, ack_timeout_s=0.3)
+    pool = sender.ConnectionPool(target, 1, Correlator(1000, metrics), metrics)
+    conn = pool._conns[0]
+    big = _MSG + "OBX|" + "A" * 65536 + "\r"
+    try:
+        pool.start()
+        for seq in range(1, 301):  # far past what the socket buffers take unread
+            assert pool.submit_nowait(Outgoing(seq, "ADT", f"X{seq}", big))
+        for _ in range(200):
+            if conn.generation >= 2:
+                break
+            await asyncio.sleep(0.05)
+        assert conn.generation >= 2, "the timed-out connection never reconnected"
+        assert metrics.counters.timeouts >= 1
+    finally:
+        await asyncio.wait_for(pool.stop(0.05), timeout=30.0)
+        for writer in held:
+            writer.transport.abort()
+        server.close()
+        await server.wait_closed()
+
+
+async def test_a_socket_timeout_is_not_taken_for_the_ack_window() -> None:
+    """An ETIMEDOUT from the socket is a TimeoutError too; it must end the read, not spin on it."""
+
+    class _TimedOut:
+        calls = 0
+
+        async def read(self, _n: int) -> bytes:
+            self.calls += 1
+            raise TimeoutError(110, "Connection timed out")
+
+    metrics = LiveMetrics(Counters(), Histogram(), Histogram())
+    conn = sender.PersistentConnection(
+        "127.0.0.1", 1, Correlator(10, metrics), metrics, ack_timeout=60.0
+    )
+    reader = _TimedOut()
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(conn._read_loop(reader), timeout=5.0)  # type: ignore[arg-type]
+    assert reader.calls == 1
+
+
+@pytest.mark.parametrize("value", [float("inf"), 1e300])
+def test_a_huge_ack_timeout_is_accepted(value: float) -> None:
+    metrics = LiveMetrics(Counters(), Histogram(), Histogram())
+    target = Target(name="t", ack_timeout_s=value)
+    sender.ConnectionPool(target, 1, Correlator(10, metrics), metrics)

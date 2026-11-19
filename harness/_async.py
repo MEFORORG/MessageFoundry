@@ -29,8 +29,10 @@ def join_worker_thread(thread: QThread, *, grace_ms: int = 6000) -> None:
     """Quit and join a worker ``QThread`` whose worker has already been told to stop.
 
     Never ``QThread.terminate``: killing a thread that runs Python code can leave the interpreter
-    or a lock it held in a broken state. The harness workers see their stop flag promptly, so the
-    join is normally short; past ``grace_ms`` it is logged and the join goes on without a bound."""
+    or a lock it held in a broken state. The harness workers see their stop flag between steps, so
+    the join is normally short, but a step stop() cannot interrupt (a name lookup, a blocked send
+    or file write) is waited out: past ``grace_ms`` it is logged and the join goes on without a
+    bound."""
     thread.quit()
     if not thread.wait(grace_ms):
         log.warning("a harness worker thread is still running %d ms after stop; waiting", grace_ms)

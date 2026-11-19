@@ -8,6 +8,8 @@ the harness reuses this dialog to authenticate its localhost API client.
 
 from __future__ import annotations
 
+import logging
+
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox,
@@ -25,6 +27,8 @@ from harness._async import AsyncRunner
 from harness._console_widgets import ERROR_COLOR
 from messagefoundry.api.auth_models import LoginResponse, ProvidersInfo
 from messagefoundry.apiclient import ApiError, EngineClient
+
+log = logging.getLogger(__name__)
 
 
 class LoginDialog(QDialog):
@@ -106,7 +110,8 @@ class LoginDialog(QDialog):
         """Runs on a worker thread. An engine that will not say leaves the Local option alone."""
         try:
             return self._client.providers()
-        except ApiError:
+        except ApiError as exc:
+            log.info("sign-in providers unavailable; offering Local only: %s", exc)
             return None
 
     def _on_providers(self, providers: ProvidersInfo | None) -> None:
@@ -114,7 +119,8 @@ class LoginDialog(QDialog):
             self._provider.addItem("Active Directory", "ad")
         self._idle()
 
-    def _on_providers_error(self, _exc: BaseException) -> None:
+    def _on_providers_error(self, exc: BaseException) -> None:
+        log.warning("sign-in provider read failed; offering Local only: %r", exc)
         self._idle()
 
     def _idle(self) -> None:
