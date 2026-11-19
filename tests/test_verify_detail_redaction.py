@@ -392,6 +392,56 @@ def test_a_password_glued_to_punctuation_is_hidden_at_every_occurrence(text: str
     assert "Kv9x7Qz3" in before, before
 
 
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Login Password: Kv9x7Qz3 then token=tk-1,mrn: Kv9x7Qz3",
+        "Login Password: Kv9x7Qz3 retry token=tk-1,mrn: Kv9x7Qz3 now",
+    ],
+)
+def test_a_password_each_order_prints_at_a_different_place_is_hidden(text: str) -> None:
+    """BACKLOG #5395 added item 2: the comparison counted fragments and never placed them. Here the
+    PHI-first order prints the password and hides the copy after ``mrn:``, the credentials-first
+    order does the reverse, so the counts are equal and the password printed. Control: the
+    count-only comparison the code used before prints it."""
+    import re
+    from collections import Counter
+
+    from messagefoundry.redaction import redact
+    from messagefoundry.secretscrub import scrub_credentials
+    from messagefoundry.verify import model
+
+    detail = model.safe_detail_text(text)
+    assert "Kv9x7Qz3" not in detail, detail
+
+    ph = model._PLACEHOLDER
+    phi_first = scrub_credentials(redact(text), placeholder=ph)
+    credentials_first = redact(scrub_credentials(text, placeholder=ph))
+    printed = Counter(p for w in credentials_first.split() for p in model._fragments(w))
+    shown = Counter(p for w in phi_first.split() for p in model._fragments(w))
+    counted_only = re.sub(
+        r"\S+",
+        lambda m: m[0] if all(shown[p] <= printed[p] for p in model._fragments(m[0])) else ph,
+        phi_first,
+    )
+    assert "Kv9x7Qz3" in counted_only, counted_only
+
+
+def test_a_repeated_word_placed_on_different_copies_is_hidden() -> None:
+    """A placeholder stands for at least one hidden fragment, so ``[redacted] X`` and ``X
+    [redacted]`` read from ``X X`` place their ``X`` on different copies."""
+    from messagefoundry.verify import model
+
+    ph = model._PLACEHOLDER
+    assert model._printed_by_both(f"{ph} Kv9x7Qz3", f"Kv9x7Qz3 {ph}", "Kv9x7Qz3 Kv9x7Qz3") == (
+        f"{ph} {ph}"
+    )
+    # Control: both orders printing the same copy keep it.
+    assert model._printed_by_both(f"{ph} Kv9x7Qz3", f"{ph} Kv9x7Qz3", "Kv9x7Qz3 Kv9x7Qz3") == (
+        f"{ph} Kv9x7Qz3"
+    )
+
+
 def test_the_placeholder_is_not_an_html_tag() -> None:
     """A sink that renders a pasted detail as HTML would drop ``<redacted>`` and show ``PWD=`` as an
     empty password; the detail's placeholder is the square-bracket one."""

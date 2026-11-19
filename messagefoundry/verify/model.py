@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 import re
+from bisect import bisect_left
 from collections import Counter
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from typing import Final
@@ -41,8 +43,8 @@ _PLACEHOLDER: Final = "[redacted]"
 
 def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     """``text`` for a :class:`CheckResult` detail: bounded, then both orders of the PHI and
-    credential passes, comparing how often each prints a fragment, then the length bound (BACKLOG
-    #5395).
+    credential passes, comparing how often and where each prints a fragment, then the length bound
+    (BACKLOG #5395).
 
     A verify report is written to JSON and Markdown that an operator pastes into a ticket, so it
     leaves the box. The text a check quotes is a driver's, a config module's or the OS's: a store
@@ -54,7 +56,8 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     log filter and wiring's own diagnostics use.
 
     NEITHER ORDER OF THE TWO PASSES HIDES WHAT THE OTHER DOES, so both run, and a fragment the
-    PHI-first order prints more often than the credentials-first order does is hidden. Credentials
+    PHI-first order prints more often than the credentials-first order does, or prints from a place
+    the credentials-first order hid, is hidden. Credentials
     first: the credential pass read ``tk-1,mrn:`` in ``token=tk-1,mrn: MRN7712345`` as the token's
     value, the PHI pass then found no ``mrn:`` label, and the MRN printed. PHI first: the PHI pass takes a label the credential pass needs, at least a capitalized pair read
     as a name (``Login Password=``, ``Svc\\nPassword:``) and an HL7 field run that holds the label
@@ -62,8 +65,7 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     credential pass over the WHOLE of it, which can only hide more than the PHI pass did; not split at
     the placeholders, which cut ``postgresql://19800505:<pw>@`` in two once the PHI pass had replaced
     the user. Then every whitespace-separated word of that result holding a fragment, a run of word
-    characters between placeholders, that it prints more often than the credentials-first result
-    does is replaced
+    characters between placeholders, that the credentials-first result hides there is replaced
     whole, at every occurrence (:func:`_printed_by_both`). That errs toward hiding: a label the
     other order spelled differently goes with its value.
 
@@ -86,7 +88,7 @@ def safe_detail_text(text: str, *, limit: int | None = None) -> str:
     head, note = bounded.rsplit("\n", 1) if bounded is not text else (bounded, "")
     phi_first = scrub_credentials(redact(head), placeholder=_PLACEHOLDER)
     credentials_first = redact(scrub_credentials(head, placeholder=_PLACEHOLDER))
-    cleaned = _printed_by_both(phi_first, credentials_first)
+    cleaned = _printed_by_both(phi_first, credentials_first, head)
     # Not safe_text: every character of ``cleaned`` was scanned above, but its placeholders can push
     # it past safe_text's work window, whose note would then call scanned characters unscanned. So
     # the PHI pass once more over the whole of it, which the placeholders at most multiply from a
@@ -110,31 +112,71 @@ def _fragments(word: str) -> list[str]:
     ]
 
 
-def _printed_by_both(primary: str, other: str) -> str:
+def _placed(text: str, where: Mapping[str, list[int]]) -> list[tuple[str, int | None]]:
+    """Each fragment of ``text`` with the index of the source fragment it was printed from, or
+    ``None`` where no source fragment matches it.
+
+    Both orders' results are the source with spans replaced by the placeholder, so a walk forward
+    through the source places each fragment at its next match. A placeholder stands for at least one
+    hidden source fragment, so it moves the walk one past the last match: in ``[redacted] X`` read
+    from ``X X`` the ``X`` is the second one. The walk is a guess where a fragment repeats with no
+    printed word or placeholder between the copies, which is why the caller keeps the count test."""
+    placed: list[tuple[str, int | None]] = []
+    floor = 0  # the lowest source index the next fragment may be placed at
+    for word in text.split():
+        for n, piece in enumerate(word.split(_PLACEHOLDER)):
+            if n:
+                floor += 1
+            for run in _WORD_RUN.findall(piece) or ([piece] if piece else []):
+                at = where.get(run, [])
+                k = bisect_left(at, floor)
+                if k < len(at):
+                    floor = at[k] + 1
+                    placed.append((run, at[k]))
+                else:
+                    placed.append((run, None))
+    return placed
+
+
+def _printed_by_both(primary: str, other: str, source: str) -> str:
     """``primary`` with each word replaced by the placeholder where it holds a fragment ``primary``
-    prints more often than ``other`` does. Linear: one split of each text and counter lookups.
+    prints and ``other`` hides: printed more often, or printed from a place in ``source`` where
+    ``other`` printed no copy of it. One split of each text, then a sorted-list lookup per fragment.
 
     COUNTS, NOT A SET (BACKLOG #5395). Against a set, a password equal to another word the line
     prints survived: in ``user svcadmin ... Login Password: svcadmin`` the credentials-first order
     hid the second ``svcadmin`` and printed the first, so the word was "printed by both" and both
-    printed. Keeping only as many occurrences as ``other`` prints would not do either: which of them
-    is the password is a position, and the first occurrence is the password when the label comes
-    first (``Login Password: svcadmin for user svcadmin``). So a fragment ``primary`` prints more
-    often than ``other`` is hidden at EVERY occurrence. That errs toward hiding: the user name goes
-    with the password it equals. A fragment is a run of word characters (:func:`_fragments`), so in
-    ``Login Password: Kv9x7Qz3 retry with Kv9x7Qz3.`` the value glued to the full stop counts with the
-    bare one and goes too, and a whole word goes when any run in it does.
+    printed. So a fragment ``primary`` prints more often than ``other`` is hidden at EVERY
+    occurrence: which occurrence is the password is a position, and the first is the password when
+    the label comes first (``Login Password: svcadmin for user svcadmin``). That errs toward hiding:
+    the user name goes with the password it equals. A fragment is a run of word characters
+    (:func:`_fragments`), so in ``Login Password: Kv9x7Qz3 retry with Kv9x7Qz3.`` the value glued to
+    the full stop counts with the bare one and goes too, and a whole word goes when any run in it
+    does.
 
-    It compares counts, never positions, so it is best-effort. Residuals, at least these: a value
-    glued to a word character is a different run, so ``xKv9x7Qz3y`` elsewhere on the line prints; and
-    a value ``primary`` prints at one place while ``other`` prints the same fragment as often at
-    another place is kept, so a credential equal to a word only the credentials-first order printed
-    elsewhere prints. BACKLOG #5395 holds it open."""
-    printed = Counter(piece for word in other.split() for piece in _fragments(word))
-    shown = Counter(piece for word in primary.split() for piece in _fragments(word))
+    POSITIONS AS WELL AS COUNTS (BACKLOG #5395 added item 2). Counts alone kept a fragment ``primary``
+    prints at one place while ``other`` prints it as often at another: in ``Login Password: Kv9x7Qz3
+    then token=tk-1,mrn: Kv9x7Qz3`` the PHI-first order printed the password and hid the copy after
+    ``mrn:``, the credentials-first order did the reverse, and the password printed. Each fragment is
+    placed back on ``source`` (:func:`_placed`), and one ``primary`` prints from a place ``other``
+    printed nothing from is hidden, at every occurrence. The count test stays, so a wrong placement
+    can only hide more.
+
+    Best-effort. Residuals, at least these: a value glued to a word character is a different run, so
+    ``xKv9x7Qz3y`` elsewhere on the line prints; and where a fragment repeats with no printed word
+    or placeholder between the copies, the walk can place both orders' copies on the same one."""
+    where: dict[str, list[int]] = {}
+    for at, run in enumerate(run for word in source.split() for run in _fragments(word)):
+        where.setdefault(run, []).append(at)
+    printed = _placed(other, where)
+    printed_at = {at for _, at in printed if at is not None}
+    counted = Counter(run for run, _ in printed)
+    shown = _placed(primary, where)
+    leaked = {run for run, at in shown if at is not None and at not in printed_at}
+    leaked |= {run for run, n in Counter(run for run, _ in shown).items() if n > counted[run]}
     return re.sub(
         r"\S+",
-        lambda m: m[0] if all(shown[p] <= printed[p] for p in _fragments(m[0])) else _PLACEHOLDER,
+        lambda m: _PLACEHOLDER if any(p in leaked for p in _fragments(m[0])) else m[0],
         primary,
     )
 
