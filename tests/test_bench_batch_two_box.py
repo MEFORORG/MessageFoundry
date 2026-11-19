@@ -670,6 +670,23 @@ async def test_a_remote_process_that_wrote_no_report_says_why(tmp_path: Path) ->
     }
 
 
+async def test_a_failed_remote_process_never_reads_an_earlier_runs_report(tmp_path: Path) -> None:
+    """BACKLOG #5304: a band report an EARLIER run left at the same path must not be read as this
+    child's. A child that fails before writing has to fail the band, not hand back stale counts."""
+    report = tmp_path / "cell.p0.json"
+    report.write_text('{"sent": 99, "stale": true}', encoding="utf-8")
+    child = "import sys; sys.stderr.write('connscale-remote setup failed: refused'); sys.exit(2)"
+    with pytest.raises(ConnScaleError, match="exited 2 and wrote no report.*refused"):
+        await bb._run_remote_proc([sys.executable, "-c", child], report, tmp_path)
+    assert not report.exists()
+    # CONTROL: a child that writes its own report over the stale one is read, not refused.
+    report.write_text('{"sent": 99, "stale": true}', encoding="utf-8")
+    writer = f"open({str(report)!r}, 'w').write('{{\"sent\": 3}}')"
+    assert await bb._run_remote_proc([sys.executable, "-c", writer], report, tmp_path) == {
+        "sent": 3
+    }
+
+
 def test_batch_engine_cli_threads_flags(monkeypatch: pytest.MonkeyPatch) -> None:
     import harness.__main__ as hmain
 

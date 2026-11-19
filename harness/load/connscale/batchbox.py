@@ -1048,7 +1048,12 @@ async def run_batch_engine(
 # Module-level so a structural test can monkeypatch the subprocess spawn (no real connscale-remote runs).
 async def _run_remote_proc(argv: list[str], report_path: Path, cwd: Path) -> dict[str, Any]:
     """Spawn one ``connscale-remote`` process, wait for it, and return its JSON report. Real work — the
-    tests replace this seam with a synthetic report per band so the fleet drive runs offline."""
+    tests replace this seam with a synthetic report per band so the fleet drive runs offline.
+
+    Any file already at ``report_path`` is removed before the spawn (BACKLOG #5304), so only a report
+    THIS child wrote can be read: a child that fails before writing would otherwise hand back the band
+    report an earlier run left at the same path."""
+    report_path.unlink(missing_ok=True)
     proc = await asyncio.create_subprocess_exec(
         *argv,
         cwd=str(cwd),
