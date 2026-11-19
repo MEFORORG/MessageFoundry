@@ -477,8 +477,6 @@ def _address_binding_problem(cert: x509.Certificate, recipients: Sequence[str]) 
         x509.SubjectAlternativeName([])
     )
     mailboxes = {_split_address(v) for v in names.get_values_for_type(x509.RFC822Name)}
-    # An address-bound cert (any rfc822Name) binds only its mailboxes; only an organisation cert
-    # (no rfc822Name) binds a domain's mailboxes through a dNSName.
     domains = set() if mailboxes else {v.lower() for v in names.get_values_for_type(x509.DNSName)}
     for position, address in enumerate(recipients, start=1):
         local, domain = _split_address(address)
@@ -487,7 +485,8 @@ def _address_binding_problem(cert: x509.Certificate, recipients: Sequence[str]) 
         return (
             f"Direct destination 'recipient_cert' does not name recipient address {position} of "
             f"{len(recipients)} in 'recipients': it carries no subjectAltName rfc822Name equal to that address, and "
-            "no dNSName equal to its domain on a cert that names no rfc822Name"
+            "no dNSName equal to its domain on a cert that names no rfc822Name (a cert naming any "
+            "rfc822Name is bound to those mailboxes alone)"
         )
     return None
 

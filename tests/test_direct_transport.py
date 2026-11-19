@@ -178,7 +178,7 @@ def pki(tmp_path: Path) -> dict[str, Any]:
     # and at the hospital.example recipients the envelope tests borrow from the Email destination's
     # tests. A cert naming any rfc822Name would bind only that mailbox (BACKLOG #5631).
     recip_key, recip_cert = _mint_leaf(
-        "recipient@hisp.example",
+        "HISP Example Organisation",
         ca_key,
         ca_cert,
         addresses=(),
@@ -2161,8 +2161,15 @@ def test_a_recipient_whose_usages_allow_email_encryption_constructs(
         ((), ()),
         (("recipient@other.example",), ("other.example",)),
         (("Recipient@hisp.example",), ()),
+        (("other@other.example",), ("hisp.example",)),
     ],
-    ids=["another-subscriber", "no-san", "another-domain", "local-part-case"],
+    ids=[
+        "another-subscriber",
+        "no-san",
+        "another-domain",
+        "local-part-case",
+        "rfc822-name-elsewhere-disables-dns-name",
+    ],
 )
 def test_a_cert_the_ca_issued_to_another_subscriber_is_refused(
     pki: dict[str, Any], tmp_path: Path, addresses: tuple[str, ...], dns_names: tuple[str, ...]
