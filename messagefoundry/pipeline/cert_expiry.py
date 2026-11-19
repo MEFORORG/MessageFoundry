@@ -710,9 +710,8 @@ def _ca_file_crl_refusal(
     ``None`` when its CRLs pass the checks below, or it holds none (BACKLOG #3176). "Might" is a
     signature the engine could not confirm (BACKLOG #3512).
 
-    Nothing judges a CA file's CRL at start, so a restart loads it whatever it is. The checks are a
-    CRL setting's start rules (:func:`~messagefoundry.config.tls_policy.judge_crl_bytes`, then
-    :func:`~messagefoundry.config.tls_policy.crl_not_in_effect` with no clock skew), then OpenSSL
+    The checks are :func:`~messagefoundry.config.tls_policy.judge_crl_bytes`, then
+    :func:`~messagefoundry.config.tls_policy.crl_not_in_effect` with no clock skew, then OpenSSL
     loading exactly the CRLs judged, then the signature check a start and the reload make
     (:func:`~messagefoundry.pki.judge_crl_signatures`): each CRL signed by the CA OpenSSL loads
     from this file for its issuer. Only a signature proven bad says handshakes fail;
@@ -734,15 +733,14 @@ def _ca_file_crl_refusal(
         "restart loads the CA file whole",
     )
     try:
-        # As the reload does: the time a CRL takes effect is asked below, for its own remedy. An
-        # out-of-scope CRL is not refused: a start loads a CA file's CRLs unjudged, and beside a
-        # usable CRL from its issuer such a one refuses no peer (pki.judge_every_crl says more).
+        # The time a CRL takes effect is asked below, for its own remedy. The out-of-scope refusal
+        # applies only where a CRL setting names this file too (pki.judge_every_crl).
         _, blocks = judge_crl_bytes(
             pem,
             label="the CA file",
             now=now,
             require_in_effect=False,
-            refuse_out_of_scope=False,
+            refuse_out_of_scope=not ca_file_only,
         )
     except ValueError:
         if file_facts is not None and file_facts.expired:

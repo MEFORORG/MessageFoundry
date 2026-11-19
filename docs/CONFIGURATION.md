@@ -2720,12 +2720,8 @@ CRLs are checked too, and past `nextUpdate` one refuses every peer under its iss
 that sets `tls_allow_expired`, as **CRL files** above says. The expiry scan watches
 each one in a row labelled `held-crl:` and the CA file's path. The reload does not apply a changed CA
 file, so a refreshed CRL inside one needs a restart, and the expiry alert's `detail` says so. A start does
-not judge a CA file's CRL, so the scan judges it first (BACKLOG #3176). It applies a CRL setting's
-start rules, with no clock skew, and checks each CRL's signature against the CA the file lists for
-its issuer. It leaves out the issuing distribution point rule: a CRL that rule refuses in a CRL
-setting raises no alert in a CA file. A start loads it, and beside a usable CRL from the same
-issuer it refuses no peer. Where it is its issuer's only CRL, peers under that issuer fail at the
-handshake, and the scan does not report that either, as before vault BACKLOG #5896. In at least these cases `detail` says to fix the CRL in the CA file before restarting.
+not judge a CA file's CRL, so the scan judges it first (BACKLOG #3176). It checks each CRL's
+signature against the CA the file lists for its issuer. In at least these cases `detail` says to fix the CRL in the CA file before restarting.
 The CRL is expired, not yet in effect, a delta CRL, unreadable, or proven badly signed. For a CRL
 not yet in effect, `detail` offers a wait too. The hop's copy of that issuer's CRL may lapse before
 the new one takes effect. Then waiting refuses that issuer's peers in between, so replace the CRL

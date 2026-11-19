@@ -375,10 +375,7 @@ def judge_every_crl(
 
     **The out-of-scope refusal is skipped where ``refuse_out_of_scope`` is False.** A start and the
     running-hop reload keep the default. The expiry scan's check of a CRL in a CA file passes
-    False, because nothing judges a CA file's CRLs at start: a restart loads such a CRL, and beside
-    a usable CRL from its issuer OpenSSL judges peers by that one. Refusing it there made the scan
-    call the file one to replace before restarting, a report it had not made before (finding 2 of
-    engine PR 3099, the same class as the PR 2566 hold above)."""
+    False where no CRL setting names that file (finding 2 of engine PR 3099)."""
     blocks = list(_crl_blocks(pem))
     # Refused, never skipped, even when the uncounted marker is only text in a comment line and
     # OpenSSL loads the file (vault BACKLOG #2866, decided 2026-10-12). Two reasons. The engine

@@ -530,3 +530,33 @@ def test_the_ca_file_scan_still_alerts_on_a_ca_file_start_up_refuses(tmp_path: P
     verdict = _scan(bundle)
     assert verdict is not None
     assert verdict[1].startswith(("Replace the CRL in the CA file", "Fix the CA file"))
+
+
+@pytest.mark.parametrize("shape", ["some-reasons", "indirect"])
+def test_the_ca_file_scan_alerts_where_a_crl_setting_names_the_ca_file_too(
+    tmp_path: Path, shape: str
+) -> None:
+    """Finding 1 of the review of the first repair of engine PR 3099. Where a CRL setting also
+    names the CA file, as ``[store].ssl_crl_file`` can, a start judges that file as a CRL setting
+    and refuses the out-of-scope CRL. So the scan, asked with ``ca_file_only=False``, must still
+    say to replace it before restarting."""
+    from messagefoundry.pipeline.cert_expiry import _ca_file_crl_refusal
+
+    pki = _Pki(tmp_path)
+    idp, words = _OUT_OF_SCOPE[shape]
+    bundle = pki.crl_file(
+        pki.ca_file.read_bytes() + _crl(pki.key) + _crl(pki.key, extensions=[(idp, True)]),
+        "bundle.pem",
+    )
+
+    # The start that names the bundle as a CRL setting refuses it.
+    with pytest.raises(ValueError, match=words):
+        _hop(bundle, bundle)
+
+    verdict = _ca_file_crl_refusal(
+        bundle.read_bytes(), time.time(), None, ca_file_only=False, on_unchecked=lambda: None
+    )
+    assert verdict is not None
+    assert verdict[1].startswith(
+        "Replace the CRL in the CA file with one the engine can judge before restarting"
+    )
