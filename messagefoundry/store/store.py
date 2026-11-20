@@ -377,9 +377,9 @@ def _warn_unsealable_orphans(skipped: list[Any], lane: str, what: str, missing: 
     ``queue.id`` is a nullable SQLite TEXT key. A NULL-id row has no cell to seal its dead-letter
     reason against, so a cell-bound cipher refuses the seal (BACKLOG #5962), and the raise would
     abort graph bring-up. Only where the seal refuses does the sweep leave the row: a keyless or
-    unbound store seals nothing and dead-letters it exactly as before #5962. A left row stays at its
-    status, which the sweep's ``WHERE id=?`` never changed for a NULL id anyway. The WARNING carries
-    only the count and lane names, never a body."""
+    unbound store seals nothing and sweeps it as before #5962. Either way the sweep's
+    ``WHERE id=?`` matches nothing for a NULL id, so that row stays at its status. The WARNING
+    carries only the count and lane names, never a body."""
     if not skipped:
         return
     log.warning(
@@ -16829,8 +16829,9 @@ class MessageStore:
 
         Shared by the three missing-lane sweeps. A row whose reason the cipher refuses to seal (a
         NULL id on a cell-bound store, :func:`_warn_unsealable_orphans`) is left as it is and named
-        in a WARNING; every other row, a NULL-id row on a keyless or unbound store included, is
-        dead-lettered, gets its ``dead`` event and finalize, and is counted, as before BACKLOG #5962.
+        in a WARNING; every other row, a NULL-id row on a keyless or unbound store included, gets
+        its UPDATE, ``dead`` event and finalize, and is counted, as before BACKLOG #5962; for a NULL
+        id the UPDATE matches nothing, so that row stays at its status.
         The decision is the seal's own refusal, so it is the same condition the cipher applies.
         Lane values are joined with ``str()``, so a NULL lane name cannot raise after the commit."""
         killed: list[Any] = []
