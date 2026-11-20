@@ -475,6 +475,7 @@ def _record(counters: Counters, reload: runner._ReloadAccount | None) -> ConnSca
         samples=[],
         in_hold_samples=0,
         in_hold_floor_ticks=0,
+        fd_probe_floor_ticks=0,
         proc_readings=[],
         drain_seconds=1.0,
         reload_seconds=None if reload is None else reload.seconds,
@@ -1059,25 +1060,20 @@ async def test_the_runner_waits_the_shipped_reply_wait_by_default(
 
 
 def test_the_shipped_reply_wait_fits_the_smokes_module_timeout() -> None:
-    # The constant's comment sizes it against the smoke: every step waiting in full, and then
-    # spending its full stop grace, must still fit the module timeout beside the 40.8 s the fixture's
-    # setup took on the failing runner. Read from the smoke module itself, so adding a count, a mode
-    # or a trial, or cutting the timeout, fails here. What it cannot see is a runner slower than that
-    # one. The grace was left out of this sum until BACKLOG #2024.
+    # The runner sizes the wait against the smoke, in THE SMOKE'S WATCHDOG ESTIMATE in runner.py:
+    # every step waiting in full, and then spending its full stop grace, must still fit the module
+    # timeout beside the 40.8 s the fixture's setup took on the failing runner. Read from the smoke
+    # module itself, so adding a count, a mode or a trial, or cutting the timeout, fails here. What it
+    # cannot see is a runner slower than that one. The grace was left out of this sum until
+    # BACKLOG #2024.
     import tests.test_connscale_smoke as smoke
 
     profile = smoke._smoke_profile(30000)
     assert isinstance(profile, ConnScaleProfile)
-    steps = (
-        len(profile.counts)
-        * len(profile.modes())
-        * len(profile.claim_modes)
-        * len(profile.fuse_modes)
-        * len(profile.batch_modes)
-        * profile.trials
-    )
+    # The runner's own count, so a sandbox axis counts here as it does in the sweep.
+    steps = runner.sweep_step_count(profile)
     (module_timeout,) = smoke.pytestmark.args
-    assert steps == 4  # the control: the count the constant's comment was written against
+    assert steps == 4  # the control: the count the estimate was written against
     per_step = runner._POST_RELOAD_REPLY_WAIT_S + runner._STOP_GRACE
     assert 40.8 + steps * per_step < module_timeout
     assert runner._POST_RELOAD_REPLY_WAIT_S > runner._STOP_GRACE  # it must add to the grace
@@ -1263,7 +1259,7 @@ _HOLD_ORDERING = (
     "in_hold_samples = len(samples)",
     "reload_account = await reload_task",
     "probe_stop.set()",
-    "reload_account = await _await_post_reload_reply(",
+    "fd_probe_floor_ticks, reload_account = await _await_probe_beside_reply(",
 )
 
 
@@ -1285,8 +1281,19 @@ def test_the_engine_sampler_stops_when_the_hold_ends_not_when_the_probe_returns(
     # The probe runs BESIDE the hold. Awaited inline, it would hold the sampler open to its end.
     assert "await _reload_mid_hold(" not in source
     assert "reload_task = asyncio.create_task(" in source
-    # The OS probe keeps its own stop, so the graded FD window did not move with the rate window.
-    assert "probe_stop, proc_readings, origin" in source
+    # The OS probe keeps its own stop, so its window did not move with the rate window. A graded FD
+    # reading can still come after that stop, from the make-up floor (BACKLOG #1488).
+    flat = " ".join(source.split())
+    assert "probe_stop, proc_readings, origin, probe_window_closed," in flat
+    # The helper waits on the same event the probe sets, so the reply wait starts behind the
+    # in-window attempt rather than beside it (BACKLOG #1488).
+    assert "_await_probe_beside_reply( probe_task, probe_window_closed," in flat
+    # The reply wait is what the step hands the helper beside the probe; passing None would skip it
+    # on every reload step with every unit test green (BACKLOG #1488).
+    assert (
+        "None if reload_account is None else "
+        "_await_post_reload_reply(driver, metrics.counters, reload_account)"
+    ) in " ".join(source.split())
     # The control: the order before #2024, where the probe returned before the sampler stopped.
     before = "\n".join(
         (
@@ -1295,7 +1302,7 @@ def test_the_engine_sampler_stops_when_the_hold_ends_not_when_the_probe_returns(
             "sampler_stop.set()",
             "in_hold_samples = len(samples)",
             "probe_stop.set()",
-            "reload_account = await _await_post_reload_reply(",
+            "fd_probe_floor_ticks, reload_account = await _await_probe_beside_reply(",
         )
     )
     assert _first_out_of_order(before, _HOLD_ORDERING) == "reload_account = await reload_task"

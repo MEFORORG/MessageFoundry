@@ -527,7 +527,12 @@ def test_the_json_artifact_carries_the_probe_provenance_beside_the_gauge() -> No
     wall4 = d["wall4_fd"]
     assert isinstance(wall4, dict)
     assert wall4["count_peak"] is None
-    assert wall4["probe"] == {"ticks": 6, "degraded_ticks": 6, "degraded": ["walk_timeout"]}
+    assert wall4["probe"] == {
+        "ticks": 6,
+        "degraded_ticks": 6,
+        "degraded": ["walk_timeout"],
+        "floor_ticks": 0,
+    }
     # It must round-trip as JSON (a tuple would serialize, an enum member would not have).
     assert json.loads(json.dumps(d))["wall4_fd"]["probe"]["degraded"] == ["walk_timeout"]
 
@@ -538,6 +543,7 @@ def test_an_older_artifact_without_the_provenance_still_builds_a_record() -> Non
     # Constructed by OMITTING them rather than by reading their declared defaults, because the property
     # that matters is that such a call still succeeds, not that a default is written down somewhere.
     # The two BACKLOG #1210 peak-provenance fields default the same way, to None ("not recorded").
+    # The BACKLOG #1488 make-up count defaults to 0, like the tick counts above it.
     added = (
         "fd_probe_ticks",
         "fd_probe_degraded_ticks",
@@ -545,11 +551,13 @@ def test_an_older_artifact_without_the_provenance_still_builds_a_record() -> Non
         "fd_count_peak_pids",
         "working_set_peak_pids",
         "fd_probe_root_pid",
+        "fd_probe_floor_ticks",
     )
     legacy: dict[str, Any] = {k: v for k, v in vars(_record()).items() if k not in added}
     r = ConnScaleRecord(**legacy)
     assert (r.fd_probe_ticks, r.fd_probe_degraded_ticks, r.fd_probe_degraded) == (0, 0, ())
     assert (r.fd_count_peak_pids, r.working_set_peak_pids, r.fd_probe_root_pid) == (None,) * 3
+    assert r.fd_probe_floor_ticks == 0  # BACKLOG #1488: no make-up tick recorded
 
 
 def test_the_console_names_the_mechanism_beside_the_n_a() -> None:
@@ -572,6 +580,11 @@ def test_the_console_names_the_mechanism_beside_the_n_a() -> None:
     # And a clean record adds no noise.
     clean = dataclasses.replace(report, records=[_record()])
     assert "measured nothing" not in clean.render_console()
+    assert "make-up floor" not in text
+    # BACKLOG #1488: a make-up tick is counted in `fd_probe_ticks` but taken after the window.
+    floored = dataclasses.replace(report.records[0], fd_probe_floor_ticks=1)
+    floored_text = dataclasses.replace(report, records=[floored]).render_console()
+    assert "1 tick(s) taken after the window by the make-up floor" in floored_text
 
 
 # --- the smoke test's verdict ------------------------------------------------------------------------

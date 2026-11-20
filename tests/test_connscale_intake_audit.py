@@ -753,6 +753,7 @@ def _record_with(audit: IntakeAudit, *, read: int, sent: int, start: int = 0) ->
         samples=[],
         in_hold_samples=0,
         in_hold_floor_ticks=0,
+        fd_probe_floor_ticks=0,
         proc_readings=[],
         drain_seconds=1.0,
         reload_seconds=None,

@@ -1150,6 +1150,9 @@ _EXPECTED_DIAGNOSTIC_LABELS = frozenset(
         # stale-ppid adoption once reported 35,600 handles at N=12. This names the processes behind
         # the peak on every run, so a real growth and a misresolution stop reading the same.
         "fd_count_peak_pids",
+        # BACKLOG #1488, added 2026-11-19. The FD walk may read once more after its window when every
+        # reading in it spent its budget, and that reading is graded, so the summary says when it ran.
+        "fd_probe_floor_ticks",
     }
 )
 

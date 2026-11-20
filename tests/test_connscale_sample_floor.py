@@ -38,19 +38,31 @@ measured that taking (a) first ships a silent green: it zeroes wall #3 while the
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import inspect
+import threading
 import time
+from typing import cast
 
 import pytest
 
 from harness.load.connscale import runner
-from harness.load.connscale.probe import ProcSample
+from harness.load.connscale.probe import _PROBE_ATTEMPT_MAX_S, ProbeDegraded, ProcSample, _gap
+from harness.load.connscale.profile import ConnScaleProfile
+from harness.load.connscale.report import ConnScaleRecord, monotonic_lane
 from harness.load.connscale.runner import (
+    _FD_PROBE_MAKEUP_ATTEMPTS,
     _MIN_IN_HOLD_SAMPLES,
     ProcReading,
+    _derive_proc,
+    _monotonic_slo,
     _probe_loop,
     _sample_loop,
 )
 from harness.load.enginepoll import EngineSample
+from tests import test_connscale_smoke as smoke
+from tests.test_connscale_probe_degradation import _record
+from tests.test_connscale_smoke import _assert_fd_probe
 
 pytestmark = pytest.mark.timeout(30)
 
@@ -212,7 +224,7 @@ async def test_a_probe_costing_multiples_of_the_interval_no_longer_starves_the_s
     readings: list[ProcReading] = []
     await asyncio.gather(
         _sample_loop(poller, _INTERVAL_S, stop, samples),  # type: ignore[arg-type]
-        _probe_loop(sampler, _INTERVAL_S, stop, readings, time.perf_counter()),  # type: ignore[arg-type]
+        _probe_loop(sampler, _INTERVAL_S, stop, readings, time.perf_counter(), asyncio.Event()),  # type: ignore[arg-type]
         _hold(stop, _HOLD_S),
     )
     # 1.5s of hold at a 0.25s interval affords 5 whole intervals; require most of them so the
@@ -291,3 +303,387 @@ async def test_a_hold_with_room_to_spare_is_not_extended_by_the_floor() -> None:
         f"a {_HOLD_S}s hold that already met the floor polled {poller.calls_after_stop} more time(s) "
         f"after it ended -- the make-up ticks are running when they are not needed"
     )
+
+
+# --- BACKLOG #1488: the OS probe's make-up floor ------------------------------------------------------
+#
+# The failing windows-2022 merge-queue run of 2026-11-19 recorded `1/1 ('walk_timeout',)` on all four
+# steps: one probe attempt per step, and that attempt spent the walk's whole 5 s budget against a 1.5 s
+# hold. The stand-ins below keep that SHAPE at test scale. Their first attempt costs longer than the
+# hold, so the window holds exactly one reading, and what that reading is decides the arm.
+
+#: How long the stand-in's slow attempt blocks its worker thread. Longer than `_STARVED_HOLD_S`, which is
+#: the whole point: it is the walk that outlasts the window.
+_SLOW_ATTEMPT_S = 0.15
+_STARVED_HOLD_S = 0.05
+#: How long a test here waits for something it expects to happen before it fails rather than hangs.
+#: Far above a scheduled thread's start on a loaded runner, far below the module's 30 s timeout.
+_TEST_DEADLINE_S = 5.0
+
+
+def _measured(handles: int) -> ProcSample:
+    """A reading that measured, naming the PID it summed as the runner's real probe does (#1210)."""
+    return ProcSample(handles, 1.0, 6_000_000, frozenset({4100}), None, frozenset({4100}))
+
+
+class _ScriptedSampler:
+    """An `FdSampler` stand-in that answers from a script of `(cost_s, sample)` entries, the last one
+    repeating. It counts the calls made after the window's `stop`, which are the floor's make-up
+    attempts read off the loop's own behaviour rather than off a stopwatch, and refuses one past
+    `_FD_PROBE_MAKEUP_ATTEMPTS`, so an unbounded floor fails at once instead of spinning to the
+    timeout, as `_FakePoller` does for the engine sampler."""
+
+    def __init__(self, script: list[tuple[float, ProcSample]], stop: asyncio.Event) -> None:
+        self._script = script
+        self._stop = stop
+        self.calls = 0
+        self.calls_after_stop = 0
+
+    def sample_proc(self) -> ProcSample:
+        if self._stop.is_set():
+            self.calls_after_stop += 1
+            assert self.calls_after_stop <= _FD_PROBE_MAKEUP_ATTEMPTS, (
+                f"the probe was called {self.calls_after_stop} times after its stop against a bound "
+                f"of {_FD_PROBE_MAKEUP_ATTEMPTS} -- the make-up floor is unbounded"
+            )
+        cost, sample = self._script[min(self.calls, len(self._script) - 1)]
+        self.calls += 1
+        time.sleep(cost)
+        return sample
+
+
+async def _hold_from_first_call(sampler: _ScriptedSampler, stop: asyncio.Event) -> None:
+    """End the window `_STARVED_HOLD_S` after the first probe call STARTS, not after the loop does.
+
+    The sampler reads `stop` on its worker thread, so a hold timed from the loop's start could end
+    before a late-scheduled thread made the in-window call, and that call would count as a make-up
+    one. Timing the hold from the call's own start removes that race on a loaded runner.
+
+    The wait for that first call has a deadline, so a loop that never probes fails here at once
+    rather than hanging until the module's thread timeout ends the worker."""
+    async with asyncio.timeout(_TEST_DEADLINE_S):
+        while not sampler.calls:
+            await asyncio.sleep(0.005)
+    await _hold(stop, _STARVED_HOLD_S)
+
+
+async def _probe_step(script: list[tuple[float, ProcSample]]) -> tuple[list[ProcReading], int]:
+    """Drive `_probe_loop` for one simulated step. Returns its readings and the make-up attempts it
+    reported, after checking that number against the sampler's own count."""
+    stop = asyncio.Event()
+    sampler = _ScriptedSampler(script, stop)
+    readings: list[ProcReading] = []
+    floor_ticks, _ = await asyncio.gather(
+        _probe_loop(sampler, _INTERVAL_S, stop, readings, time.perf_counter(), asyncio.Event()),  # type: ignore[arg-type]
+        _hold_from_first_call(sampler, stop),
+    )
+    assert floor_ticks == sampler.calls_after_stop, (
+        f"the loop reported {floor_ticks} make-up attempt(s) but probed {sampler.calls_after_stop} "
+        f"time(s) after its stop -- the provenance field miscounts the floor"
+    )
+    return readings, floor_ticks
+
+
+def _step_record(readings: list[ProcReading], *, count: int, floor_ticks: int) -> ConnScaleRecord:
+    """The wall #4 half of a record, derived from the probe's readings the way `_build_record` does."""
+    proc = _derive_proc(readings)
+    return dataclasses.replace(
+        _record(count=count),
+        fd_count_peak=proc.handles_peak,
+        fd_count_peak_pids=proc.handles_peak_pids,
+        fd_probe_ticks=proc.probe_ticks,
+        fd_probe_degraded_ticks=proc.probe_degraded_ticks,
+        fd_probe_degraded=proc.probe_degraded,
+        fd_probe_floor_ticks=floor_ticks,
+    )
+
+
+async def test_a_window_whose_only_reading_spent_its_budget_gets_a_makeup_reading() -> None:
+    """THE FLOOR, at the failing run's shape: the one in-window attempt is a spent budget, and the
+    step still ends with a measured reading because the floor took one more."""
+    readings, floor_ticks = await _probe_step(
+        [(_SLOW_ATTEMPT_S, _gap(ProbeDegraded.WALK_TIMEOUT)), (0.0, _measured(140))]
+    )
+    assert floor_ticks == 1, floor_ticks
+    assert [r.proc.handles for r in readings] == [None, 140], readings
+
+
+async def test_the_floor_is_bounded_and_a_probe_that_never_measures_still_fails_wall_four() -> None:
+    """THE BOUND, and the requirement the floor must not buy its way past. A probe that spends its
+    budget on every attempt ends after `_FD_PROBE_MAKEUP_ATTEMPTS` make-up attempts, and a run built
+    from such steps still fails WALL #4 NEVER COMPARED: the floor gives the probe another draw, it does
+    not turn a run that never measured into a pass."""
+    records = []
+    for count in (12, 24):
+        readings, floor_ticks = await _probe_step(
+            [
+                (_SLOW_ATTEMPT_S, _gap(ProbeDegraded.WALK_TIMEOUT)),
+                (0.0, _gap(ProbeDegraded.WALK_TIMEOUT)),
+            ]
+        )
+        assert floor_ticks == _FD_PROBE_MAKEUP_ATTEMPTS, floor_ticks
+        assert all(r.proc.handles is None for r in readings), readings
+        records.append(_step_record(readings, count=count, floor_ticks=floor_ticks))
+    with pytest.raises(AssertionError, match="WALL #4 NEVER COMPARED") as e:
+        _assert_fd_probe(records)
+    assert f"floor={_FD_PROBE_MAKEUP_ATTEMPTS}" in str(e.value)
+
+
+async def test_a_gap_that_did_not_spend_its_budget_gets_no_makeup_and_still_fails() -> None:
+    """A gap from any other cause means the probe RAN and produced nothing usable. The floor must not
+    retry it, or a broken probe would get a second chance to hide behind a later reading."""
+    readings, floor_ticks = await _probe_step(
+        [(_SLOW_ATTEMPT_S, _gap(ProbeDegraded.WALK_EMPTY)), (0.0, _measured(140))]
+    )
+    assert floor_ticks == 0, floor_ticks
+    broken = _step_record(readings, count=12, floor_ticks=floor_ticks)
+    with pytest.raises(AssertionError, match="PROBE DEFECT"):
+        _assert_fd_probe([broken, _record(count=24, fd=150)])
+
+
+async def test_a_window_that_measured_is_not_extended_by_the_floor() -> None:
+    """THE CONTROL. Without it, a loop that always probed once more past its stop would pass every
+    arm above."""
+    _, floor_ticks = await _probe_step([(0.0, _measured(140))])
+    assert floor_ticks == 0, floor_ticks
+
+
+async def test_a_collapse_measured_on_makeup_readings_still_fails_the_fd_slo() -> None:
+    """A make-up reading is a real reading, so it must be able to fail the SLO it now feeds. Both steps
+    of one lane measure only on their make-up attempt, and the FD count collapses from 1000 to 100
+    across N: the pair is compared, and `fd_count_monotonic` must go red."""
+    records = []
+    for count, handles in ((12, 1000), (24, 100)):
+        readings, floor_ticks = await _probe_step(
+            [(_SLOW_ATTEMPT_S, _gap(ProbeDegraded.WALK_TIMEOUT)), (0.0, _measured(handles))]
+        )
+        assert floor_ticks == 1, floor_ticks
+        records.append(_step_record(readings, count=count, floor_ticks=floor_ticks))
+    assert monotonic_lane(records[0]) == monotonic_lane(records[1])
+    _assert_fd_probe(records)  # a comparable pair exists, so the run-level bound is met
+    check = _monotonic_slo("fd_count_monotonic", records, lambda r: r.fd_count_peak)
+    assert not check.ok, check.observed
+
+
+def _measured_leg_plus_floor(attempts: int) -> tuple[int, float, float]:
+    """The floor's sum in THE SMOKE'S WATCHDOG ESTIMATE in runner.py, from its constants and from the
+    smoke's own watchdog and step count: `(steps, measured setup + steps x floor maximum, watchdog)`.
+    An estimate, not a bound; that comment says which way each term it leaves out moves it."""
+    (watchdog_s,) = smoke.pytestmark.args
+    profile = smoke._smoke_profile(30000)  # any valid port: only the axes are read
+    assert isinstance(profile, ConnScaleProfile)
+    steps = runner.sweep_step_count(profile)
+    floor_s = steps * attempts * _PROBE_ATTEMPT_MAX_S
+    return steps, runner._FD_PROBE_FLOOR_MEASURED_SETUP_S + floor_s, float(watchdog_s)
+
+
+def test_the_makeup_floor_fits_inside_the_smokes_watchdog() -> None:
+    """Pins the floor's sum in THE SMOKE'S WATCHDOG ESTIMATE: more steps, a shorter watchdog, a
+    dearer attempt or a second one fails here. The comment's 93.41 s is this sum.
+
+    WHAT IT CANNOT CATCH: a step that costs more for any other reason, such as a longer hold, reply
+    wait, stop grace or drain. The measured setup is a constant, so none of those moves it."""
+    steps, with_floor_s, watchdog_s = _measured_leg_plus_floor(_FD_PROBE_MAKEUP_ATTEMPTS)
+    assert steps == 4, steps  # the comment's "4 steps"; a new axis must revisit it
+    assert with_floor_s < watchdog_s, (
+        f"the failing leg's measured {runner._FD_PROBE_FLOOR_MEASURED_SETUP_S}s plus {steps} steps x "
+        f"{runner._FD_PROBE_MAKEUP_MAX_S}s of make-up is {with_floor_s:.2f}s against the smoke's "
+        f"{watchdog_s}s watchdog"
+    )
+
+
+def test_a_second_makeup_attempt_would_not_fit_the_smokes_watchdog() -> None:
+    """THE NEGATIVE CONTROL for the pin above (REVIEW-STANDARDS R21). The same sum at two attempts
+    must breach the watchdog, as the comment says. Without this arm, a pin whose sum could never
+    reach 120 s would pass whatever the attempt count."""
+    _, with_two_s, watchdog_s = _measured_leg_plus_floor(_FD_PROBE_MAKEUP_ATTEMPTS + 1)
+    assert with_two_s >= watchdog_s, with_two_s
+
+
+def test_an_empty_window_is_not_a_timed_out_one() -> None:
+    """A window that took no reading at all did not time out, so `fd_probe_floor_ticks` must not say
+    it did."""
+    assert not runner._only_budget_gaps([])
+    assert runner._only_budget_gaps([ProcReading(0.0, _gap(ProbeDegraded.READ_TIMEOUT))])
+
+
+def test_a_window_with_one_measured_reading_beside_a_timeout_does_not_fire_the_floor() -> None:
+    """EVERY reading must be a budget gap, not ANY. A window holding one measured reading already
+    has its peak, so `all` mutated to `any` in `_only_budget_gaps` would spend a needless attempt."""
+    timed_out = ProcReading(0.0, _gap(ProbeDegraded.WALK_TIMEOUT))
+    assert not runner._only_budget_gaps([timed_out, ProcReading(0.5, _measured(400))])
+
+
+# --- BACKLOG #1488: the floor runs beside the post-reload reply wait, never in front of it ----------
+
+#: The helper only passes the account through, so any object stands in for one.
+_ACCOUNT = cast(runner._ReloadAccount, object())
+
+
+async def test_the_reply_wait_starts_while_the_makeup_attempt_is_still_reading() -> None:
+    """The make-up attempt must not delay the reply wait. The stand-in probe closes its window, as
+    `_probe_loop` does before a make-up attempt, and then cannot finish until the reply wait has
+    STARTED, so a helper that awaited the whole probe first would never start it, and the probe's
+    deadline fails the test instead of a timing threshold."""
+    reply_started = asyncio.Event()
+    window_closed = asyncio.Event()
+
+    async def probe() -> int:
+        window_closed.set()
+        async with asyncio.timeout(_TEST_DEADLINE_S):
+            await reply_started.wait()
+        return 1
+
+    async def reply() -> runner._ReloadAccount:
+        reply_started.set()
+        return _ACCOUNT
+
+    floor, account = await runner._await_probe_beside_reply(
+        asyncio.create_task(probe()), window_closed, reply()
+    )
+    assert floor == 1
+    assert account is _ACCOUNT
+
+
+async def test_a_step_whose_floor_does_not_fire_waits_for_the_reply_after_its_last_attempt() -> (
+    None
+):
+    """The reply allowance is at least what it was before the floor, on every step. There the reply
+    wait started only once the attempt in flight at the window's close had returned, so the whole
+    `_POST_RELOAD_REPLY_WAIT_S` came after it. Started beside that attempt, the wait would overlap
+    it, and a late reply would get less time before the step judges "no reply". The real
+    `_probe_loop` runs here, with an attempt that measures, so the floor does not fire; the check is
+    an order of two clock readings, not a timing threshold."""
+    stop = asyncio.Event()
+    window_closed = asyncio.Event()
+    sampler = _ScriptedSampler([(_SLOW_ATTEMPT_S, _measured(140))], stop)
+    attempt_ended: list[float] = []
+    original = sampler.sample_proc
+
+    def sample_proc() -> ProcSample:
+        sample = original()
+        attempt_ended.append(time.monotonic())
+        return sample
+
+    sampler.sample_proc = sample_proc  # type: ignore[method-assign]
+    reply_started: list[float] = []
+
+    async def reply() -> runner._ReloadAccount:
+        reply_started.append(time.monotonic())
+        return _ACCOUNT
+
+    probe_task = asyncio.create_task(
+        _probe_loop(sampler, _INTERVAL_S, stop, [], time.perf_counter(), window_closed)  # type: ignore[arg-type]
+    )
+    async with asyncio.timeout(_TEST_DEADLINE_S):
+        while not sampler.calls:
+            await asyncio.sleep(0.005)
+    stop.set()  # the window closes with its only attempt still in flight, as `probe_stop` can
+    floor, account = await runner._await_probe_beside_reply(probe_task, window_closed, reply())
+    assert floor == 0 and sampler.calls_after_stop == 0, (floor, sampler.calls_after_stop)
+    assert account is _ACCOUNT
+    assert len(attempt_ended) == 1 and len(reply_started) == 1, (attempt_ended, reply_started)
+    assert reply_started[0] >= attempt_ended[0], (
+        f"the reply wait started {attempt_ended[0] - reply_started[0]:.4f}s before the in-flight "
+        f"probe attempt returned -- it overlaps that attempt, so a post-reload reply gets less than "
+        f"the in-flight tail plus the whole reply wait"
+    )
+
+
+async def test_the_real_probe_closes_its_window_before_its_makeup_attempt() -> None:
+    """The other half of the order, on the real `_probe_loop`: where the floor fires, the reply wait
+    starts while the make-up attempt is still running. The make-up call blocks until the reply wait
+    has started, with a deadline, so a loop that set `window_closed` only after its make-up, or never,
+    leaves it unset and fails here rather than on a timing threshold."""
+    stop = asyncio.Event()
+    window_closed = asyncio.Event()
+    sampler = _ScriptedSampler(
+        [(_SLOW_ATTEMPT_S, _gap(ProbeDegraded.WALK_TIMEOUT)), (0.0, _measured(140))], stop
+    )
+    reply_started = threading.Event()
+    seen_during_makeup: list[bool] = []
+    original = sampler.sample_proc
+
+    def sample_proc() -> ProcSample:
+        if stop.is_set():
+            seen_during_makeup.append(reply_started.wait(_TEST_DEADLINE_S))
+        return original()
+
+    sampler.sample_proc = sample_proc  # type: ignore[method-assign]
+
+    async def reply() -> runner._ReloadAccount:
+        reply_started.set()
+        return _ACCOUNT
+
+    probe_task = asyncio.create_task(
+        _probe_loop(sampler, _INTERVAL_S, stop, [], time.perf_counter(), window_closed)  # type: ignore[arg-type]
+    )
+    async with asyncio.timeout(_TEST_DEADLINE_S):
+        while not sampler.calls:
+            await asyncio.sleep(0.005)
+    stop.set()
+    floor, account = await runner._await_probe_beside_reply(probe_task, window_closed, reply())
+    assert floor == 1 and account is _ACCOUNT, (floor, account)
+    assert seen_during_makeup == [True], (
+        f"the make-up attempt ran with the reply wait not yet started ({seen_during_makeup}) -- the "
+        f"probe closed its window only after the make-up, so the make-up delayed the reply wait"
+    )
+
+
+async def test_a_probe_that_fails_cancels_the_reply_wait() -> None:
+    """Running the two side by side must not leave a reply wait watching after the probe raised."""
+    cancelled = asyncio.Event()
+
+    async def probe() -> int:
+        raise RuntimeError("walk exploded")
+
+    async def reply() -> runner._ReloadAccount:
+        try:
+            await asyncio.sleep(_TEST_DEADLINE_S)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+        return _ACCOUNT
+
+    with pytest.raises(RuntimeError, match="walk exploded"):
+        await runner._await_probe_beside_reply(
+            asyncio.create_task(probe()), asyncio.Event(), reply()
+        )
+    async with asyncio.timeout(_TEST_DEADLINE_S):
+        await cancelled.wait()
+
+
+async def test_a_probe_that_already_failed_still_lets_the_reply_wait_clean_up() -> None:
+    """A probe task that failed during the hold raises at once, without yielding. The reply wait must
+    still have started, or cancelling it skips its `finally`, which is where the real one ends its
+    first-reply watch."""
+    cleaned = asyncio.Event()
+
+    async def probe() -> int:
+        raise RuntimeError("walk exploded during the hold")
+
+    failed = asyncio.create_task(probe())
+    await asyncio.wait({failed})
+
+    async def reply() -> runner._ReloadAccount:
+        try:
+            await asyncio.sleep(_TEST_DEADLINE_S)
+        finally:
+            cleaned.set()
+        return _ACCOUNT
+
+    with pytest.raises(RuntimeError, match="during the hold"):
+        await runner._await_probe_beside_reply(failed, asyncio.Event(), reply())
+    assert cleaned.is_set()
+
+
+async def test_a_step_with_no_probe_and_no_reload_reports_neither() -> None:
+    assert await runner._await_probe_beside_reply(None, asyncio.Event(), None) == (0, None)
+
+
+def test_the_makeup_count_is_a_required_record_argument() -> None:
+    """`fd_probe_floor_ticks` has no default, like `in_hold_floor_ticks`: a caller that forgot it
+    would otherwise report a floored step as one that never needed the floor."""
+    params = inspect.signature(runner._build_record).parameters
+    for name in ("fd_probe_floor_ticks", "in_hold_floor_ticks"):
+        assert params[name].default is inspect.Parameter.empty, name

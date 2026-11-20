@@ -172,3 +172,55 @@ above stand as written. The post-fix figures under *Consequences* -- the PID set
 handle sum moving 438 to 1016, and the amortisation control that made 7 walks over 30 ticks -- were
 measured at 5.0, before the raise, and are left as recorded rather than re-run. A longer interval
 walks less often, so that control's conclusion still holds at 15.0; its count of 7 would not repeat.
+
+## Amendment -- 2026-11-19: `fd_count_peak` can come from one make-up reading after the window
+
+**This adds to *What this changes about the meaning of `handles_peak`* above, and revises nothing
+else.** The front-load, the 15.0 second interval and the attempt-counted triggers stand as decided
+and as amended on 2026-09-09. The item is BACKLOG #1488.
+
+**What the floor does, and when.** `_probe_loop` in `harness/load/connscale/runner.py` probes until
+its window closes, as before. Then it checks the window's readings. If there is at least one, and
+every one is a walk or read timeout, it takes at most `_FD_PROBE_MAKEUP_ATTEMPTS = 1` more attempt
+after the window. Any other gap cause, and an empty
+window, gets no retry. The make-up attempt runs before the driver stops, in the order against the
+post-reload reply wait that `_await_probe_beside_reply` states, so it reads the step's own engine
+after the hold, with no traffic offered. The record counts it as `fd_probe_floor_ticks`, and the reading
+feeds `fd_count_peak` like any other. The `_probe_loop` docstring is the source of record for these
+conditions.
+
+**The cause it answers.** Merge-queue run 44607871179, job 135856508516, `test (windows-2022,
+py3.14)`, 2026-11-19, failed the smoke's WALL #4 with no measured reading in any group: each of the
+four steps took exactly one probe attempt, and each was a walk timeout. One cold-PowerShell walk that
+spends its 5 second `_PROBE_TIMEOUT_S` outlasts the smoke's 1.5 second hold, so the window closed
+with that gap as its only reading. On a 32-logical-core Windows box, 20 runs per row, the walk's
+median was 0.47 to 0.72 seconds idle, with none at 5 seconds, and 3.31 to 4.35 seconds under 32 busy
+loops, with a maximum of 10.81 seconds and 2 and 7 of 20 at 5 seconds or more. That box is not a
+4-vCPU hosted runner.
+
+**Why a make-up reading may be graded.** That is sound only if a post-hold reading, taken with no
+traffic offered, matches what the hold would have read. On the same box, the real smoke sweep at
+N=12 and N=24 in both sweep modes ran with two or three extra readings taken right after each
+step's window. Across an idle run and a 32-busy-loop run, 6 steps had both a measured window and a
+measured extra reading. In all 6 the post-hold handle count equalled the window's peak (367, 403,
+363, 399; 403, 404), a difference of 0 handles. Growth from N=12 to
+N=24 was 9 to 11 percent, against the 25 percent `_MONOTONIC_TOLERANCE` band of
+`fd_count_monotonic`.
+
+**Its limits, at least these.**
+
+- It is one box at those two N, not a bound for other N or hosts.
+- No floored step had an in-window reading to pair with, so the regime the floor acts in was not
+  itself paired.
+- It gives the probe one more draw on the same budget, and does not make the walk cheaper. Under
+  local contention it fired on 2 steps and rescued 1.
+- It bounds the number of attempts, not their length. A probe call that never returned would hold
+  the step until something cancelled it.
+- `_assert_fd_probe` and WALL #4 are unchanged, so a run that never measures still fails. A positive
+  control in `tests/test_connscale_sample_floor.py` keeps a collapse measured only on make-up
+  readings red on `fd_count_monotonic`.
+- The same reading feeds `working_set_peak_bytes`, which nothing grades; the pairing above compared
+  handle counts only.
+
+**A floored step's peak is a different number, not a corrected one,** as the Decision said of its
+own change. A reader comparing steps reads `fd_probe_floor_ticks` beside `fd_count_peak`.

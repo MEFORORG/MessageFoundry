@@ -383,6 +383,7 @@ def _record(count: int, sandbox: SandboxReading) -> ConnScaleRecord:
         samples=[],
         in_hold_samples=0,
         in_hold_floor_ticks=0,
+        fd_probe_floor_ticks=0,
         proc_readings=[],
         drain_seconds=1.0,
         reload_seconds=None,
