@@ -318,7 +318,7 @@ trust, which cannot verify an internal-CA or operator-installed engine cert.
 **Decision — separate the two concepts.**
 
 - `is_local_http` → **`is_local_engine`**, true for a loopback host on `http` **or** `https`; `monitor_only` keys
-  on that alone. Locality is what actually gates the degraded features (Start/Stop/Restart drive the *local* SCM;
+  on that alone (*amended 2026-11-19, see the amendment below*). Locality is what actually gates the degraded features (Start/Stop/Restart drive the *local* SCM;
   Open-Repo opens a *local* folder), and TLS-on-loopback changes neither. A remote host stays monitor-only
   regardless of scheme — unchanged, and still the reason the degrade exists.
 - `build_engine_url(host, port, *, tls=...)` emits the scheme instead of hardcoding `http` (and brackets a bare
@@ -447,3 +447,24 @@ apiclient takes it too. One copy serves the engine, the apiclient and the tray, 
 copy to drift. It acts on Python 3.15 only; on 3.14 it changes nothing.
 
 The **Must never import** list is unchanged.
+
+## Amendment (2026-11-19) -- a wildcard bind stays monitor-only, though the tray probes it on loopback (BACKLOG #5936)
+
+A fact record of the implementation. It changes no Decision in this ADR or in its earlier amendments,
+including the 2026-07-22 one, whose sentence that `monitor_only` keys on `is_local_engine` alone stands
+as written above and is no longer the whole implementation. It rests on decision
+d20261119T232951397-a601cd and its review outcome d20261119T234105025-5f3175.
+
+- **Locality is judged on the bind host.** For a URL the tray discovers from the service entry, that is
+  the host `serve --host` names; for an `engine_url` set in `tray.toml`, it is that URL's host.
+- **A wildcard bind is not loopback.** A `serve --host` naming an unspecified address, at least `0.0.0.0`
+  and `::` in any spelling `ipaddress` parses, listens on every interface, so the tray stays monitor-only
+  for it. That matches `main` before this change, where the discovered URL carried the wildcard host and
+  `is_local_engine` rejected it.
+- **The status probe and Open Console go to loopback for a wildcard bind.** No client can connect to a
+  wildcard address, so `build_engine_url` substitutes the loopback address of the same family,
+  `127.0.0.1` or `::1`. The probe and Open Console both read that URL.
+- **`TrayConfig.bind_unspecified` is a second key beside `is_local_engine`.** `monitor_only` is
+  `bind_unspecified or not is_local_engine(engine_url)`. `compose_config` sets it only from the
+  `serve --host` registry hint, and a non-empty `engine_url` in `tray.toml` clears it, so that URL's own
+  host then decides.
