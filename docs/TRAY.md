@@ -123,8 +123,10 @@ tray takes neither from the engine's settings TOML nor from `MEFOR_*` variables 
 environment, so set `engine_url` in `tray.toml` when the bind comes from either. A LAN bind set
 only through `[security].listen_address` is therefore probed on the loopback default and keeps
 service control. A wildcard `--host`, `0.0.0.0` or `::`, is probed on the loopback address of the
-same family, because no client can connect to a wildcard address, and the tray stays monitor-only
-for it, because that bind listens on every interface. The probe verifies the engine's certificate
+same family, because no client can connect to a wildcard address, and the tray is monitor-only
+for it, because that bind listens on every interface. A `--host` naming any non-loopback address,
+a wildcard included, with no `--port` is monitor-only too; before BACKLOG #5936 the tray fell back
+to the loopback default for that bind and kept service control. The probe verifies the engine's certificate
 against the loopback address it connects to, so for a wildcard bind serve your own
 `[api].tls_cert_file` that names it. (BACKLOG #5936)
 
