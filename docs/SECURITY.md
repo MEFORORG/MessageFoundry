@@ -3803,9 +3803,9 @@ nothing to clear makes no such check:
 - At least some raises from the stamp onward, such as one from the clear, write an `auth.reauth` row
   marked `interrupted`, softly, beside any row the clear already committed. At least these write no
   interrupted row: a hard `auth.reauth` row write that raises or is cancelled (ADR 0217's 2026-11-19
-  amendment, case (a)), a stamp-window error that is answered and suppressed, and a refused rotation
-  (`rotation_lost`). A raise inside the re-proof itself, after the password verified, writes no
-  `auth.reauth` row.
+  amendment, case (a)), a stamp-window error that is answered and suppressed, and a rotation that a
+  store error or an Outage refused. A raise inside the re-proof itself, after the password verified,
+  writes no `auth.reauth` row.
 
 **A password re-auth that holds a rotated token asks the store, best effort, to revoke that session
 when its hard `auth.reauth` row write raises or is cancelled, or when its clear raises (BACKLOG
