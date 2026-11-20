@@ -836,32 +836,41 @@ def _refusal_findings(posture: ServiceEnvPosture) -> str | None:
     if posture.value_runs_on:
         # With a directory string joined, "remove those strings" alone would take the directory
         # entry too, so the exception goes in the same sentence, ahead of the step that keeps it.
-        remove = (
-            f"so remove those strings with it, but for one {_DIRECTORY_VARIABLE} entry the next "
-            "step keeps"
-            if posture.directory_joined
-            else "so remove those strings with it"
-        )
-        steps.append(
+        # ``directory_joined`` may come from another variable than the one that runs on, so the
+        # exception says "any", never that one of these strings holds it.
+        run_on = (
             "At least one refused variable is empty in its own string and its value runs on into "
             "the strings after it in the same registry value, as `nssm set` writes each argument "
-            f"as its own string, {remove}, or the value stays in the registry key"
+            "as its own string"
         )
-    if posture.directory_joined:
+        if posture.directory_joined:
+            steps.append(
+                f"{run_on}. The value stays in the registry key until those strings are removed, "
+                f"so remove each of them, but for any that sets {_DIRECTORY_VARIABLE}, which the "
+                "next step covers"
+            )
+        else:
+            steps.append(
+                f"{run_on}, so remove those strings with it, or the value stays in the registry key"
+            )
+    # Only where the remedy touches the lists' strings or needs the secrets directory: a refusal
+    # about a store key alone sends the operator to a key file, not to the directory's entry.
+    if posture.directory_joined and (posture.value_runs_on or others or values):
         steps.append(
             f"At least one string in the service's lists sets {_DIRECTORY_VARIABLE} on its first "
-            "line and is read here as part of the empty value of the variable in the string "
-            "above it. NSSM may instead read it as a variable of its own, so this reading does "
-            "not take it as naming the secrets directory. Keep one "
+            "non-blank line and is read here as part of the empty value of the variable in the "
+            "string above it. NSSM may instead read it as a variable of its own, so this reading "
+            "does not take it as naming the secrets directory. Keep one "
             f"{_DIRECTORY_VARIABLE} entry in the service's lists, written as "
             f"{_DIRECTORY_VARIABLE}=<path> naming the secrets directory by its path, and remove "
             f"any other entry that sets {_DIRECTORY_VARIABLE}, before any re-run of the "
             "installer, which refuses an existing directory the service does not name. `nssm "
             "set` replaces a whole list, so read it first with `nssm get`, running the service's "
-            "own nssm.exe by its full path, and pass back every entry but those refused above: "
-            'see docs/SERVICE.md, "Start / stop / status". Where no secrets directory exists '
-            'yet, the bullet "The other secrets: a secrets directory" under docs/SERVICE.md, '
-            '"Protect the store encryption key at rest", says how the directory is created'
+            "own nssm.exe by its full path, and pass back every entry but those refused above "
+            "and the strings this step and any step above say to remove: see docs/SERVICE.md, "
+            '"Start / stop / status". Where no secrets directory exists yet, the bullet "The '
+            'other secrets: a secrets directory" under docs/SERVICE.md, "Protect the store '
+            'encryption key at rest", says how the directory is created'
         )
     if keys:
         steps.append(
