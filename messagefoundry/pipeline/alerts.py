@@ -413,13 +413,14 @@ class AlertSink(Protocol):
         error_class: str | None = None,
     ) -> None:
         """An outbound connection's delivery lane went **down** — the first transport failure
-        (``DeliveryError``) after the lane was healthy, edge-triggered so a retry storm fires at most
-        one alert per lane per cooldown (#46, Corepoint "connection lost"). ``kind`` is the connection-
-        event kind (``connection_lost``); ``detail`` is a ``safe_exc`` reason, and it can echo
-        transport text, so an implementation must not assume it is free of message content, and must
+        (``DeliveryError``) after the lane was healthy, edge-triggered and throttled per lane and kind
+        so a retry storm fires at most one alert per lane per kind per cooldown (#46, Corepoint "connection lost"). ``kind`` is the connection-
+        event kind (``connection_lost``, or ``config_fault`` under ADR 0095 Amendment B.2);
+        ``detail`` is a ``safe_exc`` reason, and it can echo transport text, so an implementation must not assume it is free of message content, and must
         not send it off the box (BACKLOG #5021).
         ``error_class`` is the failing exception's class name (BACKLOG #3210). A partner *rejection*
-        (``NegativeAckError``) is NOT a connection error and never fires this."""
+        (``NegativeAckError``) is NOT a connection error and does not fire this, except as ADR 0095
+        Amendment B.2 says."""
         ...
 
     def storage_threshold(self, path: str, *, size_bytes: int, limit_bytes: int) -> None:
@@ -895,8 +896,8 @@ class AlertSink(Protocol):
         :class:`~messagefoundry.pipeline.update_check.UpdateCheckRunner` (the no-network local diff)."""
         ...
 
-    def connection_restored(self, name: str) -> None:
-        """An outbound lane recovered — the **inverse** of :meth:`connection_error` (``connection_lost``).
+    def connection_restored(self, name: str, *, kind: str = "connection_lost") -> None:
+        """An outbound lane recovered — the **inverse** of :meth:`connection_error` of the same ``kind``.
         Emits **no** notification (a recovery needs no page); it exists so durable alert-state (ADR 0044,
         #56) can **auto-resolve** the matching open ``connection_error`` instance when wired. The default
         :class:`LoggingAlertSink` and any state-less sink treat it as a no-op. ``name`` is the connection
@@ -1542,7 +1543,7 @@ class LoggingAlertSink:
             pinned_version,
         )
 
-    def connection_restored(self, name: str) -> None:
+    def connection_restored(self, name: str, *, kind: str = "connection_lost") -> None:
         # State-less sink: a recovery needs no page and there is no instance to auto-resolve, so this is
         # a no-op (the connection_event lifecycle row is recorded by the runner, not here). ADR 0044 #56.
         return

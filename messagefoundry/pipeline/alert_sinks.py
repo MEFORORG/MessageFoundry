@@ -295,7 +295,7 @@ class _ResolveFence:
 #: only for an operator's start or restart (``AlertSink.connection_started``, BACKLOG #1741), clears a
 #: ``connection_stopped``. Keyed by the inverse event's ``type`` → the failure event ``type`` it resolves.
 _AUTO_RESOLVE: dict[str, str] = {
-    "connection_restored": "connection_error",
+    "connection_restored": "connection_error",  # kind config_fault: _CONFIG_FAULT_INSTANCE
     "connection_started": "connection_stopped",
     # #145: a leadership step-down / clean release / self-fence resolves this node's open leadership_acquired
     # instance; a DR fail-back resolves the open dr_activated. The open set then tracks the live leaders.
@@ -321,6 +321,25 @@ _AUTO_RESOLVE: dict[str, str] = {
     # the same posture:start key, so for the same engine process.
     "posture_restored": "posture_loosened",
 }
+
+
+#: The alert instance of a ``connection_error`` of kind ``config_fault``, new in PR 3069 (BACKLOG
+#: #5910): its own notification throttle, escalation count and instance, apart from a transport
+#: ``connection_error``, so neither's page suppresses the other's or replaces its reason. A rule's
+#: control action is not split this way: it is throttled per ``(event_type, connection)``
+#: (``NotifierAlertSink._last_control``). ``connection_restored`` of the same kind resolves it.
+#: ADR 0044's 2026-11-19 amendment states the instance key, and the 2026-11-19 amendment to ADR 0128 section 4 states the
+#: notification and control throttles.
+_CONFIG_FAULT_INSTANCE = "connection_error.config_fault"
+
+
+def _instance_type(event: dict[str, Any]) -> str:
+    """The event type an alert instance, and the sink's per-key state, is keyed on."""
+    etype = str(event.get("type", ""))
+    if etype == "connection_error" and event.get("kind") == "config_fault":
+        return _CONFIG_FAULT_INSTANCE
+    return etype
+
 
 _T = TypeVar("_T")
 
@@ -1283,14 +1302,16 @@ class AlertRuleSet:
 class _ClearedState:
     """The in-memory alert state one clear dropped for a key, held until its durable resolve
     settles (:meth:`NotifierAlertSink._resolve_settled`): a ``connection_started``'s (BACKLOG
-    #1741), or any other auto-resolving inverse's (BACKLOG #4916), whose ``last`` is always None."""
+    #1741), or any other auto-resolving inverse's (BACKLOG #4916), whose ``last`` and ``control``
+    are always None."""
 
     last: float | None
     occurrences: int | None
     suspended: float | None
+    control: float | None = None
 
     def absorb(self, earlier: _ClearedState) -> None:
-        """Take over an earlier clear whose resolve failed: its count adds, and the newer cooldown
+        """Take over an earlier clear whose resolve failed: its count adds, and the newer cooldowns
         and suspend stand."""
         if earlier.occurrences is not None:
             self.occurrences = earlier.occurrences + (self.occurrences or 0)
@@ -1298,6 +1319,8 @@ class _ClearedState:
             self.last = earlier.last
         if self.suspended is None:
             self.suspended = earlier.suspended
+        if self.control is None:
+            self.control = earlier.control
 
 
 class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
@@ -1326,6 +1349,12 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         self._realert_seconds = realert_seconds
         self._rules = AlertRuleSet(rules or [])
         self._last_sent: dict[str, float] = {}
+        # ADR 0128 section 4, amended 2026-11-19 (owner ruling): per "<event_type>:<connection>", when a rule's
+        # control action was last dispatched. The control throttle reads only this map, apart from
+        # the notification throttle above, whether or not that emit's page was throttled. The 2026-11-19
+        # amendment to ADR 0128 section 4 states the bound per (event_type, connection) and at least
+        # its limits.
+        self._last_control: dict[str, float] = {}
         # Durable alert-state (ADR 0044, #56): when wired, every emit upserts a resolvable instance on
         # the (type, connection) key BEFORE the throttle, and an inverse signal auto-resolves it. None =
         # state tracking off (byte-identical to pre-#56 — fire-and-forget only).
@@ -1428,8 +1457,9 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         detail: str | None = None,
         error_class: str | None = None,
     ) -> None:
-        # #46: an outbound lane went down. The shared _emit throttle keys on (type, connection), so a
-        # retry storm on one lane collapses to one notification per cooldown. detail can echo a
+        # #46: an outbound lane went down. _emit's notification throttle keys on (type, connection),
+        # with a config_fault kind under a key of its own (_instance_type), so a retry storm on one
+        # lane collapses to one notification per kind per cooldown. detail can echo a
         # partner's reply, so it rides under _detail: stored as the alert reason, popped in _handle
         # before any transport sees the event (BACKLOG #5021). Off-box carries the class instead.
         self._emit(
@@ -2117,24 +2147,27 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             if until is not None and until > now:
                 self._suspended[f"{a.event_type}:{a.connection}"] = float(until)
 
-    def connection_restored(self, name: str) -> None:
-        """An outbound lane recovered (the inverse of ``connection_error``/``connection_lost``). Records
+    def connection_restored(self, name: str, *, kind: str = "connection_lost") -> None:
+        """An outbound lane recovered (the inverse of ``connection_error`` of the same ``kind``). Records
         NO notification (a recovery needs no page — the runner only stores the lifecycle row) but, when
         alert-state is wired (ADR 0044), **auto-resolves** the matching open ``connection_error`` instance
         so the dashboard clears. A no-op when no store is set (byte-identical to pre-#56)."""
-        self._record_state({"type": "connection_restored", "connection": name}, "info")
+        self._record_state(
+            {"type": "connection_restored", "connection": name, "kind": kind}, "info"
+        )
 
     def connection_started(self, name: str) -> None:
         """The inverse of ``connection_stopped`` (BACKLOG #1741; the Protocol says when it fires: only
         an operator's start or restart). No notification; auto-resolves the open instance when
         alert-state is wired, which drops its occurrence count, tier and suspend entry. With
-        alert-state wired it also ends the cooldown, so a stop that follows is a new incident that
-        pages and dispatches its rule's control action, whatever rule restart is in flight. Without
-        alert-state there is no instance to resolve, and the cooldown stands.
+        alert-state wired it also ends the notification and control cooldowns, so a stop that
+        follows is a new incident that pages and dispatches its rule's control action, whatever
+        rule restart is in flight. Without alert-state there is no instance to resolve, and the
+        cooldowns stand.
 
         The clear is provisional until the durable resolve lands: a stop emitted before the write
         lands must already see it to page. If the write fails, or never runs, the row stays open,
-        so the cooldown, count and suspend entry go back (:meth:`_resolve_settled`)."""
+        so the cooldowns, count and suspend entry go back (:meth:`_resolve_settled`)."""
         if self._store is None:
             return
         key = f"connection_stopped:{name}"
@@ -2142,6 +2175,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
             self._last_sent.pop(key, None),
             self._occurrences.pop(key, None),
             self._suspended.pop(key, None),
+            self._last_control.pop(key, None),
         )
         self._pending_clears.setdefault(key, []).append(cleared)
         try:
@@ -2181,6 +2215,8 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     self._occurrences[key] = cleared.occurrences + self._occurrences.get(key, 0)
                 if cleared.last is not None:
                     self._last_sent.setdefault(key, cleared.last)
+                if cleared.control is not None:
+                    self._last_control.setdefault(key, cleared.control)
                 if cleared.suspended is not None:
                     self._suspended.setdefault(key, cleared.suspended)
         if not queue:
@@ -2215,7 +2251,7 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         now_wall = time.time()
         # #81: schedule-aware decide is time-dependent, so pass the wall clock.
         decision = self._rules.decide(event, now_wall)
-        key = f"{event['type']}:{event['connection']}"
+        key = f"{_instance_type(event)}:{event['connection']}"
         # #81 (ADR 0133): occurrence-driven escalation. The in-memory occurrence count mirrors the store's
         # `count` (both bump once per emit); apply the highest tier the count has crossed. tier is persisted
         # to alert_instance.escalation_tier via _record_state below.
@@ -2233,39 +2269,64 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         )
         now = time.monotonic()
         last = self._last_sent.get(key)
-        if last is not None and now - last < cooldown:
-            return  # throttled — throttles BOTH the notification and any #144 control action for this window
-        self._last_sent[key] = now
-        # #144 (ADR 0128): fire the auto-remediation control action on a fresh (non-throttled) alert —
-        # BEFORE the transport-suppression return, so a rule may auto-remediate QUIETLY (transports=[]) or
-        # alongside a page. Dispatched off-worker + never-raise (see _dispatch_control).
+        throttled = last is not None and now - last < cooldown
+        if not throttled:
+            self._last_sent[key] = now
+        # #144 (ADR 0128 section 4, amended 2026-11-19 by owner ruling): the auto-remediation control action is
+        # decided on its own throttle, _last_control, per (event_type, connection), whether or not
+        # the notification was throttled. It is recorded only when a control task is dispatched, so
+        # an emit the guards below skip does not hold back a later restart. A skip is logged only
+        # on an emit whose notification is not throttled, so a skip that repeats on every emit
+        # logs once per notification cooldown. It runs BEFORE the notification returns, so a rule
+        # may auto-remediate QUIETLY (transports=[]) or alongside a page. Dispatched off-worker +
+        # never-raise (see _dispatch_control).
         if decision.control_action is not None:
-            subject = str(event["connection"])
-            if event["type"] not in _ALERT_CONTROL_EVENT_TYPES:
-                # BACKLOG #1898: AlertRule refuses this pair at load, so a loaded rule never reaches
-                # here. This covers only a rule built past that validator (model_construct).
-                log.warning(
-                    "alert control_action %s skipped: event type %r is not connection-scoped",
-                    decision.control_action,
-                    event["type"],
-                )
-            elif not is_connection_name(subject):
-                # BACKLOG #2527: an allowed type can still carry a stand-in. reference_sync and
-                # state_convergence raise connection_stopped under a colon key, which no connection
-                # name can hold. The event is then not about a connection, so no restart fires,
-                # not even at an explicit control_target. The subject is not logged: a stand-in is
-                # not a connection name, and this line must not echo whatever it is.
-                log.warning(
-                    "alert control_action %s skipped: the %r event is not about a connection",
-                    decision.control_action,
-                    event["type"],
-                )
-            elif decision.control_target is not None:
-                self._dispatch_control(
-                    decision.control_action, decision.control_target, default_target=False
-                )
-            else:
-                self._dispatch_control(decision.control_action, subject, default_target=True)
+            control_key = f"{event['type']}:{event['connection']}"
+            last_control = self._last_control.get(control_key)
+            if last_control is None or now - last_control >= cooldown:
+                subject = str(event["connection"])
+                dispatched = False
+                if event["type"] not in _ALERT_CONTROL_EVENT_TYPES:
+                    # BACKLOG #1898: AlertRule refuses this pair at load, so a loaded rule never
+                    # reaches here. This covers only a rule built past that validator
+                    # (model_construct).
+                    if not throttled:
+                        log.warning(
+                            "alert control_action %s skipped: event type %r is not connection-scoped",
+                            decision.control_action,
+                            event["type"],
+                        )
+                elif not is_connection_name(subject):
+                    # BACKLOG #2527: an allowed type can still carry a stand-in. reference_sync and
+                    # state_convergence raise connection_stopped under a colon key, which no
+                    # connection name can hold. The event is then not about a connection, so no
+                    # restart fires, not even at an explicit control_target. The subject is not
+                    # logged: a stand-in is not a connection name, and this line must not echo
+                    # whatever it is.
+                    if not throttled:
+                        log.warning(
+                            "alert control_action %s skipped: the %r event is not about a connection",
+                            decision.control_action,
+                            event["type"],
+                        )
+                elif decision.control_target is not None:
+                    dispatched = self._dispatch_control(
+                        decision.control_action,
+                        decision.control_target,
+                        default_target=False,
+                        log_skip=not throttled,
+                    )
+                else:
+                    dispatched = self._dispatch_control(
+                        decision.control_action,
+                        subject,
+                        default_target=True,
+                        log_skip=not throttled,
+                    )
+                if dispatched:
+                    self._last_control[control_key] = now
+        if throttled:
+            return  # the notification is throttled for this window
         # #143 (ADR 0044 amendment): the windowed suspend gate — NOTIFICATION-only. The durable instance
         # was already recorded above (AC-3: a suspended alert stays open/counted/visible), and any #144
         # control action already dispatched; a still-active suspend window only mutes the transport enqueue.
@@ -2321,9 +2382,11 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
         store = self._store
         if store is None:
             return
-        etype = str(event.get("type", ""))
+        etype = _instance_type(event)
         connection = str(event.get("connection", ""))
         inverse_of = _AUTO_RESOLVE.get(etype)
+        if etype == "connection_restored" and event.get("kind") == "config_fault":
+            inverse_of = _CONFIG_FAULT_INSTANCE
         # The instance key both writes touch: an upsert's own type, or the failure type a clear resolves.
         key = f"{inverse_of or etype}:{connection}"
         # Stamp the row with the emit time: a write may now wait behind a slow one for the same key,
@@ -2592,33 +2655,40 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                     )
                     await asyncio.gather(*pending, return_exceptions=True)
 
-    def _dispatch_control(self, action: str, target: str, *, default_target: bool) -> None:
+    def _dispatch_control(
+        self, action: str, target: str, *, default_target: bool, log_skip: bool = True
+    ) -> bool:
         """Schedule the injected connection-control callback OFF the delivery worker (a fire-and-forget
         task, exactly like the ADR 0044 state observer). Synchronous + non-blocking: it only creates the
         task, never awaits the runner, so a slow/hung restart can never stall the worker that emitted the
-        alert. A no-op when no callback is wired (logged once at emit)."""
+        alert. A no-op when no callback is wired, logged when ``log_skip`` is set. Returns whether a
+        task was scheduled."""
         cb = self._control_cb
         if cb is None and self._control_stopped:
             # Shutdown cleared it on purpose (stop_control), so this is not a wiring fault.
-            log.info("alert control_action %s for %r not run: shutting down", action, target)
-            return
+            if log_skip:
+                log.info("alert control_action %s for %r not run: shutting down", action, target)
+            return False
         if cb is None:
-            log.warning(
-                "alert control_action %s for %r requested but no control callback is wired",
-                action,
-                target,
-            )
-            return
+            if log_skip:
+                log.warning(
+                    "alert control_action %s for %r requested but no control callback is wired",
+                    action,
+                    target,
+                )
+            return False
+        run = self._run_control(cb, action, target, default_target=default_target)
         try:
-            task = asyncio.ensure_future(
-                self._run_control(cb, action, target, default_target=default_target)
-            )
+            task = asyncio.ensure_future(run)
         except RuntimeError:
             # No running loop (e.g. a control emit on a non-async test path) — best-effort, drop it rather
-            # than raise into the caller. The notification path is unaffected.
-            return
+            # than raise into the caller. The notification path is unaffected. Closing the coroutine
+            # spares a never-awaited warning.
+            run.close()
+            return False
         self._control_tasks.add(task)
         task.add_done_callback(self._control_tasks.discard)
+        return True
 
     @staticmethod
     async def _run_control(

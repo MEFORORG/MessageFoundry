@@ -101,6 +101,7 @@ from messagefoundry.transports.bounded_read import (
     hop_identity,
     read_2xx_reply_text,
     read_bounded_text,
+    refused_error_body_phrase,
 )
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture.
@@ -1365,16 +1366,38 @@ class SoapDestination(DestinationConnector):
                     connector=f"{self._hop} fault body",
                     encoding=self.encoding,
                 )
-            except EgressReplyError:
+            except EgressReplyError as refused:
                 # The FAMILY, not just the byte bound -- see the twin arm in fhir.py.
                 logger.warning(
-                    "%s returned an HTTP %s fault body the engine could not read whole; "
+                    "%s returned an HTTP %s %s; classifying on the status alone",
+                    self._hop,
+                    exc.code,
+                    refused_error_body_phrase(refused, "fault body"),
+                )
+                body = ""
+            except (OSError, ValueError, http.client.HTTPException) as failed:
+                # BACKLOG #5910: what a socket read can raise, named so it logs as a failed read.
+                # By class only: no reply byte.
+                logger.warning(
+                    "%s returned an HTTP %s fault body the read failed on (%s); classifying on "
+                    "the status alone",
+                    self._hop,
+                    exc.code,
+                    type(failed).__name__,
+                )
+                body = ""
+            except Exception as failed:  # noqa: BLE001 - a body we can't read becomes status-only
+                # Anything else, a defect included, still falls through to the status, as before
+                # BACKLOG #5910: a 5xx stays retryable and a 401 still invalidates the token,
+                # rather than the raise reaching the delivery worker as an internal error. Logged
+                # by class only: the exception text could carry reply bytes.
+                logger.warning(
+                    "%s returned an HTTP %s fault body the read raised an unexpected %s on; "
                     "classifying on the status alone",
                     self._hop,
                     exc.code,
+                    type(failed).__name__,
                 )
-                body = ""
-            except Exception:  # noqa: BLE001 - a body we can't read just becomes status-only
                 body = ""
             # A non-2xx status: _classify_soap always returns a failure here (it returns None only on
             # 2xx). This is a transport-level fault — raised for BOTH capturing and non-capturing.
