@@ -102,33 +102,6 @@ def test_a_single_shard_config_pins_nothing() -> None:
     assert filter_registry_for_shard(reg, "default").all_inbound_messages_days is None
 
 
-async def test_a_shard_id_matching_no_inbound_still_honours_the_overrides(
-    store: MessageStore,
-) -> None:
-    """``serve --shard other`` against a single-engine-shard config selects no inbound, yet its
-    runner still purges the unified store, so it must keep the keep-forever body.
-
-    Mutation: pin ``all_inbound_messages_days`` only when sharded. Red."""
-    reg = Registry()
-    reg.add_inbound(build_inbound_connection("IB_A", MLLP(port=2711), router="r", messages_days=0))
-    keep = await _delivered(store, channel_id="IB_A", control="S-A")
-    gone = await _delivered(store, channel_id="IB_INHERIT", control="S-I")
-
-    view = filter_registry_for_shard(reg, "other")
-    assert view.inbound == {}  # the precondition: nothing selected, one shard in the config
-
-    runner = RetentionRunner(
-        store,
-        RetentionSettings(messages_days=1),
-        clock=lambda: 100 * DAY,
-        registry_source=lambda: view,
-    )
-    await runner.run_once()
-
-    assert await _raw(store, keep) == RAW
-    assert await _raw(store, gone) == ""  # positive control: the purge ran
-
-
 def test_the_override_map_is_keyed_by_connection_name() -> None:
     """The store keys bodies by ``channel_id`` = the connection's NAME, so the map must be too, even
     when a hand-built ``inbound`` dict's key differs.

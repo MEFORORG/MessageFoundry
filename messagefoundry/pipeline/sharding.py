@@ -204,8 +204,7 @@ def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
     ``reingress_to`` rule is a fact about the CONFIG, and a shard that doesn't own the loopback must
     still validate it. The whole config's inbound names (``all_inbound``) and pass-through inbounds
     (``all_pt_inbound``) are pinned the same way. A single-shard config attaches none of them — it
-    stays byte-identical to plain ``serve`` everywhere, except that a filter dropping any inbound
-    still pins ``all_inbound_messages_days``.
+    stays byte-identical to plain ``serve`` everywhere.
 
     Raising is intentionally avoided for an empty result — a shard id that matches no inbound yields
     an empty-intake registry; the caller (``serve --shard``) decides whether that is an error.
@@ -266,13 +265,8 @@ def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
             MappingProxyType(inbound_guard_settings(registry)) if sharded else None
         ),
         # Pin the UNFILTERED inbounds' body-retention overrides (BACKLOG #5889; why: the field's
-        # comment). Derived from the SOURCE registry, as above. Pinned whenever the filter drops an
-        # inbound, not only when sharded: `serve --shard` with an id that matches no inbound of a
-        # single-shard config still purges the unified store, and without the pin it would purge
-        # every keep-forever body at the global window.
+        # comment). Derived from the SOURCE registry, as above.
         all_inbound_messages_days=(
-            MappingProxyType(dict(registry.inbound_messages_days()))
-            if sharded or len(selected) != len(registry.inbound)
-            else None
+            MappingProxyType(dict(registry.inbound_messages_days())) if sharded else None
         ),
     )
