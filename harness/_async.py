@@ -53,19 +53,23 @@ class _Call(QRunnable):
         self._signals = signals
 
     def run(self) -> None:
-        # Drop this runnable's own references before the call. The pool holds the runnable until
-        # some time after run() returns, and a slot reached through the emit below can finish its
-        # whole test or window first. Until then a callable that captures its widget, such as
-        # LoginDialog's sign-in lambda, keeps widget -> runner -> pool -> runnable -> callable ->
-        # widget a reference cycle, which a later collection may free off the GUI thread. The
-        # locals below live on this thread's stack instead, which the collector never frees.
+        # Drop this runnable's own references before the call. PySide adds the pool's Python link
+        # to the runnable only after QThreadPool.start() returns, with the GIL released meanwhile,
+        # so when the runnable has already run and been deleted the link is added late and never
+        # removed: the pool keeps the dead wrapper. A wrapper still holding a callable that
+        # captures its widget, such as LoginDialog's sign-in lambda, then keeps widget -> runner
+        # -> pool -> runnable -> callable -> widget a reference cycle, which a later collection
+        # may free off the GUI thread. The callable is also dropped before the emit, so a slot
+        # that finishes with the widget first does not leave this thread to free it on return.
         fn, signals = self._fn, self._signals
         del self._fn, self._signals
         try:
             result = fn()
         except Exception as exc:  # noqa: BLE001 — deliver ANY failure to the main thread, never crash the pool worker
+            del fn
             signals.failed.emit(exc)
         else:
+            del fn
             signals.done.emit(result)
 
 
@@ -88,7 +92,8 @@ class AsyncRunner(QObject):
         self._pool = QThreadPool(self)
         self._stopped = False
         # Hold each call's signals object (and its callbacks) alive until its slot has run: a queued signal
-        # needs its sender to outlive the emit→deliver gap, and the QRunnable is dropped when run() returns.
+        # needs its sender to outlive the emit→deliver gap, and the runnable no longer refers to it once run()
+        # starts (see _Call.run).
         self._calls: dict[
             _CallSignals, tuple[Callable[[Any], None], Callable[[BaseException], None] | None]
         ] = {}
