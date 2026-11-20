@@ -12,6 +12,7 @@ commands skip the check, and no k8s manifest checks the value."""
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -22,11 +23,9 @@ from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV
 
 _REPO = Path(__file__).resolve().parents[1]
 _K8S = _REPO / "docker" / "k8s"
-_DOCS = (
-    _REPO / "docs" / "CLOUD-DEPLOYMENT.md",
-    _REPO / "docker" / "README.md",
-    _K8S / "secret.example.yaml",
-)
+_README = _REPO / "docker" / "README.md"
+_CLOUD = _REPO / "docs" / "CLOUD-DEPLOYMENT.md"
+_DOCS = (_CLOUD, _README, _K8S / "secret.example.yaml")
 
 
 _SECRET = ("mefor-secrets", "tls-revocation-attested")
@@ -52,7 +51,8 @@ def _attestation_entries() -> list[tuple[str, str, list[dict[str, Any]]]]:
 
 
 def _flat(path: Path) -> str:
-    return " ".join(path.read_text(encoding="utf-8").split())
+    # A bare "#" is a YAML comment marker, so a sentence wrapped across comment lines reads whole.
+    return " ".join(w for w in path.read_text(encoding="utf-8").split() if w != "#")
 
 
 def _check_comment() -> str:
@@ -76,21 +76,53 @@ def test_each_container_reads_the_attestation_once_from_the_secret() -> None:
         assert ref.get("optional") is not True, f"{where}: the attestation must not be optional"
 
 
+def _k8s_section(doc: Path) -> str:
+    """The part of ``doc`` that tells a k8s deployer about the Secret key, bounded so that another
+    section's copy of a sentence cannot satisfy a pin. secret.example.yaml is that part whole."""
+    text = _flat(doc)
+    if doc == _CLOUD:
+        start = text.index("**Create the Secret**")
+        return text[start : text.index(" 4. **Apply**", start)]
+    if doc == _README:
+        start = text.index("**Kubernetes (single-node):**")
+        return text[start : text.index(" - **", start)]
+    return text
+
+
 @pytest.mark.parametrize("doc", _DOCS, ids=lambda p: p.name)
 def test_each_deploy_doc_names_the_required_secret_key(doc: Path) -> None:
-    text = _flat(doc)
-    assert _SECRET[1] in text, f"{doc.name} never names the Secret key {_SECRET[1]}"
-    assert "CreateContainerConfigError" in text
-    assert "crash-loop" in text, f"{doc.name} does not say a false value still crash-loops"
-    # The caveat itself, not just the word: a value such as 0 passes the kubelet.
-    assert "such as 0" in text or "such as `0`" in text, f"{doc.name} lacks the 0 caveat"
-    assert "passes the kubelet" in text, f"{doc.name} does not say a 0 passes the kubelet"
+    section = _k8s_section(doc)
+    assert _SECRET[1] in section, f"{doc.name} never names the Secret key {_SECRET[1]}"
+    assert "CreateContainerConfigError" in section, doc.name
+    assert "crash-loop" in section, f"{doc.name} does not say a false value still crash-loops"
+    # The caveat itself, beside the key: a value such as 0 passes the kubelet.
+    assert re.search(r"such as `?0`?,? passes the kubelet", section), (
+        f"{doc.name} does not say a value such as 0 passes the kubelet"
+    )
+
+
+@pytest.mark.parametrize("doc", (_CLOUD, _README), ids=lambda p: p.name)
+def test_each_deploy_doc_links_the_secret_example(doc: Path) -> None:
+    # The create command lives in secret.example.yaml, so each doc must send the reader there.
+    assert "k8s/secret.example.yaml" in _k8s_section(doc), doc.name
 
 
 def test_the_secret_example_creates_the_key() -> None:
     text = _flat(_K8S / "secret.example.yaml")
+    assert f"kubectl create secret generic {_SECRET[0]}" in text
     assert f"--from-literal={_SECRET[1]}=" in text
     assert f"name: {_SECRET[0]}" in text
+
+
+@pytest.mark.parametrize(
+    "path", (*_DOCS, *sorted(_K8S.glob("*.yaml"))), ids=lambda p: f"{p.parent.name}/{p.name}"
+)
+def test_no_deploy_file_names_the_retired_configmap(path: Path) -> None:
+    # The attestation once came from a ConfigMap; a reverted merge must not tell deployers to
+    # create one that no manifest reads.
+    text = _flat(path)
+    for stale in ("mefor-revocation-attestation", "configMapKeyRef", "kubectl create configmap"):
+        assert stale not in text, f"{path.name} still names {stale}"
 
 
 def test_the_compose_check_disables_the_image_healthcheck() -> None:
@@ -141,8 +173,6 @@ def test_the_changelog_claims_only_an_up_without_no_deps_and_names_the_skips() -
 _SKIPS = (
     "at least `docker compose up --no-deps <engine>` and `docker compose run --no-deps` skip it"
 )
-_README = _REPO / "docker" / "README.md"
-_CLOUD = _REPO / "docs" / "CLOUD-DEPLOYMENT.md"
 
 
 @pytest.mark.parametrize("doc", (_CLOUD, _README), ids=lambda p: p.name)
@@ -159,18 +189,9 @@ def test_no_deploy_doc_carries_the_unqualified_refusal_claim(doc: Path) -> None:
         assert stale not in text, f"{doc.name} still carries the unqualified claim: {stale}"
 
 
-@pytest.mark.parametrize(
-    ("doc", "anchor"),
-    [
-        (_CLOUD, "**Create the Secret**"),
-        (_README, "**Kubernetes (single-node):**"),
-    ],
-    ids=["CLOUD-DEPLOYMENT.md", "README.md"],
-)
-def test_each_k8s_section_says_no_manifest_checks_the_value(doc: Path, anchor: str) -> None:
-    text = _flat(doc)
-    start = text.index(anchor)
-    section = text[start : start + 1500]
+@pytest.mark.parametrize("doc", (_CLOUD, _README), ids=lambda p: p.name)
+def test_each_k8s_section_says_no_manifest_checks_the_value(doc: Path) -> None:
+    section = _k8s_section(doc)
     assert "anifest checks the value before the engine starts." in section, section
 
 
