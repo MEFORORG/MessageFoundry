@@ -848,6 +848,10 @@ _COL_GAP = 210
 _MARGIN = 12
 _HEAD_Y = 24
 _TOP = 40
+#: A back-edge (into the same or an earlier column) runs in its own horizontal lane under the rows.
+_LANE_GAP = 14
+#: How far a back-edge's vertical runs sit outside the node boxes, in the column gutters.
+_GUTTER = 8
 
 
 def _short(name: str, limit: int = 20) -> str:
@@ -859,7 +863,13 @@ def _short(name: str, limit: int = 20) -> str:
 def _flow_graph(graph: GraphResponse) -> Markup:
     """The status-colored by-name data-flow graph as inline SVG (a layered inbound→router→handler→
     outbound layout). Node colour is CSS-driven off the live ``status`` class (theme tokens), never an
-    operator-assigned colour. Edges are lines; a ``heuristic``-provenance edge renders dashed."""
+    operator-assigned colour. Edges are lines; a ``heuristic``-provenance edge renders dashed.
+
+    A **back-edge** points into the same or an earlier column: an outbound's ``reingress_to`` into its
+    Loopback inbound, which closes a response cycle, or a handler's pass-through ``Send``. The columns
+    are fixed by kind, so a cycle cannot reorder them; a back-edge is routed as a path out of the
+    source's right side, along its own lane under the rows and into the target's left side, rather
+    than drawn as a forward line across the whole graph."""
     if not graph.nodes:
         return el("p", "No connections in the graph.", class_="muted")
     columns: dict[str, list[str]] = {kind: [] for kind, _label in _GRAPH_COLUMNS}
@@ -877,27 +887,41 @@ def _flow_graph(graph: GraphResponse) -> Markup:
         for ri, name in enumerate(columns[kind]):
             pos[(kind, name)] = (x, _TOP + ri * _ROW_GAP)
 
+    col_of = {kind: ci for ci, (kind, _label) in enumerate(_GRAPH_COLUMNS)}
+    drawn = [
+        (edge, pos[(edge.source_kind, edge.source)], pos[(edge.target_kind, edge.target)])
+        for edge in graph.edges
+        if (edge.source_kind, edge.source) in pos and (edge.target_kind, edge.target) in pos
+    ]
+    n_back = sum(1 for e, _s, _t in drawn if col_of[e.target_kind] <= col_of[e.source_kind])
+
     max_rows = max((len(names) for names in columns.values()), default=1)
     width = _MARGIN + (len(_GRAPH_COLUMNS) - 1) * _COL_GAP + _NODE_W + _MARGIN
-    height = _TOP + max(1, max_rows) * _ROW_GAP + _MARGIN
+    rows_bottom = _TOP + max(1, max_rows) * _ROW_GAP
+    height = rows_bottom + n_back * _LANE_GAP + _MARGIN
 
     parts: list[object] = []
     for ci, (_kind, label) in enumerate(_GRAPH_COLUMNS):
         parts.append(el("text", label, x=_MARGIN + ci * _COL_GAP, y=_HEAD_Y, class_="gcolhead"))
     # Edges first (drawn behind the node boxes). A target the static extractor couldn't resolve simply
     # has no edge here (its source is flagged dynamic separately) — never a fabricated line.
-    for edge in graph.edges:
-        s = pos.get((edge.source_kind, edge.source))
-        t = pos.get((edge.target_kind, edge.target))
-        if s is None or t is None:
+    lane = 0
+    for edge, s, t in drawn:
+        sy, ty = s[1] + _NODE_H // 2, t[1] + _NODE_H // 2
+        if col_of[edge.target_kind] <= col_of[edge.source_kind]:
+            lane_y = rows_bottom + lane * _LANE_GAP
+            lane += 1
+            sx, tx = s[0] + _NODE_W + _GUTTER, t[0] - _GUTTER
+            d = f"M {s[0] + _NODE_W} {sy} H {sx} V {lane_y} H {tx} V {ty} H {t[0]}"
+            parts.append(el("path", d=d, class_=f"gedge gedge-{edge.provenance} gedge-back"))
             continue
         parts.append(
             el(
                 "line",
                 x1=s[0] + _NODE_W,
-                y1=s[1] + _NODE_H // 2,
+                y1=sy,
                 x2=t[0],
-                y2=t[1] + _NODE_H // 2,
+                y2=ty,
                 class_=f"gedge gedge-{edge.provenance}",
             )
         )
