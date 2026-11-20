@@ -333,7 +333,8 @@ _LINE_BREAK = re.compile(r"\r\n|[\r\n]")
 #: A later line that sets an ordinary variable: a name Windows allows in an environment block,
 #: which is any non-blank text without an equals sign (``ProgramFiles(x86)`` among them), then an
 #: equals sign, then a value holding something other than equals signs and blanks. Such a line
-#: ends the variable above it. A line of base64 does not match, since its only equals signs are
+#: ends the variable above it, unless it is a split secret's text (:func:`_is_split_value_line`),
+#: which :func:`_line_start` checks first. A line of base64 does not match, since its only equals signs are
 #: the padding at its end, and neither does a line of PEM armour, which holds no equals sign. So
 #: ``OTHER=`` with an empty value does not match either, nor does one whose value is only equals
 #: signs and blanks in any order, and each is read as part of the value above it: a store key
@@ -356,35 +357,46 @@ _BASE64_TEXT = re.compile(r"[A-Za-z0-9+/]+")
 #: Text of either base64 alphabet, standard or base64url.
 _ANY_BASE64_TEXT = re.compile(r"[A-Za-z0-9+/_-]+")
 
-#: A line that starts a split secret's text, read as continuing the value above it rather than
-#: as a variable of its own (vault BACKLOG #5394, added item 12): one that starts with a quote
-#: or a comma, as a quoted key or a retired-keys list led by a comma does, and one whose name is
-#: base64 text of either alphabet and whose value, after any equals signs and blanks, starts with
-#: a comma, as a padded key followed by a comma or by the next key of a retired-keys list does.
-_SPLIT_VALUE_LINE = re.compile(r"\s*[\"',]|\s*[A-Za-z0-9+/_-]+=[=\s]*,")
+#: A line led by a split secret's text (vault BACKLOG #5394, added item 12): a quote or a comma,
+#: as a quoted key or a retired-keys list led by a comma is.
+_QUOTE_OR_COMMA_LED = re.compile(r"\s*[\"',]")
 
-
-def _is_split_value_line(line: str) -> bool:
-    """Whether ``line`` starts a split secret's text (:data:`_SPLIT_VALUE_LINE`). A line that
-    sets ``MEFOR_SECRETS_DIRECTORY`` is read as the variable it names, as before, so the remedy
-    still reads the directory as set."""
-    if _SPLIT_VALUE_LINE.match(line) is None:
-        return False
-    return line.partition("=")[0].strip().upper() != _DIRECTORY_VARIABLE
-
+#: A line whose name is base64 text of either alphabet and whose value, after any equals signs
+#: and blanks, starts with a comma, as a padded key followed by a comma or by the next key of a
+#: retired-keys list is. :func:`_is_split_value_line` exempts a conventional name.
+_COMMA_TRAILED = re.compile(r"\s*([A-Za-z0-9+/_-]+)=[=\s]*,")
 
 #: A name in the conventional spelling of an environment variable: letters of one case, digits
 #: and underscores, with at least one underscore, such as ``HTTP_PROXY`` or ``no_proxy``. A
-#: base64url secret is almost never of one case, so a name of this spelling set to nothing is
-#: read as an ordinary variable; any other base64url name set to nothing reads as a secret with
-#: one ``=`` of padding.
+#: base64url secret is almost never of one case. A name of mixed case, such as ``Http_Proxy``,
+#: does not match, so it is read as a secret's text, an error toward refusing.
 _CONVENTIONAL_NAME = re.compile(r"[A-Z0-9_]*_[A-Z0-9_]*|[a-z0-9_]*_[a-z0-9_]*")
 
+
+def _is_conventional_name(name: str) -> bool:
+    """Whether ``name`` is spelled as an ordinary variable's (:data:`_CONVENTIONAL_NAME`), or
+    starts with ``MEFOR_`` in any case, as every engine name does, so that
+    ``Mefor_Secrets_Directory`` is read as the variable Windows takes it for."""
+    return _CONVENTIONAL_NAME.fullmatch(name) is not None or name.upper().startswith("MEFOR_")
+
+
+def _is_split_value_line(line: str) -> bool:
+    """Whether ``line`` starts a split secret's text, read as continuing the value above it
+    rather than as a variable of its own: quote-led or comma-led (:data:`_QUOTE_OR_COMMA_LED`),
+    or comma-trailed (:data:`_COMMA_TRAILED`) under a name that is not conventional, so
+    ``NO_PROXY=,localhost`` and a ``MEFOR_SECRETS_DIRECTORY`` line are still read as the variable
+    they set."""
+    if _QUOTE_OR_COMMA_LED.match(line):
+        return True
+    trailed = _COMMA_TRAILED.match(line)
+    return trailed is not None and not _is_conventional_name(trailed.group(1))
+
+
 #: A first line led by an equals sign that is not a split secret's text: Windows' own
-#: empty-named entries, such as ``=C:=C:\x`` and ``=::=::\``, and a nameless entry whose text is
-#: of one case, such as ``=orphan``, which a base64 secret's text almost never is. Any other line
-#: led by an equals sign reads as a split secret's text.
-_NAMELESS_ENTRY = re.compile(r"\s*=(?:[A-Za-z]:=|::=|[a-z0-9_]*\s*\Z|[A-Z0-9_]*\s*\Z)")
+#: empty-named entries, such as ``=C:=C:\x`` and ``=::=::\``, and a nameless entry of letters of
+#: one case alone, such as ``=orphan``, which a base64 or hex secret's text almost never is. Any
+#: other line led by an equals sign reads as a split secret's text.
+_NAMELESS_ENTRY = re.compile(r"\s*=(?:[A-Za-z]:=|::=|[a-z]*\s*\Z|[A-Z]*\s*\Z)")
 
 
 def _holds_key_run(text: str) -> bool:
@@ -417,7 +429,7 @@ def _line_start(line: str) -> Literal["kept", "ends"] | None:
     refusal is about, so it is a variable of its own; ``"ends"`` when it sets an ordinary
     variable (:func:`_is_ordinary_line`), which ends the value above and is not kept; ``None``
     when it starts no variable and so belongs to the value above, as a line of a split secret's
-    text (:data:`_SPLIT_VALUE_LINE`) does. :func:`_continues_string` applies it to a string's
+    text (:func:`_is_split_value_line`) does. :func:`_continues_string` applies it to a string's
     first line, narrowed as it says."""
     written, equals, _rest = line.partition("=")
     if not equals:
@@ -549,9 +561,9 @@ def _continues_string(entry: str) -> bool:
     * the name is not blank, and the value holds an equals sign and nothing but equals signs
       and whitespace;
     * the name is base64 text of either alphabet not spelled as a conventional variable name
-      (:data:`_CONVENTIONAL_NAME`), and the value is blank, as a base64url secret with one ``=``
+      (:func:`_is_conventional_name`), and the value is blank, as a base64url secret with one ``=``
       of padding reads (vault BACKLOG #5394, added item 12);
-    * the line is quoted, comma-led or comma-trailed (:data:`_SPLIT_VALUE_LINE`), or led by an
+    * the line is quoted, comma-led or comma-trailed (:func:`_is_split_value_line`), or led by an
       equals sign and not a nameless entry of its own (:data:`_NAMELESS_ENTRY`).
 
     So ``abc==`` continues it in any alphabet, and so does ``ab-c_dE=``. ``PATH=`` continues it
@@ -580,7 +592,7 @@ def _continues_string(entry: str) -> bool:
     one_pad = (
         _ANY_BASE64_TEXT.fullmatch(name) is not None
         and not rest.strip()
-        and _CONVENTIONAL_NAME.fullmatch(name) is None
+        and not _is_conventional_name(name)
     )
     # Quoted, comma-led or comma-trailed text, and text led by an equals sign that is not a
     # nameless entry of its own, is a split secret's (vault BACKLOG #5394, added item 12).
@@ -606,8 +618,9 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     it holds an equals sign: blank lines above it are skipped, as the whole-string reading's strip
     of the name skips them, so a secrets directory set below a blank first line is still read as
     set. A later line is one when it sets a name the refusal is about, so a store key on a later
-    line still refuses. A later line that sets an ordinary variable (:func:`_is_ordinary_line`)
-    ends the value above it under the line reading, and is not kept: under the whole-string
+    line still refuses. A later line that sets an ordinary variable (:func:`_is_ordinary_line`),
+    and is not a split secret's text (:func:`_is_split_value_line`), ends the value above it
+    under the line reading, and is not kept: under the whole-string
     reading it sets nothing, so the secrets directory's name is never taken as set by a later
     line. Any other line, such as one of key material, belongs to the value above it, so a key
     whose value starts on the next line is not empty.

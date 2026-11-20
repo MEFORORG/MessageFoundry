@@ -88,7 +88,8 @@ def test_the_stand_ins_have_the_shapes_they_stand_for() -> None:
 @pytest.mark.parametrize("name", [KEY_CLASS_NAMES[0], "MEFOR_AUTH_OIDC_CLIENT_SECRET"])
 def test_a_split_secret_in_the_next_item_refuses(name: str, shape: str) -> None:
     """``nssm set`` writes each argument as its own string, so a secret split from its name lands
-    in the next item. Before this fix each shape here ended the empty value above it."""
+    in the next item. Before this fix most shapes here ended the empty value above it; the
+    standard-alphabet key shapes already refused through the key-run rule, and stay as pins."""
     posture = _read([f"{name}=", _SHAPES[shape]])
     assert posture.listed == (name,), shape
     assert posture.value_runs_on, shape
@@ -119,19 +120,25 @@ def test_a_split_secret_on_a_later_line_below_another_variable_refuses(
 
 
 #: Items that still end an empty value above them, because NSSM reads each item as its own
-#: variable and none of these is a split secret's shape. The same list as the item 1 control in
-#: ``tests/test_b532r_serviceenv_reader.py``, with the lower-case spellings added.
+#: variable and none of these is a split secret's shape. Taken from the item 1 control in
+#: ``tests/test_b532r_serviceenv_reader.py``, with lower-case spellings, Windows' ``=::`` entry,
+#: a one-case nameless entry and ordinary comma-led values added.
 _ORDINARY_ITEMS = (
     "MEFOR_AI_ENVIRONMENT=prod",
     "ProgramFiles(x86)=C:\\x",
     "=C:=C:\\x",
     "=::=::\\",
+    "=orphan",
     "HTTP_PROXY=",
     "http_proxy=",
     "NO_PROXY=",
     "HTTP_PROXY= ",
+    "NO_PROXY=\t",
     "no_proxy=\t",
     "MEFOR_SECRETS_DIRECTORY=",
+    "Mefor_Secrets_Directory=",
+    "NO_PROXY=,localhost",
+    "no_proxy=,localhost",
     "A" * 42 + "_B=1",
 )
 
@@ -143,6 +150,28 @@ def test_an_ordinary_item_still_ends_the_empty_value_above_it(item: str) -> None
     assert service_env_refusal(posture) is None, item
 
 
+def test_an_ordinary_comma_led_value_on_a_later_line_is_still_its_own_variable() -> None:
+    """The line rule gains the split shapes too, so its negative control: a conventional name
+    with a comma-led value still ends the empty directory above it, which then reads as unset."""
+    posture = _read(["MEFOR_SECRETS_DIRECTORY=\nNO_PROXY=,localhost", "MEFOR_VALUE_A=1"])
+    assert posture.listed == ("MEFOR_VALUE_A",)
+    refusal = service_env_refusal(posture)
+    assert refusal is not None and "The service's lists set no" in refusal
+
+
+def test_a_hex_secret_led_by_an_equals_sign_in_the_next_item_refuses() -> None:
+    """Lower-case hex, as ``openssl rand -hex`` mints, is of one case but holds digits."""
+    name = "MEFOR_AUTH_OIDC_CLIENT_SECRET"
+    assert _read([f"{name}=", "=deadbeefcafebabe0123456789abcdef"]).listed == (name,)
+
+
+def test_an_empty_key_on_its_strings_first_line_above_an_ordinary_line_refuses() -> None:
+    """The control for the item 6 pin below: on the string's first line the whole-string reading
+    keeps the key, so it refuses."""
+    key = KEY_CLASS_NAMES[0]
+    assert _read([f"{key}=\nx=y"]).listed_keys == (key,)
+
+
 @pytest.mark.xfail(
     strict=True,
     reason=(
@@ -151,8 +180,7 @@ def test_an_ordinary_item_still_ends_the_empty_value_above_it(item: str) -> None
     ),
 )
 def test_a_later_empty_secret_above_an_ordinary_line_refuses() -> None:
-    """Added item 6: the same empty key on the string's first line refuses under the
-    whole-string reading, so the reading is position-dependent."""
+    """Added item 6: the same empty key on the string's first line refuses (the control above),
+    so the reading is position-dependent."""
     key = KEY_CLASS_NAMES[0]
-    assert _read([f"{key}=\nx=y"]).listed_keys == (key,)  # the first-line control
     assert _read([f"PATH=x\n{key}=\nx=y"]).listed_keys == (key,)
