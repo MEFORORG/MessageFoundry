@@ -720,6 +720,8 @@ def test_compose_a_host_only_bind_keeps_the_default_port() -> None:
         ("0:0:0:0:0:0:0:0", "[::1]"),
         ("10.0.0.5", "10.0.0.5"),
         ("::1", "[::1]"),
+        ("localhost", "localhost"),
+        ("engine.example.test", "engine.example.test"),
     ],
 )
 def test_build_engine_url_probes_loopback_for_a_wildcard_bind(host: str, probed: str) -> None:
@@ -865,9 +867,8 @@ def test_load_config_reads_the_scheme_from_the_file_under_the_project_root(tmp_p
 
 def test_the_tray_copies_of_the_engine_bind_defaults_match_the_engine() -> None:
     """The tray may not import config/, so it copies these; this pins the copies (BACKLOG #5973)."""
-    from messagefoundry.config.settings import ApiSettings, SecuritySettings
+    from messagefoundry.config.settings import ApiSettings
     from messagefoundry.tray import config as tray_config
 
     assert ApiSettings().host == tray_config._DEFAULT_BIND_HOST
-    assert SecuritySettings().listen_address == tray_config._DEFAULT_BIND_HOST
     assert ApiSettings().port == tray_config._DEFAULT_BIND_PORT

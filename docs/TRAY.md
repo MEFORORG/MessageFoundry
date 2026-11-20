@@ -126,10 +126,9 @@ service control. A wildcard `--host`, `0.0.0.0` or `::`, is probed on the loopba
 same family, because no client can connect to a wildcard address, and the tray is monitor-only
 for it, because that bind listens on every interface. A `--host` naming any non-loopback address,
 a wildcard included, with no `--port` is monitor-only too; before BACKLOG #5936 the tray fell back
-to the loopback default for that bind and kept service control. The probe verifies the engine's certificate
-against the loopback address it connects to. The certificate the engine mints for a wildcard bind
-names that loopback too. An operator certificate on a wildcard bind verifies only if it names that
-loopback; otherwise set `engine_url` to a name it carries. (BACKLOG #5936, #5973)
+to the loopback default for that bind and kept service control. The certificate the engine
+mints for a wildcard bind names that loopback too. An operator certificate on a wildcard bind
+verifies only if it names that loopback. (BACKLOG #5936, #5973)
 
 **What "View Service Log" will open.** Windows opens a file with whatever program owns its
 extension, so a `log_path` naming a `.bat` or `.lnk` would run it. The tray therefore opens

@@ -53,7 +53,8 @@ from messagefoundry.api_tls_source import (
 from messagefoundry.service_status import is_safe_service_name
 
 # The engine's own [api] defaults, which a `serve` command line naming only one of --host and --port
-# keeps for the other (BACKLOG #5936).
+# keeps for the other (BACKLOG #5936). Copied because the tray may not import config/;
+# tests/test_tray_config.py pins them equal.
 _DEFAULT_BIND_HOST = "127.0.0.1"
 _DEFAULT_BIND_PORT = 8765
 # https because the engine serves TLS by default (ADR 0172). Plain http is right only behind a
