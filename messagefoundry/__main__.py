@@ -571,8 +571,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
 
     # The old wording read "a SECRET-FREE / PHI-free support zip". The config summary holds no
     # secret and the status snapshot is metadata-only, the phi_contract's own terms, but the log
-    # tail meets neither, because its redaction is best-effort: a single-token identifier survives it (messagefoundry/redaction.py states that residual), and an
-    # operator username is exactly that shape while this engine's own settings classifier calls a
+    # tail meets neither, because its redaction is best-effort: a single-token identifier
+    # survives it (messagefoundry/redaction.py states that residual), and an operator username is exactly that shape while this engine's own settings classifier calls a
     # username a credential. A blanket claim resting on a member that does not meet it is the
     # false-premise shape CLAUDE.md section 11 forbids, so the claim was repaired rather than the
     # control -- see BACKLOG #1475 and the exclusion table in
@@ -582,11 +582,13 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     # Both the command list and `support-bundle --help` print it.
     support_bundle_help = (
         "write a support zip to hand to support (#49). Its members: version.txt (the engine "
-        "version); manifest.json (the member list and the phi_contract); config-summary.json "
-        "(counts/names only, holding no secret); status.json (the metadata-only status models); "
-        "and app-log.txt, a REDACTED tail of the newest app log, or an MF-BUNDLE-LOG-* code "
-        "when that log cannot be listed or read, left out when no [logging].log_dir is set, "
-        "when it holds no log file, or when --log-tail-lines is 0. The tail's "
+        "version); manifest.json (at least the member list, the engine version, a generation "
+        "time and the phi_contract); config-summary.json (counts/names only, holding no "
+        "secret); status.json (the metadata-only status models); and app-log.txt, a REDACTED "
+        "tail of the newest app log, or an MF-BUNDLE-LOG-* code in its place when the log "
+        "directory or that log cannot be read. app-log.txt is left out in at least these "
+        "cases: no [logging].log_dir is set, no log file is found there, or --log-tail-lines "
+        "is 0. The tail's "
         "redaction is BEST-EFFORT, and values survive it: at least a single-token identifier such "
         "as an operator username and, on a non-production instance logging at DEBUG, a message "
         "body the log recorded in a shape the redaction does not read. Handle the zip as a copy of "

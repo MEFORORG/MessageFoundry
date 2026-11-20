@@ -101,8 +101,14 @@ def test_the_ast_reading_finds_every_member_a_live_bundle_writes(tmp_path: Path)
 
 
 def test_the_cli_help_names_every_member(capsys: pytest.CaptureFixture[str]) -> None:
+    # Read inside the member clause only: manifest.json is also named in the help's last
+    # sentence, so a match anywhere would pass with its member entry deleted.
     help_text = _help_text(capsys)
-    missing = sorted(name for name in _members_written_by_build_bundle() if name not in help_text)
+    clause = re.search(r"Its members: (.*?)\. The tail's", help_text)
+    assert clause is not None, help_text
+    missing = sorted(
+        name for name in _members_written_by_build_bundle() if name not in clause.group(1)
+    )
     assert not missing, f"support-bundle --help does not name: {missing}"
 
 
