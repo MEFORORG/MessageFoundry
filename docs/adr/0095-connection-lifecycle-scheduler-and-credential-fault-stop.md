@@ -564,3 +564,31 @@ occurrences are parsed; the peak is lower because the plain tree holds only the 
 It is raised in `transports/fhir.py` (`_agreed_reading`, comparing `_reply_reading`), not by
 `read_2xx_reply_text`. Tests: `tests/test_fhir_transport.py`, the sections headed vault BACKLOG
 #2812 and vault BACKLOG #3796.
+
+### B.2 A coded token reply is a configuration fault (2026-11-18, BACKLOG #5910, PR 3069)
+
+> **Recorded 2026-11-18 by a Builder seat.** It describes the code in PR 3069, after the owner's
+> ruling there on 2026-11-18: "Stop the lane."
+
+`smart.request_token`, which both the SMART and the OAuth2 token providers call, raises a
+`NegativeAckError` with code `token-reply-coded`, `permanent` and `config_fault` on a coded 2xx
+token reply, as `smart.request_token` scopes it. Every queued row mints its bearer
+through that endpoint before it is sent, so every row would meet the same refusal. It takes the
+A.1 route: under `credential_fault_policy="stop"` the lane stops and the claimed rows go back to
+PENDING un-errored; under `"dead_letter"` the row, or every member of a batch, dead-letters.
+
+Under `"dead_letter"` a configuration fault a send raises now also alerts the lane, on an edge of
+its own, apart from transport health. With `[diagnostics].connection_events` on, its default,
+`connection_error` of kind `config_fault` fires. For `token-reply-coded` this follows the owner's
+ruling of 2026-11-18 on PR 3069: "Yes, keep one connection_error alert on that path." The worker
+reads `config_fault`, never the code, so this is not only `token-reply-coded`. In at least these
+cases it does not alert: a configuration fault from a connector a reload has
+retired, a batch member refused alone by its re-attach or frame check, and a `credential_fault`,
+which it does not read.
+
+This widens A.1's definition. The refusal is not of the connection's own settings: the engine sends
+`Accept-Encoding: identity`, so the coding comes from the token endpoint, or from a proxy in front
+of it that ignores that header. From this amendment a configuration fault is a permanent refusal
+every queued row meets because of the connection rather than the message or the credential: its
+own settings, or the endpoint those settings name. `NegativeAckError.remedy` carries where to fix
+it, and the stop's log line and alert name that place instead of the connection's configuration.

@@ -2275,6 +2275,11 @@ class RegistryRunner:
         # success, so a retry storm emits one transition pair, not one per delivery. A partner reject
         # (NegativeAckError) is not a transport failure and never flips it.
         self._lane_healthy: dict[str, bool] = {}
+        # Outbound lanes whose dead-lettering configuration fault has been alerted (ADR 0095
+        # Amendment B.2): an edge of its own, apart from _lane_healthy, so a transport fault's
+        # connection_lost neither suppresses this alert nor is reported in its place. Cleared by the
+        # lane's next successful delivery.
+        self._lane_config_fault: set[str] = set()
         # Connections that FAILED to build/bind at start ((kind, name) → FailedLine). A failed connection is
         # isolated, never fatal — the rest of the graph still comes up (a failed connection must not
         # crash the engine, ADR 0031). A failed OUTBOUND still gets its delivery worker, but with no
@@ -3166,6 +3171,43 @@ class RegistryRunner:
             )
         except Exception:
             log.warning("alert sink raised on connection_error for %r", name)
+
+    def _note_lane_config_fault(self, name: str, message_id: str, exc: BaseException) -> None:
+        """Edge-trigger a ``config_fault`` connection event and one ``connection_error`` alert, of
+        kind ``config_fault``, on the FIRST dead-lettering configuration fault since lane ``name``
+        last delivered (ADR 0095 Amendment B.2). Its own edge: the transport edge in
+        :meth:`_note_lane_unhealthy` neither suppresses it nor stands in for it. No-op when capture
+        is off or the lane has already alerted for one."""
+        if not self._connection_events or name in self._lane_config_fault:
+            return
+        self._lane_config_fault.add(name)
+        reason = safe_exc(exc)
+        self._enqueue_connection_event(
+            connection=name,
+            transport=self._outbound_transport(name),
+            direction="outbound",
+            kind="config_fault",
+            peer_host=None,
+            message_id=message_id,
+            reason=reason,
+        )
+        try:
+            self._alert_sink.connection_error(
+                name, kind="config_fault", detail=reason, error_class=type(exc).__name__
+            )
+        except Exception:
+            log.warning("alert sink raised on connection_error for %r", name)
+
+    def _clear_lane_config_fault(self, name: str) -> None:
+        """A successful delivery ends lane ``name``'s configuration-fault episode: the next one
+        alerts again, and the open ``connection_error`` resolves (no notification)."""
+        if name not in self._lane_config_fault:
+            return
+        self._lane_config_fault.discard(name)
+        try:
+            self._alert_sink.connection_restored(name, kind="config_fault")
+        except Exception:
+            log.warning("alert sink raised on connection_restored for %r", name)
 
     def _note_lane_healthy(self, name: str) -> None:
         """Edge-trigger ``connection_restored`` on the FIRST successful delivery after the lane was down
@@ -7892,6 +7934,7 @@ class RegistryRunner:
         self._send_pace_at.clear()
         self._simulate.clear()
         self._lane_healthy.clear()
+        self._lane_config_fault.clear()
         self._next_buildup_alert.clear()
         self._next_stall_alert.clear()
         # BACKLOG #3043: a fresh refusal log, so the first refusal after a restart or promotion logs.
@@ -11551,6 +11594,11 @@ class RegistryRunner:
                     item.id,
                     item.message_id,
                 )
+                # A configuration fault reaches here only under credential_fault_policy =
+                # "dead_letter", and every queued row meets it, so it alerts once for the lane.
+                # Read after the await: a reload that landed in it may be the fix.
+                if self._config_fault_lane_down(name, connector, exc):
+                    self._note_lane_config_fault(name, item.id, exc)
             else:
                 failed = await self._mark_failed_and_arm(name, item.id, safe_exc(exc), retry)
                 retry_until = failed.retry_at
@@ -11641,6 +11689,7 @@ class RegistryRunner:
             # that completed on a connector a reload retired: it says nothing of the new one.
             if not self._connector_retired(name, connector):
                 self._note_lane_healthy(name)
+                self._clear_lane_config_fault(name)
             self._clear_store_read_faults(name)
             # ADR 0013: a capturing outbound returns a DeliveryResponse; persist the reply
             # AND mark the row done in ONE transaction (exactly-once capture). A non-capturing
@@ -12032,6 +12081,8 @@ class RegistryRunner:
                     len(ids),
                     ids[0],
                 )
+                if self._config_fault_lane_down(name, connector, exc):  # as the single row
+                    self._note_lane_config_fault(name, ids[0], exc)
             else:
                 failed = await self._mark_batch_failed_and_arm(
                     name, ids, _member_error(safe_exc(exc), current), retry
@@ -12128,6 +12179,7 @@ class RegistryRunner:
             if ids:  # nothing was sent when every member was refused
                 if not self._connector_retired(name, connector):  # as the single row
                     self._note_lane_healthy(name)
+                    self._clear_lane_config_fault(name)
                 self._clear_store_read_faults(name)
                 await self.store.mark_batch_done(ids)
         await self._dead_letter_refused(name, refused)
@@ -12209,6 +12261,19 @@ class RegistryRunner:
             return "configuration"
         return None
 
+    def _config_fault_lane_down(
+        self, name: str, connector: DestinationConnector, exc: NegativeAckError
+    ) -> bool:
+        """Whether a permanent refusal that has just dead-lettered alerts lane ``name``
+        (:meth:`_note_lane_config_fault`): a configuration fault, which every queued row would meet,
+        from a connector a reload has not retired. Under the default ``credential_fault_policy``
+        such a fault stops the lane before it gets here, so this is the ``"dead_letter"`` policy's
+        path. ``getattr`` because a
+        connector may raise a subclass built without the marker."""
+        return bool(getattr(exc, "config_fault", False)) and not self._connector_retired(
+            name, connector
+        )
+
     async def _stop_lane_retaining(
         self, name: str, ids: Sequence[str], exc: NegativeAckError, fault: _LaneFault
     ) -> None:
@@ -12229,16 +12294,23 @@ class RegistryRunner:
             )
             detail = f"credential fault ({exc.code}); lane stopped, queue retained (#109)"
         else:
+            # A transport names where to fix a fault that is not the connection's own settings
+            # (ADR 0095 Amendment B.2); the worker reads that, never the code.
+            remedy = getattr(exc, "remedy", None)
             log.error(
                 "delivery worker %r: PERMANENT connection configuration fault (%s); STOPPING the "
                 "lane and retaining %d queued row(s) un-errored, since every row would fail the "
-                "same way (operator must fix the connection's configuration + reload/restart to "
-                "resume)",
+                "same way (operator must fix %s + reload/restart to resume)",
                 name,
                 exc.code,
                 len(ids),
+                remedy or "the connection's configuration",
             )
-            detail = f"configuration fault ({exc.code}); lane stopped, queue retained (#2083)"
+            detail = (
+                f"configuration fault ({exc.code}); lane stopped, queue retained; fix {remedy}"
+                if remedy
+                else f"configuration fault ({exc.code}); lane stopped, queue retained (#2083)"
+            )
         self._alert_sink.connection_stopped(name, detail=detail)
         self._hold_for_operator(name, "outbound")
 

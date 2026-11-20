@@ -2,11 +2,12 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Alert-triggered connection-control action (#144, ADR 0128): a firing rule dispatches an injected
 async control callback (restart_inbound/restart_outbound) off the delivery worker, never-raise,
-throttled with the notification, independent of transport suppression, and whitelisted at config-load."""
+throttled per cooldown on its own (owner ruling 2026-11-19), independent of transport suppression, and whitelisted at config-load."""
 
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any, cast
 
 import pytest
@@ -17,6 +18,7 @@ from messagefoundry.config.settings import (
     _ALERT_EVENT_TYPES,
     AlertRule,
 )
+from messagefoundry.pipeline import alert_sinks
 from messagefoundry.pipeline.alert_sinks import AlertRuleSet, NotifierAlertSink
 
 
@@ -217,15 +219,188 @@ async def test_control_explicit_target() -> None:
     assert cb.calls == [("restart_inbound", "IB_FEED")]
 
 
-async def test_control_throttled_with_notification() -> None:
+async def test_control_throttled_per_cooldown() -> None:
     cb = _Control()
     rule = AlertRule(event_type="connection_stopped", control_action="restart_outbound")
     sink = NotifierAlertSink([_RecordingTransport()], realert_seconds=10_000.0, rules=[rule])
     sink.set_control_callback(cb)
     sink.connection_stopped("OB_X", detail="boom")
-    sink.connection_stopped("OB_X", detail="boom again")  # throttled → no second restart
+    sink.connection_stopped("OB_X", detail="boom again")  # inside the restart's cooldown
     await _drain(sink)
     assert cb.calls == [("restart_outbound", "OB_X")]  # exactly once per cooldown
+
+
+@pytest.mark.parametrize(
+    "kinds", [("connection_lost", "config_fault"), ("config_fault", "connection_lost")]
+)
+async def test_control_fires_once_per_event_type_across_connection_error_kinds(
+    kinds: tuple[str, str],
+) -> None:
+    # A config_fault connection_error has its own notification key (ADR 0095 B.2), but the rule's
+    # control action stays bounded per (event_type, connection) (ADR 0128).
+    cb = _Control()
+    t = _RecordingTransport()
+    rule = AlertRule(event_type="connection_error", control_action="restart_outbound")
+    sink = NotifierAlertSink([t], realert_seconds=10_000.0, rules=[rule])
+    sink.set_control_callback(cb)
+    for kind in kinds:
+        sink.connection_error("OB_X", kind=kind, detail="boom", error_class="DeliveryError")
+    await _drain(sink)
+    assert cb.calls == [("restart_outbound", "OB_X")]
+    assert [e.get("kind") for e in t.events] == list(kinds)  # both pages still go out
+
+
+class _Clock:
+    """Stands in for the ``time`` module inside alert_sinks, so a test moves the sink's monotonic
+    clock without touching the event loop's."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
+        return time.time()
+
+
+@pytest.fixture
+def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
+    c = _Clock()
+    monkeypatch.setattr(alert_sinks, "time", c)
+    return c
+
+
+async def _settle_control(sink: NotifierAlertSink) -> None:
+    for _ in range(10):
+        if not sink._control_tasks:
+            return
+        await asyncio.gather(*list(sink._control_tasks), return_exceptions=True)
+        await asyncio.sleep(0)
+
+
+async def test_a_restart_runs_on_its_own_throttle_across_connection_error_kinds(
+    clock: _Clock,
+) -> None:
+    # Owner ruling 2026-11-19 (ADR 0128 section 4, its amendment): the restart is throttled on when a restart last
+    # ran, never on when a page last went out. A transport page whose restart was throttled must not
+    # hold back the next config_fault episode's restart once the cooldown since the last restart
+    # has passed.
+    restarts: list[float] = []
+
+    async def _control(action: str, target: str, *, default_target: bool) -> None:
+        restarts.append(clock.now - 1000.0)
+
+    t = _RecordingTransport()
+    rule = AlertRule(event_type="connection_error", control_action="restart_outbound")
+    sink = NotifierAlertSink([t], realert_seconds=10.0, rules=[rule])
+    sink.set_control_callback(_control)
+    for at, kind in ((0.0, "config_fault"), (9.0, "connection_lost"), (11.0, "config_fault")):
+        clock.now = 1000.0 + at
+        sink.connection_error("OB_X", kind=kind, detail="boom", error_class="DeliveryError")
+        await _settle_control(sink)
+    await _drain(sink)
+    assert restarts == [0.0, 11.0]
+    assert [e.get("kind") for e in t.events] == ["config_fault", "connection_lost", "config_fault"]
+
+
+async def test_a_skipped_dispatch_records_no_control_time(clock: _Clock) -> None:
+    # A control action the sink did not dispatch (here: no callback wired yet) records nothing, so
+    # it cannot hold back a later real restart. That restart fires even though its own page is
+    # throttled, because no earlier alert in the window ran a restart.
+    restarts: list[float] = []
+
+    async def _control(action: str, target: str, *, default_target: bool) -> None:
+        restarts.append(clock.now - 1000.0)
+
+    t = _RecordingTransport()
+    rule = AlertRule(event_type="connection_error", control_action="restart_outbound")
+    sink = NotifierAlertSink([t], realert_seconds=10.0, rules=[rule])
+    sink.connection_error("OB_X", kind="config_fault", detail="boom", error_class="X")
+    assert sink._last_control == {}
+    sink.set_control_callback(_control)
+    clock.now = 1005.0
+    sink.connection_error("OB_X", kind="config_fault", detail="boom", error_class="X")
+    await _settle_control(sink)
+    await _drain(sink)
+    assert restarts == [5.0]
+    assert sink._last_control == {"connection_error:OB_X": 1005.0}
+    assert [e.get("kind") for e in t.events] == ["config_fault"]  # the second page was throttled
+
+
+async def test_a_skip_logs_once_per_notification_cooldown(
+    clock: _Clock, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A skip records no control time, so it is re-evaluated on every emit; its warning still
+    # follows the notification throttle rather than repeating on every emit.
+    rule = AlertRule(event_type="connection_stopped", control_action="restart_outbound")
+    sink = NotifierAlertSink([_RecordingTransport()], realert_seconds=10.0, rules=[rule])
+    with caplog.at_level("WARNING", logger=alert_sinks.log.name):
+        for at in (0.0, 3.0, 9.0, 11.0):
+            clock.now = 1000.0 + at
+            sink.connection_stopped("OB_X", detail="boom")
+    await _drain(sink)
+    wired = [r for r in caplog.records if "no control callback is wired" in r.getMessage()]
+    assert len(wired) == 2  # at 0 and 11, the two emits whose page was not throttled
+
+
+async def test_a_config_fault_storm_pages_once_and_restarts_once(clock: _Clock) -> None:
+    # The one-alert rule (owner ruling 2026-11-18): a config_fault raised again inside the cooldown
+    # pages once, and the restart runs once.
+    cb = _Control()
+    t = _RecordingTransport()
+    rule = AlertRule(event_type="connection_error", control_action="restart_outbound")
+    sink = NotifierAlertSink([t], realert_seconds=10.0, rules=[rule])
+    sink.set_control_callback(cb)
+    for at in (0.0, 3.0, 9.0):
+        clock.now = 1000.0 + at
+        sink.connection_error("OB_X", kind="config_fault", detail="boom", error_class="X")
+        await _settle_control(sink)
+    await _drain(sink)
+    assert cb.calls == [("restart_outbound", "OB_X")]
+    assert [(e["type"], e.get("kind")) for e in t.events] == [("connection_error", "config_fault")]
+
+
+class _ResolveStore:
+    def __init__(self, *, lands: bool) -> None:
+        self.lands = lands
+
+    async def upsert_alert_instance(self, **_kw: object) -> None:
+        return None
+
+    async def resolve_alert_instances_for(self, **_kw: object) -> int:
+        if not self.lands:
+            raise OSError("store unavailable")
+        return 1
+
+
+@pytest.mark.parametrize("lands", [True, False])
+async def test_connection_started_clears_the_control_time_and_a_failed_resolve_restores_it(
+    clock: _Clock, monkeypatch: pytest.MonkeyPatch, lands: bool
+) -> None:
+    # BACKLOG #1741: an operator start ends the restart's window with the page's; a resolve that
+    # does not land puts both back.
+    monkeypatch.setattr(NotifierAlertSink, "_INVERSE_RETRY_DELAYS", ())
+    cb = _Control()
+    rule = AlertRule(event_type="connection_stopped", control_action="restart_inbound")
+    store = cast(Any, _ResolveStore(lands=lands))
+    sink = NotifierAlertSink(
+        [_RecordingTransport()], realert_seconds=10.0, rules=[rule], store=store
+    )
+    sink.set_control_callback(cb)
+    key = "connection_stopped:IB"
+    sink.connection_stopped("IB", detail="router halted")
+    await _settle_control(sink)
+    assert sink._last_control == {key: 1000.0}
+    sink.connection_started("IB")
+    assert key not in sink._last_control
+    for _ in range(10):
+        if not sink._state_tasks:
+            break
+        await asyncio.gather(*list(sink._state_tasks), return_exceptions=True)
+        await asyncio.sleep(0)
+    assert sink._last_control == ({} if lands else {key: 1000.0})
+    await _drain(sink)
 
 
 async def test_control_fires_even_when_notification_suppressed() -> None:

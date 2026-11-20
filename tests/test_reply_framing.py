@@ -2094,7 +2094,9 @@ def test_a_gzipped_soap_500_still_ends_not_delivered(caplog: pytest.LogCaptureFi
         asyncio.run(_soap(url).send("<soap:Envelope/>"))
     assert type(raised.value) is DeliveryError
     assert "HTTP 500" in str(raised.value)
-    assert "could not read whole" in caplog.text
+    # #5910 step 1: the body is refused for its coding, before any byte is read, not its length.
+    assert "fault body in a content coding the engine does not decode" in caplog.text
+    assert "could not read whole" not in caplog.text
 
 
 def test_a_gzipped_rest_reply_in_a_2xx_is_refused() -> None:
@@ -2178,6 +2180,16 @@ def test_a_gzipped_stowrs_failure_is_seen_without_the_coding() -> None:
         with pytest.raises(NegativeAckError) as raised:
             asyncio.run(dest.send(_dicom_payload()))
     assert raised.value.code == "failed-sop"
+
+
+def test_oidc_token_exchange_refuses_a_content_coded_reply() -> None:
+    """#5910 step 3: the token endpoint's coded reply is refused, as an answer with its status."""
+    from messagefoundry.auth import oidc
+
+    raw = _coded(b"200 OK", b"gzip", _TOKEN_JSON)
+    with _serve(raw) as url, pytest.raises(oidc.TokenRefusedError) as raised:
+        _exchange(url)
+    assert raised.value.status == 200
 
 
 def test_oidc_jwks_fetch_refuses_a_content_coded_reply() -> None:

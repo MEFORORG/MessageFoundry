@@ -74,6 +74,7 @@ CONNECTION_EVENT_KIND_ORDER: Final[tuple[str, ...]] = (
     "auth_rate_limited",
     "connection_lost",
     "connection_restored",
+    "config_fault",  # ADR 0095 Amendment B.2
 )
 
 #: :data:`CONNECTION_EVENT_KIND_ORDER` as a set, for membership.

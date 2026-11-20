@@ -451,7 +451,10 @@ async def test_rest_probe_classifies_a_real_invalid_url() -> None:
 
 
 async def test_fhir_probe_classifies_a_real_invalid_url() -> None:
-    dest = FhirDestination(_dest(ConnectorType.FHIR, "http://127.0.0.1/fhir x"))
+    # BACKLOG #5911: construction now refuses this URL, so it is set after the build to reach the
+    # send-time arm this test pins.
+    dest = FhirDestination(_dest(ConnectorType.FHIR, "http://127.0.0.1/fhir"))
+    dest.base_url = "http://127.0.0.1/fhir x"
     with pytest.raises(DeliveryError) as exc:
         await dest.test_connection()
     assert "rejected an invalid request value" in str(exc.value)
@@ -461,9 +464,10 @@ async def test_fhir_lookup_read_and_probe_classify_a_real_invalid_url() -> None:
     from messagefoundry.config.fhir_lookup import FhirLookupError
 
     executor = FhirLookupExecutor(
-        {"FL_1793": {"url": "http://127.0.0.1/fhir x"}},
+        {"FL_1793": {"url": "http://127.0.0.1/fhir"}},
         egress=EgressSettings(deny_by_default=False),
     )
+    executor._base["FL_1793"] = "http://127.0.0.1/fhir x"  # refused at build since BACKLOG #5911
     with pytest.raises(FhirLookupError) as exc:
         await executor.read("FL_1793", "Patient/1")
     assert "rejected an invalid request value" in str(exc.value)

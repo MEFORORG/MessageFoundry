@@ -60,10 +60,11 @@ from messagefoundry.config.tls_policy import (
     hop_name_prefix,
 )
 from messagefoundry.redaction import json_loads_or_refusal
-from messagefoundry.transports.base import DeliveryError, float_setting
+from messagefoundry.transports.base import DeliveryError, NegativeAckError, float_setting
 from messagefoundry.transports.bounded_read import (
     MAX_TOKEN_RESPONSE_BYTES,
     EgressReplyError,
+    is_content_coded_refusal,
     read_bounded_text,
 )
 
@@ -132,6 +133,16 @@ _BEARER_TOKEN_CHARS = re.compile(r"[\x21-\x7e]+")
 # no helper ever sees the credential or the query string.
 
 
+#: The ``code`` of the permanent refusal of a coded 2xx token reply, as :func:`request_token`
+#: scopes it (BACKLOG #5910).
+TOKEN_REPLY_CODED_CODE = "token-reply-coded"  # nosec B105 -- a refusal code, not a credential
+#: Where an operator fixes it: the engine sends ``Accept-Encoding: identity``, so the coding is the
+#: endpoint's, or a proxy's in front of it (ADR 0095 Amendment B.2).
+TOKEN_REPLY_CODED_REMEDY = (
+    "the token endpoint, or a proxy in front of it that ignores Accept-Encoding: identity"  # nosec B105 -- an operator hint
+)
+
+
 def request_token(
     opener: urllib.request.OpenerDirector,
     req: urllib.request.Request,
@@ -148,8 +159,47 @@ def request_token(
     in a refusal of the reply body, and holds no URL (BACKLOG #2060). A Digest refusal raised by the
     opener's proxy Digest handler becomes the permanent configuration fault
     ``rest.auth_challenge_refused`` builds (BACKLOG #2989); no built provider's hop reaches that
-    handler, since a Digest proxy in front of an https token endpoint is refused at build."""
-    body = _read_token_reply(opener, req, timeout=timeout, endpoint=endpoint, connector=connector)
+    handler, since a Digest proxy in front of an https token endpoint is refused at build.
+
+    The reply is checked in this order, and a reply refused at one step takes that step's refusal.
+    Every token opener is built by
+    :func:`~messagefoundry.transports.bounded_read.build_strict_opener`, so a bare CR in the status
+    line or header block is refused first, inside ``opener.open``: as
+    :class:`~messagefoundry.transports.bounded_read.MalformedReplyHeadError`, or as
+    ``http.client``'s own ``HTTPException`` when its header-count limit trips before the line with
+    the CR is read. Either is a retryable ``DeliveryError`` here. A non-2xx reply then
+    never reaches a body read: it is handled as the paragraph above says. On a 2xx reply,
+    :func:`~messagefoundry.transports.bounded_read.reply_framing_fault` checks the header block,
+    then the ``Transfer-Encoding`` and ``Content-Length`` framing, and only then the content
+    coding. A reply it refuses for its content coding is a permanent
+    :class:`~messagefoundry.transports.base.NegativeAckError` coded
+    :data:`TOKEN_REPLY_CODED_CODE`: a reply whose ``Content-Encoding`` names any coding but
+    ``identity``, unless it is a ``204`` or carries ``Content-Length: 0``. An empty chunked or
+    close-framed coded reply is refused too. The coded refusal is a configuration fault: every queued row mints through the
+    same endpoint and would meet the same refusal, so it is not retried, and under the default
+    ``credential_fault_policy`` the delivery worker stops the lane and keeps the queue. Owner ruling
+    2026-11-18 on PR 3069, in the owner's words: "Stop the lane."
+    """
+    coded = False
+    try:
+        body = _read_token_reply(
+            opener, req, timeout=timeout, endpoint=endpoint, connector=connector
+        )
+    except EgressReplyError as exc:
+        if not is_content_coded_refusal(exc):
+            raise
+        coded = True
+    if coded:
+        # Raised outside the handler, so no __context__ keeps the reply's frame alive. Fixed text:
+        # the connector is the hop label, never a URL (BACKLOG #2060), and no reply byte is read.
+        raise NegativeAckError(
+            f"{TOKEN_REPLY_CODED_CODE}. {connector} answered in a content coding the "
+            "engine does not decode",
+            code=TOKEN_REPLY_CODED_CODE,
+            permanent=True,
+            config_fault=True,
+            remedy=TOKEN_REPLY_CODED_REMEDY,
+        )
     return _parse_token_reply(body, endpoint=endpoint)
 
 
@@ -472,7 +522,8 @@ class _TokenEndpointProvider(abc.ABC):
         (a token ``POST``); the connector calls it inside its off-loop ``send()`` worker. Raises
         :class:`~messagefoundry.transports.base.DeliveryError` (transient) if acquisition fails, or
         the permanent configuration fault :func:`request_token` names for a refused Digest
-        challenge."""
+        challenge, or the permanent ``token-reply-coded`` configuration fault it raises for a coded
+        2xx reply, as :func:`request_token` scopes it."""
         with self._lock:
             if self._cached_token is not None and time.monotonic() < self._cached_expiry_monotonic:
                 return self._cached_token
