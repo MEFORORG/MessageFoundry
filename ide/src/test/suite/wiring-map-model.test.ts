@@ -222,33 +222,28 @@ suite("wiringMapModel — connection-to-connection references (BACKLOG #5966)", 
     inbound: [
       { name: "IB_REQ", type: "file", router: "route_req" },
       { name: "IB_LOOP", type: "loopback", router: "route_req" },
-      { name: "IB_HTTP", type: "http", router: "route_req" },
     ],
     outbound: [
       {
         name: "OB_PARTNER",
         type: "mllp",
         edges: [{ target: "IB_LOOP", target_kind: "inbound", provenance: "declared" }],
-        replies_to: ["IB_HTTP"],
       },
     ],
     routers: [{ name: "route_req", edges: [{ target: "to_partner", target_kind: "handler", provenance: "literal" }] }],
     handlers: [{ name: "to_partner", edges: [{ target: "OB_PARTNER", target_kind: "outbound", provenance: "literal" }] }],
   };
 
-  test("the reingress_to back-edge and the reply_from reference are drawn as declared edges", () => {
+  test("the reingress_to back-edge is drawn as a declared edge", () => {
     const map = buildWiringMap(LOOP, null);
     const conn = map.edges
       .filter((e) => e.fromKind !== "handler" && e.fromKind !== "router" && e.toKind !== "router")
       .map((e) => [e.fromKind, e.from, e.toKind, e.to, e.provenance]);
-    assert.deepStrictEqual(conn, [
-      ["inbound", "IB_HTTP", "outbound", "OB_PARTNER", "declared"],
-      ["outbound", "OB_PARTNER", "inbound", "IB_LOOP", "declared"],
-    ]);
+    assert.deepStrictEqual(conn, [["outbound", "OB_PARTNER", "inbound", "IB_LOOP", "declared"]]);
   });
 
   test("the back-edge pulls the loopback inbound into an outbound's one-hop focus", () => {
     const map = buildWiringMap(LOOP, { kind: "outbound", name: "OB_PARTNER" }, 1);
-    assert.deepStrictEqual(realNames(map.columns[0]), ["IB_HTTP", "IB_LOOP"]);
+    assert.deepStrictEqual(realNames(map.columns[0]), ["IB_LOOP"]);
   });
 });

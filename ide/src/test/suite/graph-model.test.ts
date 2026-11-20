@@ -209,13 +209,12 @@ suite("graphModel — v1 payload normalization (older CLI)", () => {
 
 suite("graphModel — connection-to-connection references (BACKLOG #5966)", () => {
   // A request/response loop: IB_REQ -> route_req -> to_partner -> OB_PARTNER, whose captured reply
-  // re-enters IB_LOOP (reingress_to), and the Http inbound IB_HTTP answers from OB_PARTNER (reply_from).
+  // re-enters IB_LOOP (reingress_to).
   const LOOP: Graph = {
     version: 2,
     inbound: [
       { name: "IB_REQ", type: "file", router: "route_req", receives_from: [] },
       { name: "IB_LOOP", type: "loopback", router: "route_loop", receives_from: [] },
-      { name: "IB_HTTP", type: "http", router: "route_req", receives_from: [] },
     ],
     outbound: [
       {
@@ -223,12 +222,11 @@ suite("graphModel — connection-to-connection references (BACKLOG #5966)", () =
         type: "mllp",
         receives_from: ["to_partner"],
         edges: [{ target: "IB_LOOP", target_kind: "inbound", provenance: "declared" }],
-        replies_to: ["IB_HTTP"],
       },
-      { name: "OB_RESULT", type: "file", receives_from: [], edges: [], replies_to: [] },
+      { name: "OB_RESULT", type: "file", receives_from: [], edges: [] },
     ],
     routers: [
-      { name: "route_req", edges: [{ target: "to_partner", target_kind: "handler", provenance: "literal" }], fed_by: ["IB_HTTP", "IB_REQ"] },
+      { name: "route_req", edges: [{ target: "to_partner", target_kind: "handler", provenance: "literal" }], fed_by: ["IB_REQ"] },
       { name: "route_loop", edges: [], fed_by: ["IB_LOOP"] },
     ],
     handlers: [
@@ -251,16 +249,6 @@ suite("graphModel — connection-to-connection references (BACKLOG #5966)", () =
     ]);
     const plain = byLabel(byLabel(roots, "Outbound Connections").children, "OB_RESULT");
     assert.deepStrictEqual(plain.children, []);
-  });
-
-  test("the reply_from reference shows on both ends in the elements perspective", () => {
-    const roots = buildElementsView(LOOP, "");
-    const http = byLabel(byLabel(roots, "Inbound Connections").children, "IB_HTTP");
-    assert.deepStrictEqual(group(http, "→ replies from").children.map((r) => [r.elementKind, r.elementName]), [
-      ["outbound", "OB_PARTNER"],
-    ]);
-    const ob = byLabel(byLabel(roots, "Outbound Connections").children, "OB_PARTNER");
-    assert.deepStrictEqual(group(ob, "⇦ replies to").children.map((r) => r.elementName), ["IB_HTTP"]);
   });
 
   test("the flow perspective draws the back-edge once, as a leaf ref, never a loop", () => {

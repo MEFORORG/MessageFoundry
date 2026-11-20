@@ -92,8 +92,9 @@ export function wiringMapScript(token: string): string {
       });
 
       // Edges first (under the nodes). The pipeline flows top→bottom: a forward edge leaves the
-      // source's bottom edge and enters the target's top; the legal handler→inbound pass-through
-      // back-edge runs the other way (leaves the top, lands on the target's bottom).
+      // source's bottom edge and enters the target's top; a back-edge (the legal handler→inbound
+      // pass-through, or an outbound's reingress_to into its Loopback inbound) runs the other way
+      // (leaves the top, lands on the target's bottom).
       const edgeEls = [];
       for (const e of map.edges) {
         const from = byId.get(e.fromKind + ':' + e.from);

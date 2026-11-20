@@ -39,8 +39,6 @@ export interface Graph {
     receives_from?: string[];
     /** The reingress_to back-edge: outbound -> the Loopback inbound its captured reply re-enters. */
     edges?: GraphEdge[];
-    /** The Http inbounds whose reply_from names this outbound (its captured reply answers them). */
-    replies_to?: string[];
   } & Located)[];
   routers: ({
     name: string;
@@ -192,10 +190,6 @@ export interface NormalGraph {
   reingressTo: Map<string, string[]>;
   /** Loopback inbound -> the outbounds whose reingress_to names it. */
   reingressedFrom: Map<string, string[]>;
-  /** Http inbound -> the outbounds its reply_from names. */
-  replyFrom: Map<string, string[]>;
-  /** outbound -> the Http inbounds whose reply_from names it. */
-  repliesTo: Map<string, string[]>;
 }
 
 /** Add `value` to `map[key]`, keeping the bucket sorted and duplicate-free. */
@@ -240,22 +234,16 @@ export function normalize(g: Graph): NormalGraph {
       }
     }
   }
-  // The connection-to-connection references, both directions. A payload from a CLI older than these
-  // fields carries neither, so it renders no such reference rather than a guessed one.
+  // The reingress_to back-edge, both directions. A payload from a CLI older than the outbound
+  // `edges` field carries none, so it renders no such reference rather than a guessed one.
   const reingressTo = new Map<string, string[]>();
   const reingressedFrom = new Map<string, string[]>();
-  const replyFrom = new Map<string, string[]>();
-  const repliesTo = new Map<string, string[]>();
   for (const o of g.outbound) {
     for (const e of o.edges ?? []) {
       if (e.target_kind === "inbound") {
         addSorted(reingressTo, o.name, e.target);
         addSorted(reingressedFrom, e.target, o.name);
       }
-    }
-    for (const i of o.replies_to ?? []) {
-      addSorted(repliesTo, o.name, i);
-      addSorted(replyFrom, i, o.name);
     }
   }
   return {
@@ -267,8 +255,6 @@ export function normalize(g: Graph): NormalGraph {
     inboundReceives,
     reingressTo,
     reingressedFrom,
-    replyFrom,
-    repliesTo,
   };
 }
 
@@ -391,11 +377,6 @@ export function buildElementsView(g: Graph, filter: string, runtime?: RuntimeMap
             "⇦ re-entered from",
             connRefs(`${id}/reingressed`, n.reingressedFrom, c.name, "outbound", "outbound · reingress_to"),
           ),
-          ...refGroup(
-            `${id}/replyFrom`,
-            "→ replies from",
-            connRefs(`${id}/replyFrom`, n.replyFrom, c.name, "outbound", "outbound · reply_from"),
-          ),
         ],
       };
     });
@@ -481,11 +462,6 @@ export function buildElementsView(g: Graph, filter: string, runtime?: RuntimeMap
             `${id}/reingress`,
             "→ re-enters",
             connRefs(`${id}/reingress`, n.reingressTo, o.name, "inbound", "loopback inbound · reingress_to"),
-          ),
-          ...refGroup(
-            `${id}/repliesTo`,
-            "⇦ replies to",
-            connRefs(`${id}/repliesTo`, n.repliesTo, o.name, "inbound", "inbound · reply_from"),
           ),
         ],
       };

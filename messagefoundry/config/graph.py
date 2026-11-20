@@ -3,18 +3,14 @@
 """The authoritative static wiring graph over a loaded :class:`Registry` (ADR 0091 D1).
 
 One derivation of the inbound → router → handler → outbound edges (plus the ``reingress_to``
-outbound → inbound back-edge, so the graph can hold a cycle, and the ``reply_from`` inbound →
-outbound reference), consumed by the ``graph`` CLI
+outbound → inbound back-edge, so the graph can hold a cycle), consumed by the ``graph`` CLI
 (the IDE's CONNECTIONS view), the reverse-reachability index (#152/#176), and the ``send-target``
 advisory check — previously three divergent extractors. Edges are **AST-first** (the ADR 0076 static
 discipline: parse the defining module, never re-import it) with the compiled-``co_consts`` string
 scan retained as a fallback tier, and every edge carries its **provenance**:
 
 * ``declared`` — the structured ``inbound -> router`` binding on the Registry, and an outbound's
-  ``reingress_to`` naming the Loopback inbound its captured reply re-enters (``outbound -> inbound``),
-  and an ``Http`` inbound's ``reply_from`` naming the outbound whose captured reply answers its
-  caller (``inbound -> outbound``: an edge points from the element that NAMES to the one NAMED, so
-  the reply's own data flow runs the other way);
+  ``reingress_to`` naming the Loopback inbound its captured reply re-enters (``outbound -> inbound``);
 * ``literal`` — AST-proven: a string literal, a module-level ``NAME = "..."`` constant (validated
   against the WHOLE module: a ``global NAME`` in any function or any second module-scope binding —
   ``NAME += ...``, ``for NAME in ...``, an import alias — disqualifies it), or a
@@ -78,16 +74,13 @@ class WiringEdge:
 @dataclass(frozen=True)
 class DanglingRef:
     """A **literal** Router/Handler target that resolves to nothing registered (a typo the runtime
-    would dead-letter), an outbound's declared ``reingress_to`` naming no Loopback inbound (which
-    build-check refuses on a deployed outbound), or an inbound's ``reply_from`` naming no outbound
-    (which build-check refuses on a deployed inbound)."""
+    would dead-letter), or an outbound's declared ``reingress_to`` naming no Loopback inbound (which
+    build-check refuses on a deployed outbound)."""
 
     source_kind: str
     source: str
     target: str
-    # "handler" | "outbound/pass-through" | "loopback inbound" (a reingress_to) | "outbound" (a
-    # reply_from)
-    expected: str
+    expected: str  # "handler" | "outbound/pass-through" | "loopback inbound" (a reingress_to)
 
 
 @dataclass(frozen=True)
@@ -1219,18 +1212,5 @@ def build_wiring_graph(registry: Registry) -> WiringGraph:
             dangling.append(DanglingRef("outbound", oname, target, "loopback inbound"))
         elif target in registry.inbound:
             edges.append(WiringEdge("outbound", oname, "inbound", target, "declared"))
-
-    # An Http inbound's `reply_from` (ADR 0154 D4) names the outbound whose captured reply answers the
-    # caller. Without this edge the outbound's referrer is invisible to the reference index, so a
-    # delete-impact report would miss it (BACKLOG #5966). Every engine shard's view shares the whole
-    # outbound map, so a name missing from it is a typo; build-check skips a not-deployed inbound.
-    for iname, iconn in sorted(registry.inbound.items()):
-        target = iconn.spec.settings.get("reply_from")
-        if not isinstance(target, str) or not target:
-            continue
-        if target in outbound_names:
-            edges.append(WiringEdge("inbound", iname, "outbound", target, "declared"))
-        else:
-            dangling.append(DanglingRef("inbound", iname, target, "outbound"))
 
     return WiringGraph(edges=tuple(edges), dynamic=frozenset(dynamic), dangling=tuple(dangling))

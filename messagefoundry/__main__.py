@@ -6053,8 +6053,6 @@ def _graph(args: argparse.Namespace) -> int:
                 "receives_from": in_names("outbound", name, "handler"),
                 # The reingress_to back-edge into a Loopback inbound, when this outbound has one.
                 "edges": edges_out("outbound", name),
-                # The Http inbounds whose reply_from names this outbound (ADR 0154 D4).
-                "replies_to": in_names("outbound", name, "inbound"),
             }
             for name, c in reg.outbound.items()
         ],
