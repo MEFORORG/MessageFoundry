@@ -287,7 +287,7 @@ def test_prose_naming_a_weak_source_is_not_a_hit() -> None:
 
 
 def test_a_trailing_comment_cannot_hide_a_call() -> None:
-    # The conservative direction of _js_code's per-line view, asserted rather than assumed: a code
+    # The conservative direction of _js_views's per-line view, asserted rather than assumed: a code
     # line is scanned whole, so putting a // later on a code line does not launder the draw.
     gate = _gate()
     assert gate.randomness_tokens_in("const n = Math.random(); // harmless, honest\n") == {
@@ -678,7 +678,7 @@ def test_non_python_operation_patterns_map_into_the_taxonomy() -> None:
     for tokens in gate.NON_PYTHON_OPERATION_INVENTORY.values():
         for token in tokens:
             cls, _, name = token.partition(":")
-            name = name.split("[", 1)[0]
+            name = name.removesuffix(gate.NOT_CODE).split("[", 1)[0]
             assert cls in classes and name in gate.NON_PYTHON_OPERATION_PATTERNS, token
 
 
@@ -1356,7 +1356,8 @@ def test_the_positive_control_covers_sibling_and_augmented_matchers(
     ],
 )
 def test_a_weak_draw_on_a_line_starting_with_a_comment_token_is_found(text: str) -> None:
-    assert _gate().randomness_tokens_in(text) == {"Math.random"}
+    # Found, and confirmed (#5578 added step 1): a genuine shape is never marked "(not code)".
+    assert _gate().randomness_token_views(text) == ({"Math.random"}, {"Math.random"})
 
 
 @pytest.mark.parametrize(
@@ -1367,7 +1368,9 @@ def test_a_weak_draw_on_a_line_starting_with_a_comment_token_is_found(text: str)
     ],
 )
 def test_an_operation_on_a_line_starting_with_a_comment_token_is_found(text: str) -> None:
-    assert "hash:createHash[md5]" in _gate().non_python_operation_tokens_in(text)
+    found, verified = _gate().non_python_operation_token_views(text)
+    assert "hash:createHash[md5]" in found
+    assert "hash:createHash[md5]" in verified
 
 
 def test_a_multi_line_block_comment_still_hides_its_prose() -> None:
@@ -1634,3 +1637,367 @@ def test_a_binding_that_never_ends_first_party_keeps_the_method_rule(loop: str) 
     }
     found = ops.aggregate(ops.discover_operations_in(sources))
     assert "sign_verify:.verify()" in found.get("messagefoundry/x.py", frozenset()), found
+
+
+# --- BACKLOG #5578 added step 1: an extra token alone does not keep a stale row green --------------
+#
+# The JS/TS arms find tokens in the union of the per-line view and the lexer view, and the Python
+# arm under every import binding of a name. Each such token is now judged: one the stricter reading
+# does not confirm is still found, but under a marked spelling, so a plain inventory row it alone
+# backs reads stale. Each "alone" case below fails on origin/main, where the extra token keeps the
+# row green; each control, a genuine find, stays green on both.
+
+# The text of a template literal on a *-led line. The per-line view skips the line; the lexer view
+# keeps literal text, so only it finds the call, and the lexer's verdict on it is "not code".
+_TEMPLATE_DRAW = "export const help = `\n * call randomBytes(16) for a nonce\n`;\n"
+# A genuine *-continuation draw: also found by the lexer view alone, and the lexer calls it code.
+_STAR_DRAW = "export const n = 1\n  * randomBytes(1)[0];\n"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        pytest.param(
+            _TEMPLATE_DRAW,
+            [
+                "ide/src/a.ts: undocumented randomness use ['randomBytes (not code)'] "
+                "(documented: ['randomBytes'])",
+                "ide/src/a.ts: inventory lists ['randomBytes'] but the file no longer draws from it",
+            ],
+            id="extra-lexer-token-alone",
+        ),
+        pytest.param(_STAR_DRAW, [], id="control-genuine-star-continuation"),
+    ],
+)
+def test_an_extra_lexer_token_alone_does_not_keep_a_randomness_row_green(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str, expected: list[str]
+) -> None:
+    gate = _gate()
+    monkeypatch.setattr(gate, "NON_PYTHON_INVENTORY", {"ide/src/a.ts": frozenset({"randomBytes"})})
+    repo = _ts_repo(tmp_path, {"ide/src/a.ts": text}, with_anchor=False)
+    violations, _ = gate.check_non_python_randomness(repo)
+    assert violations == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        pytest.param(
+            "export const help = `\n * createHash('md5')\n`;\n",
+            [
+                "ide/src/a.ts: undocumented crypto operation use "
+                "['hash:createHash[md5] (not code)'] (documented: ['hash:createHash[md5]'])",
+                "ide/src/a.ts: inventory lists ['hash:createHash[md5]'] but the file no longer "
+                "performs it",
+            ],
+            id="extra-lexer-token-alone",
+        ),
+        pytest.param(
+            "const d = x\n  * createHash('md5')\n", [], id="control-genuine-star-continuation"
+        ),
+        pytest.param("/* legacy */ createHash('md5')\n", [], id="control-after-an-inline-block"),
+    ],
+)
+def test_an_extra_lexer_token_alone_does_not_keep_an_operation_row_green(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, text: str, expected: list[str]
+) -> None:
+    gate = _gate()
+    monkeypatch.setattr(
+        gate,
+        "NON_PYTHON_OPERATION_INVENTORY",
+        {"ide/src/a.ts": frozenset({"hash:createHash[md5]"})},
+    )
+    _write_repo(
+        tmp_path,
+        {"ide/src/a.ts": text, "messagefoundry_webconsole/static/app.js": "var x = 1;\n"},
+    )
+    violations, _scanned, found = gate.check_non_python_operations(tmp_path)
+    assert violations == expected
+    # The corpus line still counts what was found, unmarked.
+    assert found == {"ide/src/a.ts": frozenset({"hash:createHash[md5]"})}
+
+
+def test_an_unlisted_extra_lexer_token_is_still_reported() -> None:
+    # The mark changes the spelling, not whether the token is found: origin/main reports the
+    # template's draw as undocumented, and so does this, so nothing it reported goes quiet.
+    gate = _gate()
+    assert gate.randomness_token_views(_TEMPLATE_DRAW) == ({"randomBytes"}, set())
+    assert gate.randomness_token_views(_STAR_DRAW) == ({"randomBytes"}, {"randomBytes"})
+    assert gate.judge_tokens({"randomBytes"}, set(), gate.NOT_CODE) == {"randomBytes (not code)"}
+
+
+def test_a_suite_named_only_in_template_text_does_not_admit_a_confirmed_cipher_word() -> None:
+    # The cipher-string rule reads each view on its own: a suite the lexer calls text must not let
+    # a cipher-string word through on the confirmed side.
+    gate = _gate()
+    text = "const help = `\n * ECDHE-RSA-AES256-GCM-SHA384,\n`;\nconst c = 'DEFAULT';\n"
+    found, verified = gate.non_python_operation_token_views(text)
+    assert "tls_context:cipher_string[DEFAULT]" in found
+    assert not any(t.startswith("tls_context:cipher_string[") for t in verified), verified
+
+
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        pytest.param(
+            "import hashlib\n\n\ndef other(b):\n    from mylib import thing as hashlib\n"
+            "    return hashlib.sha1(b)\n",
+            [
+                "pkg/a.py: undocumented crypto operation use ['hash:hashlib.sha1 (out of scope)'] "
+                "(documented: ['hash:hashlib.sha1'])",
+                "pkg/a.py: inventory lists ['hash:hashlib.sha1'] but the file no longer performs it",
+            ],
+            id="extra-multi-binding-token-alone",
+        ),
+        pytest.param(
+            "import hashlib\n\n\ndef a(b):\n    return hashlib.sha1(b)\n\n\n"
+            "def other(b):\n    from mylib import thing as hashlib\n    return hashlib.sha1(b)\n",
+            [],
+            id="control-genuine-call-in-scope",
+        ),
+    ],
+)
+def test_an_extra_multi_binding_token_alone_does_not_keep_an_operation_row_green(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source: str, expected: list[str]
+) -> None:
+    gate = _gate()
+    files = _write_repo(tmp_path, {"pkg/a.py": source})
+    monkeypatch.setattr(gate, "OPERATION_INVENTORY", {"pkg/a.py": frozenset({"hash:hashlib.sha1"})})
+    monkeypatch.setattr(gate, "INVENTORY", {})
+    monkeypatch.setattr(gate, "IMPORT_ONLY", {})
+    violations, _ops = gate.check_operations(files, tmp_path, check_stale=True)
+    assert violations == expected
+
+
+def test_the_positive_control_reds_when_the_scope_aware_reading_is_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _gate()
+    ops = gate.crypto_operations
+    assert gate.operations_self_test() == []
+    real = ops.discover_operations_in_modules
+    monkeypatch.setattr(
+        ops, "discover_operations_in_modules", lambda modules, scope_aware=False: real(modules)
+    )
+    assert gate.operations_self_test()
+
+
+@pytest.mark.parametrize(
+    ("source", "union", "scoped"),
+    [
+        pytest.param(
+            "def f():\n    global hashlib\n    import hashlib\n\n\n"
+            "def g(b):\n    return hashlib.sha1(b)\n",
+            {"hash:hashlib.sha1"},
+            {"hash:hashlib.sha1"},
+            id="global-import-binds-the-module",
+        ),
+        pytest.param(
+            "class C:\n    import hashlib\n\n    def m(self, b):\n        return hashlib.sha1(b)\n",
+            {"hash:hashlib.sha1"},
+            set(),
+            id="class-body-does-not-enclose-its-methods",
+        ),
+        pytest.param(
+            "class C:\n    import hashlib\n    d = hashlib.sha1(b'')\n",
+            {"hash:hashlib.sha1"},
+            {"hash:hashlib.sha1"},
+            id="class-body-sees-its-own-import",
+        ),
+        pytest.param(
+            "def outer():\n    def inner():\n        nonlocal h\n        import hashlib as h\n"
+            "    h = None\n    inner()\n    return h.sha1(b'')\n",
+            {"hash:hashlib.sha1"},
+            {"hash:hashlib.sha1"},
+            id="nonlocal-import-binds-the-enclosing-function",
+        ),
+        pytest.param(
+            "import hashlib\n\n\ndef f(xs):\n    from mylib import thing as hashlib\n"
+            "    return [hashlib.sha1(x) for x in xs]\n",
+            {"hash:hashlib.sha1"},
+            set(),
+            id="comprehension-sees-its-function-import",
+        ),
+        pytest.param(
+            "import hashlib\n\n\ndef f(h=hashlib.sha1(b'')):\n"
+            "    from mylib import thing as hashlib\n    return h\n",
+            {"hash:hashlib.sha1"},
+            {"hash:hashlib.sha1"},
+            id="default-runs-in-the-enclosing-scope",
+        ),
+        pytest.param(
+            "import hashlib\n\n\ndef f(hashlib):\n    return hashlib.sha1(b'')\n",
+            {"hash:hashlib.sha1"},
+            {"hash:hashlib.sha1"},
+            id="a-parameter-is-not-a-binding",
+        ),
+    ],
+)
+def test_the_scope_aware_reading_follows_python_scoping_for_imports(
+    source: str, union: set[str], scoped: set[str]
+) -> None:
+    ops = _gate().crypto_operations
+    modules = ops.parse_sources({"messagefoundry/x.py": source})
+    got_union = ops.aggregate(ops.discover_operations_in_modules(modules))
+    got_scoped = ops.aggregate(ops.discover_operations_in_modules(modules, scope_aware=True))
+    assert got_union.get("messagefoundry/x.py", frozenset()) == union
+    assert got_scoped.get("messagefoundry/x.py", frozenset()) == scoped
+
+
+def test_the_lexer_verdict_marks_literals_comments_and_code() -> None:
+    from scripts.security import js_lexer
+
+    text = "a = 'q' /* c */ + `t\n*` // d\n"
+    blanked, verdicts = js_lexer.classify_js(text)
+    assert blanked == js_lexer.blank_js_comments(text)
+    assert len(verdicts) == len(text)
+    assert [i for i, c in enumerate(text) if c == "\n"] == [
+        i for i, c in enumerate(verdicts) if c == "\n"
+    ]
+    assert verdicts[text.index("a")] == js_lexer.CODE
+    assert verdicts[text.index("q")] == js_lexer.LITERAL
+    assert verdicts[text.index("c")] == js_lexer.COMMENT
+    assert verdicts[text.index("t\n")] == js_lexer.LITERAL
+    assert verdicts[text.index("*`")] == js_lexer.CONTINUED
+    assert verdicts[text.index("d")] == js_lexer.COMMENT
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        pytest.param("const s = [\n  /* 1.3 */ 'TLS_AES_256_GCM_SHA384',\n];\n", id="quoted"),
+        pytest.param("const s = [\n  /* 1.3 */ `TLS_AES_256_GCM_SHA384`,\n];\n", id="template"),
+    ],
+)
+def test_a_suite_pinned_after_an_inline_comment_is_confirmed(text: str) -> None:
+    # A suite's match is a literal's own text. Opened on its own line, it is a genuine pin, so the
+    # lexer's LITERAL verdict confirms it; only a template's later line is refused.
+    found, verified = _gate().non_python_operation_token_views(text)
+    token = "tls_context:suite[TLS_AES_256_GCM_SHA384]"
+    assert token in found and token in verified, (found, verified)
+
+
+def test_a_call_only_the_scope_aware_reading_gives_is_not_added() -> None:
+    # The stricter reading judges what is found and never finds on its own, so the diff, the
+    # corpus line and --list-operations name the same tokens.
+    gate = _gate()
+    ops = gate.crypto_operations
+    sources = {
+        "messagefoundry/helper.py": "def verify(x):\n    return x\n",
+        "messagefoundry/x.py": (
+            "def f(sig, d):\n    return sig.verify(d)\n\n\n"
+            "def g():\n    from messagefoundry import helper as sig\n    return sig\n"
+        ),
+    }
+    modules = ops.parse_sources(sources)
+    found = ops.aggregate(ops.discover_operations_in_modules(modules))
+    scoped = ops.aggregate(ops.discover_operations_in_modules(modules, scope_aware=True))
+    assert "messagefoundry/x.py" not in found
+    assert scoped.get("messagefoundry/x.py") == frozenset({"sign_verify:.verify()"})
+    assert gate.judge_operations(modules, found) == found
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "def outer():\n    h = None\n\n    def middle():\n        def inner():\n"
+            "            nonlocal h\n            import hashlib as h\n\n        inner()\n\n"
+            "    middle()\n    return h.sha1(b'')\n",
+            id="nonlocal-reaches-past-a-function-that-does-not-bind-it",
+        ),
+        pytest.param(
+            "def outer():\n    h = None\n\n    class C:\n        nonlocal h\n"
+            "        import hashlib as h\n\n    return h.sha1(b'')\n",
+            id="nonlocal-in-a-class-body",
+        ),
+    ],
+)
+def test_a_nonlocal_import_binds_the_nearest_function_that_binds_the_name(source: str) -> None:
+    ops = _gate().crypto_operations
+    modules = ops.parse_sources({"messagefoundry/x.py": source})
+    scoped = ops.aggregate(ops.discover_operations_in_modules(modules, scope_aware=True))
+    assert scoped.get("messagefoundry/x.py") == frozenset({"hash:hashlib.sha1"}), scoped
+
+
+def test_a_deeply_nested_expression_does_not_crash_the_scope_aware_reading() -> None:
+    # origin/main walks with the iterative ast.walk; the scope walk must not recurse per AST level.
+    ops = _gate().crypto_operations
+    source = "import hashlib\n\nx = " + " + ".join(["1"] * 3000) + "\nhashlib.sha1(b'')\n"
+    modules = ops.parse_sources({"messagefoundry/x.py": source})
+    scoped = ops.aggregate(ops.discover_operations_in_modules(modules, scope_aware=True))
+    assert scoped["messagefoundry/x.py"] == frozenset({"hash:hashlib.sha1"})
+
+
+def test_the_lexer_verdict_positive_control_reds_when_the_verdict_is_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = _gate()
+    assert (
+        gate.lexer_verdict_self_test("randomness")
+        == gate.lexer_verdict_self_test("operations")
+        == []
+    )
+
+    real = gate.js_lexer.classify_js
+
+    def every_character_is_code(source: str) -> tuple[str, str]:
+        blanked, verdicts = real(source)
+        return blanked, "".join(c if c == "\n" else gate.js_lexer.CODE for c in verdicts)
+
+    monkeypatch.setattr(gate.js_lexer, "classify_js", every_character_is_code)
+    assert gate.lexer_verdict_self_test("randomness")
+    assert gate.lexer_verdict_self_test("operations")
+    violations, _ = gate.check_non_python_randomness(_ROOT)
+    assert any("lexer verdict POSITIVE CONTROL" in v for v in violations), violations
+
+
+def test_the_positive_control_reds_when_the_scope_aware_reading_marks_a_genuine_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The control compares the whole judged map, so a scope-aware reading that loses a genuine
+    # call (here the bare sibling import under scripts/) reds it, not only the planted fixture.
+    gate = _gate()
+    ops = gate.crypto_operations
+    real = ops.discover_operations_in_modules
+
+    def drops_a_sibling(modules: list[object], scope_aware: bool = False) -> list[object]:
+        found = real(modules, scope_aware=scope_aware)
+        return [op for op in found if not (scope_aware and op.path == "scripts/st/user.py")]
+
+    monkeypatch.setattr(ops, "discover_operations_in_modules", drops_a_sibling)
+    assert gate.operations_self_test()
+
+
+def test_an_over_resolved_algorithm_label_does_not_mark_a_real_call() -> None:
+    # The scope-aware reading confirms the call; the union reading's label merges both bindings of
+    # ``alg``. A real hmac.new must not be spelled "(out of scope)" for that.
+    gate = _gate()
+    ops = gate.crypto_operations
+    source = (
+        "import hmac\n\n\ndef f(k, m):\n    from hashlib import md5 as alg\n"
+        "    return hmac.new(k, m, alg)\n\n\ndef g():\n    from hashlib import sha256 as alg\n"
+        "    return alg\n"
+    )
+    modules = ops.parse_sources({"messagefoundry/x.py": source})
+    found = ops.aggregate(ops.discover_operations_in_modules(modules))
+    assert found["messagefoundry/x.py"] == frozenset({"mac:hmac.new[md5,sha256]"})
+    assert gate.judge_operations(modules, found) == found
+
+
+def test_an_out_of_scope_tls_value_is_still_marked() -> None:
+    # A posture value is part of its token's callee text, so the label rule above does not cover it.
+    gate = _gate()
+    ops = gate.crypto_operations
+    source = (
+        "from ssl import CERT_NONE as mode\n\n\ndef f(ctx):\n"
+        "    from ssl import CERT_REQUIRED as mode\n    ctx.verify_mode = mode\n"
+    )
+    modules = ops.parse_sources({"messagefoundry/x.py": source})
+    found = ops.aggregate(ops.discover_operations_in_modules(modules))
+    assert gate.judge_operations(modules, found)["messagefoundry/x.py"] == frozenset(
+        {
+            "tls_context:.verify_mode = CERT_REQUIRED",
+            "tls_context:.verify_mode = CERT_NONE (out of scope)",
+        }
+    )

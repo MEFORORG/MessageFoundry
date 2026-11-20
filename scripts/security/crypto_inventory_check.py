@@ -67,6 +67,11 @@ visible operation has to say why. Three properties, each pinned in
 **What no arm sees is stated ONCE**, in the module docstring of ``crypto_operations.py`` under THE
 RESIDUAL. Read it there; every arm's green reads "at least" because of it.
 
+**Each token carries a verdict (BACKLOG #5578).** The Python operation arm and the TypeScript/
+JavaScript arms find tokens by a wide reading, and a token only that reading gives is spelled with a
+mark, so it cannot keep a plain inventory row green on its own, except in at least the cases THE
+RESIDUAL in crypto_operations.py lists. :func:`judge_tokens` says how.
+
 **A SECOND ARM COVERS THE NON-PYTHON TREE (BACKLOG #1172, ASVS 11.5.1).** Everything above is an
 ``import ast`` walk of ``*.py``, so it is Python-only *by construction* and cannot see a randomness
 draw in another language however the walk-set is spelled. :func:`check_non_python_randomness` scans
@@ -2254,6 +2259,9 @@ def discover(package: Path) -> dict[str, frozenset[str]]:
     return out
 
 
+#: The positive control file the scope-aware reading is checked on (BACKLOG #5578).
+_SELF_TEST_SCOPED_PATH = "selftest/scoped.py"
+
 #: The operation arm's POSITIVE CONTROL, run on every gate invocation before the tree is read. A
 #: fixture that never touches the disk and exercises AT LEAST these matchers: an exact rule, a
 #: prefix rule, an algorithm carried by an ARGUMENT, a method rule, a TLS posture assignment with its
@@ -2294,6 +2302,12 @@ _SELF_TEST_SOURCES: dict[str, str] = {
         "import hashlib\n\n\ndef a(b):\n    return hashlib.md5(b)\n\n\n"
         "def other():\n    from mylib import thing as hashlib\n    return hashlib\n"
     ),
+    # BACKLOG #5578: the same shape with a call in other(). The union reading gives hashlib.sha1
+    # there; the scope-aware reading knows other()'s hashlib is mylib's, so the token is marked.
+    _SELF_TEST_SCOPED_PATH: (
+        "import hashlib\n\n\ndef a(b):\n    return hashlib.md5(b)\n\n\n"
+        "def other(b):\n    from mylib import thing as hashlib\n    return hashlib.sha1(b)\n"
+    ),
 }
 _SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
     "selftest/seam.py": frozenset(
@@ -2319,18 +2333,54 @@ _SELF_TEST_EXPECTED: dict[str, frozenset[str]] = {
     "scripts/st/helper.py": frozenset({"hash:hashlib.sha1"}),
     "scripts/st/user.py": frozenset({"hash:via scripts.st.helper"}),
     "selftest/shadow.py": frozenset({"hash:hashlib.md5"}),
+    _SELF_TEST_SCOPED_PATH: frozenset({"hash:hashlib.md5", "hash:hashlib.sha1"}),
 }
+#: What the gate's diff reads for :data:`_SELF_TEST_SCOPED_PATH` once each token is judged.
+_SELF_TEST_SCOPED_JUDGED = frozenset({"hash:hashlib.md5", "hash:hashlib.sha1 (out of scope)"})
+
+
+def judge_operations(
+    modules: list[crypto_operations.ParsedModule], found: dict[str, frozenset[str]]
+) -> dict[str, frozenset[str]]:
+    """``found`` (the union-of-imports reading, :func:`crypto_operations.aggregate` of it) judged by
+    the scope-aware reading of the same ``modules``, per :func:`judge_tokens` (BACKLOG #5578).
+
+    The scope-aware reading confirms a CALL, not its algorithm label. A found token whose callee
+    (the text before its ``[label]``) the scope-aware reading also gives in the file is confirmed,
+    so a real ``hmac.new`` whose union label names one binding's algorithm too many is not spelled
+    out of scope; that the union reading merges labels across bindings is its own open item. A TLS
+    posture value is part of its token's callee text, so an out-of-scope value is still marked."""
+    scoped = crypto_operations.aggregate(
+        crypto_operations.discover_operations_in_modules(modules, scope_aware=True)
+    )
+    confirmed: dict[str, frozenset[str]] = {}
+    for path, tokens in found.items():
+        callees = {token.split("[", 1)[0] for token in scoped.get(path, ())}
+        confirmed[path] = frozenset(t for t in tokens if t.split("[", 1)[0] in callees)
+    return judge_map(found, confirmed, OUT_OF_SCOPE)
 
 
 def operations_self_test() -> list[str]:
     """Run the operation instrument over :data:`_SELF_TEST_SOURCES`. Returns violation lines."""
-    got = crypto_operations.aggregate(crypto_operations.discover_operations_in(_SELF_TEST_SOURCES))
-    if got == _SELF_TEST_EXPECTED:
-        return []
-    return [
-        f"operation arm POSITIVE CONTROL did not fire as planted: expected {_SELF_TEST_EXPECTED}, "
-        f"got {got}. The instrument is broken, so a clean result from it would mean nothing"
-    ]
+    modules = crypto_operations.parse_sources(_SELF_TEST_SOURCES)
+    got = crypto_operations.aggregate(crypto_operations.discover_operations_in_modules(modules))
+    if got != _SELF_TEST_EXPECTED:
+        return [
+            f"operation arm POSITIVE CONTROL did not fire as planted: expected "
+            f"{_SELF_TEST_EXPECTED}, got {got}. The instrument is broken, so a clean result from it "
+            "would mean nothing"
+        ]
+    # The scope-aware reading must still tell a call it reaches from one it does not (#5578). If it
+    # stopped, every token would read confirmed and an extra one could keep a row green again.
+    # Every OTHER fixture must stay unmarked, or a reading that marks genuine calls would pass.
+    expected = {**_SELF_TEST_EXPECTED, _SELF_TEST_SCOPED_PATH: _SELF_TEST_SCOPED_JUDGED}
+    judged = judge_operations(modules, got)
+    if judged != expected:
+        return [
+            f"operation arm POSITIVE CONTROL for the scope-aware reading did not fire as planted: "
+            f"expected {expected}, got {judged}"
+        ]
+    return []
 
 
 def check_operations(
@@ -2352,7 +2402,7 @@ def check_operations(
     operations = crypto_operations.discover_operations_in_modules(modules)
     actual = crypto_operations.aggregate(operations)
     undocumented, stale = find_violations(
-        actual,
+        judge_operations(modules, actual),
         OPERATION_INVENTORY,
         check_stale=check_stale,
         noun="crypto operation",
@@ -2413,23 +2463,66 @@ def find_violations(
     return undocumented, stale
 
 
-def _js_code(text: str) -> list[str]:
-    """The code of a TypeScript/JavaScript source, one entry per line: the UNION of two views.
+#: The suffix a TypeScript/JavaScript token takes when only the lexer view finds it and the lexer's
+#: verdict does not confirm it (BACKLOG #5578). :func:`_matches` states the rule.
+NOT_CODE = " (not code)"
+#: The suffix a Python operation token takes when only the union-of-imports reading gives it and the
+#: scope-aware reading does not (BACKLOG #5578). See :func:`judge_tokens`.
+OUT_OF_SCOPE = " (out of scope)"
 
-    1. The lexer view, :func:`js_lexer.blank_js_comments`, which skips string, template and regex
-       literals and blanks only real comments. It sees what BACKLOG #5578 found hidden: a call after
-       an inline ``/* */``, or on a ``*`` continuation line. The JS line terminators CR, U+2028 and
-       U+2029 are folded to ``\\n`` for it, because each ends a ``//`` comment.
+
+def judge_tokens(found: Iterable[str], verified: Iterable[str], mark: str) -> frozenset[str]:
+    """The token set both directions of an inventory diff read, with a verdict on each token
+    (BACKLOG #5578).
+
+    ``found`` is what the gate reports and lists, the widest reading; ``verified`` is what the
+    stricter reading confirms: for TypeScript/JavaScript, the per-line view plus the lexer matches
+    the lexer's verdict confirms (:func:`_matches`); for Python, the scope-aware reading. A found
+    token the stricter reading also gives keeps its spelling; any other is kept with ``mark``
+    appended. A token only the stricter reading gives is not added: the stricter reading judges
+    what is found and never finds on its own, so the corpus line, ``--list-operations`` and the
+    import-only checks, which read the found set, describe the same tokens the diff reads.
+
+    Why a mark and not a drop. The undocumented and stale directions must read one set, or no
+    inventory satisfies both: a token the first demands, the second must accept. Dropping an
+    unconfirmed token would stop reporting it; accepting it under its plain spelling lets it keep a
+    row green that the stricter reading would report stale. Under its own spelling it is still
+    found and still has to be listed, a plain row it alone backs reads stale, and a marked row goes
+    stale once the token is gone or is confirmed."""
+    confirmed = frozenset(verified)
+    return frozenset(token if token in confirmed else token + mark for token in found)
+
+
+def judge_map(
+    found: dict[str, frozenset[str]], verified: dict[str, frozenset[str]], mark: str
+) -> dict[str, frozenset[str]]:
+    """:func:`judge_tokens` for every path ``found`` names."""
+    return {
+        path: judge_tokens(tokens, verified.get(path, ()), mark)
+        for path, tokens in found.items()
+        if tokens
+    }
+
+
+def _js_views(text: str) -> tuple[list[str], list[tuple[str, str]]]:
+    """The code of a TypeScript/JavaScript source, read two ways: ``(per-line view, lexer view)``.
+
+    1. The lexer view, :func:`js_lexer.classify_js`, which skips string, template and regex
+       literals and blanks only real comments. Each line comes with the lexer's verdict on each of
+       its characters. It sees what BACKLOG #5578 found hidden: a call after an inline ``/* */``, or
+       on a ``*`` continuation line. The JS line terminators CR, U+2028 and U+2029 are folded to
+       ``\\n`` for it, because each ends a ``//`` comment.
     2. The per-line view this gate used before #5578: every line, split by ``splitlines``, that does
        not start with ``//``, ``*`` or ``/*``. A trailing comment stays on its line.
 
-    The union is the point. The lexer can misread a literal (the residual in crypto_operations.py
-    says how) and blank real code; the per-line view still scans every line it scanned before. So
-    the gate scans at least what it scanned before #5578: the per-line view is unchanged, and only
-    the lexer's input drops a leading BOM. The cost is false positives from both views: the per-line
-    view's old ones (a prose line inside a block comment that does not start with ``*``), and the
-    lexer's (a comment-shaped line inside a template literal, or a real comment line kept after a
-    literal misread).
+    The arms FIND tokens in the union of the two. The lexer can misread a literal (the residual in
+    crypto_operations.py says how) and blank real code; the per-line view still scans every line it
+    scanned before. So the gate scans at least what it scanned before #5578: the per-line view is
+    unchanged, and only the lexer's input drops a leading BOM. The cost is false positives from both
+    views: the per-line view's old ones (a prose line inside a block comment that does not start
+    with ``*``), and the lexer's (a comment-shaped line inside a template literal, or a real comment
+    line kept after a literal misread). The lexer's are what :func:`judge_tokens` marks: a lexer
+    match counts as confirmed only where :func:`_matches` accepts the lexer's verdict on it.
 
     The shipped extension test ``ide/src/test/suite/extension-hardening.test.ts`` skips comment
     lines too, for the same reason: ``cspNonce.ts`` NAMES ``Math.random`` in prose to explain why it
@@ -2439,22 +2532,70 @@ def _js_code(text: str) -> list[str]:
     folded = text.removeprefix("\ufeff")
     for terminator in ("\r\n", "\r", "\u2028", "\u2029"):
         folded = folded.replace(terminator, "\n")
-    lexed = js_lexer.blank_js_comments(folded).split("\n")
+    blanked, verdicts = js_lexer.classify_js(folded)
+    lexed = list(zip(blanked.split("\n"), verdicts.split("\n"), strict=True))
     per_line = [
         line for line in text.splitlines() if not line.lstrip().startswith(("//", "*", "/*"))
     ]
-    return lexed + per_line
+    return per_line, lexed
+
+
+#: The operation patterns whose match is a string literal's own text (a suite name, a cipher-string
+#: word), so the lexer verdict that confirms one is a literal opened on the same line. Every other
+#: pattern names a call or an option key, and is confirmed only where its first character is code.
+_LITERAL_PATTERNS = frozenset({"suite", "cipher_string"})
+
+
+def _matches(
+    pattern: re.Pattern[str], line: str, verdicts: str | None, *, in_literal: bool = False
+) -> list[re.Match[str]]:
+    """Every match of ``pattern`` in ``line``. With ``verdicts``, only those whose first character
+    the lexer calls code, or, when ``in_literal``, text of a literal opened on this line. Text on a
+    template literal's later line is never confirmed: it is where a comment-shaped line of prose
+    sits that the per-line view skips."""
+    accept = (js_lexer.CODE, js_lexer.LITERAL) if in_literal else (js_lexer.CODE,)
+    return [
+        match
+        for match in pattern.finditer(line)
+        if verdicts is None or verdicts[match.start() : match.start() + 1] in accept
+    ]
+
+
+def _js_token_views(
+    text: str, line_tokens: Callable[[str, str | None], set[str]]
+) -> tuple[set[str], set[str]]:
+    """``(found, verified)`` for one source: the tokens of both views, and the tokens of the
+    per-line view plus the lexer matches the lexer calls code. :func:`judge_tokens` reads the pair."""
+    per_line, lexed = _js_views(text)
+    main_view: set[str] = set()
+    for line in per_line:
+        main_view |= line_tokens(line, None)
+    found, verified = set(main_view), set(main_view)
+    for line, verdicts in lexed:
+        found |= line_tokens(line, None)
+        verified |= line_tokens(line, verdicts)
+    return found, verified
+
+
+_RANDOMNESS_PATTERNS = {**STRONG_RANDOMNESS_PATTERNS, **WEAK_RANDOMNESS_PATTERNS}
+
+
+def _randomness_line_tokens(line: str, verdicts: str | None) -> set[str]:
+    return {
+        token
+        for token, pattern in _RANDOMNESS_PATTERNS.items()
+        if _matches(pattern, line, verdicts)
+    }
+
+
+def randomness_token_views(text: str) -> tuple[set[str], set[str]]:
+    """``(found, verified)`` randomness-source tokens, strong and weak, for :func:`judge_tokens`."""
+    return _js_token_views(text, _randomness_line_tokens)
 
 
 def randomness_tokens_in(text: str) -> set[str]:
     """The randomness-source tokens (strong and weak) a non-Python source draws from."""
-    found: set[str] = set()
-    patterns = {**STRONG_RANDOMNESS_PATTERNS, **WEAK_RANDOMNESS_PATTERNS}
-    for line in _js_code(text):
-        for token, pattern in patterns.items():
-            if token not in found and pattern.search(line):
-                found.add(token)
-    return found
+    return randomness_token_views(text)[0]
 
 
 def non_python_sources(root: Path) -> list[Path]:
@@ -2466,14 +2607,25 @@ def non_python_sources(root: Path) -> list[Path]:
     return sorted(out)
 
 
+def _discover_non_python_views(
+    root: Path, *, repo: Path
+) -> tuple[dict[str, frozenset[str]], dict[str, frozenset[str]]]:
+    """``(found, verified)``: repo-relative path -> randomness tokens, for the files that draw
+    randomness at all, as :func:`randomness_token_views` reads them."""
+    found: dict[str, frozenset[str]] = {}
+    verified: dict[str, frozenset[str]] = {}
+    for path in non_python_sources(root):
+        tokens, confirmed = randomness_token_views(path.read_text(encoding="utf-8"))
+        if tokens:  # ``confirmed`` is a subset of ``tokens``
+            rel = path.relative_to(repo).as_posix()
+            found[rel] = frozenset(tokens)
+            verified[rel] = frozenset(confirmed)
+    return found, verified
+
+
 def discover_non_python(root: Path, *, repo: Path) -> dict[str, frozenset[str]]:
     """Map repo-relative path -> randomness tokens, for the files that draw randomness at all."""
-    out: dict[str, frozenset[str]] = {}
-    for path in non_python_sources(root):
-        tokens = randomness_tokens_in(path.read_text(encoding="utf-8"))
-        if tokens:
-            out[path.relative_to(repo).as_posix()] = frozenset(tokens)
-    return out
+    return _discover_non_python_views(root, repo=repo)[0]
 
 
 def check_non_python_randomness(repo: Path) -> tuple[list[str], int]:
@@ -2482,8 +2634,9 @@ def check_non_python_randomness(repo: Path) -> tuple[list[str], int]:
     The file count is returned so the caller can PRINT what was scanned. An instrument that reports
     "clean" without saying what it read is indistinguishable from one that read nothing, which is the
     failure this arm exists to close for ASVS 11.5.1."""
-    violations: list[str] = []
+    violations = lexer_verdict_self_test("randomness")
     actual: dict[str, frozenset[str]] = {}
+    verified: dict[str, frozenset[str]] = {}
     scanned = 0
 
     for name in NON_PYTHON_WALK_ROOTS:
@@ -2504,7 +2657,9 @@ def check_non_python_randomness(repo: Path) -> tuple[list[str], int]:
             )
             continue
         scanned += len(files)
-        actual |= discover_non_python(root, repo=repo)
+        found, confirmed = _discover_non_python_views(root, repo=repo)
+        actual |= found
+        verified |= confirmed
 
     weak_tokens = set(WEAK_RANDOMNESS_PATTERNS)
     for path, tokens in sorted(actual.items()):
@@ -2517,13 +2672,12 @@ def check_non_python_randomness(repo: Path) -> tuple[list[str], int]:
                 " Draw from node:crypto instead - ide/src/cspNonce.ts is the worked example"
             )
 
-    strong_actual = {
-        path: frozenset(tokens - weak_tokens)
-        for path, tokens in actual.items()
-        if tokens - weak_tokens
-    }
     undocumented, stale = find_violations(
-        strong_actual,
+        judge_map(
+            {path: tokens - weak_tokens for path, tokens in actual.items()},
+            {path: tokens - weak_tokens for path, tokens in verified.items()},
+            NOT_CODE,
+        ),
         NON_PYTHON_INVENTORY,
         check_stale=True,
         noun="randomness",
@@ -2765,13 +2919,18 @@ NON_PYTHON_OPERATION_INVENTORY: dict[str, frozenset[str]] = {
 
 
 def _pattern_tokens(
-    line: str, patterns: dict[str, tuple[re.Pattern[str], str]], *, fold_case: bool
+    line: str,
+    patterns: dict[str, tuple[re.Pattern[str], str]],
+    *,
+    fold_case: bool,
+    verdicts: str | None = None,
 ) -> set[str]:
     """Every ``class:name`` token the patterns find in one code line, as ``class:name[alg]`` when an
-    ``alg`` group captured a literal and ``class:name[=ref]`` when a ``ref`` group captured a name."""
+    ``alg`` group captured a literal and ``class:name[=ref]`` when a ``ref`` group captured a name.
+    With the lexer's ``verdicts`` for the line, only the matches :func:`_matches` confirms."""
     found: set[str] = set()
     for name, (pattern, op_class) in patterns.items():
-        for match in pattern.finditer(line):
+        for match in _matches(pattern, line, verdicts, in_literal=name in _LITERAL_PATTERNS):
             groups = match.groupdict()
             alg, ref = groups.get("alg"), groups.get("ref")
             if ref:
@@ -2784,33 +2943,50 @@ def _pattern_tokens(
     return found
 
 
+def _without_stray_cipher_strings(found: set[str]) -> set[str]:
+    """A cipher-string word counts only where the file pins or names suites (BACKLOG #2020); see
+    ``_CIPHER_STRING`` for why."""
+    names = {token.split(":", 1)[1].split("[", 1)[0] for token in found}
+    if names & {"ciphers", "suite"}:
+        return found
+    return {token for token in found if not token.startswith("tls_context:cipher_string[")}
+
+
+def _operation_line_tokens(line: str, verdicts: str | None) -> set[str]:
+    return _pattern_tokens(line, NON_PYTHON_OPERATION_PATTERNS, fold_case=False, verdicts=verdicts)
+
+
+def non_python_operation_token_views(text: str) -> tuple[set[str], set[str]]:
+    """``(found, verified)`` operation tokens for :func:`judge_tokens`. The cipher-string rule is
+    applied to each reading on its own, so an unconfirmed suite cannot admit a confirmed word."""
+    found, verified = _js_token_views(text, _operation_line_tokens)
+    return _without_stray_cipher_strings(found), _without_stray_cipher_strings(verified)
+
+
 def non_python_operation_tokens_in(text: str) -> set[str]:
     """The ``class:token`` operations a TypeScript/JavaScript source performs, read from the same
-    two-view code as the randomness arm (:func:`_js_code`)."""
-    found: set[str] = set()
-    for line in _js_code(text):
-        found |= _pattern_tokens(line, NON_PYTHON_OPERATION_PATTERNS, fold_case=False)
-    # A cipher-string word counts only where the file pins or names suites (BACKLOG #2020); see
-    # ``_CIPHER_STRING`` for why.
-    names = {token.split(":", 1)[1].split("[", 1)[0] for token in found}
-    if not names & {"ciphers", "suite"}:
-        found = {token for token in found if not token.startswith("tls_context:cipher_string[")}
-    return found
+    two-view code as the randomness arm (:func:`_js_views`)."""
+    return non_python_operation_token_views(text)[0]
 
 
 def _run_pattern_arm(
     repo: Path,
     roots: tuple[str, ...],
     list_files: Callable[[Path], list[Path]],
-    tokens_in: Callable[[str], set[str]],
+    tokens_in: Callable[[str], tuple[set[str], set[str]]],
     inventory: dict[str, frozenset[str]],
     label: str,
 ) -> tuple[list[str], int, dict[str, frozenset[str]]]:
     """Walk ``roots``, tokenize every file, and diff against ``inventory`` both ways. Shared by the
     two non-Python operation arms so they cannot drift into two subtly different diffs. An empty
-    walk is a violation, never a clean result."""
+    walk is a violation, never a clean result.
+
+    ``tokens_in`` gives ``(found, verified)``, and the diff reads :func:`judge_tokens` of the pair.
+    The PowerShell arm has one view, so it passes the same set twice and nothing is marked. The
+    returned map is the found tokens, unmarked, which is what the arm's corpus line counts."""
     violations: list[str] = []
     actual: dict[str, frozenset[str]] = {}
+    judged: dict[str, frozenset[str]] = {}
     scanned = 0
     for name in roots:
         root = repo / name
@@ -2823,25 +2999,62 @@ def _run_pattern_arm(
             continue
         scanned += len(files)
         for path in files:
-            tokens = tokens_in(path.read_text(encoding="utf-8-sig"))
+            tokens, confirmed = tokens_in(path.read_text(encoding="utf-8-sig"))
+            rel = path.relative_to(repo).as_posix()
             if tokens:
-                actual[path.relative_to(repo).as_posix()] = frozenset(tokens)
+                actual[rel] = frozenset(tokens)
+            if marked := judge_tokens(tokens, confirmed, NOT_CODE):
+                judged[rel] = marked
     undocumented, stale = find_violations(
-        actual, inventory, check_stale=True, noun="crypto operation", stale_verb="performs"
+        judged, inventory, check_stale=True, noun="crypto operation", stale_verb="performs"
     )
     return violations + undocumented + stale, scanned, actual
 
 
+#: The lexer verdict's POSITIVE CONTROL (BACKLOG #5578): ``source -> (found, verified)`` for the
+#: randomness views, then for the operation views. Prose on a template literal's later line is found
+#: and not confirmed; a *-continuation call and a call after an inline comment are both.
+_VERDICT_SELF_TEST_RANDOMNESS: dict[str, tuple[set[str], set[str]]] = {
+    "const help = `\n * call randomBytes(16)\n`;\n": ({"randomBytes"}, set()),
+    "const n = 1\n  * randomBytes(1)[0];\n": ({"randomBytes"}, {"randomBytes"}),
+}
+_VERDICT_SELF_TEST_OPERATIONS: dict[str, tuple[set[str], set[str]]] = {
+    "const help = `\n * createHash('md5')\n`;\n": ({"hash:createHash[md5]"}, set()),
+    "/* legacy */ createHash('md5')\n": ({"hash:createHash[md5]"}, {"hash:createHash[md5]"}),
+}
+
+
+def lexer_verdict_self_test(arm: str) -> list[str]:
+    """Run one arm's JS/TS views (``"randomness"`` or ``"operations"``) over its planted sources
+    above. Returns violation lines: if the verdict stops telling text from code, an extra token
+    could keep a row green again, or a genuine find could be marked, and the arm's clean result
+    would mean nothing. Each arm runs only its own half, so neither depends on the other's patterns."""
+    out: list[str] = []
+    views, planted = {
+        "randomness": (randomness_token_views, _VERDICT_SELF_TEST_RANDOMNESS),
+        "operations": (non_python_operation_token_views, _VERDICT_SELF_TEST_OPERATIONS),
+    }[arm]
+    for source, expected in planted.items():
+        got = views(source)
+        if got != expected:
+            out.append(
+                f"lexer verdict POSITIVE CONTROL did not fire as planted on {source!r}: "
+                f"expected (found, verified) {expected}, got {got}"
+            )
+    return out
+
+
 def check_non_python_operations(repo: Path) -> tuple[list[str], int, dict[str, frozenset[str]]]:
     """Run the TypeScript/JavaScript operation arm. Returns ``(violations, scanned, found)``."""
-    return _run_pattern_arm(
+    violations, scanned, found = _run_pattern_arm(
         repo,
         NON_PYTHON_WALK_ROOTS,
         non_python_sources,
-        non_python_operation_tokens_in,
+        non_python_operation_token_views,
         NON_PYTHON_OPERATION_INVENTORY,
         "TypeScript/JavaScript",
     )
+    return lexer_verdict_self_test("operations") + violations, scanned, found
 
 
 # --------------------------------------------------------------------------------------------
@@ -3075,6 +3288,12 @@ def powershell_operation_tokens_in(text: str) -> set[str]:
     return found
 
 
+def _powershell_token_views(text: str) -> tuple[set[str], set[str]]:
+    """The PowerShell arm has one view, so every token it finds is confirmed and none is marked."""
+    tokens = powershell_operation_tokens_in(text)
+    return tokens, tokens
+
+
 def powershell_sources(root: Path) -> list[Path]:
     """Every PowerShell script or module under ``root``, matched on the suffix case-insensitively,
     so a ``.PS1`` on a case-sensitive filesystem is still read."""
@@ -3091,7 +3310,7 @@ def check_powershell_operations(repo: Path) -> tuple[list[str], int, dict[str, f
         repo,
         POWERSHELL_WALK_ROOTS,
         powershell_sources,
-        powershell_operation_tokens_in,
+        _powershell_token_views,
         POWERSHELL_OPERATION_INVENTORY,
         "PowerShell",
     )
