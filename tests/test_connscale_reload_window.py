@@ -1060,11 +1060,12 @@ async def test_the_runner_waits_the_shipped_reply_wait_by_default(
 
 
 def test_the_shipped_reply_wait_fits_the_smokes_module_timeout() -> None:
-    # The constant's comment sizes it against the smoke: every step waiting in full, and then
-    # spending its full stop grace, must still fit the module timeout beside the 40.8 s the fixture's
-    # setup took on the failing runner. Read from the smoke module itself, so adding a count, a mode
-    # or a trial, or cutting the timeout, fails here. What it cannot see is a runner slower than that
-    # one. The grace was left out of this sum until BACKLOG #2024.
+    # The runner sizes the wait against the smoke, in its comment on `_FD_PROBE_MAKEUP_ATTEMPTS`:
+    # every step waiting in full, and then spending its full stop grace, must still fit the module
+    # timeout beside the 40.8 s the fixture's setup took on the failing runner. Read from the smoke
+    # module itself, so adding a count, a mode or a trial, or cutting the timeout, fails here. What it
+    # cannot see is a runner slower than that one. The grace was left out of this sum until
+    # BACKLOG #2024.
     import tests.test_connscale_smoke as smoke
 
     profile = smoke._smoke_profile(30000)

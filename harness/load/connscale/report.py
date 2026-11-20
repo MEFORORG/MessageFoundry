@@ -299,14 +299,10 @@ class ConnScaleRecord:
     fd_probe_ticks: int = 0
     fd_probe_degraded_ticks: int = 0
     fd_probe_degraded: tuple[str, ...] = ()
-    # How many of `fd_probe_ticks` the probe's make-up floor took AFTER its window closed, because every
-    # reading in the window was an exhausted budget (BACKLOG #1488). Zero on a window that took any
-    # other reading, and where no probe ran, which `fd_probe_ticks` of 0 tells apart. A
-    # peak read on such a tick comes from the step's engine before the driver stops, so the
-    # connections the driver opened have not been closed by the harness; one the reload probe left
-    # down is still down, as for an in-window reading after the reload. It is taken after the hold,
-    # with no traffic offered, and a reader choosing a verdict should be able to see that. The count
-    # itself is reported, never graded; the reading it marks feeds `fd_count_peak` like any other.
+    # How many of `fd_probe_ticks` the probe's make-up floor took AFTER its window closed (BACKLOG
+    # #1488). `runner._probe_loop` states when it fires and what such a reading is. Zero
+    # also where no probe ran, which `fd_probe_ticks` of 0 tells apart. The count itself is reported,
+    # never graded; the reading it marks feeds `fd_count_peak` like any other.
     fd_probe_floor_ticks: int = 0
     # --- BACKLOG #1210: which processes the FD and RSS peaks were summed over ---
     # The PIDs the tick that set `fd_count_peak` covered, sorted, and the same for
@@ -980,15 +976,16 @@ DIAGNOSTIC_FIELDS: tuple[DiagnosticField, ...] = (
     DiagnosticField(
         "fd_probe_floor_ticks",
         lambda r: r.fd_probe_floor_ticks,
-        "whether the walk read again past its window (BACKLOG #1488): NON-ZERO means every reading the "
-        "window took, the one in flight when it closed included, spent its budget, and the walk read "
-        "again after the hold with no traffic offered; 0 also where no probe ran",
+        "whether the walk read again past its window (BACKLOG #1488; when: runner._probe_loop): "
+        "NON-ZERO means the window measured nothing and the peak may come from a reading taken after "
+        "the hold, with no traffic offered; 0 also where no probe ran",
     ),
     DiagnosticField(
         "fd_probe_degraded_ticks",
         lambda r: r.fd_probe_degraded_ticks,
-        "contention vs probe-cost: NON-ZERO means the walk could not measure, ZERO means it measured "
-        "cleanly and any wrong reading is a wrong SUBJECT rather than a failed sample",
+        "contention vs probe-cost: NON-ZERO means that many readings measured nothing, though the "
+        "step can still carry a peak from another, a make-up reading included; ZERO means every "
+        "reading measured cleanly and any wrong reading is a wrong SUBJECT rather than a failed sample",
     ),
     DiagnosticField(
         "fd_count_peak_pids",

@@ -174,12 +174,10 @@ _POST_RELOAD_HOLD_FRACTION = 0.25
 #: visible in the record rather than read as a dead one.
 #:
 #: It is spent in full only when no reply comes inside it. That does not always fail the step: a
-#: reply can still come inside the stop grace that follows. 10 s keeps the smoke's four steps inside
-#: its 120 s module timeout even if every one of them waits in full AND then spends its full stop
-#: grace: the fixture's setup took 40.8 s on that runner, and 4 x (10 s + 5 s) more is 100.8 s.
-#: CORRECTED 2026-09-30 (BACKLOG #2024): this read "4 x 10 s more is 80.8 s", which left out the stop
-#: grace. That margin does NOT cover a step that also spends its reconnect wait, so the wait is
-#: skipped where a connection never came back.
+#: reply can still come inside the stop grace that follows. 10 s is sized against the smoke's 120 s
+#: module timeout; the estimate is at `_FD_PROBE_MAKEUP_ATTEMPTS`. It does not
+#: cover a step that also spends its reconnect wait, so the wait is skipped where a connection never
+#: came back.
 _POST_RELOAD_REPLY_WAIT_S = 10.0
 _HEALTH_TIMEOUT = 30.0
 # One spelling, because both audit moments report it and they must not drift into disagreeing about
@@ -667,10 +665,8 @@ async def _run_started_step(
             )
         # TWO stop events. `sampler_stop` ends the ENGINE sampler, whose readings are the rate window,
         # and it fires when the hold ends. `probe_stop` closes the OS probe's window after the reload
-        # probe returns (BACKLOG #2024). The probe can still read past it: where every reading in the
-        # window was an exhausted budget, its make-up floor takes one more, beside the post-reload
-        # reply wait and before the driver stops, and that reading is graded (BACKLOG #1488; see
-        # `_probe_loop`).
+        # probe returns (BACKLOG #2024). The probe can still take a graded make-up reading past it;
+        # `_probe_loop` says when (BACKLOG #1488).
         sampler_stop = asyncio.Event()
         probe_stop = asyncio.Event()
         # TWO tasks, not one task doing both (BACKLOG #1430). The engine poll is cheap; the OS probe
@@ -1476,31 +1472,42 @@ async def _sample_loop(
         await asyncio.sleep(max(0.0, interval - (time.monotonic() - started)))
 
 
-#: The make-up attempts :func:`_probe_loop` may spend past its ``stop`` when every reading the window
-#: took was an exhausted budget (BACKLOG #1488).
+#: The make-up attempts :func:`_probe_loop` may spend past its ``stop``; it states when they fire
+#: (BACKLOG #1488).
 #:
 #: ONE, AND THE BOUND IS THE SMOKE'S WATCHDOG, NOT TASTE. On this repository's
 #: ``--timeout-method=thread`` a ``pytest.mark.timeout(120)`` that fires ends the whole worker process
-#: rather than one test, so what the floor adds has to fit beside what the sweep already costs.
+#: rather than one test, so what a step adds has to fit beside what the sweep already costs. This is
+#: the one place the runner prices that watchdog, for this constant and ``_POST_RELOAD_REPLY_WAIT_S``
+#: alike. Each sum is one failing run's measured fixture setup plus a 4-step worst case for its own
+#: terms:
 #:
-#: What the floor adds, at most, is :data:`_FD_PROBE_MAKEUP_MAX_S` per step. The sweep's other
-#: costs are not priced term by term: the failing windows-2022 run of 2026-11-19 measured them all
-#: at once, as :data:`_FD_PROBE_FLOOR_MEASURED_SETUP_S`, the smoke fixture's setup time on that leg,
-#: with every spawn and kill, reply wait, stop grace, drain and in-window walk as they ran there. That
-#: leg plus the floor at its maximum is 53.41 + 4 steps x 10 s = 93.41 s; a second attempt would put
-#: the same sum at 133.41 s, past 120.
+#: - The reply wait: setup took 40.8 s on merge-group run 36166728739 (windows-2025). Every step
+#:   waiting its full 10 s and then spending its full 5 s stop grace adds 4 x 15 s, for 100.8 s.
+#:   CORRECTED 2026-09-30 (BACKLOG #2024): this read "4 x 10 s more is 80.8 s", which left out the
+#:   stop grace.
+#: - The make-up floor: :data:`_FD_PROBE_FLOOR_MEASURED_SETUP_S`, 53.41 s on the windows-2022 run of
+#:   2026-11-19, with every spawn and kill, reply wait, stop grace, drain and in-window walk as they
+#:   ran there. The floor's shell-outs add up to :data:`_FD_PROBE_MAKEUP_MAX_S` per step, for 93.41 s;
+#:   a second attempt would put the same sum at 133.41 s, past 120.
 #:
-#: THAT SUM IS AN ESTIMATE, NOT A BOUND IN EITHER DIRECTION. It is lower where a make-up attempt
-#: returns inside its budget, or overlaps the reply wait (:func:`_await_probe_beside_reply`), which
-#: also overlaps the in-flight tail that leg ran in front of its wait. It is higher on a run whose
-#: other terms cost more than they did on that leg: a reply wait (``_POST_RELOAD_REPLY_WAIT_S``) or
-#: stop grace (``_STOP_GRACE``) that ran longer, an in-window attempt that spent both budgets where
-#: that run's spent one, or a slower engine spawn or kill. Nor does it price the kill and reap
-#: ``subprocess.run`` does after a timed-out shell-out, which ``_FD_PROBE_MAKEUP_MAX_S`` leaves out
-#: too. ``tests/test_connscale_sample_floor.py`` recomputes this sum from these constants.
+#: NEITHER SUM PRICES THE OTHER'S TERM. Before the floor, the attempt in flight when the window
+#: closed ran in front of the reply wait; now it and the make-up attempt run beside the wait
+#: (:func:`_await_probe_beside_reply`). Either way that phase reaches 2 x 10 s at its longest on a
+#: Windows leg, kill and reap aside. Every term at its maximum at once, which neither run came near,
+#: gives 40.8 + 4 x (20 s + 5 s) = 140.8 s, past 120, before the floor as after it.
+#:
+#: BOTH ARE ESTIMATES, NOT BOUNDS IN EITHER DIRECTION. A run costs less where an attempt returns
+#: inside its budget. Terms that cost more than on the run measured raise it, at least these: a
+#: longer reply wait or stop grace (``_STOP_GRACE``), an in-window attempt that spent both budgets
+#: where that run's spent one, a slower engine spawn or kill, the warm-up, the drain,
+#: ``sample_until_reconciled``, ``_SETTLE``, the intake audit, and the kill and reap
+#: ``subprocess.run`` does after a timed-out shell-out. ``tests/test_connscale_sample_floor.py``
+#: recomputes the floor's sum from these constants, and ``tests/test_connscale_reload_window.py``
+#: the reply wait's.
 _FD_PROBE_MAKEUP_ATTEMPTS = 1
-#: The most :data:`_FD_PROBE_MAKEUP_ATTEMPTS` can add to one step on a Windows leg, on the terms
-#: ``_PROBE_ATTEMPT_MAX_S`` in ``probe.py`` states.
+#: The most the shell-outs of :data:`_FD_PROBE_MAKEUP_ATTEMPTS` can add to one step on a Windows leg,
+#: kill and reap aside, on the terms ``_PROBE_ATTEMPT_MAX_S`` in ``probe.py`` states.
 _FD_PROBE_MAKEUP_MAX_S = _FD_PROBE_MAKEUP_ATTEMPTS * _PROBE_ATTEMPT_MAX_S
 #: The smoke fixture's setup time on the failing job (run 44607871179, job 135856508516), from
 #: pytest's slowest-durations line. A measurement, not a contract.
@@ -1538,9 +1545,10 @@ async def _probe_loop(
     THE MAKE-UP FLOOR (BACKLOG #1488). A walk that times out spends ``_PROBE_TIMEOUT_S`` (5 s), which
     outlasts the CI cell's whole probe window, so on a contended runner a step got exactly one attempt
     and that attempt was the gap. Four such steps leave no lane with two readings, and the smoke's
-    WALL #4 assertion then fails on the runner rather than the engine. So when every reading in
-    ``out``, which is the step's own list, is a budget-exhausted gap, the loop keeps probing for at
-    most ``_FD_PROBE_MAKEUP_ATTEMPTS`` more, stopping at the first reading that is not one. A
+    WALL #4 assertion then fails on the runner rather than the engine. So while
+    :func:`_only_budget_gaps` holds for ``out``, the step's own list with the attempt in flight when
+    ``stop`` was set included, the loop keeps probing for at most ``_FD_PROBE_MAKEUP_ATTEMPTS``
+    more. The record and the report point here for when the floor fires. A
     reading taken here still comes from the step's engine before the driver stops: the caller sets
     ``stop`` only after the reload probe returns, and stops the driver only after this task returns
     (:func:`_await_probe_beside_reply`, beside the post-reload reply wait). It is taken after the
@@ -1560,7 +1568,9 @@ async def _probe_loop(
     handle count equalled the window's peak (367, 403, 363, 399; 403, 404). The growth from N=12 to
     N=24 was 9 to 11 percent, and the SLO's band is ``_MONOTONIC_TOLERANCE`` (25 percent). A gap of
     zero handles cannot produce a false red or hide growth at that band. It is one box at these N,
-    not a bound for other N or hosts.
+    not a bound for other N or hosts. The same reading also feeds ``working_set_peak_bytes`` and its
+    PIDs through :func:`_derive_proc`; nothing grades that peak (:func:`_evaluate_slos` has no RSS
+    check), and the measurement above paired handle counts only.
 
     ONE PROBE AT A TIME. :class:`~harness.load.connscale.probe.FdSampler` holds the front-load counter
     and the resolved subtree as mutable state, so overlapping calls would race them. This loop is
@@ -1591,7 +1601,9 @@ async def _await_probe_beside_reply(
     in flight, then at most :data:`_FD_PROBE_MAKEUP_ATTEMPTS` make-up attempts. Awaited one after the
     other, that time ran in front of the reply wait, which delayed the wait and widened the window
     ``post_reload_drops`` counts over. Run side by side, the reply wait starts when the window closes
-    and the probe's reading is still taken before the caller stops the driver.
+    and the probe's reading is still taken before the caller stops the driver. No SLO or smoke
+    assertion bounds ``post_reload_reply_s``; the tests that bound ``reply_s`` time
+    :func:`_await_post_reload_reply` alone.
 
     If the probe raises, the reply wait is cancelled and awaited before the error propagates, so its
     own cleanup runs and it is not left watching past the step. A reply-wait error surfaces once the
@@ -2648,7 +2660,8 @@ class _ProcDerived:
     cpu_util_cores_peak: float | None
     cpu_util_cores_mean: float | None
     working_set_peak_bytes: int | None
-    #: How many probe ticks this window collected at all. The SCOPE for the count below: "2 degraded"
+    #: How many readings the probe took for the step at all, a make-up reading past its window
+    #: included (BACKLOG #1488, :func:`_probe_loop`). The SCOPE for the count below: "2 degraded"
     #: means nothing without it, and 2-of-3 and 2-of-200 warrant opposite reactions.
     probe_ticks: int
     #: How many of those ticks were full gaps (:attr:`ProcSample.degraded` set).
