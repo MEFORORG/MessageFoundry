@@ -20,12 +20,12 @@ export interface Field {
   // switch is never a loosening at one value (listen_address, the posture lever).
   insecure?: boolean | number;
   // True for a number that is a loosening ABOVE its shipped default, read from the state's own
-  // `defaults` rather than restated here: the two session limits (vault BACKLOG #2600). 0 or less ends
-  // every session at once, which is stricter, so only a value above the default is marked.
+  // `defaults` rather than restated here: the two session limits (vault BACKLOG #2600). Only a value
+  // above the default is marked; the engine refuses one below 1 at load (BACKLOG #5772).
   looserAboveDefault?: boolean;
   // The least value an int switch takes, where the engine refuses less. Save refuses a value below
   // it (BACKLOG #5412), and the host checks it again (securityEditorModel.ts). Unset means no
-  // minimum: a session limit of 0 or less is stricter, and the engine takes it.
+  // minimum. The session limits take 1, the floor the engine refuses below (BACKLOG #5772).
   min?: number;
   risk?: string;
 }
@@ -64,10 +64,10 @@ export const FIELDS: Field[] = [
     desc: "Audited ack (ADR 0140): lifts the start refusal that an exposed instance with Require MFA off meets under strict enforcement.",
     insecure: true, risk: "an EXPOSED instance under enforcement = enforce may start with [security].require_mfa off, on an audited warning instead of the refusal. Every account with no second factor enrolled is then single-factor over the network, unless an OIDC sign-in carries an amr/acr claim checked while [auth].oidc_require_mfa_claim is on" },
   // Each risk ends with the engine's own clause; tests/test_security_config.py reds when it drifts.
-  { key: "sign_out_after_idle_minutes", label: "Sign out after idle (min)", type: "int", group: "Sign-in & identity",
+  { key: "sign_out_after_idle_minutes", min: 1, label: "Sign out after idle (min)", type: "int", group: "Sign-in & identity",
     desc: "Session idle timeout, in minutes. Above the default is a loosening.",
     looserAboveDefault: true, risk: "the idle sign-out is longer than the default, so a session left open or taken over stays usable for longer before it is signed out" },
-  { key: "max_session_hours", label: "Max session (hours)", type: "int", group: "Sign-in & identity",
+  { key: "max_session_hours", min: 1, label: "Max session (hours)", type: "int", group: "Sign-in & identity",
     desc: "Absolute session lifetime, in hours. Above the default is a loosening.",
     looserAboveDefault: true, risk: "the absolute session lifetime is longer than the default, so a session left open or taken over stays usable for longer before it is signed out" },
   // ── Data handling ───────────────────────────────────────────────
@@ -144,8 +144,8 @@ export function securityEditorScript(token: string, fields: unknown): string {
           for (const [v, t] of [['','Derived from environment'],['true','Yes'],['false','No']]) { const o = document.createElement('option'); o.value = v; o.textContent = t; input.appendChild(o); }
         } else if (f.type === 'int') {
           input = document.createElement('input'); input.type = 'number';
-          // The spinner's floor. Only a field's own min is enforced on Save (intProblem); 0 here keeps
-          // the arrows from walking a session limit below 0, where every session would end at once.
+          // The spinner's floor: the field's own min, which Save enforces (intProblem), or 0 for a
+          // field that declares none.
           input.min = String(typeof f.min === 'number' ? f.min : 0);
         } else {
           input = document.createElement('input'); input.type = 'text';

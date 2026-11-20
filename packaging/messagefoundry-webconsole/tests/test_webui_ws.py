@@ -111,6 +111,30 @@ async def test_ws_cookie_auth_rejects_cross_origin(engine: Engine) -> None:
     assert identity is None
 
 
+async def test_ws_cookie_auth_rejects_a_repeated_or_blank_origin(engine: Engine) -> None:
+    """BACKLOG #5789: the cookie gate judges every Origin copy, as the header path does. A second
+    copy is refused even after our own origin, and a blank one is refused, not taken for absent."""
+    from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import authorize_ui_ws
+
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    app, token = await _token(engine, service, "op")
+    repeated = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
+    repeated.headers = Headers(
+        raw=[(b"origin", b"http://t"), (b"origin", b"http://evil.example"), (b"host", b"t")]
+    )
+    blank = _FakeWS(origin=" ", host="t", cookie=token, app=app)
+    for ws in (repeated, blank):
+        record_ws_gate(ws, admitted=True)  # type: ignore[arg-type]
+        identity, _ = await authorize_ui_ws(ws, Permission.MONITORING_READ)  # type: ignore[arg-type]
+        assert identity is None
+        assert not ws_accept_allowed(ws.scope)
+    # The control: the same handshake with our own origin once is admitted.
+    ok = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
+    assert (await authorize_ui_ws(ok, Permission.MONITORING_READ))[0] is not None  # type: ignore[arg-type]
+
+
 async def test_ws_cookie_auth_requires_cookie_and_origin(engine: Engine) -> None:
     from messagefoundry.auth import Permission
     from messagefoundry_webconsole import authorize_ui_ws

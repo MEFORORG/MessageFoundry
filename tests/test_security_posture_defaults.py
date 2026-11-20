@@ -731,13 +731,13 @@ def test_a_session_limit_above_its_default_is_named_under_its_security_name(
     switch: str, field: str, longer: int
 ) -> None:
     """Named alone, under the [security] name, with the value and the default. At or below the
-    default, or at 0 or less (a session that dies at once), it is not named."""
+    default, down to 1, it is not named; below 1 is refused at load (BACKLOG #5772)."""
     risks = dict(_pairs(auth=AuthSettings(**{field: longer})))  # type: ignore[arg-type]
     assert list(risks) == [switch]
     assert f"is {longer}" in risks[switch]
     assert "above the default of" in risks[switch]
     default = AuthSettings.model_fields[field].default
-    for value in (default, default - 1, 0, -1):
+    for value in (default, default - 1, 1):
         assert _names(auth=AuthSettings(**{field: value})) == []  # type: ignore[arg-type]
 
 

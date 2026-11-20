@@ -130,6 +130,19 @@ def test_ws_origin_honors_allowlist() -> None:
     assert _ws_origin_allowed(_fake_ws("https://evil.example", ("https://ok.example",))) is False
 
 
+@pytest.mark.parametrize("origin", ["", " ", "\t"])
+def test_ws_origin_refuses_a_blank_origin(origin: str) -> None:
+    """BACKLOG #5789: only an absent header is a native client; a blank one is refused."""
+    assert _ws_origin_allowed(_fake_ws(origin, ())) is False
+
+
+def test_ws_origin_refuses_a_repeated_origin() -> None:
+    """BACKLOG #5789: a second Origin header is refused, even after an allowed first one."""
+    ws = _fake_ws("https://ok.example", ("https://ok.example",))
+    ws.scope["headers"].append((b"origin", b"https://evil.example"))
+    assert _ws_origin_allowed(ws) is False
+
+
 # --- WP-1: header-only WS token + security headers --------------------------
 
 
