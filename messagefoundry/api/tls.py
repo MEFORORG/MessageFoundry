@@ -276,9 +276,11 @@ class GeneratedPairReplaced:
     parsed, or was the missing half of a half-written pair.
     """
 
-    #: ``renewal``: a loadable pair near or past its expiry. ``unusable``: a pair that would not
+    #: ``renewal``: a loadable pair near or past its expiry. ``bind_changed``: a loadable pair whose
+    #: certificate lacks a name a fresh mint for the current ``[api].host`` would carry, such as a
+    #: bind moved to a wildcard after the mint (BACKLOG #5973). ``unusable``: a pair that would not
     #: load as one. ``half_pair``: one file of the two, left by an interrupted mint or renewal.
-    reason: Literal["renewal", "unusable", "half_pair"]
+    reason: Literal["renewal", "bind_changed", "unusable", "half_pair"]
     cert_file: str
     old_sha256: str | None
     old_not_after: str | None
@@ -652,11 +654,15 @@ def ensure_api_tls_material(
     with less than a third of its lifetime left, or past it, is RENEWED at startup -- see
     :func:`_renew_generated_pair` -- but only when it is still the engine's own shape (self-signed,
     ``CA=false``). Anything else at the generated path is served as found and never replaced.
-    Nothing renews mid-run: ``CertExpiryRunner`` watches the served certificate, because ``serve``
+    **A pair of that shape that does not name the current bind is replaced the same way**, the
+    report's reason ``bind_changed``: a fresh mint for ``[api].host`` would carry a name the old
+    certificate lacks, for example the loopback of a wildcard bind (BACKLOG #5973). Only the
+    engine's own generated pair is ever checked; an operator's ``[api].tls_cert_file`` never
+    reaches this branch. Nothing renews mid-run: ``CertExpiryRunner`` watches the served certificate, because ``serve``
     hands it the path this function RETURNS, and it stays the alarm for an engine never restarted.
 
-    **``renew=False`` is for an engine shard (``serve --shard``).** Every process that serves the
-    pair must start together when it is renewed, or a lone restarted shard would serve a new
+    **``renew=False`` is for an engine shard (``serve --shard``).** It skips the bind check too.
+    Every process that serves the pair must start together when it is renewed, or a lone restarted shard would serve a new
     certificate while its siblings keep the old one in memory. So ``supervise`` renews before it
     spawns any shard, and a shard only reuses a pair that loads, due or not. It still mints on a
     first run and still recovers a pair that does not load, because it has nothing else to serve.
@@ -708,7 +714,7 @@ def ensure_api_tls_material(
         return plan.material()
 
     cert_path, key_path = _generated_pair(state_dir)
-    if _reusable_without_the_lock(cert_path, key_path, renew=renew):
+    if _reusable_without_the_lock(api.host, cert_path, key_path, renew=renew):
         return str(cert_path), str(key_path)
     events = replacements if replacements is not None else []
     try:
@@ -764,7 +770,7 @@ def _settle_under_the_lock(
     if cert_path.exists() and key_path.exists():
         reason = _why_generated_pair_is_unusable(cert_path, key_path)
         if reason is None:
-            due = _renewal_due(cert_path) if renew else None
+            due = _renewal_due(api.host, cert_path) if renew else None
             if due is not None:
                 _renew_generated_pair(api, cert_path, key_path, due, events)
             return
@@ -791,7 +797,7 @@ def _still_serves(cert_path: Path, key_path: Path) -> bool:
     return facts is None or facts.not_after > time.time()
 
 
-def _reusable_without_the_lock(cert_path: Path, key_path: Path, *, renew: bool) -> bool:
+def _reusable_without_the_lock(host: str, cert_path: Path, key_path: Path, *, renew: bool) -> bool:
     """True when the pair loads and, if ``renew``, is not due for renewal, read WITHOUT the lock.
 
     Every other answer is ``False``, and the caller then decides again under the lock. A read that
@@ -809,7 +815,7 @@ def _reusable_without_the_lock(cert_path: Path, key_path: Path, *, renew: bool) 
             cert_path.exists()
             and key_path.exists()
             and _why_generated_pair_is_unusable(cert_path, key_path) is None
-            and (not renew or _renewal_due(cert_path) is None)
+            and (not renew or _renewal_due(host, cert_path) is None)
         )
     except OSError:
         return False
@@ -825,11 +831,16 @@ def _cert_facts(cert_path: Path) -> SelfSignedFacts | None:
         return None
 
 
-def _renewal_due(cert_path: Path) -> SelfSignedFacts | None:
-    """The old certificate's facts when the generated pair should be renewed now, else ``None``.
+def _renewal_due(
+    host: str, cert_path: Path
+) -> tuple[Literal["renewal", "bind_changed"], SelfSignedFacts] | None:
+    """Why the generated pair should be replaced now, with the old certificate's facts, else ``None``.
 
-    Due means expired, or less than :data:`_RENEW_REMAINING_FRACTION` of the certificate's own
-    validity period left. **Only the engine's own shape is ever due**: a certificate at the
+    ``renewal`` means expired, or less than :data:`_RENEW_REMAINING_FRACTION` of the certificate's
+    own validity period left. ``bind_changed`` means the certificate lacks a name a fresh mint for
+    ``host`` would carry (:func:`_names_the_bind`), so a bind moved after the mint, for example to a
+    wildcard whose loopback the tray dials, gets a certificate naming it at this start rather than at
+    the next renewal (BACKLOG #5973). **Only the engine's own shape is ever due**: a certificate at the
     generated path that is not self-signed with ``CA=false`` was put there by someone else, so it is
     served as found. That case is logged at WARNING, because a certificate left to expire beside
     the store deserves a reason in the log. ``None`` too when the certificate cannot be
@@ -839,9 +850,10 @@ def _renewal_due(cert_path: Path) -> SelfSignedFacts | None:
     if facts is None:
         return None
     lifetime = facts.not_after - facts.not_before
-    if facts.not_after - time.time() >= lifetime * _RENEW_REMAINING_FRACTION:
-        return None
+    expiring = facts.not_after - time.time() < lifetime * _RENEW_REMAINING_FRACTION
     if not facts.engine_shaped:
+        if not expiring:
+            return None
         log.warning(
             "not renewing %s: it expires %s, but it is not a self-signed certificate the engine "
             "generated, so the engine leaves it alone. Replace it yourself, or set "
@@ -850,7 +862,25 @@ def _renewal_due(cert_path: Path) -> SelfSignedFacts | None:
             log_timestamp(facts.not_after_iso),
         )
         return None
-    return facts
+    if expiring:
+        return "renewal", facts
+    if not _names_the_bind(host, cert_path):
+        return "bind_changed", facts
+    return None
+
+
+def _names_the_bind(host: str, cert_path: Path) -> bool:
+    """True when the certificate names ``host`` and every name :func:`_generated_sans` adds for it,
+    the names :func:`_mint_generated_pair` would put in a fresh certificate for this bind.
+
+    ``True`` too when the certificate cannot be read or parsed, since nothing here may replace what
+    it cannot identify."""
+    from messagefoundry import pki
+
+    try:
+        return pki.names_all_of(cert_path.read_bytes(), [host, *_generated_sans(host)])
+    except (OSError, ValueError):
+        return True
 
 
 def _staged_pair(cert_path: Path, key_path: Path) -> tuple[Path, Path]:
@@ -877,10 +907,13 @@ def _renew_generated_pair(
     api: ApiSettings,
     cert_path: Path,
     key_path: Path,
-    old: SelfSignedFacts,
+    due: tuple[Literal["renewal", "bind_changed"], SelfSignedFacts],
     events: list[GeneratedPairReplaced],
 ) -> None:
     """Replace a loadable generated pair that is due, with a new key and certificate. Lock held.
+
+    ``due`` is :func:`_renewal_due`'s answer: why, and the old certificate's facts. A replacement
+    for a changed bind takes this same path, so its key is written exactly as a renewal's is.
 
     **Staged, then replaced, certificate first.** The new key is written under a temporary name with
     :func:`_write_private_key` (``O_EXCL``, ``0o600``, Windows DACL) and the new certificate beside it,
@@ -917,12 +950,16 @@ def _renew_generated_pair(
                 log.warning("could not remove %s after a failed renewal: %s", leftover, cleanup)
         raise
     _replace_generated(staged_key, key_path)
-    event = _replaced("renewal", cert_path, old, new)
+    reason, old = due
+    event = _replaced(reason, cert_path, old, new)
     events.append(event)
     log.warning(
-        "renewed the generated self-signed TLS certificate at %s: the old one (sha256 %s) expires "
+        "%s the generated self-signed TLS certificate at %s: the old one (sha256 %s) expires "
         "%s, the new one (sha256 %s) expires %s. Any browser trust store or --cacert copy that "
         "holds the old certificate must import the new one.",
+        "renewed"
+        if reason == "renewal"
+        else f"re-minted, for the bind {api.host}, which the old one did not name,",
         cert_path,
         event.old_sha256,
         "at an unknown date" if event.old_not_after is None else log_timestamp(event.old_not_after),
@@ -932,7 +969,7 @@ def _renew_generated_pair(
 
 
 def _replaced(
-    reason: Literal["renewal", "unusable", "half_pair"],
+    reason: Literal["renewal", "bind_changed", "unusable", "half_pair"],
     cert_path: Path,
     old: SelfSignedFacts | None,
     new: SelfSignedFacts,

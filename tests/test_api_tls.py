@@ -4284,6 +4284,76 @@ def test_the_minted_certificate_names_a_wildcard_binds_loopback(
     assert [str(n.value) for n in san] == names
 
 
+@pytest.mark.parametrize(
+    ("first", "then", "names"),
+    [
+        ("127.0.0.1", "0.0.0.0", ["0.0.0.0", "127.0.0.1"]),
+        ("::1", "::", ["::", "::1"]),
+        ("127.0.0.1", "10.0.0.9", ["10.0.0.9"]),
+    ],
+)
+def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
+    first: str, then: str, names: list[str], tmp_path: Path
+) -> None:
+    """BACKLOG #5973. A pair minted for one bind, reused after the bind moved, must name the new
+    bind, or a client dialling it (the tray on a wildcard's loopback) fails hostname verification
+    until the renewal months later. The re-mint is a reported, audited replacement.
+
+    Mutation: drop the bind check in ``_renewal_due``. Red: the second start reuses the first
+    certificate, which names only ``first``."""
+    old_cert, old_key = ensure_api_tls_material(ApiSettings(host=first), state_dir=tmp_path)
+    old_sha = _sha256(Path(old_cert))
+    events: list[GeneratedPairReplaced] = []
+
+    cert, key = ensure_api_tls_material(
+        ApiSettings(host=then), state_dir=tmp_path, replacements=events
+    )
+
+    assert (cert, key) == (old_cert, old_key)  # the same fixed names
+    _load_pair(Path(cert), Path(key))
+    loaded = x509.load_pem_x509_certificate(Path(cert).read_bytes())
+    san = loaded.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert [str(n.value) for n in san] == names
+    assert [(e.reason, e.old_sha256) for e in events] == [("bind_changed", old_sha)]
+    assert events[0].new_sha256 == _sha256(Path(cert)) != old_sha
+    # Once it names the bind, the next start reuses it and writes nothing.
+    again: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(ApiSettings(host=then), state_dir=tmp_path, replacements=again)
+    assert again == []
+
+
+def test_a_bind_move_back_to_a_name_the_pair_already_holds_reuses_it(tmp_path: Path) -> None:
+    """A wildcard's pair also names its loopback, so moving the bind to that loopback reuses it."""
+    ensure_api_tls_material(ApiSettings(host="0.0.0.0"), state_dir=tmp_path)
+    cert, _ = _generated_pair(tmp_path)
+    before = cert.read_bytes()
+    events: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(ApiSettings(host="127.0.0.1"), state_dir=tmp_path, replacements=events)
+    assert events == [] and cert.read_bytes() == before
+
+
+def test_a_shard_never_re_mints_for_a_bind_move(tmp_path: Path) -> None:
+    """``renew=False`` (an engine shard) reuses a loadable pair as found, the bind check included,
+    so a lone restarted shard cannot serve a different certificate from its siblings."""
+    ensure_api_tls_material(ApiSettings(host="127.0.0.1"), state_dir=tmp_path)
+    cert, _ = _generated_pair(tmp_path)
+    before = cert.read_bytes()
+    events: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(
+        ApiSettings(host="0.0.0.0"), state_dir=tmp_path, replacements=events, renew=False
+    )
+    assert events == [] and cert.read_bytes() == before
+
+
+def test_a_pair_not_the_engines_shape_is_never_re_minted_for_a_bind_move(tmp_path: Path) -> None:
+    """A certificate at the generated path that the engine did not mint is served as found."""
+    cert, key = _plant_generated_pair(tmp_path, lived_days=1, left_days=300, shape="issued")
+    before = _snapshot(cert, key)
+    events: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(ApiSettings(host="0.0.0.0"), state_dir=tmp_path, replacements=events)
+    assert events == [] and _snapshot(cert, key) == before
+
+
 def test_a_second_start_reuses_a_fresh_pair_and_never_re_mints(tmp_path: Path) -> None:
     # MINT ONCE, THEN REUSE WHILE FRESH. A pair with most of its lifetime left is never replaced:
     # early renewal (ADR 0172, 2026-09-26 amendment) starts only in its last third, and the tests
@@ -5083,6 +5153,12 @@ def _plant_generated_pair(
         .not_valid_after(now + left_days * _DAY)
         .add_extension(
             x509.BasicConstraints(ca=shape == "ca_true", path_length=None), critical=True
+        )
+        # The name a mint for the default bind carries, so a fresh planted pair is not replaced for
+        # a bind it does not name (BACKLOG #5973).
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+            critical=False,
         )
         .sign(signer, hashes.SHA256())
     )

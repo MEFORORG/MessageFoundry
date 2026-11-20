@@ -1850,6 +1850,26 @@ def _general_names(names: list[str]) -> list[x509.GeneralName]:
     return out
 
 
+def names_all_of(pem: bytes, names: list[str]) -> bool:
+    """True when the certificate's SubjectAlternativeName holds every name in ``names``.
+
+    Each name is classified as :func:`make_self_signed` classifies it (:func:`_general_names`), so a
+    certificate that function minted for ``names`` always answers ``True``. ``False`` when the
+    certificate has no SAN extension or one that cannot be read. Raises ``ValueError`` when ``pem``
+    is not a parseable certificate. Reads only the public certificate."""
+    cert = x509.load_pem_x509_certificate(pem)
+    try:
+        held = set(cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value)
+    except (
+        x509.ExtensionNotFound,
+        x509.DuplicateExtension,
+        x509.UnsupportedGeneralNameType,
+        ValueError,
+    ):
+        return False
+    return all(name in held for name in _general_names(names))
+
+
 def make_self_signed(cn: str, sans: list[str], days: int) -> tuple[bytes, bytes]:
     """Mint a self-signed EC P-256 cert + key, a TLS PLACEHOLDER. Returns ``(cert_pem, key_pem)``.
 
