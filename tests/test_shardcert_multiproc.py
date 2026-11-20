@@ -42,6 +42,7 @@ from harness.load.coord import (
     SHARDS_READY,
     SINK_BOUND,
     SINK_DONE,
+    CoordTimeout,
     FileDropCoord,
 )
 
@@ -1363,6 +1364,105 @@ async def test_gated_drive_notes_an_advisory_poll_that_raises(
     assert report.tallied_behind_gate
     assert report.drained is False
     assert any("advisory /stats drain poll failed" in n for n in report.notes), report.notes
+
+
+_BAD_DRIVE_VALUES = [float("nan"), float("inf"), 0.0, -1.0]
+
+
+@pytest.mark.parametrize("bad", _BAD_DRIVE_VALUES, ids=["nan", "inf", "zero", "negative"])
+@pytest.mark.parametrize("field", ["aggregate_rate", "hold_seconds"])
+@pytest.mark.parametrize("entry", ["drive", "driver", "driver_worker"])
+async def test_drive_entries_refuse_a_rate_or_hold_that_is_not_finite_and_positive(
+    tmp_path: Path, entry: str, field: str, bad: float
+) -> None:
+    """BACKLOG #5977, S27-64: the CLI parses ``--aggregate-rate``/``--hold-seconds`` with
+    ``type=float``, which takes nan, inf, 0 and negatives. Each entry refuses them with a ValueError
+    before any coord wait, so no SHARDS_READY is posted here. Red on the unvalidated code: the entry
+    waits for SHARDS_READY and raises CoordTimeout instead."""
+    coord = FileDropCoord(tmp_path, run_id=f"bad-{entry}-{field}")
+    shape: dict[str, Any] = {"aggregate_rate": 20.0, "hold_seconds": 1.0, field: bad}
+    calls: dict[str, Callable[[], Any]] = {
+        "drive": lambda: sc.run_shardcert_drive(
+            engine_host="10.0.0.5", coord=coord, shards_ready_timeout=0.05, **shape
+        ),
+        "driver": lambda: sc.run_shardcert_driver(
+            engine_host="10.0.0.5", coord=coord, shards_ready_timeout=0.05, **shape
+        ),
+        "driver_worker": lambda: sc.run_shardcert_driver_worker(
+            engine_host="10.0.0.5",
+            driver_index=0,
+            driver_count=1,
+            coord=coord,
+            shards_ready_timeout=0.05,
+            **shape,
+        ),
+    }
+    with pytest.raises(ValueError, match=f"{field} must be a finite number above 0"):
+        await calls[entry]()
+
+
+class _ExitedProc:
+    """A child that has already exited: ``returncode`` is set and its output is its last words."""
+
+    def __init__(self, returncode: int | None, output: bytes) -> None:
+        self.returncode = returncode
+        self._output = output
+
+    async def communicate(self) -> tuple[bytes, bytes]:
+        return (self._output, b"")
+
+    def kill(self) -> None:
+        self.returncode = -9
+
+
+async def test_drive_fails_fast_with_the_tail_of_a_child_that_exited_before_posting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5977, S27-65: a sink child that exits before posting SINK_BOUND must end the wait at
+    once, not after ``child_ready_timeout``, and the raised error carries the child's output tail
+    rather than leaving it in a note the unwinding CoordTimeout discards. Red on the unfixed code:
+    the drive waits out the 60s child_ready_timeout, so the 10s outer bound fires."""
+    coord, _ended = _gated_drive_fakes(monkeypatch, tmp_path, "crashedsink", poll_seconds=0.0)
+
+    async def crashed_spawn(argv: list[str]) -> _ExitedProc:
+        return _ExitedProc(
+            1, b"Traceback (most recent call last):\nValueError: synthetic sink crash\n"
+        )
+
+    monkeypatch.setattr(sc, "_spawn_proc", crashed_spawn)
+    with pytest.raises(CoordTimeout) as raised:
+        await asyncio.wait_for(
+            sc.run_shardcert_drive(
+                coord=coord, drain_timeout=1.0, child_ready_timeout=60.0, **_GATED_DRIVE_KWARGS
+            ),
+            timeout=10.0,
+        )
+    assert isinstance(raised.value, sc.ShardCertChildExited), repr(raised.value)
+    text = str(raised.value)
+    assert "sink-0" in text and "code 1" in text and f"{SINK_BOUND}.0" in text, text
+    assert "ValueError: synthetic sink crash" in text, text
+
+
+async def test_drive_timeout_carries_the_tail_of_a_child_still_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5977, S27-65: when a child never posts and never exits, the wait still times out,
+    and the CoordTimeout raised carries the reaped child's output tail. Red on the unfixed code: the
+    tail is appended only to the local notes, so the raised message names no child output."""
+    coord, _ended = _gated_drive_fakes(monkeypatch, tmp_path, "hungsink", poll_seconds=0.0)
+
+    async def hung_spawn(argv: list[str]) -> _ExitedProc:
+        return _ExitedProc(None, b"sink: waiting on a port that never bound\n")
+
+    monkeypatch.setattr(sc, "_spawn_proc", hung_spawn)
+    with pytest.raises(CoordTimeout) as raised:
+        await sc.run_shardcert_drive(
+            coord=coord, drain_timeout=1.0, child_ready_timeout=0.3, **_GATED_DRIVE_KWARGS
+        )
+    assert not isinstance(raised.value, sc.ShardCertChildExited)
+    text = str(raised.value)
+    assert f"{SINK_BOUND}.0" in text and "not received within 0.3s" in text, text
+    assert "[sink-0] sink: waiting on a port that never bound" in text, text
 
 
 async def test_coordinator_fails_loud_on_oversized_sink_count(
