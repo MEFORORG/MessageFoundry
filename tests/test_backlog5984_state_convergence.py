@@ -221,19 +221,42 @@ async def _promote_with_failing_reload(
         raise exc
 
     eng.store.reload_state_cache = _reload  # type: ignore[method-assign]
-    await eng.start()
+    try:
+        await eng.start()
+    except BaseException:
+        await eng.stop()
+        raise
     coord.leader = True
     return eng, coord, sink, calls
 
 
+class _DriverError(Exception):
+    """Stands in for pyodbc's ``Error`` root, which only ``store_connect_errors`` names."""
+
+
 @pytest.mark.parametrize(
     "exc",
-    [CipherError("state.value ns/MRN-0001: tag check failed"), RuntimeError("acquire timed out")],
-    ids=["cipher", "store-refusal"],
+    [
+        CipherError("state.value ns/MRN-0001: tag check failed"),
+        RuntimeError("acquire timed out"),
+        _DriverError("40001 deadlock victim"),
+    ],
+    ids=["cipher", "store-refusal", "driver-root"],
 )
 async def test_a_failed_promotion_reload_still_brings_the_graph_up(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture, exc: Exception
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    exc: Exception,
 ) -> None:
+    # pyodbc is an optional extra; stand its Error root in, so the store_connect_errors() half of
+    # the catch is exercised whether or not the driver is installed.
+    from messagefoundry.store.base import store_connect_errors
+
+    monkeypatch.setattr(
+        "messagefoundry.pipeline.engine.store_connect_errors",
+        lambda: (*store_connect_errors(), _DriverError),
+    )
     # A raise out of the re-read would abort _start_graph while this node holds the lease, and the
     # supervisor would retry the whole start every poll with no graph running. The re-read keeps the
     # cache it already holds, so the graph comes up on it. As the convergence pass does, the WARNING

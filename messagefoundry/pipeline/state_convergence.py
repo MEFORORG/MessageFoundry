@@ -40,7 +40,7 @@ from collections.abc import Awaitable, Callable
 
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 
-__all__ = ["STATE_CONVERGENCE_ALERT_SUBJECT", "StateConvergenceRunner"]
+__all__ = ["STATE_CONVERGENCE_ALERT_SUBJECT", "StateConvergenceRunner", "alert_state_cache_failure"]
 
 log = logging.getLogger(__name__)
 
@@ -159,4 +159,4 @@ def alert_state_cache_failure(sink: AlertSink | None, detail: str) -> None:
             STATE_CONVERGENCE_ALERT_SUBJECT, detail=detail
         )
     except Exception:
-        log.warning("transform-state convergence alert sink failed", exc_info=True)
+        log.warning("transform-state cache alert sink failed", exc_info=True)

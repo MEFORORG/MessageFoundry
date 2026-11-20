@@ -293,12 +293,13 @@ async def test_a_null_id_orphan_on_a_bound_store_does_not_stop_graph_bring_up(
 
 
 @pytest.mark.parametrize("cipher", ["keyless", "unbound"])
-async def test_a_null_id_orphan_on_a_store_that_does_not_bind_is_dead_lettered_as_before(
+async def test_a_null_id_orphan_on_a_store_that_does_not_bind_is_swept_as_before(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, cipher: str
 ) -> None:
     # Where the seal never refuses (no key, or [store].aad_bind off), each sweep treats a NULL-id
     # orphan as it did before BACKLOG #5962: it counts the row, writes its `dead` event and runs the
-    # finalizer. Its UPDATE ... WHERE id=? still matches nothing, as it always did.
+    # finalizer. Its UPDATE ... WHERE id=? still matches nothing, as it always did, so the row itself
+    # stays where it was: the main-branch behaviour, pinned here as it is, not endorsed.
     db = tmp_path / f"null_{cipher}.db"
     store = await (
         MessageStore.open(db)
@@ -317,6 +318,8 @@ async def test_a_null_id_orphan_on_a_store_that_does_not_bind_is_dead_lettered_a
         assert await _dead_events(store, mids["ingress"]) == 1
         assert await _dead_events(store, mids["outbound"]) == 1
         assert await _dead_events(store, mids["routed"]) == 2
+        for role in ("ingress", "outbound", "routed"):
+            assert await _queue_status(store, mids[role]) != ["dead"]
     finally:
         await store.close()
 

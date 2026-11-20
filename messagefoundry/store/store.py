@@ -16851,7 +16851,8 @@ class MessageStore:
             )
             await self._maybe_finalize_message(row["message_id"], now)
             killed.append(row)
-        await self._commit()
+        if killed:  # a sweep that only skipped wrote nothing to commit
+            await self._commit()
         _warn_unsealable_orphans(skipped, lane, what, missing)
         if killed:
             log.warning(
