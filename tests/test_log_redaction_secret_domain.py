@@ -1493,23 +1493,22 @@ def test_a_label_glued_after_a_dsn_is_masked_and_main_did_no_better(
 
 
 def test_an_empty_user_dsn_hides_an_equals_sign_and_states_its_residual() -> None:
-    """The residuals secretscrub's ``_WIDE_DSN_PASSWORD`` comment states, pinned both ways. A
-    password-only DSN whose value holds "=" is read; one holding ";" or "|" is not, and prints whole;
-    and with a user, a password that starts with "@" prints, as it did before #5386. A red on a
-    residual line means the comment is stale, not that a leak opened."""
+    """Empty-user DSN lines, pinned both ways; tests/test_b532r_redaction_segments.py pins more
+    residuals. A red on a residual line means the reading changed, not that a leak opened."""
     for line in ("redis://:pw=Eq_Sec-81@host", "ws://:8765=accessToken=Tail@Tok_Sec-82"):
         for out in (redact_log_line(line), scrub_credentials(line)):
             assert "Eq_Sec-81" not in out and "Tok_Sec-82" not in out, out
     assert "pw;Semi_Sec-83" in scrub_credentials("redis://:pw;Semi_Sec-83@host")
     assert "pw|Pipe_Sec-84" in scrub_credentials("redis://:pw|Pipe_Sec-84@host")
+    assert "p%7CKv9x" in scrub_credentials("redis://:p%7CKv9x@host")
     assert "Lead_At-74" in scrub_credentials("store dsn postgres://svc:@Lead_At-74@db.invalid/m")
-    # Round 4 review: a placeholder the PHI pass wrote first, a percent-encoded password, and a line
-    # where the union keeps the reading before whole, which runs no widened pass.
+    # Round 4 review: a placeholder the PHI pass wrote first is a residual. BACKLOG #5386's added
+    # item 3 hides the "%" line below; tests/test_b532r_redaction_segments.py holds the rest.
     chained = scrub_credentials(redact_untrusted("connect redis://:Zq7-19800505-Kv9x@host failed"))
     assert "Zq7-" in chained and "-Kv9x" in chained, chained
-    assert "p%40Kv9x" in scrub_credentials("redis://:p%40Kv9x@host")
-    kept_before = "connect redis://:Zq-Pw_1@h failed; userPwd='a;PWD=b c'"
-    assert "Zq-Pw_1" in scrub_credentials(kept_before)
+    assert "Kv9x" not in scrub_credentials("redis://:p%40Kv9x@host")
+    # A line where the union keeps the reading before whole is no longer a residual (BACKLOG #5386,
+    # added item 2); tests/test_b532r_redaction_dsn.py holds it. The control takes no union.
     assert "Zq-Pw_1" not in scrub_credentials("connect redis://:Zq-Pw_1@h failed")
 
 

@@ -107,6 +107,7 @@ from messagefoundry.config.tls_policy import (
     log_attested_crossing,
 )
 from messagefoundry.config.wiring import (
+    _INTAKE_KEY_MODES,
     CLEARTEXT_REVOCATION_KEYS,
     INTAKE_AUTH_RATE_LIMIT_DEFAULT,
     INTAKE_AUTH_RATE_LIMIT_GLOBAL_DEFAULT,
@@ -143,7 +144,9 @@ from messagefoundry.logging_guard import active_guard as active_log_guard
 from messagefoundry.netaddr import (
     ALLOWLIST_MIN_PREFIX_V4,
     ALLOWLIST_MIN_PREFIX_V6,
+    ALLOWLIST_RULE_TEXT,
     allowlist_restricts,
+    allowlist_shortfall,
 )
 from messagefoundry.parsing import (
     HL7PeekError,
@@ -16062,9 +16065,23 @@ def check_http_tls_exposure(
 
 
 #: The allow-list floors, owned by :mod:`messagefoundry.netaddr` since vault BACKLOG #2622 so the
-#: DICOM server's gate applies the same ones. Kept under these names for the refusal text below.
+#: DICOM server's gate applies the same ones. The refusal text below quotes netaddr's rule text,
+#: which the docs link to rather than restate; these names stay for the tests that probe the gate
+#: on both sides of each floor.
 _INTAKE_ALLOWLIST_MIN_PREFIX_V4 = ALLOWLIST_MIN_PREFIX_V4
 _INTAKE_ALLOWLIST_MIN_PREFIX_V6 = ALLOWLIST_MIN_PREFIX_V6
+
+#: The ``intake_auth`` modes :func:`_has_effective_peer_control` judges without the allow-list,
+#: built from wiring's key modes so a key mode added there is not read here as weighing the list.
+_INTAKE_MODES_JUDGED_ALONE = frozenset({*_INTAKE_KEY_MODES, "mtls_subject"})
+
+
+def _allowlist_weighed(settings: Mapping[str, Any]) -> bool:
+    """Whether the peer-control gate judges this listener by its ``source_ip_allowlist``: for any
+    ``intake_auth`` value but a mode judged alone, ``none`` or one ``Http()`` would have refused.
+    One reading, so :func:`check_http_intake_auth` names the list's shortfall exactly when
+    :func:`_has_effective_peer_control` weighed the list."""
+    return str(settings.get("intake_auth") or "none") not in _INTAKE_MODES_JUDGED_ALONE
 
 
 def _has_effective_peer_control(settings: Mapping[str, Any]) -> bool:
@@ -16077,14 +16094,12 @@ def _has_effective_peer_control(settings: Mapping[str, Any]) -> bool:
     configuration that fails this test is treated exactly as one with no control, and is not given a
     softer landing for having a control that does not work.
     """
-    mode = str(settings.get("intake_auth") or "none")
-    if mode in ("api_key", "bearer"):
-        return bool(settings.get("intake_api_key"))
-    if mode == "mtls_subject":
+    if _allowlist_weighed(settings):
+        return allowlist_restricts(settings.get("source_ip_allowlist"))
+    if str(settings.get("intake_auth")) == "mtls_subject":
         # The subject list is what tls_ca_file alone does not give you.
         return bool(settings.get("tls_ca_file")) and bool(settings.get("intake_client_subjects"))
-
-    return allowlist_restricts(settings.get("source_ip_allowlist"))
+    return bool(settings.get("intake_api_key"))  # api_key or bearer
 
 
 def check_http_sync_reply(
@@ -16243,16 +16258,19 @@ def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | N
     if _has_effective_peer_control(source.settings):
         return
 
+    # The list is weighed only when intake_auth names no mode the gate judges alone
+    # (_has_effective_peer_control), so only then is its shortfall the reason for this refusal.
+    allowlist = source.settings.get("source_ip_allowlist")
+    weighed = _allowlist_weighed(source.settings)
+    shortfall = allowlist_shortfall(allowlist) if allowlist and weighed else None
     detail = (
         f"inbound connection {name!r} binds non-loopback host {host!r} with no effective peer "
-        "control: anyone who can reach the socket can submit a message. Set intake_auth "
+        "control: anyone who can reach the socket can submit a message. "
+        + (f"The source_ip_allowlist set does not count: {shortfall}. " if shortfall else "")
+        + "Set intake_auth "
         "(api_key/bearer with intake_api_key, or mtls_subject with tls_ca_file + "
-        "intake_client_subjects), or narrow source_ip_allowlist so every entry is at least a "
-        f"/{_INTAKE_ALLOWLIST_MIN_PREFIX_V4} (IPv4) or /{_INTAKE_ALLOWLIST_MIN_PREFIX_V6} (IPv6). "
-        "An IPv6 entry inside a prefix the gate reads as carrying IPv4 addresses (at least "
-        "::ffff:0:0/96, 64:ff9b::/96 and 2001::/32) must also be at least a "
-        f"/{96 + _INTAKE_ALLOWLIST_MIN_PREFIX_V4}, and an IPv6 entry that holds such a prefix, "
-        "such as 64:ff9b::/32, does not count. "
+        "intake_client_subjects), or narrow source_ip_allowlist until it counts, which it does "
+        f"when {ALLOWLIST_RULE_TEXT}. "
         "Note that tls + tls_ca_file alone does NOT satisfy this: it accepts any certificate that CA "
         "ever signed, which binds no subject. TLS is confidentiality; this gate is authentication."
     )

@@ -244,7 +244,11 @@ spec:
             # your attestation, so it comes from the Secret's tls-revocation-attested key and this
             # file never writes it. The key is NOT optional: without it the kubelet refuses to start
             # the container, rather than the engine exiting and restarting forever. Set it to 1 only
-            # if your PKI enforces revocation; a value the engine reads as false still refuses.
+            # if your PKI enforces revocation for the certificates the engine serves and accepts. A
+            # value the engine reads as false, such as 0, passes the kubelet and then crash-loops the
+            # engine, which still refuses the bind. Outbound hops, the Postgres store hop among them,
+            # read the same variable with a different effect (docs/DEPLOYMENT.md, "Revocation-guard
+            # behavior").
             - name: MEFOR_TLS_REVOCATION_ATTESTED
               valueFrom: { secretKeyRef: { name: mefor-secrets, key: tls-revocation-attested } }
             - { name: MEFOR_INBOUND_BIND_HOST, value: "0.0.0.0" }   # each MLLP() must set tls=True (exposure gate)

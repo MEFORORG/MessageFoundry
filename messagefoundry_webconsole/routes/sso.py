@@ -22,8 +22,8 @@ from messagefoundry.api.security import (
 
 from .. import pages
 from .._auth import (
-    session_token,
     set_session_cookie,
+    superseded_session_token,
 )
 
 _log = logging.getLogger(__name__)
@@ -96,7 +96,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # leg's start page does for OIDC. A same-site navigation, such as the login page's own link,
         # carries the cookie and is covered.
         outcome = await auth.authenticate_kerberos(
-            token_bytes, client=client, supersedes=session_token(request)
+            token_bytes,
+            client=client,
+            # Bounded, as /ui/login bounds it and the engine does again (BACKLOG #5397 added item 2).
+            supersedes=superseded_session_token(request),
         )
         alert_directory_administrator_granted(
             request.app.state, outcome, via="directory_sign_in_sso"

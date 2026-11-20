@@ -200,7 +200,8 @@ and uses your user value or the default instead, until you trust the workspace (
   `-P -X disable-remote-debug` as serve does, so the working directory is not put on the import
   path: a config module can import its `_`-prefixed siblings, but not a top-level workspace package
   that the interpreter cannot otherwise import. The Test Bench's Debug launch goes through debugpy
-  and does not take these options.
+  and passes it the same options; an older debugpy that ignores `-P` when it runs a module may still
+  put the working directory on the import path.
 - `messagefoundry.configDir` (default `samples/config`) — config modules directory. This,
   `serviceConfig` and `messageSetsDir` are relative to the workspace folder. A value set in workspace
   settings whose spelling names a path outside the first workspace folder is not used, nor is a user
@@ -211,9 +212,25 @@ and uses your user value or the default instead, until you trust the workspace (
   command, New Route, version-control setup and the security editor. A user value does not lift
   that refusal; to use a path elsewhere, remove the workspace value and set the path in user
   settings. Version-control setup writes no commit hook when either folder lies outside the
-  workspace, because the hook is committed; it still sets up the rest. The check reads the spelling only, so it does not catch a link or junction inside
-  the folder that leads out of it; the New Route wizard and the security editor make their own link
-  checks before they write.
+  workspace, because the hook is committed; it still sets up the rest. Readers compare the spelling
+  only. Writers also check the real path, in a trusted window. They refuse a value spelled inside the
+  folder when at least one of these holds:
+  - a symbolic link or junction on the named path leads out of the folder;
+  - the value climbs with `..`;
+  - its real path cannot be read;
+  - on Windows, a folder or file name on it ends in a dot or a space;
+  - on Windows, a folder or file name on it holds a colon, which Windows opens as a stream on
+    another entry.
+
+  The fix is a plain folder or file inside the workspace folder. Commands other than New Route and
+  the commit hook also take a link's target as an absolute path in user settings, once any
+  workspace value for the setting is removed, since a workspace value wins. For a set but
+  blank `serviceConfig`, the check reads the CLI's own fallback, `messagefoundry.toml` in the
+  workspace folder. The check reads the named path only, so a link below it is still followed, such
+  as a linked folder under `configDir`. The security editor does not run this check. It makes its
+  own: it collapses a `..` rather than refusing it, and it refuses a link anywhere on the named
+  path below the workspace folder. On Windows it also refuses a name that ends in a dot or a space or holds a colon.
+  The New Route wizard makes its own link check as well.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. The security
   editor refuses a workspace-set value outside the workspace folder, and any path inside the folder
@@ -253,6 +270,9 @@ and uses your user value or the default instead, until you trust the workspace (
   commit-time checks when a config project has no git repo yet.
 - `messagefoundry.ai.contextCharLimit` (default `8000`) — how much of the active editor's **code** may
   ride along on a `@messagefoundry` chat request (`0` sends only the graph names). Never message bodies.
+  A workspace value can only lower the limit your user value, or else the default, sets; one above it
+  is ignored, so a repository's settings cannot make the extension send more of your code. To send
+  more, raise the user value and remove any lower workspace value.
 - `messagefoundry.liveDebug.debounceMs` (default `400`) — debounce before Live Debug re-runs `dryrun`
   after a save.
 - `messagefoundry.liveStatus.enabled` (default `false`) / `messagefoundry.liveStatus.intervalSeconds`

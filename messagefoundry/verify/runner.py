@@ -103,7 +103,9 @@ def _load_settings(service_config: str | None) -> tuple[ServiceSettings | None, 
         # OSError covers a --service-config that names a DIRECTORY; the mechanism is stated once,
         # at messagefoundry.__main__._load_service_settings. It costs more here than there: the
         # report IS this command's output, so a traceback leaves an operator with no report at all.
-        return None, settings_error_detail(exc)
+        # The message is returned as written, so a validator that quotes the value it refused, at
+        # least a URL's userinfo, still shows it; the report leaves the box (BACKLOG #5395).
+        return None, safe_detail_text(settings_error_detail(exc), limit=DRIVER_DETAIL_LIMIT)
     # Every store check below then tests the store serve opens, not one beside the working
     # directory (BACKLOG #5926).
     anchor_settings_store_path(settings, cwd=Path.cwd())

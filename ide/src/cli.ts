@@ -17,14 +17,18 @@ import {
   type CliResult,
 } from "./cliJson";
 import { connectionServiceConfig, settingIsSet } from "./connectionWizardModel";
+import { contextCharLimitOf } from "./aiPolicyModel";
 import { cliArgv } from "./engineControlModel";
 import { LENS_CONTRACT, isUnknownArgumentError, looksLikeUnknownArgument } from "./stepsModel";
 import type { LensParseResult, OpSchema } from "./stepsModel";
 import {
   containedPathSetting,
   droppedNotice,
+  escapesByLink,
+  linkEscapeRefusal,
   writerRefusal,
   type ContainedPathSetting,
+  type PathSettingKey,
 } from "./workspaceContainment";
 
 // Parsing lives in cliJson.ts (no vscode, so the unit suite runs it). Every importer of CliResult
@@ -94,9 +98,6 @@ export function isExecGated(): boolean {
  *  named once a session rather than on every CLI call, and a new dropped value is named again. */
 const droppedPathSettings = new Set<string>();
 
-/** The workspace-relative path settings {@link containedPathSetting} contains. */
-export type PathSettingKey = "configDir" | "serviceConfig" | "messageSetsDir";
-
 /**
  * A workspace-relative path setting, contained to the workspace folder by
  * {@link containedPathSetting} (BACKLOG #5404): a workspace value that leaves the folder, or a user
@@ -132,11 +133,26 @@ export function writerCheckSetting(key: PathSettingKey): ContainedPathSetting {
   return pathSetting(key, PATH_FALLBACK[key], false);
 }
 
-/** {@link writerPathSetting}'s reading with its scope, or undefined after the refusal is shown. */
+/**
+ * {@link writerPathSetting}'s reading with its scope, or undefined after the refusal is shown. The
+ * link check ({@link escapesByLink}, BACKLOG #5404 item 1) runs only in a trusted window, so an
+ * untrusted one touches no file before its own trust refusal: there the writer's CLI call is refused
+ * by the exec gate ({@link isExecGated}), and the writers that write without the CLI refuse an
+ * untrusted window themselves.
+ */
 function writerSetting(key: PathSettingKey): ContainedPathSetting | undefined {
   const s = writerCheckSetting(key);
   if (s.dropped !== false) {
     void vscode.window.showErrorMessage(writerRefusal(key, s.dropped));
+    return undefined;
+  }
+  // A blank serviceConfig sends no --service-config (connectionServiceConfig), so the CLI opens its
+  // own fallback, `./messagefoundry.toml` in the workspace folder, at least serve does. That file is
+  // checked in its place, since the blank value names the folder itself.
+  const blank = key === "serviceConfig" && s.value.trim() === "";
+  const checked = blank ? PATH_FALLBACK.serviceConfig : s.value;
+  if (!isExecGated() && escapesByLink(workspaceDir(), checked)) {
+    void vscode.window.showErrorMessage(linkEscapeRefusal(key, blank ? checked : undefined));
     return undefined;
   }
   return s;
@@ -295,12 +311,12 @@ export function messageSetsDirSetting(): ContainedPathSetting {
 /**
  * Max characters of active-editor code attached to a `@messagefoundry` AI chat request
  * (`messagefoundry.ai.contextCharLimit`, default 8000). Bounds how much of the user's own code
- * egresses to their chosen model provider. A non-numeric/negative value (which the settings schema
- * already discourages) falls back to the default; `0` means "graph names only, no editor code".
+ * egresses to their chosen model provider; `0` means "graph names only, no editor code". A
+ * workspace value may only LOWER the bound that the user's own value or the default sets, never
+ * raise it (BACKLOG #5404 item 2); see {@link contextCharLimitOf}.
  */
 export function aiContextCharLimit(): number {
-  const v = config().get<number>("ai.contextCharLimit", 8000);
-  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? Math.floor(v) : 8000;
+  return contextCharLimitOf(config().inspect("ai.contextCharLimit"));
 }
 
 export function workspaceDir(): string | undefined {

@@ -23,8 +23,9 @@ only the metadata-only status models; and ``.env`` / ``*.db`` / ``MEFOR_*`` are 
 bundle. **The app-log tail is the exception.** It reads the app log, which can hold a residual secret
 the redaction pass does not read, and, on a non-production instance running at ``DEBUG``, a full
 message body (``docs/PHI.md`` §7, the prod-``DEBUG`` refusal), so the redacted tail can still carry
-either. What the archive does and does not hold is stated once, in the manifest's ``phi_contract``
-(BACKLOG #5385), and ``docs/PHI.md`` stream 14 is the record.
+either. The manifest's ``phi_contract`` states what the archive does and does not hold (BACKLOG
+#5385), the ``support-bundle`` CLI help repeats its log-tail residual in the same terms, and
+``docs/PHI.md`` stream 14 is the record.
 
 That rule reaches the FAILURE branches too, which is where it used to fail (BACKLOG #1571). A caught
 exception's **message** never enters the bundle: config loading wraps text raised by arbitrary operator
@@ -361,8 +362,9 @@ def build_bundle(
     is already broken.
 
     Returns a :class:`BundleResult` (the path + member names). The caller is responsible for picking a
-    PHI-safe destination; this function never reads ``.env`` / ``*.db`` content into the bundle nor any
-    secret value."""
+    PHI-safe destination. This function never copies ``.env`` / ``*.db`` content into the bundle, but
+    the bundle is neither secret-free nor PHI-free: the app-log tail is only best-effort redacted,
+    and the manifest's ``phi_contract`` names at least what survives it (BACKLOG #5385)."""
     now = time.time() if now is None else now
     members: dict[str, str] = {}
 
@@ -389,8 +391,8 @@ def build_bundle(
         "members": sorted(members),
         # An explicit, auditable statement of what is and isn't in the bundle (the PHI contract). It
         # is machine-readable and a reviewer may rely on it, so it claims no more than every member
-        # meets, and it is the one place the log tail's residual is stated (BACKLOG #5385; the CLI
-        # help made the same repair under BACKLOG #1475).
+        # meets. The CLI help repeats its log-tail residual (BACKLOG #1475, #5385), and
+        # tests/test_support_bundle.py holds the two to the same terms, so change both together.
         "phi_contract": (
             "no member reads a message body from the store; config summary is counts/names only and "
             "holds no secret; status is the metadata-only status models; the app-log tail is a "

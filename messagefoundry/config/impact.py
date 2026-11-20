@@ -52,7 +52,13 @@ from messagefoundry.config.reachability import (
     source_lines,
     table_kinds,
 )
-from messagefoundry.config.wiring import Registry, WiringError, config_py_files
+from messagefoundry.config.wiring import (
+    CASE_TWIN_TABLES,
+    Registry,
+    WiringError,
+    case_twins,
+    config_py_files,
+)
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.redaction import safe_exc
@@ -69,6 +75,9 @@ __all__ = [
 RENAMEABLE_KINDS = frozenset(
     {"inbound", "router", "handler", "outbound", "code_set", "reference", "lookup", "fhir_lookup"}
 )
+
+#: The rename kinds whose table refuses case twins at load (BACKLOG #5392).
+_CASE_TWIN_KINDS = frozenset(kind for kind, _attribute, _label in CASE_TWIN_TABLES)
 
 #: Kinds whose rename implies renaming a file on disk (a ``codesets/<name>.csv`` table), so ``new`` gets
 #: the stricter file-stem name-safety codeset_edit enforces. Only ``code_set`` is file-backed: a
@@ -214,16 +223,16 @@ def plan_rename(
             f"cannot rename {target_kind} {old!r} to {new!r}: {new!r} already names a "
             f"registered {target_kind}"
         )
-    # And onto a case twin of another connection, which graph_problems refuses (BACKLOG #5392).
-    if target_kind in ("inbound", "outbound"):
-        folded = new.casefold()
-        twin = next(
-            (n for n in _table(registry, target_kind) if n != old and n.casefold() == folded), None
-        )
+    # And onto a case twin of another name in a table graph_problems refuses case twins in
+    # (BACKLOG #5392).
+    # The same fold, through case_twins: `new` goes last, so a pair naming it is (twin, new).
+    if target_kind in _CASE_TWIN_KINDS:
+        others = [name for name in _table(registry, target_kind) if name != old]
+        twin = next((first for first, second in case_twins([*others, new]) if second == new), None)
         if twin is not None:
             raise WiringError(
-                f"cannot rename {target_kind} {old!r} to {new!r}: it differs only in case from "
-                f"the registered {target_kind} {twin!r}"
+                f"cannot rename {target_kind} {old!r} to {new!r}: it differs only in case, width "
+                f"or trailing spaces from the registered {target_kind} {twin!r}"
             )
 
     sources = SourceCache()

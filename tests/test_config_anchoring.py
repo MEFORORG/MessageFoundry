@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import textwrap
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -311,6 +312,68 @@ def test_absolute_db_bypasses_root_at_serve(
     )
     # AC-7: an absolute --db is honored as-is, ignoring the root.
     assert store_path == abs_db
+
+
+@pytest.mark.skipif(
+    Path("/data/mf.db").is_absolute(), reason="a leading slash is drive-relative only on Windows"
+)
+def test_a_drive_relative_db_stays_under_the_root_at_serve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5391 item 1, S19-26: ``_serve`` anchors ``[store].path`` through
+    ``anchored_store_path``. A direct ``root / path`` join lets a leading-slash path discard the
+    root on Windows and name a store on the launch drive's root, with no warning. The path comes
+    from the settings file, because a ``--db`` is anchored before the load as well.
+
+    The TLS pair is minted beside the store, so a regressed join would mint a private key on the
+    launch drive's root. The mint is refused outside ``tmp_path`` instead, which fails the start."""
+    import messagefoundry.api.tls as api_tls
+    from messagefoundry.restricted_file import RestrictedFileError
+
+    real_mint = api_tls.ensure_api_tls_material
+
+    def _mint_inside_tmp(api: Any, *, state_dir: Path, **kwargs: Any) -> Any:
+        if not Path(state_dir).resolve().is_relative_to(tmp_path.resolve()):
+            raise RestrictedFileError(f"test refuses to mint outside tmp_path: {state_dir}")
+        return real_mint(api, state_dir=state_dir, **kwargs)
+
+    monkeypatch.setattr(api_tls, "ensure_api_tls_material", _mint_inside_tmp)
+    cfg = _config_dir(tmp_path, _NO_ENV_GRAPH)
+    root = tmp_path / "repo"
+    root.mkdir()
+    svc = tmp_path / "messagefoundry.toml"
+    svc.write_text(
+        f'[environments]\nbase_dir = "{root.as_posix()}"\n\n[store]\npath = "/data/mf.db"\n',
+        encoding="utf-8",
+    )
+    argv = ["serve", "--config", str(cfg), "--service-config", str(svc), "--env", "dev"]
+    assert _serve_capturing_store_path(tmp_path, monkeypatch, argv) == str(root / "data" / "mf.db")
+
+
+@pytest.mark.skipif(
+    Path("/data/mf.db").is_absolute(), reason="a leading slash is drive-relative only on Windows"
+)
+def test_a_drive_relative_db_stays_under_the_root_at_the_fleet_renewal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5391 item 1, S19-26: the supervisor's TLS-pair renewal derives the state dir from
+    the anchored store path, so a drive-relative ``--db`` names the pair under the root that each
+    engine shard's ``serve`` uses, never one on the launch drive's root."""
+    from messagefoundry.__main__ import _renew_api_tls_before_spawning
+    from messagefoundry.config.settings import load_settings
+
+    seen: list[Path] = []
+
+    def _no_mint(_api: object, *, state_dir: Path, replacements: list[object]) -> None:
+        seen.append(Path(state_dir))
+
+    monkeypatch.setattr("messagefoundry.api.tls.ensure_api_tls_material", _no_mint)
+    settings = load_settings(
+        environ={"MEFOR_ENVIRONMENTS_BASE_DIR": str(tmp_path)}, default_file=False
+    )
+    state_dir = _renew_api_tls_before_spawning(settings, "/data/mf.db")
+    assert seen == [Path(state_dir)]
+    assert Path(state_dir) == (tmp_path / "data").resolve()
 
 
 def test_no_root_keeps_db_default_at_serve(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

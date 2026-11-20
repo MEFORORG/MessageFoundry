@@ -7,7 +7,12 @@
 import * as path from "node:path";
 
 import type { Field, FieldType } from "./securityEditorWebview";
-import type { ContainedPathSetting, PathSettingScopes } from "./workspaceContainment";
+import {
+  hasColonInName,
+  hasTrailingDotOrSpaceName,
+  type ContainedPathSetting,
+  type PathSettingScopes,
+} from "./workspaceContainment";
 
 /**
  * The value and scope {@link securityConfigTarget} judges for `messagefoundry.serviceConfig`, from
@@ -96,7 +101,10 @@ function noLinkBelow(root: string, rel: string, fsx: LinkFs): boolean {
  *    the CLI's open goes through Windows path normalization, which can drop the ending and open
  *    another entry. Measured through Python 3.14.7's open, it dropped at least every trailing dot
  *    and space from the file name and one trailing dot from a folder name, and kept a folder name's
- *    trailing space. The check refuses every such name, the ones kept as written included. Then
+ *    trailing space. The check refuses every such name, the ones kept as written included. A
+ *    folder or file name below the workspace folder that holds a colon is refused there too, before
+ *    any file-system call, since a Win32 open reads it as a stream on another entry, which may be a
+ *    link out of the folder ({@link hasColonInName} says why the link walk cannot be relied on). Then
  *    every existing path below the workspace folder, down to the target, must lstat as not a link,
  *    a dangling one included; the walk stops at the first that does not exist. The deepest
  *    existing one must then realpath to the folder's own realpath joined with the same parts,
@@ -146,12 +154,20 @@ export function securityConfigTarget(
     }
     return { ok: true, path: target };
   }
-  if (path.sep === "\\" && rel.split(path.sep).some((part) => part.endsWith(".") || part.endsWith(" "))) {
+  if (hasTrailingDotOrSpaceName(rel)) {
     return {
       ok: false,
       problem:
         "messagefoundry.serviceConfig names a path in the workspace folder with a folder or file name that ends in " +
         "a dot or a space, which Windows can open as a different name. Remove the trailing dot or space",
+    };
+  }
+  if (hasColonInName(rel)) {
+    return {
+      ok: false,
+      problem:
+        "messagefoundry.serviceConfig names a path in the workspace folder with a folder or file name that holds " +
+        "a colon, which Windows opens as a stream on another entry. Remove the colon",
     };
   }
   if (!noLinkBelow(root, rel, fsx)) {

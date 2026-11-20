@@ -11,8 +11,10 @@ underscore so the unrelated long-base64 sweep cannot be what hides it.
 
 from __future__ import annotations
 
+import importlib
 import socket
 import ssl
+import sys
 from pathlib import Path
 
 import pytest
@@ -334,9 +336,9 @@ def test_a_password_equal_to_another_printed_word_is_hidden_at_every_occurrence(
     set the code used before prints the word twice."""
     import re
 
+    from messagefoundry import verify_leaf as model
     from messagefoundry.redaction import redact
     from messagefoundry.secretscrub import scrub_credentials
-    from messagefoundry.verify import model
 
     def count(out: str) -> int:
         return len(re.findall(r"\bsvcadmin\b", out))
@@ -369,9 +371,9 @@ def test_a_password_glued_to_punctuation_is_hidden_at_every_occurrence(text: str
     import re
     from collections import Counter
 
+    from messagefoundry import verify_leaf as model
     from messagefoundry.redaction import redact
     from messagefoundry.secretscrub import scrub_credentials
-    from messagefoundry.verify import model
 
     ph = model._PLACEHOLDER
     detail = model.safe_detail_text(text)
@@ -390,6 +392,64 @@ def test_a_password_glued_to_punctuation_is_hidden_at_every_occurrence(text: str
         phi_first,
     )
     assert "Kv9x7Qz3" in before, before
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Login Password: Kv9x7Qz3 then token=tk-1,mrn: Kv9x7Qz3",
+        "Login Password: Kv9x7Qz3 retry token=tk-1,mrn: Kv9x7Qz3 now",
+        # Code review round 1: the clauses swapped, so a placeholder that hid several source
+        # tokens left a forward-only walk behind and placed the password on the earlier copy.
+        "token=tk-1,mrn: Kv9x7Qz3 Login Password: Kv9x7Qz3",
+        "token=tk-1,mrn: Kv9x7Qz3 Svc Account Login Password: Kv9x7Qz3",
+        # ...and placeholders the source already held, which the walk did not count as slots.
+        "[redacted] [redacted] Login Password: Kv9x7Qz3 then token=tk-1,mrn: Kv9x7Qz3",
+        # Code review round 2: a trailing name misled the backward walk of the other order too.
+        "token=tk-1,mrn: Kv9x7Qz3 Login Password: Kv9x7Qz3 Mary Ann Lee Smith",
+    ],
+)
+def test_a_password_each_order_prints_at_a_different_place_is_hidden(text: str) -> None:
+    """BACKLOG #5395 added item 2: the comparison counted fragments and never placed them. Here the
+    PHI-first order prints the password and hides the copy after ``mrn:``, the credentials-first
+    order does the reverse, so the counts are equal and the password printed. Control: the
+    count-only comparison the code used before prints it."""
+    import re
+    from collections import Counter
+
+    from messagefoundry import verify_leaf as model
+    from messagefoundry.redaction import redact
+    from messagefoundry.secretscrub import scrub_credentials
+
+    detail = model.safe_detail_text(text)
+    assert "Kv9x7Qz3" not in detail, detail
+
+    ph = model._PLACEHOLDER
+    phi_first = scrub_credentials(redact(text), placeholder=ph)
+    credentials_first = redact(scrub_credentials(text, placeholder=ph))
+    printed = Counter(p for w in credentials_first.split() for p in model._fragments(w))
+    shown = Counter(p for w in phi_first.split() for p in model._fragments(w))
+    counted_only = re.sub(
+        r"\S+",
+        lambda m: m[0] if all(shown[p] <= printed[p] for p in model._fragments(m[0])) else ph,
+        phi_first,
+    )
+    assert "Kv9x7Qz3" in counted_only, counted_only
+
+
+def test_a_word_either_order_hid_a_copy_of_is_hidden_everywhere() -> None:
+    """Each order hid a different copy of ``X X``, so the counts are equal and both orders print
+    one copy. The test is against the source, which holds two."""
+    from messagefoundry import verify_leaf as model
+
+    ph = model._PLACEHOLDER
+    assert model._printed_by_both(f"{ph} Kv9x7Qz3", f"Kv9x7Qz3 {ph}", "Kv9x7Qz3 Kv9x7Qz3") == (
+        f"{ph} {ph}"
+    )
+    # Control: a word neither order hid any copy of is kept, at every copy.
+    assert model._printed_by_both("at Kv9x7Qz3 at", "at Kv9x7Qz3 at", "at Kv9x7Qz3 at") == (
+        "at Kv9x7Qz3 at"
+    )
 
 
 def test_the_placeholder_is_not_an_html_tag() -> None:
@@ -417,9 +477,9 @@ def test_placeholders_past_the_window_do_not_call_scanned_text_unscanned() -> No
     """An input inside the window whose placeholders push the cleaned text past it: every character
     was scanned, so the detail carries no unscanned note, and what the length bound held back is
     counted. Control: ``safe_text`` over that cleaned text at its default window writes the note."""
+    from messagefoundry import verify_leaf as model
     from messagefoundry.redaction import _REDACT_WINDOW, safe_text
     from messagefoundry.secretscrub import scrub_credentials
-    from messagefoundry.verify import model
 
     text = "PWD=x; " * (_REDACT_WINDOW // 8)
     assert len(text) < _REDACT_WINDOW
@@ -540,3 +600,60 @@ def test_the_graph_read_failure_reason_hides_the_credential(
     hops = runner._driver_hops(None, None, str(tmp_path), lambda: Registry())
     assert hops.unknown is not None and "graph read raised" in hops.unknown
     assert _PLANTED not in hops.unknown, hops.unknown
+
+
+# --- The arms that still quoted an exception raw (BACKLOG #5395 added item 1) ---------------------
+
+
+def test_a_federation_file_read_failure_hides_the_credential(tmp_path: Path) -> None:
+    """The ``fed`` file read quotes the path, and the OSError quotes it again."""
+    from messagefoundry.verify import federation
+
+    path = tmp_path / f"jwks password={_PLANTED}.json"
+    _, row = federation._read(str(path), "fed.jwks", "JWKS")
+    assert row is not None
+    _assert_hidden(row, "could not read ")
+
+
+def test_a_federation_unforeseen_failure_hides_the_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import messagefoundry.auth.oidc as oidc
+    from messagefoundry.verify import federation
+
+    def boom(_jwks: bytes) -> object:
+        raise RuntimeError(_LEAKY)
+
+    monkeypatch.setattr(oidc, "parse_jwks", boom)
+    _, row = federation._jwks_row(b"{}")
+    _assert_hidden(row, "RuntimeError: ")
+
+
+class _UnstatablePath:
+    def is_dir(self) -> bool:
+        raise OSError(_LEAKY)
+
+    def __str__(self) -> str:
+        return "/srv/mefor"
+
+
+def test_the_writable_dir_stat_failure_hides_the_credential() -> None:
+    from typing import cast
+
+    row = checks.check_writable_dir(cast("Path", _UnstatablePath()))
+    _assert_hidden(row, "cannot stat /srv/mefor: ")
+
+
+def test_the_console_window_import_failure_hides_the_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom(name: str) -> object:
+        raise ImportError(_LEAKY)
+
+    monkeypatch.setattr(importlib, "import_module", boom)
+    # The import is reached on Windows only; elsewhere the row is the platform SKIP.
+    monkeypatch.setattr(sys, "platform", "win32")
+    row = checks.check_console_no_window()
+    assert row.status is Status.SKIP
+    assert _PLANTED not in row.detail, row.detail
+    assert "not importable: " in row.detail

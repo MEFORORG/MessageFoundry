@@ -94,11 +94,7 @@ from messagefoundry.config.tls_policy import (
     skips_validity_period,
 )
 from messagefoundry.keywrap import load_connection_cert_chain
-from messagefoundry.netaddr import (
-    ALLOWLIST_MIN_PREFIX_V4,
-    ALLOWLIST_MIN_PREFIX_V6,
-    allowlist_restricts,
-)
+from messagefoundry.netaddr import ALLOWLIST_RULE_TEXT, allowlist_restricts, allowlist_shortfall
 from messagefoundry.parsing.binary import BinaryCarriageError
 from messagefoundry.parsing.binary import decode as _carriage_decode
 from messagefoundry.parsing.dicom import _inflate as _dicom_inflate
@@ -1975,8 +1971,9 @@ class DicomScpSource(SourceConnector):
         # PAIRED with a control that can actually be verified.
         #
         # The allow-list is weighed, not counted (vault BACKLOG #2622 item 2): ["0.0.0.0/0"] parses
-        # and restricts nobody, so it is held to the same prefix floors as the HTTP intake gate, by
-        # the same function (netaddr.allowlist_restricts).
+        # and restricts nobody, so it is held to the same allow-list rule as the HTTP intake gate, by
+        # the same function (netaddr.allowlist_restricts). The rule is stated once, as
+        # netaddr.ALLOWLIST_RULE_TEXT: per-entry floors and a whole-list cap (vault BACKLOG #5393).
         #
         # NOT BUILT HERE, dated 2026-10-06: mTLS is still counted by presence. tls + tls_ca_file
         # accepts any certificate that CA signed and binds no client subject, which the HTTP gate
@@ -1995,14 +1992,10 @@ class DicomScpSource(SourceConnector):
                 else ""
             )
             too_wide = (
-                " You set source_ip_allowlist, but an entry in it is wider than"
-                f" /{ALLOWLIST_MIN_PREFIX_V4} (IPv4) or /{ALLOWLIST_MIN_PREFIX_V6} (IPv6), is an"
-                " IPv6 entry inside a prefix the gate reads as carrying IPv4 addresses (at least"
-                " ::ffff:0:0/96, 64:ff9b::/96 and 2001::/32) that is wider than"
-                f" /{96 + ALLOWLIST_MIN_PREFIX_V4}, is an IPv6 entry that holds such a prefix,"
-                " such as 64:ff9b::/32, or does not parse, so it"
-                " restricts nobody it can be shown to and does not count (vault"
-                " BACKLOG #2622, #5393). Narrow every entry."
+                " You set source_ip_allowlist, but it does not count as a peer control:"
+                f" {allowlist_shortfall(self._source_ip_allowlist)}. It counts only when"
+                f" {ALLOWLIST_RULE_TEXT} (vault BACKLOG #2622, #5393). Narrow every entry, or list"
+                " fewer."
                 if self._source_ip_allowlist
                 else ""
             )

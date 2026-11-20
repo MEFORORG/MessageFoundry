@@ -818,18 +818,26 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    range, so the prior key can never open another. `rotate-key` under it re-seals the data and then
    refuses at the audit step, and leaves you worse off. A skip clears when you fix its cause, or
    remove that upload's two files, and re-run: the roll is then a verified no-op and the stamp
-   follows. A new key is only for leaving this key, and clears no skip. Keep the prior key in
+   follows. For a skip whose sidecar every reader refuses, as below, remove that upload's files
+   only deliberately: the sidecar may hold a value under the prior key, so keep that key until the
+   sidecar is fixed or so removed. `rotate-key` gives its advice to remove an upload's two files
+   only for its other skips. A new key is only for leaving this key, and clears no skip. Keep the prior key in
    `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` until a run completes, because a skipped upload may still be
    under it. **To read the chain,** run `messagefoundry audit-verify` with the new key active and the
    prior key retired. If it warns that the audit chain's current range is keyed under a retired
    store key, the chain has not rolled, so you may put the prior key back, with the new key in
    `MEFOR_STORE_ENCRYPTION_KEYS_RETIRED` because values may already be under it, and re-run. If it
-   gives no such warning, or you cannot tell, do not put the prior key back: go forward. **Some skips need a person (BACKLOG #3737).** A sidecar that is not
-   UTF-8, or a sealed value the key it names does not open, is skipped on every run, because no
-   key will ever open it. Restore that upload, or remove its two files from the uploads directory.
-   The log names each skipped file, and says whether the key its marker names is configured. A file
-   larger than an upload can be is skipped too, and only its first bytes are read. One that starts
-   with the active key's marker reads as already current instead, and is not reported. If a skipped
+   gives no such warning, or you cannot tell, do not put the prior key back: go forward. **Some skips need a person (BACKLOG #3737).** A sealed value the
+   key it names does not open is skipped on every run, because no key will ever open it. Restore
+   that upload, or remove its two files from the uploads directory. A sidecar every reader refuses
+   before decrypting, as below, is skipped on every run too, but it is neither decrypted nor
+   looked inside, so it may hold a value under the prior key: do not retire that key until the sidecar is fixed, as by restoring
+   it, or deliberately removed. The log names each skipped file. For a sealed value no key opens,
+   it also says whether the key its marker names is configured, where the marker names one; for a
+   refused sidecar it names the refusal instead, not whether any key is configured. A file
+   larger than an upload can be is skipped too, and only its first bytes are read. A body that
+   starts with the active key's marker reads as already current instead, and is not reported; a
+   sidecar does not, since it is decoded whole first. If a skipped
    one is a real upload from before `[store].max_upload_bytes` came down, raise that setting for the
    run. **A symlink at an upload's
    path is not followed, and it is a skip**, because its target may be a real upload under the
@@ -870,27 +878,83 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    blank sidecar, or one that is not UTF-8, is the damaged kind below. A plaintext
    sidecar that is not UTF-8 only past that part is removed by the prune at expiry, and since
    BACKLOG #5388 the same override holder can delete it through the API too: the read's decode
-   error is refused as damaged, and the delete then classes it.
+   error is refused as damaged, and the delete then classes it. A plaintext sidecar refused as
+   oversized (below) over such a body is classed the same way.
    **On every cipher, a sidecar that is damaged or out of shape is not trusted (BACKLOG #5387,
    #5388).** At least these are refused: one that is blank, not UTF-8 or not a JSON object, one
    whose `file_id` is not its own path id, a count that is negative or above 2^53, an
-   `uploaded_at` that is missing, not a number, 0 or less, or above 2^53, and a text field that
-   is not a string, is longer than the store allows, or holds a lone surrogate. The check reads no clock: an `uploaded_at` far ahead is not a defect, since after a
+   `uploaded_at` that is missing, not a number, earlier than 2026-01-01T00:00:00Z, or above 2^53,
+   a text field that is not a string, is longer than the store allows, or holds a lone surrogate,
+   and a sidecar larger than 128 KiB on disk. A plaintext sidecar longer than the longest whose
+   seal still fits 128 KiB, about 96 KiB once its padding is skipped, is refused the same way, on
+   every cipher. Each reader bounds what it reads of a sidecar, so a planted large one cannot
+   exhaust memory under the quota lock. The listing scan, the by-id reads, the startup count and
+   `rotate-key` read no more than about 128 KiB. The check that classes an upload `rotate-key`
+   cannot seal reads up to 64 Ki characters, at most about 256 KiB. The floor is before this engine's first release, so no
+   sidecar the store wrote is older. The check reads no clock: an `uploaded_at` far ahead is not a defect, since after a
    host clock is stepped back every genuine upload is dated ahead, so such an upload is still
-   listed, billed by the quota and readable by its owner. A missing or non-positive `uploaded_at`
-   is refused rather than read as 1970, which the prune would take as past every window and
-   delete on its first pass; refused, the pair is aged by its mtimes as below. An upload never
-   writes an over-long or surrogate field, or an `uploaded_at` the reader refuses, such as one
-   from a clock set before 1970: the save refuses it up front, and the API answers 400 with
-   nothing stored.
+   listed, billed by the quota and readable by its owner. A missing `uploaded_at`, or one before
+   the floor, such as 0, a negative one or a small positive one, is refused rather than read as
+   decades old, which the prune would take as past every window and delete on its first pass;
+   refused, the pair is aged by its mtimes as below. A planted `uploaded_at` after the floor but
+   older than the retention window is not refused, since no rule that reads no clock can tell it
+   from a genuine old upload; planting it needs write access to the store, which can delete the
+   body anyway. An upload never writes an over-long or surrogate field, an `uploaded_at` the
+   reader refuses, such as one from a clock set before the floor, or sealed metadata larger than
+   128 KiB: the save refuses it up front, and the API answers 400 with nothing stored.
+   **A UTF-8 byte-order mark and JSON whitespace around a sidecar's value are skipped (BACKLOG
+   #5387).** Every reader skips them, `rotate-key` and the startup count included, so a sealed
+   sidecar that gained them still reads as sealed under its key and is never taken for a damaged
+   one. A sidecar that holds nothing else is blank, the damaged kind. **`rotate-key` skips a
+   sidecar every reader refuses before decrypting, whatever it holds (BACKLOG #5387).** At least
+   one over 128 KiB, one that is not UTF-8, such as a UTF-16 re-save with its byte-order mark,
+   and a plaintext one past that seal bound are such. `rotate-key` does not decrypt it or look
+   inside it for a key's marker, so padding, a stray byte, a re-encoding or text around a value
+   sealed under a prior key cannot make such a sidecar read as holding nothing. That covers only a
+   sidecar the readers refuse: a prior-key value behind a stray prefix that still decodes as UTF-8,
+   such as a BOM-less UTF-16 re-save or a leading `x`, reads as plaintext, and `rotate-key` seals it
+   within the plaintext bound and completes, so the prior key would then not open it. A sidecar that
+   starts with the active key's marker is decoded before it is taken as current, so one that is not
+   UTF-8 past the marker is such a skip too. Each is counted in `skipped`, so the run exits non-zero, writes no
+   rotation stamp, and the rotation stays open until the sidecar is fixed or deliberately
+   removed. That holds over any body, one that is missing or is not text included, so such a
+   plaintext sidecar is not the never-sealable kind `rotate-key` reports apart, though the prune
+   and the delete class it as that kind. The command's error names how many of its skips are
+   such a sidecar, says it may hold a value under the prior key, and says not to retire that key
+   until each is fixed or deliberately removed. Its advice to remove an upload's two files, in
+   that error and in its closing note after the audit roll, is given only when some skip is not
+   such a sidecar, and says it covers only those other skips. The retention prune and the API
+   delete still class such a plaintext sidecar over a lost body as the never-sealable kind and
+   remove it; that is an open finding. Among the sidecars `rotate-key` leaves as they are without
+   a skip is at least one that provably holds nothing: read in full within 128 KiB, it is empty,
+   or only a byte-order mark and whitespace. One that is not a regular file is another, counted in
+   the note on such files above. Over a body the run does not skip, `rotate-key` counts a sidecar
+   that holds nothing apart from `skipped`, as `damaged`, so it does not hold the rotation open.
+   The command's output does not report that count, and the log names each such upload. The
+   startup count counts none of these kinds' sidecars, as `rotate-key` seals none of them, and
+   counts the plaintext body under one where `rotate-key` would seal it. It also counts at least a
+   body whose first bytes it reads but whose whole read then fails for a cause other than
+   decoding, which `rotate-key` skips, so the startup count can exceed what that run seals.
+   **A part the filesystem refuses the engine is not damaged (BACKLOG #5388).** At least a
+   permission or an ACL the engine lacks, and on Windows a file another program holds open, are
+   answered on a by-id read where a damaged file's 423 would be, with a 423 whose own text says
+   the file is not known to be damaged and does not invite a delete. The listing scan skips such a sidecar and logs it, and the prune never
+   ages it, so it stays until the cause is fixed. Any other I/O error on that read, such as too many
+   open files, is answered as a server error, since a retry may pass.
    Apart from the never-sealable kind above, which the quota still bills, a refused sidecar is
    left out of the listing and the quota, and the API answers 404 to its owner and 423 to an
    override holder, with text naming the file as damaged and saying it is not served. That text
    promises no removal, because at least the cases kept out of retention below are not removed,
    and the delete it says may be refused does succeed for the non-UTF-8 never-sealable kind above.
-   The web console's `/ui` page does not
-   pass that text on: it shows its one locked notice for every 423, which names `rotate-key` as
-   the conditional fix, and `rotate-key` does not repair a damaged file. It is not left out of
+   The web console's `/ui` page shows its own notices for a damaged file, which name no
+   `rotate-key` and offer no key as a fix, and for a file the filesystem refused the engine. Each
+   damaged notice says that, where the store has had an encryption key, at least a damaged file
+   whose sidecar is oversized, not UTF-8 or plaintext too long to seal may still hold a value
+   under a prior key, which should not be retired until each such file is fixed or deliberately
+   removed. It picks them by the kind of
+   refusal the engine's 423 carries on the exception, not by the 423's text. Its notice for a
+   refused delete promises no removal: it says the prune removes some damaged files, and names at
+   least the kinds kept out of retention below. A damaged sidecar is not otherwise left out of
    retention: the prune removes the pair once the later of its
    sidecar's and its body's **mtimes** passes the retention window, never by the time the sidecar
    claims. Unlike the never-sealable kind, a pair dated ahead is not pruned early, so a damaged

@@ -1506,3 +1506,62 @@ async def test_the_file_routes_explain_an_unconfigured_uploads_store(
     lines = [r.getMessage() for r in caplog.records if r.name == _ROUTE_LOGGER]
     for op in ("browse", "resend", "resend-confirm", "delete", "delete-confirm"):
         assert f"uploaded-log {op} refused: file_id={fid} status=503" in lines
+
+
+# --- BACKLOG #5388 added item 1: a damaged file's 423 gets its own notice ---------------------------
+
+
+async def test_a_damaged_file_is_explained_without_a_key_remedy(
+    engine: Engine, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The engine answers a damaged file 423 with its own text, which says no key repairs it. The
+    console used to give it the locked notice, which tells an administrator to seal the file with
+    rotate-key, on a keyless store too, where there is no key. The test engine is keyless.
+
+    A damaged body under a sound sidecar reaches its owner. A damaged sidecar hides its owner, so
+    only the files:access_any holder gets the 423, on browse and on delete. Landing on the damaged
+    code at all also pins the kind the engine's refusal carries (``upload_refusal``) to the one
+    the console reads: if the two differed, the 423 would land on the locked code."""
+    from messagefoundry_webconsole.routes import uploaded_logs as ul_routes
+
+    service = await _service(engine, ("op", Role.OPERATOR), ("root", Role.ADMINISTRATOR))
+    app: Any = _app(engine, service, tmp_path)
+    transport = httpx.ASGITransport(app=app)
+    root = tmp_path / "uploads"
+
+    async def _damaged(c: httpx.AsyncClient, r: httpx.Response, code: str, lead: str) -> None:
+        page = await _landed_notice(c, r, code, lead)
+        assert "found the file damaged" in page
+        assert "rotate-key" not in page
+
+    with caplog.at_level(logging.WARNING, logger=_ROUTE_LOGGER):
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            await _login(c, "op")
+            body_damaged = await _upload(c, "body.hl7")
+            sidecar_damaged = await _upload(c, "sidecar.hl7")
+            (root / f"{body_damaged}.blob").write_bytes(b"not base64!")
+            (root / f"{sidecar_damaged}.meta").write_bytes(b"\xff\xfe not utf-8")
+            browse = await c.get(f"/ui/uploaded-logs/file/{body_damaged}", follow_redirects=False)
+            await _damaged(c, browse, "browse_damaged", "That file could not be opened")
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as a:
+            await _login(a, "root")
+            browse = await a.get(
+                f"/ui/uploaded-logs/file/{sidecar_damaged}", follow_redirects=False
+            )
+            await _damaged(a, browse, "browse_damaged", "That file could not be opened")
+            delete = await a.post(
+                f"/ui/uploaded-logs/file/{sidecar_damaged}/delete", follow_redirects=False
+            )
+            await _damaged(a, delete, "delete_damaged", "That delete did not run")
+
+    # The refused delete removed nothing, and the log line is the status alone, as for any 423.
+    assert (root / f"{sidecar_damaged}.meta").exists()
+    lines = [r.getMessage() for r in caplog.records if r.name == _ROUTE_LOGGER]
+    assert f"uploaded-log delete refused: file_id={sidecar_damaged} status=423" in lines
+    for notice in (
+        ul_routes.BROWSE_DAMAGED_NOTICE,
+        ul_routes.RESEND_DAMAGED_NOTICE,
+        ul_routes.DELETE_DAMAGED_NOTICE,
+    ):
+        assert "rotate-key" not in notice and "turned on" not in notice

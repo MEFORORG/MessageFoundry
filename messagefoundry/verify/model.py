@@ -4,11 +4,13 @@
 
 from __future__ import annotations
 
-import re
-from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
-from typing import Final
+
+from messagefoundry.verify_leaf import DRIVER_DETAIL_LIMIT as DRIVER_DETAIL_LIMIT
+from messagefoundry.verify_leaf import safe_detail_text as safe_detail_text
+from messagefoundry.verify_leaf import safe_exc_detail as safe_exc_detail
+from messagefoundry.verify_leaf import safe_exc_text as safe_exc_text
 
 
 class Status(str, Enum):  # noqa: UP042
@@ -25,132 +27,9 @@ class Status(str, Enum):  # noqa: UP042
 FAILING: tuple[Status, ...] = (Status.FAIL, Status.ERROR)
 
 
-#: The bound for an arm that quotes a store driver, a socket or the TLS stack rather than a
-#: Router/Handler. Those arms printed the whole text before BACKLOG #5395, and the engine's own
-#: refusals there, such as the store's Vault revocation remedy, run past ``safe_text``'s 200; the
-#: arms that can quote a message (config load, a WiringError included, and dry run, BACKLOG #1779)
-#: keep 200.
-DRIVER_DETAIL_LIMIT: Final = 2000
-
-
-#: The placeholder both passes write here: the PHI pass's own, and ``scrub_credentials`` is told to use
-#: it. Square brackets rather than ``secretscrub``'s ``<redacted>``, so a sink that renders a pasted
-#: detail as HTML cannot read it as a tag and show ``PWD=`` as an empty password.
-_PLACEHOLDER: Final = "[redacted]"
-
-
-def safe_detail_text(text: str, *, limit: int | None = None) -> str:
-    """``text`` for a :class:`CheckResult` detail: bounded, then both orders of the PHI and
-    credential passes, comparing how often each prints a fragment, then the length bound (BACKLOG
-    #5395).
-
-    A verify report is written to JSON and Markdown that an operator pastes into a ticket, so it
-    leaves the box. The text a check quotes is a driver's, a config module's or the OS's: a store
-    driver can quote its DSN or a ``password=`` / ``PWD=`` pair, and a config module can raise
-    anything. :func:`~messagefoundry.redaction.safe_text` is a PHI pass, and on such a text it left
-    the DSN password and the ``PWD=`` and ``password=`` values in place
-    (``tests/test_verify_detail_redaction.py``). So the text also takes
-    :func:`~messagefoundry.secretscrub.scrub_credentials`, the write-time credential vocabulary the
-    log filter and wiring's own diagnostics use.
-
-    NEITHER ORDER OF THE TWO PASSES HIDES WHAT THE OTHER DOES, so both run, and a fragment the
-    PHI-first order prints more often than the credentials-first order does is hidden. Credentials
-    first: the credential pass read ``tk-1,mrn:`` in ``token=tk-1,mrn: MRN7712345`` as the token's
-    value, the PHI pass then found no ``mrn:`` label, and the MRN printed. PHI first: the PHI pass takes a label the credential pass needs, at least a capitalized pair read
-    as a name (``Login Password=``, ``Svc\\nPassword:``) and an HL7 field run that holds the label
-    (``a|b^password= <value>``), and the value printed. The primary result is PHI first, then the
-    credential pass over the WHOLE of it, which can only hide more than the PHI pass did; not split at
-    the placeholders, which cut ``postgresql://19800505:<pw>@`` in two once the PHI pass had replaced
-    the user. Then every whitespace-separated word of that result holding a fragment, a run of word
-    characters between placeholders, that it prints more often than the credentials-first result
-    does is replaced
-    whole, at every occurrence (:func:`_printed_by_both`). That errs toward hiding: a label the
-    other order spelled differently goes with its value.
-
-    The input is cut to :func:`~messagefoundry.redaction.clamp_untrusted`'s window before any pass
-    reads it, and its note is kept past the length bound. That note is the only unscanned note the
-    detail carries: what the length bound then holds back was scanned, and is counted
-    as ``(+N chars)``.
-
-    Not the support bundle's ``redact_log_line``: its long-base64 sweep blanked any 24-character run,
-    which is an exception class name such as ``SSLCertVerificationError`` and the segments of a POSIX
-    path, the words an operator needs here. This is best-effort, with at least the residuals
-    ``secretscrub`` and :mod:`messagefoundry.redaction` state, and the PHI pass can blank a
-    capitalized two-word phrase such as ``Program Files``."""
-    from messagefoundry.redaction import _DEFAULT_LIMIT, _held_back, clamp_untrusted, redact
-    from messagefoundry.secretscrub import scrub_credentials
-
-    bounded = clamp_untrusted(text)
-    # clamp_untrusted ends a cut text with "\n" and its note. The note says what no pass read, so it
-    # must outlive the length bound below, which would otherwise drop it with the tail.
-    head, note = bounded.rsplit("\n", 1) if bounded is not text else (bounded, "")
-    phi_first = scrub_credentials(redact(head), placeholder=_PLACEHOLDER)
-    credentials_first = redact(scrub_credentials(head, placeholder=_PLACEHOLDER))
-    cleaned = _printed_by_both(phi_first, credentials_first)
-    # Not safe_text: every character of ``cleaned`` was scanned above, but its placeholders can push
-    # it past safe_text's work window, whose note would then call scanned characters unscanned. So
-    # the PHI pass once more over the whole of it, which the placeholders at most multiply from a
-    # bounded head, then safe_text's length bound alone.
-    shown = _held_back(redact(cleaned).strip(), _DEFAULT_LIMIT if limit is None else limit)
-    return f"{shown} {note}" if note else shown
-
-
-_WORD_RUN: Final = re.compile(r"\w+")
-
-
-def _fragments(word: str) -> list[str]:
-    """The pieces of ``word`` between placeholders, each cut into its runs of word characters, so a
-    value glued to punctuation (``Kv9x7Qz3.``, ``(Kv9x7Qz3)``) is the same fragment as the bare value.
-    A piece holding no word character is kept whole."""
-    return [
-        run
-        for piece in word.split(_PLACEHOLDER)
-        if piece
-        for run in (_WORD_RUN.findall(piece) or [piece])
-    ]
-
-
-def _printed_by_both(primary: str, other: str) -> str:
-    """``primary`` with each word replaced by the placeholder where it holds a fragment ``primary``
-    prints more often than ``other`` does. Linear: one split of each text and counter lookups.
-
-    COUNTS, NOT A SET (BACKLOG #5395). Against a set, a password equal to another word the line
-    prints survived: in ``user svcadmin ... Login Password: svcadmin`` the credentials-first order
-    hid the second ``svcadmin`` and printed the first, so the word was "printed by both" and both
-    printed. Keeping only as many occurrences as ``other`` prints would not do either: which of them
-    is the password is a position, and the first occurrence is the password when the label comes
-    first (``Login Password: svcadmin for user svcadmin``). So a fragment ``primary`` prints more
-    often than ``other`` is hidden at EVERY occurrence. That errs toward hiding: the user name goes
-    with the password it equals. A fragment is a run of word characters (:func:`_fragments`), so in
-    ``Login Password: Kv9x7Qz3 retry with Kv9x7Qz3.`` the value glued to the full stop counts with the
-    bare one and goes too, and a whole word goes when any run in it does.
-
-    It compares counts, never positions, so it is best-effort. Residuals, at least these: a value
-    glued to a word character is a different run, so ``xKv9x7Qz3y`` elsewhere on the line prints; and
-    a value ``primary`` prints at one place while ``other`` prints the same fragment as often at
-    another place is kept, so a credential equal to a word only the credentials-first order printed
-    elsewhere prints. BACKLOG #5395 holds it open."""
-    printed = Counter(piece for word in other.split() for piece in _fragments(word))
-    shown = Counter(piece for word in primary.split() for piece in _fragments(word))
-    return re.sub(
-        r"\S+",
-        lambda m: m[0] if all(shown[p] <= printed[p] for p in _fragments(m[0])) else _PLACEHOLDER,
-        primary,
-    )
-
-
-def safe_exc_detail(exc: BaseException, *, limit: int | None = None) -> str:
-    """``exc`` for a :class:`CheckResult` detail: its type, then its text through
-    :func:`safe_detail_text`. A ``UnicodeError`` takes :func:`~messagefoundry.redaction.safe_exc`
-    whole, which builds the text from its attributes and quotes no character of the message; an
-    exception holding one renders as ``codec_safe_str``'s fixed note. ``limit`` as
-    :func:`safe_detail_text`, on both branches."""
-    from messagefoundry.redaction import codec_safe_str, safe_exc
-
-    if isinstance(exc, UnicodeError):
-        return safe_exc(exc) if limit is None else safe_exc(exc, limit=limit)
-    message = safe_detail_text(codec_safe_str(exc), limit=limit)
-    return f"{type(exc).__name__}: {message}" if message else type(exc).__name__
+# The detail scrub imported above lives in the client-importable leaf messagefoundry.verify_leaf,
+# whose module docstring says what it imports, so the acceptance harness can share it without
+# loading this package's runner (BACKLOG #5389, #5395); it is re-exported for the checks.
 
 
 @dataclass

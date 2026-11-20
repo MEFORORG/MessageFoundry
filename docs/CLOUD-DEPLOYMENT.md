@@ -367,7 +367,15 @@ and the engine's at-rest encryption does not cover them ([`PHI.md`](PHI.md) §2,
    manifest names under `/config/pki/` into the same image.
 3. **Create the Secret** ([`docker/k8s/secret.example.yaml`](../docker/k8s/secret.example.yaml)) with
    `store-encryption-key`, `store-password`, `tls-revocation-attested`, and the API TLS cert/key (and
-   optional `api-tls-key-password`).
+   optional `api-tls-key-password`). Both manifests, `ha-postgres.yaml` and `statefulset.yaml`, read
+   `MEFOR_TLS_REVOCATION_ATTESTED` from the `tls-revocation-attested` key, with no default and not
+   optional, so without it the kubelet refuses each engine container with
+   `CreateContainerConfigError`. The attestation is yours
+   ([SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate)): set the key only if your PKI
+   enforces revocation for the certificates the engine serves and accepts, and to a value that reads
+   as true to the engine (`1`, `true`, `yes` or `on`, in any case). A value that does not, such as
+   `0`, passes the kubelet and the engine then exits 2, at the latest at the revocation gate, so
+   the pod crash-loops. Neither Kubernetes manifest checks the value before the engine starts.
 4. **Apply** [`docker/k8s/ha-postgres.yaml`](../docker/k8s/ha-postgres.yaml) with all three `image:` fields
    (`tls-dir`, `copy-tls` and `engine`) set to your baked image and `MEFOR_STORE_SERVER` set to the managed-PG endpoint.
    Uncomment every entry in its block *what an enforcing start needs* and give it your own value. They

@@ -143,7 +143,13 @@ against one case that matters, described under
   An enforcing start needs more than the bind, and the manifest's block *what an enforcing start
   needs* names at least the alert channel, verified-TLS log forwarding and the retention bounds as
   commented entries. As shipped the engine refuses to start; uncomment each entry with your value. Bake the syslog CA and CRL it names under `/config/pki/`, and
-  add the Secret's `tls-revocation-attested` key, without which the pod does not start.
+  add the Secret's `tls-revocation-attested` key, without which the pod does not start: the kubelet
+  refuses the engine container with `CreateContainerConfigError`. The HA manifest below,
+  `k8s/ha-postgres.yaml`, requires the same key. Set it only
+  if your PKI enforces revocation ([SECURITY.md, API revocation gate](../docs/SECURITY.md#api-revocation-gate)),
+  and to a value that reads as true (`1`, `true`, `yes` or `on`). A value such as `0` passes the
+  kubelet, and the engine then exits 2 and the pod crash-loops: neither Kubernetes manifest checks
+  the value before the engine starts.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
   Postgres-backed `replicas: 3` Deployment with `[cluster].enabled`, a PodDisruptionBudget, and
   lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)
@@ -164,7 +170,16 @@ against one case that matters, described under
   [SECURITY.md, API revocation gate](../docs/SECURITY.md#api-revocation-gate) states.
   `compose.yaml` passes it by compose substitution with no default, so `docker compose` refuses to
   start until you export it or put it in a `.env` beside `compose.yaml` (an `env_file:` does not
-  feed substitution). Set it only if your PKI enforces revocation; the file never sets it for you.
+  feed substitution, and passing `--env-file` reads the named file instead of that `.env`, so keep
+  every substituted value, at least this one and the Postgres password, in the file substitution
+  reads; the `ha` engines still read their own store password from `secrets.env`). The
+  `revocation-attestation-check` service refuses a value that does not read as true, such as `0`.
+  `docker compose up` and `docker compose --profile ha up` run that check before they start any
+  serving engine, and `docker compose logs revocation-attestation-check` shows why it refused. Not
+  every command runs the check: at least `docker compose up --no-deps <engine>` and
+  `docker compose run --no-deps` skip it. Never start a serving engine with `--no-deps`; the
+  comment on that service in `compose.yaml` says why. Set it only if your PKI enforces revocation;
+  the file never sets it for you.
 - **(B) Reverse-proxy / same-pod sidecar — k8s-preferred.** Engine stays on loopback behind the
   sidecar, declared with `tls_terminated_upstream=true` + `trusted_proxies=[…]` +
   `plaintext_upstream_hop_acknowledged=true`, because with no `tls_cert_file` that hop is

@@ -569,20 +569,27 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     security.add_argument("--json", action="store_true", help="emit JSON")
 
-    support_bundle = sub.add_parser(
-        "support-bundle",
-        # The old wording read "a SECRET-FREE / PHI-free support zip". That is true of the config
-        # summary and the status snapshot and NOT of the log tail, whose redaction is best-effort: a
-        # single-token identifier survives it (messagefoundry/redaction.py states that residual), and an
-        # operator username is exactly that shape while this engine's own settings classifier calls a
-        # username a credential. A blanket claim resting on a member that does not meet it is the
-        # false-premise shape CLAUDE.md section 11 forbids, so the claim was repaired rather than the
-        # control -- see BACKLOG #1475 and the exclusion table in
-        # tests/test_log_redaction_secret_domain.py for why the username class stays out.
-        help="write a support zip to hand to support (#49): a secret-free config summary "
+    # The old wording read "a SECRET-FREE / PHI-free support zip". That is true of the config
+    # summary and the status snapshot and NOT of the log tail, whose redaction is best-effort: a
+    # single-token identifier survives it (messagefoundry/redaction.py states that residual), and an
+    # operator username is exactly that shape while this engine's own settings classifier calls a
+    # username a credential. A blanket claim resting on a member that does not meet it is the
+    # false-premise shape CLAUDE.md section 11 forbids, so the claim was repaired rather than the
+    # control -- see BACKLOG #1475 and the exclusion table in
+    # tests/test_log_redaction_secret_domain.py for why the username class stays out. The help
+    # repeats the manifest phi_contract's log-tail residual because an operator reads it before the
+    # zip exists; tests/test_support_bundle.py holds the two to the same terms (BACKLOG #5385).
+    # Both the command list and `support-bundle --help` print it.
+    support_bundle_help = (
+        "write a support zip to hand to support (#49): a secret-free config summary "
         "(counts/names only) + a PHI-free /status snapshot + a REDACTED app-log tail. The tail's "
-        "redaction is BEST-EFFORT: a single-token identifier can survive it, an operator username "
-        "included",
+        "redaction is BEST-EFFORT, and values survive it: at least a single-token identifier such "
+        "as an operator username and, on a non-production instance logging at DEBUG, a message "
+        "body the log recorded in a shape the redaction does not read. Handle the zip as a copy of "
+        "the app log, not as secret-free or PHI-free; manifest.json's phi_contract states it too"
+    )
+    support_bundle = sub.add_parser(
+        "support-bundle", help=support_bundle_help, description=support_bundle_help
     )
     support_bundle.add_argument(
         "--out", required=True, help="path to write the support-bundle .zip"
@@ -2267,11 +2274,17 @@ def _write_start_audit(lines: list[str]) -> None:
     :func:`_start_logging` and of the span in ``serve`` and ``supervise`` that queues lines before
     it, a refusal or a raise, so a refused start does not lose a record the old decision-time log
     call wrote: in ``supervise`` that reached its stdout handler, and in ``serve`` before
-    ``configure_logging`` it reaches ``main()``'s filtered lastResort on stderr. The static-
-    credential (#1989) and remote-debugging (#2700) AUDIT lines, logged after ``_start_logging``,
-    come through here too, so ``[logging].level`` does not filter them either. At least five other
-    AUDIT lines ``serve`` logs after ``_start_logging`` still go through ``logger.warning``, so that
-    level does filter those.
+    ``configure_logging`` it reaches ``main()``'s filtered lastResort on stderr.
+
+    Each line is a decision-time record: it says what a gate accepted when it decided, and is
+    written the same way whether or not a later gate refuses the start. A later refusal is
+    reported on its own, on stderr at least; not every one is also a log record, so a forwarded
+    copy of these lines can lack the refusal beside it (BACKLOG #5390, the reviewed not-a-bug for
+    its last limb). The static-credential
+    (#1989) and remote-debugging (#2700) AUDIT lines, logged after ``_start_logging``, come through
+    here too, so ``[logging].level`` does not filter them either. At least five other AUDIT lines
+    ``serve`` logs after ``_start_logging`` still go through ``logger.warning``, so that level
+    does filter those.
 
     Each line goes through ``Logger.handle``, which skips the logger's effective level. A
     process-wide ``logging.disable()`` at WARNING or above still drops it, as it would drop
@@ -3238,10 +3251,9 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         _start_audit.append(
-            f"AUDIT: starting keyless on a {'production ' if production else ''}PHI instance "
-            f"(environment {env_name!r}) because {opt_out_switches}"
-            f"{' + [security].allow_unencrypted_phi_under_strict_enforcement=true' if enforcing else ''}"
-            " — PHI is stored UNENCRYPTED at rest (at-rest encryption opt-out override)."
+            _keyless_start_audit_line(
+                opt_out_switches, env_name=env_name, production=production, enforcing=enforcing
+            )
         )
 
     # The store key file is checked BEFORE it is used (vault BACKLOG #2601), first in the guarded
@@ -5764,6 +5776,9 @@ def _supervise(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # The gate passed with no key, so the audited opt-out is what let the fleet through: its
+    # AUDIT line is queued below (BACKLOG #5391 item 4).
+    fleet_keyless = not _store_key_configured(settings)
 
     # Vault BACKLOG #2601: the two key-file checks each shard's `serve` makes, for the same reason
     # as the gates above: every shard would refuse, and the supervisor would only restart them. The
@@ -5789,7 +5804,22 @@ def _supervise(args: argparse.Namespace) -> int:
     #
     # BACKLOG #5391: the opt-out's AUDIT line is written on every way out of this span, a refusal or
     # a raise, the spool directory's evaluation included, until _start_logging's own guard takes it.
+    #
+    # BACKLOG #5391 item 4: first, the keyless-start AUDIT line, when the at-rest opt-out let the
+    # fleet through with no store key at the gate above. Each engine shard's `serve` writes its
+    # own, to its own handlers. This one is the supervisor's own record: the pair renewal below
+    # opens the store keyless in this process when it re-mints the pair.
     posture_audit: list[str] = []
+    if fleet_keyless:
+        posture_audit.append(
+            _keyless_start_audit_line(
+                _keyless_opt_out_switches(settings),
+                env_name=env_name,
+                production=production,
+                enforcing=enforcing,
+                what="the at-rest opt-out accepts a keyless fleet start",
+            )
+        )
     try:
         posture_refused = _forwarder_posture_refused(
             settings,
@@ -8641,6 +8671,31 @@ def _keyless_opt_out_switches(settings: ServiceSettings) -> str:
     if security.allow_unencrypted_phi or not switches:
         switches.append("[security].allow_unencrypted_phi=true")
     return " and ".join(switches)
+
+
+def _keyless_start_audit_line(
+    opt_out_switches: str,
+    *,
+    env_name: str | None,
+    production: bool,
+    enforcing: bool,
+    what: str = "starting keyless",
+) -> str:
+    """The AUDIT line for a start the at-rest opt-out lets run keyless (BACKLOG #5391).
+
+    One text for ``serve`` and ``supervise``, which differ only in ``what``. ``opt_out_switches``
+    is :func:`_keyless_opt_out_switches`, which ``serve`` has already computed for its warning, so
+    the warning and the record name the same switches. Under strict enforcement the second
+    acknowledgment was verified by the caller's gate, so the line names it too; the warn posture
+    names the opt-out alone, as the operator wrote it (vault BACKLOG #2340)."""
+    strict = (
+        " + [security].allow_unencrypted_phi_under_strict_enforcement=true" if enforcing else ""
+    )
+    return (
+        f"AUDIT: {what} on a {'production ' if production else ''}PHI instance "
+        f"(environment {env_name!r}) because {opt_out_switches}{strict}"
+        " — PHI is stored UNENCRYPTED at rest (at-rest encryption opt-out override)."
+    )
 
 
 def _keyless_store_gate(settings: ServiceSettings) -> str | None:
@@ -12449,12 +12504,36 @@ def _rotate_key(args: argparse.Namespace) -> int:
             "pair lock this "
             "account could not take (BACKLOG #3181). The log names each file and its "
             "cause. Fix the cause and re-run rotate-key BEFORE retiring any prior key "
-            "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). No key will ever open a damaged file, so restore "
-            "that upload, or remove its two files from the uploads directory, before the re-run. "
-            "This run did not stamp the key's rotation date, and no serve start does while the "
+            "(MEFOR_STORE_ENCRYPTION_KEYS_RETIRED). "
+            + (
+                # BACKLOG #5387: never said when every skip is a refused sidecar, below.
+                "No key will ever open a file the log names as damaged because a key did not open "
+                "it, so restore that upload, or remove its two files from the uploads directory, "
+                "before the re-run. "
+                + (
+                    "That does not apply to an upload with a sidecar every reader refuses, below. "
+                    if uploads.refused_sidecars
+                    else ""
+                )
+                if uploads.skipped > uploads.refused_sidecars
+                else ""
+            )
+            + "This run did not stamp the key's rotation date, and no serve start does while the "
             "rotation stands open, though one that came before this run may have.",
             file=sys.stderr,
         )
+        if uploads.refused_sidecars:
+            # BACKLOG #5387: such a sidecar is neither decrypted nor looked inside, so nothing rules
+            # out a value under the prior key in it. Deleting it could destroy that value, so this
+            # never advises it.
+            print(
+                f"error: {uploads.refused_sidecars} of those uploaded file(s) have a sidecar that "
+                "every reader refuses, as one larger than a sidecar can be, not UTF-8, or "
+                "plaintext too long to seal. It may hold a value under the prior key. Do not "
+                "retire the prior key until each such sidecar is fixed, for example by restoring "
+                "it from a backup, or is deliberately removed. The log names each one.",
+                file=sys.stderr,
+            )
     if seals.refused:
         # Vault BACKLOG #5635: a seal that names a key this run holds other than the active one, or
         # is malformed, is left as it is. One that fails no key re-seals, so it must not fail the
@@ -12500,10 +12579,18 @@ def _rotate_key(args: argparse.Namespace) -> int:
         # BACKLOG #3737, owner ruling 2026-10-30: a skip does not stop the roll, so an operator who
         # reads PARTIAL as "go back" must be told. Conditional, because this run cannot see whether
         # the key changed: a same-key run or a keyless chain rolled nothing. A new key is no remedy
-        # here, because the file skips the same way under it.
+        # here, because the file skips the same way under it. Removal is offered only for the skips
+        # that are not a refused sidecar, which may hold a value under the prior key (BACKLOG #5387).
+        removal = (
+            "Fix the cause and re-run, or, for a skip that is not a sidecar every reader refuses, "
+            "remove the two files of an upload that cannot be fixed and re-run. "
+            if uploads.skipped > uploads.refused_sidecars
+            else "Fix the cause and re-run. "
+        )
         print(
-            "note: this run did not complete. Fix the cause and re-run, or remove the two files of "
-            "an upload that cannot be fixed and re-run. If this store is moving to a new key and "
+            "note: this run did not complete. "
+            + removal
+            + "If this store is moving to a new key and "
             "its audit chain is keyed, the chain has rolled to that key, and a key opens one audit "
             "range, so you cannot go back to the prior key: keep it in "
             "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED until a run completes."

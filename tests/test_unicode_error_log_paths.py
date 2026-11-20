@@ -2967,6 +2967,10 @@ _SAFE_CALLS = frozenset(
         "isinstance",
         "_decode_refusal",
         "_safe_db_error",
+        # verify_leaf's two render a Unicode error through safe_exc, never its raw object or reason
+        # (tests/test_b532r_verify_fu3.py).
+        "safe_exc_text",
+        "safe_exc_detail",
     }
 )
 #: An arm that names one of these also receives a Unicode error, which is a ``ValueError``.

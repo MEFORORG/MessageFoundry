@@ -572,6 +572,7 @@ from messagefoundry.transports.base import (
 )
 from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
 from messagefoundry.uploads import (
+    UploadAccessError,
     UploadContentError,
     UploadDamagedError,
     UploadedFileMeta,
@@ -9136,6 +9137,20 @@ def create_app(
         "this uploaded file is damaged, so it was not read and is not served. No key and no "
         "command repairs it. An operator may try to delete it, and the delete may be refused too"
     )
+    # BACKLOG #5388 added item 2: a part the filesystem refused the engine (UploadAccessError), a
+    # permission or ACL fault or, on Windows, a file another program holds open. The file is not
+    # known to be damaged, so the text does not invite a delete: fixing the cause makes it readable.
+    _UPLOAD_ACCESS_REFUSED = (
+        "this uploaded file could not be opened, because the filesystem refused the engine access "
+        "to it, for example by its permissions or because another program holds it open. It is not "
+        "known to be damaged, so do not delete it for this. An operator fixes the cause on the "
+        "server, then tries again"
+    )
+    _UPLOAD_REFUSED_TEXT: dict[str, str] = {
+        "locked": _UPLOAD_UNREADABLE,
+        "damaged": _UPLOAD_DAMAGED,
+        "denied": _UPLOAD_ACCESS_REFUSED,
+    }
 
     _UPLOAD_UNAVAILABLE = (
         "the store's key service could not complete the request, so nothing was read, stored or "
@@ -9170,20 +9185,34 @@ def create_app(
         _log.warning("upload %s answered 503: %s", op, cause)
         return _UploadUnavailable()
 
-    class _UploadSidecarRefused(HTTPException):
+    def _upload_refusal_kind(exc: UploadUnreadableError) -> str:
+        """``"denied"``, ``"damaged"`` or ``"locked"``: which refusal ``exc`` is (BACKLOG #5388,
+        #5388 added item 2). Only its class is read, so its message reaches no response."""
+        if isinstance(exc, UploadAccessError):
+            return "denied"
+        if isinstance(exc, UploadDamagedError):
+            return "damaged"
+        return "locked"
+
+    class _UploadRefused(HTTPException):
+        """The 423 of a refused upload, with the text of its ``kind`` (:func:`_upload_refusal_kind`).
+
+        ``upload_refusal`` carries the kind as a typed signal for the web console, which calls these
+        handlers directly and picks its notice by it rather than by comparing the detail text, so a
+        reworded detail cannot send a damaged or access-refused file to the store-key notice. It is
+        not in the response. ``args`` is ``(kind,)``, so a copy through ``cls(*args)`` rebuilds it."""
+
+        def __init__(self, kind: str = "locked") -> None:
+            super().__init__(_UPLOAD_UNREADABLE_STATUS, _UPLOAD_REFUSED_TEXT[kind])
+            self.upload_refusal = kind
+            self.args = (kind,)
+
+    class _UploadSidecarRefused(_UploadRefused):
         """The 423 an override holder gets when an upload's sidecar is refused. Every other route
         answers it as is. DELETE alone catches it and asks ``UploadStore.delete``. That call can
-        still remove an upload ``rotate-key`` never seals (BACKLOG #2322). ``damaged`` carries a
-        damaged sidecar's own text (BACKLOG #5388), and DELETE then lets the store read it again."""
-
-        def __init__(self, damaged: bool = False) -> None:
-            super().__init__(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(damaged))
-            self.damaged = damaged
-
-    def _upload_refused_text(damaged: bool) -> str:
-        """The 423 text of a refused file, a damaged file's own (BACKLOG #5388). Callers pass only
-        the refusal's class, so its message reaches no response."""
-        return _UPLOAD_DAMAGED if damaged else _UPLOAD_UNREADABLE
+        still remove an upload ``rotate-key`` never seals (BACKLOG #2322). For a damaged or an
+        access-refused sidecar (BACKLOG #5388, #5388 added item 2), DELETE lets the store read it
+        again, so the store answers its own refusal."""
 
     async def _authorized_upload_meta(
         request: Request, engine: Engine, us: UploadStore, identity: Identity, file_id: str, op: str
@@ -9214,7 +9243,7 @@ def create_app(
             # BACKLOG #3734: an outage, not the 423. Only its text is kept past this clause.
             override_answer = partial(_upload_unavailable, str(exc), op)
         except UploadUnreadableError as exc:
-            override_answer = partial(_UploadSidecarRefused, isinstance(exc, UploadDamagedError))
+            override_answer = partial(_UploadSidecarRefused, _upload_refusal_kind(exc))
         if override_answer is not None:
             # The owner cannot be read, so ownership cannot be checked. Keep the 404 contract above
             # for everyone but an override holder, who may see any file anyway and is the one who
@@ -9511,8 +9540,7 @@ def create_app(
         except UploadUnavailableError as exc:
             outage = str(exc)
         except UploadUnreadableError as exc:
-            damaged = isinstance(exc, UploadDamagedError)
-            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(damaged)) from None
+            raise _UploadRefused(_upload_refusal_kind(exc)) from None
         if outage is not None:
             raise _upload_unavailable(outage, "browse")  # after the handler: no chain link
         result = await asyncio.to_thread(
@@ -9671,8 +9699,7 @@ def create_app(
         except UploadUnavailableError as exc:
             outage = str(exc)
         except UploadUnreadableError as exc:
-            damaged = isinstance(exc, UploadDamagedError)
-            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(damaged)) from None
+            raise _UploadRefused(_upload_refusal_kind(exc)) from None
         if outage is not None:
             raise _upload_unavailable(outage, "resend")  # after the handler: no chain link
         parts = await asyncio.to_thread(split_uploaded, data)
@@ -9754,9 +9781,10 @@ def create_app(
         try:
             await _authorized_upload_meta(request, engine, us, identity, file_id, "delete")
         except _UploadSidecarRefused as exc:
-            # A damaged sidecar is read again by the store, which classes it as the scan does and
-            # answers its own refusal (BACKLOG #5388); the flag would skip that read.
-            refused = not exc.damaged
+            # A damaged or access-refused sidecar is read again by the store, which classes it as
+            # the scan does and answers its own refusal (BACKLOG #5388, #5388 added item 2); the
+            # flag would skip that read and answer the store-key refusal instead.
+            refused = exc.upload_refusal == "locked"
         client = client_ip(request)
         actor = identity.username
 
@@ -9806,8 +9834,7 @@ def create_app(
         except UploadUnavailableError as exc:
             outage = str(exc)
         except UploadUnreadableError as exc:
-            damaged = isinstance(exc, UploadDamagedError)
-            raise HTTPException(_UPLOAD_UNREADABLE_STATUS, _upload_refused_text(damaged)) from None
+            raise _UploadRefused(_upload_refusal_kind(exc)) from None
         if outage is not None:
             raise _upload_unavailable(outage, "delete")  # after the handler: no chain link
         return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)
