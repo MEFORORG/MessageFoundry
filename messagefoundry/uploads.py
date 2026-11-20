@@ -48,7 +48,7 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from stat import FILE_ATTRIBUTE_REPARSE_POINT, S_ISDIR, S_ISLNK, S_ISREG
+from stat import FILE_ATTRIBUTE_REPARSE_POINT, S_ISLNK, S_ISREG
 from typing import Any, BinaryIO, Literal, NamedTuple, Protocol, TypeGuard
 
 from messagefoundry.config.atomic_edit import _REFUSED, LOCK_FILE_NAME, edit_lock, lock_path_for
@@ -356,14 +356,17 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
         raise _NotPlainError(f"{path.name} is not a plain file")
     fd = os.open(path, _PLAIN_OPEN_FLAGS)
     try:
+        # Before the fdopen, which answers a directory swapped in after the lstat with its own
+        # IsADirectoryError, naming the descriptor rather than the path (BACKLOG #5388 added
+        # item 3). POSIX opens a directory for reading, so this check is the one that refuses it.
+        after = os.fstat(fd)
+        if not S_ISREG(after.st_mode):
+            raise _NotPlainError(f"{path.name} changed after it was checked")
         handle = os.fdopen(fd, "rb")
     except BaseException:
         os.close(fd)
         raise
     try:
-        after = os.fstat(handle.fileno())
-        if not S_ISREG(after.st_mode):
-            raise _NotPlainError(f"{path.name} changed after it was checked")
         if not _O_NOFOLLOW:
             again = path.lstat()
             if _names_a_link(again) or not os.path.samestat(again, after):
@@ -437,26 +440,47 @@ def _read_sidecar(path: Path) -> str:
 _ReadRefusal = Literal["damaged", "denied"]
 
 
+#: The errnos an open or a read of a part gives only for a part that is not a plain file (BACKLOG
+#: #5388 added items 2 and 3): ``ELOOP`` for a link ``O_NOFOLLOW`` would not follow, ``EISDIR``
+#: for a directory and ``ENXIO`` for a socket or a device node with nothing behind it. They hold
+#: even when the part has gone by the time :func:`_names_unplain_now` looks again.
+_NOT_PLAIN_ERRNOS = frozenset({errno.ELOOP, errno.EISDIR, errno.ENXIO})
+
+
 def _refused_read(exc: OSError) -> _ReadRefusal | None:
-    """How a by-id read answers ``exc``, raised reading an upload's part (BACKLOG #5388 added item
-    2). ``"damaged"`` for a part that is not a plain file, or a link the open would not follow.
-    ``"denied"`` for a ``PermissionError``: at least a permission or an ACL the engine lacks, and
-    on Windows a file another program holds open (a sharing violation). That is not damage, so it
-    is never answered as a file an operator should delete. A ``PermissionError`` whose path is now
-    a folder is ``"damaged"``, since Windows refuses an open of a folder that way. ``None`` for any other ``OSError``,
-    such as too many open files or an I/O error, which may pass on a retry, so the caller
-    re-raises it."""
-    if isinstance(exc, _NotPlainError) or exc.errno == errno.ELOOP:
+    """How a by-id read answers ``exc``, raised reading an upload's part (BACKLOG #5388 added items
+    2 and 3). ``"damaged"`` for a part that is not a plain file: a :class:`_NotPlainError`, an
+    errno in :data:`_NOT_PLAIN_ERRNOS`, or any refusal whose path is now not a regular file or is
+    a link (:func:`_names_unplain_now`), which is how at least a socket answers an open on some
+    platforms and a folder answers one on Windows. ``"denied"`` for any other ``PermissionError``:
+    at least a permission or an ACL the engine lacks, and on Windows a file another program holds
+    open (a sharing violation). That is not damage, so it is never answered as a file an operator
+    should delete. ``None`` for any other ``OSError`` on a part that is still a regular file, such
+    as too many open files or an I/O error, which may pass on a retry, so the caller re-raises
+    it."""
+    if isinstance(exc, _NotPlainError) or exc.errno in _NOT_PLAIN_ERRNOS or _names_unplain_now(exc):
         return "damaged"
-    if isinstance(exc, PermissionError):
-        # Windows answers an open of a folder with a PermissionError too, so a folder swapped in
-        # after the lstat is a part that is not a plain file, not one the engine may not open.
-        try:
-            folder = exc.filename is not None and S_ISDIR(os.lstat(exc.filename).st_mode)
-        except (OSError, TypeError, ValueError):
-            folder = False
-        return "damaged" if folder else "denied"
-    return None
+    return "denied" if isinstance(exc, PermissionError) else None
+
+
+def _names_unplain_now(exc: OSError) -> bool:
+    """Whether the path ``exc`` names is, by a fresh ``lstat``, not a regular file or a link
+    (BACKLOG #5388 added item 3). ``False`` when ``exc`` names no path, or names a descriptor rather
+    than a path. An ``lstat`` that fails is logged, never swallowed, and answers
+    ``False``, so the caller answers ``exc`` by its own type."""
+    name = exc.filename
+    if not isinstance(name, str | bytes | os.PathLike):
+        return False
+    try:
+        info = os.lstat(name)
+    except (OSError, ValueError) as again:
+        _log.warning(
+            "uploaded-file part could not be checked again after a refused read (%s): %s",
+            codec_safe_str(exc),
+            codec_safe_str(again),
+        )
+        return False
+    return _names_a_link(info) or not S_ISREG(info.st_mode)
 
 
 def _unpadded(text: str) -> str:
