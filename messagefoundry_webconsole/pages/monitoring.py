@@ -889,11 +889,16 @@ def _flow_graph(graph: GraphResponse) -> Markup:
 
     col_of = {kind: ci for ci, (kind, _label) in enumerate(_GRAPH_COLUMNS)}
     drawn = [
-        (edge, pos[(edge.source_kind, edge.source)], pos[(edge.target_kind, edge.target)])
+        (
+            edge,
+            pos[(edge.source_kind, edge.source)],
+            pos[(edge.target_kind, edge.target)],
+            col_of[edge.target_kind] <= col_of[edge.source_kind],
+        )
         for edge in graph.edges
         if (edge.source_kind, edge.source) in pos and (edge.target_kind, edge.target) in pos
     ]
-    n_back = sum(1 for e, _s, _t in drawn if col_of[e.target_kind] <= col_of[e.source_kind])
+    n_back = sum(1 for *_, is_back in drawn if is_back)
 
     max_rows = max((len(names) for names in columns.values()), default=1)
     width = _MARGIN + (len(_GRAPH_COLUMNS) - 1) * _COL_GAP + _NODE_W + _MARGIN
@@ -906,13 +911,15 @@ def _flow_graph(graph: GraphResponse) -> Markup:
     # Edges first (drawn behind the node boxes). A target the static extractor couldn't resolve simply
     # has no edge here (its source is flagged dynamic separately) — never a fabricated line.
     lane = 0
-    for edge, s, t in drawn:
+    for edge, s, t, is_back in drawn:
         sy, ty = s[1] + _NODE_H // 2, t[1] + _NODE_H // 2
-        if col_of[edge.target_kind] <= col_of[edge.source_kind]:
+        if is_back:
             lane_y = rows_bottom + lane * _LANE_GAP
             lane += 1
-            sx, tx = s[0] + _NODE_W + _GUTTER, t[0] - _GUTTER
-            d = f"M {s[0] + _NODE_W} {sy} H {sx} V {lane_y} H {tx} V {ty} H {t[0]}"
+            d = (
+                f"M {s[0] + _NODE_W} {sy} H {s[0] + _NODE_W + _GUTTER} V {lane_y} "
+                f"H {t[0] - _GUTTER} V {ty} H {t[0]}"
+            )
             parts.append(el("path", d=d, class_=f"gedge gedge-{edge.provenance} gedge-back"))
             continue
         parts.append(

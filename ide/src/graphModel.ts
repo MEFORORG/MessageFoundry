@@ -31,8 +31,6 @@ export interface Graph {
     router: string;
     settings?: Record<string, unknown>;
     receives_from?: string[];
-    /** A Loopback inbound: the outbounds whose reingress_to names it (the back-edge's sources). */
-    reingressed_from?: string[];
   } & Located)[];
   outbound: ({
     name: string;
@@ -337,10 +335,10 @@ function sendRefs(idPrefix: string, edges: GraphEdge[]): VmNode[] {
     });
 }
 
-/** An outbound's reingress_to back-edge as refs to the Loopback inbound(s) it re-enters. A ref is a
- *  leaf, so the cycle the back-edge closes is shown once and never expanded into a loop. */
-function reingressRefs(idPrefix: string, outbound: string, n: NormalGraph): VmNode[] {
-  return (n.reingressTo.get(outbound) ?? []).map((i) => ref(`${idPrefix}/${i}`, "inbound", i, "loopback inbound · reingress_to"));
+/** The connection-to-connection references `map` holds for `key`, as leaf refs. A ref never expands,
+ *  so the cycle a reingress_to back-edge closes is shown once and never unrolled into a loop. */
+function connRefs(idPrefix: string, map: Map<string, string[]>, key: string, kind: ElementKind, description: string): VmNode[] {
+  return (map.get(key) ?? []).map((name) => ref(`${idPrefix}/${name}`, kind, name, description));
 }
 
 // ---------------------------------------------------------------------------
@@ -391,12 +389,12 @@ export function buildElementsView(g: Graph, filter: string, runtime?: RuntimeMap
           ...refGroup(
             `${id}/reingressed`,
             "⇦ re-entered from",
-            (n.reingressedFrom.get(c.name) ?? []).map((o) => ref(`${id}/reingressed/${o}`, "outbound", o, "outbound · reingress_to")),
+            connRefs(`${id}/reingressed`, n.reingressedFrom, c.name, "outbound", "outbound · reingress_to"),
           ),
           ...refGroup(
             `${id}/replyFrom`,
             "→ replies from",
-            (n.replyFrom.get(c.name) ?? []).map((o) => ref(`${id}/replyFrom/${o}`, "outbound", o, "outbound · reply_from")),
+            connRefs(`${id}/replyFrom`, n.replyFrom, c.name, "outbound", "outbound · reply_from"),
           ),
         ],
       };
@@ -479,11 +477,15 @@ export function buildElementsView(g: Graph, filter: string, runtime?: RuntimeMap
             "⇦ receives from",
             receives.map((h) => ref(`${id}/receives/${h}`, "handler", h, "handler")),
           ),
-          ...refGroup(`${id}/reingress`, "→ re-enters", reingressRefs(`${id}/reingress`, o.name, n)),
+          ...refGroup(
+            `${id}/reingress`,
+            "→ re-enters",
+            connRefs(`${id}/reingress`, n.reingressTo, o.name, "inbound", "loopback inbound · reingress_to"),
+          ),
           ...refGroup(
             `${id}/repliesTo`,
             "⇦ replies to",
-            (n.repliesTo.get(o.name) ?? []).map((i) => ref(`${id}/repliesTo/${i}`, "inbound", i, "inbound · reply_from")),
+            connRefs(`${id}/repliesTo`, n.repliesTo, o.name, "inbound", "inbound · reply_from"),
           ),
         ],
       };
@@ -569,7 +571,7 @@ export function buildFlowView(g: Graph, filter: string, grouping: GroupingMode):
     ...[...n.outbound.values()].map((o): VmNode => {
       const receives = n.outboundReceives.get(o.name) ?? [];
       const id = `flow:ob:${o.name}`;
-      const children = reingressRefs(`${id}/reingress`, o.name, n);
+      const children = connRefs(`${id}/reingress`, n.reingressTo, o.name, "inbound", "loopback inbound · reingress_to");
       return {
         id,
         label: o.name,

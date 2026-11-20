@@ -213,9 +213,9 @@ suite("graphModel — connection-to-connection references (BACKLOG #5966)", () =
   const LOOP: Graph = {
     version: 2,
     inbound: [
-      { name: "IB_REQ", type: "file", router: "route_req", receives_from: [], reingressed_from: [] },
-      { name: "IB_LOOP", type: "loopback", router: "route_loop", receives_from: [], reingressed_from: ["OB_PARTNER"] },
-      { name: "IB_HTTP", type: "http", router: "route_req", receives_from: [], reingressed_from: [] },
+      { name: "IB_REQ", type: "file", router: "route_req", receives_from: [] },
+      { name: "IB_LOOP", type: "loopback", router: "route_loop", receives_from: [] },
+      { name: "IB_HTTP", type: "http", router: "route_req", receives_from: [] },
     ],
     outbound: [
       {

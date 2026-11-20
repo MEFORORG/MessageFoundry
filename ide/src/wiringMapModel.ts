@@ -140,16 +140,15 @@ function collectEdges(n: NormalGraph): MapEdge[] {
       }
     }
   }
+  // Both maps are keyed or valued by names read off g.outbound, so only the inbound end can miss.
   for (const [o, inbounds] of n.reingressTo) {
-    for (const i of inbounds) {
-      if (n.outbound.has(o) && n.inbound.has(i)) {
-        push("outbound", o, "inbound", i, "declared");
-      }
+    for (const i of inbounds.filter((name) => n.inbound.has(name))) {
+      push("outbound", o, "inbound", i, "declared");
     }
   }
   for (const [i, outbounds] of n.replyFrom) {
-    for (const o of outbounds) {
-      if (n.inbound.has(i) && n.outbound.has(o)) {
+    if (n.inbound.has(i)) {
+      for (const o of outbounds) {
         push("inbound", i, "outbound", o, "declared");
       }
     }
