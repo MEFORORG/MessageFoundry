@@ -292,6 +292,9 @@ export function buildForm(
  *   a boolean -- so a value the record did not carry AND that equals the schema default is omitted
  *   too (see the guard below). Without that, every save wrote an explicit `encrypt = true` for each
  *   default-true bool, which is exactly the bloat (and the upgrade-unsafety) invariant 2 forbids.
+ *   A box with NO schema default (null/undefined) draws unticked for "never set", which a boolean
+ *   cannot tell from a chosen false, so the caller passes undefined for one the user never touched
+ *   and the record never set (the webview tracks the touch; BACKLOG #5976).
  * - number: `Number(text)`; text that is not a number is returned VERBATIM so the engine's validator
  *   rejects what the user actually typed instead of this function silently discarding it.
  * - select: the matching entry from `choices`, preserving its JSON type (a Literal may be an int).

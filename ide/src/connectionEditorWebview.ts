@@ -510,7 +510,7 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
         }
         if (el.dataset.kind === 'checkbox') {
           // A checkbox has no "untouched" state, so one the record did not set, left at the schema
-          // default, writes nothing: the rule coerce in connectionForm.ts applies. Without it every
+          // default, writes nothing: the rule coerce in connectionForm.ts documents. Without it every
           // edit save wrote an explicit value for each default bool. "The record set it" is judged
           // against the record itself, not the descriptor: a transport or direction rebuild carries
           // what was ticked as the field's value, so a box moved off its default and back before

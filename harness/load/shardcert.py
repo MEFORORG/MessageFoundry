@@ -4481,32 +4481,30 @@ async def _await_indexed(
     count: int,
     *,
     timeout: float,
-    children: Mapping[int, tuple[str, Any]] | None = None,
+    children: Sequence[tuple[str, Any]] = (),
     interval: float = 0.25,
 ) -> list[dict[str, Any]]:
     """Await the per-child-index messages ``base_name.0 .. base_name.<count-1>`` (each posted by one
     child), returning their payloads in index order. Sequential awaits are fine — the children post
     around the same time, so the total wait is bounded by the slowest to appear, not their sum.
 
-    ``children`` maps an index to the ``(label, proc)`` that posts its message. A child that has exited
+    ``children[i]``, where given, is the ``(label, proc)`` that posts message ``i``. A child that has exited
     with its message still absent raises :class:`ShardCertChildExited` at once rather than stalling for
-    ``timeout`` (BACKLOG #5977, S27-65). The file is read once more after the exit is seen, since a child
-    posts its message and then exits, and the poll may land between the two."""
+    ``timeout`` (BACKLOG #5977, S27-65)."""
     loop = asyncio.get_running_loop()
     payloads: list[dict[str, Any]] = []
     for i in range(count):
         name = f"{base_name}.{i}"
-        label, proc = (children or {}).get(i, ("", None))
+        label, proc = children[i] if i < len(children) else ("", None)
         deadline = loop.time() + timeout
         while True:
+            # The exit code is taken BEFORE the read, so a child that posted and then exited is read
+            # as posted, never as crashed.
+            code = getattr(proc, "returncode", None)
             payload = coord.read(name)
             if payload is not None:
                 break
-            code = getattr(proc, "returncode", None)
             if code is not None:
-                payload = coord.read(name)
-                if payload is not None:
-                    break
                 raise ShardCertChildExited(
                     f"child {label} exited with code {code} before posting coord message {name!r}"
                 )
@@ -5026,9 +5024,8 @@ async def run_shardcert_drive(
 
     coord_dir = str(coord.directory)
     run_id = coord.run_id
-    procs: list[tuple[str, Any]] = []
-    sink_procs: dict[int, tuple[str, Any]] = {}
-    worker_procs: dict[int, tuple[str, Any]] = {}
+    sink_procs: list[tuple[str, Any]] = []
+    worker_procs: list[tuple[str, Any]] = []
     coord_failure: CoordTimeout | None = None
     child_tails: list[str] = []
     notes: list[str] = []
@@ -5096,8 +5093,7 @@ async def run_shardcert_drive(
                     run_id,
                 ]
             )
-            sink_procs[m] = (f"sink-{m}", proc)
-            procs.append(sink_procs[m])
+            sink_procs.append((f"sink-{m}", proc))
         await _await_indexed(
             coord, SINK_BOUND, sink_count, timeout=child_ready_timeout, children=sink_procs
         )
@@ -5123,8 +5119,7 @@ async def run_shardcert_drive(
                     run_id,
                 ]
             )
-            worker_procs[j] = (f"worker-{j}", proc)
-            procs.append(worker_procs[j])
+            worker_procs.append((f"worker-{j}", proc))
         await _await_indexed(
             coord, DRIVER_ARMED, driver_count, timeout=child_ready_timeout, children=worker_procs
         )
@@ -5247,6 +5242,7 @@ async def run_shardcert_drive(
         # Reap CONCURRENTLY so an early failure (e.g. a coord timeout while M+K children are still
         # live, some blocked on DRIVE_COMPLETE) tears the whole tier down in ~one reap_grace, not
         # (M+K)*reap_grace — no lingering child processes on the load-gen box between ladder steps.
+        procs = sink_procs + worker_procs
         if procs:
             child_tails = await asyncio.gather(
                 *(_reap_child(label, proc, grace=reap_grace) for label, proc in procs)
