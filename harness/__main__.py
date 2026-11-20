@@ -1582,6 +1582,9 @@ def _run_shardcert_driver(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 2
+    except ValueError as exc:  # a rate or hold that is not a finite number above 0 — setup error
+        print(f"shardcert-driver: {exc}", file=sys.stderr)
+        return 2
     except CoordTimeout as exc:
         print(f"shardcert-driver: {exc}", file=sys.stderr)
         return 2
@@ -2127,8 +2130,9 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
         type=float,
         default=300.0,
         help="soak hold in seconds (default 300s = 5 min; OMITTING THIS STILL RUNS A 300s SOAK — it is "
-        "not 'off'). To DISABLE the soak use --no-soak; --soak-hold-seconds 0 is NOT a skip (it runs a "
-        "degenerate 0s soak). The soak also self-skips when no climb rung sustained (nothing to soak).",
+        "not 'off'). To DISABLE the soak use --no-soak; --soak-hold-seconds 0 is NOT a skip (it is "
+        "refused, with any value that is not a finite number above 0). The soak also self-skips when no "
+        "climb rung sustained (nothing to soak).",
     )
     parser.add_argument(
         "--soak-drain-timeout",

@@ -1465,6 +1465,95 @@ async def test_drive_timeout_carries_the_tail_of_a_child_still_running(
     assert "[sink-0] sink: waiting on a port that never bound" in text, text
 
 
+async def test_await_indexed_sees_a_crashed_child_at_any_pending_index(tmp_path: Path) -> None:
+    """BACKLOG #5977, S27-65: with child 0 still running and child 1 already exited, the wait names
+    child 1 within the exit grace rather than waiting out child 0's timeout first."""
+    coord = FileDropCoord(tmp_path, run_id="anyindex")
+    children = [("sink-0", _ExitedProc(None, b"")), ("sink-1", _ExitedProc(3, b""))]
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    with pytest.raises(sc.ShardCertChildExited, match="sink-1 exited with code 3"):
+        await sc._await_indexed(
+            coord, SINK_BOUND, 2, timeout=30.0, children=children, interval=0.01
+        )
+    assert loop.time() - start < 10.0
+
+
+async def test_await_indexed_bounds_the_whole_step_by_one_timeout(tmp_path: Path) -> None:
+    """BACKLOG #5977: one deadline covers every index, so three silent children time out after
+    ``timeout``, not three times it. A NaN timeout times out at once rather than never."""
+    coord = FileDropCoord(tmp_path, run_id="onedeadline")
+    loop = asyncio.get_running_loop()
+    start = loop.time()
+    with pytest.raises(CoordTimeout, match=f"{SINK_BOUND}.0"):
+        await sc._await_indexed(coord, SINK_BOUND, 3, timeout=0.3, interval=0.01)
+    assert loop.time() - start < 0.8
+    with pytest.raises(CoordTimeout):
+        await asyncio.wait_for(
+            sc._await_indexed(coord, SINK_BOUND, 1, timeout=float("nan"), interval=0.01), 5.0
+        )
+
+
+async def test_await_indexed_reads_a_message_that_lands_just_after_its_child_exits(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5977: a read that returns None just after a clean exit (a file a scanner holds open)
+    is not a crash; the message that turns up inside the exit grace is read."""
+    monkeypatch.setattr(sc, "_CHILD_EXIT_GRACE", 1.0)
+    coord = FileDropCoord(tmp_path, run_id="lateread")
+
+    async def post_late() -> None:
+        await asyncio.sleep(0.3)
+        coord.post(f"{SINK_BOUND}.0", {"sink_index": 0})
+
+    poster = asyncio.create_task(post_late())
+    got = await sc._await_indexed(
+        coord,
+        SINK_BOUND,
+        1,
+        timeout=30.0,
+        children=[("sink-0", _ExitedProc(0, b""))],
+        interval=0.01,
+    )
+    await poster
+    assert got == [{"sink_index": 0}]
+
+
+@pytest.mark.parametrize(
+    ("overrides", "field"),
+    [
+        ({"soak_hold_seconds": 0.0}, "hold_seconds"),
+        ({"soak_rate_override": float("nan")}, "aggregate_rate"),
+        ({"rates": [0.0, 40.0]}, "aggregate_rate"),
+        ({"hold_seconds": float("inf")}, "hold_seconds"),
+    ],
+)
+async def test_drive_ladder_refuses_a_bad_rate_or_hold_before_the_climb(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, overrides: dict[str, Any], field: str
+) -> None:
+    """BACKLOG #5977, S27-64: the ladder refuses every rate and hold it would hand the drive before
+    any rung runs, so a bad soak value cannot discard a finished climb. No rung may be driven."""
+    import harness.load.shardcert_ladder as ladder
+
+    async def no_drive(**kw: Any) -> Any:
+        raise AssertionError("a rung was driven")
+
+    monkeypatch.setattr(ladder, "run_shardcert_drive", no_drive)
+    kwargs: dict[str, Any] = {
+        "engine_host": "10.0.0.5",
+        "rates": [40.0],
+        "hold_seconds": 1.0,
+        "drain_timeout": 1.0,
+        "driver_count": 1,
+        "sink_count": 1,
+        "sink_host": "127.0.0.1",
+        "base_coord": FileDropCoord(tmp_path, run_id="ladderbad"),
+        **overrides,
+    }
+    with pytest.raises(ValueError, match=f"{field} must be a finite number above 0"):
+        await ladder.run_drive_ladder(**kwargs)
+
+
 async def test_coordinator_fails_loud_on_oversized_sink_count(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -209,9 +209,6 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
       if (f.control === 'checkbox' && !useEnv && boolish) {
         control = document.createElement('input'); control.type = 'checkbox';
         control.checked = f.value === true || (f.value === undefined && f.defaultValue === true);
-        // A box whose schema has no default draws unticked for "never set", which a save cannot
-        // tell from a chosen false without knowing whether the user touched it (collectSettings).
-        control.addEventListener('change', () => { control.dataset.touched = '1'; });
       } else if (f.control === 'select' && !useEnv) {
         control = document.createElement('select');
         const choices = f.choices || [];
@@ -515,15 +512,10 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
           // against the record itself, not the descriptor: a transport or direction rebuild carries
           // what was ticked as the field's value, so a box moved off its default and back before
           // the rebuild would otherwise write the default (BACKLOG #5976).
-          const dflt = f.defaultValue;
-          // No schema default: unticked is drawn for "never set", so an untouched box the record and
-          // any rebuild left unset posts nothing rather than false; a touched one, or one a record
-          // or rebuild carried a value for, posts what it shows.
-          if (dflt === undefined || dflt === null) {
-            if (f.value === undefined && el.dataset.touched !== '1') continue;
-            settings[key] = el.checked;
-            continue;
-          }
+          // A box with no schema default is drawn unticked for "never set", so for this rule its unset
+          // position is unticked: an unticked box the record did not set posts nothing rather than
+          // false. Ticked and unticked again looks the same as never touched, and posts the same.
+          const dflt = f.defaultValue === undefined || f.defaultValue === null ? false : f.defaultValue;
           const fromRecord = f.value !== undefined && RECORDED_KEYS.has(key);
           if (!fromRecord && el.checked === dflt) continue;
           settings[key] = el.checked;

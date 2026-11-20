@@ -139,7 +139,7 @@ def _derive_driver_done_timeout(
     return hold_seconds + drain_timeout + _DRIVER_DONE_MARGIN
 
 
-def _require_drive_shape(aggregate_rate: float, hold_seconds: float) -> None:
+def require_drive_shape(aggregate_rate: float, hold_seconds: float) -> None:
     """Refuse an offered rate or hold that is not a finite positive number (BACKLOG #5977, S27-64).
 
     The CLI parses both with ``type=float``, which accepts ``nan``, ``inf``, ``0`` and negatives. An
@@ -3880,7 +3880,7 @@ async def run_shardcert_driver(
 
     The drain poll is https with the remote rig session unless ``allow_insecure``; ``cacert`` is the
     engine box's certificate PEM (see :func:`_remote_engine_poller`)."""
-    _require_drive_shape(aggregate_rate, hold_seconds)
+    require_drive_shape(aggregate_rate, hold_seconds)
     ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     inbound_base = int(ready["inbound_base"])
@@ -4345,7 +4345,7 @@ async def run_shardcert_driver_worker(
     It NEVER binds a sink (the external sink tier owns delivery) and NEVER spawns an engine — the whole
     point is CPU isolation and horizontal sender scale. **Fail loud** if the band slice is empty / the
     worker count exceeds the bands (see :func:`_band_slice`)."""
-    _require_drive_shape(aggregate_rate, hold_seconds)
+    require_drive_shape(aggregate_rate, hold_seconds)
     ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     inbound_base = int(ready["inbound_base"])
@@ -4475,6 +4475,12 @@ class ShardCertChildExited(CoordTimeout):
     so a crashed child gets the same handling at once instead of after the whole wait."""
 
 
+#: How long a child's exit may precede its coord message being readable before the wait calls it a
+#: crash. ``FileDropCoord.read`` returns None for a file it cannot read yet (a scanner or a share holding
+#: it open), so one None read after a clean post-and-exit must not abort a healthy rung.
+_CHILD_EXIT_GRACE = 2.0
+
+
 async def _await_indexed(
     coord: FileDropCoord,
     base_name: str,
@@ -4485,36 +4491,50 @@ async def _await_indexed(
     interval: float = 0.25,
 ) -> list[dict[str, Any]]:
     """Await the per-child-index messages ``base_name.0 .. base_name.<count-1>`` (each posted by one
-    child), returning their payloads in index order. Sequential awaits are fine — the children post
-    around the same time, so the total wait is bounded by the slowest to appear, not their sum.
+    child), returning their payloads in index order. ONE deadline covers the whole step, so the wait is
+    bounded by ``timeout`` however many children there are, as the B6 sink budget assumes.
 
-    ``children[i]``, where given, is the ``(label, proc)`` that posts message ``i``. A child that has exited
-    with its message still absent raises :class:`ShardCertChildExited` at once rather than stalling for
-    ``timeout`` (BACKLOG #5977, S27-65)."""
+    ``children[i]``, where given, is the ``(label, proc)`` that posts message ``i``. Every pending index
+    is checked on each poll, so a child that has exited with its message still absent (after
+    :data:`_CHILD_EXIT_GRACE`) raises :class:`ShardCertChildExited` rather than stalling for ``timeout``,
+    whichever index it holds (BACKLOG #5977, S27-65)."""
     loop = asyncio.get_running_loop()
-    payloads: list[dict[str, Any]] = []
-    for i in range(count):
-        name = f"{base_name}.{i}"
-        label, proc = children[i] if i < len(children) else ("", None)
-        deadline = loop.time() + timeout
-        while True:
+    deadline = loop.time() + timeout
+    payloads: dict[int, dict[str, Any]] = {}
+    exited_at: dict[int, float] = {}
+    while True:
+        now = loop.time()
+        for i in range(count):
+            if i in payloads:
+                continue
+            label, proc = children[i] if i < len(children) else ("", None)
             # The exit code is taken BEFORE the read, so a child that posted and then exited is read
             # as posted, never as crashed.
             code = getattr(proc, "returncode", None)
-            payload = coord.read(name)
+            payload = coord.read(f"{base_name}.{i}")
             if payload is not None:
-                break
-            if code is not None:
+                payloads[i] = payload
+            elif code is not None and now - exited_at.setdefault(i, now) >= _CHILD_EXIT_GRACE:
                 raise ShardCertChildExited(
-                    f"child {label} exited with code {code} before posting coord message {name!r}"
+                    f"child {label} exited with code {code} before posting coord message "
+                    f"{f'{base_name}.{i}'!r}"
                 )
-            if loop.time() >= deadline:
-                raise CoordTimeout(
-                    f"coord message {name!r} not received within {timeout}s (dir={coord.directory})"
-                )
-            await asyncio.sleep(interval)
-        payloads.append(payload)
-    return payloads
+        if len(payloads) == count:
+            return [payloads[i] for i in range(count)]
+        # Written as "not before", so a NaN deadline (a NaN timeout) times out at once, as
+        # FileDropCoord.await_message does, rather than waiting forever.
+        if not now < deadline:
+            missing = next(i for i in range(count) if i not in payloads)
+            raise CoordTimeout(
+                f"coord message {f'{base_name}.{missing}'!r} not received within {timeout}s "
+                f"(dir={coord.directory})"
+            )
+        await asyncio.sleep(interval)
+
+
+#: The longest stretch of one child's output tail the raised error carries. The ladder posts the error
+#: text across the coord channel (RUNG_ABORTED), which refuses a message over its byte cap.
+_CHILD_TAIL_CHARS = 400
 
 
 async def _reap_child(label: str, proc: Any, *, grace: float) -> str:
@@ -4966,7 +4986,7 @@ async def run_shardcert_drive(
     closes that window. The advisory poll runs beside the gate: once the gate lands it gets
     :data:`_ADVISORY_DRAIN_GRACE` more, then is asked to stop. Bounded + best-effort — a missing signal degrades to
     the advisory-drain fallback (the poll then runs in full) with a note, never a hang."""
-    _require_drive_shape(aggregate_rate, hold_seconds)
+    require_drive_shape(aggregate_rate, hold_seconds)
     ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     dests = int(ready["dests"])
@@ -5249,10 +5269,16 @@ async def run_shardcert_drive(
             )
             notes.extend(child_tails)
     if coord_failure is not None:
-        tails = "; ".join(escape_for_terminal(t, single_line=True) for t in child_tails)
-        raise type(coord_failure)(
-            f"{coord_failure}; child output: {tails or '(none)'}"
-        ) from coord_failure
+        tails = "; ".join(
+            escape_for_terminal(t[:_CHILD_TAIL_CHARS], single_line=True) for t in child_tails
+        )
+        # Rebuilt as one of the two classes this module raises, whose constructors take one message.
+        cls = (
+            ShardCertChildExited
+            if isinstance(coord_failure, ShardCertChildExited)
+            else CoordTimeout
+        )
+        raise cls(f"{coord_failure}; child output: {tails or '(none)'}") from coord_failure
 
     # (6) Aggregate the children's coord DONE files (the authority) + the engine's REMOTE drain gauge.
     a = sum(int(d["acked"]) for d in driver_dones)
