@@ -3801,8 +3801,9 @@ nothing to clear makes no such check:
   failures, are appended in the reset's own transaction, so the counters are not reset without
   them, and a refused append rolls the reset back.
 - A raise from the stamp onward writes an `auth.reauth` row marked `interrupted`, softly, beside
-  any row the clear already committed. A raise inside the re-proof itself, after the password
-  verified, writes no `auth.reauth` row.
+  any row the clear already committed, except when the hard `auth.reauth` row write itself raises
+  or is cancelled (ADR 0217's 2026-11-19 amendment, case (a)). A raise inside the re-proof itself,
+  after the password verified, writes no `auth.reauth` row.
 
 **A password re-auth that holds a rotated token asks the store, best effort, to revoke that session
 when its hard `auth.reauth` row write raises or is cancelled, or when its clear raises (BACKLOG
