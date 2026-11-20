@@ -106,7 +106,9 @@ function collectElements(n: NormalGraph): Map<string, FlatElement> {
 
 /** Every statically-known edge, provenance carried through; targets that resolve to no known
  *  element are omitted here (the element's `dynamic` flag + stub covers unresolvables). A
- *  handler→inbound pass-through edge is legal and kept — its target lays out in the inbound column. */
+ *  handler→inbound pass-through edge is legal and kept — its target lays out in the inbound column —
+ *  and so is an outbound's reingress_to back-edge into its Loopback inbound, which closes a cycle,
+ *  and an Http inbound's reply_from reference to the outbound whose captured reply answers it. */
 function collectEdges(n: NormalGraph): MapEdge[] {
   const edges: MapEdge[] = [];
   const seen = new Set<string>();
@@ -135,6 +137,20 @@ function collectEdges(n: NormalGraph): MapEdge[] {
         push("handler", h.name, "outbound", e.target, e.provenance);
       } else if (e.target_kind === "inbound" && n.inbound.has(e.target)) {
         push("handler", h.name, "inbound", e.target, e.provenance);
+      }
+    }
+  }
+  for (const [o, inbounds] of n.reingressTo) {
+    for (const i of inbounds) {
+      if (n.outbound.has(o) && n.inbound.has(i)) {
+        push("outbound", o, "inbound", i, "declared");
+      }
+    }
+  }
+  for (const [i, outbounds] of n.replyFrom) {
+    for (const o of outbounds) {
+      if (n.inbound.has(i) && n.outbound.has(o)) {
+        push("inbound", i, "outbound", o, "declared");
       }
     }
   }

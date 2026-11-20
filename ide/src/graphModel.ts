@@ -31,12 +31,18 @@ export interface Graph {
     router: string;
     settings?: Record<string, unknown>;
     receives_from?: string[];
+    /** A Loopback inbound: the outbounds whose reingress_to names it (the back-edge's sources). */
+    reingressed_from?: string[];
   } & Located)[];
   outbound: ({
     name: string;
     type: string;
     settings?: Record<string, unknown>;
     receives_from?: string[];
+    /** The reingress_to back-edge: outbound -> the Loopback inbound its captured reply re-enters. */
+    edges?: GraphEdge[];
+    /** The Http inbounds whose reply_from names this outbound (its captured reply answers them). */
+    replies_to?: string[];
   } & Located)[];
   routers: ({
     name: string;
@@ -184,6 +190,22 @@ export interface NormalGraph {
   handlers: Map<string, Graph["handlers"][number] & { edges: GraphEdge[]; fed_by: string[] }>;
   outboundReceives: Map<string, string[]>;
   inboundReceives: Map<string, string[]>;
+  /** outbound -> the Loopback inbounds its reingress_to names (a back-edge closing a cycle). */
+  reingressTo: Map<string, string[]>;
+  /** Loopback inbound -> the outbounds whose reingress_to names it. */
+  reingressedFrom: Map<string, string[]>;
+  /** Http inbound -> the outbounds its reply_from names. */
+  replyFrom: Map<string, string[]>;
+  /** outbound -> the Http inbounds whose reply_from names it. */
+  repliesTo: Map<string, string[]>;
+}
+
+/** Add `value` to `map[key]`, keeping the bucket sorted and duplicate-free. */
+function addSorted(map: Map<string, string[]>, key: string, value: string): void {
+  const cur = map.get(key) ?? [];
+  if (!cur.includes(value)) {
+    map.set(key, [...cur, value].sort());
+  }
 }
 
 export function normalize(g: Graph): NormalGraph {
@@ -216,11 +238,26 @@ export function normalize(g: Graph): NormalGraph {
     for (const e of h.edges) {
       const bucket = e.target_kind === "outbound" ? outboundReceives : e.target_kind === "inbound" ? inboundReceives : undefined;
       if (bucket) {
-        const cur = bucket.get(e.target) ?? [];
-        if (!cur.includes(h.name)) {
-          bucket.set(e.target, [...cur, h.name].sort());
-        }
+        addSorted(bucket, e.target, h.name);
       }
+    }
+  }
+  // The connection-to-connection references, both directions. A payload from a CLI older than these
+  // fields carries neither, so it renders no such reference rather than a guessed one.
+  const reingressTo = new Map<string, string[]>();
+  const reingressedFrom = new Map<string, string[]>();
+  const replyFrom = new Map<string, string[]>();
+  const repliesTo = new Map<string, string[]>();
+  for (const o of g.outbound) {
+    for (const e of o.edges ?? []) {
+      if (e.target_kind === "inbound") {
+        addSorted(reingressTo, o.name, e.target);
+        addSorted(reingressedFrom, e.target, o.name);
+      }
+    }
+    for (const i of o.replies_to ?? []) {
+      addSorted(repliesTo, o.name, i);
+      addSorted(replyFrom, i, o.name);
     }
   }
   return {
@@ -230,6 +267,10 @@ export function normalize(g: Graph): NormalGraph {
     handlers,
     outboundReceives,
     inboundReceives,
+    reingressTo,
+    reingressedFrom,
+    replyFrom,
+    repliesTo,
   };
 }
 
@@ -296,6 +337,12 @@ function sendRefs(idPrefix: string, edges: GraphEdge[]): VmNode[] {
     });
 }
 
+/** An outbound's reingress_to back-edge as refs to the Loopback inbound(s) it re-enters. A ref is a
+ *  leaf, so the cycle the back-edge closes is shown once and never expanded into a loop. */
+function reingressRefs(idPrefix: string, outbound: string, n: NormalGraph): VmNode[] {
+  return (n.reingressTo.get(outbound) ?? []).map((i) => ref(`${idPrefix}/${i}`, "inbound", i, "loopback inbound · reingress_to"));
+}
+
 // ---------------------------------------------------------------------------
 // Elements perspective
 // ---------------------------------------------------------------------------
@@ -340,6 +387,16 @@ export function buildElementsView(g: Graph, filter: string, runtime?: RuntimeMap
             `${id}/receives`,
             "⇦ receives from",
             receives.map((h) => ref(`${id}/receives/${h}`, "handler", h, "handler · pass-through Send")),
+          ),
+          ...refGroup(
+            `${id}/reingressed`,
+            "⇦ re-entered from",
+            (n.reingressedFrom.get(c.name) ?? []).map((o) => ref(`${id}/reingressed/${o}`, "outbound", o, "outbound · reingress_to")),
+          ),
+          ...refGroup(
+            `${id}/replyFrom`,
+            "→ replies from",
+            (n.replyFrom.get(c.name) ?? []).map((o) => ref(`${id}/replyFrom/${o}`, "outbound", o, "outbound · reply_from")),
           ),
         ],
       };
@@ -416,11 +473,19 @@ export function buildElementsView(g: Graph, filter: string, runtime?: RuntimeMap
         elementKind: "outbound",
         elementName: o.name,
         open: opened(o),
-        children: refGroup(
-          `${id}/receives`,
-          "⇦ receives from",
-          receives.map((h) => ref(`${id}/receives/${h}`, "handler", h, "handler")),
-        ),
+        children: [
+          ...refGroup(
+            `${id}/receives`,
+            "⇦ receives from",
+            receives.map((h) => ref(`${id}/receives/${h}`, "handler", h, "handler")),
+          ),
+          ...refGroup(`${id}/reingress`, "→ re-enters", reingressRefs(`${id}/reingress`, o.name, n)),
+          ...refGroup(
+            `${id}/repliesTo`,
+            "⇦ replies to",
+            (n.repliesTo.get(o.name) ?? []).map((i) => ref(`${id}/repliesTo/${i}`, "inbound", i, "inbound · reply_from")),
+          ),
+        ],
       };
     });
 
@@ -503,15 +568,17 @@ export function buildFlowView(g: Graph, filter: string, grouping: GroupingMode):
     }),
     ...[...n.outbound.values()].map((o): VmNode => {
       const receives = n.outboundReceives.get(o.name) ?? [];
+      const id = `flow:ob:${o.name}`;
+      const children = reingressRefs(`${id}/reingress`, o.name, n);
       return {
-        id: `flow:ob:${o.name}`,
+        id,
         label: o.name,
         kind: "element",
         description: `outbound · ${o.type}${receives.length ? ` · ⇦ ${receives.length} handler(s)` : ""}`,
         icon: "arrow-up",
         contextValue: "meforConnection",
-        collapsible: "none",
-        children: [],
+        collapsible: children.length ? "collapsed" : "none",
+        children,
         elementKind: "outbound",
         elementName: o.name,
         open: opened(o),
