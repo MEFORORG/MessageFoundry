@@ -1290,7 +1290,10 @@ def test_the_engine_sampler_stops_when_the_hold_ends_not_when_the_probe_returns(
     assert "_await_probe_beside_reply( probe_task, probe_window_closed," in flat
     # The reply wait is what the step hands the helper beside the probe; passing None would skip it
     # on every reload step with every unit test green (BACKLOG #1488).
-    assert "else _await_post_reload_reply(driver, metrics.counters, reload_account)" in source
+    assert (
+        "None if reload_account is None else "
+        "_await_post_reload_reply(driver, metrics.counters, reload_account)"
+    ) in " ".join(source.split())
     # The control: the order before #2024, where the probe returned before the sampler stopped.
     before = "\n".join(
         (

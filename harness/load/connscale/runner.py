@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import inspect
 import itertools
 import logging
 import os
@@ -176,11 +175,10 @@ _POST_RELOAD_HOLD_FRACTION = 0.25
 #   ran there. The floor's shell-outs add up to `_FD_PROBE_MAKEUP_MAX_S` per step, for 93.41 s; a
 #   second attempt would put the same sum at 133.41 s, past 120.
 #
-# NEITHER SUM PRICES THE OTHER'S TERM. The attempt in flight when the window closed runs in front
-# of the reply wait, as before the floor, and only the make-up attempt runs beside it
-# (`_await_probe_beside_reply` says why). That phase reaches 2 x 10 s at its longest on a Windows
-# leg either way, kill and reap aside. Every term at its maximum at once, which neither run came
-# near, gives 40.8 + 4 x (20 s + 5 s) = 140.8 s, past 120, before the floor as after it.
+# NEITHER SUM PRICES THE OTHER'S TERM. In the order `_await_probe_beside_reply` states, the time
+# from the probe window's close to the stop grace reaches 2 x 10 s at its longest on a Windows leg,
+# kill and reap aside, before the floor as after it. Every term at its maximum at once, which neither
+# run came near, gives 40.8 + 4 x (20 s + 5 s) = 140.8 s, past 120.
 #
 # BOTH ARE ESTIMATES, NOT BOUNDS IN EITHER DIRECTION. A run costs less where an attempt returns
 # inside its budget. Terms that cost more than on the run measured raise it, at least these: a longer
@@ -774,8 +772,7 @@ async def _run_started_step(
         probe_stop.set()
         # The reply wait runs after the engine sampler, so it is not in the rate window, and before
         # the stop, so a slow first reply after the reload is waited for rather than read as none
-        # (BACKLOG #1292). It starts once the OS probe's in-window attempt is done and runs beside
-        # any make-up attempt (BACKLOG #1488).
+        # (BACKLOG #1292). The helper states its order against the OS probe (BACKLOG #1488).
         fd_probe_floor_ticks, reload_account = await _await_probe_beside_reply(
             probe_task,
             probe_window_closed,
@@ -1568,8 +1565,8 @@ async def _probe_loop(
     more. The record and the report point here for when the floor fires. A
     reading taken here still comes from the step's engine before the driver stops: the caller sets
     ``stop`` only after the reload probe returns, and stops the driver only after this task returns
-    (:func:`_await_probe_beside_reply`, which runs it beside the post-reload reply wait). It is
-    taken after the
+    (:func:`_await_probe_beside_reply` states the order against the post-reload reply wait). It
+    is taken after the
     hold, with no traffic offered, and with any connection the reload left down still down, as for
     an in-window reading after the reload. ATTEMPTS are counted, so a probe whose attempts keep
     returning gaps cannot hold the step open past that many more. That bounds the number of calls,
@@ -1655,7 +1652,7 @@ async def _await_probe_beside_reply(
             await asyncio.wait({reply_task})
             if not reply_task.cancelled():
                 reply_task.exception()  # retrieved, so an error the probe's overtook is not logged
-        elif inspect.iscoroutine(reply):
+        elif asyncio.iscoroutine(reply):
             reply.close()  # cancelled before it started: closed, so it is not reported unawaited
 
 
