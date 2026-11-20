@@ -3806,25 +3806,30 @@ nothing to clear makes no such check:
   them, and a refused append rolls the reset back.
 - A raise from the stamp onward writes an `auth.reauth` row marked `interrupted`, softly, beside
   any row the clear already committed. When the clear itself raises, the store is first asked to
-  end the rotated session, and the row carries `clear_raised` and `session_ended`. That covers at
+  end the rotated session, and the row, where its write succeeds, carries `clear_raised` and
+  `session_ended`; an Outage that refuses the audit-chain MAC refuses that row too, and only log
+  lines record the revoke. That covers at
   least a store error whose commit the re-auth cannot read back, which includes a Vault transit
   Outage refusing the audit-chain MAC of the rows the clear appends (`CipherError`). A raise
   inside the re-proof itself, after the password verified, writes no `auth.reauth` row.
 
-**An `auth.reauth` row write that raises or is cancelled also ends the rotated session, whether or not a clear was due
-(BACKLOG #5900; ADR 0217's 2026-11-19 amendment, decided by the Lander under the owner's
-delegation of 2026-11-19, record d20261119T234650256-3bf83e).** When a password re-auth
-has rotated its session and the write of its hard `auth.reauth` row raises, at least on a Vault
+**An `auth.reauth` row write that raises or is cancelled asks the store to end the rotated
+session, whether or not a clear was due (BACKLOG #5900, PR 3100).** When a password re-auth has
+rotated its session and the write of its hard `auth.reauth` row raises, at least on a Vault
 transit Outage, an `OSError` or a defect, or is cancelled, the re-auth raises and never hands back
-the rotated token. It drops any purpose grant
-minted for that token and asks the store to end the rotated session; that revoke ends nothing
-else. The clear-raise path in the last bullet asks the same. On both paths the user is signed out
+the rotated token. It drops any purpose grant minted for that token and asks the store to end the
+rotated session; that revoke ends nothing else. The clear-raise path in the last bullet asks the
+same. For a re-auth due a clear during a Vault transit Outage, the sign-out this causes was
+accepted in ADR 0217's 2026-11-19 amendment, decided by the Lander under the owner's delegation of
+2026-11-19, record d20261119T234650256-3bf83e. That sign-out happens only when the clear raises or
+the hard row's write then raises or is cancelled: an Outage at the account record's seal that
+leaves the audit append working writes the row, hands back the rotated token and ends nothing. On both paths the user is signed out
 because the rotation has already retired the token the caller held; for the clear, that is the
 reorder that moves it after the rotation. The sign-out does not come from the revoke. The revoke is
 best effort: a refused revoke is tried once more, and when it is refused again, or raises, the
 rotated session stays live, unreachable. On the refused-row path only log lines then record it.
 A cancel, or a raise such as a connection lost at the commit, can follow a commit that landed, so
-those lines say it is not known whether the row committed.
+those lines say that whether the row committed was not checked.
 
 **A directory step-up or enrolment leg refuses a present account that lost a role in the directory
 (BACKLOG #2240).** At least the code and passkey legs above, the two enrolment legs, the IdP

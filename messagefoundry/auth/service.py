@@ -15772,9 +15772,10 @@ class AuthService:
         ``session_epoch`` moved or failing its seal, is granted nothing: the store is asked to end
         the rotated session, and the answer is ``session_lost``. A clear that raises, at least on a
         store error it cannot read back or a cancel, also asks the store to end the rotated
-        session, and the error propagates; so does a hard ``auth.reauth`` row that is refused after
-        a rotation. A success that clears a run of failures is labelled
-        ``auth.login_after_failures``; that row and the ``auth.reauth`` row commit with the clear.
+        session, and the error propagates; so does a hard ``auth.reauth`` row whose write raises or
+        is cancelled after a rotation, whether or not a clear was due. A success that clears a run
+        of failures is labelled ``auth.login_after_failures``; that row and the ``auth.reauth`` row
+        commit with the clear.
         The ``auth.reauth`` row is written even when the ceremony raises from its stamp onward."""
         if await self.session_steps_up_at_idp(token):
             # BACKLOG #296, ADR 0142 Amendment B: a session the federated login minted steps up at the
@@ -16043,20 +16044,20 @@ class AuthService:
                             row_write = "auth.reauth row write was cancelled"
                         else:
                             row_write = f"auth.reauth row write raised {type(row_exc).__name__}"
-                        row_refused_ended: list[bool] = []
+                        row_write_ended: list[bool] = []
                         try:
                             await self._end_reauth_rotated_session_shielded(
-                                elevation.token, identity.username, row_write, row_refused_ended
+                                elevation.token, identity.username, row_write, row_write_ended
                             )
                         finally:
                             # No row is known to record it, so the log does.
                             _log.warning(
                                 "a re-auth for %s whose %s %s the session it rotated; whether that "
-                                "row committed is not known",
+                                "row committed was not checked",
                                 scrub_log_argument(identity.username),
                                 row_write,
                                 "ended"
-                                if row_refused_ended and row_refused_ended[0]
+                                if row_write_ended and row_write_ended[0]
                                 else "could not end",
                             )
                     raise

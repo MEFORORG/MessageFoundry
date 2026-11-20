@@ -1234,8 +1234,8 @@ async def test_a_cancel_after_the_reauth_row_committed_is_not_logged_as_a_refusa
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A cancel that lands once the hard ``auth.reauth`` row has committed still ends the rotated
-    session, and its log line says the write was cancelled and that whether the row committed is
-    not known, never that the row was refused."""
+    session, and its log line says the write was cancelled and that whether the row committed was
+    not checked, never that the row was refused."""
     store = await MessageStore.open(":memory:")
     try:
         service, _, identity, token = await _setup(store)
@@ -1270,7 +1270,7 @@ async def test_a_cancel_after_the_reauth_row_committed_is_not_logged_as_a_refusa
         text = caplog.text
         assert (
             "whose auth.reauth row write was cancelled ended the session it rotated; "
-            "whether that row committed is not known"
+            "whether that row committed was not checked"
         ) in text
         assert "row was refused" not in text
     finally:
