@@ -61,9 +61,11 @@
        seats/.writer-errors.txt and the script still exits 0. Exiting non-zero from a Stop hook is
        its own hazard; leaving no trace is worse than either. A -Record hook input refused under
        scripts/hooks/_hookinput.ps1's rules is NOT a failure, so it never goes there. It goes to
-       stderr, which seat-record.ps1 discards, and to seats/.writer-refusals.txt in the registry of
-       the checkout the hook started in, where that checkout and its registry resolve, at most one
-       line per session key and host per hour. fleet.ps1 does not read that file.
+       stderr and to seats/.writer-refusals.txt in the registry of the checkout this script started
+       in, where that checkout and its registry resolve, at most one line per session key and host
+       per hour. Only a -Record run with no -Worktree refuses input: seat-record.ps1 resolves the
+       worktree itself, says on stdout when it cannot, and then does not run this script.
+       fleet.ps1 does not read that file.
 
     3. TOUCH seats/.writer-alive/<boxKey>.txt ON EVERY INVOCATION, including no-op ones. "The writer
        ran" and "the seat had something to say" are different sentences, and a reader that cannot
@@ -368,7 +370,9 @@ function Read-HookPayload {
 function Read-RecordHookInput {
     <#
       The -Record hook input, and which worktree it answers for. Returns
-      @{ Payload; Dir = <worktree root or $null>; FromPin = <bool>; Reason = <fault or ''>; Fault = <bool> }.
+      @{ Payload; Dir = <worktree root or $null>; FromPin = <bool>; HintFromPin = <bool>;
+      Reason = <fault or ''>; Fault = <bool> }. HintFromPin says the session pin names -Hint, the
+      worktree seat-record.ps1 passed, which it resolves by the same pin rules.
       A Reason means NO WRITE. Fault marks a Reason that is this writer's own failure (the helper is
       missing or threw) rather than input it refused. A $null Dir means the directory this script runs in.
 
@@ -384,20 +388,23 @@ function Read-RecordHookInput {
     # The helper is written for the hooks' 'Continue', as mail-drain and seat-unlock run it. Under
     # this script's 'Stop', a non-terminating error inside it (a pin naming an unmapped drive, say)
     # would refuse input the helper itself would answer.
+    param([string]$Hint)
     $ErrorActionPreference = 'Continue'
     $helper = Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks/_hookinput.ps1'
     if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
         $p = Read-HookPayload
         $why = if ($p -and ($p.PSObject.Properties.Name -contains 'cwd')) { "scripts/hooks/_hookinput.ps1 is missing beside this script, so the hook input's cwd cannot be checked" } else { '' }
-        return @{ Payload = $p; Dir = $null; FromPin = $false; Reason = $why; Fault = [bool]$why }
+        return @{ Payload = $p; Dir = $null; FromPin = $false; HintFromPin = $false; Reason = $why; Fault = [bool]$why }
     }
     try {
         . $helper
         $s = Resolve-CcxHookSession -Text (Read-CcxHookInput) -ReadOnly
     } catch {
-        return @{ Payload = $null; Dir = $null; FromPin = $false; Reason = "the hook-input helper failed ($($_.Exception.Message))"; Fault = $true }
+        return @{ Payload = $null; Dir = $null; FromPin = $false; HintFromPin = $false; Reason = "the hook-input helper failed ($($_.Exception.Message))"; Fault = $true }
     }
-    return @{ Payload = $s.Payload; Dir = $s.Root; FromPin = ($s.Source -eq 'pin'); Reason = [string]$s.Reason; Fault = $false }
+    $fromPin = ($s.Source -eq 'pin')
+    $hintFromPin = [bool]($fromPin -and $Hint -and $s.Root -and (Test-CcxSamePath ([string]$s.Root) $Hint))
+    return @{ Payload = $s.Payload; Dir = $s.Root; FromPin = $fromPin; HintFromPin = $hintFromPin; Reason = [string]$s.Reason; Fault = $false }
 }
 
 function Get-SessionKey {
@@ -1004,20 +1011,18 @@ try {
     $wtHint = $Worktree
     $script:WorktreeSource = 'git rev-parse --show-toplevel'
     if ($Record) {
-        $hookIn = Read-RecordHookInput
+        $hookIn = Read-RecordHookInput -Hint $wtHint
         $payload = $hookIn.Payload
         if (-not $wtHint) {
             if ($hookIn.Reason) {
                 # Rule 1 again: input this cannot vouch for names no worktree, so NO RECORD, and exit
-                # 0 because this is the Stop path. Refused input is not a writer failure, so it
-                # NEVER goes to .writer-errors.txt, which fleet.ps1 counts as failures; an unpinned
-                # session would otherwise add one line there on every Stop (the same rule
-                # Invoke-ClearHandoff states). seat-record.ps1 discards stderr, so a refusal also
-                # goes to .writer-refusals.txt (rule 2), rate-limited per session key and host, or it
-                # would leave no trace at all. No .writer-alive heartbeat: it is keyed by this session's
-                # box, and refused input names no box to key it by. Both files go to the registry
-                # of the checkout this hook started in, where that checkout and its registry
-                # resolve.
+                # 0. Reached only with no -Worktree (rule 2). Refused input is not a writer failure,
+                # so it NEVER goes to .writer-errors.txt, which fleet.ps1 counts as failures (the
+                # same rule Invoke-ClearHandoff states); it goes to .writer-refusals.txt (rule 2),
+                # rate-limited per session key and host. No .writer-alive heartbeat: it is keyed by
+                # this session's box, and refused input names no box to key it by. Both files go to
+                # the registry of the checkout this script started in, where that checkout and its
+                # registry resolve.
                 $why = "the hook input was refused, so nothing was recorded: $($hookIn.Reason)"
                 [System.Console]::Error.WriteLine("seat.ps1: $why")
                 if (Set-StartSeatsDir) {
@@ -1034,6 +1039,11 @@ try {
             }
             $wtHint = $hookIn.Dir
             if ($hookIn.FromPin) { $script:WorktreeSource = 'session pin (scripts/hooks/_hookinput.ps1)' }
+        }
+        elseif ($hookIn.HintFromPin) {
+            # seat-record.ps1 passes -Worktree resolved by the same pin rules, so a -Worktree the
+            # session pin also names came from that pin.
+            $script:WorktreeSource = 'session pin (scripts/hooks/_hookinput.ps1)'
         }
     }
     $wt = Resolve-Worktree -Hint $wtHint

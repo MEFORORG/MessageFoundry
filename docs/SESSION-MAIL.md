@@ -235,15 +235,14 @@ lives in [`scripts/hooks/_hookinput.ps1`](../scripts/hooks/_hookinput.ps1): a Se
 launch worktree, and every later event answers for the pin, so a `cd` into a sibling never shows or
 consumes the sibling's mail. `EnterWorktree` looks like that `cd` to the drain.
 
-The Stop-hook seat record now follows the pin too (BACKLOG #5961), so a peer that addresses you by
+The Stop-hook seat record now follows the pin too (BACKLOG #5954), so a peer that addresses you by
 that record writes to the box the drain reads. Mail can still reach the worktree you moved into in
 at least these ways: a peer that addresses that path, a record written there by a `seat.ps1
--Declare` or `-Close` you ran from it, and a record written before the change. A session with no
-pin whose `cwd` is a linked worktree, for example after a /clear under the desktop app, gets no
-Stop record at all. Where the checkout the hook started in and its seat registry resolve, the
-refusals leave at most one line per session key and host per hour in `.writer-refusals.txt` in that
-registry, never in `.writer-errors.txt`, so a missing line within the hour does not mean no
-refusal. Before the change,
+-Declare` or `-Close` you ran from it, a record written before the change, and a session with no
+pin, for example after a /clear under the desktop app, whose `cwd` is a worktree of this
+repository: only a pin can tell its own worktree from a sibling, so that record lands at the `cwd`.
+Where the hook cannot name a worktree, it records nothing and says so at the turn end. Before the
+change,
 `scripts/coord/seat.ps1` recorded the toplevel of the hook `cwd`. Measured 2026-10-28 under that
 behaviour: a Lander launched in the primary, entered a sibling worktree, and fifteen messages waited
 there for fourteen hours with nothing saying so.

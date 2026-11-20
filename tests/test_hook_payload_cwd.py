@@ -923,13 +923,15 @@ def test_after_a_cd_to_another_repository_the_seat_recorder_writes_nothing_there
     assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
 
 
-def test_an_unpinned_seat_recorder_writes_no_record_for_a_sibling_cwd(
+def test_an_unpinned_seat_recorder_records_a_sibling_cwd_there(
     seat_clones: tuple[Path, Path, Path, Path],
 ) -> None:
-    """No pin says the session started in the sibling, so neither its box nor the primary's is right."""
+    """BACKLOG #5954: with no pin, a cwd in a worktree of this repository is recorded at that
+    worktree, as seat-record.ps1 says, since only a pin can tell its own worktree from a sibling."""
     repo, _, sibling, _ = seat_clones
     _record_stop(repo, _stop("s1", sibling))
-    assert _seat_records(repo) == []
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], sibling), recs
 
 
 def test_an_unpinned_seat_recorder_still_records_the_checkout_it_started_in(
@@ -954,8 +956,8 @@ def test_a_pinned_seat_recorder_with_no_cwd_records_its_pin(
 
 
 def test_seat_ps1_says_why_it_refused_a_cwd(seat_clones: tuple[Path, Path, Path, Path]) -> None:
-    """seat-record.ps1 discards seat.ps1's stderr, so the refusal is read from seat.ps1 itself: an
-    absent record must be this refusal, not a writer that failed for some other reason."""
+    """seat.ps1 -Record with no -Worktree refuses a cwd outside its pin rules, and says why on
+    stderr: an absent record must be this refusal, not a writer that failed for another reason."""
     repo, _, sibling, _ = seat_clones
     seat = ROOT / "scripts" / "coord" / "seat.ps1"
     proc = subprocess.run(
@@ -976,44 +978,57 @@ def test_seat_ps1_says_why_it_refused_a_cwd(seat_clones: tuple[Path, Path, Path,
     assert not errors.exists() or errors.read_text(encoding="utf-8").strip() == "", errors
 
 
+def _record_seat_direct(repo: Path, payload: dict[str, Any]) -> None:
+    """Run seat.ps1 -Record with no -Worktree, the one route on which it refuses input."""
+    seat = ROOT / "scripts" / "coord" / "seat.ps1"
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(seat), "-Record"],
+        cwd=str(repo),
+        input=_raw(payload),
+        capture_output=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+
+
 def test_a_refused_seat_record_leaves_one_refusal_line_an_hour(
     seat_clones: tuple[Path, Path, Path, Path],
 ) -> None:
-    """seat-record.ps1 discards seat.ps1's stderr, so a refusal recorded only there left no trace,
-    and an unpinned session's record would stop refreshing in silence. Each refusal goes to
-    .writer-refusals.txt instead, one line per session key and host per hour, never to
-    .writer-errors.txt."""
+    """seat.ps1 -Record with no -Worktree writes each refusal to .writer-refusals.txt, one line
+    per session key and host per hour, never to .writer-errors.txt. Run directly, because
+    seat-record.ps1 answers a refused input itself and never runs seat.ps1 for it."""
     repo, _, sibling, _ = seat_clones
     common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     seats = common / "mefor-coord" / "seats"
     refusals = seats / ".writer-refusals.txt"
     errors = seats / ".writer-errors.txt"
 
-    _record_stop(repo, _stop("s1", sibling))
+    _record_seat_direct(repo, _stop("s1", sibling))
     assert refusals.is_file(), "a refused hook input left no .writer-refusals.txt line"
     lines = refusals.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1, lines
     cols = lines[0].split("\t")
     assert cols[2] == "s1" and cols[3] == sibling.name, cols
 
-    _record_stop(repo, _stop("s1", sibling))
+    _record_seat_direct(repo, _stop("s1", sibling))
     assert refusals.read_text(encoding="utf-8").splitlines() == lines, "the hour's limit failed"
     assert not errors.exists() or errors.read_text(encoding="utf-8").strip() == "", errors
     assert _seat_records(repo) == []
 
     # The controls: the limit is per session key and host, and a line over an hour old, or stamped in the
     # future by a skewed clock, does not hold it.
-    _record_stop(repo, _stop("s2", sibling))
+    _record_seat_direct(repo, _stop("s2", sibling))
     assert len(refusals.read_text(encoding="utf-8").splitlines()) == 2, "another key was silenced"
     for stamp in ("2000-01-01T00:00:00Z", "2999-01-01T00:00:00Z"):
         refusals.write_text("\t".join([stamp, *cols[1:]]) + "\n", encoding="utf-8")
-        _record_stop(repo, _stop("s1", sibling))
+        _record_seat_direct(repo, _stop("s1", sibling))
         got = refusals.read_text(encoding="utf-8").splitlines()
         assert len(got) == 2 and got[1].split("\t")[2] == "s1", (stamp, got)
 
 
 def _record_stop_in_culture(repo: Path, payload: dict[str, Any], culture: str) -> None:
-    """Run seat.ps1 -Record, as seat-record.ps1 does, with the thread culture set first."""
+    """Run seat.ps1 -Record with no -Worktree, with the thread culture set first."""
     seat = ROOT / "scripts" / "coord" / "seat.ps1"
     lit = str(seat).replace("'", "''")
     command = (
