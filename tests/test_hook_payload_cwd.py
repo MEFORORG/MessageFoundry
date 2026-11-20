@@ -951,12 +951,9 @@ UNPINNED_SOURCE = (
 def test_an_unpinned_seat_recorder_records_a_sibling_cwd_there_labelled_unpinned(
     seat_clones: tuple[Path, Path, Path, Path],
 ) -> None:
-    """DECIDED, NOT A BUG (BACKLOG #5961 remainder, under #5954). With no pin, a cwd in a worktree of
-    this repository is recorded at that worktree. Such a session has no other source of truth for
-    its worktree: /clear mints a new session id and never pins (rule 5 of _hookinput.ps1), so the
-    cwd is all there is, and refusing it would leave every desktop-app session unrecorded after a
-    /clear. Only a pin can tell its own worktree from a sibling, so the record says no pin vouches
-    for it, and a reader does not take its worktree as proven."""
+    """DECIDED, NOT A BUG (BACKLOG #5961 remainder, under #5954): with no pin, a cwd in a worktree
+    of this repository is recorded at that worktree, and the record says no pin vouches for it.
+    seat-record.ps1's comment on that branch says why; no reader consults the label yet."""
     repo, _, sibling, _ = seat_clones
     _record_stop(repo, _stop("s1", sibling))
     recs = _seat_records(repo)
@@ -987,6 +984,21 @@ def test_a_hook_refusal_leaves_a_refusal_line(seat_clones: tuple[Path, Path, Pat
     assert len(lines) == 1 and lines[0].split("\t")[2] == "s1", lines
     errors = seats / ".writer-errors.txt"
     assert not errors.exists() or errors.read_text(encoding="utf-8").strip() == "", errors
+
+
+def test_a_hook_refusal_wins_over_input_seat_ps1_would_accept(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """-Refused is the hook's verdict, passed rather than re-derived: seat.ps1 records nothing even
+    for input its own resolution would record (a cwd in the start checkout)."""
+    repo, _, _, _ = seat_clones
+    _record_seat_direct(repo, _stop("s1", repo), "-Refused", "the hook refused it")
+    assert _seat_records(repo) == []
+    lines = (_seats_dir(repo) / ".writer-refusals.txt").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1 and lines[0].split("\t")[-1] == "the hook refused it", lines
+    # The control: the same input with no -Refused is recorded.
+    _record_seat_direct(repo, _stop("s1", repo))
+    assert len(_seat_records(repo)) == 1
 
 
 def test_a_pinned_seat_recorder_with_no_cwd_records_its_pin(

@@ -124,8 +124,9 @@ param(
     # lock is handed over to that id when no other live session is in the tree (BACKLOG #2524;
     # scripts/worktree/seat-lock.ps1).
     [Parameter(ParameterSetName = 'Prompt')][string]$Source,
-    # The worktree to record. scripts/hooks/seat-record.ps1 passes it on every -Record, resolved by the
-    # shared session-pin rules, so the payload's cwd is never the hint there. Tests and -Declare from a
+    # The worktree to record. scripts/hooks/seat-record.ps1 passes it on every -Record it does not
+    # refuse (-Refused), resolved by the shared session-pin rules, so the payload's cwd is never the
+    # hint there. Tests and -Declare from a
     # different cwd pass it too. Derived from the payload cwd or the current directory when absent.
     [string]$Worktree,
     # -Record only: the Reason scripts/hooks/seat-record.ps1 refused the hook input for. Nothing is
@@ -134,10 +135,9 @@ param(
     # a second resolution can never turn the refusal into a record somewhere else.
     [Parameter(ParameterSetName = 'Record')][string]$Refused,
     # -Record only: scripts/hooks/seat-record.ps1's verdict that NO SESSION PIN VOUCHES for the
-    # -Worktree it passes. It passes the cwd of an unpinned session whose cwd is a worktree of this
-    # repository (BACKLOG #5954), for example a desktop-app session after a /clear, which never pins.
-    # Only a pin can tell its own worktree from a sibling it moved into, so the record's
-    # worktreeSource says so and no reader should take its worktree as proven (BACKLOG #5961).
+    # -Worktree it passes: the cwd of an unpinned session whose cwd is a worktree of this repository.
+    # The hook's comment there says why it records that cwd (BACKLOG #5954, #5961). The record's
+    # worktreeSource says so; no reader consults that label yet.
     [Parameter(ParameterSetName = 'Record')][switch]$Unpinned,
     # Precedence for the record's session key, highest first: this parameter, then the hook's stdin
     # payload session_id, then $env:CLAUDE_CODE_SESSION_ID, then the literal 'nosid'. See
@@ -1039,10 +1039,10 @@ try {
             $why = "the hook input was refused, so nothing was recorded: $refusal"
             [System.Console]::Error.WriteLine("seat.ps1: $why")
             if (Set-StartSeatsDir) {
-                if ($hookIn.Fault -and -not $Refused) {
-                    # A missing or throwing helper IS a writer failure, and rule 2 wants a line.
-                    Write-WriterError -Stage 'hook-input' -Message $why
-                } else {
+                # A missing or throwing helper IS a writer failure, and rule 2 wants a line, even
+                # when the hook refused first.
+                if ($hookIn.Fault) { Write-WriterError -Stage 'hook-input' -Message "the hook-input helper failed: $($hookIn.Reason)" }
+                if ($Refused -or -not $hookIn.Fault) {
                     $cwd = ''
                     if ($payload -and $payload.PSObject.Properties['cwd']) { $cwd = [string]$payload.PSObject.Properties['cwd'].Value }
                     Write-WriterRefusal -SessionKey (Get-SessionKey -Payload $payload -Override $SessionId).Key -Cwd $cwd -Reason $refusal
@@ -1054,19 +1054,22 @@ try {
             $wtHint = $hookIn.Dir
             if ($hookIn.FromPin) { $script:WorktreeSource = 'session pin (scripts/hooks/_hookinput.ps1)' }
         }
-        elseif ($hookIn.Fault) {
-            # The caller named the worktree, so it is still recorded, but this script's own helper
-            # failed, which rule 2 wants on record once the registry resolves below.
-            $hookFault = "the hook input could not be checked, recorded at -Worktree as passed: $($hookIn.Reason)"
-        }
-        elseif ($hookIn.HintFromPin) {
-            # seat-record.ps1 passes -Worktree resolved by the same pin rules, so a -Worktree the
-            # session pin also names came from that pin.
-            $script:WorktreeSource = 'session pin (scripts/hooks/_hookinput.ps1)'
-        }
-        elseif ($Unpinned) {
-            # The hook's verdict, passed rather than re-derived; see -Unpinned.
-            $script:WorktreeSource = 'hook cwd, unpinned: no session pin vouches for it (scripts/hooks/seat-record.ps1)'
+        else {
+            if ($hookIn.Fault) {
+                # The caller named the worktree, so it is still recorded, but this script's own helper
+                # failed, which rule 2 wants on record once the registry resolves below.
+                $hookFault = "the hook input could not be checked, recorded at -Worktree as passed: $($hookIn.Reason)"
+            }
+            if ($Unpinned) {
+                # The hook's verdict, passed rather than re-derived; see -Unpinned. Checked first, so a
+                # fault in this script's own second read cannot drop it.
+                $script:WorktreeSource = 'hook cwd, unpinned: no session pin vouches for it (scripts/hooks/seat-record.ps1)'
+            }
+            elseif ($hookIn.HintFromPin) {
+                # seat-record.ps1 passes -Worktree resolved by the same pin rules, so a -Worktree the
+                # session pin also names came from that pin.
+                $script:WorktreeSource = 'session pin (scripts/hooks/_hookinput.ps1)'
+            }
         }
     }
     $wt = Resolve-Worktree -Hint $wtHint

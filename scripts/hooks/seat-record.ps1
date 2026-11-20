@@ -4,7 +4,8 @@
 .SYNOPSIS
     Stop hook: record this session's episode so a replacement seat under another account can pick the
     work up. Thin by design -- it resolves the session's worktree with scripts/hooks/_hookinput.ps1,
-    forwards stdin to scripts/coord/seat.ps1 with that worktree named, and gets out of the way.
+    forwards stdin to scripts/coord/seat.ps1 with that worktree named, or with -Refused and the
+    Reason where it names none, and gets out of the way.
 
 .DESCRIPTION
     WIRED TO Stop ONLY, and that is a measured choice rather than a default. Stop already pays a pwsh
@@ -75,8 +76,8 @@ try {
         # be read are still refused below.
         # DECIDED, NOT ACCIDENTAL (BACKLOG #5961, after #5954). Such a session has no other source of
         # truth for its worktree: /clear mints a new session id and no pin, so the cwd is all there is.
-        # -Unpinned makes seat.ps1 label the record's worktreeSource so; the label is for a reader of
-        # the record, and nothing acts on it yet. tests/test_hook_payload_cwd.py pins both halves.
+        # -Unpinned makes seat.ps1 label the record's worktreeSource so; no reader consults that
+        # label yet. tests/test_hook_payload_cwd.py pins both halves.
         $p = Get-CcxHookPayloadCwd -Payload $session.Payload
         $startCommon = Get-CcxGitCommonDir (Get-CcxWorktreeRoot (Get-Location).ProviderPath)
         $cwdRoot = if ($p.Cwd) { Get-CcxWorktreeRoot $p.Cwd } else { $null }
@@ -88,7 +89,8 @@ try {
             # The only worktree left to record is the one this hook started in, the PRIMARY under the
             # desktop app, and a record there would say this session sits in the primary.
             Write-Output "[seat] could not read this session's worktree: $($session.Reason). Nothing was recorded for this turn."
-            $recordArgs = @('-Refused', [string]$session.Reason)
+            # A Reason can quote payload text, so no double quote reaches the child's command line.
+            $recordArgs = @('-Refused', ([string]$session.Reason -replace '"', "'"))
         }
     }
     if (-not $recordArgs) {
@@ -101,6 +103,10 @@ try {
     # layer exists to show. A missing pwsh throws into the catch below.
     $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
     $recorderArgs = @('-NoProfile', '-File', $seat, '-Record') + $recordArgs
+    # The session id the hook already read, so a record is never keyed 'nosid' because seat.ps1's own
+    # second read of the input failed.
+    $sid = if ($session.Payload) { $session.Payload.PSObject.Properties['session_id'] } else { $null }
+    if ($sid -and $sid.Value -is [string] -and $sid.Value -and $sid.Value -notmatch '"') { $recorderArgs += @('-SessionId', $sid.Value) }
     $out = if ($payload) { $payload | & $pwsh @recorderArgs 2>&1 } else { & $pwsh @recorderArgs 2>&1 }
     # seat.ps1 -Record exits 0 on every route it controls, so any other code means it never ran as
     # written, for example because pwsh refused the file.
