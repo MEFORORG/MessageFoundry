@@ -3804,13 +3804,13 @@ nothing to clear makes no such check:
   any row the clear already committed. A raise inside the re-proof itself, after the password
   verified, writes no `auth.reauth` row.
 
-**A password re-auth that holds a rotated token asks the store, best effort, to revoke that
-session when its hard `auth.reauth` row write raises or is cancelled, or when its clear raises
-(BACKLOG #5900, PR 3100).** In both cases it raises and never hands back the rotated token. The
-user is signed out because the rotation already retired the old token, not because of the revoke.
-Which revoke outcomes are recorded where, the federated step-up's gap, and the
-Lander's delegated decision that accepts this sign-out during a Vault transit Outage, are stated
-once, in the 2026-11-19 amendment to the Outage row of
+**A password re-auth that holds a rotated token asks the store, best effort, to revoke that session
+when its hard `auth.reauth` row write raises or is cancelled, or when its clear raises (BACKLOG
+#5900, PR 3100).** In both cases it raises and never hands back the rotated token. The user is
+signed out because the rotation already retired the old token, not because of the revoke. Which
+revoke outcomes are recorded where, the federated step-up's gap, and the Lander's delegated decision
+that accepts this sign-out during a Vault transit Outage, are stated once, in the 2026-11-19
+amendment to the Outage row of
 [ADR 0217](adr/0217-an-unverifiable-transit-row-seal-is-denied-like-a-failed-one-and-the-ad-reconciler-ends-sessions-rather-than-holding.md).
 
 **A directory step-up or enrolment leg refuses a present account that lost a role in the directory
