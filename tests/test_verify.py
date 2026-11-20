@@ -819,8 +819,8 @@ def test_smoke_self_threads_snapshot_on_send(monkeypatch: pytest.MonkeyPatch) ->
 
 def test_run_verify_self_smoke_threads_resolved_setting(monkeypatch: pytest.MonkeyPatch) -> None:
     # run_verify must feed smoke_self the RESOLVED [pipeline].snapshot_on_send — True on a default
-    # engine (PipelineSettings default), the configured value otherwise — and keep the dry_run library
-    # default (False) when no service settings load (#241 F3, #230 CLI parity).
+    # engine (PipelineSettings default), the configured value otherwise — and the PipelineSettings
+    # default (True) when no service settings load (#241 F3, #230 CLI parity, BACKLOG #5794).
     from messagefoundry.config.settings import PipelineSettings, ServiceSettings
     from messagefoundry.verify import runner as runner_mod
 
@@ -830,7 +830,7 @@ def test_run_verify_self_smoke_threads_resolved_setting(monkeypatch: pytest.Monk
         config_dir: str,
         *,
         inbound: str | None = None,
-        snapshot_on_send: bool = False,
+        snapshot_on_send: bool = True,
         graph: object = None,
     ) -> CheckResult:
         seen.append(snapshot_on_send)
@@ -852,10 +852,10 @@ def test_run_verify_self_smoke_threads_resolved_setting(monkeypatch: pytest.Monk
     run_verify(sections=["smoke"], smoke_mode="self")
     assert seen[-1] is False
 
-    # no service settings -> keep the dry_run library default (False), never the ON engine default.
+    # no service settings -> the PipelineSettings default (True), what a default engine delivers.
     monkeypatch.setattr(runner_mod, "_load_settings", lambda _c: (None, "boom"))
     run_verify(sections=["smoke"], smoke_mode="self")
-    assert seen[-1] is False
+    assert seen[-1] is True
 
 
 # ---- live smoke (ACK parsing + a fake MLLP server) --------------------------------------------

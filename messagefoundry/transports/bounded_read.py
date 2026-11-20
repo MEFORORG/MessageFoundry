@@ -160,6 +160,7 @@ __all__ = [
     "build_strict_opener",
     "drain_bounded",
     "hop_identity",
+    "is_content_coded_refusal",
     "is_never_proxied_host",
     "is_proxy_credential_header_name",
     "proxy_credential_header_name_shown",
@@ -167,6 +168,7 @@ __all__ = [
     "read_bounded",
     "read_bounded_text",
     "read_reply_body",
+    "refused_error_body_phrase",
     "reply_framing_fault",
 ]
 
@@ -268,8 +270,8 @@ class AmbiguousFramingError(EgressReplyError):
     ``http.client`` happens to consult first. The shapes are listed on :func:`reply_framing_fault`.
 
     Also raised for a body in a content coding other than ``identity`` (BACKLOG #5910). That body
-    is framed legally and read whole, but the engine does not decode it, so the caller would take
-    compressed bytes as the reply's text. Its reason names the coding fault, not a length.
+    is framed legally, but the engine does not decode it, so the caller would take compressed
+    bytes as the reply's text. It is refused before any body byte is read. Its reason names the coding fault, not a length.
 
     Also raised part-way through a chunked body, at the first chunk-size line, chunk terminator or
     trailer line that breaks the RFC 9112 section 7.1 grammar. By then some bytes have been read,
@@ -538,6 +540,24 @@ def reply_framing_fault(reader: object) -> str | None:
 
 #: The fixed reason :func:`reply_framing_fault` gives a content-coded body (BACKLOG #5910).
 _CONTENT_CODED_REASON = "a content coding other than identity, which the engine does not decode"
+
+
+def is_content_coded_refusal(exc: BaseException) -> bool:
+    """Whether ``exc`` is the refusal of a body in a content coding the engine does not decode
+    (BACKLOG #5910), rather than of a body that is misframed, cut short or over its bound."""
+    return isinstance(exc, AmbiguousFramingError) and exc.reason == _CONTENT_CODED_REASON
+
+
+def refused_error_body_phrase(refusal: EgressReplyError, body: str) -> str:
+    """How a WARNING names a non-2xx ``body`` the engine refused with ``refusal`` (BACKLOG #5910).
+
+    A content-coded body is refused before any byte of it is read, for its coding, which the engine
+    does not decode, and not for its length, so the warning names the coding rather than saying
+    "could not read whole". Fixed text only, never a byte of the reply.
+    """
+    if is_content_coded_refusal(refusal):
+        return f"{body} in a content coding the engine does not decode"
+    return f"{body} the engine could not read whole"
 
 
 def _codings(fields: Collection[object]) -> list[str]:

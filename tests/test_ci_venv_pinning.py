@@ -1306,12 +1306,10 @@ def test_release_asset_downloads_in_blocking_jobs_are_checksum_verified() -> Non
     own checksums file, so this was unfinished scope rather than an accepted risk, and the SHAPE of
     that step is the template a download in this workflow must follow.
 
-    THAT TEMPLATE IS PROSE, NOT A THING THIS RULE ENFORCES, and the distinction is the point of this
-    paragraph. Measured 2026-09-18: security.yml's `sbom` job carries JOB-level
-    `continue-on-error: true`, so the skip below passes over it and this rule never examines the
-    sbomqs step at all — deleting its `curl … checksums.txt` and `sha256sum -c` leaves the suite
-    green. The two steps this rule actually examines are the `gitleaks` installs. Citing the sbomqs
-    step as a control this rule holds would be a compensating control resting on a false premise.
+    UNTIL BACKLOG #5475 THAT TEMPLATE WAS PROSE, NOT A THING THIS RULE ENFORCED. Measured
+    2026-09-18: security.yml's `sbom` job carried JOB-level `continue-on-error: true`, so the skip
+    below passed over it and deleting the sbomqs step's `sha256sum -c` left the suite green. Since
+    #5475 neither SBOM job carries a job-level flag, so this rule examines both sbomqs steps too.
 
     THE TEMPLATE ALSO STOPS AT THIS FILE'S DOOR (BACKLOG #1698). A checksums file fetched from the
     SAME origin as the asset is signed by nothing and moves with it: whoever can replace the tarball
@@ -1323,9 +1321,10 @@ def test_release_asset_downloads_in_blocking_jobs_are_checksum_verified() -> Non
     `test_release_asset_downloads_in_oidc_jobs_are_pinned_in_repo` below holds that stronger line.
 
     Scoped to jobs WITHOUT a job-level `continue-on-error`. An advisory job cannot turn a required
-    context green while compromised, so `sbom` (job-level `continue-on-error: true`) is out -- worth
-    hardening, but not on this rule. `trivy` used to be out for the same reason; since 2026-09-22 its
-    flag sits on the scan step instead, so this rule now examines its Trivy install too. "Blocking"
+    context green while compromised, so a job-level-softened job is out -- worth hardening, but not on
+    this rule. `trivy` used to be out for that reason until 2026-09-22, and `sbom` and `sbom-windows`
+    until BACKLOG #5475; each now carries its flag on one step, so this rule examines their sbomqs and
+    Trivy installs too. "Blocking"
     in this test's name means "not job-level softened", not "a required context".
     """
     yaml = pytest.importorskip("yaml")

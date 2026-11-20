@@ -1311,13 +1311,20 @@ class NegativeAckError(DeliveryError):
     lane and retain the backlog un-errored rather than dead-letter each queued row and hammer the
     partner's auth (which could trip an account lockout). Only meaningful when ``permanent`` is True.
 
-    ``config_fault`` (BACKLOG #2083) marks a permanent failure in the **connection's configuration**
-    rather than in the message or the credential: an FTP server refusing ``AUTH TLS`` or ``PROT P``,
-    demanding TLS of a plain session, or refusing the greeting; or an HTTP endpoint or web proxy
-    sending a Digest challenge the engine refuses (BACKLOG #2323). Every queued row would fail the
-    same way, so the delivery worker stops the lane and keeps the queue, under the same
-    ``credential_fault_policy`` as a credential fault. ADR 0095 Amendment B says where "every row"
+    ``config_fault`` (BACKLOG #2083) marks a permanent failure every queued row would meet because
+    of the **connection** rather than the message or the credential: its own settings, or the
+    endpoint they name (ADR 0095 Amendment B.2). At least: an FTP server refusing ``AUTH TLS`` or
+    ``PROT P``, demanding TLS of a plain session, or refusing the greeting; an HTTP endpoint or web
+    proxy sending a Digest challenge the engine refuses (BACKLOG #2323); or an OAuth2 or SMART
+    token endpoint answering a coded 2xx reply, as
+    :func:`~messagefoundry.transports.smart.request_token` scopes it (``token-reply-coded``,
+    BACKLOG #5910). Every queued row would fail the same way, so the delivery worker stops the lane and keeps the queue, under the
+    same ``credential_fault_policy`` as a credential fault. ADR 0095 Amendment B says where "every row"
     is weaker for HTTP than for FTP. Only meaningful when ``permanent`` is True.
+
+    ``remedy`` is a fixed operator-facing phrase naming where to fix a lane-stopping fault, for a
+    fault whose fix is not the connection's configuration (ADR 0095 Amendment B.2). It is the
+    transport's own text and never carries message content; ``None`` keeps the stop's generic text.
     """
 
     def __init__(
@@ -1328,12 +1335,14 @@ class NegativeAckError(DeliveryError):
         permanent: bool,
         credential_fault: bool = False,
         config_fault: bool = False,
+        remedy: str | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
         self.permanent = permanent
         self.credential_fault = credential_fault
         self.config_fault = config_fault
+        self.remedy = remedy
 
 
 #: ``NegativeAckError.code`` of a delivery its send-time hop re-check refused (:func:`insecure_hop_refused`).

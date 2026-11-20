@@ -290,6 +290,58 @@ def test_the_step_up_handler_re_proves_and_restarts_the_poller(
         panel.shutdown()
 
 
+def test_a_search_step_up_during_a_purge_prompt_mints_no_purge_grant(
+    qapp: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refused message search can reach the GUI thread through the Purge prompt's nested event
+    loop. Its re-proof must not post the purge action the client stashed for that prompt, which
+    would mint a purge grant from a password typed for the search and leave the purge's own reauth
+    with no purpose."""
+    import json
+
+    bodies: list[dict[str, object]] = []
+    purges: list[int] = []
+
+    def _send(request: httpx.Request, *args: object, **kwargs: object) -> httpx.Response:
+        if request.url.path == "/me/reauth":
+            bodies.append(json.loads(request.content))
+            return httpx.Response(200, json={"token": "rotated"}, request=request)
+        purges.append(1)
+        if len(purges) == 1:
+            headers = {"X-Step-Up-Required": "1", "X-Step-Up-Action": "purge"}
+            return httpx.Response(403, json={"detail": "refused"}, headers=headers, request=request)
+        return httpx.Response(200, json={}, request=request)
+
+    client = EngineClient("http://127.0.0.1:8765")
+    client._http.send = _send  # type: ignore[method-assign]
+    panel = MonitorPanel()
+    panel._client = client
+    client.set_step_up_handler(panel._step_up)
+    monkeypatch.setattr(MonitorPanel, "_stop_poller", lambda self: None)
+    monkeypatch.setattr(MonitorPanel, "_start_poller", lambda self: None)
+    prompts: list[int] = []
+    nested: list[bool] = []
+
+    def prompt(*_a: object, **_k: object) -> tuple[str, bool]:
+        prompts.append(1)
+        if len(prompts) == 1:
+            # The search's step-up, as the messages panel would call it from inside this prompt.
+            nested.append(panel._step_up())
+        return ("typed-pw", True)
+
+    monkeypatch.setattr(QInputDialog, "getText", prompt)
+    try:
+        client._request("POST", "/connections/c/purge")
+        assert nested == [False]
+        assert len(prompts) == 1
+        assert [b.get("purpose") for b in bodies] == ["purge"]
+        assert len(purges) == 2  # the purge's own re-proof carried its grant, and the retry ran
+    finally:
+        panel._client = None
+        panel.shutdown()
+        client.close()
+
+
 def test_the_step_up_handler_refuses_off_the_gui_thread(
     qapp: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -390,6 +442,7 @@ class _RefusedClient:
 def _cancelled_dialog(client: object, parent: object = None) -> Any:
     class _Dialog:
         must_change_password = False
+        session_may_remain = False
 
         def exec(self) -> bool:
             return False
@@ -481,14 +534,131 @@ class _LoginClient:
         )
 
 
+def _settle_login(qapp: Any, dialog: Any) -> None:
+    """The dialog's engine calls run off the GUI thread (BACKLOG #5946); wait for them to land."""
+    deadline = time.time() + 10
+    while dialog._busy and time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.005)
+    assert not dialog._busy
+
+
+_MAY_REMAIN = "sign-in cancelled, but a session may stay valid until it expires"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "status", "logouts"),
+    [
+        ("logged-out", "sign-in cancelled", 1),
+        ("logout-failed", _MAY_REMAIN, 1),
+        ("logout-401", "sign-in cancelled", 1),
+        ("sign-in-no-reply", _MAY_REMAIN, 0),
+        ("sign-in-refused", "sign-in cancelled", 0),
+    ],
+    ids=["logged-out", "logout-failed", "logout-401", "sign-in-no-reply", "sign-in-refused"],
+)
+def test_a_cancel_during_sign_in_wins_and_the_monitor_does_not_connect(
+    qapp: Any, monkeypatch: pytest.MonkeyPatch, outcome: str, status: str, logouts: int
+) -> None:
+    """A Cancel pressed while the sign-in is in flight is held until it answers. If the sign-in
+    then succeeds, the dialog is still rejected: the monitor does not connect, and it ends the
+    session the client was handed. When that logout fails, the status bar says the session may
+    stay valid until it expires. A 401 on the logout means the session has already ended, so it
+    does not. A sign-in with no reply (status None) leaves the outcome unknown, so it does; a
+    sign-in the engine refused made no session, so it does not."""
+    from harness import _login
+
+    login_gate = threading.Event()
+
+    class _Client:
+        def __init__(self, *_a: object, **_k: object) -> None:
+            self.token: str | None = None
+            self.logouts = 0
+            self.polled = 0
+
+        def health(self) -> None:
+            pass
+
+        def me(self) -> None:
+            raise ApiError("sign in", status=401)
+
+        def providers(self) -> None:
+            raise ApiError("unreachable", status=503)
+
+        def login(self, *_a: object, **_k: object) -> LoginResponse:
+            if not login_gate.wait(10):
+                raise TimeoutError("login gate never opened")
+            if outcome == "sign-in-no-reply":
+                raise ApiError("timed out waiting for the engine", status=None)
+            if outcome == "sign-in-refused":
+                raise ApiError("refused", status=403)
+            self.token = "t"
+            return LoginResponse(
+                token="t",
+                must_change_password=False,
+                user=CurrentUser(
+                    user_id="u", username="op", auth_provider="local", roles=[], permissions=[]
+                ),
+            )
+
+        def logout(self) -> None:
+            self.logouts += 1
+            self.token = None
+            if outcome == "logout-failed":
+                raise ApiError("engine unreachable", status=None)
+            if outcome == "logout-401":
+                raise ApiError("not signed in", status=401)
+
+        def for_polling(self) -> Any:
+            self.polled += 1
+            raise ApiError("must not be reached", status=None)
+
+        def close(self) -> None:
+            pass
+
+    clients: list[_Client] = []
+
+    def make_client(*a: object, **k: object) -> _Client:
+        clients.append(_Client(*a, **k))
+        return clients[-1]
+
+    class _CancellingDialog(_login.LoginDialog):
+        def exec(self) -> int:
+            # Stands in for the operator: sign in, press Cancel while it is in flight, and the
+            # sign-in then succeeds.
+            _settle_login(qapp, self)
+            self._username.setText("op")
+            self._password.setText("pw")
+            self._attempt()
+            self.reject()
+            login_gate.set()
+            _settle_login(qapp, self)
+            return int(self.result())
+
+    monkeypatch.setattr(monitor, "EngineClient", make_client)
+    monkeypatch.setattr(monitor, "LoginDialog", _CancellingDialog)
+    panel = MonitorPanel()
+    try:
+        panel._connect()
+        assert panel._client is None
+        assert panel._status.text() == status
+        assert clients and clients[0].polled == 0
+        assert clients[0].logouts == logouts and clients[0].token is None
+    finally:
+        login_gate.set()
+        panel.shutdown()
+
+
 def test_the_login_dialog_carries_the_deadline_the_engine_returned(qapp: Any) -> None:
     # The monitor states only what the dialog hands back, so the hand-off is its own link.
     from harness._login import LoginDialog
 
     dialog = LoginDialog(_LoginClient(1.8e9))  # type: ignore[arg-type]
+    _settle_login(qapp, dialog)
     dialog._username.setText("op")
     dialog._password.setText("pw")
     dialog._attempt()
+    _settle_login(qapp, dialog)
     assert dialog.must_change_password is True
     assert dialog.credential_expires_at == 1.8e9
 

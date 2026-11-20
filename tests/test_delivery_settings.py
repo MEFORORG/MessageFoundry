@@ -100,6 +100,50 @@ def test_stall_threshold_default_off_and_toml_override(tmp_path: Path) -> None:
     assert st.max_oldest_seconds == 120.0
 
 
+@pytest.mark.parametrize("value", [0, -1, float("nan"), True])
+def test_buildup_and_stall_thresholds_refuse_non_positive_nan_or_bool(value: float) -> None:
+    # BACKLOG #5778: zero or below is crossed by every lane holding a message (a page for each such
+    # lane, at the re-alert interval); NaN is never crossed (the alert silently off); a boolean would read as 1. Each is
+    # refused at load, on the per-connection models and on the [delivery] keys that mirror them.
+    with pytest.raises(ValueError):
+        BuildupThreshold(max_oldest_seconds=value)
+    with pytest.raises(ValueError):
+        StallThreshold(max_oldest_seconds=value)
+    with pytest.raises(ValueError):
+        DeliverySettings(buildup_max_oldest_seconds=value)
+    with pytest.raises(ValueError):
+        DeliverySettings(stall_max_oldest_seconds=value)
+
+
+def test_infinite_age_threshold_loads_as_off(tmp_path: Path) -> None:
+    # BACKLOG #5778: TOML has no null, so `inf` is the settings-file spelling of an off age
+    # dimension. It loads as None, so the runner skips the store read an off dimension needs no read
+    # for, and a JSON view carries null. Negative infinity is still refused.
+    assert BuildupThreshold(max_oldest_seconds=float("inf")).max_oldest_seconds is None
+    assert StallThreshold(max_oldest_seconds=float("inf")).max_oldest_seconds is None
+    assert BuildupThreshold(max_oldest_seconds="inf").max_oldest_seconds is None  # type: ignore[arg-type]
+    with pytest.raises(ValueError):
+        BuildupThreshold(max_oldest_seconds=float("-inf"))
+    cfg = tmp_path / "messagefoundry.toml"
+    cfg.write_text(
+        "[delivery]\nbuildup_max_oldest_seconds = inf\nstall_max_oldest_seconds = inf\n",
+        encoding="utf-8",
+    )
+    delivery = load_settings(config_path=cfg).delivery
+    assert delivery.buildup_max_oldest_seconds is None
+    assert delivery.stall_max_oldest_seconds is None
+    assert delivery.buildup_threshold() == BuildupThreshold(max_oldest_seconds=None)
+    assert delivery.stall_threshold().max_oldest_seconds is None
+
+
+@pytest.mark.parametrize("depth", [0, -5, True])
+def test_buildup_depth_refuses_below_one(depth: int) -> None:
+    with pytest.raises(ValueError):
+        BuildupThreshold(max_depth=depth)
+    with pytest.raises(ValueError):
+        DeliverySettings(buildup_max_depth=depth)
+
+
 def test_saturation_threshold_default_off_and_toml_override(tmp_path: Path) -> None:
     # The [delivery] saturation_sustain_samples key mirrors SaturationThreshold; the saturation
     # (rising-backlog derivative) alert is OFF by default (deny-by-default, #93, ADR 0014 amendment),

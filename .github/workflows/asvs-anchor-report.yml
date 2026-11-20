@@ -62,8 +62,10 @@ name: ASVS anchor report
 
 on:
   pull_request:
-    # The filter MUST include this file and the tool, or the gate cannot observe changes to itself:
-    # a broken reporter would merge green and be found later by an unrelated engine edit.
+    # The job never runs on a pull request (BACKLOG #5476; see its `if:`), so on one it reports
+    # SKIPPED. The filter still names this file and the tool so that skip is visible on every pull
+    # request that could change what the report does; the first real run of such a change is the
+    # push to main that merges it.
     paths: &anchor_paths
       - 'messagefoundry/**'
       - 'messagefoundry_webconsole/**'
@@ -82,14 +84,38 @@ on:
 permissions: {}
 
 concurrency:
-  group: asvs-anchor-report-${{ github.ref }}
-  cancel-in-progress: true
+  # Only pull request runs, which skip the job anyway, share a group and supersede each other. A push
+  # run is the only one that attributes breakage to its range (github.event.before), so each push and
+  # dispatch run gets a group of its own: a shared group would let a newer run cancel a PENDING one
+  # even with cancel-in-progress off, and that range would be lost for good. net-helper.yml's pattern.
+  group: asvs-anchor-report-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   report:
     name: anchors that no longer resolve (advisory)
     # SKIPPED, not absent, when there is no record to read. See the block above on why those differ.
-    if: vars.ASVS_VAULT_REPO != ''
+    #
+    # NEVER ON A PULL REQUEST, whatever the variable says (BACKLOG #5476). A `pull_request` run
+    # executes the pull request's own copy of this file and of scripts/asvs/, so gating on the
+    # variable alone would let a pull request's code run with the private scorecard checked out, on
+    # a runner whose logs are public, the moment the vault variable and read token were configured.
+    # An ALLOWLIST of events rather than `!= 'pull_request'`, so a trigger added later is refused
+    # until someone decides it may reach the record. And main only: a dispatch on another branch
+    # would run that branch's copy of this file and of scripts/asvs/, the same exposure. Actions
+    # compares strings case-insensitively, so a branch whose name is `main` in another case (`Main`)
+    # also passes the ref test; only someone able to push a branch can make one. The
+    # `pull_request` trigger above stays: on a pull request this job reports SKIPPED, which is the
+    # visible not-run the block above asks for.
+    #
+    # THIS GUARD BINDS ONLY THE COPY OF THIS FILE ON main. A branch can edit its own copy, `if:`
+    # included, and a pull request runs that copy. So the guard is not what would protect a vault
+    # credential held here; the header's decision that no such credential exists in this repository
+    # is, and this guard adds nothing to that case.
+    if: >-
+      ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
+      && vars.ASVS_VAULT_REPO != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -131,9 +157,10 @@ jobs:
         working-directory: engine
         env:
           SCORECARD: ${{ github.workspace }}/vault/docs/security/asvs-scorecard.toml
-          # The base of the range to attribute breakage to. Empty on workflow_dispatch, where there
-          # is no range and the whole-record totals are the answer.
-          SINCE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          # The base of the range to attribute breakage to: the push's previous tip. Empty on
+          # workflow_dispatch, where there is no range and the whole-record totals are the answer.
+          # No pull request base here, because the job's `if:` never admits a pull_request run.
+          SINCE: ${{ github.event.before }}
         run: |
           set -euo pipefail
           # An ARRAY, not a string: an unquoted expansion would rely on word splitting (SC2086, and

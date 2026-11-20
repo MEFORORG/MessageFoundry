@@ -451,7 +451,7 @@ INVENTORY: dict[str, frozenset[str]] = {
     # arithmetic on an ALREADY-VERIFIED cert: it builds no SSLContext, reads no key material, and makes
     # no trust decision (the chain was verified by the listener long before this runs).
     # BACKLOG #3176: before it advises a restart into a changed CA file, the scan judges the CRLs in
-    # it as a start judges a CRL setting (tls_policy.judge_crl_bytes, which reads the CRL fields). It
+    # it through tls_policy.judge_crl_bytes, which reads the CRL fields. It
     # loads those bytes into a scratch context (tls_policy.crl_scratch_context) to read the CA
     # certificates OpenSSL takes from them, and checks each CRL's signature against those through
     # pki.judge_crl_signatures (a public-key verify), which tells a signature proven bad from one

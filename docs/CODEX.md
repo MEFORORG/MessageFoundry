@@ -8,6 +8,8 @@ User-level sources come from `$CLAUDE_CONFIG_DIR/skills` when set, otherwise
 `~/.claude/skills`. This follows junctions into `.claude-shared-skills` too.
 Repo skill names take precedence over user-level names.
 Git ignores `.claude/skills/`, so a repo skill exists only in the checkout that holds it.
+In a linked worktree the bridge also reads the primary checkout's `.claude/skills/`,
+found through the git common dir, after the worktree's own and before user-level ones.
 Every pointer therefore finds its source at run time through `source-skill`.
 A link into that folder would break in every other clone.
 
@@ -17,7 +19,13 @@ A link into that folder would break in every other clone.
 `scripts/codex/bridge.py` reads `.claude/settings.json` on **each event**.
 Matching command hooks run from their current source paths, with their arguments
 and timeouts. Removing or changing a source handler affects the next call.
-The bridge combines context and keeps a denial over an allowance.
+The bridge combines context. Among the hooks of one event that complete, it keeps
+a `hookSpecificOutput.permissionDecision` of deny over ask or allow, and a
+top-level `decision: block` or `continue: false` over later hooks.
+PermissionRequest's `hookSpecificOutput.decision` is not ranked: the last hook
+that sets it wins, so a later allow replaces an earlier deny. For how the other
+`hookSpecificOutput` keys merge, see `merge_output` in `scripts/codex/bridge.py`.
+The known gap below covers a fault.
 
 Codex calls shell hooks `Bash`, including PowerShell commands. The bridge also
 matches Claude's `PowerShell` name. Patch calls match `apply_patch`, `Edit`, and
@@ -26,9 +34,34 @@ adapter; alias matching alone cannot translate an edit payload.
 
 New event types appear as unmapped at startup. Unsupported handler types and
 failed commands report errors. The bridge does not silently claim they ran.
-Command-only hooks use PowerShell on Windows and `sh` elsewhere; structured
-`command` and `args` avoid shell parsing. Codex's documentation does not say
-which shell runs a hook command.
+A failed SessionStart hook, exit 2 included, is reported in `systemMessage` and
+the other hooks' context is kept, as in Claude Code.
+
+The bridge does not fail closed on a fault; this is a known gap. At least these
+end the bridge or its launcher with a non-zero exit, and no deny or block
+output, which the registered line delivers to Codex as 1: a hook that exits
+non-zero other than 2, or times out, on any event but SessionStart, and, on any
+event, unreadable settings, a bad payload or a missing `.venv`. The bridge then
+prints none of the event's output, so what earlier hooks returned, a deny
+included, is lost, and later hooks of the event do not run. How Codex handles
+that 1 is not measured here. The assumed behaviour is that Codex treats an exit
+other than 0 or 2 as a non-blocking error, so the event is not blocked: a
+PreToolUse fault lets the tool run, a PostToolUse fault loses the event's
+feedback, and an event with no tool, such as Stop or UserPromptSubmit, proceeds.
+A hook's deliberate exit 2 leaves the registered line as 2 when it is run
+directly, because `invoke.ps1` ends its process with 2 for it.
+Whether Codex's own launcher keeps that 2 is unverified; an outer
+`pwsh -Command` shell would report it as 1.
+
+On Windows a timeout kills the hook's process tree; a descendant that escaped
+it gets a short drain and is then left behind.
+A command-only hook runs in the shell its `shell` key names: `bash` (Git Bash on
+Windows, never the WSL launcher) or `powershell`. With no `shell`, it uses
+PowerShell on Windows and `sh` elsewhere. Structured `command` and `args` avoid
+shell parsing. Codex's documentation does not say which shell runs a hook command.
+Codex stops the bridge at the event's timeout in `.codex/config.toml`, so every
+hook of one event shares that budget, less a margin; a longer hook timeout is
+cut to what remains.
 
 Only repo settings are imported. Claude's user settings, local settings, account
 credentials, permission grants, plugins, and status line remain Claude-owned.

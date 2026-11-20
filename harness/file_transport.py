@@ -16,6 +16,8 @@ only live arrivals).
 from __future__ import annotations
 
 import logging
+import threading
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -24,7 +26,7 @@ from PySide6.QtCore import QFileSystemWatcher, QObject, QTimer, Signal
 
 from harness.bounded_file import read_capped
 from harness.drivers.file import drop_atomic, drop_name
-from harness.mllp import Received, SendItem
+from harness.mllp import Received, SendItem, pause_unless_stopped
 from messagefoundry.parsing import HL7PeekError, Peek, normalize
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
 
@@ -51,34 +53,46 @@ class FileDropWorker(QObject):
     result = Signal(object)  # DropResult
     finished = Signal()
 
-    def __init__(self, directory: str, items: list[SendItem], *, rate: float) -> None:
+    def __init__(self, directory: str, items: Iterable[SendItem], *, rate: float) -> None:
         super().__init__()
         self._directory = directory
         self._items = items
         self._rate = rate
-        self._stop = False
+        self._stop = threading.Event()
+        # Set before finished when the batch ended on a fault, so the tab can say so.
+        self.failure = ""
 
     def stop(self) -> None:
-        self._stop = True
+        """Thread-safe; also ends a pause between files at once (BACKLOG #5948)."""
+        self._stop.set()
 
     def run(self) -> None:
-        import time
+        # The items may be generated lazily on this thread, so a generator fault ends the batch
+        # here; finished is emitted whatever happens, or the tab would wait on it for good.
+        try:
+            self._drop_all()
+        except Exception as exc:  # noqa: BLE001 -- any fault ends the batch; the tab must hear why
+            log.exception("harness file drop batch ended early")
+            self.failure = f"{type(exc).__name__}: {exc}"
+        finally:
+            self.finished.emit()
 
+    def _drop_all(self) -> None:
         delay = 1.0 / self._rate if self._rate > 0 else 0.0
         try:
             Path(self._directory).mkdir(parents=True, exist_ok=True)
         except OSError as exc:
             for item in self._items:
+                if self._stop.is_set():
+                    break
                 self.result.emit(DropResult(item, "", str(exc)))
-            self.finished.emit()
             return
         for item in self._items:
-            if self._stop:
+            if self._stop.is_set():
                 break
             self.result.emit(self._write_one(item))
-            if delay:
-                time.sleep(delay)
-        self.finished.emit()
+            if delay and pause_unless_stopped(self._stop, delay):
+                break
 
     def _write_one(self, item: SendItem) -> DropResult:
         try:

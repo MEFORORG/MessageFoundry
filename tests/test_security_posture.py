@@ -21,11 +21,11 @@ while measuring nothing (``scripts/quality/liveness.py``, ``tests/test_gate_live
 catches a gate that RAN and measured nothing. This catches a gate that was told its findings do not
 count.
 
-WHY IT ALSO PINS THE ADVISORY JOBS. The check runs in both directions on purpose. ``sbom`` and
-``trivy`` are advisory *by design* and are scheduled for promotion; if one silently loses
-``continue-on-error`` it starts blocking merges from a cron-only trigger, which is the
-required-but-absent trap wearing the opposite hat. Either move must be a deliberate edit to the lists
-below.
+WHY IT ALSO PINS THE ADVISORY JOBS. The check runs in both directions on purpose. ``sbom``,
+``sbom-windows`` and ``trivy`` are advisory *by design* and are scheduled for promotion; each carries
+``continue-on-error`` on exactly one named STEP, never on the job (``_STEP_ADVISORY_JOBS``), and if
+one silently loses that step flag, or gains a job-level one, it changes what the job reports for a
+reason nobody chose. Either move must be a deliberate edit to the lists below.
 
 NOT VACUOUS BY CONSTRUCTION. ``test_every_security_job_is_classified`` fails when a job is added to
 ``security.yml`` without being named blocking or advisory here, so a new scanner cannot arrive
@@ -37,7 +37,10 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
+
+import pytest
 
 from tests._bash_resolver import (
     CANNOT_RUN_CODES,
@@ -80,10 +83,12 @@ _BLOCKING_SECURITY_JOBS = frozenset(
 
 # ADVISORY by design: these MUST keep continue-on-error. All three are cron/dispatch-only, so promoting one
 # without also removing its `if:` would wedge every PR (see security.yml's own notes on trivy).
-# WHERE the flag sits differs: `sbom` carries it on the job, `trivy` on its one scan step, and a job
-# listed in _STEP_ADVISORY_JOBS below is graded there instead of by the job-level rule.
-# `sbom-windows` is `sbom`'s Windows twin (the engine SBOM resolved on win32, ADR 0149's 2026-09-30
-# amendment) and carries the flag on the job, the same way.
+# WHERE the flag sits: on one named step of each, never on the job. All three are listed in
+# _STEP_ADVISORY_JOBS below and graded there instead of by the job-level rule. `sbom` and
+# `sbom-windows` (its Windows twin, the engine SBOM resolved on win32, ADR 0149's 2026-09-30
+# amendment) carried the flag on the JOB until BACKLOG #5475: that would turn a broken SBOM dry-run
+# into a green scheduled run, so the nightly notice would not fire and the break would surface only at
+# a tagged release. Each now softens only its sbomqs score step.
 _ADVISORY_SECURITY_JOBS = frozenset({"sbom", "sbom-windows", "trivy"})
 
 # ADVISORY BY PLACEMENT: hard-failing, but NOT in branch protection. This is a third posture the file
@@ -475,6 +480,108 @@ def test_advisory_by_placement_jobs_cannot_run_on_a_pull_request() -> None:
         )
 
 
+#: The functions a job-level ``if:`` may call, as GitHub evaluates them for a job with no ``needs``:
+#: no dependency has failed or been cancelled, so ``success()`` and ``always()`` are true. The string
+#: functions compare case-insensitively, as GitHub's do.
+_IF_FUNCTIONS: dict[str, Callable[..., str | bool]] = {
+    "always": lambda: True,
+    "success": lambda: True,
+    "failure": lambda: False,
+    "cancelled": lambda: False,
+    "startsWith": lambda s, p: str(s).casefold().startswith(str(p).casefold()),
+    "endsWith": lambda s, p: str(s).casefold().endswith(str(p).casefold()),
+    "contains": lambda s, x: str(x).casefold() in str(s).casefold(),
+}
+
+#: Each event a step-advisory job must not run on, with the context a real run of it carries.
+#: ``head_ref`` and ``base_ref`` are seeded on every one, merge groups included, as the worst case:
+#: a term reaching for either would otherwise read empty and pass unseen.
+_PR_EVENT_CONTEXTS = {
+    event: {
+        "github.event_name": event,
+        "github.ref": ref,
+        "github.head_ref": "feature",
+        "github.base_ref": "main",
+    }
+    for event, ref in (
+        ("pull_request", "refs/pull/1/merge"),
+        ("pull_request_target", "refs/heads/main"),
+        ("merge_group", "refs/heads/gh-readonly-queue/main/pr-1-0000000"),
+    )
+}
+
+
+def _job_if_runs(expression: str, context: dict[str, str]) -> bool:
+    """Evaluate a job's ``if:`` through the evaluator tests/test_dependabot_automerge_guardrails.py
+    holds, imported as tests/test_asvs_anchor_report.py imports it. It refuses any construct it does
+    not parse, and any function ``_IF_FUNCTIONS`` does not name.
+
+    ITS LIMIT: a context name not seeded reads as the empty string, so a loosening that reaches for
+    a name ``_PR_EVENT_CONTEXTS`` does not seed (``github.actor``, ``github.event.*``) could pass
+    unseen. An absent ``if:`` is GitHub's implicit ``success()``, which runs.
+    """
+    from tests.test_dependabot_automerge_guardrails import _evaluate_expression
+
+    body = expression.strip()
+    if body.startswith("${{") and body.endswith("}}"):
+        body = body[3:-2].strip()
+    return _evaluate_expression(body or "success()", context, _IF_FUNCTIONS)
+
+
+def test_step_advisory_security_jobs_cannot_run_on_a_pull_request() -> None:
+    """RED when: a step-advisory job's ``if:`` admits a pull request or merge group (BACKLOG #5475).
+
+    With no job-level continue-on-error, that ``if:`` is all that keeps these jobs, which now go red
+    on a failed step, off every pull request and merge group run. So it is EVALUATED for each such
+    event rather than searched for substrings: ``|| always()`` or ``|| github.head_ref`` names no
+    event and still admits one. The schedule and dispatch arms must still read as a run, so a
+    condition that runs nothing cannot pass either.
+    """
+    jobs = jobs_of(_SECURITY)
+    keys = sorted({key for wf, key, _, _ in _STEP_ADVISORY_JOBS if wf == _SECURITY})
+    assert keys, "no security.yml job is step-advisory; this test would grade nothing"
+    for key in keys:
+        expr = str(jobs[key].get("if") or "")
+        for event, context in _PR_EVENT_CONTEXTS.items():
+            assert not _job_if_runs(expr, context), (
+                f"security.yml job {key!r} is step-advisory, so must not run on {event}: {expr!r}"
+            )
+        for event in ("schedule", "workflow_dispatch"):
+            context = {"github.event_name": event, "github.ref": "refs/heads/main"}
+            assert _job_if_runs(expr, context), (
+                f"security.yml job {key!r} no longer runs on {event}: {expr!r}"
+            )
+
+
+@pytest.mark.parametrize(
+    "loosening",
+    [
+        "always()",
+        "github.head_ref",
+        "github.base_ref != ''",
+        "startsWith(github.ref, 'refs/pull/')",
+        "contains(github.event_name, 'pull')",
+        "contains(github.event_name || '', 'pull')",
+        "github.EVENT_NAME == 'pull_request'",
+    ],
+)
+def test_the_job_if_evaluation_reads_each_loosening_as_a_run(loosening: str) -> None:
+    """The control for the test above: each loosening a substring check let through reads as a run
+    on a pull request, so the evaluation can tell a loosened condition from the shipped one."""
+    shipped = str(jobs_of(_SECURITY)["sbom"]["if"])
+    context = _PR_EVENT_CONTEXTS["pull_request"]
+    assert not _job_if_runs(shipped, context)
+    variant = f"({shipped}) || {loosening}"
+    assert _job_if_runs(variant, context), f"control: {variant!r} must read as a run"
+
+
+def test_the_job_if_evaluation_refuses_a_function_it_cannot_evaluate() -> None:
+    """An unlisted function must fail the test, not read as false and pass a loosened condition."""
+    shipped = str(jobs_of(_SECURITY)["sbom"]["if"])
+    with pytest.raises(AssertionError, match="unsupported function"):
+        _job_if_runs(f"({shipped}) || hashFiles('x')", _PR_EVENT_CONTEXTS["pull_request"])
+
+
 def test_advisory_security_jobs_keep_continue_on_error() -> None:
     """The mirror of the blocking assertion: an accidental promotion must also be a deliberate edit."""
     jobs = jobs_of(_SECURITY)
@@ -485,6 +592,8 @@ def test_advisory_security_jobs_keep_continue_on_error() -> None:
         f"{sorted(step_graded - _ADVISORY_SECURITY_JOBS)} is step-advisory in _STEP_ADVISORY_JOBS "
         "but not advisory here; classify it in one posture, not two."
     )
+    # Since BACKLOG #5475 every advisory job is step-graded, so this loop runs over no job today. It
+    # stays for a job later added to the advisory set with its flag on the job.
     for key in sorted(_ADVISORY_SECURITY_JOBS - step_graded):
         assert jobs[key].get("continue-on-error") is True, (
             f"security.yml job {key!r} is advisory by design but no longer declares "
@@ -1058,6 +1167,20 @@ _STEP_ADVISORY_JOBS: tuple[tuple[str, str, str, str], ...] = (
         "trivy (container image vulnerabilities)",
         "Scan the image (advisory - fixable HIGH/CRITICAL reported, never gates)",
     ),
+    # BACKLOG #5475. A broken SBOM render must red the scheduled run; only the quality SCORE is a
+    # signal rather than a gate (ADR 0149), so only the score step may carry the flag.
+    (
+        "security.yml",
+        "sbom",
+        "SBOMs (CycloneDX, multi-ecosystem)",
+        "Score SBOM quality (sbomqs — advisory)",
+    ),
+    (
+        "security.yml",
+        "sbom-windows",
+        "SBOM (CycloneDX, engine resolved on Windows)",
+        "Score the Windows SBOM's quality (sbomqs -- advisory)",
+    ),
 )
 
 
@@ -1111,6 +1234,361 @@ def test_step_advisory_jobs_soften_only_their_named_step() -> None:
             "an advisory job blocking-shaped, which is the same move in the other direction: both "
             "have to be a deliberate edit to _STEP_ADVISORY_JOBS."
         )
+
+
+#: The SBOM jobs whose sbomqs download and checksum must sit in a step of their own, outside the
+#: softened score step (BACKLOG #5475; the split release.yml made under BACKLOG #1698).
+_SBOMQS_SPLIT_JOBS = ("sbom", "sbom-windows")
+
+
+def _shell_lines(step: dict) -> str:
+    """A step's ``run:`` with comment lines dropped, so a comment quoting a command cannot match.
+    Reuses tests/test_ci_venv_pinning.py's stripper rather than adding another copy of it."""
+    from tests.test_ci_venv_pinning import _executed_shell
+
+    return _executed_shell(str(step.get("run") or ""))
+
+
+def _sbomqs_split_offences(job: dict, soft_step: str) -> list[str]:
+    """Why ``job``'s sbomqs checksum could end green, or never run; empty when a failed check fails
+    the job. Modelled on tests/test_release_pipeline.py's release twin, which it does not share code
+    with. Two rules differ for this job: its install step may run on ``always()`` (so the IDE SBOM is
+    still scored after a failed Python one) or ``success()``, absent or written out, and the step may
+    name ``shell: bash``, which keeps errexit (GitHub runs it as ``bash -e``). It does not check the
+    score step's own flag; test_step_advisory_jobs_soften_only_their_named_step does.
+    """
+    from tests._verify_softeners import verification_softeners
+
+    steps = [s for s in job.get("steps") or [] if isinstance(s, dict)]
+    verifying = [i for i, s in enumerate(steps) if "sha256sum -c" in _shell_lines(s)]
+    scores = [i for i, s in enumerate(steps) if s.get("name") == soft_step]
+    if len(verifying) != 1 or len(scores) != 1:
+        return [
+            f"expected one `sha256sum -c` step and one {soft_step!r}, found {verifying}, {scores}"
+        ]
+    install, score = steps[verifying[0]], steps[scores[0]]
+    name = install.get("name") or "<unnamed step>"
+    body = _shell_lines(install)
+    offences: list[str] = []
+    if install is score or re.search(r"sha256sum -c|releases/download|curl ", _shell_lines(score)):
+        offences.append(f"the softened step {soft_step!r} downloads or verifies sbomqs")
+    if install.get("continue-on-error") not in (None, False):
+        offences.append(f"the checksum step {name!r} carries continue-on-error")
+    if job.get("continue-on-error") not in (None, False):
+        offences.append("the job carries continue-on-error, which turns a failed check green")
+    if str(install.get("if") or "success()").strip() not in ("always()", "success()"):
+        offences.append(f"the checksum step {name!r} can be skipped: if: {install.get('if')!r}")
+    # A step with no `shell:` takes the job's `defaults.run.shell`, which can drop errexit.
+    default_shell = ((job.get("defaults") or {}).get("run") or {}).get("shell")
+    shell = install.get("shell", default_shell)
+    if shell not in (None, "bash"):
+        offences.append(f"the checksum step {name!r} runs under shell {shell!r}")
+    if "||" in body:
+        offences.append(f"the checksum step {name!r} carries a `||` fallback")
+    offences.extend(
+        f"the checksum step {name!r} lets a failed check carry on: {reason}"
+        for reason in verification_softeners(body)
+    )
+    if verifying[0] > scores[0]:
+        offences.append("the sbomqs score runs before the step that verifies sbomqs")
+    return offences
+
+
+def test_a_failed_sbomqs_checksum_fails_the_sbom_job() -> None:
+    """RED when: an SBOM job's sbomqs download or ``sha256sum -c`` runs inside its softened score
+    step, or in a step of its own that is softened, skippable, or swallows a failed check. Each way
+    a failed pin check ends green."""
+    soft = {key: step for wf, key, _, step in _STEP_ADVISORY_JOBS if wf == _SECURITY}
+    jobs = jobs_of(_SECURITY)
+    for key in _SBOMQS_SPLIT_JOBS:
+        offences = _sbomqs_split_offences(jobs[key], soft[key])
+        assert not offences, f"security.yml:{key}: {offences}"
+
+
+def _edit_verify_step(edit: Callable[[dict], dict]) -> Callable[[list[dict], dict], list[dict]]:
+    def mutate(steps: list[dict], verify: dict) -> list[dict]:
+        return [edit(dict(s)) if s is verify else s for s in steps]
+
+    return mutate
+
+
+def _swap_verify_and_score(steps: list[dict], verify: dict) -> list[dict]:
+    at = steps.index(verify)
+    out = list(steps)
+    out[at], out[at + 1] = out[at + 1], out[at]
+    return out
+
+
+@pytest.mark.parametrize("key", _SBOMQS_SPLIT_JOBS)
+@pytest.mark.parametrize(
+    ("mutate", "needle"),
+    [
+        (_edit_verify_step(lambda s: {**s, "continue-on-error": True}), "continue-on-error"),
+        (_edit_verify_step(lambda s: {**s, "if": "false"}), "can be skipped"),
+        (
+            _edit_verify_step(
+                lambda s: {**s, "run": s["run"].replace("sha256sum -c -", "sha256sum -c - || true")}
+            ),
+            "fallback",
+        ),
+        (
+            _edit_verify_step(lambda s: {**s, "run": "set +e\n" + s["run"]}),
+            "carry on",
+        ),
+        (_swap_verify_and_score, "runs before"),
+    ],
+    ids=["softened", "skippable", "or-true", "errexit-off", "reordered"],
+)
+def test_the_sbomqs_split_check_reds_on_each_loosening(
+    key: str, mutate: Callable[[list[dict], dict], list[dict]], needle: str
+) -> None:
+    """The controls: each loosening of the checksum step is reported."""
+    soft = {k: step for wf, k, _, step in _STEP_ADVISORY_JOBS if wf == _SECURITY}[key]
+    job = jobs_of(_SECURITY)[key]
+    steps = [s for s in job["steps"] if isinstance(s, dict)]
+    verify = next(s for s in steps if "sha256sum -c" in _shell_lines(s))
+    assert steps[steps.index(verify) + 1].get("name") == soft, "the score no longer follows"
+    offences = _sbomqs_split_offences({**job, "steps": mutate(steps, verify)}, soft)
+    assert any(needle in o for o in offences), offences
+
+
+@pytest.mark.parametrize("key", _SBOMQS_SPLIT_JOBS)
+@pytest.mark.parametrize(
+    ("job_edit", "needle"),
+    [
+        ({"defaults": {"run": {"shell": "bash {0}"}}}, "runs under shell"),
+        ({"continue-on-error": True}, "job carries continue-on-error"),
+    ],
+    ids=["job-default-shell", "job-continue-on-error"],
+)
+def test_the_sbomqs_split_check_reds_on_a_job_level_loosening(
+    key: str, job_edit: dict, needle: str
+) -> None:
+    """The controls for the job-level rules: a default shell without errexit, which a step naming no
+    ``shell:`` inherits, and a job-level flag. The Windows install names ``shell: bash`` itself, so
+    the default-shell arm plants it on a copy whose install names none."""
+    soft = {k: step for wf, k, _, step in _STEP_ADVISORY_JOBS if wf == _SECURITY}[key]
+    job = jobs_of(_SECURITY)[key]
+    steps = [
+        {k: v for k, v in s.items() if k != "shell"} if "sha256sum -c" in _shell_lines(s) else s
+        for s in job["steps"]
+        if isinstance(s, dict)
+    ]
+    assert not _sbomqs_split_offences({**job, "steps": steps}, soft)
+    offences = _sbomqs_split_offences({**job, "steps": steps, **job_edit}, soft)
+    assert any(needle in o for o in offences), offences
+
+
+@pytest.mark.parametrize("key", _SBOMQS_SPLIT_JOBS)
+def test_the_sbomqs_split_check_reds_on_the_merged_shape(key: str) -> None:
+    """The control: folding the verify step back into the score step, the shape before BACKLOG
+    #5475, is reported."""
+    soft = {k: step for wf, k, _, step in _STEP_ADVISORY_JOBS if wf == _SECURITY}[key]
+    job = jobs_of(_SECURITY)[key]
+    steps = [s for s in job["steps"] if isinstance(s, dict)]
+    verify = next(s for s in steps if "sha256sum -c" in _shell_lines(s))
+    score = next(s for s in steps if s.get("name") == soft)
+    merged = {**score, "run": f"{verify['run']}\n{score['run']}"}
+    folded = {**job, "steps": [merged if s is score else s for s in steps if s is not verify]}
+    offences = _sbomqs_split_offences(folded, soft)
+    assert any("downloads or verifies" in o for o in offences), offences
+    assert any("carries continue-on-error" in o for o in offences), offences
+
+
+_STATUS_FUNCTIONS = frozenset({"always", "success", "failure", "cancelled"})
+
+
+def _step_if_runs(
+    step: dict, *, earlier_failed: bool, outcomes: dict[str, str], cancelled: bool = False
+) -> bool:
+    """Evaluate a STEP's ``if:`` as GitHub does for one run state.
+
+    A condition calling no status function gets an implicit ``success() &&`` in front, decided from
+    the parsed tokens so a string literal cannot count. A YAML boolean is read as one. ``outcomes``
+    maps a step id to its outcome, seeded as both ``steps.<id>.outcome`` and ``.conclusion`` (equal
+    for a step with no continue-on-error). Any other context name is REFUSED rather than read as
+    the empty string, so an ``||`` term on a context this job always carries cannot pass unseen.
+    """
+    from tests.test_dependabot_automerge_guardrails import (
+        _evaluate_expression,
+        _tokenize_expression,
+    )
+
+    raw = step.get("if")
+    if isinstance(raw, bool):
+        return raw and not earlier_failed and not cancelled
+    body = str(raw or "").strip()
+    if body.startswith("${{") and body.endswith("}}"):
+        body = body[3:-2].strip()
+    tokens = _tokenize_expression(body) if body else ()
+    context = {
+        f"steps.{sid}.{field}": outcome
+        for sid, outcome in outcomes.items()
+        for field in ("outcome", "conclusion")
+    }
+    seeded = {k.casefold() for k in context}
+    called: set[str] = set()
+    for i, (kind, text) in enumerate(tokens):
+        if kind != "ref":
+            continue
+        if i + 1 < len(tokens) and tokens[i + 1] == ("op", "("):
+            called.add(text.casefold())
+        else:
+            assert text.casefold() in seeded, f"unseeded context {text!r} in {body!r}"
+    if not called & _STATUS_FUNCTIONS:
+        body = f"success() && ({body})" if body else "success()"
+    functions: dict[str, Callable[..., str | bool]] = {
+        "always": lambda: True,
+        "success": lambda: not earlier_failed and not cancelled,
+        "failure": lambda: earlier_failed,
+        "cancelled": lambda: cancelled,
+    }
+    return _evaluate_expression(body, context, functions)
+
+
+def _sbomqs_score_gate_offences(job: dict, soft_step: str, *, must_survive: bool) -> list[str]:
+    """Why ``job``'s sbomqs score could run with no verified binary behind it; empty when it cannot.
+
+    The score must not run after the install step failed, was skipped or was cancelled, and must
+    run after a good install. ``must_survive`` adds the BACKLOG #2521 case: after an unrelated
+    earlier failure the install's OUTCOME is derived from its own ``if:``, and the score must still
+    run."""
+    steps = [s for s in job.get("steps") or [] if isinstance(s, dict)]
+    verifying = [s for s in steps if "sha256sum -c" in _shell_lines(s)]
+    scores = [s for s in steps if s.get("name") == soft_step]
+    if len(verifying) != 1 or len(scores) != 1:
+        return [
+            f"expected one `sha256sum -c` step and one {soft_step!r}, found "
+            f"{len(verifying)} and {len(scores)}"
+        ]
+    install, score = verifying[0], scores[0]
+    sid = str(install.get("id") or "")
+    shown = f"if: {score.get('if')!r}, install id {sid or None!r}"
+
+    def seed(outcome: str) -> dict[str, str]:
+        return {sid: outcome} if sid else {}
+
+    offences = [
+        f"the score step runs after a {outcome} install: {shown}"
+        for outcome in ("failure", "skipped", "cancelled")
+        if _step_if_runs(
+            score,
+            earlier_failed=outcome != "cancelled",
+            outcomes=seed(outcome),
+            cancelled=outcome == "cancelled",
+        )
+    ]
+    if not _step_if_runs(score, earlier_failed=False, outcomes=seed("success")):
+        offences.append(f"the score step never runs after a good install: {shown}")
+    if must_survive:
+        ran = _step_if_runs(install, earlier_failed=True, outcomes={})
+        if not _step_if_runs(
+            score, earlier_failed=True, outcomes=seed("success" if ran else "skipped")
+        ):
+            offences.append(
+                "the score step skips after an unrelated earlier failure (BACKLOG #2521); install "
+                f"if: {install.get('if')!r}, {shown}"
+            )
+    return offences
+
+
+#: Whether each SBOM job's score must still run after an unrelated earlier failure (BACKLOG
+#: #2521). Only `sbom` scores two files; `sbom-windows` scores one, so its implicit success() holds.
+_SBOMQS_SCORE_SURVIVES = {"sbom": True, "sbom-windows": False}
+
+
+def test_the_sbomqs_score_never_runs_after_a_failed_install() -> None:
+    """RED when: an SBOM job's sbomqs score step can run after its install-and-verify step failed
+    (BACKLOG #5475), so it would call whatever sits at the install path with no verified binary
+    behind it. Evaluated, not searched: the step's ``if:`` is run through the expression evaluator
+    for a failed install, a good install, and (Linux) a good install after an unrelated failure."""
+    soft = {k: step for wf, k, _, step in _STEP_ADVISORY_JOBS if wf == _SECURITY}
+    jobs = jobs_of(_SECURITY)
+    for key in _SBOMQS_SPLIT_JOBS:
+        offences = _sbomqs_score_gate_offences(
+            jobs[key], soft[key], must_survive=_SBOMQS_SCORE_SURVIVES[key]
+        )
+        assert not offences, f"security.yml:{key}: {offences}"
+
+
+_SBOM_SOFT = next(
+    step for wf, key, _, step in _STEP_ADVISORY_JOBS if wf == _SECURITY and key == "sbom"
+)
+
+
+def _sbom_with(score_if: object = None, install_edit: Callable[[dict], dict] | None = None) -> dict:
+    """The `sbom` job with its score step's ``if:`` replaced and/or its install step edited."""
+    job = jobs_of(_SECURITY)["sbom"]
+    steps = []
+    for s in job["steps"]:
+        if not isinstance(s, dict):
+            continue
+        if score_if is not None and s.get("name") == _SBOM_SOFT:
+            s = {**s, "if": score_if}
+        elif install_edit is not None and "sha256sum -c" in _shell_lines(s):
+            s = install_edit(dict(s))
+        steps.append(s)
+    return {**job, "steps": steps}
+
+
+@pytest.mark.parametrize(
+    ("score_if", "needle"),
+    [
+        ("always()", "runs after a failure install"),
+        ("always() || steps.sbomqs-install.outcome == 'success'", "runs after a failure install"),
+        ("always() && steps.sbomqs-install.outcome != 'failure'", "runs after a skipped install"),
+        ("steps.sbomqs-install.outcome == 'success'", "unrelated earlier failure"),
+        (False, "never runs after a good install"),
+    ],
+    ids=[
+        "always-only",
+        "or-always",
+        "not-failure",
+        "implicit-success",
+        "yaml-false",
+    ],
+)
+def test_the_sbomqs_score_gate_check_reds_on_each_loosening(score_if: object, needle: str) -> None:
+    """The controls: the gate before this fix (``always()`` alone), an ``||`` that admits a failed
+    install, a test that admits a skipped one, a gate that loses the BACKLOG #2521 survival, and a
+    gate that never runs."""
+    offences = _sbomqs_score_gate_offences(_sbom_with(score_if), _SBOM_SOFT, must_survive=True)
+    assert any(needle in o for o in offences), offences
+
+
+def test_the_sbomqs_score_gate_check_accepts_the_conclusion_form() -> None:
+    """The control against a false red: ``conclusion`` equals ``outcome`` for a step with no
+    continue-on-error, so that spelling of the gate is accepted."""
+    score_if = "${{ !cancelled() && steps.sbomqs-install.conclusion == 'success' }}"
+    assert not _sbomqs_score_gate_offences(_sbom_with(score_if), _SBOM_SOFT, must_survive=True)
+
+
+@pytest.mark.parametrize(
+    "job",
+    [
+        _sbom_with(
+            "!cancelled() && (steps.sbomqs-install.outcome == 'success' || github.ref != '')"
+        ),
+        _sbom_with("!cancelled() && steps.other.outcome == 'success'"),
+        _sbom_with(install_edit=lambda s: {k: v for k, v in s.items() if k != "id"}),
+    ],
+    ids=["or-github-ref", "wrong-id", "install-without-id"],
+)
+def test_the_sbomqs_score_gate_check_refuses_an_unseeded_context(job: dict) -> None:
+    """A name the check does not seed fails the test rather than reading as the empty string. An
+    ``||`` on a context the job always carries (``github.ref`` on a scheduled run from main) would
+    run the score after every failed install; a gate on another step's id, or an install that lost
+    its id, gates on nothing the install decides."""
+    with pytest.raises(AssertionError, match="unseeded context"):
+        _sbomqs_score_gate_offences(job, _SBOM_SOFT, must_survive=True)
+
+
+def test_the_sbomqs_score_gate_check_reds_when_the_install_runs_on_success() -> None:
+    """The control for the install's own ``if:``: on ``success()`` it is skipped after an unrelated
+    failure, so the IDE SBOM goes unscored (BACKLOG #2521)."""
+    job = _sbom_with(install_edit=lambda s: {**s, "if": "success()"})
+    offences = _sbomqs_score_gate_offences(job, _SBOM_SOFT, must_survive=True)
+    assert any("unrelated earlier failure" in o for o in offences), offences
 
 
 # --- trivy: run the scan step and its reporter against each other, verbatim ----------------------

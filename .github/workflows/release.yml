@@ -1093,8 +1093,8 @@ jobs:
           # cannot fail. The line stays so the next edit that adds a pipe here inherits it.
           # The DELETED `grep " ${asset}$" sbomqs-checksums.txt | sha256sum -c -` was a latent
           # hazard, not a live one. security.yml's "Install gitleaks (pinned + checksum-verified)"
-          # step records why that shape fails safe. security.yml's sbomqs twin still runs it with
-          # no pipefail, in the same latent state; that file is not in this change's scope.
+          # step records why that shape fails safe. security.yml's sbomqs twin still runs that
+          # shape, under `set -o pipefail` since BACKLOG #5475.
           set -o pipefail
           VER=2.0.11
           SBOMQS_SHA256=14fd58b89d4948265cce0fdb95d9b635ff667f352b5a9a05b3d13dbefa5d0195

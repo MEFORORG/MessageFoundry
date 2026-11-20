@@ -15,6 +15,7 @@ generic and synthetic; profiles never name a real partner/site/host — see ``do
 
 from __future__ import annotations
 
+import math
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -165,7 +166,9 @@ class Failover:
 @dataclass(frozen=True)
 class Target:
     """An inbound MLLP endpoint to drive. ``types`` restricts which message-type codes route here
-    (empty = any); ``weight`` splits offered load across targets."""
+    (empty = any); ``weight`` splits offered load across targets. ``ack_timeout_s``, when set,
+    closes and reopens a connection whose oldest send has waited that long for its ACK; unset, a
+    connection waits on its ACKs for as long as the socket stays open."""
 
     name: str
     host: str = "127.0.0.1"
@@ -173,7 +176,7 @@ class Target:
     types: tuple[str, ...] = ()
     weight: float = 1.0
     expect_ack: bool = True
-    ack_timeout_s: float = 10.0
+    ack_timeout_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -390,7 +393,7 @@ def _targets_from(raw: Any, where: str) -> tuple[Target, ...]:
                 types=_opt_str_tuple(table, "types", ctx),
                 weight=_opt_float(table, "weight", ctx, default=1.0, minimum=0.0),
                 expect_ack=_opt_bool(table, "expect_ack", ctx, default=True),
-                ack_timeout_s=_opt_float(table, "ack_timeout_s", ctx, default=10.0, minimum=0.1),
+                ack_timeout_s=_ack_timeout(table, ctx),
             )
         )
     return tuple(targets)
@@ -606,6 +609,15 @@ def _opt_float(
         maximum=maximum,
         exclusive_min=False,
     )
+
+
+def _ack_timeout(table: dict[str, Any], where: str) -> float | None:
+    """``ack_timeout_s``: unset, or at least 0.1 s. NaN passes a minimum check, so it is refused
+    by name here rather than later, at connection construction."""
+    value = _opt_float_or_none(table, "ack_timeout_s", where, minimum=0.1)
+    if value is not None and math.isnan(value):
+        raise LoadProfileError(f"{where}: 'ack_timeout_s' must be a number, not NaN")
+    return value
 
 
 def _opt_float_or_none(

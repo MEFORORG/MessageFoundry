@@ -776,7 +776,6 @@ _GRANDFATHERED: frozenset[tuple[str, str, str]] = frozenset(
             "Smoke-check the console wheel (clean venv, install, then the console's OWN "
             "__version__ == tag)",
         ),
-        ("security.yml", "sbom", "Score SBOM quality (sbomqs — advisory)"),
         ("security.yml", "trivy", "Install Trivy (pinned)"),
         ("zizmor.yml", "zizmor", "Lint workflow syntax (actionlint, pinned)"),
     }

@@ -343,3 +343,7 @@ must ride one keep-alive TCP connection). `urllib.request` opens a **fresh conne
 structurally cannot carry the handshake — a correct build needs a keep-alive HTTP client driven by
 `pyspnego` (already in `requirements.lock`, backing the AD/SSO server path). Deferred as a follow-up; the
 provider seam here is shaped to admit it (a challenge/response plug alongside the bearer + digest plugs).
+
+## Amendment (2026-11-18, BACKLOG #5910)
+
+A 2xx token reply that `reply_framing_fault` refuses for its content coding (any coding but `identity`, on a reply that is not a `204` and does not carry `Content-Length: 0`) is refused permanently with code `token-reply-coded`, not retried as a malformed token response. A bare CR in the reply head, and a header-block or framing fault, are refused before the coding is checked and take their own refusal. `smart.request_token` states the condition and the order in full. What a delivery does with that refusal is stated in [ADR 0095 section B.2](0095-connection-lifecycle-scheduler-and-credential-fault-stop.md#b2-a-coded-token-reply-is-a-configuration-fault-2026-11-18-backlog-5910-pr-3069).

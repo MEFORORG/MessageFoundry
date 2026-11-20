@@ -378,6 +378,108 @@ def test_header_form_oversized_conditional_query_refused_at_construction() -> No
         _dest(conditional="if-none-exist", conditional_query=_OVER_HEADER_LIMIT_QUERY)
 
 
+@pytest.mark.parametrize("conditional", ["if-none-exist", "conditional-update"])
+@pytest.mark.parametrize("value", [" ", "   ", " \u00a0 "])
+def test_an_all_space_conditional_query_is_refused_at_construction(
+    conditional: str, value: str
+) -> None:
+    """BACKLOG #5911 step 1: all spaces is no search, and the header form would send it as one."""
+    with pytest.raises(ValueError, match="requires a 'conditional_query'"):
+        _dest(conditional=conditional, conditional_query=value)
+
+
+def _build_fhir(url: str, **over: object) -> FhirDestination:
+    d = build_destination(
+        Destination(
+            name="OB_FHIR",
+            type=ConnectorType.FHIR,
+            settings=FHIR(url=url, **over).settings,  # type: ignore[arg-type]
+        ),
+        egress=EgressSettings(deny_by_default=False),
+    )
+    assert isinstance(d, FhirDestination)
+    return d
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"{BASE}/a b",  # http.client refuses a space in the request line
+        f"{BASE}/caf\u00e9",  # the request target is sent as ASCII
+        f"{BASE}?q=\u0101",
+        f"{BASE}/a\u00a0b",  # a non-ASCII space
+        "https://fhir.exāmple.org/fhir",  # urllib's Host header is Latin-1, never IDNA
+        f"{BASE}#x",  # urllib drops the fragment, and every path appended after it
+    ],
+)
+def test_an_unsendable_static_url_is_refused_at_construction(url: str) -> None:
+    """BACKLOG #5911 step 2: the static base url gets a screen like conditional_query's."""
+    with pytest.raises(ValueError, match="'url' must be ASCII with no whitespace") as ei:
+        _build_fhir(url)
+    assert ei.value.__context__ is None
+
+
+def test_an_unsendable_static_header_value_is_refused_at_construction() -> None:
+    """BACKLOG #5911 step 2: http.client sends a header value as Latin-1, so a static one that is
+    not would fail every send. The value never reaches the refusal."""
+    with pytest.raises(ValueError, match="X-Site.*Latin-1") as ei:
+        _dest(headers={"X-Site": "snow\u0101man"})
+    assert "snow" not in str(ei.value)
+    assert ei.value.__context__ is None
+
+
+def test_a_static_header_value_with_a_line_break_is_refused_at_construction() -> None:
+    with pytest.raises(ValueError, match="X-Site has a value http.client refuses") as ei:
+        _dest(headers={"X-Site": "a\r\nb"})
+    assert "a\r\nb" not in str(ei.value)
+
+
+@pytest.mark.parametrize("name", ["X-Caf\u00e9", "X:A", " X-A", "X\r\nA"])
+def test_an_unsendable_static_header_name_is_refused_at_construction(name: str) -> None:
+    with pytest.raises(ValueError, match="not a header name http.client can send"):
+        _dest(headers={name: "1"})
+
+
+def test_a_refused_static_header_key_shaped_like_a_credential_is_withheld() -> None:
+    """vault BACKLOG #3533: an operator can type a credential into a header key."""
+    with pytest.raises(ValueError, match="withheld") as ei:
+        _dest(headers={"Authorization Bearer tok123": "ā"})
+    assert "tok123" not in str(ei.value)
+
+
+def test_a_latin_1_static_header_value_still_constructs() -> None:
+    """Positive control: a space and a Latin-1 character are legal in a header value, and an
+    ASCII url with a percent-encoded path builds."""
+    dest = _dest(headers={"X-Site": "caf\u00e9 one"})
+    assert dest._headers["X-Site"] == "caf\u00e9 one"
+    assert _build_fhir(f"{BASE}/caf%C3%A9").base_url == f"{BASE}/caf%C3%A9"
+
+
+def test_a_static_conditional_a_wrapped_update_moves_into_the_entry_is_not_screened() -> None:
+    """A wrapped update sends a static If-None-Exist as JSON in the Bundle entry (#1965), never as
+    an HTTP header, so the header screen must not refuse what main builds."""
+    value = "name=\u0141ukasz"  # not Latin-1, and legal in JSON
+    dest = _dest(interaction="update", headers={"If-None-Exist": value})
+    assert dest._static_conditionals == {"If-None-Exist": value}
+
+
+@pytest.mark.parametrize(
+    ("url", "headers"),
+    [(f"{BASE}/a b", {}), (BASE, {"X-Site": "snow\u0101man"})],
+)
+def test_the_lookup_sibling_refuses_an_unsendable_static_url_or_header(
+    url: str, headers: dict[str, str]
+) -> None:
+    """#1241: the read executor is screened like the destination, not left as the gap."""
+    from messagefoundry.transports.fhir import FhirLookupExecutor
+
+    with pytest.raises(ValueError, match="FhirLookup 'epic'"):
+        FhirLookupExecutor(
+            {"epic": {"url": url, "headers": headers}},
+            egress=EgressSettings(deny_by_default=False),
+        )
+
+
 def test_header_form_hash_refused_at_construction() -> None:
     """BACKLOG #5350: a server reading the If-None-Exist value as a query stops at a '#', so it
     would match on a shorter search than the one configured."""

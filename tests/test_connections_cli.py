@@ -6,12 +6,15 @@ the VS Code GUI shells (ADR 0007). Validates-before-persist and rolls back on fa
 from __future__ import annotations
 
 import json
+import math
 import textwrap
 from pathlib import Path
 
 import pytest
+import tomlkit
 
 from messagefoundry.__main__ import main
+from messagefoundry.config.connections_edit import NON_FINITE_TAG
 from messagefoundry.config.wiring import load_config
 
 LOGIC = textwrap.dedent(
@@ -365,6 +368,457 @@ def test_cli_end_to_end_maximal_with_commented_sibling(
     assert ob_after.metadata == ob_before.metadata
     assert ob_after.dead_letter_days == ob_before.dead_letter_days
     assert "HAND" in after_reg.inbound
+
+
+def _strict_json(text: str) -> object:
+    def _refuse(token: str) -> object:
+        raise ValueError(f"non-standard JSON token {token}")
+
+    return json.loads(text, parse_constant=_refuse)
+
+
+def test_list_emits_standard_json_for_an_infinite_alert_age(
+    cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5778: `inf` is the TOML spelling of an off alert age. `connection list` used to print
+    it as a bare Infinity token the IDE's JSON.parse refuses; it now passes a strict parse, loads as
+    off, and stays off through the GUI's list -> upsert re-save."""
+    (cfg / "connections.toml").write_text(
+        textwrap.dedent(
+            """\
+            [[outbound]]
+            name = "OB"
+            transport = "mllp"
+            cleartext_accepted = true
+            cleartext_reason = "legacy partner has no MLLP-over-TLS listener"
+              [outbound.settings]
+              host = "epic.example"
+              port = 2700
+              [outbound.buildup]
+              max_oldest_seconds = inf
+              [outbound.stall]
+              max_oldest_seconds = inf
+            """
+        ),
+        encoding="utf-8",
+    )
+    svc = _svc(cfg, _EPIC_EGRESS)
+    assert load_config(cfg).outbound["OB"].buildup.max_oldest_seconds is None  # type: ignore[union-attr]
+    rc = main(["connection", "list", "--config", str(cfg), "--json"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    entries = _strict_json(out)
+    assert isinstance(entries, list)
+    [entry] = [e for e in entries if e["name"] == "OB"]
+    assert _upsert(cfg, entry, capsys, svc=svc)[0] == 0
+    after = load_config(cfg).outbound["OB"]
+    assert after.buildup is not None and after.buildup.max_oldest_seconds is None
+    assert after.stall is not None and after.stall.max_oldest_seconds is None
+
+
+_BASE_FILE = """\
+[[inbound]]
+name = "IB"
+transport = "mllp"
+router = "r"
+{inbound_extra}  [inbound.settings]
+  port = 2600
+
+[[outbound]]
+name = "OB"
+transport = "mllp"
+cleartext_accepted = true
+cleartext_reason = "legacy partner has no MLLP-over-TLS listener"
+{outbound_extra}  [outbound.settings]
+  host = "epic.example"
+  port = 2700
+{outbound_tables}"""
+
+
+def _base(inbound_extra: str = "", outbound_extra: str = "", outbound_tables: str = "") -> str:
+    return _BASE_FILE.format(
+        inbound_extra=inbound_extra, outbound_extra=outbound_extra, outbound_tables=outbound_tables
+    )
+
+
+_FILE_OB = """\
+[[outbound]]
+name = "OB"
+transport = "file"
+  [outbound.settings]
+  directory = "{out_dir}"
+  poll_seconds = { env = "MEFOR_TEST_PS_UNSET", default = inf, cast = "float" }  # env default
+  min_age_seconds = inf
+"""
+
+#: case -> (connection name, file text). `{out_dir}` is filled per test. Every non-finite value
+#: carries a trailing comment, which a rewrite of that value would drop.
+_CASES: dict[str, tuple[str, str]] = {
+    # strict_timeout_s and waiting_display_delay are not here: main's finite_seconds refuses a
+    # non-finite value in either at load (BACKLOG #5321), so they are refusal cases below.
+    "metadata -inf": ("IB", _base(inbound_extra="metadata = { low = -inf }  # untyped\n")),
+    "metadata nan": ("IB", _base(inbound_extra="metadata = { odd = nan }  # untyped\n")),
+    "metadata -nan": ("IB", _base(inbound_extra="metadata = { odd = -nan }  # untyped\n")),
+    "outbound metadata": ("OB", _base(outbound_extra="metadata = { cap = inf }  # untyped\n")),
+    "buildup": (
+        "OB",
+        _base(outbound_tables="  [outbound.buildup]\n  max_oldest_seconds = inf  # off\n"),
+    ),
+    "stall": (
+        "OB",
+        _base(outbound_tables="  [outbound.stall]\n  max_oldest_seconds = inf  # off\n"),
+    ),
+    "metadata": ("IB", _base(inbound_extra="metadata = { cap = inf, low = -inf }  # untyped\n")),
+    "nested array": (
+        "IB",
+        _base(inbound_extra="metadata = { m = [[inf], [1.0, -nan]] }  # nest\n"),
+    ),
+    "mixed array": ("IB", _base(inbound_extra='metadata = { m = ["inf", inf, "x"] }  # mixed\n')),
+    "env default": ("OB", _FILE_OB),
+}
+
+
+def _write_case(cfg: Path, case: str) -> tuple[str, bytes, Path]:
+    name, text = _CASES[case]
+    out_dir = (cfg / "out").as_posix()
+    data = text.replace("{out_dir}", out_dir).encode("utf-8")
+    (cfg / "connections.toml").write_bytes(data)
+    egress = _EPIC_EGRESS + f'allowed_file_dirs = ["{out_dir}"]\n'
+    return name, data, _svc(cfg, egress)
+
+
+def _listed(cfg: Path, capsys: pytest.CaptureFixture[str]) -> dict[str, dict]:
+    rc = main(["connection", "list", "--config", str(cfg), "--json"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    entries = _strict_json(out)
+    assert isinstance(entries, list)
+    return {entry["name"]: entry for entry in entries}
+
+
+def _canon(value: object) -> object:
+    """A comparable form, independent of the module under test: a float is typed and signed, so a
+    NaN equals a NaN of the same sign and an "inf" string never equals an inf float."""
+    if isinstance(value, dict):
+        return {key: _canon(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_canon(item) for item in value]
+    if isinstance(value, float):
+        return (
+            "float",
+            math.copysign(1.0, value),
+            math.isnan(value),
+            0.0 if value != value else value,
+        )
+    return value
+
+
+def _tables(cfg: Path) -> dict[str, object]:
+    """Each connection table in the file, by name, in :func:`_canon` form."""
+    doc = tomlkit.parse((cfg / "connections.toml").read_text(encoding="utf-8"))
+    tables = [*doc.get("inbound", []), *doc.get("outbound", [])]
+    return {t["name"]: _canon(t.unwrap()) for t in tables}
+
+
+@pytest.mark.parametrize("case", sorted(_CASES))
+def test_non_finite_list_upsert_no_op_is_byte_identical(
+    case: str, cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5778: `connection list` emits each non-finite float as the tag {"$toml": "inf"}
+    and upsert decodes it, so a no-op save of any listed entry leaves the file byte-identical."""
+    _name, before, svc = _write_case(cfg, case)
+    for entry in _listed(cfg, capsys).values():
+        rc, out = _upsert(cfg, entry, capsys, svc=svc)
+        assert rc == 0, out
+    assert (cfg / "connections.toml").read_bytes() == before
+    load_config(cfg)
+
+
+@pytest.mark.parametrize("case", sorted(_CASES))
+def test_non_finite_clone_and_rename_keep_every_value(
+    case: str, cfg: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clone, and a rename (clone + remove), carry each non-finite float as the float -- typed,
+    untyped metadata, an env() default, nested and mixed arrays, -inf, nan and -nan -- and a real
+    "inf" string as a string. The tag needs no same-named table to match against."""
+    monkeypatch.delenv("MEFOR_TEST_PS_UNSET", raising=False)
+    name, _before, svc = _write_case(cfg, case)
+    source = _tables(cfg)[name]
+    entry = _listed(cfg, capsys)[name]
+    entry["name"] = name + "2"
+    if "port" in entry["settings"]:
+        entry["settings"]["port"] += 10
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 0, out
+    rc = main(
+        ["connection", "remove", "--config", str(cfg), "--name", name, "--json"]
+        + ["--service-config", str(svc)]
+    )
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    tables = _tables(cfg)
+    assert name not in tables
+    renamed = tables[name + "2"]
+    assert isinstance(source, dict) and isinstance(renamed, dict)
+    source = {**source, "name": name + "2"}
+    if "port" in source["settings"]:
+        source["settings"] = {**source["settings"], "port": source["settings"]["port"] + 10}
+    assert renamed == source
+    load_config(cfg)
+
+
+def test_infinite_value_edited_to_a_finite_value_is_written(
+    cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The negative arm: an edit to a tagged value lands."""
+    _name, _before, svc = _write_case(cfg, "buildup")
+    entry = _listed(cfg, capsys)["OB"]
+    assert entry["buildup"]["max_oldest_seconds"] == {NON_FINITE_TAG: "inf"}
+    entry["buildup"]["max_oldest_seconds"] = 30.0
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 0, out
+    assert _listed(cfg, capsys)["OB"]["buildup"]["max_oldest_seconds"] == 30.0
+
+
+def test_sibling_edit_in_buildup_keeps_the_untouched_inf(
+    cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (cfg / "connections.toml").write_text(
+        _base(
+            outbound_tables=(
+                "  [outbound.buildup]\n  max_depth = 10\n  max_oldest_seconds = inf  # off\n"
+            )
+        ),
+        encoding="utf-8",
+    )
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entry = _listed(cfg, capsys)["OB"]
+    entry["buildup"]["max_depth"] = 20
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 0, out
+    text = (cfg / "connections.toml").read_text(encoding="utf-8")
+    assert "max_depth = 20" in text and "max_oldest_seconds = inf  # off" in text
+
+
+@pytest.mark.parametrize(
+    ("edit", "expected"),
+    [
+        (lambda m: m.insert(0, 0.5), [0.5, 1.0, float("inf")]),
+        (lambda m: m.pop(0), [float("inf")]),
+        (lambda m: m.__setitem__(0, 2.0), [2.0, float("inf")]),
+    ],
+    ids=["insert", "delete", "edit"],
+)
+def test_untouched_inf_survives_an_array_edit(
+    edit: object, expected: list[float], cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (cfg / "connections.toml").write_text(
+        _base(inbound_extra="metadata = { m = [1.0, inf] }\n"), encoding="utf-8"
+    )
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entry = _listed(cfg, capsys)["IB"]
+    assert callable(edit)
+    edit(entry["metadata"]["m"])
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 0, out
+    assert load_config(cfg).inbound["IB"].metadata == {"m": expected}
+
+
+@pytest.mark.parametrize("spelling", ["inf", "-inf", "nan"])
+@pytest.mark.parametrize(
+    ("field", "obj"),
+    [
+        (
+            "strict_timeout_s",
+            {
+                "direction": "inbound",
+                "name": "IB",
+                "transport": "mllp",
+                "router": "r",
+                "settings": {"port": 2600},
+                "strict_timeout_s": None,
+            },
+        ),
+        (
+            "interval_seconds",
+            {
+                "direction": "inbound",
+                "name": "TI",
+                "transport": "timer",
+                "router": "r",
+                "settings": {"body": "MSH|^~\\\\&|", "interval_seconds": None},
+            },
+        ),
+        (
+            "min_age_seconds",
+            {
+                "direction": "inbound",
+                "name": "FI",
+                "transport": "file",
+                "router": "r",
+                "settings": {"directory": "in", "min_age_seconds": None},
+            },
+        ),
+    ],
+    ids=["strict_timeout_s", "interval_seconds", "min_age_seconds"],
+)
+def test_a_fresh_non_finite_string_in_a_float_field_is_refused(
+    field: str, obj: dict, spelling: str, cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Only the tag decodes. A plain "inf" / "-inf" / "nan" string in a float field is refused, as
+    on main, and nothing is written."""
+    obj = json.loads(json.dumps(obj))
+    target = obj if field in obj else obj["settings"]
+    target[field] = spelling
+    rc, out = _upsert(cfg, obj, capsys, svc=_svc(cfg))
+    assert rc == 1, out
+    assert field in out
+    assert not (cfg / "connections.toml").exists()
+
+
+_FINITE_REFUSAL = "is not a valid float value (value withheld): it is not a finite number"
+
+
+@pytest.mark.parametrize("spelling", ["nan", "inf", "-inf"])
+@pytest.mark.parametrize(
+    ("name", "field"), [("IB", "strict_timeout_s"), ("OB", "waiting_display_delay")]
+)
+def test_a_fresh_non_finite_tag_in_a_seconds_field_is_refused(
+    name: str, field: str, spelling: str, cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The tag decodes to the float, and the float meets main's finite_seconds refusal (BACKLOG
+    #5321): a NaN strict_timeout_s would switch the strict-validation backstop off, an infinity
+    would make it, or a display delay, never fire. Nothing is written."""
+    (cfg / "connections.toml").write_text(_base(), encoding="utf-8")
+    before = (cfg / "connections.toml").read_bytes()
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entry = _listed(cfg, capsys)[name]
+    entry[field] = {NON_FINITE_TAG: spelling}
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 1, out
+    assert f"{field} {_FINITE_REFUSAL}" in out
+    assert (cfg / "connections.toml").read_bytes() == before
+
+
+def test_a_clone_of_a_hand_written_non_finite_strict_timeout_is_refused(
+    cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A file holding strict_timeout_s = nan does not load, so a clone of it is refused with main's
+    finite_seconds refusal, as on origin/main, and the file is unchanged."""
+    (cfg / "connections.toml").write_text(
+        _base(inbound_extra="strict_timeout_s = nan\n"), encoding="utf-8"
+    )
+    before = (cfg / "connections.toml").read_bytes()
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entry = _listed(cfg, capsys)["IB"]
+    assert entry["strict_timeout_s"] == {NON_FINITE_TAG: "nan"}
+    entry["name"] = "IB2"
+    entry["settings"]["port"] = 2610
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 1, out
+    assert f"strict_timeout_s {_FINITE_REFUSAL}" in out
+    assert (cfg / "connections.toml").read_bytes() == before
+
+
+_HAND_WRITTEN_TAG_TABLES = {
+    "string inf": ('"$toml" = "inf"', {NON_FINITE_TAG: {NON_FINITE_TAG: "inf"}}),
+    "other string": ('"$toml" = "hello"', {NON_FINITE_TAG: {NON_FINITE_TAG: "hello"}}),
+    "float inf": (
+        '"$toml" = inf',
+        {NON_FINITE_TAG: {NON_FINITE_TAG: {NON_FINITE_TAG: "inf"}}},
+    ),
+    "nested": (
+        '"$toml" = { "$toml" = "nan" }',
+        {NON_FINITE_TAG: {NON_FINITE_TAG: {NON_FINITE_TAG: {NON_FINITE_TAG: "nan"}}}},
+    ),
+    "array": (
+        '"$toml" = [1, inf]',
+        {NON_FINITE_TAG: {NON_FINITE_TAG: [1, {NON_FINITE_TAG: "inf"}]}},
+    ),
+}
+
+
+@pytest.mark.parametrize("case", sorted(_HAND_WRITTEN_TAG_TABLES))
+def test_a_hand_written_tag_shaped_table_lists_escaped_and_round_trips(
+    case: str, cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A hand-written table whose only key is `$toml` loads on main, so `connection list` must
+    still list the whole file. It lists that table under the escape {"$toml": {"$toml": v}}, which
+    cannot be read as the non-finite tag (whose value is always a string), and upsert unwraps it:
+    a no-op save is byte-identical, and a clone carries the same table."""
+    body, escaped = _HAND_WRITTEN_TAG_TABLES[case]
+    before = _base(inbound_extra=f"metadata = {{ t = {{ {body} }} }}  # hand\n").encode("utf-8")
+    (cfg / "connections.toml").write_bytes(before)
+    svc = _svc(cfg, _EPIC_EGRESS)
+    listed = _listed(cfg, capsys)
+    assert set(listed) == {"IB", "OB"}
+    assert listed["IB"]["metadata"]["t"] == escaped
+    for entry in listed.values():
+        rc, out = _upsert(cfg, entry, capsys, svc=svc)
+        assert rc == 0, out
+    assert (cfg / "connections.toml").read_bytes() == before
+    source = _tables(cfg)["IB"]
+    entry = listed["IB"]
+    entry["name"] = "IB2"
+    entry["settings"]["port"] = 2610
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 0, out
+    clone = _tables(cfg)["IB2"]
+    assert isinstance(source, dict) and isinstance(clone, dict)
+    assert clone["metadata"] == source["metadata"]
+    load_config(cfg)
+
+
+@pytest.mark.parametrize("value", ["bogus", ["inf"], {}, 5])
+def test_upsert_refuses_a_tag_shaped_table_that_is_not_a_tag(
+    value: object, cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A one-key `$toml` table that is not one of the four spellings would be written, and then
+    refused by `connection list`, locking the editor out of the file. Upsert refuses it first, as a
+    WiringError, an unhashable value included."""
+    (cfg / "connections.toml").write_text(_base(), encoding="utf-8")
+    before = (cfg / "connections.toml").read_bytes()
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entry = _listed(cfg, capsys)["IB"]
+    entry["metadata"] = {"t": {NON_FINITE_TAG: value}}
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 1, out
+    assert "non-finite number tag" in out
+    assert (cfg / "connections.toml").read_bytes() == before
+
+
+def test_untouched_nan_in_a_multi_line_array_is_byte_identical(
+    cfg: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """NaN never compares equal, so the comparison holds it equal inside an array too; otherwise the
+    whole array was rewritten on a no-op save, its comments and layout lost."""
+    before = _base(
+        inbound_extra="metadata = { m = [\n  nan,  # keep me\n  -nan,\n  1.0,\n] }\n"
+    ).encode("utf-8")
+    (cfg / "connections.toml").write_bytes(before)
+    svc = _svc(cfg, _EPIC_EGRESS)
+    rc, out = _upsert(cfg, _listed(cfg, capsys)["IB"], capsys, svc=svc)
+    assert rc == 0, out
+    assert (cfg / "connections.toml").read_bytes() == before
+
+
+def test_only_the_exact_tag_decodes(cfg: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A dict with the tag key and another key, or an unknown spelling, is data, not a tag."""
+    (cfg / "connections.toml").write_text(_base(), encoding="utf-8")
+    svc = _svc(cfg, _EPIC_EGRESS)
+    entry = _listed(cfg, capsys)["IB"]
+    entry["metadata"] = {
+        "two": {NON_FINITE_TAG: "inf", "b": 1},
+        "odd": {"other": "inf"},
+        "tag": {NON_FINITE_TAG: "inf"},
+    }
+    rc, out = _upsert(cfg, entry, capsys, svc=svc)
+    assert rc == 0, out
+    assert load_config(cfg).inbound["IB"].metadata == {
+        "two": {NON_FINITE_TAG: "inf", "b": 1},
+        "odd": {"other": "inf"},
+        "tag": float("inf"),
+    }
 
 
 def test_upsert_rejects_unknown_key_and_writes_nothing(

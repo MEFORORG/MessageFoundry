@@ -35,6 +35,7 @@ from __future__ import annotations
 # load service_status (asyncio, subprocess, ctypes) or tomllib.
 __lazy_modules__ = ["messagefoundry.service_status", "tomllib"]
 
+import ipaddress
 import re
 import sys
 import tomllib
@@ -47,9 +48,13 @@ from urllib.parse import urlsplit
 from messagefoundry.api_tls_source import GENERATED_CERT_NAME, ApiTlsSource, api_tls_source
 from messagefoundry.service_status import is_safe_service_name
 
+# The engine's own [api] defaults, which a `serve` command line naming only one of --host and --port
+# keeps for the other (BACKLOG #5936).
+_DEFAULT_BIND_HOST = "127.0.0.1"
+_DEFAULT_BIND_PORT = 8765
 # https because the engine serves TLS by default (ADR 0172). Plain http is right only behind a
 # declared upstream terminator, and the tray learns that from the engine's settings, not by default.
-DEFAULT_ENGINE_URL = "https://127.0.0.1:8765"
+DEFAULT_ENGINE_URL = f"https://{_DEFAULT_BIND_HOST}:{_DEFAULT_BIND_PORT}"
 DEFAULT_SERVICE_NAME = "MessageFoundry"
 DEFAULT_POLL_SECONDS = 5.0
 _POLL_MIN_S = 1.0
@@ -77,16 +82,22 @@ class TrayConfig:
     log_path: str | None = None
     #: A PEM the probe pins as its ONLY trust anchor, or ``None`` for the OS trust store.
     engine_cacert: str | None = None
+    #: True when ``serve --host`` names a wildcard (unspecified) address. The probe then connects
+    #: on loopback, but the bind itself listens on every interface, so it stays monitor-only.
+    bind_unspecified: bool = False
 
     @property
     def monitor_only(self) -> bool:
         """A **remote** engine → monitor-only (service control + Open-Repo disabled).
 
-        Keyed on locality alone: a loopback engine is controllable whether it serves http or
-        https (see the module docstring). Only a non-loopback host degrades the tray, because
-        only then are "start the local service" and "open the local repo" meaningless.
+        Keyed on locality, never on the scheme: a loopback engine is controllable whether it
+        serves http or https (see the module docstring). A non-loopback host degrades the tray,
+        because then "start the local service" and "open the local repo" are meaningless.
+
+        A wildcard bind named by ``serve --host`` is monitor-only too, though the tray probes it
+        on loopback: it listens on every interface, so it is not a loopback-only engine.
         """
-        return not is_local_engine(self.engine_url)
+        return self.bind_unspecified or not is_local_engine(self.engine_url)
 
 
 @dataclass(frozen=True)
@@ -309,6 +320,23 @@ def _last_path_option(app_parameters: str, flags: frozenset[str]) -> str | None:
     return found
 
 
+def _is_unspecified(host: str) -> bool:
+    """Whether ``host`` is a wildcard (unspecified) address, ``0.0.0.0`` or ``::`` in any spelling."""
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_unspecified
+    except ValueError:
+        return False
+
+
+def _probe_host(host: str) -> str:
+    """``host``, or the loopback of its family when it is a wildcard (unspecified) address.
+
+    No client can connect to a wildcard address, and a wildcard bind accepts on loopback too."""
+    if not _is_unspecified(host):
+        return host
+    return "::1" if ":" in host else "127.0.0.1"
+
+
 def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -> str | None:
     """A validated ``http(s)://host:port`` URL, or ``None`` if either part is missing/invalid.
 
@@ -322,6 +350,7 @@ def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -
         return None
     # A bare IPv6 literal must be bracketed or the ':'s read as the port separator — `serve
     # --host ::1` would otherwise yield the unparseable "http://::1:8765".
+    host = _probe_host(host)
     authority = f"[{host}]" if ":" in host and not host.startswith("[") else host
     return f"{'https' if tls else 'http'}://{authority}:{port}"
 
@@ -435,6 +464,11 @@ def compose_config(
 ) -> TrayConfig:
     """Merge built-in defaults ← registry hints ← TOML (TOML wins). Pure.
 
+    A ``serve`` command line that names only one of ``--host`` and ``--port`` keeps the engine's
+    default for the other, so a bind named only in part still yields the engine's URL (BACKLOG
+    #5936). The host and port come from the registry hints alone, never from the engine's
+    settings file (ADR 0113 amendment 2026-07-22).
+
     ``engine_tls`` scheme-corrects the *registry-derived* URL only; an explicit ``engine_url`` in
     ``tray.toml`` already carries its own scheme and always wins. It defaults to True for the same
     reason :func:`engine_serves_https` answers True on no settings: an engine on its defaults mints.
@@ -451,13 +485,21 @@ def compose_config(
     repo_path: str | None = None
     poll_seconds = DEFAULT_POLL_SECONDS
     log_path: str | None = None
+    bind_unspecified = False
 
     # Registry hints (untrusted; validated).
     if reg is not None:
         host_hint, port_hint = parse_serve_args(reg.app_parameters or "")
-        url_hint = build_engine_url(host_hint, port_hint, tls=engine_tls)
+        # Built even when nothing names a part, so the scheme still follows engine_tls: an engine
+        # behind a declared upstream terminator speaks http on the default bind too.
+        url_hint = build_engine_url(
+            host_hint or _DEFAULT_BIND_HOST,
+            port_hint or _DEFAULT_BIND_PORT,
+            tls=engine_tls,
+        )
         if url_hint is not None:
             engine_url = url_hint
+            bind_unspecified = host_hint is not None and _is_unspecified(host_hint)
         repo_path = (
             parse_project_root_arg(reg.app_parameters or "")
             or _clean_path_hint(reg.app_directory)
@@ -471,6 +513,7 @@ def compose_config(
         if isinstance(raw_url, str) and raw_url:
             engine_url = raw_url
             cacert = None
+            bind_unspecified = False
         raw_cacert = _clean_path_hint(toml_data.get("engine_cacert"))
         if raw_cacert is not None and Path(raw_cacert).is_absolute():
             cacert = raw_cacert
@@ -490,6 +533,7 @@ def compose_config(
         poll_seconds=poll_seconds,
         log_path=log_path,
         engine_cacert=cacert,
+        bind_unspecified=bind_unspecified,
     )
 
 
@@ -515,19 +559,38 @@ def _read_toml(path: Path) -> dict[str, object] | None:
 def service_toml_path(reg: ServiceRegistryInfo | None) -> Path | None:
     """Where the engine service's settings TOML lives, per its NSSM registry entry — or ``None``.
 
-    Mirrors ``serve``'s own resolution: an explicit ``--service-config`` (relative paths resolve
-    against the service's working directory, which NSSM records as ``AppDirectory``), else
-    ``<AppDirectory>/messagefoundry.toml``. Both inputs are untrusted registry strings, already
-    length/NUL-validated by :func:`_clean_path_hint`; the result is only ever *read*.
+    Mirrors ``serve``'s own resolution (ADR 0050): an explicit ``--service-config``, where a
+    relative path resolves under ``--project-root`` when one is given and otherwise against the
+    service's working directory, which NSSM records as ``AppDirectory``; else
+    ``<AppDirectory>/messagefoundry.toml``. A relative ``--project-root`` is joined to
+    ``AppDirectory`` as ``serve`` joins it to its working directory, so a Windows drive-relative
+    ``\\repo`` lands at the root of that directory's drive. Under a root, a ``--service-config``
+    with a leading separator keeps its tail under the root, as ``serve``'s anchor does. The inputs
+    are untrusted registry strings,
+    already length/NUL-validated by :func:`_clean_path_hint`; the result is only ever *read*.
     """
     if reg is None:
         return None
     base = _clean_path_hint(reg.app_directory)
-    explicit = parse_service_config_arg(reg.app_parameters or "")
+    params = reg.app_parameters or ""
+    explicit = parse_service_config_arg(params)
     if explicit is not None:
         candidate = Path(explicit)
         if candidate.is_absolute():
             return candidate
+        root = parse_project_root_arg(params)
+        if root is not None:
+            anchor = Path(root)
+            if not anchor.is_absolute():
+                if not base:
+                    return None
+                # serve's resolve_values_base_dir joins it to the working directory, drive-relative
+                # or not (it warns on a drive-relative one and still uses it).
+                anchor = Path(base) / anchor
+            # Drop a leading separator (``\x``) so the tail stays under the root, as serve's
+            # anchor_under_root does. A drive-letter relative ``C:x`` keeps its drive, as there.
+            drop = 1 if candidate.root and not candidate.drive else 0
+            return anchor.joinpath(*candidate.parts[drop:])
         return Path(base) / candidate if base else None
     return Path(base) / _DEFAULT_SERVICE_TOML if base else None
 

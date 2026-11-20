@@ -236,6 +236,7 @@ from messagefoundry.api.multipart import (
 )
 from messagefoundry.api.outlive import (
     CANCEL_GRACE_SECONDS,
+    OperationInterrupted,
     OutlivingOperations,
     cancel_grace_left,
 )
@@ -4990,6 +4991,27 @@ def create_app(
         if hsts_notable(request.url.scheme, exposure_protected, host=request.url.hostname or ""):
             headers[HSTS_HEADER] = HSTS_VALUE
         return JSONResponse({"detail": "internal error"}, status_code=500, headers=headers)
+
+    @app.exception_handler(OperationInterrupted)
+    async def _operation_interrupted(request: Request, exc: OperationInterrupted) -> JSONResponse:
+        # BACKLOG #5903: an outliving operation cancelled while its request still waited. Not
+        # "retry": it may have landed. When it ran as an approval's release, that approval is now
+        # 'interrupted', to be resolved rather than approved again. The label only is logged and
+        # answered.
+        _log.warning(
+            "%s %s: %s",
+            scrub_log_argument(request.method),
+            scrub_log_argument(request.url.path),
+            exc,
+        )
+        return JSONResponse(
+            {
+                "detail": f"{exc}. Check the audit log and the state it changes before running it "
+                "again. If it ran as an approval's release, that approval is now interrupted; "
+                "resolve it rather than approving it again."
+            },
+            status_code=503,
+        )
 
     @app.exception_handler(RequestValidationError)
     async def _validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -12580,8 +12602,10 @@ def create_managed_app(
     schedule_tick_seconds: float = 30.0,  # #147 (ADR 0095): active-window scheduler tick
     fuse_thread_hops: bool = False,  # ADR 0071 B5: SQL-Server-only thread-hop fusion (default-OFF)
     pooled_fusing_workers: int = 8,
-    batch_handoff_statements: bool = False,  # ADR 0075: SQL-Server-only per-hop batching (default-OFF)
-    snapshot_on_send: bool = False,  # ADR 0104: copy-on-Send at Send construction (default-OFF)
+    # Both default as PipelineSettings does, so an embedder on keyword defaults runs as serve does
+    # (BACKLOG #5794).
+    batch_handoff_statements: bool = True,  # ADR 0075: SQL-Server-only per-hop batching (default-ON)
+    snapshot_on_send: bool = True,  # ADR 0104: copy-on-Send at Send construction (default-ON)
     connection_events: bool = True,
     response_sent_default: bool = True,
     message_events: str = "all",  # #63 [diagnostics].message_events verbosity → open_store

@@ -251,3 +251,31 @@ def test_compose_sends_the_frame_byte_when_the_operator_opts_in(qapp: Any) -> No
         server.close()
     # The bare frame went out: the payload's own 0x0B sits inside the frame, as the operator asked.
     assert got and got[0] == frame(_HOSTILE)
+
+
+@pytest.mark.parametrize("transport", ["MLLP", "File"])
+def test_a_worker_failure_is_shown_not_dropped(qapp: Any, tmp_path: Any, transport: str) -> None:
+    # A fault the worker's run() catches ends the send with no result row; the tab must say why.
+    from harness.file_transport import FileDropWorker
+
+    def _boom() -> Any:
+        raise RuntimeError("boom")
+        yield  # pragma: no cover - makes this a generator
+
+    worker: SendWorker | FileDropWorker
+    if transport == "MLLP":
+        worker = SendWorker("127.0.0.1", 9, _boom(), timeout=1.0, rate=0.0)
+    else:
+        worker = FileDropWorker(str(tmp_path), _boom(), rate=0.0)
+    worker.run()
+    assert worker.failure == "RuntimeError: boom"
+    panel = ComposePanel()
+    panel._worker = worker
+    panel._on_finished()
+    assert panel._results.rowCount() == 1
+    row = [panel._results.item(0, c) for c in range(panel._results.columnCount())]
+    cells = [cell.text() if cell is not None else None for cell in row]
+    assert cells[1] == transport
+    assert cells[_OK_COL] == "no"
+    assert cells[5] == "ended early: RuntimeError: boom"
+    assert panel._send_btn.isEnabled()

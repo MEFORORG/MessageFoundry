@@ -18,7 +18,9 @@ start is a FAST exit: each one in a row doubles the delay before the next launch
 trip the crash-loop breaker for THAT shard: it is not relaunched again, the ERROR line names it and
 its exit history, and it stays listed in :attr:`Supervisor.crash_looped`. The other shards keep
 running, so one shard's start-up failure is not a fleet outage (a crash in one supervised task stays
-isolated). Only when every shard has tripped does ``supervise`` return non-zero. The supervisor has
+isolated). Of the crash-loop outcomes, only every engine shard having tripped makes ``supervise`` return
+non-zero (1); ``supervise`` returns 3 when it returns with :attr:`Supervisor.drain_failure` set
+(:func:`supervise` lists every code). The supervisor has
 no store and so no alert store; the ERROR log is its alert, and its CRL reload's only sink logs
 (:func:`_supervisor_crl_alert_sink`). A child that ran for ``stable_uptime``
 resets both. Without this a start-up failure neither config load reproduces (a
@@ -326,6 +328,14 @@ async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
     return await asyncio.create_subprocess_exec(*spec.argv, env=env)
 
 
+class ShardDrainError(RuntimeError):
+    """The shutdown drain may have left at least one engine shard's child running: a child the
+    force could not end, or a launch still running ``terminate_grace`` seconds after the drain
+    cancelled it, whose child may or may not exist.
+
+    :func:`supervise` maps it to exit code 3, apart from the crash-loop code 1."""
+
+
 @dataclass
 class _Child:
     spec: ShardSpec
@@ -339,7 +349,8 @@ class Supervisor:
     Inject ``spawn`` for tests (default: launch a real ``serve``). ``restart`` controls whether an
     unexpectedly-exited child is relaunched (the operator runtime sets it True; a one-shot smoke may
     set it False). ``terminate_grace`` is the seconds to wait after the stop request before forcing
-    the child.
+    the child. It also bounds a launch still in flight at shutdown: the drain gives it that long to
+    return, then cancels it and gives it that long again.
 
     The restart backoff and crash-loop breaker are the module docstring's; their knobs are
     ``restart_backoff_initial``, ``restart_backoff_max``, ``stable_uptime`` and
@@ -359,10 +370,21 @@ class Supervisor:
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     _children: dict[str, _Child] = field(default_factory=dict, init=False)
     _stopping: asyncio.Event = field(default_factory=asyncio.Event, init=False)
+    #: Every launch not yet returned to its watcher, with its spec. This is the launches' strong
+    #: reference; the drain awaits whatever is still here (:meth:`_settle_launches`).
+    _launches: dict[asyncio.Future[asyncio.subprocess.Process], ShardSpec] = field(
+        default_factory=dict, init=False
+    )
     #: Per-shard restart counters, exposed for tests and observability.
     restarts: dict[str, int] = field(default_factory=dict, init=False)
     #: Shards that tripped the crash-loop breaker in the current :meth:`run`: down, and not relaunched.
     crash_looped: set[str] = field(default_factory=set, init=False)
+    #: Set by :meth:`_terminate_all` when the current :meth:`run`'s drain may have left an engine
+    #: shard's child running. With a child or a launch live, it sets it before its first await and
+    #: settles it at the end, so a drain cut short inside :meth:`_terminate_all` reads as failed.
+    #: A drain cancelled earlier, during :meth:`_drain`'s wait for the watchers, leaves it ``None``
+    #: with no child asked to stop. :func:`supervise` maps it to exit 3.
+    drain_failure: ShardDrainError | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         # Each of these would switch the protection off quietly: a limit of 0 trips on the first
@@ -372,7 +394,13 @@ class Supervisor:
             raise ValueError(
                 f"crash_loop_limit must be an integer >= 1, got {self.crash_loop_limit!r}"
             )
-        for knob in ("restart_backoff_initial", "restart_backoff_max", "stable_uptime"):
+        # terminate_grace also bounds the wait after a kill, so it must be finite to bound it.
+        for knob in (
+            "restart_backoff_initial",
+            "restart_backoff_max",
+            "stable_uptime",
+            "terminate_grace",
+        ):
             value = getattr(self, knob)
             if not (math.isfinite(value) and value > 0):
                 raise ValueError(f"{knob} must be a finite number of seconds > 0, got {value!r}")
@@ -381,29 +409,101 @@ class Supervisor:
         """Spawn every shard, then watch them until cancelled or :meth:`stop` is called.
 
         Each shard runs under its own watcher task that relaunches it on an unexpected exit (when
-        ``restart``). Either route drains all children cleanly: :meth:`stop` ends the watchers so
-        ``gather`` returns and the ``else`` branch drains, and a cancellation or a watcher that
-        raised takes the branch above, so no failure leaves sibling shards running undrained.
+        ``restart``). A cancellation, a watcher that raised, and :meth:`stop` once the watchers
+        return all drain every child the same way. A launch in flight does not hold a watcher up:
+        each races the stop, and the drain settles the launches itself, within twice
+        ``terminate_grace``. A drain whose :meth:`_terminate_all` finishes having found a child it
+        may have left running (one the force could not end, or a launch that outlived its
+        cancellation) raises :class:`ShardDrainError`, and :attr:`drain_failure` records that
+        outcome. It outranks the other outcomes, except at least these: a fatal BaseException a
+        watcher raised propagates instead, chained to it when the drain finished; a fatal
+        BaseException a launch raised during the drain propagates instead, chained to it; and a
+        cancellation of the drain's own task raises ``CancelledError``, unless a watcher raised a
+        fatal BaseException, which propagates. Cancelled inside :meth:`_terminate_all`, the drain
+        leaves its placeholder :attr:`drain_failure` set; cancelled earlier, during
+        :meth:`_drain`'s wait for the watchers, it leaves :attr:`drain_failure` ``None`` with no
+        child asked to stop.
+
+        Refuses to start, with ``RuntimeError``, while a launch an earlier run stranded is still
+        pending: this run's drain would otherwise report that launch as its own.
         """
+        if any(not launch.done() for launch in self._launches):
+            raise RuntimeError(
+                "a launch stranded by an earlier run is still pending; not starting another run"
+            )
+        self._launches.clear()
         self._stopping.clear()
         self.crash_looped.clear()
+        self.drain_failure = None
         watchers = [
             asyncio.create_task(self._watch(spec), name=f"shard:{spec.shard}")
             for spec in self.specs
         ]
+        # Cooperative shutdown, a stop, or one watcher raised: every route drains every child
+        # before ``run`` ends. A cancellation of ``run``'s own task during the drain is absorbed
+        # rather than cutting it short, and is raised once the drain is done. A cancellation of
+        # the drain's own task is not absorbed (:func:`_finish_despite_cancel`).
+        raised: BaseException | None = None
         try:
             await asyncio.gather(*watchers)
-        except BaseException:
-            # Cooperative shutdown, or one watcher raised: signal the others to stop relaunching,
-            # then drain every child before the exception goes on.
-            self._stopping.set()
-            for w in watchers:
-                w.cancel()
-            await asyncio.gather(*watchers, return_exceptions=True)
-            await self._terminate_all()
-            raise
-        else:
-            await self._terminate_all()
+        except BaseException as exc:
+            raised = exc
+        self._stopping.set()
+        for w in watchers:
+            w.cancel()
+        drain, cancelled = await _finish_despite_cancel(self._drain(watchers, raised))
+        fatal = raised is not None and not isinstance(raised, (Exception, asyncio.CancelledError))
+        if drain.cancelled():
+            # The drain's own task was cancelled, at least by ``asyncio.run``'s teardown. A fatal
+            # exit (SystemExit, KeyboardInterrupt) a watcher raised is not replaced by that.
+            if fatal:
+                assert raised is not None
+                raise raised
+            if isinstance(raised, Exception):
+                logger.error(
+                    "supervise: an engine shard watcher failed before the drain was cancelled",
+                    exc_info=raised,
+                )
+            raise asyncio.CancelledError
+        if (failure := drain.exception()) is not None:
+            if fatal:
+                assert raised is not None
+                # A fatal exit a watcher raised is not replaced by the drain's failure either.
+                logger.error("supervise: the drain also failed: %s", failure)
+                raise raised from failure
+            # A failed drain may have left a child running, which outranks ``raised``.
+            if isinstance(raised, Exception):
+                logger.error(
+                    "supervise: an engine shard watcher failed before the drain failed",
+                    exc_info=raised,
+                )
+            raise failure
+        if raised is None:
+            if cancelled:
+                raise asyncio.CancelledError
+            return
+        if cancelled and isinstance(raised, Exception):
+            # A shutdown signal is owed to the caller, which treats it as a shutdown. A fatal
+            # BaseException (SystemExit, KeyboardInterrupt) is never replaced by it.
+            logger.error(
+                "supervise: a shutdown signal arrived while draining after an engine shard "
+                "watcher failed: %r",
+                raised,
+            )
+            raise asyncio.CancelledError from raised
+        raise raised
+
+    async def _drain(
+        self, watchers: Sequence[asyncio.Task[None]], raised: BaseException | None
+    ) -> None:
+        """Wait for the stopped watchers to return, then stop every child.
+
+        A watcher failure other than ``raised``, the one ``run`` goes on to raise, is logged here,
+        since nothing else reads it."""
+        for result in await asyncio.gather(*watchers, return_exceptions=True):
+            if isinstance(result, Exception) and result is not raised:
+                logger.error("supervise: an engine shard watcher also failed: %r", result)
+        await self._terminate_all()
 
     async def _watch(self, spec: ShardSpec) -> None:
         """Keep one shard alive: spawn it, await exit OR a stop request, relaunch on a crash after
@@ -428,16 +528,14 @@ class Supervisor:
         while not self._stopping.is_set():
             started = self.clock()
             try:
-                process = await self.spawn(spec)
+                process = await self._launch(spec)
             except OSError as exc:
                 if not self.restart:
                     raise
                 rc: int | str = f"launch failed ({exc})"
             else:
-                self._children[spec.shard] = _Child(spec, process)
-                logger.info(
-                    "shard %r started (pid=%s, port=%d)", spec.shard, process.pid, spec.port
-                )
+                if process is None:
+                    return  # shutdown mid-launch -- the drain settles the launch
                 exit_rc = await self._unless_stopped(process.wait())
                 if exit_rc is None:
                     return  # shutdown — leave the child for _terminate_all to drain
@@ -489,6 +587,37 @@ class Supervisor:
             # never ran.
             self.restarts[spec.shard] = self.restarts.get(spec.shard, 0) + 1
 
+    async def _launch(self, spec: ShardSpec) -> asyncio.subprocess.Process | None:
+        """Spawn ``spec``'s child and register it for :meth:`_terminate_all`; ``None`` on a stop.
+
+        The launch races the stop request, and neither a stop nor this watcher's cancellation
+        cancels it: a launch's child can exist before its await returns, and asyncio's own launch
+        kills that child when cancelled mid-spawn, which skips the graceful stop. So a launch still
+        in flight at shutdown stays in :attr:`_launches`, which holds the only reference to it,
+        and :meth:`_settle_launches` finishes it."""
+        launch = asyncio.ensure_future(self.spawn(spec))
+        self._launches[launch] = spec
+        stopping = asyncio.ensure_future(self._stopping.wait())
+        try:
+            await asyncio.wait({launch, stopping}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stopping.cancel()
+        if not launch.done():
+            return None
+        return self._adopt(launch)
+
+    def _adopt(
+        self, launch: asyncio.Future[asyncio.subprocess.Process]
+    ) -> asyncio.subprocess.Process:
+        """Take a finished launch out of :attr:`_launches` and register the child it returned.
+
+        Raises what the launch raised."""
+        spec = self._launches.pop(launch)
+        process = launch.result()
+        self._children[spec.shard] = _Child(spec, process)
+        logger.info("engine shard %r started (pid=%s, port=%d)", spec.shard, process.pid, spec.port)
+        return process
+
     async def _unless_stopped[T](self, aw: Awaitable[T]) -> T | None:
         """Await ``aw`` unless a stop request comes first: its result, or ``None`` on a stop.
 
@@ -510,8 +639,9 @@ class Supervisor:
 
     def stop(self) -> None:
         """Signal a cooperative shutdown (idempotent). The watchers stop relaunching and return, so
-        the running :meth:`run` drains the children itself — no cancellation needed. Safe to call
-        from a signal handler."""
+        the running :meth:`run` drains the children itself — no cancellation needed. A launch in
+        flight does not hold its watcher up; the drain bounds it (:meth:`_settle_launches`). Safe
+        to call from a signal handler."""
         self._stopping.set()
 
     def _request_stop(self, child: _Child) -> None:
@@ -538,11 +668,135 @@ class Supervisor:
         except ProcessLookupError:
             pass  # already gone
 
-    async def _terminate_all(self) -> None:
-        """Ask every live child to stop, then force what is still running after ``terminate_grace``."""
-        live = [c for c in self._children.values() if c.process.returncode is None]
-        for child in live:
+    def _ask_to_stop(self, child: _Child) -> None:
+        """:meth:`_request_stop`, logging a failure; the force after the grace still runs."""
+        try:
             self._request_stop(child)
+        except Exception as exc:  # noqa: BLE001 -- logged; the kill after the grace still runs
+            logger.error(
+                "engine shard %r: the stop request failed (%r) -- forcing after the grace",
+                child.spec.shard,
+                exc,
+            )
+
+    async def _settle_launches(
+        self, live: list[_Child], stranded: list[BaseException], fatal: list[BaseException]
+    ) -> None:
+        """Finish every launch still in flight, so none outlives the drain unreported.
+
+        Each gets ``terminate_grace`` to return, uncancelled; a child it returns is asked to stop
+        and joins ``live``, drained like the rest. A launch still running then is cancelled and
+        gets ``terminate_grace`` again. A child it returns after the cancel is killed and waited
+        for, since its graceful stop's window is over. A launch still running after that is added
+        to ``stranded``: its child may exist, and nothing here can end the launch. A launch that
+        raised a fatal BaseException is stranded too, and the exception goes to ``fatal`` for the
+        caller to raise once every child is drained."""
+        if not self._launches:
+            return
+        done, pending = await asyncio.wait(set(self._launches), timeout=self.terminate_grace)
+        for launch in done:
+            if (child := self._settled_child(launch, stranded, fatal)) is not None:
+                self._ask_to_stop(child)
+                live.append(child)
+        if not pending:
+            return
+        for launch in pending:
+            launch.cancel()
+        done, pending = await asyncio.wait(pending, timeout=self.terminate_grace)
+        for launch in done:
+            if (child := self._settled_child(launch, stranded, fatal)) is not None:
+                logger.error(
+                    "engine shard %r: the launch returned pid=%s after it was cancelled; killing it",
+                    child.spec.shard,
+                    child.process.pid,
+                )
+                await self._force(child, stranded)
+        for launch in pending:
+            shard = self._launches[launch].shard
+            message = (
+                f"engine shard {shard!r}: the launch was still running {self.terminate_grace:g}s "
+                "after it was cancelled at shutdown; a child may remain"
+            )
+            logger.error("%s", message)
+            stranded.append(RuntimeError(message))
+
+    def _settled_child(
+        self,
+        launch: asyncio.Future[asyncio.subprocess.Process],
+        stranded: list[BaseException],
+        fatal: list[BaseException],
+    ) -> _Child | None:
+        """The child a launch that finished during the drain returned, or ``None``, logged, when
+        it returned none. Never raises, so one launch cannot cut the drain of the rest short: a
+        fatal BaseException goes to ``fatal``, and its launch to ``stranded``."""
+        shard = self._launches[launch].shard
+        try:
+            self._adopt(launch)
+        except asyncio.CancelledError:
+            logger.info("engine shard %r: the launch honoured its cancellation", shard)
+            return None
+        except OSError as exc:
+            logger.warning("engine shard %r: launch failed during shutdown (%s)", shard, exc)
+            return None
+        except Exception as exc:  # noqa: BLE001 -- logged; the drain goes on
+            logger.error("engine shard %r: launch raised during shutdown: %r", shard, exc)
+            return None
+        except BaseException as exc:  # noqa: BLE001 -- raised once every child is drained
+            message = (
+                f"engine shard {shard!r}: the launch raised {exc!r} during shutdown; a child may "
+                "remain"
+            )
+            logger.error("%s", message)
+            stranded.append(RuntimeError(message))
+            fatal.append(exc)
+            return None
+        return self._children[shard]
+
+    async def _force(self, child: _Child, stranded: list[BaseException]) -> None:
+        """Kill ``child`` and wait for it, adding to ``stranded`` if it may still be running."""
+        try:
+            child.process.kill()
+        except ProcessLookupError:
+            return
+        except Exception as exc:  # noqa: BLE001 -- raised once every child is tried
+            logger.error("engine shard %r: the kill failed: %r", child.spec.shard, exc)
+            stranded.append(exc)
+            return
+        # Bounded, because the drain absorbs shutdown signals: a child that outlives even the kill
+        # would otherwise hold the supervisor up with nothing able to end it.
+        try:
+            await asyncio.wait_for(child.process.wait(), timeout=self.terminate_grace)
+        except TimeoutError:
+            message = (
+                f"engine shard {child.spec.shard!r} (pid={child.process.pid}) still "
+                f"running {self.terminate_grace:.0f}s after the kill"
+            )
+            logger.error("%s; leaving it", message)
+            stranded.append(RuntimeError(message))
+
+    async def _terminate_all(self) -> None:
+        """Ask every live child to stop, settle the launches in flight, then force what is still
+        running after ``terminate_grace``.
+
+        The stop requests go out first, so a launch in flight does not delay them. One child's
+        failure does not stop the rest being drained. A refused request falls through to the
+        force; a child that may still be running is raised once every child has been tried, so
+        ``run`` does not end as a clean shutdown with it still running. The comment on
+        :attr:`drain_failure` says when this sets and settles it. A fatal BaseException a launch
+        raised is raised last, chained to the drain's failure."""
+        live = [c for c in self._children.values() if c.process.returncode is None]
+        if live or self._launches:
+            self.drain_failure = ShardDrainError(
+                "the shutdown drain did not finish; an engine shard child may still be running"
+            )
+        stranded: list[BaseException] = []
+        for child in live:
+            self._ask_to_stop(child)
+        # A launch's own strandings go after the kill failures, so the error's cause names a real
+        # kill failure when there is one.
+        launch_stranded: list[BaseException] = []
+        fatal: list[BaseException] = []
+        await self._settle_launches(live, launch_stranded, fatal)
         for child in live:
             try:
                 await asyncio.wait_for(child.process.wait(), timeout=self.terminate_grace)
@@ -552,11 +806,37 @@ class Supervisor:
                     child.spec.shard,
                     self.terminate_grace,
                 )
-                try:  # noqa: SIM105
-                    child.process.kill()
-                except ProcessLookupError:
-                    pass
-                await child.process.wait()
+                await self._force(child, stranded)
+        stranded.extend(launch_stranded)
+        failure: ShardDrainError | None = None
+        if stranded:
+            failure = ShardDrainError(
+                f"{len(stranded)} engine shard child(ren) may still be running: {stranded[0]}"
+            )
+            failure.__cause__ = stranded[0]
+        self.drain_failure = failure
+        if fatal:
+            raise fatal[0] from failure
+        if failure is not None:
+            raise failure
+
+
+async def _finish_despite_cancel[T](aw: Awaitable[T]) -> tuple[asyncio.Future[T], bool]:
+    """Await ``aw`` to completion however often the caller is cancelled meanwhile.
+
+    Returns the future, which the caller reads, and whether a cancellation arrived. The caller
+    owes that cancellation: it raises it once its own cleanup is done. This never cancels ``aw``,
+    so cancelling the CALLER cannot cut a drain short, which is how the POSIX signal handlers stop
+    the supervisor. A cancel aimed at ``aw``'s own task is not absorbed: on Windows a second
+    Ctrl-C makes ``asyncio.run``'s teardown cancel every task, this one too."""
+    fut = asyncio.ensure_future(aw)
+    cancelled = False
+    while not fut.done():
+        try:
+            await asyncio.wait({fut})
+        except asyncio.CancelledError:
+            cancelled = True
+    return fut, cancelled
 
 
 async def supervise(
@@ -577,8 +857,11 @@ async def supervise(
 
     Installs SIGINT/SIGTERM handlers (when ``install_signal_handlers``) that trigger a clean drain.
     Runs while any engine shard is alive. Returns 0 on a clean shutdown, 1 when every engine shard
-    tripped the crash-loop breaker, and 2 on a config/discovery error, which includes a graph
-    ``registry_guard`` refuses (:func:`discover_shard_specs`).
+    tripped the crash-loop breaker, 2 on a config/discovery error, which includes a graph
+    ``registry_guard`` refuses (:func:`discover_shard_specs`), and 3 when
+    :attr:`Supervisor.drain_failure` is set, which outranks 0 and 1. Known limit: the BACKLOG
+    #5894 note in ADR 0037 (``docs/adr/0037-multi-process-sharding-l3.md``) lists at least the cases
+    that can leave a child running with no exit 3, or report exit 3 and still wait at teardown.
 
     While the engine shards run, a :class:`~messagefoundry.pipeline.crl_reload.CrlReloadRunner`
     applies a replaced CRL file to this process's own TLS contexts, as an engine process's runner
@@ -731,13 +1014,25 @@ async def _run_supervisor(
                 # backstops Ctrl-C there. Non-fatal.
                 pass
 
+    # The drain's outcome is read from the supervisor, not from how run() ended.
     try:
         await runner
-    except asyncio.CancelledError:
+    except asyncio.CancelledError as exc:
+        if isinstance(exc.__cause__, Exception) and supervisor.drain_failure is None:
+            # run() raises this when a shutdown signal arrived while it drained after a watcher
+            # failed. The failure still is one, as it is without the signal.
+            raise exc.__cause__ from exc
         logger.info("supervise: shutting down")
-    except KeyboardInterrupt:  # pragma: no cover - interactive Ctrl-C on Windows
+    except ShardDrainError:
+        pass
+    except KeyboardInterrupt:
+        # Interactive Ctrl-C on Windows, or a watcher's KeyboardInterrupt.
         runner.cancel()
         await asyncio.gather(runner, return_exceptions=True)
+    except SystemExit:
+        if supervisor.drain_failure is None:
+            raise
+    drain_failure = supervisor.drain_failure
     # run() returns on its own only once every watcher has. With every shard tripped, the whole
     # fleet is down, which is not a clean shutdown.
     if len(supervisor.crash_looped) == len(specs):
@@ -746,13 +1041,17 @@ async def _run_supervisor(
             "down",
             join_shard_names(supervisor.crash_looped),
         )
-        return 1
-    if supervisor.crash_looped:
+    elif supervisor.crash_looped:
         logger.error(
             "supervise: stopped with engine shard(s) %s down after a crash loop",
             join_shard_names(supervisor.crash_looped),
         )
-    return 0
+    if drain_failure is not None:
+        logger.error(
+            "supervise: the shutdown drain failed: %s; a process may be stranded", drain_failure
+        )
+        return 3
+    return 1 if len(supervisor.crash_looped) == len(specs) else 0
 
 
 def _shutdown_signals() -> tuple[signal.Signals, ...]:

@@ -209,6 +209,8 @@ class MonitorPanel(QWidget):
         self._poll_client: EngineClient | None = None
         self._thread: QThread | None = None
         self._poller: MonitorPoller | None = None
+        # True while a step-up password prompt is up (see _step_up).
+        self._step_up_open = False
 
         # Sub-widgets of the connected view (rebuilt per connect, so they bind the live client).
         self._stats: QLabel | None = None
@@ -277,10 +279,11 @@ class MonitorPanel(QWidget):
             self._set_status(str(exc), error=True)
             return
         if not self._ensure_auth(client):
-            # A must-change sign-in, or one whose second factor was never verified, leaves the client
-            # holding a session it will never use. End it before dropping the client, or it stays
-            # live until it expires (BACKLOG #2091, #5568). The engine lets a must-change or an
-            # MFA-pending session reach /auth/logout.
+            # A sign-in this panel will not use can leave the client holding a session, for example
+            # a must-change one or one whose second factor was never verified. End it before
+            # dropping the client, or it stays live until it expires (BACKLOG #2091, #5568). The
+            # engine lets a must-change or an MFA-pending session reach /auth/logout. A cancelled
+            # sign-in's dialog logs out itself, which clears the token, so this skips it.
             if client.token is not None:
                 with contextlib.suppress(ApiError):
                     client.logout()
@@ -331,7 +334,13 @@ class MonitorPanel(QWidget):
                 return False
         dialog = LoginDialog(client, self)
         if not dialog.exec():
-            self._set_status("sign-in cancelled")
+            if dialog.session_may_remain:
+                self._set_status(
+                    "sign-in cancelled, but a session may stay valid until it expires",
+                    error=True,
+                )
+            else:
+                self._set_status("sign-in cancelled")
             return False
         if dialog.must_change_password:
             # The token works but is restricted to the password-change routes, so every poll/action
@@ -403,12 +412,23 @@ class MonitorPanel(QWidget):
         # which has no handler, so this is a second guard: refuse rather than build Qt off-thread.
         if client is None or QThread.currentThread() is not self.thread():
             return False
-        password, ok = QInputDialog.getText(
-            self,
-            "Confirm it's you",
-            "This action needs your password again:",
-            QLineEdit.EchoMode.Password,
-        )
+        if self._step_up_open:
+            # The open prompt's nested event loop delivered a second step-up, such as a refused
+            # message search arriving while a Purge prompt is up. Its reauth would post the action
+            # the first refusal stashed (X-Step-Up-Action), minting that action's grant from a
+            # password typed for this one, and leave the first action's own reauth with none. So
+            # it is declined; re-running it once the open prompt closes prompts then.
+            return False
+        self._step_up_open = True
+        try:
+            password, ok = QInputDialog.getText(
+                self,
+                "Confirm it's you",
+                "This action needs your password again:",
+                QLineEdit.EchoMode.Password,
+            )
+        finally:
+            self._step_up_open = False
         if not ok or not password:
             return False
         # A refused re-proof raises out of the action that asked for it, so the action's own error
@@ -527,8 +547,11 @@ class MonitorPanel(QWidget):
         # Messages: reuse the console's filter list + detail pane (user-initiated, GUI thread).
         # Their reads run on worker threads, so they get a polling client: it shares the token but
         # carries no step-up handler, so a refusal there can never open a Qt dialog off the GUI
-        # thread (vault BACKLOG #2625 gave the main client one).
-        self._messages = MessagesPanel(self._client, poll_client=self._poll_client)
+        # thread (vault BACKLOG #2625 gave the main client one). The step-up gated content search
+        # hands its 403 back to the GUI thread, which answers it with the same re-proof.
+        self._messages = MessagesPanel(
+            self._client, poll_client=self._poll_client, step_up=self._step_up
+        )
         self._detail = MessageDetailPanel(self._client, poll_client=self._poll_client)
         self._messages.message_selected.connect(self._detail.load)
         self._messages.error.connect(lambda m: self._set_status(m, error=True))

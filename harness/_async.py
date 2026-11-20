@@ -16,10 +16,27 @@ the harness reuses these Qt view widgets, so they now live beside it.
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable
 from typing import Any
 
-from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
+from PySide6.QtCore import QObject, QRunnable, QThread, QThreadPool, Signal
+
+log = logging.getLogger(__name__)
+
+
+def join_worker_thread(thread: QThread, *, grace_ms: int = 6000) -> None:
+    """Quit and join a worker ``QThread`` whose worker has already been told to stop.
+
+    Never ``QThread.terminate``: killing a thread that runs Python code can leave the interpreter
+    or a lock it held in a broken state. The harness workers see their stop flag between steps, so
+    the join is normally short, but a step stop() cannot interrupt (a name lookup, a blocked send
+    or file write) is waited out: past ``grace_ms`` it is logged and the join goes on without a
+    bound."""
+    thread.quit()
+    if not thread.wait(grace_ms):
+        log.warning("a harness worker thread is still running %d ms after stop; waiting", grace_ms)
+        thread.wait()
 
 
 class _CallSignals(QObject):
@@ -36,12 +53,27 @@ class _Call(QRunnable):
         self._signals = signals
 
     def run(self) -> None:
+        # Drop this runnable's own references before the call. PySide adds the pool's Python link
+        # to the runnable only after QThreadPool.start() returns, with the GIL released meanwhile,
+        # so when the runnable has already run and been deleted the link is added late and never
+        # removed: the pool keeps the dead wrapper. A wrapper still holding a callable that
+        # captures its widget, such as LoginDialog's sign-in lambda, then keeps widget -> runner
+        # -> pool -> runnable -> callable -> widget a reference cycle, which a later collection
+        # may free off the GUI thread. On the success path the callable is also dropped before the
+        # emit, so a slot that finishes with the widget first does not leave this thread to free it
+        # on return. On the error path `del fn` does not drop it: the exception's traceback still
+        # holds the callable's frame, and so its closure and the widget, until the exception is
+        # released. That can be on this thread, or a cycle if on_error stores the exception.
+        fn, signals = self._fn, self._signals
+        del self._fn, self._signals
         try:
-            result = self._fn()
+            result = fn()
         except Exception as exc:  # noqa: BLE001 — deliver ANY failure to the main thread, never crash the pool worker
-            self._signals.failed.emit(exc)
+            del fn
+            signals.failed.emit(exc)
         else:
-            self._signals.done.emit(result)
+            del fn
+            signals.done.emit(result)
 
 
 class AsyncRunner(QObject):
@@ -63,7 +95,8 @@ class AsyncRunner(QObject):
         self._pool = QThreadPool(self)
         self._stopped = False
         # Hold each call's signals object (and its callbacks) alive until its slot has run: a queued signal
-        # needs its sender to outlive the emit→deliver gap, and the QRunnable is dropped when run() returns.
+        # needs its sender to outlive the emit→deliver gap, and the runnable no longer refers to it once run()
+        # starts (see _Call.run).
         self._calls: dict[
             _CallSignals, tuple[Callable[[Any], None], Callable[[BaseException], None] | None]
         ] = {}

@@ -193,8 +193,13 @@
     set, which is that reader's rule too; an empty contexts list is a real empty answer. Only a
     base where both name nothing falls back, out loud, to "at least one check exists and none is
     still running", which can end early on a roll-up that has not started. THIS IS A COPY of that
-    reader's rule in PowerShell, not a call to it, and it parts from it once on purpose: that
-    reader refuses an unprotected branch, where a waiter can still wait on the visible checks.
+    reader's rule in PowerShell, not a call to it, and it parts from it on purpose in at least
+    these ways. That reader refuses an unprotected branch, where a waiter can still wait on the
+    visible checks. A ruleset rule with no checks list is exit 1 here, as a classic payload with
+    no contexts key is, where that reader reads an empty set. A required check whose name is
+    $null, missing, empty or only white space, in either list, is exit 1 here: no check reports
+    such a name, so the wait would run to its timeout. That reader keeps a $null or empty name as
+    the name "None" or "", and raises on a ruleset check with no context key.
 
     THE DESKTOP'S PR MONITOR IS NOT A SUBSTITUTE, READ 2026-10-21 from its tool description: it
     watches the one PR bound to the session, wakes it on CI failures, conflicts and review comments,
@@ -527,17 +532,32 @@ function Read-Required([string]$Base) {
             Fail "base $Base is protected but its branch payload names no required_status_checks.contexts; that is not an empty required set."
         }
         $classic = @($contexts | ForEach-Object { [string]$_ })
+        Assert-Named $classic $Base
     }
     $rules = @(Read-Pages "repos/$Repo/rules/branches/$(Esc $Base)?")
+    # A $null list is refused here, as the classic read refuses one: it is not an empty set.
     $ruleset = @(
-        $rules | Where-Object { (Prop $_ 'type') -eq 'required_status_checks' } |
-            ForEach-Object { $checks = Prop (Prop $_ 'parameters') 'required_status_checks'; $checks } |
-            ForEach-Object { [string](Prop $_ 'context') }
+        $rules | Where-Object { (Prop $_ 'type') -eq 'required_status_checks' } | ForEach-Object {
+            $checks = Prop (Prop $_ 'parameters') 'required_status_checks'
+            if ($null -eq $checks) {
+                Fail "a required_status_checks rule on $Base names no parameters.required_status_checks list; that is not an empty required set."
+            }
+            $checks
+        } | ForEach-Object { [string](Prop $_ 'context') }
     )
+    Assert-Named $ruleset $Base
     # Ordinal and in order: Sort-Object -Unique is culture-aware, and would fold two names that
     # differ only by an invisible character into one requirement.
     $unique = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
     @($classic + $ruleset | Where-Object { $unique.Add($_) })
+}
+
+# A name no check reports; the .NOTES say why that is exit 1. Not `-contains ''`: that compares
+# culture-aware, and would read a name of only an ignorable character as empty.
+function Assert-Named([string[]]$Names, [string]$Base) {
+    if (@($Names | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -gt 0) {
+        Fail "the required set on $Base names a check with no context; that is not a check to wait on."
+    }
 }
 
 # Every paged read stops before page $MaxPages + 1, so a server that ignores `page` cannot keep a

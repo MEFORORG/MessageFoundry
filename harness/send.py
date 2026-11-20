@@ -21,14 +21,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from harness._async import join_worker_thread
+from harness._batch import MAX_RESULT_ROWS, generated_items
+from harness._batch import RANDOM_TRIGGER as _RANDOM
 from harness._console_widgets import ConfigurableTable
-from harness.mllp import SendItem, SendResult, SendWorker
+from harness.mllp import SendResult, SendWorker
 from messagefoundry_toolkit.generators import (
     _core,
     all_types,  # noqa: F401  (registers the built-in message types)
 )
 
-_RANDOM = "(random across all)"
 _COLUMNS = ["#", "Type", "Trigger", "Control ID", "ACK", "Latency (ms)", "Error"]
 
 
@@ -100,18 +102,14 @@ class SendPanel(QWidget):
         code = self._code.currentText()
         if not code or self._worker is not None:
             return
-        triggers = _core.triggers_for(code)
-        choice = self._trigger.currentText()
-        items: list[SendItem] = []
-        for i in range(1, self._count.value() + 1):
-            trigger = self._rng.choice(triggers) if choice == _RANDOM else choice
-            payload = _core.generate_message(code, trigger, i)
-            items.append(SendItem(i, code, trigger, _core.control_id(code, trigger, i), payload))
+        count = self._count.value()
+        # Generated lazily, on the worker thread as each message is sent (BACKLOG #5949).
+        items = generated_items(code, self._trigger.currentText(), count, self._rng)
 
         self._results.setRowCount(0)
         self._results.setSortingEnabled(False)
         self._sent = self._ok = self._not_sent = 0
-        self._summary.setText(f"sending {len(items)} {code} message(s)…")
+        self._summary.setText(f"sending {count} {code} message(s)…")
 
         self._thread = QThread(self)
         self._worker = SendWorker(
@@ -135,18 +133,19 @@ class SendPanel(QWidget):
 
     def _on_result(self, res: SendResult) -> None:
         row = self._results.rowCount()
-        self._results.insertRow(row)
-        values = [
-            str(res.item.seq),
-            res.item.code,
-            res.item.trigger,
-            res.item.control_id,
-            res.ack_code,
-            f"{res.latency_ms:.0f}",
-            res.error,
-        ]
-        for col, value in enumerate(values):
-            self._results.setItem(row, col, QTableWidgetItem(value))
+        if row < MAX_RESULT_ROWS:
+            self._results.insertRow(row)
+            values = [
+                str(res.item.seq),
+                res.item.code,
+                res.item.trigger,
+                res.item.control_id,
+                res.ack_code,
+                f"{res.latency_ms:.0f}",
+                res.error,
+            ]
+            for col, value in enumerate(values):
+                self._results.setItem(row, col, QTableWidgetItem(value))
         # A payload refused before any dial (ADR 0205 rule 1) never reached the wire, so it is
         # counted apart from what was sent.
         if res.error.startswith("not sent:"):
@@ -157,9 +156,12 @@ class SendPanel(QWidget):
         summary = f"sent {self._sent} · accepted {self._ok} · failed {self._sent - self._ok}"
         if self._not_sent:
             summary += f"; not sent {self._not_sent}"
+        if self._sent + self._not_sent > MAX_RESULT_ROWS:
+            summary += f" (table shows the first {MAX_RESULT_ROWS})"
         self._summary.setText(summary)
 
     def _on_finished(self) -> None:
+        failure = self._worker.failure if self._worker is not None else ""
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait()
@@ -168,17 +170,17 @@ class SendPanel(QWidget):
         self._results.setSortingEnabled(True)
         self._send_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
-        self._summary.setText(self._summary.text() + " — done")
+        ending = f" — stopped early: {failure}" if failure else " — done"
+        self._summary.setText(self._summary.text() + ending)
 
     def shutdown(self) -> None:
         """Stop and join the send thread so the window can close without destroying a running
-        QThread (stop() interrupts an in-flight recv, so the join is prompt)."""
+        QThread. stop() interrupts an in-flight recv, a dial and a pause between messages, so the
+        join is normally prompt. What it cannot interrupt, a name lookup or a send to a peer that
+        stopped reading, is waited out, never terminated."""
         if self._worker is not None:
             self._worker.stop()
         if self._thread is not None:
-            self._thread.quit()
-            if not self._thread.wait(6000):
-                self._thread.terminate()
-                self._thread.wait()
+            join_worker_thread(self._thread)
             self._thread = None
         self._worker = None

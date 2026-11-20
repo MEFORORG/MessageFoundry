@@ -7,8 +7,14 @@
 // source instead. After a save the graph refreshes and a Promote is offered.
 import * as vscode from "vscode";
 import { configDir, writerConfigTarget, runJson, workspaceDir } from "./cli";
-import { type ConnObj, nameCollisionError, planSave } from "./connectionMerge";
-import { connectionRemoveArgs, connectionUpsertArgs } from "./connectionWizardModel";
+import { type ConnObj, type Direction, nameCollisionError, planSave } from "./connectionMerge";
+import {
+  connectionRemoveArgs,
+  connectionUpsertArgs,
+  removalDirection,
+  removeConfirmText,
+  sharedNameRemovalError,
+} from "./connectionWizardModel";
 import { type FieldGroup, buildForm } from "./connectionForm";
 import { connectionSchema } from "./connectionSchema";
 import { STARTUP_BANNERS, openChannel, postToSameRender, postToWebview, requestToken } from "./webviewMessaging";
@@ -79,6 +85,7 @@ export async function openConnectionEditor(
   const lookupName = opts.editName ?? opts.cloneFrom;
   const clone = opts.editName == null && opts.cloneFrom != null;
   let initial: ConnObj | undefined;
+  let deleteDirection: Direction | undefined;
   if (lookupName) {
     let entries: ConnObj[];
     try {
@@ -88,6 +95,7 @@ export async function openConnectionEditor(
       return;
     }
     initial = entries.find((c) => c.name === lookupName);
+    deleteDirection = removalDirection(entries, lookupName);
     if (!initial) {
       void vscode.window.showInformationMessage(
         `MessageFoundry: ${lookupName} is authored in code (a .py module), not connections.toml — ` +
@@ -130,7 +138,11 @@ export async function openConnectionEditor(
           opts.onSaved,
         );
       } else if (m?.command === "delete" && m.name) {
-        await remove(m.name, current, opts.onSaved);
+        if (deleteDirection === undefined) {
+          postToWebview(current.webview, { command: "error", message: sharedNameRemovalError(m.name) });
+          return;
+        }
+        await remove(m.name, deleteDirection, current, opts.onSaved);
       } else if (m?.command === "cancel") {
         current.dispose();
       } else if (
@@ -227,7 +239,12 @@ async function save(
   }
 }
 
-async function remove(name: string, current: vscode.WebviewPanel, onSaved?: () => void): Promise<void> {
+async function remove(
+  name: string,
+  direction: Direction,
+  current: vscode.WebviewPanel,
+  onSaved?: () => void,
+): Promise<void> {
   const ws = workspaceDir();
   if (!ws) {
     return;
@@ -237,7 +254,7 @@ async function remove(name: string, current: vscode.WebviewPanel, onSaved?: () =
     return;
   }
   const confirm = await vscode.window.showWarningMessage(
-    `Remove connection "${name}" from connections.toml?`,
+    removeConfirmText(name, direction),
     { modal: true },
     "Remove",
   );
@@ -245,7 +262,7 @@ async function remove(name: string, current: vscode.WebviewPanel, onSaved?: () =
     return;
   }
   try {
-    await runJson(connectionRemoveArgs(target.configDir, target.serviceConfig, name), ws);
+    await runJson(connectionRemoveArgs(target.configDir, target.serviceConfig, name, direction), ws);
   } catch (e) {
     postToWebview(current.webview, { command: "error", message: String(e) });
     return;

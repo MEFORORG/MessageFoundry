@@ -798,6 +798,331 @@ async def test_drive_ladder_threads_cacert_and_escapes_an_abort_note(
     assert "\x1b" not in rendered and "\x07" not in rendered
 
 
+# --- BACKLOG #5953: an aborted climb runs no soak, and a malformed LADDER_SOAK arms none ----------
+
+
+def _engine_ladder_kwargs(coord: FileDropCoord, tmp_path: Path) -> dict[str, Any]:
+    return {
+        "rates": [10.0, 20.0],
+        "dests": 1,
+        "hold_seconds": 0.05,
+        "drain_timeout": 1.0,
+        "sink_port": 21000,
+        "sink_ports": 1,
+        "sink_host": "127.0.0.1",
+        "inbound_bind_host": "127.0.0.1",
+        "claim_mode": "skip_locked",
+        "store_env": {},
+        "base_coord": coord,
+        "keep_logs_base": tmp_path / "logs",
+        "stop_poll_grace": 0.0,
+        # Long enough that waiting it out fails the test's own bound below.
+        "soak_timeout": 60.0,
+    }
+
+
+def _fake_engine_report(*, aborted: bool) -> Any:
+    return types.SimpleNamespace(aborted=aborted, shards=())
+
+
+def _no_payload(monkeypatch: pytest.MonkeyPatch) -> None:
+    import harness.load.shardcert_ladder as ladder
+
+    monkeypatch.setattr(ladder, "_engine_rung_payload", lambda report: {})
+    monkeypatch.setattr(ladder, "_attach_rung_timings", lambda payload, logs: None)
+
+
+async def test_engine_ladder_does_not_wait_for_a_soak_after_the_drive_aborts_a_rung(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Once the drive aborts a rung, the engine half ends at once rather than wait out
+    ``soak_timeout`` for a LADDER_SOAK the drive has no reason to post.
+
+    Mutation: drop the climb-abort return. Red: the bounded wait times out."""
+    import harness.load.shardcert_ladder as ladder
+
+    calls: list[float] = []
+
+    async def fake_engine(**kwargs: Any) -> Any:
+        calls.append(kwargs["hold_seconds"])
+        return _fake_engine_report(aborted=True)
+
+    monkeypatch.setattr(ladder, "run_shardcert_engine", fake_engine)
+    _no_payload(monkeypatch)
+    coord = FileDropCoord(tmp_path / "coord", run_id="eab")
+    result = await asyncio.wait_for(
+        ladder.run_engine_ladder(**_engine_ladder_kwargs(coord, tmp_path)), timeout=10.0
+    )
+    assert len(calls) == 1
+    assert "soak" not in result.rungs_armed
+    assert "no soak: the climb aborted" in result.notes
+    # A drive that reaches the soak anyway is told at once, rather than wait out SHARDS_READY.
+    assert coord.for_run("eab.soak").read(sc.ENGINE_SETUP_FAILED) is not None
+
+
+async def test_engine_ladder_still_soaks_after_a_missed_ladder_stop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """LADDER_STOP is an optimisation (coord.py): with it lost, a DRIVE_START timeout still ends the
+    climb, and the engine half still arms the soak the drive posts.
+
+    Mutation: refuse the soak on the unresponsive branch. Red: no soak armed."""
+    import harness.load.shardcert_ladder as ladder
+    from harness.load.coord import LADDER_SOAK, CoordTimeout
+
+    soak_calls: list[dict[str, Any]] = []
+
+    async def fake_engine(**kwargs: Any) -> Any:
+        run_id = kwargs["coord"].run_id
+        if run_id.endswith(".soak"):
+            soak_calls.append(kwargs)
+            return _fake_engine_report(aborted=False)
+        if run_id.endswith(".r1"):
+            # The drive's STOP was lost; its soak message is not.
+            base.post(LADDER_SOAK, {"soak_rate": 10.0, "hold_seconds": 1.0, "drain_timeout": 1.0})
+            raise CoordTimeout("no DRIVE_START")
+        return _fake_engine_report(aborted=False)
+
+    monkeypatch.setattr(ladder, "run_shardcert_engine", fake_engine)
+    _no_payload(monkeypatch)
+    base = FileDropCoord(tmp_path / "coord", run_id="lost")
+    result = await asyncio.wait_for(
+        ladder.run_engine_ladder(**_engine_ladder_kwargs(base, tmp_path)), timeout=10.0
+    )
+    assert len(soak_calls) == 1, result.notes
+    assert result.rungs_armed == ["r0", "soak"], result.notes
+    assert any("drive unresponsive" in n for n in result.notes), result.notes
+
+
+@pytest.mark.parametrize(
+    "soak_msg",
+    [
+        {},
+        {"soak_rate": "fast"},
+        {"soak_rate": None},
+        {"soak_rate": True},
+        {"soak_rate": float("nan")},
+        {"soak_rate": float("inf")},
+        {"soak_rate": -5.0},
+        {"soak_rate": 10.0, "hold_seconds": "long"},
+        {"soak_rate": 10.0, "hold_seconds": -1.0},
+        {"soak_rate": 10.0, "drain_timeout": float("nan")},
+        {"soak_rate": 10.0, "drain_timeout": [1]},
+        {"soak_rate": 10**400},
+        {"skip": "false", "soak_rate": 10.0},
+        {"skip": 0, "soak_rate": 10.0},
+        {"skip": 0.0, "soak_rate": 10.0},
+        {"skip": 1, "soak_rate": 10.0},
+    ],
+)
+async def test_engine_ladder_refuses_a_malformed_ladder_soak(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, soak_msg: dict[str, Any]
+) -> None:
+    """A LADDER_SOAK field the drive box wrote that is missing, non-numeric, boolean, non-finite or
+    negative arms no soak and raises nothing; the drive is told through ENGINE_SETUP_FAILED.
+
+    Mutation: cast the fields with ``float()`` as before. Red: an exception, or a soak armed."""
+    import harness.load.shardcert_ladder as ladder
+    from harness.load.coord import LADDER_SOAK
+
+    soak_calls: list[dict[str, Any]] = []
+
+    async def fake_engine(**kwargs: Any) -> Any:
+        coord_: FileDropCoord = kwargs["coord"]
+        if coord_.run_id.endswith(".soak"):
+            soak_calls.append(kwargs)
+        else:
+            base.post(LADDER_SOAK, soak_msg)
+        return _fake_engine_report(aborted=False)
+
+    monkeypatch.setattr(ladder, "run_shardcert_engine", fake_engine)
+    _no_payload(monkeypatch)
+    base = FileDropCoord(tmp_path / "coord", run_id="mal")
+    # An earlier run's soak left SHARDS_READY behind; the drive reads it before ENGINE_SETUP_FAILED.
+    base.for_run("mal.soak").post(SHARDS_READY, {"stale": True})
+    kwargs = _engine_ladder_kwargs(base, tmp_path)
+    kwargs["rates"] = [10.0]
+    result = await asyncio.wait_for(ladder.run_engine_ladder(**kwargs), timeout=10.0)
+    assert soak_calls == []
+    assert "soak" not in result.rungs_armed
+    assert base.for_run("mal.soak").read(SHARDS_READY) is None
+    assert any("LADDER_SOAK malformed" in n for n in result.notes), result.notes
+    assert base.for_run("mal.soak").read(sc.ENGINE_SETUP_FAILED) is not None
+
+
+async def test_engine_ladder_still_arms_a_well_formed_soak(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The positive control for the refusal above: integer and float fields arm the soak as before."""
+    import harness.load.shardcert_ladder as ladder
+    from harness.load.coord import LADDER_SOAK
+
+    soak_calls: list[dict[str, Any]] = []
+
+    async def fake_engine(**kwargs: Any) -> Any:
+        coord_: FileDropCoord = kwargs["coord"]
+        if coord_.run_id.endswith(".soak"):
+            soak_calls.append(kwargs)
+        else:
+            base.post(LADDER_SOAK, {"soak_rate": 10, "hold_seconds": 0, "drain_timeout": 2.5})
+        return _fake_engine_report(aborted=False)
+
+    monkeypatch.setattr(ladder, "run_shardcert_engine", fake_engine)
+    _no_payload(monkeypatch)
+    base = FileDropCoord(tmp_path / "coord", run_id="ok")
+    kwargs = _engine_ladder_kwargs(base, tmp_path)
+    kwargs["rates"] = [10.0]
+    result = await asyncio.wait_for(ladder.run_engine_ladder(**kwargs), timeout=10.0)
+    assert [(c["hold_seconds"], c["drain_timeout"]) for c in soak_calls] == [(0.0, 2.5)]
+    assert result.rungs_armed == ["r0", "soak"]
+
+
+async def test_engine_ladder_still_soaks_when_ladder_stop_lands_just_after_the_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A STOP the drive posts just after the engine's DRIVE_START timeout is a normal early-stop,
+    not an unresponsive drive, so the soak still runs.
+
+    Mutation: read LADDER_STOP once, without the bounded poll. Red: no soak armed."""
+    import harness.load.shardcert_ladder as ladder
+    from harness.load.coord import LADDER_SOAK, LADDER_STOP, CoordTimeout
+
+    soak_calls: list[dict[str, Any]] = []
+    pending: list[asyncio.Task[None]] = []
+
+    async def late_stop() -> None:
+        await asyncio.sleep(0.3)
+        base.post(LADDER_STOP, {"stopped_at": "r0", "verdict": "collapsed"})
+        base.post(LADDER_SOAK, {"soak_rate": 10.0, "hold_seconds": 1.0, "drain_timeout": 1.0})
+
+    async def fake_engine(**kwargs: Any) -> Any:
+        run_id = kwargs["coord"].run_id
+        if run_id.endswith(".soak"):
+            soak_calls.append(kwargs)
+        elif run_id.endswith(".r1"):
+            pending.append(asyncio.create_task(late_stop()))
+            raise CoordTimeout("no DRIVE_START")
+        return _fake_engine_report(aborted=False)
+
+    monkeypatch.setattr(ladder, "run_shardcert_engine", fake_engine)
+    _no_payload(monkeypatch)
+    base = FileDropCoord(tmp_path / "coord", run_id="late")
+    kwargs = _engine_ladder_kwargs(base, tmp_path)
+    kwargs["stop_poll_grace"] = 3.0
+    result = await asyncio.wait_for(ladder.run_engine_ladder(**kwargs), timeout=20.0)
+    await asyncio.gather(*pending)
+    assert len(soak_calls) == 1, result.notes
+    assert result.rungs_armed == ["r0", "soak"], result.notes
+
+
+async def test_engine_ladder_clears_a_stale_soak_handshake_at_startup(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The drive reads the soak's SHARDS_READY as soon as it posts LADDER_SOAK, so one an earlier
+    run left must be gone before the climb starts, not only when this half refuses the soak.
+
+    Mutation: drop the startup clear of the soak coord. Red: the stale file is still there."""
+    import harness.load.shardcert_ladder as ladder
+
+    seen: list[object] = []
+
+    async def fake_engine(**kwargs: Any) -> Any:
+        seen.append(base.for_run("stale.soak").read(SHARDS_READY))
+        return _fake_engine_report(aborted=True)
+
+    monkeypatch.setattr(ladder, "run_shardcert_engine", fake_engine)
+    _no_payload(monkeypatch)
+    base = FileDropCoord(tmp_path / "coord", run_id="stale")
+    base.for_run("stale.soak").post(SHARDS_READY, {"stale": True})
+    await asyncio.wait_for(
+        ladder.run_engine_ladder(**_engine_ladder_kwargs(base, tmp_path)), timeout=10.0
+    )
+    assert seen == [None]
+
+
+async def test_drive_ladder_launches_no_soak_after_a_climb_abort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A climb that sustained a rung and then aborted on a rendezvous failure skips the soak and
+    tells the engine half so, rather than drive a soak at the earlier rung's rate.
+
+    Mutation: gate the soak on ``engine_setup_failed`` alone, as before. Red: a second drive call."""
+    import harness.load.shardcert_ladder as ladder
+    from harness.load.coord import LADDER_SOAK, CoordTimeout
+
+    calls: list[dict[str, Any]] = []
+
+    async def drive(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return types.SimpleNamespace(
+                shards=("a",),
+                dests=1,
+                handlers=1,
+                delivering=1,
+                routing=BROADCAST,
+                lanes=1,
+                sink_count=1,
+            )
+        raise CoordTimeout("SHARDS_READY not seen")
+
+    sustained = ladder.RungVerdict.SUSTAINED
+    monkeypatch.setattr(ladder, "run_shardcert_drive", drive)
+    monkeypatch.setattr(
+        ladder,
+        "build_rung_outcome",
+        lambda rung, drive_, gate, report: types.SimpleNamespace(
+            verdict=sustained, is_soak=rung.is_soak, fidelity_admissible=True
+        ),
+    )
+    monkeypatch.setattr(ladder, "pick_soak_rate", lambda outcomes, override: 10.0)
+    built: dict[str, Any] = {}
+    monkeypatch.setattr(ladder, "build_consolidated_report", lambda **kw: built.update(kw) or kw)
+
+    async def no_report(coord: Any, *, timeout_seen: float) -> None:
+        return None
+
+    monkeypatch.setattr(ladder, "_read_engine_report", no_report)
+    coord = FileDropCoord(tmp_path, run_id="dab")
+    await ladder.run_drive_ladder(
+        engine_host="10.0.0.5",
+        rates=[10.0, 20.0],
+        hold_seconds=0.05,
+        drain_timeout=1.0,
+        driver_count=1,
+        sink_count=1,
+        sink_host="127.0.0.1",
+        base_coord=coord,
+    )
+    assert len(calls) == 2  # the two climb rungs; no soak drive
+    assert coord.read(LADDER_SOAK) == {"skip": True}
+    assert built["soak"] is None and built["climb_aborted"] is True
+    assert "no soak: the climb aborted (setup-degraded)" in built["notes"]
+
+
+def test_report_names_an_aborted_climb_as_the_soak_skip() -> None:
+    """The soak line must not say 'no sustained rung' when the climb aborted after one sustained."""
+    import harness.load.shardcert_ladder as ladder
+
+    report = ladder.build_consolidated_report(
+        shards=(),
+        dests=0,
+        handlers=0,
+        delivering=0,
+        routing=BROADCAST,
+        lanes_per_shard=1,
+        driver_count=1,
+        sink_count=1,
+        climb=[],
+        soak=None,
+        notes=[],
+        climb_aborted=True,
+    )
+    rendered = report.render()
+    assert "soak: (skipped — the climb aborted, setup-degraded)" in rendered, rendered
+    assert "no sustained rung to soak" not in rendered, rendered
+
+
 # --- BACKLOG #5640 / #5977 (https and session half): the two-box drain poll ------------------------
 
 

@@ -37,6 +37,8 @@ from functools import cache
 from pathlib import Path
 from typing import Any, TypeVar
 
+from pydantic import BaseModel
+
 from messagefoundry.config.models import (
     AckAfter,
     AckMode,
@@ -226,7 +228,7 @@ _OUTBOUND_KEYS = frozenset(
 )
 
 _E = TypeVar("_E", bound=Enum)
-_M = TypeVar("_M")  # a policy model (RetryPolicy/BuildupThreshold/StallThreshold) — not an Enum
+_M = TypeVar("_M", bound=BaseModel)  # a policy model (RetryPolicy, BuildupThreshold, ...)
 
 
 def load_connections_file(path: Path, registry: Registry) -> None:
@@ -310,7 +312,7 @@ def _inbound_from_table(table: dict[str, Any], source: str) -> InboundConnection
         if table.get("priority") is not None
         else None,
         shard=_optional_str(table, "shard", where),
-        schedule=_policy(Schedule, table.get("schedule"), "schedule", where),
+        schedule=_policy(Schedule, table.get("schedule"), "schedule", where, strict=False),
         # Both lifecycle flags default TRUE (an absent key means "run it", as it always has).
         auto_start=_require_bool(table, "auto_start", where, default=True),
         deployed=_require_bool(table, "deployed", where, default=True),
@@ -354,7 +356,7 @@ def _outbound_from_table(table: dict[str, Any], source: str) -> OutboundConnecti
         if table.get("priority") is not None
         else None,
         metadata=_optional_table(table, "metadata", where),
-        schedule=_policy(Schedule, table.get("schedule"), "schedule", where),
+        schedule=_policy(Schedule, table.get("schedule"), "schedule", where, strict=False),
         # Both lifecycle flags default TRUE (an absent key means "run it", as it always has).
         auto_start=_require_bool(table, "auto_start", where, default=True),
         deployed=_require_bool(table, "deployed", where, default=True),
@@ -1012,13 +1014,32 @@ def _enum(enum_cls: type[_E], value: Any, key: str, where: str) -> _E:  # noqa: 
         raise WiringError(f"{where}: invalid {key} {value!r} (allowed: {allowed})") from exc
 
 
-def _policy(model_cls: Callable[..., _M], raw: Any, key: str, where: str) -> _M | None:  # noqa: UP047
+def _policy(  # noqa: UP047
+    model_cls: type[_M], raw: Any, key: str, where: str, *, strict: bool = True
+) -> _M | None:
+    """Build one policy sub-table (BACKLOG #5899).
+
+    An unknown key at the table's top level is refused here, by name, before the model sees the
+    table. pydantic's own ``extra_forbidden`` error would quote the key's value, so a secret written
+    under the wrong table would reach the load error; this names only the key, as every other table
+    in the file does. Only that top-level unknown key is kept out of the error: an unknown key in a
+    nested table, such as a schedule's ``windows``, is checked by its model alone, and that error and
+    a wrong-typed value's error both still quote the value.
+
+    ``strict``, the default, refuses a value of the wrong TOML type instead of coercing it, so
+    ``max_attempts = "3"``, ``max_depth = true`` or ``max_count = 10.0`` is a load error rather than
+    a number. The schedule table passes ``strict=False``, so its values are coerced, not strictly
+    typed: a window's ``days`` arrive as a TOML array, which strict mode refuses for the model's
+    ``frozenset``, and its ``start``/``end`` times arrive as strings such as ``"07:00:00"``, which
+    strict mode refuses for the model's ``time``. ``connections_edit.list_connections`` writes them
+    back in that string form, so every schedule the editor saves carries string times."""
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise WiringError(f"{where}: [{key}] must be a table")
+    _reject_unknown(raw, frozenset(model_cls.model_fields), f"{where} [{key}]")
     try:
-        return model_cls(**raw)
+        return model_cls.model_validate(raw, strict=strict)
     except (ValueError, TypeError) as exc:
         raise WiringError(f"{where}: invalid {key} — {exc}") from exc
 
@@ -1026,10 +1047,12 @@ def _policy(model_cls: Callable[..., _M], raw: Any, key: str, where: str) -> _M 
 def _coerce_retry_forever(raw: Any) -> Any:
     """BACKLOG #1217 half 2. TOML has no null literal, so a per-outbound retry-forever posture
     (``[outbound.retry] max_attempts = "forever"``, case-insensitive) needs a string spelling here —
-    mirrors the ``[delivery]`` global's field validator on ``DeliverySettings.retry_max_attempts``
-    (``config/settings.py``). Anything else (not a table, no ``max_attempts`` key, or a value that
-    isn't the literal word) passes through untouched so ``_policy``'s "must be a table" check and
-    :class:`~messagefoundry.config.models.RetryPolicy`'s own validation still fire exactly as before.
+    the same spelling the ``[delivery]`` global's field validator on
+    ``DeliverySettings.retry_max_attempts`` (``config/settings.py``) accepts. Anything else (not a
+    table, no ``max_attempts`` key, or a value that isn't the literal word) passes through untouched
+    to ``_policy``, which refuses a non-table and an unknown key, then validates the table with
+    RetryPolicy in strict mode, so a wrong-typed value is refused by that validation itself
+    (BACKLOG #5899).
     """
     if not isinstance(raw, dict):
         return raw

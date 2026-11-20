@@ -329,10 +329,11 @@ def test_a_record_it_could_not_read_is_never_a_clean_zero(
 #: invented -- ``ZZ.SENTINEL.9`` and ``bogus`` cannot collide with a real requirement -- so a hit in
 #: captured output is proof of disclosure rather than a coincidence.
 #:
-#: THE THREE ``KeyError`` ROWS ARE THE SECOND DEFECT. ``load_scorecard`` subscripts the record
+#: THE THREE MISSING-FIELD ROWS WERE THE SECOND DEFECT. ``load_scorecard`` subscripted the record
 #: directly in a dozen places, so these never reached the reporter's refusal at all: they escaped as a
 #: traceback and exit 1, which is :data:`EXIT_FINDINGS` -- "I could not measure this" rendered as "I
-#: measured it, and citations are broken".
+#: measured it, and citations are broken". They raised ``KeyError`` until BACKLOG #5457 made the loader
+#: read every field typed, so a missing one is now a ``ScorecardError`` naming the field.
 _UNREADABLE: dict[str, tuple[str, str]] = {
     "unknown_state": ('[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "bogus"\n', "ScorecardError"),
     "na_without_rationale": (
@@ -343,12 +344,12 @@ _UNREADABLE: dict[str, tuple[str, str]] = {
         '[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "pass"\ndecision_closed = true\n',
         "ScorecardError",
     ),
-    "row_without_id": ('[[cell]]\nlevel = 1\nverdict = "pass"\n', "KeyError"),
-    "row_without_level": ('[[cell]]\nid = "{id}"\nverdict = "pass"\n', "KeyError"),
+    "row_without_id": ('[[cell]]\nlevel = 1\nverdict = "pass"\n', "ScorecardError"),
+    "row_without_level": ('[[cell]]\nid = "{id}"\nverdict = "pass"\n', "ScorecardError"),
     "citation_without_a_token": (
         '[[cell]]\nid = "{id}"\nlevel = 1\nverdict = "pass"\n\n'
         '[[cell.evidence]]\npath = "engine_module.py"\nline = 2\n',
-        "KeyError",
+        "ScorecardError",
     ),
 }
 
@@ -492,3 +493,128 @@ def test_it_runs_on_a_bare_interpreter_from_an_unrelated_directory(tmp_path: Pat
     )
     assert proc.returncode == 0, f"rc={proc.returncode}\n--- stderr ---\n{proc.stderr}"
     assert "--scorecard" in proc.stdout, proc.stdout[:400]
+
+
+# --------------------------------------------------------------------------------------------
+# The workflow never reads the record for a pull request (BACKLOG #5476).
+# --------------------------------------------------------------------------------------------
+
+
+_PR_EVENTS = frozenset({"pull_request", "pull_request_target"})
+
+
+def _if_body(expression: str) -> str:
+    """The expression inside an ``if:``'s ``${{ ... }}`` wrapper, or the text itself if unwrapped."""
+    body = expression.strip()
+    if body.startswith("${{") and body.endswith("}}"):
+        body = body[3:-2]
+    return body.strip()
+
+
+def _evaluate_job_if(
+    expression: str,
+    *,
+    event_name: str,
+    vault_repo: str,
+    ref: str = "refs/heads/main",
+    extra: dict[str, str] | None = None,
+) -> bool:
+    """Evaluate the report job's ``if:`` for one event, without a runner, through the evaluator
+    tests/test_dependabot_automerge_guardrails.py already holds. It refuses any construct it does not
+    understand, so an edit reaching for one fails here instead of reading as true.
+
+    ITS LIMIT: a context name not seeded here reads as the empty string, so this sees a term only on
+    a name it seeds. It seeds the event name, the ref, the vault variable and, on a pull request
+    event, a non-empty ``github.head_ref`` and ``github.base_ref`` as a real run has; any other name
+    a loosened condition reaches for (``github.actor``, ``github.event.*``) reads empty and could pass
+    unseen. ``extra`` seeds more, and overrides these.
+    """
+    # Imported here, not at module scope, so the stdlib instrument tests above never depend on that
+    # module's imports.
+    from tests.test_dependabot_automerge_guardrails import _evaluate_expression
+
+    context = {
+        "github.event_name": event_name,
+        "github.ref": ref,
+        "vars.ASVS_VAULT_REPO": vault_repo,
+    }
+    if event_name in _PR_EVENTS:
+        context |= {"github.head_ref": "feature", "github.base_ref": "main"}
+    context |= extra or {}
+    return _evaluate_expression(_if_body(expression), context)
+
+
+@pytest.mark.parametrize(
+    ("event_name", "vault_repo", "runs"),
+    [
+        # The defect: with the variable configured, a pull request ran the job.
+        ("pull_request", "owner/vault", False),
+        ("pull_request_target", "owner/vault", False),
+        ("merge_group", "owner/vault", False),
+        ("pull_request", "", False),
+        # The admitted events still run, once the record is configured, and skip without it.
+        ("push", "owner/vault", True),
+        ("workflow_dispatch", "owner/vault", True),
+        ("push", "", False),
+        ("workflow_dispatch", "", False),
+    ],
+)
+def test_the_report_job_never_runs_for_a_pull_request(
+    event_name: str, vault_repo: str, runs: bool
+) -> None:
+    """RED when: the job's ``if:`` admits a pull_request run once the vault variable is set.
+
+    A ``pull_request`` run executes the pull request's own workflow and scripts, so a variable-only
+    gate would hand that code a checkout of the private scorecard on a runner whose logs are public.
+    """
+    from tests._workflow_contexts import load_workflow
+
+    job = load_workflow("asvs-anchor-report.yml")["jobs"]["report"]
+    assert _evaluate_job_if(str(job["if"]), event_name=event_name, vault_repo=vault_repo) is runs
+
+
+@pytest.mark.parametrize("event_name", ["push", "workflow_dispatch"])
+def test_the_report_job_runs_only_on_main(event_name: str) -> None:
+    """RED when: a dispatch (or push) on another branch can reach the record. That branch's copy of
+    the workflow and of scripts/asvs/ would run with the scorecard checked out, as a pull request's
+    would."""
+    from tests._workflow_contexts import load_workflow
+
+    expression = str(load_workflow("asvs-anchor-report.yml")["jobs"]["report"]["if"])
+    assert not _evaluate_job_if(
+        expression, event_name=event_name, vault_repo="owner/vault", ref="refs/heads/feature"
+    )
+
+
+def test_a_pull_request_with_a_head_ref_never_runs_the_report_job() -> None:
+    """RED when: a pull_request run whose ``github.head_ref`` is set reaches the record.
+
+    The evaluator reads an unseeded name as empty, so a term such as ``|| github.head_ref != ''``
+    would pass unseen unless the case seeds it. This seeds it, with ``github.ref`` on main as the
+    worst case, and the control shows the seeding is what lets that loosening read as a run.
+    """
+    from tests._workflow_contexts import load_workflow
+
+    expression = str(load_workflow("asvs-anchor-report.yml")["jobs"]["report"]["if"])
+    seeded = {"github.head_ref": "refs/heads/main"}
+    assert not _evaluate_job_if(
+        expression, event_name="pull_request", vault_repo="owner/vault", extra=seeded
+    )
+    loosened = f"({_if_body(expression)}) || github.head_ref != ''"
+    assert _evaluate_job_if(
+        loosened, event_name="pull_request", vault_repo="owner/vault", extra=seeded
+    ), "control: the loosened condition must read as a run once head_ref is seeded"
+    assert not _evaluate_job_if(
+        loosened, event_name="pull_request", vault_repo="owner/vault", extra={"github.head_ref": ""}
+    ), "control: unseeded, the same loosening reads as no run -- the limit this case covers"
+
+
+def test_every_step_reading_the_vault_sits_behind_the_job_gate() -> None:
+    """RED when: a second job names the vault repository or its token. The event allowlist is on the
+    ``report`` job, so a vault read moved into any other job would not be covered by it."""
+    from tests._workflow_contexts import load_workflow
+
+    jobs = load_workflow("asvs-anchor-report.yml")["jobs"]
+    # Any ASVS_VAULT_* name: the repository variable that names the vault and the read token both.
+    readers = [key for key, job in jobs.items() if "ASVS_VAULT" in repr(job)]
+    assert readers == ["report"], f"jobs naming the vault: {readers}"

@@ -3545,8 +3545,8 @@ def _register_executor(pool: Any, executor: ThreadPoolExecutor) -> None:
 
 def _bound_statements(pool: Any, seconds: int) -> Any:
     """Record ``seconds`` (:func:`_statement_timeout`) as the statement timeout every borrow from
-    ``pool`` carries (:func:`_apply_statement_timeout`), and return ``pool``. A pool site with no
-    such setting, the reference-set sync's, does not call it, and its borrows carry none."""
+    ``pool`` carries (:func:`_apply_statement_timeout`), and return ``pool``. A pool site that does
+    not call it carries none on its borrows."""
     try:
         _STATEMENT_TIMEOUTS[_pool_key(pool)] = seconds
     except TypeError:
@@ -3791,9 +3791,9 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     :func:`_return_when_settled` at once. Until the running call returns,
     the connection keeps its pool slot, and counts as held back, so a close of the pool stops
     waiting for it at a bound (:func:`_close_pool_bounded`). The connection's
-    ``statement_timeout`` bounds that time, unless it is ``0`` or the pool set none, as a
-    ``DatabaseRef`` sync's does not (BACKLOG #5756; ADR 0159, amendment of 2026-10-30, recorded the
-    connector before it had one).
+    ``statement_timeout`` bounds that time, unless it is ``0`` or the pool set none (BACKLOG
+    #5756; a ``DatabaseRef`` sync's pool sets one since BACKLOG #5891; ADR 0159, amendment of
+    2026-10-30, recorded the connector before it had one).
 
     **The cancel paths the gate itself closes (BACKLOG #2394).** A cancellation during
     ``conn.cursor()`` reaches this function with no cursor. On a gated connection the rollback

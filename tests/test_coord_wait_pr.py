@@ -449,6 +449,145 @@ def test_a_protected_base_with_no_contexts_list_is_an_error_not_an_empty_set(
     assert "is protected but its branch payload names no" in run.err
 
 
+NO_LIST = "names no parameters.required_status_checks list"
+NO_NAME = "names a check with no context"
+ONE_GREEN_RUN = [
+    ok(
+        {
+            "total_count": 1,
+            "check_runs": [{"name": "a", "status": "completed", "conclusion": "success"}],
+        }
+    )
+]
+
+
+def required_rule(parameters: Any = ..., /) -> dict[str, Any]:
+    """A ``required_status_checks`` rule; ``...`` omits its ``parameters`` key."""
+    rule: dict[str, Any] = {"type": "required_status_checks"}
+    if parameters is not ...:
+        rule["parameters"] = parameters
+    return rule
+
+
+@pytest.mark.parametrize(
+    ("rule", "message"),
+    [
+        (required_rule(), NO_LIST),
+        (required_rule(None), NO_LIST),
+        (required_rule({}), NO_LIST),
+        (required_rule({"required_status_checks": None}), NO_LIST),
+        (required_rule({"required_status_checks": [{}]}), NO_NAME),
+        (required_rule({"required_status_checks": [{"context": None}]}), NO_NAME),
+        (required_rule({"required_status_checks": [{"context": ""}]}), NO_NAME),
+    ],
+    ids=[
+        "parameters-omitted",
+        "parameters-null",
+        "checks-omitted",
+        "checks-null",
+        "context-omitted",
+        "context-null",
+        "context-empty",
+    ],
+)
+def test_a_ruleset_rule_that_names_no_context_is_an_error_not_an_empty_name(
+    tmp_path: Path, rule: dict[str, Any], message: str
+) -> None:
+    """A missing list is not an empty set (NO_LIST); a nameless check is never reported (NO_NAME)."""
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {
+            PR_PATH: [ok(pr())],
+            BRANCH_PATH: [ok({"protected": False})],
+            RULES_PATH: [ok([rule])],
+            RUNS_PATH: ONE_GREEN_RUN,
+            STATUS_PATH: NO_STATUSES,
+        },
+        "-MaxMinutes",
+        "2",
+    )
+    assert run.code == 1, run.out
+    assert message in run.err
+    assert run.sleeps == []
+
+
+def test_a_ruleset_rule_with_an_empty_checks_list_is_a_real_empty_answer(tmp_path: Path) -> None:
+    """The negative control for the refusals above: ``[]`` is not a missing list."""
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {
+            PR_PATH: [ok(pr())],
+            BRANCH_PATH: [ok({"protected": False})],
+            RULES_PATH: [ok([required_rule({"required_status_checks": []})])],
+            RUNS_PATH: ONE_GREEN_RUN,
+            STATUS_PATH: NO_STATUSES,
+        },
+    )
+    assert run.code == 0, run.err
+    assert "no required contexts on main" in run.out
+
+
+@pytest.mark.parametrize("name", ["", None, " \t"], ids=["empty", "null", "white-space"])
+def test_a_classic_context_with_no_name_is_refused_before_the_rules_read(
+    tmp_path: Path, name: str | None
+) -> None:
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {
+            PR_PATH: [ok(pr())],
+            BRANCH_PATH: [
+                ok(
+                    {
+                        "protected": True,
+                        "protection": {"required_status_checks": {"contexts": [name]}},
+                    }
+                )
+            ],
+        },
+    )
+    assert run.code == 1, run.out
+    assert NO_NAME in run.err
+    assert RULES_PATH not in run.paths()
+    assert run.sleeps == []
+
+
+def test_a_required_name_of_only_an_ignorable_character_is_not_empty(tmp_path: Path) -> None:
+    """A culture-aware compare reads a lone U+200B as equal to ``''``; the name is real."""
+    zwsp = "\u200b"
+    run = wait_pr(
+        tmp_path,
+        "checks-complete",
+        {
+            PR_PATH: [ok(pr())],
+            BRANCH_PATH: [
+                ok(
+                    {
+                        "protected": True,
+                        "protection": {"required_status_checks": {"contexts": [zwsp]}},
+                    }
+                )
+            ],
+            RULES_PATH: [ok([])],
+            RUNS_PATH: [
+                ok(
+                    {
+                        "total_count": 1,
+                        "check_runs": [
+                            {"name": zwsp, "status": "completed", "conclusion": "success"}
+                        ],
+                    }
+                )
+            ],
+            STATUS_PATH: NO_STATUSES,
+        },
+    )
+    assert run.code == 0, run.err
+    assert "required contexts on main: 1" in run.out
+
+
 def test_checks_complete_reads_every_page_and_waits_on_a_pending_status(tmp_path: Path) -> None:
     done = [
         {"name": f"leg {i}", "status": "completed", "conclusion": "success"} for i in range(100)

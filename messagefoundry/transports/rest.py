@@ -96,6 +96,7 @@ from messagefoundry.transports.bounded_read import (
     EgressReplyError,
     LoopbackDirectProxyHandler,
     NoRedirectHandler,
+    _refusal_by_http_client,
     build_strict_opener,
     drain_bounded,
     hop_identity,
@@ -135,6 +136,7 @@ __all__ = [
     "refuse_cleartext_credentials",
     "refuse_cleartext_egress",
     "refuse_unrevoked_verified_hop",
+    "refuse_unsendable_static_request",
     "refuse_url_credentials",
     "refuse_verify_off",
     "url_host_label",
@@ -1853,6 +1855,47 @@ def enforce_outbound_length_limits(url: str, headers: dict[str, str]) -> None:
         f"outbound header {violation.name!r} is {violation.length} chars, over the "
         f"{violation.limit}-char limit; check the configured header / credential value"
     )
+
+
+def refuse_unsendable_static_request(url: str, headers: Mapping[str, str], *, setting: str) -> None:
+    """Refuse at construction a static URL or header ``http.client`` could never send (BACKLOG #5911).
+
+    The screen a configured value needs beside :func:`enforce_outbound_length_limits`: that gate
+    bounds lengths only, and these values are the same for every message, so one the wire refuses
+    would fail every send. A URL must be ASCII with no whitespace: ``http.client`` sends the request
+    target as ASCII and refuses a space in it, and urllib sets the ``Host`` header from the URL's
+    host as it stands, which ``http.client`` encodes as Latin-1 rather than IDNA. A ``#`` is refused
+    too, because urllib splits it off client-side, so every path the connector appends to the URL
+    would be dropped. Each header is put to ``http.client`` itself, as
+    :func:`~messagefoundry.transports.bounded_read._refusal_by_http_client` does for a proxy
+    header, so the screen follows its name and value rules in every Python version.
+
+    Raises :class:`ValueError` naming ``setting``, and a header key only as
+    :func:`_shown_header_key` shows it, never a value, which an ``env()`` binding can fill with a
+    credential. Every raise sits outside any ``except`` block, so no ``__context__`` carries the
+    value (see :func:`_latin1_refusal_position`).
+    """
+    if not url.isascii() or any(ch.isspace() for ch in url) or "#" in url:
+        raise ValueError(
+            f"{setting} 'url' must be ASCII with no whitespace or '#' (http.client sends it as "
+            "ASCII); percent-encode it, and give an internationalized host in its IDNA form"
+        )
+    for name, value in headers.items():
+        if _refusal_by_http_client(name, "") is not None:
+            raise ValueError(
+                f"{setting} header {_shown_header_key(name)} is not a header name http.client "
+                "can send"
+            )
+        if _latin1_refusal_position(value) is not None:
+            raise ValueError(
+                f"{setting} header {_shown_header_key(name)} is not encodable as Latin-1 "
+                "(http.client sends header values as Latin-1)"
+            )
+        if _refusal_by_http_client(name, value) is not None:
+            raise ValueError(
+                f"{setting} header {_shown_header_key(name)} has a value http.client refuses to "
+                "send"
+            )
 
 
 def enforce_send_time_length_limits(

@@ -18,6 +18,10 @@ name: ASVS prove-absences
 # deliberately the FIRST half of a two-step: wire it while adoption is zero, harden it after. Making
 # it fail on zero adoption would be correct and entirely inert, because nothing was running it.
 #
+# CORRECTED 2026-11-18: a run over a record where no absence claim names a `mutation_path` now DOES
+# fail, in advisory mode too. The paragraph above is kept as the record of the first step; the rule
+# is stated once, under ADVISORY APPLIES TO FINDINGS below.
+#
 # WHY HERE AND NOT IN THE VAULT'S asvs-scorecard.yml. That job is `timeout-minutes: 5`, has no install
 # step, and its own comment states the stdlib-only constraint is deliberate "so this job cannot rot on
 # a lockfile it does not own". Proving needs the full engine install plus pytest, which is what this
@@ -74,7 +78,10 @@ name: ASVS prove-absences
 # Those are two different questions and conflating them is what a `schedule:` here would have done.
 #
 # ADVISORY APPLIES TO FINDINGS, NEVER TO THE INSTRUMENT. A claim that will not prove is reported and
-# does not fail this job (see `vars.ASVS_PROVE_STRICT`). A run that could not obtain a scorecard
+# does not fail this job (see `vars.ASVS_PROVE_STRICT`). Every prover exit 2 fails it, in advisory
+# mode too, and the prover exits 2 on a record where no absence claim names a `mutation_path`: it
+# skipped every claim, so that is an instrument failure, not a finding. A run that could not obtain
+# a scorecard
 # scanned ZERO claims and is not evidence about any of them, so it exits non-zero -- the rule
 # `scorecard.py` already states for its own loader ("Fail closed, never skip ... refusing to report a
 # pass on a missing file"). That is unchanged and must stay unchanged: never make the no-input path
@@ -187,8 +194,8 @@ jobs:
     # Generous because the prover spawns a pytest run per provable claim, and that is what the budget
     # is for. The tree is copied ONCE for the whole pass (save/apply/run/restore against one pristine
     # copy, plus a rebuild if a run writes into it), so the copy cost no longer scales with adoption
-    # -- it used to be one copytree per claim at roughly 1.2s each. At today's adoption -- zero -- the
-    # whole pass is under a second, so this budget is for the future, not the present.
+    # -- it used to be one copytree per claim at roughly 1.2s each. At zero adoption -- the 2026-08-09
+    # census above -- the whole pass was under a second, so this budget is for growth past that.
     timeout-minutes: 60
     permissions:
       contents: read
@@ -257,8 +264,9 @@ jobs:
         working-directory: engine
         env:
           # Both default OFF. STRICT is the whole ratchet -- one variable, proved to bite by selftest
-          # limb L3 -- and it should stay off until adoption is non-zero, because a strict run over
-          # 276 unprovable claims fails on the absence of work rather than on a defect. DETAIL prints
+          # limb L3. It decides only whether problems on claims that carry a `mutation_path` fail
+          # the job; a prover exit 2 fails it either way (header, ADVISORY APPLIES TO FINDINGS). When
+          # to turn it on is the owner's call (`EXIT_FINDINGS` in prove_report.py). DETAIL prints
           # the per-claim problem lines and is ONLY appropriate where the run log is private.
           STRICT: ${{ vars.ASVS_PROVE_STRICT }}
           DETAIL: ${{ vars.ASVS_PROVE_DETAIL }}

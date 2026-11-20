@@ -28,11 +28,14 @@ than as shell inside the workflow for three reasons, each of which was a defect 
    is how ``$?``-after-a-pipe bugs are born (SDS-3.8).
 
 **Advisory applies to FINDINGS, never to the INSTRUMENT.** A claim that will not prove is reported
-and, until adoption is non-zero, does not fail the job (:data:`EXIT_FINDINGS` is returned only under
-``--strict``). A run that could not obtain a scorecard, could not run the prover, or could not
-reconcile its own numbers returns :data:`EXIT_INSTRUMENT` unconditionally -- the rule
-``scorecard.py`` already states for its own loader failure ("could not measure -- never 0, never
-confused with clean").
+and does not fail the job (:data:`EXIT_FINDINGS` is returned only under ``--strict``). A run that
+could not obtain a scorecard, could not run the prover, or could not reconcile its own numbers
+returns :data:`EXIT_INSTRUMENT` unconditionally -- the rule ``scorecard.py`` already states for its
+own loader failure ("could not measure -- never 0, never confused with clean"). So does every prover
+exit 2, in advisory mode as well as under ``--strict``. One prover exit 2 is a record where no
+absence claim names a ``mutation_path`` (``_run_prove_absences`` in ``scorecard.py``): the prover
+skipped every claim, so the pass proved and screened nothing, and that is an instrument failure, not
+an advisory finding. This module does not check that case itself; it rests on the prover's exit code.
 
 **Per-claim detail is suppressed by default because this repo is public.** The prover's problem
 lines name the cell and the control that would not prove, which is a ranked list of the weakest
@@ -172,6 +175,10 @@ def _invoke_prover(
     proc = subprocess.run(  # nosec B603 - fixed argv, no shell; paths come from argparse
         [
             python,
+            # UTF-8 mode for the prover alone: a flag, unlike the PYTHONUTF8 variable, is not
+            # inherited, so the observables it runs keep their own locale and default encoding.
+            "-X",
+            "utf8",
             str(SCORECARD_PY),
             "--scorecard",
             str(scorecard),
@@ -180,7 +187,14 @@ def _invoke_prover(
             "--prove-absences",
         ],
         capture_output=True,
-        text=True,
+        # UTF-8 BOTH WAYS, NOT THE LOCALE (BACKLOG #5456). On a cp1252 console the child could not
+        # print claim text cp1252 cannot encode and the parent could not decode it, so the run died on an
+        # encoding error rather than reporting. `replace` keeps a stray byte from doing the same.
+        # PYTHONIOENCODING overrides an inherited setting, which takes precedence over UTF-8 mode.
+        # The observables inherit it, so their stdio is UTF-8, which the prover in UTF-8 mode reads.
+        encoding="utf-8",
+        errors="replace",
+        env={**os.environ, "PYTHONIOENCODING": "utf-8"},
         check=False,
         timeout=timeout,
     )
@@ -276,8 +290,47 @@ def _emit_summary(lines: list[str]) -> None:
     dest = os.environ.get("GITHUB_STEP_SUMMARY")
     if not dest:
         return
-    with open(dest, "a", encoding="utf-8") as fh:
-        fh.write("\n".join(lines) + "\n")
+    try:
+        with open(dest, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    except OSError as exc:
+        # The summary is a convenience. A traceback here would exit 1, which reads as a findings
+        # run, so report it and let the run's own exit code stand (BACKLOG #5456).
+        print(f"warning: could not write the job summary: {exc}", file=sys.stderr)
+
+
+def _instrument_failure(reason: str, *raw: tuple[str, str], detail: bool = False) -> int:
+    """Report a run that measured nothing checkable, and return :data:`EXIT_INSTRUMENT`.
+
+    The prover's raw streams print only under ``--detail`` (BACKLOG #5456). They hold the problem
+    lines and more: a failing load names the cell, and a traceback can quote a claim. These paths
+    printed them unconditionally, so a public run log carried exactly the text ``_report``
+    suppresses. Without ``--detail`` a note says each was suppressed, in words only. The reason, which
+    carries no claim text, also goes to the job summary, so a red run says which failure it was.
+
+    THESE FAILURE MESSAGES ADD NO COUNT TO THE LOG: no stream size, problem count or FAIL-line
+    count. That is a rule for this function's callers only. It does not make the log count-free:
+    the census and counter table ``_report`` prints on a completed run, and the ``RECONCILE`` lines,
+    are unchanged by it.
+    """
+    print(f"error: {reason}", file=sys.stderr)
+    for name, text in raw:
+        if detail:
+            print(f"the prover's {name} was:\n{text}", file=sys.stderr)
+        else:
+            print(
+                f"  the prover's {name} is SUPPRESSED: it can name cells and claims, and this "
+                "repo's run logs are public. Re-run with --detail where the log is private.",
+                file=sys.stderr,
+            )
+    _emit_summary(
+        [
+            "### ASVS `--prove-absences` MEASURED NOTHING CHECKABLE",
+            "",
+            f"{reason}. This run is not evidence about any claim.",
+        ]
+    )
+    return EXIT_INSTRUMENT
 
 
 def _report(
@@ -351,51 +404,82 @@ def _report(
 def run(args: argparse.Namespace) -> int:
     scorecard = Path(args.scorecard)
     root = Path(args.root)
+    # EVERY RETURN OF EXIT_INSTRUMENT GOES THROUGH `_instrument_failure` (BACKLOG #5456), so each
+    # one names its reason in the job summary and none prints a raw stream without --detail.
     if not scorecard.is_file():
         # Fail closed. This is the limb that fires when the vault scorecard could not be obtained,
         # and it must never be mistaken for "nothing to report".
-        print(
-            f"error: scorecard not found at {scorecard} -- refusing to report a pass on a run that "
-            "scanned nothing",
-            file=sys.stderr,
+        return _instrument_failure(
+            f"scorecard not found at {scorecard} -- refusing to report a pass on a run that "
+            "scanned nothing"
         )
-        _emit_summary(
-            [
-                "### ASVS `--prove-absences` DID NOT RUN",
-                "",
-                "No scorecard input was available, so **zero** absence claims were scanned. This "
-                "run is not evidence about any claim.",
-            ]
-        )
-        return EXIT_INSTRUMENT
     if not root.is_dir():
-        print(f"error: --root {root} is not a directory", file=sys.stderr)
-        return EXIT_INSTRUMENT
+        return _instrument_failure(f"--root {root} is not a directory")
 
     try:
         c = census(scorecard)
-    except (tomllib.TOMLDecodeError, OSError) as exc:
-        print(f"error: could not read the scorecard: {exc}", file=sys.stderr)
-        return EXIT_INSTRUMENT
+    except (tomllib.TOMLDecodeError, OSError, ValueError, AttributeError, TypeError) as exc:
+        # ValueError covers a file that is not UTF-8; AttributeError and TypeError a TOML-valid
+        # record of the wrong shape. Uncaught, each exited 1, which reads as a findings run.
+        return _instrument_failure(f"could not read the scorecard: {type(exc).__name__}: {exc}")
+
+    # A RECORD WITH NOTHING TO SCAN IS NOT A CLEAN RECORD (BACKLOG #5456). An empty file, a file
+    # with no cells, or cells with no absence claim all reconcile against a prover that saw zero, so
+    # without this the run reported a pass having examined nothing. Like every failure message,
+    # this one adds no count (see `_instrument_failure`).
+    if c.claims == 0:
+        return _instrument_failure(
+            "the scorecard holds no absence claim -- refusing to report a pass on a run that "
+            "scanned nothing"
+        )
 
     try:
         rc, stdout, stderr = _invoke_prover(scorecard, root, args.python, args.timeout)
     except subprocess.TimeoutExpired:
-        print(f"error: the prover did not finish within {args.timeout}s", file=sys.stderr)
-        return EXIT_INSTRUMENT
+        return _instrument_failure(f"the prover did not finish within {args.timeout}s")
+    except OSError as exc:
+        return _instrument_failure(f"the prover could not be started: {exc}")
 
     if rc == EXIT_INSTRUMENT:
-        print(f"error: the prover could not measure (exit 2):\n{stderr}", file=sys.stderr)
-        return EXIT_INSTRUMENT
+        return _instrument_failure(
+            "the prover could not measure (exit 2)", ("stderr", stderr), detail=args.detail
+        )
 
     r = parse_prover(rc, stdout, stderr)
     if r is None:
-        print(
-            "error: the prover printed no summary line -- its output could not be parsed, so this "
-            f"run measured nothing checkable. stdout was:\n{stdout}",
-            file=sys.stderr,
+        # Both streams: a prover that crashed before its summary left the traceback on stderr.
+        return _instrument_failure(
+            "the prover printed no summary line -- its output could not be parsed, so this run "
+            "measured nothing checkable",
+            ("stdout", stdout),
+            ("stderr", stderr),
+            detail=args.detail,
         )
-        return EXIT_INSTRUMENT
+
+    # THE PROVER MUST HAVE FINISHED THE WAY ITS SUMMARY SAYS (BACKLOG #5456). It exits 0 on no
+    # problem and 1 on a problem, and prints one FAIL line per problem after the summary. A crash
+    # after the summary also exits 1: with zero problems it was read as a clean run, and with some it
+    # was read as an ordinary findings run whose FAIL lines were cut short.
+    # The reason names which condition failed in words, with no count (see `_instrument_failure`).
+    crashed = any(ln.startswith("Traceback (most recent call last)") for ln in stderr.splitlines())
+    why = [
+        text
+        for failed, text in (
+            (crashed, "the prover crashed"),
+            (rc != (1 if r.problems else 0), "its exit code does not match its summary"),
+            (
+                len(r.problem_lines) < r.problems,
+                "it printed fewer FAIL lines than its summary reports problems",
+            ),
+        )
+        if failed
+    ]
+    if why:
+        return _instrument_failure(
+            "the prover did not finish the way its summary says: " + "; ".join(why),
+            ("stderr", stderr),
+            detail=args.detail,
+        )
 
     _report(scorecard, root, c, r, detail=args.detail, strict=args.strict)
 
@@ -403,7 +487,10 @@ def run(args: argparse.Namespace) -> int:
     if mismatches:
         for m in mismatches:
             print(f"  RECONCILE {m}", file=sys.stderr)
-        return EXIT_INSTRUMENT
+        return _instrument_failure(
+            "the prover's counters do not reconcile with the census, so they do not describe the "
+            "same claims"
+        )
 
     if r.problems and args.strict:
         return EXIT_FINDINGS
@@ -613,7 +700,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument(
         "--strict",
         action="store_true",
-        help="findings fail the job. Off while adoption is zero; this is the whole ratchet.",
+        help="findings fail the job; this is the whole ratchet. A prover exit 2, such as a record "
+        "where no claim names a mutation_path, fails the job with or without it.",
     )
     r.set_defaults(func=run)
 

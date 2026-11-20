@@ -343,6 +343,9 @@ export function coerce(
     return undefined;
   }
   if (descriptor.control === "number") {
+    if (descriptor.type === "float" && (text === "inf" || text === "-inf")) {
+      return { [NON_FINITE_TAG]: text }; // TOML's spelling, carried as the tag; "nan" stays refused
+    }
     const parsed = Number(text);
     return Number.isFinite(parsed) ? parsed : text;
   }
@@ -449,6 +452,28 @@ function count(text: string, character: string): number {
  * The key list is exported so the connection editor page applies the same list (BACKLOG #5565).
  */
 export const ENVREF_KEY_NAMES: readonly string[] = ["env", "default", "cast"];
+
+/**
+ * The tag `connection list` carries a non-finite float as, `{"$toml": "inf"}`: JSON has no Infinity
+ * or NaN literal. Mirrors the engine's `connections_edit.NON_FINITE_TAG`, which decodes only this
+ * exact shape back to the float on upsert (BACKLOG #5778). A tag is a leaf value, never a table.
+ */
+export const NON_FINITE_TAG = "$toml";
+export const NON_FINITE_SPELLINGS: readonly string[] = ["inf", "-inf", "nan", "-nan"];
+
+export function isNonFiniteTag(value: unknown): value is Record<string, string> {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return false;
+  }
+  const keys = Object.keys(value);
+  const spelling = (value as Record<string, unknown>)[NON_FINITE_TAG];
+  return (
+    keys.length === 1 &&
+    keys[0] === NON_FINITE_TAG &&
+    typeof spelling === "string" &&
+    NON_FINITE_SPELLINGS.includes(spelling)
+  );
+}
 const ENVREF_KEYS = new Set(ENVREF_KEY_NAMES);
 
 function envRefOf(
@@ -491,6 +516,9 @@ function controlFor(type: ParamType, choices: unknown[] | null): FieldControl {
 function placeholderFor(value: unknown): string {
   if (value === undefined || value === null) {
     return "";
+  }
+  if (isNonFiniteTag(value)) {
+    return value[NON_FINITE_TAG];
   }
   return typeof value === "object" ? JSON.stringify(value) : String(value);
 }
@@ -615,6 +643,9 @@ function inferType(value: unknown): ParamType {
   }
   if (typeof value === "number") {
     return Number.isInteger(value) ? "int" : "float";
+  }
+  if (isNonFiniteTag(value)) {
+    return "float";
   }
   if (value !== null && typeof value === "object") {
     return "table";

@@ -828,6 +828,11 @@ def enc_result(phase: str, result: object, blobs: _Blobs) -> dict[str, Any]:
             return {"r": "items", "shape": "none"}
         items = handler_result_items(result)
         if items is not None:
+            # Every item's admissibility first, as _partition checks it, so an inadmissible item is
+            # refused before any Send's encode() below runs (BACKLOG #5890).
+            for it in items:
+                if (fault := handler_item_fault(it)) is not None:
+                    raise SandboxCodecError(f"handler {fault}")
             return {"r": "items", "shape": "list", "i": [_enc_item(it, blobs) for it in items]}
         return {"r": "items", "shape": "one", "i": _enc_item(result, blobs)}
     raise SandboxCodecError(f"unknown sandbox phase {phase!r}")
@@ -869,9 +874,10 @@ def _enc_item(item: object, blobs: _Blobs) -> dict[str, Any]:
     # isinstance, in _partition's order — NOT type identity, so a user SUBCLASS of Send still
     # delivers exactly as it does in-process.
     if isinstance(item, Send):
-        # `.encode()` is called at DESCRIBE time — the same relative instant mode=off evaluates
-        # dryrun.py's `send.message if isinstance(..., str) else send.message.encode()`, which is the
-        # SOLE parent-side consumer of Send.message. Carrying text (never a live Message) is what makes
+        # On the worker path `_run_one` has already encoded every Send's message, inside its run
+        # context and exception arms (BACKLOG #5890), so this `.encode()` call serves only a direct
+        # codec caller. It mirrors dryrun.py's `send.message if isinstance(..., str) else
+        # send.message.encode()`, which is the SOLE parent-side consumer of Send.message. Carrying text (never a live Message) is what makes
         # the parent's Send() rebuild a provable no-op for ADR 0104's copy-on-Send choke point.
         try:
             text = item.message if isinstance(item.message, str) else item.message.encode()

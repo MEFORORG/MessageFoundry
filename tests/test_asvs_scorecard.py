@@ -2844,13 +2844,16 @@ def test_main_summary_says_RESOLVED_not_VERIFIED_and_carries_the_form_split(
     assert "1 of 2 (50.0%) resolve into prose or a non-Python file" in out
 
 
-def test_main_verify_without_corpus_returns_exit_2(tmp_path: Path) -> None:
+def test_main_verify_without_corpus_returns_exit_2(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     """Verify mode needs the corpus; omitting `--corpus` (without `--prove-absences`) must exit 2 --
     could-not-measure, never confused with a clean 0. Proves the argparse-independent guard in `main`.
 
-    Falsified by deleting the `if args.corpus is None: ... return 2` branch in `main`: it then falls
-    through to `verify(...)` with `corpus=None`, raising instead of returning 2, and this test's
-    `rc == 2` goes RED. Restored.
+    Falsified by deleting the `if args.corpus is None: ... return 2` branch in `_dispatch`: it then
+    falls through to `verify(...)` with `corpus=None`, which raises. `main`'s catch-all maps that to
+    exit 2 as well (BACKLOG #5462), so `rc == 2` alone stays green; the guard's own message is what
+    goes RED. Restored.
     """
     sc = tmp_path / "sc.toml"
     sc.write_text(
@@ -2868,6 +2871,7 @@ def test_main_verify_without_corpus_returns_exit_2(tmp_path: Path) -> None:
     engine.mkdir()
     rc = main(["--scorecard", str(sc), "--root", str(engine)])
     assert rc == 2
+    assert "--corpus is required to verify the scorecard" in capsys.readouterr().err
 
 
 # --- provenance and `--status`: a count is a fact about a (file x ref) PAIR -----------------------
@@ -3674,31 +3678,36 @@ def test_prove_absences_summary_prints_the_population_before_the_parts(
     Falsified by deleting the `saw ... absence claim(s);` term from `_run_prove_absences`: both
     assertions go RED. Restored.
     """
-    _module(tmp_path, "scanner.py", _SCANNER)
-    _obs_test(tmp_path, "test_scanner.py", _OBS_TEST)
+    # The record sits beside the tree, not in it: a root that holds the record is refused (#5461).
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    _module(tree, "scanner.py", _SCANNER)
+    _obs_test(tree, "test_scanner.py", _OBS_TEST)
     sc = tmp_path / "sc.toml"
     _biting_scorecard(sc, "scanner.py")
-    rc = main(["--scorecard", str(sc), "--root", str(tmp_path), "--prove-absences"])
+    rc = main(["--scorecard", str(sc), "--root", str(tree), "--prove-absences"])
     out = capsys.readouterr().out
     assert rc == 0
     assert "prove-absences: saw 1 absence claim(s);" in out
     assert "proved 1 by mutation" in out
 
 
-def test_prove_absences_summary_negative_control_an_empty_run_says_saw_zero(
+def test_prove_absences_summary_negative_control_an_empty_run_is_refused(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The negative control: a scorecard with NO absence claims must say so, not print four zeroes
-    that read like a clean pass over a real population."""
+    that read like a clean pass over a real population. It REFUSES, exit 2: a `saw 0` summary on
+    exit 0 still read as a pass to a CI step that only checks the code (BACKLOG #5461)."""
     sc = tmp_path / "sc.toml"
     sc.write_text(
         '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "unverified"\n',
         encoding="utf-8",
     )
-    rc = main(["--scorecard", str(sc), "--root", str(tmp_path), "--prove-absences"])
-    out = capsys.readouterr().out
-    assert rc == 0
-    assert "saw 0 absence claim(s)" in out
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    rc = main(["--scorecard", str(sc), "--root", str(tree), "--prove-absences"])
+    assert rc == 2
+    assert "no absence claims" in capsys.readouterr().err
 
 
 # --- sym + ctx: WHERE in the structure, and it is a DISPLACEMENT signal ---------------------------

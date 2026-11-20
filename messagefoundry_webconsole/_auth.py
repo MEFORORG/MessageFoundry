@@ -2162,14 +2162,20 @@ async def authorize_ui_ws(
     at all. A native client sends no ``Origin``, so
     this returns ``(None, None)`` and does not interfere with the header path.
     """
-    origin = websocket.headers.get("origin")
-    if not origin:
+    origins = websocket.headers.getlist("origin")
+    if not origins:
         # Native client (no Origin): not this gate's handshake, so it records nothing and leaves
         # the header path's answer standing.
         return None, None
     # Vault BACKLOG #2955: the handshake is this gate's to judge from here. Not admitted until the
     # end below, so a refusal clears an earlier answer.
     record_ws_gate(websocket, admitted=False)
+    if len(origins) > 1 or not origins[0].strip():
+        # BACKLOG #5789: a blank Origin, or more than one, is refused, as the header path's check
+        # refuses it. Judging the first copy alone would let this gate and a reader of another copy
+        # disagree about which origin the handshake came from.
+        return None, None
+    origin = origins[0]
     if not _origin_matches(websocket.app.state, origin, websocket.headers.get("host")):
         return None, None  # cross-origin browser handshake (CSWSH) — reject
     if session_cookie_copies(websocket) > 1:

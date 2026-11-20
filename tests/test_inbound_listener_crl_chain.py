@@ -35,6 +35,9 @@ two_tier = _api_suite.two_tier
 clean_anchor_checks = _api_suite.clean_anchor_checks
 _fresh_registry = _api_suite._fresh_registry
 
+#: What every CRL-signature line says once a build has loaded the file (vault BACKLOG #5896).
+_LOADED = "This TLS context loaded the file and checks revocation with it"
+
 _Builder = Callable[[dict[str, Any]], ssl.SSLContext | None]
 
 
@@ -91,7 +94,7 @@ def test_a_loaded_client_ca_with_no_crl_of_its_own_refuses_the_build(
 ) -> None:
     """A site that supplies only the issuing intermediate's CRL is refused at start, naming the
     root, rather than built to refuse every client at the handshake. The refusal is not preceded
-    by the signature warning that says the file is loaded. The control is the same CA file with
+    by the signature warning that says the context loaded the file. The control is the same CA file with
     the root's CRL added, which builds and admits the client."""
     crl = tmp_path / "inter-crl-only.pem"
     crl.write_bytes(two_tier.inter_crl_file.read_bytes())
@@ -104,13 +107,13 @@ def test_a_loaded_client_ca_with_no_crl_of_its_own_refuses_the_build(
         ),
     ):
         _listener(build, two_tier, crl)
-    assert "The file is loaded" not in caplog.text
+    assert _LOADED.lower() not in caplog.text.lower()
     # The control: the file that builds also holds the intermediate's CRL, which no loaded CA
     # signed, so the warning this test looks for is logged there and the instrument can differ.
     crl.write_bytes(two_tier.revokes_nothing.read_bytes())
     with caplog.at_level(logging.WARNING, logger="messagefoundry.config.tls_policy"):
         ctx = _listener(build, two_tier, crl)
-    assert "The file is loaded" in caplog.text
+    assert _LOADED in caplog.text
     _handshake(_client(two_tier), ctx)
 
 
