@@ -264,4 +264,9 @@ def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
         all_inbound_guard_settings=(
             MappingProxyType(inbound_guard_settings(registry)) if sharded else None
         ),
+        # Pin the UNFILTERED inbounds' body-retention overrides (BACKLOG #5889; why: the field's
+        # comment). Derived from the SOURCE registry, as above.
+        all_inbound_messages_days=(
+            MappingProxyType(dict(registry.inbound_messages_days())) if sharded else None
+        ),
     )

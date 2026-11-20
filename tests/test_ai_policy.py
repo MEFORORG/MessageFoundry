@@ -123,6 +123,14 @@ def test_nonproduction_ceiling_is_synthetic() -> None:
     )
 
 
+def test_managed_endpoint_nonproduction_advertises_code_only() -> None:
+    # BACKLOG #5773: the synthetic ceiling used to pass through for managed_endpoint, so /ai/policy
+    # advertised a scope that POST /ai/chat then refuses with a 403.
+    eff = _resolve(AiMode.MANAGED_ENDPOINT, AiDataScope.SYNTHETIC, production=False)
+    assert eff.data_scope is AiDataScope.CODE_ONLY
+    assert eff.reason is not None and "managed_endpoint" in eff.reason
+
+
 # --- exhaustive sweep over every combination, asserting the invariants --------
 
 
@@ -158,17 +166,23 @@ def test_invariants_over_all_combinations(
     if mode is AiMode.OFF:
         assert eff.data_scope is AiDataScope.CODE_ONLY
 
+    # 5. managed_endpoint yields code_only, the only scope POST /ai/chat accepts (BACKLOG #5773).
+    if mode is AiMode.MANAGED_ENDPOINT:
+        assert eff.data_scope is AiDataScope.CODE_ONLY
+
     # reason is None exactly when none of the *reason-producing* rules fired. Per the CONTRACT only
-    # the ceiling cap (1), the phi rule (2), and the deid rule (3) record a reason — the off
-    # normalization (4) silently pins scope to the floor without a note ("scope is irrelevant when
-    # AI is off"). So model the reason on the pre-off scope: a reason is expected iff the requested
+    # the ceiling cap (1), the phi rule (2), the managed_endpoint rule (3) and the deid rule (4)
+    # record a reason — the off normalization (5) silently pins scope to the floor without a note
+    # ("scope is irrelevant when AI is off"). So model the reason on the pre-off scope: a reason is expected iff the requested
     # scope would have been clamped before the off step.
     pre_off = scope
     if _SCOPE_ORDER[_ceiling(mode, production)] < _SCOPE_ORDER[pre_off]:  # rule 1
         pre_off = _ceiling(mode, production)
     if pre_off is AiDataScope.PHI and mode is not AiMode.MANAGED_CLAUDE_BAA:  # rule 2
         pre_off = AiDataScope.CODE_ONLY
-    expect_reason = pre_off is not scope or scope is AiDataScope.DEIDENTIFIED  # rule 3 always notes
+    if mode is AiMode.MANAGED_ENDPOINT:  # rule 3
+        pre_off = AiDataScope.CODE_ONLY
+    expect_reason = pre_off is not scope or scope is AiDataScope.DEIDENTIFIED  # rule 4 always notes
     assert (eff.reason is not None) == expect_reason
 
 

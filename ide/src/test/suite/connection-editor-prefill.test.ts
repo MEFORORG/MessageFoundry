@@ -882,3 +882,79 @@ suite("connection editor — the legacy rows, when the engine cannot describe it
     assert.strictEqual(saved(p, false).poll_statement, RECORD.settings.poll_statement);
   });
 });
+
+suite("connection editor — a non-finite float tag round-trips (BACKLOG #5778)", () => {
+  teardown(closeWindows);
+
+  const mllp = SCHEMA.transports.mllp;
+  const schema: ConnectionSchema = {
+    ...SCHEMA,
+    transports: {
+      ...SCHEMA.transports,
+      mllp: {
+        ...mllp,
+        params: {
+          ...mllp.params,
+          receive_timeout: param({ type: "float", env: true }),
+          connect_timeout: param({ type: "float", env: true }),
+        },
+      },
+    },
+  };
+  const record = {
+    ...RECORD,
+    settings: {
+      host: "peer.example",
+      port: 6661,
+      receive_timeout: { $toml: "inf" },
+      connect_timeout: { env: "CT", cast: "float", default: { $toml: "-inf" } },
+      undescribed: { $toml: "-nan" },
+    },
+  };
+  const groups = buildForm(schema, "mllp", "outbound", record.settings);
+
+  for (const clone of [false, true]) {
+    test(`${clone ? "clone" : "edit"}: untouched tags show their spelling and save back exactly`, () => {
+      const p = load({ clone, groups, initial: record });
+      const box = p.window.document.querySelector('#settings [data-key="receive_timeout"]');
+      assert.strictEqual(box.value, "inf");
+      const settings = saved(p, clone);
+      assert.deepStrictEqual(settings.receive_timeout, { $toml: "inf" });
+      assert.deepStrictEqual(settings.connect_timeout, {
+        env: "CT",
+        cast: "float",
+        default: { $toml: "-inf" },
+      });
+      assert.deepStrictEqual(settings.undescribed, { $toml: "-nan" });
+    });
+  }
+
+  test("legacy rows: an untouched tag saves back exactly, and an edited -inf posts the tag", () => {
+    const p = load({ groups: null, initial: record });
+    assert.deepStrictEqual(saved(p, false).receive_timeout, { $toml: "inf" });
+    const q = load({ groups: null, initial: record });
+    const row = [...q.window.document.querySelectorAll("#settings .setting")].find(
+      (r: DomNode) => r.querySelector("input").value === "receive_timeout",
+    );
+    assert.ok(row);
+    const value = row.querySelectorAll("input[type=text]")[1];
+    assert.strictEqual(value.value, "inf");
+    value.value = "-inf";
+    assert.deepStrictEqual(saved(q, false).receive_timeout, { $toml: "-inf" });
+  });
+
+  test("edit: inf / -inf typed into a float field post the tag; nan and Infinity post as typed", () => {
+    const cases: Array<[string, unknown]> = [
+      ["inf", { $toml: "inf" }],
+      ["-inf", { $toml: "-inf" }],
+      ["nan", "nan"],
+      ["Infinity", "Infinity"],
+      ["30", 30],
+    ];
+    for (const [typed, expected] of cases) {
+      const p = load({ groups, initial: record });
+      p.window.document.querySelector('#settings [data-key="receive_timeout"]').value = typed;
+      assert.deepStrictEqual(saved(p, false).receive_timeout, expected, typed);
+    }
+  });
+});

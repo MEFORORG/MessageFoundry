@@ -500,6 +500,12 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     connection.add_argument("--name", default=None, help="connection name (for remove)")
     connection.add_argument(
+        "--direction",
+        choices=["inbound", "outbound"],
+        default=None,
+        help="which connection to remove when an inbound and an outbound share --name",
+    )
+    connection.add_argument(
         "--data", default=None, help="connection JSON for upsert (default: read from stdin)"
     )
     connection.add_argument("--json", action="store_true", help="emit JSON")
@@ -6124,7 +6130,8 @@ def _dryrun(args: argparse.Namespace) -> int:
         return _emit_error(str(exc), as_json=args.json)
 
     # #230 P4 (ADR 0104): preview under the engine's copy-on-Send posture, resolved from the service
-    # settings serve would load — the library defaults stay False, but the CLI mirrors the live engine.
+    # settings serve would load, so a site's [pipeline] value reaches the preview; the library default,
+    # True, is the PipelineSettings default and applies only where nothing is passed (BACKLOG #5794).
     snapshot_on_send = _snapshot_on_send_setting(service_config)
 
     show_phi: bool = args.show_phi
@@ -13514,6 +13521,10 @@ def _connection(args: argparse.Namespace) -> int:
     from messagefoundry.config.wiring import API_LISTENER_LABEL, WiringError, load_config
     from messagefoundry.pipeline.wiring_runner import build_check_registry
 
+    if args.direction is not None and args.action != "remove":
+        # Only `remove` reads it; an upsert takes its direction from the connection JSON.
+        return _emit_error("--direction applies only to `connection remove`", as_json=args.json)
+
     if args.action == "schema":
         # Describes the ENGINE, not a workspace: no --config, no load_config. A schema fetch must not
         # fail because some unrelated module in the user's config dir does not import, and it must
@@ -13622,11 +13633,15 @@ def _connection(args: argparse.Namespace) -> int:
         else:  # remove
             if not args.name:
                 return _emit_error("--name is required for `connection remove`", as_json=args.json)
-            result = connections_edit.remove_connection(args.config, args.name, validate=validate)
+            result = connections_edit.remove_connection(
+                args.config, args.name, validate=validate, direction=args.direction
+            )
     except _OperatorJsonError as exc:
         return _emit_error(str(exc), as_json=args.json)
     except WiringError as exc:
         message = str(exc)
+        if connections_edit.SHARED_NAME_REFUSAL in message:
+            message += ": pass --direction inbound or --direction outbound"
         # At least these three refusals say which settings file the edit was checked against and
         # what to change there: the deny default's unlisted outbound (vault BACKLOG #2605), the
         # keep-forever retention refusal (vault BACKLOG #2368) and the exposure refusal. They say it

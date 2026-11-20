@@ -26,12 +26,14 @@ silently deleted by the next GUI/CLI save (the #234 data-loss bug this closes).
 from __future__ import annotations
 
 import contextlib
+import math
 from collections.abc import Callable, Iterator
 from datetime import date, datetime, time
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import tomlkit
+from tomlkit.items import Float, Trivia
 
 from messagefoundry.config import atomic_edit
 from messagefoundry.config.connections_file import (
@@ -128,6 +130,10 @@ assert "direction" not in _SCALAR_FIELDS + _SUB_TABLES
 
 Validate = Callable[[Path], None]
 
+#: The phrase :func:`remove_connection` refuses a name held by both an inbound and an outbound with,
+#: so the CLI can add its own flag to the advice without the library naming one.
+SHARED_NAME_REFUSAL = "is both an inbound and an outbound"
+
 
 @contextlib.contextmanager
 def locked(config_dir: str | Path) -> Iterator[None]:
@@ -174,17 +180,73 @@ def list_connections(config_dir: str | Path) -> list[dict[str, Any]]:
     return out
 
 
+#: The key of the tag a non-finite float is listed as, ``{"$toml": "inf"}``. TOML's inf / -inf /
+#: nan have no JSON literal: json.dumps would print a bare Infinity or NaN token that a strict
+#: parser (the IDE's JSON.parse) refuses, and a plain string would lose the type (BACKLOG #5778).
+NON_FINITE_TAG = "$toml"
+
+#: The spellings the tag carries, mapped to the float each one decodes to.
+_NON_FINITE: dict[str, float] = {
+    "inf": math.inf,
+    "-inf": -math.inf,
+    "nan": math.nan,
+    "-nan": -math.nan,
+}
+
+
+def _non_finite_spelling(value: float) -> str:
+    if math.isnan(value):
+        return "-nan" if math.copysign(1.0, value) < 0 else "nan"
+    return "inf" if value > 0 else "-inf"
+
+
+def _is_tag_shaped(value: Any) -> bool:
+    return isinstance(value, dict) and len(value) == 1 and NON_FINITE_TAG in value
+
+
 def _jsonable(value: Any) -> Any:
     """Canonicalize a TOML-unwrapped value for the list boundary: ``datetime``/``date``/``time``
-    become ISO-8601 strings (``HH:MM:SS`` for a time), containers recurse, everything else passes
-    verbatim. Those are the only non-JSON types ``tomllib``/tomlkit can yield, so the result is
-    always ``json.dumps``-able."""
+    become ISO-8601 strings (``HH:MM:SS`` for a time), a non-finite float becomes the tag
+    ``{"$toml": "inf"}`` (``-inf``, ``nan``, ``-nan``), containers recurse, and everything else
+    passes verbatim, so the result is standard JSON with no bare ``Infinity`` or ``NaN`` token.
+
+    A hand-written table whose only key is ``$toml`` is listed under an escape, wrapped once more:
+    ``{"$toml": v}`` becomes ``{"$toml": {"$toml": v'}}``. The tag's value is always a string and
+    the escape's always a table, so neither can be read as the other, and :func:`_decode_tags`
+    unwraps the escape back to the same table."""
+    if _is_tag_shaped(value):
+        return {NON_FINITE_TAG: {NON_FINITE_TAG: _jsonable(value[NON_FINITE_TAG])}}
     if isinstance(value, dict):
         return {key: _jsonable(item) for key, item in value.items()}
     if isinstance(value, list):
         return [_jsonable(item) for item in value]
     if isinstance(value, (datetime, date, time)):
         return value.isoformat()
+    if isinstance(value, float) and not math.isfinite(value):
+        return {NON_FINITE_TAG: _non_finite_spelling(value)}
+    return value
+
+
+def _decode_tags(value: Any) -> Any:
+    """``value`` with each exact non-finite tag (one key, ``$toml``, one of the four spellings)
+    decoded to its float, and each escape :func:`_jsonable` writes for a hand-written ``$toml``
+    table unwrapped back to that table, at any depth. A plain string is never decoded as a tag. Any
+    other one-key ``$toml`` table is refused, since it is neither."""
+    if _is_tag_shaped(value):
+        inner = value[NON_FINITE_TAG]
+        if isinstance(inner, str) and inner in _NON_FINITE:
+            return _NON_FINITE[inner]
+        if _is_tag_shaped(inner):
+            return {NON_FINITE_TAG: _decode_tags(inner[NON_FINITE_TAG])}
+        raise WiringError(
+            f"a table whose only key is {NON_FINITE_TAG!r} is the non-finite number tag, with a "
+            f"value of {', '.join(_NON_FINITE)}, or the escape of a hand-written "
+            f"{NON_FINITE_TAG!r} table: {{{NON_FINITE_TAG!r}: {{{NON_FINITE_TAG!r}: <value>}}}}"
+        )
+    if isinstance(value, dict):
+        return {key: _decode_tags(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_decode_tags(item) for item in value]
     return value
 
 
@@ -200,7 +262,11 @@ def upsert_connection(
     before persisting; raises :class:`WiringError` on bad input (including any key the direction's
     read schema does not accept — never silently dropped, #234) or a config that wouldn't load (a
     duplicate vs. a code-first name, unknown router, egress-denied host, …) — leaving
-    ``connections.toml`` untouched."""
+    ``connections.toml`` untouched.
+
+    A non-finite float arrives as the tag :func:`_jsonable` lists it as, and is decoded here,
+    before anything checks a value's type. A plain ``"inf"`` string is never decoded."""
+    obj = _decode_tags(obj)
     _validate_input(obj)
     path = _path(config_dir)
     with locked(config_dir):
@@ -212,17 +278,16 @@ def upsert_connection(
         if aot is None:
             aot = tomlkit.aot()
             doc[direction] = aot
+        index = next((i for i, table in enumerate(aot) if table.get("name") == obj["name"]), None)
         new_table = _build_table(obj)
-        for index in range(len(aot)):
-            if aot[index].get("name") == obj["name"]:
-                # Update the EXISTING table object key-wise. Assigning ``aot[index] = new_table``
-                # swaps the whole table out, and tomlkit discards the trivia around it: the edited
-                # table's own inline comments AND the leading comment block of the FOLLOWING entry
-                # (which tomlkit carries as trivia on the array body, not on the next table). A no-op
-                # save therefore deleted the documentation of a connection the user never touched.
-                # Mutating in place keeps every comment that is not attached to a value we change.
-                _apply_table(aot[index], new_table)
-                break
+        if index is not None:
+            # Update the EXISTING table object key-wise. Assigning ``aot[index] = new_table``
+            # swaps the whole table out, and tomlkit discards the trivia around it: the edited
+            # table's own inline comments AND the leading comment block of the FOLLOWING entry
+            # (which tomlkit carries as trivia on the array body, not on the next table). A no-op
+            # save therefore deleted the documentation of a connection the user never touched.
+            # Mutating in place keeps every comment that is not attached to a value we change.
+            _apply_table(aot[index], new_table)
         else:
             aot.append(new_table)
 
@@ -230,9 +295,23 @@ def upsert_connection(
     return {"op": "upsert", "direction": direction, "name": obj["name"]}
 
 
-def remove_connection(config_dir: str | Path, name: str, *, validate: Validate) -> dict[str, Any]:
+def remove_connection(
+    config_dir: str | Path,
+    name: str,
+    *,
+    validate: Validate,
+    direction: Literal["inbound", "outbound"] | None = None,
+) -> dict[str, Any]:
     """Remove the data-authored connection ``name``. Raises :class:`WiringError` if it isn't in
-    ``connections.toml`` (a code-first connection can't be removed here)."""
+    ``connections.toml`` (a code-first connection can't be removed here).
+
+    An inbound and an outbound may share a name, since the :class:`~messagefoundry.config.wiring.
+    Registry` keeps inbounds and outbounds in separate tables, so ``direction`` says which one to
+    remove. Without it, a name held in both directions is refused (:data:`SHARED_NAME_REFUSAL`)
+    rather than resolved to the first match, which removed the inbound when the outbound was meant
+    (BACKLOG #5898). Within one direction the first match is removed, as before."""
+    if direction not in (None, "inbound", "outbound"):
+        raise WiringError(f"direction must be 'inbound' or 'outbound', not {direction!r}")
     path = _path(config_dir)
     if not atomic_edit.is_file(path, refused_error=WiringError):
         raise WiringError(f"no {CONNECTIONS_FILE_NAME} in {config_dir}")
@@ -240,26 +319,38 @@ def remove_connection(config_dir: str | Path, name: str, *, validate: Validate) 
         text, crlf = atomic_edit.read_text(path, refused_error=WiringError)
         doc = tomlkit.parse(text)
 
-        removed = False
-        for direction in ("inbound", "outbound"):
-            aot = doc.get(direction)
-            if aot is None:
+        # Each direction whose array holds the name, with the index of its first match.
+        held: dict[str, tuple[Any, int]] = {}
+        for where in ("inbound", "outbound"):
+            tables = doc.get(where)
+            if tables is None:
                 continue
-            for index in range(len(aot)):
-                if aot[index].get("name") == name:
-                    del aot[index]
-                    removed = True
+            for index in range(len(tables)):
+                if tables[index].get("name") == name:
+                    held[where] = (tables, index)
                     break
-            if removed:
-                break
-        if not removed:
+        if direction is not None and held and direction not in held:
+            (other,) = held
+            raise WiringError(
+                f"{direction} connection {name!r} is not in {CONNECTIONS_FILE_NAME}; "
+                f"it holds {name!r} only as an {other} (nothing was removed)"
+            )
+        if direction is None and len(held) > 1:
+            raise WiringError(
+                f"connection {name!r} {SHARED_NAME_REFUSAL} in {CONNECTIONS_FILE_NAME}; name the "
+                "direction to remove (nothing was removed)"
+            )
+        removed_direction = direction if direction is not None else next(iter(held), None)
+        if removed_direction is None or removed_direction not in held:
             raise WiringError(
                 f"connection {name!r} is not in {CONNECTIONS_FILE_NAME} "
                 "(a code-authored connection can't be removed here)"
             )
+        tables, index = held[removed_direction]
+        del tables[index]
 
         _write_validated(path, atomic_edit.encode_text(tomlkit.dumps(doc), crlf), validate)
-    return {"op": "remove", "name": name}
+    return {"op": "remove", "direction": removed_direction, "name": name}
 
 
 # --- internals ---------------------------------------------------------------
@@ -347,9 +438,30 @@ def _plain(item: Any) -> Any:
 def _same_value(current: Any, new: Any) -> bool:
     """Compare a tomlkit item against a freshly built one by VALUE, ignoring formatting."""
     try:
-        return bool(_plain(current) == _plain(new))
+        return _same_plain(_plain(current), _plain(new))
     except Exception:  # pragma: no cover - defensive: an exotic item type compares as "changed"
         return False
+
+
+def _same_plain(old: Any, new: Any) -> bool:
+    """Plain equality that also holds :func:`_same_nan` inside an array or inline table."""
+    if isinstance(old, dict) and isinstance(new, dict):
+        return old.keys() == new.keys() and all(_same_plain(old[key], new[key]) for key in old)
+    if isinstance(old, list) and isinstance(new, list):
+        return len(old) == len(new) and all(map(_same_plain, old, new))
+    return bool(old == new) or _same_nan(old, new)
+
+
+def _same_nan(old: Any, new: Any) -> bool:
+    """Two NaNs of one sign are the same value. NaN never compares equal, so without this an
+    untouched ``nan`` was rewritten, losing its comment, on every save."""
+    return (
+        isinstance(old, float)
+        and isinstance(new, float)
+        and math.isnan(old)
+        and math.isnan(new)
+        and math.copysign(1.0, old) == math.copysign(1.0, new)
+    )
 
 
 def _is_table_like(item: Any) -> bool:
@@ -378,6 +490,8 @@ def _toml_value(value: Any) -> Any:
         for item in value:
             array.append(_toml_value(item))
         return array
+    if isinstance(value, float) and math.isnan(value) and math.copysign(1.0, value) < 0:
+        return Float(value, Trivia(), "-nan")  # tomlkit renders a bare -nan float as `nan`
     return value
 
 

@@ -44,6 +44,8 @@ tests/test_asvs_scorecard.py
 tests/test_asvs_scorecard_failclosed.py
 tests/test_asvs_tally_lint.py
 tests/test_asvs_verifier_vault_contract.py
+tests/test_b616_5879_codex_hook_shell_and_budget.py
+tests/test_b616_5880_codex_skills_from_primary_checkout.py
 tests/test_bash_probe_path.py
 tests/test_bash_resolver.py
 tests/test_blanket_stage_config_env.py

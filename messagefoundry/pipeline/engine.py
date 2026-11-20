@@ -523,8 +523,10 @@ class Engine:
         schedule_tick_seconds: float = 30.0,  # #147 (ADR 0095): active-window scheduler tick
         fuse_thread_hops: bool = False,  # ADR 0071 B5: SQL-Server-only thread-hop fusion (default-OFF)
         pooled_fusing_workers: int = 8,
-        batch_handoff_statements: bool = False,  # ADR 0075: SQL-Server-only per-hop batching (default-OFF)
-        snapshot_on_send: bool = False,  # ADR 0104: copy-on-Send at Send construction (default-OFF)
+        # Both default as PipelineSettings does, so an embedder on keyword defaults runs as serve
+        # does (BACKLOG #5794).
+        batch_handoff_statements: bool = True,  # ADR 0075: SQL-Server-only per-hop batching (default-ON)
+        snapshot_on_send: bool = True,  # ADR 0104: copy-on-Send at Send construction (default-ON)
         connection_events: bool = True,
         response_sent_default: bool = True,
         audit_verify_on_start: bool = False,
@@ -676,10 +678,10 @@ class Engine:
         # ONCE here — a /config/reload never re-reads it (restart to change, exactly like claim_mode).
         self._fuse_thread_hops = fuse_thread_hops
         self._fusing_workers = pooled_fusing_workers
-        # ADR 0075 per-hop SQL statement batching (SQL-Server-only, default-OFF); every runner inherits
+        # ADR 0075 per-hop SQL statement batching (SQL-Server-only, default-ON); every runner inherits
         # it. Read ONCE here — a /config/reload never re-reads it (restart to change, like fuse_thread_hops).
         self._batch_handoff_statements = batch_handoff_statements
-        # ADR 0104 copy-on-Send (default-OFF); every runner inherits it. Read ONCE here — a /config/reload
+        # ADR 0104 copy-on-Send (default-ON); every runner inherits it. Read ONCE here — a /config/reload
         # never re-reads it (restart to change, exactly like fuse_thread_hops).
         self._snapshot_on_send = snapshot_on_send
         # [diagnostics] Corepoint-style event log (#46); every runner inherits these master switches.
@@ -998,8 +1000,8 @@ class Engine:
         schedule_tick_seconds: float = 30.0,  # #147 (ADR 0095)
         fuse_thread_hops: bool = False,  # ADR 0071 B5
         pooled_fusing_workers: int = 8,
-        batch_handoff_statements: bool = False,  # ADR 0075
-        snapshot_on_send: bool = False,  # ADR 0104
+        batch_handoff_statements: bool = True,  # ADR 0075 (BACKLOG #5794: as PipelineSettings)
+        snapshot_on_send: bool = True,  # ADR 0104 (BACKLOG #5794: as PipelineSettings)
         connection_events: bool = True,
         response_sent_default: bool = True,
         audit_verify_on_start: bool = False,
