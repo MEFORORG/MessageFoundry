@@ -407,11 +407,10 @@ async def test_an_inbound_keep_forever_override_leaves_a_dead_ingress_row_to_the
 async def test_a_sibling_engine_shard_keeps_an_inbound_keep_forever_body(
     store: MessageStore,
 ) -> None:
-    """BACKLOG #5967 pinned a sibling engine shard purging an inbound's ``messages_days = 0`` body
-    on the global window. BACKLOG #5889 made the engine-shard filter carry the whole config's
-    ``messages_days`` overrides, so the sibling keeps it too, as
-    ``tests/test_b616_5889_retention_overrides_across_shards.py`` also pins. ``ENGINE_SHARD_LIMIT``
-    still states the earlier behaviour; correcting that text is its own change."""
+    """BACKLOG #5889: the engine-shard filter carries the whole config's ``messages_days``
+    overrides, so a sibling engine shard that does not hold an inbound still keeps that inbound's
+    ``messages_days = 0`` body. The control: the same sibling run purges an inheriting inbound's
+    body on the global window, so its purge ran."""
     from messagefoundry.pipeline.sharding import filter_registry_for_shard
 
     keep, _ = await _delivered(store, channel_id="IB_KEEP", dest="OB", now=0.0, control="S-KEEP")
@@ -429,10 +428,15 @@ async def test_a_sibling_engine_shard_keeps_an_inbound_keep_forever_body(
     assert await _raw(store, keep) == RAW  # the engine shard holding IB_KEEP keeps the body
 
     sibling = filter_registry_for_shard(reg, "b")
+    # The sibling's own view does not hold IB_KEEP, so the body is kept through the whole config's
+    # overrides, not through its own inbounds.
+    assert set(sibling.inbound) == {"IB_OTHER"}, set(sibling.inbound)
+    other, _ = await _delivered(store, channel_id="IB_OTHER", dest="OB", now=0.0, control="S-OTH")
     await RetentionRunner(
         store, settings, clock=lambda: 100 * DAY, registry_source=lambda: sibling
     ).run_once()
     assert await _raw(store, keep) == RAW  # the sibling reads the whole config's overrides
+    assert await _raw(store, other) == ""  # control: the sibling's purge ran on the global window
 
 
 async def test_runner_without_registry_is_global_only(store: MessageStore) -> None:

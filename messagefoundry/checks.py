@@ -4134,9 +4134,7 @@ def _check_retention_overrides(
 
     An inbound ``messages_days = 0`` or an outbound ``dead_letter_days = 0`` asks to keep that
     connection's PHI forever. What each keeps is stated once, on
-    :func:`~messagefoundry.config.retention_classification._override_scope`, and the engine shard
-    limit on an inbound override on
-    :data:`~messagefoundry.config.retention_classification.ENGINE_SHARD_LIMIT`.
+    :func:`~messagefoundry.config.retention_classification._override_scope`.
     ``serve`` hands the engine a registry guard that refuses such a graph under ``enforce`` unless
     ``[security].allow_keeping_phi_indefinitely`` is set, and this gate passed it. The decision is
     :func:`~messagefoundry.config.retention_classification.judge_keep_forever_overrides`, the

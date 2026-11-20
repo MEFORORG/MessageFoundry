@@ -1320,21 +1320,16 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 > **Per-connection overrides ([ADR 0027](adr/0027-per-connection-retention.md)).** `messages_days` and
 > `dead_letter_days` are **global defaults** an individual connection may override: an **inbound** sets its
 > own `messages_days`, an **outbound** its own `dead_letter_days` (both `None` = inherit this global window,
-> `0` = keep forever what that override's purge holds, which the note below states, `>0` = days; an
-> inbound's override, at any value, is subject to the engine shard limit stated there). An inbound may also opt into **embedded-document
+> `0` = keep forever what that override's purge holds, which the note below states, `>0` = days).
+> An inbound may also opt into **embedded-document
 > pruning** (`prune_documents_after` + `prune_documents_min_bytes`, [ADR 0042](adr/0042-embedded-document-pruning.md))
 > to strip bulky base64 attachments while keeping the readable message. These live on the connection (code-first
 > or in `connections.toml`) — see [CONNECTIONS.md](CONNECTIONS.md).
 >
 > **Under `enforce`, an override of `0` needs the same acknowledgement as a global `0`** (BACKLOG
-> #2368). Subject to the engine shard limit next, it keeps forever what that override's purge
-> holds, whatever the global window says, and not every row about its messages; the refusal and the
-> `AUDIT:` line state which (BACKLOG #5967). **The engine shard limit:** where a `serve --shard`
-> process that does not hold an inbound runs retention against the same store, that inbound's
-> override keeps none of what the purge of message bodies holds for that inbound's messages past
-> that process's global `[security].delete_message_bodies_after_days` window, where that window is
-> bounded; no `messages_days` value on that inbound changes this. The
-> overrides live in the graph, so `serve` checks them when it loads the graph, at least at startup
+> #2368). It keeps forever what that override's purge holds, whatever the global window says, and
+> not every row about its messages; the refusal and the `AUDIT:` line state which (BACKLOG #5967).
+> The overrides live in the graph, so `serve` checks them when it loads the graph, at least at startup
 > and on every config reload:
 >
 > - Without `[security].allow_keeping_phi_indefinitely = true`, under `enforce`, the engine refuses the
@@ -1342,8 +1337,7 @@ entry a Handler still reads. That stays true until state has an eviction key tha
 >   graph stays.
 > - Without it, under `warn`, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming
 >   each connection, with the remedy (owner ruling 2026-11-01). The graph loads with no
->   acknowledgement, and what the override holds is kept forever, subject to the engine shard
->   limit above.
+>   acknowledgement, and what the override holds is kept forever.
 > - With it, the gate passes the graph and logs a WARNING-level `AUDIT:` line naming each connection.
 >
 > The gate writes its `AUDIT:` line each time it passes such a graph. A dry-run reload counts, and

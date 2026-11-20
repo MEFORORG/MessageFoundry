@@ -44,7 +44,6 @@ from messagefoundry.auth.permissions import (
 )
 from messagefoundry.config.retention_classification import (
     BODY_ACKNOWLEDGEMENT_SETTING,
-    ENGINE_SHARD_LIMIT,
     RetentionGateLine,
     evaluate_retention_gate,
 )
@@ -1800,11 +1799,11 @@ _REVIEWED_TEXT_CHECKS: dict[tuple[str, str], str] = {
     ),
     (
         "test_security_doc_drift.py",
-        "test_the_override_note_states_the_engine_shard_limit_the_refusal_states",
+        "test_the_override_note_no_longer_states_an_engine_shard_limit",
     ): (
-        "compares CONFIGURATION.md prose to the refusal's ENGINE_SHARD_LIMIT string, a prose "
-        "claim; tests/test_per_connection_retention.py drives the purge it describes (BACKLOG "
-        "#5967)"
+        "reads CONFIGURATION.md prose for the absence of a removed claim; "
+        "tests/test_per_connection_retention.py drives the purge behaviour (BACKLOG #5967, "
+        "#5889)"
     ),
     ("test_security_doc_rate_limits.py", "_config_section"): "slices CONFIGURATION.md prose",
     ("test_security_doc_rate_limits.py", "test_ui_refusal_reader_can_fail"): (
@@ -3971,7 +3970,6 @@ _OVERRIDE_ARMS: tuple[tuple[str, tuple[str, ...]], ...] = (
             _OVERRIDE_AUDITED,
             "with the remedy",
             "what the override holds is kept forever",
-            "subject to the engine shard limit above",
         ),
     ),
     ("- With it, the gate passes the graph", (_OVERRIDE_AUDITED,)),
@@ -3981,9 +3979,7 @@ _OVERRIDE_NOTE_FACTS = (
     "each time it passes such a graph",
     "A dry-run reload counts",
     "each engine shard writes its own",
-    # BACKLOG #5967: the limit itself is checked against ENGINE_SHARD_LIMIT, the refusal's own
-    # sentence, by test_the_override_note_states_the_engine_shard_limit_the_refusal_states.
-    "Subject to the engine shard limit next, it keeps forever what that override's purge holds",
+    "It keeps forever what that override's purge holds",
     # The body windows' line is the older rule, left alone by the 2026-11-01 ruling. The other
     # global tiers are not in this claim: an acknowledged one writes its line on either dial.
     "The startup gate for the global body windows differs: it writes its `AUDIT:` line only under "
@@ -4023,15 +4019,26 @@ _RETIRED_RETENTION_CLAIMS: tuple[tuple[Path, str], ...] = (
 )
 
 
-def test_the_override_note_states_the_engine_shard_limit_the_refusal_states() -> None:
-    """BACKLOG #5967 (SDS-3.5): the note restates ENGINE_SHARD_LIMIT, the refusal's own sentence,
-    word for word once its markup is dropped, so the two cannot drift apart. Red on either copy
-    changing alone."""
+#: BACKLOG #5967 stated an engine shard limit on an inbound override, which BACKLOG #5889 removed
+#: by making every engine shard read the whole config's overrides. None of it may come back.
+_REMOVED_ENGINE_SHARD_LIMIT = (
+    "engine shard limit",
+    "process that does not hold an inbound",
+    "keeps none of what the purge of message bodies holds",
+)
+
+
+def test_the_override_note_no_longer_states_an_engine_shard_limit() -> None:
+    """Absence pin for the removed limit, in the note and in the connection field table. The
+    control: the note itself is found, so an empty read cannot pass."""
     quoted = blockquote_lines(_CONFIG_DOC.read_text(encoding="utf-8"), _OVERRIDE_NOTE)
     note = " ".join(line.removeprefix(">").strip() for line in quoted)
     plain = note.replace("**", "").replace("`", "")
-    assert ENGINE_SHARD_LIMIT.startswith("The engine shard limit: ")
-    assert plain.count(ENGINE_SHARD_LIMIT) == 1
+    assert "It keeps forever what that override's purge holds" in plain, plain[:200]
+    connections = (_ROOT / "docs" / "CONNECTIONS.md").read_text(encoding="utf-8").casefold()
+    for removed in _REMOVED_ENGINE_SHARD_LIMIT:
+        assert removed.casefold() not in plain.casefold(), removed
+        assert removed.casefold() not in connections, removed
 
 
 def _override_note_findings(doc: str) -> list[str]:

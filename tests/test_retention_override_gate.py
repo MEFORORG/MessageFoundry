@@ -24,7 +24,6 @@ import pytest
 from messagefoundry.__main__ import _chain_registry_guards, main
 from messagefoundry.checks import CheckReport, CheckResult, run_checks
 from messagefoundry.config.retention_classification import (
-    ENGINE_SHARD_LIMIT,
     auto_bounded_windows,
     judge_keep_forever_overrides,
     keep_forever_overrides,
@@ -227,7 +226,7 @@ def test_the_override_text_states_what_the_purge_keeps(
 @pytest.mark.parametrize(
     ("acknowledged", "enforcing"), [(True, True), (False, True), (False, False)]
 )
-def test_the_override_text_names_what_is_kept_and_the_engine_shard_limit(
+def test_the_override_text_names_what_is_kept_and_no_engine_shard_limit(
     tmp_path: Path,
     acknowledged: bool,
     enforcing: bool,
@@ -236,9 +235,10 @@ def test_the_override_text_names_what_is_kept_and_the_engine_shard_limit(
     kept: str,
 ) -> None:
     """BACKLOG #5967: the opening sentence names what the overrides keep, so an outbound-only
-    override is not said to keep message bodies, and an inbound override's text states the engine
-    shard limit once. Red on a text that says "PHI message bodies" for every override, or promises
-    an inbound's hold on every engine shard."""
+    override is not said to keep message bodies. The engine shard limit this text once stated was
+    removed once BACKLOG #5889 made every engine shard read the whole config's overrides, so no
+    part of it may come back. Red on a text that says "PHI message bodies" for every override, or
+    that names the limit again."""
     registry = _graph(tmp_path / "cfg", inbound_days=inbound_days, outbound_days=outbound_days)
     verdict = judge_keep_forever_overrides(
         registry, acknowledged=acknowledged, enforcing=enforcing, env_name="prod"
@@ -248,31 +248,16 @@ def test_the_override_text_names_what_is_kept_and_the_engine_shard_limit(
     assert text is not None
     opening = f"keeps {kept} indefinitely" if refused else f"connections' {kept} are retained"
     assert opening in text
-    # The caveat only points at the limit, and it leaves no comma before "(status)".
-    caveat = ", subject, for an inbound override, to the engine shard limit stated after this"
-    assert (caveat in text) is (inbound_days is not None)
-    assert "this, (" not in text and ",," not in text
+    # The removed caveat left no stray punctuation behind it.
+    assert ",," not in text and "indefinitely, on" not in text and "INDEFINITELY," not in text
     if inbound_days is None:
         assert "PHI message bodies" not in text
-    # The limit is keyed on a `serve --shard` process that does NOT hold the inbound, and it covers
-    # all the body purge holds, not the stored body alone. It is stated once.
-    shard_limit = (
-        "The engine shard limit: where a serve --shard process that does not hold an inbound runs "
-        "retention against the same store, that inbound's override keeps none of what the purge "
-        "of message bodies holds for that inbound's messages past that process's global "
-        "[security].delete_message_bodies_after_days window, where that window is bounded; no "
-        "messages_days value on that inbound changes this."
-    )
-    assert shard_limit == ENGINE_SHARD_LIMIT
-    assert text.count(shard_limit) == (1 if inbound_days is not None else 0)
-    assert text.count("serve --shard") == (1 if inbound_days is not None else 0)
-    # Keep-forever is made subject to the limit, never to the holding process applying it.
+    # Absence pins: no part of the removed engine shard limit, and no other engine shard claim.
+    for removed in ("engine shard limit", "serve --shard", "Subject to that limit", "subject, for"):
+        assert removed not in text, removed
     assert (
-        "Subject to that limit, an inbound override keeps forever, while that inbound stays in the "
-        "live graph" in text
+        "An inbound override keeps forever, while that inbound stays in the live graph" in text
     ) is (inbound_days is not None)
-    assert "holds the inbound, apply the override" not in text
-    assert "honour the override" not in text
     if outbound_days is not None:
         assert "the replies that outbound captured: that purge reads no outbound override." in text
 

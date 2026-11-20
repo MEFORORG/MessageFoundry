@@ -539,10 +539,9 @@ def keep_forever_overrides(registry: Registry) -> tuple[str, ...]:
     an outbound sets ``dead_letter_days``. ``None`` inherits the global window and a positive number
     bounds it. ``0`` asks to keep that connection's PHI forever, whatever the global window says, so
     it is the same choice as a global ``0`` made for one connection. Which rows each kind keeps,
-    and which it does not, is stated on :func:`_override_scope`, and the engine shard limit on an
-    inbound override on :data:`ENGINE_SHARD_LIMIT`. The global windows live in the service
-    settings, where :func:`unbounded_windows` reads them; these live in the graph, so the start gate
-    cannot see them and a registry guard must (vault BACKLOG #2368).
+    and which it does not, is stated on :func:`_override_scope`. The global windows live in the
+    service settings, where :func:`unbounded_windows` reads them; these live in the graph, so the
+    start gate cannot see them and a registry guard must (vault BACKLOG #2368).
 
     The test is ``<= 0``, as the purge reads it: the factories refuse a negative override, but a
     registry built without them would keep those bodies forever too.
@@ -569,20 +568,6 @@ def _window_setting(field: str) -> str:
     return next(w.setting for w in PHI_RETENTION_WINDOWS if w.field == field)
 
 
-#: The engine shard limit on an inbound override, the one statement of it (BACKLOG #5967).
-#: docs/CONFIGURATION.md carries the same sentence, and tests/test_security_doc_drift.py checks the
-#: two match. Each ``serve --shard`` process's retention reads its override maps from its own
-#: registry (``RetentionRunner._resolve_overrides``), and ``filter_registry_for_shard`` leaves only
-#: that process's inbounds in it, and every outbound.
-ENGINE_SHARD_LIMIT: Final[str] = (
-    "The engine shard limit: where a serve --shard process that does not hold an inbound runs "
-    "retention against the same store, that inbound's override keeps none of what the purge of "
-    "message bodies holds for that inbound's messages past that process's global "
-    f"{_window_setting('messages_days')} window, where that window is bounded; no messages_days "
-    "value on that inbound changes this."
-)
-
-
 def _override_scope(kept: tuple[str, ...]) -> str:
     """What each kind of override in ``kept`` keeps and does not keep, so the refusal and the
     ``AUDIT:`` line promise no more than the store does (BACKLOG #5967).
@@ -591,15 +576,13 @@ def _override_scope(kept: tuple[str, ...]) -> str:
     ``messages_days`` is the cutoff of ``purge_message_bodies``, keyed on the receiving inbound, and
     an outbound's ``dead_letter_days`` the cutoff of ``purge_dead_letters``, keyed on the dead
     row's outbound. Read their docstrings for what each blanks. The lists in the text say "at
-    least", because a closed list here would go false when a purge gains a tier. Where ``kept``
-    holds an inbound override, the text opens with :data:`ENGINE_SHARD_LIMIT`."""
+    least", because a closed list here would go false when a purge gains a tier."""
     dead_global = _window_setting("dead_letter_days")
     inbound, outbound = _override_kinds(kept)
     parts = []
     if inbound:
         parts.append(
-            f"{ENGINE_SHARD_LIMIT} Subject to that limit, an inbound override keeps "
-            "forever, while that inbound stays in the live graph with it, at least what that "
+            "An inbound override keeps forever, while that inbound stays in the live graph with it, at least what that "
             "purge holds for the messages that inbound "
             "received: each stored body, though the inbound's own prune_documents_after, where "
             "set, still strips embedded documents from it; its delivered and cancelled outbound "
@@ -658,19 +641,6 @@ def _kept_phi(kept: tuple[str, ...]) -> str:
     return "PHI message bodies" if inbound else "dead-lettered PHI rows"
 
 
-def _engine_shard_caveat(kept: tuple[str, ...]) -> str:
-    """The clause that follows "indefinitely" in the opening sentence where ``kept`` holds an
-    inbound override, pointing at :data:`ENGINE_SHARD_LIMIT`, which the scope text after it
-    states; empty otherwise. It carries no trailing comma, so each caller punctuates its own
-    sentence."""
-    inbound, _ = _override_kinds(kept)
-    return (
-        ", subject, for an inbound override, to the engine shard limit stated after this"
-        if inbound
-        else ""
-    )
-
-
 def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None) -> str:
     """The refusal text for ``kept``, the non-empty result of :func:`keep_forever_overrides`.
 
@@ -678,10 +648,9 @@ def keep_forever_override_refusal(kept: tuple[str, ...], *, env_name: str | None
     ``supervise`` and ``connection upsert`` reach it through that, so an edit is refused in the
     words a reload would use. ``env_name`` is ``None`` where no environment is active."""
     where = f" ({env_name!r})" if env_name is not None else ""
-    caveat = _engine_shard_caveat(kept)
     return (
         f"a per-connection retention override keeps {_kept_phi(kept)} indefinitely"
-        f"{caveat}{',' if caveat else ''} on a PHI instance{where}: {'; '.join(kept)} "
+        f" on a PHI instance{where}: {'; '.join(kept)} "
         "(unbounded PHI at rest, ASVS 14.2.4/14.2.7). "
         f"{_override_scope(kept)} {_keep_forever_remedy()}"
     )
@@ -702,7 +671,7 @@ def _override_audit_line(
         f"AUDIT: the retention gate on a PHI instance{where} passed a graph "
         f"with per-connection unbounded data retention ({basis}; {'; '.join(kept)}) -- once that "
         f"graph is live, these connections' {_kept_phi(kept)} are retained INDEFINITELY"
-        f"{_engine_shard_caveat(kept)} ({status}). {_override_scope(kept)}"
+        f" ({status}). {_override_scope(kept)}"
     )
 
 
