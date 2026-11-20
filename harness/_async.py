@@ -59,8 +59,11 @@ class _Call(QRunnable):
         # removed: the pool keeps the dead wrapper. A wrapper still holding a callable that
         # captures its widget, such as LoginDialog's sign-in lambda, then keeps widget -> runner
         # -> pool -> runnable -> callable -> widget a reference cycle, which a later collection
-        # may free off the GUI thread. The callable is also dropped before the emit, so a slot
-        # that finishes with the widget first does not leave this thread to free it on return.
+        # may free off the GUI thread. On the success path the callable is also dropped before the
+        # emit, so a slot that finishes with the widget first does not leave this thread to free it
+        # on return. On the error path `del fn` does not drop it: the exception's traceback still
+        # holds the callable's frame, and so its closure and the widget, until the exception is
+        # released. That can be on this thread, or a cycle if on_error stores the exception.
         fn, signals = self._fn, self._signals
         del self._fn, self._signals
         try:
