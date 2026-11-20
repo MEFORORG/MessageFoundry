@@ -73,7 +73,7 @@ class HealthProbe(Enum):
     The cost of a wrong verdict is bounded but NOT only cosmetic. :data:`TrayState.FOREIGN` greys
     out Start, Stop and Restart (``menu.build_menu`` renders them disabled, not absent), so a real
     engine misread as FOREIGN loses its service actions, not just its icon. That lands on a LOCAL
-    engine too: ``monitor_only`` keys on the URL's locality ALONE, so a loopback engine installed
+    engine too: ``monitor_only`` never reads this verdict, so a loopback engine installed
     from a different wheel than the tray stays controllable right up until its key set disagrees.
 
     What this verdict is NOT: authentication, authorization and TLS verification belong to the

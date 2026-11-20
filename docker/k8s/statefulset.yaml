@@ -152,11 +152,47 @@ spec:
             - { name: MEFOR_API_TLS_CERT_FILE, value: "/etc/mefor/tls/engine/api.crt" }
             - { name: MEFOR_API_TLS_KEY_FILE, value: "/etc/mefor/tls/engine/api.key" }
             # Off loopback serve also refuses this certificate bind until you attest revocation with
-            # MEFOR_TLS_REVOCATION_ATTESTED=1 (docs/SECURITY.md, API revocation gate). Not set here: it is your attestation.
+            # MEFOR_TLS_REVOCATION_ATTESTED=1 (docs/SECURITY.md, API revocation gate). The value is
+            # your attestation, so it comes from the Secret's tls-revocation-attested key and this
+            # file never writes it. The key is NOT optional: without it the kubelet refuses to start
+            # the container, rather than the engine exiting and restarting forever. Set it to 1 only
+            # if your PKI enforces revocation; a value the engine reads as false still refuses.
+            - name: MEFOR_TLS_REVOCATION_ATTESTED
+              valueFrom: { secretKeyRef: { name: mefor-secrets, key: tls-revocation-attested } }
             - { name: MEFOR_INBOUND_BIND_HOST, value: "0.0.0.0" }   # MLLP() must set tls=True (exposure gate)
             - { name: MEFOR_SECURITY_REQUIRE_MFA, value: "true" }       # covers directory accounts too; off + exposed = refused under enforce
             - { name: MEFOR_STORE_REQUIRE_ENCRYPTION, value: "true" }   # keeps the default keyless refusal past the audited opt-out (docs/PHI.md section 3)
             - { name: MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND, value: "true" } # plus MEFOR_EGRESS_ALLOWED_* for your graph
+            # --- what an enforcing start needs (BACKLOG #5935) ---
+            # [security].enforcement defaults to enforce and nothing here lowers it. As shipped, serve
+            # REFUSES to start: the inputs below are commented out, because a placeholder value would
+            # pass these gates and start an engine whose notices and logs go nowhere. Uncomment each
+            # line and give it your own value. At least these gates read them; serve's refusal
+            # message names any other one your config trips.
+            # Security notices and credential reminders (ASVS 6.3.5/6.3.7/6.4.5): an SMTP relay, a
+            # sender and a recipient. The relay hop verifies its certificate by default.
+            # - { name: MEFOR_ALERTS_EMAIL_SMTP_HOST, value: "REPLACE-smtp.example.org" }
+            # - { name: MEFOR_ALERTS_SMTP_ALLOWED_HOSTS, value: "REPLACE-smtp.example.org" }
+            # - { name: MEFOR_ALERTS_EMAIL_FROM, value: "REPLACE-mefor@example.org" }
+            # - { name: MEFOR_ALERTS_EMAIL_TO, value: "REPLACE-mefor-ops@example.org" }
+            # Off-box log forwarding: verified TLS to a collector that is not this host (ADR 0200),
+            # on the egress allowlist block_unlisted_outbound requires. Bake the CA and CRL into the
+            # config image under /config, root-owned like the config itself, because the engine
+            # refuses a CA another account could replace. Rebuild the image with a fresh CRL before
+            # the baked one's nextUpdate.
+            # - { name: MEFOR_LOGGING_FORWARD_HOST, value: "REPLACE-siem.example.org" }
+            # - { name: MEFOR_LOGGING_FORWARD_PORT, value: "6514" }
+            # - { name: MEFOR_LOGGING_FORWARD_PROTOCOL, value: "tls" }
+            # - { name: MEFOR_LOGGING_FORWARD_TLS_CA_FILE, value: "/config/pki/syslog-ca.pem" }
+            # - { name: MEFOR_LOGGING_FORWARD_TLS_CRL_FILE, value: "/config/pki/syslog-crl.pem" }
+            # - { name: MEFOR_EGRESS_ALLOWED_SYSLOG, value: "REPLACE-siem.example.org" }
+            # Retention bounds (ASVS 14.2.7). The message-body and dead-letter windows default on;
+            # these two tiers need a window or an acknowledgement, and both are your decision. For
+            # transform state the gate names the acknowledgement as the safe answer: a window deletes
+            # it by write time, while a Handler may still be using it.
+            # - { name: MEFOR_RETENTION_SEARCH_PRESET_DAYS, value: "REPLACE-days" }
+            # - { name: MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY, value: "true" }
+            # The log spool (ADR 0200) defaults to log-spool beside the store, on the store PVC.
             # Secrets injected from the Secret as env (never plain manifest values):
             - name: MEFOR_STORE_ENCRYPTION_KEY
               valueFrom: { secretKeyRef: { name: mefor-secrets, key: store-encryption-key } }
