@@ -1286,7 +1286,8 @@ def test_the_engine_sampler_stops_when_the_hold_ends_not_when_the_probe_returns(
     # The probe runs BESIDE the hold. Awaited inline, it would hold the sampler open to its end.
     assert "await _reload_mid_hold(" not in source
     assert "reload_task = asyncio.create_task(" in source
-    # The OS probe keeps its own stop, so the graded FD window did not move with the rate window.
+    # The OS probe keeps its own stop, so its window did not move with the rate window. A graded FD
+    # reading can still come after that stop, from the make-up floor (BACKLOG #1488).
     assert "probe_stop, proc_readings, origin" in source
     # The control: the order before #2024, where the probe returned before the sampler stopped.
     before = "\n".join(

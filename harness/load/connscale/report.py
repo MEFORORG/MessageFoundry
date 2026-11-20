@@ -300,7 +300,8 @@ class ConnScaleRecord:
     fd_probe_degraded_ticks: int = 0
     fd_probe_degraded: tuple[str, ...] = ()
     # How many of `fd_probe_ticks` the probe's make-up floor took AFTER its window closed, because every
-    # reading in the window was an exhausted budget (BACKLOG #1488). Zero on a window that measured. A
+    # reading in the window was an exhausted budget (BACKLOG #1488). Zero on a window that took any
+    # other reading, and where no probe ran, which `fd_probe_ticks` of 0 tells apart. A
     # peak read on such a tick comes from the step's engine before the driver stops, so the
     # connections the driver opened have not been closed by the harness; one the reload probe left
     # down is still down, as for an in-window reading after the reload. It is taken after the hold,
@@ -979,8 +980,9 @@ DIAGNOSTIC_FIELDS: tuple[DiagnosticField, ...] = (
     DiagnosticField(
         "fd_probe_floor_ticks",
         lambda r: r.fd_probe_floor_ticks,
-        "an in-window reading vs a make-up one (BACKLOG #1488): NON-ZERO means every reading in the "
-        "window spent its budget and the walk read again after the hold, with no traffic offered",
+        "whether the walk read again past its window (BACKLOG #1488): NON-ZERO means every reading the "
+        "window took, the one in flight when it closed included, spent its budget, and the walk read "
+        "again after the hold with no traffic offered; 0 also where no probe ran",
     ),
     DiagnosticField(
         "fd_probe_degraded_ticks",

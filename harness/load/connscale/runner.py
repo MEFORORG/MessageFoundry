@@ -1486,17 +1486,18 @@ async def _sample_loop(
 #: What the floor adds, at most, is :data:`_FD_PROBE_MAKEUP_MAX_S` per step. The sweep's other
 #: costs are not priced term by term: the failing windows-2022 run of 2026-11-19 measured them all
 #: at once, as :data:`_FD_PROBE_FLOOR_MEASURED_SETUP_S`, the smoke fixture's setup time on that leg,
-#: with every spawn and kill, reply wait, stop grace, drain and in-window walk as they ran there. So
-#: on that leg the floor would have brought the fixture to at least 53.41 + 4 steps x 10 s =
-#: 93.41 s. A second attempt would make it at least 133.41 s, past 120.
+#: with every spawn and kill, reply wait, stop grace, drain and in-window walk as they ran there. That
+#: leg plus the floor at its maximum is 53.41 + 4 steps x 10 s = 93.41 s; a second attempt would put
+#: the same sum at 133.41 s, past 120.
 #:
-#: THAT IS NOT A WORST CASE. It does not cover a run whose other terms cost more than they did on that
-#: leg: a reply wait (``_POST_RELOAD_REPLY_WAIT_S``) or stop grace (``_STOP_GRACE``) that ran longer
-#: than it did there, an in-window attempt that spent both budgets where that run's spent one,
-#: or a slower engine spawn or kill. Nor does it price the kill and reap ``subprocess.run`` does after
-#: a timed-out shell-out, which ``_FD_PROBE_MAKEUP_MAX_S`` leaves out too. Run beside the reply wait
-#: (:func:`_await_probe_beside_reply`), the floor adds less than its maximum wherever that wait runs.
-#: ``tests/test_connscale_sample_floor.py`` pins this sum from these constants.
+#: THAT SUM IS AN ESTIMATE, NOT A BOUND IN EITHER DIRECTION. It is lower where a make-up attempt
+#: returns inside its budget, or overlaps the reply wait (:func:`_await_probe_beside_reply`), which
+#: also overlaps the in-flight tail that leg ran in front of its wait. It is higher on a run whose
+#: other terms cost more than they did on that leg: a reply wait (``_POST_RELOAD_REPLY_WAIT_S``) or
+#: stop grace (``_STOP_GRACE``) that ran longer, an in-window attempt that spent both budgets where
+#: that run's spent one, or a slower engine spawn or kill. Nor does it price the kill and reap
+#: ``subprocess.run`` does after a timed-out shell-out, which ``_FD_PROBE_MAKEUP_MAX_S`` leaves out
+#: too. ``tests/test_connscale_sample_floor.py`` recomputes this sum from these constants.
 _FD_PROBE_MAKEUP_ATTEMPTS = 1
 #: The most :data:`_FD_PROBE_MAKEUP_ATTEMPTS` can add to one step on a Windows leg, on the terms
 #: ``_PROBE_ATTEMPT_MAX_S`` in ``probe.py`` states.
@@ -1592,17 +1593,24 @@ async def _await_probe_beside_reply(
     ``post_reload_drops`` counts over. Run side by side, the reply wait starts when the window closes
     and the probe's reading is still taken before the caller stops the driver.
 
-    If the probe raises, the reply wait is cancelled before the error propagates, so it is not left
-    watching past the step. The step's own cleanup cancels the probe task on every path out; that
-    does not stop a walk already running in its executor thread, which ends at its own
-    ``_PROBE_TIMEOUT_S``."""
+    If the probe raises, the reply wait is cancelled and awaited before the error propagates, so its
+    own cleanup runs and it is not left watching past the step. A reply-wait error surfaces once the
+    probe returns. The step's own cleanup cancels the probe task on every path out; that does not stop
+    a walk already running in its executor thread, which ends at its own ``_PROBE_TIMEOUT_S``."""
     reply_task = None if reply is None else asyncio.ensure_future(reply)
     try:
+        if reply_task is not None:
+            # One turn of the loop, so the reply wait is inside its own `try` before anything here can
+            # cancel it: a task cancelled before its first step never runs its `finally`.
+            await asyncio.sleep(0)
         floor_ticks = 0 if probe_task is None else await probe_task
         return floor_ticks, None if reply_task is None else await reply_task
     finally:
         if reply_task is not None:
             reply_task.cancel()  # a no-op once it is done
+            await asyncio.wait({reply_task})
+            if not reply_task.cancelled():
+                reply_task.exception()  # retrieved, so an error the probe's overtook is not logged
 
 
 async def _time_reload(poller: EnginePoller) -> tuple[float | None, bool]:

@@ -467,8 +467,7 @@ async def test_a_collapse_measured_on_makeup_readings_still_fails_the_fd_slo() -
 def _measured_leg_plus_floor(attempts: int) -> tuple[int, float, float]:
     """The sum the comment on `_FD_PROBE_MAKEUP_ATTEMPTS` states, from its constants and from the
     smoke's own watchdog and step count: `(steps, measured setup + steps x floor maximum, watchdog)`.
-    A lower bound on the failing leg with the floor, not a worst case; that comment says what it
-    leaves out."""
+    An estimate, not a bound; that comment says which way each term it leaves out moves it."""
     (watchdog_s,) = smoke.pytestmark.args
     profile = smoke._smoke_profile(30000)  # any valid port: only the axes are read
     assert isinstance(profile, ConnScaleProfile)
@@ -478,8 +477,11 @@ def _measured_leg_plus_floor(attempts: int) -> tuple[int, float, float]:
 
 
 def test_the_makeup_floor_fits_inside_the_smokes_watchdog() -> None:
-    """Pins the comment on `_FD_PROBE_MAKEUP_ATTEMPTS`, so a longer sweep, a shorter watchdog or a
-    second attempt fails here rather than in a killed worker. The comment's 93.41 s is this sum."""
+    """Pins the comment on `_FD_PROBE_MAKEUP_ATTEMPTS`: more steps, a shorter watchdog, a dearer
+    attempt or a second one fails here. The comment's 93.41 s is this sum.
+
+    WHAT IT CANNOT CATCH: a step that costs more for any other reason, such as a longer hold, reply
+    wait, stop grace or drain. The measured setup is a constant, so none of those moves it."""
     steps, with_floor_s, watchdog_s = _measured_leg_plus_floor(_FD_PROBE_MAKEUP_ATTEMPTS)
     assert steps == 4, steps  # the comment's "4 steps"; a new axis must revisit it
     assert with_floor_s < watchdog_s, (
@@ -549,6 +551,30 @@ async def test_a_probe_that_fails_cancels_the_reply_wait() -> None:
         await runner._await_probe_beside_reply(asyncio.create_task(probe()), reply())
     async with asyncio.timeout(_TEST_DEADLINE_S):
         await cancelled.wait()
+
+
+async def test_a_probe_that_already_failed_still_lets_the_reply_wait_clean_up() -> None:
+    """A probe task that failed during the hold raises at once, without yielding. The reply wait must
+    still have started, or cancelling it skips its `finally`, which is where the real one ends its
+    first-reply watch."""
+    cleaned = asyncio.Event()
+
+    async def probe() -> int:
+        raise RuntimeError("walk exploded during the hold")
+
+    failed = asyncio.create_task(probe())
+    await asyncio.wait({failed})
+
+    async def reply() -> runner._ReloadAccount:
+        try:
+            await asyncio.sleep(_TEST_DEADLINE_S)
+        finally:
+            cleaned.set()
+        return _ACCOUNT
+
+    with pytest.raises(RuntimeError, match="during the hold"):
+        await runner._await_probe_beside_reply(failed, reply())
+    assert cleaned.is_set()
 
 
 async def test_a_step_with_no_probe_and_no_reload_reports_neither() -> None:

@@ -543,6 +543,7 @@ def test_an_older_artifact_without_the_provenance_still_builds_a_record() -> Non
     # Constructed by OMITTING them rather than by reading their declared defaults, because the property
     # that matters is that such a call still succeeds, not that a default is written down somewhere.
     # The two BACKLOG #1210 peak-provenance fields default the same way, to None ("not recorded").
+    # The BACKLOG #1488 make-up count defaults to 0, like the tick counts above it.
     added = (
         "fd_probe_ticks",
         "fd_probe_degraded_ticks",
