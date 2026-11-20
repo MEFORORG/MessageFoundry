@@ -175,8 +175,10 @@ with reason `transit_unavailable`, not `store_error`.
 A correction to that note, added 2026-11-09: "the first load is the lapse check" means the first
 load after the ceremony's stamp. The route's own session check, and the stamp write's check, run
 through Transit before `_elevated_hash` does; an Outage there refuses the request and writes no
-stamp, so nothing is left elevated. The lapse check also reads the account record, and an Outage
-on that check revokes the session too, though the session's own seal held.
+stamp, so nothing is left elevated (corrected 2026-11-19: not at the stamp write's check, where the
+stamp-to-rotation window below, armed before the write, revokes the session). The lapse check also
+reads the account record, and an Outage on that check revokes the session too, though the session's
+own seal held.
 
 A second correction, added 2026-11-09, which RETRACTS the two notes above where they disagree:
 the lapse check is NOT always the first Transit call after a stamp lands, and an Outage before it
@@ -319,19 +321,20 @@ revoke whose call raised after it committed can be reported as not ended.
 During a Vault Transit Outage, case (a) or (b) signs out a re-auth due a clear, and the
 stamp-to-rotation window above can too, by revoking the stamped hash. An Outage at the account
 record's seal that leaves the audit append working writes the row, hands back the rotated token and
-ends nothing. Accepting the sign-out in case (a) or (b) was decided by the Lander under the owner's
-delegation of 2026-11-19, record d20261119T234650256-3bf83e, because it fails closed. The question
-asked, quoted from the Lander's owner table: "During a Vault Transit outage, a re-auth whose lockout
-counters are due to be cleared now signs the user out; main keeps their session live. [...] ADR
-0217's Outage row, which you accepted, says 'end nothing'." The owner answered "/driver". The owner
-can reverse the decision by ruling that the Outage row's "end nothing" governs; keeping the session
-in case (b) would then need a design that clears the lockout before the stamp, as main did, since
-the sign-out comes from the rotation and dropping the revoke alone keeps no session. The question
-covered only a re-auth due a clear. On a re-auth with no clear due, the revoke in case (a) during an
-Outage is this PR's own behaviour and an exception to the Outage row's "end nothing" for that path
-only, accepted by the Lander as strictly safer under the owner's standing instruction of 2026-10-22,
-record d20261120T015953943-d015e0. The row's text, apart from its label's pointer to this amendment,
-is unchanged.
+ends nothing. Accepting the sign-out in case (a) or (b), or through the stamp-to-rotation window,
+was decided by the Lander under the owner's delegation of 2026-11-19, record
+d20261119T234650256-3bf83e, because it fails closed. The question asked, quoted from the Lander's
+owner table: "During a Vault Transit outage, a re-auth whose lockout counters are due to be cleared
+now signs the user out; main keeps their session live. [...] ADR 0217's Outage row, which you
+accepted, says 'end nothing'." The owner answered "/driver". The owner can reverse the decision by
+ruling that the Outage row's "end nothing" governs; keeping the session in case (b) would then need
+a design that clears the lockout before the stamp, as main did, since the sign-out comes from the
+rotation and dropping the revoke alone keeps no session. The question covered only a re-auth due a
+clear. On a re-auth with no clear due, the revoke in case (a) during an Outage is this PR's own
+behaviour and an exception to the Outage row's "end nothing" for that path only, accepted by the
+Lander as strictly safer under the owner's standing instruction of 2026-10-22, record
+d20261120T015953943-d015e0. The row's text, apart from its label's pointer to this amendment, is
+unchanged.
 
 Before this PR, the clear ran before the rotation, so an Outage at the clear kept the original
 session. A hard `auth.reauth` row refused after the rotation left the rotated session live, with
