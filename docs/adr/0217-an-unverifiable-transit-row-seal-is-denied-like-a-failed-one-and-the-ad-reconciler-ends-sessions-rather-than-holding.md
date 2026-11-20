@@ -304,13 +304,18 @@ moves the password re-auth's lockout clear after the session rotation, so during
 Outage a re-auth that is due a clear now signs the user out, where this row's "end nothing" kept
 the session. Accepting that sign-out was decided by the Lander under the owner's delegation of
 2026-11-19, record d20261119T234650256-3bf83e: it fails closed, and the revoke below ends only a
-session whose token was never handed back. The row's text, apart from its label's pointer to this
+session whose token was never handed back. The question, from the Lander's owner table, was:
+"During a Vault Transit outage, a re-auth whose lockout counters are due to be cleared now signs
+the user out; main keeps their session live. [...] ADR 0217's Outage row, which you accepted, says
+'end nothing'." The owner answered "/driver". The owner can reverse the decision by ruling that the
+Outage row's "end nothing" governs. The row's text, apart from its label's pointer to this
 amendment, is unchanged.
 
-What the code does. On two paths, a password re-auth that has rotated its session raises and
-never hands back the rotated token. One is a refused hard `auth.reauth` row: any refusal of the
-row, at least a Vault Transit Outage, an `OSError` or a defect, and a cancel that lands while the
-row is written, whether or not a lockout clear was due. The other is a clear that raises, which
+What the code does. On at least two paths, a password re-auth that has rotated its session raises
+and never hands back the rotated token. One is a hard `auth.reauth` row whose write raises, at
+least on a Vault Transit Outage, an `OSError` or a defect, or is cancelled, whether or not a
+lockout clear was due; neither proves the row is not in, since a cancel, or a connection lost at
+the commit, can follow a commit that landed. The other is a clear that raises, which
 includes a Vault Transit Outage refusing the audit-chain MAC of the rows the clear appends
 (`CipherError`; [SECURITY.md](../SECURITY.md), the re-auth leg's lockout clear). On either path
 the user is signed out because the rotation has already retired the token the caller held. Where a
@@ -319,7 +324,7 @@ row was always written after it. The sign-out does not come from the revoke. The
 drops any purpose grant minted for the rotated token and asks the store to end the rotated session,
 whose token was never handed back; that revoke ends nothing else. It is best effort: a refused
 revoke is tried once more, and when it is refused again, or raises, the rotated session stays live.
-On the refused-row path only WARNING log lines then record it; on the clear-raise path the
+On the refused-row path only log lines then record it; on the clear-raise path the
 `interrupted` row, written softly, also carries `session_ended`. Asking the store to end that
 session departs from the Outage row's "end nothing".
 

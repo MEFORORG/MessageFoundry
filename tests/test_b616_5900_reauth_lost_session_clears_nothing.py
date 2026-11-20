@@ -1220,7 +1220,10 @@ async def test_a_refused_revoke_after_a_refused_row_logs_what_happened(
             await service.reauth(identity, GOOD, token=token, purpose=STEP_UP_ACTION_MFA_ENROLL)
         text = caplog.text
         assert "whose rotated token is never handed back had its revoke refused" in text
-        assert "whose auth.reauth row was refused could not end the session it rotated" in text
+        assert (
+            "whose auth.reauth row write raised OSError could not end the session it rotated"
+            in text
+        )
         assert "granted nothing" not in text
         assert not service._action_step_up_grants
     finally:
@@ -1266,7 +1269,7 @@ async def test_a_cancel_after_the_reauth_row_committed_is_not_logged_as_a_refusa
         assert not service._action_step_up_grants
         text = caplog.text
         assert (
-            "cancelled while its auth.reauth row was written ended the session it rotated; "
+            "whose auth.reauth row write was cancelled ended the session it rotated; "
             "whether that row committed is not known"
         ) in text
         assert "row was refused" not in text

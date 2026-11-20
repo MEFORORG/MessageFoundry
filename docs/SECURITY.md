@@ -3811,20 +3811,20 @@ nothing to clear makes no such check:
   Outage refusing the audit-chain MAC of the rows the clear appends (`CipherError`). A raise
   inside the re-proof itself, after the password verified, writes no `auth.reauth` row.
 
-**A refused `auth.reauth` row also ends the rotated session, whether or not a clear was due
+**An `auth.reauth` row write that raises or is cancelled also ends the rotated session, whether or not a clear was due
 (BACKLOG #5900; ADR 0217's 2026-11-19 amendment, decided by the Lander under the owner's
 delegation of 2026-11-19, record d20261119T234650256-3bf83e).** When a password re-auth
-has rotated its session and its hard `auth.reauth` row is not written, refused at least by a Vault
-transit Outage, an `OSError` or a defect, or interrupted by a cancel that lands while it is
-written, the re-auth raises and never hands back the rotated token. It drops any purpose grant
+has rotated its session and the write of its hard `auth.reauth` row raises, at least on a Vault
+transit Outage, an `OSError` or a defect, or is cancelled, the re-auth raises and never hands back
+the rotated token. It drops any purpose grant
 minted for that token and asks the store to end the rotated session; that revoke ends nothing
 else. The clear-raise path in the last bullet asks the same. On both paths the user is signed out
 because the rotation has already retired the token the caller held; for the clear, that is the
 reorder that moves it after the rotation. The sign-out does not come from the revoke. The revoke is
 best effort: a refused revoke is tried once more, and when it is refused again, or raises, the
-rotated session stays live, unreachable. On the refused-row path only WARNING log lines then
-record it, and since a cancel can land after the row committed, a cancel's line says it is not
-known whether that row committed.
+rotated session stays live, unreachable. On the refused-row path only log lines then record it.
+A cancel, or a raise such as a connection lost at the commit, can follow a commit that landed, so
+those lines say it is not known whether the row committed.
 
 **A directory step-up or enrolment leg refuses a present account that lost a role in the directory
 (BACKLOG #2240).** At least the code and passkey legs above, the two enrolment legs, the IdP

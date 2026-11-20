@@ -15692,14 +15692,14 @@ class AuthService:
     async def _end_reauth_rotated_session(self, rotated_token: str, actor: str) -> bool:
         """Ask the store to end the session a re-auth rotated once :meth:`_clear_after_reauth`
         answered ``"denied"`` or raised, or once a re-auth that finished with a rotated token had
-        its hard ``auth.reauth`` row refused or its write cancelled, whether or not a clear was due,
-        any purpose grant minted for that token being dropped first (BACKLOG #5900), and say
+        the write of its hard ``auth.reauth`` row raise or be cancelled, whether or not a clear was
+        due, any purpose grant minted for that token being dropped first (BACKLOG #5900), and say
         whether the revoke landed, as far as this call saw. A refused revoke is tried once more, as
         ``confirm_mfa_enrollment`` tries its own (BACKLOG #3025). Refused twice, it is logged and
         answered False: the elevated session may then stay live, unreachable, because the caller
         answers ``session_lost`` or raises either way and its new token is never handed back. The
-        caller records the answer on its ``auth.reauth`` row, or logs it when that row was
-        refused or its write cancelled."""
+        caller records the answer on its ``auth.reauth`` row, or logs it when that row's write
+        raised or was cancelled."""
         rotated = hash_token(rotated_token)
         for attempt in ("retrying", "and could not end the session it rotated"):
             ended = await write_audit_soft(
@@ -16015,11 +16015,13 @@ class AuthService:
             # A raise after a row that went in with the clear still writes one interrupted row.
             if not row_written or not finished:
                 # Soft on a raise, so a store fault on the row does not replace the exception
-                # propagating (a defect the soft write re-raises still does). Hard after a refused
-                # clear, which runs after the address was marked known and the purpose grant was
-                # minted: a fault that refuses the row raises, so the rotated token, and with it
-                # the grant, is never handed back, but the address stays marked known. The
-                # rotated session is then ended, through a cancel too, rather than left live.
+                # propagating (a defect the soft write re-raises still does). Hard on a re-auth
+                # that finished without its row going in with a clear, whether no clear was due or
+                # the clear was refused. That runs after the address was marked known and the
+                # purpose grant was minted: a raise from the row, or a cancel while it is written,
+                # propagates, so the rotated token, and with it the grant, is never handed back,
+                # but the address stays marked known. The store is then asked to end the rotated
+                # session, through a cancel too, rather than leave it live.
                 try:
                     await self._write_reauth_row(
                         lost=lost or not finished,
@@ -16034,28 +16036,25 @@ class AuthService:
                             self._action_step_up_grants.pop(
                                 (hash_token(elevation.token), purpose), None
                             )
-                        # A cancel can land after the row committed, so it says nothing about
-                        # whether the row is in; only a raise from the write is a refusal.
-                        row_cancelled = isinstance(row_exc, asyncio.CancelledError)
+                        # Neither proves the row is not in: a cancel can land after it committed,
+                        # and so can a raise, at least a connection lost at the commit. So the log
+                        # names what happened to the write, never what happened to the row.
+                        if isinstance(row_exc, asyncio.CancelledError):
+                            row_write = "auth.reauth row write was cancelled"
+                        else:
+                            row_write = f"auth.reauth row write raised {type(row_exc).__name__}"
                         row_refused_ended: list[bool] = []
                         try:
                             await self._end_reauth_rotated_session_shielded(
-                                elevation.token,
-                                identity.username,
-                                "auth.reauth row write was cancelled"
-                                if row_cancelled
-                                else "auth.reauth row was refused",
-                                row_refused_ended,
+                                elevation.token, identity.username, row_write, row_refused_ended
                             )
                         finally:
                             # No row is known to record it, so the log does.
                             _log.warning(
-                                "a re-auth for %s cancelled while its auth.reauth row was written "
-                                "%s the session it rotated; whether that row committed is not known"
-                                if row_cancelled
-                                else "a re-auth for %s whose auth.reauth row was refused %s the "
-                                "session it rotated",
+                                "a re-auth for %s whose %s %s the session it rotated; whether that "
+                                "row committed is not known",
                                 scrub_log_argument(identity.username),
+                                row_write,
                                 "ended"
                                 if row_refused_ended and row_refused_ended[0]
                                 else "could not end",
