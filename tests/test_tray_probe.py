@@ -925,18 +925,10 @@ _WILDCARDS = [
 ]
 
 
-def _load_tray_config(tmp_path: Path, bind_host: str, port: int, source: str) -> TrayConfig:
+def _load_tray_config(tmp_path: Path, bind_host: str, port: int) -> TrayConfig:
     """The tray's config, discovered the way a real tray does (:func:`load_config`) for an engine
     whose store, and so whose minted pair, is in ``tmp_path``."""
-    params = f'serve --db "{tmp_path / "messagefoundry.db"}"'
-    if source == "serve-flag":
-        params += f" --host {bind_host} --port {port}"
-    else:
-        (tmp_path / "messagefoundry.toml").write_text(
-            "[security]\nlocal_access_only = false\n"
-            f'listen_address = "{bind_host}"\n[api]\nport = {port}\n',
-            encoding="utf-8",
-        )
+    params = f'serve --db "{tmp_path / "messagefoundry.db"}" --host {bind_host} --port {port}'
     info = ServiceRegistryInfo(app_directory=str(tmp_path), app_parameters=params)
 
     class _Reader:
@@ -949,26 +941,24 @@ def _load_tray_config(tmp_path: Path, bind_host: str, port: int, source: str) ->
 
 
 @pytest.mark.parametrize(("bind_host", "dial_host"), _WILDCARDS)
-@pytest.mark.parametrize("source", ["serve-flag", "settings-toml"])
 def test_a_pinned_probe_reads_an_engine_on_a_wildcard_bind_as_up(
-    bind_host: str, dial_host: str, source: str, tmp_path: Path
+    bind_host: str, dial_host: str, tmp_path: Path
 ) -> None:
     """The fix end to end, over a real handshake and through the poller (BACKLOG #5973).
 
     The engine mints its pair for a wildcard bind, the tray discovers the bind from the service's
-    registry entry or its settings TOML, dials the loopback of the bind's family, and verifies the
+    registry entry, dials the loopback of the bind's family, and verifies the
     certificate against that address with the minted pair as its only trust anchor. Before the
-    change the URL named the wildcard itself, which no client on Windows can connect to, the
-    certificate named only the wildcard, and a bind set only in the settings TOML was not read."""
+    change the certificate named only the wildcard."""
     from messagefoundry.tray.poller import StatusPoller
     from messagefoundry.tray.state import ScmState
     from messagefoundry.tray.winsvc import ScmReading
 
     with _engine_minted_for(bind_host, dial_host, tmp_path) as (port, cert):
-        cfg = _load_tray_config(tmp_path, bind_host, port, source)
+        cfg = _load_tray_config(tmp_path, bind_host, port)
         assert cfg.engine_url == build_engine_url(dial_host, port, tls=True)
         assert cfg.engine_cacert == cert
-        assert cfg.monitor_only is False  # a wildcard bind is still this box's engine
+        assert cfg.monitor_only is True  # a wildcard bind listens on every interface
         poller = StatusPoller(
             cfg, on_update=lambda _r: None, scm_reader=lambda _n: ScmReading(ScmState.RUNNING)
         )

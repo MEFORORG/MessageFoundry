@@ -26,15 +26,6 @@ with it. No trust store holds that certificate, so an https URL alone still fail
 renders a running engine as ``DOWN``. :func:`generated_cert_path` finds the minted certificate from
 the same registry hints and settings TOML the scheme comes from, and :class:`TrayConfig` carries it
 as ``engine_cacert`` for :mod:`messagefoundry.tray.probe` to pin.
-
-**The bind is not always a dialable URL host** (BACKLOG #5973). The tray takes the engine's bind
-from ``serve --host/--port``, else from its settings TOML (:func:`service_toml_bind`), else from the
-engine's defaults. It does not see the engine's environment layer (``MEFOR_*`` variables in the
-service's environment), which outranks the TOML; ``engine_url`` in ``tray.toml`` covers that. A
-wildcard bind (``0.0.0.0``, ``::``) is not an address a client can connect to, so
-:func:`dial_target` dials the loopback of its family instead, and the engine names that loopback in
-the certificate it mints for a wildcard bind (``api/tls.py``), so the probe verifies the certificate
-against the address it dials, as before.
 """
 
 from __future__ import annotations
@@ -61,14 +52,13 @@ from messagefoundry.api_tls_source import (
 )
 from messagefoundry.service_status import is_safe_service_name
 
+# The engine's own [api] defaults, which a `serve` command line naming only one of --host and --port
+# keeps for the other (BACKLOG #5936).
+_DEFAULT_BIND_HOST = "127.0.0.1"
+_DEFAULT_BIND_PORT = 8765
 # https because the engine serves TLS by default (ADR 0172). Plain http is right only behind a
 # declared upstream terminator, and the tray learns that from the engine's settings, not by default.
-# The engine's own [api] host and port defaults (config/settings.py ApiSettings, and
-# SecuritySettings.listen_address), copied because the tray may not import config/;
-# tests/test_tray_config.py pins them equal.
-_DEFAULT_API_HOST = "127.0.0.1"
-_DEFAULT_API_PORT = 8765
-DEFAULT_ENGINE_URL = f"https://{_DEFAULT_API_HOST}:{_DEFAULT_API_PORT}"
+DEFAULT_ENGINE_URL = f"https://{_DEFAULT_BIND_HOST}:{_DEFAULT_BIND_PORT}"
 DEFAULT_SERVICE_NAME = "MessageFoundry"
 DEFAULT_POLL_SECONDS = 5.0
 _POLL_MIN_S = 1.0
@@ -83,8 +73,6 @@ _MAX_PATH_LEN = 4096
 _DEFAULT_SERVICE_TOML = "messagefoundry.toml"
 # The engine's default [store].path, resolved the same way. The minted pair sits beside it.
 _DEFAULT_STORE_PATH = "messagefoundry.db"
-# The spellings of false the engine's settings model accepts for a bool (pydantic's lax mode).
-_FALSE_WORDS = frozenset({"0", "off", "f", "false", "n", "no"})
 
 
 @dataclass(frozen=True)
@@ -98,16 +86,22 @@ class TrayConfig:
     log_path: str | None = None
     #: A PEM the probe pins as its ONLY trust anchor, or ``None`` for the OS trust store.
     engine_cacert: str | None = None
+    #: True when ``serve --host`` names a wildcard (unspecified) address. The probe then connects
+    #: on loopback, but the bind itself listens on every interface, so it stays monitor-only.
+    bind_unspecified: bool = False
 
     @property
     def monitor_only(self) -> bool:
         """A **remote** engine → monitor-only (service control + Open-Repo disabled).
 
-        Keyed on locality alone: a loopback engine is controllable whether it serves http or
-        https (see the module docstring). Only a non-loopback host degrades the tray, because
-        only then are "start the local service" and "open the local repo" meaningless.
+        Keyed on locality, never on the scheme: a loopback engine is controllable whether it
+        serves http or https (see the module docstring). A non-loopback host degrades the tray,
+        because then "start the local service" and "open the local repo" are meaningless.
+
+        A wildcard bind named by ``serve --host`` is monitor-only too, though the tray probes it
+        on loopback: it listens on every interface, so it is not a loopback-only engine.
         """
-        return not is_local_engine(self.engine_url)
+        return self.bind_unspecified or not is_local_engine(self.engine_url)
 
 
 @dataclass(frozen=True)
@@ -330,6 +324,20 @@ def _last_path_option(app_parameters: str, flags: frozenset[str]) -> str | None:
     return found
 
 
+def _is_unspecified(host: str) -> bool:
+    """Whether ``host`` is a wildcard (unspecified) address, ``0.0.0.0`` or ``::`` in any spelling."""
+    return wildcard_loopback(host) is not None
+
+
+def _probe_host(host: str) -> str:
+    """``host``, or the loopback of its family when it is a wildcard (unspecified) address.
+
+    No client can connect to a wildcard address, and a wildcard bind accepts on loopback too. The
+    loopback is :func:`messagefoundry.api_tls_source.wildcard_loopback`, the same rule that names
+    it in the certificate the engine mints for a wildcard bind (BACKLOG #5973)."""
+    return wildcard_loopback(host) or host
+
+
 def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -> str | None:
     """A validated ``http(s)://host:port`` URL, or ``None`` if either part is missing/invalid.
 
@@ -343,54 +351,9 @@ def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -
         return None
     # A bare IPv6 literal must be bracketed or the ':'s read as the port separator — `serve
     # --host ::1` would otherwise yield the unparseable "http://::1:8765".
+    host = _probe_host(host)
     authority = f"[{host}]" if ":" in host and not host.startswith("[") else host
     return f"{'https' if tls else 'http'}://{authority}:{port}"
-
-
-def dial_target(bind_host: str) -> str:
-    """The address to dial for an engine bound to ``bind_host``. Pure.
-
-    A **wildcard** bind is dialled on the loopback of its family, the address the engine also names
-    in the certificate it mints for that bind (:func:`messagefoundry.api_tls_source.wildcard_loopback`).
-    Any other host is dialled as written.
-    """
-    return wildcard_loopback(bind_host) or bind_host
-
-
-def _is_false(value: object) -> bool:
-    """Whether the engine's settings model reads ``value`` as ``False`` for a bool field."""
-    if isinstance(value, bool):
-        return value is False
-    if isinstance(value, int):
-        return value == 0
-    return isinstance(value, str) and value.strip().lower() in _FALSE_WORDS
-
-
-def service_toml_bind(service_toml: dict[str, object] | None) -> tuple[str | None, int | None]:
-    """The API bind host and port that the engine's raw, untrusted settings TOML sets. Pure.
-
-    Mirrors the engine's own reading (``config/settings.py``, ``_desugar_security``): the TOML names
-    the host only through ``[security]``, as ``listen_address`` once ``local_access_only`` is
-    ``false``, and the engine refuses ``[api].host`` in the file. With ``local_access_only`` absent
-    or ``true`` the bind is loopback, which the default already says, so the host comes back
-    ``None``. ``local_access_only`` and ``[api].port`` are read with the engine's settings model's
-    coercions: a spelling of false such as ``"no"`` or ``0``, and a port given as a string of digits.
-    Each value comes back ``None`` when absent or not plausible.
-    """
-    toml = service_toml or {}
-    host: str | None = None
-    security = toml.get("security")
-    if isinstance(security, dict) and _is_false(security.get("local_access_only", True)):
-        raw_host = security.get("listen_address", _DEFAULT_API_HOST)
-        host = raw_host if isinstance(raw_host, str) and _valid_host(raw_host) else None
-    api = toml.get("api")
-    raw_port = api.get("port") if isinstance(api, dict) else None
-    port: int | None = None
-    if isinstance(raw_port, str) and raw_port.strip().isascii() and raw_port.strip().isdigit():
-        raw_port = int(raw_port.strip())
-    if isinstance(raw_port, int) and not isinstance(raw_port, bool) and 1 <= raw_port <= 65535:
-        port = raw_port
-    return host, port
 
 
 def _clean_path_hint(value: object) -> str | None:
@@ -499,14 +462,13 @@ def compose_config(
     *,
     engine_tls: bool = True,
     engine_cacert: str | None = None,
-    engine_bind: tuple[str | None, int | None] = (None, None),
 ) -> TrayConfig:
     """Merge built-in defaults ← registry hints ← TOML (TOML wins). Pure.
 
-    ``engine_bind`` is the host and port the engine's settings TOML sets (see
-    :func:`service_toml_bind`). A ``serve --host``/``--port`` flag overrides each, as ``serve`` does,
-    and the engine's own defaults fill whatever neither names. The host then goes through
-    :func:`dial_target`. An explicit ``engine_url`` in ``tray.toml`` still wins over all of it.
+    A ``serve`` command line that names only one of ``--host`` and ``--port`` keeps the engine's
+    default for the other, so a bind named only in part still yields the engine's URL (BACKLOG
+    #5936). The host and port come from the registry hints alone, never from the engine's
+    settings file (ADR 0113 amendment 2026-07-22).
 
     ``engine_tls`` scheme-corrects the *registry-derived* URL only; an explicit ``engine_url`` in
     ``tray.toml`` already carries its own scheme and always wins. It defaults to True for the same
@@ -524,16 +486,21 @@ def compose_config(
     repo_path: str | None = None
     poll_seconds = DEFAULT_POLL_SECONDS
     log_path: str | None = None
+    bind_unspecified = False
 
     # Registry hints (untrusted; validated).
     if reg is not None:
-        flag_host, flag_port = parse_serve_args(reg.app_parameters or "")
-        toml_host, toml_port = engine_bind
-        dial_host = dial_target(flag_host or toml_host or _DEFAULT_API_HOST)
-        port = flag_port or toml_port or _DEFAULT_API_PORT
-        url_hint = build_engine_url(dial_host, port, tls=engine_tls)
+        host_hint, port_hint = parse_serve_args(reg.app_parameters or "")
+        # Built even when nothing names a part, so the scheme still follows engine_tls: an engine
+        # behind a declared upstream terminator speaks http on the default bind too.
+        url_hint = build_engine_url(
+            host_hint or _DEFAULT_BIND_HOST,
+            port_hint or _DEFAULT_BIND_PORT,
+            tls=engine_tls,
+        )
         if url_hint is not None:
             engine_url = url_hint
+            bind_unspecified = host_hint is not None and _is_unspecified(host_hint)
         repo_path = (
             parse_project_root_arg(reg.app_parameters or "")
             or _clean_path_hint(reg.app_directory)
@@ -547,6 +514,7 @@ def compose_config(
         if isinstance(raw_url, str) and raw_url:
             engine_url = raw_url
             cacert = None
+            bind_unspecified = False
         raw_cacert = _clean_path_hint(toml_data.get("engine_cacert"))
         if raw_cacert is not None and Path(raw_cacert).is_absolute():
             cacert = raw_cacert
@@ -566,6 +534,7 @@ def compose_config(
         poll_seconds=poll_seconds,
         log_path=log_path,
         engine_cacert=cacert,
+        bind_unspecified=bind_unspecified,
     )
 
 
@@ -591,19 +560,38 @@ def _read_toml(path: Path) -> dict[str, object] | None:
 def service_toml_path(reg: ServiceRegistryInfo | None) -> Path | None:
     """Where the engine service's settings TOML lives, per its NSSM registry entry — or ``None``.
 
-    Mirrors ``serve``'s own resolution: an explicit ``--service-config`` (relative paths resolve
-    against the service's working directory, which NSSM records as ``AppDirectory``), else
-    ``<AppDirectory>/messagefoundry.toml``. Both inputs are untrusted registry strings, already
-    length/NUL-validated by :func:`_clean_path_hint`; the result is only ever *read*.
+    Mirrors ``serve``'s own resolution (ADR 0050): an explicit ``--service-config``, where a
+    relative path resolves under ``--project-root`` when one is given and otherwise against the
+    service's working directory, which NSSM records as ``AppDirectory``; else
+    ``<AppDirectory>/messagefoundry.toml``. A relative ``--project-root`` is joined to
+    ``AppDirectory`` as ``serve`` joins it to its working directory, so a Windows drive-relative
+    ``\\repo`` lands at the root of that directory's drive. Under a root, a ``--service-config``
+    with a leading separator keeps its tail under the root, as ``serve``'s anchor does. The inputs
+    are untrusted registry strings,
+    already length/NUL-validated by :func:`_clean_path_hint`; the result is only ever *read*.
     """
     if reg is None:
         return None
     base = _clean_path_hint(reg.app_directory)
-    explicit = parse_service_config_arg(reg.app_parameters or "")
+    params = reg.app_parameters or ""
+    explicit = parse_service_config_arg(params)
     if explicit is not None:
         candidate = Path(explicit)
         if candidate.is_absolute():
             return candidate
+        root = parse_project_root_arg(params)
+        if root is not None:
+            anchor = Path(root)
+            if not anchor.is_absolute():
+                if not base:
+                    return None
+                # serve's resolve_values_base_dir joins it to the working directory, drive-relative
+                # or not (it warns on a drive-relative one and still uses it).
+                anchor = Path(base) / anchor
+            # Drop a leading separator (``\x``) so the tail stays under the root, as serve's
+            # anchor_under_root does. A drive-letter relative ``C:x`` keeps its drive, as there.
+            drop = 1 if candidate.root and not candidate.drive else 0
+            return anchor.joinpath(*candidate.parts[drop:])
         return Path(base) / candidate if base else None
     return Path(base) / _DEFAULT_SERVICE_TOML if base else None
 
@@ -614,9 +602,8 @@ def load_config(config_dir: Path, reader: RegistryReader | None = None) -> TrayC
     Missing file → all defaults. A malformed TOML file is treated as absent (defaults + hints).
     The engine's *own* settings TOML is also read — read-only, fail-soft — for what the registry
     cannot carry: which scheme the API bind serves (since ADR 0172 not the question "is a cert
-    configured", see :func:`engine_serves_https`), where the minted certificate is
-    (:func:`generated_cert_path`), and a bind ``serve`` flags do not name
-    (:func:`service_toml_bind`).
+    configured", see :func:`engine_serves_https`), and where the minted certificate is
+    (:func:`generated_cert_path`).
     """
     toml_data = _read_toml(config_dir / "tray.toml")
 
@@ -632,7 +619,6 @@ def load_config(config_dir: Path, reader: RegistryReader | None = None) -> TrayC
         reg,
         engine_tls=engine_serves_https(service_toml),
         engine_cacert=generated_cert_path(service_toml, reg),
-        engine_bind=service_toml_bind(service_toml),
     )
 
 

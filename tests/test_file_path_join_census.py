@@ -1084,7 +1084,7 @@ SITES: dict[str, Site] = {
     "messagefoundry/tray/config.py::ensure_tray_toml": Site(1, INTERNAL, _TRAY_FIXED),
     "messagefoundry/tray/config.py::generated_cert_path": Site(2, OPERATOR, _TRAY_SERVICE),
     "messagefoundry/tray/config.py::load_config": Site(1, INTERNAL, _TRAY_FIXED),
-    "messagefoundry/tray/config.py::service_toml_path": Site(2, OPERATOR, _TRAY_SERVICE),
+    "messagefoundry/tray/config.py::service_toml_path": Site(4, OPERATOR, _TRAY_SERVICE),
     "messagefoundry/tray/iconset.py::<module>": Site(1, INTERNAL, _PKG_LITERAL),
     "messagefoundry/tray/iconset.py::icon_path": Site(
         1, INTERNAL, "An icon name built from fixed state and theme values."

@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from harness._async import join_worker_thread
 from harness._console_widgets import ConfigurableTable
 from harness.file_transport import DropResult, FileDropWorker
 from harness.mllp import SendItem, SendResult, SendWorker
@@ -216,22 +217,29 @@ class ComposePanel(QWidget):
         )
 
     def _on_finished(self) -> None:
+        worker = self._worker
+        failure = worker.failure if worker is not None else ""
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait()
         self._worker = None
         self._thread = None
         self._send_btn.setEnabled(True)
+        if failure:
+            # A fault the worker's run() caught ended the send without a result row: say why,
+            # rather than end it silently.
+            transport = "MLLP" if isinstance(worker, SendWorker) else "File"
+            self._append(transport, "—", "no", f"ended early: {failure}", expected="—")
 
     def shutdown(self) -> None:
         """Stop and join the worker thread so the window can close cleanly."""
         if self._worker is not None:
             self._worker.stop()
         if self._thread is not None:
-            self._thread.quit()
-            if not self._thread.wait(6000):
-                self._thread.terminate()
-                self._thread.wait()
+            # The send worker sees stop() while dialling too, so this join is normally prompt.
+            # What stop() cannot interrupt, a name lookup say, is waited out, never terminated
+            # (BACKLOG #5947).
+            join_worker_thread(self._thread)
             self._thread = None
         self._worker = None
 

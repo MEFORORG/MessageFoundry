@@ -14,12 +14,18 @@ ticks its opt-in to send frame bytes on purpose; only then does it pass the bare
 from __future__ import annotations
 
 import contextlib
+import errno
+import logging
+import os
+import select
 import socket
+import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtNetwork import QHostAddress, QTcpServer, QTcpSocket
@@ -90,10 +96,73 @@ def _ack_code(ack_text: str) -> str:
         return "?"
 
 
+# How often a dial in progress looks at the stop flag, so stop() is seen within about this long
+# rather than after the whole connect timeout (BACKLOG #5947).
+_STOP_POLL_S = 0.1
+# What a non-blocking connect_ex returns while the dial is still in progress. On Windows that is
+# WSAEWOULDBLOCK alone. On POSIX it is EINPROGRESS, or EINTR, after which the connect goes on
+# asynchronously (CPython bpo-23618), so both are polled. An EAGAIN or EWOULDBLOCK there is a dial
+# that failed, so it surfaces as the error a blocking dial would have raised.
+_WSAEWOULDBLOCK = 10035
+_DIAL_IN_PROGRESS_POSIX = frozenset({errno.EINPROGRESS, errno.EINTR})
+_DIAL_IN_PROGRESS_WINDOWS = frozenset({getattr(errno, "WSAEWOULDBLOCK", _WSAEWOULDBLOCK)})
+
+
+def _dial_in_progress(code: int) -> bool:
+    """Whether ``code`` from a non-blocking ``connect_ex`` means the dial is still in progress."""
+    if sys.platform == "win32":
+        return code in _DIAL_IN_PROGRESS_WINDOWS
+    return code in _DIAL_IN_PROGRESS_POSIX
+
+
+# The socket constructor the dial uses; a seam for a test that needs a dial which never settles.
+_open_socket = socket.socket
+
+log = logging.getLogger(__name__)
+
+
+def pause_unless_stopped(stop: threading.Event, seconds: float) -> bool:
+    """Sleep ``seconds``, or less if ``stop`` is set meanwhile; return True if it is set.
+
+    ``time.sleep`` in :data:`_STOP_POLL_S` slices rather than one ``Event.wait``: on Windows an
+    ``Event.wait`` rounds up to the system timer tick, about 15 ms, which would cap a rate of
+    1000 messages a second at about 65."""
+    deadline = time.monotonic() + seconds
+    while not stop.is_set():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(remaining, _STOP_POLL_S))
+    return True
+
+
+def _socket_error(code: int) -> OSError:
+    """The OSError for a failed dial's ``code``. On Windows the ``winerror`` argument picks the
+    subclass a blocking connect raises, such as ``ConnectionRefusedError`` for 10061, and the text
+    comes from ``socket.errorTab``, the standard library's table of Winsock messages."""
+    if sys.platform == "win32":
+        table: dict[int, str] = getattr(socket, "errorTab", {})
+        return OSError(None, table.get(code, f"Winsock error {code}"), None, code)
+    return OSError(code, os.strerror(code))
+
+
+def _dial_settled(sock: socket.socket, wait_s: float) -> bool:
+    """Whether a non-blocking dial has finished, either way, within ``wait_s``. Windows reports a
+    failed dial only as an exceptional condition, so ``select`` watches for both there; elsewhere
+    ``poll`` has no descriptor-number ceiling, which ``select`` has."""
+    if not hasattr(select, "poll"):
+        _, writable, failed = select.select([], [sock], [sock], wait_s)
+        return bool(writable or failed)
+    poller = select.poll()
+    poller.register(sock, select.POLLOUT)
+    return bool(poller.poll(wait_s * 1000))
+
+
 class SendWorker(QObject):
     """Sends a batch of messages over MLLP, emitting one :class:`SendResult` per message.
 
-    Lives in a worker thread: ``run`` blocks on sockets; :meth:`stop` is a thread-safe flag.
+    Lives in a worker thread: ``run`` blocks on sockets; :meth:`stop` is thread-safe and is seen
+    promptly, whether the worker is dialling, waiting for an ACK, or pausing between messages.
     """
 
     result = Signal(object)  # SendResult
@@ -103,7 +172,7 @@ class SendWorker(QObject):
         self,
         host: str,
         port: int,
-        items: list[SendItem],
+        items: Iterable[SendItem],
         *,
         timeout: float,
         rate: float,
@@ -119,28 +188,87 @@ class SendWorker(QObject):
         self._timeout = timeout
         self._rate = rate
         self._expect_ack = expect_ack  # False: NONE-ack inbound — confirm no ACK in a short window
-        self._stop = False
+        self._stop = threading.Event()
         self._lock = threading.Lock()
         self._sock: socket.socket | None = None
+        # Set before finished when the batch ended on a fault, so the tab can say so.
+        self.failure = ""
 
     def stop(self) -> None:
         """Stop between messages, and interrupt an in-flight blocking recv on the current socket
-        (so Stop / app-close don't hang for the full timeout against a slow or silent peer)."""
-        self._stop = True
+        (so Stop / app-close don't hang for the full timeout against a slow or silent peer). A dial
+        in progress and a pause between messages see the flag within :data:`_STOP_POLL_S`."""
+        self._stop.set()
         with self._lock:
             if self._sock is not None:
                 with contextlib.suppress(OSError):
                     self._sock.shutdown(socket.SHUT_RDWR)
 
     def run(self) -> None:
-        delay = 1.0 / self._rate if self._rate > 0 else 0.0
-        for item in self._items:
-            if self._stop:
+        # The items may be generated lazily on this thread, so a generator fault ends the batch
+        # here; finished is emitted whatever happens, or the tab would wait on it for good.
+        try:
+            delay = 1.0 / self._rate if self._rate > 0 else 0.0
+            for item in self._items:
+                if self._stop.is_set():
+                    break
+                self.result.emit(self._send_one(item))
+                if delay and pause_unless_stopped(self._stop, delay):
+                    break
+        except Exception as exc:  # noqa: BLE001 -- any fault ends the batch; the tab must hear why
+            log.exception("harness send batch ended early")
+            self.failure = f"{type(exc).__name__}: {exc}"
+        finally:
+            self.finished.emit()
+
+    def _connect(self) -> socket.socket:
+        """``socket.create_connection`` with the same timeout for each address, but each dial is
+        a non-blocking connect polled in :data:`_STOP_POLL_S` slices, so :meth:`stop` aborts it. A
+        blocking dial could not be interrupted, and held a window close for the whole connect
+        timeout. The name lookup before it still blocks."""
+        last: OSError | None = None
+        for family, kind, proto, _name, addr in socket.getaddrinfo(
+            self._host, self._port, type=socket.SOCK_STREAM
+        ):
+            sock: socket.socket | None = None
+            try:
+                sock = _open_socket(family, kind, proto)
+                self._dial(sock, addr, time.monotonic() + self._timeout)
+            except OSError as exc:
+                if sock is not None:
+                    sock.close()
+                last = exc
+                if self._stop.is_set():
+                    break
+                continue
+            last = None  # an earlier address's error holds this frame in its traceback: a cycle
+            return sock
+        if last is None:
+            raise OSError("getaddrinfo returned no address")
+        try:
+            raise last
+        finally:
+            # The raised error's traceback holds this frame; dropping the local breaks that cycle,
+            # which would otherwise keep this worker alive until a collection on another thread.
+            last = None
+
+    def _dial(self, sock: socket.socket, addr: Any, deadline: float) -> None:
+        sock.setblocking(False)
+        code = sock.connect_ex(addr)
+        if code and not _dial_in_progress(code):
+            raise _socket_error(code)
+        while code:
+            if self._stop.is_set():
+                raise ConnectionAbortedError("stopped while connecting")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out")
+            if _dial_settled(sock, min(_STOP_POLL_S, remaining)):
+                code = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                if code:
+                    raise _socket_error(code)
                 break
-            self.result.emit(self._send_one(item))
-            if delay:
-                time.sleep(delay)
-        self.finished.emit()
+        sock.settimeout(self._timeout)
 
     def _send_one(self, item: SendItem) -> SendResult:
         start = time.monotonic()
@@ -153,10 +281,15 @@ class SendWorker(QObject):
             latency = (time.monotonic() - start) * 1000.0
             return SendResult(item, False, "-", latency, f"not sent: {exc}")
         try:
-            with socket.create_connection((self._host, self._port), self._timeout) as sock:
+            with self._connect() as sock:
                 with self._lock:
                     self._sock = sock  # publish so stop() can interrupt a blocking recv
+                    # A stop() that ran between the dial and the publish found no socket to shut
+                    # down; read its flag under the same lock so it is not missed.
+                    stopped = self._stop.is_set()
                 try:
+                    if stopped:
+                        raise ConnectionAbortedError("stopped before sending")
                     sock.settimeout(self._timeout)
                     sock.sendall(wire)
                     if not self._expect_ack:
@@ -166,7 +299,7 @@ class SendWorker(QObject):
                     decoder = MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES)
                     ack = b""
                     while not ack:
-                        chunk = sock.recv(4096)
+                        chunk = self._recv(sock)
                         if not chunk:
                             raise ConnectionError("peer closed before sending an ACK")
                         for message in decoder.feed(chunk):
@@ -184,6 +317,25 @@ class SendWorker(QObject):
         except OSError as exc:
             latency = (time.monotonic() - start) * 1000.0
             return SendResult(item, False, "-", latency, str(exc))
+
+    def _recv(self, sock: socket.socket) -> bytes:
+        """``sock.recv(4096)`` under the worker's timeout, waited in :data:`_STOP_POLL_S` slices so
+        :meth:`stop` is seen. Shutting the socket down does not wake a blocked receive on every
+        platform while the peer stays silent; Windows is one where it does not."""
+        deadline = time.monotonic() + self._timeout
+        while True:
+            if self._stop.is_set():
+                raise ConnectionAbortedError("stopped while waiting for an ACK")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out")
+            sock.settimeout(min(_STOP_POLL_S, remaining))
+            try:
+                return sock.recv(4096)
+            except TimeoutError:
+                continue
+            finally:
+                sock.settimeout(self._timeout)
 
     def _read_no_ack(self, item: SendItem, sock: socket.socket, start: float) -> SendResult:
         """Fire-and-forget: confirm no ACK arrives in a short window (a NONE-ack inbound sends
