@@ -289,7 +289,8 @@ def plan_rename(
     # binding). Keep each py referrer's sites, so a referrer we could not rewrite is surfaced, not
     # dropped -- including one whose source, or one of whose captured values, could not be located.
     referrers: list[tuple[Reference, list[_Site], bool]] = []
-    for ref in index.referrers(target_kind, old):
+    indexed = index.referrers(target_kind, old)
+    for ref in [*indexed, *_scanned_referrers(registry, indexed, target_kind, old, sources)]:
         found = _referrer_sites(registry, ref, old, target_kind, sources, toml_targets)
         if found is None:
             continue
@@ -485,7 +486,9 @@ class _Site:
     a referent at all and so are neither rewritten nor counted: the referrer's own registering
     ``@handler("name")`` argument, when the referrer is named like the target. ``reads`` holds the
     ids of the function's name reads a role takes or that do not depend on the value, so a module
-    binding read anywhere else in the body is not rewritten."""
+    binding read anywhere else in the body is not rewritten. ``returned`` holds the referent
+    positions a helper (``helper``, its name) hands back as its return value: rewriting one changes
+    every caller's value, so each call must be one a role reads."""
 
     file: str
     span: _Span
@@ -493,6 +496,8 @@ class _Site:
     rewritable: frozenset[tuple[int, int]] | None = None
     ignored: frozenset[tuple[int, int]] = frozenset()
     reads: frozenset[int] = frozenset()
+    returned: frozenset[tuple[int, int]] = frozenset()
+    helper: str | None = None
 
     def rewrites(
         self,
@@ -617,10 +622,18 @@ def _referrer_sites(
                 # ``ignored`` holds bare positions in the decorator's own file; a helper elsewhere
                 # at the same (line, col) is a referent and must stay counted.
                 own = ignored if file == own_file else frozenset()
-                sites.append(_Site(file, span, None, frozenset(rewritable), own, scan.reads))
+            # A helper's return value is read by its callers, each of which must be in a role.
+            returned = frozenset(scan.returned) if depth > 0 else frozenset()
+            helper = func.__name__ if depth > 0 else None
+            if table_kind is None or depth == 0:
+                # ``ignored`` holds bare positions in the decorator's own file; a helper elsewhere
+                # at the same (line, col) is a referent and must stay counted.
+                own = ignored if file == own_file else frozenset()
+                site = _Site(file, span, None, frozenset(rewritable), own, scan.reads)
             else:
                 allowed = _accessor_positions(sources, file, span, old, table_kind) | rewritable
-                sites.append(_Site(file, span, frozenset(allowed), reads=scan.reads))
+                site = _Site(file, span, frozenset(allowed), reads=scan.reads)
+            sites.append(replace(site, returned=returned, helper=helper))
         # A local that carries a rewritten literal into another read leaves the referrer unresolved.
         complete = complete and not any(scan.unsafe for scan in scans)
         for func in reached:
@@ -650,6 +663,35 @@ def _referrer_sites(
             return None
         return [], False
     return None
+
+
+def _scanned_referrers(
+    registry: Registry,
+    indexed: list[Reference],
+    target_kind: str,
+    old: str,
+    sources: SourceCache,
+) -> list[Reference]:
+    """The handlers (for an outbound) or routers (for a handler) the reverse index has no edge
+    from, whose role scan still finds ``old`` in a referent role: a name a helper returns
+    (``Send(_route("ADT"), msg)``), one read out of a module table, and other forms the wiring
+    graph does not follow. Left out, their literal would keep the old name while the plan reported
+    success (BACKLOG #5980); taken in, each is rewritten or reported unresolved like any other."""
+    table: Mapping[str, object]
+    if target_kind == "outbound":
+        kind, table = "handler", registry.handlers
+    elif target_kind == "handler":
+        kind, table = "router", registry.routers
+    else:
+        return []
+    known = {ref.referrer for ref in indexed if ref.referrer_kind == kind}
+    out: list[Reference] = []
+    for name in sorted(set(table) - known):
+        ref = Reference(kind, name, target_kind, old)
+        found = _referrer_sites(registry, ref, old, target_kind, sources, set())
+        if found is not None and any(site.rewritable for site in found[0]):
+            out.append(ref)
+    return out
 
 
 def _accessor_positions(
@@ -780,6 +822,8 @@ class _Scan:
     # whether a local carries a rewritten literal into some other read.
     reads: frozenset[int] = frozenset()
     unsafe: bool = False
+    # The referent positions this function hands back as its return value.
+    returned: set[tuple[int, int]] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -966,12 +1010,17 @@ def _scan_function(
             _carried_elements(root, values, set(), back)
         else:
             _carried(root, values, set(), back)
-    positions = {
-        pos
-        for const in (*sink.consts, *back.consts)
-        if const.value == old
-        and span.start <= (pos := sources.position(file, const))[0] <= span.end
-    }
+
+    def in_span(consts: list[ast.Constant]) -> set[_Pos]:
+        return {
+            pos
+            for const in consts
+            if const.value == old
+            and span.start <= (pos := sources.position(file, const))[0] <= span.end
+        }
+
+    returned_positions = in_span(back.consts)
+    positions = in_span(sink.consts) | returned_positions
     # A name a role reads may also be read elsewhere -- in a comparison, a log line, a lookup.
     # Rewriting its value changes that read too, so such a name gives no role (BACKLOG #5980).
     reads = sink.read | back.read | _value_agnostic_reads(body)
@@ -1015,6 +1064,7 @@ def _scan_function(
         iter_passes=slots_of(back.iterated) - own_iter_slots,
         reads=frozenset(reads),
         unsafe=unsafe,
+        returned=returned_positions,
     )
 
 
@@ -1257,6 +1307,8 @@ def _carried_call(
             _carried(call.args[1], values, seen, flow)
     elif (helper := _helper_name(call.func, flow.modules)) is not None:
         flow.calls.add(helper)
+        # The helper's name is read here for its return value, which is in a role.
+        flow.read.add(id(call.func))
         # This call's value is in a role, so a pass-through helper's argument is too.
         for root in _slot_arguments(call, flow.passes.get(helper, ())):
             _carried(root, values, seen, flow)
@@ -1621,7 +1673,9 @@ def _binding_read_only_by_referents(
     as a referent. Any other read -- a second declaration (``inbound(NAME, router=NAME)``), another
     object's decorator (``@handler(NAME)``), module-level code, a function no referrer covers, a
     config module that imports it -- would change with it, so the literal is not rewritten: the
-    definition then counts as not located, and a referrer as unresolved (BACKLOG #5980)."""
+    definition then counts as not located, and a referrer as unresolved (BACKLOG #5980). A literal
+    a helper returns is read by every call of the helper, so it is held to the same rule, and so
+    is a read in a covered body that no role takes (:attr:`_Site.reads`)."""
     names: set[str] = set()
     for stmt, stmt_names in _module_bindings(sources, file, None):
         if stmt.value is not None and any(
@@ -1629,6 +1683,12 @@ def _binding_read_only_by_referents(
             for node in ast.walk(stmt.value)
         ):
             names |= stmt_names
+    # A helper's returned literal is read by every call of the helper, the same way.
+    names |= {
+        site.helper
+        for site in covering
+        if site.helper is not None and site.file == file and pos in site.returned
+    }
     if not names:
         return True
     if len(declaring) > 1 or modules is None:

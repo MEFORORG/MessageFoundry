@@ -245,3 +245,114 @@ def test_a_value_agnostic_read_keeps_the_rename_resolved(tmp_path: Path, body: s
     apply_rename(plan)
     assert '"OB_OLD"' not in _text(config_dir)
     load_config(config_dir)
+
+
+@pytest.mark.parametrize(
+    "prelude",
+    [
+        'TARGETS = {"ADT": "OB_OLD"}\n\n\ndef _route(kind):\n    return TARGETS[kind]\n',
+        'def _route(kind):\n    return "OB_OLD"\n',
+    ],
+)
+def test_a_referrer_the_index_has_no_edge_from_is_rewritten(tmp_path: Path, prelude: str) -> None:
+    """Step 8: a name that reaches Send through a helper or a module table gives the wiring graph
+    no edge, so the plan renamed the outbound and left the handler sending to the old name."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "mod.py": _HEAD + _WIRE + prelude + '\n@handler("h_p")\n'
+            "def h_p(msg):\n"
+            '    return Send(_route("ADT"), msg)\n'
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert '"OB_OLD"' not in _text(config_dir)
+    load_config(config_dir)
+
+
+def test_a_router_the_index_has_no_edge_from_is_rewritten(tmp_path: Path) -> None:
+    """Step 8: the same for a handler name a router reads out of a module table."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "mod.py": _HEAD + 'inbound("IB_P", MLLP(port=2901), router="r_p")\n'
+            'outbound("OB_A", MLLP(host="127.0.0.1", port=6902))\n'
+            "\n"
+            'ROUTES = {"ADT": ["h_old"]}\n'
+            "\n"
+            '@router("r_p")\n'
+            "def r_p(msg):\n"
+            '    return ROUTES.get("ADT", [])\n'
+            "\n"
+            '@handler("h_old")\n'
+            "def h_old(msg):\n"
+            '    return Send("OB_A", msg)\n'
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "handler", "h_old", "h_new")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert 'ROUTES = {"ADT": ["h_new"]}' in _text(config_dir)
+    load_config(config_dir)
+
+
+@pytest.mark.parametrize(
+    ("reader", "routes"),
+    [
+        # Another handler compares with the same helper's return.
+        (
+            '@handler("h_q")\ndef h_q(msg):\n    if str(msg) == _dest():\n        return None\n'
+            '    return Send("OB_A", msg)\n',
+            '["h_p", "h_q"]',
+        ),
+        # Module-level code reads it.
+        ("DEFAULT = _dest()\n", '["h_p"]'),
+    ],
+)
+def test_a_shared_helper_return_read_outside_a_role_reports_the_referrer(
+    tmp_path: Path, reader: str, routes: str
+) -> None:
+    """Step 3: rewriting a helper's returned name changes every caller's value, so a caller that
+    reads it in no role would change silently."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "mod.py": _HEAD + _WIRE.replace('["h_p"]', routes) + "def _dest():\n"
+            '    return "OB_OLD"\n'
+            "\n"
+            '@handler("h_p")\n'
+            "def h_p(msg):\n"
+            "    return Send(_dest(), msg)\n"
+            "\n" + reader
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert _H_P in plan.unresolved
+    apply_rename(plan)
+    assert 'return "OB_OLD"' in _text(config_dir)
+
+
+def test_a_shared_helper_return_every_referrer_sends_is_rewritten(tmp_path: Path) -> None:
+    """Step 3: two handlers that both send a helper's return rename together."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "mod.py": _HEAD + _WIRE.replace('["h_p"]', '["h_p", "h_q"]') + "def _dest():\n"
+            '    return "OB_OLD"\n'
+            "\n"
+            '@handler("h_p")\n'
+            "def h_p(msg):\n"
+            "    return Send(_dest(), msg)\n"
+            "\n"
+            '@handler("h_q")\n'
+            "def h_q(msg):\n"
+            '    return [Send(_dest(), msg), Send("OB_A", msg)]\n'
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert '"OB_OLD"' not in _text(config_dir)
+    load_config(config_dir)
