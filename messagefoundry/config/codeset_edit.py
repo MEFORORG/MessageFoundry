@@ -211,11 +211,11 @@ def rename_code_set(
         # modules that call code_set("old"). PLAN the referent rewrite BEFORE moving the file — the
         # plan is built from the loaded graph while "old" still resolves (the loader would otherwise
         # fail on a code_set("old") capture whose table just vanished). impact.py owns the
-        # tokenize-safe rewriter, so it is never duplicated here. Best-effort + additive: the file
-        # rename is the core operation, so a config that doesn't load leaves the result
-        # byte-identical to the pre-#152 shape.
+        # tokenize-safe rewriter, so it is never duplicated here. A config that does not load has
+        # referents nobody can find, so the rename refuses rather than move the file under them
+        # (BACKLOG #5980).
         plan = _plan_code_set_referents(config_dir, old, new)
-        if plan is not None and plan.unresolved:
+        if plan.unresolved:
             # A referrer the planner could not rewrite would still read the old name once the file
             # moved, so the table would vanish under it. Refuse before anything moves (BACKLOG #5980).
             named = ", ".join(f"{r.referrer_kind} {r.referrer!r}" for r in plan.unresolved)
@@ -230,12 +230,19 @@ def rename_code_set(
         result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
         # The referent rewrite stays under the lock: a second rename planned between the move
         # and the rewrite would read literals naming a table that is already gone.
-        if plan is not None:
-            from messagefoundry.config import impact
+        from messagefoundry.config import impact
 
+        try:
             rewritten = len(impact.apply_rename(plan))
-            if rewritten:
-                result["referents_rewritten"] = rewritten
+        except (WiringError, OSError, UnicodeDecodeError):
+            # A referent file changed after the plan, or could not be read. apply_rename checks
+            # and reads every file before it writes one, so it wrote nothing, and moving the table
+            # back leaves the config as it was rather than half renamed.
+            with atomic_edit.refused_as(dest, WiringError, f"rename it back to {src.name}"):
+                replace_generated(dest, src)
+            raise
+        if rewritten:
+            result["referents_rewritten"] = rewritten
     return result
 
 
@@ -644,18 +651,25 @@ def _write_validated(path: Path, new_text: str, validate: Validate) -> None:
 
 def _plan_code_set_referents(config_dir: str | Path, old: str, new: str) -> Any:
     """The :class:`~messagefoundry.config.impact.RenamePlan` rewriting a code set's ``code_set("old")``
-    referents to ``new``, or ``None`` when the graph can't be loaded / ``old`` isn't referenced. Built
-    while ``old`` still resolves (call BEFORE moving the file). The tokenize-safe rewriter lives in
-    :mod:`messagefoundry.config.impact` and is never duplicated here."""
-    registry = _load_referent_registry(config_dir)
-    if registry is None:
-        return None
+    referents to ``new``. Built while ``old`` still resolves (call BEFORE moving the file). The
+    tokenize-safe rewriter lives in :mod:`messagefoundry.config.impact` and is never duplicated here.
+
+    Raises :class:`WiringError` when no plan can be built: a config that does not load, or a plan
+    the planner refuses. The referents are then unknown, and moving the file would leave every
+    ``code_set("old")`` reading a table that is gone while the rename reported success (BACKLOG
+    #5980)."""
     from messagefoundry.config import impact
+    from messagefoundry.config.wiring import load_config
 
     try:
+        # allow_empty: see _load_referent_registry.
+        registry = load_config(config_dir, allow_empty=True)
         return impact.plan_rename(registry, config_dir, "code_set", old, new)
-    except WiringError:
-        return None
+    except (WiringError, FileNotFoundError, OSError, ValueError) as exc:
+        raise WiringError(
+            f"cannot rename code set {old!r} to {new!r}: its references could not be checked "
+            f"({exc}). Nothing was changed; fix the config so it loads, then rename again"
+        ) from exc
 
 
 def _code_set_referrers(config_dir: str | Path, name: str) -> list[dict[str, str]]:

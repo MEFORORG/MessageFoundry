@@ -13,9 +13,12 @@ Two authoring surfaces are covered:
   router. These are rewritten with :mod:`tokenize`, so a match is a *plain* ``str`` literal whose
   decoded value is exactly the old name — never a substring, an identifier, a comment, an f-string, a
   bytes literal, or a fragment of an implicit adjacent-string concatenation.
-* ``connections.toml`` — a data-authored inbound's ``router = "r"`` binding (and a connection's own
-  ``name`` definition) is edited as **text** (no TOML round-trip, so hand-authored formatting/comments
-  survive byte-for-byte outside the one edited value).
+* ``connections.toml`` — a data-authored inbound's ``router = "r"`` binding, a connection's own
+  ``name`` definition, and an outbound's ``reingress_to`` or an inbound's ``reply_from`` naming the
+  renamed connection, are edited as **text** (no TOML round-trip, so hand-authored formatting/comments
+  survive byte-for-byte outside the one edited value). Only the value at that key path in a
+  connection entry is touched, and the edited text must parse to the original with exactly those
+  values changed, or the referrer is reported unresolved (BACKLOG #5980).
 
 The rewrite is **site-scoped**: only literals at a referrer's sites (its own body, a handler's ``accepts=``
 predicate, a module-level statement binding a name it reads, and, for a table rename, the accessor call
@@ -40,11 +43,13 @@ from __future__ import annotations
 
 import ast
 import codecs
+import copy
 import io
 import logging
 import os
 import re
 import tokenize
+import tomllib
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -259,8 +264,9 @@ def plan_rename(
     # A definition that exists but that this plan cannot read: outside the config dir, with no
     # source, or not found by the declaration scan. Its name would stay old, so the plan refuses.
     unlocated: list[str] = []
-    # (toml-path, key) pairs whose value == old must be rewritten (router binding / name definition).
-    toml_targets: set[tuple[str, str]] = set()
+    # connections.toml values equal to old that must be rewritten (the name definition, a router
+    # binding, a reingress_to / reply_from setting), each with the referrers it carries.
+    toml_targets: dict[_TomlTarget, list[Reference]] = {}
 
     def add_def_span(
         file: str | None, span: _Span | None, positions: Mapping[_Pos, frozenset[_Pos]]
@@ -283,14 +289,20 @@ def plan_rename(
     _add_definition_span(
         registry, config_dir, target_kind, old, sources, add_def_span, toml_targets
     )
-    toml_defs = {path for path, key in toml_targets if key == "name"}
+    toml_defs = {path for path, _table, keys in toml_targets if keys == ("name",)}
 
     # Every referent edge: rewrite the literal at each site the referrer reads it from (or its toml
     # binding). Keep each py referrer's sites, so a referrer we could not rewrite is surfaced, not
     # dropped -- including one whose source, or one of whose captured values, could not be located.
+    # A connection naming another in its settings (an outbound's reingress_to, an inbound's
+    # reply_from) is a referrer too (BACKLOG #5966).
     referrers: list[tuple[Reference, list[_Site], bool]] = []
-    for ref in index.referrers(target_kind, old):
-        found = _referrer_sites(registry, ref, old, target_kind, sources, toml_targets)
+    for ref, setting in _all_referrers(registry, index, target_kind, old):
+        found = (
+            _referrer_sites(registry, ref, old, target_kind, sources, toml_targets)
+            if setting is None
+            else _setting_sites(registry, ref, setting, old, sources, toml_targets)
+        )
         if found is None:
             continue
         sites, complete = found
@@ -348,11 +360,16 @@ def plan_rename(
                 listed.append(_config_modules(config_dir))
             if _binding_read_only_by_referents(sources, listed[0], file, pos, declaring, covering):
                 edits.append(edit)
-    for toml_path, key in toml_targets:
-        toml_edits = _toml_value_edits(toml_path, key, old, new)
-        if key == "name" and not toml_edits:
+    # A connections.toml referrer whose value could not be rewritten exactly is unresolved.
+    toml_unresolved: list[Reference] = []
+    for toml_path, table, keys in sorted(toml_targets):
+        toml_refs = toml_targets[(toml_path, table, keys)]
+        toml_edits = _toml_edits(toml_path, table, keys, old, new)
+        if keys == ("name",) and not toml_edits:
             unlocated.append(toml_path)
-        edits.extend(toml_edits)
+        elif toml_edits is None or (toml_refs and not toml_edits):
+            toml_unresolved.extend(toml_refs)
+        edits.extend(toml_edits or ())
 
     # Deterministic, de-duplicated (a literal reachable from two overlapping spans appears once).
     unique = {(e.file, e.start_line, e.start_col): e for e in edits}
@@ -373,7 +390,11 @@ def plan_rename(
             "could not be located, or other code reads it too, so the rename would leave the "
             "definition under its old name or change what that code reads; rename it by hand"
         )
-    unresolved = _unresolved_referrers(referrers, edited, old, sources, shared_kind)
+    unresolved = tuple(
+        dict.fromkeys(
+            (*_unresolved_referrers(referrers, edited, old, sources, shared_kind), *toml_unresolved)
+        )
+    )
     return RenamePlan(
         target_kind=target_kind, old=old, new=new, edits=tuple(ordered), unresolved=unresolved
     )
@@ -383,24 +404,42 @@ def apply_rename(plan: RenamePlan) -> list[LiteralEdit]:
     """Write ``plan``'s edits to disk and return the edits actually applied.
 
     Each file is rewritten byte-for-byte outside the replaced spans (newline style preserved). Edits
-    are applied bottom-to-top / right-to-left so earlier offsets stay valid, and a span that no longer
-    carries ``old_literal`` (already renamed) is skipped, so re-applying a plan is a safe no-op."""
-    applied: list[LiteralEdit] = []
+    are applied bottom-to-top / right-to-left so earlier offsets stay valid. A file whose every span
+    already carries the new literal (a re-applied plan) is left alone, so re-applying is a no-op.
+
+    Any other state -- a span carrying neither literal, or a file only partly renamed -- means the
+    file changed after the plan was made, and writing the rest would leave a half-renamed config
+    while reporting success. That raises :class:`WiringError` before any file is written (BACKLOG
+    #5980)."""
     by_file: dict[str, list[LiteralEdit]] = {}
     for edit in plan.edits:
         by_file.setdefault(edit.file, []).append(edit)
 
+    rewritten: dict[str, list[str]] = {}
+    applied: list[LiteralEdit] = []
+    stale: list[LiteralEdit] = []
     for file, file_edits in by_file.items():
-        raw = Path(file).read_bytes()
-        text = raw.decode("utf-8")
         # Split on \n, \r\n and \r only: the plan numbered lines by tokenizing a universal-newline read,
         # which breaks on exactly those, so an edit's line is the line it names here too.
-        lines = source_lines(text)
-        # Bottom-to-top, right-to-left: a multi-line edit changes the line count below it, so applying
-        # in descending (start_line, start_col) keeps every not-yet-applied edit's indices valid.
-        for edit in sorted(file_edits, key=lambda e: (e.start_line, e.start_col), reverse=True):
-            if _apply_one(lines, edit):
-                applied.append(edit)
+        lines = source_lines(Path(file).read_bytes().decode("utf-8"))
+        fresh = [e for e in file_edits if _span_text(lines, e) == e.old_literal]
+        if len(fresh) == len(file_edits):
+            # Bottom-to-top, right-to-left: a multi-line edit changes the line count below it, so
+            # applying in descending (start_line, start_col) keeps every later edit's indices valid.
+            for edit in sorted(file_edits, key=lambda e: (e.start_line, e.start_col), reverse=True):
+                _apply_one(lines, edit)
+            rewritten[file] = lines
+            applied.extend(file_edits)
+        elif fresh or not _already_renamed(lines, file_edits):
+            stale.extend(e for e in file_edits if e not in fresh)
+    if stale:
+        where = ", ".join(f"{e.file}:{e.start_line}" for e in stale)
+        raise WiringError(
+            f"cannot apply the rename of {plan.target_kind} {plan.old!r}: {len(stale)} edit(s) no "
+            f"longer match the file, which changed after the plan was made ({where}). Nothing was "
+            "written; plan the rename again"
+        )
+    for file, lines in rewritten.items():
         Path(file).write_bytes("".join(lines).encode("utf-8"))
     return applied
 
@@ -421,7 +460,7 @@ def _add_definition_span(
     old: str,
     sources: SourceCache,
     add_py_span: Callable[[str | None, _Span | None, Mapping[_Pos, frozenset[_Pos]]], None],
-    toml_targets: set[tuple[str, str]],
+    toml_targets: dict[_TomlTarget, list[Reference]],
 ) -> None:
     """Scope the object's own definition (``@router("old")`` / ``outbound("old", …)`` /
     ``DatabaseLookup("old", …)`` / a TOML ``name = "old"``), with the position of its name argument,
@@ -452,7 +491,7 @@ def _add_definition_span(
                 _call_line_positions(sources, conn.source_file, conn.source_line, old, target_kind),
             )
         elif conn.source_file and _is_connections_toml(conn.source_file):
-            toml_targets.add((conn.source_file, "name"))
+            toml_targets.setdefault((conn.source_file, target_kind, ("name",)), [])
         else:
             # Declared somewhere this plan cannot read, so its name cannot be rewritten.
             add_py_span(None, None, {})
@@ -529,7 +568,7 @@ def _referrer_sites(
     old: str,
     target_kind: str,
     sources: SourceCache,
-    toml_targets: set[tuple[str, str]],
+    toml_targets: dict[_TomlTarget, list[Reference]],
 ) -> tuple[list[_Site], bool] | None:
     """The ``.py`` sites one referent edge reads ``old`` from, and whether every value the referrer
     captures holding ``old`` was located; ``None`` for a ``connections.toml`` router binding
@@ -618,14 +657,66 @@ def _referrer_sites(
             # the inbound's own name or a sibling argument equal to the router's is another value
             # (BACKLOG #5980). A router= the statement does not spell leaves the site empty, which
             # reports the inbound unresolved.
-            binding = _router_binding_positions(sources, conn.source_file, span, old)
+            binding = _keyword_value_positions(sources, conn.source_file, span, old, "router")
             return [_Site(conn.source_file, span, binding)], True
         if conn.source_file and _is_connections_toml(conn.source_file):
             # The referent edge is the router binding; rewrite only the `router = "..."` value.
-            toml_targets.add((conn.source_file, "router"))
+            toml_targets.setdefault((conn.source_file, "inbound", ("router",)), []).append(ref)
             return None
         return [], False
     return None
+
+
+def _all_referrers(
+    registry: Registry, index: ReferenceIndex, target_kind: str, old: str
+) -> list[tuple[Reference, str | None]]:
+    """Every referrer of ``(target_kind, old)``, each with the connection setting it names the
+    target in, or ``None`` for a referrer read from its code or its router binding.
+
+    The index carries an outbound's ``reingress_to`` as an ``outbound -> inbound`` edge, and has no
+    edge for an inbound's ``reply_from`` (an ``Http`` inbound naming the outbound whose reply it
+    returns), so that one is read from the registry here (BACKLOG #5966). An inbound only ever names
+    an outbound in its ``reply_from``, so an index edge of that shape, should the graph gain one, is
+    read the same way rather than twice."""
+    settings = {
+        "outbound": "reingress_to",
+        "inbound": "reply_from" if target_kind == "outbound" else None,
+    }
+    out = {ref: settings.get(ref.referrer_kind) for ref in index.referrers(target_kind, old)}
+    if target_kind == "outbound":
+        for name, conn in sorted(registry.inbound.items()):
+            if conn.spec.settings.get("reply_from") == old:
+                out[Reference("inbound", name, "outbound", old)] = "reply_from"
+    return list(out.items())
+
+
+def _setting_sites(
+    registry: Registry,
+    ref: Reference,
+    setting: str,
+    old: str,
+    sources: SourceCache,
+    toml_targets: dict[_TomlTarget, list[Reference]],
+) -> tuple[list[_Site], bool] | None:
+    """The site a connection names ``old`` at in its ``setting`` (``reingress_to`` / ``reply_from``):
+    the ``setting=`` value in its declaring statement, or ``None`` for a ``connections.toml`` entry,
+    recorded in ``toml_targets`` instead. A setting the statement does not spell as a literal leaves
+    the site empty, which reports the referrer unresolved (BACKLOG #5966)."""
+    table = registry.inbound if ref.referrer_kind == "inbound" else registry.outbound
+    conn = table.get(ref.referrer)
+    if conn is None:
+        return [], False
+    if conn.source_line is not None and conn.source_file:
+        span = _statement_span(conn.source_file, conn.source_line)
+        if span is None:
+            return [], False
+        binding = _keyword_value_positions(sources, conn.source_file, span, old, setting)
+        return [_Site(conn.source_file, span, binding)], True
+    if conn.source_file and _is_connections_toml(conn.source_file):
+        key = (conn.source_file, ref.referrer_kind, ("settings", setting))
+        toml_targets.setdefault(key, []).append(ref)
+        return None
+    return [], False
 
 
 def _accessor_positions(
@@ -1105,10 +1196,11 @@ def _slot_arguments(call: ast.Call, slots: Iterable[tuple[int, str]]) -> list[as
     return out
 
 
-def _router_binding_positions(
-    sources: SourceCache, file: str, span: _Span, old: str
+def _keyword_value_positions(
+    sources: SourceCache, file: str, span: _Span, old: str, keyword: str
 ) -> frozenset[tuple[int, int]]:
-    """The ``router=`` values equal to ``old`` in an inbound's declaring statement at ``span``."""
+    """The ``<keyword>=`` values equal to ``old`` in a connection's declaring statement at ``span``
+    (an inbound's ``router=`` or ``reply_from=``, an outbound's ``reingress_to=``)."""
     parsed = sources.parse(file)
     if parsed is None:
         return frozenset()
@@ -1116,7 +1208,7 @@ def _router_binding_positions(
     for node in ast.walk(parsed[0]):
         if isinstance(node, ast.Call) and span.start <= node.lineno <= span.end:
             for kw in node.keywords:
-                if kw.arg == "router":
+                if kw.arg == keyword:
                     _carried(kw.value, {}, set(), flow)
     return frozenset(sources.position(file, c) for c in flow.consts if c.value == old)
 
@@ -1781,37 +1873,71 @@ def _in_any_span(line: int, spans: list[_Span]) -> bool:
 # --- connections.toml text rewriting -----------------------------------------
 
 
-def _toml_value_edits(toml_path: str, key: str, old: str, new: str) -> list[LiteralEdit]:
-    """Rewrite a ``connections.toml`` ``<key> = "old"`` assignment as text (no TOML round-trip).
+#: A ``connections.toml`` value a rename rewrites: the file, the connection table (``inbound`` /
+#: ``outbound``) and the key path inside an entry (``("name",)``, ``("settings", "reply_from")``).
+_TomlTarget = tuple[str, str, tuple[str, ...]]
 
-    Matches only a line whose value is exactly ``old`` between matching quotes (no escapes), so a
-    substring or a differently-keyed value is never touched. The quote style is preserved."""
+#: A table header line: ``[[inbound]]``, ``[outbound.settings]``. A quoted key part is not matched,
+#: so the lines under it are attributed to no table and are never rewritten.
+_TOML_HEADER = re.compile(
+    r"^\s*\[\[?\s*(?P<path>[A-Za-z0-9_-]+(?:\s*\.\s*[A-Za-z0-9_-]+)*)\s*\]\]?\s*(?:#.*)?$"
+)
+
+#: A bare or dotted key assigned a one-line string with no escape: ``router = "r"``.
+_TOML_STRING_KEY = re.compile(
+    r"^(?P<pre>\s*(?P<key>[A-Za-z0-9_-]+(?:\s*\.\s*[A-Za-z0-9_-]+)*)\s*=\s*)"
+    r"(?P<lit>(?P<q>[\"'])(?P<value>[^\"'\\\r\n]*)(?P=q))\s*(?:#.*)?$"
+)
+
+
+def _toml_edits(
+    toml_path: str, table: str, keys: tuple[str, ...], old: str, new: str
+) -> list[LiteralEdit] | None:
+    """Rewrite, as text (no TOML round-trip), every ``<table>`` entry's value at ``keys`` equal to
+    ``old`` in ``toml_path``: ``[]`` when no entry holds it, ``None`` when the edits cannot be proved.
+
+    A candidate is a string assignment of ``old`` whose key path, under the table header above it,
+    is exactly ``(table, *keys)``, so a ``name`` under ``[inbound.metadata]``, or an outbound named
+    like the inbound being renamed, is not one. The candidates are then applied in memory and the
+    file parsed again: the result must equal the original with exactly those values changed. A value
+    spelled another way (an inline table, a quoted key, an escape) fails that check, so its referrer
+    is reported rather than left reading the old name (BACKLOG #5980). The quote style and every
+    other byte survive."""
     try:
-        text = Path(toml_path).read_text(encoding="utf-8")
-    except OSError:
+        # Decoded as apply_rename decodes it, so line numbers agree.
+        text = Path(toml_path).read_bytes().decode("utf-8")
+        before = tomllib.loads(text)
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        _log.debug("rename could not read %s: %s", toml_path, type(exc).__name__)
+        return None
+    expected = copy.deepcopy(before)
+    entries = expected.get(table)
+    held = 0
+    for entry in entries if isinstance(entries, list) else ():
+        parent: object = entry
+        for key in keys[:-1]:
+            parent = parent.get(key) if isinstance(parent, dict) else None
+        if isinstance(parent, dict) and parent.get(keys[-1]) == old:
+            parent[keys[-1]] = new
+            held += 1
+    if not held:
         return []
-    pattern = re.compile(
-        r"^(?P<pre>\s*"
-        + re.escape(key)
-        + r"\s*=\s*)(?P<lit>(?P<q>[\"'])"
-        + re.escape(old)
-        + r"(?P=q))"
-    )
+    wanted = (table, *keys)
+    header: tuple[str, ...] | None = ()
     edits: list[LiteralEdit] = []
-    # Number lines exactly as apply_rename splits them: a TOML string may hold U+2028 or U+0085, and a
-    # split on those would shift every later edit's line.
-    for lineno, line in enumerate(source_lines(text), start=1):
-        line = line.rstrip("\r\n")
-        m = pattern.match(line)
-        if m is None:
+    lines = source_lines(text)
+    for lineno, raw_line in enumerate(lines, start=1):
+        line = raw_line.rstrip("\r\n")
+        if line.lstrip().startswith("["):
+            m = _TOML_HEADER.match(line)
+            header = _toml_key_path(m.group("path")) if m is not None else None
             continue
-        # Guard against a trailing non-comment token that would make this not a bare scalar assignment.
-        rest = line[m.end("lit") :].lstrip()
-        if rest and not rest.startswith("#"):
+        m = _TOML_STRING_KEY.match(line)
+        if m is None or m.group("value") != old or header is None:
             continue
-        lit = m.group("lit")
-        quote = m.group("q")
-        col = len(m.group("pre"))
+        if (*header, *_toml_key_path(m.group("key"))) != wanted:
+            continue
+        lit, quote, col = m.group("lit"), m.group("q"), len(m.group("pre"))
         edits.append(
             LiteralEdit(
                 file=toml_path,
@@ -1823,40 +1949,67 @@ def _toml_value_edits(toml_path: str, key: str, old: str, new: str) -> list[Lite
                 new_literal=f"{quote}{new}{quote}",
             )
         )
-    return edits
+    for edit in edits:
+        _apply_one(lines, edit)
+    try:
+        after = tomllib.loads("".join(lines))
+    except tomllib.TOMLDecodeError:
+        return None
+    return edits if after == expected else None
+
+
+def _toml_key_path(key: str) -> tuple[str, ...]:
+    """A bare dotted TOML key's parts (``settings . reply_from`` -> ``("settings", "reply_from")``)."""
+    return tuple(part.strip() for part in key.split("."))
 
 
 # --- apply -------------------------------------------------------------------
 
 
-def _apply_one(lines: list[str], edit: LiteralEdit) -> bool:
-    """Apply one edit in place, returning whether it was applied (``False`` = span already renamed)."""
-    if edit.start_line == edit.end_line:
-        idx = edit.start_line - 1
-        if idx >= len(lines):
-            return False
-        line = lines[idx]
-        current = line[edit.start_col : edit.end_col]
-        if current == edit.old_literal:
-            lines[idx] = line[: edit.start_col] + edit.new_literal + line[edit.end_col :]
-            return True
-        # Idempotent no-op: the span already carries the new literal (a re-applied plan).
-        if line[edit.start_col : edit.start_col + len(edit.new_literal)] == edit.new_literal:
-            return False
-        return False
-    # Multi-line (triple-quoted) literal: reconstruct the region across the affected lines.
+def _apply_one(lines: list[str], edit: LiteralEdit) -> None:
+    """Replace ``edit``'s span, which carries its old literal, in place."""
     lo, hi = edit.start_line - 1, edit.end_line - 1
-    if hi >= len(lines):
-        return False
     region_lines = lines[lo : hi + 1]
     region = "".join(region_lines)
-    inner_start = edit.start_col
     inner_end = len(region) - (len(region_lines[-1]) - edit.end_col)
-    if region[inner_start:inner_end] != edit.old_literal:
-        return False
-    new_region = region[:inner_start] + edit.new_literal + region[inner_end:]
+    new_region = region[: edit.start_col] + edit.new_literal + region[inner_end:]
     # Re-split as apply_rename split the file, so an earlier edit on line ``lo`` still indexes its line.
     lines[lo : hi + 1] = source_lines(new_region)
+
+
+def _span_text(
+    lines: list[str], edit: LiteralEdit, at: tuple[int, int] | None = None
+) -> str | None:
+    """The text ``edit`` spans in ``lines``, or ``None`` past the end. With ``at``, the text of the
+    edit's new literal's length starting at that (line, col) instead, a one-line span."""
+    if at is not None:
+        line, col = at
+        return lines[line - 1][col : col + len(edit.new_literal)] if line <= len(lines) else None
+    if edit.end_line > len(lines):
+        return None
+    if edit.start_line == edit.end_line:
+        return lines[edit.start_line - 1][edit.start_col : edit.end_col]
+    region_lines = lines[edit.start_line - 1 : edit.end_line]
+    region = "".join(region_lines)
+    return region[edit.start_col : len(region) - (len(region_lines[-1]) - edit.end_col)]
+
+
+def _already_renamed(lines: list[str], edits: list[LiteralEdit]) -> bool:
+    """Whether every edit's new literal sits where applying the edits would have put it.
+
+    A new literal is one line (a name holds no line break), so an edit moves the text after it on
+    its last line by the literal's change in length, and every later line up by the lines it spanned."""
+    line_shift = 0
+    prev: tuple[int, int, int, int] | None = None  # the last edit's old end, and where it now ends
+    for edit in sorted(edits, key=lambda e: (e.start_line, e.start_col)):
+        if prev is not None and edit.start_line == prev[0]:
+            at = (prev[2], prev[3] + edit.start_col - prev[1])
+        else:
+            at = (edit.start_line + line_shift, edit.start_col)
+        if _span_text(lines, edit, at) != edit.new_literal:
+            return False
+        line_shift += edit.start_line - edit.end_line
+        prev = (edit.end_line, edit.end_col, at[0], at[1] + len(edit.new_literal))
     return True
 
 
