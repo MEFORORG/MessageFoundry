@@ -88,6 +88,10 @@ selections, verbatim:
 - Ruling 2: **"Run step 2 (Recommended)"**.
 - Ruling 3, a narrowing write to an unverifiable user row: **"Refuse, end sessions (Recommended)"**.
 - Ruling 7: **"Accept as listed (Recommended)"**.
+- A later ruling, on 2026-11-20 (UTC) in the batch 616 Manager's chat, on the store-fault residual
+  of a re-auth due a clear (see the Outage amendment): **"Accept, file a row (Recommended)"**,
+  recorded on PR 3100 comment
+  [7041132815](https://github.com/MEFORORG/MessageFoundry/pull/3100#issuecomment-7041132815).
 
 **What differs from the ruled text at `94b485c2e1`** (every difference `git diff 94b485c2e1` shows
 in this file, apart from this section, the status line and *Open findings carried to the build*):
@@ -175,8 +179,10 @@ with reason `transit_unavailable`, not `store_error`.
 A correction to that note, added 2026-11-09: "the first load is the lapse check" means the first
 load after the ceremony's stamp. The route's own session check, and the stamp write's check, run
 through Transit before `_elevated_hash` does; an Outage there refuses the request and writes no
-stamp, so nothing is left elevated. The lapse check also reads the account record, and an Outage
-on that check revokes the session too, though the session's own seal held.
+stamp, so nothing is left elevated (corrected 2026-11-19: not at the stamp write's check, where the
+stamp-to-rotation window below, armed before the write, revokes the session). The lapse check also
+reads the account record, and an Outage on that check revokes the session too, though the session's
+own seal held.
 
 A second correction, added 2026-11-09, which RETRACTS the two notes above where they disagree:
 the lapse check is NOT always the first Transit call after a stamp lands, and an Outage before it
@@ -191,23 +197,29 @@ into `RowSealError`" is out of date: since slice 1b-ii every backend's session w
 `session_writer_seal_check`.
 
 **The stamp-to-rotation window, decided 2026-11-09 (decisions d20261109T165402853-83b348 and
-d20261109T165406730-2505f2).** The open question above is answered by the Manager under the
-Owner's standing instruction of 2026-10-22, widening "Revoke both" (Q1) to the whole window from
-the stamp to the rotation. The adversarial review split only on whose call it was, and the guard
-is strictly safer. This supersedes the Outage row's "end nothing" in *The four answers, defined
-once* for this window only; that row's text is unchanged. It is the **Owner's open reversal
-point**: the Owner may reverse it, and until then it stands. One guard,
-`AuthService._stamp_to_rotation`, is armed when a `_sealed_stamp` lands and closed when
-`_elevated_hash` begins. On a refusal `_rotation_store_errors()` names, raised between the two, it
-revokes the stamped old hash, best effort, writes `auth.session_rotation_failed` with Q1's
-`reason` and `revokes_landed`, and the ceremony answers `session_lost`. It covers at least the
-second stamp and `record_login_success` in `verify_mfa`, the passkey assertion, the factor-binding
-check in `reauth` and in the federated re-auth callback, and the audit row written after the
-stamp. The `_load_user` arm before the federated callback's stamp is unchanged. A refusal before
-any stamp lands still refuses the request with nothing elevated. **Limit:** on a `vault_transit`
-store a Transit Outage at that audit row raises `CipherError` from the audit-chain MAC, which
-`_rotation_store_errors()` does not take, so there the guard fires only on a store refusal of the
-audit write.
+d20261109T165406730-2505f2).** The open question above is answered by the Manager under the Owner's
+standing instruction of 2026-10-22, widening "Revoke both" (Q1) to the whole window from the stamp
+to the rotation. The adversarial review split only on whose call it was, and the guard is strictly
+safer. This supersedes the Outage row's "end nothing" in *The four answers, defined once* for this
+window only; that row's text is unchanged. It is the **Owner's open reversal point**: the Owner may
+reverse it, and until then it stands. One guard, `AuthService._stamp_to_rotation`, is armed at the
+first `_sealed_stamp` entry, before its write, and closed once `_elevated_hash`'s lapse check passes
+(corrected 2026-11-19: this read "armed when a `_sealed_stamp` lands", see Q4 below, and "closed
+when `_elevated_hash` begins"). A `_rotation_store_errors()` refusal at the lapse check is answered
+`session_lost` by `_elevated_hash`. An Unverifiable answer there is revoked and recorded by
+`_elevated_hash`, then propagated. Any exception there that `_elevated_hash`'s handlers do not take
+still reaches the window. On a refusal `_rotation_store_errors()` names, raised between the stamp
+and the lapse check, it revokes the stamped old hash, best effort, writes
+`auth.session_rotation_failed` with Q1's `reason` and `revokes_landed`, and the ceremony answers
+`session_lost`. It covers at least the second stamp and `record_login_success` in `verify_mfa`, the
+passkey assertion, the factor-binding check in `reauth` and in the federated re-auth callback, and
+the audit row written after the stamp. The `_load_user` arm before the federated callback's stamp is
+unchanged. A refusal before any stamp lands still refuses the request with nothing elevated
+(corrected 2026-11-19: a refusal at the first stamp's own write also revokes the session, best
+effort, under Q4 below; if that write committed before it raised and the revoke is refused, the
+stamp stands on a live session). **Limit:** on a `vault_transit` store a Transit Outage at that
+audit row raises `CipherError` from the audit-chain MAC, which `_rotation_store_errors()` does not
+take, so there the guard fires only on a store refusal of the audit write.
 
 **The window takes any exception, decided 2026-11-09 (decision d20261109T200352805-599b24, item
 1).** This closes the Limit above. Once the guard is armed, any exception before the rotation
@@ -288,7 +300,7 @@ give, or freeze a revocation a failed seal would not**. That is the test each an
 | **Holds** | `verify` HTTP 200, `valid: true` | `True`, cached (see *The success cache*) | allow | none | none |
 | **Forged** | `verify` HTTP 200, `valid: false`; or the stored seal fails the strict well-formed parse (below), with no Transit call | `False` | deny the row (a session is ended, a user, role or map grants nothing, a write is refused) | `integrity.authority_seal_failed` | `AUTHORITY_SEAL_SUBJECT`, as today; a directory map pages under its own subject, (b) |
 | **Unverifiable** | `verify` HTTP 400, and the fixed-input key probe (`hmac` over a constant) then answers with a well-formed MAC, whatever version it names | `TransitSealUnverifiableError` | deny the row, with three limits: it never tombstones or raw-deletes a user, role, map or approval where Forged would (ending a session is allowed, since signing in replaces it); the AD maps follow (b) and (d); a write that keeps the row's stored values is refused, while an operator's explicit delete of the row, full replacement of it (a map's only with `replace_unverifiable`, (d)), or Reject of a pending approval (below), which keep none of its values, is allowed and audited | `integrity.authority_seal_unverifiable` | `authority-seal-transit-unverifiable:<kind>:<ref>:<digest suffix>` (*A ref is for reading*), capped; the two Unverifiable AD map subjects, fixed names with no ref or suffix, are exempt from the cap |
-| **Outage** | any other `verify` failure (network, timeout, 5xx, 403, malformed reply), or a 400 the probe cannot clear; except that a 400 or 403 on a seal naming a retired key, while the active key's probe works, is Unverifiable (*The key id, and a retired key*) | `TransitSealUnavailableError` | refuse the request or roll back the write; end nothing, except that (c) ends an account's sessions after a refused narrowing write; record no seal failure | none for the row; the refused request itself is audited where the audit append still works (many outages, such as a 403 on `verify` alone or a timeout, leave it working), a refused sign-in as `auth.login_refused_unavailable`, (e); a throttled ERROR log line is the record only when the append fails too | `authority-seal-transit` |
+| **Outage** (amended 2026-11-19, see below) | any other `verify` failure (network, timeout, 5xx, 403, malformed reply), or a 400 the probe cannot clear; except that a 400 or 403 on a seal naming a retired key, while the active key's probe works, is Unverifiable (*The key id, and a retired key*) | `TransitSealUnavailableError` | refuse the request or roll back the write; end nothing, except that (c) ends an account's sessions after a refused narrowing write; record no seal failure | none for the row; the refused request itself is audited where the audit append still works (many outages, such as a 403 on `verify` alone or a timeout, leave it working), a refused sign-in as `auth.login_refused_unavailable`, (e); a throttled ERROR log line is the record only when the append fails too | `authority-seal-transit` |
 
 A correction, added 2026-11-11: the Outage row's "the refused request itself is audited where the
 audit append still works" does not hold for a request the approval gate refuses on an Outage, which
@@ -298,6 +310,62 @@ writes no row; that path and two others are named in *Open audit gaps, a correct
 A correction, added 2026-11-11: the Unverifiable row's audit action and page do not hold on at
 least gaps (1), (2), (5) and (6) of *Open audit gaps, a correction added 2026-11-11*, and its
 extension, in (c).
+
+**An amendment to the Outage row, added 2026-11-19 (BACKLOG #5900, PR 3100).** BACKLOG #5900 moves
+the password re-auth's (`reauth`) lockout clear after the session rotation. A re-auth that holds a
+rotated token raises in at least two cases: (a) the write of its hard `auth.reauth` row raises or is
+cancelled, whether or not a clear was due; (b) the clear itself raises, at least on a Vault Transit
+Outage refusing the audit-chain MAC of the rows the clear appends (`CipherError`). In both it drops
+any purpose grant minted for the rotated token, never hands that token back, and asks the store to
+revoke the rotated session through a shielded, best-effort revoke that ends nothing else. The
+federated step-up, `complete_oidc_step_up`, also raises and withholds its token when its hard row
+raises, but it neither drops its grant nor revokes its rotated session.
+
+The user is signed out because the rotation already retired the caller's old token, not because
+of the revoke. If the revoke fails, the rotated session stays live, but no caller holds its token.
+In case (a), log lines record what the revoke call reported. In case (b), the soft `interrupted`
+`auth.reauth` row carries `session_ended` when that write succeeds. When that row is refused too,
+a refused revoke is logged, and a revoke that landed is recorded by no audit row or log line. A
+revoke whose call raised after it committed can be reported as not ended.
+
+During a Vault Transit Outage, case (a) or (b) signs out a re-auth due a clear, and the
+stamp-to-rotation window above can too, by revoking the stamped hash. An Outage at the account
+record's seal that leaves the audit append working writes the row, hands back the rotated token and
+ends nothing. Accepting the sign-out in case (a) or (b) was decided by the Lander under the owner's
+delegation of 2026-11-19, record d20261119T234650256-3bf83e, because it fails closed, and record
+d20261120T032444709-be504f extends that outcome to the stamp-to-rotation window, for a re-auth due a
+clear during an Outage. The question asked, quoted from the Lander's owner table: "During a Vault
+Transit outage, a re-auth whose lockout counters are due to be cleared now signs the user out; main
+keeps their session live. [...] ADR 0217's Outage row, which you accepted, says 'end nothing'." The
+owner answered "/driver". The owner can reverse the decision for a re-auth due a clear by ruling
+that the Outage row's "end nothing" governs. In case (a) or (b), dropping the revoke alone keeps no
+session, since the sign-out comes from the rotation, and keeping the session in case (b) would need
+a design that clears the lockout before the stamp, as main did; the window's revoke rests at least
+on decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2, the Owner's open reversal
+point above, and on Q4, d20261110T004920629-fb8ff6. Outside an Outage, a store fault that refuses
+writes reaches the window at the stamp write of a re-auth due a clear, and the window asks the store
+to revoke the session, best effort, though the route answers at least 401 or 500. Under a fault
+where that first write commits and then raises, and every later write, the revoke included, is
+refused, this PR can leave the original token live, stamped and unrotated, where main leaves it
+unstamped because main's first write is the clear; main can reach the same state for a fault that
+begins one write later (d20261120T042802906-777260), and here the lockout counters stay uncleared.
+The owner accepted this residual on 2026-11-20, in the batch 616 Manager's chat (recorded on PR
+3100, comment
+[7041132815](https://github.com/MEFORORG/MessageFoundry/pull/3100#issuecomment-7041132815)). A
+follow-up row, to be filed by the Lander under ledger ruling R2, is to change the re-auth writes so
+that a fault where the stamp commits and then raises leaves no worse a state than main; the ruling
+names re-ordering the writes or adding a revoke that does not depend on later writes. The Lander's
+earlier acceptance d20261120T032446206-33a44d was withdrawn before that ruling
+(d20261120T045030279-68e180). The 2026-11-19 /driver question quoted above covered only a re-auth
+due a clear during an Outage. On a re-auth with no clear due, the revoke in case (a) during an
+Outage is this PR's own behaviour and an exception to the Outage row's "end nothing" for that path
+only, accepted by the Lander as strictly safer under the owner's standing instruction of 2026-10-22,
+record d20261120T015953943-d015e0 (independent review d20261120T035330577-6e0dc7). The row's text,
+apart from its label's pointer to this amendment, is unchanged.
+
+Before this PR, the clear ran before the rotation, so an Outage at the clear kept the original
+session. A hard `auth.reauth` row refused after the rotation left the rotated session live, with
+any purpose grant.
 
 **The seal input is a fixed-length digest.** The sealer sends Transit not the row's encoding but its
 SHA-256: `seal = Transit hmac(SHA-256(label || store id || seal_bytes(kind, fields)))`, each part

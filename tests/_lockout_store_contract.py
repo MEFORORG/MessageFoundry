@@ -51,14 +51,20 @@ webauthn nor the harness extra.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 import pytest
 
+from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.service import _opened_totp_state
 from messagefoundry.auth.tokens import credential_id_hash
-from messagefoundry.store.store import AuditAppend
+from messagefoundry.store.store import (
+    FULL_AUTHENTICATION_GUARD,
+    AuditAppend,
+    full_authentication_snapshot,
+)
 
 #: The audit row the contract's unlocks append, in the clear's own transaction (BACKLOG #5633).
 _UNLOCK_AUDIT = AuditAppend("auth.admin_unlocked", actor="cli:contract")
@@ -164,6 +170,7 @@ async def _assert_lockout_contract(store: Any, *, corrupt_passkeys: PasskeyCorru
     await _assert_a_wrong_password_below_the_threshold_opens_no_cell(store)
     await _assert_get_totp_secret_opens_off_the_loop(store)
     await _assert_the_increment_carries_the_escalation_verdict(store)
+    await _assert_conditional_full_authentication(store)
 
 
 async def _assert_single_counter_policy(store: Any) -> None:
@@ -213,17 +220,17 @@ async def _assert_single_counter_policy(store: Any) -> None:
     assert user is not None and user.lock_cycles == 2
 
     # --- a successful login clears every lockout column, cycles included (AC-8) --------------------
-    await store.record_login_success("lock-u1", now=second + 1.0)
+    await store.record_login_success("lock-u1", now=second + 1.0, audits=())
     user = await store.get_user("lock-u1")
     assert user is not None and _lockout_columns(user) == (0, None, 0, 0, None, 0)
     assert await _fail(store, "lock-u1", now=second + 2.0) == (1, False, 0)
 
     # --- threshold 1 locks on the FIRST failure, which is why the doc says it is not an off switch -
-    await store.record_login_success("lock-u1", now=second + 3.0)
+    await store.record_login_success("lock-u1", now=second + 3.0, audits=())
     assert await _fail(store, "lock-u1", now=second + 4.0, threshold=1) == (1, True, 1)
 
     # --- lockout_minutes = 0 still means "the lock expires at once", escalated or not --------------
-    await store.record_login_success("lock-u1", now=second + 5.0)
+    await store.record_login_success("lock-u1", now=second + 5.0, audits=())
     assert await _fail(store, "lock-u1", now=second + 6.0, threshold=1, lockout_seconds=0.0) == (
         1,
         True,
@@ -300,7 +307,7 @@ async def _assert_escalation(store: Any) -> None:
             cycles = user.lock_cycles if counter == "sign_in" else user.second_step_lock_cycles
             assert cycles == cycle
             start = locked + 1.0  # the next cycle starts after this lock lapses
-        await store.record_login_success(user_id, now=start)
+        await store.record_login_success(user_id, now=start, audits=())
 
     # --- the exponent is capped before it is computed, so a huge stored count cannot overflow -----
     start = 20_000.0
@@ -1301,3 +1308,118 @@ async def _assert_the_increment_carries_the_escalation_verdict(store: Any) -> No
         assert step.totp_state is None
         await store.disable_totp(uid, now=99_999.0)
         await store.delete_user(uid)
+
+
+#: The audit row the conditional reset arm appends with the reset (BACKLOG #5900).
+_RESET_AUDIT = AuditAppend("auth.reauth", actor="cli:contract-reset")
+
+
+async def _reset_rows(store: Any) -> int:
+    return len(await store.list_audit(limit=500, actor="cli:contract-reset"))
+
+
+async def _assert_conditional_full_authentication(store: Any) -> None:
+    """BACKLOG #5900: ``record_login_success`` with ``expected`` is a compare-and-set decided under
+    the write's own lock on every backend. It writes, and appends its ``audits``, only while the row
+    still holds the snapshot, and says what it found: a changed lockout column, a changed account
+    (enablement, provider or directory id), or no account."""
+    uid = "lock-cas1"
+    await store.create_user(
+        user_id=uid,
+        username="lock-cas",
+        auth_provider="local",
+        password_hash="h",
+        now=1.0,
+        password_generated=False,
+        audits=(),
+    )
+    t0 = 50_000.0
+    await _fail(store, uid, now=t0)
+
+    async def snapshot() -> tuple[object, ...]:
+        user = await store.get_user(uid)
+        assert user is not None
+        return full_authentication_snapshot(user)
+
+    async def columns() -> tuple[Any, ...]:
+        user = await store.get_user(uid)
+        assert user is not None
+        return _lockout_columns(user)
+
+    rows = await _reset_rows(store)
+    # A failure another writer commits after the snapshot: the reset writes nothing.
+    stale = await snapshot()
+    await _fail(store, uid, now=t0 + 1.0)
+    held = await columns()
+    answer = await store.record_login_success(
+        uid, now=t0 + 2.0, expected=stale, audits=[_RESET_AUDIT]
+    )
+    assert answer == "lockout_changed"
+    assert await columns() == held and await _reset_rows(store) == rows
+
+    # A disable, then a re-bind of the directory id or the provider: the account changed.
+    fresh = await snapshot()
+    await store.set_user_disabled(uid, disabled=True, now=t0 + 3.0)
+    answer = await store.record_login_success(
+        uid, now=t0 + 4.0, expected=fresh, audits=[_RESET_AUDIT]
+    )
+    assert answer == "account_changed"
+    assert await columns() == held and await _reset_rows(store) == rows
+    await store.set_user_disabled(uid, disabled=False, now=t0 + 5.0)
+    fresh = await snapshot()
+    # The provider as the enum member reads as its stored value, not as the member's name.
+    held_user = await store.get_user(uid)
+    assert held_user is not None
+    assert full_authentication_snapshot(
+        dataclasses.replace(held_user, auth_provider=AuthProvider.LOCAL)
+    ) == full_authentication_snapshot(held_user)
+    for column, value in (
+        ("directory_object_id", "synthetic-guid-0002"),
+        ("auth_provider", "ad"),
+        ("session_epoch", 99),
+    ):
+        rebound = list(fresh)
+        rebound[FULL_AUTHENTICATION_GUARD.index(column)] = value
+        answer = await store.record_login_success(
+            uid, now=t0 + 6.0, expected=tuple(rebound), audits=[_RESET_AUDIT]
+        )
+        assert answer == "account_changed", column
+        assert await columns() == held and await _reset_rows(store) == rows
+
+    # No such account.
+    assert (
+        await store.record_login_success(
+            "lock-nobody", now=t0 + 7.0, expected=fresh, audits=[_RESET_AUDIT]
+        )
+        == "gone"
+    )
+    assert await _reset_rows(store) == rows
+
+    # A refused append rolls the reset back.
+    async def refuse_append(*_a: object, **_k: object) -> object:
+        raise RuntimeError("audit append refused (test)")
+
+    store._append_audits = refuse_append  # the store is typed Any here: one patch, three backends
+    try:
+        with pytest.raises(RuntimeError, match="audit append refused"):
+            await store.record_login_success(
+                uid, now=t0 + 8.0, expected=fresh, audits=[_RESET_AUDIT]
+            )
+    finally:
+        del store._append_audits
+    assert await columns() == held, "a reset committed without its audit row"
+
+    # The snapshot still holds: the reset and its row land together.
+    answer = await store.record_login_success(
+        uid, now=t0 + 9.0, expected=fresh, audits=[_RESET_AUDIT]
+    )
+    assert answer == "written"
+    assert await columns() == (0, None, 0, 0, None, 0)
+    assert await _reset_rows(store) == rows + 1
+    # The unconditional form still writes, and appends nothing it was not given.
+    await _fail(store, uid, now=t0 + 10.0)
+    assert await store.record_login_success(uid, now=t0 + 11.0, audits=()) == "written"
+    assert await columns() == (0, None, 0, 0, None, 0)
+    assert await _reset_rows(store) == rows + 1
+
+    await store.delete_user(uid)

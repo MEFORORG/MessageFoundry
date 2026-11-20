@@ -1691,9 +1691,9 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
         and _called(n, "record_login_success")
     )
     assert writers == [
+        "_clear_after_reauth",
         "_complete_ad_login",
         "_login_local",
-        "_reproof_serialized",
         "finish_webauthn_assertion",
         "verify_mfa",
     ], f"record_login_success is now written by {writers}; restate the Recovery paragraph."
@@ -1811,18 +1811,23 @@ def test_the_sixth_sweep_states_both_adr_0197_locks_in_the_lock_prose() -> None:
         )
 
     # The Recovery paragraph's "a good password re-proof clears neither lock" and "nothing reaches it
-    # under a live second-step lock" rest on this guard, the only one on the re-proof's clear.
+    # under a live second-step lock" rest on this guard, the only decision of the re-proof's clear.
+    # The write, _clear_after_reauth, is the store's compare-and-set against the state decided on
+    # (BACKLOG #5900).
     reproof = _service_func("_reproof_serialized")
     cleared = [
         n.value
         for n in ast.walk(reproof)
         if isinstance(n, ast.Assign)
-        and any(isinstance(tg, ast.Name) and tg.id == "cleared" for tg in n.targets)
+        and any(isinstance(tg, ast.Name) and tg.id == "clear_due" for tg in n.targets)
     ]
-    assert len(cleared) == 1, "_reproof_serialized no longer assigns `cleared` exactly once."
+    assert len(cleared) == 1, "_reproof_serialized no longer assigns `clear_due` exactly once."
     guard = cleared[0]
     assert isinstance(guard, ast.BoolOp) and isinstance(guard.op, ast.And), (
-        "_reproof_serialized no longer decides its lockout clear in one `cleared = ... and ...`."
+        "_reproof_serialized no longer decides its lockout clear in one `clear_due = ... and ...`."
+    )
+    assert _called(_service_func("_clear_after_reauth"), "full_authentication_snapshot"), (
+        "_clear_after_reauth no longer checks the row against the state its clear was decided on."
     )
     terms = [ast.unparse(v) for v in guard.values]
     assert "not locked" in terms and "not current.second_step_locked(now)" in terms, (

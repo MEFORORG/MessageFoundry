@@ -168,7 +168,7 @@ async def test_login_failure_lockout_and_success_reset() -> None:
         await store.record_login_failure("u1", failed_attempts=3, locked_until=500.0, now=10.0)
         u = await store.get_user("u1")
         assert u is not None and u.failed_attempts == 3 and u.locked_until == 500.0
-        await store.record_login_success("u1", now=20.0)
+        await store.record_login_success("u1", now=20.0, audits=())
         u = await store.get_user("u1")
         assert u is not None and u.failed_attempts == 0 and u.locked_until is None
         assert u.last_login_at == 20.0

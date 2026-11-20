@@ -283,11 +283,13 @@ from messagefoundry.store.store import (
     EpochRaise,
     FailOutcome,
     FederatedUnbind,
+    FullAuthenticationWrite,
     InboundMetrics,
     KeptSessionRestamp,
     LatencyHistogram,
     LockoutCounter,
     LockoutIncrement,
+    LoginSuccessAnswer,
     MessageOrigin,
     MessageSearchResult,
     MessageStatus,
@@ -362,7 +364,6 @@ from messagefoundry.store.store import (
     federated_unbind,
     first_admin_grant,
     first_sealed_approval_async,
-    full_authentication_clear,
     global_epoch_or_refuse,
     global_epoch_raise,
     global_epoch_unmoved,
@@ -11137,9 +11138,27 @@ class PostgresStore:
         await conn.execute("DELETE FROM search_presets WHERE owner_user_id=$1", user_id)
         await conn.execute("DELETE FROM users WHERE id=$1", user_id)
 
-    async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
+    async def record_login_success(
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        expected: tuple[object, ...] | None = None,
+        audits: Sequence[AuditAppend],
+    ) -> LoginSuccessAnswer:
+        """See the SQLite twin (BACKLOG #5900): the compare with ``expected`` reads the row
+        ``_write_user`` holds ``FOR UPDATE``, and ``audits`` share the reset's transaction. This leg
+        is CI-only, so a divergence from the SQLite and SQL Server bodies surfaces first in CI."""
         now = time.time() if now is None else now
-        await self._write_user_txn(user_id, lambda r: full_authentication_clear(r, now))
+        write = FullAuthenticationWrite(now, expected)
+        appended: list[AppendedAuditRow] = []
+        async with self._timed_acquire(record=False) as conn, conn.transaction():
+            written = await self._write_user(conn, user_id, write)
+            if written is not None and audits:
+                appended = await self._append_audits(conn, audits, now=now)
+        if appended:
+            tee_audits(audits, appended, ts=now)
+        return write.answer(written)
 
     async def clear_lockout(
         self,

@@ -3768,8 +3768,55 @@ unconditionally. A change landing there is not seen: for example, a run of wrong
 session of the same account can set the second-step lock there, and the passkey leg, which takes
 no account queue, would then clear it. The re-read does not check the session's expiry either;
 the rotation that follows refuses an expired session, but only after the counters are cleared.
-Closing the window would take store writes conditional on the state the re-read saw, which no leg
-has. The re-read narrows it from the whole proof check to those writes.
+Closing the window would take store writes conditional on the state the re-read saw, which
+neither factor leg makes. The re-read narrows it from the whole proof check to those writes.
+
+**The password re-auth leg's lockout clear is a compare-and-set (BACKLOG #5900).** The re-proof
+decides whether a clear is due: the account holds lockout state, no lock is live, and the session
+has met its second-factor requirement. A due clear is written only once the session has rotated, so
+a correct password on a session the ceremony lost clears nothing and raises no
+`auth.login_after_failures`. The write is `record_login_success` with an expected snapshot. On
+every backend it writes only while the account row, read inside the write's own transaction, still
+holds the six lockout columns, `disabled`, `auth_provider`, `directory_object_id` and
+`session_epoch` of the row the proof decided on. So a failure, a lock, a disable, a re-bind or a
+raise of the account's own `session_epoch` that any writer commits after that read, on this engine
+shard or another, leaves the counters as they are. The store's global session epoch (BACKLOG
+#5091) is not in the snapshot: an every-account revoke is seen only once it has raised this
+account's own `session_epoch`, which it does after raising the global one. On SQLite the
+conditional write does the account row's seal work, a Vault transit call under a Transit sealer,
+before it takes the write lock; the audit-chain MAC of each row it appends is still computed under
+that lock. It then re-reads the row under the lock and writes only if the row is the one that seal
+work read, so another process cannot commit in between; a changed row redoes the seal work. The compare reads the account
+row only: a revoke of the rotated session itself, after the rotation and before the clear, is not
+seen. At least these outcomes follow, and **only on a re-auth whose clear is due**; a re-auth with
+nothing to clear makes no such check:
+
+- A changed lockout column clears nothing, and the re-auth keeps its rotated session.
+- An account gone, disabled, re-bound or whose own `session_epoch` moved, or whose record fails
+  its seal or cannot be verified by Vault transit, is granted nothing. A failing record is
+  reported, the store is asked to end the rotated session, and the re-auth answers
+  `session_lost`. Its `auth.reauth` row carries `clear_denied` and `session_ended`, which says
+  whether that revoke landed as far as the re-auth saw.
+- A Vault transit Outage at the account record's seal, which is paged, clears nothing, and the
+  clear does not end the rotated session; the re-auth then writes its `auth.reauth` row hard.
+- The `auth.reauth` row, and the `auth.login_after_failures` row when the clear ends a run of
+  failures, are appended in the reset's own transaction, so the counters are not reset without
+  them, and a refused append rolls the reset back.
+- At least some raises from the stamp onward, such as one from the clear, write an `auth.reauth` row
+  marked `interrupted`, softly, beside any row the clear already committed. At least these write no
+  interrupted row: a hard `auth.reauth` row write that raises or is cancelled (ADR 0217's 2026-11-19
+  amendment, case (a)), a stamp-window error that is answered and suppressed, and a rotation that a
+  store error or an Outage refused. A raise inside the re-proof itself, after the password verified,
+  writes no `auth.reauth` row.
+
+**A password re-auth that holds a rotated token asks the store, best effort, to revoke that session
+when its hard `auth.reauth` row write raises or is cancelled, or when its clear raises (BACKLOG
+#5900, PR 3100).** In both cases it raises and never hands back the rotated token. The user is
+signed out because the rotation already retired the old token, not because of the revoke. Which
+revoke outcomes are recorded where, the federated step-up's gap, and the Lander's delegated decision
+that accepts this sign-out during a Vault transit Outage, are stated once, in the 2026-11-19
+amendment to the Outage row of
+[ADR 0217](adr/0217-an-unverifiable-transit-row-seal-is-denied-like-a-failed-one-and-the-ad-reconciler-ends-sessions-rather-than-holding.md).
 
 **A directory step-up or enrolment leg refuses a present account that lost a role in the directory
 (BACKLOG #2240).** At least the code and passkey legs above, the two enrolment legs, the IdP
@@ -7285,8 +7332,11 @@ only as a combined sign-in with both factors right. A session holder reaches it 
 TOTP or recovery code (`verify_mfa`) or a good passkey assertion (`finish_webauthn_assertion`),
 because the sign-in lock refuses neither leg and each success makes that write. Nothing reaches the
 successful-login write under a live second-step lock, which refuses every sign-in and both of those
-legs. A good password re-proof or IdP step-up clears neither lock. At least three routes reach
-`set_password` while a local account is locked,
+legs. A good password re-proof or IdP step-up clears neither lock: the re-auth leg's clear is
+decided only with neither lock live and written only while the row still holds what the proof
+read, so a lock set after the proof is kept (BACKLOG #5900, under
+[Step-up re-verification](#step-up-re-verification-on-sensitive-operations-wp-l3-16-asvs-753)).
+At least three routes reach `set_password` while a local account is locked,
 and **each of these issues a new password rather than merely lifting the lock**: the holder's own
 `POST /me/password`, reachable only while they still have a live session (session validation
 consults neither lock, neither lock refuses this re-proof, and that route is exempt from the

@@ -119,6 +119,7 @@ from messagefoundry.store.store import (
     LatencyHistogram,
     LockoutCounter,
     LockoutIncrement,
+    LoginSuccessAnswer,
     MessageOrigin,
     MessageSearchResult,
     MessageStatus,
@@ -2892,8 +2893,18 @@ class AuthStore(Protocol):
     ) -> SignCountAnswer: ...
 
     # A FULL authentication: stamps ``last_login_at`` and zeroes all six lockout columns, both
-    # counters' counts, expiries and cycle counts, in one UPDATE (ADR 0197 AC-8).
-    async def record_login_success(self, user_id: str, *, now: float | None = None) -> None: ...
+    # counters' counts, expiries and cycle counts, in one UPDATE (ADR 0197 AC-8). With ``expected``
+    # (``full_authentication_snapshot``) it writes only while the row still holds that snapshot,
+    # decided under the write's own lock, and ``audits`` share its transaction and land only with
+    # the reset (BACKLOG #5900). The answer says whether it was written, the row changed, or is gone.
+    async def record_login_success(
+        self,
+        user_id: str,
+        *,
+        now: float | None = None,
+        expected: tuple[object, ...] | None = None,
+        audits: Sequence[AuditAppend],
+    ) -> LoginSuccessAnswer: ...
 
     # The offline administrator unlock's write (ADR 0171 as amended by ADR 0197): clears both locks and
     # both failure counts, and keeps both cycle counts unless ``reset_cycles``. A named method, in

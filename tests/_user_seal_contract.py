@@ -309,7 +309,7 @@ async def assert_user_seal_contract(store: Any, raw: RawSql) -> None:
         lambda: store.set_user_disabled(bent, disabled=False),
         lambda: store.set_user_roles(bent, [Role.VIEWER.value], audits=()),
         lambda: store.set_user_channel_scope(bent, '["IB_A"]', source="manual"),
-        lambda: store.record_login_success(bent),
+        lambda: store.record_login_success(bent, audits=()),
         lambda: store.set_password(
             bent, password_hash="h", password_generated=False, must_change_password=False
         ),

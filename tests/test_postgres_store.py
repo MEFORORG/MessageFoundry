@@ -1077,7 +1077,7 @@ async def test_auth_users_roles_sessions(store) -> None:
 
     await store.record_login_failure("u1", failed_attempts=2, locked_until=500.0, now=10.0)
     assert (await store.get_user("u1")).locked_until == 500.0
-    await store.record_login_success("u1", now=20.0)
+    await store.record_login_success("u1", now=20.0, audits=())
     refreshed = await store.get_user("u1")
     assert refreshed.failed_attempts == 0 and refreshed.last_login_at == 20.0
 
