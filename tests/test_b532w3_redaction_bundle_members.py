@@ -29,28 +29,37 @@ _REPO = Path(__file__).resolve().parents[1]
 
 
 def _members_written_by_build_bundle() -> set[str]:
+    """Every ``members["<literal>"] = ...`` in ``build_bundle``. A store under any other key, or
+    any method call on ``members`` such as ``update`` or ``setdefault``, fails here, because this
+    reading would not see the member it adds."""
     source = textwrap.dedent(inspect.getsource(bundle_mod.build_bundle))
     names: set[str] = set()
     for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Assign):
-            continue
-        for target in node.targets:
-            if (
-                isinstance(target, ast.Subscript)
-                and isinstance(target.value, ast.Name)
-                and target.value.id == "members"
-                and isinstance(target.slice, ast.Constant)
-                and isinstance(target.slice.value, str)
-            ):
-                names.add(target.slice.value)
+        if (
+            isinstance(node, ast.Attribute)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "members"
+        ):
+            raise AssertionError(f"build_bundle calls members.{node.attr}; read its names here")
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.ctx, ast.Store)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "members"
+        ):
+            key = node.slice
+            assert isinstance(key, ast.Constant) and isinstance(key.value, str), ast.dump(key)
+            names.add(key.value)
     return names
 
 
 def _help_text(capsys: pytest.CaptureFixture[str]) -> str:
-    from messagefoundry.__main__ import main
+    # The parser alone, which builds with no side effect, so main()'s process-wide hooks stay out.
+    from messagefoundry.__main__ import _build_parser
 
+    parser, _ = _build_parser()
     with pytest.raises(SystemExit) as exc:
-        main(["support-bundle", "--help"])
+        parser.parse_args(["support-bundle", "--help"])
     assert exc.value.code == 0
     # argparse wraps at a hyphen too, so a wrapped name is joined back before matching.
     return re.sub(r"-\s+", "-", " ".join(capsys.readouterr().out.split()))
@@ -72,7 +81,13 @@ def test_the_ast_reading_finds_every_member_a_live_bundle_writes(tmp_path: Path)
     log_dir.mkdir()
     (log_dir / "engine.log").write_text("INFO synthetic line\n", encoding="utf-8")
     toml = tmp_path / "messagefoundry.toml"
-    toml.write_text(f'[logging]\nlog_dir = "{log_dir.as_posix()}"\n', encoding="utf-8")
+    # The store path is pinned under tmp_path, so the status snapshot never opens a store in the
+    # working directory.
+    store = (tmp_path / "absent.db").as_posix()
+    toml.write_text(
+        f'[logging]\nlog_dir = "{log_dir.as_posix()}"\n[store]\npath = "{store}"\n',
+        encoding="utf-8",
+    )
     out = tmp_path / "bundle.zip"
     build_bundle(out, config_dir=None, settings=load_settings(config_path=toml))
     with zipfile.ZipFile(out) as zf:
@@ -105,8 +120,9 @@ def test_the_help_describes_status_as_the_phi_contract_does(
     with zipfile.ZipFile(out) as zf:
         contract = json.loads(zf.read("manifest.json"))["phi_contract"].lower()
     help_text = _help_text(capsys).lower()
-    assert "metadata-only" in contract
-    assert "metadata-only" in help_text
+    assert "status is the metadata-only status models" in contract
+    # Anchored on the member, so "metadata-only" elsewhere on the screen does not pass.
+    assert "status.json (the metadata-only status models)" in help_text, help_text
     # The contract makes no PHI-free claim about any member, so the help may not either, except
     # in the "not as secret-free or PHI-free" residual sentence it shares with the contract.
     residual = "not as secret-free or phi-free"

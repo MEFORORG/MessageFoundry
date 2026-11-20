@@ -7,14 +7,16 @@ starts no server. Contents (each a small text/JSON member):
 
 * ``version.txt`` / ``manifest.json`` — the engine :data:`messagefoundry.__version__` + generation
   timestamp + a content listing.
-* ``config-summary.json`` — a **secret-free** summary of the wired graph: registry COUNTS only
+* ``config-summary.json`` — a summary of the wired graph that holds no secret: registry COUNTS only
   (inbound/outbound/router/handler counts + the connection NAMES + transport TYPE), never a settings
   value, host, path, credential, or any ``env()``-resolved data.
 * ``status.json`` — a ``/status`` snapshot built from the REAL status models
   (:class:`~messagefoundry.api.models.SystemStatus` / ``EngineInfo`` / ``DbInfo``), populated offline
   from the store. Metadata-only (counts + sizes), the term the manifest's ``phi_contract`` uses.
-* ``app-log.txt`` — a **redacted** tail of the configured app log (see
-  :mod:`messagefoundry.support.redact`); omitted when no ``[logging].log_dir`` is configured.
+* ``app-log.txt`` — a **redacted** tail of the newest app log (see
+  :mod:`messagefoundry.support.redact`), or an ``MF-BUNDLE-LOG-*`` code when that log cannot be
+  listed or read; omitted when no ``[logging].log_dir`` is configured, when it holds no log file, or
+  when the tail is set to 0 lines.
 
 HARD RULE (do not break): no member this module builds reads a message body from the store, and only
 the app-log tail can carry a secret or a body into the archive. The config summary loads the config but
@@ -139,7 +141,7 @@ def status_snapshot(settings: ServiceSettings | None) -> dict[str, Any]:
 
     The engine isn't running under the CLI, so ``EngineInfo`` carries the version with a zero uptime /
     no live channel counts; ``DbInfo`` is read from the store the settings point at (when reachable).
-    PHI-free — the status models are metadata/counts/sizes only. Returns an ``error`` member instead of
+    Metadata-only, the manifest ``phi_contract``'s term — the status models are counts/sizes only. Returns an ``error`` member instead of
     raising if the store can't be opened (e.g. the DB is missing or in use), so the bundle still builds."""
     import os
 

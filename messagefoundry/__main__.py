@@ -569,9 +569,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     security.add_argument("--json", action="store_true", help="emit JSON")
 
-    # The old wording read "a SECRET-FREE / PHI-free support zip". That is true of the config
-    # summary and the status snapshot and NOT of the log tail, whose redaction is best-effort: a
-    # single-token identifier survives it (messagefoundry/redaction.py states that residual), and an
+    # The old wording read "a SECRET-FREE / PHI-free support zip". The config summary holds no
+    # secret and the status snapshot is metadata-only, the phi_contract's own terms, but the log
+    # tail meets neither, because its redaction is best-effort: a single-token identifier survives it (messagefoundry/redaction.py states that residual), and an
     # operator username is exactly that shape while this engine's own settings classifier calls a
     # username a credential. A blanket claim resting on a member that does not meet it is the
     # false-premise shape CLAUDE.md section 11 forbids, so the claim was repaired rather than the
@@ -584,9 +584,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "write a support zip to hand to support (#49). Its members: version.txt (the engine "
         "version); manifest.json (the member list and the phi_contract); config-summary.json "
         "(counts/names only, holding no secret); status.json (the metadata-only status models); "
-        "and, when the configured log directory holds a log and the tail is not 0 lines, "
-        "app-log.txt (a "
-        "REDACTED app-log tail). The tail's "
+        "and app-log.txt, a REDACTED tail of the newest app log, or an MF-BUNDLE-LOG-* code "
+        "when that log cannot be listed or read, left out when no [logging].log_dir is set, "
+        "when it holds no log file, or when --log-tail-lines is 0. The tail's "
         "redaction is BEST-EFFORT, and values survive it: at least a single-token identifier such "
         "as an operator username and, on a non-production instance logging at DEBUG, a message "
         "body the log recorded in a shape the redaction does not read. Handle the zip as a copy of "
@@ -601,7 +601,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     support_bundle.add_argument(
         "--config",
         default=None,
-        help="config modules directory — drives the secret-free graph summary (counts/names only)",
+        help="config modules directory — drives the graph summary (counts/names only, no secret)",
     )
     support_bundle.add_argument(
         "--service-config",
