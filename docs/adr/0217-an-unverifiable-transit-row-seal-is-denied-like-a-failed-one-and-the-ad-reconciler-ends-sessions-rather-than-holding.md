@@ -322,21 +322,25 @@ revoke whose call raised after it committed can be reported as not ended.
 During a Vault Transit Outage, case (a) or (b) signs out a re-auth due a clear, and the
 stamp-to-rotation window above can too, by revoking the stamped hash. An Outage at the account
 record's seal that leaves the audit append working writes the row, hands back the rotated token and
-ends nothing. Accepting the sign-out in case (a) or (b), or through the stamp-to-rotation window,
-was decided by the Lander under the owner's delegation of 2026-11-19, record
-d20261119T234650256-3bf83e, because it fails closed. The question asked, quoted from the Lander's
-owner table: "During a Vault Transit outage, a re-auth whose lockout counters are due to be cleared
-now signs the user out; main keeps their session live. [...] ADR 0217's Outage row, which you
-accepted, says 'end nothing'." The owner answered "/driver". The owner can reverse the decision by
-ruling that the Outage row's "end nothing" governs. In case (a) or (b), dropping the revoke alone
-keeps no session, since the sign-out comes from the rotation, and keeping the session in case (b)
-would need a design that clears the lockout before the stamp, as main did; the window's revoke rests
-on decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2, the Owner's open reversal
-point above. The question covered only a re-auth due a clear. On a re-auth with no clear due, the
-revoke in case (a) during an Outage is this PR's own behaviour and an exception to the Outage row's
-"end nothing" for that path only, accepted by the Lander as strictly safer under the owner's
-standing instruction of 2026-10-22, record d20261120T015953943-d015e0. The row's text, apart from
-its label's pointer to this amendment, is unchanged.
+ends nothing. Accepting the sign-out in case (a) or (b) was decided by the Lander under the owner's
+delegation of 2026-11-19, record d20261119T234650256-3bf83e, because it fails closed, and record
+d20261120T032444709-be504f extends that outcome to the stamp-to-rotation window. The question asked,
+quoted from the Lander's owner table: "During a Vault Transit outage, a re-auth whose lockout
+counters are due to be cleared now signs the user out; main keeps their session live. [...] ADR
+0217's Outage row, which you accepted, says 'end nothing'." The owner answered "/driver". The owner
+can reverse the decision by ruling that the Outage row's "end nothing" governs. In case (a) or (b),
+dropping the revoke alone keeps no session, since the sign-out comes from the rotation, and keeping
+the session in case (b) would need a design that clears the lockout before the stamp, as main did;
+the window's revoke rests at least on decisions d20261109T165402853-83b348 and
+d20261109T165406730-2505f2, the Owner's open reversal point above, and on Q4,
+d20261110T004920629-fb8ff6. Outside an Outage, a store fault that refuses writes can now sign out a
+re-auth due a clear, through the window's best-effort revoke at the stamp write, where main's clear
+raised first and kept the session; the Lander accepted this as d20261120T032446206-33a44d, because
+it fails closed and costs availability only. The question covered only a re-auth due a clear. On a
+re-auth with no clear due, the revoke in case (a) during an Outage is this PR's own behaviour and an
+exception to the Outage row's "end nothing" for that path only, accepted by the Lander as strictly
+safer under the owner's standing instruction of 2026-10-22, record d20261120T015953943-d015e0. The
+row's text, apart from its label's pointer to this amendment, is unchanged.
 
 Before this PR, the clear ran before the rotation, so an Outage at the clear kept the original
 session. A hard `auth.reauth` row refused after the rotation left the rotated session live, with
