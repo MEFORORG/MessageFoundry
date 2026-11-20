@@ -15766,8 +15766,7 @@ class AuthService:
         hard ``auth.reauth`` row whose write raises or is cancelled after the rotation, also asks
         for that revoke and raises; ADR 0217's 2026-11-19 amendment is the record. A success that
         clears a run of failures is labelled ``auth.login_after_failures``; that row and the
-        ``auth.reauth`` row commit with the clear. A ceremony that raises from its stamp onward
-        still tries to write its ``auth.reauth`` row, softly."""
+        ``auth.reauth`` row commit with the clear."""
         if await self.session_steps_up_at_idp(token):
             # BACKLOG #296, ADR 0142 Amendment B: a session the federated login minted steps up at the
             # IdP and NEVER by a password. Refused before any verify, so the password is not sent to

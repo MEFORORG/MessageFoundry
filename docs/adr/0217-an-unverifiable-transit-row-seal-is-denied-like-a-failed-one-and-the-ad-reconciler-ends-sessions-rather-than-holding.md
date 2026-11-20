@@ -301,11 +301,11 @@ extension, in (c).
 
 **An amendment to the Outage row, added 2026-11-19 (BACKLOG #5900, PR 3100).** BACKLOG #5900
 moves the password re-auth's (`reauth`) lockout clear after the session rotation. A re-auth that
-holds a rotated token ends that session in at least two cases: (a) the write of its hard
-`auth.reauth` row raises or is cancelled, whether or not a clear was due; (b) the clear itself
-raises, at least on a Vault Transit Outage refusing the audit-chain MAC of the rows the clear
-appends (`CipherError`). In both it drops any purpose grant minted for the rotated token, raises,
-never hands that token back, and asks the store to revoke the rotated session through a shielded,
+holds a rotated token raises in at least two cases: (a) the write of its hard `auth.reauth` row
+raises or is cancelled, whether or not a clear was due; (b) the clear itself raises, at least on a
+Vault Transit Outage refusing the audit-chain MAC of the rows the clear appends (`CipherError`).
+In both it drops any purpose grant minted for the rotated token, never hands that token back, and
+asks the store to revoke the rotated session through a shielded,
 best-effort revoke that ends nothing else. The federated step-up, `complete_oidc_step_up`, also
 raises and withholds its token when its hard row raises, but it neither drops its grant nor
 revokes its rotated session.
@@ -314,12 +314,10 @@ The user is signed out because the rotation already retired the caller's old tok
 of the revoke. If the revoke fails, the rotated session stays live, but no caller holds its token.
 In case (a), log lines record what the revoke call reported. In case (b), the soft `interrupted`
 `auth.reauth` row carries `session_ended` when that write succeeds. When that row is refused too,
-a refused revoke is logged, and a revoke that landed is recorded by no audit row or log line; the
-session row's `revoked_at` still records it. A revoke whose call raised after it committed can be
-reported as not ended.
+a refused revoke is logged, and a revoke that landed is recorded by no audit row or log line. A
+revoke whose call raised after it committed can be reported as not ended.
 
-During a Vault Transit Outage, a re-auth due a clear signs the user out only through case (a) or
-(b). An Outage at the account record's seal that leaves the audit append working writes the row,
+During a Vault Transit Outage, a re-auth due a clear signs the user out through case (a) or (b). An Outage at the account record's seal that leaves the audit append working writes the row,
 hands back the rotated token and ends nothing. Accepting that sign-out was decided by the Lander
 under the owner's delegation of 2026-11-19, record d20261119T234650256-3bf83e, because it fails
 closed. The question asked, quoted from the Lander's owner table: "During a Vault Transit outage,

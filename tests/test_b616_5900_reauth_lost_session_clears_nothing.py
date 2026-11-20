@@ -1245,12 +1245,11 @@ async def test_a_cancel_after_the_reauth_row_committed_is_not_logged_as_a_refusa
         async def outage(user_id: str, **kwargs: Any) -> None:
             raise _outage(user_id)
 
-        async def commit_then_hang(action: str, **kwargs: Any) -> Any:
-            result = await real_audit(action, **kwargs)
+        async def commit_then_hang(action: str, **kwargs: Any) -> None:
+            await real_audit(action, **kwargs)
             if action == "auth.reauth":
                 committed.set()
                 await asyncio.Event().wait()
-            return result
 
         monkeypatch.setattr(store, "record_login_success", outage)
         monkeypatch.setattr(service, "_user_seal_outage", lambda refused: None)
