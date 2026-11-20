@@ -88,6 +88,10 @@ selections, verbatim:
 - Ruling 2: **"Run step 2 (Recommended)"**.
 - Ruling 3, a narrowing write to an unverifiable user row: **"Refuse, end sessions (Recommended)"**.
 - Ruling 7: **"Accept as listed (Recommended)"**.
+- A later ruling, on 2026-11-20 (UTC) in the batch 616 Manager's chat, on the store-fault residual
+  of a re-auth due a clear (see the Outage amendment): **"Accept, file a row (Recommended)"**,
+  recorded on PR 3100 comment
+  [7041132815](https://github.com/MEFORORG/MessageFoundry/pull/3100#issuecomment-7041132815).
 
 **What differs from the ruled text at `94b485c2e1`** (every difference `git diff 94b485c2e1` shows
 in this file, apart from this section, the status line and *Open findings carried to the build*):
@@ -346,15 +350,18 @@ refused, this PR can leave the original token live, stamped and unrotated, where
 unstamped because main's first write is the clear; main can reach the same state for a fault that
 begins one write later (d20261120T042802906-777260), and here the lockout counters stay uncleared.
 The owner accepted this residual on 2026-11-20, in the batch 616 Manager's chat (recorded on PR
-3100, comment 7041132815), and a follow-up row is to re-order the re-auth writes, or add a revoke
-that does not depend on later writes, so this fault leaves no worse a state than main; the Lander's
-earlier acceptance d20261120T032446206-33a44d was withdrawn first (d20261120T045030279-68e180). The
-question covered only a re-auth due a clear during an Outage. On a re-auth with no clear due, the
-revoke in case (a) during an Outage is this PR's own behaviour and an exception to the Outage row's
-"end nothing" for that path only, accepted by the Lander as strictly safer under the owner's
-standing instruction of 2026-10-22, record d20261120T015953943-d015e0 (independent review
-d20261120T035330577-6e0dc7). The row's text, apart from its label's pointer to this amendment, is
-unchanged.
+3100, comment
+[7041132815](https://github.com/MEFORORG/MessageFoundry/pull/3100#issuecomment-7041132815)). A
+follow-up row, to be filed by the Lander under ledger ruling R2, is to change the re-auth writes so
+that a fault where the stamp commits and then raises leaves no worse a state than main; the ruling
+names re-ordering the writes or adding a revoke that does not depend on later writes. The Lander's
+earlier acceptance d20261120T032446206-33a44d was withdrawn before that ruling
+(d20261120T045030279-68e180). The 2026-11-19 /driver question quoted above covered only a re-auth
+due a clear during an Outage. On a re-auth with no clear due, the revoke in case (a) during an
+Outage is this PR's own behaviour and an exception to the Outage row's "end nothing" for that path
+only, accepted by the Lander as strictly safer under the owner's standing instruction of 2026-10-22,
+record d20261120T015953943-d015e0 (independent review d20261120T035330577-6e0dc7). The row's text,
+apart from its label's pointer to this amendment, is unchanged.
 
 Before this PR, the clear ran before the rotation, so an Outage at the clear kept the original
 session. A hard `auth.reauth` row refused after the rotation left the rotated session live, with
