@@ -315,10 +315,11 @@ ruling that the Outage row's "end nothing" governs. The row's text, apart from i
 to this amendment, is unchanged.
 
 What the code does. On at least two paths, a password re-auth that has rotated its session raises
-and never hands back the rotated token. One is a clear that raises, which includes a Vault Transit
+and never hands back the rotated token. The federated step-up, `complete_oidc_step_up`, does not
+do this yet. One, the clear-raise path, is a clear that raises, which includes a Vault Transit
 Outage refusing the audit-chain MAC of the rows the clear appends (`CipherError`;
-[SECURITY.md](../SECURITY.md), the re-auth leg's lockout clear). The other is a hard `auth.reauth`
-row whose write raises, at least on a Vault Transit Outage, an `OSError` or a defect, or is
+[SECURITY.md](../SECURITY.md), the re-auth leg's lockout clear). The other, the hard-row path, is
+a hard `auth.reauth` row whose write raises, at least on a Vault Transit Outage, an `OSError` or a defect, or is
 cancelled; neither proves the row is not in, since a cancel, or a connection lost at the commit,
 can follow a commit that landed. This PR applies the second path whether or not a lockout clear
 was due; the delegated question above covered only a re-auth due a clear. On either path the user
@@ -328,9 +329,11 @@ always written after it. The sign-out does not come from the revoke. The re-auth
 purpose grant minted for the rotated token and asks the store to end the rotated session, whose
 token was never handed back; that revoke ends nothing else. It is best effort: a refused revoke is
 tried once more, and when it is refused again, or raises, the rotated session stays live. On the
-hard-row path only log lines then record it. On the clear-raise path the re-auth also writes an
-`interrupted` row softly, carrying `session_ended`, where that write succeeds; an Outage that
-refuses the audit-chain MAC refuses that row too, and only log lines record the revoke. Asking the
+hard-row path log lines record the revoke's outcome, landed or not, and no row does. On the
+clear-raise path the re-auth writes an `interrupted` row softly, which records the outcome in
+`session_ended` where that write succeeds. An Outage that refuses the audit-chain MAC refuses that
+row too: then a refused revoke is recorded only by log lines, and a revoke that landed is recorded
+by nothing. Asking the
 store to end that session departs from the Outage row's "end nothing".
 
 Before this PR, the clear ran inside the re-proof, before the rotation, so a clear that an Outage

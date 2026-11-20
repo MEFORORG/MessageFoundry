@@ -15697,9 +15697,12 @@ class AuthService:
         whether the revoke landed, as far as this call saw. A refused revoke is tried once more, as
         ``confirm_mfa_enrollment`` tries its own (BACKLOG #3025). Refused twice, it is logged and
         answered False: the elevated session may then stay live, unreachable, because the caller
-        answers ``session_lost`` or raises either way and its new token is never handed back. The
-        caller records the answer on its ``auth.reauth`` row, or logs it when that row's write
-        raised or was cancelled."""
+        answers ``session_lost`` or raises either way and its new token is never handed back. A
+        refused revoke is logged here. After a denied or raised clear, the caller records the
+        answer in ``session_ended`` on the ``auth.reauth`` row it then writes softly, where that
+        write succeeds; when that write is refused too, a revoke that landed is recorded nowhere.
+        On the hard-row path, where that row's write raised or was cancelled, the caller logs the
+        answer instead."""
         rotated = hash_token(rotated_token)
         for attempt in ("retrying", "and could not end the session it rotated"):
             ended = await write_audit_soft(

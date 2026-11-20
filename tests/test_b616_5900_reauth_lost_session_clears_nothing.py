@@ -1192,7 +1192,7 @@ async def test_an_outage_at_the_clear_and_a_refused_row_end_the_rotated_session(
 async def test_a_refused_revoke_after_a_refused_row_logs_what_happened(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The refused-row path minted a purpose grant and then dropped it, so its revoke's log lines
+    """The hard-row path minted a purpose grant and then dropped it, so its revoke's log lines
     say the rotated token is never handed back and that the session could not be ended, never that
     the re-auth granted nothing."""
     store = await MessageStore.open(":memory:")
