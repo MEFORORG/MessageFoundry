@@ -223,7 +223,7 @@ async def test_a_probe_costing_multiples_of_the_interval_no_longer_starves_the_s
     readings: list[ProcReading] = []
     await asyncio.gather(
         _sample_loop(poller, _INTERVAL_S, stop, samples),  # type: ignore[arg-type]
-        _probe_loop(sampler, _INTERVAL_S, stop, readings, time.perf_counter()),  # type: ignore[arg-type]
+        _probe_loop(sampler, _INTERVAL_S, stop, readings, time.perf_counter(), asyncio.Event()),  # type: ignore[arg-type]
         _hold(stop, _HOLD_S),
     )
     # 1.5s of hold at a 0.25s interval affords 5 whole intervals; require most of them so the
@@ -373,7 +373,7 @@ async def _probe_step(script: list[tuple[float, ProcSample]]) -> tuple[list[Proc
     sampler = _ScriptedSampler(script, stop)
     readings: list[ProcReading] = []
     floor_ticks, _ = await asyncio.gather(
-        _probe_loop(sampler, _INTERVAL_S, stop, readings, time.perf_counter()),  # type: ignore[arg-type]
+        _probe_loop(sampler, _INTERVAL_S, stop, readings, time.perf_counter(), asyncio.Event()),  # type: ignore[arg-type]
         _hold_from_first_call(sampler, stop),
     )
     assert floor_ticks == sampler.calls_after_stop, (
@@ -519,13 +519,16 @@ def test_a_window_with_one_measured_reading_beside_a_timeout_does_not_fire_the_f
 _ACCOUNT = cast(runner._ReloadAccount, object())
 
 
-async def test_the_reply_wait_starts_while_the_probe_is_still_reading() -> None:
-    """The make-up attempt must not delay the reply wait. The stand-in probe cannot finish until the
-    reply wait has STARTED, so a helper that awaited the probe first would never start it, and the
-    probe's deadline fails the test instead of a timing threshold."""
+async def test_the_reply_wait_starts_while_the_makeup_attempt_is_still_reading() -> None:
+    """The make-up attempt must not delay the reply wait. The stand-in probe closes its window, as
+    `_probe_loop` does before a make-up attempt, and then cannot finish until the reply wait has
+    STARTED, so a helper that awaited the whole probe first would never start it, and the probe's
+    deadline fails the test instead of a timing threshold."""
     reply_started = asyncio.Event()
+    window_closed = asyncio.Event()
 
     async def probe() -> int:
+        window_closed.set()
         async with asyncio.timeout(_TEST_DEADLINE_S):
             await reply_started.wait()
         return 1
@@ -534,9 +537,56 @@ async def test_the_reply_wait_starts_while_the_probe_is_still_reading() -> None:
         reply_started.set()
         return _ACCOUNT
 
-    floor, account = await runner._await_probe_beside_reply(asyncio.create_task(probe()), reply())
+    floor, account = await runner._await_probe_beside_reply(
+        asyncio.create_task(probe()), window_closed, reply()
+    )
     assert floor == 1
     assert account is _ACCOUNT
+
+
+async def test_a_step_whose_floor_does_not_fire_waits_for_the_reply_after_its_last_attempt() -> (
+    None
+):
+    """The reply allowance is at least what it was before the floor, on every step. There the reply
+    wait started only once the attempt in flight at the window's close had returned, so the whole
+    `_POST_RELOAD_REPLY_WAIT_S` came after it. Started beside that attempt, the wait would overlap
+    it, and a late reply would get less time before the step judges "no reply". The real
+    `_probe_loop` runs here, with an attempt that measures, so the floor does not fire; the check is
+    an order of two clock readings, not a timing threshold."""
+    stop = asyncio.Event()
+    window_closed = asyncio.Event()
+    sampler = _ScriptedSampler([(_SLOW_ATTEMPT_S, _measured(140))], stop)
+    attempt_ended: list[float] = []
+    original = sampler.sample_proc
+
+    def sample_proc() -> ProcSample:
+        sample = original()
+        attempt_ended.append(time.monotonic())
+        return sample
+
+    sampler.sample_proc = sample_proc  # type: ignore[method-assign]
+    reply_started: list[float] = []
+
+    async def reply() -> runner._ReloadAccount:
+        reply_started.append(time.monotonic())
+        return _ACCOUNT
+
+    probe_task = asyncio.create_task(
+        _probe_loop(sampler, _INTERVAL_S, stop, [], time.perf_counter(), window_closed)  # type: ignore[arg-type]
+    )
+    async with asyncio.timeout(_TEST_DEADLINE_S):
+        while not sampler.calls:
+            await asyncio.sleep(0.005)
+    stop.set()  # the window closes with its only attempt still in flight, as `probe_stop` can
+    floor, account = await runner._await_probe_beside_reply(probe_task, window_closed, reply())
+    assert floor == 0 and sampler.calls_after_stop == 0, (floor, sampler.calls_after_stop)
+    assert account is _ACCOUNT
+    assert len(attempt_ended) == 1 and len(reply_started) == 1, (attempt_ended, reply_started)
+    assert reply_started[0] >= attempt_ended[0], (
+        f"the reply wait started {attempt_ended[0] - reply_started[0]:.4f}s before the in-flight "
+        f"probe attempt returned -- it overlaps that attempt, so a post-reload reply gets less than "
+        f"the in-flight tail plus the whole reply wait"
+    )
 
 
 async def test_a_probe_that_fails_cancels_the_reply_wait() -> None:
@@ -555,7 +605,9 @@ async def test_a_probe_that_fails_cancels_the_reply_wait() -> None:
         return _ACCOUNT
 
     with pytest.raises(RuntimeError, match="walk exploded"):
-        await runner._await_probe_beside_reply(asyncio.create_task(probe()), reply())
+        await runner._await_probe_beside_reply(
+            asyncio.create_task(probe()), asyncio.Event(), reply()
+        )
     async with asyncio.timeout(_TEST_DEADLINE_S):
         await cancelled.wait()
 
@@ -580,12 +632,12 @@ async def test_a_probe_that_already_failed_still_lets_the_reply_wait_clean_up() 
         return _ACCOUNT
 
     with pytest.raises(RuntimeError, match="during the hold"):
-        await runner._await_probe_beside_reply(failed, reply())
+        await runner._await_probe_beside_reply(failed, asyncio.Event(), reply())
     assert cleaned.is_set()
 
 
 async def test_a_step_with_no_probe_and_no_reload_reports_neither() -> None:
-    assert await runner._await_probe_beside_reply(None, None) == (0, None)
+    assert await runner._await_probe_beside_reply(None, asyncio.Event(), None) == (0, None)
 
 
 def test_the_makeup_count_is_a_required_record_argument() -> None:

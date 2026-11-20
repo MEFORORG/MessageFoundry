@@ -183,8 +183,9 @@ and as amended on 2026-09-09. The item is BACKLOG #1488.
 its window closes, as before. Then it checks the window's readings. If there is at least one, and
 every one is a walk or read timeout, it takes at most `_FD_PROBE_MAKEUP_ATTEMPTS = 1` more attempt
 after the window. Any other gap cause, and an empty
-window, gets no retry. The attempt runs beside the post-reload reply wait
-(`_await_probe_beside_reply`) and before the driver stops, so it reads the step's own engine after
+window, gets no retry. The make-up attempt runs beside the post-reload reply wait, which starts
+only once the attempt in flight when the window closed has returned, and before the driver stops;
+`_await_probe_beside_reply` states the order, so it reads the step's own engine after
 the hold, with no traffic offered. The record counts it as `fd_probe_floor_ticks`, and the reading
 feeds `fd_count_peak` like any other. The `_probe_loop` docstring is the source of record for these
 conditions.

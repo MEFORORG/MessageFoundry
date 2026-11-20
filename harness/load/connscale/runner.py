@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import itertools
 import logging
 import os
@@ -175,11 +176,11 @@ _POST_RELOAD_HOLD_FRACTION = 0.25
 #   ran there. The floor's shell-outs add up to `_FD_PROBE_MAKEUP_MAX_S` per step, for 93.41 s; a
 #   second attempt would put the same sum at 133.41 s, past 120.
 #
-# NEITHER SUM PRICES THE OTHER'S TERM. Before the floor, the attempt in flight when the window closed
-# ran in front of the reply wait; now it and the make-up attempt run beside the wait
-# (`_await_probe_beside_reply`). Either way that phase reaches 2 x 10 s at its longest on a Windows
-# leg, kill and reap aside. Every term at its maximum at once, which neither run came near, gives
-# 40.8 + 4 x (20 s + 5 s) = 140.8 s, past 120, before the floor as after it.
+# NEITHER SUM PRICES THE OTHER'S TERM. The attempt in flight when the window closed runs in front
+# of the reply wait, as before the floor, and only the make-up attempt runs beside it
+# (`_await_probe_beside_reply` says why). That phase reaches 2 x 10 s at its longest on a Windows
+# leg either way, kill and reap aside. Every term at its maximum at once, which neither run came
+# near, gives 40.8 + 4 x (20 s + 5 s) = 140.8 s, past 120, before the floor as after it.
 #
 # BOTH ARE ESTIMATES, NOT BOUNDS IN EITHER DIRECTION. A run costs less where an attempt returns
 # inside its budget. Terms that cost more than on the run measured raise it, at least these: a longer
@@ -699,6 +700,9 @@ async def _run_started_step(
         # `_probe_loop` says when (BACKLOG #1488).
         sampler_stop = asyncio.Event()
         probe_stop = asyncio.Event()
+        # Set by the probe when its in-window attempts are done, so the reply wait starts behind them
+        # and beside any make-up attempt (`_await_probe_beside_reply`).
+        probe_window_closed = asyncio.Event()
         # TWO tasks, not one task doing both (BACKLOG #1430). The engine poll is cheap; the OS probe
         # is a process-table walk. Welded to a single tick, the probe's cost set the step's ENGINE
         # sample count, and at the CI cell's 1.5 s hold that count was one.
@@ -709,7 +713,14 @@ async def _run_started_step(
         probe_task: asyncio.Task[int] | None = None
         if fd_sampler is not None:
             probe_task = asyncio.create_task(
-                _probe_loop(fd_sampler, profile.poll_interval_s, probe_stop, proc_readings, origin)
+                _probe_loop(
+                    fd_sampler,
+                    profile.poll_interval_s,
+                    probe_stop,
+                    proc_readings,
+                    origin,
+                    probe_window_closed,
+                )
             )
             sampler_tasks.append(probe_task)
         reload_seconds: float | None = None
@@ -763,10 +774,11 @@ async def _run_started_step(
         probe_stop.set()
         # The reply wait runs after the engine sampler, so it is not in the rate window, and before
         # the stop, so a slow first reply after the reload is waited for rather than read as none
-        # (BACKLOG #1292). It runs BESIDE the OS probe's last attempt, never behind it, so neither an
-        # in-flight walk nor the make-up floor delays it (BACKLOG #1488).
+        # (BACKLOG #1292). It starts once the OS probe's in-window attempt is done and runs beside
+        # any make-up attempt (BACKLOG #1488).
         fd_probe_floor_ticks, reload_account = await _await_probe_beside_reply(
             probe_task,
+            probe_window_closed,
             None
             if reload_account is None
             else _await_post_reload_reply(driver, metrics.counters, reload_account),
@@ -1536,9 +1548,11 @@ async def _probe_loop(
     stop: asyncio.Event,
     out: list[ProcReading],
     origin: float,
+    window_closed: asyncio.Event,
 ) -> int:
     """Read the OS-side process footprint every ``interval`` until ``stop``, on its OWN task. Returns
-    how many MAKE-UP attempts it spent past ``stop``, which is zero on a window that measured.
+    how many MAKE-UP attempts it spent past ``stop``, which is zero on a window that measured. It sets
+    ``window_closed`` once the attempt in flight at ``stop`` has returned, before any make-up attempt.
 
     It rode the engine poll's tick until BACKLOG #1430, which made the step's ENGINE sample count a
     function of the probe's cost -- :func:`_sample_loop` carries the measurement. It still runs OFF
@@ -1554,7 +1568,8 @@ async def _probe_loop(
     more. The record and the report point here for when the floor fires. A
     reading taken here still comes from the step's engine before the driver stops: the caller sets
     ``stop`` only after the reload probe returns, and stops the driver only after this task returns
-    (:func:`_await_probe_beside_reply`, beside the post-reload reply wait). It is taken after the
+    (:func:`_await_probe_beside_reply`, which runs it beside the post-reload reply wait). It is
+    taken after the
     hold, with no traffic offered, and with any connection the reload left down still down, as for
     an in-window reading after the reload. ATTEMPTS are counted, so a probe whose attempts keep
     returning gaps cannot hold the step open past that many more. That bounds the number of calls,
@@ -1580,6 +1595,7 @@ async def _probe_loop(
         out.append(ProcReading(time.perf_counter() - origin, proc))
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=interval)
+    window_closed.set()
     past_stop = 0
     while past_stop < _FD_PROBE_MAKEUP_ATTEMPTS and _only_budget_gaps(out):
         past_stop += 1
@@ -1590,33 +1606,44 @@ async def _probe_loop(
 
 async def _await_probe_beside_reply(
     probe_task: asyncio.Task[int] | None,
+    window_closed: asyncio.Event,
     reply: Awaitable[_ReloadAccount] | None,
 ) -> tuple[int, _ReloadAccount | None]:
-    """Wait for the OS probe's last reading and the post-reload reply wait TOGETHER, and return the
-    probe's make-up count with the account the reply wait filled in (BACKLOG #1488).
+    """Wait for the OS probe's last reading and the post-reload reply wait, and return the probe's
+    make-up count with the account the reply wait filled in (BACKLOG #1488).
 
-    The caller sets ``probe_stop`` first. The probe can still be busy after that: an attempt already
-    in flight, then at most :data:`_FD_PROBE_MAKEUP_ATTEMPTS` make-up attempts. Awaited one after the
-    other, that time ran in front of the reply wait, which delayed the wait and widened the window
-    ``post_reload_drops`` counts over. Run side by side, the reply wait starts when the window closes
-    and the probe's reading is still taken before the caller stops the driver.
+    THE ORDER, stated here once. The caller sets ``probe_stop`` first. The attempt then in flight
+    finishes BEFORE the reply wait starts, as it did before the make-up floor: the probe sets
+    ``window_closed`` once that attempt returns, or its task ends. Only the make-up attempts, at most
+    :data:`_FD_PROBE_MAKEUP_ATTEMPTS`, run BESIDE the reply wait. In front of it they would delay the
+    wait and widen the window ``post_reload_drops`` counts over; beside it, the probe's reading is
+    still taken before the caller stops the driver.
 
-    WHAT THE OVERLAP MOVES, and it does move a verdict. No SLO or smoke assertion bounds
-    ``post_reload_reply_s``, and the tests that bound ``reply_s`` time :func:`_await_post_reload_reply`
-    alone. But a reply still counts for the no-reply LOSS verdict until the stop grace ends, so the
-    time before that grace was the probe's tail plus the wait, and is now the longer of the two. The
-    wait itself is the allowance ``_POST_RELOAD_REPLY_WAIT_S`` sizes. Where the tail outlasts the
-    wait, the step stays open past the end of the window ``post_reload_drops`` counts over, and a
-    close in that gap is not counted there.
+    WHAT THE ORDER KEEPS. A reply counts for the no-reply LOSS verdict until the stop grace ends, so
+    a post-reload reply gets the in-flight tail, then the whole ``_POST_RELOAD_REPLY_WAIT_S``, then
+    the grace, on every step, and a step whose floor does not fire runs as it did before the floor.
+    Where the floor fires, the time before the grace is the longer of the wait and the make-up
+    attempt; where the attempt outlasts the wait, the step stays open past the end of the window
+    ``post_reload_drops`` counts over, and a close in that gap is not counted there. No SLO or smoke
+    assertion bounds ``post_reload_reply_s``.
 
-    If the probe raises, the reply wait is cancelled and awaited before the error propagates, so its
-    own cleanup runs and it is not left watching past the step. A reply-wait error surfaces once the
-    probe returns. The step's own cleanup cancels the probe task on every path out; that does not stop
-    a ``sample_proc`` call already running in its executor thread, which can run on for a walk and a
-    per-PID read, each with its own ``_PROBE_TIMEOUT_S``, plus the kill and reap after a timeout."""
-    reply_task = None if reply is None else asyncio.ensure_future(reply)
+    If the probe raises, the reply wait is still started, then cancelled and awaited before the error
+    propagates, so its own cleanup runs and it is not left watching past the step. A reply-wait error
+    surfaces once the probe returns. The step's own cleanup cancels the probe task on every path out;
+    that does not stop a ``sample_proc`` call already running in its executor thread, which can run
+    on for a walk and a per-PID read, each with its own ``_PROBE_TIMEOUT_S``, plus the kill and reap
+    after a timeout."""
+    reply_task: asyncio.Future[_ReloadAccount] | None = None
     try:
-        if reply_task is not None:
+        if probe_task is not None:
+            closed = asyncio.ensure_future(window_closed.wait())
+            try:
+                # Either one ends the in-window attempt: a probe that raised never sets the event.
+                await asyncio.wait({probe_task, closed}, return_when=asyncio.FIRST_COMPLETED)
+            finally:
+                closed.cancel()
+        if reply is not None:
+            reply_task = asyncio.ensure_future(reply)
             # One turn of the loop, so the reply wait is inside its own `try` before anything here can
             # cancel it: a task cancelled before its first step never runs its `finally`.
             await asyncio.sleep(0)
@@ -1628,6 +1655,8 @@ async def _await_probe_beside_reply(
             await asyncio.wait({reply_task})
             if not reply_task.cancelled():
                 reply_task.exception()  # retrieved, so an error the probe's overtook is not logged
+        elif inspect.iscoroutine(reply):
+            reply.close()  # cancelled before it started: closed, so it is not reported unawaited
 
 
 async def _time_reload(poller: EnginePoller) -> tuple[float | None, bool]:

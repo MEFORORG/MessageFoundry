@@ -1283,7 +1283,11 @@ def test_the_engine_sampler_stops_when_the_hold_ends_not_when_the_probe_returns(
     assert "reload_task = asyncio.create_task(" in source
     # The OS probe keeps its own stop, so its window did not move with the rate window. A graded FD
     # reading can still come after that stop, from the make-up floor (BACKLOG #1488).
-    assert "probe_stop, proc_readings, origin" in source
+    flat = " ".join(source.split())
+    assert "probe_stop, proc_readings, origin, probe_window_closed," in flat
+    # The helper waits on the same event the probe sets, so the reply wait starts behind the
+    # in-window attempt rather than beside it (BACKLOG #1488).
+    assert "_await_probe_beside_reply( probe_task, probe_window_closed," in flat
     # The reply wait is what the step hands the helper beside the probe; passing None would skip it
     # on every reload step with every unit test green (BACKLOG #1488).
     assert "else _await_post_reload_reply(driver, metrics.counters, reload_account)" in source
