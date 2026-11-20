@@ -580,6 +580,18 @@ def _referrer_sites(
                     complete = complete and depth > 0
                 else:
                     funcs.append((depth, func, file, span))
+        # The scan knows a helper by its bare name (``_a.pick()`` and ``_b.pick()`` are both
+        # ``pick``), so two reached functions sharing one cannot be told apart: one's return or
+        # parameter would be taken for the other's. Such a referrer is unresolved (BACKLOG #5980).
+        # Code objects compare by content, so two helpers with one body are told apart by place.
+        by_name: dict[str, set[tuple[str, int]]] = {}
+        for func in reached:
+            if func.__name__ != "<lambda>":
+                code = func.__code__
+                by_name.setdefault(func.__name__, set()).add(
+                    (code.co_filename, code.co_firstlineno)
+                )
+        complete = complete and all(len(codes) == 1 for codes in by_name.values())
         scans = _scan_referrer(sources, funcs, old, ref.referrer_kind, table_kind)
         role_globals = {name for scan in scans for name in scan.globals}
         role_attrs = {name for scan in scans for name in scan.attrs}

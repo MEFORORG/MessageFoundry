@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.impact import apply_rename, plan_rename
+from messagefoundry.config.reachability import Reference
 from messagefoundry.config.wiring import load_config
 
 _HEAD = "from messagefoundry import MLLP, Send, code_set, handler, inbound, outbound, router\n\n"
@@ -126,6 +127,25 @@ def test_iterating_a_dict_rewrites_a_key_that_is_sent(tmp_path: Path, body: str)
     assert plan.unresolved == ()
     apply_rename(plan)
     assert '"OB_OLD"' not in _text(config_dir)
+
+
+def test_two_helpers_sharing_a_bare_name_report_the_referrer(tmp_path: Path) -> None:
+    """Step 4: the scan's role maps are keyed by a helper's bare name, so ``_hb.pick`` (read in a
+    comparison) would take ``_ha.pick``'s role and have its literal rewritten."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "_ha.py": 'def pick():\n    return "OB_OLD"\n',
+            "_hb.py": 'def pick():\n    return "OB_OLD"\n',
+            "mod.py": _HEAD + "import _ha\nimport _hb\n\n" + _WIRE + '@handler("h_p")\n'
+            "def h_p(msg):\n"
+            "    if str(msg) == _hb.pick():\n"
+            '        return Send("OB_OLD", msg)\n'
+            "    return Send(_ha.pick(), msg)\n",
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == (Reference("handler", "h_p", "outbound", "OB_OLD"),)
 
 
 def test_a_router_returning_a_dict_routes_to_its_keys(tmp_path: Path) -> None:
