@@ -368,3 +368,32 @@ def test_a_401_on_the_cancelled_sign_in_logout_is_a_session_already_ended(
         dialog.done(dialog.DialogCode.Rejected)
         if client.logout_error is not None:
             client.logout_error.__traceback__ = None
+
+
+def test_a_running_call_leaves_its_callable_off_the_pool(qapp: Any) -> None:
+    """The pool holds a runnable until some time after its run() returns, and the dialog's sign-in
+    lambda captures the dialog. A runnable that still held the lambda then could keep dialog ->
+    runner -> pool -> runnable -> lambda -> dialog a reference cycle past the end of a test, which
+    the conftest cycle guard caught on a loaded runner (engine PR 3118). So the runnable lets go of
+    its callable before calling it."""
+    import gc
+
+    from harness._async import AsyncRunner, _Call
+
+    runner = AsyncRunner()
+    held: list[list[bool]] = []
+    results: list[str] = []
+
+    def call() -> str:
+        # The pool's wrapper refers to the running runnable: that is the edge the cycle used.
+        held.append(
+            [hasattr(o, "_fn") for o in gc.get_referents(runner._pool) if isinstance(o, _Call)]
+        )
+        return "done"
+
+    try:
+        runner.submit(call, on_done=results.append)
+        assert _until(qapp, lambda: results == ["done"])
+        assert held == [[False]]  # one runnable held by the pool, and it holds no callable
+    finally:
+        runner.stop()

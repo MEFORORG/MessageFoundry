@@ -53,12 +53,20 @@ class _Call(QRunnable):
         self._signals = signals
 
     def run(self) -> None:
+        # Drop this runnable's own references before the call. The pool holds the runnable until
+        # some time after run() returns, and a slot reached through the emit below can finish its
+        # whole test or window first. Until then a callable that captures its widget, such as
+        # LoginDialog's sign-in lambda, keeps widget -> runner -> pool -> runnable -> callable ->
+        # widget a reference cycle, which a later collection may free off the GUI thread. The
+        # locals below live on this thread's stack instead, which the collector never frees.
+        fn, signals = self._fn, self._signals
+        del self._fn, self._signals
         try:
-            result = self._fn()
+            result = fn()
         except Exception as exc:  # noqa: BLE001 — deliver ANY failure to the main thread, never crash the pool worker
-            self._signals.failed.emit(exc)
+            signals.failed.emit(exc)
         else:
-            self._signals.done.emit(result)
+            signals.done.emit(result)
 
 
 class AsyncRunner(QObject):
