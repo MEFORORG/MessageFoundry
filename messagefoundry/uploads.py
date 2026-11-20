@@ -354,7 +354,16 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
     before = path.lstat()
     if _names_a_link(before) or not S_ISREG(before.st_mode):
         raise _NotPlainError(f"{path.name} is not a plain file")
-    fd = os.open(path, _PLAIN_OPEN_FLAGS)
+    try:
+        fd = os.open(path, _PLAIN_OPEN_FLAGS)
+    except OSError as exc:
+        # What the open meets when the name is swapped after the lstat varies by platform: at
+        # least ENXIO or EOPNOTSUPP for a socket, a PermissionError for a folder on Windows, and
+        # there a FileNotFoundError for a dangling link it followed. The name is what decides,
+        # so every caller sees one refusal (BACKLOG #5388 added item 3).
+        if _unplain_now(path, exc):
+            raise _NotPlainError(f"{path.name} changed after it was checked") from None
+        raise
     try:
         # Before the fdopen, which answers a directory swapped in after the lstat with its own
         # IsADirectoryError, naming the descriptor rather than the path (BACKLOG #5388 added
@@ -440,46 +449,45 @@ def _read_sidecar(path: Path) -> str:
 _ReadRefusal = Literal["damaged", "denied"]
 
 
-#: The errnos an open or a read of a part gives only for a part that is not a plain file (BACKLOG
-#: #5388 added items 2 and 3): ``ELOOP`` for a link ``O_NOFOLLOW`` would not follow, ``EISDIR``
-#: for a directory and ``ENXIO`` for a socket or a device node with nothing behind it. They hold
-#: even when the part has gone by the time :func:`_names_unplain_now` looks again.
-_NOT_PLAIN_ERRNOS = frozenset({errno.ELOOP, errno.EISDIR, errno.ENXIO})
-
-
 def _refused_read(exc: OSError) -> _ReadRefusal | None:
     """How a by-id read answers ``exc``, raised reading an upload's part (BACKLOG #5388 added items
     2 and 3). ``"damaged"`` for a part that is not a plain file: a :class:`_NotPlainError`, an
-    errno in :data:`_NOT_PLAIN_ERRNOS`, or any refusal whose path is now not a regular file or is
-    a link (:func:`_names_unplain_now`), which is how at least a socket answers an open on some
-    platforms and a folder answers one on Windows. ``"denied"`` for any other ``PermissionError``:
-    at least a permission or an ACL the engine lacks, and on Windows a file another program holds
-    open (a sharing violation). That is not damage, so it is never answered as a file an operator
-    should delete. ``None`` for any other ``OSError`` on a part that is still a regular file, such
-    as too many open files or an I/O error, which may pass on a retry, so the caller re-raises
-    it."""
-    if isinstance(exc, _NotPlainError) or exc.errno in _NOT_PLAIN_ERRNOS or _names_unplain_now(exc):
+    ``ELOOP`` for a link ``O_NOFOLLOW`` would not follow, or a refusal whose path a fresh ``lstat``
+    shows is a link or is not a regular file (:func:`_unplain_now`). Only when that ``lstat``
+    cannot tell, because the path is gone, is not named, or cannot be checked, does an errno in
+    ``_NOT_A_FILE`` decide it, so a regular file the filesystem answers with ``ENXIO`` for some
+    other reason is not called damaged. ``"denied"`` for any other ``PermissionError``: at least a
+    permission or an ACL the engine lacks, and on Windows a file another program holds open (a
+    sharing violation). That is not damage, so it is never answered as a file an operator should
+    delete. ``None`` for any other ``OSError``, such as too many open files or an I/O error, which
+    may pass on a retry, so the caller re-raises it."""
+    if isinstance(exc, _NotPlainError) or exc.errno == errno.ELOOP:
+        return "damaged"
+    now = _unplain_now(exc.filename, exc)
+    if now or (now is None and exc.errno in _NOT_A_FILE):
         return "damaged"
     return "denied" if isinstance(exc, PermissionError) else None
 
 
-def _names_unplain_now(exc: OSError) -> bool:
-    """Whether the path ``exc`` names is, by a fresh ``lstat``, not a regular file or a link
-    (BACKLOG #5388 added item 3). ``False`` when ``exc`` names no path, or names a descriptor rather
-    than a path. An ``lstat`` that fails is logged, never swallowed, and answers
-    ``False``, so the caller answers ``exc`` by its own type."""
-    name = exc.filename
+def _unplain_now(name: object, cause: OSError) -> bool | None:
+    """Whether ``name``, by a fresh ``lstat``, is a link or is not a regular file (BACKLOG #5388
+    added item 3), after ``cause`` refused an access to it. ``None`` when that cannot be told:
+    ``name`` is no path (``None``, or a descriptor), or the ``lstat`` fails. A part that is gone
+    answers ``None`` quietly, since its absence is the caller's to report; any other failure is
+    logged, never swallowed."""
     if not isinstance(name, str | bytes | os.PathLike):
-        return False
+        return None
     try:
         info = os.lstat(name)
+    except FileNotFoundError:
+        return None
     except (OSError, ValueError) as again:
         _log.warning(
-            "uploaded-file part could not be checked again after a refused read (%s): %s",
-            codec_safe_str(exc),
+            "uploaded-file part could not be checked again after a refused access (%s): %s",
+            codec_safe_str(cause),
             codec_safe_str(again),
         )
-        return False
+        return None
     return _names_a_link(info) or not S_ISREG(info.st_mode)
 
 
@@ -2919,7 +2927,18 @@ class UploadStore:
             # listing key, so once it is gone the file is invisible even if the blob lingers).
             # Under the pair lock, so a rotate-key re-seal cannot put either back (BACKLOG #3181).
             with _pair_lock(meta_path):
-                blob_path.unlink(missing_ok=True)
+                try:
+                    blob_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    # A directory swapped in for the body after the check above (BACKLOG #5388
+                    # added item 3). The sidecar is kept, so the upload stays listed.
+                    if _refused_read(exc) != "damaged":
+                        raise
+                    body_defect: str | None = codec_safe_str(exc)
+                else:
+                    body_defect = None
+                if body_defect is not None:
+                    raise _damaged(file_id, "body", body_defect)
                 meta_path.unlink(missing_ok=True)
             return meta
 
