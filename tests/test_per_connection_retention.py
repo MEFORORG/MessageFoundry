@@ -408,9 +408,10 @@ async def test_a_sibling_engine_shard_keeps_an_inbound_keep_forever_body(
     store: MessageStore,
 ) -> None:
     """BACKLOG #5967 pinned a sibling engine shard purging an inbound's ``messages_days = 0`` body
-    on the global window. BACKLOG #5889 on main since made the engine-shard filter carry the whole
-    config's ``messages_days`` overrides, so the sibling keeps it too. This pins the behaviour now
-    on main; ``ENGINE_SHARD_LIMIT``'s text still describes the old behaviour."""
+    on the global window. BACKLOG #5889 made the engine-shard filter carry the whole config's
+    ``messages_days`` overrides, so the sibling keeps it too, as
+    ``tests/test_b616_5889_retention_overrides_across_shards.py`` also pins. ``ENGINE_SHARD_LIMIT``
+    still states the earlier behaviour; correcting that text is its own change."""
     from messagefoundry.pipeline.sharding import filter_registry_for_shard
 
     keep, _ = await _delivered(store, channel_id="IB_KEEP", dest="OB", now=0.0, control="S-KEEP")
