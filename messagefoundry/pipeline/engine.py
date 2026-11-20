@@ -2691,8 +2691,9 @@ class Engine:
             # while this node holds the lease, and the supervisor would retry the whole start every
             # poll with no graph running anywhere. The re-read fails closed and keeps the cache it
             # warmed at open, so carrying on serves what the engine served before #5984, and the
-            # WARNING says so. Same as the reference-set sync below: a failure there never blocks
-            # intake either.
+            # WARNING says so. Nothing retries the re-read: the cache stays as loaded at open until
+            # the next promotion or restart. A cipher failure on a state row is caught here too;
+            # the next open-time warm still fails closed on that row.
             try:
                 await self.store.reload_state_cache()
             except Exception:

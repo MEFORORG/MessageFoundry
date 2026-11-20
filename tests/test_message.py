@@ -192,6 +192,14 @@ def test_a_delimiter_refusal_names_only_what_the_field_accepts() -> None:
     with pytest.raises(ValueError) as field_2:
         m.set("MSH-2", "#~\\&")
     assert "change only the one v2.7 truncation character" in str(field_2.value)
+    # A component or repetition-2 write at field 2 cannot change the truncation character, so its
+    # refusal must not offer that.
+    scoped_writes: list[tuple[str, int | None]] = [("MSH-2.2", None), ("MSH-2", 2)]
+    for path, repetition in scoped_writes:
+        with pytest.raises(ValueError) as scoped:
+            m.set(path, "x", repetition=repetition)
+        assert "truncation" not in str(scoped.value)
+        assert "must leave it reading as it does. Re-encode" in str(scoped.value)
     with pytest.raises(ValueError) as added:
         m.add_repetition("MSH-2", "x")
     assert "a repetition cannot be added to it" in str(added.value)

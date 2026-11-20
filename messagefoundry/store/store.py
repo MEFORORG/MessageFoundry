@@ -370,6 +370,28 @@ class AbandonedTransactionError(RuntimeError):
     transaction; the caller's write did not happen (BACKLOG #1803)."""
 
 
+def _skip_null_id_orphans(orphans: list[Any], lane: str, what: str, missing: str) -> list[Any]:
+    """Drop the NULL-id rows from a startup orphan sweep, with a WARNING naming their lanes.
+
+    ``queue.id`` is a nullable SQLite TEXT key. A NULL-id row has no cell to seal its dead-letter
+    reason against, so a keyed store's ``_enc`` refuses it (BACKLOG #5962), and the raise would
+    abort graph bring-up. The sweep's ``WHERE id=?`` matched no such row before #5962 either, so
+    the row stays at its status, as it did then, and the rest of the sweep goes ahead. The WARNING
+    carries only the count and lane names, never a body."""
+    unkeyed = [r for r in orphans if r["id"] is None]
+    if not unkeyed:
+        return orphans
+    log.warning(
+        "skipped %d orphaned %s row(s) with a NULL id at startup for missing %s(s): %s; a row with"
+        " no id cannot be dead-lettered by id",
+        len(unkeyed),
+        what,
+        missing,
+        ", ".join(sorted({str(r[lane]) for r in unkeyed})),
+    )
+    return [r for r in orphans if r["id"] is not None]
+
+
 @asynccontextmanager
 async def _writer_guard(db: aiosqlite.Connection, lock: asyncio.Lock) -> AsyncIterator[None]:
     """Hold ``lock`` over a SHORT writer and never let the block leave a transaction open.
@@ -16813,6 +16835,7 @@ class MessageStore:
             # Filter in Python: valid_names may be empty (NOT IN () is invalid SQL) and the
             # non-terminal backlog is small relative to the message history.
             orphans = [r for r in await cur.fetchall() if r["destination_name"] not in valid_names]
+            orphans = _skip_null_id_orphans(orphans, "destination_name", "outbox", "destination")
             if not orphans:
                 return 0
             error = "destination removed from outbound registry"
@@ -16859,6 +16882,7 @@ class MessageStore:
             # Filter in Python (valid_names may be empty → NOT IN () is invalid SQL); the non-terminal
             # routed backlog is small relative to message history.
             orphans = [r for r in await cur.fetchall() if r["handler_name"] not in valid_names]
+            orphans = _skip_null_id_orphans(orphans, "handler_name", "routed", "handler")
             if not orphans:
                 return 0
             error = "handler removed from registry"
@@ -16919,19 +16943,9 @@ class MessageStore:
             # Filter in Python (valid_names may be empty → NOT IN () is invalid SQL); the non-terminal
             # channel-keyed backlog is small relative to message history.
             orphans = [r for r in await cur.fetchall() if r["channel_id"] not in valid_names]
-            # queue.id is a nullable SQLite TEXT key. A NULL-id row has no cell to seal its reason
-            # against, so a keyed store's `_enc` refuses it (BACKLOG #5962), and raising here would
-            # abort graph bring-up. `WHERE id=NULL` matches nothing anyway, so the row cannot be
-            # dead-lettered by id: skip it and say so, rather than fail the sweep for every other row.
-            unkeyed = [r for r in orphans if r["id"] is None]
-            if unkeyed:
-                log.warning(
-                    "skipped %d orphaned ingress/routed/response row(s) with a NULL id at startup for"
-                    " missing inbound(s): %s; they cannot be dead-lettered by id",
-                    len(unkeyed),
-                    ", ".join(sorted({r["channel_id"] for r in unkeyed})),
-                )
-                orphans = [r for r in orphans if r["id"] is not None]
+            orphans = _skip_null_id_orphans(
+                orphans, "channel_id", "ingress/routed/response", "inbound"
+            )
             if not orphans:
                 return 0
             error = "inbound removed from registry"

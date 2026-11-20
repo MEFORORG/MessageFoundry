@@ -227,9 +227,10 @@ async def test_a_null_key_with_a_null_cell_does_not_fail_a_list_read(
 async def test_a_null_id_row_on_a_removed_inbound_does_not_stop_graph_bring_up(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # BACKLOG #5962: a keyed store refuses to seal against a NULL key, and the startup sweep for a
-    # removed inbound seals each orphan's reason. A NULL-id pending row there must not abort graph
-    # bring-up; the sweep skips it with a WARNING and still dead-letters the orphan beside it.
+    # BACKLOG #5962: a keyed store refuses to seal against a NULL key, and the startup sweeps for a
+    # removed inbound or destination seal each orphan's reason. A NULL-id pending row there must not
+    # abort graph bring-up; the sweep skips it with a WARNING and still dead-letters the orphan
+    # beside it.
     from messagefoundry.config.settings import EgressSettings
     from messagefoundry.config.wiring import Registry
     from messagefoundry.pipeline.engine import Engine
@@ -237,7 +238,11 @@ async def test_a_null_id_row_on_a_removed_inbound_does_not_stop_graph_bring_up(
     store = await _open_bound(tmp_path / "null_inbound.db", generate_key())
     null_mid = await store.enqueue_ingress(channel_id="GONE", raw=RAW)
     keyed_mid = await store.enqueue_ingress(channel_id="GONE", raw=RAW)
-    await store._db.execute("UPDATE queue SET id=NULL WHERE message_id=?", (null_mid,))
+    null_out = await store.enqueue_message(
+        channel_id="GONE", raw=RAW, deliveries=[("OB_GONE", BODY)]
+    )
+    for mid in (null_mid, null_out):
+        await store._db.execute("UPDATE queue SET id=NULL WHERE message_id=?", (mid,))
     await store._db.commit()
     eng = Engine(store, egress_settings=EgressSettings(deny_by_default=False))
     eng.add_registry(Registry())
@@ -246,7 +251,8 @@ async def test_a_null_id_row_on_a_removed_inbound_does_not_stop_graph_bring_up(
         await eng.start()
         assert eng._registry_runner is not None and eng._registry_runner.running is True
         assert "skipped 1 orphaned ingress/routed/response row(s) with a NULL id" in caplog.text
-        for mid, status in ((keyed_mid, "dead"), (null_mid, "pending")):
+        assert "skipped 1 orphaned outbox row(s) with a NULL id" in caplog.text
+        for mid, status in ((keyed_mid, "dead"), (null_mid, "pending"), (null_out, "pending")):
             cur = await store._db.execute("SELECT status FROM queue WHERE message_id=?", (mid,))
             assert [r["status"] for r in await cur.fetchall()] == [status]
     finally:

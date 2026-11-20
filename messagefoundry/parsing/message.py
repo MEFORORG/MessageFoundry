@@ -676,7 +676,8 @@ class Message:
             self.field(path, occurrence=occurrence, repetition=repetition) or ""
         ):
             return
-        if whole and fld == 2 and len(current) >= 4 and value[:4] == current[:4]:
+        truncation = whole and fld == 2 and len(current) >= 4
+        if truncation and value[:4] == current[:4]:
             tail = value[4:]
             delimiters = self._raw_field(seg, 1, occurrence) + current[:4]
             if not tail or (
@@ -687,20 +688,25 @@ class Message:
             ):
                 self._assign_field(seg, fld, occurrence, value)
                 return
-        raise self._delimiter_write_refusal(seg, fld)
+        raise self._delimiter_write_refusal(seg, fld, truncation=truncation)
 
     @staticmethod
-    def _delimiter_write_refusal(seg: str, fld: int, *, repetition: bool = False) -> ValueError:
+    def _delimiter_write_refusal(
+        seg: str, fld: int, *, truncation: bool = False, repetition: bool = False
+    ) -> ValueError:
         """The refusal of a write that would change a header's delimiter field (BACKLOG #5972). The
         parser reads the message's separators once, from the first line, and splits and re-encodes
         every other line on them, so a changed delimiter field would advertise delimiters the rest
         of the message is not written in.
 
-        The text names what :meth:`_write_delimiter_field` accepts, so it stays true of the write
-        it refuses: ``repetition`` is for :meth:`add_repetition`, which accepts nothing there."""
+        The text names what :meth:`_write_delimiter_field` accepts for the refused write's shape,
+        so it stays true of that write. ``truncation`` is True when the write could have changed
+        the v2.7 truncation character instead: a whole-field (or repetition 1) write at field 2 of
+        a header whose field 2 holds all four encoding characters. ``repetition`` is for
+        :meth:`add_repetition`, which accepts nothing there."""
         if repetition:
             accepted = "a repetition cannot be added to it"
-        elif fld == 2:
+        elif truncation:
             accepted = (
                 "a write there must leave it reading as it does, or keep its four encoding "
                 "characters and add, drop or change only the one v2.7 truncation character after "
