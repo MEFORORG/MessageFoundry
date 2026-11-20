@@ -69,6 +69,10 @@ try {
         # turn end. Only a pin can tell its own worktree from a sibling it moved into, so this case is
         # no better than before and no worse. Another repository, no checkout, and input that cannot
         # be read are still refused below.
+        # DECIDED, NOT ACCIDENTAL (BACKLOG #5961, after #5954). Such a session has no other source of
+        # truth for its worktree: /clear mints a new session id and no pin, so the cwd is all there is.
+        # seat.ps1 labels the record's worktreeSource as unpinned, so no reader takes it as proven.
+        # tests/test_hook_payload_cwd.py pins both halves.
         $p = Get-CcxHookPayloadCwd -Payload $session.Payload
         $startCommon = Get-CcxGitCommonDir (Get-CcxWorktreeRoot (Get-Location).ProviderPath)
         $cwdRoot = if ($p.Cwd) { Get-CcxWorktreeRoot $p.Cwd } else { $null }
@@ -78,8 +82,15 @@ try {
         }
         else {
             # The only worktree left to record is the one this hook started in, the PRIMARY under the
-            # desktop app, and a record there would say this session sits in the primary.
+            # desktop app, and a record there would say this session sits in the primary. The Reason
+            # is handed to seat.ps1 as -Refused, which records nothing and leaves the rate-limited
+            # line in .writer-refusals.txt, so a refusal leaves a trace beyond this turn's notice.
             Write-Output "[seat] could not read this session's worktree: $($session.Reason). Nothing was recorded for this turn."
+            try {
+                $pwshRefuse = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
+                $refuseArgs = @('-NoProfile', '-File', $seat, '-Record', '-Refused', [string]$session.Reason)
+                $null = if ($payload) { $payload | & $pwshRefuse @refuseArgs 2>&1 } else { & $pwshRefuse @refuseArgs 2>&1 }
+            } catch { Write-Output "[seat] the refusal could not be logged: $($_.Exception.Message)" }
             exit 0
         }
     }

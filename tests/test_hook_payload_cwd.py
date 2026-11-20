@@ -926,15 +926,37 @@ def test_after_a_cd_to_another_repository_the_seat_recorder_writes_nothing_there
     assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
 
 
-def test_an_unpinned_seat_recorder_records_a_sibling_cwd_there(
+def test_the_other_repository_takes_a_record_when_one_is_meant_for_it(
     seat_clones: tuple[Path, Path, Path, Path],
 ) -> None:
-    """BACKLOG #5954: with no pin, a cwd in a worktree of this repository is recorded at that
-    worktree, as seat-record.ps1 says, since only a pin can tell its own worktree from a sibling."""
+    """The negative control for the absence pin above. Run from the other repository itself, the
+    same hook records there, so an empty registry above is the pin rule and not a fixture whose
+    other repository can hold no record."""
+    _, _, _, other = seat_clones
+    _record_stop(other, _stop("s1", other))
+    recs = _seat_records(other)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], other), recs
+
+
+UNPINNED_SOURCE = (
+    "hook cwd, unpinned: no session pin vouches for it (scripts/hooks/seat-record.ps1)"
+)
+
+
+def test_an_unpinned_seat_recorder_records_a_sibling_cwd_there_labelled_unpinned(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """DECIDED, NOT A BUG (BACKLOG #5961 remainder, under #5954). With no pin, a cwd in a worktree of
+    this repository is recorded at that worktree. Such a session has no other source of truth for
+    its worktree: /clear mints a new session id and never pins (rule 5 of _hookinput.ps1), so the
+    cwd is all there is, and refusing it would leave every desktop-app session unrecorded after a
+    /clear. Only a pin can tell its own worktree from a sibling, so the record says no pin vouches
+    for it, and a reader does not take its worktree as proven."""
     repo, _, sibling, _ = seat_clones
     _record_stop(repo, _stop("s1", sibling))
     recs = _seat_records(repo)
     assert len(recs) == 1 and _same_dir(recs[0]["worktree"], sibling), recs
+    assert recs[0]["worktreeSource"] == UNPINNED_SOURCE, recs
 
 
 def test_an_unpinned_seat_recorder_still_records_the_checkout_it_started_in(
@@ -945,6 +967,22 @@ def test_an_unpinned_seat_recorder_still_records_the_checkout_it_started_in(
     _record_stop(repo, _stop("s1", repo))
     recs = _seat_records(repo)
     assert len(recs) == 1 and _same_dir(recs[0]["worktree"], repo), recs
+    # The label's control: the start checkout is the one cwd rule 4 takes, so nothing says unpinned.
+    assert recs[0]["worktreeSource"] == "git rev-parse --show-toplevel", recs
+
+
+def test_a_hook_refusal_leaves_a_refusal_line(seat_clones: tuple[Path, Path, Path, Path]) -> None:
+    """seat-record.ps1 refuses a cwd in another repository itself and hands its Reason to seat.ps1
+    as -Refused, so the refusal reaches .writer-refusals.txt and not only the turn's notice."""
+    repo, _, _, other = seat_clones
+    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    seats = common / "mefor-coord" / "seats"
+    _record_stop(repo, _stop("s1", other))
+    assert _seat_records(repo) == [] and _seat_records(other) == []
+    lines = (seats / ".writer-refusals.txt").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1 and lines[0].split("\t")[2] == "s1", lines
+    errors = seats / ".writer-errors.txt"
+    assert not errors.exists() or errors.read_text(encoding="utf-8").strip() == "", errors
 
 
 def test_a_pinned_seat_recorder_with_no_cwd_records_its_pin(
@@ -981,6 +1019,44 @@ def test_seat_ps1_says_why_it_refused_a_cwd(seat_clones: tuple[Path, Path, Path,
     assert not errors.exists() or errors.read_text(encoding="utf-8").strip() == "", errors
 
 
+def test_a_named_worktree_record_still_logs_a_hook_input_fault(
+    seat_clones: tuple[Path, Path, Path, Path], tmp_path: Path
+) -> None:
+    """seat.ps1 -Record -Worktree recorded at the named worktree and dropped its own helper's Fault
+    unread. A copy of seat.ps1 with no scripts/hooks/_hookinput.ps1 beside it still records where
+    -Worktree says, and leaves the hook-input line rule 2 wants in .writer-errors.txt."""
+    repo, wt, _, _ = seat_clones
+    sandbox = Path(os.path.realpath(tmp_path)) / "sandbox" / "scripts"
+    shutil.copytree(ROOT / "scripts" / "coord", sandbox / "coord")
+    shutil.copytree(ROOT / "scripts" / "worktree", sandbox / "worktree")
+    assert not (sandbox / "hooks").exists()
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(sandbox / "coord" / "seat.ps1"),
+            "-Record",
+            "-Worktree",
+            str(wt),
+        ],
+        cwd=str(repo),
+        input=_raw(_stop("s1", wt)),
+        capture_output=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    errors = common / "mefor-coord" / "seats" / ".writer-errors.txt"
+    assert errors.is_file(), "the helper's Fault left no .writer-errors.txt line"
+    lines = errors.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1 and lines[0].split("\t")[2] == "hook-input", lines
+
+
 def _record_seat_direct(repo: Path, payload: dict[str, Any]) -> None:
     """Run seat.ps1 -Record with no -Worktree, the one route on which it refuses input."""
     seat = ROOT / "scripts" / "coord" / "seat.ps1"
@@ -1000,7 +1076,7 @@ def test_a_refused_seat_record_leaves_one_refusal_line_an_hour(
 ) -> None:
     """seat.ps1 -Record with no -Worktree writes each refusal to .writer-refusals.txt, one line
     per session key and host per hour, never to .writer-errors.txt. Run directly, because
-    seat-record.ps1 answers a refused input itself and never runs seat.ps1 for it."""
+    seat-record.ps1 refuses a sibling cwd only for a pinned session, which it records at the pin."""
     repo, _, sibling, _ = seat_clones
     common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     seats = common / "mefor-coord" / "seats"

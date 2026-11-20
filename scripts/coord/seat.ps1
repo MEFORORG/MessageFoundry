@@ -63,9 +63,9 @@
        scripts/hooks/_hookinput.ps1's rules is NOT a failure, so it never goes there. It goes to
        stderr and to seats/.writer-refusals.txt in the registry of the checkout this script started
        in, where that checkout and its registry resolve, at most one line per session key and host
-       per hour. Only a -Record run with no -Worktree refuses input: seat-record.ps1 resolves the
-       worktree itself, says on stdout when it cannot, and then does not run this script.
-       fleet.ps1 does not read that file.
+       per hour. A -Record run with no -Worktree refuses input itself. seat-record.ps1 resolves the
+       worktree itself, says on stdout when it cannot, and then passes its Reason as -Refused, so
+       its refusals reach that file too. fleet.ps1 does not read that file.
 
     3. TOUCH seats/.writer-alive/<boxKey>.txt ON EVERY INVOCATION, including no-op ones. "The writer
        ran" and "the seat had something to say" are different sentences, and a reader that cannot
@@ -128,6 +128,11 @@ param(
     # shared session-pin rules, so the payload's cwd is never the hint there. Tests and -Declare from a
     # different cwd pass it too. Derived from the payload cwd or the current directory when absent.
     [string]$Worktree,
+    # -Record only: the Reason scripts/hooks/seat-record.ps1 refused the hook input for. Nothing is
+    # recorded; the refusal goes to stderr and .writer-refusals.txt (rule 2), as a refusal of this
+    # script's own does. Passed rather than re-derived, so the hook's verdict is the one recorded and
+    # a second resolution can never turn the refusal into a record somewhere else.
+    [Parameter(ParameterSetName = 'Record')][string]$Refused,
     # Precedence for the record's session key, highest first: this parameter, then the hook's stdin
     # payload session_id, then $env:CLAUDE_CODE_SESSION_ID, then the literal 'nosid'. See
     # Get-SessionKey -- the env rung is what keeps a CLI -Declare on the same record as the hooks.
@@ -1011,40 +1016,55 @@ try {
     $payload = $null
     $wtHint = $Worktree
     $script:WorktreeSource = 'git rev-parse --show-toplevel'
+    $script:HookInputFault = ''
     if ($Record) {
         $hookIn = Read-RecordHookInput -Hint $wtHint
         $payload = $hookIn.Payload
-        if (-not $wtHint) {
-            if ($hookIn.Reason) {
-                # Rule 1 again: input this cannot vouch for names no worktree, so NO RECORD, and exit
-                # 0. Reached only with no -Worktree (rule 2). Refused input is not a writer failure,
-                # so it NEVER goes to .writer-errors.txt, which fleet.ps1 counts as failures (the
-                # same rule Invoke-ClearHandoff states); it goes to .writer-refusals.txt (rule 2),
-                # rate-limited per session key and host. No .writer-alive heartbeat: it is keyed by
-                # this session's box, and refused input names no box to key it by. Both files go to
-                # the registry of the checkout this script started in, where that checkout and its
-                # registry resolve.
-                $why = "the hook input was refused, so nothing was recorded: $($hookIn.Reason)"
-                [System.Console]::Error.WriteLine("seat.ps1: $why")
-                if (Set-StartSeatsDir) {
-                    if ($hookIn.Fault) {
-                        # A missing or throwing helper IS a writer failure, and rule 2 wants a line.
-                        Write-WriterError -Stage 'hook-input' -Message $why
-                    } else {
-                        $cwd = ''
-                        if ($payload -and $payload.PSObject.Properties['cwd']) { $cwd = [string]$payload.PSObject.Properties['cwd'].Value }
-                        Write-WriterRefusal -SessionKey (Get-SessionKey -Payload $payload -Override $SessionId).Key -Cwd $cwd -Reason $hookIn.Reason
-                    }
+        # A refusal is the hook's (-Refused), or, with no -Worktree, this script's own Reason.
+        $refusal = if ($Refused) { $Refused } elseif (-not $wtHint) { [string]$hookIn.Reason } else { '' }
+        if ($refusal) {
+            # Rule 1 again: input this cannot vouch for names no worktree, so NO RECORD, and exit 0.
+            # Refused input is not a writer failure, so it NEVER goes to .writer-errors.txt, which
+            # fleet.ps1 counts as failures (the same rule Invoke-ClearHandoff states); it goes to
+            # .writer-refusals.txt (rule 2), rate-limited per session key and host. No .writer-alive
+            # heartbeat: it is keyed by this session's box, and refused input names no box to key it
+            # by. Both files go to the registry of the checkout this script started in, where that
+            # checkout and its registry resolve.
+            $why = "the hook input was refused, so nothing was recorded: $refusal"
+            [System.Console]::Error.WriteLine("seat.ps1: $why")
+            if (Set-StartSeatsDir) {
+                if ($hookIn.Fault -and -not $Refused) {
+                    # A missing or throwing helper IS a writer failure, and rule 2 wants a line.
+                    Write-WriterError -Stage 'hook-input' -Message $why
+                } else {
+                    $cwd = ''
+                    if ($payload -and $payload.PSObject.Properties['cwd']) { $cwd = [string]$payload.PSObject.Properties['cwd'].Value }
+                    Write-WriterRefusal -SessionKey (Get-SessionKey -Payload $payload -Override $SessionId).Key -Cwd $cwd -Reason $refusal
                 }
-                exit 0
             }
+            exit 0
+        }
+        if (-not $wtHint) {
             $wtHint = $hookIn.Dir
             if ($hookIn.FromPin) { $script:WorktreeSource = 'session pin (scripts/hooks/_hookinput.ps1)' }
+        }
+        elseif ($hookIn.Fault) {
+            # The caller named the worktree, so it is still recorded, but this script's own helper
+            # failed, which rule 2 wants on record once the registry resolves below.
+            $script:HookInputFault = "the hook input could not be checked, recorded at -Worktree as passed: $($hookIn.Reason)"
         }
         elseif ($hookIn.HintFromPin) {
             # seat-record.ps1 passes -Worktree resolved by the same pin rules, so a -Worktree the
             # session pin also names came from that pin.
             $script:WorktreeSource = 'session pin (scripts/hooks/_hookinput.ps1)'
+        }
+        elseif ($hookIn.Reason) {
+            # NO PIN VOUCHES FOR THIS -Worktree, and the record says so. seat-record.ps1 passes the
+            # cwd of an unpinned session whose cwd is a worktree of this repository (BACKLOG #5954),
+            # for example a desktop-app session after a /clear, which never pins. Only a pin can tell
+            # its own worktree from a sibling it moved into, so a reader must not take this record's
+            # worktree as proven (BACKLOG #5961).
+            $script:WorktreeSource = 'hook cwd, unpinned: no session pin vouches for it (scripts/hooks/seat-record.ps1)'
         }
     }
     $wt = Resolve-Worktree -Hint $wtHint
@@ -1087,6 +1107,7 @@ try {
     if (-not (Test-Path -LiteralPath $script:SeatsDir)) {
         New-Item -ItemType Directory -Path $script:SeatsDir -Force | Out-Null
     }
+    if ($script:HookInputFault) { Write-WriterError -Stage 'hook-input' -Message $script:HookInputFault }
 
     $boxKey = ConvertTo-BoxKey -Path $wt
 
