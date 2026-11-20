@@ -4822,7 +4822,7 @@ def _serve(args: argparse.Namespace) -> int:
     # security notifications — must surface first. An operator who is missing three declarations
     # should be told about the concrete misconfiguration before the platform-property one, and a
     # gate that jumped the queue would silently change which error every existing exposed-PHI test
-    # (and every existing exposed-PHI deployment) reports.
+    # reports, and which one a deploying site would meet first.
     # ASVS 3.7.3: the "you are leaving this site" interstitial. Two knobs can weaken it, and BOTH are
     # announced at start rather than discovered in a later assessment. Warn-only by design: neither is
     # a PHI-safety property and refusing on an operator's deliberate UX decision would be a
@@ -5305,7 +5305,9 @@ def _serve(args: argparse.Namespace) -> int:
         ),
         trust_anchors_enforcing=enforcing,
         # BACKLOG #3470: the collector CA `_start_logging` refused, for the lifespan to refuse on.
-        prestore_anchor_refusals=tuple(_forward_ca_refusals),
+        # The list itself, not a copy: the lifespan reads it when it runs, so an API client-CA
+        # refusal appended below reaches its audited preflight (BACKLOG #5391 added item 2).
+        prestore_anchor_refusals=_forward_ca_refusals,
     )
     # log_config=None: uvicorn's loggers propagate to the handler configure_logging installed,
     # so everything shares one format/stream (and one log file under NSSM).
@@ -5364,6 +5366,12 @@ def _serve(args: argparse.Namespace) -> int:
             # renders, so the log file and the collector keep the record the uncaught floor used to
             # give them, and a defect that raised one of these types can still be traced.
             _tls_refusal = scrub_control_chars(safe_exc(exc))
+            if isinstance(exc, TrustAnchorError):
+                # This refusal comes before uvicorn runs the lifespan, so the lifespan's audited
+                # preflight would never write the anchor's auth.trust_anchor row. Hand it the
+                # refusal and run it, binding nothing (BACKLOG #5391 added item 2).
+                _forward_ca_refusals.append(exc)
+                _audit_refused_api_tls_context(app)
             print(
                 f"error: the API TLS context was not built: {_tls_refusal}; refusing to start.",
                 file=sys.stderr,
@@ -5408,6 +5416,55 @@ def _serve(args: argparse.Namespace) -> int:
         if api_handshakes is not None:
             api_handshakes.close()
     return 0
+
+
+def _audit_refused_api_tls_context(app: Any) -> None:
+    """Run ``app``'s lifespan to write the audit rows of a start the API TLS context refused.
+
+    ``serve`` builds the API context before uvicorn runs the lifespan. A refused
+    ``[api].tls_client_ca_file`` therefore stopped the start before the store opened, and the
+    lifespan's audited preflight never wrote its ``auth.trust_anchor`` row. The caller has put the
+    refusal in the app's ``prestore_anchor_refusals``, as ``_start_logging`` does with a refused
+    collector CA (BACKLOG #3470), and this runs the lifespan's startup with no server, so no
+    listener binds. The lifespan opens the store, writes what it writes before its anchor check
+    (at least any generated API pair replaced, ADR 0172 decision 6), and then always raises: its
+    audited preflight refuses the CA and writes the row, or, if that passes, it raises the early
+    refusal marked ``unaudited``.
+
+    The refusal is not always the client CA's own. The API context also checks
+    ``[api].tls_client_crl_file``, which is deliberately kept out of the audited preflight, so that
+    refusal comes back ``unaudited`` and no row records it.
+
+    The caller has already refused the start, so this only logs. A raise from the lifespan is
+    expected and logged at WARNING when it is not the audited refusal. It never propagates, because
+    that would turn the clean exit 2 into the uncaught floor's exit 1."""
+    from messagefoundry.auth.trust_anchors import TrustAnchorError
+    from messagefoundry.controlchars import scrub_log_argument
+    from messagefoundry.last_resort import run_guarded
+    from messagefoundry.redaction import safe_exc
+
+    async def _startup() -> None:
+        async with app.router.lifespan_context(app):
+            pass
+
+    log = logging.getLogger(__name__)
+    try:
+        run_guarded(_startup())
+    except TrustAnchorError as refused:
+        if refused.unaudited:
+            log.warning("no audit row records the refused TLS context of the API")
+        return
+    except Exception as exc:  # the start is refused already; log it, never mask the exit 2
+        log.warning(
+            "no audit row records the refused TLS context of the API: the startup that writes it "
+            "stopped first (%s)",
+            scrub_log_argument(safe_exc(exc)),
+        )
+        return
+    # Not reached while the lifespan holds its contract: a queued refusal always raises.
+    log.warning(
+        "no audit row records the refused TLS context of the API: the startup raised nothing"
+    )
 
 
 def _floor_or_refusal[T](refusing_to: str, build: Callable[[], T]) -> T | None:
