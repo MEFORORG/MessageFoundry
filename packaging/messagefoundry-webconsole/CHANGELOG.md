@@ -76,6 +76,10 @@ this line.**
 
 ### Security
 
+- **The cookie WebSocket gate refuses a blank or repeated `Origin`.** `authorize_ui_ws` read
+  only the first `Origin` header. It now reads every copy and refuses a blank `Origin`, or more
+  than one, as the engine's header path does; an absent header still leaves the handshake to the
+  header path. The supported engine seam moved with it. (`BACKLOG #5789`)
 - **The sign-in, MFA, step-up and enrolment-confirm forms check their credentials through the JSON
   routes' own models.** `POST /ui/login`, `POST /ui/mfa`, `POST /ui/reauth` and
   `POST /ui/account/mfa/verify` check at least their hand-parsed username, password and codes

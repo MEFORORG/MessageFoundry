@@ -122,7 +122,9 @@ param(
     # lock is handed over to that id when no other live session is in the tree (BACKLOG #2524;
     # scripts/worktree/seat-lock.ps1).
     [Parameter(ParameterSetName = 'Prompt')][string]$Source,
-    # Only for tests and for -Declare from a different cwd. Normally derived.
+    # The worktree to record. scripts/hooks/seat-record.ps1 passes it on every -Record, resolved by the
+    # shared session-pin rules, so the payload's cwd is never the hint there. Tests and -Declare from a
+    # different cwd pass it too. Derived from the payload cwd or the current directory when absent.
     [string]$Worktree,
     # Precedence for the record's session key, highest first: this parameter, then the hook's stdin
     # payload session_id, then $env:CLAUDE_CODE_SESSION_ID, then the literal 'nosid'. See
