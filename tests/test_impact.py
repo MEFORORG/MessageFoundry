@@ -712,15 +712,15 @@ _CODESET_MOD_NO_CONNECTIONS = (
 def test_codeset_rename_still_rewrites_referents_with_no_connection_declared(
     tmp_path: Path,
 ) -> None:
-    """The #1648 empty-graph refusal must not reach this pre-flight, which SWALLOWS load failures.
+    """The #1648 empty-graph refusal must not reach this pre-flight.
 
-    ``_load_referent_registry`` catches ``WiringError`` and returns ``None``, so a refusal here is
-    silent: the table moves and every ``code_set("diets")`` call is left pointing at a file that no
-    longer exists, with no ``referents_rewritten`` key and no error. Measured A/B against
-    ``test_codeset_rename_rewrites_referent_and_moves_file`` above -- the only difference between the
-    two fixtures is whether a connection is declared.
+    Before BACKLOG #5980 the pre-flight swallowed load failures, so a refusal here was silent: the
+    table moved and every ``code_set("diets")`` call was left pointing at a file that no longer
+    existed. A rename now refuses on a config that does not load, so the refusal would fail this
+    rename instead. The only difference from ``test_codeset_rename_rewrites_referent_and_moves_file``
+    above is whether a connection is declared.
 
-    Falsified by dropping ``allow_empty=True`` from ``_load_referent_registry``."""
+    Falsified by dropping ``allow_empty=True`` from ``_load_referent_registry_or_raise``."""
     config_dir = _write_config(tmp_path, {"mod.py": _CODESET_MOD_NO_CONNECTIONS})
     codesets = config_dir / "codesets"
     codesets.mkdir()

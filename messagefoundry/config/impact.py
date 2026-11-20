@@ -422,16 +422,16 @@ def apply_rename(plan: RenamePlan) -> list[LiteralEdit]:
         # Split on \n, \r\n and \r only: the plan numbered lines by tokenizing a universal-newline read,
         # which breaks on exactly those, so an edit's line is the line it names here too.
         lines = source_lines(Path(file).read_bytes().decode("utf-8"))
-        fresh = [e for e in file_edits if _span_text(lines, e) == e.old_literal]
-        if len(fresh) == len(file_edits):
+        missing = [e for e in file_edits if _span_text(lines, e) != e.old_literal]
+        if not missing:
             # Bottom-to-top, right-to-left: a multi-line edit changes the line count below it, so
             # applying in descending (start_line, start_col) keeps every later edit's indices valid.
             for edit in sorted(file_edits, key=lambda e: (e.start_line, e.start_col), reverse=True):
                 _apply_one(lines, edit)
             rewritten[file] = lines
             applied.extend(file_edits)
-        elif fresh or not _already_renamed(lines, file_edits):
-            stale.extend(e for e in file_edits if e not in fresh)
+        elif len(missing) < len(file_edits) or not _already_renamed(lines, file_edits):
+            stale.extend(missing)
     if stale:
         where = ", ".join(f"{e.file}:{e.start_line}" for e in stale)
         raise WiringError(
@@ -675,14 +675,12 @@ def _all_referrers(
 
     The index carries an outbound's ``reingress_to`` as an ``outbound -> inbound`` edge, and has no
     edge for an inbound's ``reply_from`` (an ``Http`` inbound naming the outbound whose reply it
-    returns), so that one is read from the registry here (BACKLOG #5966). An inbound only ever names
-    an outbound in its ``reply_from``, so an index edge of that shape, should the graph gain one, is
-    read the same way rather than twice."""
-    settings = {
-        "outbound": "reingress_to",
-        "inbound": "reply_from" if target_kind == "outbound" else None,
+    returns), so that one is read from the registry here (BACKLOG #5966); should the graph gain
+    that edge, the registry's reading replaces the index's rather than adding a second."""
+    out: dict[Reference, str | None] = {
+        ref: "reingress_to" if ref.referrer_kind == "outbound" else None
+        for ref in index.referrers(target_kind, old)
     }
-    out = {ref: settings.get(ref.referrer_kind) for ref in index.referrers(target_kind, old)}
     if target_kind == "outbound":
         for name, conn in sorted(registry.inbound.items()):
             if conn.spec.settings.get("reply_from") == old:
@@ -1966,32 +1964,27 @@ def _toml_key_path(key: str) -> tuple[str, ...]:
 # --- apply -------------------------------------------------------------------
 
 
-def _apply_one(lines: list[str], edit: LiteralEdit) -> None:
-    """Replace ``edit``'s span, which carries its old literal, in place."""
-    lo, hi = edit.start_line - 1, edit.end_line - 1
-    region_lines = lines[lo : hi + 1]
-    region = "".join(region_lines)
-    inner_end = len(region) - (len(region_lines[-1]) - edit.end_col)
-    new_region = region[: edit.start_col] + edit.new_literal + region[inner_end:]
-    # Re-split as apply_rename split the file, so an earlier edit on line ``lo`` still indexes its line.
-    lines[lo : hi + 1] = source_lines(new_region)
-
-
-def _span_text(
-    lines: list[str], edit: LiteralEdit, at: tuple[int, int] | None = None
-) -> str | None:
-    """The text ``edit`` spans in ``lines``, or ``None`` past the end. With ``at``, the text of the
-    edit's new literal's length starting at that (line, col) instead, a one-line span."""
-    if at is not None:
-        line, col = at
-        return lines[line - 1][col : col + len(edit.new_literal)] if line <= len(lines) else None
-    if edit.end_line > len(lines):
-        return None
-    if edit.start_line == edit.end_line:
-        return lines[edit.start_line - 1][edit.start_col : edit.end_col]
+def _region(lines: list[str], edit: LiteralEdit) -> tuple[str, int]:
+    """The text of ``edit``'s lines joined, and the offset in it where the edit's span ends."""
     region_lines = lines[edit.start_line - 1 : edit.end_line]
     region = "".join(region_lines)
-    return region[edit.start_col : len(region) - (len(region_lines[-1]) - edit.end_col)]
+    return region, len(region) - (len(region_lines[-1]) - edit.end_col)
+
+
+def _apply_one(lines: list[str], edit: LiteralEdit) -> None:
+    """Replace ``edit``'s span, which carries its old literal, in place."""
+    region, end = _region(lines, edit)
+    new_region = region[: edit.start_col] + edit.new_literal + region[end:]
+    # Re-split as apply_rename split the file, so an earlier edit on its first line still indexes it.
+    lines[edit.start_line - 1 : edit.end_line] = source_lines(new_region)
+
+
+def _span_text(lines: list[str], edit: LiteralEdit) -> str | None:
+    """The text ``edit`` spans in ``lines``, or ``None`` past the end."""
+    if edit.end_line > len(lines):
+        return None
+    region, end = _region(lines, edit)
+    return region[edit.start_col : end]
 
 
 def _already_renamed(lines: list[str], edits: list[LiteralEdit]) -> bool:
@@ -2006,7 +1999,11 @@ def _already_renamed(lines: list[str], edits: list[LiteralEdit]) -> bool:
             at = (prev[2], prev[3] + edit.start_col - prev[1])
         else:
             at = (edit.start_line + line_shift, edit.start_col)
-        if _span_text(lines, edit, at) != edit.new_literal:
+        line, col = at
+        if (
+            line > len(lines)
+            or lines[line - 1][col : col + len(edit.new_literal)] != edit.new_literal
+        ):
             return False
         line_shift += edit.start_line - edit.end_line
         prev = (edit.end_line, edit.end_col, at[0], at[1] + len(edit.new_literal))

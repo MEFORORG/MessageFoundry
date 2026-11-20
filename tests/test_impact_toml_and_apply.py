@@ -303,17 +303,28 @@ SPLIT = {
 }
 
 
-def _drift(config_dir: Path) -> None:
-    """Change b.py after the plan so its edit's span no longer holds the old literal."""
-    b = config_dir / "b.py"
-    b.write_text(b.read_text(encoding="utf-8").replace('Send("OB_X"', 'Send( "OB_X"'), "utf-8")
+def _drift(path: Path, old: str = 'Send("OB_X"', new: str = 'Send( "OB_X"') -> None:
+    """Change ``path`` after the plan so an edit's span no longer holds the old literal."""
+    path.write_text(path.read_text(encoding="utf-8").replace(old, new), "utf-8")
+
+
+def _drift_after_planning(monkeypatch: pytest.MonkeyPatch, path: Path, *replace: str) -> None:
+    """Make every plan_rename call change ``path`` once it has planned, as a concurrent edit would."""
+    real = impact.plan_rename
+
+    def plan_then_drift(*args: object, **kwargs: object) -> RenamePlan:
+        plan = real(*args, **kwargs)  # type: ignore[arg-type]
+        _drift(path, *replace)
+        return plan
+
+    monkeypatch.setattr(impact, "plan_rename", plan_then_drift)
 
 
 def test_apply_writes_nothing_when_a_file_changed_after_the_plan(tmp_path: Path) -> None:
     config_dir = _config(tmp_path, SPLIT)
     plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
     assert {Path(e.file).name for e in plan.edits} == {"a.py", "b.py"}
-    _drift(config_dir)
+    _drift(config_dir / "b.py")
     before = {name: (config_dir / name).read_bytes() for name in SPLIT}
     with pytest.raises(WiringError, match="changed after the plan"):
         apply_rename(plan)
@@ -324,14 +335,7 @@ def test_the_cli_does_not_report_success_when_an_edit_could_not_be_made(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     config_dir = _config(tmp_path, SPLIT)
-    real = impact.plan_rename
-
-    def plan_then_drift(*args: object, **kwargs: object) -> RenamePlan:
-        plan = real(*args, **kwargs)  # type: ignore[arg-type]
-        _drift(config_dir)
-        return plan
-
-    monkeypatch.setattr(impact, "plan_rename", plan_then_drift)
+    _drift_after_planning(monkeypatch, config_dir / "b.py")
     argv = ["impact", "--config", str(config_dir), "outbound", "OB_X", "--rename-to", "OB_Y"]
     rc = main([*argv, "--apply", "--json"])
     out = json.loads(capsys.readouterr().out)
@@ -344,16 +348,9 @@ def test_codeset_rename_moves_the_table_back_when_the_rewrite_fails(
 ) -> None:
     mod = CODESET_MOD.replace("r_cs_misspelled", "r_cs")
     config_dir = _config(tmp_path, {"mod.py": mod, "codesets/diets.csv": "code,value\nA,Apple\n"})
-    real = impact.plan_rename
-
-    def plan_then_drift(*args: object, **kwargs: object) -> RenamePlan:
-        plan = real(*args, **kwargs)  # type: ignore[arg-type]
-        path = config_dir / "mod.py"
-        text = path.read_text(encoding="utf-8")
-        path.write_text(text.replace('code_set("diets")', 'code_set( "diets")'), "utf-8")
-        return plan
-
-    monkeypatch.setattr(impact, "plan_rename", plan_then_drift)
+    _drift_after_planning(
+        monkeypatch, config_dir / "mod.py", 'code_set("diets")', 'code_set( "diets")'
+    )
     with pytest.raises(WiringError, match="changed after the plan"):
         codeset_edit.rename_code_set(config_dir, "diets", "meals", validate=_validate)
     assert sorted(p.name for p in (config_dir / "codesets").iterdir()) == ["diets.csv"]

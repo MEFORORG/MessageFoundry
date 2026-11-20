@@ -659,13 +659,11 @@ def _plan_code_set_referents(config_dir: str | Path, old: str, new: str) -> Any:
     ``code_set("old")`` reading a table that is gone while the rename reported success (BACKLOG
     #5980)."""
     from messagefoundry.config import impact
-    from messagefoundry.config.wiring import load_config
 
     try:
-        # allow_empty: see _load_referent_registry.
-        registry = load_config(config_dir, allow_empty=True)
+        registry = _load_referent_registry_or_raise(config_dir)
         return impact.plan_rename(registry, config_dir, "code_set", old, new)
-    except (WiringError, FileNotFoundError, OSError, ValueError) as exc:
+    except _REGISTRY_LOAD_ERRORS as exc:
         raise WiringError(
             f"cannot rename code set {old!r} to {new!r}: its references could not be checked "
             f"({exc}). Nothing was changed; fix the config so it loads, then rename again"
@@ -688,12 +686,25 @@ def _code_set_referrers(config_dir: str | Path, name: str) -> list[dict[str, str
     ]
 
 
+#: What load_config raises for a config that does not load.
+_REGISTRY_LOAD_ERRORS = (WiringError, OSError, ValueError)
+
+
 def _load_referent_registry(config_dir: str | Path) -> Any:
-    """Load the config graph for the referent pre-flight, or ``None`` if it can't be loaded.
+    """Load the config graph for the delete pre-flight, or ``None`` if it can't be loaded: a broken
+    graph never fails a ``remove``, whose referrers are advisory. A ``rename`` needs the graph to
+    rewrite its referents, and refuses without it (:func:`_plan_code_set_referents`)."""
+    try:
+        return _load_referent_registry_or_raise(config_dir)
+    except _REGISTRY_LOAD_ERRORS:
+        return None
+
+
+def _load_referent_registry_or_raise(config_dir: str | Path) -> Any:
+    """Load the config graph for a referent pre-flight.
 
     The code-set edit itself is standalone data (validated by re-loading the one file); the referent
-    pre-flight additionally needs the wired graph. Loading executes config modules, so a broken /
-    absent graph must never fail the core code-set operation — swallow and skip.
+    pre-flight additionally needs the wired graph.
 
     ``allow_empty``: this is an AUTHORING surface, like ``connection upsert/remove`` (BACKLOG #1648).
     Swallowing the empty-graph refusal here would be SILENT and wrong, not merely conservative — a
@@ -704,7 +715,4 @@ def _load_referent_registry(config_dir: str | Path) -> Any:
     connection-less arm lost the rewrite."""
     from messagefoundry.config.wiring import load_config
 
-    try:
-        return load_config(config_dir, allow_empty=True)
-    except (WiringError, FileNotFoundError, OSError, ValueError):
-        return None
+    return load_config(config_dir, allow_empty=True)
