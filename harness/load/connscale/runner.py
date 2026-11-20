@@ -159,6 +159,36 @@ _RELOAD_LOOKBACK_FLOOR_S = 0.25
 #: a hold behind it and this adds nothing. A slow one used to leave none: the step then had no send
 #: the reload did not touch. At the smoke's 1.5 s hold this is 0.375 s, 4 to 9 sends by lane.
 _POST_RELOAD_HOLD_FRACTION = 0.25
+
+# THE SMOKE'S WATCHDOG ESTIMATE, the one place the runner prices it, for `_POST_RELOAD_REPLY_WAIT_S`
+# and `_FD_PROBE_MAKEUP_ATTEMPTS` alike (BACKLOG #2024, #1488). On this repository's
+# `--timeout-method=thread` a `pytest.mark.timeout(120)` that fires ends the whole worker process
+# rather than one test, so what a step adds has to fit beside what the sweep already costs. Each sum
+# is one failing run's measured fixture setup plus a 4-step worst case for its own terms:
+#
+# - The reply wait: setup took 40.8 s on merge-group run 36166728739 (windows-2025). Every step
+#   waiting its full 10 s and then spending its full 5 s stop grace adds 4 x 15 s, for 100.8 s.
+#   CORRECTED 2026-09-30 (BACKLOG #2024): this read "4 x 10 s more is 80.8 s", which left out the
+#   stop grace.
+# - The make-up floor: `_FD_PROBE_FLOOR_MEASURED_SETUP_S`, 53.41 s on the windows-2022 run of
+#   2026-11-19, with every spawn and kill, reply wait, stop grace, drain and in-window walk as they
+#   ran there. The floor's shell-outs add up to `_FD_PROBE_MAKEUP_MAX_S` per step, for 93.41 s; a
+#   second attempt would put the same sum at 133.41 s, past 120.
+#
+# NEITHER SUM PRICES THE OTHER'S TERM. Before the floor, the attempt in flight when the window closed
+# ran in front of the reply wait; now it and the make-up attempt run beside the wait
+# (`_await_probe_beside_reply`). Either way that phase reaches 2 x 10 s at its longest on a Windows
+# leg, kill and reap aside. Every term at its maximum at once, which neither run came near, gives
+# 40.8 + 4 x (20 s + 5 s) = 140.8 s, past 120, before the floor as after it.
+#
+# BOTH ARE ESTIMATES, NOT BOUNDS IN EITHER DIRECTION. A run costs less where an attempt returns
+# inside its budget. Terms that cost more than on the run measured raise it, at least these: a longer
+# reply wait or stop grace (`_STOP_GRACE`), an in-window attempt that spent both budgets where that
+# run's spent one, a slower engine spawn or kill, the warm-up, the drain, `sample_until_reconciled`,
+# `_SETTLE`, the intake audit, and the kill and reap `subprocess.run` does after a timed-out
+# shell-out. `tests/test_connscale_sample_floor.py` recomputes the floor's sum from these constants,
+# and `tests/test_connscale_reload_window.py` the reply wait's.
+
 #: How long a step waits, after its engine sampler stops and before the stop grace, for the FIRST reply
 #: read after every connection came back from the reload probe (BACKLOG #1292). The stop grace of
 #: `_STOP_GRACE` follows it, so an engine gets this plus 5 s to answer once before the step says it
@@ -175,7 +205,7 @@ _POST_RELOAD_HOLD_FRACTION = 0.25
 #:
 #: It is spent in full only when no reply comes inside it. That does not always fail the step: a
 #: reply can still come inside the stop grace that follows. 10 s is sized against the smoke's 120 s
-#: module timeout; the estimate is at `_FD_PROBE_MAKEUP_ATTEMPTS`. It does not
+#: module timeout, in THE SMOKE'S WATCHDOG ESTIMATE above. It does not
 #: cover a step that also spends its reconnect wait, so the wait is skipped where a connection never
 #: came back.
 _POST_RELOAD_REPLY_WAIT_S = 10.0
@@ -1475,36 +1505,9 @@ async def _sample_loop(
 #: The make-up attempts :func:`_probe_loop` may spend past its ``stop``; it states when they fire
 #: (BACKLOG #1488).
 #:
-#: ONE, AND THE BOUND IS THE SMOKE'S WATCHDOG, NOT TASTE. On this repository's
-#: ``--timeout-method=thread`` a ``pytest.mark.timeout(120)`` that fires ends the whole worker process
-#: rather than one test, so what a step adds has to fit beside what the sweep already costs. This is
-#: the one place the runner prices that watchdog, for this constant and ``_POST_RELOAD_REPLY_WAIT_S``
-#: alike. Each sum is one failing run's measured fixture setup plus a 4-step worst case for its own
-#: terms:
-#:
-#: - The reply wait: setup took 40.8 s on merge-group run 36166728739 (windows-2025). Every step
-#:   waiting its full 10 s and then spending its full 5 s stop grace adds 4 x 15 s, for 100.8 s.
-#:   CORRECTED 2026-09-30 (BACKLOG #2024): this read "4 x 10 s more is 80.8 s", which left out the
-#:   stop grace.
-#: - The make-up floor: :data:`_FD_PROBE_FLOOR_MEASURED_SETUP_S`, 53.41 s on the windows-2022 run of
-#:   2026-11-19, with every spawn and kill, reply wait, stop grace, drain and in-window walk as they
-#:   ran there. The floor's shell-outs add up to :data:`_FD_PROBE_MAKEUP_MAX_S` per step, for 93.41 s;
-#:   a second attempt would put the same sum at 133.41 s, past 120.
-#:
-#: NEITHER SUM PRICES THE OTHER'S TERM. Before the floor, the attempt in flight when the window
-#: closed ran in front of the reply wait; now it and the make-up attempt run beside the wait
-#: (:func:`_await_probe_beside_reply`). Either way that phase reaches 2 x 10 s at its longest on a
-#: Windows leg, kill and reap aside. Every term at its maximum at once, which neither run came near,
-#: gives 40.8 + 4 x (20 s + 5 s) = 140.8 s, past 120, before the floor as after it.
-#:
-#: BOTH ARE ESTIMATES, NOT BOUNDS IN EITHER DIRECTION. A run costs less where an attempt returns
-#: inside its budget. Terms that cost more than on the run measured raise it, at least these: a
-#: longer reply wait or stop grace (``_STOP_GRACE``), an in-window attempt that spent both budgets
-#: where that run's spent one, a slower engine spawn or kill, the warm-up, the drain,
-#: ``sample_until_reconciled``, ``_SETTLE``, the intake audit, and the kill and reap
-#: ``subprocess.run`` does after a timed-out shell-out. ``tests/test_connscale_sample_floor.py``
-#: recomputes the floor's sum from these constants, and ``tests/test_connscale_reload_window.py``
-#: the reply wait's.
+#: ONE, AND THE BOUND IS THE SMOKE'S WATCHDOG, NOT TASTE: a second attempt would not fit it. The
+#: estimate, for this constant and the reply wait alike, is THE SMOKE'S WATCHDOG ESTIMATE, the comment
+#: block above ``_POST_RELOAD_REPLY_WAIT_S``.
 _FD_PROBE_MAKEUP_ATTEMPTS = 1
 #: The most the shell-outs of :data:`_FD_PROBE_MAKEUP_ATTEMPTS` can add to one step on a Windows leg,
 #: kill and reap aside, on the terms ``_PROBE_ATTEMPT_MAX_S`` in ``probe.py`` states.
@@ -1561,16 +1564,11 @@ async def _probe_loop(
 
     A MAKE-UP READING IS GRADED, and that rests on a measurement. It feeds ``fd_count_peak`` like an
     in-window one, so ``fd_count_monotonic`` compares it with in-hold peaks at other N. That is sound
-    only if an idle post-hold reading matches what the hold would have read. Measured on a 32-core
-    Windows box, 2026-11-19, running the real smoke sweep (N=12 and 24, both sweep modes) with two
-    or three extra readings taken right after each step's window: in the 6 steps where the window
-    and the extra reading both measured, across an idle and a 32-busy-loop run, every post-hold
-    handle count equalled the window's peak (367, 403, 363, 399; 403, 404). The growth from N=12 to
-    N=24 was 9 to 11 percent, and the SLO's band is ``_MONOTONIC_TOLERANCE`` (25 percent). A gap of
-    zero handles cannot produce a false red or hide growth at that band. It is one box at these N,
-    not a bound for other N or hosts. The same reading also feeds ``working_set_peak_bytes`` and its
-    PIDs through :func:`_derive_proc`; nothing grades that peak (:func:`_evaluate_slos` has no RSS
-    check), and the measurement above paired handle counts only.
+    only if a post-hold reading matches what the hold would have read. The measurement this rests
+    on, and its limits, are recorded once, in ADR 0179's amendment of 2026-11-19. The same reading
+    also feeds ``working_set_peak_bytes`` and its PIDs through :func:`_derive_proc`; nothing grades
+    that peak (:func:`_evaluate_slos` has no RSS check), and that measurement paired handle counts
+    only.
 
     ONE PROBE AT A TIME. :class:`~harness.load.connscale.probe.FdSampler` holds the front-load counter
     and the resolved subtree as mutable state, so overlapping calls would race them. This loop is
@@ -1604,6 +1602,12 @@ async def _await_probe_beside_reply(
     and the probe's reading is still taken before the caller stops the driver. No SLO or smoke
     assertion bounds ``post_reload_reply_s``; the tests that bound ``reply_s`` time
     :func:`_await_post_reload_reply` alone.
+
+    WHAT THE OVERLAP MOVES. A reply still counts for the no-reply verdict until the stop grace ends,
+    so that time was the probe's tail plus the wait, and is now the longer of the two, each before
+    the grace. The wait itself is the allowance ``_POST_RELOAD_REPLY_WAIT_S`` sizes. Where the tail
+    outlasts the wait, the step stays open past the end of the window ``post_reload_drops`` counts
+    over, and a close in that gap is not counted there.
 
     If the probe raises, the reply wait is cancelled and awaited before the error propagates, so its
     own cleanup runs and it is not left watching past the step. A reply-wait error surfaces once the
@@ -2645,10 +2649,11 @@ _CPU_FLAT_GAP_SPAN_S = 5.0
 
 @dataclass(frozen=True)
 class _ProcDerived:
-    """Derived process-footprint gauges over the window (each None where the OS probe couldn't read).
+    """Derived process-footprint gauges over the probe's readings (each None where the OS probe
+    couldn't read). That is the window, plus any make-up reading :func:`_probe_loop` took past it.
 
-    ``probe_ticks``, ``probe_degraded_ticks`` and ``probe_degraded`` are the window's probe
-    PROVENANCE, not gauges: they say how much of the window the OS probe actually measured and, where
+    ``probe_ticks``, ``probe_degraded_ticks`` and ``probe_degraded`` are the readings' probe
+    PROVENANCE, not gauges: they say how much of that span the OS probe actually measured and, where
     it did not, WHY. Without those three a ``None`` gauge is indistinguishable across a starved host,
     a dead process tree and a broken enumerator — three conditions with three different verdicts.
 

@@ -180,9 +180,9 @@ else.** The front-load, the 15.0 second interval and the attempt-counted trigger
 and as amended on 2026-09-09. The item is BACKLOG #1488.
 
 **What the floor does, and when.** `_probe_loop` in `harness/load/connscale/runner.py` probes until
-its window closes, as before. Where that window took at least one reading and every one was a gap
-whose cause is an exhausted budget (a walk or read timeout), it takes at most
-`_FD_PROBE_MAKEUP_ATTEMPTS = 1` more attempt after the window. Any other gap cause, and an empty
+its window closes, as before. Then it checks the window's readings. If there is at least one, and
+every one is a walk or read timeout, it takes at most `_FD_PROBE_MAKEUP_ATTEMPTS = 1` more attempt
+after the window. Any other gap cause, and an empty
 window, gets no retry. The attempt runs beside the post-reload reply wait
 (`_await_probe_beside_reply`) and before the driver stops, so it reads the step's own engine after
 the hold, with no traffic offered. The record counts it as `fd_probe_floor_ticks`, and the reading
@@ -199,10 +199,11 @@ loops, with a maximum of 10.81 seconds and 2 and 7 of 20 at 5 seconds or more. T
 4-vCPU hosted runner.
 
 **Why a make-up reading may be graded.** That is sound only if a post-hold reading, taken with no
-traffic offered, matches what the hold would have read. On the same box, the real smoke sweep at N=12 and N=24 in both sweep
-modes ran with extra readings taken right after each step's window. Across an idle run and a
-32-busy-loop run, 6 steps had both a measured window and a measured extra reading. In all 6 the
-post-hold handle count equalled the window's peak, a difference of 0 handles. Growth from N=12 to
+traffic offered, matches what the hold would have read. On the same box, the real smoke sweep at
+N=12 and N=24 in both sweep modes ran with two or three extra readings taken right after each
+step's window. Across an idle run and a 32-busy-loop run, 6 steps had both a measured window and a
+measured extra reading. In all 6 the post-hold handle count equalled the window's peak (367, 403,
+363, 399; 403, 404), a difference of 0 handles. Growth from N=12 to
 N=24 was 9 to 11 percent, against the 25 percent `_MONOTONIC_TOLERANCE` band of
 `fd_count_monotonic`.
 

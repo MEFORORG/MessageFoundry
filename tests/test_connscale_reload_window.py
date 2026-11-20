@@ -1060,7 +1060,7 @@ async def test_the_runner_waits_the_shipped_reply_wait_by_default(
 
 
 def test_the_shipped_reply_wait_fits_the_smokes_module_timeout() -> None:
-    # The runner sizes the wait against the smoke, in its comment on `_FD_PROBE_MAKEUP_ATTEMPTS`:
+    # The runner sizes the wait against the smoke, in THE SMOKE'S WATCHDOG ESTIMATE in runner.py:
     # every step waiting in full, and then spending its full stop grace, must still fit the module
     # timeout beside the 40.8 s the fixture's setup took on the failing runner. Read from the smoke
     # module itself, so adding a count, a mode or a trial, or cutting the timeout, fails here. What it
@@ -1070,16 +1070,10 @@ def test_the_shipped_reply_wait_fits_the_smokes_module_timeout() -> None:
 
     profile = smoke._smoke_profile(30000)
     assert isinstance(profile, ConnScaleProfile)
-    steps = (
-        len(profile.counts)
-        * len(profile.modes())
-        * len(profile.claim_modes)
-        * len(profile.fuse_modes)
-        * len(profile.batch_modes)
-        * profile.trials
-    )
+    # The runner's own count, so a sandbox axis counts here as it does in the sweep.
+    steps = runner.sweep_step_count(profile)
     (module_timeout,) = smoke.pytestmark.args
-    assert steps == 4  # the control: the count the constant's comment was written against
+    assert steps == 4  # the control: the count the estimate was written against
     per_step = runner._POST_RELOAD_REPLY_WAIT_S + runner._STOP_GRACE
     assert 40.8 + steps * per_step < module_timeout
     assert runner._POST_RELOAD_REPLY_WAIT_S > runner._STOP_GRACE  # it must add to the grace

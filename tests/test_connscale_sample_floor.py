@@ -465,7 +465,7 @@ async def test_a_collapse_measured_on_makeup_readings_still_fails_the_fd_slo() -
 
 
 def _measured_leg_plus_floor(attempts: int) -> tuple[int, float, float]:
-    """The sum the comment on `_FD_PROBE_MAKEUP_ATTEMPTS` states, from its constants and from the
+    """The floor's sum in THE SMOKE'S WATCHDOG ESTIMATE in runner.py, from its constants and from the
     smoke's own watchdog and step count: `(steps, measured setup + steps x floor maximum, watchdog)`.
     An estimate, not a bound; that comment says which way each term it leaves out moves it."""
     (watchdog_s,) = smoke.pytestmark.args
@@ -477,8 +477,8 @@ def _measured_leg_plus_floor(attempts: int) -> tuple[int, float, float]:
 
 
 def test_the_makeup_floor_fits_inside_the_smokes_watchdog() -> None:
-    """Pins the comment on `_FD_PROBE_MAKEUP_ATTEMPTS`: more steps, a shorter watchdog, a dearer
-    attempt or a second one fails here. The comment's 93.41 s is this sum.
+    """Pins the floor's sum in THE SMOKE'S WATCHDOG ESTIMATE: more steps, a shorter watchdog, a
+    dearer attempt or a second one fails here. The comment's 93.41 s is this sum.
 
     WHAT IT CANNOT CATCH: a step that costs more for any other reason, such as a longer hold, reply
     wait, stop grace or drain. The measured setup is a constant, so none of those moves it."""
@@ -504,6 +504,13 @@ def test_an_empty_window_is_not_a_timed_out_one() -> None:
     it did."""
     assert not runner._only_budget_gaps([])
     assert runner._only_budget_gaps([ProcReading(0.0, _gap(ProbeDegraded.READ_TIMEOUT))])
+
+
+def test_a_window_with_one_measured_reading_beside_a_timeout_does_not_fire_the_floor() -> None:
+    """EVERY reading must be a budget gap, not ANY. A window holding one measured reading already
+    has its peak, so `all` mutated to `any` in `_only_budget_gaps` would spend a needless attempt."""
+    timed_out = ProcReading(0.0, _gap(ProbeDegraded.WALK_TIMEOUT))
+    assert not runner._only_budget_gaps([timed_out, ProcReading(0.5, _measured(400))])
 
 
 # --- BACKLOG #1488: the floor runs beside the post-reload reply wait, never in front of it ----------
