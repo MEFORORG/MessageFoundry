@@ -533,6 +533,12 @@ async def test_a_row_the_keys_cannot_open_stops_the_export_on_the_record(
     assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
     assert await _stop_rows(engine) == [{"selected": 2, "streamed": 1, "reason": reason}]
     assert [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.ERROR] == []
+    # The refusal is logged by class only, never with the caller-supplied id.
+    refused = [
+        rec.getMessage() for rec in caplog.records if "could not be opened" in rec.getMessage()
+    ]
+    assert refused == [f"a message could not be opened: {type(raised).__name__}"], refused
+    assert not any(mid_b in rec.getMessage() for rec in caplog.records)
 
 
 async def test_a_failed_denial_audit_mid_export_is_not_recorded_as_a_cipher_refusal(

@@ -29,6 +29,7 @@ from messagefoundry.tray.probe import (
     build_verify,
     classify_health,
     classify_ui,
+    load_pin,
     make_probe_client,
     probe_health,
     probe_ui,
@@ -987,7 +988,13 @@ def test_a_pair_naming_only_the_wildcard_still_fails_verification(
     because the certificate names the dialled address, not because hostname checking went away."""
     with _engine_minted_for(bind_host, dial_host, tmp_path, wildcard_only=True) as (port, cert):
         url = build_engine_url(dial_host, port, tls=True) or ""
-        with make_probe_client(url, cacert=cert) as client:
+        # The pin is loaded here and handed over as the poller does, so the client's TLS context
+        # is visibly the pinned, verifying one at this call site.
+        loaded = load_pin(cert)
+        assert loaded is not None
+        _, pinned = loaded
+        assert pinned.verify_mode is ssl.CERT_REQUIRED and pinned.check_hostname is True
+        with make_probe_client(url, pinned=pinned) as client:
             assert probe_health(client) is HealthProbe.DOWN
             # DOWN for the right reason: the handshake reached the server and the hostname check
             # refused it, rather than a refused connection or a dead server thread.

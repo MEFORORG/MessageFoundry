@@ -181,9 +181,10 @@ async def read_scoped_message(
             await audit_channel_denied(engine, identity, now_in, client_ip(request))
             return None
         no_verdict, error_class = cipher_refused
-        # The class name only: the cipher's text can echo fields cut from the stored value.
-        cause = f"message {message_id} could not be opened: {error_class}"
-        _log.warning("%s", cause)
+        # The class name only: the cipher's text can echo fields cut from the stored value, and the
+        # message id is the caller's, so neither the log line nor the error carries it.
+        cause = f"a message could not be opened: {error_class}"
+        _log.warning("a message could not be opened: %s", error_class)
         if not refuse_integrity:
             # The export stream does not skip such a row: an export that leaves out rows nothing
             # records would read as complete, so it records a stop instead. A fresh error, so no
