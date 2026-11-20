@@ -12913,11 +12913,10 @@ class AuthService:
                 return Elevation(session_lost=True)
             if window is not None:
                 # The rotation owns its refusals from here (:meth:`_stamp_to_rotation`). The lapse
-                # check is before it, so an exception there that no handler below takes (at least a
-                # code defect, or a users row with no readable id) still reaches the window, which
-                # revokes the stamped hash and re-raises (decision d20261109T200352805-599b24,
-                # item 1). An Unverifiable answer there is revoked and recorded by the handler below
-                # instead.
+                # check is before it, so any exception there that `_elevated_hash`'s handlers do not
+                # take still reaches the window, which revokes the stamped hash and re-raises
+                # (decision d20261109T200352805-599b24, item 1). An Unverifiable answer there is
+                # revoked and recorded by the handler below instead.
                 window.closed = True
             rotated = await self._rotate_session_hash(token_hash, unverifiable=unverifiable)
         except (TransitSealUnverifiableError, RowSealUnverifiableError) as exc:

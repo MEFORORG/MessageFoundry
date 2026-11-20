@@ -198,24 +198,24 @@ standing instruction of 2026-10-22, widening "Revoke both" (Q1) to the whole win
 to the rotation. The adversarial review split only on whose call it was, and the guard is strictly
 safer. This supersedes the Outage row's "end nothing" in *The four answers, defined once* for this
 window only; that row's text is unchanged. It is the **Owner's open reversal point**: the Owner may
-reverse it, and until then it stands. One guard, `AuthService._stamp_to_rotation`, is open from the
-first `_sealed_stamp` entry, before its write, until `_elevated_hash`'s lapse check passes
-(corrected 2026-11-19: this read "armed when a `_sealed_stamp` lands"; see Q4 below). A refusal
-`_rotation_store_errors()` names at that check, or an Unverifiable answer there, is answered by
-`_elevated_hash`, which revokes the stamped hash itself, as below; at least a code defect, or a
-users row with no readable id, there still reaches the window. On a refusal
-`_rotation_store_errors()` names, raised between the stamp and the lapse check, it revokes the
-stamped old hash, best effort, writes `auth.session_rotation_failed` with Q1's `reason` and
-`revokes_landed`, and the ceremony answers `session_lost`. It covers at least the second stamp and
-`record_login_success` in `verify_mfa`, the passkey assertion, the factor-binding check in `reauth`
-and in the federated re-auth callback, and the audit row written after the stamp. The `_load_user`
-arm before the federated callback's stamp is unchanged. A refusal before any stamp lands still
-refuses the request with nothing elevated (corrected 2026-11-19: a refusal at the first stamp's own
-write also revokes the session, best effort, under Q4 below; if that write committed before it
-raised and the revoke is refused, the stamp stands on a live session). **Limit:** on a
-`vault_transit` store a Transit Outage at that audit row raises `CipherError` from the audit-chain
-MAC, which `_rotation_store_errors()` does not take, so there the guard fires only on a store
-refusal of the audit write.
+reverse it, and until then it stands. One guard, `AuthService._stamp_to_rotation`, is armed at the
+first `_sealed_stamp` entry, before its write, and closed once `_elevated_hash`'s lapse check passes
+(corrected 2026-11-19: this read "armed when a `_sealed_stamp` lands", see Q4 below, and "closed
+when `_elevated_hash` begins"). A `_rotation_store_errors()` refusal at the lapse check is answered
+`session_lost` by `_elevated_hash`. An Unverifiable answer there is revoked and recorded by
+`_elevated_hash`, then propagated. Any exception there that `_elevated_hash`'s handlers do not take
+still reaches the window. On a refusal `_rotation_store_errors()` names, raised between the stamp
+and the lapse check, it revokes the stamped old hash, best effort, writes
+`auth.session_rotation_failed` with Q1's `reason` and `revokes_landed`, and the ceremony answers
+`session_lost`. It covers at least the second stamp and `record_login_success` in `verify_mfa`, the
+passkey assertion, the factor-binding check in `reauth` and in the federated re-auth callback, and
+the audit row written after the stamp. The `_load_user` arm before the federated callback's stamp is
+unchanged. A refusal before any stamp lands still refuses the request with nothing elevated
+(corrected 2026-11-19: a refusal at the first stamp's own write also revokes the session, best
+effort, under Q4 below; if that write committed before it raised and the revoke is refused, the
+stamp stands on a live session). **Limit:** on a `vault_transit` store a Transit Outage at that
+audit row raises `CipherError` from the audit-chain MAC, which `_rotation_store_errors()` does not
+take, so there the guard fires only on a store refusal of the audit write.
 
 **The window takes any exception, decided 2026-11-09 (decision d20261109T200352805-599b24, item
 1).** This closes the Limit above. Once the guard is armed, any exception before the rotation
@@ -338,21 +338,20 @@ that the Outage row's "end nothing" governs. In case (a) or (b), dropping the re
 session, since the sign-out comes from the rotation, and keeping the session in case (b) would need
 a design that clears the lockout before the stamp, as main did; the window's revoke rests at least
 on decisions d20261109T165402853-83b348 and d20261109T165406730-2505f2, the Owner's open reversal
-point above, and on Q4, d20261110T004920629-fb8ff6. Outside an Outage, at a store fault that refuses
-writes, the window asks the store to revoke the session of a re-auth due a clear at its stamp write,
-best effort, where main's clear raised first and kept the session; under that fault, if the stamp
-landed and the revoke is refused, the session can stay live and stamped, as a re-auth with no clear
-due already can on main, though the route answers at least 401 or 500. The Lander accepted this as
-d20261120T032446206-33a44d, under the owner's standing instruction of 2026-10-22, because no control
-weakens against main: on main a re-auth due a clear commits the clear before the window opens, so a
-fault that begins after the clear reaches the same live, stamped, unrotated state on that path, and
-here the lockout counters stay uncleared (independent reviews d20261120T035328762-8e0fb7 and
-d20261120T042802906-777260). The question covered only a re-auth due a clear during an Outage. On a
-re-auth with no clear due, the revoke in case (a) during an Outage is this PR's own behaviour and an
-exception to the Outage row's "end nothing" for that path only, accepted by the Lander as strictly
-safer under the owner's standing instruction of 2026-10-22, record d20261120T015953943-d015e0
-(independent review d20261120T035330577-6e0dc7). The row's text, apart from its label's pointer to
-this amendment, is unchanged.
+point above, and on Q4, d20261110T004920629-fb8ff6. Outside an Outage, a store fault that refuses
+writes reaches the window at the stamp write of a re-auth due a clear, and the window asks the store
+to revoke the session, best effort, though the route answers at least 401 or 500. Under a fault
+where that first write commits and then raises, and every later write, the revoke included, is
+refused, this PR can leave the original token live, stamped and unrotated, where main leaves it
+unstamped because main's first write is the clear; main can reach the same state for a fault that
+begins one write later (d20261120T042802906-777260), and here the lockout counters stay uncleared.
+Acceptance of this residual awaits the owner's ruling; the Lander's earlier acceptance
+d20261120T032446206-33a44d is withdrawn (d20261120T045030279-68e180). The question covered only a
+re-auth due a clear during an Outage. On a re-auth with no clear due, the revoke in case (a) during
+an Outage is this PR's own behaviour and an exception to the Outage row's "end nothing" for that
+path only, accepted by the Lander as strictly safer under the owner's standing instruction of
+2026-10-22, record d20261120T015953943-d015e0 (independent review d20261120T035330577-6e0dc7). The
+row's text, apart from its label's pointer to this amendment, is unchanged.
 
 Before this PR, the clear ran before the rotation, so an Outage at the clear kept the original
 session. A hard `auth.reauth` row refused after the rotation left the rotated session live, with
