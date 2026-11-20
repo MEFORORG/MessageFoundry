@@ -616,8 +616,9 @@ class QueueStore(StoreLifecycle, Protocol):
         workers start, so a promoted standby does not serve the state it loaded at open while the prior
         leader went on writing. SQL Server implements it for real. SQLite (the sole writer) and Postgres
         (which converges continuously through :meth:`converge_state_cache`) make it a no-op. If it
-        raises, the engine logs a WARNING and starts the graph on the cache this handle holds, so a
-        failed re-read serves the state loaded at open."""
+        raises a store read or cipher error, the engine logs a WARNING, alerts, and starts the graph
+        on the state cache it already holds, so an implementation must leave that cache in place
+        when it raises."""
         ...
 
     # --- delivery worker path ------------------------------------------------

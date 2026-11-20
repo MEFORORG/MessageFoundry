@@ -26,10 +26,12 @@ import pytest
 
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import load_config
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.sharding import filter_registry_for_shard
-from messagefoundry.store.crypto import cell_aad, generate_key, make_cipher
+from messagefoundry.pipeline.state_convergence import STATE_CONVERGENCE_ALERT_SUBJECT
+from messagefoundry.store.crypto import CipherError, cell_aad, generate_key, make_cipher
 from messagefoundry.store.sealed_cache import new_state_cache
 
 
@@ -195,32 +197,77 @@ async def test_active_passive_promotion_reloads_the_state_cache(tmp_path: Path) 
         await eng.stop()
 
 
-async def test_a_failed_promotion_reload_still_brings_the_graph_up(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    # A raise out of the re-read would abort _start_graph while this node holds the lease, and the
-    # supervisor would retry the whole start every poll with no graph running. The re-read keeps the
-    # cache it warmed at open, so the graph comes up on it and a WARNING says so.
+class _RecordingAlertSink(LoggingAlertSink):
+    def __init__(self) -> None:
+        self.stopped: list[tuple[str, str]] = []
+
+    def connection_stopped(self, name: str, *, detail: str) -> None:
+        self.stopped.append((name, detail))
+
+
+async def _promote_with_failing_reload(
+    tmp_path: Path, exc: Exception
+) -> tuple[Engine, _ClusterCoordinator, _RecordingAlertSink, list[int]]:
     cfgdir = tmp_path / "cfg"
     _graph(cfgdir, tmp_path)
     coord = _ClusterCoordinator(leader=False)
-    eng = await _engine(tmp_path, coordinator=coord)
+    sink = _RecordingAlertSink()
+    eng = await _engine(tmp_path, coordinator=coord, alert_sink=sink)
     eng.add_registry(load_config(cfgdir))
     calls: list[int] = []
 
     async def _reload() -> None:
         calls.append(1)
-        raise RuntimeError("state table unreadable")
+        raise exc
 
     eng.store.reload_state_cache = _reload  # type: ignore[method-assign]
     await eng.start()
+    coord.leader = True
+    return eng, coord, sink, calls
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [CipherError("state.value ns/MRN-0001: tag check failed"), RuntimeError("acquire timed out")],
+    ids=["cipher", "store-refusal"],
+)
+async def test_a_failed_promotion_reload_still_brings_the_graph_up(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, exc: Exception
+) -> None:
+    # A raise out of the re-read would abort _start_graph while this node holds the lease, and the
+    # supervisor would retry the whole start every poll with no graph running. The re-read keeps the
+    # cache it already holds, so the graph comes up on it. As the convergence pass does, the WARNING
+    # and the alert carry the exception CLASS only: a decrypt failure's text can carry a key.
+    eng, _coord, sink, calls = await _promote_with_failing_reload(tmp_path, exc)
     try:
-        coord.leader = True
         caplog.set_level(logging.WARNING)
         await eng._reconcile_graph()  # promotion
         assert calls == [1]
         assert eng._registry_runner is not None and eng._registry_runner.running is True
-        assert "re-reading transform state on promotion failed" in caplog.text
+        assert f"re-reading transform state on promotion failed ({type(exc).__name__})" in (
+            caplog.text
+        )
+        assert "the state cache it already holds" in caplog.text
+        assert str(exc) not in caplog.text
+        assert sink.stopped == [
+            (
+                STATE_CONVERGENCE_ALERT_SUBJECT,
+                f"state cache re-read on promotion failed ({type(exc).__name__})",
+            )
+        ]
+    finally:
+        await eng.stop()
+
+
+async def test_a_defect_in_the_promotion_reload_is_not_swallowed(tmp_path: Path) -> None:
+    # Only the store's read and cipher refusals are caught. A programming error propagates, so the
+    # bring-up fails loudly rather than run on a cache a bug left behind.
+    eng, _coord, sink, calls = await _promote_with_failing_reload(tmp_path, TypeError("a bug"))
+    try:
+        with pytest.raises(TypeError, match="a bug"):
+            await eng._reconcile_graph()
+        assert calls == [1]
+        assert sink.stopped == []
     finally:
         await eng.stop()
 

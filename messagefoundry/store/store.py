@@ -133,6 +133,7 @@ from messagefoundry.store.crypto import (
     AUDIT_SCHEME_UNNAMED_TRANSIT,
     NO_STORE_ID,
     STORE_ID_BYTES,
+    AADComponentError,
     AesGcmCipher,
     AuditKeyVersionRefusedError,
     AuditMacFn,
@@ -370,26 +371,25 @@ class AbandonedTransactionError(RuntimeError):
     transaction; the caller's write did not happen (BACKLOG #1803)."""
 
 
-def _skip_null_id_orphans(orphans: list[Any], lane: str, what: str, missing: str) -> list[Any]:
-    """Drop the NULL-id rows from a startup orphan sweep, with a WARNING naming their lanes.
+def _warn_unsealable_orphans(skipped: list[Any], lane: str, what: str, missing: str) -> None:
+    """WARN about the orphans a startup sweep left because their reason could not be sealed.
 
     ``queue.id`` is a nullable SQLite TEXT key. A NULL-id row has no cell to seal its dead-letter
-    reason against, so a keyed store's ``_enc`` refuses it (BACKLOG #5962), and the raise would
-    abort graph bring-up. The sweep's ``WHERE id=?`` matched no such row before #5962 either, so
-    the row stays at its status, as it did then, and the rest of the sweep goes ahead. The WARNING
-    carries only the count and lane names, never a body."""
-    unkeyed = [r for r in orphans if r["id"] is None]
-    if not unkeyed:
-        return orphans
+    reason against, so a cell-bound cipher refuses the seal (BACKLOG #5962), and the raise would
+    abort graph bring-up. Only where the seal refuses does the sweep leave the row: a keyless or
+    unbound store seals nothing and dead-letters it exactly as before #5962. A left row stays at its
+    status, which the sweep's ``WHERE id=?`` never changed for a NULL id anyway. The WARNING carries
+    only the count and lane names, never a body."""
+    if not skipped:
+        return
     log.warning(
-        "skipped %d orphaned %s row(s) with a NULL id at startup for missing %s(s): %s; a row with"
-        " no id cannot be dead-lettered by id",
-        len(unkeyed),
+        "skipped %d orphaned %s row(s) with a NULL id at startup for missing %s(s): %s; a"
+        " cell-bound store cannot seal a dead-letter reason for a row with no id",
+        len(skipped),
         what,
         missing,
-        ", ".join(sorted({str(r[lane]) for r in unkeyed})),
+        ", ".join(sorted({str(r[lane]) for r in skipped})),
     )
-    return [r for r in orphans if r["id"] is not None]
 
 
 @asynccontextmanager
@@ -16814,6 +16814,55 @@ class MessageStore:
             await self._commit()
             return recovered
 
+    async def _dead_letter_orphans(
+        self,
+        orphans: list[Any],
+        error: str,
+        now: float,
+        *,
+        lane: str,
+        what: str,
+        missing: str,
+        event_names_lane: bool,
+    ) -> int:
+        """Dead-letter a startup sweep's orphans under the caller's writer guard, commit, and log.
+
+        Shared by the three missing-lane sweeps. A row whose reason the cipher refuses to seal (a
+        NULL id on a cell-bound store, :func:`_warn_unsealable_orphans`) is left as it is and named
+        in a WARNING; every other row, a NULL-id row on a keyless or unbound store included, is
+        dead-lettered, gets its ``dead`` event and finalize, and is counted, as before BACKLOG #5962.
+        The decision is the seal's own refusal, so it is the same condition the cipher applies.
+        Lane values are joined with ``str()``, so a NULL lane name cannot raise after the commit."""
+        killed: list[Any] = []
+        skipped: list[Any] = []
+        for row in orphans:
+            try:
+                reason = self._enc(error, aad=cell_aad("queue", "last_error", row["id"]))
+            except AADComponentError:
+                skipped.append(row)
+                continue
+            await self._db.execute(
+                "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
+                " WHERE id=?",
+                (OutboxStatus.DEAD.value, now, reason, now, row["id"]),
+            )
+            await self._event(
+                row["message_id"], "dead", row[lane] if event_names_lane else None, error, now
+            )
+            await self._maybe_finalize_message(row["message_id"], now)
+            killed.append(row)
+        await self._commit()
+        _warn_unsealable_orphans(skipped, lane, what, missing)
+        if killed:
+            log.warning(
+                "dead-lettered %d orphaned %s row(s) at startup for missing %s(s): %s",
+                len(killed),
+                what,
+                missing,
+                ", ".join(sorted({str(r[lane]) for r in killed})),
+            )
+        return len(killed)
+
     async def dead_letter_missing_destinations(
         self, valid_names: set[str], now: float | None = None
     ) -> int:
@@ -16835,31 +16884,17 @@ class MessageStore:
             # Filter in Python: valid_names may be empty (NOT IN () is invalid SQL) and the
             # non-terminal backlog is small relative to the message history.
             orphans = [r for r in await cur.fetchall() if r["destination_name"] not in valid_names]
-            orphans = _skip_null_id_orphans(orphans, "destination_name", "outbox", "destination")
             if not orphans:
                 return 0
-            error = "destination removed from outbound registry"
-            for row in orphans:
-                await self._db.execute(
-                    "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
-                    " WHERE id=?",
-                    (
-                        OutboxStatus.DEAD.value,
-                        now,
-                        self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
-                        now,
-                        row["id"],
-                    ),
-                )
-                await self._event(row["message_id"], "dead", row["destination_name"], error, now)
-                await self._maybe_finalize_message(row["message_id"], now)
-            await self._commit()
-            log.warning(
-                "dead-lettered %d orphaned outbox row(s) at startup for missing destination(s): %s",
-                len(orphans),
-                ", ".join(sorted({r["destination_name"] for r in orphans})),
+            return await self._dead_letter_orphans(
+                orphans,
+                "destination removed from outbound registry",
+                now,
+                lane="destination_name",
+                what="outbox",
+                missing="destination",
+                event_names_lane=True,
             )
-            return len(orphans)
 
     async def dead_letter_missing_handlers(
         self, valid_names: set[str], now: float | None = None
@@ -16882,31 +16917,17 @@ class MessageStore:
             # Filter in Python (valid_names may be empty → NOT IN () is invalid SQL); the non-terminal
             # routed backlog is small relative to message history.
             orphans = [r for r in await cur.fetchall() if r["handler_name"] not in valid_names]
-            orphans = _skip_null_id_orphans(orphans, "handler_name", "routed", "handler")
             if not orphans:
                 return 0
-            error = "handler removed from registry"
-            for row in orphans:
-                await self._db.execute(
-                    "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
-                    " WHERE id=?",
-                    (
-                        OutboxStatus.DEAD.value,
-                        now,
-                        self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
-                        now,
-                        row["id"],
-                    ),
-                )
-                await self._event(row["message_id"], "dead", None, error, now)
-                await self._maybe_finalize_message(row["message_id"], now)
-            await self._commit()
-            log.warning(
-                "dead-lettered %d orphaned routed row(s) at startup for missing handler(s): %s",
-                len(orphans),
-                ", ".join(sorted({r["handler_name"] for r in orphans})),
+            return await self._dead_letter_orphans(
+                orphans,
+                "handler removed from registry",
+                now,
+                lane="handler_name",
+                what="routed",
+                missing="handler",
+                event_names_lane=False,
             )
-            return len(orphans)
 
     async def dead_letter_missing_inbounds(
         self, valid_names: set[str], now: float | None = None
@@ -16943,34 +16964,17 @@ class MessageStore:
             # Filter in Python (valid_names may be empty → NOT IN () is invalid SQL); the non-terminal
             # channel-keyed backlog is small relative to message history.
             orphans = [r for r in await cur.fetchall() if r["channel_id"] not in valid_names]
-            orphans = _skip_null_id_orphans(
-                orphans, "channel_id", "ingress/routed/response", "inbound"
-            )
             if not orphans:
                 return 0
-            error = "inbound removed from registry"
-            for row in orphans:
-                await self._db.execute(
-                    "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
-                    " WHERE id=?",
-                    (
-                        OutboxStatus.DEAD.value,
-                        now,
-                        self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
-                        now,
-                        row["id"],
-                    ),
-                )
-                await self._event(row["message_id"], "dead", None, error, now)
-                await self._maybe_finalize_message(row["message_id"], now)
-            await self._commit()
-            log.warning(
-                "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
-                " inbound(s): %s",
-                len(orphans),
-                ", ".join(sorted({r["channel_id"] for r in orphans})),
+            return await self._dead_letter_orphans(
+                orphans,
+                "inbound removed from registry",
+                now,
+                lane="channel_id",
+                what="ingress/routed/response",
+                missing="inbound",
+                event_names_lane=False,
             )
-            return len(orphans)
 
     async def replay(
         self,

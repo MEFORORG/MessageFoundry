@@ -144,9 +144,19 @@ class StateConvergenceRunner:
         return refreshed
 
     def _alert(self, detail: str) -> None:
-        # The AlertSink has no state-specific event; reuse connection_stopped as the generic "a named
-        # component degraded" signal (never raises — be defensive anyway).
-        try:
-            self._alert_sink.connection_stopped(STATE_CONVERGENCE_ALERT_SUBJECT, detail=detail)
-        except Exception:
-            log.warning("transform-state convergence alert sink failed", exc_info=True)
+        alert_state_cache_failure(self._alert_sink, detail)
+
+
+def alert_state_cache_failure(sink: AlertSink | None, detail: str) -> None:
+    """Raise a transform-state cache failure on ``sink`` (the logging sink when ``None``).
+
+    Shared by the convergence pass and the engine's re-read on promotion (BACKLOG #5984), so both
+    alert on the same subject. ``detail`` must carry the exception CLASS only, never its text."""
+    # The AlertSink has no state-specific event; reuse connection_stopped as the generic "a named
+    # component degraded" signal (never raises — be defensive anyway).
+    try:
+        (sink or LoggingAlertSink()).connection_stopped(
+            STATE_CONVERGENCE_ALERT_SUBJECT, detail=detail
+        )
+    except Exception:
+        log.warning("transform-state convergence alert sink failed", exc_info=True)

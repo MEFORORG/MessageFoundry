@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth.trust_anchors import LaneAnchorCheck
 from messagefoundry.config.environments import SnapshotEnvValuesProvider
 from messagefoundry.config.models import (
@@ -98,7 +99,10 @@ from messagefoundry.pipeline.secret_rotation import (
     secrets_from_settings_and_stamps,
 )
 from messagefoundry.pipeline.sharding import join_shard_names, owned_destination_set
-from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
+from messagefoundry.pipeline.state_convergence import (
+    StateConvergenceRunner,
+    alert_state_cache_failure,
+)
 from messagefoundry.pipeline.update_check import UpdateCheckResult, UpdateCheckRunner
 from messagefoundry.pipeline.wiring_runner import (
     FhirLookupAnchorPass,
@@ -110,6 +114,7 @@ from messagefoundry.pipeline.wiring_runner import (
 )
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
+from messagefoundry.store.base import sealed_read_errors, store_connect_errors
 from messagefoundry.store.crypto import Cipher
 from messagefoundry.store.row_seal import probe_row_sealer_at_start
 from messagefoundry.store.store import (
@@ -2690,17 +2695,29 @@ class Engine:
             # A failed re-read must not stop the bring-up. Raising here would abort _start_graph
             # while this node holds the lease, and the supervisor would retry the whole start every
             # poll with no graph running anywhere. The re-read fails closed and keeps the cache it
-            # warmed at open, so carrying on serves what the engine served before #5984, and the
-            # WARNING says so. Nothing retries the re-read: the cache stays as loaded at open until
-            # the next promotion or restart. A cipher failure on a state row is caught here too;
-            # the next open-time warm still fails closed on that row.
+            # already holds, so the node serves that, and the WARNING and an alert say so. Nothing
+            # retries the re-read before the next promotion or restart. A cipher failure on a state
+            # row is caught here too; the next open-time warm still fails closed on that row.
+            #
+            # Only the store's own read and cipher refusals are caught: sealed_read_errors() plus
+            # store_connect_errors() (pyodbc's Error root, which a deadlock victim raises, and the
+            # acquire timeout). A defect in AUDIT_WRITE_DEFECTS, or any other type, propagates. As
+            # the convergence pass does (state_convergence.py), the log and the alert carry the
+            # exception CLASS only: a decrypt failure's text can carry a PHI-bearing key.
             try:
                 await self.store.reload_state_cache()
-            except Exception:
+            except AUDIT_WRITE_DEFECTS:
+                raise
+            except (*sealed_read_errors(), *store_connect_errors()) as exc:
+                kind = type(exc).__name__
                 log.warning(
-                    "engine: re-reading transform state on promotion failed; this node serves the "
-                    "state cache it loaded at open, which may miss the prior leader's later writes",
-                    exc_info=True,
+                    "engine: re-reading transform state on promotion failed (%s); this node serves "
+                    "the state cache it already holds, which may miss the prior leader's later "
+                    "writes",
+                    kind,
+                )
+                alert_state_cache_failure(
+                    self._alert_sink, f"state cache re-read on promotion failed ({kind})"
                 )
         # A3 — dead-letter OUTBOUND/ROUTED rows whose destination/handler left the config (no worker
         # would ever drain them). Now part of graph bring-up, so in a cluster ONLY the leader (the one
