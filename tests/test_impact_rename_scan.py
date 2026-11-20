@@ -174,3 +174,74 @@ def test_a_router_returning_a_dict_routes_to_its_keys(tmp_path: Path) -> None:
     text = _text(config_dir)
     assert '@handler("h_new")' in text
     assert 'return {"h_a": "h_old"}' in text
+
+
+_H_P = Reference("handler", "h_p", "outbound", "OB_OLD")
+
+
+@pytest.mark.parametrize(
+    ("prelude", "body"),
+    [
+        # Step 7: a local read as the Send target and in a comparison.
+        (
+            "",
+            '    dest = "OB_OLD"\n    if str(msg) == dest:\n        return None\n'
+            "    return Send(dest, msg)\n",
+        ),
+        # Step 7: a module constant read the same two ways.
+        (
+            'DEST = "OB_OLD"\n',
+            "    if str(msg) == DEST:\n        return None\n    return Send(DEST, msg)\n",
+        ),
+        # Step 7: a helper parameter read the same two ways.
+        (
+            "def _send(dest, msg):\n    if str(msg) == dest:\n        return None\n"
+            "    return Send(dest, msg)\n",
+            '    return _send("OB_OLD", msg)\n',
+        ),
+        # Step 9: flow-insensitive values: a later value never reaches the Send, only the comparison.
+        (
+            "",
+            '    dest = "OB_A"\n    out = Send(dest, msg)\n    dest = "OB_OLD"\n'
+            "    if str(msg) == dest:\n        return None\n    return out\n",
+        ),
+        # Step 9: a copy taken before the Send keeps reading the old value.
+        (
+            "",
+            '    dest = "OB_OLD"\n    label = dest\n    if str(msg) == label:\n        return None\n'
+            "    return Send(dest, msg)\n",
+        ),
+    ],
+)
+def test_a_name_read_outside_its_role_reports_the_referrer(
+    tmp_path: Path, prelude: str, body: str
+) -> None:
+    """Steps 7 and 9: rewriting a name's value would change every other read of it."""
+    config_dir = _write(
+        tmp_path,
+        {"mod.py": _HEAD + _WIRE + prelude + '\n@handler("h_p")\ndef h_p(msg):\n' + body},
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == (_H_P,)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '    dests = []\n    if msg:\n        dests.append("OB_OLD")\n    if not dests:\n'
+        "        return None\n    return [Send(d, msg) for d in dests if d]\n",
+        '    dest = "OB_OLD"\n    if dest is None or len(dest) == 0:\n        return None\n'
+        "    return Send(dest, msg)\n",
+    ],
+)
+def test_a_value_agnostic_read_keeps_the_rename_resolved(tmp_path: Path, body: str) -> None:
+    """Steps 7 and 9: a truth test, len(), an ``is None`` check and a collector do not read the
+    string, so they do not stop the rewrite."""
+    config_dir = _write(
+        tmp_path, {"mod.py": _HEAD + _WIRE + '@handler("h_p")\ndef h_p(msg):\n' + body}
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert '"OB_OLD"' not in _text(config_dir)
+    load_config(config_dir)

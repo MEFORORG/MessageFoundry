@@ -483,13 +483,16 @@ class _Site:
     handler name and the like, so an equal literal in another role is left alone and, being still
     counted, reports its referrer unresolved. ``ignored`` holds the literals at the site that are not
     a referent at all and so are neither rewritten nor counted: the referrer's own registering
-    ``@handler("name")`` argument, when the referrer is named like the target."""
+    ``@handler("name")`` argument, when the referrer is named like the target. ``reads`` holds the
+    ids of the function's name reads a role takes or that do not depend on the value, so a module
+    binding read anywhere else in the body is not rewritten."""
 
     file: str
     span: _Span
     allowed: frozenset[tuple[int, int]] | None
     rewritable: frozenset[tuple[int, int]] | None = None
     ignored: frozenset[tuple[int, int]] = frozenset()
+    reads: frozenset[int] = frozenset()
 
     def rewrites(
         self,
@@ -614,10 +617,12 @@ def _referrer_sites(
                 # ``ignored`` holds bare positions in the decorator's own file; a helper elsewhere
                 # at the same (line, col) is a referent and must stay counted.
                 own = ignored if file == own_file else frozenset()
-                sites.append(_Site(file, span, None, frozenset(rewritable), own))
+                sites.append(_Site(file, span, None, frozenset(rewritable), own, scan.reads))
             else:
                 allowed = _accessor_positions(sources, file, span, old, table_kind) | rewritable
-                sites.append(_Site(file, span, frozenset(allowed)))
+                sites.append(_Site(file, span, frozenset(allowed), reads=scan.reads))
+        # A local that carries a rewritten literal into another read leaves the referrer unresolved.
+        complete = complete and not any(scan.unsafe for scan in scans)
         for func in reached:
             bound_sites, located = _module_binding_sites(
                 func, old, table_kind, sources, role_globals, role_attrs, iter_globals, iter_attrs
@@ -749,6 +754,8 @@ class _Flow:
     attrs: set[str] = field(default_factory=set)
     iter_attrs: set[str] = field(default_factory=set)
     calls: set[str] = field(default_factory=set)
+    # The ids of the name and attribute nodes the flow read.
+    read: set[int] = field(default_factory=set)
 
 
 @dataclass
@@ -769,6 +776,10 @@ class _Scan:
     iter_attrs: set[str] = field(default_factory=set)
     iter_slots: set[tuple[int, str]] = field(default_factory=set)
     iter_passes: set[tuple[int, str]] = field(default_factory=set)
+    # The ids of the reads in the body that a role takes, or that do not depend on the value; and
+    # whether a local carries a rewritten literal into some other read.
+    reads: frozenset[int] = frozenset()
+    unsafe: bool = False
 
 
 @dataclass(frozen=True)
@@ -961,8 +972,31 @@ def _scan_function(
         if const.value == old
         and span.start <= (pos := sources.position(file, const))[0] <= span.end
     }
+    # A name a role reads may also be read elsewhere -- in a comparison, a log line, a lookup.
+    # Rewriting its value changes that read too, so such a name gives no role (BACKLOG #5980).
+    reads = sink.read | back.read | _value_agnostic_reads(body)
+    loose = {
+        child.id
+        for stmt in body
+        for child in ast.walk(stmt)
+        if isinstance(child, ast.Name)
+        and isinstance(child.ctx, ast.Load)
+        and id(child) not in reads
+    }
+    # A local carrying a rewritten literal into a loose read: the referrer is unresolved. A
+    # parameter read loosely is no role slot, so a caller's argument for it stays counted.
+    unsafe = False
+    for name in loose & set(values):
+        probe = _Flow(params=params, modules=role.names.modules)
+        ref = ast.Name(id=name, ctx=ast.Load())
+        _carried(ref, values, set(), probe)
+        _carried_elements(ref, values, set(), probe)
+        unsafe = unsafe or any(
+            c.value == old and sources.position(file, c) in positions for c in probe.consts
+        )
 
     def slots_of(unbound: set[str]) -> set[tuple[int, str]]:
+        unbound = unbound - loose
         found = {(positional.index(p), p) for p in unbound if p in positional}
         return found | {(-1, p) for p in unbound if p in keyword_only}
 
@@ -979,7 +1013,67 @@ def _scan_function(
         iter_attrs=sink.iter_attrs | back.iter_attrs,
         iter_slots=own_iter_slots,
         iter_passes=slots_of(back.iterated) - own_iter_slots,
+        reads=frozenset(reads),
+        unsafe=unsafe,
     )
+
+
+def _value_agnostic_reads(body: Iterable[ast.AST]) -> set[int]:
+    """The ids of the name and attribute reads in ``body`` whose result does not depend on which
+    string the name holds: a truth test (``if names:``, ``not names``, a comprehension's ``if``),
+    ``len()``/``isinstance()``/``bool()``, an ``is None`` check, and the receiver of a list or set
+    collector (``names.append("h")``)."""
+    out: set[int] = set()
+    parents: dict[int, ast.AST] = {}
+    for stmt in body:
+        for holder in ast.walk(stmt):
+            for child in ast.iter_child_nodes(holder):
+                parents[id(child)] = holder
+
+    def tested(node: ast.AST) -> bool:
+        parent = parents.get(id(node))
+        if isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)):
+            return parent.test is node
+        if isinstance(parent, ast.comprehension):
+            return node in parent.ifs
+        if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not):
+            return True
+        if isinstance(parent, ast.BoolOp):
+            return tested(parent)
+        return False
+
+    for stmt in body:
+        for node in ast.walk(stmt):
+            if not isinstance(node, (ast.Name, ast.Attribute)) or not isinstance(
+                node.ctx, ast.Load
+            ):
+                continue
+            parent = parents.get(id(node))
+            if (
+                tested(node)
+                or (
+                    isinstance(parent, ast.Call)
+                    and isinstance(parent.func, ast.Name)
+                    and parent.func.id in ("len", "isinstance", "bool")
+                    and node in parent.args
+                )
+                or (
+                    isinstance(parent, ast.Compare)
+                    and all(isinstance(op, (ast.Is, ast.IsNot)) for op in parent.ops)
+                    and all(
+                        isinstance(c, ast.Constant) and c.value is None
+                        for c in (parent.left, *parent.comparators)
+                        if c is not node
+                    )
+                )
+                or (
+                    isinstance(parent, ast.Attribute)
+                    and parent.attr in _COLLECTOR_METHODS
+                    and isinstance(parents.get(id(parent)), ast.Call)
+                )
+            ):
+                out.add(id(node))
+    return out
 
 
 def _call_roots(call: ast.Call, role: _Role) -> list[ast.expr]:
@@ -1135,6 +1229,7 @@ def _carried(
     elif isinstance(expr, ast.Call):
         _carried_call(expr, values, seen, flow)
     elif isinstance(expr, ast.Name):
+        flow.read.add(id(expr))
         if expr.id not in values or expr.id in flow.params:
             # A parameter (even one reassigned locally) or a module global; the caller sorts which.
             flow.unbound.add(expr.id)
@@ -1143,6 +1238,7 @@ def _carried(
             for value in values[expr.id]:
                 _carried(value, values, seen, flow)
     elif isinstance(expr, ast.Attribute):
+        flow.read.add(id(expr))
         flow.attrs.add(expr.attr)
 
 
@@ -1191,6 +1287,7 @@ def _carried_elements(
         for value in expr.values:
             _carried_elements(value, values, seen, flow)
     elif isinstance(expr, ast.Name):
+        flow.read.add(id(expr))
         if expr.id not in values or expr.id in flow.params:
             flow.iterated.add(expr.id)
         # Seen apart from a read for its value, which follows the name separately.
@@ -1199,6 +1296,7 @@ def _carried_elements(
             for value in values[expr.id]:
                 _carried_elements(value, values, seen, flow)
     elif isinstance(expr, ast.Attribute):
+        flow.read.add(id(expr))
         flow.iter_attrs.add(expr.attr)
     elif isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute) and not expr.args:
         if expr.func.attr == "keys":
@@ -1539,6 +1637,10 @@ def _binding_read_only_by_referents(
         if reader_file == file and sources.position(file, node) in declaring:
             continue
         if not _in_covered_body(sources, reader_file, node, covering):
+            return False
+        # In a covered body, only a read a role takes, or one that does not depend on the value:
+        # ``if msg.x == TARGET`` beside ``Send(TARGET, msg)`` would change with it (BACKLOG #5980).
+        if not any(id(node) in site.reads for site in covering):
             return False
     return True
 
