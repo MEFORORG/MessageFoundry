@@ -581,8 +581,12 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     # zip exists; tests/test_support_bundle.py holds the two to the same terms (BACKLOG #5385).
     # Both the command list and `support-bundle --help` print it.
     support_bundle_help = (
-        "write a support zip to hand to support (#49): a secret-free config summary "
-        "(counts/names only) + a PHI-free /status snapshot + a REDACTED app-log tail. The tail's "
+        "write a support zip to hand to support (#49). Its members: version.txt (the engine "
+        "version); manifest.json (the member list and the phi_contract); config-summary.json "
+        "(counts/names only, holding no secret); status.json (the metadata-only status models); "
+        "and, when the configured log directory holds a log and the tail is not 0 lines, "
+        "app-log.txt (a "
+        "REDACTED app-log tail). The tail's "
         "redaction is BEST-EFFORT, and values survive it: at least a single-token identifier such "
         "as an operator username and, on a non-production instance logging at DEBUG, a message "
         "body the log recorded in a shape the redaction does not read. Handle the zip as a copy of "

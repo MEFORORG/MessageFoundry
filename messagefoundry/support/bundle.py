@@ -12,7 +12,7 @@ starts no server. Contents (each a small text/JSON member):
   value, host, path, credential, or any ``env()``-resolved data.
 * ``status.json`` — a ``/status`` snapshot built from the REAL status models
   (:class:`~messagefoundry.api.models.SystemStatus` / ``EngineInfo`` / ``DbInfo``), populated offline
-  from the store. PHI-free (counts + sizes only).
+  from the store. Metadata-only (counts + sizes), the term the manifest's ``phi_contract`` uses.
 * ``app-log.txt`` — a **redacted** tail of the configured app log (see
   :mod:`messagefoundry.support.redact`); omitted when no ``[logging].log_dir`` is configured.
 
