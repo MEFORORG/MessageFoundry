@@ -609,6 +609,13 @@ SITES: dict[str, Site] = {
         called=True,
     ),
     "messagefoundry/config/impact.py::_validate_new_name": Site(1, OPERATOR, _CODESETS),
+    "messagefoundry/config/impact.py::_config_modules": Site(
+        2,
+        OPERATOR,
+        "Names os.walk listed under the operator's config directory, joined to probe a directory "
+        "for pyvenv.cfg and to name each .py module a rename reads; nothing is written "
+        "(BACKLOG #5980).",
+    ),
     "messagefoundry/config/snapshot.py::ConfigSnapshot._folder_of": Site(
         1, OPERATOR, _CONFIG_FIXED
     ),
