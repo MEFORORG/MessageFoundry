@@ -1108,13 +1108,21 @@ def _slot_arguments(call: ast.Call, slots: Iterable[tuple[int, str]]) -> list[as
 def _router_binding_positions(
     sources: SourceCache, file: str, span: _Span, old: str
 ) -> frozenset[tuple[int, int]]:
-    """The ``router=`` values equal to ``old`` in an inbound's declaring statement at ``span``."""
+    """The ``router=`` values equal to ``old`` in an inbound's declaring statement at ``span``: the
+    keyword of the ``inbound(...)`` call itself, spelled as :func:`_factory_spellings` finds it. A
+    ``router=`` keyword of a call inside a sibling argument (``_transport(router="r")``) is another
+    call's argument, not the binding, so it is left and counted (BACKLOG #5980)."""
     parsed = sources.parse(file)
     if parsed is None:
         return frozenset()
+    spelled = _factory_spellings(parsed[0], {"inbound"})
     flow = _Flow()
     for node in ast.walk(parsed[0]):
-        if isinstance(node, ast.Call) and span.start <= node.lineno <= span.end:
+        if (
+            isinstance(node, ast.Call)
+            and span.start <= node.lineno <= span.end
+            and _call_name(node.func) in spelled
+        ):
             for kw in node.keywords:
                 if kw.arg == "router":
                     _carried(kw.value, {}, set(), flow)
