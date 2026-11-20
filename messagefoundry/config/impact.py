@@ -583,12 +583,19 @@ def _referrer_sites(
         scans = _scan_referrer(sources, funcs, old, ref.referrer_kind, table_kind)
         role_globals = {name for scan in scans for name in scan.globals}
         role_attrs = {name for scan in scans for name in scan.attrs}
+        iter_globals = {name for scan in scans for name in scan.iter_globals}
+        iter_attrs = {name for scan in scans for name in scan.iter_attrs}
         for (depth, func, file, span), scan in zip(funcs, scans, strict=True):
             rewritable = set(scan.positions)
             # A non-table rename rewrites a default only for a parameter that reaches a referent
             # role; a table rename rewrites every default equal to the old name.
             role_params = (
-                None if table_kind is not None else {name for _i, name in scan.slots | scan.passes}
+                None
+                if table_kind is not None
+                else {
+                    name
+                    for _i, name in scan.slots | scan.passes | scan.iter_slots | scan.iter_passes
+                }
             )
             rewritable |= _default_positions(sources, func, file, span, old, role_params)
             if table_kind is None or depth == 0:
@@ -601,7 +608,7 @@ def _referrer_sites(
                 sites.append(_Site(file, span, frozenset(allowed)))
         for func in reached:
             bound_sites, located = _module_binding_sites(
-                func, old, table_kind, sources, role_globals, role_attrs
+                func, old, table_kind, sources, role_globals, role_attrs, iter_globals, iter_attrs
             )
             sites.extend(bound_sites)
             complete = complete and located
@@ -720,9 +727,15 @@ class _Flow:
     # A pass-through helper's parameters that reach only its return value: a call to it carries
     # those arguments only where the call itself is carried into a role.
     passes: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
+    # The pass-through parameters a helper iterates, so a call's argument there carries elements.
+    iter_passes: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
     consts: list[ast.Constant] = field(default_factory=list)
+    # Names read for their value, and names read for their elements (iterated): a dict's elements
+    # are its keys, its value is read through its values (BACKLOG #5980).
     unbound: set[str] = field(default_factory=set)
+    iterated: set[str] = field(default_factory=set)
     attrs: set[str] = field(default_factory=set)
+    iter_attrs: set[str] = field(default_factory=set)
     calls: set[str] = field(default_factory=set)
 
 
@@ -739,6 +752,11 @@ class _Scan:
     calls: set[str]
     slots: set[tuple[int, str]]
     passes: set[tuple[int, str]] = field(default_factory=set)
+    # The same, for what a role reads through its elements (a loop, a comprehension, list(...)).
+    iter_globals: set[str] = field(default_factory=set)
+    iter_attrs: set[str] = field(default_factory=set)
+    iter_slots: set[tuple[int, str]] = field(default_factory=set)
+    iter_passes: set[tuple[int, str]] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -799,30 +817,41 @@ def _scan_referrer(
     ]
     send = table_kind is None and referrer_kind == "handler"
     returns: set[str] = set()
-    slots: dict[str, set[tuple[int, str]]] = {}
-    passes: dict[str, set[tuple[int, str]]] = {}
+    # helper name -> its role parameters: read for their value, then read for their elements; and
+    # its pass-through parameters, the same two ways.
+    maps: tuple[dict[str, set[tuple[int, str]]], ...] = ({}, {}, {}, {})
     while True:
         scans: list[_Scan] = []
         for depth, func, file, span, node, values, names in prepared:
-            if depth == 0:
-                give_back = referrer_kind == "router" and table_kind is None
-            else:
-                give_back = func.__name__ in returns
-            role = _Role(send, give_back, table_kind, slots, names, passes)
+            router_return = depth == 0 and referrer_kind == "router" and table_kind is None
+            give_back = router_return if depth == 0 else func.__name__ in returns
+            role = _Role(
+                send,
+                give_back,
+                table_kind,
+                maps[0],
+                names,
+                passes=maps[2],
+                iter_slots=maps[1],
+                iter_passes=maps[3],
+                # The engine iterates a router's return, so a dict it returns names its keys.
+                iterate_returns=router_return,
+            )
             scans.append(_scan_function(sources, file, span, node, values, old, role))
         new_returns = returns | {name for scan in scans for name in scan.calls}
-        new_slots = {name: set(found) for name, found in slots.items()}
-        new_passes = {name: set(found) for name, found in passes.items()}
+        new_maps = tuple({name: set(found) for name, found in m.items()} for m in maps)
         for (depth, func, *_rest), scan in zip(prepared, scans, strict=True):
-            if scan.slots:
-                new_slots.setdefault(func.__name__, set()).update(scan.slots)
             # The referrer's own return is no helper's, so it gives no call a pass-through.
-            if scan.passes and depth > 0:
-                new_passes.setdefault(func.__name__, set()).update(scan.passes)
-        # All three only grow and are bounded by the helpers' names and parameters, so this ends.
-        if new_returns == returns and new_slots == slots and new_passes == passes:
+            found = (scan.slots, scan.iter_slots) + (
+                (scan.passes, scan.iter_passes) if depth > 0 else (set(), set())
+            )
+            for target, params in zip(new_maps, found, strict=True):
+                if params:
+                    target.setdefault(func.__name__, set()).update(params)
+        # All of them only grow and are bounded by the helpers' names and parameters, so this ends.
+        if new_returns == returns and new_maps == maps:
             return scans
-        returns, slots, passes = new_returns, new_slots, new_passes
+        returns, maps = new_returns, new_maps
 
 
 @dataclass(frozen=True)
@@ -835,6 +864,9 @@ class _Role:
     slots: Mapping[str, set[tuple[int, str]]]
     names: _Names
     passes: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
+    iter_slots: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
+    iter_passes: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
+    iterate_returns: bool = False
 
 
 def _function_node(
@@ -885,8 +917,12 @@ def _scan_function(
     # Two flows: what reaches a role inside this function (``sink``), and what reaches only its
     # return value (``back``). A parameter in ``sink`` makes every call's argument a referent; one
     # only in ``back`` does so only for a call that is itself carried into a role (BACKLOG #5980).
-    sink = _Flow(params=params, modules=role.names.modules, passes=role.passes)
-    back = _Flow(params=params, modules=role.names.modules, passes=role.passes)
+    sink = _Flow(
+        params=params, modules=role.names.modules, passes=role.passes, iter_passes=role.iter_passes
+    )
+    back = _Flow(
+        params=params, modules=role.names.modules, passes=role.passes, iter_passes=role.iter_passes
+    )
     returned: list[ast.expr] = []
     if role.give_back:
         if isinstance(node, ast.Lambda):
@@ -903,7 +939,10 @@ def _scan_function(
                 for root in _call_roots(child, role):
                     _carried(root, values, set(), sink)
     for root in returned:
-        _carried(root, values, set(), back)
+        if role.iterate_returns:
+            _carried_elements(root, values, set(), back)
+        else:
+            _carried(root, values, set(), back)
     positions = {
         pos
         for const in (*sink.consts, *back.consts)
@@ -916,6 +955,7 @@ def _scan_function(
         return found | {(-1, p) for p in unbound if p in keyword_only}
 
     own_slots = slots_of(sink.unbound)
+    own_iter_slots = slots_of(sink.iterated)
     return _Scan(
         positions,
         (sink.unbound | back.unbound) - params,
@@ -923,6 +963,10 @@ def _scan_function(
         sink.calls | back.calls,
         own_slots,
         slots_of(back.unbound) - own_slots,
+        iter_globals=(sink.iterated | back.iterated) - params,
+        iter_attrs=sink.iter_attrs | back.iter_attrs,
+        iter_slots=own_iter_slots,
+        iter_passes=slots_of(back.iterated) - own_iter_slots,
     )
 
 
@@ -943,9 +987,17 @@ def _call_roots(call: ast.Call, role: _Role) -> list[ast.expr]:
         and (table := _first_or_keyword(call, _ACCESSOR_NAME_PARAMS[accessor])) is not None
     ):
         out.append(table)
-    helper = _helper_name(call.func, role.names.modules)
-    out.extend(_slot_arguments(call, role.slots.get(helper or "", ())))
+    helper = _helper_name(call.func, role.names.modules) or ""
+    out.extend(_slot_arguments(call, role.slots.get(helper, ())))
+    # A parameter the helper iterates takes the argument's elements (a dict's keys).
+    out.extend(_elements(arg) for arg in _slot_arguments(call, role.iter_slots.get(helper, ())))
     return out
+
+
+def _elements(expr: ast.expr) -> ast.Starred:
+    """A marker for "the elements of ``expr``", as ``*expr`` reads them: :func:`_carried` takes a
+    starred value through :func:`_carried_elements`."""
+    return ast.Starred(value=expr, ctx=ast.Load())
 
 
 def _first_or_keyword(call: ast.Call, keyword: str) -> ast.expr | None:
@@ -1012,6 +1064,11 @@ def _bind(
         for elt in value.elts:
             _bind(target, elt, values, element=False)
         return
+    if element and isinstance(target, ast.Name):
+        # Taken in turn from any other iterable, the name holds its elements: a dict's keys, never
+        # its values (BACKLOG #5980).
+        values.setdefault(target.id, []).append(_elements(value))
+        return
     if isinstance(target, ast.Name):
         values.setdefault(target.id, []).append(value)
         return
@@ -1042,7 +1099,9 @@ def _carried(
             _carried(elt, values, seen, flow)
     elif isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
         _carried(expr.elt, values, seen, flow)
-    elif isinstance(expr, (ast.DictComp, ast.Starred)):
+    elif isinstance(expr, ast.Starred):
+        _carried_elements(expr.value, values, seen, flow)
+    elif isinstance(expr, ast.DictComp):
         _carried(expr.value, values, seen, flow)
     elif isinstance(expr, ast.IfExp):
         _carried(expr.body, values, seen, flow)
@@ -1082,7 +1141,8 @@ def _carried_call(
     container through; any other call's return value is recorded as a helper's to scan."""
     called = _call_name(call.func)
     if called in _COPY_CALLS and isinstance(call.func, ast.Name) and call.args:
-        _carried(call.args[0], values, seen, flow)
+        # list(d) and sorted(d) build from d's elements, which for a dict are its keys.
+        _carried_elements(call.args[0], values, seen, flow)
     elif isinstance(call.func, ast.Attribute) and called in ("get", "copy"):
         _carried(call.func.value, values, seen, flow)
         if called == "get" and len(call.args) > 1:
@@ -1092,6 +1152,53 @@ def _carried_call(
         # This call's value is in a role, so a pass-through helper's argument is too.
         for root in _slot_arguments(call, flow.passes.get(helper, ())):
             _carried(root, values, seen, flow)
+        for root in _slot_arguments(call, flow.iter_passes.get(helper, ())):
+            _carried_elements(root, values, seen, flow)
+
+
+def _carried_elements(
+    expr: ast.expr, values: Mapping[str, list[ast.expr]], seen: set[str], flow: _Flow
+) -> None:
+    """Add to ``flow`` what ``expr``'s elements are made of, as a loop, a comprehension, ``*expr``
+    or ``list(expr)`` reads them: a dict's keys (never its values), the keys of ``d.keys()``, the
+    values of ``d.values()``; a name read this way is recorded as iterated, so its module binding
+    is read the same way (BACKLOG #5980). ``d.items()`` yields pairs, which carry no name."""
+    if isinstance(expr, ast.Dict):
+        for key, value in zip(expr.keys, expr.values, strict=True):
+            if key is None:
+                # {**other} takes other's keys.
+                _carried_elements(value, values, seen, flow)
+            else:
+                _carried(key, values, seen, flow)
+    elif isinstance(expr, ast.DictComp):
+        _carried(expr.key, values, seen, flow)
+    elif isinstance(expr, ast.IfExp):
+        _carried_elements(expr.body, values, seen, flow)
+        _carried_elements(expr.orelse, values, seen, flow)
+    elif isinstance(expr, ast.BoolOp):
+        for value in expr.values:
+            _carried_elements(value, values, seen, flow)
+    elif isinstance(expr, ast.Name):
+        if expr.id not in values or expr.id in flow.params:
+            flow.iterated.add(expr.id)
+        # Seen apart from a read for its value, which follows the name separately.
+        if expr.id in values and f"*{expr.id}" not in seen:
+            seen.add(f"*{expr.id}")
+            for value in values[expr.id]:
+                _carried_elements(value, values, seen, flow)
+    elif isinstance(expr, ast.Attribute):
+        flow.iter_attrs.add(expr.attr)
+    elif isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute) and not expr.args:
+        if expr.func.attr == "keys":
+            _carried_elements(expr.func.value, values, seen, flow)
+        elif expr.func.attr == "values":
+            _carried(expr.func.value, values, seen, flow)
+        elif expr.func.attr != "items":
+            _carried(expr, values, seen, flow)
+    else:
+        # A list, a tuple, a set, a comprehension or anything else: its value's parts are its
+        # elements.
+        _carried(expr, values, seen, flow)
 
 
 def _slot_arguments(call: ast.Call, slots: Iterable[tuple[int, str]]) -> list[ast.expr]:
@@ -1318,6 +1425,8 @@ def _module_binding_sites(
     sources: SourceCache,
     role_names: set[str],
     role_attrs: set[str],
+    iter_names: set[str],
+    iter_attrs: set[str],
 ) -> tuple[list[_Site], bool]:
     """The module-level statements that bind a name ``func`` reads and hold ``old`` -- a global in
     ``func``'s own module, or an attribute of a config module it reads (``_consts.TARGET``) in that
@@ -1330,7 +1439,8 @@ def _module_binding_sites(
 
     For a non-table rename only a binding of a name the referrer reads in a referent role is
     rewritten, and only in its bound value: a bare global (``role_names``) in ``func``'s own module,
-    a module attribute (``role_attrs``) in another, as :func:`_scan_referrer` found them.
+    a module attribute (``role_attrs``) in another, as :func:`_scan_referrer` found them; a name
+    the referrer iterates (``iter_names``, ``iter_attrs``) gives its bound value's elements.
     ``SKIP = "h"`` read only in a comparison is left, and counted (BACKLOG #5980)."""
     names_by_file: dict[str, set[str]] = {}
     required: set[tuple[str | None, str]] = set()
@@ -1357,9 +1467,13 @@ def _module_binding_sites(
                 found = any(span.start <= p[0] <= span.end for p in sources.occurrences(file, old))
                 # The bound value is the referent, not a dict key or a comparison beside it.
                 flow = _Flow()
-                read = role_names if file == func.__code__.co_filename else role_attrs
+                own = file == func.__code__.co_filename
+                read = role_names if own else role_attrs
+                iterated = iter_names if own else iter_attrs
                 if stmt.value is not None and stmt_names & read:
                     _carried(stmt.value, {}, set(), flow)
+                if stmt.value is not None and stmt_names & iterated:
+                    _carried_elements(stmt.value, {}, set(), flow)
                 rewritable = frozenset(
                     sources.position(file, c) for c in flow.consts if c.value == old
                 )

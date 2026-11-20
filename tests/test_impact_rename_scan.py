@@ -80,3 +80,77 @@ def test_a_router_keyword_inside_a_sibling_argument_is_left(tmp_path: Path) -> N
     apply_rename(plan)
     assert 'inbound("IB_Q", _t(2902, router="r_old"), router="r_new")' in _text(config_dir)
     load_config(config_dir)
+
+
+@pytest.mark.parametrize(
+    ("prelude", "body"),
+    [
+        ("", '    labels = {"OB_A": "OB_OLD"}\n    return [Send(dest, msg) for dest in labels]\n'),
+        ('LABELS = {"OB_A": "OB_OLD"}\n', "    return [Send(d, msg) for d in list(LABELS)]\n"),
+        ('LABELS = {"OB_A": "OB_OLD"}\n', "    return [Send(d, msg) for d in LABELS.keys()]\n"),
+        (
+            "def _fan(dests, msg):\n    return [Send(d, msg) for d in dests]\n",
+            '    return _fan({"OB_A": "OB_OLD"}, msg)\n',
+        ),
+    ],
+)
+def test_iterating_a_dict_reads_its_keys_not_its_values(
+    tmp_path: Path, prelude: str, body: str
+) -> None:
+    """Step 5: a dict value equal to the name is a label when the dict is iterated."""
+    config_dir = _write(
+        tmp_path,
+        {"mod.py": _HEAD + _WIRE + prelude + '\n@handler("h_p")\ndef h_p(msg):\n' + body},
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    apply_rename(plan)
+    text = _text(config_dir)
+    assert 'outbound("OB_NEW"' in text
+    assert '{"OB_A": "OB_OLD"}' in text
+    load_config(config_dir)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '    return [Send(dest, msg) for dest in {"OB_OLD": "primary"}]\n',
+        '    for dest in {**{"OB_OLD": 1}}:\n        return Send(dest, msg)\n',
+    ],
+)
+def test_iterating_a_dict_rewrites_a_key_that_is_sent(tmp_path: Path, body: str) -> None:
+    """Step 5: the keys a dict is iterated for are the referents."""
+    config_dir = _write(
+        tmp_path, {"mod.py": _HEAD + _WIRE + '@handler("h_p")\ndef h_p(msg):\n' + body}
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert '"OB_OLD"' not in _text(config_dir)
+
+
+def test_a_router_returning_a_dict_routes_to_its_keys(tmp_path: Path) -> None:
+    """Step 5: the engine iterates a router's return, so a dict value is not a handler name."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "mod.py": _HEAD + 'inbound("IB_P", MLLP(port=2901), router="r_p")\n'
+            'outbound("OB_A", MLLP(host="127.0.0.1", port=6902))\n'
+            "\n"
+            '@router("r_p")\n'
+            "def r_p(msg):\n"
+            '    return {"h_a": "h_old"}\n'
+            "\n"
+            '@handler("h_a")\n'
+            "def h_a(msg):\n"
+            '    return Send("OB_A", msg)\n'
+            "\n"
+            '@handler("h_old")\n'
+            "def h_old(msg):\n"
+            '    return Send("OB_A", msg)\n'
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "handler", "h_old", "h_new")
+    apply_rename(plan)
+    text = _text(config_dir)
+    assert '@handler("h_new")' in text
+    assert 'return {"h_a": "h_old"}' in text
