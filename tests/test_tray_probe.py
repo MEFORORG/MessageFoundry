@@ -996,7 +996,12 @@ def test_a_pair_naming_only_the_wildcard_still_fails_verification(
         assert pinned.verify_mode is ssl.CERT_REQUIRED and pinned.check_hostname is True
         with make_probe_client(url, pinned=pinned) as client:
             assert probe_health(client) is HealthProbe.DOWN
-            # DOWN for the right reason: the handshake reached the server and the hostname check
-            # refused it, rather than a refused connection or a dead server thread.
-            with pytest.raises(httpx.ConnectError, match="IP address mismatch"):
-                client.get("/health")
+        # DOWN for the right reason: the handshake reached the server and the hostname check
+        # refused it, rather than a refused connection or a dead server thread. Read through a
+        # client handed the same pinned context directly, so the request's verification is that
+        # context at this call site.
+        with (
+            httpx.Client(base_url=url, verify=pinned, trust_env=False) as direct,
+            pytest.raises(httpx.ConnectError, match="IP address mismatch"),
+        ):
+            direct.get("/health")
