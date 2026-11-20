@@ -289,8 +289,8 @@ class ConnScaleRecord:
     # --- wall #4 probe provenance: why `fd_count_peak` is None, when it is None ---
     # `fd_count_peak = None` used to be the whole story, and it is the same value whether the host was
     # too starved to enumerate, the process tree was gone, or the enumerator ran and returned zero
-    # rows. Those warrant different verdicts, so the OS probe's own account of the window travels with
-    # the gauge. `fd_probe_ticks` is the SCOPE for `fd_probe_degraded_ticks` (a degraded count without
+    # rows. Those warrant different verdicts, so the OS probe's own account of its readings, any
+    # make-up reading past the window included (BACKLOG #1488), travels with the gauge. `fd_probe_ticks` is the SCOPE for `fd_probe_degraded_ticks` (a degraded count without
     # its denominator is not readable), and `fd_probe_degraded` holds the DISTINCT causes as strings
     # (`harness.load.connscale.probe.ProbeDegraded` values) — strings, so this module keeps its
     # independence from the probe. All three default so an older artifact deserializes unchanged;

@@ -1599,20 +1599,21 @@ async def _await_probe_beside_reply(
     in flight, then at most :data:`_FD_PROBE_MAKEUP_ATTEMPTS` make-up attempts. Awaited one after the
     other, that time ran in front of the reply wait, which delayed the wait and widened the window
     ``post_reload_drops`` counts over. Run side by side, the reply wait starts when the window closes
-    and the probe's reading is still taken before the caller stops the driver. No SLO or smoke
-    assertion bounds ``post_reload_reply_s``; the tests that bound ``reply_s`` time
-    :func:`_await_post_reload_reply` alone.
+    and the probe's reading is still taken before the caller stops the driver.
 
-    WHAT THE OVERLAP MOVES. A reply still counts for the no-reply verdict until the stop grace ends,
-    so that time was the probe's tail plus the wait, and is now the longer of the two, each before
-    the grace. The wait itself is the allowance ``_POST_RELOAD_REPLY_WAIT_S`` sizes. Where the tail
-    outlasts the wait, the step stays open past the end of the window ``post_reload_drops`` counts
-    over, and a close in that gap is not counted there.
+    WHAT THE OVERLAP MOVES, and it does move a verdict. No SLO or smoke assertion bounds
+    ``post_reload_reply_s``, and the tests that bound ``reply_s`` time :func:`_await_post_reload_reply`
+    alone. But a reply still counts for the no-reply LOSS verdict until the stop grace ends, so the
+    time before that grace was the probe's tail plus the wait, and is now the longer of the two. The
+    wait itself is the allowance ``_POST_RELOAD_REPLY_WAIT_S`` sizes. Where the tail outlasts the
+    wait, the step stays open past the end of the window ``post_reload_drops`` counts over, and a
+    close in that gap is not counted there.
 
     If the probe raises, the reply wait is cancelled and awaited before the error propagates, so its
     own cleanup runs and it is not left watching past the step. A reply-wait error surfaces once the
     probe returns. The step's own cleanup cancels the probe task on every path out; that does not stop
-    a walk already running in its executor thread, which ends at its own ``_PROBE_TIMEOUT_S``."""
+    a ``sample_proc`` call already running in its executor thread, which can run on for a walk and a
+    per-PID read, each with its own ``_PROBE_TIMEOUT_S``, plus the kill and reap after a timeout."""
     reply_task = None if reply is None else asyncio.ensure_future(reply)
     try:
         if reply_task is not None:
@@ -2671,7 +2672,8 @@ class _ProcDerived:
     probe_ticks: int
     #: How many of those ticks were full gaps (:attr:`ProcSample.degraded` set).
     probe_degraded_ticks: int
-    #: The DISTINCT degradation causes seen across the window, sorted. Values are
+    #: The DISTINCT degradation causes seen across those readings, a make-up one included, sorted.
+    #: The list does not say which span a cause came from. Values are
     #: :class:`ProbeDegraded` members, carried as plain strings so the report layer need not import
     #: the probe. Empty when every tick read something.
     probe_degraded: tuple[str, ...]
