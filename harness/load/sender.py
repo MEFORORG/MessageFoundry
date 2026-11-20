@@ -48,6 +48,16 @@ _READ_BYTES = 65536
 _ACCEPT = frozenset({"AA", "CA"})  # MSA-1 accept codes; anything else is a NAK
 _BACKOFF_START = 0.1
 _BACKOFF_MAX = 5.0
+# How long past its ACK grace a graceful stop may run before the connection is aborted and its task
+# cancelled (BACKLOG #5951). A peer that stalls a connect, a drain or a close would otherwise hold
+# the run's shutdown for good. The margin leaves a healthy peer room to take what is still queued.
+_STOP_HARD_MARGIN_S = 10.0
+# The longest single wait in an ACK-timed read before it re-checks the oldest send's deadline.
+_ACK_WAIT_CAP_S = 60.0
+
+
+class AckTimeoutError(Exception):
+    """The oldest in-flight send went unanswered past the connection's ACK timeout."""
 
 
 def _ack_code(payload: bytes) -> str:
@@ -79,8 +89,15 @@ class PersistentConnection:
         tracker: FailoverTracker | None = None,
         ledger: IntakeLedger | None = None,
         on_strand: Callable[[int], None] | None = None,
+        ack_timeout: float | None = None,
     ) -> None:
         self._host = host
+        # BACKLOG #5952: the target's ``ack_timeout_s``. When the oldest in-flight send has waited
+        # this long with no reply, the connection is closed, its in-flight sends are counted as
+        # timeouts, and it reconnects. None waits for ever, as every direct caller did before.
+        if ack_timeout is not None and not ack_timeout > 0:
+            raise ValueError(f"ack_timeout must be positive, got {ack_timeout!r}")
+        self._ack_timeout = ack_timeout  # seconds; float math, so inf or a huge value is fine
         self._port = port
         self._correlator = correlator
         self._m = metrics
@@ -103,6 +120,7 @@ class PersistentConnection:
             2.0  # seconds to wait for in-flight ACKs at graceful stop (set by stop())
         )
         self._task: asyncio.Task[None] | None = None
+        self._writer: asyncio.StreamWriter | None = None  # the open socket, for a hard stop
         # How many times this connection has been ESTABLISHED. It moves only on a successful open,
         # so a caller that snapshots it before an event that closes the socket (the connscale
         # reload probe, BACKLOG #1292) can wait until the connection is back rather than guess.
@@ -180,9 +198,65 @@ class PersistentConnection:
         # then waits for outstanding ACKs (set before the event so the writer sees it).
         self._stop_grace = grace
         self._stop.set()
-        if self._task is not None:
+        task = self._task
+        if task is None:
+            return
+        # A hard deadline (BACKLOG #5951): once the connection has made no progress for a window,
+        # the socket is aborted, which ends a stalled drain, read or close, and the task is
+        # cancelled, which ends a stalled connect. Progress is the queue shrinking, so a healthy
+        # peer that is still taking a long queue is never cut off. Every window covers the whole
+        # ACK grace, so a grace longer than the margin is never cut short after the queue drains.
+        window = max(grace, _STOP_HARD_MARGIN_S) + _STOP_HARD_MARGIN_S
+        queued = self._queue.qsize()
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=window)
+                if done:
+                    break
+                if self._queue.qsize() < queued:
+                    queued = self._queue.qsize()
+                    continue
+                log.warning(
+                    "load connection %s:%d made no progress for %.1fs while stopping; aborting it",
+                    self._host,
+                    self._port,
+                    window,
+                )
+                self._hard_stop(task)
+                break
+        except asyncio.CancelledError:
+            # stop() itself was cancelled: asyncio.wait does not pass that on, so take the
+            # connection down here, as awaiting the task used to, then re-raise.
+            self._hard_stop(task)
             with contextlib.suppress(asyncio.CancelledError):
-                await self._task
+                await task
+            self._release_unsent()
+            raise
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        self._release_unsent()
+
+    def _hard_stop(self, task: asyncio.Task[None]) -> None:
+        """Abort the open socket, ending a stalled drain, read or close, and cancel the task."""
+        if self._writer is not None:
+            self._writer.transport.abort()
+        task.cancel()
+
+    def _release_unsent(self) -> None:
+        """Release the closed-loop slot of each job a hard stop left unwritten, and say how many."""
+        unsent = 0
+        while not self._queue.empty():
+            _out, on_done = self._queue.get_nowait()
+            unsent += 1
+            if on_done is not None:
+                on_done()
+        if unsent:
+            log.warning(
+                "load connection %s:%d stopped with %d queued sends unwritten",
+                self._host,
+                self._port,
+                unsent,
+            )
 
     # --- internals -----------------------------------------------------------
 
@@ -200,6 +274,7 @@ class PersistentConnection:
             backoff = _BACKOFF_START
             self._generation += 1
             self._up = True
+            self._writer = writer
             # Only the two ends a PEER causes count as a drop: `_serve` returning while this side is
             # not stopping (the read loop saw EOF), or a socket error. A harness exception or a
             # cancellation is not the engine closing anything, so it is not counted.
@@ -209,6 +284,13 @@ class PersistentConnection:
                 dropped = not self._stop.is_set()
             except (OSError, ConnectionError):
                 dropped = not self._stop.is_set()
+            except AckTimeoutError as exc:
+                # This side closes the socket, so it is not a drop. Aborted, not closed: a peer that
+                # stopped answering may have stopped reading too, and a graceful close would wait on
+                # it to take the unsent buffer. Its in-flight sends are released as timeouts below,
+                # like any other close, and the connection reopens.
+                writer.transport.abort()
+                log.warning("load connection %s:%d: %s; reconnecting", self._host, self._port, exc)
             except MLLPFrameError as exc:
                 # A reply frame over the cap: refused, counted as a transport error, and the socket
                 # closed rather than the frame buffered whole. Its in-flight sends are released as
@@ -224,6 +306,8 @@ class PersistentConnection:
                 writer.close()
                 with contextlib.suppress(ConnectionError, OSError):
                     await writer.wait_closed()
+                # Cleared only once closed, so a hard stop can still abort a close that stalls.
+                self._writer = None
             if self._stop.is_set():
                 return
             if await self._wait_backoff(backoff):  # brief pause before reconnect
@@ -239,11 +323,19 @@ class PersistentConnection:
         wtask = asyncio.create_task(self._write_loop(writer))
         rtask = asyncio.create_task(self._read_loop(reader)) if self._expect_ack else None
         tasks = {wtask} | ({rtask} if rtask else set())
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        # If the writer finished (queue drained on graceful stop), give in-flight ACKs the configured
-        # grace (set by stop()) before cancelling the reader.
-        if wtask in done and rtask is not None and not rtask.done():
-            await self._grace_for_acks(rtask, self._stop_grace)
+        try:
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            # If the writer finished (queue drained on graceful stop), give in-flight ACKs the
+            # configured grace (set by stop()) before cancelling the reader.
+            if wtask in done and rtask is not None and not rtask.done():
+                await self._grace_for_acks(rtask, self._stop_grace)
+        except asyncio.CancelledError:
+            # A hard stop cancels this task; take the reader and writer down with it rather than
+            # leave them running against a closed socket with nobody to collect their errors.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
         # Re-split AFTER the grace: a reader that finished inside it is done now, and cancelling it
         # is a no-op whose exception (an over-cap ACK refused, say) the gather below would swallow.
         done = {t for t in tasks if t.done()}
@@ -313,7 +405,30 @@ class PersistentConnection:
         # `_run` refuses it; ACKs earlier in the same read were already handled (the feed is lazy).
         decoder = MLLPDecoder(max_frame_bytes=DEFAULT_MAX_FRAME_BYTES)
         while True:
-            chunk = await reader.read(_READ_BYTES)
+            if self._ack_timeout is None:
+                chunk = await reader.read(_READ_BYTES)
+            else:
+                # Wake at the oldest send's deadline, or one timeout from now when nothing is in
+                # flight, since a send made meanwhile starts its own clock. Capped, so a huge
+                # timeout never reaches the event loop's own wait.
+                wait = self._ack_timeout
+                if self._inflight:
+                    oldest = self._inflight[0][1] / 1e9
+                    wait = oldest + self._ack_timeout - time.perf_counter_ns() / 1e9
+                    if wait <= 0:
+                        raise AckTimeoutError(
+                            f"no reply to seq={self._inflight[0][0]} within {self._ack_timeout:g}s"
+                        )
+                window = asyncio.timeout(min(wait, _ACK_WAIT_CAP_S))
+                try:
+                    async with window:
+                        chunk = await reader.read(_READ_BYTES)
+                except TimeoutError:
+                    # Only this window's expiry: a socket ETIMEDOUT is a TimeoutError too, and the
+                    # reader raises it again on every read, so swallowing it would spin the loop.
+                    if not window.expired():
+                        raise
+                    continue  # re-check the oldest send against its deadline
             if not chunk:
                 return  # peer closed
             for ack in decoder.feed(chunk):
@@ -377,6 +492,8 @@ class ConnectionPool:
     ) -> None:
         if size <= 0:
             raise ValueError("pool size must be positive")
+        # The target's ACK timeout reaches each connection only when an ACK is expected; with none
+        # expected nothing is ever in flight to time.
         self._conns = [
             PersistentConnection(
                 target.host,
@@ -386,6 +503,7 @@ class ConnectionPool:
                 expect_ack=target.expect_ack,
                 queue_max=queue_max,
                 tracker=tracker,
+                ack_timeout=target.ack_timeout_s if target.expect_ack else None,
             )
             for _ in range(size)
         ]

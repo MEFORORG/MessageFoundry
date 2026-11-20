@@ -91,7 +91,7 @@ from messagefoundry.keywrap import KeyWrapRefused, load_checked_cert_chain
 from messagefoundry.redaction import json_loads_or_refusal
 from messagefoundry.tls_sigalgs import NarrowerRefused, narrow_signature_algorithms
 
-__all__ = ["EngineClient", "ApiError", "IdpStepUpRequired", "MfaConfirmed"]
+__all__ = ["EngineClient", "ApiError", "IdpStepUpRequired", "MfaConfirmed", "StepUpRequired"]
 
 _log = logging.getLogger(__name__)
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
@@ -219,6 +219,19 @@ class IdpStepUpRequired(ApiError):
     cannot perform it: that leg needs a browser and
     re-keys the session it steps up. A subclass of :class:`ApiError`, so a caller that catches only
     that still sees the refusal."""
+
+
+class StepUpRequired(ApiError):
+    """The engine refused the call with 403 + ``X-Step-Up-Required``, and no registered step-up
+    handler answered it: there was none, as on a :meth:`EngineClient.for_polling` client, or it
+    declined, or the retry after it was refused again (BACKLOG #5945).
+
+    It lets a caller tell a step-up refusal from a role or scope refusal, which shares the status.
+    For a session-window gate the caller can re-prove the password on its own GUI thread and retry.
+    It carries no ``X-Step-Up-Action``, so for a per-action gate (ADR 0077) a re-proof made from it
+    binds no action, and the retry is refused again. A subclass of
+    :class:`ApiError`, so a caller that catches only that still sees the refusal. A refusal that
+    carries ``X-Step-Up-Via: idp`` raises :class:`IdpStepUpRequired` instead."""
 
 
 def _buffer_bounded(streaming: httpx.Response, *, limit: int) -> httpx.Response:
@@ -1019,9 +1032,12 @@ class EngineClient:
         :class:`_TokenCell` — but has its **own** ``httpx.Client`` connection pool and **no
         step-up/MFA handlers**, so background reader threads never contend on the main-thread
         client's pool or its mutable auth state. That separation is what makes the console
-        concurrency-safe: the handler-bearing, token-mutating primary client stays **main-thread
-        only** (it serves the modal sign-in/step-up/MFA flows and user actions), while this read-only
-        client is the only one shared across worker threads — and sharing *it* is safe because it
+        concurrency-safe: once its step-up/MFA handlers are registered, the handler-bearing,
+        token-mutating primary client stays **main-thread only** (it serves the modal step-up/MFA
+        flows and user actions), while this read-only client is the only one shared across worker
+        threads. The one exception is the harness sign-in dialog, which runs ``providers()`` and
+        ``login()`` on a worker thread (BACKLOG #5946) before any handler is registered, while
+        nothing else uses the client. Sharing *this* client is safe because it
         never WRITES the token, its 403→prompt retry branches are inert (no handlers), and
         ``httpx.Client`` is itself thread-safe for concurrent requests.
 
@@ -1237,7 +1253,15 @@ class EngineClient:
             # handler runs so the reauth() it calls binds the fresh proof to that action. A plain
             # session-window step-up omits the header → None → reauth() posts no purpose (unchanged).
             self._pending_step_up_action = response.headers.get("X-Step-Up-Action")
-            if self._step_up_handler():
+            proved = False
+            try:
+                proved = self._step_up_handler()
+            finally:
+                if not proved:
+                    # Declined: drop the stash, or a later reauth() made for another reason would
+                    # post this action as its purpose and mint a grant nobody proved for.
+                    self._pending_step_up_action = None
+            if proved:
                 return self._request(
                     method,
                     path,
@@ -1247,6 +1271,8 @@ class EngineClient:
                     _bearer=_bearer,  # always None here; kept for mypy, as in the MFA retry above
                     **kw,
                 )
+        if response.status_code == 403 and response.headers.get("X-Step-Up-Required"):
+            raise StepUpRequired(_error_detail(response), status=response.status_code)
         if response.status_code >= 400:
             raise ApiError(_error_detail(response), status=response.status_code)
         return response
