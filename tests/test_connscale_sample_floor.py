@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
+import threading
 import time
 from typing import cast
 
@@ -586,6 +587,46 @@ async def test_a_step_whose_floor_does_not_fire_waits_for_the_reply_after_its_la
         f"the reply wait started {attempt_ended[0] - reply_started[0]:.4f}s before the in-flight "
         f"probe attempt returned -- it overlaps that attempt, so a post-reload reply gets less than "
         f"the in-flight tail plus the whole reply wait"
+    )
+
+
+async def test_the_real_probe_closes_its_window_before_its_makeup_attempt() -> None:
+    """The other half of the order, on the real `_probe_loop`: where the floor fires, the reply wait
+    starts while the make-up attempt is still running. The make-up call blocks until the reply wait
+    has started, with a deadline, so a loop that set `window_closed` only after its make-up, or never,
+    leaves it unset and fails here rather than on a timing threshold."""
+    stop = asyncio.Event()
+    window_closed = asyncio.Event()
+    sampler = _ScriptedSampler(
+        [(_SLOW_ATTEMPT_S, _gap(ProbeDegraded.WALK_TIMEOUT)), (0.0, _measured(140))], stop
+    )
+    reply_started = threading.Event()
+    seen_during_makeup: list[bool] = []
+    original = sampler.sample_proc
+
+    def sample_proc() -> ProcSample:
+        if stop.is_set():
+            seen_during_makeup.append(reply_started.wait(_TEST_DEADLINE_S))
+        return original()
+
+    sampler.sample_proc = sample_proc  # type: ignore[method-assign]
+
+    async def reply() -> runner._ReloadAccount:
+        reply_started.set()
+        return _ACCOUNT
+
+    probe_task = asyncio.create_task(
+        _probe_loop(sampler, _INTERVAL_S, stop, [], time.perf_counter(), window_closed)  # type: ignore[arg-type]
+    )
+    async with asyncio.timeout(_TEST_DEADLINE_S):
+        while not sampler.calls:
+            await asyncio.sleep(0.005)
+    stop.set()
+    floor, account = await runner._await_probe_beside_reply(probe_task, window_closed, reply())
+    assert floor == 1 and account is _ACCOUNT, (floor, account)
+    assert seen_during_makeup == [True], (
+        f"the make-up attempt ran with the reply wait not yet started ({seen_during_makeup}) -- the "
+        f"probe closed its window only after the make-up, so the make-up delayed the reply wait"
     )
 
 
