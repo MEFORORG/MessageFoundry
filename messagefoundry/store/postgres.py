@@ -6314,7 +6314,9 @@ class PostgresStore:
         # breaking count-and-log.
         guard, guard_args = self._resolve_guard(6)
         tag_failures: list[CellTagError] = []
-        queue_tag_rows: list[Any] = []  # BACKLOG #5982: reported after the transaction
+        queue_tag_rows: list[
+            tuple[Any, QueueTagError]
+        ] = []  # BACKLOG #5982: reported after the transaction
         try:
             async with self._timed_acquire() as conn:  # noqa: SIM117
                 async with conn.transaction():
@@ -6359,11 +6361,11 @@ class PostgresStore:
                         ref = open_queue_cell(self._cipher, wr) or ""
                         origin_msg_id, dest, seq_s = ref.split("\x1f")
                         seq = int(seq_s)
-                    except QueueTagError:
+                    except QueueTagError as err:
                         # BACKLOG #5982: dead-lettered like a corrupt reference, then audited and
                         # alerted as a claim reports a tag failure, after the transaction. Queued
                         # first, so a dead-letter write that fails is still reported.
-                        queue_tag_rows.append(wr)
+                        queue_tag_rows.append((wr, err))
                         return await _consume_dead(
                             "ingress_handoff(tag-failed)",
                             REINGRESS_TOKEN_TAG_FAILED,
@@ -6569,9 +6571,9 @@ class PostgresStore:
         finally:
             # BACKLOG #2593: after the transaction, never inside it.
             await report_cell_tag_failures(self, tag_failures)
-            for row in queue_tag_rows:
+            for row, error in queue_tag_rows:
                 await report_queue_tag_failure(
-                    self, self._cipher, row, outcome=REINGRESS_TAG_FAILURE_OUTCOME
+                    self, self._cipher, row, error=error, outcome=REINGRESS_TAG_FAILURE_OUTCOME
                 )
         return True
 
@@ -6587,10 +6589,10 @@ class PostgresStore:
             return None
         try:
             ref = open_queue_cell(self._cipher, row) or ""
-        except QueueTagError:
+        except QueueTagError as err:
             # BACKLOG #5982: audited and alerted, then raised, as on SQLite.
             await report_queue_tag_failure(
-                self, self._cipher, row, outcome=REINGRESS_READ_TAG_FAILURE_OUTCOME
+                self, self._cipher, row, error=err, outcome=REINGRESS_READ_TAG_FAILURE_OUTCOME
             )
             raise
         try:

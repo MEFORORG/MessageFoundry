@@ -15998,7 +15998,7 @@ class MessageStore:
         is dead-lettered under :data:`REINGRESS_ARTIFACT_MISSING` and keeps its reference as the
         evidence."""
         tag_failures: list[CellTagError] = []
-        queue_tag_rows: list[aiosqlite.Row] = []
+        queue_tag_rows: list[tuple[aiosqlite.Row, QueueTagError]] = []
         try:
             return await self._ingress_handoff_txn(
                 response_row_id=response_row_id,
@@ -16017,9 +16017,9 @@ class MessageStore:
             )
         finally:
             await report_cell_tag_failures(self, tag_failures)
-            for row in queue_tag_rows:  # BACKLOG #5982: after the writer lock, as above
+            for row, error in queue_tag_rows:  # BACKLOG #5982: after the writer lock, as above
                 await report_queue_tag_failure(
-                    self, self._cipher, row, outcome=REINGRESS_TAG_FAILURE_OUTCOME
+                    self, self._cipher, row, error=error, outcome=REINGRESS_TAG_FAILURE_OUTCOME
                 )
 
     async def _ingress_handoff_txn(
@@ -16037,7 +16037,7 @@ class MessageStore:
         refused_metadata: Mapping[str, Any] | None,
         now: float,
         tag_failures: list[CellTagError],
-        queue_tag_rows: list[aiosqlite.Row],
+        queue_tag_rows: list[tuple[aiosqlite.Row, QueueTagError]],
     ) -> bool:
         """:meth:`ingress_handoff`'s one transaction. An origin tag failure is appended to
         ``tag_failures``, and a work-row whose own payload failed its queue tag, before its dead-letter,
@@ -16080,12 +16080,12 @@ class MessageStore:
                 ref = open_queue_cell(self._cipher, wr) or ""
                 origin_msg_id, dest, seq_s = ref.split("\x1f")
                 seq = int(seq_s)
-            except QueueTagError:
+            except QueueTagError as err:
                 # BACKLOG #5982: the payload no longer opens under the token's own tag. Dead-lettered
                 # like a corrupt reference, then audited and alerted as a claim reports a tag
                 # failure, once the writer lock is released. Queued first, so a dead-letter write
                 # that fails is still reported.
-                queue_tag_rows.append(wr)
+                queue_tag_rows.append((wr, err))
                 return await _consume_dead(
                     REINGRESS_TOKEN_TAG_FAILED, "re-ingress work-row failed its integrity check"
                 )
@@ -16312,7 +16312,7 @@ class MessageStore:
                 art = await cur.fetchone()
         if refused is not None:
             await report_queue_tag_failure(
-                self, self._cipher, row, outcome=REINGRESS_READ_TAG_FAILURE_OUTCOME
+                self, self._cipher, row, error=refused, outcome=REINGRESS_READ_TAG_FAILURE_OUTCOME
             )
             raise refused
         return (

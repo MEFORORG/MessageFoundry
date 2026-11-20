@@ -9134,7 +9134,7 @@ class SqlServerStore:
         child stores ``refused_raw`` and ``refused_metadata`` as :meth:`QueueStore.ingress_handoff`
         says (vault BACKLOG #4796)."""
         tag_failures: list[CellTagError] = []
-        queue_tag_rows: list[dict[str, Any]] = []
+        queue_tag_rows: list[tuple[dict[str, Any], QueueTagError]] = []
         try:
             return await self._ingress_handoff_txn(
                 response_row_id=response_row_id,
@@ -9153,9 +9153,9 @@ class SqlServerStore:
             )
         finally:
             await report_cell_tag_failures(self, tag_failures)
-            for row in queue_tag_rows:  # BACKLOG #5982: after the transaction, as above
+            for row, error in queue_tag_rows:  # BACKLOG #5982: after the transaction, as above
                 await report_queue_tag_failure(
-                    self, self._cipher, row, outcome=REINGRESS_TAG_FAILURE_OUTCOME
+                    self, self._cipher, row, error=error, outcome=REINGRESS_TAG_FAILURE_OUTCOME
                 )
 
     async def _ingress_handoff_txn(
@@ -9173,7 +9173,7 @@ class SqlServerStore:
         refused_metadata: Mapping[str, Any] | None,
         now: float,
         tag_failures: list[CellTagError],
-        queue_tag_rows: list[dict[str, Any]],
+        queue_tag_rows: list[tuple[dict[str, Any], QueueTagError]],
     ) -> bool:
         """:meth:`ingress_handoff`'s one transaction. An origin tag failure is appended to
         ``tag_failures``, and a work-row whose own payload failed its queue tag, before its dead-letter,
@@ -9234,11 +9234,11 @@ class SqlServerStore:
                     ref = open_queue_cell(self._cipher, work_row) or ""
                     origin_msg_id, dest, seq_s = ref.split("\x1f")
                     seq = int(seq_s)
-                except QueueTagError:
+                except QueueTagError as err:
                     # BACKLOG #5982: dead-lettered like a corrupt reference, then audited and
                     # alerted as a claim reports a tag failure, after the transaction. Queued
                     # first, so a dead-letter write that fails is still reported.
-                    queue_tag_rows.append(work_row)
+                    queue_tag_rows.append((work_row, err))
                     return await _consume_dead(
                         "ingress_handoff(tag-failed)",
                         REINGRESS_TOKEN_TAG_FAILED,
@@ -9484,9 +9484,9 @@ class SqlServerStore:
             return None
         try:
             ref = open_queue_cell(self._cipher, row) or ""
-        except QueueTagError:
+        except QueueTagError as err:
             await report_queue_tag_failure(
-                self, self._cipher, row, outcome=REINGRESS_READ_TAG_FAILURE_OUTCOME
+                self, self._cipher, row, error=err, outcome=REINGRESS_READ_TAG_FAILURE_OUTCOME
             )
             raise
         try:
