@@ -80,6 +80,8 @@ const SCHEMA: ConnectionSchema = {
         listen_secret: param({ secret: true, direction: "inbound" }),
         poll_statement: param({}),
         keepalive: param({ type: "bool", default: false }),
+        // No schema default (an Optional[bool] = None): unticked is "never set", not false.
+        nodelay: param({ type: "bool" }),
       },
     },
     file: {
@@ -774,6 +776,38 @@ suite("connection editor: what a create save posts (BACKLOG #5976)", () => {
     const p = createOutbound();
     box(p, "verify").click();
     box(p, "verify").click();
+    box(p, "headers").value = "{}";
+    assert.deepStrictEqual(saved(p, false), { headers: {} });
+  });
+
+  test("an untouched checkbox with no schema default posts nothing; a touched one posts its value", () => {
+    const untouched = createOutbound();
+    assert.strictEqual(box(untouched, "nodelay").checked, false, "a defaultless checkbox is drawn unticked");
+    box(untouched, "headers").value = "{}";
+    assert.deepStrictEqual(saved(untouched, false), { headers: {} });
+
+    const ticked = createOutbound();
+    box(ticked, "nodelay").click();
+    box(ticked, "headers").value = "{}";
+    assert.deepStrictEqual(saved(ticked, false), { headers: {}, nodelay: true });
+
+    // Ticked and unticked again is a chosen false: the box was touched, so it posts what it shows.
+    const chosenFalse = createOutbound();
+    box(chosenFalse, "nodelay").click();
+    box(chosenFalse, "nodelay").click();
+    box(chosenFalse, "headers").value = "{}";
+    assert.deepStrictEqual(saved(chosenFalse, false), { headers: {}, nodelay: false });
+  });
+
+  test("an untouched defaultless checkbox posts nothing across a direction rebuild", () => {
+    const p = create("inbound");
+    const direction = p.window.document.getElementById("direction");
+    direction.value = "outbound";
+    direction.dispatchEvent(new p.window.Event("change"));
+    const asked = p.posted.filter((m) => m.command === "fields");
+    assert.strictEqual(asked.length, 1);
+    assert.ok(!("nodelay" in asked[0].settings), "the rebuild request carried an untouched defaultless box");
+    p.deliver({ command: "fields", groups: buildForm(SCHEMA, "mllp", "outbound", asked[0].settings) });
     box(p, "headers").value = "{}";
     assert.deepStrictEqual(saved(p, false), { headers: {} });
   });
