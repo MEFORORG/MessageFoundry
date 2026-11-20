@@ -77,6 +77,14 @@ def test_run_parses_capture_corepoint_copy_flag() -> None:
     assert args.capture_bodies is False  # the copy-only posture does NOT imply capturing inputs
 
 
+@pytest.mark.parametrize("bad", ["0", "-1", "nan", "inf", "soon"])
+def test_run_refuses_a_stop_grace_that_is_not_a_finite_positive_number(bad: str) -> None:
+    base = ["run", "--listen-epic", ":6661", "--corepoint", "h:5000", "--mefor", "h:2575"]
+    assert _build_parser().parse_args([*base, "--db", "x"]).stop_grace == 30.0
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args([*base, "--db", "x", "--stop-grace", bad])
+
+
 def test_confirm_prints_warning_and_yes_bypass(capsys: pytest.CaptureFixture[str]) -> None:
     assert _confirm_test_only(assume_yes=True) is True
     err = capsys.readouterr().err

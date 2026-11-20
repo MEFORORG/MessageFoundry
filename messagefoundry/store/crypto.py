@@ -114,7 +114,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, Self, runtime_checkable
 
 from messagefoundry.redaction import json_loads_or_refusal
 
@@ -326,8 +326,12 @@ _GCM_RESERVE_REFILL_AT = _GCM_RESERVE_BLOCK // 2
 
 # --- cell-bound AAD (ASVS 11.3.3, ADR 0019) -----------------------------------------------------------
 # The scheme tag prefixed into every cell_aad. Its own version so the AAD-construction scheme can evolve
-# additively (a future mfenc-aad/v2 would be a different bound value — a deliberate, migrated change,
-# never a silent one). NOT related to the mfenc marker version.
+# additively: a change to the bound value is meant to take a new tag (a future mfenc-aad/v2) and a
+# migration, so it is deliberate. NOT related to the mfenc marker version. BACKLOG #5962 is the
+# recorded exception: it changed at least v1's spelling of an integral float ("1000.0" became "1000")
+# and of a mixin-Enum member ("E.A" became its value) under the same tag, with no migration, because
+# nothing is deployed. A cell sealed under the old spelling of either, such as a connection_event
+# reason written with now=1000.0, would no longer open.
 _AAD_SCHEME = b"mfenc-aad/v1"
 
 
@@ -341,17 +345,89 @@ def cell_aad(table: str, column: str, *pk: object) -> bytes:
 
     The byte form is (a) **unambiguous**: every field is length-prefixed (4-byte big-endian) so no two
     distinct field tuples collide (``("a","bc")`` != ``("ab","c")``); (b) **versioned**: the ``_AAD_SCHEME``
-    tag leads; (c) **backend-agnostic**: each component is ``str(...)``-encoded, so the same logical cell
+    tag leads; (c) **backend-agnostic**: each component is spelled as text, so the same logical cell
     yields identical AAD whether the PK is a SQLite ``INTEGER`` id or a Postgres/SQL Server ``BIGINT`` —
     the re-encrypt/rotation and cross-backend restore paths must reconstruct the same value. AAD length is
-    irrelevant to GCM (it is hashed into the tag), so a verbose, collision-free form is free."""
-    fields = (
-        _AAD_SCHEME,
-        table.encode("utf-8"),
-        column.encode("utf-8"),
-        *(str(p).encode("utf-8") for p in pk),
-    )
-    return b"".join(len(f).to_bytes(4, "big") + f for f in fields)
+    irrelevant to GCM (it is hashed into the tag), so a verbose, collision-free form is free.
+
+    :func:`_aad_component` says how each component is spelled. A ``None`` or ``bool`` component is
+    refused where the AAD is bound, not here: the value returned is an :class:`UnboundAAD`, and a
+    cipher that binds it into a seal or an open raises :class:`AADComponentError`, a
+    :class:`CipherError` naming the table and column, so a read path contains it like any cell that
+    does not open. A ``None`` or ``bool`` component never makes the build raise, because a store
+    builds the AAD for a row's cells before it knows whether any is sealed: a NULL cell, a keyless
+    store, or a v1 cell sealed with no AAD binds nothing, and reads as it did before BACKLOG #5962."""
+    components: list[bytes] = []
+    refusal: str | None = None
+    for p in pk:
+        if refusal is None and (p is None or isinstance(p, bool)):
+            refusal = f"{table}.{column}: cell_aad key component must not be {p!r}"
+        components.append(_aad_component(p))
+    fields = (_AAD_SCHEME, table.encode("utf-8"), column.encode("utf-8"), *components)
+    aad = b"".join(len(f).to_bytes(4, "big") + f for f in fields)
+    return aad if refusal is None else UnboundAAD(aad, refusal)
+
+
+class UnboundAAD(bytes):
+    """A :func:`cell_aad` whose key holds a ``None`` or ``bool`` component (BACKLOG #5962).
+
+    Its ``None`` or ``bool`` component is spelled by ``str()``, so ``None`` and the string
+    ``"None"`` give equal bytes. That is why no cipher may bind it: :func:`require_bound_aad` raises
+    :class:`AADComponentError` with ``refusal`` as its message, and each cipher calls it before an
+    AAD reaches AES-GCM or Transit. Concatenating or slicing one gives a plain ``bytes``; the two
+    builders that append to a :func:`cell_aad` append to the keyless frame, which is never one."""
+
+    refusal: str
+
+    def __new__(cls, aad: bytes, refusal: str) -> Self:
+        unbound = super().__new__(cls, aad)
+        unbound.refusal = refusal
+        return unbound
+
+
+def require_bound_aad(aad: bytes | None) -> None:
+    """Raise :class:`AADComponentError` when ``aad`` is an :class:`UnboundAAD`. A cipher calls it
+    only where it binds ``aad``, so a value it seals or opens with no AAD is not refused."""
+    if isinstance(aad, UnboundAAD):
+        raise AADComponentError(aad.refusal)
+
+
+def _aad_component(value: object) -> bytes:
+    """One :func:`cell_aad` key component as bytes, spelled the same at seal time and at every read.
+
+    A writer binds what it has in hand, and a reader binds what the column hands back, so a number
+    is spelled by its value, not its Python type: a timestamp column (SQLite ``REAL``, Postgres
+    ``DOUBLE PRECISION``, SQL Server ``FLOAT``) returns ``1000.0`` for an ``int`` 1000 written into
+    it, and both must bind ``1000``. An integral float is therefore spelled as its integer, and any
+    other float by ``float.__repr__``, which round-trips exactly. The base types' own methods are
+    called, so a subclass (an ``int``-valued Enum member, say) is spelled as the value a driver binds,
+    never by its own ``__str__``. ``None`` and ``bool`` keep their ``str()`` spelling here, and
+    :func:`cell_aad` returns an :class:`UnboundAAD` for them: ``str()`` gives them the same bytes as
+    the strings ``"None"`` and ``"True"``, and the int spelling would give ``True`` the bytes of
+    ``1``. A nullable key column can hand back ``None``, for example a SQLite ``TEXT`` key that a
+    damaged or planted row leaves NULL. A string is UTF-8 with ``surrogatepass``, so a lone surrogate
+    binds bytes no valid string produces instead of raising here; the backend's own write still
+    refuses one. Any other type, such as a BLOB a damaged SQLite row hands back, keeps its ``str()``
+    spelling. None of these cases raises, so a keyless open or a read whose cell is NULL does not
+    fail on such a key; an int too long for ``int.__repr__`` or an object whose ``__str__`` raises
+    still does.
+
+    Not covered, at least: a float bound into a TEXT-affinity key column comes back as the text
+    ``"1000.0"``; an int past 2**53 written to a float column comes back rounded; and a ``Decimal``
+    a NUMERIC or DECIMAL column hands back keeps its ``str()`` spelling, so ``Decimal("1000.0")``
+    binds ``1000.0``, not the ``1000`` an int or integral float binds. No key column today takes
+    any of the three; no store schema has a NUMERIC or DECIMAL column."""
+    if value is None or isinstance(value, bool):
+        return str(value).encode("ascii")
+    if isinstance(value, str):
+        return str.encode(value, "utf-8", "surrogatepass")
+    if isinstance(value, int):
+        return int.__repr__(value).encode("ascii")
+    if isinstance(value, float):
+        if float.is_integer(value):
+            return int.__repr__(int(value)).encode("ascii")
+        return float.__repr__(value).encode("ascii")
+    return str(value).encode("utf-8", "surrogatepass")
 
 
 def aad_cell_name(aad: bytes | None) -> tuple[str, str]:
@@ -672,6 +748,17 @@ class CipherError(Exception):
     It also covers a **corrupt row** that no key fixes (BACKLOG #2308): a value whose tag verified
     but whose plaintext is not UTF-8, or, at an eager read seam (:func:`decrypt_json_cell`), is not
     JSON. The message says which, so an operator is not sent looking for a missing key."""
+
+
+class AADComponentError(CipherError, TypeError):
+    """A cipher was asked to bind an :class:`UnboundAAD`, a :func:`cell_aad` whose key holds a
+    ``None`` or a ``bool`` component (BACKLOG #5962). Raised at the seal or the open, never when
+    the AAD is built.
+
+    A :class:`CipherError`, so a read or rotation path that contains an unopenable cell contains a
+    sealed cell whose key column holds a NULL the same way. Also a ``TypeError``, because on a write
+    path it is a caller passing the wrong type. The message names the table, the column and the
+    refused value, never the row's key."""
 
 
 class TransitSealRefused(Exception):
@@ -2102,12 +2189,13 @@ class AesGcmCipher(_UnmarkedPolicy):
         return write
 
     def encrypt(self, plaintext: str, *, aad: bytes | None = None) -> str:
-        write = self._count_invocation()  # fail-closed before 2**32 (#190-F); no-op cost otherwise
-        nonce = os.urandom(_NONCE_BYTES)
         # Cell-bound AAD (ASVS 11.3.3) is bound ONLY on the cell-bound (v4) writer. The v1 writer is FROZEN (CRYPTO-1):
         # it always encrypts with None AAD so its output stays byte-identical even if a caller passes
         # `aad`. So `aad` takes effect iff write_v2 is set (the [store].aad_bind knob).
         gcm_aad = aad if self._write_v2 else None
+        require_bound_aad(gcm_aad)  # before the invocation is charged, so nothing is sealed
+        write = self._count_invocation()  # fail-closed before 2**32 (#190-F); no-op cost otherwise
+        nonce = os.urandom(_NONCE_BYTES)
         # Own the encoded plaintext in a mutable buffer so it can be wiped once the AEAD has consumed it.
         # RESIDUAL (documented): the source `plaintext` str and the returned marker str are immutable —
         # CPython gives no hook to wipe a str — and `bytes(pt)` is a transient immutable copy AESGCM
@@ -2194,6 +2282,7 @@ class AesGcmCipher(_UnmarkedPolicy):
         # `aad`; a v2 blob cut-and-pasted into another cell (a different `aad`) fails the tag below →
         # CipherError (fail-closed, never a silent mis-decrypt). v4 is the cell-bound writer too.
         gcm_aad = aad if stored.startswith((_V2_PREFIX, _V4_PREFIX)) else None
+        require_bound_aad(gcm_aad)
         key_id, salt, blob = self._parse(stored)
         try:
             raw = base64.b64decode(blob)

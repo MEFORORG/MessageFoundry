@@ -340,6 +340,14 @@ class QueueStore(StoreLifecycle, Protocol):
     #: fused-hop dispatcher gates on this flag before taking the sync path.
     supports_fused_sync_handoff: bool = False
 
+    #: Whether :meth:`converge_state_cache` really pulls another process's transform-state writes into
+    #: this handle's cache (BACKLOG #5984). ``True`` only on Postgres, the one backend with the
+    #: per-namespace ``state_version`` bump. SQLite and SQL Server leave it ``False``: their converge is
+    #: a no-op, so the engine never starts a ``StateConvergenceRunner`` over them, and where several
+    #: processes share the store (a cluster or engine shards) it warns that transform state does not
+    #: converge, rather than announcing a convergence nothing performs.
+    converges_transform_state: bool = False
+
     #: Whether this backend ships the streaming-attachment substrate (#149, ADR 0105): the
     #: ``attachment`` + ``attachment_chunk`` + ``message_attachment`` tables and :meth:`put_attachment` /
     #: :meth:`read_attachment` / :meth:`attachments_for` / :meth:`attachment_incref` /
@@ -589,16 +597,28 @@ class QueueStore(StoreLifecycle, Protocol):
         The follower read-through for ADR 0005 state: re-reads any namespace whose per-namespace version
         (in the shared store) is newer than the version currently reflected in this handle's cache, so a
         sibling node's state write reaches every node. Returns the namespace names actually refreshed
-        (``[]`` when nothing changed). Multi-node Postgres implements it for real; single-node backends
-        (SQLite, SQL Server) return ``[]`` (a single node is the sole writer, so its cache is always
-        current)."""
+        (``[]`` when nothing changed). Postgres implements it for real. SQLite (the sole writer, so its
+        cache is always current) and SQL Server (which has no per-namespace state version, so it cannot
+        read through, even under HA) return ``[]``; :attr:`converges_transform_state` says which."""
         ...
 
     def enable_state_convergence(self) -> None:
         """Turn on per-namespace state-version bumping for cross-node convergence (Track B Step 6b). The
-        engine calls this only in a cluster (``coordinator.is_clustered()``) BEFORE workers start, so a
-        sibling's :meth:`converge_state_cache` sees every write. Single-node never calls it → no version
+        engine calls this only where another process shares the store, a cluster
+        (``coordinator.is_clustered()``) or an engine shard of a multi-shard config, BEFORE workers
+        start, so a sibling's :meth:`converge_state_cache` sees every write. Single-node never calls it → no version
         writes → byte-identical. A no-op on backends without cross-node convergence (SQLite, SQL Server)."""
+        ...
+
+    async def reload_state_cache(self) -> None:
+        """Re-read this handle's whole transform-state cache from the shared ``state`` table (BACKLOG
+        #5984). The engine calls it on an active-passive promotion (SQL Server HA), before the graph's
+        workers start, so a promoted standby does not serve the state it loaded at open while the prior
+        leader went on writing. SQL Server implements it for real. SQLite (the sole writer) and Postgres
+        (which converges continuously through :meth:`converge_state_cache`) make it a no-op. If it
+        raises a store read or cipher error, the engine logs a WARNING, alerts, and starts the graph
+        on the state cache it already holds, so an implementation must leave that cache in place
+        when it raises."""
         ...
 
     # --- delivery worker path ------------------------------------------------
@@ -976,7 +996,9 @@ class QueueStore(StoreLifecycle, Protocol):
         read by the re-ingress worker to HL7-peek the reply (in ``pipeline/``) before
         :meth:`ingress_handoff`. ``None`` if the row is gone or its reference is malformed. ``""``
         if the artifact row is missing, its body was erased, or the reply was empty: the peek needs
-        no more, and :meth:`ingress_handoff` tells those three apart itself (BACKLOG #4996)."""
+        no more, and :meth:`ingress_handoff` tells those three apart itself (BACKLOG #4996). A
+        work-row whose ``payload`` fails its own queue tag is audited and alerted, then raises
+        :class:`~messagefoundry.store.queue_tag.QueueTagError` (BACKLOG #5982)."""
         ...
 
     async def mark_failed(
@@ -1313,6 +1335,12 @@ class QueueStore(StoreLifecycle, Protocol):
     # Row sequences are returned as Sequence[Row] (covariant) so a backend may return its own row
     # type (e.g. aiosqlite.Row) — list[Row] would be invariant and reject that.
     async def get_message(self, message_id: str) -> dict[str, Any] | None: ...
+
+    async def message_channel_id(self, message_id: str) -> str | None:
+        """The message's ``channel_id``, or ``None`` when no such message exists. Plaintext only:
+        it opens no cell, so a by-id read can check the caller's channel scope before
+        :meth:`get_message` decrypts anything (BACKLOG #5969, #5981)."""
+        ...
 
     async def message_metadata_json(self, message_id: str) -> str | None:
         """The message's **decrypted** ``metadata`` JSON (ADR 0081), or ``None`` when absent/unknown.

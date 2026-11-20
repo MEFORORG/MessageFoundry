@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import base64
+import enum
 import inspect
 import json
 import logging
@@ -18,6 +19,7 @@ from messagefoundry.store.cell_tag import message_cell_aad
 from messagefoundry.store.crypto import (
     MARKER_PREFIX,
     PREFIX,
+    AADComponentError,
     AesGcmCipher,
     CipherError,
     IdentityCipher,
@@ -639,7 +641,8 @@ def test_cell_aad_unambiguous_and_backend_agnostic() -> None:
     assert cell_aad("messages", "raw", "1") != cell_aad("messages", "error", "1")
     assert cell_aad("messages", "raw", "1") != cell_aad("messages", "raw", "2")
     # Same logical cell → identical AAD regardless of PK column type (SQLite int id vs a str id on a
-    # server-DB): str()-encoding makes 5 and "5" the same bound value, so re-encrypt/cross-backend agree.
+    # server-DB): an int is spelled as its decimal text, so 5 and "5" are the same bound value and
+    # re-encrypt/cross-backend agree.
     assert cell_aad("attachment_chunk", "ciphertext", 5, 0) == cell_aad(
         "attachment_chunk", "ciphertext", "5", "0"
     )
@@ -1206,3 +1209,65 @@ async def test_keyless_open_of_encrypted_reference_raises_operator_error(tmp_pat
     with pytest.raises(StoreKeylessError) as ei:
         await MessageStore.open(db)  # keyless open — the reference load fails closed
     assert "reference" in str(ei.value)
+
+
+def test_cell_aad_spells_a_number_by_its_value_not_its_type() -> None:
+    # BACKLOG #5962: a REAL/DOUBLE/FLOAT timestamp column returns 1000.0 for an int 1000 written into
+    # it, so the writer's int and the reader's float must bind the same bytes, or the cell never opens.
+    assert cell_aad("connection_event", "reason", "IB", 1000, "k") == cell_aad(
+        "connection_event", "reason", "IB", 1000.0, "k"
+    )
+    # A non-integral float is spelled by its shortest exact repr, distinct from its integer neighbour.
+    ts = 1763400000.123456
+    assert cell_aad("t", "c", ts) == cell_aad("t", "c", "1763400000.123456")
+    assert cell_aad("t", "c", ts) != cell_aad("t", "c", 1763400000)
+    # An int is its decimal text, as before.
+    assert cell_aad("t", "c", 5, "x") == cell_aad("t", "c", "5", "x")
+
+
+def test_cell_aad_spells_a_mixin_enum_member_by_its_value() -> None:
+    # A driver binds a mixin Enum member as its value, so the reader gets 1 or "x". str() spelled
+    # these "K.A" and "S.X", which no column hands back.
+    class K(int, enum.Enum):  # noqa: UP042 - the mixin form is the one str() misspelled
+        A = 1
+
+    class S(str, enum.Enum):  # noqa: UP042 - the mixin form is the one str() misspelled
+        X = "x"
+
+    assert str(K.A) == "K.A" and str(S.X) == "S.X"  # the control: str() would misspell both
+    assert cell_aad("t", "c", K.A) == cell_aad("t", "c", 1)
+    assert cell_aad("t", "c", S.X) == cell_aad("t", "c", "x")
+
+
+@pytest.mark.parametrize("bad", [None, True, False])
+def test_a_sealed_cell_refuses_a_key_component_str_would_collide(bad: object) -> None:
+    # str(None) == "None" and str(True) == "True" would bind the same AAD as those strings, so the
+    # cell-bound cipher refuses to seal or open under one. The refusal is a CipherError too, so a
+    # read path contains a NULL key like any unopenable cell.
+    aad = cell_aad("t", "c", bad)  # building it never raises: the store builds before it knows
+    assert aad == cell_aad("t", "c", str(bad))  # the collision the refusal exists for
+    bound = make_cipher(generate_key(), write_v2=True)
+    with pytest.raises(AADComponentError, match=r"^t\.c: ") as ei:
+        bound.encrypt("x", aad=aad)
+    assert isinstance(ei.value, CipherError) and isinstance(ei.value, TypeError)
+    sealed = bound.encrypt("x", aad=cell_aad("t", "c", str(bad)))
+    with pytest.raises(AADComponentError, match=r"^t\.c: "):
+        bound.decrypt(sealed, aad=aad)
+
+
+@pytest.mark.parametrize("bad", [None, True])
+def test_a_null_key_binds_nothing_where_no_aad_is_bound(bad: object) -> None:
+    # BACKLOG #5962: the refusal fires only where an AAD is bound. A keyless store, the frozen v1
+    # writer (which seals with no AAD) and a purged '' cell all read as they did before it.
+    aad = cell_aad("t", "c", bad)
+    assert IdentityCipher().decrypt(IdentityCipher().encrypt("x", aad=aad), aad=aad) == "x"
+    v1 = make_cipher(generate_key())
+    assert v1.decrypt(v1.encrypt("x", aad=aad), aad=aad) == "x"
+    assert make_cipher(generate_key(), write_v2=True).decrypt("", aad=aad) == ""
+
+
+def test_cell_aad_binds_a_lone_surrogate_to_bytes_no_valid_string_spells() -> None:
+    lone = cell_aad("state", "value", "k\ud800")
+    assert lone.endswith(b"\x00\x00\x00\x04k\xed\xa0\x80")  # surrogatepass, not a lossy replace
+    for valid in ("k", "k?", "k\ufffd"):
+        assert lone != cell_aad("state", "value", valid)

@@ -126,9 +126,9 @@ service control. A wildcard `--host`, `0.0.0.0` or `::`, is probed on the loopba
 same family, because no client can connect to a wildcard address, and the tray is monitor-only
 for it, because that bind listens on every interface. A `--host` naming any non-loopback address,
 a wildcard included, with no `--port` is monitor-only too; before BACKLOG #5936 the tray fell back
-to the loopback default for that bind and kept service control. The probe verifies the engine's certificate
-against the loopback address it connects to, so for a wildcard bind serve your own
-`[api].tls_cert_file` that names it. (BACKLOG #5936)
+to the loopback default for that bind and kept service control. The certificate the engine
+mints for a wildcard bind names that loopback too. An operator certificate on a wildcard bind
+verifies only if it names that loopback. (BACKLOG #5936, #5973)
 
 **What "View Service Log" will open.** Windows opens a file with whatever program owns its
 extension, so a `log_path` naming a `.bat` or `.lnk` would run it. The tray therefore opens
@@ -211,7 +211,7 @@ as down. See the ADR 0113 amendment.)
 The tray discovers the scheme the same way it discovers host and port — from the service's NSSM
 registry entry. There is no `serve` TLS flag, so it also reads the engine's own settings TOML
 (`serve --service-config`, or `messagefoundry.toml` under the service's `AppDirectory`) and takes
-two booleans from it: whether `[api].tls_cert_file` is set, and whether
+two facts about the scheme from it: whether `[api].tls_cert_file` is set, and whether
 `[api].tls_terminated_upstream` is declared. That read is read-only and fail-soft — a missing or
 malformed file means the engine is running on its own defaults, which mint, so the tray assumes
 https. Setting `engine_url` in `tray.toml` overrides all of it.

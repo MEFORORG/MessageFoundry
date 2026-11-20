@@ -74,7 +74,7 @@ async def test_failover_load_sqlserver() -> None:
     await _reset_store()
     await reset_accounts("sqlserver")  # the rig provisions its own Administrator
     report = await run_failover_load(
-        failover_test_profile(),
+        failover_test_profile("sqlserver"),
         ports=reserve_failover_ports(),
         db_backend="sqlserver",
     )

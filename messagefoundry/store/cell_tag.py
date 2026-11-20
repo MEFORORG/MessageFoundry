@@ -27,12 +27,19 @@ key raises :class:`CorruptCellError`: it is contained the same way, but only log
 drift. An unmarked value the cipher refuses raises :class:`UnmarkedCellError`: drift, audited and
 contained, with the cipher's own refusal as its alert (BACKLOG #5650).
 
+**A list-shaped read withholds a cell only for a key the store does not hold** (BACKLOG #5970,
+owner ruling 2026-11-19): in-process, a key not supplied, a retired key version or an unknown
+one; under Vault Transit, only a retired or unknown key VERSION, never a configured key Transit
+does not find (:func:`refused_for_key`, which names the marker rewrites it cannot tell from
+those). Every other cipher error fails the read, as it did before #5970.
+
 **The store id.** No store id is minted yet, so every tag carries
 :data:`~messagefoundry.store.crypto.NO_STORE_ID`, as the queue tag does.
 """
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import inspect
 import json
@@ -78,15 +85,19 @@ __all__ = [
     "dead_letters_on_cell_tag",
     "is_row_tagged",
     "message_cell_aad",
+    "open_listed_cell",
     "open_message_cell",
+    "open_message_record",
     "open_preset_criteria",
     "open_tagged_cell",
     "preset_criteria_aad",
+    "refused_for_key",
     "report_cell_tag_failure",
     "report_cell_tag_failures",
     "row_tag_aad",
     "row_tag_columns",
     "withhold_message_cells",
+    "withhold_refused_cell",
 ]
 
 _log = logging.getLogger(__name__)
@@ -395,6 +406,20 @@ def open_message_cell(
     )
 
 
+def open_message_record(cipher: Cipher, record: dict[str, Any]) -> None:
+    """Open a whole ``messages`` row's cells in place, each under the tag its row's id and channel
+    build (ASVS 11.3.3, BACKLOG #2593), so a cell that fails that tag refuses the whole read. Every
+    backend's ``get_message`` runs it through ``asyncio.to_thread`` (BACKLOG #5981)."""
+    for column in MESSAGE_TAG_CELLS:
+        record[column] = open_message_cell(
+            cipher,
+            column,
+            record[column],
+            message_id=record["id"],
+            channel_id=record["channel_id"],
+        )
+
+
 def open_preset_criteria(
     cipher: Cipher, stored: object, *, preset_id: str, owner_user_id: str
 ) -> str:
@@ -435,20 +460,32 @@ def withhold_message_cells(
     channel_id: str,
     failures: list[CellTagError],
 ) -> None:
-    """Open ``columns`` of one message in ``record`` in place, for a list-shaped read. A cell that
-    fails its tag withholds every one of the row's cells (``None``) and appends the error to
-    ``failures`` for the caller to audit, so the row still lists by its plaintext columns."""
+    """Open ``columns`` of one message in ``record`` in place, for a list-shaped read. A
+    :class:`CellTagError` from :func:`open_message_cell`, which is at least a failed tag, a
+    corrupt cell under a held key and an unmarked value, withholds every one of the row's cells
+    (``None``) and appends the error to ``failures`` for the caller to audit or log, so the row
+    still lists by its plaintext columns. A cell the cipher refused only for a key the store does
+    not hold, a retired key version or an unknown one (:func:`refused_for_key`), withholds them
+    too, but is only logged, never appended (:func:`withhold_refused_cell`, BACKLOG #5970). Any
+    other cipher error raises, failing the read as before #5970 (owner ruling 2026-11-19): at
+    least an outage, a malformed or truncated cell under a key the store does not hold, and a
+    Transit refusal other than its tag that names no key version."""
+    stored: str | None = None
     try:
         for col in columns:
             if col in record:
+                stored = record[col]
                 record[col] = open_message_cell(
-                    cipher, col, record[col], message_id=message_id, channel_id=channel_id
+                    cipher, col, stored, message_id=message_id, channel_id=channel_id
                 )
-    except CellTagError as err:
+    except CipherError as exc:
+        if isinstance(exc, CellTagError):
+            failures.append(exc)
+        else:
+            withhold_refused_cell(cipher, "messages", exc, stored)
         for col in columns:
             if col in record:
                 record[col] = None
-        failures.append(err)
 
 
 #: How long one cell's failure is reported once per process. A list view or a retention pass meets
@@ -457,7 +494,7 @@ def withhold_message_cells(
 _REPORT_INTERVAL_S: Final = 3600.0
 #: The most cells remembered; the oldest is forgotten first.
 _REPORTED_MAX: Final = 4096
-type _Key = tuple[str, str, str, type[CellTagError]]
+type _Key = tuple[str, str, str, type[CipherError]]
 type _Memo = dict[_Key, float]
 _reported: _Memo = {}
 _reported_audit: _Memo = {}
@@ -501,6 +538,150 @@ def _first_in_interval(memo: _Memo, err: CellTagError, key: _Key | None = None) 
             return False
         _remember(memo, key, now)
     return True
+
+
+#: The texts, lower-cased and matched WHOLE, never as a substring, that a Transit data-key
+#: ``decrypt`` 400 names a retired or unknown key version with (BACKLOG #5970). Read on 2026-11-19
+#: from Vault ``main``'s ``sdk/helper/keysutil/policy.go`` (``ErrTooOld``, ``DecryptWithOptions``,
+#: ``safeGetKeyEntry``); OpenBao was not read. Decrypt-only on purpose: the audit walk's
+#: :data:`~messagefoundry.store.crypto_transit._VERSION_REFUSAL_TEXTS` holds HMAC wording and is
+#: matched as a substring, so a missing-key or malformed-cell reason that merely mentions a
+#: version would read as one. Wording a release changes stops matching, so that refusal fails the
+#: read loudly, the side the owner's ruling keeps. ``encryption key not found`` is deliberately
+#: absent: Transit answers it when the store's configured key is missing, a fault of the whole
+#: store rather than of a cell's key version, so a list read raises on it (owner ruling
+#: 2026-11-19).
+_TRANSIT_KEY_REFUSAL_TEXTS: Final = frozenset(
+    {
+        "ciphertext or signature version is disallowed by policy (too old)",
+        "invalid ciphertext: version is too new",
+        "no such key version",
+    }
+)
+
+
+def _transit_refused_for_key(cause: BaseException | None) -> bool:
+    """Whether a Transit ``decrypt`` failure's ``cause`` is Vault's HTTP 400 whose every reason
+    names the cell's key version: one below ``min_decryption_version``, one past the key's latest,
+    or one it has no entry for. Every other 400 is ``False``, at least invalid or truncated
+    ciphertext, bad base64, a version number that does not decode, a missing prefix, the
+    configured key not found, and a body too long to read. The reply is read by the Transit
+    cipher's own bounded reader. A memory or stack fault reading it reads as ``False``, and is
+    logged by class where the warning can still be written; a second such fault while logging is
+    suppressed, so the warning is lost but the read still fails. Anything else the reader raises
+    propagates in place of the cipher's error, which fails the read too."""
+    from messagefoundry.store.crypto_transit import (  # noqa: PLC0415 -- Transit only
+        _READ_FAULTS,
+        _reply_errors,
+    )
+    from messagefoundry.store.keyprovider_vault import is_vault_bad_request  # noqa: PLC0415
+
+    if not isinstance(cause, Exception) or not is_vault_bad_request(cause):
+        return False
+    try:
+        errors, oversize = _reply_errors(cause, bound_parsed=True)
+    except _READ_FAULTS as fault:
+        kind = type(fault).__name__
+        # Short of memory or stack, logging can fault again; the read still fails either way.
+        with contextlib.suppress(*_READ_FAULTS):
+            _log.warning("reading a Transit decrypt 400 raised %s; not read as a key refusal", kind)
+        return False
+    if oversize is not None or not isinstance(errors, list) or not errors:
+        return False
+    return all(
+        isinstance(entry, str) and entry.strip().lower() in _TRANSIT_KEY_REFUSAL_TEXTS
+        for entry in errors
+    )
+
+
+def refused_for_key(cipher: Cipher, exc: CipherError, stored: str | None) -> bool:
+    """Whether ``exc``, from opening ``stored``, is the cipher refusing that cell only because it
+    does not hold the key the cell names (BACKLOG #5970): in-process, a key not supplied, a
+    retired key version, or an unknown one; under Transit, a retired or unknown key version only.
+    Only such a cell may a list-shaped read withhold (owner ruling 2026-11-19); every other
+    refusal fails the read.
+
+    Under Transit only a retired or unknown key VERSION counts; a configured key Transit does not
+    find is a fault of the whole store, so it fails the read.
+
+    The in-process cipher, which names its keys (``holds_key_for``), says so with
+    :class:`~messagefoundry.store.crypto.UnauthenticatedCipherError` for a marked value whose
+    marker names a key id of the shape it writes (``named_key_id``) that it does not hold. Its
+    plain :class:`~messagefoundry.store.crypto.CipherError` is a malformed, truncated or
+    unknown-format value, so it is not. The Vault Transit cipher, which names none
+    (``names_no_keys``), says so only in Vault's own 400 text (:func:`_transit_refused_for_key`).
+    A cipher that declares neither is never read as refusing for its key. A tag failure, an
+    outage and an unmarked value are never this.
+
+    It reads the marker, which a writer outside the store can rewrite, so a substituted cell whose
+    marker was rewritten to name a key the store does not hold reads as this too: in-process, a
+    well-shaped key id outside the keyring; under Transit, a ``vault:vN`` version past the key's
+    latest or below its ``min_decryption_version``. Neither can be told from a key genuinely not
+    held."""
+    if isinstance(exc, (CellTagError, UnmarkedCipherError)) or gave_no_verdict(exc):
+        return False
+    holds = getattr(cipher, "holds_key_for", None)
+    if callable(holds):
+        if stored is None or not isinstance(exc, UnauthenticatedCipherError):
+            return False
+        named = getattr(cipher, "named_key_id", None)
+        return not holds(stored) and (not callable(named) or named(stored) is not None)
+    if _declares_tag_refusals(cipher):
+        return not isinstance(exc, UnauthenticatedCipherError) and _transit_refused_for_key(
+            exc.__cause__
+        )
+    return False
+
+
+#: One WARNING per (table, error class) per interval for a cell a list-shaped read withheld for
+#: a key it does not hold; a list view meets the same cells on every refresh.
+_withheld: _Memo = {}
+
+
+def withhold_refused_cell(cipher: Cipher, table: str, exc: CipherError, stored: str | None) -> None:
+    """For a list-shaped read that met a plain cipher error opening the ``table`` cell ``stored``
+    (BACKLOG #5970): when the cipher refused it only for a key it does not hold
+    (:func:`refused_for_key`), log
+    that the cell was withheld, once per table and error class per interval, and return; else
+    re-raise ``exc``, failing the read as before #5970 (owner ruling 2026-11-19). That raises at
+    least an outage, a malformed or truncated cell, and a Transit 400 that names no key version.
+    The class name only: the cipher's text can echo fields cut from the stored value."""
+    if not refused_for_key(cipher, exc, stored):
+        raise exc
+    key, now = (table, "", "", type(exc)), time.monotonic()
+    with _reported_lock:
+        if _is_recent(_withheld, key, now):
+            return
+        _remember(_withheld, key, now)
+    _log.warning(
+        "a %s cell is sealed under a key the store does not hold (%s), so a list read withheld it",
+        table,
+        type(exc).__name__,
+    )
+
+
+def open_listed_cell(cipher: Cipher, stored: str | None, aad: bytes, *, table: str) -> str | None:
+    """Open one cell of a table this module does not tag, for a list-shaped read, or ``None`` when
+    the cipher refuses it only because it does not hold the key the cell names: in-process, a key
+    not supplied, a retired key version or an unknown one; under Transit, a retired or unknown key
+    version only (:func:`refused_for_key`, BACKLOG #5970). So one such cell withholds that cell
+    rather than failing the page.
+
+    Every other refusal raises the cipher's own error, failing the read as it did before #5970
+    (owner ruling 2026-11-19): at least an outage, a tag that failed under a key the store holds
+    (a substituted or tampered cell), a corrupt, malformed or truncated cell, an unmarked value,
+    and any Transit refusal whose text names no key version. These tables have no tag-failed
+    audit row or ``integrity_drift`` alert, so the failed read is the only signal, and withholding
+    it would hide the tamper. A substituted cell whose marker was also rewritten to name a key the
+    store does not hold cannot be told from a key genuinely not held, so it is withheld
+    (:func:`refused_for_key` names the cases)."""
+    if stored is None:
+        return None
+    try:
+        return cipher.decrypt(stored, aad=aad)
+    except CipherError as exc:
+        withhold_refused_cell(cipher, table, exc, stored)
+        return None
 
 
 def _alert(cipher: object, err: CellTagError) -> None:

@@ -166,8 +166,17 @@ async def test_no_reply_a_stop_ends_the_hold_and_names_the_loss(
     last = [r for r in caplog.records if "one last attempt" in r.getMessage()]
     assert len(last) == 1 and "(attempt 2)" in last[0].getMessage()
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert len(errors) == 1
-    assert "nor is any frame behind it" in errors[0] and "listener is stopping" in errors[0]
+    hold = [e for e in errors if "not handed to the pipeline" not in e]
+    assert len(hold) == 1
+    assert "nor is any frame behind it" in hold[0] and "listener is stopping" in hold[0]
+    if transport == "X12":
+        # BACKLOG #5971: the X12 close also counts the frame behind it, at ERROR, since this
+        # inbound's sender never resends.
+        counted = [e for e in errors if "not handed to the pipeline" in e]
+        assert len(counted) == 1 and "closed with 1 complete interchange(s)" in counted[0]
+        assert "does not resend, so they are lost" in counted[0]
+    else:
+        assert errors == hold
 
 
 class _Blocking:
@@ -403,3 +412,291 @@ async def test_an_x12_reply_in_an_unusable_charset_name_is_sent_in_utf8(
     events = await _drive(source, _ThenEof(EDI), writer, handler=handler)
     assert "framing_error" not in _kinds(events)
     assert b"".join(writer.written) == reply.encode("utf-8")
+
+
+# --- BACKLOG #5971: the X12 listener's pipelined remainder and its reply encode -----------------
+
+
+def _unhandled_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "messagefoundry.transports.x12"
+        and "not handed to the pipeline" in r.getMessage()
+    ]
+
+
+async def test_x12_a_close_mid_read_counts_the_interchanges_it_leaves_unhandled(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Three interchanges pipelined into one read; the reply-owed fault on the first closes the
+    # connection. The two behind it were read off the socket and never handed on, so the close
+    # must say how many, or nothing records that they arrived.
+    seen: list[bytes] = []
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(
+            _replying(_x12), _ThenEof(EDI * 3), _Peer(), handler=_failing_for(99, seen)
+        )
+    assert seen == [EDI]
+    assert _kinds(events) == ["established", "handler_error"]
+    lines = _unhandled_lines(caplog)
+    assert len(lines) == 1 and "closed with 2 complete interchange(s)" in lines[0]
+    assert "ISA" not in lines[0], "a count, never frame content"
+
+
+async def test_x12_a_clean_read_reports_nothing_unhandled(caplog: pytest.LogCaptureFixture) -> None:
+    # The control for the count above: every interchange handled, so no line.
+    seen: list[bytes] = []
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(
+            _replying(_x12), _ThenEof(EDI * 3), _Peer(), handler=_failing_for(0, seen)
+        )
+    assert seen == [EDI] * 3
+    assert _kinds(events) == ["established", "closed"]
+    assert_capture_sees(caplog, "messagefoundry.transports.x12")
+    assert _unhandled_lines(caplog) == []
+
+
+async def test_x12_a_reply_its_charset_cannot_hold_is_replaced_and_sent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The engine's own reply is the fault here, not the partner's bytes. Before BACKLOG #5958 it
+    # fell to the last-resort arm and read as `framing_error`, closing unanswered, so a sender
+    # waiting for the reply would resend an interchange already stored. The shared reply policy
+    # (BACKLOG #5799) replaces the character and sends, as MLLP and raw TCP do. Beside the #5958
+    # test above, this one pins that a pipelined second interchange is still handled and that
+    # nothing logs at ERROR.
+    source = _replying(lambda: _x12(encoding="ascii"))
+    seen: list[bytes] = []
+
+    async def narrow_reply(raw: bytes) -> str:
+        seen.append(raw)
+        return "synthetic reply \u2019"
+
+    writer = _Peer()
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(source, _ThenEof(EDI * 2), writer, handler=narrow_reply)
+    assert seen == [EDI] * 2
+    assert writer.written == [b"synthetic reply ?"] * 2
+    assert _kinds(events) == ["established", "closed"]
+    assert_capture_sees(caplog, "messagefoundry.transports.x12")
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+async def test_x12_a_partial_interchange_left_by_a_close_is_named(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # An interchange still arriving when the connection closes is lost with it too. It is not a
+    # complete interchange, so it is named rather than counted.
+    seen: list[bytes] = []
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(
+            _replying(_x12), _ThenEof(EDI * 2 + EDI[:200]), _Peer(), handler=_failing_for(99, seen)
+        )
+    assert seen == [EDI]
+    assert _kinds(events) == ["established", "handler_error"]
+    lines = _unhandled_lines(caplog)
+    assert len(lines) == 1 and "closed with 1 complete interchange(s)" in lines[0]
+    assert "and a partial interchange still arriving" in lines[0]
+
+
+async def test_x12_a_reply_the_policy_still_refuses_is_a_handler_error_not_a_framing_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # An MSH-led reply whose own delimiter is the replacement "?" cannot be replaced safely, so the
+    # shared policy refuses it. That is still the engine's fault: `handler_error`, and the read's
+    # remainder is counted.
+    source = _replying(lambda: _x12(encoding="ascii"))
+    seen: list[bytes] = []
+
+    async def refused_reply(raw: bytes) -> str:
+        seen.append(raw)
+        return "MSH?^~\\&?SYNTH\u2019\r"
+
+    writer = _Peer()
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(source, _ThenEof(EDI * 2), writer, handler=refused_reply)
+    assert seen == [EDI], "the first interchange is recorded; the close stops the second"
+    assert _kinds(events) == ["established", "handler_error"]
+    assert not writer.written and writer.closed
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "could not be encoded" in errors[0]
+    assert "SYNTH" not in errors[0], "the reply is never logged"
+    lines = _unhandled_lines(caplog)
+    assert len(lines) == 1 and "closed with 1 complete interchange(s)" in lines[0]
+    assert "sender resends" in lines[0]
+
+
+async def test_x12_a_cancel_mid_read_counts_the_remainder(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The stop path: stop() cancels a client task past its grace. The interchanges behind the one
+    # in hand are counted on the cancel too, at ERROR on a no-reply inbound, whose sender never
+    # resends.
+    source = _no_reply(_x12)
+    handler = _Blocking()
+    events: list[Event] = []
+    source.on_connection_event = _sink(events)  # type: ignore[assignment]
+    source._handler = handler
+    with caplog.at_level(logging.WARNING):
+        client = asyncio.create_task(source._on_client(_ThenEof(EDI * 3), _Peer()))  # type: ignore[arg-type]
+        await asyncio.wait_for(handler.blocked.wait(), timeout=2.0)
+        client.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(client, timeout=2.0)
+    lines = [r for r in caplog.records if "not handed to the pipeline" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelno == logging.ERROR
+    assert "closed with 2 complete interchange(s)" in lines[0].getMessage()
+
+
+async def test_x12_an_over_cap_interchange_in_the_remainder_is_named(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The decoder discards the rest of its buffer at an over-cap interchange, so the count cannot
+    # see past it; the line says so rather than reading as a complete count.
+    source = _replying(lambda: _x12(max_interchange_bytes=len(EDI) + 16))
+    big = EDI.replace(b"~IEA", b"~" + b"X" * 64 + b"~IEA", 1)
+    assert len(big) > len(EDI) + 16
+    seen: list[bytes] = []
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(
+            source, _ThenEof(EDI + EDI + big + EDI), _Peer(), handler=_failing_for(99, seen)
+        )
+    assert seen == [EDI]
+    assert _kinds(events) == ["established", "handler_error"]
+    lines = _unhandled_lines(caplog)
+    assert len(lines) == 1 and "closed with 1 complete interchange(s)" in lines[0]
+    assert "over-cap interchange that discarded the rest of the read" in lines[0]
+
+
+@pytest.mark.parametrize("tail", [EDI[:200], b"ISA"], ids=["cut-interchange", "stray-isa"])
+async def test_x12_a_partial_only_remainder_on_an_ordinary_close_does_not_cry_wolf(
+    caplog: pytest.LogCaptureFixture, tail: bytes
+) -> None:
+    # Every complete interchange was handled and the sender then hung up mid-interchange, or line
+    # noise carried a stray "ISA". Nothing complete was lost, so the note stays at DEBUG: at
+    # WARNING or ERROR, noise and connection churn could flood the log, one line per close.
+    seen: list[bytes] = []
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.transports.x12"):
+        events = await _drive(
+            _no_reply(_x12), _ThenEof(EDI + tail), _Peer(), handler=_failing_for(0, seen)
+        )
+    assert seen == [EDI]
+    assert _kinds(events)[0] == "established"
+    lines = [r for r in caplog.records if "not handed to the pipeline" in r.getMessage()]
+    assert lines, "the partial is still named, at DEBUG"
+    assert all(r.levelno == logging.DEBUG for r in lines), [r.levelname for r in lines]
+    assert all("closed with 0 complete interchange(s)" in r.getMessage() for r in lines)
+
+
+async def test_x12_a_refused_reply_on_a_no_reply_inbound_carries_on(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # No reply is owed here, so a reply the charset policy refuses is skipped and recorded as
+    # `handler_error`, and the interchanges behind it are still handed on rather than dropped with
+    # a close.
+    source = _no_reply(lambda: _x12(encoding="ascii"))
+    seen: list[bytes] = []
+
+    async def refused_reply(raw: bytes) -> str:
+        seen.append(raw)
+        return "MSH?^~\\&?SYNTH’\r"
+
+    writer = _Peer()
+    with caplog.at_level(logging.WARNING):
+        events = await _drive(source, _ThenEof(EDI * 3), writer, handler=refused_reply)
+    assert seen == [EDI] * 3, "every interchange is handed to the pipeline"
+    assert _kinds(events) == ["established"] + ["handler_error"] * 3 + ["closed"]
+    assert not writer.written
+    assert _unhandled_lines(caplog) == []
+    assert not any("SYNTH" in r.getMessage() for r in caplog.records), "the reply is never logged"
+
+
+async def _cancel_mid_read(data: bytes, **settings: object) -> None:
+    """Cancel a no-reply listener's client task while its handler hangs on the first interchange
+    of ``data``, as a stop past its grace does."""
+    source = _no_reply(lambda: _x12(**settings))
+    handler = _Blocking()
+    events: list[Event] = []
+    source.on_connection_event = _sink(events)  # type: ignore[assignment]
+    source._handler = handler
+    client = asyncio.create_task(source._on_client(_ThenEof(data), _Peer()))  # type: ignore[arg-type]
+    await asyncio.wait_for(handler.blocked.wait(), timeout=2.0)
+    client.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(client, timeout=2.0)
+
+
+async def test_x12_an_over_cap_only_remainder_on_a_no_resend_inbound_is_an_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The over-cap interchange behind the one in hand is a complete loss this sender never
+    # resends, so it is logged at ERROR like a counted one, not at WARNING.
+    big = EDI.replace(b"~IEA", b"~" + b"X" * 64 + b"~IEA", 1)
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.transports.x12"):
+        await _cancel_mid_read(EDI + big, max_interchange_bytes=len(EDI) + 16)
+    lines = [r for r in caplog.records if "not handed to the pipeline" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelno == logging.ERROR
+    assert "over-cap interchange" in lines[0].getMessage()
+
+
+async def test_x12_a_partial_the_listener_cuts_off_is_a_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A stop that cancels the connection cuts off an interchange still arriving: the listener did
+    # that, not the peer, so the note is visible at WARNING rather than hidden at DEBUG.
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.transports.x12"):
+        await _cancel_mid_read(EDI + EDI[:200])
+    lines = [r for r in caplog.records if "not handed to the pipeline" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].levelno == logging.WARNING
+    assert "closed with 0 complete interchange(s)" in lines[0].getMessage()
+    assert "a partial interchange still arriving" in lines[0].getMessage()
+
+
+class _PartialThenStop:
+    """Hands over ``data``, then waits for ``release`` and reads EOF, as a stop inside its grace
+    does when it closes the client's writer."""
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self.waiting = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def read(self, _n: int) -> bytes:
+        if self._data:
+            chunk, self._data = self._data, b""
+            return chunk
+        self.waiting.set()
+        await self.release.wait()
+        return b""
+
+
+@pytest.mark.parametrize("stopping", [True, False], ids=["stop", "peer-eof-control"])
+async def test_x12_a_partial_a_stop_inside_its_grace_cuts_off_is_a_warning(
+    stopping: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    # stop() sets `stopping` and closes the writer, so the pending read returns EOF and the
+    # connection ends with neither a cancel nor a failure. That cut is still the listener's, so the
+    # partial is named at WARNING. The control is the same EOF with no stop: the peer closed, DEBUG.
+    source = _no_reply(_x12)
+    reader = _PartialThenStop(EDI[:200])
+    events: list[Event] = []
+    source.on_connection_event = _sink(events)  # type: ignore[assignment]
+
+    async def handler(raw: bytes) -> None:
+        return None
+
+    source._handler = handler
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.transports.x12"):
+        client = asyncio.create_task(source._on_client(reader, _Peer()))  # type: ignore[arg-type]
+        try:
+            await asyncio.wait_for(reader.waiting.wait(), timeout=2.0)
+            source._admission.stopping = stopping
+            reader.release.set()
+            await asyncio.wait_for(client, timeout=2.0)
+        finally:
+            client.cancel()
+    lines = [r for r in caplog.records if "not handed to the pipeline" in r.getMessage()]
+    assert len(lines) == 1
+    assert lines[0].levelno == (logging.WARNING if stopping else logging.DEBUG)
+    assert "a partial interchange still arriving" in lines[0].getMessage()

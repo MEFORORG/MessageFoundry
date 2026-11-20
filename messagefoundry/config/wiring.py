@@ -5732,7 +5732,7 @@ class SetState:
                 raise StateKeyError(f"SetState {name} must not contain U+0000 (NUL)")
             # NVARCHAR counts UTF-16 code units. ASCII is one unit per char, so the usual MRN-style
             # key skips the encode. A strict encode refuses a lone surrogate (U+D800..U+DFFF): no
-            # backend stores one, and cell_aad's UTF-8 encode would raise it inside the handoff, a
+            # backend stores one, and the backend's bind would raise it inside the handoff, a
             # store error the runner retries rather than a content fault it dead-letters. A key
             # already over the limit in code points is refused unencoded: each is at least a unit,
             # so a huge content-derived key costs no copy.

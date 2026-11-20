@@ -247,10 +247,14 @@ suite("auth.ts routes sign-in through the superseding path (BACKLOG #2281)", () 
 
   /** The source of the top-level function `name`, from its declaration to the next one. */
   function functionSource(text: string, name: string): string {
-    const start = text.search(new RegExp(`export async function ${name}[(<]`));
+    const start = text.search(new RegExp(`(?:export )?async function ${name}[(<]`));
     assert.ok(start >= 0, `${name} was not found in auth.ts`);
-    const next = text.indexOf("\nexport ", start + 1);
-    return text.slice(start, next < 0 ? undefined : next);
+    // Ends at the next declaration or doc comment, exported or not, so a module-private function
+    // placed after `name` is never read as part of it.
+    const rest = text
+      .slice(start + 1)
+      .search(/\n(?:export |async function |function |const |let |class |interface |type |\/\*\*|\/\/)/);
+    return text.slice(start, rest < 0 ? undefined : start + 1 + rest);
   }
 
   /** The lines that post `/auth/logout`. */
@@ -296,10 +300,11 @@ suite("auth.ts routes sign-in through the superseding path (BACKLOG #2281)", () 
     const direct = text.split(/\r?\n/).filter((l) => l.includes("ctx.secrets.get("));
     assert.strictEqual(direct.length, 1, `a cache read bypasses peekToken: ${direct.join(" | ")}`);
     assert.ok(functionSource(text, "ensureToken").includes("await peekToken(ctx, url)"));
-    const withAuth = functionSource(text, "withAuth");
+    // withAuth delegates its 401 loop to withAuthAdopting (BACKLOG #5960), so the pin reads that.
+    const withAuth = functionSource(text, "withAuthAdopting");
     const cached = withAuth.indexOf("const cached = await peekToken(ctx, url);");
     const clear = withAuth.indexOf("await clearToken(ctx, url);");
-    assert.ok(cached > 0, "withAuth no longer reads the cache through peekToken after a 401");
+    assert.ok(cached > 0, "withAuthAdopting no longer reads the cache through peekToken after a 401");
     assert.ok(clear > cached, "the clear moved ahead of the cache read");
   });
 });

@@ -148,6 +148,9 @@ class _RecordingStore:
     path with NO registry only touches reset_stale_inflight + the coordinator, so the rest of the
     store surface is unused here."""
 
+    # Models the Postgres profile, whose converge_state_cache really converges (BACKLOG #5984).
+    converges_transform_state = True
+
     def __init__(self) -> None:
         self.reset_calls = 0
         self.state_convergence_enabled = False

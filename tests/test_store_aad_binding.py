@@ -13,6 +13,7 @@ the ``MEFOR_TEST_FORCE_AAD_BIND`` conftest fixture; these are the targeted, alwa
 from __future__ import annotations
 
 import base64
+import logging
 from pathlib import Path
 
 import pytest
@@ -196,6 +197,196 @@ async def test_totp_connection_event_alert_roundtrip(tmp_path: Path) -> None:
         )
         alerts = await store.list_active_alert_instances(allowed_channels=None)
         assert alerts and alerts[0].reason == "connect refused"
+    finally:
+        await store.close()
+
+
+@pytest.mark.parametrize("keyed", [False, True], ids=["keyless", "keyed"])
+async def test_a_null_key_with_a_null_cell_does_not_fail_a_list_read(
+    tmp_path: Path, keyed: bool
+) -> None:
+    # BACKLOG #5962: queue.id is a nullable SQLite TEXT key, and these reads build each row's AAD
+    # before they know whether its cell is sealed. A NULL id with a NULL last_error binds nothing, so
+    # it reads as it did before the None refusal, keyed or keyless.
+    db = tmp_path / "null_key.db"
+    store = await (_open_bound(db, generate_key()) if keyed else MessageStore.open(db))
+    try:
+        mid = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", BODY)])
+        await store._db.execute(
+            "UPDATE queue SET id=NULL, status='dead', last_error=NULL WHERE message_id=?", (mid,)
+        )
+        await store._db.commit()
+        rows = await store.outbox_for(mid)
+        assert [(r["id"], r["last_error"]) for r in rows] == [(None, None)]
+        dead = await store.list_dead(allowed_channels=None)
+        assert [(r["outbox_id"], r["last_error"]) for r in dead] == [(None, None)]
+    finally:
+        await store.close()
+
+
+async def _seed_null_id_orphans(store: MessageStore) -> dict[str, str]:
+    """One orphan per startup sweep with a NULL id, plus one ingress orphan with a real id.
+
+    Ingress on the removed inbound ``GONE``, outbound on the removed destination ``OB_GONE``, and a
+    routed row on the removed handler ``H`` (its inbound ``IB`` is removed too). Returns the message
+    ids by role."""
+    mids = {
+        "ingress": await store.enqueue_ingress(channel_id="GONE", raw=RAW),
+        "keyed": await store.enqueue_ingress(channel_id="GONE", raw=RAW),
+        "outbound": await store.enqueue_message(
+            channel_id="GONE", raw=RAW, deliveries=[("OB_GONE", BODY)]
+        ),
+    }
+    mids["routed"], _ = await _route_one(store)
+    for role in ("ingress", "outbound", "routed"):
+        await store._db.execute("UPDATE queue SET id=NULL WHERE message_id=?", (mids[role],))
+    await store._db.commit()
+    return mids
+
+
+async def _queue_status(store: MessageStore, mid: str) -> list[str]:
+    cur = await store._db.execute("SELECT status FROM queue WHERE message_id=?", (mid,))
+    return [r["status"] for r in await cur.fetchall()]
+
+
+async def _dead_events(store: MessageStore, mid: str) -> int:
+    cur = await store._db.execute(
+        "SELECT COUNT(*) AS n FROM message_events WHERE message_id=? AND event='dead'", (mid,)
+    )
+    row = await cur.fetchone()
+    assert row is not None
+    return int(row["n"])
+
+
+async def test_a_null_id_orphan_on_a_bound_store_does_not_stop_graph_bring_up(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # BACKLOG #5962: a cell-bound store refuses to seal against a NULL key, and each startup sweep
+    # (destination, handler, inbound) seals each orphan's reason. A NULL-id row there must not abort
+    # graph bring-up: the sweep leaves it with a WARNING and still dead-letters the orphan beside it.
+    from messagefoundry.config.settings import EgressSettings
+    from messagefoundry.config.wiring import Registry
+    from messagefoundry.pipeline.engine import Engine
+
+    store = await _open_bound(tmp_path / "null_bound.db", generate_key())
+    mids = await _seed_null_id_orphans(store)
+    eng = Engine(store, egress_settings=EgressSettings(deny_by_default=False))
+    eng.add_registry(Registry())
+    caplog.set_level(logging.WARNING)
+    try:
+        await eng.start()
+        assert eng._registry_runner is not None and eng._registry_runner.running is True
+        assert "skipped 1 orphaned outbox row(s) with a NULL id" in caplog.text
+        assert "skipped 1 orphaned routed row(s) with a NULL id" in caplog.text
+        # The inbound sweep sees the ingress row and, on its removed inbound, the routed row too.
+        assert "skipped 2 orphaned ingress/routed/response row(s) with a NULL id" in caplog.text
+        assert await _queue_status(store, mids["keyed"]) == ["dead"]
+        assert await _queue_status(store, mids["ingress"]) == ["pending"]
+        assert await _queue_status(store, mids["outbound"]) == ["pending"]
+        assert await _queue_status(store, mids["routed"]) == [
+            "pending"
+        ]  # start() resets in-flight rows first
+        for role in ("ingress", "outbound", "routed"):
+            assert await _dead_events(store, mids[role]) == 0
+    finally:
+        await eng.stop()
+
+
+@pytest.mark.parametrize("cipher", ["keyless", "unbound"])
+async def test_a_null_id_orphan_on_a_store_that_does_not_bind_is_swept_as_before(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, cipher: str
+) -> None:
+    # Where the seal never refuses (no key, or [store].aad_bind off), each sweep treats a NULL-id
+    # orphan as it did before BACKLOG #5962: it counts the row, writes its `dead` event and runs the
+    # finalizer. Its UPDATE ... WHERE id=? still matches nothing, as it always did, so the row itself
+    # stays where it was: the main-branch behaviour, pinned here as it is, not endorsed.
+    db = tmp_path / f"null_{cipher}.db"
+    store = await (
+        MessageStore.open(db)
+        if cipher == "keyless"
+        else MessageStore.open(db, cipher=make_cipher(generate_key(), [], write_v2=False))
+    )
+    caplog.set_level(logging.WARNING)
+    try:
+        mids = await _seed_null_id_orphans(store)
+        assert await store.dead_letter_missing_destinations(set()) == 1
+        assert await store.dead_letter_missing_handlers(set()) == 1
+        # The ingress pair, and the routed row again on its removed inbound.
+        assert await store.dead_letter_missing_inbounds(set()) == 3
+        assert "with a NULL id" not in caplog.text
+        assert await _queue_status(store, mids["keyed"]) == ["dead"]
+        assert await _dead_events(store, mids["ingress"]) == 1
+        assert await _dead_events(store, mids["outbound"]) == 1
+        assert await _dead_events(store, mids["routed"]) == 2
+        for role in ("ingress", "outbound", "routed"):
+            assert await _queue_status(store, mids[role]) != ["dead"]
+    finally:
+        await store.close()
+
+
+async def test_a_null_lane_name_does_not_break_the_dead_letter_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The sweep's summary WARNING joins lane names after its commit. A NULL destination_name or
+    # handler_name is an orphan too, and joining it raw raised TypeError out of bring-up.
+    store = await MessageStore.open(tmp_path / "null_lane.db")
+    caplog.set_level(logging.WARNING)
+    try:
+        out = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB", BODY)])
+        routed, _ = await _route_one(store)
+        await store._db.execute("UPDATE queue SET destination_name=NULL WHERE message_id=?", (out,))
+        await store._db.execute("UPDATE queue SET handler_name=NULL WHERE message_id=?", (routed,))
+        await store._db.commit()
+        assert await store.dead_letter_missing_destinations({"OB"}) == 1
+        assert await store.dead_letter_missing_handlers({"H"}) == 1
+        assert "missing destination(s): None" in caplog.text
+        assert "missing handler(s): None" in caplog.text
+    finally:
+        await store.close()
+
+
+async def test_only_the_destination_sweep_names_its_lane_in_the_dead_event(tmp_path: Path) -> None:
+    # The shared sweep writes the lane into the event's destination column for the destination
+    # sweep alone; a handler or inbound name is not a destination.
+    store = await MessageStore.open(tmp_path / "dead_event_lane.db")
+    try:
+        out = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB_GONE", BODY)])
+        routed, _ = await _route_one(store)
+        assert await store.dead_letter_missing_destinations(set()) == 1
+        assert await store.dead_letter_missing_handlers(set()) == 1
+        for mid, destination in ((out, "OB_GONE"), (routed, None)):
+            cur = await store._db.execute(
+                "SELECT destination FROM message_events WHERE message_id=? AND event='dead'",
+                (mid,),
+            )
+            assert [r["destination"] for r in await cur.fetchall()] == [destination]
+    finally:
+        await store.close()
+
+
+async def test_an_integer_timestamp_still_opens_its_connection_event(tmp_path: Path) -> None:
+    # BACKLOG #5962: the writer binds the int it was given, the REAL column hands back a float, and
+    # both must spell the same AAD, or the reason never opens on read or on rotate-key.
+    db, old = tmp_path / "int_ts.db", generate_key()
+    store = await _open_bound(db, old)
+    try:
+        await store.record_connection_event(
+            connection="IB",
+            transport="mllp",
+            direction="inbound",
+            kind="framing_error",
+            reason="bad MLLP frame",
+            now=1_763_400_000,
+        )
+        evs = await store.list_connection_events(connection="IB", allowed_channels=None)
+        assert evs and evs[0].reason == "bad MLLP frame"
+    finally:
+        await store.close()
+    store = await _open_bound(db, generate_key(), retired=[old])
+    try:
+        assert await store.reencrypt_to_active() >= 1
+        evs = await store.list_connection_events(connection="IB", allowed_channels=None)
+        assert evs and evs[0].reason == "bad MLLP frame"
     finally:
         await store.close()
 

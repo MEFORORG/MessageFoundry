@@ -18,6 +18,10 @@ from harness.load.profile import LoadProfile, load_profile_text
 # A SHORT failover profile sized for CI: tuned-short leases (heartbeat < fence < ttl), a modest rate at
 # pool_size = 1 (sound per-lane ordering), and a generous drain for a server-DB round-trip per handoff.
 # recovery_ttl_multiple is roomy (3×) so ordinary CI scheduling jitter doesn't flake the time bound.
+# The TTL is 5.0 on Postgres and 6.0 on SQL Server, because SQL Server refuses a pair whose lease
+# claim's pool wait plus its statement reaches the detection margin (BACKLOG #5979): 3.0 / 5.0 leaves a
+# 1.4 s margin, which even the 1 s floor clamp's 1 + 1 s reaches; 3.0 / 6.0 leaves 2.4 s, and its
+# derived 1.2 s clamp runs 1.2 + 1 s = 2.2 s. Postgres keeps 5.0 so its recovery bound is not loosened.
 _PROFILE = """
 [load]
 name = "failover-it"
@@ -36,7 +40,7 @@ types = ["ADT"]
 kill_at_fraction = 0.4
 heartbeat_seconds = 1.5
 leader_fence_timeout_seconds = 3.0
-leader_lease_ttl_seconds = 5.0
+leader_lease_ttl_seconds = {ttl}
 recovery_ttl_multiple = 3.0
 max_dup_rate = 0.30
 [[load.phase]]
@@ -54,8 +58,14 @@ duration_s = 10.0
 """
 
 
-def failover_test_profile() -> LoadProfile:
-    return load_profile_text(_PROFILE, where="<failover-it>")
+#: The CI profile's lease TTL per server backend; the comment above ``_PROFILE`` says why.
+FAILOVER_TEST_TTL: dict[str, float] = {"postgres": 5.0, "sqlserver": 6.0}
+
+
+def failover_test_profile(db_backend: str = "postgres") -> LoadProfile:
+    return load_profile_text(
+        _PROFILE.format(ttl=FAILOVER_TEST_TTL[db_backend]), where=f"<failover-it {db_backend}>"
+    )
 
 
 def reserve_failover_ports() -> FailoverPorts:

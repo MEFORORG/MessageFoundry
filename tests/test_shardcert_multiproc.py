@@ -38,6 +38,7 @@ from harness.load.coord import (
     DRIVE_START,
     DRIVER_ARMED,
     DRIVER_DONE,
+    ENGINE_DRAINED,
     SHARDS_READY,
     SINK_BOUND,
     SINK_DONE,
@@ -621,7 +622,9 @@ def _install_coordinator_fakes(
         async def open(self) -> None:
             return None
 
-        async def await_drain(self, *, timeout: float, interval: float) -> float | None:
+        async def await_drain(
+            self, *, timeout: float, interval: float, stop: Any = None
+        ) -> float | None:
             return drain_seconds
 
         async def close(self) -> None:
@@ -1191,6 +1194,175 @@ async def test_coordinator_signs_in_over_https_and_a_refusal_needs_a_barrier(
     assert report.no_loss
     assert report.drained is False  # the advisory drain went unread, and says so
     assert any("advisory /stats poller not opened" in n for n in report.notes), report.notes
+
+
+def _gated_drive_fakes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, run_id: str, *, poll_seconds: float | None
+) -> tuple[FileDropCoord, list[str]]:
+    """Coordinator fakes for the gated-drive tests (BACKLOG #5977), with an advisory poller that
+    drains after ``poll_seconds`` (``None``: never), honouring ``stop`` between samples. Returns the
+    coord and the list the poller appends ``"stopped"`` / ``"drained"`` / ``"timeout"`` to."""
+    import types
+
+    final = types.SimpleNamespace(done=40, dead=0, in_pipeline=0)
+    _install_coordinator_fakes(
+        monkeypatch,
+        sink_tally={
+            0: {
+                "sink_received": 40,
+                "lane_inversions": 0,
+                "lane_repeats": 0,
+                "lanes_observed": 2,
+                "ports": [3700],
+            }
+        },
+        worker_tally={
+            0: {"sent": 40, "acked": 40, "ack_p50_ms": 1.0, "ack_p99_ms": 2.0, "bands": [0]}
+        },
+        engine_final=final,
+    )
+    ended: list[str] = []
+
+    class SlowPoller:
+        def __init__(self, urls: Any, token: Any = None, **kw: Any) -> None:
+            self.final = final
+
+        async def open(self) -> None:
+            return None
+
+        async def await_drain(
+            self, *, timeout: float, interval: float, stop: asyncio.Event | None = None
+        ) -> float | None:
+            loop = asyncio.get_running_loop()
+            start = loop.time()
+            while loop.time() - start < timeout:
+                if stop is not None and stop.is_set():
+                    ended.append("stopped")
+                    return None
+                if poll_seconds is not None and loop.time() - start >= poll_seconds:
+                    ended.append("drained")
+                    return poll_seconds
+                await asyncio.sleep(0.01)
+            ended.append("timeout")
+            return None
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(sc, "EnginePoller", SlowPoller)
+    monkeypatch.setattr(sc, "_ADVISORY_DRAIN_GRACE", 2.0)
+    coord = FileDropCoord(tmp_path, run_id=run_id)
+    coord.post(
+        SHARDS_READY,
+        {
+            "shards": ["a"],
+            "inbound_base": 3600,
+            "lanes": 1,
+            "dests": 1,
+            "handlers": 1,
+            "delivering": 1,
+            "routing": "broadcast",
+            "api_ports": [9001],
+            "sink_base": 3700,
+            "sink_ports": 1,
+            "sink_port": 3700,
+        },
+    )
+    return coord, ended
+
+
+_GATED_DRIVE_KWARGS: dict[str, Any] = {
+    "engine_host": "10.0.0.5",
+    "aggregate_rate": 20.0,
+    "hold_seconds": 1.0,
+    "driver_count": 1,
+    "sink_count": 1,
+    "cacert": "engine-box.pem",
+    "await_engine_drained": True,
+}
+
+
+async def test_gated_drive_stops_a_hung_advisory_poll_once_the_gate_lands(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5977: with the ENGINE_DRAINED gate armed, the remote /stats drain poll is advisory,
+    so it must not hold the sinks' tally for its whole ``drain_timeout`` in front of the gate. A poll
+    that never sees drained is stopped, between samples, a short grace after the gate lands.
+
+    Mutation: await the poll in full before the gate again. Red: the drive runs past the outer
+    20s bound (the poll's drain_timeout is 60s)."""
+    coord, ended = _gated_drive_fakes(monkeypatch, tmp_path, "hungpoll", poll_seconds=None)
+    coord.post(ENGINE_DRAINED, {"engine_ok": True, "stranded": 0, "dead_total": 0})
+    report = await asyncio.wait_for(
+        sc.run_shardcert_drive(coord=coord, drain_timeout=60.0, **_GATED_DRIVE_KWARGS),
+        timeout=20.0,
+    )
+    assert ended == ["stopped"], "the advisory poll should be stopped after the grace"
+    assert report.tallied_behind_gate
+    assert report.drained is False
+    assert any("advisory /stats drain not seen" in n for n in report.notes), report.notes
+
+
+async def test_gated_drive_records_an_advisory_drain_that_lands_in_the_grace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5977: a poll that drains within the grace after the gate still records its drain
+    time and final sample. Mutation: drop the ``drain_s`` assignment. Red: drained reads False."""
+    coord, ended = _gated_drive_fakes(monkeypatch, tmp_path, "gracepoll", poll_seconds=0.05)
+    coord.post(ENGINE_DRAINED, {"engine_ok": True, "stranded": 0, "dead_total": 0})
+    report = await sc.run_shardcert_drive(coord=coord, drain_timeout=60.0, **_GATED_DRIVE_KWARGS)
+    assert ended == ["drained"]
+    assert report.drained is True
+    assert report.drain_seconds == 0.05
+    assert report.engine_done == 40
+    assert not any("advisory /stats drain not seen" in n for n in report.notes), report.notes
+
+
+async def test_gated_drive_lets_the_poll_run_in_full_when_the_gate_never_lands(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5977: when ENGINE_DRAINED never comes, the advisory poll is the only barrier left
+    before the sinks tally, so it runs in full rather than for the grace. Here the gate gives up at
+    once and the poll drains after the 2s grace. Mutation: stop the poll on this path too. Red:
+    the poll reads stopped."""
+    coord, ended = _gated_drive_fakes(monkeypatch, tmp_path, "nogate", poll_seconds=2.5)
+    report = await sc.run_shardcert_drive(
+        coord=coord, drain_timeout=10.0, engine_drained_timeout=0.0, **_GATED_DRIVE_KWARGS
+    )
+    assert ended == ["drained"]
+    assert report.drained is True
+    assert not report.tallied_behind_gate
+    assert any("ENGINE_DRAINED not seen within 0.0s" in n for n in report.notes), report.notes
+
+
+async def test_gated_drive_notes_an_advisory_poll_that_raises(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5977: on the gated path the poll is advisory, so a poll that raises is a note and
+    the rung still reports. Mutation: let the error propagate. Red: the drive raises."""
+    coord, _ended = _gated_drive_fakes(monkeypatch, tmp_path, "raisepoll", poll_seconds=None)
+
+    class RaisingPoller:
+        def __init__(self, urls: Any, token: Any = None, **kw: Any) -> None:
+            self.final = None
+
+        async def open(self) -> None:
+            return None
+
+        async def await_drain(
+            self, *, timeout: float, interval: float, stop: asyncio.Event | None = None
+        ) -> float | None:
+            raise RuntimeError("odd /stats reply")
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(sc, "EnginePoller", RaisingPoller)
+    coord.post(ENGINE_DRAINED, {"engine_ok": True, "stranded": 0, "dead_total": 0})
+    report = await sc.run_shardcert_drive(coord=coord, drain_timeout=60.0, **_GATED_DRIVE_KWARGS)
+    assert report.tallied_behind_gate
+    assert report.drained is False
+    assert any("advisory /stats drain poll failed" in n for n in report.notes), report.notes
 
 
 async def test_coordinator_fails_loud_on_oversized_sink_count(

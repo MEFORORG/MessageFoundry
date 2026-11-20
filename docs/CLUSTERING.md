@@ -140,10 +140,11 @@ cluster coordinates the parts that must not double-run or interleave:
   On SQL Server the claim/renew is clamped at `[cluster].lease_renew_timeout_seconds`, derived from
   the margin unless set. There its wait for a pooled connection and its statement each get the full
   clamp, rather than sharing one deadline as on Postgres, so a renew can land up to about twice the
-  clamp after it is issued, while the validator compares the clamp alone with the margin. The
-  statement timeout counts whole seconds, so a clamp under 1 s is refused on that backend. `serve`
-  logs a warning at start-up when twice the clamp reaches the margin, which the shipped `10 / 20 / 30`
-  does. The `lease_renew_timeout_seconds` row of [`CONFIGURATION.md`](CONFIGURATION.md) gives the
+  clamp after it is issued, while the cluster section's own margin check compares the clamp alone
+  with the margin. The statement timeout counts whole seconds, so a clamp under 1 s is refused on
+  that backend, and the engine also checks the pool wait plus the statement against the margin,
+  stepping a derived clamp down or refusing the config. `serve` logs a warning at start-up when
+  twice the clamp reaches the margin, which the shipped `10 / 20 / 30` does. The `lease_renew_timeout_seconds` row of [`CONFIGURATION.md`](CONFIGURATION.md) gives the
   arithmetic and what the clamp leaves unbounded.
 - **Store-checked leader epoch (fencing token).** The self-fence above is *temporal* — it relies on a
   paused/partitioned old leader noticing it has fallen behind and demoting itself before the lease TTL
@@ -586,13 +587,18 @@ The defaults (`heartbeat_seconds=10`, `leader_fence_timeout_seconds=20`, `leader
 trade a ~30 s crash-failover for ample margin. Lower all three proportionally (keeping
 `heartbeat < fence < ttl`) for faster failover at the cost of less tolerance for a slow DB / GC pause.
 
-**The validator enforces the ordering, not a margin.** `heartbeat < fence < ttl` is checked at config
-load; nothing checks that any usable time survives between the fence firing and the lease expiring. The
-real margin is `ttl - fence` *minus* the renew round trip (the fence baseline is taken after the renew
-returns, while the expiry is stamped on the database clock at statement execution) *minus* up to one
-fence tick of detection lag — and graph teardown then has to fit in what remains. Tightening these
-proportionally keeps the ordering legal while shrinking that budget toward zero, and the failure mode
-is a longer overlap between an old and a new primary, not a config error. Keep headroom on a
+**Config load checks the ordering and the renew clamp against the margin, not that teardown fits.**
+`heartbeat < fence < ttl` is checked at config load. So, at least, is the detection margin, `ttl -
+fence - one fence tick`: a pair that leaves none is refused, and so is a renew clamp that does not
+fit inside it. On SQL Server load also refuses a config whose lease claim's pool wait plus its
+statement timeout reaches the margin, stepping a derived clamp down to a whole second that fits
+first (BACKLOG #5979). Load does not check that graph teardown fits in what is left, and on SQL
+Server it does not cover the claim's cursor creation or its COMMIT. The real margin is `ttl - fence`
+*minus* the renew round trip (the fence baseline is taken after the renew returns, while the expiry is
+stamped on the database clock at statement execution) *minus* up to one fence tick of detection lag —
+and graph teardown then has to fit in what remains. Tightening these proportionally can pass every
+load check while shrinking that teardown budget toward zero, and the failure mode there is a longer
+overlap between an old and a new primary, not a config error. Keep headroom on a
 synchronous-commit or cross-AZ database.
 
 Because the **leadership** lease is evaluated on the **database's** clock, node clock skew does not

@@ -284,6 +284,9 @@ _NO_KEY: dict[str, str] = {
     "messagefoundry/pipeline/wiring_runner.py": _POSTURE_ONLY,
     "messagefoundry/api/app.py": _POSTURE_ONLY,
     "messagefoundry/api/security.py": _POSTURE_ONLY,
+    "messagefoundry/api/message_scope.py": "names store.crypto's refusal classes to classify a "
+    "refused read of a message's cells and to raise a fresh refusal for the export stream; it "
+    "calls no cipher and loads, resolves or holds no key, since the store backends open the cells",
     "messagefoundry/store/cipher_cells.py": "declares the cipher-covered cells and walks them "
     "read-only, decrypting each sealed value through a store cipher its caller built; it builds "
     "a cell's AAD, which is byte framing, and never loads, resolves or holds a key itself",

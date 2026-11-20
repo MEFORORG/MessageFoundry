@@ -22,8 +22,13 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 from uuid import uuid4
 
-from messagefoundry.store.cell_tag import MESSAGE_TAG_FAILED_ACTION, PRESET_TAG_FAILED_ACTION
+from messagefoundry.store.cell_tag import (
+    MESSAGE_TAG_FAILED_ACTION,
+    PRESET_TAG_FAILED_ACTION,
+    CellTagError,
+)
 from messagefoundry.store.content_search import make_spec
+from messagefoundry.store.crypto import CipherError, generate_key, make_cipher
 from messagefoundry.store.store import MessageStatus, OutboxStatus, Stage
 from tests._store_audit import no_operator_audit
 
@@ -191,6 +196,361 @@ async def assert_cell_tag_contract(store: Any, raw: RawSql, fetch: RawFetch) -> 
 
     # --- presets: one moved to another owner is refused ----------------------------------------
     await _assert_presets(store, raw, fetch, hook)
+
+    # --- a cell under a key the store does not hold is withheld from a list --------------------
+    await _assert_foreign_key_cells(store, raw)
+    # --- a substituted cell under a held key still fails a list read loudly --------------------
+    await _assert_substituted_listed_cells(store, raw, fetch)
+    # --- under Transit, only a refusal naming a key version withholds a listed cell ----------
+    await _assert_transit_listed_refusals(store, raw, fetch)
+
+
+#: Vault's 400 texts for a Transit data-key decrypt, read 2026-11-19 from Vault ``main``
+#: (``sdk/helper/keysutil/policy.go``, ``builtin/logical/transit/path_decrypt.go``). The first
+#: two name a retired or unknown key version, so a list withholds the cell; the rest are a
+#: missing configured key or a malformed, truncated or rewritten cell, which must fail the list
+#: read (BACKLOG #5970, owner ruling 2026-11-19).
+_TRANSIT_KEY_REFUSALS = (
+    "ciphertext or signature version is disallowed by policy (too old)",
+    "invalid ciphertext: version is too new",
+)
+_TRANSIT_LOUD_REFUSALS = (
+    "encryption key not found",
+    "invalid ciphertext: could not decode base64",
+    "invalid ciphertext length",
+    "invalid ciphertext: version number could not be decoded",
+    "invalid ciphertext: wrong number of fields",
+    "invalid ciphertext: no prefix",
+)
+
+
+class _TransitShaped:
+    """The store's own cipher, shown to the store as the Vault Transit cipher is: it names no keys
+    (no ``holds_key_for``, ``names_no_keys``), and each planted value is refused with the error
+    :class:`~messagefoundry.store.crypto_transit.TransitCipher` raises for Vault's 400 with that
+    text. Every other value goes to the real cipher, so the rest of the store still reads."""
+
+    names_no_keys = True
+
+    def __init__(self, real: Any, refusal: Callable[[str], CipherError]) -> None:
+        self._real = real
+        self._refusal = refusal
+        self.planted: dict[str, str] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        if name in ("holds_key_for", "named_key_id"):
+            raise AttributeError(name)
+        return getattr(self._real, name)
+
+    def decrypt(self, stored: str, **kw: Any) -> str:
+        if stored in self.planted:
+            raise self._refusal(self.planted[stored])
+        return self._real.decrypt(stored, **kw)
+
+
+async def _assert_transit_listed_refusals(store: Any, raw: RawSql, fetch: RawFetch) -> None:
+    """BACKLOG #5970, owner ruling 2026-11-19: under Transit a list read withholds a cell only
+    where Vault's refusal names a retired or unknown key version. Any other refusal, such as the
+    configured key not found, an invalid or truncated ciphertext or a ``vault:vN`` version that
+    does not decode, fails the read on every list path: messages list, content search,
+    ``queue.last_error``, ``connection_event.reason`` and ``alert_instance.reason``. Each planted
+    cell is put back after, and each list has an untouched row beside it."""
+    try:
+        from hvac.exceptions import (  # type: ignore[import-untyped]  # noqa: PLC0415
+            InvalidRequest,
+        )
+    except ImportError:
+        return  # a leg without the [vault] extra cannot build Vault's 400
+    from messagefoundry.store.crypto_transit import _transit_failure  # noqa: PLC0415
+
+    def refusal(text: str) -> CipherError:
+        try:
+            raise InvalidRequest(errors=[text])
+        except InvalidRequest as exc:
+            error = _transit_failure("decrypt", "mefor-store", exc)
+            error.__cause__ = exc
+            return error
+
+    real = store._cipher
+    shaped = _TransitShaped(real, refusal)
+
+    def plant(text: str) -> str:
+        value = f"mfenc:v3:vault:v1:SYNTH-{uuid4().hex}"
+        shaped.planted[value] = text
+        return value
+
+    ch, out = f"IB_CT_V_{_RUN}", f"OB_CT_V_{_RUN}"
+    m, mctl = await _message(store, ch), await _message(store, ch)
+    for _ in range(2):
+        await store.enqueue_message(channel_id=f"IB_CT_Y_{_RUN}", raw=_RAW, deliveries=[(out, "B")])
+        item = await store.claim_next_fifo(out)
+        assert item is not None
+        await store.dead_letter_now(item.id, "synthetic permanent reject")
+    qa, qb = [
+        r["outbox_id"] for r in await store.list_dead(destination_name=out, allowed_channels=None)
+    ]
+    planted, kept = f"IB_CT_W_{_RUN}", f"IB_CT_X_{_RUN}"
+    for conn in (planted, kept):
+        await store.record_connection_event(
+            connection=conn, transport="mllp", direction="in", kind="closed", reason="SYNTH-REASON"
+        )
+        await store.upsert_alert_instance(
+            event_type="connection_error", connection=conn, severity="warning", reason="SYNTH-ALERT"
+        )
+    [summary] = [r["summary"] for r in await fetch("SELECT summary FROM messages WHERE id=?", (m,))]
+    [last_error] = [
+        r["last_error"] for r in await fetch("SELECT last_error FROM queue WHERE id=?", (qa,))
+    ]
+    reasons = {
+        table: next(
+            r["reason"]
+            for r in await fetch(
+                f"SELECT reason FROM {table} WHERE connection=?",  # noqa: S608
+                (planted,),
+            )
+        )
+        for table in ("connection_event", "alert_instance")
+    }
+
+    async def messages_list() -> list[dict[str, Any]]:
+        return list(await store.list_messages(channel_id=ch, allowed_channels=None))
+
+    async def content_search() -> list[dict[str, Any]]:
+        spec = make_spec(content="SYNTH-200", field_path=None, field_value=None)
+        return list((await store.search_messages(spec, channel_id=ch, allowed_channels=None)).rows)
+
+    async def dead_list() -> list[dict[str, Any]]:
+        return list(await store.list_dead(destination_name=out, allowed_channels=None))
+
+    async def events() -> list[Any]:
+        return list(await store.list_connection_events(connection=planted, allowed_channels=None))
+
+    async def alerts() -> list[Any]:
+        found = await store.list_active_alert_instances(allowed_channels=[planted, kept])
+        return [a for a in found if a.connection in (planted, kept)]
+
+    # (the statement that plants and puts back, its row, the put-back parameters, the list read)
+    cases: list[
+        tuple[str, tuple[Any, ...], tuple[Any, ...], Callable[[], Awaitable[list[Any]]]]
+    ] = [
+        ("UPDATE messages SET summary=? WHERE id=?", (m,), (summary, m), messages_list),
+        ("UPDATE messages SET summary=? WHERE id=?", (m,), (summary, m), content_search),
+        ("UPDATE queue SET last_error=? WHERE id=?", (qa,), (last_error, qa), dead_list),
+        (
+            "UPDATE connection_event SET reason=? WHERE connection=?",
+            (planted,),
+            (reasons["connection_event"], planted),
+            events,
+        ),
+        (
+            "UPDATE alert_instance SET reason=? WHERE connection=?",
+            (planted,),
+            (reasons["alert_instance"], planted),
+            alerts,
+        ),
+    ]
+    store._cipher = shaped
+    try:
+        for sql, where, put_back, read in cases:
+            for text in (*_TRANSIT_KEY_REFUSALS, *_TRANSIT_LOUD_REFUSALS):
+                loud = text in _TRANSIT_LOUD_REFUSALS
+                await raw(sql, (plant(text), *where))
+                try:
+                    rows = await read()
+                except CellTagError as exc:
+                    raise AssertionError(
+                        f"{read.__name__}: {text!r} read as a tag failure"
+                    ) from exc
+                except CipherError:
+                    assert loud, f"{read.__name__}: a key refusal failed the read: {text!r}"
+                    continue
+                finally:
+                    await raw(sql, put_back)
+                assert not loud, f"{read.__name__}: {text!r} was withheld, not refused"
+                _assert_withheld(read.__name__, rows, m=m, mctl=mctl, qa=qa, qb=qb)
+    finally:
+        store._cipher = real
+    # Control: with the cells put back every list reads in full again.
+    assert {r["id"]: r for r in await messages_list()}[m]["summary"] == "SYNTH-SUMMARY"
+    assert all(r["last_error"] is not None for r in await dead_list())
+    assert [e.reason for e in await events()] == ["SYNTH-REASON"]
+    assert {a.reason for a in await alerts()} == {"SYNTH-ALERT"}
+
+
+def _assert_withheld(name: str, rows: list[Any], *, m: str, mctl: str, qa: str, qb: str) -> None:
+    """The planted cell is withheld and its untouched sibling reads (the control)."""
+    if name == "messages_list":
+        listed = {r["id"]: r for r in rows}
+        assert listed[m]["summary"] is None and listed[mctl]["summary"] == "SYNTH-SUMMARY"
+    elif name == "content_search":
+        assert {r["id"] for r in rows} == {mctl}
+    elif name == "dead_list":
+        listed = {r["outbox_id"]: r for r in rows}
+        assert listed[qa]["last_error"] is None and listed[qb]["last_error"] is not None
+    elif name == "events":
+        assert [e.reason for e in rows] == [None]
+    else:
+        assert sorted((a.reason or "") for a in rows) == ["", "SYNTH-ALERT"]
+
+
+async def _assert_foreign_key_cells(store: Any, raw: RawSql) -> None:
+    """BACKLOG #5969, #5970: a cell sealed under a key the store does not hold raises a plain
+    :class:`CipherError`, not a tag failure. A by-id read still raises it, for the API to answer;
+    a list withholds that row's cell and lists the rest, where it used to fail the whole page.
+    Each list has an untouched row beside the planted one as its control."""
+    foreign = make_cipher(generate_key(), write_v2=True).encrypt("SYNTH-FOREIGN")
+    ch = f"IB_CT_F_{_RUN}"
+
+    # The scope read opens no cell, so it answers for a message whose cells cannot be opened.
+    fm = await _message(store, ch)
+    fctl = await _message(store, ch)
+    assert await store.message_channel_id(fm) == ch
+    assert await store.message_channel_id(f"no-such-{_RUN}") is None
+    await raw("UPDATE messages SET summary=? WHERE id=?", (foreign, fm))
+    try:
+        await store.get_message(fm)
+    except CellTagError as exc:
+        raise AssertionError("a foreign-key cell read as a tag failure") from exc
+    except CipherError:
+        pass
+    else:
+        raise AssertionError("a foreign-key cell was opened")
+    listed = {r["id"]: r for r in await store.list_messages(channel_id=ch, allowed_channels=None)}
+    assert listed[fctl]["summary"] == "SYNTH-SUMMARY"  # control
+    assert listed[fm]["summary"] is None and listed[fm]["error"] is None
+    assert listed[fm]["metadata"] is None
+    # Content search leaves the row out, as it does a failed tag, and still finds its sibling.
+    found = await store.search_messages(
+        make_spec(content="SYNTH-200", field_path=None, field_value=None),
+        channel_id=ch,
+        allowed_channels=None,
+    )
+    assert {r["id"] for r in found.rows} == {fctl}
+
+    # Dead letters: a foreign last_error is withheld; the row and its sibling still list.
+    out = f"OB_CT_F_{_RUN}"
+    for _ in range(2):
+        await store.enqueue_message(channel_id=ch, raw=_RAW, deliveries=[(out, "B")])
+        item = await store.claim_next_fifo(out)
+        assert item is not None
+        await store.dead_letter_now(item.id, "synthetic permanent reject")
+    dead = await store.list_dead(destination_name=out, allowed_channels=None)
+    assert len(dead) == 2
+    await raw("UPDATE queue SET last_error=? WHERE id=?", (foreign, dead[0]["outbox_id"]))
+    reread = {
+        r["outbox_id"]: r
+        for r in await store.list_dead(destination_name=out, allowed_channels=None)
+    }
+    assert reread[dead[0]["outbox_id"]]["last_error"] is None
+    assert reread[dead[1]["outbox_id"]]["last_error"] is not None  # control
+
+    # Connection events and alert instances: a foreign reason is withheld, its sibling reads.
+    planted, kept = f"IB_CT_G_{_RUN}", f"IB_CT_H_{_RUN}"
+    for conn in (planted, kept):
+        await store.record_connection_event(
+            connection=conn, transport="mllp", direction="in", kind="closed", reason="SYNTH-REASON"
+        )
+        await store.upsert_alert_instance(
+            event_type="connection_error", connection=conn, severity="warning", reason="SYNTH-ALERT"
+        )
+    await raw("UPDATE connection_event SET reason=? WHERE connection=?", (foreign, planted))
+    await raw("UPDATE alert_instance SET reason=? WHERE connection=?", (foreign, planted))
+    for conn, want in ((planted, None), (kept, "SYNTH-REASON")):
+        [event] = await store.list_connection_events(connection=conn, allowed_channels=None)
+        assert event.reason == want, conn
+    alerts = {
+        a.connection: a
+        for a in await store.list_active_alert_instances(allowed_channels=None)
+        if a.connection in (planted, kept)
+    }
+    assert alerts[planted].reason is None
+    assert alerts[kept].reason == "SYNTH-ALERT"  # control
+    # A by-id alert read (the ack, resolve, suspend and resume echoes) is not a list: the owner's
+    # ruling covers list reads only, so it still raises on the cell, as before #5970.
+    try:
+        await store.get_alert_instance(alerts[planted].id, allowed_channels=None)
+    except CellTagError as exc:
+        raise AssertionError("a foreign-key alert reason read as a tag failure") from exc
+    except CipherError:
+        pass
+    else:
+        raise AssertionError("a by-id alert read withheld a reason the store's keys refused")
+    echoed = await store.get_alert_instance(alerts[kept].id, allowed_channels=None)
+    assert echoed is not None and echoed.reason == "SYNTH-ALERT"  # control
+
+
+async def _assert_list_fails(read: Awaitable[object]) -> None:
+    """The list read raises the cipher's own error, neither a tag error nor a withheld cell."""
+    try:
+        await read
+    except CellTagError as exc:
+        raise AssertionError(
+            "a substituted cell on an untagged table read as a CellTagError"
+        ) from exc
+    except CipherError:
+        return
+    raise AssertionError("a substituted cell under a held key was withheld, not refused")
+
+
+async def _assert_substituted_listed_cells(store: Any, raw: RawSql, fetch: RawFetch) -> None:
+    """BACKLOG #5970 withholds only a key or format refusal. A cell copied from a sibling row,
+    sealed under a key the store holds but for the sibling's cell, fails its tag: on the queue,
+    connection_event and alert_instance tables, which have no tag-failed audit or alert, the list
+    read still fails with the cipher's error, so the tamper is not hidden as a withheld cell. Each
+    planted cell is put back after, so later lists on the same store still read."""
+    ch, out = f"IB_CT_S_{_RUN}", f"OB_CT_S_{_RUN}"
+    for _ in range(2):
+        await store.enqueue_message(channel_id=ch, raw=_RAW, deliveries=[(out, "B")])
+        item = await store.claim_next_fifo(out)
+        assert item is not None
+        await store.dead_letter_now(item.id, "synthetic permanent reject")
+    a, b = [
+        r["outbox_id"] for r in await store.list_dead(destination_name=out, allowed_channels=None)
+    ]
+    rows = {
+        r["id"]: r["last_error"]
+        for r in await fetch("SELECT id, last_error FROM queue WHERE id IN (?, ?)", (a, b))
+    }
+    await raw("UPDATE queue SET last_error=? WHERE id=?", (rows[b], a))
+    await _assert_list_fails(store.list_dead(destination_name=out, allowed_channels=None))
+    await raw("UPDATE queue SET last_error=? WHERE id=?", (rows[a], a))
+    assert len(await store.list_dead(destination_name=out, allowed_channels=None)) == 2  # control
+
+    planted, kept = f"IB_CT_T_{_RUN}", f"IB_CT_U_{_RUN}"
+    for conn in (planted, kept):
+        await store.record_connection_event(
+            connection=conn, transport="mllp", direction="in", kind="closed", reason="SYNTH-REASON"
+        )
+        await store.upsert_alert_instance(
+            event_type="connection_error", connection=conn, severity="warning", reason="SYNTH-ALERT"
+        )
+    for table in ("connection_event", "alert_instance"):
+        sealed = {
+            r["connection"]: r["reason"]
+            for r in await fetch(
+                f"SELECT connection, reason FROM {table} WHERE connection IN (?, ?)",  # noqa: S608
+                (planted, kept),
+            )
+        }
+        await raw(
+            f"UPDATE {table} SET reason=? WHERE connection=?",  # noqa: S608
+            (sealed[kept], planted),
+        )
+        await _assert_list_fails(
+            store.list_connection_events(connection=planted, allowed_channels=None)
+            if table == "connection_event"
+            else store.list_active_alert_instances(allowed_channels=None)
+        )
+        await raw(
+            f"UPDATE {table} SET reason=? WHERE connection=?",  # noqa: S608
+            (sealed[planted], planted),
+        )
+    [event] = await store.list_connection_events(connection=planted, allowed_channels=None)
+    assert event.reason == "SYNTH-REASON"  # control: the put-back cell opens
+    assert any(
+        a.connection == planted and a.reason == "SYNTH-ALERT"
+        for a in await store.list_active_alert_instances(allowed_channels=None)
+    )
 
 
 async def _routed(store: Any, fetch: RawFetch, channel_id: str) -> tuple[str, str]:

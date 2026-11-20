@@ -158,6 +158,8 @@ def _build_client(
     revocation_attested: bool,
     posture: HopPosture | None = None,
     revocation_reason: str | None = None,
+    timeout: float | tuple[float, float] | None = None,
+    ca_kwargs: Mapping[str, str] | None = None,
 ) -> Any:
     """Construct an ``hvac.Client``. Factored out so tests can substitute a fake Transit backend without
     a live Vault. ``addr`` and ``token`` are REQUIRED and always passed to hvac (BACKLOG #2851):
@@ -170,7 +172,10 @@ def _build_client(
 
     ``posture`` is the instance posture the caller was handed, or ``None``. ``None`` counts as
     enforcing, so leaving it out is the strict answer. ``revocation_reason`` is the attestation's
-    reason, for the one line an attested crossing logs."""
+    reason, for the one line an attested crossing logs. ``timeout`` is the requests timeout every
+    request takes; ``None`` leaves hvac's own default (BACKLOG #5983). ``ca_kwargs`` is what
+    :func:`_vault_ca_kwargs` returned for ``addr`` when the caller read it once to build several
+    clients alike (BACKLOG #5963); ``None`` reads it here."""
     # The backstop for a caller that did not read through those two functions.
     if not addr:
         raise KeyProviderError(_ADDR_UNSET)
@@ -206,12 +211,26 @@ def _build_client(
     # #1180 (ASVS 12.3.4) rides in the SAME dict: narrow the trust anchor when the operator named
     # one, omitting the keyword when they did not so the stock construction is unchanged. Putting it
     # here rather than at the call means the operator's CA is inside what the assertion below sees.
+    #
+    # A caller's ``ca_kwargs`` may carry ``verify`` alone, which is all _vault_ca_kwargs returns. Any
+    # other key is refused, and the mapping is spread BEFORE the fixed keys, so it can never replace
+    # the address, the token or the no-redirect policy (BACKLOG #5963).
+    if ca_kwargs is None:
+        ca_kwargs = _vault_ca_kwargs(addr)
+    elif not set(ca_kwargs) <= {"verify"}:
+        raise ValueError(
+            "a Vault client's ca_kwargs may carry only 'verify'; refused keys: "
+            + ", ".join(sorted(repr(key) for key in set(ca_kwargs) - {"verify"}))
+        )
     kwargs: dict[str, object] = {
+        **ca_kwargs,
         "url": addr,
         "token": token,
         "allow_redirects": False,
-        **_vault_ca_kwargs(addr),
     }
+    if timeout is not None:
+        # Omitted when unset, so the stock construction is unchanged (BACKLOG #5983).
+        kwargs["timeout"] = timeout
     # ASVS 12.1.2 (BACKLOG #1317, ADR 0180; BACKLOG #300): hvac exposes no SSLContext, so the
     # assertion returns a factory that BUILDS this hop's context, narrows it to the approved suites
     # and asserts it, once per connection. It runs it once here, so a bad list raises ValueError at

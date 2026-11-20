@@ -73,6 +73,7 @@ from messagefoundry.config.settings import (
     StoreBackend,
     StorePrivilegeStatus,
     StoreSettings,
+    _clamped_statement_timeout,
 )
 from messagefoundry.config.tls_policy import HopPosture, StoreTlsRefused, current_hop_posture
 from messagefoundry.connection_events import check_connection_event_kind
@@ -114,13 +115,16 @@ from messagefoundry.store.cell_tag import (
     dead_letters_on_cell_tag,
     is_row_tagged,
     message_cell_aad,
+    open_listed_cell,
     open_message_cell,
+    open_message_record,
     open_preset_criteria,
     preset_criteria_aad,
     report_cell_tag_failures,
     row_tag_aad,
     row_tag_columns,
     withhold_message_cells,
+    withhold_refused_cell,
 )
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
@@ -243,7 +247,10 @@ from messagefoundry.store.store import (
     REINGRESS_ARTIFACT_ERASED,
     REINGRESS_ARTIFACT_MISSING,
     REINGRESS_PEEK_FAILED,
+    REINGRESS_READ_TAG_FAILURE_OUTCOME,
+    REINGRESS_TAG_FAILURE_OUTCOME,
     REINGRESS_TARGET_PREFIX,
+    REINGRESS_TOKEN_TAG_FAILED,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
     VIEWED_EVENT,
@@ -1117,20 +1124,6 @@ def _applock_timeout_ms(command_timeout: int) -> int:
 #: at a fixed bound that none does. It stays short enough that ``safe_exc``'s default limit keeps
 #: the whole rendered message, at any timeout (BACKLOG #5064).
 CLAMPED_BORROW_ADVICE = "its [cluster] clamp's setting, if any (docs/CONFIGURATION.md [cluster])"
-
-
-def _clamped_statement_timeout(clamp_seconds: float, command_timeout: int) -> int:
-    """The whole-second pyodbc statement timeout for a statement clamped below ``command_timeout``
-    (ADR 0157 Inc 0: the cluster coordinator's maintenance loop and stepdown, BACKLOG #5064).
-
-    pyodbc's ``Connection.timeout`` is an integer, so the clamp rounds DOWN, never up: a bound that
-    rounded up could land past the detection margin the clamp was checked against. It never drops
-    below 1, because 0 means no limit at all. A clamp under one second cannot be expressed, and
-    ``ServiceSettings._sqlserver_renew_clamp_whole_seconds`` refuses one at config load. A
-    ``command_timeout`` shorter than the clamp still wins, and ``command_timeout == 0`` (no limit)
-    leaves the clamp as the only bound."""
-    whole = max(1, math.floor(clamp_seconds))
-    return min(whole, command_timeout) if command_timeout > 0 else whole
 
 
 def _restore_statement_timeout(raw: Any, previous: int) -> None:
@@ -3498,6 +3491,10 @@ class SqlServerStore:
     # re-ingress worker on this backend.
     supports_response_capture = True
 
+    # No per-namespace state version, so converge_state_cache is a no-op and the engine must not run or
+    # announce a convergence loop over this backend (BACKLOG #5984).
+    converges_transform_state = False
+
     # Pass-through (PT) re-ingress (the `pt_deliveries` branch of transform_handoff, ADR 0013
     # generalized) is implemented at full SQLite parity: the atomic PT-child + parent-marker branch runs
     # inside transform_handoff's transaction (see _insert_passthrough_child_mssql / _insert_passthrough_
@@ -5804,6 +5801,17 @@ class SqlServerStore:
         return bool(row is not None and row[0] == expected)
 
     async def close(self) -> None:
+        try:
+            await self._close_handles()
+        finally:
+            # BACKLOG #5963: tell a cipher holding Vault sockets (the Transit cipher) the store is
+            # closing, even when a step above raised. close_connections says what it closes, and
+            # that is not every thread's. Read by name: the store does not import the cipher.
+            release = getattr(self._cipher, "close_connections", None)
+            if callable(release):
+                release()
+
+    async def _close_handles(self) -> None:
         # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
@@ -8631,9 +8639,12 @@ class SqlServerStore:
                 kind=r["kind"],
                 peer_host=r["peer_host"],
                 message_id=r["message_id"],
-                reason=self._dec(
+                # BACKLOG #5970: only a reason under a key the store does not hold is withheld.
+                reason=open_listed_cell(
+                    self._cipher,
                     r["reason"],
-                    aad=cell_aad("connection_event", "reason", r["connection"], r["ts"], r["kind"]),
+                    cell_aad("connection_event", "reason", r["connection"], r["ts"], r["kind"]),
+                    table="connection_event",
                 ),
             )
             for r in rows
@@ -8747,7 +8758,7 @@ class SqlServerStore:
             " ORDER BY last_seen DESC, id DESC",
             tuple(params),
         )
-        return [self._alert_instance_row(r) for r in rows]
+        return [self._alert_instance_row(r, listed=True) for r in rows]
 
     async def summarize_active_alert_instances(
         self, *, allowed_channels: Sequence[str] | None
@@ -8780,9 +8791,10 @@ class SqlServerStore:
             f" escalation_tier FROM alert_instance{clause}",
             tuple(params),
         )
-        return self._alert_instance_row(row) if row is not None else None
+        return self._alert_instance_row(row, listed=False) if row is not None else None
 
-    def _alert_instance_row(self, r: dict[str, Any]) -> AlertInstance:
+    def _alert_instance_row(self, r: dict[str, Any], *, listed: bool) -> AlertInstance:
+        aad = cell_aad("alert_instance", "reason", r["event_type"], r["connection"])
         return AlertInstance(
             id=int(r["id"]),
             event_type=r["event_type"],
@@ -8792,9 +8804,12 @@ class SqlServerStore:
             first_seen=float(r["first_seen"]),
             last_seen=float(r["last_seen"]),
             count=int(r["count"]),
-            reason=self._dec(
-                r["reason"],
-                aad=cell_aad("alert_instance", "reason", r["event_type"], r["connection"]),
+            # BACKLOG #5970: on a list read only, a reason under a key the store does not hold is
+            # withheld; a by-id read raises every refusal, as before (owner ruling 2026-11-19).
+            reason=(
+                open_listed_cell(self._cipher, r["reason"], aad, table="alert_instance")
+                if listed
+                else self._dec(r["reason"], aad=aad)
             ),
             acked_by=r["acked_by"],
             acked_at=r["acked_at"],
@@ -9113,10 +9128,13 @@ class SqlServerStore:
         dead-lettered (and the token still consumed; one whose reply is erased is also blanked). The
         re-ingress message id is content-addressed (deterministic), so a re-run never double-inserts the
         child. An origin whose metadata cell fails its row tag (BACKLOG #2593) is consumed like a
-        corrupt ref, and the failure is audited once the transaction has closed. A ``peek_failed``
+        corrupt ref, and the failure is audited once the transaction has closed; so is a work-row
+        whose own ``payload`` fails its queue tag (:data:`REINGRESS_TOKEN_TAG_FAILED`, BACKLOG
+        #5982), which is also alerted. A ``peek_failed``
         child stores ``refused_raw`` and ``refused_metadata`` as :meth:`QueueStore.ingress_handoff`
         says (vault BACKLOG #4796)."""
         tag_failures: list[CellTagError] = []
+        queue_tag_rows: list[tuple[dict[str, Any], QueueTagError]] = []
         try:
             return await self._ingress_handoff_txn(
                 response_row_id=response_row_id,
@@ -9131,9 +9149,14 @@ class SqlServerStore:
                 refused_metadata=refused_metadata,
                 now=time.time() if now is None else now,
                 tag_failures=tag_failures,
+                queue_tag_rows=queue_tag_rows,
             )
         finally:
             await report_cell_tag_failures(self, tag_failures)
+            for row, error in queue_tag_rows:  # BACKLOG #5982: after the transaction, as above
+                await report_queue_tag_failure(
+                    self, self._cipher, row, error=error, outcome=REINGRESS_TAG_FAILURE_OUTCOME
+                )
 
     async def _ingress_handoff_txn(
         self,
@@ -9150,9 +9173,11 @@ class SqlServerStore:
         refused_metadata: Mapping[str, Any] | None,
         now: float,
         tag_failures: list[CellTagError],
+        queue_tag_rows: list[tuple[dict[str, Any], QueueTagError]],
     ) -> bool:
         """:meth:`ingress_handoff`'s one transaction. An origin tag failure is appended to
-        ``tag_failures`` for the caller to audit."""
+        ``tag_failures``, and a work-row whose own payload failed its queue tag, before its dead-letter,
+        to ``queue_tag_rows`` (BACKLOG #5982), for the caller to audit."""
         # ADR 0157 C1: every DEAD branch below is TERMINAL on a claimed RESPONSE work-row AND
         # finalize the origin, so each is guarded. The SUCCESS path is deliberately NOT guarded: it
         # ADMITS a message, and fencing it would turn a permitted duplicate into a LOST re-ingress.
@@ -9206,11 +9231,20 @@ class SqlServerStore:
 
                 # (2) Decrypt + parse the artifact ref; ANY failure -> consume-and-dead-letter.
                 try:
-                    ref = (
-                        self._cipher.decrypt(work_row["payload"], aad=queue_row_aad(work_row)) or ""
-                    )
+                    ref = open_queue_cell(self._cipher, work_row) or ""
                     origin_msg_id, dest, seq_s = ref.split("\x1f")
                     seq = int(seq_s)
+                except QueueTagError as err:
+                    # BACKLOG #5982: dead-lettered like a corrupt reference, then audited and
+                    # alerted as a claim reports a tag failure, after the transaction. Queued
+                    # first, so a dead-letter write that fails is still reported.
+                    # Without its traceback, so the queued error holds no frame of this transaction.
+                    queue_tag_rows.append((work_row, err.with_traceback(None)))
+                    return await _consume_dead(
+                        "ingress_handoff(tag-failed)",
+                        REINGRESS_TOKEN_TAG_FAILED,
+                        "re-ingress work-row failed its integrity check",
+                    )
                 except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
                     return await _consume_dead(
                         "ingress_handoff(corrupt-ref)",
@@ -9440,14 +9474,22 @@ class SqlServerStore:
         worker's HL7 peek. ``None`` if the work-row is missing/consumed or its ref is unparseable; ``''``
         if the artifact row is missing, its body was erased, or the reply was empty, as on SQLite.
         Reads the SAME immutable artifact ``ingress_handoff``
-        re-reads, so the peek and the persisted raw always agree."""
+        re-reads, so the peek and the persisted raw always agree. A token whose ``payload`` fails its
+        own tag is audited, alerted and raised as :class:`QueueTagError`, as on SQLite (BACKLOG
+        #5982)."""
         row = await self._fetchone(
             f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=?",
             (response_row_id, Stage.RESPONSE.value),
         )
         if row is None:
             return None
-        ref = self._cipher.decrypt(row["payload"], aad=queue_row_aad(row)) or ""
+        try:
+            ref = open_queue_cell(self._cipher, row) or ""
+        except QueueTagError as err:
+            await report_queue_tag_failure(
+                self, self._cipher, row, error=err, outcome=REINGRESS_READ_TAG_FAILURE_OUTCOME
+            )
+            raise
         try:
             mid, dest, seq_s = ref.split("\x1f")
             seq = int(seq_s)
@@ -9503,7 +9545,15 @@ class SqlServerStore:
 
     async def _load_state_cache(self) -> None:
         """Warm the transform-state read-through cache from the ``state`` table at open (ADR 0005)."""
-        rows = await self._fetchall("SELECT namespace, [key], value FROM state")
+        self._state_cache = self._decode_state_rows(
+            await self._fetchall("SELECT namespace, [key], value FROM state")
+        )
+
+    def _decode_state_rows(
+        self, rows: Sequence[Mapping[str, Any]]
+    ) -> MutableMapping[tuple[str, str], Any]:
+        """Decrypt ``state`` rows into a fresh sealed cache. Synchronous, so the promotion reload can run
+        it off the event loop."""
         cache = new_state_cache()  # sealed (BACKLOG #1174); the decrypt below still fails closed
         for r in rows:
             # #241 F2: UN-MASK the former silent-skip of unreadable state rows — that quietly dropped
@@ -9517,7 +9567,7 @@ class SqlServerStore:
                 aad=cell_aad("state", "value", r["namespace"], r["key"]),
                 table="state",
             )
-        self._state_cache = cache
+        return cache
 
     async def _load_state_cache_noting(self, folded_collation: str | None) -> None:
         """:meth:`_load_state_cache`, with a note on a ``CipherError`` naming the folding collation
@@ -9715,15 +9765,29 @@ class SqlServerStore:
         return refreshed
 
     async def converge_state_cache(self) -> list[str]:
-        """No-op on the SQL Server backend (Track B Step 6b): a single-node backend with no cross-node
-        state convergence (transform state IS written here via transform_handoff, but never converged
-        across nodes). Present for ``Store`` protocol completeness; returns ``[]``."""
+        """No-op on the SQL Server backend (Track B Step 6b): this backend has no per-namespace state
+        version, so it cannot read through another process's transform-state writes. Returns ``[]``.
+        :attr:`converges_transform_state` is ``False`` here, so the engine never runs the convergence
+        loop over it and warns instead where several processes share the store (BACKLOG #5984). An
+        active-passive promotion re-reads the whole cache through :meth:`reload_state_cache`."""
         return []
 
     def enable_state_convergence(self) -> None:
         """No-op on the SQL Server backend (Track B Step 6b): there is no cross-node convergence here, so
         there is no per-namespace version to bump. Present for ``Store`` protocol completeness."""
         return None
+
+    async def reload_state_cache(self) -> None:
+        """Re-read the whole transform-state cache from the shared ``state`` table (BACKLOG #5984).
+
+        SQL Server HA is active-passive: only the leader runs transforms, but a standby warmed its cache
+        at open, so on promotion it would serve state as of its own start while the prior leader went on
+        writing. The engine calls this on promotion, before the graph's workers start, so nothing reads
+        the cache mid-swap. The decrypt runs in a worker thread: the coordinator's lease renewal is
+        live by then, and a whole-table decrypt on the loop could stall it into a fence. It fails closed
+        like the open-time warm: a row it cannot decrypt raises, and the cache in place is kept."""
+        rows = await self._fetchall("SELECT namespace, [key], value FROM state")
+        self._state_cache = await asyncio.to_thread(self._decode_state_rows, rows)
 
     async def dead_letter_missing_handlers(
         self, valid_names: set[str], now: float | None = None
@@ -13557,18 +13621,14 @@ class SqlServerStore:
     async def get_message(self, message_id: str) -> dict[str, Any] | None:
         record = await self._fetchone("SELECT * FROM messages WHERE id=?", (message_id,))
         if record is not None:
-            # Decrypt for display: raw (the body), error (may embed raw HL7 fragments, H4), summary
-            # and metadata (EF-3 PHI). Each cell is bound to the row's id and channel (ASVS 11.3.3,
-            # BACKLOG #2593), so a cell that fails that tag refuses the whole read.
-            for column in ("raw", "error", "summary", "metadata"):
-                record[column] = open_message_cell(
-                    self._cipher,
-                    column,
-                    record[column],
-                    message_id=record["id"],
-                    channel_id=record["channel_id"],
-                )
+            # Off the event loop (BACKLOG #5981): under vault_transit each open is a blocking Vault
+            # call.
+            await asyncio.to_thread(open_message_record, self._cipher, record)
         return record
+
+    async def message_channel_id(self, message_id: str) -> str | None:
+        record = await self._fetchone("SELECT channel_id FROM messages WHERE id=?", (message_id,))
+        return None if record is None else str(record["channel_id"])
 
     @audits_cell_tag
     async def message_metadata_json(self, message_id: str) -> str | None:
@@ -13713,15 +13773,23 @@ class SqlServerStore:
             stored_raw = d.pop("raw", None)
 
             tag = {"message_id": d["id"], "channel_id": d["channel_id"]}
+            cell = d.get("summary")  # the cell being opened, which a refusal is judged on
             try:
-                d["summary"] = open_message_cell(self._cipher, "summary", d.get("summary"), **tag)
-                raw = open_message_cell(self._cipher, "raw", stored_raw, **tag)
+                d["summary"] = open_message_cell(self._cipher, "summary", cell, **tag)
+                cell = stored_raw
+                raw = open_message_cell(self._cipher, "raw", cell, **tag)
                 if not row_matches(spec, raw=raw, summary=d["summary"]):
                     continue
                 for column in ("error", "metadata"):
-                    d[column] = open_message_cell(self._cipher, column, d.get(column), **tag)
+                    cell = d.get(column)
+                    d[column] = open_message_cell(self._cipher, column, cell, **tag)
             except CellTagError as err:
                 failures.append(err)
+                continue
+            except CipherError as exc:
+                # BACKLOG #5970: a candidate sealed under a key the store does not hold is left
+                # out, as a failed tag is; any other cipher error raises (owner ruling 2026-11-19).
+                withhold_refused_cell(self._cipher, "messages", exc, cell)
                 continue
             out.append(d)
             if len(out) >= limit:
@@ -13752,8 +13820,12 @@ class SqlServerStore:
             # Mixed-table join: last_error is queue's (o.id → outbox_id), summary is the messages
             # row's (keyed by message_id and bound to the message's own channel, BACKLOG #2593) —
             # each binds to its own cell (ASVS 11.3.3).
-            r["last_error"] = self._dec(
-                r["last_error"], aad=cell_aad("queue", "last_error", r["outbox_id"])
+            # BACKLOG #5970: only a last_error under a key the store does not hold is withheld.
+            r["last_error"] = open_listed_cell(
+                self._cipher,
+                r["last_error"],
+                cell_aad("queue", "last_error", r["outbox_id"]),
+                table="queue",
             )
             withhold_message_cells(
                 self._cipher,

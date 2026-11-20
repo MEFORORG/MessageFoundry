@@ -36,7 +36,13 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
+from messagefoundry.store.crypto import (
+    MARKER_PREFIX,
+    CipherError,
+    CipherUnavailableError,
+    generate_key,
+    make_cipher,
+)
 from messagefoundry.store.store import MessageStore, RevokeResult
 from tests._admin_account import create_local_user_chosen
 from tests._bound_proof import prove, reproving_transport
@@ -489,6 +495,82 @@ async def test_a_session_revoked_mid_export_stops_the_stream(
     warnings = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.WARNING]
     assert "message export stopped after 1 of 2 rows: standing_changed" in warnings
     assert [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.ERROR] == []
+
+
+@pytest.mark.parametrize(
+    ("raised", "reason"),
+    [
+        (CipherError("retired key"), "cipher_refused"),
+        (CipherUnavailableError("vault down"), "key_service_unavailable"),
+    ],
+)
+async def test_a_row_the_keys_cannot_open_stops_the_export_on_the_record(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    raised: CipherError,
+    reason: str,
+) -> None:
+    """BACKLOG #5969: a second row whose cells the store's keys refuse stops the export with a
+    ``messages_export.stopped`` row naming why, rather than skipping it (a gap nothing records) or
+    leaving the stream as an unhandled ERROR."""
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value])
+    mid_a, mid_b = await _seed(engine)
+    real = engine.store.get_message
+
+    async def refusing(message_id: str) -> Any:
+        if message_id == mid_b:
+            raise raised
+        return await real(message_id)
+
+    monkeypatch.setattr(engine.store, "get_message", refusing)
+    caplog.set_level(logging.WARNING)
+    async with _client(engine, service, raise_app_exceptions=False) as c:
+        token = await _login(c, "op")
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
+    assert r.status_code == 200  # the response had started before the stop
+    assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
+    assert await _stop_rows(engine) == [{"selected": 2, "streamed": 1, "reason": reason}]
+    assert [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.ERROR] == []
+    # The refusal is logged by class only: no record at WARNING or above carries the caller's id.
+    refused = [
+        rec.getMessage() for rec in caplog.records if "could not be opened" in rec.getMessage()
+    ]
+    assert refused == [f"a message could not be opened: {type(raised).__name__}"], refused
+    assert not any(mid_b in rec.getMessage() for rec in caplog.records)
+
+
+async def test_a_failed_denial_audit_mid_export_is_not_recorded_as_a_cipher_refusal(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5970: a CipherError raised while the export writes the ``auth.channel_denied``
+    row of an out-of-scope id (a Transit audit MAC failing, say) is not the row's cells. The stop
+    row names ``audit_write_failed``, never ``cipher_refused``, and a WARNING says the audit row is
+    lost. Before the fix the export read every CipherError as a cell refusal."""
+    service = await _service(engine)
+    await _add_user(service, "op", [Role.OPERATOR.value], scope=["IB_A"])
+    mid_a, mid_b = await _seed(engine)
+    real = engine.store.record_audit
+
+    async def failing(action: str, **kw: Any) -> Any:
+        if action == "auth.channel_denied":
+            raise CipherError("Transit hmac failed (key='mefor-audit')")
+        return await real(action, **kw)
+
+    monkeypatch.setattr(engine.store, "record_audit", failing)
+    caplog.set_level(logging.WARNING)
+    async with _client(engine, service, raise_app_exceptions=False) as c:
+        token = await _login(c, "op")
+        r = await c.get("/messages/export", headers=_auth(token), params={"ids": [mid_a, mid_b]})
+    assert r.status_code == 200
+    assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
+    assert await _stop_rows(engine) == [
+        {"selected": 2, "streamed": 1, "reason": "audit_write_failed"}
+    ]
+    warnings = [rec.getMessage() for rec in caplog.records if rec.levelno == logging.WARNING]
+    assert any("that row is lost" in w and "CipherError" in w for w in warnings), warnings
+    assert all("mefor-audit" not in w for w in warnings)  # the class only, never the text
 
 
 async def test_a_store_fault_on_the_second_read_mid_export_still_records_the_stop(

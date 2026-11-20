@@ -22,7 +22,7 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
-from messagefoundry.parsing import Message, RawMessage
+from messagefoundry.parsing import Message, RawMessage, _builtin_hl7
 from messagefoundry.parsing.binary import (
     MARKER,
     BinaryCarriageError,
@@ -238,21 +238,28 @@ def test_extract_of_an_obx_less_group_on_an_unreadable_message_stays_the_obx_2_r
         extract_obx_document(msg, occurrence=2)
 
 
+def _write_msh_1_below_the_api(msg: Message, value: str) -> None:
+    """Write MSH-1 on the parsed tree directly. ``Message.set`` refuses to change a delimiter field
+    (BACKLOG #5972), so a multi-character MSH-1 now arises only below that API; the OBX helpers
+    still name it as the cause when it does."""
+    _builtin_hl7.set_field(msg._m, "MSH", 1, value)
+
+
 def test_iter_obx_documents_names_a_handler_written_msh_1_as_the_cause() -> None:
     """The detach scan shares the cause text: a two-character MSH-1 is named, not blamed on MSH-2."""
     msg = Message.parse(OBX_HL7)
     embed_obx_document(msg, b"data", data_subtype="PDF")
-    msg.set("MSH-1", "##")
+    _write_msh_1_below_the_api(msg, "##")
     with pytest.raises(UnreadableDelimitersError, match="^its first MSH's MSH-1 is not one"):
         list(iter_obx_documents(msg, received=OBX_HL7))
 
 
 @pytest.mark.parametrize("op", sorted(_DELIMITER_GUARDED))
 def test_obx_helpers_name_a_handler_written_msh_1_as_the_cause(op: str) -> None:
-    """BACKLOG #2873: a Handler that writes a two-character MSH-1 gets the MSH-1 cause named."""
+    """BACKLOG #2873: a two-character MSH-1 written below the Message API is named as the cause."""
     msg = Message.parse(OBX_HL7)
     embed_obx_document(msg, b"data", data_subtype="PDF")
-    msg.set("MSH-1", "##")
+    _write_msh_1_below_the_api(msg, "##")
     with pytest.raises(
         UnreadableDelimitersError, match="^its first MSH's MSH-1 is not one character,"
     ):

@@ -113,7 +113,19 @@ python -m tee naks --db ./tee.db
 Useful flags: `--corepoint-attempts` / `--corepoint-retry-delay` (quick retries before tripping
 fail-closed), `--connect-timeout` / `--send-timeout`, `--max-frame-bytes` (frame-size DoS cap),
 `--mefor-queue-max` (shadow buffer bound), `--capture-bodies` (persist full bodies — **test data only**),
-`-y/--yes` (skip the test-data-only confirmation for an unattended/service start), `--log-level`.
+`-y/--yes` (skip the test-data-only confirmation for an unattended/service start), `--log-level`,
+`--stop-grace` (default 30 seconds). On shutdown the relay stops ACKing new messages, then gives
+messages it has already ACKed up to the grace to finish their Corepoint and MEFOR legs, then gives
+the MEFOR shadow queue up to the grace again to drain. It cancels whatever is left at each deadline
+and logs it. An Epic message cut off after its ACK but before its Corepoint row is written is
+logged by control id and still gets a Corepoint row: a `transport_error` row (so `naks` lists it)
+while the forward is unfinished, or the forward's real outcome once it finished (a cut-off during
+that row's own write can leave the outcome recorded twice). A MEFOR copy dropped at the queue
+deadline, or a Corepoint-copy message cut off after its ACK, appears only in the log, by count.
+Keep twice the grace inside your service manager's stop timeout. A relay object is single-use: a
+second `start()` is refused, and a `stop()` requested before or during `start()` stays in force,
+so `serve_forever()` returns: a `start()` after the `stop()` opens nothing, and one the `stop()`
+interrupts tears down what it opened and serves nothing.
 
 ## The SQLite log
 

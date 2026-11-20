@@ -34,13 +34,14 @@ from pydantic import ValidationError
 from messagefoundry.config.settings import (
     ClusterSettings,
     StoreSettings,
+    _clamped_statement_timeout,
     _detection_margin_seconds,
+    _sqlserver_renew_reach_seconds,
     load_settings,
 )
 from messagefoundry.pipeline.cluster import build_coordinator
 from messagefoundry.pipeline.cluster_sqlserver import SqlServerCoordinator
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram
-from messagefoundry.store.sqlserver import _clamped_statement_timeout
 from tests._log_absence import assert_capture_sees
 
 # --- the whole-second conversion ---------------------------------------------
@@ -919,6 +920,11 @@ _POSTGRES = (
 )
 
 
+def _sqlserver_with_acquire_timeout(seconds: float) -> str:
+    """:data:`_SQLSERVER` with ``[store].acquire_timeout`` set, the pool wait the claim borrows under."""
+    return _SQLSERVER.replace("[cluster]", f"acquire_timeout = {seconds}\n[cluster]")
+
+
 def _load(tmp_path: Path, text: str) -> Any:
     cfg = tmp_path / "messagefoundry.toml"
     cfg.write_text(text, encoding="utf-8")
@@ -939,6 +945,124 @@ def test_a_sub_second_clamp_still_loads_on_postgres(tmp_path: Path) -> None:
     """Control: asyncpg takes a fractional timeout, so the refusal is SQL Server's alone."""
     s = _load(tmp_path, _POSTGRES + "lease_renew_timeout_seconds = 0.5\n")
     assert s.cluster.lease_renew_timeout_seconds == 0.5
+
+
+# --- BACKLOG #5979: the claim's two windows against the margin -------------------
+
+
+@pytest.mark.parametrize("clamp", [1.0, 1.2, 2.0, 3.25, 4.5, 4.99, 5.0, 8.9])
+@pytest.mark.parametrize(
+    ("acquire_timeout", "command_timeout"), [(30.0, 30), (0.5, 30), (3.0, 30), (30.0, 3), (30.0, 0)]
+)
+def test_the_settings_reach_is_what_the_store_applies(
+    clamp: float, acquire_timeout: float, command_timeout: int
+) -> None:
+    """The settings restate the store's bounds because config cannot import the store; this pins
+    the two together. ``_borrow`` is replaced so the wait the store would borrow under is read back
+    rather than retyped."""
+    store = _store(_Conn(), command_timeout=command_timeout, acquire_timeout=acquire_timeout)
+    store._borrow = lambda timeout, **_kw: timeout
+    borrow_timeout, statement_timeout, _ = store._clamp_bounds(clamp)
+    assert statement_timeout is not None
+    assert _sqlserver_renew_reach_seconds(clamp, acquire_timeout, command_timeout) == pytest.approx(
+        borrow_timeout + statement_timeout
+    )
+
+
+def test_a_clamp_inside_the_margin_whose_two_windows_reach_it_is_refused(tmp_path: Path) -> None:
+    """The defect: 5.0 < 9.0 passes ClusterSettings._renew_fits_the_margin, but on SQL Server the
+    claim waits up to 5 s for a connection and then runs a 5 s statement, 10 s past its issue."""
+    with pytest.raises(ValidationError) as caught:
+        _load(tmp_path, _SQLSERVER + "lease_renew_timeout_seconds = 5.0\n")
+    text = str(caught.value)
+    assert "for up to 10 s, which reaches the demotion detection margin (9 s)" in text
+    # Set by the operator, and a 1 s clamp would fit, so lowering it is offered.
+    assert "Lower lease_renew_timeout_seconds or unset it" in text
+
+
+def test_the_same_clamp_loads_on_postgres(tmp_path: Path) -> None:
+    """Control: on Postgres the wait and the statement share the clamp, so 5.0 is the bound."""
+    assert _load(tmp_path, _POSTGRES + "lease_renew_timeout_seconds = 5.0\n").cluster.enabled
+
+
+def test_a_shorter_pool_wait_brings_the_same_clamp_inside_the_margin(tmp_path: Path) -> None:
+    """Control on the term: a 3 s acquire_timeout makes the reach 3 + 5 = 8 s, under 9."""
+    text = _sqlserver_with_acquire_timeout(3.0)
+    s = _load(tmp_path, text + "lease_renew_timeout_seconds = 5.0\n")
+    assert s.cluster.lease_renew_timeout_seconds == 5.0
+
+
+def test_a_tight_pair_whose_derived_clamp_cannot_fit_is_refused_on_sqlserver(
+    tmp_path: Path,
+) -> None:
+    """Fence 4.0 / TTL 6.0 leaves 1.2 s; the derived 1.0 runs as a 1 s wait plus a 1 s statement.
+    Before BACKLOG #5979 this loaded and only warned."""
+    timings = (
+        "heartbeat_seconds = 1.0\nleader_fence_timeout_seconds = 4.0\n"
+        "leader_lease_ttl_seconds = 6.0\n"
+    )
+    with pytest.raises(ValidationError) as caught:
+        _load(tmp_path, _SQLSERVER + timings)
+    text = str(caught.value)
+    assert "lease_renew_timeout_seconds is not set, and no clamp of at least 1 s" in text
+    assert "margin (1.2 s)" in text
+    # Derived, so the message never tells the operator to lower a value they did not write.
+    assert "Lower lease_renew_timeout_seconds" not in text
+    _assert_names_the_fix_and_the_acquire_timeout_scope(text)
+    assert _load(tmp_path, _POSTGRES + timings).cluster.lease_renew_timeout_seconds == 1.0
+
+
+def _assert_names_the_fix_and_the_acquire_timeout_scope(text: str) -> None:
+    """The fix the refusal leads with is the fence/TTL gap. [store].acquire_timeout is named only
+    with its engine-wide scope, so an operator does not shorten every pooled borrow to pass a
+    [cluster] check (BACKLOG #5979)."""
+    assert "Widen the gap between leader_fence_timeout_seconds and leader_lease_ttl_seconds" in text
+    assert "or shorten [store].acquire_timeout" not in text
+    assert "bounds every pooled-connection borrow in the engine, not only this claim" in text
+
+
+def test_a_set_clamp_at_a_margin_no_clamp_fits_names_widening_alone(tmp_path: Path) -> None:
+    """Fence 4.0 / TTL 6.0 with 1.0 set by hand: even the 1 s floor runs as 2 s of a 1.2 s margin,
+    so lowering is not offered."""
+    timings = (
+        "heartbeat_seconds = 1.0\nleader_fence_timeout_seconds = 4.0\n"
+        "leader_lease_ttl_seconds = 6.0\nlease_renew_timeout_seconds = 1.0\n"
+    )
+    with pytest.raises(ValidationError) as caught:
+        _load(tmp_path, _SQLSERVER + timings)
+    text = str(caught.value)
+    assert "even a 1 s clamp, the SQL Server floor, runs for 2 s" in text
+    assert "Lower lease_renew_timeout_seconds" not in text
+    _assert_names_the_fix_and_the_acquire_timeout_scope(text)
+
+
+@pytest.mark.parametrize(
+    ("fence", "ttl", "expected"),
+    [
+        (10.0, 15.0, 1.0),  # margin 4.0: derived 2.0 runs as 2 + 2 s, so it steps to 1
+        (20.0, 27.0, 2.0),  # margin 6.0: derived 3.0 runs as 3 + 3 s
+        (20.0, 31.0, 4.0),  # margin 10.0: derived 5.0 (the ceiling) runs as 5 + 5 s
+        (20.0, 30.0, 4.5),  # control: the stock margin 9.0 keeps 4.5, which runs as 4.5 + 4 s
+    ],
+)
+def test_a_derived_clamp_steps_down_to_fit_an_even_margin(
+    tmp_path: Path, fence: float, ttl: float, expected: float
+) -> None:
+    """An even margin derives half of itself, which on SQL Server runs as exactly the margin. Such a
+    pair must load at a smaller whole-second clamp rather than be refused: the operator set no
+    clamp, and lowering all three timings proportionally is the documented way to tighten them.
+    Postgres is the control: there the derived value stands."""
+    timings = (
+        f"heartbeat_seconds = 5.0\nleader_fence_timeout_seconds = {fence}\n"
+        f"leader_lease_ttl_seconds = {ttl}\n"
+    )
+    s = _load(tmp_path, _SQLSERVER + timings)
+    clamp = s.cluster.lease_renew_timeout_seconds
+    assert clamp == expected
+    margin = _detection_margin_seconds(fence, ttl)
+    assert _sqlserver_renew_reach_seconds(clamp, 30.0, 30) < margin
+    pg = _load(tmp_path, _POSTGRES + timings).cluster.lease_renew_timeout_seconds
+    assert pg == min(5.0, margin / 2)
 
 
 # --- the start-up warning on the SQL Server bound --------------------------------
@@ -989,13 +1113,15 @@ def test_the_same_value_set_explicitly_is_named_as_set(tmp_path: Path) -> None:
 
 
 def test_a_floored_derived_clamp_names_widening_alone(tmp_path: Path) -> None:
-    """Fence 4.0 / TTL 6.0 leaves a 1.2 s margin; the derived clamp is floored at 1.0, and no clamp
-    at or above the 1 s SQL Server floor is below 0.6 s, so setting one is not offered."""
+    """Fence 2.0 / TTL 4.2 leaves a 1.8 s margin; the derived clamp is floored at 1.0, and no clamp
+    at or above the 1 s SQL Server floor is below 0.9 s, so setting one is not offered. The short
+    pool wait keeps the claim's two windows (0.5 + 1 s) under the margin, so it loads at all
+    (BACKLOG #5979)."""
     s = _load(
         tmp_path,
-        _SQLSERVER
-        + "heartbeat_seconds = 1.0\nleader_fence_timeout_seconds = 4.0\n"
-        + "leader_lease_ttl_seconds = 6.0\n",
+        _sqlserver_with_acquire_timeout(0.5)
+        + "heartbeat_seconds = 1.0\nleader_fence_timeout_seconds = 2.0\n"
+        + "leader_lease_ttl_seconds = 4.2\n",
     )
     assert s.cluster.lease_renew_timeout_seconds == 1.0
     note = s.sqlserver_renew_bound_warning()

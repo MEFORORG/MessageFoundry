@@ -114,6 +114,145 @@ def test_custom_separators_round_trip() -> None:
     assert m["PID-5.2"] == "JANE"
 
 
+# --- header delimiter fields (BACKLOG #5972) -----------------------------------
+
+#: A batch-led message: the parser reads its separators from the BHS line, not from the MSH.
+_BATCH = "BHS|^~\\&|A|B\rMSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\rPID|1||X^Y\r"
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("MSH-1", "#"),
+        ("MSH-2", "#~\\&"),
+        ("MSH-2", "^~\\"),  # a short MSH-2
+        ("MSH-2.1", "#"),
+    ],
+)
+@pytest.mark.parametrize("as_data", [False, True])
+def test_a_write_that_changes_a_delimiter_field_is_refused(
+    path: str, value: str, as_data: bool
+) -> None:
+    """A changed MSH-1 or MSH-2 would advertise delimiters the rest of the message is not written
+    in, while the separators the parser read stay as they were: mixed-delimiter HL7. So the write
+    raises and the message is left exactly as it was."""
+    m = Message.parse(ADT)
+    before = m.encode()
+    write = m.set_data if as_data else m.set
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        write(path, value)
+    assert m.encode() == before
+    assert m["PID-5.1"] == "DOE"
+
+
+def test_a_repetition_scoped_delimiter_write_is_refused() -> None:
+    m = Message.parse(ADT)
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        m.set("MSH-2", "#~\\&", repetition=1)
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        m.set("MSH-2", m["MSH-2"] or "", repetition=2)
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        m.add_repetition("MSH-2", "x")
+
+
+def test_a_repetition_1_passthrough_of_a_delimiter_field_changes_nothing() -> None:
+    """A copy loop that passes ``repetition=1`` writes the same bytes as one that passes none."""
+    m = Message.parse(ADT)
+    before = m.encode()
+    m.set("MSH-2", m["MSH-2"] or "", repetition=1)
+    m.set("MSH-2", m.field("MSH-2", repetition=1) or "", repetition=1)
+    m.set("MSH-2.1", m.field("MSH-2.1") or "")
+    assert m.encode() == before
+
+
+def test_msh_2_past_its_four_encoding_characters_can_change() -> None:
+    """The delimiters do not move, so a v2.7 truncation character may be added or dropped."""
+    m = Message.parse(ADT.replace("MSH|^~\\&|", "MSH|^~\\&#|", 1))
+    m.set("MSH-2", "^~\\&")
+    assert m.encode() == ADT
+    m.set("MSH-2", "^~\\&#")
+    assert Message.parse(m.encode())["MSH-2"] == "^~\\&#"
+    assert m["PID-5.2"] == "JANE"
+    # The truncation character must be one printable, non-space, non-delimiter character, as a
+    # per-outbound re-encode of a batch header requires (BACKLOG #5802).
+    for refused in ("^~\\&|", "^~\\&^", "^~\\&~", "^~\\& ", "^~\\&\x07", "^~\\&##"):
+        with pytest.raises(ValueError, match="holds the message's delimiters"):
+            m.set("MSH-2", refused)
+    assert Message.parse(m.encode())["MSH-2"] == "^~\\&#"
+
+
+def test_a_delimiter_refusal_names_only_what_the_field_accepts() -> None:
+    """The refusal must be true of the write it refuses. Field 2 also accepts a changed v2.7
+    truncation character, so its text must not say only the text already there is accepted, and
+    ``add_repetition`` accepts nothing there."""
+    m = Message.parse(ADT)
+    with pytest.raises(ValueError) as field_1:
+        m.set("MSH-1", "#")
+    assert "must leave it reading as it does. Re-encode" in str(field_1.value)
+    with pytest.raises(ValueError) as field_2:
+        m.set("MSH-2", "#~\\&")
+    assert "change only the one v2.7 truncation character" in str(field_2.value)
+    # A component or repetition-2 write at field 2 cannot change the truncation character, so its
+    # refusal must not offer that.
+    scoped_writes: list[tuple[str, int | None]] = [("MSH-2.2", None), ("MSH-2", 2)]
+    for path, repetition in scoped_writes:
+        with pytest.raises(ValueError) as scoped:
+            m.set(path, "x", repetition=repetition)
+        assert "truncation" not in str(scoped.value)
+        assert "must leave it reading as it does. Re-encode" in str(scoped.value)
+    with pytest.raises(ValueError) as added:
+        m.add_repetition("MSH-2", "x")
+    assert "a repetition cannot be added to it" in str(added.value)
+    for refusal in (field_1.value, field_2.value, added.value):
+        assert "already holds" not in str(refusal)
+    # The accepted truncation-character write the field-2 text names really is accepted.
+    m.set("MSH-2", "^~\\&#")
+    assert m["MSH-2"] == "^~\\&#"
+
+
+def test_a_delimiter_write_of_the_text_already_there_changes_nothing() -> None:
+    """A passthrough copy of the header (``set("MSH-2", msg["MSH-2"])``) still works."""
+    m = Message.parse(ADT)
+    before = m.encode()
+    m.set("MSH-1", m["MSH-1"] or "")
+    m.set_data("MSH-2", m["MSH-2"] or "")
+    assert m.encode() == before
+
+
+@pytest.mark.parametrize(
+    ("raw", "path", "occurrence"),
+    [
+        (_BATCH, "BHS-1", 1),
+        (_BATCH, "BHS-2", 1),
+        (_BATCH, "MSH-2", 1),
+        ("FHS|^~\\&|A\r" + _BATCH, "FHS-2", 1),
+        ("FHS|^~\\&|A\r" + _BATCH, "BHS-1", 1),
+        (_BATCH + "MSH|^~\\&|A|B\rPID|2\r", "MSH-2", 2),
+    ],
+)
+def test_a_batch_header_delimiter_write_is_refused(raw: str, path: str, occurrence: int) -> None:
+    """BHS and FHS fields 1 and 2 hold the delimiters the whole batch or file is split on, and an
+    inner MSH-1 or MSH-2, at any occurrence, that differed from them would contradict its body."""
+    m = Message.parse(raw)
+    before = m.encode()
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        m.set(path, "#", occurrence=occurrence)
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        m.add_repetition(path, "x", occurrence=occurrence)
+    assert m.encode() == before
+
+
+@pytest.mark.parametrize("header", ["BHS", "FHS"])
+def test_add_segment_refuses_a_header_segment(header: str) -> None:
+    """A split line numbers a header's delimiter fields as MSH-3 onward, so it would encode as a
+    garbled line; it is refused as a second MSH is."""
+    m = Message.parse(ADT)
+    before = m.encode()
+    with pytest.raises(ValueError, match=f"refusing to add a {header} header segment"):
+        m.add_segment(f"{header}|^~\\&|Z")
+    assert m.encode() == before
+
+
 # --- field repetitions (H-9) -------------------------------------------------
 
 

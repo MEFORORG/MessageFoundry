@@ -6036,6 +6036,8 @@ def _graph(args: argparse.Namespace) -> int:
                 "line": c.source_line,
                 # Non-empty only for a pass-through (PT) inbound — the handlers that Send here.
                 "receives_from": in_names("inbound", name, "handler"),
+                # Non-empty only for a Loopback inbound — the outbounds whose reingress_to names it.
+                "reingressed_from": in_names("inbound", name, "outbound"),
             }
             for name, c in reg.inbound.items()
         ],
@@ -6049,6 +6051,8 @@ def _graph(args: argparse.Namespace) -> int:
                 "file": c.source_file,
                 "line": c.source_line,
                 "receives_from": in_names("outbound", name, "handler"),
+                # The reingress_to back-edge into a Loopback inbound, when this outbound has one.
+                "edges": edges_out("outbound", name),
             }
             for name, c in reg.outbound.items()
         ],

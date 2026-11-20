@@ -1460,8 +1460,11 @@ async def _run_command(
     still be taking the address. So the shell starts as the root of a tree
     :mod:`messagefoundry.proctree` can kill, and a cancel kills that tree before it propagates.
     With ``stop_kills=False`` the hook starts as it did before, in no tree of its own, and a
-    cancel leaves it running. On Windows that also keeps it out of a kill-on-close job, which
-    would end it when the engine exits. Anything outside this code that stops the engine's
+    cancel leaves it running. On Windows that also keeps it out of a kill-on-close job of its own,
+    which would end it when the engine exits. Under ``supervise`` on Windows the engine shard
+    itself runs in the supervisor's kill-on-close job, and the hook with it, so the hook still ends
+    if the supervisor process dies while that engine shard runs (BACKLOG #5978). Anything outside
+    this code that stops the engine's
     processes, such as a service wrapper's tree kill or a signal to the engine's process group,
     can still end it. A hook that finishes on its own is left alone either way, including
     anything it left running."""

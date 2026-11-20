@@ -149,12 +149,20 @@ _DRIVE_COMPLETE_MARGIN = 60.0
 #: flag to raise it with, so lengthening the drain window quietly disarmed the gate.
 _ENGINE_DRAINED_MARGIN = 150.0
 
+#: BACKLOG #5977: with the ENGINE_DRAINED gate armed, the remote ``/stats`` drain poll runs BESIDE the gate
+#: rather than in front of it, and once the gate lands the poll gets this long to finish before it is asked
+#: to stop; it then ends after the sample it has in flight, if any. The engine posts the gate after its own
+#: store-truth drain, so a healthy poll needs about two 0.5s intervals more. A poll that cannot read the
+#: engine box (an engine shard unreachable, or the fleet already torn down) would otherwise hold the sinks'
+#: tally for the whole ``drain_timeout`` on every rung.
+_ADVISORY_DRAIN_GRACE = 5.0
+
 
 def _derive_engine_drained_timeout(drain_timeout: float, override: float | None) -> float:
     """The ENGINE_DRAINED gate wait (B7): an explicit ``override`` if given, else ``drain + margin``.
 
-    The drive opens this await AFTER its own advisory ``/stats`` drain returns — which "zeroes under load on
-    a unified store", so it can return early — and the engine posts ENGINE_DRAINED only once ITS real
+    The drive opens this await BESIDE its own advisory ``/stats`` drain (BACKLOG #5977), which "zeroes under
+    load on a unified store", so it can return early. The engine posts ENGINE_DRAINED only once ITS real
     store-truth drain (bounded by the same ``drain_timeout``) plus ``_queue_breakdown`` completes. So the
     wait scales with ``drain_timeout``, and the old fixed ``300.0`` was safe only while the drain stayed
     under ~150s. At ``drain_timeout=150`` this derives 300.0 — byte-identical to the old default.
@@ -197,7 +205,9 @@ def _derive_drive_complete_timeout(
     2. ``child_ready_timeout``  — the ``K`` sender children spawn and post DRIVER_ARMED.
     3. ``driver_done_wait``     — DRIVE_GO → every DRIVER_DONE (spans the full hold; == the B1 derivation).
     4. ``drain_timeout``        — the advisory remote ``/stats`` drain poll.
-    5. ``engine_drained_timeout`` — the PR-C2 store-truth drain gate, when ``await_engine_drained``.
+    5. ``engine_drained_timeout`` + ``_ADVISORY_DRAIN_GRACE`` — the PR-C2 store-truth drain gate and the
+       poll's grace after it, when ``await_engine_drained``. Since BACKLOG #5977 the gate runs beside the
+       poll rather than after it, so counting steps 4 and 5 in series over-counts, the safe direction.
 
     Each term is the coordinator's OWN timeout for that step, so the sum is the longest run the coordinator
     can have before it gives up and reaps us anyway. A sink that fires earlier records a partial tally and
@@ -211,7 +221,7 @@ def _derive_drive_complete_timeout(
         2.0 * child_ready_timeout
         + driver_done_wait
         + drain_timeout
-        + (engine_drained_timeout if await_engine_drained else 0.0)
+        + (engine_drained_timeout + _ADVISORY_DRAIN_GRACE if await_engine_drained else 0.0)
         + _DRIVE_COMPLETE_MARGIN
     )
 
@@ -4884,8 +4894,9 @@ async def run_shardcert_drive(
 
     Handshake order: await SHARDS_READY → spawn+await all :data:`SINK_BOUND` → spawn+await all
     :data:`DRIVER_ARMED` → post :data:`DRIVE_START` (the engine's kill anchor — no kill here) +
-    :data:`DRIVE_GO` (release the senders) → await all :data:`DRIVER_DONE` → drain REMOTE ``/stats`` →
-    post :data:`DRIVE_COMPLETE` → await all :data:`SINK_DONE` → reconcile.
+    :data:`DRIVE_GO` (release the senders) → await all :data:`DRIVER_DONE` → drain REMOTE ``/stats``
+    (beside the :data:`ENGINE_DRAINED` gate when it is armed) → post :data:`DRIVE_COMPLETE` → await all
+    :data:`SINK_DONE` → reconcile.
 
     The coordinator + all spawned children run on the load-gen box — NEVER co-located with the engine
     fleet (the attribution isolation; an operator/runbook concern). **Fail loud** early on a mis-sized
@@ -4896,8 +4907,9 @@ async def run_shardcert_drive(
     their final tally), wait for the ENGINE half's RELIABLE store-truth :data:`ENGINE_DRAINED`. The remote
     ``/stats`` poller below is advisory (it can zero out under load on a unified store), so tallying on it
     alone risks reading a teardown-frozen in-flight tail as loss; awaiting the engine's DIRECT store read
-    closes that window. Bounded + best-effort — a missing signal degrades to the advisory-drain fallback
-    with a note, never a hang."""
+    closes that window. The advisory poll runs beside the gate: once the gate lands it gets
+    :data:`_ADVISORY_DRAIN_GRACE` more, then is asked to stop. Bounded + best-effort — a missing signal degrades to
+    the advisory-drain fallback (the poll then runs in full) with a note, never a hang."""
     ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     dests = int(ready["dests"])
@@ -4958,6 +4970,8 @@ async def run_shardcert_drive(
     procs: list[tuple[str, Any]] = []
     notes: list[str] = []
     poller: EnginePoller | None = None
+    advisory_drain: asyncio.Task[float | None] | None = None
+    advisory_stop = asyncio.Event()
     # B6: the sink children each bound their DRIVE_COMPLETE await, and their window OPENS at SINK_BOUND
     # (below) and CLOSES at our DRIVE_COMPLETE post (step 5) — strictly wider than our own DRIVER_DONE wait.
     # They cannot derive it (they never see hold/drain), so derive it HERE and thread it into the argv. A
@@ -5051,8 +5065,8 @@ async def run_shardcert_drive(
         coord.post(DRIVE_START, {"t0": time.time()})
         coord.post(DRIVE_GO, {"go": True})
 
-        # (4) Await every sender-worker's DONE, then drain the engine's REMOTE /stats (the authoritative
-        #     drain signal, polled off-box) before declaring the pipeline empty. B1: a child posts DRIVER_DONE
+        # (4) Await every sender-worker's DONE, then drain the engine's REMOTE /stats (polled off-box;
+        #     the barrier when the gate below is off, advisory beside it when on). B1: a child posts DRIVER_DONE
         #     only AFTER its full hold, so a FIXED timeout under-shoots any hold near it — a long soak would
         #     abort mid-send, reaping the sinks while the engine still delivers and manufacturing a fake
         #     collapse (B3). Derive the timeout from hold + drain + margin instead.
@@ -5063,11 +5077,18 @@ async def run_shardcert_drive(
             coord, DRIVER_DONE, driver_count, timeout=driver_done_wait
         )
         # The poller was opened, and signed in, at step (0); without it the advisory terms stay unread.
+        # Without the gate the poll is the barrier, awaited here in full. With the gate armed it is
+        # advisory, so it runs as a task BESIDE the gate rather than in front of it (BACKLOG #5977), and
+        # a poll that cannot read the engine box no longer holds the tally.
         drain_s: float | None = None
         final: EngineSample | None = None
         if poller is not None:
-            drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
-            final = poller.final
+            if await_engine_drained:
+                advisory_drain = asyncio.create_task(
+                    poller.await_drain(timeout=drain_timeout, interval=0.5, stop=advisory_stop)
+                )
+            else:
+                drain_s = await poller.await_drain(timeout=drain_timeout, interval=0.5)
 
         # (4b) PR-C2 ladder drain gate (default OFF): before releasing the sinks to tally, wait for the
         # ENGINE half's RELIABLE store-truth drain signal. The remote poller above is advisory (zeroes
@@ -5105,10 +5126,46 @@ async def run_shardcert_drive(
                     "Store-truth still comes from ENGINE_RUNG_REPORT, never the advisory poller"
                 )
 
+        if advisory_drain is not None:
+            # When the gate landed the poll only adds telemetry: a short grace, then it is asked to stop
+            # (a stop, not a cancel, so no sample is in flight when the poller closes). When the gate never
+            # came the poll is the only barrier left, so it runs in full. Either way it stays advisory, so
+            # a poll that raises is a note, not a failed rung.
+            try:
+                if tallied_behind_gate:
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(
+                            asyncio.shield(advisory_drain), _ADVISORY_DRAIN_GRACE
+                        )
+                    advisory_stop.set()
+                drain_s = await advisory_drain
+                if drain_s is None and tallied_behind_gate:
+                    notes.append(
+                        f"advisory /stats drain not seen within {_ADVISORY_DRAIN_GRACE}s of the "
+                        "ENGINE_DRAINED gate; stopped rather than holding the tally"
+                    )
+            # Broad on purpose, and recorded: the poll is advisory on this path, and step (0) treats
+            # its sign-in refusal the same way.
+            except Exception as exc:
+                notes.append(
+                    "advisory /stats drain poll failed, so drained/engine_done/engine_dead are unread: "
+                    f"{type(exc).__name__}: " + escape_for_terminal(str(exc), single_line=True)
+                )
+        if poller is not None:
+            final = poller.final
+
         # (5) Signal drained → every sink records its final tally and posts SINK_DONE.<m>.
         coord.post(DRIVE_COMPLETE, {"t": time.time()})
         sink_dones = await _await_indexed(coord, SINK_DONE, sink_count, timeout=sink_done_timeout)
     finally:
+        if advisory_drain is not None and not advisory_drain.done():
+            # An early failure (or a cancel) leaves the poll running: stop it and let it finish before
+            # its clients close under it. asyncio.wait never raises the task's own outcome, so the
+            # teardown below always runs; an outcome nobody read is logged rather than dropped.
+            advisory_stop.set()
+            await asyncio.wait({advisory_drain})
+            if not advisory_drain.cancelled() and advisory_drain.exception() is not None:
+                await _teardown_step("advisory drain poll", advisory_drain)
         if poller is not None:
             await _teardown_step("drain poller close", poller.close())
         # Reap CONCURRENTLY so an early failure (e.g. a coord timeout while M+K children are still

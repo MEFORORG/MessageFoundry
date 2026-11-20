@@ -35,7 +35,6 @@ from __future__ import annotations
 # load service_status (asyncio, subprocess, ctypes) or tomllib.
 __lazy_modules__ = ["messagefoundry.service_status", "tomllib"]
 
-import ipaddress
 import re
 import sys
 import tomllib
@@ -45,11 +44,17 @@ from pathlib import Path
 from typing import Protocol
 from urllib.parse import urlsplit
 
-from messagefoundry.api_tls_source import GENERATED_CERT_NAME, ApiTlsSource, api_tls_source
+from messagefoundry.api_tls_source import (
+    GENERATED_CERT_NAME,
+    ApiTlsSource,
+    api_tls_source,
+    wildcard_loopback,
+)
 from messagefoundry.service_status import is_safe_service_name
 
 # The engine's own [api] defaults, which a `serve` command line naming only one of --host and --port
-# keeps for the other (BACKLOG #5936).
+# keeps for the other (BACKLOG #5936). Copied because the tray may not import config/;
+# tests/test_tray_config.py pins them equal.
 _DEFAULT_BIND_HOST = "127.0.0.1"
 _DEFAULT_BIND_PORT = 8765
 # https because the engine serves TLS by default (ADR 0172). Plain http is right only behind a
@@ -322,19 +327,16 @@ def _last_path_option(app_parameters: str, flags: frozenset[str]) -> str | None:
 
 def _is_unspecified(host: str) -> bool:
     """Whether ``host`` is a wildcard (unspecified) address, ``0.0.0.0`` or ``::`` in any spelling."""
-    try:
-        return ipaddress.ip_address(host.strip("[]")).is_unspecified
-    except ValueError:
-        return False
+    return wildcard_loopback(host) is not None
 
 
 def _probe_host(host: str) -> str:
     """``host``, or the loopback of its family when it is a wildcard (unspecified) address.
 
-    No client can connect to a wildcard address, and a wildcard bind accepts on loopback too."""
-    if not _is_unspecified(host):
-        return host
-    return "::1" if ":" in host else "127.0.0.1"
+    No client can connect to a wildcard address, and a wildcard bind accepts on loopback too. The
+    loopback is :func:`messagefoundry.api_tls_source.wildcard_loopback`, the same rule that names
+    it in the certificate the engine mints for a wildcard bind (BACKLOG #5973)."""
+    return wildcard_loopback(host) or host
 
 
 def build_engine_url(host: str | None, port: int | None, *, tls: bool = False) -> str | None:
@@ -599,9 +601,10 @@ def load_config(config_dir: Path, reader: RegistryReader | None = None) -> TrayC
     """Read ``<config_dir>/tray.toml`` (if present) and the service registry hints, then compose.
 
     Missing file → all defaults. A malformed TOML file is treated as absent (defaults + hints).
-    The engine's *own* settings TOML is also read — read-only, fail-soft — for the single fact
-    the registry cannot carry: which scheme the API bind serves. Since ADR 0172 that is no longer
-    the question "is a cert configured" — see :func:`engine_serves_https`.
+    The engine's *own* settings TOML is also read — read-only, fail-soft — for what the registry
+    cannot carry: which scheme the API bind serves (since ADR 0172 not the question "is a cert
+    configured", see :func:`engine_serves_https`), and where the minted certificate is
+    (:func:`generated_cert_path`).
     """
     toml_data = _read_toml(config_dir / "tray.toml")
 

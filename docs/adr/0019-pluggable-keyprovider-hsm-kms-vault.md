@@ -500,9 +500,13 @@ Design + build:
 
 - **`cell_aad(table, column, *pk)`** ([store/crypto.py](../../messagefoundry/store/crypto.py)) is the
   single AAD builder — **length-prefixed** (4-byte big-endian per field, so distinct field tuples never
-  collide), **versioned** (`mfenc-aad/v1`), and **backend-agnostic** (`str(pk)`, so a SQLite `INTEGER`
-  id and a Postgres/SQL Server `BIGINT` for the same logical row yield identical AAD — a cross-backend
-  backup/restore of a v2 value stays decryptable).
+  collide), **versioned** (`mfenc-aad/v1`), and **backend-agnostic** (each key component spelled as
+  text, so a SQLite `INTEGER` id and a Postgres/SQL Server `BIGINT` for the same logical row yield
+  identical AAD — a cross-backend backup/restore of a v2 value stays decryptable). Since BACKLOG #5962
+  a number is spelled by its value, so an integral float binds the same bytes as the int, and `None`
+  or a `bool` component is refused wherever a cipher binds the AAD (a keyless store, the v1 writer
+  and a NULL cell bind none); the `cell_aad` and `_aad_component` docstrings in the same file hold
+  the full rule and spelling.
 - **v1 stays FROZEN (CRYPTO-1).** AAD rides ONLY the additive `mfenc:v2` writer; `decrypt` dispatches AAD
   by marker version (v1 → `None`, v2 → the caller's `aad`), so legacy v1 rows still read (**dual-read**)
   and `messagefoundry rotate-key` upgrades a row v1 → cell-bound v2 in place under `[store].aad_bind`.

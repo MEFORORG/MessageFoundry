@@ -59,7 +59,13 @@
 
     2. A WRITER THAT DIES MUST NOT DIE SILENTLY. Every failure appends one line to
        seats/.writer-errors.txt and the script still exits 0. Exiting non-zero from a Stop hook is
-       its own hazard; leaving no trace is worse than either.
+       its own hazard; leaving no trace is worse than either. A -Record hook input refused under
+       scripts/hooks/_hookinput.ps1's rules is NOT a failure, so it never goes there. It goes to
+       stderr and to seats/.writer-refusals.txt in the registry of the checkout this script started
+       in, where that checkout and its registry resolve, at most one line per session key and host
+       per hour. Only a -Record run with no -Worktree refuses input: seat-record.ps1 resolves the
+       worktree itself, says on stdout when it cannot, and then does not run this script.
+       fleet.ps1 does not read that file.
 
     3. TOUCH seats/.writer-alive/<boxKey>.txt ON EVERY INVOCATION, including no-op ones. "The writer
        ran" and "the seat had something to say" are different sentences, and a reader that cannot
@@ -165,6 +171,70 @@ function Write-WriterError {
         $f = Join-Path $script:SeatsDir '.writer-errors.txt'
         $line = "{0}`t{1}`t{2}`t{3}" -f ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')), $env:COMPUTERNAME, $Stage, ($Message -replace '\s+', ' ')
         Add-Content -Path $f -Value $line -Encoding utf8 -EA SilentlyContinue
+    } catch { }
+}
+
+function Set-StartSeatsDir {
+    # Point $script:SeatsDir at the registry of the checkout this hook STARTED in, for a -Record
+    # whose input named no usable worktree. Mirrors the main path's resolution, the codex-seats
+    # branch included. Returns $false, writing nothing, where that checkout or its registry does not
+    # resolve. Never throws.
+    try {
+        $startWt = Resolve-Worktree -Hint $null
+        if (-not $startWt) { return $false }
+        $startLocal = Get-CoordLocalRoot -From $startWt
+        $startRes = Resolve-CoordSharedRoot -From $startWt -LocalRoot $startLocal
+        if ($startRes.Error) { return $false }
+        $dir = Join-Path $startRes.Path 'seats'
+        if ($env:KORUS_AGENT -eq 'codex') {
+            $dir = (Resolve-CoordDir -From $startWt -Kind 'codex-seats' -LocalRoot $startLocal).Path
+        }
+        $null = New-Item -ItemType Directory -Force -Path $dir -EA Stop
+        $script:SeatsDir = $dir
+        return $true
+    } catch { return $false }
+}
+
+function Write-WriterRefusal {
+    param([string]$SessionKey, [string]$Cwd, [string]$Reason)
+    # A refused hook input, recorded where a reader can find it. Never .writer-errors.txt (rule 2).
+    # At most one line per session key and host per hour, because an unpinned session is refused on
+    # EVERY Stop and one line says as much as a hundred. Only this host's own lines are read, so a
+    # line stamped in the future means this host's clock stepped back; it does not count, or the step
+    # would silence refusals for hours. The stamp is written and read in the invariant culture: a
+    # culture-formatted stamp (fi-FI writes '.' for ':') never parses, and the limit never holds.
+    # Columns: UTC time, host, session key, the leaf of the refused cwd with its whitespace collapsed,
+    # and the helper's Reason, collapsed the same way, which may quote paths; no payload text beyond
+    # the cwd is written.
+    try {
+        if (-not $script:SeatsDir) { return }
+        $f = Join-Path $script:SeatsDir '.writer-refusals.txt'
+        $now = [DateTime]::UtcNow
+        $inv = [Globalization.CultureInfo]::InvariantCulture
+        $stampFmt = 'yyyy-MM-ddTHH:mm:ssZ'
+        $hostName = Get-CoordHost
+        if (Test-Path -LiteralPath $f -PathType Leaf) {
+            foreach ($l in [System.IO.File]::ReadLines($f)) {
+                $cols = $l -split "`t"
+                if ($cols.Count -lt 3 -or $cols[1] -ne $hostName -or $cols[2] -ne $SessionKey) { continue }
+                $at = [DateTime]::MinValue
+                $ok = [DateTime]::TryParseExact($cols[0], $stampFmt, $inv,
+                    ([Globalization.DateTimeStyles]::AdjustToUniversal -bor [Globalization.DateTimeStyles]::AssumeUniversal), [ref]$at)
+                $age = $now - $at
+                if ($ok -and $age -ge [TimeSpan]::Zero -and $age -lt [TimeSpan]::FromHours(1)) { return }
+            }
+        }
+        $leaf = ''
+        $trimmed = $Cwd.TrimEnd('\', '/')
+        if ($trimmed) { $leaf = (Split-Path -Leaf $trimmed) -replace '\s+', ' ' }
+        $why = $Reason -replace '\s+', ' '
+        if ($why.Length -gt 300) {
+            # Never split a surrogate pair, as the notes cap below (BACKLOG #5764).
+            $cut = if ([char]::IsHighSurrogate($why[299])) { 299 } else { 300 }
+            $why = $why.Substring(0, $cut)
+        }
+        $line = "{0}`t{1}`t{2}`t{3}`t{4}" -f $now.ToString($stampFmt, $inv), $hostName, $SessionKey, $leaf, $why
+        Add-Content -LiteralPath $f -Value $line -Encoding utf8 -EA SilentlyContinue
     } catch { }
 }
 
@@ -288,12 +358,54 @@ function Resolve-Worktree {
 function Read-HookPayload {
     # Hooks receive JSON on stdin. Absent or unparsable stdin is NORMAL for a manual run and is not
     # an error -- it just means every payload-derived field reports its source as 'absent'.
+    # Only Read-RecordHookInput's fallback, where the hook-input helper is absent, reads this way.
     if ([Console]::IsInputRedirected -ne $true) { return $null }
     try {
         $raw = [Console]::In.ReadToEnd()
         if (-not $raw -or -not $raw.Trim()) { return $null }
         return ($raw | ConvertFrom-Json -EA Stop)
     } catch { return $null }
+}
+
+function Read-RecordHookInput {
+    <#
+      The -Record hook input, and which worktree it answers for. Returns
+      @{ Payload; Dir = <worktree root or $null>; FromPin = <bool>; HintFromPin = <bool>;
+      Reason = <fault or ''>; Fault = <bool> }. HintFromPin says the hook input resolved through
+      the session pin, as FromPin does, to -Hint, the worktree seat-record.ps1 passed, which it
+      resolves by the same pin rules. A cwd inside the pinned worktree resolves through the cwd.
+      A Reason means NO WRITE. Fault marks a Reason that is this writer's own failure (the helper is
+      missing or threw) rather than input it refused. A $null Dir means the directory this script runs in.
+
+      Taken as it stood, the payload `cwd` after a `cd` put this session's record in a sibling's box
+      or in another repository's registry (BACKLOG #5961). scripts/hooks/_hookinput.ps1's header
+      gives the rule this follows instead. It is read -ReadOnly, because a Stop must never write a
+      pin.
+
+      Without the helper (a sandbox that copies this script alone), input that names a `cwd` is a
+      Reason rather than a fallback to the raw `cwd`, which is the defect. Other input is read as
+      before.
+    #>
+    # The helper is written for the hooks' 'Continue', as mail-drain and seat-unlock run it. Under
+    # this script's 'Stop', a non-terminating error inside it (a pin naming an unmapped drive, say)
+    # would refuse input the helper itself would answer.
+    param([string]$Hint)
+    $ErrorActionPreference = 'Continue'
+    $helper = Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks/_hookinput.ps1'
+    if (-not (Test-Path -LiteralPath $helper -PathType Leaf)) {
+        $p = Read-HookPayload
+        $why = if ($p -and ($p.PSObject.Properties.Name -contains 'cwd')) { "scripts/hooks/_hookinput.ps1 is missing beside this script, so the hook input's cwd cannot be checked" } else { '' }
+        return @{ Payload = $p; Dir = $null; FromPin = $false; HintFromPin = $false; Reason = $why; Fault = [bool]$why }
+    }
+    try {
+        . $helper
+        $s = Resolve-CcxHookSession -Text (Read-CcxHookInput) -ReadOnly
+    } catch {
+        return @{ Payload = $null; Dir = $null; FromPin = $false; HintFromPin = $false; Reason = "the hook-input helper failed ($($_.Exception.Message))"; Fault = $true }
+    }
+    $fromPin = ($s.Source -eq 'pin')
+    $hintFromPin = [bool]($fromPin -and $Hint -and $s.Root -and (Test-CcxSamePath ([string]$s.Root) $Hint))
+    return @{ Payload = $s.Payload; Dir = $s.Root; FromPin = $fromPin; HintFromPin = $hintFromPin; Reason = [string]$s.Reason; Fault = $false }
 }
 
 function Get-SessionKey {
@@ -896,10 +1008,45 @@ function Invoke-SeatWorktreeLock {
 
 $exit = 0
 try {
-    $payload = if ($Record) { Read-HookPayload } else { $null }
-
+    $payload = $null
     $wtHint = $Worktree
-    if (-not $wtHint -and $payload -and ($payload.PSObject.Properties.Name -contains 'cwd')) { $wtHint = [string]$payload.cwd }
+    $script:WorktreeSource = 'git rev-parse --show-toplevel'
+    if ($Record) {
+        $hookIn = Read-RecordHookInput -Hint $wtHint
+        $payload = $hookIn.Payload
+        if (-not $wtHint) {
+            if ($hookIn.Reason) {
+                # Rule 1 again: input this cannot vouch for names no worktree, so NO RECORD, and exit
+                # 0. Reached only with no -Worktree (rule 2). Refused input is not a writer failure,
+                # so it NEVER goes to .writer-errors.txt, which fleet.ps1 counts as failures (the
+                # same rule Invoke-ClearHandoff states); it goes to .writer-refusals.txt (rule 2),
+                # rate-limited per session key and host. No .writer-alive heartbeat: it is keyed by
+                # this session's box, and refused input names no box to key it by. Both files go to
+                # the registry of the checkout this script started in, where that checkout and its
+                # registry resolve.
+                $why = "the hook input was refused, so nothing was recorded: $($hookIn.Reason)"
+                [System.Console]::Error.WriteLine("seat.ps1: $why")
+                if (Set-StartSeatsDir) {
+                    if ($hookIn.Fault) {
+                        # A missing or throwing helper IS a writer failure, and rule 2 wants a line.
+                        Write-WriterError -Stage 'hook-input' -Message $why
+                    } else {
+                        $cwd = ''
+                        if ($payload -and $payload.PSObject.Properties['cwd']) { $cwd = [string]$payload.PSObject.Properties['cwd'].Value }
+                        Write-WriterRefusal -SessionKey (Get-SessionKey -Payload $payload -Override $SessionId).Key -Cwd $cwd -Reason $hookIn.Reason
+                    }
+                }
+                exit 0
+            }
+            $wtHint = $hookIn.Dir
+            if ($hookIn.FromPin) { $script:WorktreeSource = 'session pin (scripts/hooks/_hookinput.ps1)' }
+        }
+        elseif ($hookIn.HintFromPin) {
+            # seat-record.ps1 passes -Worktree resolved by the same pin rules, so a -Worktree the
+            # session pin also names came from that pin.
+            $script:WorktreeSource = 'session pin (scripts/hooks/_hookinput.ps1)'
+        }
+    }
     $wt = Resolve-Worktree -Hint $wtHint
 
     if (-not $wt) {
@@ -1104,7 +1251,7 @@ try {
         # on its own disk; see Test-CoordRecordIsHere and docs/COORD-SHARED-ROOT.md.
         host             = Get-CoordHost
         worktree         = $wt
-        worktreeSource   = 'git rev-parse --show-toplevel'
+        worktreeSource   = $script:WorktreeSource
         sessionId        = $sk.Id
         sessionKey       = $sk.Key
         sessionIdSource  = $sk.Source

@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
+import itertools
 import json
 import logging
 import math
@@ -64,6 +65,7 @@ from collections.abc import (
     Callable,
     Collection,
     Iterable,
+    Iterator,
     Mapping,
     MutableMapping,
     Sequence,
@@ -73,7 +75,7 @@ from contextlib import asynccontextmanager
 from dataclasses import replace
 from time import perf_counter
 from types import MappingProxyType
-from typing import Any, Final, assert_never
+from typing import Any, ClassVar, Final, assert_never
 from uuid import uuid4
 
 from messagefoundry.config.models import RetryPolicy
@@ -125,13 +127,16 @@ from messagefoundry.store.cell_tag import (
     dead_letters_on_cell_tag,
     is_row_tagged,
     message_cell_aad,
+    open_listed_cell,
     open_message_cell,
+    open_message_record,
     open_preset_criteria,
     preset_criteria_aad,
     report_cell_tag_failures,
     row_tag_aad,
     row_tag_columns,
     withhold_message_cells,
+    withhold_refused_cell,
 )
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
@@ -241,7 +246,10 @@ from messagefoundry.store.store import (
     REINGRESS_ARTIFACT_ERASED,
     REINGRESS_ARTIFACT_MISSING,
     REINGRESS_PEEK_FAILED,
+    REINGRESS_READ_TAG_FAILURE_OUTCOME,
+    REINGRESS_TAG_FAILURE_OUTCOME,
     REINGRESS_TARGET_PREFIX,
+    REINGRESS_TOKEN_TAG_FAILED,
     TRANSIT_ATTESTATION_COLUMNS,
     USER_READ_SQL,
     VIEWED_EVENT,
@@ -2062,6 +2070,11 @@ class PostgresStore:
     # complete_with_response), with the same single-transaction atomicity as SQLite.
     supports_response_capture = True
 
+    # The per-namespace state_version bump makes converge_state_cache a real read-through of another
+    # process's transform-state writes (Track B Step 6b), so the engine runs the convergence loop over
+    # this backend in a cluster AND across engine shards on one node (BACKLOG #5984).
+    converges_transform_state = True
+
     # Pass-through (PT) re-ingress (the `pt_deliveries` branch of transform_handoff, ADR 0013
     # generalized) is implemented at full SQLite parity: the atomic PT-child + parent-marker branch runs
     # inside transform_handoff's transaction (see _insert_passthrough_child_pg / _insert_passthrough_
@@ -2190,9 +2203,10 @@ class PostgresStore:
         # FOLLOWER must re-read (read-through), mirroring _reference_versions for reference sets. Seeded at
         # open (_load_state_cache) and advanced on every gated transform_handoff/purge_state bump.
         self._state_versions: dict[str, int] = {}
-        # Gates the in-txn state-version bump. The engine flips it on (enable_state_convergence) only when
-        # clustered, BEFORE workers start; single-node never turns it on, so no state_version rows are ever
-        # written and the backend stays byte-identical.
+        # Gates the in-txn state-version bump. The engine flips it on (enable_state_convergence) only where
+        # another process shares the store (a cluster, or engine shards), BEFORE workers start; a lone
+        # process never turns it on, so no state_version rows are ever written and the backend stays
+        # byte-identical.
         self._cluster_state_convergence: bool = False
         # H1 fencing token: the leader epoch this node currently holds + the leader_lease row to validate
         # it against, both pushed by the engine on promotion via set_leader_epoch() (the store NEVER
@@ -2918,6 +2932,17 @@ class PostgresStore:
         # --- end custom RBAC roles (ADR 0045) --------------------------------
 
     async def close(self) -> None:
+        try:
+            await self._close_handles()
+        finally:
+            # BACKLOG #5963: tell a cipher holding Vault sockets (the Transit cipher) the store is
+            # closing, even when a step above raised. close_connections says what it closes, and
+            # that is not every thread's. Read by name: the store does not import the cipher.
+            release = getattr(self._cipher, "close_connections", None)
+            if callable(release):
+                release()
+
+    async def _close_handles(self) -> None:
         # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
@@ -3358,7 +3383,14 @@ class PostgresStore:
 
         Also seeds :attr:`_state_versions` from ``state_version`` (Track B Step 6b): a fresh clustered node
         loads the WHOLE ``state`` table here (so it starts fully converged), and recording the per-namespace
-        versions means its first convergence tick won't needlessly re-read every namespace it already holds."""
+        versions means its first convergence tick won't needlessly re-read every namespace it already holds.
+
+        The versions are read BEFORE the rows, the read-skew-safe order :meth:`converge_state_cache`
+        uses: a sibling's write landing between the two reads then leaves the recorded version below
+        the shared one, so the first tick re-reads it, rather than above the rows loaded, which would
+        skip it for the life of the process (BACKLOG #5984)."""
+        vrows = await self._fetchall("SELECT namespace, version FROM state_version")
+        versions = {r["namespace"]: int(r["version"]) for r in vrows}
         rows = await self._fetchall("SELECT namespace, key, value FROM state")
         cache = new_state_cache()  # sealed (BACKLOG #1174); the decrypt below still fails closed
         for r in rows:
@@ -3366,8 +3398,7 @@ class PostgresStore:
                 r["namespace"], r["key"], r["value"]
             )
         self._state_cache = cache
-        vrows = await self._fetchall("SELECT namespace, version FROM state_version")
-        self._state_versions = {r["namespace"]: int(r["version"]) for r in vrows}
+        self._state_versions = versions
 
     def _decode_state_cell(self, namespace: str, key: str, stored: str) -> Any:
         """Decrypt and decode one ``state`` cell, for both the open-time load and the follower
@@ -3448,10 +3479,72 @@ class PostgresStore:
         return refreshed
 
     def enable_state_convergence(self) -> None:
-        """Turn on per-namespace state-version bumping (Track B Step 6b). The engine calls this in a
-        cluster (is_clustered()) BEFORE workers start, so a sibling's converge_state_cache sees every
-        write. Single-node never calls it → no state_version writes → byte-identical."""
+        """Turn on per-namespace state-version bumping (Track B Step 6b). The engine calls this whenever
+        another process shares the store, in a cluster (is_clustered()) or on an engine shard of a
+        multi-shard config (BACKLOG #5984), BEFORE workers start, so a sibling's converge_state_cache
+        sees every write. A lone process never calls it → no state_version writes → byte-identical."""
         self._cluster_state_convergence = True
+
+    async def reload_state_cache(self) -> None:
+        """No-op on Postgres (BACKLOG #5984): a sibling's writes already reach this handle through
+        :meth:`converge_state_cache`, whose runner is live before any promotion, and a whole-cache
+        reload racing that runner could only regress it."""
+        return None
+
+    def _record_own_state_bumps(self, bumped: list[tuple[str, int]]) -> None:
+        """Record the versions this handle's own committed write bumped each namespace to.
+
+        Only a CONTIGUOUS bump (the held version was ``ver - 1``) proves this handle reflects ``ver``:
+        a gap means another process bumped in between, and recording ``ver`` would make the next
+        converge skip that sibling's write for good (BACKLOG #5984; engine shards write the same
+        namespaces at once). Any other record, a gap or a late record at or below the held version,
+        sets a fresh stale mark (:meth:`_new_stale_mark`).
+
+        A stale mark matches no shared version, so the next converge re-reads the namespace, and it
+        matches no value held before, so a converge in flight whose captured ``seen`` it replaced
+        merges rather than reseeds. Recording ``ver - 1`` on a gap could do neither reliably: two
+        transform workers in this process recording out of order could land it back on that ``seen``,
+        and that pass would reseed destructively and drop the later write's just-published key for a
+        tick. A late record also must not leave the held version alone: the write published its
+        value just before, possibly over a newer sibling value a converge already read, so the
+        namespace has to be re-read."""
+        for ns, ver in bumped:
+            held = self._state_versions.get(ns, 0)
+            self._state_versions[ns] = ver if held == ver - 1 else self._new_stale_mark()
+
+    # Process-wide source of stale marks: negative, so never a shared version (those start at 1), and
+    # each drawn once. Only the event loop draws from it.
+    _stale_marks: ClassVar[Iterator[int]] = itertools.count(-1, -1)
+
+    def _new_stale_mark(self) -> int:
+        """A held-version value that equals no shared version and no value this handle held before, so
+        the namespace is re-read on the next converge and an in-flight converge sees it change."""
+        return next(self._stale_marks)
+
+    async def _bump_state_versions(
+        self, conn: Any, namespaces: Iterable[str], now: float
+    ) -> list[tuple[str, int]]:
+        """Bump each distinct namespace's ``state_version`` row in ``conn``'s transaction, in sorted
+        order, and return the versions bumped to.
+
+        Every path that locks these rows takes them in one global order, so two engine shards (or two
+        cluster nodes) bumping overlapping namespaces cannot deadlock on the ``state_version`` rows,
+        as a first-appearance order could (BACKLOG #5984). The ``state`` rows a write or purge locks
+        before this are not ordered here."""
+        bumped: list[tuple[str, int]] = []
+        for ns in sorted(set(namespaces)):
+            row = await conn.fetchrow(
+                "INSERT INTO state_version (namespace, version, updated_at) "
+                "VALUES ($1, 1, $2) "
+                "ON CONFLICT (namespace) DO UPDATE SET "
+                "version = state_version.version + 1, updated_at = excluded.updated_at "
+                "RETURNING version",
+                ns,
+                now,
+            )
+            assert row is not None, "state_version upsert returned no row"
+            bumped.append((ns, int(row["version"])))
+        return bumped
 
     async def converge_state_cache(self) -> list[str]:
         """Pull any newer shared transform-state writes into this node's local cache (Track B Step 6b).
@@ -3500,11 +3593,17 @@ class PostgresStore:
                 # window, advancing the DB version past `version`. A destructive reseed from the stale
                 # `fresh` would drop that just-committed local key; merge non-destructively instead
                 # (setdefault keeps any newer local value) so the sibling rows we read still land. We
-                # deliberately record `version` (< the DB version the local write bumped to) so the next
-                # tick does a clean reseed that reconciles any sibling deletes this merge could not see.
+                # deliberately record a stale mark, so the next tick does a clean reseed that
+                # reconciles any sibling update or delete this merge kept a stale local value over.
+                # Recording `version` was safe only while the local write always landed after the
+                # scan; with engine shards writing at once it can land before it, and the scanned
+                # version is then the shared one. `version - 1` is no better: a later own bump to
+                # `version` would read as contiguous and raise the held version to the shared one
+                # with the stale value still cached (BACKLOG #5984).
                 for k, v in fresh.items():
                     if (ns, k) not in self._state_cache:  # setdefault would decrypt the kept value
                         self._state_cache[(ns, k)] = v
+                version = self._new_stale_mark()
             self._state_versions[ns] = version
             refreshed.append(ns)
         return refreshed
@@ -4991,18 +5090,9 @@ class PostgresStore:
                 # here, so the bump never double-applies.
                 bumped: list[tuple[str, int]] = []
                 if self._cluster_state_convergence and state_ops:
-                    for ns in dict.fromkeys(n for n, _, _ in state_ops):  # distinct, order-stable
-                        row = await conn.fetchrow(
-                            "INSERT INTO state_version (namespace, version, updated_at) "
-                            "VALUES ($1, 1, $2) "
-                            "ON CONFLICT (namespace) DO UPDATE SET "
-                            "version = state_version.version + 1, updated_at = excluded.updated_at "
-                            "RETURNING version",
-                            ns,
-                            now,
-                        )
-                        assert row is not None, "state_version upsert returned no row"
-                        bumped.append((ns, int(row["version"])))
+                    bumped = await self._bump_state_versions(
+                        conn, (n for n, _, _ in state_ops), now
+                    )
                 total_targets = len(deliveries) + len(pt_deliveries)
                 await self._event(
                     conn,
@@ -5028,8 +5118,7 @@ class PostgresStore:
             self._state_cache[ck] = cv
         # The writer records its own new per-namespace versions so its own converge_state_cache() skips
         # re-reading the namespaces it just wrote (Track B Step 6b).
-        for ns, ver in bumped:
-            self._state_versions[ns] = ver
+        self._record_own_state_bumps(bumped)
         return True
 
     # --- transform-state / reference views (ADR 0005 / 0006) -----------------
@@ -6225,6 +6314,8 @@ class PostgresStore:
         # breaking count-and-log.
         guard, guard_args = self._resolve_guard(6)
         tag_failures: list[CellTagError] = []
+        # BACKLOG #5982: reported after the transaction.
+        queue_tag_rows: list[tuple[Any, QueueTagError]] = []
         try:
             async with self._timed_acquire() as conn:  # noqa: SIM117
                 async with conn.transaction():
@@ -6266,9 +6357,20 @@ class PostgresStore:
                         return True
 
                     try:
-                        ref = self._dec(wr["payload"], aad=queue_row_aad(wr)) or ""
+                        ref = open_queue_cell(self._cipher, wr) or ""
                         origin_msg_id, dest, seq_s = ref.split("\x1f")
                         seq = int(seq_s)
+                    except QueueTagError as err:
+                        # BACKLOG #5982: dead-lettered like a corrupt reference, then audited and
+                        # alerted as a claim reports a tag failure, after the transaction. Queued
+                        # first, so a dead-letter write that fails is still reported.
+                        # Without its traceback, so the queued error holds no frame of this transaction.
+                        queue_tag_rows.append((wr, err.with_traceback(None)))
+                        return await _consume_dead(
+                            "ingress_handoff(tag-failed)",
+                            REINGRESS_TOKEN_TAG_FAILED,
+                            "re-ingress work-row failed its integrity check",
+                        )
                     except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
                         # A corrupt/undecryptable work-row reference can never be re-ingressed.
                         # Mirrors the SQLite branch and the depth-cap branch.
@@ -6469,6 +6571,10 @@ class PostgresStore:
         finally:
             # BACKLOG #2593: after the transaction, never inside it.
             await report_cell_tag_failures(self, tag_failures)
+            for row, error in queue_tag_rows:
+                await report_queue_tag_failure(
+                    self, self._cipher, row, error=error, outcome=REINGRESS_TAG_FAILURE_OUTCOME
+                )
         return True
 
     async def response_body_for_work_row(self, response_row_id: str) -> str | None:
@@ -6481,7 +6587,14 @@ class PostgresStore:
         )
         if row is None:
             return None
-        ref = self._dec(row["payload"], aad=queue_row_aad(row)) or ""
+        try:
+            ref = open_queue_cell(self._cipher, row) or ""
+        except QueueTagError as err:
+            # BACKLOG #5982: audited and alerted, then raised, as on SQLite.
+            await report_queue_tag_failure(
+                self, self._cipher, row, error=err, outcome=REINGRESS_READ_TAG_FAILURE_OUTCOME
+            )
+            raise
         try:
             mid, dest, seq_s = ref.split("\x1f")
             seq = int(seq_s)
@@ -6864,9 +6977,12 @@ class PostgresStore:
                 kind=r["kind"],
                 peer_host=r["peer_host"],
                 message_id=r["message_id"],
-                reason=self._dec(
+                # BACKLOG #5970: only a reason under a key the store does not hold is withheld.
+                reason=open_listed_cell(
+                    self._cipher,
                     r["reason"],
-                    aad=cell_aad("connection_event", "reason", r["connection"], r["ts"], r["kind"]),
+                    cell_aad("connection_event", "reason", r["connection"], r["ts"], r["kind"]),
+                    table="connection_event",
                 ),
             )
             for r in rows
@@ -6992,7 +7108,7 @@ class PostgresStore:
             f" ORDER BY last_seen DESC, id DESC LIMIT ${len(params)}",
             *params,
         )
-        return [self._alert_instance_row(r) for r in rows]
+        return [self._alert_instance_row(r, listed=True) for r in rows]
 
     async def summarize_active_alert_instances(
         self, *, allowed_channels: Sequence[str] | None
@@ -7029,9 +7145,10 @@ class PostgresStore:
             f" FROM alert_instance{clause}",
             *params,
         )
-        return self._alert_instance_row(row) if row is not None else None
+        return self._alert_instance_row(row, listed=False) if row is not None else None
 
-    def _alert_instance_row(self, r: Any) -> AlertInstance:
+    def _alert_instance_row(self, r: Any, *, listed: bool) -> AlertInstance:
+        aad = cell_aad("alert_instance", "reason", r["event_type"], r["connection"])
         return AlertInstance(
             id=r["id"],
             event_type=r["event_type"],
@@ -7041,9 +7158,12 @@ class PostgresStore:
             first_seen=r["first_seen"],
             last_seen=r["last_seen"],
             count=int(r["count"]),
-            reason=self._dec(
-                r["reason"],
-                aad=cell_aad("alert_instance", "reason", r["event_type"], r["connection"]),
+            # BACKLOG #5970: on a list read only, a reason under a key the store does not hold is
+            # withheld; a by-id read raises every refusal, as before (owner ruling 2026-11-19).
+            reason=(
+                open_listed_cell(self._cipher, r["reason"], aad, table="alert_instance")
+                if listed
+                else self._dec(r["reason"], aad=aad)
             ),
             acked_by=r["acked_by"],
             acked_at=r["acked_at"],
@@ -8748,14 +8868,13 @@ class PostgresStore:
         if record is None:
             return None
         d = dict(record)
-        # Decrypt for display: raw (the body), error (may embed raw HL7 fragments, WP-5), summary and
-        # metadata (EF-3 PHI). Each cell is bound to the row's id and channel (ASVS 11.3.3, BACKLOG
-        # #2593), so a cell that fails that tag refuses the whole read.
-        for column in ("raw", "error", "summary", "metadata"):
-            d[column] = open_message_cell(
-                self._cipher, column, d[column], message_id=d["id"], channel_id=d["channel_id"]
-            )
+        # Off the event loop (BACKLOG #5981): under vault_transit each open is a blocking Vault call.
+        await asyncio.to_thread(open_message_record, self._cipher, d)
         return d
+
+    async def message_channel_id(self, message_id: str) -> str | None:
+        record = await self._fetchone("SELECT channel_id FROM messages WHERE id=$1", message_id)
+        return None if record is None else str(record["channel_id"])
 
     @audits_cell_tag
     async def message_metadata_json(self, message_id: str) -> str | None:
@@ -8910,15 +9029,23 @@ class PostgresStore:
             stored_raw = d.pop("raw", None)
 
             tag = {"message_id": d["id"], "channel_id": d["channel_id"]}
+            cell = d.get("summary")  # the cell being opened, which a refusal is judged on
             try:
-                d["summary"] = open_message_cell(self._cipher, "summary", d.get("summary"), **tag)
-                raw = open_message_cell(self._cipher, "raw", stored_raw, **tag)
+                d["summary"] = open_message_cell(self._cipher, "summary", cell, **tag)
+                cell = stored_raw
+                raw = open_message_cell(self._cipher, "raw", cell, **tag)
                 if not row_matches(spec, raw=raw, summary=d["summary"]):
                     continue
                 for column in ("error", "metadata"):
-                    d[column] = open_message_cell(self._cipher, column, d.get(column), **tag)
+                    cell = d.get(column)
+                    d[column] = open_message_cell(self._cipher, column, cell, **tag)
             except CellTagError as err:
                 failures.append(err)
+                continue
+            except CipherError as exc:
+                # BACKLOG #5970: a candidate sealed under a key the store does not hold is left
+                # out, as a failed tag is; any other cipher error raises (owner ruling 2026-11-19).
+                withhold_refused_cell(self._cipher, "messages", exc, cell)
                 continue
             out.append(d)
             if len(out) >= limit:
@@ -8955,7 +9082,14 @@ class PostgresStore:
         failures: list[CellTagError] = []
         out: list[dict[str, Any]] = []
         for r in rows:
-            d = self._decode_record(r, "queue", (r["outbox_id"],), "last_error")
+            d = dict(r)
+            # BACKLOG #5970: only a last_error under a key the store does not hold is withheld.
+            d["last_error"] = open_listed_cell(
+                self._cipher,
+                d["last_error"],
+                cell_aad("queue", "last_error", r["outbox_id"]),
+                table="queue",
+            )
             withhold_message_cells(
                 self._cipher,
                 d,
@@ -12269,26 +12403,14 @@ class PostgresStore:
             purged_keys = [(r["namespace"], r["key"]) for r in rows]
             bumped: list[tuple[str, int]] = []
             if self._cluster_state_convergence:
-                for ns in dict.fromkeys(n for n, _ in purged_keys):  # distinct, order-stable
-                    vrow = await conn.fetchrow(
-                        "INSERT INTO state_version (namespace, version, updated_at) "
-                        "VALUES ($1, 1, $2) "
-                        "ON CONFLICT (namespace) DO UPDATE SET "
-                        "version = state_version.version + 1, updated_at = excluded.updated_at "
-                        "RETURNING version",
-                        ns,
-                        now,
-                    )
-                    assert vrow is not None, "state_version upsert returned no row"
-                    bumped.append((ns, int(vrow["version"])))
+                bumped = await self._bump_state_versions(conn, (n for n, _ in purged_keys), now)
         # Commit succeeded → evict the purged keys from the read-through cache.
         for ck in purged_keys:
             # `in` + `del`, not pop(): pop would decrypt each purged value just to drop it (#1174).
             if ck in self._state_cache:
                 del self._state_cache[ck]
         # Record this node's new per-namespace versions so its own converge skips re-reading them.
-        for ns, ver in bumped:
-            self._state_versions[ns] = ver
+        self._record_own_state_bumps(bumped)
         return len(purged_keys)
 
     async def wal_checkpoint(self) -> None:

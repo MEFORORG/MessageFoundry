@@ -268,8 +268,14 @@ from messagefoundry.store.crypto import (
     gave_no_verdict,
 )
 from messagefoundry.store.metadata import user_metadata
+from messagefoundry.store.queue_tag import QueueTagError
 from messagefoundry.store.sealed_cache import point_in_time
-from messagefoundry.store.store import REINGRESS_PEEK_FAILED, ConnectionEventWrite, OwnedLanes
+from messagefoundry.store.store import (
+    REINGRESS_PEEK_FAILED,
+    REINGRESS_TOKEN_TAG_FAILED,
+    ConnectionEventWrite,
+    OwnedLanes,
+)
 from messagefoundry.store.transit_attestation import utf16_units
 from messagefoundry.transports import (
     DeliveryError,
@@ -12808,6 +12814,17 @@ class RegistryRunner:
         # refused (peek_failed) child is the exception: it stores this read's bounded view instead.
         try:
             body = await self.store.response_body_for_work_row(item.id) or ""
+        except QueueTagError:
+            # BACKLOG #5982: the token's own payload failed its tag after the claim opened it. The
+            # store has audited and alerted it; dead-letter it under the error the handoff records
+            # for the same failure, not as an undecryptable reply.
+            log.warning(
+                "response worker %r: work-row %s failed its integrity tag; dead-lettering",
+                name,
+                item.id,
+            )
+            await self.store.dead_letter_now(item.id, REINGRESS_TOKEN_TAG_FAILED)
+            return _ItemOutcome.PROCESSED, None
         except CipherError as exc:
             # BACKLOG #4995: an undecryptable reply body fails on every pass, so the fault arm
             # re-pended it at the head of this FIFO lane forever. Dead-letter it at once, as a claim

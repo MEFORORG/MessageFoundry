@@ -58,6 +58,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from messagefoundry import proctree
 from messagefoundry.childenv import engine_environment, python_child_argv
 from messagefoundry.config.settings import StoreBackend
 from messagefoundry.config.wiring import Registry, load_config
@@ -304,6 +305,20 @@ async def preflight_shard_config(config: str) -> str | None:
 SpawnFn = Callable[["ShardSpec"], Awaitable["asyncio.subprocess.Process"]]
 
 
+#: The kill-on-close job each Windows engine shard runs in, keyed by its process (BACKLOG #5978).
+#: Holding the handle here is what ties the engine shard's lifetime to the supervisor's: when the
+#: supervisor process ends by any route, a hard kill or a service manager's forced stop included,
+#: Windows closes the handle and ends at least the engine shard and the processes it started in
+#: its own tree. Work handed to a process outside that tree escapes, as
+#: :mod:`messagefoundry.proctree` says: this is process hygiene, not a trust control. The supervisor
+#: removes an entry, and clears its limit, once it sees the engine shard has exited
+#: (:func:`_release_shard_job`).
+_SHARD_JOBS: dict[asyncio.subprocess.Process, int] = {}
+
+#: How long a failed Windows launch waits for the unresumed child it killed to exit.
+_UNRESUMED_EXIT_WAIT = 5.0
+
+
 async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
     """Launch one shard subprocess from its argv (inherits stdout/stderr → NSSM/console).
 
@@ -317,15 +332,71 @@ async def _default_spawn(spec: ShardSpec) -> asyncio.subprocess.Process:
     The new group also stops the console's own Ctrl-C from reaching the child, which is why
     :meth:`Supervisor._request_stop` has to deliver the break explicitly on every shutdown path.
 
+    On Windows the child also starts suspended and is put in a kill-on-close job before it runs
+    (:func:`messagefoundry.proctree.resume_into_job`), so it ends with the supervisor process while
+    it is running, however that process ends (BACKLOG #5978, :data:`_SHARD_JOBS`). Without the job a
+    supervisor that was hard-killed, or force-stopped by a service manager whose stop timed out,
+    would leave its engine shards running, holding their ports and the store. The cost is accepted:
+    such a death also ends what a running engine shard started, at least a DR release hook it left
+    running on purpose. A job that cannot be set up is logged and the engine shard still runs,
+    without that guarantee. A child that cannot be resumed is killed and the launch raises
+    :class:`OSError`; under ``restart`` that counts as a fast exit. **POSIX has no counterpart
+    here:** a supervisor that is ``SIGKILL``-ed there still leaves its engine shards running.
+
     The child is a whole engine, so it gets the whole environment, secrets included, and gets it
     by name (:func:`messagefoundry.childenv.engine_environment`, vault BACKLOG #2587).
     """
     env = engine_environment()
-    if sys.platform == "win32":
-        return await asyncio.create_subprocess_exec(
-            *spec.argv, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP, env=env
-        )
-    return await asyncio.create_subprocess_exec(*spec.argv, env=env)
+    if sys.platform != "win32":
+        return await asyncio.create_subprocess_exec(*spec.argv, env=env)
+    process = await asyncio.create_subprocess_exec(
+        *spec.argv,
+        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | proctree.ADOPT_CREATIONFLAGS,
+        env=env,
+    )
+    try:
+        job = proctree.resume_into_job(process.pid, who=f"engine shard {spec.shard!r}")
+    except BaseException:
+        # Suspended, it would never run; ending it here keeps a failed launch from leaving it behind.
+        # resume_into_job may already have ended it through its job, and killing a process that is
+        # still exiting is refused, so either refusal leaves the resume error as the one raised.
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        except OSError as exc:  # a refusal, or a handle already gone
+            logger.warning(
+                "engine shard %r: could not kill its unresumed process (%s)", spec.shard, exc
+            )
+        # Bounded: a refused kill with no job to end it leaves a suspended process that never
+        # exits, and an unbounded wait would hang this launch and the shutdown behind it.
+        try:
+            await asyncio.wait_for(process.wait(), timeout=_UNRESUMED_EXIT_WAIT)
+        except TimeoutError:
+            logger.warning(
+                "engine shard %r: its unresumed process %s did not exit in %.0fs and is left"
+                " behind",
+                spec.shard,
+                process.pid,
+                _UNRESUMED_EXIT_WAIT,
+            )
+        raise
+    if job is not None:
+        _SHARD_JOBS[process] = job
+    return process
+
+
+def _release_shard_job(process: asyncio.subprocess.Process) -> None:
+    """Close the kill-on-close job of an engine shard ``process`` that has exited, leaving alive
+    whatever it started (:func:`messagefoundry.proctree.release_job`). A no-op for a process with
+    no job.
+
+    Released rather than ended: what an engine shard leaves running on purpose, such as a DR
+    release hook, outlives the engine shard's own exit as it did before the job existed. Only the
+    supervisor's death while the engine shard runs ends it."""
+    job = _SHARD_JOBS.pop(process, None)
+    if job is not None:
+        proctree.release_job(job)
 
 
 class ShardDrainError(RuntimeError):
@@ -539,6 +610,7 @@ class Supervisor:
                 exit_rc = await self._unless_stopped(process.wait())
                 if exit_rc is None:
                     return  # shutdown — leave the child for _terminate_all to drain
+                _release_shard_job(process)
                 rc = exit_rc
                 if not self.restart:
                     logger.info("shard %r exited rc=%s (restart disabled)", spec.shard, rc)
@@ -710,7 +782,7 @@ class Supervisor:
                     child.spec.shard,
                     child.process.pid,
                 )
-                await self._force(child, stranded)
+                await self._force_and_release(child, stranded)
         for launch in pending:
             shard = self._launches[launch].shard
             message = (
@@ -774,6 +846,32 @@ class Supervisor:
             logger.error("%s; leaving it", message)
             stranded.append(RuntimeError(message))
 
+    async def _force_and_release(self, child: _Child, stranded: list[BaseException]) -> None:
+        """:meth:`_force`, then release the engine shard's job once it is gone (BACKLOG #5978).
+
+        A child that may still be running keeps its job, so the supervisor's own exit still ends
+        it."""
+        mine: list[BaseException] = []
+        await self._force(child, mine)
+        stranded.extend(mine)
+        if not mine:
+            _release_shard_job(child.process)
+
+    async def _drain_child(self, child: _Child, stranded: list[BaseException]) -> None:
+        """Wait ``terminate_grace`` for one asked child, then force it; release its job once it
+        is gone."""
+        try:
+            await asyncio.wait_for(child.process.wait(), timeout=self.terminate_grace)
+        except TimeoutError:
+            logger.warning(
+                "engine shard %r did not exit in %.0fs — killing",
+                child.spec.shard,
+                self.terminate_grace,
+            )
+            await self._force_and_release(child, stranded)
+        else:
+            _release_shard_job(child.process)
+
     async def _terminate_all(self) -> None:
         """Ask every live child to stop, settle the launches in flight, then force what is still
         running after ``terminate_grace``.
@@ -783,8 +881,15 @@ class Supervisor:
         force; a child that may still be running is raised once every child has been tried, so
         ``run`` does not end as a clean shutdown with it still running. The comment on
         :attr:`drain_failure` says when this sets and settles it. A fatal BaseException a launch
-        raised is raised last, chained to the drain's failure."""
+        raised is raised last, chained to the drain's failure.
+
+        The children wait out the grace together, so a drain takes one grace period however many
+        hang, rather than one per hung child (BACKLOG #5978). A child already gone has its job
+        released first."""
         live = [c for c in self._children.values() if c.process.returncode is None]
+        for child in self._children.values():
+            if child.process.returncode is not None:
+                _release_shard_job(child.process)
         if live or self._launches:
             self.drain_failure = ShardDrainError(
                 "the shutdown drain did not finish; an engine shard child may still be running"
@@ -797,16 +902,16 @@ class Supervisor:
         launch_stranded: list[BaseException] = []
         fatal: list[BaseException] = []
         await self._settle_launches(live, launch_stranded, fatal)
-        for child in live:
-            try:
-                await asyncio.wait_for(child.process.wait(), timeout=self.terminate_grace)
-            except TimeoutError:
-                logger.warning(
-                    "shard %r did not exit in %.0fs — killing",
-                    child.spec.shard,
-                    self.terminate_grace,
-                )
-                await self._force(child, stranded)
+        results = await asyncio.gather(
+            *(self._drain_child(child, stranded) for child in live), return_exceptions=True
+        )
+        for child, result in zip(live, results, strict=True):
+            # One drain that fails does not stop the others; its child may still be running.
+            if isinstance(result, Exception):
+                logger.error("engine shard %r: drain failed (%r)", child.spec.shard, result)
+                stranded.append(result)
+            elif isinstance(result, BaseException):
+                fatal.append(result)
         stranded.extend(launch_stranded)
         failure: ShardDrainError | None = None
         if stranded:

@@ -215,6 +215,16 @@ def rename_code_set(
         # rename is the core operation, so a config that doesn't load leaves the result
         # byte-identical to the pre-#152 shape.
         plan = _plan_code_set_referents(config_dir, old, new)
+        if plan is not None and plan.unresolved:
+            # A referrer the planner could not rewrite would still read the old name once the file
+            # moved, so the table would vanish under it. Refuse before anything moves (BACKLOG #5980).
+            named = ", ".join(f"{r.referrer_kind} {r.referrer!r}" for r in plan.unresolved)
+            raise WiringError(
+                f"cannot rename code set {old!r} to {new!r}: {len(plan.unresolved)} reference(s) "
+                f"cannot be rewritten and would still read the old name: {named}. Nothing was "
+                "changed; rewrite those references by hand, or run `messagefoundry-toolkit impact "
+                "--kind code_set --rename-to` to see the plan"
+            )
         with atomic_edit.refused_as(src, WiringError, f"rename it to {dest.name}"):
             replace_generated(src, dest)
         result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
@@ -226,13 +236,6 @@ def rename_code_set(
             rewritten = len(impact.apply_rename(plan))
             if rewritten:
                 result["referents_rewritten"] = rewritten
-            # A referrer the planner could not rewrite still reads the old name, so the rename left
-            # it dangling; say so rather than report only what was rewritten (BACKLOG #5620).
-            if plan.unresolved:
-                result["referents_unresolved"] = [
-                    {"referrer_kind": r.referrer_kind, "referrer": r.referrer}
-                    for r in plan.unresolved
-                ]
     return result
 
 

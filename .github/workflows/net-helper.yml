@@ -82,6 +82,17 @@ jobs:
           # The csproj targets .NET 10 and publishes with NativeAOT; its comments record why.
           dotnet-version: "10.0.x"
 
+      - name: Check a caller that closes before the accept does not stop the helper
+        timeout-minutes: 3
+        run: |
+          # BACKLOG #5974. The script compiles the helper's sources with Add-Type and drives the accept on a
+          # pipe of its own, so it makes the early close happen instead of racing the binary for it. It runs
+          # under this runner's pwsh and its .NET, JIT-compiled, so it tests the logic, not the NativeAOT
+          # binary the next step publishes. It runs first, so a logic regression reports even when that
+          # publish fails.
+          pwsh -NoProfile -File net-helper/tests/accept-dropped-caller.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Publish (Release, NativeAOT)
         run: |
           # Publish, not build: only publish runs the NativeAOT compiler. Build output needs the .NET runtime

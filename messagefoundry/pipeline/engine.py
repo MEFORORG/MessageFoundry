@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
 from messagefoundry.auth.trust_anchors import LaneAnchorCheck
 from messagefoundry.config.environments import SnapshotEnvValuesProvider
 from messagefoundry.config.models import (
@@ -98,7 +99,10 @@ from messagefoundry.pipeline.secret_rotation import (
     secrets_from_settings_and_stamps,
 )
 from messagefoundry.pipeline.sharding import join_shard_names, owned_destination_set
-from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
+from messagefoundry.pipeline.state_convergence import (
+    StateConvergenceRunner,
+    alert_state_cache_failure,
+)
 from messagefoundry.pipeline.update_check import UpdateCheckResult, UpdateCheckRunner
 from messagefoundry.pipeline.wiring_runner import (
     FhirLookupAnchorPass,
@@ -110,6 +114,7 @@ from messagefoundry.pipeline.wiring_runner import (
 )
 from messagefoundry.redaction import safe_exc
 from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
+from messagefoundry.store.base import sealed_read_errors, store_connect_errors
 from messagefoundry.store.crypto import Cipher
 from messagefoundry.store.row_seal import probe_row_sealer_at_start
 from messagefoundry.store.store import (
@@ -643,10 +648,11 @@ class Engine:
         self._config_convergence: ConfigConvergenceRunner | None = None
         self._applied_config_version: int = 0
         self._config_version_seeded = False
-        # Transform-state read-through convergence (Track B Step 6b). Spawned ONLY in clustered mode
-        # (is_clustered()), so single-node never pays for it. Each tick it read-throughs any namespace a
-        # sibling node wrote/purged into this node's local _state_cache (off the hot path, so state_get
-        # stays a pure sync dict lookup). Mirrors _config_convergence's lifecycle.
+        # Transform-state read-through convergence (Track B Step 6b). Spawned ONLY where another process
+        # shares a converging store (_start_state_convergence), so a lone process never pays for it.
+        # Each tick it read-throughs any namespace a sibling process wrote/purged into this process's
+        # _state_cache (off the hot path, so state_get stays a pure sync dict lookup). Mirrors
+        # _config_convergence's lifecycle.
         self._state_convergence: StateConvergenceRunner | None = None
         # The active environment name ([ai].environment / serve --env), passed to every runner this
         # engine builds so a Handler's current_environment() resolves to it (per-face transform logic).
@@ -1895,6 +1901,40 @@ class Engine:
         owner (BACKLOG #3252)."""
         return self._registry_filter is not None
 
+    def _shares_transform_state(self) -> bool:
+        """Whether another engine process writes transform state to this store: a cluster node, or an
+        engine shard of a multi-shard config (BACKLOG #5984). Each process holds its own state cache,
+        so a write in one reaches the others only through ``converge_state_cache``. It is the test
+        :attr:`instance_identity` names the process by."""
+        return self.instance_identity is not None
+
+    def _start_state_convergence(self) -> None:
+        """Spawn the transform-state read-through loop (Track B Step 6b) where another process shares
+        the store, and only over a backend whose ``converge_state_cache`` really converges. Elsewhere it
+        warns once instead, so no log line announces a convergence the store does not perform (BACKLOG
+        #5984). Reuses the cluster heartbeat interval (owner decision) and the engine's alert sink."""
+        if not self._shares_transform_state():
+            return
+        if not getattr(self.store, "converges_transform_state", False):
+            log.warning(
+                "transform state does not converge across the processes sharing this store: the "
+                "%s backend has no state read-through, so a state_get on one cluster node or engine "
+                "shard does not see state another process wrote until it restarts%s",
+                type(self.store).__name__,
+                (
+                    "; an active-passive promotion re-reads it whole"
+                    if self._coordinator.is_clustered()
+                    else ""
+                ),
+            )
+            return
+        self._state_convergence = StateConvergenceRunner(
+            converge=self.store.converge_state_cache,
+            interval_seconds=self._cluster_settings.heartbeat_seconds,
+            alert_sink=self._alert_sink,
+        )
+        self._state_convergence.start()
+
     def _owned_lanes(self) -> OwnedLanes | None:
         """The ADR 0073 ownership scope for crash recovery — ``None`` (recover globally) unless this
         process runs a SHARDED registry (a >1-shard config filtered by ``--shard``). Channel-keyed
@@ -2190,11 +2230,13 @@ class Engine:
         # NullCoordinator (the single-node default) is a no-op here, so this line is free for SQLite /
         # single-node Postgres.
         await self._coordinator.start()
-        # Track B Step 6b: in a cluster, turn ON the store's per-namespace state-version bumping BEFORE the
-        # workers (hence transform_handoff) start, so the very first state write bumps and a sibling's
-        # convergence loop can see it. Single-node (NullCoordinator, is_clustered() False) never calls this,
-        # so no state_version rows are written and the backend stays byte-identical.
-        if self._coordinator.is_clustered():
+        # Track B Step 6b: where another process shares the store, turn ON the store's per-namespace
+        # state-version bumping BEFORE the workers (hence transform_handoff) start, so the very first
+        # state write bumps and a sibling's convergence loop can see it. That is a cluster, and since
+        # BACKLOG #5984 an engine shard of a multi-shard config too, which runs the NullCoordinator over
+        # the same unified store. A lone process never calls this, so no state_version rows are written
+        # and the backend stays byte-identical.
+        if self._shares_transform_state():
             self.store.enable_state_convergence()
         # BACKLOG #290 slice 2: the runtime intake pause. Store-level like retention, so it survives
         # reloads, and NOT leader-gated: whichever node runs the graph pauses its own listeners
@@ -2539,15 +2581,7 @@ class Engine:
                 interval_seconds=self._cluster_settings.heartbeat_seconds,
             )
             self._config_convergence.start()
-            # Transform-state read-through convergence (Track B Step 6b) — each tick read-throughs any
-            # namespace a sibling wrote/purged into this node's local _state_cache. Reuses the cluster
-            # heartbeat interval (owner decision) and the same alert sink as the rest of the engine.
-            self._state_convergence = StateConvergenceRunner(
-                converge=self.store.converge_state_cache,
-                interval_seconds=self._cluster_settings.heartbeat_seconds,
-                alert_sink=self._alert_sink,
-            )
-            self._state_convergence.start()
+        self._start_state_convergence()
         # Active-passive graph supervisor (Workstream A1) — spawned LAST (after _leader_maintenance
         # exists, so the on-promotion reclaim can fire) and ONLY in clustered mode with a wired graph.
         # It polls leadership and starts/stops the graph so only the leader binds listeners + runs
@@ -2650,6 +2684,46 @@ class Engine:
             # (Single-node NullCoordinator is_clustered() is False, so this never runs there; its boot
             # residue was already recovered by the unconditional reset_stale_inflight in start().)
             await self.store.reset_stale_inflight()
+        if self._coordinator.is_clustered() and not getattr(
+            self.store, "converges_transform_state", False
+        ):
+            # BACKLOG #5984: this backend cannot converge transform state while it runs, and a standby
+            # warmed its cache at open, so it would serve state as of its own start while the prior
+            # leader went on writing. Re-read it whole here, before the workers start. A write the
+            # prior leader commits after this read, while it winds down, is still missed.
+            #
+            # A failed re-read must not stop the bring-up. Raising here would abort _start_graph
+            # while this node holds the lease, and the supervisor would retry the whole start every
+            # poll with no graph running anywhere. The re-read fails closed and keeps the cache it
+            # already holds, so the node serves that, and the WARNING and an alert say so. Nothing
+            # retries the re-read before the next promotion or restart. A cipher failure on a state
+            # row is caught here too; the next open-time warm still fails closed on that row.
+            #
+            # The catch takes the store layer's refusal sets, sealed_read_errors() plus
+            # store_connect_errors(). Together they hold at least RuntimeError (so StoreKeylessError
+            # and StoreAcquireTimeout too), OSError, ValueError, sqlite3.DatabaseError, asyncpg's
+            # PostgresError, InterfaceError and InternalClientError, pyodbc's DatabaseError,
+            # CipherError, and pyodbc's Error root, which a deadlock victim raises; the asyncpg and
+            # pyodbc entries are there only when that driver is installed. An AUDIT_WRITE_DEFECTS
+            # type is re-raised first, so it propagates, and so does any type outside the sets. A
+            # bug that raises any other type in the sets reads as a refusal here. As the convergence
+            # pass does (state_convergence.py), the log and the alert carry the
+            # exception CLASS only: a decrypt failure's text can carry a PHI-bearing key.
+            try:
+                await self.store.reload_state_cache()
+            except AUDIT_WRITE_DEFECTS:
+                raise
+            except (*sealed_read_errors(), *store_connect_errors()) as exc:
+                kind = type(exc).__name__
+                log.warning(
+                    "engine: re-reading transform state on promotion failed (%s); this node serves "
+                    "the state cache it already holds, which may miss the prior leader's later "
+                    "writes",
+                    kind,
+                )
+                alert_state_cache_failure(
+                    self._alert_sink, f"state cache re-read on promotion failed ({kind})"
+                )
         # A3 — dead-letter OUTBOUND/ROUTED rows whose destination/handler left the config (no worker
         # would ever drain them). Now part of graph bring-up, so in a cluster ONLY the leader (the one
         # node that runs the graph) sweeps — a restarting standby never dead-letters the primary's

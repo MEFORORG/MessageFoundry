@@ -2,13 +2,15 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The authoritative static wiring graph over a loaded :class:`Registry` (ADR 0091 D1).
 
-One derivation of the inbound → router → handler → outbound edges, consumed by the ``graph`` CLI
+One derivation of the inbound → router → handler → outbound edges (plus the ``reingress_to``
+outbound → inbound back-edge, so the graph can hold a cycle), consumed by the ``graph`` CLI
 (the IDE's CONNECTIONS view), the reverse-reachability index (#152/#176), and the ``send-target``
 advisory check — previously three divergent extractors. Edges are **AST-first** (the ADR 0076 static
 discipline: parse the defining module, never re-import it) with the compiled-``co_consts`` string
 scan retained as a fallback tier, and every edge carries its **provenance**:
 
-* ``declared`` — the structured ``inbound -> router`` binding on the Registry;
+* ``declared`` — the structured ``inbound -> router`` binding on the Registry, and an outbound's
+  ``reingress_to`` naming the Loopback inbound its captured reply re-enters (``outbound -> inbound``);
 * ``literal`` — AST-proven: a string literal, a module-level ``NAME = "..."`` constant (validated
   against the WHOLE module: a ``global NAME`` in any function or any second module-scope binding —
   ``NAME += ...``, ``for NAME in ...``, an import alias — disqualifies it), or a
@@ -71,12 +73,14 @@ class WiringEdge:
 
 @dataclass(frozen=True)
 class DanglingRef:
-    """A **literal** target that resolves to nothing registered (a typo the runtime would dead-letter)."""
+    """A **literal** Router/Handler target that resolves to nothing registered (a typo the runtime
+    would dead-letter), or an outbound's declared ``reingress_to`` naming no Loopback inbound (which
+    build-check refuses on a deployed outbound)."""
 
     source_kind: str
     source: str
     target: str
-    expected: str  # "handler" | "outbound/pass-through"
+    expected: str  # "handler" | "outbound/pass-through" | "loopback inbound" (a reingress_to)
 
 
 @dataclass(frozen=True)
@@ -1191,5 +1195,22 @@ def build_wiring_graph(registry: Registry) -> WiringGraph:
             edges.append(WiringEdge("handler", hname, "outbound", name, "heuristic"))
         for name in sorted(((consts | extra) & pt_names) - literal):
             edges.append(WiringEdge("handler", hname, "inbound", name, "heuristic"))
+
+    # An outbound's `reingress_to` (ADR 0013) re-enters its captured reply on the named Loopback
+    # inbound; a .py factory and a connections.toml entry both land it in `spec.settings`. Without
+    # this edge a response cycle and the loopback's referrer are invisible (BACKLOG #5966). A name
+    # that is no Loopback inbound anywhere in the config is dangling: build-check skips a
+    # not-deployed outbound, so nothing else would report it. It is appended after the Send/Router
+    # passes so the send-target advisory's first five still show those typos. A sibling engine
+    # shard's loopback is valid but not in this filtered view's `inbound`, so it gets neither.
+    loopback_names = registry.loopback_inbound_names()
+    for oname, oconn in sorted(registry.outbound.items()):
+        target = oconn.spec.settings.get("reingress_to")
+        if not isinstance(target, str):
+            continue
+        if target not in loopback_names:
+            dangling.append(DanglingRef("outbound", oname, target, "loopback inbound"))
+        elif target in registry.inbound:
+            edges.append(WiringEdge("outbound", oname, "inbound", target, "declared"))
 
     return WiringGraph(edges=tuple(edges), dynamic=frozenset(dynamic), dangling=tuple(dangling))

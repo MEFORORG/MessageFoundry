@@ -16,7 +16,7 @@ import io
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Iterable, Sequence
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
@@ -177,7 +177,12 @@ from messagefoundry.auth.tokens import hash_token
 from messagefoundry.credential import constant_time_equal
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
 from messagefoundry.store.row_seal import RowSealError, TransitSealUnavailableError
-from messagefoundry.store.store import SessionRecord, UserRecord, VerifiedUser
+from messagefoundry.store.store import (
+    SessionRecord,
+    UnknownRoleError,
+    UserRecord,
+    VerifiedUser,
+)
 from messagefoundry.transports.http_listener import TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS
 
 _VALID_ROLE_IDS = {role.value for role in Role}
@@ -555,9 +560,16 @@ async def _validate_roles(service: AuthService, roles: list[str]) -> None:
         custom_ids = {r.id for r in await service.list_custom_roles()}
         unknown -= custom_ids
     if unknown:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, f"unknown role(s): {', '.join(sorted(unknown))}"
-        )
+        raise _unknown_roles(unknown)
+
+
+def _unknown_roles(role_ids: Iterable[str]) -> HTTPException:
+    """The 400 for role ids that name no role. :func:`_validate_roles` raises it up front, and each
+    role write's route raises it again for a custom role deleted after that check, which the
+    service reports as :class:`UnknownRoleError` (BACKLOG #5968)."""
+    return HTTPException(
+        status.HTTP_400_BAD_REQUEST, f"unknown role(s): {', '.join(sorted(set(role_ids)))}"
+    )
 
 
 #: How many refused group keys the 400 names before it only counts the rest.
@@ -1525,6 +1537,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             )
         except UsernameTaken as exc:
             raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
+        except UnknownRoleError as exc:
+            # BACKLOG #5968: a role deleted after _validate_roles. The service removed the account
+            # its first write committed, or logged why it could not.
+            raise _unknown_roles(exc.role_ids) from exc
         except (InvalidNotifyEmail, InvalidUsername) as exc:
             # BACKLOG #2018, #5521: raised before any write, as on PATCH /users/{id}. The message
             # names the rule and never echoes the value. The request model refuses the same
@@ -1784,6 +1800,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
             await service.set_roles(user_id, body.roles, actor=identity.username)
         except LastAdministratorRefused as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
+        except UnknownRoleError as exc:
+            # BACKLOG #5968: a role deleted after _validate_roles; nothing was written.
+            raise _unknown_roles(exc.role_ids) from exc
         if granted:
             _alert_administrator_granted(
                 app, f"user:{user.username}", via="roles_changed", granted_by=identity.username
@@ -2235,11 +2254,15 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
         grants = any(e.role == Role.ADMINISTRATOR.value for e in body.entries)
         before = await admin_groups() if grants else set()
-        await service.set_ad_group_map(
-            [(g, e.role) for g, e in zip(groups, body.entries, strict=True)],
-            actor=identity.username,
-            ended=ended,
-        )
+        try:
+            await service.set_ad_group_map(
+                [(g, e.role) for g, e in zip(groups, body.entries, strict=True)],
+                actor=identity.username,
+                ended=ended,
+            )
+        except UnknownRoleError as exc:
+            # BACKLOG #5968: a role deleted after _validate_roles; nothing was written.
+            raise _unknown_roles(exc.role_ids) from exc
         for group in sorted((await admin_groups() - before) if grants else set()):
             _alert_administrator_granted(
                 app, f"ad-group:{group}", via="ad_group_map", granted_by=identity.username

@@ -21,6 +21,7 @@ import messagefoundry
 from messagefoundry.pipeline.alerts import QUEUE_TAG_SUBJECT, alert_cell_tag_failure
 from messagefoundry.store import MessageStore
 from messagefoundry.store.crypto import (
+    AADComponentError,
     AesGcmCipher,
     CipherError,
     aad_cell_name,
@@ -78,13 +79,18 @@ def test_each_routing_field_changes_the_tag(field: str, value: object) -> None:
 
 
 def test_a_null_destination_is_not_the_text_none_or_blank() -> None:
-    """AC-10: ``cell_aad`` str()-encodes, so NULL and ``"None"`` once built the same bytes."""
+    """AC-10: ``cell_aad`` str()-encodes None, so NULL and ``"None"`` build the same bytes."""
     tags = {
         queue_payload_aad(**{**_BASE, "destination_name": value}) for value in (None, "None", "")
     }
     assert len(tags) == 3
-    # The control that shows why the encoder matters: the id-only cell_aad conflates them.
+    # The control that shows why the encoder matters: the id-only cell_aad conflates them. A cipher
+    # refuses to bind that AAD (BACKLOG #5962), but its bytes are the same.
     assert cell_aad("queue", "payload", None) == cell_aad("queue", "payload", "None")
+    with pytest.raises(AADComponentError):
+        make_cipher(generate_key(), write_v2=True).encrypt(
+            "x", aad=cell_aad("queue", "payload", None)
+        )
 
 
 def test_the_tag_still_names_its_cell_and_reads_off_a_row() -> None:
@@ -424,6 +430,56 @@ def test_the_no_verdict_rule_reads_the_status_first_on_any_cause() -> None:
     assert not is_transient_open_failure(
         _caused(with_reply_status(hv.VaultDown(), 503), UnauthenticatedCipherError)
     )
+
+
+async def test_the_response_worker_dead_letters_a_token_whose_tag_fails_after_its_claim(
+    tmp_path: pathlib.Path,
+) -> None:
+    """BACKLOG #5982: the worker step itself, not only the store read. A token changed after its
+    claim is dead-lettered under the tag-failure error, audited once, and re-ingresses nothing."""
+    from messagefoundry.pipeline.wiring_runner import _ItemOutcome  # noqa: PLC0415
+    from messagefoundry.store.queue_tag import QUEUE_TAG_FAILED_ACTION  # noqa: PLC0415
+    from messagefoundry.store.store import (  # noqa: PLC0415
+        REINGRESS_TOKEN_TAG_FAILED,
+        MessageStatus,
+        OutboxStatus,
+        Stage,
+    )
+    from tests import _undecryptable_reply_contract as reply  # noqa: PLC0415
+    from tests._erased_reply_contract import LOOP, children, status_of  # noqa: PLC0415
+
+    store = await MessageStore.open(
+        tmp_path / "worker.db", cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    try:
+
+        async def fetch(sql: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
+            cur = await store._db.execute(sql, params)
+            return [dict(r) for r in await cur.fetchall()]
+
+        mid = await reply.captured(store, control="QT-W", now=1.0)
+        item = await store.claim_next_fifo(LOOP, stage=Stage.RESPONSE.value)
+        assert item is not None
+        await store._db.execute("UPDATE queue SET handler_name='H_QT_W' WHERE id=?", (item.id,))
+        await store._db.commit()
+
+        outcome = await reply.runner(store)._process_response_item(LOOP, item)
+
+        assert outcome[0] is _ItemOutcome.PROCESSED
+        assert (await reply.token_of(fetch, mid))["status"] == OutboxStatus.DEAD.value
+        [row] = await fetch("SELECT last_error FROM queue WHERE id=?", (item.id,))
+        last_error = store.cipher().decrypt(
+            row["last_error"], aad=cell_aad("queue", "last_error", item.id)
+        )
+        assert last_error == REINGRESS_TOKEN_TAG_FAILED
+        assert await status_of(store, mid) == MessageStatus.ERROR.value
+        audited = await fetch(
+            "SELECT detail FROM audit_log WHERE action=?", (QUEUE_TAG_FAILED_ACTION,)
+        )
+        assert len(audited) == 1 and item.id[:12] in audited[0]["detail"], audited
+        assert await children(fetch) == []
+    finally:
+        await store.close()
 
 
 def test_an_open_fault_names_a_non_cipher_error_by_its_type_alone() -> None:

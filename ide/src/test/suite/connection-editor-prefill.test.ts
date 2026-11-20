@@ -733,6 +733,69 @@ suite("connection editor: create mode shows the transport whose fields are drawn
   });
 });
 
+suite("connection editor: what a create save posts (BACKLOG #5976)", () => {
+  teardown(closeWindows);
+
+  // BACKLOG #5976: the page posted every checkbox default and a table as a string. PR 3022 and
+  // PR 3065 fixed the edit and clone paths; these pin what the page posts on the create path,
+  // which the edit and clone suites do not reach, including a checkbox carried through a
+  // direction rebuild. What the host then writes to connections.toml is not exercised here.
+  function create(direction: "inbound" | "outbound"): Page {
+    const p = load({
+      initial: null,
+      groups: buildForm(SCHEMA, "mllp", direction, {}),
+      fieldGroupsFor: { transport: "mllp", direction },
+    });
+    p.window.document.getElementById("name").value = "OB_SYNTH_CREATE";
+    return p;
+  }
+  const createOutbound = (): Page => create("outbound");
+  function box(p: Page, key: string): DomNode {
+    const el = p.window.document.querySelector(`#settings [data-key="${key}"]`);
+    assert.ok(el, `no control drawn for ${key}`);
+    return el;
+  }
+
+  test("checkboxes left at their defaults post nothing, and a typed table posts as a table", () => {
+    const p = createOutbound();
+    assert.strictEqual(box(p, "verify").checked, true, "a default-true checkbox is drawn ticked");
+    box(p, "headers").value = '{"X-Feed":"adt"}';
+    assert.deepStrictEqual(saved(p, false), { headers: { "X-Feed": "adt" } });
+  });
+
+  test("a checkbox moved off its default posts its value, either way", () => {
+    const p = createOutbound();
+    box(p, "verify").click();
+    box(p, "tls").click();
+    assert.deepStrictEqual(saved(p, false), { verify: false, tls: true });
+  });
+
+  test("a checkbox ticked off and back on posts nothing", () => {
+    const p = createOutbound();
+    box(p, "verify").click();
+    box(p, "verify").click();
+    box(p, "headers").value = "{}";
+    assert.deepStrictEqual(saved(p, false), { headers: {} });
+  });
+
+  test("a checkbox moved off its default and back across a direction rebuild posts nothing", () => {
+    // The hosts open a create as inbound, so an outbound create always goes through this rebuild,
+    // and the rebuilt descriptor carries the unticked box as its value.
+    const p = create("inbound");
+    box(p, "verify").click();
+    const direction = p.window.document.getElementById("direction");
+    direction.value = "outbound";
+    direction.dispatchEvent(new p.window.Event("change"));
+    const asked = p.posted.filter((m) => m.command === "fields");
+    assert.strictEqual(asked.length, 1);
+    p.deliver({ command: "fields", groups: buildForm(SCHEMA, "mllp", "outbound", asked[0].settings) });
+    assert.strictEqual(box(p, "verify").checked, false, "the rebuild kept the unticked box");
+    box(p, "verify").click();
+    box(p, "headers").value = "{}";
+    assert.deepStrictEqual(saved(p, false), { headers: {} });
+  });
+});
+
 suite("webviewMessaging.postToSameRender (BACKLOG #5565)", () => {
   test("a reply to a request from a replaced render is dropped, even if handled after the re-render", () => {
     const sent: Payload[] = [];

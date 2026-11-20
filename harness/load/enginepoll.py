@@ -941,7 +941,9 @@ class EnginePoller:
             except TimeoutError:
                 await self.sample_once()
 
-    async def await_drain(self, *, timeout: float, interval: float) -> float | None:
+    async def await_drain(
+        self, *, timeout: float, interval: float, stop: asyncio.Event | None = None
+    ) -> float | None:
         """Poll until the **whole cluster's** pipeline is empty and inbound/delivery counters stop
         moving. Returns seconds-to-drain, or ``None`` on timeout.
 
@@ -951,15 +953,26 @@ class EnginePoller:
         poll. Because the cluster sample sums every shard, this only completes once **every** shard reports ``in_pipeline == 0`` and an
         empty backlog. The ``in_pipeline`` gauge (from ``/stats``) closes the prior blind spot: a
         fully **stalled** router/transform leaves the outbound backlog at 0 but ``in_pipeline > 0``,
-        so it no longer reads as drained."""
+        so it no longer reads as drained.
+
+        ``stop``, once set, ends the poll with ``None`` before its next sample (a sample already in
+        flight finishes first), so a caller can end it early without cancelling a sample on the
+        executor (BACKLOG #5977)."""
         loop = asyncio.get_running_loop()
         start = loop.time()
         prev = self.final or await self.sample_once()
         while loop.time() - start < timeout:
-            try:  # noqa: SIM105 - suppress() would drop the pragma below, which coverage reads
-                await asyncio.wait_for(asyncio.sleep(interval), timeout=interval + 1.0)
-            except TimeoutError:  # pragma: no cover - defensive
-                pass
+            if stop is None:
+                try:  # noqa: SIM105 - suppress() would drop the pragma below, which coverage reads
+                    await asyncio.wait_for(asyncio.sleep(interval), timeout=interval + 1.0)
+                except TimeoutError:  # pragma: no cover - defensive
+                    pass
+            else:
+                # Wait on the event itself, as run() does, so a stop wakes the poll at once.
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(stop.wait(), timeout=interval)
+                if stop.is_set():
+                    return None
             cur = await self.sample_once()
             if cur is None:
                 continue

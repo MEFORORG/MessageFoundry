@@ -112,13 +112,16 @@ from messagefoundry.store.cell_tag import (
     dead_letters_on_cell_tag,
     is_row_tagged,
     message_cell_aad,
+    open_listed_cell,
     open_message_cell,
+    open_message_record,
     open_preset_criteria,
     preset_criteria_aad,
     report_cell_tag_failures,
     row_tag_aad,
     row_tag_columns,
     withhold_message_cells,
+    withhold_refused_cell,
 )
 from messagefoundry.store.content_search import SearchSpec, newest_first, row_matches
 from messagefoundry.store.crypto import (
@@ -130,6 +133,7 @@ from messagefoundry.store.crypto import (
     AUDIT_SCHEME_UNNAMED_TRANSIT,
     NO_STORE_ID,
     STORE_ID_BYTES,
+    AADComponentError,
     AesGcmCipher,
     AuditKeyVersionRefusedError,
     AuditMacFn,
@@ -365,6 +369,27 @@ class AbandonedTransactionError(RuntimeError):
 
     The guard refuses the writer rather than run it on a connection that may still hold that
     transaction; the caller's write did not happen (BACKLOG #1803)."""
+
+
+def _warn_unsealable_orphans(skipped: list[Any], lane: str, what: str, missing: str) -> None:
+    """WARN about the orphans a startup sweep left because their reason could not be sealed.
+
+    ``queue.id`` is a nullable SQLite TEXT key. A NULL-id row has no cell to seal its dead-letter
+    reason against, so a cell-bound cipher refuses the seal (BACKLOG #5962), and the raise would
+    abort graph bring-up. Only where the seal refuses does the sweep leave the row: a keyless or
+    unbound store seals nothing and sweeps it as before #5962. Either way the sweep's
+    ``WHERE id=?`` matches nothing for a NULL id, so that row stays at its status. The WARNING
+    carries only the count and lane names, never a body."""
+    if not skipped:
+        return
+    log.warning(
+        "skipped %d orphaned %s row(s) with a NULL id at startup for missing %s(s): %s; a"
+        " cell-bound store cannot seal a dead-letter reason for a row with no id",
+        len(skipped),
+        what,
+        missing,
+        ", ".join(sorted({str(r[lane]) for r in skipped})),
+    )
 
 
 @asynccontextmanager
@@ -1021,6 +1046,22 @@ REINGRESS_ARTIFACT_ERASED: Final = "re-ingress reply was erased by retention"
 #: the row, so this is damage rather than an erasure, and the reference itself opened: named apart
 #: from a reference that did not, so an operator knows which row to look for (BACKLOG #4996).
 REINGRESS_ARTIFACT_MISSING: Final = "re-ingress reply row is missing"
+#: The ``last_error`` of a re-ingress token whose own ``payload`` failed its queue tag after its
+#: claim had opened it (BACKLOG #5982), at the reply read or at the handoff: at least a routing
+#: column or the payload cell changed outside the store, or the payload was blanked. Named apart
+#: from a corrupt reference or an undecryptable reply, because it is audited and alerted as a tag
+#: failure. The server backends and the re-ingress worker import it.
+REINGRESS_TOKEN_TAG_FAILED: Final = "integrity: the re-ingress work-row failed its queue tag"
+#: The ``outcome`` the handoff reports that tag failure with (BACKLOG #5982). It says the handoff
+#: refused the token rather than that the token is dead. Each backend's handoff queues the report
+#: before its dead-letter write, so it is sent even when that write or its commit fails, or is
+#: fenced. The token then stays live, and a later claim refuses and reports it again under the
+#: claim's own outcome.
+REINGRESS_TAG_FAILURE_OUTCOME: Final = "was refused at the re-ingress handoff"
+#: The ``outcome`` the re-ingress worker's reply read reports a tag failure with
+#: (:meth:`MessageStore.response_body_for_work_row`), which then raises, so the worker dead-letters
+#: the token rather than peek a reply it could not read.
+REINGRESS_READ_TAG_FAILURE_OUTCOME: Final = "was refused at the re-ingress reply read"
 #: The ``error`` of a re-ingress child whose body failed its HL7 peek, when the worker passes no reason
 #: of its own. The server backends import it, and so does the re-ingress worker, which leads it with
 #: the refused-body allowance note when it stores only the head (vault BACKLOG #4796).
@@ -11460,6 +11501,10 @@ class MessageStore:
     # can't, failing closed rather than silently dropping captures.
     supports_response_capture = True
 
+    # Single-writer: converge_state_cache is a no-op, so the engine runs no convergence loop over this
+    # backend (BACKLOG #5984).
+    converges_transform_state = False
+
     # This backend implements pass-through (PT) re-ingress — the foundational slice of the
     # `pt_deliveries` branch of transform_handoff (ConnectorType.PT, ADR 0013 generalized) lands here.
     # The engine ALLOW-LISTS PT to this backend only: a graph with a PT inbound on any backend whose
@@ -13474,6 +13519,17 @@ class MessageStore:
             )
 
     async def close(self) -> None:
+        try:
+            await self._close_handles()
+        finally:
+            # BACKLOG #5963: tell a cipher holding Vault sockets (the Transit cipher) the store is
+            # closing, even when a step above raised. close_connections says what it closes, and
+            # that is not every thread's. Read by name: the store does not import the cipher.
+            release = getattr(self._cipher, "close_connections", None)
+            if callable(release):
+                release()
+
+    async def _close_handles(self) -> None:
         # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
         # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
         # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
@@ -14434,6 +14490,10 @@ class MessageStore:
     def enable_state_convergence(self) -> None:
         """No-op on SQLite (Track B Step 6b): there is no cross-node convergence on this backend, so there
         is no per-namespace version to bump. Present for ``Store`` protocol completeness."""
+        return None
+
+    async def reload_state_cache(self) -> None:
+        """No-op on SQLite (BACKLOG #5984): this handle is the sole writer, so its cache is current."""
         return None
 
     async def _apply_state_op(
@@ -15952,12 +16012,15 @@ class MessageStore:
         Returns ``True`` if this call performed the handoff, ``False`` if it was an already-consumed no-op.
 
         An origin whose metadata cell fails its row tag (BACKLOG #2593) makes the token unrecoverable:
-        it is dead-lettered and consumed like a corrupt reference, and the failure is audited. A token
+        it is dead-lettered and consumed like a corrupt reference, and the failure is audited. So is a
+        token whose own ``payload`` fails its queue tag (:data:`REINGRESS_TOKEN_TAG_FAILED`, BACKLOG
+        #5982), which is also alerted, as a claim reports a tag failure. A token
         whose reply retention erased is dead-lettered, consumed and blanked (BACKLOG #1560), so it
         produces no child and cannot be replayed. One whose ``response`` row is missing is damage: it
         is dead-lettered under :data:`REINGRESS_ARTIFACT_MISSING` and keeps its reference as the
         evidence."""
         tag_failures: list[CellTagError] = []
+        queue_tag_rows: list[tuple[aiosqlite.Row, QueueTagError]] = []
         try:
             return await self._ingress_handoff_txn(
                 response_row_id=response_row_id,
@@ -15972,9 +16035,14 @@ class MessageStore:
                 refused_metadata=refused_metadata,
                 now=time.time() if now is None else now,
                 tag_failures=tag_failures,
+                queue_tag_rows=queue_tag_rows,
             )
         finally:
             await report_cell_tag_failures(self, tag_failures)
+            for row, error in queue_tag_rows:  # BACKLOG #5982: after the writer lock, as above
+                await report_queue_tag_failure(
+                    self, self._cipher, row, error=error, outcome=REINGRESS_TAG_FAILURE_OUTCOME
+                )
 
     async def _ingress_handoff_txn(
         self,
@@ -15991,9 +16059,12 @@ class MessageStore:
         refused_metadata: Mapping[str, Any] | None,
         now: float,
         tag_failures: list[CellTagError],
+        queue_tag_rows: list[tuple[aiosqlite.Row, QueueTagError]],
     ) -> bool:
         """:meth:`ingress_handoff`'s one transaction. An origin tag failure is appended to
-        ``tag_failures`` for the caller to audit after the writer lock is released."""
+        ``tag_failures``, and a work-row whose own payload failed its queue tag, before its dead-letter,
+        to ``queue_tag_rows`` (BACKLOG #5982), for the caller to audit after the writer lock is
+        released."""
         async with _writer_txn(self._db, self._lock):
             # 1. The work-row must still be INFLIGHT (the claim set it so); it carries the artifact ref.
             cur = await self._db.execute(
@@ -16028,9 +16099,19 @@ class MessageStore:
                 return True
 
             try:
-                ref = self._dec(wr["payload"], aad=queue_row_aad(wr)) or ""
+                ref = open_queue_cell(self._cipher, wr) or ""
                 origin_msg_id, dest, seq_s = ref.split("\x1f")
                 seq = int(seq_s)
+            except QueueTagError as err:
+                # BACKLOG #5982: the payload no longer opens under the token's own tag. Dead-lettered
+                # like a corrupt reference, then audited and alerted as a claim reports a tag
+                # failure, once the writer lock is released. Queued first, so a dead-letter write
+                # that fails is still reported.
+                # Without its traceback, so the queued error holds no frame of this transaction.
+                queue_tag_rows.append((wr, err.with_traceback(None)))
+                return await _consume_dead(
+                    REINGRESS_TOKEN_TAG_FAILED, "re-ingress work-row failed its integrity check"
+                )
             except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
                 # A corrupt/undecryptable work-row reference (DB corruption, a cipher/key failure)
                 # can NEVER be re-ingressed. Mirrors the depth-cap branch (a different
@@ -16222,7 +16303,12 @@ class MessageStore:
         prior handoff) or its reference is malformed, and ``""`` if the artifact row is missing, its
         body was erased, or the reply was empty; :meth:`ingress_handoff` tells those apart. The
         ``ingress_handoff`` it precedes re-reads the same immutable artifact for the message raw, so the
-        peek and the raw always agree."""
+        peek and the raw always agree.
+
+        The token's ``payload`` is opened under its own tag (BACKLOG #5982). A token that fails it
+        raises :class:`QueueTagError`, after the failure is audited and alerted as a claim reports
+        one, so the worker dead-letters it rather than peek a reply it could not read."""
+        refused: QueueTagError | None = None
         async with self._read() as db:
             cur = await db.execute(
                 f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue WHERE id=? AND stage=?",
@@ -16231,18 +16317,27 @@ class MessageStore:
             row = await cur.fetchone()
             if row is None:
                 return None
-            ref = self._dec(row["payload"], aad=queue_row_aad(row)) or ""
             try:
-                mid, dest, seq_s = ref.split("\x1f")
-                seq = int(seq_s)
-            except ValueError:
-                return None  # `ingress_handoff` dead-letters it as a corrupt reference
-            cur = await db.execute(
-                "SELECT body FROM response"
-                " WHERE message_id=? AND destination_name=? AND response_seq=?",
-                (mid, dest, seq),
+                ref = open_queue_cell(self._cipher, row) or ""
+            except QueueTagError as err:
+                refused = err  # reported below, once the read connection is released
+            else:
+                try:
+                    mid, dest, seq_s = ref.split("\x1f")
+                    seq = int(seq_s)
+                except ValueError:
+                    return None  # `ingress_handoff` dead-letters it as a corrupt reference
+                cur = await db.execute(
+                    "SELECT body FROM response"
+                    " WHERE message_id=? AND destination_name=? AND response_seq=?",
+                    (mid, dest, seq),
+                )
+                art = await cur.fetchone()
+        if refused is not None:
+            await report_queue_tag_failure(
+                self, self._cipher, row, error=refused, outcome=REINGRESS_READ_TAG_FAILURE_OUTCOME
             )
-            art = await cur.fetchone()
+            raise refused
         return (
             self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, seq))
             if (art and art["body"] is not None)
@@ -16719,6 +16814,57 @@ class MessageStore:
             await self._commit()
             return recovered
 
+    async def _dead_letter_orphans(
+        self,
+        orphans: list[Any],
+        error: str,
+        now: float,
+        *,
+        lane: str,
+        what: str,
+        missing: str,
+        event_names_lane: bool,
+    ) -> int:
+        """Dead-letter a startup sweep's orphans under the caller's writer guard, commit, and log.
+
+        Shared by the three missing-lane sweeps. A row whose reason the cipher refuses to seal (a
+        NULL id on a cell-bound store, :func:`_warn_unsealable_orphans`) is left as it is and named
+        in a WARNING; every other row, a NULL-id row on a keyless or unbound store included, gets
+        its UPDATE, ``dead`` event and finalize, and is counted, as before BACKLOG #5962; for a NULL
+        id the UPDATE matches nothing, so that row stays at its status.
+        The decision is the seal's own refusal, so it is the same condition the cipher applies.
+        Lane values are joined with ``str()``, so a NULL lane name cannot raise after the commit."""
+        killed: list[Any] = []
+        skipped: list[Any] = []
+        for row in orphans:
+            try:
+                reason = self._enc(error, aad=cell_aad("queue", "last_error", row["id"]))
+            except AADComponentError:
+                skipped.append(row)
+                continue
+            await self._db.execute(
+                "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
+                " WHERE id=?",
+                (OutboxStatus.DEAD.value, now, reason, now, row["id"]),
+            )
+            await self._event(
+                row["message_id"], "dead", row[lane] if event_names_lane else None, error, now
+            )
+            await self._maybe_finalize_message(row["message_id"], now)
+            killed.append(row)
+        if killed:  # a sweep that only skipped wrote nothing to commit
+            await self._commit()
+        _warn_unsealable_orphans(skipped, lane, what, missing)
+        if killed:
+            log.warning(
+                "dead-lettered %d orphaned %s row(s) at startup for missing %s(s): %s",
+                len(killed),
+                what,
+                missing,
+                ", ".join(sorted({str(r[lane]) for r in killed})),
+            )
+        return len(killed)
+
     async def dead_letter_missing_destinations(
         self, valid_names: set[str], now: float | None = None
     ) -> int:
@@ -16742,28 +16888,15 @@ class MessageStore:
             orphans = [r for r in await cur.fetchall() if r["destination_name"] not in valid_names]
             if not orphans:
                 return 0
-            error = "destination removed from outbound registry"
-            for row in orphans:
-                await self._db.execute(
-                    "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
-                    " WHERE id=?",
-                    (
-                        OutboxStatus.DEAD.value,
-                        now,
-                        self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
-                        now,
-                        row["id"],
-                    ),
-                )
-                await self._event(row["message_id"], "dead", row["destination_name"], error, now)
-                await self._maybe_finalize_message(row["message_id"], now)
-            await self._commit()
-            log.warning(
-                "dead-lettered %d orphaned outbox row(s) at startup for missing destination(s): %s",
-                len(orphans),
-                ", ".join(sorted({r["destination_name"] for r in orphans})),
+            return await self._dead_letter_orphans(
+                orphans,
+                "destination removed from outbound registry",
+                now,
+                lane="destination_name",
+                what="outbox",
+                missing="destination",
+                event_names_lane=True,
             )
-            return len(orphans)
 
     async def dead_letter_missing_handlers(
         self, valid_names: set[str], now: float | None = None
@@ -16788,28 +16921,15 @@ class MessageStore:
             orphans = [r for r in await cur.fetchall() if r["handler_name"] not in valid_names]
             if not orphans:
                 return 0
-            error = "handler removed from registry"
-            for row in orphans:
-                await self._db.execute(
-                    "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
-                    " WHERE id=?",
-                    (
-                        OutboxStatus.DEAD.value,
-                        now,
-                        self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
-                        now,
-                        row["id"],
-                    ),
-                )
-                await self._event(row["message_id"], "dead", None, error, now)
-                await self._maybe_finalize_message(row["message_id"], now)
-            await self._commit()
-            log.warning(
-                "dead-lettered %d orphaned routed row(s) at startup for missing handler(s): %s",
-                len(orphans),
-                ", ".join(sorted({r["handler_name"] for r in orphans})),
+            return await self._dead_letter_orphans(
+                orphans,
+                "handler removed from registry",
+                now,
+                lane="handler_name",
+                what="routed",
+                missing="handler",
+                event_names_lane=False,
             )
-            return len(orphans)
 
     async def dead_letter_missing_inbounds(
         self, valid_names: set[str], now: float | None = None
@@ -16848,29 +16968,15 @@ class MessageStore:
             orphans = [r for r in await cur.fetchall() if r["channel_id"] not in valid_names]
             if not orphans:
                 return 0
-            error = "inbound removed from registry"
-            for row in orphans:
-                await self._db.execute(
-                    "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
-                    " WHERE id=?",
-                    (
-                        OutboxStatus.DEAD.value,
-                        now,
-                        self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
-                        now,
-                        row["id"],
-                    ),
-                )
-                await self._event(row["message_id"], "dead", None, error, now)
-                await self._maybe_finalize_message(row["message_id"], now)
-            await self._commit()
-            log.warning(
-                "dead-lettered %d orphaned ingress/routed/response row(s) at startup for missing"
-                " inbound(s): %s",
-                len(orphans),
-                ", ".join(sorted({r["channel_id"] for r in orphans})),
+            return await self._dead_letter_orphans(
+                orphans,
+                "inbound removed from registry",
+                now,
+                lane="channel_id",
+                what="ingress/routed/response",
+                missing="inbound",
+                event_names_lane=False,
             )
-            return len(orphans)
 
     async def replay(
         self,
@@ -17576,18 +17682,15 @@ class MessageStore:
         if row is None:
             return None
         record = dict(row)
-        # Decrypt for display: raw (the body), error (may embed raw HL7 fragments, WP-5), summary and
-        # metadata (EF-3 PHI). Each cell is bound to the row's id and channel (ASVS 11.3.3, BACKLOG
-        # #2593), so a cell that fails that tag refuses the whole read.
-        for column in ("raw", "error", "summary", "metadata"):
-            record[column] = open_message_cell(
-                self._cipher,
-                column,
-                record[column],
-                message_id=record["id"],
-                channel_id=record["channel_id"],
-            )
+        # Off the event loop (BACKLOG #5981): under vault_transit each open is a blocking Vault call.
+        await asyncio.to_thread(open_message_record, self._cipher, record)
         return record
+
+    async def message_channel_id(self, message_id: str) -> str | None:
+        async with self._read() as db:
+            cur = await db.execute("SELECT channel_id FROM messages WHERE id=?", (message_id,))
+            row = await cur.fetchone()
+        return None if row is None else str(row["channel_id"])
 
     @audits_cell_tag
     async def message_metadata_json(self, message_id: str) -> str | None:
@@ -17769,15 +17872,23 @@ class MessageStore:
             )  # never return the decrypted body in a list-shaped result
 
             tag = {"message_id": d["id"], "channel_id": d["channel_id"]}
+            cell = d.get("summary")  # the cell being opened, which a refusal is judged on
             try:
-                d["summary"] = open_message_cell(self._cipher, "summary", d.get("summary"), **tag)
-                raw = open_message_cell(self._cipher, "raw", stored_raw, **tag)
+                d["summary"] = open_message_cell(self._cipher, "summary", cell, **tag)
+                cell = stored_raw
+                raw = open_message_cell(self._cipher, "raw", cell, **tag)
                 if not row_matches(spec, raw=raw, summary=d["summary"]):
                     continue
                 for column in ("error", "metadata"):
-                    d[column] = open_message_cell(self._cipher, column, d.get(column), **tag)
+                    cell = d.get(column)
+                    d[column] = open_message_cell(self._cipher, column, cell, **tag)
             except CellTagError as err:
                 failures.append(err)
+                continue
+            except CipherError as exc:
+                # BACKLOG #5970: a candidate sealed under a key the store does not hold is left
+                # out, as a failed tag is; any other cipher error raises (owner ruling 2026-11-19).
+                withhold_refused_cell(self._cipher, "messages", exc, cell)
                 continue
             rows.append(d)
             if len(rows) >= limit:
@@ -17816,7 +17927,14 @@ class MessageStore:
             failures: list[CellTagError] = []
             out: list[dict[str, Any]] = []
             for r in await cur.fetchall():
-                d = self._decode_row(r, "queue", (r["outbox_id"],), "last_error")
+                d = dict(r)
+                # BACKLOG #5970: only a last_error under a key the store does not hold is withheld.
+                d["last_error"] = open_listed_cell(
+                    self._cipher,
+                    d["last_error"],
+                    cell_aad("queue", "last_error", r["outbox_id"]),
+                    table="queue",
+                )
                 withhold_message_cells(
                     self._cipher,
                     d,
@@ -18082,11 +18200,12 @@ class MessageStore:
                     kind=r["kind"],
                     peer_host=r["peer_host"],
                     message_id=r["message_id"],
-                    reason=self._dec(
+                    # BACKLOG #5970: only a reason under a key the store does not hold is withheld.
+                    reason=open_listed_cell(
+                        self._cipher,
                         r["reason"],
-                        aad=cell_aad(
-                            "connection_event", "reason", r["connection"], r["ts"], r["kind"]
-                        ),
+                        cell_aad("connection_event", "reason", r["connection"], r["ts"], r["kind"]),
+                        table="connection_event",
                     ),
                 )
                 for r in await cur.fetchall()
@@ -18197,7 +18316,7 @@ class MessageStore:
                 " ORDER BY last_seen DESC, id DESC LIMIT ?",
                 params,
             )
-            return [self._alert_instance_row(r) for r in await cur.fetchall()]
+            return [self._alert_instance_row(r, listed=True) for r in await cur.fetchall()]
 
     async def summarize_active_alert_instances(
         self, *, allowed_channels: Sequence[str] | None
@@ -18238,9 +18357,10 @@ class MessageStore:
                 params,
             )
             row = await cur.fetchone()
-            return self._alert_instance_row(row) if row is not None else None
+            return self._alert_instance_row(row, listed=False) if row is not None else None
 
-    def _alert_instance_row(self, r: aiosqlite.Row) -> AlertInstance:
+    def _alert_instance_row(self, r: aiosqlite.Row, *, listed: bool) -> AlertInstance:
+        aad = cell_aad("alert_instance", "reason", r["event_type"], r["connection"])
         return AlertInstance(
             id=r["id"],
             event_type=r["event_type"],
@@ -18250,9 +18370,12 @@ class MessageStore:
             first_seen=r["first_seen"],
             last_seen=r["last_seen"],
             count=r["count"],
-            reason=self._dec(
-                r["reason"],
-                aad=cell_aad("alert_instance", "reason", r["event_type"], r["connection"]),
+            # BACKLOG #5970: on a list read only, a reason under a key the store does not hold is
+            # withheld; a by-id read raises every refusal, as before (owner ruling 2026-11-19).
+            reason=(
+                open_listed_cell(self._cipher, r["reason"], aad, table="alert_instance")
+                if listed
+                else self._dec(r["reason"], aad=aad)
             ),
             acked_by=r["acked_by"],
             acked_at=r["acked_at"],
