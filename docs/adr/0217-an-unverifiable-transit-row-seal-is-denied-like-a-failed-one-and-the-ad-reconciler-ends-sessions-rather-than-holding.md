@@ -345,13 +345,16 @@ where that first write commits and then raises, and every later write, the revok
 refused, this PR can leave the original token live, stamped and unrotated, where main leaves it
 unstamped because main's first write is the clear; main can reach the same state for a fault that
 begins one write later (d20261120T042802906-777260), and here the lockout counters stay uncleared.
-Acceptance of this residual awaits the owner's ruling; the Lander's earlier acceptance
-d20261120T032446206-33a44d is withdrawn (d20261120T045030279-68e180). The question covered only a
-re-auth due a clear during an Outage. On a re-auth with no clear due, the revoke in case (a) during
-an Outage is this PR's own behaviour and an exception to the Outage row's "end nothing" for that
-path only, accepted by the Lander as strictly safer under the owner's standing instruction of
-2026-10-22, record d20261120T015953943-d015e0 (independent review d20261120T035330577-6e0dc7). The
-row's text, apart from its label's pointer to this amendment, is unchanged.
+The owner accepted this residual on 2026-11-20, in the batch 616 Manager's chat (recorded on PR
+3100, comment 7041132815), and a follow-up row is to re-order the re-auth writes, or add a revoke
+that does not depend on later writes, so this fault leaves no worse a state than main; the Lander's
+earlier acceptance d20261120T032446206-33a44d was withdrawn first (d20261120T045030279-68e180). The
+question covered only a re-auth due a clear during an Outage. On a re-auth with no clear due, the
+revoke in case (a) during an Outage is this PR's own behaviour and an exception to the Outage row's
+"end nothing" for that path only, accepted by the Lander as strictly safer under the owner's
+standing instruction of 2026-10-22, record d20261120T015953943-d015e0 (independent review
+d20261120T035330577-6e0dc7). The row's text, apart from its label's pointer to this amendment, is
+unchanged.
 
 Before this PR, the clear ran before the rotation, so an Outage at the clear kept the original
 session. A hard `auth.reauth` row refused after the rotation left the rotated session live, with
