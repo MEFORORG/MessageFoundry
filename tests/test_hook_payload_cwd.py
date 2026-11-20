@@ -899,6 +899,8 @@ def test_the_seat_recorder_records_the_pinned_worktree_its_cwd_names(
     _record_stop(repo, _stop("s1", wt))
     recs = _seat_records(repo)
     assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+    # The cwd named the worktree, so the pin did not: the label's negative control.
+    assert recs[0]["worktreeSource"] == "git rev-parse --show-toplevel", recs
 
 
 def test_after_a_cd_to_a_sibling_the_seat_recorder_records_the_pinned_worktree(
@@ -910,6 +912,7 @@ def test_after_a_cd_to_a_sibling_the_seat_recorder_records_the_pinned_worktree(
     recs = _seat_records(repo)
     assert not any(_same_dir(r["worktree"], sibling) for r in recs), recs
     assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+    assert recs[0]["worktreeSource"].startswith("session pin"), recs
 
 
 def test_after_a_cd_to_another_repository_the_seat_recorder_writes_nothing_there(

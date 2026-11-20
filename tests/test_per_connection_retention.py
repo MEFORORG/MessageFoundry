@@ -409,8 +409,8 @@ async def test_a_sibling_engine_shard_keeps_an_inbound_keep_forever_body(
 ) -> None:
     """BACKLOG #5889: the engine-shard filter carries the whole config's ``messages_days``
     overrides, so a sibling engine shard that does not hold an inbound still keeps that inbound's
-    ``messages_days = 0`` body. The control: the same sibling run purges an inheriting inbound's
-    body on the global window, so its purge ran."""
+    ``messages_days = 0`` body. The controls: the same sibling run purges, on the global window,
+    an inheriting inbound it holds and one it does not."""
     from messagefoundry.pipeline.sharding import filter_registry_for_shard
 
     keep, _ = await _delivered(store, channel_id="IB_KEEP", dest="OB", now=0.0, control="S-KEEP")
@@ -419,6 +419,7 @@ async def test_a_sibling_engine_shard_keeps_an_inbound_keep_forever_body(
         build_inbound_connection("IB_KEEP", MLLP(port=2601), router="r", messages_days=0, shard="a")
     )
     reg.add_inbound(build_inbound_connection("IB_OTHER", MLLP(port=2603), router="r", shard="b"))
+    reg.add_inbound(build_inbound_connection("IB_A_INH", MLLP(port=2604), router="r", shard="a"))
     settings = RetentionSettings(messages_days=1)
 
     owner = filter_registry_for_shard(reg, "a")
@@ -432,11 +433,15 @@ async def test_a_sibling_engine_shard_keeps_an_inbound_keep_forever_body(
     # overrides, not through its own inbounds.
     assert set(sibling.inbound) == {"IB_OTHER"}, set(sibling.inbound)
     other, _ = await _delivered(store, channel_id="IB_OTHER", dest="OB", now=0.0, control="S-OTH")
+    unheld, _ = await _delivered(store, channel_id="IB_A_INH", dest="OB", now=0.0, control="S-AI")
     await RetentionRunner(
         store, settings, clock=lambda: 100 * DAY, registry_source=lambda: sibling
     ).run_once()
     assert await _raw(store, keep) == RAW  # the sibling reads the whole config's overrides
     assert await _raw(store, other) == ""  # control: the sibling's purge ran on the global window
+    # Discriminating control: an inheriting inbound the sibling does NOT hold is purged too, so
+    # IB_KEEP is kept by its override, not because the sibling skips inbounds it does not hold.
+    assert await _raw(store, unheld) == ""
 
 
 async def test_runner_without_registry_is_global_only(store: MessageStore) -> None:

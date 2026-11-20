@@ -371,8 +371,9 @@ function Read-RecordHookInput {
     <#
       The -Record hook input, and which worktree it answers for. Returns
       @{ Payload; Dir = <worktree root or $null>; FromPin = <bool>; HintFromPin = <bool>;
-      Reason = <fault or ''>; Fault = <bool> }. HintFromPin says the session pin names -Hint, the
-      worktree seat-record.ps1 passed, which it resolves by the same pin rules.
+      Reason = <fault or ''>; Fault = <bool> }. HintFromPin says the hook input resolved through
+      the session pin, as FromPin does, to -Hint, the worktree seat-record.ps1 passed, which it
+      resolves by the same pin rules. A cwd inside the pinned worktree resolves through the cwd.
       A Reason means NO WRITE. Fault marks a Reason that is this writer's own failure (the helper is
       missing or threw) rather than input it refused. A $null Dir means the directory this script runs in.
 

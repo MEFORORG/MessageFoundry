@@ -582,9 +582,9 @@ def _override_scope(kept: tuple[str, ...]) -> str:
     parts = []
     if inbound:
         parts.append(
-            "An inbound override keeps forever, while that inbound stays in the live graph with it, at least what that "
-            "purge holds for the messages that inbound "
-            "received: each stored body, though the inbound's own prune_documents_after, where "
+            "An inbound override keeps forever, while that inbound stays in the live graph with "
+            "it, at least what that purge holds for the messages that inbound received: each "
+            "stored body, though the inbound's own prune_documents_after, where "
             "set, still strips embedded documents from it; its delivered and cancelled outbound "
             "payloads, its event detail and the replies captured for it. It does not keep their "
             "dead-lettered rows at any stage, or a streaming attachment the purge of the last of "
