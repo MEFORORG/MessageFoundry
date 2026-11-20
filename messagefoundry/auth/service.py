@@ -15690,19 +15690,9 @@ class AuthService:
         )
 
     async def _end_reauth_rotated_session(self, rotated_token: str, actor: str) -> bool:
-        """Ask the store to end the session a re-auth rotated once :meth:`_clear_after_reauth`
-        answered ``"denied"`` or raised, or once a re-auth that finished with a rotated token had
-        the write of its hard ``auth.reauth`` row raise or be cancelled, whether or not a clear was
-        due, any purpose grant minted for that token being dropped first (BACKLOG #5900), and say
-        whether the revoke landed, as far as this call saw. A refused revoke is tried once more, as
-        ``confirm_mfa_enrollment`` tries its own (BACKLOG #3025). Refused twice, it is logged and
-        answered False: the elevated session may then stay live, unreachable, because the caller
-        answers ``session_lost`` or raises either way and its new token is never handed back. A
-        refused revoke is logged here. After a denied or raised clear, the caller records the
-        answer in ``session_ended`` on the ``auth.reauth`` row it then writes softly, where that
-        write succeeds; when that write is refused too, a revoke that landed is recorded nowhere.
-        On the hard-row path, where that row's write raised or was cancelled, the caller logs the
-        answer instead."""
+        """Revoke the session a re-auth rotated and will never hand back (BACKLOG #5900), and say
+        whether the revoke landed, as far as this call saw. A refused revoke is logged and tried
+        once more, as ``confirm_mfa_enrollment`` tries its own (BACKLOG #3025)."""
         rotated = hash_token(rotated_token)
         for attempt in ("retrying", "and could not end the session it rotated"):
             ended = await write_audit_soft(
@@ -15771,15 +15761,13 @@ class AuthService:
         second-factor requirement and no lock is live (BACKLOG #1638's rule for the login leg), and
         only once its rotation succeeded and the account's lockout state is still what the proof
         saw, decided by the store's compare-and-set (:meth:`_clear_after_reauth`, BACKLOG #5900).
-        An account that cannot be established there, gone, disabled, re-bound, its own
-        ``session_epoch`` moved or failing its seal, is granted nothing: the store is asked to end
-        the rotated session, and the answer is ``session_lost``. A clear that raises, at least on a
-        store error it cannot read back or a cancel, also asks the store to end the rotated
-        session, and the error propagates; so does a hard ``auth.reauth`` row whose write raises or
-        is cancelled after a rotation, whether or not a clear was due. A success that clears a run
-        of failures is labelled ``auth.login_after_failures``; that row and the ``auth.reauth`` row
-        commit with the clear.
-        The ``auth.reauth`` row is written even when the ceremony raises from its stamp onward."""
+        An account that cannot be established there is granted nothing, the store is asked to
+        revoke the rotated session, and the answer is ``session_lost``. A clear that raises, or a
+        hard ``auth.reauth`` row whose write raises or is cancelled after the rotation, also asks
+        for that revoke and raises; ADR 0217's 2026-11-19 amendment is the record. A success that
+        clears a run of failures is labelled ``auth.login_after_failures``; that row and the
+        ``auth.reauth`` row commit with the clear. A ceremony that raises from its stamp onward
+        still tries to write its ``auth.reauth`` row, softly."""
         if await self.session_steps_up_at_idp(token):
             # BACKLOG #296, ADR 0142 Amendment B: a session the federated login minted steps up at the
             # IdP and NEVER by a password. Refused before any verify, so the password is not sent to

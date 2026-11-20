@@ -300,46 +300,39 @@ least gaps (1), (2), (5) and (6) of *Open audit gaps, a correction added 2026-11
 extension, in (c).
 
 **An amendment to the Outage row, added 2026-11-19 (BACKLOG #5900, PR 3100).** BACKLOG #5900
-moves the password re-auth's lockout clear after the session rotation. So during a Vault Transit
-Outage, a re-auth that is due a clear signs the user out when the clear itself raises, at least on
-an Outage refusing the audit-chain MAC of the rows it appends, or when the write of its hard
-`auth.reauth` row then raises or is cancelled. An Outage at the account record's seal that leaves
-the audit append working refuses the clear, writes the hard row, hands back the rotated token and
-ends nothing. Accepting that sign-out was decided by the Lander under the owner's delegation of
-2026-11-19, record d20261119T234650256-3bf83e: it fails closed, and the revoke below ends only a
-session whose token was never handed back. The question asked, quoted from the Lander's owner
-table: "During a Vault Transit outage, a re-auth whose lockout counters are due to be cleared now
-signs the user out; main keeps their session live. [...] ADR 0217's Outage row, which you
-accepted, says 'end nothing'." The owner answered "/driver". The owner can reverse the decision by
-ruling that the Outage row's "end nothing" governs. The row's text, apart from its label's pointer
-to this amendment, is unchanged.
+moves the password re-auth's (`reauth`) lockout clear after the session rotation. A re-auth that
+holds a rotated token ends that session in at least two cases: (a) the write of its hard
+`auth.reauth` row raises or is cancelled, whether or not a clear was due; (b) the clear itself
+raises, at least on a Vault Transit Outage refusing the audit-chain MAC of the rows the clear
+appends (`CipherError`). In both it drops any purpose grant minted for the rotated token, raises,
+never hands that token back, and asks the store to revoke the rotated session through a shielded,
+best-effort revoke that ends nothing else. The federated step-up, `complete_oidc_step_up`, also
+raises and withholds its token when its hard row raises, but it neither drops its grant nor
+revokes its rotated session.
 
-What the code does. On at least two paths, a password re-auth that has rotated its session raises
-and never hands back the rotated token. The federated step-up, `complete_oidc_step_up`, does not
-do this yet. One, the clear-raise path, is a clear that raises, which includes a Vault Transit
-Outage refusing the audit-chain MAC of the rows the clear appends (`CipherError`;
-[SECURITY.md](../SECURITY.md), the re-auth leg's lockout clear). The other, the hard-row path, is
-a hard `auth.reauth` row whose write raises, at least on a Vault Transit Outage, an `OSError` or a defect, or is
-cancelled; neither proves the row is not in, since a cancel, or a connection lost at the commit,
-can follow a commit that landed. This PR applies the second path whether or not a lockout clear
-was due; the delegated question above covered only a re-auth due a clear. On either path the user
-is signed out because the rotation has already retired the token the caller held. Where a clear is
-involved, that is the #5900 reorder, which moves the clear after the rotation; the hard row was
-always written after it. The sign-out does not come from the revoke. The re-auth then drops any
-purpose grant minted for the rotated token and asks the store to end the rotated session, whose
-token was never handed back; that revoke ends nothing else. It is best effort: a refused revoke is
-tried once more, and when it is refused again, or raises, the rotated session stays live. On the
-hard-row path log lines record the revoke's outcome, landed or not, and no row does. On the
-clear-raise path the re-auth writes an `interrupted` row softly, which records the outcome in
-`session_ended` where that write succeeds. An Outage that refuses the audit-chain MAC refuses that
-row too: then a refused revoke is recorded only by log lines, and a revoke that landed is recorded
-by nothing. Asking the
-store to end that session departs from the Outage row's "end nothing".
+The user is signed out because the rotation already retired the caller's old token, not because
+of the revoke. If the revoke fails, the rotated session stays live, but no caller holds its token.
+In case (a), log lines record what the revoke call reported. In case (b), the soft `interrupted`
+`auth.reauth` row carries `session_ended` when that write succeeds. When that row is refused too,
+a refused revoke is logged, and a revoke that landed is recorded by no audit row or log line; the
+session row's `revoked_at` still records it. A revoke whose call raised after it committed can be
+reported as not ended.
 
-Before this PR, the clear ran inside the re-proof, before the rotation, so a clear that an Outage
-refused raised there and the original session stayed live. A hard `auth.reauth` row refused after
-the rotation left the rotated session live, with any purpose grant, and nothing asked the store to
-end it.
+During a Vault Transit Outage, a re-auth due a clear signs the user out only through case (a) or
+(b). An Outage at the account record's seal that leaves the audit append working writes the row,
+hands back the rotated token and ends nothing. Accepting that sign-out was decided by the Lander
+under the owner's delegation of 2026-11-19, record d20261119T234650256-3bf83e, because it fails
+closed. The question asked, quoted from the Lander's owner table: "During a Vault Transit outage,
+a re-auth whose lockout counters are due to be cleared now signs the user out; main keeps their
+session live. [...] ADR 0217's Outage row, which you accepted, says 'end nothing'." The owner
+answered "/driver". The owner can reverse the decision by ruling that the Outage row's "end
+nothing" governs. The question covered only a re-auth due a clear: the revoke in case (a) on a
+re-auth with no clear due is this PR's own behaviour. The row's text, apart from its label's
+pointer to this amendment, is unchanged.
+
+Before this PR, the clear ran before the rotation, so an Outage at the clear kept the original
+session. A hard `auth.reauth` row refused after the rotation left the rotated session live, with
+any purpose grant.
 
 **The seal input is a fixed-length digest.** The sealer sends Transit not the row's encoding but its
 SHA-256: `seal = Transit hmac(SHA-256(label || store id || seal_bytes(kind, fields)))`, each part

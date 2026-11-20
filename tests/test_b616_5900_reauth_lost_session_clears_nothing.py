@@ -1158,7 +1158,7 @@ async def test_a_cancel_during_the_clear_ends_the_rotated_session(
         await store.close()
 
 
-async def test_an_outage_at_the_clear_and_a_refused_row_end_the_rotated_session(
+async def test_an_outage_at_the_clear_and_a_raised_hard_row_end_the_rotated_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A Transit Outage at the account record's seal answers refused, and the store then refuses
@@ -1189,7 +1189,7 @@ async def test_an_outage_at_the_clear_and_a_refused_row_end_the_rotated_session(
         await store.close()
 
 
-async def test_a_refused_revoke_after_a_refused_row_logs_what_happened(
+async def test_a_refused_revoke_after_a_raised_hard_row_logs_what_happened(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """The hard-row path minted a purpose grant and then dropped it, so its revoke's log lines
