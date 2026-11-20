@@ -2699,9 +2699,13 @@ class Engine:
             # retries the re-read before the next promotion or restart. A cipher failure on a state
             # row is caught here too; the next open-time warm still fails closed on that row.
             #
-            # Only the store's own read and cipher refusals are caught: sealed_read_errors() plus
-            # store_connect_errors() (pyodbc's Error root, which a deadlock victim raises, and the
-            # acquire timeout). A defect in AUDIT_WRITE_DEFECTS, or any other type, propagates. As
+            # The catch takes the store layer's refusal sets, sealed_read_errors() plus
+            # store_connect_errors(). Together they hold at least RuntimeError (so StoreKeylessError
+            # and StoreAcquireTimeout too), OSError, ValueError, the installed drivers' DatabaseError
+            # classes (sqlite3, asyncpg's roots, pyodbc), CipherError, and pyodbc's Error root,
+            # which a deadlock victim raises. RuntimeError and ValueError are broad, so a bug of
+            # either type reads as a refusal here. A defect in AUDIT_WRITE_DEFECTS is re-raised
+            # first, and any type outside the sets propagates. As
             # the convergence pass does (state_convergence.py), the log and the alert carry the
             # exception CLASS only: a decrypt failure's text can carry a PHI-bearing key.
             try:

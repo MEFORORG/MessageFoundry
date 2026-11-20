@@ -345,6 +345,25 @@ async def test_a_null_lane_name_does_not_break_the_dead_letter_warning(
         await store.close()
 
 
+async def test_only_the_destination_sweep_names_its_lane_in_the_dead_event(tmp_path: Path) -> None:
+    # The shared sweep writes the lane into the event's destination column for the destination
+    # sweep alone; a handler or inbound name is not a destination.
+    store = await MessageStore.open(tmp_path / "dead_event_lane.db")
+    try:
+        out = await store.enqueue_message(channel_id="IB", raw=RAW, deliveries=[("OB_GONE", BODY)])
+        routed, _ = await _route_one(store)
+        assert await store.dead_letter_missing_destinations(set()) == 1
+        assert await store.dead_letter_missing_handlers(set()) == 1
+        for mid, destination in ((out, "OB_GONE"), (routed, None)):
+            cur = await store._db.execute(
+                "SELECT destination FROM message_events WHERE message_id=? AND event='dead'",
+                (mid,),
+            )
+            assert [r["destination"] for r in await cur.fetchall()] == [destination]
+    finally:
+        await store.close()
+
+
 async def test_an_integer_timestamp_still_opens_its_connection_event(tmp_path: Path) -> None:
     # BACKLOG #5962: the writer binds the int it was given, the REAL column hands back a float, and
     # both must spell the same AAD, or the reason never opens on read or on rotate-key.

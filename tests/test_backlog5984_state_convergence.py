@@ -295,6 +295,24 @@ async def test_a_defect_in_the_promotion_reload_is_not_swallowed(tmp_path: Path)
         await eng.stop()
 
 
+async def test_an_audit_write_defect_in_the_promotion_reload_propagates(tmp_path: Path) -> None:
+    # NotImplementedError is in AUDIT_WRITE_DEFECTS and is also a RuntimeError, which the refusal
+    # sets catch. The defect re-raise runs first, so it propagates and nothing is alerted.
+    from messagefoundry.audit_write import AUDIT_WRITE_DEFECTS
+
+    assert NotImplementedError in AUDIT_WRITE_DEFECTS
+    eng, _coord, sink, calls = await _promote_with_failing_reload(
+        tmp_path, NotImplementedError("not built")
+    )
+    try:
+        with pytest.raises(NotImplementedError, match="not built"):
+            await eng._reconcile_graph()
+        assert calls == [1]
+        assert sink.stopped == []
+    finally:
+        await eng.stop()
+
+
 async def test_sqlserver_reload_state_cache_rereads_the_shared_table() -> None:
     from messagefoundry.store.sqlserver import SqlServerStore
 
