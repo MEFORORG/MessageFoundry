@@ -4287,20 +4287,23 @@ def test_the_minted_certificate_names_a_wildcard_binds_loopback(
 @pytest.mark.parametrize(
     ("first", "then", "names"),
     [
-        ("127.0.0.1", "0.0.0.0", ["0.0.0.0", "127.0.0.1"]),
-        ("::1", "::", ["::", "::1"]),
-        ("127.0.0.1", "10.0.0.9", ["10.0.0.9"]),
+        # The new bind's names first, then every name the old certificate carried, kept so a
+        # client still dialling one of them keeps verifying.
+        ("127.0.0.1", "::", ["::", "::1", "127.0.0.1"]),
+        ("10.0.0.9", "0.0.0.0", ["0.0.0.0", "127.0.0.1", "10.0.0.9"]),
+        ("127.0.0.1", "localhost", ["localhost", "127.0.0.1"]),
     ],
 )
 def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
     first: str, then: str, names: list[str], tmp_path: Path
 ) -> None:
-    """BACKLOG #5973. A pair minted for one bind, reused after the bind moved, must name the new
-    bind, or a client dialling it (the tray on a wildcard's loopback) fails hostname verification
-    until the renewal months later. The re-mint is a reported, audited replacement.
+    """BACKLOG #5973. A pair minted for one bind, reused after the bind moved, must name what a
+    client dials for the new bind (a wildcard's loopback, else the host), or that client (the
+    tray, pinning the file) fails hostname verification until the renewal months later. The
+    re-mint is a reported, audited replacement.
 
-    Mutation: drop the bind check in ``_renewal_due``. Red: the second start reuses the first
-    certificate, which names only ``first``."""
+    Mutation: drop the bind check in ``_replacement_due``. Red: the second start reuses the first
+    certificate, which lacks the dialled name."""
     old_cert, old_key = ensure_api_tls_material(ApiSettings(host=first), state_dir=tmp_path)
     old_sha = _sha256(Path(old_cert))
     events: list[GeneratedPairReplaced] = []
@@ -4316,20 +4319,27 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
     assert [str(n.value) for n in san] == names
     assert [(e.reason, e.old_sha256) for e in events] == [("bind_changed", old_sha)]
     assert events[0].new_sha256 == _sha256(Path(cert)) != old_sha
-    # Once it names the bind, the next start reuses it and writes nothing.
-    again: list[GeneratedPairReplaced] = []
-    ensure_api_tls_material(ApiSettings(host=then), state_dir=tmp_path, replacements=again)
-    assert again == []
+    # Once it names the bind, neither bind re-mints it again: two engines that share a state dir
+    # with these two binds converge on one certificate instead of replacing each other's.
+    for host in (then, first):
+        again: list[GeneratedPairReplaced] = []
+        ensure_api_tls_material(ApiSettings(host=host), state_dir=tmp_path, replacements=again)
+        assert again == []
 
 
 @pytest.mark.parametrize(
     ("first", "then", "renew"),
     [
-        # A wildcard's pair also names its loopback, so moving the bind there reuses it.
+        # The old certificate already names what a client dials for the new bind.
+        ("127.0.0.1", "0.0.0.0", True),
         ("0.0.0.0", "127.0.0.1", True),
+        ("::1", "[::]", True),
+        # Hostname matching ignores case, and a SAN cannot carry an IPv6 zone.
+        ("myhost", "MYHOST", True),
+        ("fe80::1%12", "fe80::1%12", True),
         # An engine shard (renew=False) reuses a loadable pair as found, the bind check included,
         # so a lone restarted shard cannot serve a different certificate from its siblings.
-        ("127.0.0.1", "0.0.0.0", False),
+        ("127.0.0.1", "::", False),
     ],
 )
 def test_a_bind_move_that_needs_no_new_name_or_is_a_shard_reuses_the_pair(

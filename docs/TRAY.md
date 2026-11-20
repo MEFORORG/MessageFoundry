@@ -120,18 +120,22 @@ hints (validated, never executed).
 **Where the tray finds the engine's host and port.** From `serve --host` and `--port` in
 `AppParameters` only. A part they leave unset is the engine's default, `127.0.0.1` or `8765`.
 
-**Known limit: the tray does not read the bind from the engine's settings TOML** (ADR 0113, owner
-ruling 2026-11-20), nor from `MEFOR_*` variables in the service's environment. A bind set only
-through `[security].listen_address` or `[api].port`, with no `serve --host` or `--port`, is not
-discovered: the tray probes `127.0.0.1:8765` and keeps service control. So a LAN or wildcard
-`listen_address` is probed on that loopback default as if the engine were loopback-only, and a
-non-default `[api].port` reads a running engine as down. Set the bind with `serve --host` and
-`--port` instead. `scripts/service/install-service.ps1` always writes both into `AppParameters`,
+**Known limit: the tray does not read the bind from the engine's settings TOML**, nor from
+`MEFOR_*` variables in the service's environment. This is deliberate: ADR 0113 is unchanged, by
+the owner's ruling of 2026-11-20 on PR 3128. A bind set only through `[security].listen_address`
+or `[api].port`, with no `serve --host` or `--port`, is not discovered: the tray probes
+`127.0.0.1:8765` and keeps service control. A LAN `listen_address` does not listen on that
+loopback, so the tray reads a running engine as down. A wildcard one, `0.0.0.0`, does listen there,
+so the probe works, but the tray keeps service control for a bind that listens on every
+interface. A non-default `[api].port` reads a running engine as down. Set the bind with
+`serve --host` and `--port` instead. `scripts/service/install-service.ps1` always writes both into `AppParameters`,
 from its `-ListenHost` and `-Port` parameters (defaults `127.0.0.1` and `8765`), so a service it
 installed is discovered. Otherwise set `engine_url` in `tray.toml`. An `engine_url` naming a
-loopback host (`127.0.0.1`, `localhost` or `::1`) keeps service control, a wildcard `--host`
-included; one naming any other host makes the tray monitor-only. An explicit `engine_url` also
-drops the certificate the tray found, so set `engine_cacert` beside it (see TLS engines).
+loopback host (`127.0.0.1`, `localhost` or `::1`) keeps service control; one naming any other host
+makes the tray monitor-only. An explicit `engine_url` also drops the certificate the tray found,
+so set `engine_cacert` beside it (see TLS engines). Do not use a loopback `engine_url` to regain
+service control on a wildcard `--host`: the tray then no longer knows the bind is a wildcard, and
+treats it as loopback-only.
 
 A wildcard `--host` is probed on the loopback address of the same family, `127.0.0.1` for
 `0.0.0.0` and `::1` for `::`, because no client can connect to a wildcard address, and the tray is
@@ -139,11 +143,12 @@ monitor-only for it, because that bind listens on every interface. A `--host` na
 non-loopback address, a wildcard included, with no `--port` is monitor-only too; before BACKLOG
 #5936 the tray fell back to the loopback default for that bind and kept service control. The
 certificate the engine mints for a wildcard bind names that same loopback, `127.0.0.1` or `::1`.
-A pair the engine minted earlier for another bind is replaced at the next start, because the
-engine re-mints its own generated pair whenever it lacks a name a fresh mint for the current bind
-would carry; that replacement is logged and audited like a renewal. An engine shard
-(`serve --shard`) never re-mints; `supervise` does it before it starts the shards. An operator
-certificate on a wildcard bind is never re-minted, and verifies only if it names that loopback.
+A pair the engine minted earlier for another bind is replaced at the next start when it does not
+name the address a client dials for the current bind (the loopback for a wildcard, else the host);
+the new certificate keeps the old one's names beside the new ones, and the replacement is logged
+and audited like a renewal. An engine shard (`serve --shard`) never makes that replacement;
+`supervise` makes it before it starts the shards. An operator certificate is never replaced, and
+on a wildcard bind it verifies only if it names that loopback.
 (BACKLOG #5936, #5973)
 
 **What "View Service Log" will open.** Windows opens a file with whatever program owns its

@@ -194,7 +194,9 @@ nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
    reports it as an unusable pair. That row's old fingerprint is the half-installed certificate,
    not the one clients trusted, whose fingerprint only the earlier WARNING line carries.
 6. **Decision 6, realised: every re-mint of an existing pair is audited.** A renewal, a replaced
-   unusable pair, and a replaced half-pair each write one `api.tls_generated_pair_replaced` row to
+   unusable pair, a replaced half-pair, and (BACKLOG #5973) a re-mint at startup of a pair whose
+   certificate does not name the address a client dials for the current bind, reason
+   `bind_changed`, each write one `api.tls_generated_pair_replaced` row to
    the store's existing hash-chained audit log. The row carries the reason, the certificate path,
    and the old and new SHA-256 fingerprints and expiry dates. It never carries key material. The
    replacement happens before the store is open, so `serve` hands the event to the app, and the

@@ -1139,8 +1139,9 @@ log as `api.tls_generated_pair_replaced`, with the old and new SHA-256 fingerpri
 renewal, import the new `api-generated-cert.pem` into the browser trust store again, and replace
 any copy of it you pass to `--cacert`.** A sharded service (`supervise`) renews once, before it
 starts its shards, and a shard it restarts never renews, so every shard serves the same certificate.
-The same replacement runs at startup, whatever the expiry, when the bind moved to a name the
-certificate lacks, for example from `127.0.0.1` to `0.0.0.0`; its audit row's reason is
+The same replacement runs at startup, whatever the expiry, when the certificate does not name the
+address a client dials for the current bind, for example after a move from `127.0.0.1` to `::`,
+whose loopback is `::1`. The new certificate keeps the old one's names too. Its audit row's reason is
 `bind_changed`, and the new certificate must be imported the same way (BACKLOG #5973).
 See
 [INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console". (The former PySide6 desktop
