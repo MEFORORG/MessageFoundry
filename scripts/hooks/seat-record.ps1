@@ -76,21 +76,26 @@ try {
         # be read are still refused below.
         # DECIDED, NOT ACCIDENTAL (BACKLOG #5961, after #5954). Such a session has no other source of
         # truth for its worktree: /clear mints a new session id and no pin, so the cwd is all there is.
-        # -Unpinned makes seat.ps1 label the record's worktreeSource so; no reader consults that
-        # label yet. tests/test_hook_payload_cwd.py pins both halves.
+        # -Unpinned labels the record so (seat.ps1's -Unpinned says what the label does), except for
+        # the start checkout itself, which rule 4 takes. tests/test_hook_payload_cwd.py pins both.
         $p = Get-CcxHookPayloadCwd -Payload $session.Payload
-        $startCommon = Get-CcxGitCommonDir (Get-CcxWorktreeRoot (Get-Location).ProviderPath)
+        $startRoot = Get-CcxWorktreeRoot (Get-Location).ProviderPath
+        $startCommon = if ($startRoot) { Get-CcxGitCommonDir $startRoot } else { $null }
         $cwdRoot = if ($p.Cwd) { Get-CcxWorktreeRoot $p.Cwd } else { $null }
         $cwdCommon = if ($cwdRoot) { Get-CcxGitCommonDir $cwdRoot } else { $null }
         if (-not $session.Pinned -and $startCommon -and $cwdCommon -and (Test-CcxSamePath $cwdCommon $startCommon)) {
-            $recordArgs = @('-Worktree', [string]$cwdRoot, '-Unpinned')
+            $recordArgs = @('-Worktree', [string]$cwdRoot)
+            if (-not (Test-CcxSamePath ([string]$cwdRoot) ([string]$startRoot))) { $recordArgs += '-Unpinned' }
         }
         else {
             # The only worktree left to record is the one this hook started in, the PRIMARY under the
             # desktop app, and a record there would say this session sits in the primary.
             Write-Output "[seat] could not read this session's worktree: $($session.Reason). Nothing was recorded for this turn."
-            # A Reason can quote payload text, so no double quote reaches the child's command line.
-            $recordArgs = @('-Refused', ([string]$session.Reason -replace '"', "'"))
+            # A Reason can quote payload text, so no double quote reaches the child's command line,
+            # and it is cut to the 300 characters seat.ps1 keeps, so a long cwd cannot overrun it.
+            $why = [string]$session.Reason -replace '"', "'"
+            if ($why.Length -gt 300) { $why = $why.Substring(0, 300) }
+            $recordArgs = @('-Refused', $why)
         }
     }
     if (-not $recordArgs) {
@@ -103,16 +108,13 @@ try {
     # layer exists to show. A missing pwsh throws into the catch below.
     $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
     $recorderArgs = @('-NoProfile', '-File', $seat, '-Record') + $recordArgs
-    # The session id the hook already read, so a record is never keyed 'nosid' because seat.ps1's own
-    # second read of the input failed.
-    $sid = if ($session.Payload) { $session.Payload.PSObject.Properties['session_id'] } else { $null }
-    if ($sid -and $sid.Value -is [string] -and $sid.Value -and $sid.Value -notmatch '"') { $recorderArgs += @('-SessionId', $sid.Value) }
     $out = if ($payload) { $payload | & $pwsh @recorderArgs 2>&1 } else { & $pwsh @recorderArgs 2>&1 }
     # seat.ps1 -Record exits 0 on every route it controls, so any other code means it never ran as
     # written, for example because pwsh refused the file.
     if ($LASTEXITCODE -ne 0) {
         $detail = (@($out) | ForEach-Object { [string]$_ } | Where-Object { $_.Trim() } | Select-Object -Last 3) -join ' | '
-        Write-Output "[seat] the seat recorder exited $LASTEXITCODE, so this turn was not recorded. $detail"
+        $lost = if ($recordArgs[0] -eq '-Refused') { 'the refusal above was not logged' } else { 'this turn was not recorded' }
+        Write-Output "[seat] the seat recorder exited $LASTEXITCODE, so $lost. $detail"
     }
 } catch {
     # Last resort. seat.ps1 owns the error log; if we could not even reach it, say so on stdout, where

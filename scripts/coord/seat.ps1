@@ -126,8 +126,8 @@ param(
     [Parameter(ParameterSetName = 'Prompt')][string]$Source,
     # The worktree to record. scripts/hooks/seat-record.ps1 passes it on every -Record it does not
     # refuse (-Refused), resolved by the shared session-pin rules, so the payload's cwd is never the
-    # hint there. Tests and -Declare from a
-    # different cwd pass it too. Derived from the payload cwd or the current directory when absent.
+    # hint there. Tests and -Declare from a different cwd pass it too. Derived from the payload cwd
+    # or the current directory when absent.
     [string]$Worktree,
     # -Record only: the Reason scripts/hooks/seat-record.ps1 refused the hook input for. Nothing is
     # recorded; the refusal goes to stderr and .writer-refusals.txt (rule 2), as a refusal of this
@@ -1041,7 +1041,7 @@ try {
             if (Set-StartSeatsDir) {
                 # A missing or throwing helper IS a writer failure, and rule 2 wants a line, even
                 # when the hook refused first.
-                if ($hookIn.Fault) { Write-WriterError -Stage 'hook-input' -Message "the hook-input helper failed: $($hookIn.Reason)" }
+                if ($hookIn.Fault) { Write-WriterError -Stage 'hook-input' -Message "nothing was recorded: $($hookIn.Reason)" }
                 if ($Refused -or -not $hookIn.Fault) {
                     $cwd = ''
                     if ($payload -and $payload.PSObject.Properties['cwd']) { $cwd = [string]$payload.PSObject.Properties['cwd'].Value }

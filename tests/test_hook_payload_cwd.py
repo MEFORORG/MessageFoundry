@@ -1030,8 +1030,7 @@ def test_seat_ps1_says_why_it_refused_a_cwd(seat_clones: tuple[Path, Path, Path,
     assert _seat_records(repo) == []
     # A refusal is not a writer failure: fleet.ps1 counts .writer-errors.txt lines as failures, so
     # an unpinned session must not add one on every Stop.
-    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    errors = common / "mefor-coord" / "seats" / ".writer-errors.txt"
+    errors = _seats_dir(repo) / ".writer-errors.txt"
     assert not errors.exists() or errors.read_text(encoding="utf-8").strip() == "", errors
 
 
@@ -1046,15 +1045,20 @@ def test_a_named_worktree_record_still_logs_a_hook_input_fault(
     shutil.copytree(ROOT / "scripts" / "coord", sandbox / "coord")
     shutil.copytree(ROOT / "scripts" / "worktree", sandbox / "worktree")
     assert not (sandbox / "hooks").exists()
-    _record_seat_direct(
-        repo, _stop("s1", wt), "-Worktree", str(wt), seat=sandbox / "coord" / "seat.ps1"
-    )
+    seat = sandbox / "coord" / "seat.ps1"
+    _record_seat_direct(repo, _stop("s1", wt), "-Worktree", str(wt), seat=seat)
     recs = _seat_records(repo)
     assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
     errors = _seats_dir(repo) / ".writer-errors.txt"
     assert errors.is_file(), "the helper's Fault left no .writer-errors.txt line"
     lines = errors.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1 and lines[0].split("\t")[2] == "hook-input", lines
+
+    # With -Refused as well, the fault is still a writer error, and the hook's refusal still a line.
+    _record_seat_direct(repo, _stop("s2", wt), "-Refused", "the hook refused it", seat=seat)
+    assert len(errors.read_text(encoding="utf-8").splitlines()) == 2
+    refusals = (_seats_dir(repo) / ".writer-refusals.txt").read_text(encoding="utf-8").splitlines()
+    assert len(refusals) == 1 and refusals[0].split("\t")[-1] == "the hook refused it", refusals
 
 
 def _record_seat_direct(
@@ -1082,8 +1086,7 @@ def test_a_refused_seat_record_leaves_one_refusal_line_an_hour(
     per session key and host per hour, never to .writer-errors.txt. Run directly, because
     seat-record.ps1 never refuses a sibling cwd: it records it at the pin, or with no pin there."""
     repo, _, sibling, _ = seat_clones
-    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    seats = common / "mefor-coord" / "seats"
+    seats = _seats_dir(repo)
     refusals = seats / ".writer-refusals.txt"
     errors = seats / ".writer-errors.txt"
 
@@ -1137,8 +1140,7 @@ def test_the_refusal_limit_holds_under_a_culture_that_formats_time_differently(
     the time separator as '.', and th-TH counts years in the Buddhist era, so the stamp never parsed
     and every refusal added a line. The second refusal within the hour must add none."""
     repo, _, sibling, _ = seat_clones
-    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    refusals = common / "mefor-coord" / "seats" / ".writer-refusals.txt"
+    refusals = _seats_dir(repo) / ".writer-refusals.txt"
 
     before = time.strftime("%Y", time.gmtime())
     _record_stop_in_culture(repo, _stop("s1", sibling), culture)

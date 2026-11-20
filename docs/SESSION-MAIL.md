@@ -240,13 +240,13 @@ that addresses you by that record writes to the box the drain reads. Mail can st
 worktree you moved into in at least these ways: a peer that addresses that path, a record written
 there by a `seat.ps1 -Declare` or `-Close` you ran from it, a record written before the change, and
 a session with no pin, for example after a /clear under the desktop app, whose `cwd` is a worktree
-of this repository. Only a pin can tell its own worktree from a sibling, so that record lands at
-the `cwd`, and its `worktreeSource` says no session pin vouches for it (BACKLOG #5961). It is not
-the box the drain reads: with no pin, the drain refuses a `cwd` outside the checkout its hook
-started in under rule 4 of `_hookinput.ps1`, reads no box, and says so. Nothing that addresses mail
-reads that label yet. While the session stays unpinned, its drain reads none
-of the mail sent by that record. Where the hook cannot name a worktree, it records nothing and says so at the
-turn end. Where the checkout it started in and its registry resolve, it also leaves a line in
+of this repository. Only a pin can tell its own worktree from a sibling. So that record lands at
+the `cwd`, and its `worktreeSource` says no session pin vouches for it (BACKLOG #5961). Nothing
+that addresses mail reads that label yet. The drain does not read that box. With no pin, rule 4 of
+`_hookinput.ps1` refuses a `cwd` outside the checkout the hook started in. The drain then reads no
+box and says so. While the session stays unpinned, its drain reads none of the mail sent by that
+record. Where the hook cannot name a worktree, it records nothing and says so at the turn end.
+Where the checkout it started in and its registry resolve, it also leaves a line in
 `.writer-refusals.txt`, at most one per session key and host per hour. Before the change,
 `scripts/coord/seat.ps1` recorded the toplevel of the hook `cwd`. Measured 2026-10-28 under that
 behaviour: a Lander launched in the primary, entered a sibling worktree, and fifteen messages waited
