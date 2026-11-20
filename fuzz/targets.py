@@ -79,7 +79,6 @@ from messagefoundry.parsing.binary import (
     EscapedDocumentError,
     InboundDocRefError,
     NonVerbatimDocumentError,
-    UnreadableDelimitersError,
     extract_obx_document,
     is_doc_ref,
     iter_obx_documents,
@@ -253,10 +252,10 @@ class KnownFinding:
 #: were fixed under BACKLOG #2873, and their entries and the carve-out in :func:`_binary_carriage`
 #: came out with them. Both were a bare ``ValueError`` ('cannot determine HL7 separators') out of
 #: ``extract_obx_document``, on an MSH-led body whose MSH-2 carries fewer than four encoding
-#: characters and on an FHS- or BHS-led body with no MSH; it now refuses both as
-#: ``UnreadableDelimitersError``, which is not a ``BinaryCarriageError``. What each body still
-#: meets at the listener is in ``fuzz/README.md``,
-#: *Known findings*. Both reproducers stay on as ``binary_carriage`` seeds, and
+#: characters and on an FHS- or BHS-led body with no MSH. BACKLOG #5972 then made
+#: ``Message._encoding_chars`` read the delimiters the parser recorded, so both bodies now read
+#: under them and neither is refused. What each body meets at the listener is in
+#: ``fuzz/README.md``, *Known findings*. Both reproducers stay on as ``binary_carriage`` seeds, and
 #: ``tests/test_fuzz_targets.py`` drives them, so the fix cannot quietly regress.
 SHORT_MSH2_REPRODUCER = (
     b"MSH|^~|A|B|C|D|20260101||ORU^R01|X1|P|2.5\rOBX|1|ED|X||^Application^pdf^Base64^JVBERi0=\r"
@@ -623,11 +622,10 @@ def _binary_carriage(data: bytes) -> None:
     * after ``Message.parse`` (``HL7PeekError`` is its refusal), ``iter_obx_documents`` -- the ingress
       document-detach scan, whose refusals are ``EscapedDocumentError``, for a handle a sender
       wrote into ``OBX-5.5`` ``InboundDocRefError``, for a value the splice would not set back
-      verbatim ``NonVerbatimDocumentError``, and for a body with an OBX and no MSH, or an MSH-2
-      shorter than four characters, ``UnreadableDelimitersError`` (BACKLOG #5099) -- and
-      ``extract_obx_document`` on every OBX, whose refusals are ``BinaryCarriageError`` for an OBX
-      that is not a Base64 ED document and, for a body whose delimiters cannot be read,
-      ``UnreadableDelimitersError`` (BACKLOG #2873), which is not a ``BinaryCarriageError``.
+      verbatim ``NonVerbatimDocumentError`` (BACKLOG #5099) -- and ``extract_obx_document`` on
+      every OBX, whose refusal is ``BinaryCarriageError`` for an OBX that is not a Base64 ED
+      document. A body the parser accepts always has readable delimiters (BACKLOG #5972), so a
+      ``ValueError`` out of either is a defect, not a refusal.
 
     There is no carve-out.
     """
@@ -637,8 +635,7 @@ def _binary_carriage(data: bytes) -> None:
     if is_doc_ref(text):
         with contextlib.suppress(DocRefError):
             parse_doc_ref(text)
-    # The retention pass calls strip_documents bare, so no raise is allowed; it returns a body
-    # whose separators cannot be read unchanged (BACKLOG #5099).
+    # The retention pass calls strip_documents bare, so no raise is allowed.
     strip_documents(CARRIAGE_MARKER + text, pruned_at=0.0)
     strip_documents(text, pruned_at=0.0)
     _strip_and_scan_hl7(text)
@@ -650,33 +647,11 @@ def _strip_and_scan_hl7(text: str) -> None:
         message = Message.parse(text)
     except HL7PeekError:
         return
-    try:
+    with contextlib.suppress(EscapedDocumentError, InboundDocRefError, NonVerbatimDocumentError):
         list(iter_obx_documents(message, received=text))
-    except UnreadableDelimitersError:
-        _require_unreadable(message, "iter_obx_documents")
-    except (EscapedDocumentError, InboundDocRefError, NonVerbatimDocumentError):
-        pass
     for occurrence in range(1, message.count_segments("OBX") + 1):
-        # UnreadableDelimitersError first, so the check still runs were it ever made a subclass.
-        try:
+        with contextlib.suppress(BinaryCarriageError):
             extract_obx_document(message, occurrence=occurrence)
-        except UnreadableDelimitersError:
-            _require_unreadable(message, "extract_obx_document")
-            break  # the header is the cause, so every later OBX is refused the same way
-        except BinaryCarriageError:
-            pass
-
-
-def _require_unreadable(message: Message, refuser: str) -> None:
-    """An ``UnreadableDelimitersError`` is the header's refusal, so the header must be one the
-    engine cannot read; a refusal of a readable body is a defect, not a refusal (BACKLOG #2873).
-    The oracle is ``Message._encoding_chars``, the engine's own read, so it catches a guard that
-    over-refuses but not a regression in that read itself."""
-    try:
-        message._encoding_chars()
-    except ValueError:
-        return
-    raise AssertionError(f"{refuser} refused readable delimiters as unreadable")
 
 
 @dataclass(frozen=True)

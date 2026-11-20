@@ -100,7 +100,6 @@ __all__ = [
     "InboundDocRefError",
     "NonVerbatimDocumentError",
     "Base64DelimiterError",
-    "UnreadableDelimitersError",
     "UnreattachableDocumentError",
     "encode",
     "decode",
@@ -138,14 +137,7 @@ class BinaryCarriageError(ValueError):
     :func:`extract_obx_document`, an OBX that is not a Base64 ED document. Subclasses ``ValueError``
     so a Router/Handler can let it propagate to the **error/dead-letter** path (status ``ERROR``)
     rather than yielding a silently-truncated body — honoring the count-and-log invariant
-    (CLAUDE.md §2).
-
-    A message whose delimiters cannot be read is **not** one of these: :func:`extract_obx_document`,
-    :func:`embed_obx_document` and :func:`strip_documents_in_hl7` refuse it as
-    :class:`UnreadableDelimitersError`, which is not a subclass (BACKLOG #2873). A Handler that
-    skips the OBXs that are not documents with ``except BinaryCarriageError: continue`` then does
-    not skip every OBX of a message none of whose OBXs can be read; the refusal escapes it, and
-    the message ends ``ERROR`` rather than ``FILTERED``."""
+    (CLAUDE.md §2)."""
 
 
 class DocRefError(ValueError):
@@ -181,30 +173,6 @@ class NonVerbatimDocumentError(ValueError):
     value."""
 
 
-class UnreadableDelimitersError(ValueError):
-    """``Message._encoding_chars`` cannot read a message's delimiters: it has no MSH, its first
-    MSH's MSH-2 is shorter than four characters, or (only where the tree was written below the
-    ``Message`` API, whose writes refuse to change MSH-1, BACKLOG #5972) its MSH-1 is not one
-    character (BACKLOG #5099, #2873). :func:`iter_obx_documents` and
-    :func:`strip_documents_in_hl7` raise it only on a message that has an OBX,
-    :func:`embed_obx_document` only for an OBX that exists, and :func:`extract_obx_document` for
-    any occurrence of a Message but only for an OBX a SegmentGroup holds. Where a received body has an MSH, the
-    parser reads its MSH-1 as one character, so MSH-1 is never the cause there; with no MSH, MSH-1
-    and MSH-2 both read empty.
-
-    Deliberately **not** a :class:`BinaryCarriageError`: the OBX helpers
-    :func:`extract_obx_document`, :func:`embed_obx_document` and :func:`strip_documents_in_hl7`
-    raise it too (BACKLOG #2873), and a Handler loop that skips a non-document OBX on
-    ``BinaryCarriageError`` must not skip, and so silently drop, every OBX of such a message. It
-    escapes that loop, and the message ends ``ERROR``.
-
-    Every ``OBX-5.5`` read raises on such a body, so the ingress detach refuses it by this name,
-    before anything is stored and before the ACK, rather than letting a plain ``ValueError`` out
-    that no listener records. Only the short MSH-2 reaches the detach on a listener, whose
-    ``Peek.parse`` refuses a body with no MSH first; the text names whichever cause the body has,
-    and no byte of it."""
-
-
 class Base64DelimiterError(InboundDocRefError):
     """A received body would have a document detached, and its MSH-1 or MSH-2 names a character of
     the base64 alphabet as a delimiter (BACKLOG #5099). ``Message.set`` escapes that character
@@ -218,9 +186,7 @@ class Base64DelimiterError(InboundDocRefError):
 class UnreattachableDocumentError(ValueError):
     """The payload itself stops a re-attach (vault BACKLOG #2809, BACKLOG #5099). At least these
     shapes: the parser refuses the payload as not HL7 (an ``HL7PeekError`` without ``parser_fault``
-    set); it holds the raw handle marker and has no MSH, or a first MSH whose MSH-2 is shorter
-    than four characters, so its separators cannot be read (without the raw marker such a payload
-    is carried as it is); an ``OBX-5.5`` handle is malformed; a
+    set); an ``OBX-5.5`` handle is malformed; a
     handle names an attachment its own message does not hold; a handle sits somewhere the
     re-attach does not splice, such as ``NTE-3`` or a second ``OBX-5.5`` repetition; or a
     delimiter is a character of the base64 alphabet while a handle, or the marker, is in the
@@ -316,15 +282,7 @@ def embed_obx_document(
     the message's escaping untouched, and it is emitted **unbroken** (no MIME line wrap) so no
     ``CR``/``LF`` splits the segment. The OBX segment must already exist (``Message.set`` raises
     ``KeyError`` for an absent segment); a Handler builds it with ``add_segment`` first.
-    Raises :class:`UnreadableDelimitersError`, not a :class:`BinaryCarriageError`, before it sets
-    anything, when that OBX exists and ``Message._encoding_chars`` cannot read the message's
-    delimiters, such as an MSH-2 shorter than four characters or no MSH at all (BACKLOG #2873).
     Recover the bytes with :func:`extract_obx_document`."""
-    # occurrence < 1 and an absent OBX stay Message.set's own refusals, which it raises before it
-    # reads any delimiter. The check runs before the first set, so this refusal leaves nothing
-    # half-set; a later set's own refusal, such as a CR in data_subtype, still can.
-    if 1 <= occurrence <= message.count_segments("OBX") and not _delimiters_readable(message):
-        raise _unreadable_delimiters_refusal(message, "no OBX field can be set; refusing the embed")
     message.set("OBX-2", "ED", occurrence=occurrence)
     message.set("OBX-5.2", type_of_data, occurrence=occurrence)
     message.set("OBX-5.3", data_subtype, occurrence=occurrence)
@@ -337,34 +295,7 @@ def extract_obx_document(message: Message, *, occurrence: int = 1) -> bytes:
     §7). Reads the ``Encoding`` component (``OBX-5.4``), requires it to be ``"Base64"``
     (case-insensitive), then decodes the data component (``OBX-5.5``). Raises
     :class:`BinaryCarriageError` if ``OBX-2`` is not ``ED``, the encoding is not ``Base64``, or the
-    data is corrupt — so a Handler can dead-letter rather than mis-decode. It raises
-    :class:`UnreadableDelimitersError` instead, which is not a :class:`BinaryCarriageError`, when
-    ``Message._encoding_chars`` cannot read the message's delimiters (for a SegmentGroup, only
-    for an OBX the group holds), such as an MSH-2 shorter than
-    four characters or no MSH at all (BACKLOG #2873): that is the message's header, not this OBX,
-    so a Handler that skips an OBX on ``BinaryCarriageError`` does not skip it."""
-    # occurrence < 1 is left to Message.field, which refuses it as the caller's error before it
-    # reads any delimiter. A Message's field read reads the delimiters for any occurrence, so
-    # every occurrence of one is checked. A SegmentGroup from Message.groups() reads fields
-    # through its parent Message, which is the one checked, but reads an OBX the group does not
-    # hold as None without reading a delimiter; that stays the "OBX-2 is None" refusal it was,
-    # so a Handler skipping an OBX-less group on BinaryCarriageError keeps skipping it.
-    if hasattr(message, "_encoding_chars"):
-        holder: Message | None = message
-        reads_delimiters = True
-    else:
-        holder = getattr(message, "_m", None)
-        count = getattr(message, "count", None)
-        reads_delimiters = callable(count) and occurrence <= count("OBX")
-    if (
-        holder is not None
-        and occurrence >= 1
-        and reads_delimiters
-        and not _delimiters_readable(holder)
-    ):
-        raise _unreadable_delimiters_refusal(
-            holder, "no OBX field can be read; refusing the extract"
-        )
+    data is corrupt — so a Handler can dead-letter rather than mis-decode."""
     obx2 = message.field("OBX-2", occurrence=occurrence)
     if (obx2 or "").upper() != "ED":
         raise BinaryCarriageError(f"OBX-2 is {obx2!r}, not 'ED' — not an embedded document")
@@ -434,9 +365,6 @@ def is_doc_ref(value: str) -> bool:
 #: raw text (BACKLOG #5099).
 _DOC_REF_MARKER_CHARS = frozenset(DOC_REF_MARKER)
 
-#: The first MSH segment after a batch header, the one ``Message.set`` escapes by.
-_FIRST_MSH = re.compile(r"[\r\n]MSH")
-
 #: The re-attach's refusal of a handle marker the splice did not resolve (BACKLOG #5099).
 _UNSPLICED_HANDLE = "a document handle marker was left that the re-attach splice did not resolve"
 
@@ -448,7 +376,7 @@ _BASE64_DELIMITED_HANDLE = (
 
 def _delimits_with_base64(separators: Iterable[str]) -> bool:
     """Whether any of a message's five delimiters, read as ``Message._encoding_chars`` reads them
-    (MSH-1 and the first four MSH-2 characters of the first MSH), is a character of
+    (the ones the parser read from the first line), is a character of
     :data:`_BASE64_ALPHABET` (BACKLOG #5099).
 
     The one delimiter-class rule. ``Message.set`` escapes a delimiter wherever it occurs in a
@@ -484,17 +412,9 @@ def marker_under_base64_delimiters(message: Message, text: str) -> bool:
     delivery re-attach refuses any marker under these delimiters, so it would be ACKed and then
     dead-letter on every outbound.
 
-    ``message`` is ``text`` parsed. A body whose delimiters cannot be read, because it has no MSH
-    or its first MSH's MSH-2 is shorter than four characters, counts when it holds the raw marker,
-    as delivery refuses that too. For ordinary delimiters the cost is the
-    header read alone; otherwise at most two substring scans of ``text``. A marker hidden behind
+    ``message`` is ``text`` parsed. For ordinary delimiters the cost is the delimiter read alone; otherwise at most two substring scans of ``text``. A marker hidden behind
     a hex escape is not looked for: the engine never writes one, so it is the sender's text."""
-    try:
-        separators = message._encoding_chars()
-    except ValueError:
-        # Delivery refuses a raw marker under such a header (reattach_documents_in_hl7), so it is
-        # refused here too, before the ACK.
-        return DOC_REF_MARKER in text
+    separators = message._encoding_chars()
     return _delimits_with_base64(separators) and _holds_marker(text, separators)
 
 
@@ -502,26 +422,20 @@ def may_hold_doc_ref(text: str) -> bool:
     """Whether a delivery payload may carry a live document handle the re-attach must resolve
     (BACKLOG #5099). The delivery path's cheap gate ahead of a parse.
 
-    True when the marker is in the raw text. Also true for an HL7 payload whose MSH-1 or MSH-2
-    names a character of the marker: there an engine handle written into ``OBX-5.5`` is escaped,
-    so the raw text never holds the marker, and a substring test alone let the handle reach the
-    wire unresolved. ``Message.set`` escapes by the first MSH's delimiters, so for a payload led by
-    an FHS or BHS batch header the first MSH is checked as well as the header. A handle hidden by
+    True when the marker is in the raw text. Also true for an HL7 payload whose leading MSH, FHS
+    or BHS header names a character of the marker in its fields 1 and 2: there an engine handle
+    written into ``OBX-5.5`` is escaped, so the raw text never holds the marker, and a substring
+    test alone let the handle reach the wire unresolved. ``Message.set`` escapes by the delimiters
+    the parser read from that first line (BACKLOG #5972), so no later MSH is read. A handle hidden by
     any other escape cannot be the engine's, which escapes only the delimiters, so it is the
     sender's text and resolves nothing unless the gate opens for another reason, where the
     re-attach parses it and resolves it only to an attachment the message holds. False otherwise."""
     if DOC_REF_MARKER in text:
         return True
     lead = _whitespace_end(text, 0, len(text))
-    head = text[lead : lead + 3]
-    if head == "MSH":
-        return _header_names_marker_char(text, lead)
-    if head not in ("FHS", "BHS"):
+    if text[lead : lead + 3] not in ("MSH", "FHS", "BHS"):
         return False
-    if _header_names_marker_char(text, lead):
-        return True
-    first_msh = _FIRST_MSH.search(text, lead)
-    return first_msh is not None and _header_names_marker_char(text, first_msh.start() + 1)
+    return _header_names_marker_char(text, lead)
 
 
 def _header_names_marker_char(text: str, start: int) -> bool:
@@ -654,10 +568,6 @@ def iter_obx_documents(
     delimiters: a document is detached only if splicing it back under them reproduces it exactly.
     A Handler that moves ``MSH-1`` or ``MSH-2`` afterwards is caught by the re-attach instead.
 
-    It raises :class:`UnreadableDelimitersError` when the body has an OBX and either no MSH or a
-    first MSH whose MSH-2 is shorter than four characters, since no ``OBX-5.5`` can then be read;
-    nothing else in the body is read first.
-
     Each document's value is held one at a time, as the caller's in-flight budget assumes: each
     check reads a value inside :func:`_scan_obx`, whose frame ends before the next read, and the
     value is read again when it is yielded and dropped after. No check makes a copy of a value:
@@ -665,11 +575,6 @@ def iter_obx_documents(
     copy of its field that the read splits, dropped when the read returns. Holding every value
     until the scan ends would make the peak the sum of the documents."""
     obx_count = message.count_segments("OBX")
-    if obx_count and not _delimiters_readable(message):
-        # Every OBX-5.5 read below would raise a plain ValueError, which no listener records;
-        # named here, it is a refusal both of them answer (BACKLOG #5099). The text names the one
-        # cause the body has, since the listeners store it: only a short MSH-2 reaches them.
-        raise _unreadable_delimiters_refusal(message, "no OBX-5.5 can be read; refusing the detach")
     occurrences: list[int] = []
     documents: list[int] = []
     value_holds_marker = False
@@ -683,8 +588,6 @@ def iter_obx_documents(
             value_holds_marker = value_holds_marker or holds_marker
             if alters and altered is None:
                 altered = occ
-    # The guard before the loop refused delimiters that cannot be read wherever an OBX exists,
-    # and a document needs one, so this read cannot raise.
     if documents and _delimits_with_base64(message._encoding_chars()):
         raise Base64DelimiterError(
             "a delimiter of the body is a base64 character, so a detached document could not be "
@@ -716,43 +619,6 @@ def iter_obx_documents(
         yield occ, data_b64, ed_type
         # Dropped before the next read, so no two documents' values are held here at once.
         del data_b64
-
-
-def _delimiters_readable(message: Message) -> bool:
-    """Whether ``Message._encoding_chars`` names ``message``'s delimiters. Its refusal quotes
-    ``MSH-1`` and ``MSH-2``, so the caller raises outside this handler, with nothing chained.
-    Only that refusal, a bare ``ValueError``, answers False: a subclass is some other fault, and
-    is let out rather than blamed on the sender's header."""
-    try:
-        message._encoding_chars()
-    except ValueError as exc:
-        if type(exc) is not ValueError:
-            raise
-        return False
-    return True
-
-
-def _unreadable_delimiters_cause(message: Message) -> str:
-    """Name, without quoting either field, why :func:`_delimiters_readable` answered False for
-    ``message``: it has no MSH, its first MSH's MSH-2 is short, or its MSH-1 is not one character.
-    A cause none of those checks finds is named as such, never blamed on a field."""
-    if not message.count_segments("MSH"):
-        return "the body has no MSH"
-    if len(message._raw_field("MSH", 2)) < 4:
-        return "its first MSH's MSH-2 is shorter than four characters"
-    if len(message._raw_field("MSH", 1)) != 1:
-        return "its first MSH's MSH-1 is not one character"
-    return "its first MSH's delimiters cannot be read"
-
-
-def _unreadable_delimiters_refusal(message: Message, consequence: str) -> UnreadableDelimitersError:
-    """The :class:`UnreadableDelimitersError` an OBX reader or writer raises in place of the bare
-    ``ValueError`` every OBX read or set would let out on ``message``, whose text quotes ``MSH-1``
-    and ``MSH-2`` (BACKLOG #5099, #2873). ``consequence`` names what the caller cannot do and
-    that it refuses. Chaining is set where it is raised, not here: raise it outside any ``except``
-    that caught the bare refusal, as every caller does, or its quoting text rides on
-    ``__context__``."""
-    return UnreadableDelimitersError(f"{_unreadable_delimiters_cause(message)}, so {consequence}")
 
 
 def _scan_obx(message: Message, occ: int, min_b64_len: int) -> tuple[bool, bool, bool, bool]:
@@ -799,14 +665,7 @@ def _received_holds_marker(message: Message, received: str) -> bool:
     """Whether ``received`` holds the handle marker anywhere, raw or escaped by the message's
     delimiters: where a detach would leave it for delivery's after-the-splice guard to find
     (BACKLOG #5099). Reads the text the caller already holds, and copies no document."""
-    try:
-        separators = message._encoding_chars()
-    except ValueError:
-        # Fail closed: a body whose separators cannot be read cannot be checked for the escaped
-        # form, so it is refused rather than detached unchecked. iter_obx_documents refuses such
-        # a header before its first OBX read, so the branch only guards a reorder.
-        return True
-    return _holds_marker(received, separators)
+    return _holds_marker(received, message._encoding_chars())
 
 
 def chunk_b64(b64: str, chunk_len: int = DETACH_CHUNK_BYTES) -> Iterator[str]:
@@ -828,7 +687,6 @@ def strip_documents(
     pruned_at: float | None = None,
     min_bytes: int = 0,
     content_type: str | None = None,
-    on_unreadable: Callable[[], object] | None = None,
 ) -> tuple[str, int, int]:
     """Strip embedded documents from a stored ``raw`` body in place, returning
     ``(new_raw, documents_stripped, bytes_reclaimed)`` (#47, ADR 0042).
@@ -842,13 +700,7 @@ def strip_documents(
     Anything else is returned unchanged with ``(raw, 0, 0)``, so the caller can skip a no-op
     write and the pass is idempotent. At least: plain HL7 with no ED; a body whose first eight
     characters do not hold ``MSH``, such as an FHS- or BHS-led batch, whatever segments follow;
-    HL7 whose delimiters cannot be read, because it has no MSH segment (an FHS- or BHS-led body
-    whose first eight characters hold ``MSH`` reaches this) or its MSH-2 is shorter than four
-    characters; JSON/XML/text; an already-stripped tombstone.
-
-    ``on_unreadable`` is called, with nothing, once for a body skipped because its delimiters
-    cannot be read: its documents, if it holds any, stay past the strip window, so the caller
-    can log the skip against its own row. The codec logs nothing itself. No other skip calls it.
+    JSON/XML/text; an already-stripped tombstone.
 
     ``min_bytes`` skips a document whose decoded size is below the threshold (small embeds aren't worth
     evicting; ``0`` = strip every embed). ``content_type`` (the connection's declared format) labels a
@@ -864,7 +716,7 @@ def strip_documents(
         # Only attempt the HL7/OBX path on something that looks like an HL7 message (starts with MSH).
         # A non-HL7 body that merely contains the substring "OBX" is left untouched by the parse guard
         # below (a parse failure / no OBX-5 ED → returned unchanged).
-        return _strip_obx_ed(raw, pruned_at, min_bytes, on_unreadable)
+        return _strip_obx_ed(raw, pruned_at, min_bytes)
     return raw, 0, 0
 
 
@@ -889,20 +741,12 @@ def strip_documents_in_hl7(
 ) -> tuple[int, int]:
     """Strip every qualifying OBX-5 ED embedded document from a parsed :class:`Message` **in place**,
     returning ``(documents_stripped, bytes_reclaimed)``. The message is mutated through its own API
-    (reads its MSH-2 separators, escapes the tombstone as a leaf value) so a re-encode round-trips and
-    re-parses. Used by :func:`strip_documents` and directly testable against a parsed message.
-    Raises :class:`UnreadableDelimitersError`, not a :class:`BinaryCarriageError`, when the message
-    has an OBX and ``Message._encoding_chars`` cannot read its delimiters, such as an MSH-2 shorter
-    than four characters or no MSH at all (BACKLOG #2873); :func:`strip_documents` checks for that
-    first and skips such a body."""
+    (reads the message's delimiters, escapes the tombstone as a leaf value) so a re-encode round-trips and
+    re-parses. Used by :func:`strip_documents` and directly testable against a parsed message."""
     pruned_at = time.time() if pruned_at is None else pruned_at
     stripped = 0
     reclaimed = 0
     count = message.count_segments("OBX")
-    if count and not _delimiters_readable(message):
-        raise _unreadable_delimiters_refusal(
-            message, "no OBX field can be read; refusing the strip"
-        )
     for occ in range(1, count + 1):
         if (message.field("OBX-2", occurrence=occ) or "").upper() != "ED":
             continue
@@ -930,12 +774,9 @@ def strip_documents_in_hl7(
     return stripped, reclaimed
 
 
-def _strip_obx_ed(
-    raw: str, pruned_at: float, min_bytes: int, on_unreadable: Callable[[], object] | None
-) -> tuple[str, int, int]:
+def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int, int]:
     """Parse ``raw`` as HL7, strip its OBX-5 ED embeds, and re-encode. Returns the original unchanged on
-    a parse failure, when its delimiters cannot be read (calling ``on_unreadable`` first), or when
-    nothing was stripped (so the caller skips the write)."""
+    a parse failure, or when nothing was stripped (so the caller skips the write)."""
     # Local import keeps the one-way dependency (message.py imports binary.py, never the reverse) — the
     # cycle is broken by importing inside the function, not at module top.
     from messagefoundry.parsing.message import Message
@@ -944,26 +785,6 @@ def _strip_obx_ed(
         message = Message.parse(raw)
     except Exception:
         # A malformed body that merely looked like HL7 — never crash a retention pass on it.
-        return raw, 0, 0
-    try:
-        message._encoding_chars()
-        readable = True
-    except ValueError:
-        # No MSH, or an MSH-2 shorter than four characters: every OBX read would raise, and the
-        # retention pass calls this with no try, so one such stored row would abort the pass on
-        # every run. Its document stays, as any body this strip cannot read does (BACKLOG #5099).
-        # Any ValueError, not only the bare one _delimiters_readable answers for: the detach lets
-        # another fault out, but a retention pass must contain it as it contains a parse failure.
-        # So this does not lean on strip_documents_in_hl7's own refusal, which lets a subclass
-        # out and is skipped on a body with no OBX, where on_unreadable is still called.
-        readable = False
-    if not readable:
-        # Reported, not silent, because a document it holds now outlives its window; the caller
-        # holds the row id and logs it, so this pure codec has no logging side effect. Called
-        # outside the handler, so nothing the caller raises chains the refusal, which quotes
-        # MSH-1 and MSH-2.
-        if on_unreadable is not None:
-            on_unreadable()
         return raw, 0, 0
     stripped, reclaimed = strip_documents_in_hl7(message, pruned_at=pruned_at, min_bytes=min_bytes)
     if stripped == 0:
@@ -1001,9 +822,8 @@ def doc_ref_addresses_in_hl7(text: str) -> frozenset[str]:
     """The content addresses named by the well-formed document handles in an HL7 body's
     ``OBX-5.5`` values, read as :func:`reattach_documents_in_hl7` reads them: the places delivery
     splices (BACKLOG #5099). A handle anywhere else, or a bare content address, is not one, since
-    delivery never resolves it. Empty for a body that does not parse as HL7, or that has no MSH or
-    a first MSH whose MSH-2 is shorter than four characters: delivery resolves no handle in
-    either."""
+    delivery never resolves it. Empty for a body that does not parse as HL7: delivery resolves no
+    handle in it."""
     # Local import, as reattach_documents_in_hl7 does: message.py imports this module.
     from messagefoundry.parsing.message import Message
     from messagefoundry.parsing.peek import HL7PeekError
@@ -1011,8 +831,6 @@ def doc_ref_addresses_in_hl7(text: str) -> frozenset[str]:
     try:
         message = Message.parse(text)
     except HL7PeekError:
-        return frozenset()
-    if len(message._raw_field("MSH", 1)) != 1 or len(message._raw_field("MSH", 2)) < 4:
         return frozenset()
     found: set[str] = set()
     for occ in range(1, message.count_segments("OBX") + 1):
@@ -1092,19 +910,6 @@ async def reattach_documents_in_hl7(
             # Raised after the handler, so the parse error, which may quote the payload, is on no
             # chain.
             raise UnreattachableDocumentError(refused)
-        # The separators every OBX-5.5 read below needs, by the rule Message._encoding_chars applies:
-        # no MSH, or an MSH-2 shorter than four characters, is the payload's, and every read would
-        # raise on it. The MSH-1 test mirrors that rule; any MSH the parser accepts passes it.
-        if len(message._raw_field("MSH", 1)) != 1 or len(message._raw_field("MSH", 2)) < 4:
-            if DOC_REF_MARKER not in text:
-                # The gate opened on a header naming a marker character, not on a handle. No
-                # handle can be escaped here, since Message.set refuses to write under these
-                # separators, so there is nothing to resolve: carried as it was before the gate
-                # read headers (BACKLOG #5099).
-                return None
-            raise UnreattachableDocumentError(
-                "the payload has no MSH, or its MSH-2 is shorter than four characters"
-            )
         found: list[tuple[int, str]] = []
         for occ in range(1, message.count_segments("OBX") + 1):
             value = message.field("OBX-5.5", occurrence=occ) or ""
@@ -1120,9 +925,7 @@ async def reattach_documents_in_hl7(
                     raise UnreattachableDocumentError(refused)
         separators = message._encoding_chars()
         # Under a base64 delimiter the splice below would escape it inside the stored document,
-        # so a handle to splice is refused before any read (_delimits_with_base64). A body
-        # whose MSH-1 or MSH-2 was rewritten below the Message API after the detach reaches this
-        # too; the API itself refuses such a write (BACKLOG #5972).
+        # so a handle to splice is refused before any read (_delimits_with_base64).
         base64_delimited = _delimits_with_base64(separators)
         if found and base64_delimited:
             raise UnreattachableDocumentError(_BASE64_DELIMITED_HANDLE)

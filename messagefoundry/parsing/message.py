@@ -720,18 +720,21 @@ class Message:
         )
 
     def _encoding_chars(self) -> tuple[str, str, str, str, str]:
-        """The message's ``(field, component, repetition, escape, subcomponent)`` delimiters, read
-        from its **own** MSH-1 (field separator) + MSH-2 (the other four).
+        """The message's ``(field, component, repetition, escape, subcomponent)`` delimiters: the
+        ones the parser read from the first line (an ``MSH``, ``BHS`` or ``FHS`` header) and split
+        every other line on.
 
         Derived from the actual encoding characters, not hardcoded defaults — so a custom-delimiter
-        message isn't split on the wrong characters. Raises ``ValueError`` if they can't be determined
-        rather than guess (XFORM-2/3). The read-side unescape uses the same MSH-2-derived characters,
-        so write-escaping and read-unescaping stay consistent."""
-        field_sep = self._raw_field("MSH", 1)  # MSH-1 is the field separator itself
-        enc = self._raw_field("MSH", 2)  # e.g. "^~\&": component, repetition, escape, subcomponent
-        if len(field_sep) != 1 or len(enc) < 4:
-            raise ValueError(f"cannot determine HL7 separators: MSH-1={field_sep!r}, MSH-2={enc!r}")
-        return field_sep, enc[0], enc[1], enc[2], enc[3]
+        message isn't split on the wrong characters (XFORM-2/3). A short field 2 has its missing
+        characters filled exactly as the parser filled them (``^``, ``~``, ``\\``, ``&``), so a read
+        here agrees with the split, and with ``Peek.field``, on every message the parser accepts:
+        reading them from ``MSH-2`` instead refused a short ``MSH-2``, or a ``BHS`` or ``FHS`` with
+        no ``MSH``, that the parser had already split (BACKLOG #5972). The header's delimiter fields
+        cannot be rewritten through this API (:meth:`_write_delimiter_field`), so the parser's read
+        stays the message's. The read-side unescape uses the same characters, so write-escaping and
+        read-unescaping stay consistent."""
+        field_sep, comp_sep, rep_sep, sub_sep, esc = _builtin_hl7.separators(self._m)
+        return field_sep, comp_sep, rep_sep, esc, sub_sep
 
     @staticmethod
     def _escape_leaf(

@@ -452,7 +452,7 @@ async def test_pooled_claim_projects_created_at(store: Any) -> None:
 async def test_unparseable_head_dead_letters_not_strands(store: Any) -> None:
     # An MLLP outbound is payload-agnostic (ADR 0004): a non-HL7 body can reach the batch framer. It must
     # dead-letter (framing inside the try) — NOT leave every claimed row INFLIGHT forever.
-    bad = "MSH|^~|X\r"  # MSH-2 has < 4 encoding chars → _encoding_chars raises at frame time
+    bad = "NOT-HL7|X\r"  # no MSH/BHS/FHS header, so the head parse raises at frame time
     mids = [
         await store.enqueue_message(channel_id="c1", raw=bad, deliveries=[(DEST, bad)], now=now)
         for now in (101.0, 102.0)

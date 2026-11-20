@@ -384,8 +384,9 @@ def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: s
     row's sequence, ADR 0082 ratified decision #3), so a crash re-run that re-claims the same prefix
     re-derives the **byte-identical** envelope (the at-least-once purity requirement).
 
-    The ``BHS`` header is built from the **head member's own** MSH-1 (field separator) and MSH-2
-    (encoding characters) — never hardcoded ``|^~\\&`` — so a custom-delimiter feed frames correctly:
+    The ``BHS`` header is built from the **head member's own** delimiters, the ones its parse reads
+    from its first line (an MSH's MSH-1 and MSH-2, a short MSH-2 filled as the parser fills it) —
+    never hardcoded ``|^~\\&`` — so a custom-delimiter feed frames correctly:
 
     * ``BHS-1`` = the field separator (the literal char after ``BHS``), ``BHS-2`` = the encoding chars,
     * ``BHS-7`` = ``timestamp`` (batch creation date/time), ``BHS-11`` = ``control_id`` (batch control
@@ -400,7 +401,7 @@ def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: s
     """
     if not messages:
         raise ValueError("encode_batch requires at least one message")
-    # Read the batch separators from the HEAD member's own MSH (never hardcode |^~\&). The head drives
+    # Read the batch separators from the HEAD member's own header (never hardcode |^~\&). The head drives
     # the whole envelope's framing; mixed-delimiter members in one batch are not a real feed shape.
     head = messages[0]
     if isinstance(head, Message):
@@ -426,21 +427,22 @@ def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: s
     return "".join(pieces)
 
 
-#: How wide an MSH line's opening must be to hold MSH-1 and four encoding characters.
-_SEPARATORS_WIDTH = len(_MSH) + 1 + 4
+#: The shortest MSH line the parser reads separators from: the id, MSH-1 and one encoding
+#: character. A shorter one is refused by the parse, so it goes there.
+_SEPARATORS_WIDTH = len(_MSH) + 1 + 1
 
 
 def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
     """The ``(field, component, repetition, escape, subcomponent)`` delimiters of a batch's head
     member, normalized as ``norm``, as :meth:`Message._encoding_chars` reads them after a parse.
 
-    For a head that opens with ``MSH`` after whitespace, with MSH-1 and four encoding characters,
-    they are read from that line's first few characters alone, through the parser's own window
+    For a head that opens with ``MSH`` after whitespace, with MSH-1 and at least one encoding
+    character, they are read from that line's first few characters alone, through the parser's own window
     (:func:`~messagefoundry.parsing._builtin_hl7._first_line_head`) and separator read (BACKLOG
     #5919): a full parse of a large hydrated head to read eight characters copied the whole head
-    at least twice. Every other head, such as an ``FHS``/``BHS``-led one, one led by a byte order mark, a
-    non-HL7 one or one whose MSH-2 is short, is parsed as before, so it frames or raises exactly as
-    it did, ``ValueError`` and its message included.
+    at least twice. A short MSH-2 is filled with the parser's defaults, as
+    the parse fills it. Every other head, such as an ``FHS``/``BHS``-led one, one led by a byte
+    order mark or a non-HL7 one, is parsed, so it frames or raises exactly as a parse does.
 
     A head read from its MSH line is still checked against the parser's own escape expansion
     budget (:func:`~messagefoundry.parsing.peek.enforce_expansion_budget`, ASVS 1.3.3), run on
@@ -450,14 +452,10 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
     budget first, so there this is a second check, not the only one. What else a parse checks in the
     rest of the head is not checked: at least a later header line too short to read."""
     line = _first_line_head(norm)
-    # _extract_separators fills a short MSH-2 with defaults, where _encoding_chars refuses one, so
-    # the line must hold MSH-1 and four encoding characters with no field separator among them. A
-    # window narrower than that only sends every head to the parse.
-    if (
-        not line.startswith(_MSH)
-        or len(line) < _SEPARATORS_WIDTH
-        or line.find(line[3], 4, _SEPARATORS_WIDTH) != -1
-    ):
+    # The parse's _encoding_chars returns exactly what _extract_separators reads from this line,
+    # a short MSH-2 filled with the same defaults (BACKLOG #5972), so any MSH line the parse would
+    # read takes the fast read.
+    if not line.startswith(_MSH) or len(line) < _SEPARATORS_WIDTH:
         return Message.parse(norm)._encoding_chars()
     # A parse checks the budget before it reads anything, so a head it refuses for its escapes is
     # refused here too, with the same error. The parse above checks it for itself.

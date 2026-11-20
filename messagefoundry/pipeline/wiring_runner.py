@@ -162,7 +162,6 @@ from messagefoundry.parsing.binary import (
     EscapedDocumentError,
     InboundDocRefError,
     NonVerbatimDocumentError,
-    UnreadableDelimitersError,
     UnreattachableDocumentError,
     chunk_b64,
     iter_obx_documents,
@@ -1232,9 +1231,7 @@ def _label_fits_every_backend(label: str) -> bool:
 
 #: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
 #: exactly these and record ``ERROR`` before the ACK, so a type added here is refused by both, never
-#: by one alone. A body with an OBX and an MSH-2 shorter than four characters is one,
-#: :class:`UnreadableDelimitersError`, rather than the plain ``ValueError`` the OBX reads raise. A
-#: body with no MSH never reaches the detach: both listeners' ``Peek.parse`` refuses it first.
+#: by one alone.
 _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     _StreamBudgetExceeded,
     StreamingAttachmentsUnsupported,
@@ -1242,7 +1239,6 @@ _DETACH_REFUSALS: tuple[type[Exception], ...] = (
     EscapedDocumentError,
     InboundDocRefError,
     NonVerbatimDocumentError,
-    UnreadableDelimitersError,
 )
 
 #: BACKLOG #4907: the stored reason, and the MSA-3 text, for a message from a sender whose verified
@@ -10328,10 +10324,7 @@ class RegistryRunner:
         holds an HL7 escape (vault BACKLOG #2809),
         :class:`~messagefoundry.parsing.binary.InboundDocRefError` for a received handle or marker,
         and :class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError` for a document
-        delivery's splice would not set back verbatim, and
-        :class:`~messagefoundry.parsing.binary.UnreadableDelimitersError` for a body with an OBX
-        and an MSH-2 shorter than four characters (a body with no MSH never gets here: the caller's
-        ``Peek.parse`` refused it first; BACKLOG #5099) — each, as one of
+        delivery's splice would not set back verbatim (BACKLOG #5099) — each, as one of
         :data:`_DETACH_REFUSALS`, is turned
         into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
         Phase-C); the budget bounds how many such buffers can be concurrent."""
@@ -10713,11 +10706,6 @@ class RegistryRunner:
                 elif isinstance(exc, NonVerbatimDocumentError):
                     # A document's own value, which the splice would escape, not a marker.
                     nak_text = "OBX-5.5 document holds a delimiter or control"
-                elif isinstance(exc, UnreadableDelimitersError):
-                    # The header, not a document: no OBX-5.5 of this body can be read. Only a
-                    # short MSH-2 reaches here, since the listener's parse refuses a body with no
-                    # MSH.
-                    nak_text = "MSH-2 shorter than four characters"
                 elif isinstance(exc, Base64DelimiterError):
                     # Checked before its base class: the body's delimiters, not a marker.
                     nak_text = "document under base64 delimiters"
@@ -11385,9 +11373,8 @@ class RegistryRunner:
             # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
         except UnreattachableDocumentError as exc:
-            # Only failures the MESSAGE causes, at least: the payload does not parse as HL7, or it
-            # holds the raw marker and its separators cannot be read: no MSH, or an MSH-2 shorter
-            # than four characters (vault BACKLOG #2809), or a handle is
+            # Only failures the MESSAGE causes, at least: the payload does not parse as HL7 (vault
+            # BACKLOG #2809), or a handle is
             # malformed, names an attachment its message does not hold, or sits outside the
             # splice, or the splice would escape a character of its stored value (BACKLOG #5099).
             # The same payload fails the same way on every attempt, so a retry could never succeed:

@@ -186,9 +186,7 @@ the engine code the target drives; for `hl7_tree`, `dicom_peek` and `stream_fram
 entry call itself, which shows less, and the table's comment says so. Further tests break the
 split-invariance, cap, ceiling and deflate-tail properties on purpose and assert the target says so,
 and others assert that a separators `ValueError` planted on either retired binary-carriage
-reproducer escapes, whether planted in the detach scan or in the extract, and that the target
-refuses an `UnreadableDelimitersError` out of the extract or the detach scan on a body whose
-delimiters are readable. A fuzz harness nobody has seen catch anything measures nothing.
+reproducer escapes, whether planted in the detach scan or in the extract. A fuzz harness nobody has seen catch anything measures nothing.
 
 ## Where the files go
 
@@ -266,26 +264,17 @@ with its carve-out. Its reproducer stays on as the `hl7_peek` seed `BLANK_SEGMEN
 **It is empty today.** The two entries `binary_carriage` produced under vault BACKLOG #2683 were
 both a bare `ValueError("cannot determine HL7 separators ...")` out of `extract_obx_document`, on
 an MSH-led body whose MSH-2 carries fewer than four encoding characters and on an FHS- or BHS-led
-body with no MSH (BACKLOG #2873 and #2874). Both were fixed under BACKLOG #2873:
-`extract_obx_document` now refuses either as `UnreadableDelimitersError`, the refusal
-`iter_obx_documents` already raised for such a body, and so do the reader `strip_documents_in_hl7`
-and the writer `embed_obx_document`; the entries and the carve-out in `_binary_carriage` came out
-with them. `UnreadableDelimitersError` is a `ValueError` and deliberately not a
-`BinaryCarriageError`, so a Handler that skips an OBX that is not a document on
-`BinaryCarriageError` does not skip, and silently drop, every OBX of such a message. Both
-reproducers stay on as `binary_carriage` seeds, so the fix cannot quietly regress.
+body with no MSH (BACKLOG #2873 and #2874). BACKLOG #2873 first refused both by name in the OBX
+helpers; BACKLOG #5972 then made `Message._encoding_chars` read the delimiters the parser recorded
+from the first line, filling a short MSH-2 as the parser does, so every `Message` read and write
+now agrees with the parse and with `Peek.field`, and neither body is refused. The entries and the
+carve-out in `_binary_carriage` are gone. Both reproducers stay on as `binary_carriage` seeds,
+so a regression to a bare `ValueError` cannot come back quietly.
 
-The short-MSH-2 body is still accepted by `Peek.parse` and `Message.parse`. ADR 0054 is the source
-of record for what the parse refuses: only a header too short for MSH-1 plus one encoding
-character. Where to refuse the short MSH-2 is decided: in the OBX helpers, not at parse, by
-Manager decision d20261110T013333950-2b2a11 after adversarial review under BACKLOG #2873's first
-closing step. Such a body can still be ACKed `AA`, at least below the streaming threshold when no
-other ingress check refuses it. Over the threshold, a body with an OBX reaches the ingress document
-detach, where `iter_obx_documents` refuses it as `UnreadableDelimitersError` with an `ERROR` row and
-a refusal from the listener, `AR` over MLLP (BACKLOG #5099).
-`strip_documents` returns such a body unchanged, so the retention document-strip pass skips the row
-rather than aborting. The FHS- or BHS-led body is refused by `Peek.parse`, so the listener refuses
-it before any detach; that `Message.parse` accepts it is BACKLOG #2874, not changed here.
+The short-MSH-2 body is accepted by `Peek.parse` and `Message.parse`. ADR 0054 is the source of
+record for what the parse refuses: only a header too short for MSH-1 plus one encoding character.
+The FHS- or BHS-led body is refused by `Peek.parse`, so the listener refuses it before any
+detach; that `Message.parse` accepts it is BACKLOG #2874.
 
 ## Not covered
 
@@ -310,7 +299,7 @@ out" says why it does not.
 | `transports/http_listener.py` header-mode authentication (`_authorize_head`) | ruled out, for now | Needs a configured `HttpSource` with credentials. The next candidate on this surface. |
 | `parsing/compression.py`, all four decompressors | target `compression` | `gzip_decompress` runs on a File feed with `decompress="gzip"`; the rest are Handler-facing. |
 | `parsing/binary.py`: carriage `decode`, `parse_doc_ref`, `strip_documents`, `iter_obx_documents`, `extract_obx_document` | target `binary_carriage` | Produced two findings (BACKLOG #2873 and #2874), whose reader refusals were fixed under BACKLOG #2873. |
-| `parsing/binary.py` `embed_obx_document`, and `strip_documents_in_hl7` called directly | not yet a target | `embed_obx_document` is Handler-facing, exported from `messagefoundry.parsing`; `strip_documents_in_hl7` is not exported there and is called by `strip_documents`. Their unreadable-delimiter refusals are pinned by unit tests in `tests/test_binary_carriage.py` only; `binary_carriage` reaches `strip_documents_in_hl7` only through `strip_documents`, which skips such a body first. |
+| `parsing/binary.py` `embed_obx_document`, and `strip_documents_in_hl7` called directly | not yet a target | `embed_obx_document` is Handler-facing, exported from `messagefoundry.parsing`; `strip_documents_in_hl7` is not exported there and is called by `strip_documents`. `binary_carriage` reaches `strip_documents_in_hl7` only through `strip_documents`. |
 | `parsing/binary.py` `reattach_documents_in_hl7`, `may_hold_doc_ref`, `doc_ref_addresses_in_hl7` | not yet a target | Delivery side, through an async store reader. It is not out of reach of untrusted input: a sender's `OBX-5.5` text and its MSH, FHS and BHS headers reach all three (BACKLOG #5099). The candidate next to `binary_carriage`. |
 | `parsing/sniff.py` | ruled out as a target of its own | Prefix tests with no exception path. The archive-member checks run inside `zip_decompress`, so `compression` reaches them. |
 | `parsing/split.py` `split_batch` (File ingress batch split) | ruled out | A regex split and string operations on a `str`, with no exception path. |

@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import logging
 from pathlib import Path
 
 import pytest
@@ -55,7 +54,6 @@ from messagefoundry.pipeline.dryrun import dry_run
 from messagefoundry.pipeline.ingress_guards import DOC_REF_MARKER_REFUSED_REASON
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
-from tests._log_absence import assert_capture_sees
 
 DEST = "OB_PARTNER"
 
@@ -783,22 +781,37 @@ async def test_an_edit_and_resend_child_delivers_the_origins_document(
 
 def _batch(msh2: str, obx5_5: str) -> str:
     """An FHS/BHS-led batch whose header keeps the default delimiters while its one MSH names
-    ``msh2``. ``Message.set`` escapes a value by the MSH's delimiters, not the batch header's."""
+    ``msh2``. The parser splits every line on the batch header's delimiters, and ``Message.set``
+    escapes by them too (BACKLOG #5972)."""
     return (
         "FHS|^~\\&|APP|FAC|RCV|RCVF|20260101120000\r"
         "BHS|^~\\&|APP|FAC|RCV|RCVF|20260101120000\r" + _hl7(obx5_5, msh2=msh2)
     )
 
 
-def test_the_gate_opens_when_a_batch_msh2_escapes_the_marker() -> None:
+def test_a_batch_escapes_by_its_header_not_by_its_msh() -> None:
+    """BACKLOG #5972: every line of a batch is split on the delimiters of its first line, so
+    ``Message.set`` escapes by the batch header's, not by an MSH's that names ``:``: the handle is
+    written raw, which the gate's substring test finds."""
     handle = make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application")
     msg = Message.parse(_batch(":~\\&", _b64(10)))
     msg.set("OBX-5.5", handle)
     payload = msg.encode()
     assert payload.startswith("FHS")
-    assert DOC_REF_MARKER not in payload  # the engine's own handle is escaped here
+    assert DOC_REF_MARKER in payload
     assert may_hold_doc_ref(payload)
+    assert not may_hold_doc_ref(_batch(":~\\&", _b64(10)))
     assert not may_hold_doc_ref(_batch("^~\\&", _b64(10)))
+
+
+def test_the_gate_opens_when_a_batch_header_escapes_the_marker() -> None:
+    handle = make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application")
+    raw = "FHS|:~\\&|APP|FAC|RCV|RCVF|20260101120000\r" + _hl7(_b64(10), msh2="^~\\&")
+    msg = Message.parse(raw)
+    msg.set("OBX-5.5", handle)
+    payload = msg.encode()
+    assert DOC_REF_MARKER not in payload  # the engine's own handle is escaped by the FHS's ":"
+    assert may_hold_doc_ref(payload)
 
 
 async def test_a_hex_escaped_handle_cannot_offset_a_copy_left_live(store: MessageStore) -> None:
@@ -1547,30 +1560,22 @@ def test_the_dry_run_refuses_the_marker_as_the_listeners_do(msh2: str, refused: 
         assert result.error != DOC_REF_MARKER_REFUSED_REASON
 
 
-async def test_a_raw_marker_under_a_short_msh2_is_refused_at_both_listeners(
+async def test_a_raw_marker_under_a_short_msh2_is_judged_by_the_filled_delimiters(
     store: MessageStore,
 ) -> None:
-    """``Message._encoding_chars`` names no delimiters for a three-character MSH-2, though the
-    parser fills the fourth in. Delivery refuses a raw marker under such a header, so the
-    listeners refuse it before the ACK rather than ACK it and dead-letter it (BACKLOG #5099). The
-    same header with no marker is accepted as before."""
-    from messagefoundry.transports.receipt import RefusalKind
-
+    """A three-character MSH-2 is read under the delimiters the parser fills for it, which hold no
+    base64 character, so a raw marker under it is judged as under ``^~\\&``: accepted, as delivery
+    now reads it the same way (BACKLOG #5972; it was refused before the ACK under BACKLOG #5099,
+    when every ``Message`` read of such a header raised)."""
     head = "MSH|^~\\|APP|FAC|RCV|RCVF|20260101120000||ADT^A01|MSGID003|P|2.5\r"
     ic = _plain_ic()
     runner = _runner(store, ic)
 
     marked = (head + f"NTE|1||{DOC_REF_MARKER}x\r").encode("utf-8")
-    assert _ack_code(await runner._handle_inbound(ic, marked)) == "AR"
-    assert (await runner._handle_inbound_http(ic, marked)).refusal is RefusalKind.PERMANENT
+    assert _ack_code(await runner._handle_inbound(ic, marked)) == "AA"
     plain = (head + "NTE|1||plain\r").encode("utf-8")
     assert _ack_code(await runner._handle_inbound(ic, plain)) == "AA"
-
-    rows = await _rows(store, ic.name)
-    errors = [str(r["error"]) for r in rows if r["status"] == MessageStatus.ERROR.value]
-    assert len(errors) == 2
-    assert all(e.endswith(DOC_REF_MARKER_REFUSED_REASON) for e in errors)
-    assert await _ingress_count(store, ic.name) == 1
+    assert await _ingress_count(store, ic.name) == 2
 
 
 # --- a document is detached only if the splice sets it back verbatim (BACKLOG #5099) ----------
@@ -1758,145 +1763,48 @@ def test_the_splice_check_is_linear_on_a_hostile_value() -> None:
         assert time.perf_counter() - started < 2.0
 
 
-#: A streaming body with a document under a three-character MSH-2, ``^~\\``. ``Message`` reads
-#: no delimiters from it, so every ``OBX-5.5`` read raises.
+#: A streaming body with a document under a three-character MSH-2, ``^~\\``. The parser fills
+#: the missing subcomponent separator with ``&``, and ``Message`` reads under that (BACKLOG #5972).
 _SHORT_MSH2_DOCUMENT = _hl7(_b64(2000), msh2="^~\\")
 
 
-def test_the_detach_scan_refuses_a_body_whose_header_names_no_delimiters() -> None:
-    from messagefoundry.parsing.binary import UnreadableDelimitersError
-
+def test_the_detach_scan_reads_a_body_under_the_delimiters_the_parser_filled() -> None:
+    """BACKLOG #5972: a three-character MSH-2, and an FHS header with no MSH, are read under the
+    delimiters the parser read from the first line, so the detach scan yields the document rather
+    than refusing every ``OBX-5.5`` read."""
     message = Message.parse(_SHORT_MSH2_DOCUMENT)
-    with pytest.raises(ValueError, match="cannot determine HL7 separators"):
-        message._encoding_chars()
-    scan = iter_obx_documents(message, received=_SHORT_MSH2_DOCUMENT)
-    with pytest.raises(UnreadableDelimitersError) as caught:
-        next(scan)
-    assert "^~" not in str(caught.value)
-    # The stored reason names the one cause this body has, not "no MSH" beside it.
-    assert str(caught.value).startswith("its first MSH's MSH-2 is shorter than four characters")
-    # The separator read's refusal quotes MSH-1 and MSH-2; none of it rides on the chain.
-    assert caught.value.__cause__ is None and caught.value.__context__ is None
-    # With no MSH at all, the reason says so instead.
-    batch = "FHS|MSH|A\r" + _SHORT_MSH2_DOCUMENT[_SHORT_MSH2_DOCUMENT.index("OBX|") :]
-    with pytest.raises(UnreadableDelimitersError, match="^the body has no MSH,"):
-        next(iter_obx_documents(Message.parse(batch), received=batch))
+    assert message._encoding_chars() == ("|", "^", "~", "\\", "&")
+    assert [
+        occ for occ, _b64, _type in iter_obx_documents(message, received=_SHORT_MSH2_DOCUMENT)
+    ] == [1]
+    batch = "FHS|^~\\&|A\r" + _SHORT_MSH2_DOCUMENT[_SHORT_MSH2_DOCUMENT.index("OBX|") :]
+    assert [
+        occ for occ, _b64, _type in iter_obx_documents(Message.parse(batch), received=batch)
+    ] == [1]
 
 
-def test_the_retention_strip_skips_a_body_whose_header_names_no_delimiters() -> None:
-    """The over-threshold detach stores such a body as an ``ERROR`` row, and a smaller one is
-    ingested as before. The retention pass calls ``strip_documents`` on each stored body with no
-    ``try``, so it must leave this one as it is rather than raise, or one row would abort the pass
-    on every run (BACKLOG #5099)."""
+def test_the_retention_strip_strips_a_body_under_the_delimiters_the_parser_filled() -> None:
+    """The retention pass strips the document of a short-MSH-2 body as it strips any other, where
+    it used to skip the row and leave the document past its strip window (BACKLOG #5972)."""
     from messagefoundry.parsing.binary import strip_documents
 
     body = _SHORT_MSH2_DOCUMENT
-    assert "OBX" in body and body.startswith("MSH")
-    assert strip_documents(body, pruned_at=0.0) == (body, 0, 0)
-    # A batch header with no MSH passes the strip's "MSH" in the first eight characters gate, and
-    # its separators cannot be read either.
-    batch = "FHS|MSH|A\r" + body[body.index("OBX|") :]
-    assert strip_documents(batch, pruned_at=0.0) == (batch, 0, 0)
-    # The control: the same document under a full MSH-2 is stripped.
-    readable = _hl7(_b64(2000))
-    stripped, documents, _reclaimed = strip_documents(readable, pruned_at=0.0)
-    assert documents == 1 and stripped != readable
+    stripped, documents, _reclaimed = strip_documents(body, pruned_at=0.0)
+    assert documents == 1 and stripped != body
 
 
-def test_the_retention_strip_reports_an_unreadable_skip_to_its_caller(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A row the strip skips because its delimiters cannot be read keeps any document past the
-    strip window, so ``strip_documents`` reports the skip through ``on_unreadable`` for the store
-    to log against the row (BACKLOG #5099). The codec logs nothing itself. A readable body, and a
-    body with no OBX, are not reported: the controls that the call marks this skip alone."""
-    from messagefoundry.parsing.binary import strip_documents
-
-    calls: list[str] = []
-
-    def report() -> None:
-        calls.append("unreadable")
-
-    with caplog.at_level(logging.DEBUG):
-        assert strip_documents(_hl7(_b64(2000)), pruned_at=0.0, on_unreadable=report)[1] == 1
-        assert strip_documents("MSH|^~|A\rPID|1\r", pruned_at=0.0, on_unreadable=report)[1] == 0
-        assert calls == []
-        body = _SHORT_MSH2_DOCUMENT
-        assert strip_documents(body, pruned_at=0.0, on_unreadable=report) == (body, 0, 0)
-        assert calls == ["unreadable"]
-        batch = "FHS|MSH|A\r" + body[body.index("OBX|") :]
-        assert strip_documents(batch, pruned_at=0.0, on_unreadable=report) == (batch, 0, 0)
-        assert calls == ["unreadable", "unreadable"]
-    assert_capture_sees(caplog, "messagefoundry.parsing.binary")
-    assert [r for r in caplog.records if r.name.startswith("messagefoundry.parsing")] == []
-
-
-def test_the_retention_strip_contains_any_fault_in_the_separator_read(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Unlike the detach, which lets a ``ValueError`` subclass from the separator read out, the
-    retention strip contains it, as it contains a parse failure: one row must not end the pass."""
-    from messagefoundry.parsing.binary import strip_documents
-
-    class _Fault(ValueError):
-        pass
-
-    def _raise(_self: Message) -> tuple[str, str, str, str, str]:
-        raise _Fault("not the header")
-
-    body = _hl7(_b64(2000))
-    monkeypatch.setattr(Message, "_encoding_chars", _raise)
-    assert strip_documents(body, pruned_at=0.0) == (body, 0, 0)
-
-
-def test_another_fault_in_the_separator_read_is_not_blamed_on_the_header(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Only the separator read's own refusal, a bare ``ValueError``, is the sender's header; a
-    subclass from that read is some other fault and escapes as itself."""
-    from messagefoundry.parsing.binary import UnreadableDelimitersError
-
-    class _Fault(ValueError):
-        pass
-
-    def _raise(_self: Message) -> tuple[str, str, str, str, str]:
-        raise _Fault("not the header")
-
-    message = Message.parse(_hl7(_b64(2000)))
-    monkeypatch.setattr(Message, "_encoding_chars", _raise)
-    with pytest.raises(_Fault) as caught:
-        next(iter_obx_documents(message, received=""))
-    assert not isinstance(caught.value, UnreadableDelimitersError)
-
-
-async def test_a_streaming_body_whose_header_names_no_delimiters_is_refused_before_the_ack(
-    store: MessageStore,
-) -> None:
-    """A streaming body over the threshold whose MSH-2 is shorter than four characters, with no
-    marker for the listener's check to find: the detach's OBX reads raised a plain ValueError
-    that neither listener records. It is refused by name instead, with an ERROR row, an AR on
-    MLLP, a permanent refusal on HTTP and nothing stored (BACKLOG #5099)."""
-    from messagefoundry.transports.receipt import RefusalKind
-
+async def test_a_streaming_short_msh2_body_is_detached_and_acked(store: MessageStore) -> None:
+    """BACKLOG #5972: a streaming body over the threshold whose MSH-2 is shorter than four
+    characters is read under the parser's filled delimiters, so it is detached and ACKed AA, where
+    the detach used to refuse it with an ERROR row and AR."""
     body = _SHORT_MSH2_DOCUMENT
-    assert DOC_REF_MARKER not in body
     ic = _streaming_ic()
     assert len(body) >= (ic.stream_threshold_bytes or 0)
     runner = _runner(store, ic)
 
-    ack = await runner._handle_inbound(ic, body.encode("utf-8"))
-    receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
-
-    assert _ack_code(ack) == "AR"
-    assert ack is not None and "MSH-2 shorter than four characters" in ack
-    assert receipt.refusal is RefusalKind.PERMANENT
-    rows = await _rows(store, ic.name)
-    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
-    assert all(
-        "streaming detach failed: UnreadableDelimitersError" in str(r["error"]) for r in rows
-    )
-    assert await _attachment_count(store) == 0
-    assert await _ingress_count(store, ic.name) == 0
+    assert _ack_code(await runner._handle_inbound(ic, body.encode("utf-8"))) == "AA"
+    assert await _attachment_count(store) == 1
+    assert await _ingress_count(store, ic.name) == 1
 
 
 async def test_an_ordinary_base64_document_is_detached_and_spliced_back_byte_identical(
