@@ -283,9 +283,9 @@ async def test_a_failed_promotion_reload_still_brings_the_graph_up(
 
 
 async def test_a_defect_in_the_promotion_reload_is_not_swallowed(tmp_path: Path) -> None:
-    # The catch takes the store's refusal sets, which hold at least the types the engine comment
-    # lists, so a programming error of one of those types is caught too. Only a type outside the
-    # sets propagates, as TypeError does here, and an AUDIT_WRITE_DEFECTS type is re-raised.
+    # The catch takes the store's refusal sets, so a programming error of a type in those sets is
+    # caught too. AUDIT_WRITE_DEFECTS types are re-raised, and a type outside the sets propagates,
+    # as the plain TypeError here does.
     eng, _coord, sink, calls = await _promote_with_failing_reload(tmp_path, TypeError("a bug"))
     try:
         with pytest.raises(TypeError, match="a bug"):

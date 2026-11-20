@@ -2703,11 +2703,11 @@ class Engine:
             # store_connect_errors(). Together they hold at least RuntimeError (so StoreKeylessError
             # and StoreAcquireTimeout too), OSError, ValueError, sqlite3.DatabaseError, asyncpg's
             # PostgresError, InterfaceError and InternalClientError, pyodbc's DatabaseError,
-            # CipherError, and pyodbc's Error root, which a deadlock victim raises; each driver
-            # entry is there only when that driver is installed. Every one of those classes is
-            # broad, so a bug that raises any of them reads as a refusal here. A defect in
-            # AUDIT_WRITE_DEFECTS is re-raised first, and only a type outside the sets propagates. As
-            # the convergence pass does (state_convergence.py), the log and the alert carry the
+            # CipherError, and pyodbc's Error root, which a deadlock victim raises; the asyncpg and
+            # pyodbc entries are there only when that driver is installed. A bug that raises any
+            # type in the sets reads as a refusal here. An AUDIT_WRITE_DEFECTS type is re-raised
+            # first, so it propagates, and so does any type outside the sets. As the convergence
+            # pass does (state_convergence.py), the log and the alert carry the
             # exception CLASS only: a decrypt failure's text can carry a PHI-bearing key.
             try:
                 await self.store.reload_state_cache()
