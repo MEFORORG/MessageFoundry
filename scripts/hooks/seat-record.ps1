@@ -61,7 +61,11 @@ try {
     # install-coordination.ps1 still bounds the whole run.
     $payload = Read-CcxHookInput -TimeoutMs -1
     $session = Enter-CcxHookSession -Text $payload -ReadOnly
-    $worktree = $null
+    # The recorder's arguments: -Worktree with the worktree to record, or -Refused with the Reason,
+    # which records nothing and leaves the rate-limited line in .writer-refusals.txt, so a refusal
+    # leaves a trace beyond this turn's notice. Named explicitly either way, so seat.ps1 never falls
+    # back to the payload's cwd as its hint.
+    $recordArgs = $null
     if ($session.Reason) {
         # AN UNPINNED SESSION WHOSE cwd IS A WORKTREE OF THIS SAME REPOSITORY keeps the record it always
         # had, at that worktree. That is every desktop-app worktree session after a /clear, which never
@@ -71,37 +75,32 @@ try {
         # be read are still refused below.
         # DECIDED, NOT ACCIDENTAL (BACKLOG #5961, after #5954). Such a session has no other source of
         # truth for its worktree: /clear mints a new session id and no pin, so the cwd is all there is.
-        # seat.ps1 labels the record's worktreeSource as unpinned, so no reader takes it as proven.
-        # tests/test_hook_payload_cwd.py pins both halves.
+        # -Unpinned makes seat.ps1 label the record's worktreeSource so; the label is for a reader of
+        # the record, and nothing acts on it yet. tests/test_hook_payload_cwd.py pins both halves.
         $p = Get-CcxHookPayloadCwd -Payload $session.Payload
         $startCommon = Get-CcxGitCommonDir (Get-CcxWorktreeRoot (Get-Location).ProviderPath)
         $cwdRoot = if ($p.Cwd) { Get-CcxWorktreeRoot $p.Cwd } else { $null }
         $cwdCommon = if ($cwdRoot) { Get-CcxGitCommonDir $cwdRoot } else { $null }
         if (-not $session.Pinned -and $startCommon -and $cwdCommon -and (Test-CcxSamePath $cwdCommon $startCommon)) {
-            $worktree = [string]$cwdRoot
+            $recordArgs = @('-Worktree', [string]$cwdRoot, '-Unpinned')
         }
         else {
             # The only worktree left to record is the one this hook started in, the PRIMARY under the
-            # desktop app, and a record there would say this session sits in the primary. The Reason
-            # is handed to seat.ps1 as -Refused, which records nothing and leaves the rate-limited
-            # line in .writer-refusals.txt, so a refusal leaves a trace beyond this turn's notice.
+            # desktop app, and a record there would say this session sits in the primary.
             Write-Output "[seat] could not read this session's worktree: $($session.Reason). Nothing was recorded for this turn."
-            try {
-                $pwshRefuse = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-                $refuseArgs = @('-NoProfile', '-File', $seat, '-Record', '-Refused', [string]$session.Reason)
-                $null = if ($payload) { $payload | & $pwshRefuse @refuseArgs 2>&1 } else { & $pwshRefuse @refuseArgs 2>&1 }
-            } catch { Write-Output "[seat] the refusal could not be logged: $($_.Exception.Message)" }
-            exit 0
+            $recordArgs = @('-Refused', [string]$session.Reason)
         }
     }
-    # Named explicitly, so seat.ps1 never falls back to the payload's cwd as its hint.
-    if (-not $worktree) { $worktree = if ($session.Dir) { [string]$session.Dir } else { (Get-Location).ProviderPath } }
+    if (-not $recordArgs) {
+        $worktree = if ($session.Dir) { [string]$session.Dir } else { (Get-Location).ProviderPath }
+        $recordArgs = @('-Worktree', $worktree)
+    }
 
     # The pwsh on PATH, as before, resolved to its full path first: a launch error must not be
     # discarded with the recorder's output, because a recorder that never ran is the failure this
     # layer exists to show. A missing pwsh throws into the catch below.
     $pwsh = (Get-Command pwsh -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
-    $recorderArgs = @('-NoProfile', '-File', $seat, '-Record', '-Worktree', $worktree)
+    $recorderArgs = @('-NoProfile', '-File', $seat, '-Record') + $recordArgs
     $out = if ($payload) { $payload | & $pwsh @recorderArgs 2>&1 } else { & $pwsh @recorderArgs 2>&1 }
     # seat.ps1 -Record exits 0 on every route it controls, so any other code means it never ran as
     # written, for example because pwsh refused the file.

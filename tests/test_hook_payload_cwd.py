@@ -862,10 +862,15 @@ def test_lane_level_says_aloud_when_the_cwd_does_not_exist(
 SEAT_RECORD = HOOKS / "seat-record.ps1"
 
 
+def _seats_dir(start: Path) -> Path:
+    """The seat registry of the clone ``start`` belongs to."""
+    common = Path(_git(start, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+    return common / "mefor-coord" / "seats"
+
+
 def _seat_records(start: Path) -> list[dict[str, Any]]:
     """Every seat record in the registry of the clone ``start`` belongs to."""
-    common = Path(_git(start, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    seats = common / "mefor-coord" / "seats"
+    seats = _seats_dir(start)
     return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(seats.rglob("*.json"))]
 
 
@@ -975,8 +980,7 @@ def test_a_hook_refusal_leaves_a_refusal_line(seat_clones: tuple[Path, Path, Pat
     """seat-record.ps1 refuses a cwd in another repository itself and hands its Reason to seat.ps1
     as -Refused, so the refusal reaches .writer-refusals.txt and not only the turn's notice."""
     repo, _, _, other = seat_clones
-    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    seats = common / "mefor-coord" / "seats"
+    seats = _seats_dir(repo)
     _record_stop(repo, _stop("s1", other))
     assert _seat_records(repo) == [] and _seat_records(other) == []
     lines = (seats / ".writer-refusals.txt").read_text(encoding="utf-8").splitlines()
@@ -1030,38 +1034,26 @@ def test_a_named_worktree_record_still_logs_a_hook_input_fault(
     shutil.copytree(ROOT / "scripts" / "coord", sandbox / "coord")
     shutil.copytree(ROOT / "scripts" / "worktree", sandbox / "worktree")
     assert not (sandbox / "hooks").exists()
-    proc = subprocess.run(
-        [
-            "pwsh",
-            "-NoProfile",
-            "-NonInteractive",
-            "-File",
-            str(sandbox / "coord" / "seat.ps1"),
-            "-Record",
-            "-Worktree",
-            str(wt),
-        ],
-        cwd=str(repo),
-        input=_raw(_stop("s1", wt)),
-        capture_output=True,
-        timeout=TIMEOUT,
-        check=False,
+    _record_seat_direct(
+        repo, _stop("s1", wt), "-Worktree", str(wt), seat=sandbox / "coord" / "seat.ps1"
     )
-    assert proc.returncode == 0, proc.stderr.decode("utf-8", "replace")
     recs = _seat_records(repo)
     assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
-    common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-    errors = common / "mefor-coord" / "seats" / ".writer-errors.txt"
+    errors = _seats_dir(repo) / ".writer-errors.txt"
     assert errors.is_file(), "the helper's Fault left no .writer-errors.txt line"
     lines = errors.read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1 and lines[0].split("\t")[2] == "hook-input", lines
 
 
-def _record_seat_direct(repo: Path, payload: dict[str, Any]) -> None:
-    """Run seat.ps1 -Record with no -Worktree, the one route on which it refuses input."""
-    seat = ROOT / "scripts" / "coord" / "seat.ps1"
+def _record_seat_direct(
+    repo: Path,
+    payload: dict[str, Any],
+    *args: str,
+    seat: Path = ROOT / "scripts" / "coord" / "seat.ps1",
+) -> None:
+    """Run seat.ps1 -Record directly, with no -Worktree unless ``args`` name one."""
     proc = subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(seat), "-Record"],
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(seat), "-Record", *args],
         cwd=str(repo),
         input=_raw(payload),
         capture_output=True,
@@ -1076,7 +1068,7 @@ def test_a_refused_seat_record_leaves_one_refusal_line_an_hour(
 ) -> None:
     """seat.ps1 -Record with no -Worktree writes each refusal to .writer-refusals.txt, one line
     per session key and host per hour, never to .writer-errors.txt. Run directly, because
-    seat-record.ps1 refuses a sibling cwd only for a pinned session, which it records at the pin."""
+    seat-record.ps1 never refuses a sibling cwd: it records it at the pin, or with no pin there."""
     repo, _, sibling, _ = seat_clones
     common = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
     seats = common / "mefor-coord" / "seats"
