@@ -143,13 +143,16 @@ class _Pki:
         if delta:
             builder = builder.add_extension(x509.DeltaCRLIndicator(1), critical=True)
         if scope:
-            # A narrower scope OpenSSL scores lower for a leaf, so it would keep the held CRL.
+            # A narrower scope OpenSSL scores lower for a leaf, so it would keep the held CRL: a
+            # named distribution point the leaf does not carry. Before vault BACKLOG #5896 this
+            # was a CRL of CA certificates only; that one is kept out of this case so the case
+            # does not hang on whether such a CRL is refused earlier.
             builder = builder.add_extension(
                 x509.IssuingDistributionPoint(
-                    full_name=None,
+                    full_name=[x509.UniformResourceIdentifier("http://crl.invalid/5896.crl")],
                     relative_name=None,
                     only_contains_user_certs=False,
-                    only_contains_ca_certs=True,
+                    only_contains_ca_certs=False,
                     only_some_reasons=None,
                     indirect_crl=False,
                     only_contains_attribute_certs=False,

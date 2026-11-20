@@ -37,7 +37,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives.serialization import pkcs12
 from cryptography.utils import CryptographyDeprecationWarning
-from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+from cryptography.x509.oid import CRLEntryExtensionOID, ExtendedKeyUsageOID, ExtensionOID, NameOID
 
 from messagefoundry.keywrap import (
     DerTlv,
@@ -57,6 +57,7 @@ __all__ = [
     "CrlIssuerKey",
     "CrlSignature",
     "CrlSignatureFinding",
+    "NO_CRL_SIGN",
     "PROVEN_BAD_SIGNATURE",
     "UNCONFIRMED_SIGNATURE",
     "UNLISTED_SIGNATURE",
@@ -332,7 +333,11 @@ class CrlBlock:
 
 
 def judge_every_crl(
-    pem: bytes, *, now: float, refuse_unread_extensions: bool = False
+    pem: bytes,
+    *,
+    now: float,
+    refuse_unread_extensions: bool = False,
+    refuse_fail_closed: bool = True,
 ) -> list[tuple[CrlFacts, CrlBlock]]:
     """The facts and the :class:`CrlBlock` of EVERY CRL in ``pem``, in file order, refusing any block
     it cannot judge. One parse per block.
@@ -361,7 +366,18 @@ def judge_every_crl(
     in at least 3.0.22, 3.4.7, 3.5.8, 3.6.4 and 4.0.2. Before it, OpenSSL uses a newer delta as if
     it were complete, so revocations only the base CRL lists are dropped. After it, OpenSSL sets
     the delta aside, so revocations only the delta lists are dropped. Give the setting base CRLs
-    only."""
+    only.
+
+    **So do two shapes OpenSSL fails closed on** (vault BACKLOG #5896): a CRL whose Issuing
+    Distribution Point means OpenSSL never judges a certificate by it (:func:`_out_of_scope`),
+    and one carrying a critical extension OpenSSL does not handle, on the CRL or on an entry
+    whose extensions ``cryptography`` reads (:func:`_unhandled_critical`; an entry whose
+    extensions do not read is skipped), which refuses every peer OpenSSL judges by it. Both started
+    clean before, and the handshake error does not name the file.
+
+    **Both are skipped where ``refuse_fail_closed`` is False.** A start and the running-hop reload
+    keep the default. The expiry scan's check of a CRL in a CA file passes False, so it judges
+    those CRLs as it did before #5896, and a start can refuse a CA file that scan passed."""
     blocks = list(_crl_blocks(pem))
     # Refused, never skipped, even when the uncounted marker is only text in a comment line and
     # OpenSSL loads the file (vault BACKLOG #2866, decided 2026-10-12). Two reasons. The engine
@@ -402,6 +418,22 @@ def judge_every_crl(
                     "From that fix on it rejects a delta as a complete CRL and loses the delta's "
                     "revocations. Give base CRLs only"
                 )
+            if refuse_fail_closed and (why := _out_of_scope(extensions)) is not None:
+                raise ValueError(why)
+            fingerprint = crl.fingerprint(hashes.SHA256())
+            if (
+                refuse_fail_closed
+                and (critical := _unhandled_critical(crl, extensions, fingerprint)) is not None
+            ):
+                raise ValueError(
+                    f"it carries the critical extension {critical}, which OpenSSL does not "
+                    "handle, so OpenSSL refuses every peer it judges by this CRL with "
+                    "'unhandled critical CRL extension'. Give a CRL whose only critical "
+                    "extensions are the issuing distribution point and the authority key "
+                    "identifier, and whose entries' only critical extension is the certificate "
+                    "issuer. This CRL refuses the whole file, even beside a usable CRL from the "
+                    "same issuer: where the file holds one, remove this CRL"
+                )
             judged.append(
                 (
                     _crl_facts(crl, nxt, now),
@@ -410,7 +442,7 @@ def judge_every_crl(
                         issuer_key=_crl_issuer_key(crl.issuer),
                         this_update=crl.last_update_utc,
                         next_update=nxt,
-                        fingerprint=crl.fingerprint(hashes.SHA256()),
+                        fingerprint=fingerprint,
                         selection=_selection(extensions),
                     ),
                 )
@@ -418,6 +450,104 @@ def judge_every_crl(
         except ValueError as exc:
             raise ValueError(f"{where} cannot be judged: {exc}") from exc
     return judged
+
+
+#: The CRL extensions OpenSSL handles when one is critical, read from its ``crl_cb``: any other
+#: critical CRL extension sets ``EXFLAG_CRITICAL``, and the handshake then refuses every peer the
+#: CRL judges (vault BACKLOG #5896). A delta CRL Indicator is handled there too, but
+#: :func:`judge_every_crl` refuses a delta CRL before this is asked.
+_HANDLED_CRITICAL = frozenset(
+    {
+        ExtensionOID.ISSUING_DISTRIBUTION_POINT,
+        ExtensionOID.AUTHORITY_KEY_IDENTIFIER,
+        ExtensionOID.DELTA_CRL_INDICATOR,
+    }
+)
+
+
+def _out_of_scope(read: _CrlExtensions) -> str | None:
+    """Why OpenSSL would never judge a certificate by the CRL ``read`` came from, read from its
+    Issuing Distribution Point, or ``None`` (vault BACKLOG #5896, RFC 5280 section 5.2.5).
+
+    The engine turns on no extended CRL support, so OpenSSL scores a reason-partitioned or an
+    indirect CRL zero and never uses it, and it puts a CRL of attribute certificates only out of
+    scope for every certificate. Such a CRL is never of use, and where it is its issuer's only
+    CRL each peer under that issuer is refused with an error that does not name the file.
+
+    **A CRL of CA certificates only, an ARL, is not refused**, nor one of user certificates only.
+    Each is in scope for some certificates, and which ones a hop judges by it depends on the
+    chain: a root's ARL beside its intermediate's full CRL passes a whole-chain check, measured
+    by review on CPython 3.14 with OpenSSL 3.5.7. This has no chain to judge them against."""
+    try:
+        idp = read.extensions.get_extension_for_class(x509.IssuingDistributionPoint).value
+    except x509.ExtensionNotFound:
+        return None
+    if idp.only_contains_attribute_certs:
+        shape = "covers attribute certificates only"
+    elif idp.only_some_reasons is not None:
+        shape = "covers only some revocation reasons"
+    elif idp.indirect_crl:
+        shape = "is an indirect CRL"
+    else:
+        return None
+    return (
+        f"its issuing distribution point says it {shape}, and the engine turns on no extended "
+        "CRL support, so OpenSSL never judges a certificate by it, and refuses each peer whose "
+        "issuer has no other CRL. Give a base CRL whose issuing distribution point, if it has "
+        "one, does not do that. This CRL refuses the whole file, even beside a usable CRL from "
+        "the same issuer: where the file holds one, remove this CRL"
+    )
+
+
+#: :func:`_unhandled_critical`'s verdict on a CRL's entries, by the SHA-256 of its DER. A hop
+#: such as the PostgreSQL store builds a context per connection, and reading every entry of a
+#: long CRL each time would cost that much per connection. Bounded, and cleared when full.
+_ENTRY_VERDICTS: dict[bytes, str | None] = {}
+_ENTRY_VERDICTS_MAX = 256
+_UNKEPT = object()
+
+
+def _unhandled_critical(
+    crl: x509.CertificateRevocationList, read: _CrlExtensions, fingerprint: bytes
+) -> str | None:
+    """Where the CRL ``read`` came from carries a critical extension OpenSSL does not handle, on
+    the CRL or on one of its entries, as the extension's dotted OID, or ``None`` (vault BACKLOG
+    #5896, RFC 5280 sections 5.2 and 5.3). OpenSSL then refuses every peer it judges by the CRL.
+
+    On an entry, OpenSSL handles only the certificate issuer extension. Reading every entry costs
+    time on a long CRL: measured 2026-11-18 on Windows, CPython 3.14, about 31 ms for 20,000
+    entries that each carry a reason code. So the entries' verdict is kept by ``fingerprint``.
+    **An entry whose extensions ``cryptography`` cannot read, at least a duplicate extension or a
+    reason code it does not know, gives no verdict, and the check goes on to the next entry**:
+    this adds a diagnosis, and such a CRL loaded before it. OpenSSL still refuses a critical
+    extension it meets there."""
+    for ext in read.extensions:
+        if ext.critical and ext.oid not in _HANDLED_CRITICAL:
+            return str(ext.oid.dotted_string)
+    # One read, never ``in`` then ``[]``: another thread may clear the cache between the two.
+    if (kept := _ENTRY_VERDICTS.get(fingerprint, _UNKEPT)) is not _UNKEPT:
+        return kept  # type: ignore[return-value]
+    verdict: str | None = None
+    for entry in crl:
+        try:
+            extensions = entry.extensions
+        except (ValueError, x509.DuplicateExtension, *_UNREAD_EXTENSIONS):
+            continue  # this entry gives no verdict; a later one still may
+        found = next(
+            (
+                ext
+                for ext in extensions
+                if ext.critical and ext.oid != CRLEntryExtensionOID.CERTIFICATE_ISSUER
+            ),
+            None,
+        )
+        if found is not None:
+            verdict = f"{found.oid.dotted_string} on a revoked entry"
+            break
+    if len(_ENTRY_VERDICTS) >= _ENTRY_VERDICTS_MAX:
+        _ENTRY_VERDICTS.clear()
+    _ENTRY_VERDICTS[fingerprint] = verdict
+    return verdict
 
 
 def _selection(
@@ -486,6 +616,10 @@ class CrlSignature:
 
     where: str
     state: CrlSignatureState
+    #: True only for a ``verified`` CRL whose every judged CA that verifies it carries a key
+    #: usage without ``cRLSign`` (vault BACKLOG #5896, RFC 5280 section 6.3.3). OpenSSL then
+    #: refuses every peer it judges by the CRL with 'key usage does not include CRL signing'.
+    without_crl_sign: bool = False
 
 
 def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSignature]:
@@ -510,8 +644,11 @@ def judge_crl_signatures(pem: bytes, ca_ders: Iterable[bytes]) -> Iterator[CrlSi
     for index, block in enumerate(blocks, start=1):
         crl = x509.load_pem_x509_crl(block)
         issuer = quoted_issuer(crl.issuer.rfc4514_string())
+        state = _signature_state(crl, cas)
         yield CrlSignature(
-            f"CRL block {index} of {len(blocks)} (issuer {issuer})", _signature_state(crl, cas)
+            f"CRL block {index} of {len(blocks)} (issuer {issuer})",
+            state,
+            without_crl_sign=state == "verified" and _signed_without_crl_sign(crl, cas),
         )
 
 
@@ -936,18 +1073,19 @@ def _crl_attribute_key(attribute: x509.NameAttribute[str | bytes]) -> tuple[str,
     return attribute.oid.dotted_string, tag, value
 
 
-def _signature_state(
+def _judged_cas(
     crl: x509.CertificateRevocationList, cas: list[_ListedCa]
-) -> CrlSignatureState:
-    """Which :class:`CrlSignature` state ``cas`` gives ``crl``."""
+) -> tuple[list[x509.Certificate], bool]:
+    """The CAs of ``cas`` that :func:`_signature_state` judges ``crl`` by, and whether the CRL
+    names their key. Empty when no listed CA fits, the ``unlisted`` state."""
     issuer = _issuer_name_key(crl.issuer)
     named_cas = [ca for ca in cas if ca.name == issuer]
     if not named_cas:
-        return "unlisted"  # the usual case for an intermediate's CRL: its extensions go unread
+        return [], False  # the usual case for an intermediate's CRL: its extensions go unread
     try:
         akid = _crl_extensions(crl).akid  # once per CRL, not once per CA
     except _UNREADABLE_CA:
-        return "unlisted"  # its extensions do not read: no CA is shown to fit
+        return [], False  # its extensions do not read: no CA is shown to fit
     fitting: list[x509.Certificate] = []
     named: list[x509.Certificate] = []  # the fitting CAs whose key the CRL names
     for ca in named_cas:
@@ -959,13 +1097,21 @@ def _signature_state(
             fitting.append(ca.cert)
             if names_key:
                 named.append(ca.cert)
-    if not fitting:
-        return "unlisted"
     # Where the CRL names a key, _akid_fit drops a CA whose identifier differs, so a fitting CA it
     # does not name carries none. Only the named CAs are tried then, whatever the other's key
     # would say, and whatever the CA-file order (vault BACKLOG #4159); CrlSignature says why.
+    return (named, True) if named else (fitting, False)
+
+
+def _signature_state(
+    crl: x509.CertificateRevocationList, cas: list[_ListedCa]
+) -> CrlSignatureState:
+    """Which :class:`CrlSignature` state ``cas`` gives ``crl``."""
+    judged, named = _judged_cas(crl, cas)
+    if not judged:
+        return "unlisted"
     unchecked = False
-    for cert in named or fitting:
+    for cert in judged:
         answer = _verifies(crl, cert)
         if answer:
             return "verified"
@@ -973,6 +1119,28 @@ def _signature_state(
     if unchecked:
         return "uncheckable"
     return "bad" if named else "unproven"
+
+
+def _may_sign_crls(ca: x509.Certificate) -> bool:
+    """False only when ``ca`` carries a key usage extension without ``cRLSign``, the case OpenSSL
+    refuses; a CA with no key usage, or one whose key usage does not read, is not proven unable."""
+    try:
+        return ca.extensions.get_extension_for_class(x509.KeyUsage).value.crl_sign
+    except (x509.ExtensionNotFound, x509.DuplicateExtension, *_UNREADABLE_CA):
+        return True
+
+
+def _signed_without_crl_sign(crl: x509.CertificateRevocationList, cas: list[_ListedCa]) -> bool:
+    """Whether some judged CA's key verifies ``crl`` and every one that does may not sign CRLs
+    (:attr:`CrlSignature.without_crl_sign`). Only where a listed CA of the CRL's issuer name may
+    not sign CRLs are the judged CAs found and their signatures checked again, so a CA list whose
+    CAs of that name all carry ``cRLSign``, or no key usage, pays only the name comparison."""
+    issuer = _issuer_name_key(crl.issuer)
+    if all(_may_sign_crls(ca.cert) for ca in cas if ca.name == issuer):
+        return False
+    judged, _ = _judged_cas(crl, cas)
+    verifiers = [ca for ca in judged if _verifies(crl, ca)]
+    return bool(verifiers) and not any(map(_may_sign_crls, verifiers))
 
 
 #: Why a CRL reads :class:`CrlSignature` state ``unlisted``, for a start's warning and a reload's
@@ -1001,6 +1169,14 @@ UNCONFIRMED_SIGNATURE: dict[CrlSignatureState, str] = {
         "some listed CA that fits it"
     ),
 }
+
+#: What a whole-chain build's refusal, and a leaf build's WARNING, say of a CRL whose
+#: :attr:`CrlSignature.without_crl_sign` is set, after the block (vault BACKLOG #5896).
+NO_CRL_SIGN = (
+    "is signed by a CA certificate this hop trusts whose key usage does not include cRLSign. A "
+    "handshake whose chain runs through that CA and that OpenSSL judges by this CRL fails with "
+    "'key usage does not include CRL signing'"
+)
 
 #: What a start's refusal and a reload's refusal say of a CRL in state ``bad``, after the block
 #: or the CRL it names, so the two cannot drift apart (vault BACKLOG #3506).
@@ -1055,7 +1231,11 @@ def crl_signature_finding(pem: bytes, ca_ders: Iterable[bytes]) -> CrlSignatureF
     after a CA renews its key. Before #3506 the reload read one flag that folded those three
     states together.
 
-    **It holds back more than a start refuses (vault BACKLOG #2905).** A start refuses only
+    **It does not hold back a CRL from a CA without cRLSign**, which a start refuses on a
+    whole-chain hop and only warns of on a leaf hop (vault BACKLOG #5896,
+    :attr:`CrlSignature.without_crl_sign`): that CRL reads ``verified`` here.
+
+    **Otherwise it holds back more than a start refuses (vault BACKLOG #2905).** A start refuses only
     ``bad``, the proven case, and loads ``unproven`` and ``uncheckable`` with a warning. So the
     reload holds back some files that a start would load, at least a genuine SHA-1 CRL from a
     judged CA, whose revocations then wait for a restart (the ``uncheckable`` state says why).

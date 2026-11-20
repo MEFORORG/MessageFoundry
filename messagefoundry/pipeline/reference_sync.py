@@ -61,12 +61,16 @@ from messagefoundry.store.base import (
     ReferenceKeyCollision,
     acquire_pooled,
 )
-from messagefoundry.transports.base import count_setting, float_setting
+from messagefoundry.transports.base import NegativeAckError, count_setting, float_setting
 from messagefoundry.transports.egress import check_lookup_allowed
 
 __all__ = [
+    "ReferenceColumnMismatch",
+    "ReferenceKeyRefused",
     "ReferenceRowCeilingExceeded",
     "ReferenceStatementRefused",
+    "ReferenceStatementTimedOut",
+    "ReferenceStatementTimeoutRefused",
     "ReferenceSyncError",
     "ReferenceSyncRunner",
 ]
@@ -78,7 +82,7 @@ class ReferenceSyncError(RuntimeError):
     """A reference set's source could not be materialized (bad source kind, missing file, parse error)."""
 
 
-# The two below are separate classes because the sync's log and alert carry the error's CLASS name
+# The classes below are separate because the sync's log and alert carry the error's CLASS name
 # only, never its text (a source error can hold a reference key). The class is all an operator gets,
 # so it has to say which control refused the set (BACKLOG #2617).
 
@@ -89,6 +93,37 @@ class ReferenceStatementRefused(ReferenceSyncError):
 
 class ReferenceRowCeilingExceeded(ReferenceSyncError):
     """A ``DatabaseRef`` statement returned more rows than its ``max_rows``."""
+
+
+class ReferenceStatementTimedOut(ReferenceSyncError):
+    """A ``DatabaseRef`` statement ran past its ``statement_timeout`` (``HYT00``)."""
+
+
+class ReferenceStatementTimeoutRefused(ReferenceSyncError):
+    """The database driver refused a ``DatabaseRef``'s ``statement_timeout``."""
+
+
+class ReferenceColumnMismatch(ReferenceSyncError):
+    """A ``DatabaseRef`` result does not fit its ``key_column`` and ``value_column``.
+
+    At least: the result lacks either, holds either twice, or, with no ``value_column``, holds one
+    column name twice.
+
+    The message holds the set's name and which check failed, never a column's name, so
+    ``_sync_one`` logs it whole, as it does ``ReferenceKeyCollision``."""
+
+
+class ReferenceKeyRefused(ReferenceSyncError):
+    """A ``DatabaseRef`` statement returned a NULL key, or two rows with one key.
+
+    The message holds the set's name and row ordinals, never a key, so ``_sync_one`` logs it
+    whole, as it does ``ReferenceKeyCollision``."""
+
+
+#: The SQLSTATE a statement that ran past its ODBC query timeout fails with.
+_STATEMENT_TIMEOUT_STATE = "HYT00"
+#: The SQLSTATEs a driver that refuses the query timeout on a cursor raises (docs/CONNECTIONS.md).
+_CURSOR_TIMEOUT_REFUSALS = frozenset({"HYC00", "HY092"})
 
 
 @dataclass(frozen=True)
@@ -169,6 +204,19 @@ def reference_max_rows(settings: Mapping[str, Any]) -> int | None:
         label="DATABASE reference source",
         default=DEFAULT_REFERENCE_MAX_ROWS,
     )
+
+
+def reference_statement_timeout(settings: Mapping[str, Any]) -> int:
+    """Read a DATABASE reference source's ``statement_timeout``, in whole seconds, ``0`` for no
+    limit, or refuse it, by the DATABASE connector's rule (``transports.database._statement_timeout``,
+    BACKLOG #5756). Unset is :data:`~messagefoundry.config.models.DEFAULT_DB_STATEMENT_TIMEOUT`,
+    since a ``DatabaseRef`` is always the SQL Server preset.
+
+    One reader for the sync and for ``build_check_registry``, as :func:`reference_acquire_timeout` is,
+    so an ``env()`` value the sync would refuse fails ``messagefoundry check`` too."""
+    from messagefoundry.transports.database import _statement_timeout
+
+    return _statement_timeout(settings, "DATABASE reference source")
 
 
 def reference_statement(settings: Mapping[str, Any], *, name: str | None = None) -> str:
@@ -265,6 +313,10 @@ async def _load_database_source(
     :class:`ReferenceRowCeilingExceeded`. The set is never built from a truncated result. The runner
     then keeps the last-good snapshot, as for any source failure.
 
+    It fails in at least these classes too (BACKLOG #5891), each class's docstring saying when:
+    :class:`ReferenceStatementTimedOut`, :class:`ReferenceStatementTimeoutRefused`,
+    :class:`ReferenceColumnMismatch` and :class:`ReferenceKeyRefused`.
+
     ``posture`` is the instance hop posture (vault BACKLOG #2354). A sync runs after start, outside
     every ``active_hop_posture`` scope, so it is handed down and stamped here. Since vault BACKLOG
     #3533 item 2 no cell under that stamp reads it, so it is inert: a DatabaseRef is always the SQL
@@ -285,13 +337,21 @@ async def _load_database_source(
     either again."""
     from messagefoundry.transports.database import (
         LoginRoleVerdict,
+        _apply_statement_timeout,
+        _bound_statements,
         _close_and_release,
         _close_pool_bounded,
         _login_timeout,
         _make_pool,
+        _sqlstate,
         probe_login_roles,
     )
 
+    where = "" if name is None else f"reference set {name!r}: "
+    refused_text = (
+        f"{where}the database driver refused statement_timeout; set statement_timeout = 0"
+        " on this DatabaseRef if its driver cannot take one"
+    )
     server = str(settings.get("server", ""))
     # `egress` is required (vault BACKLOG #2605): a caller that passed none used to skip this check.
     # The same [egress].allowed_db rule as a db_lookup, so the two cannot drift.
@@ -321,6 +381,7 @@ async def _load_database_source(
     # Read before the pool is made, so a refused value leaves no pool unclosed (BACKLOG #3432).
     acquire_timeout = reference_acquire_timeout(settings)
     limit = reference_max_rows(settings)  # BACKLOG #2617, read early for the same reason
+    statement_timeout = reference_statement_timeout(settings)  # read early for the same reason
     pool = await _make_pool(
         dsn,
         count_setting(
@@ -329,6 +390,12 @@ async def _load_database_source(
         autocommit=True,
         login_timeout=_login_timeout(settings, "DATABASE reference source"),
     )
+    # Every borrow from this pool carries the statement timeout, as a DATABASE connector's does
+    # (BACKLOG #5756). A non-zero value bounds each statement call (execute, each fetch) as the ODBC
+    # query timeout, not the pass as a whole. Nothing bounds it at least at 0, on a pool that could
+    # not be tracked, or on a driver connection with no timeout (both logged at WARNING; see
+    # _bound_statements and _apply_statement_timeout).
+    _bound_statements(pool, statement_timeout)
     try:
         # What names the login, never the password, so the remembered key holds no credential.
         probe_key = (str(name),) + tuple(str(settings.get(k, "")) for k in _LOGIN_KEYS)
@@ -342,30 +409,106 @@ async def _load_database_source(
             if probed is not None and reading.verdict is not LoginRoleVerdict.NOT_RUN:
                 probed.add(probe_key)
         conn = await acquire_pooled(pool, timeout=acquire_timeout, backend="reference:database")
+        # Before the cursor is made, since pyodbc sets the query timeout on each cursor as it is
+        # made, and before the try below: on a refusal it gives the connection back itself.
+        timeout_refused = False
+        try:
+            await _apply_statement_timeout(pool, conn)
+        except NegativeAckError:
+            timeout_refused = True  # raised below, outside the handler, so no chain is carried
+        if timeout_refused:
+            raise ReferenceStatementTimeoutRefused(refused_text)
+        timed_out = False
         cur: Any = None
         try:
-            cur = await conn.cursor()
-            await cur.execute(statement)
-            columns = [d[0] for d in cur.description]
-            rows = await _fetch_reference_rows(cur, limit, name)
+            try:
+                cur = await conn.cursor()
+            except Exception as exc:
+                # A driver that takes the connection timeout but refuses it on a cursor refuses
+                # every cursor (docs/CONNECTIONS.md, the statement_timeout facts).
+                if not statement_timeout or _sqlstate(exc) not in _CURSOR_TIMEOUT_REFUSALS:
+                    raise
+                timeout_refused = True  # raised below, outside the handler
+            if cur is not None:
+                try:
+                    await cur.execute(statement)
+                    columns = [d[0] for d in cur.description]
+                    rows = await _fetch_reference_rows(cur, limit, name)
+                except Exception as exc:
+                    # Read as this setting firing only where one was set.
+                    if not statement_timeout or _sqlstate(exc) != _STATEMENT_TIMEOUT_STATE:
+                        raise
+                    timed_out = True  # raised below, outside the handler: driver text is withheld
         finally:
             # A cancellation returns the connection only once its statement and cursor close have
             # ended (BACKLOG #2394). The pool close below stops waiting for such a held connection
             # at a bound, so once a stop cancels this sync, a statement with no time limit does not
-            # hold that stop. Nothing here bounds an uncancelled statement: it holds the pass.
+            # hold that stop. An uncancelled statement's calls are bounded by statement_timeout
+            # except in the cases the comment at the _bound_statements call above lists.
             await _close_and_release(pool, conn, cur)
     finally:
         await _close_pool_bounded(pool, "DATABASE reference source")
-    if key_col not in columns:
-        raise ReferenceSyncError(f"key_column {key_col!r} not in the statement's result columns")
+    if timeout_refused:
+        raise ReferenceStatementTimeoutRefused(refused_text)
+    if timed_out:
+        raise ReferenceStatementTimedOut(
+            f"{where}the DatabaseRef statement ran past statement_timeout={statement_timeout}s;"
+            " narrow the statement, or raise statement_timeout on this DatabaseRef"
+        )
+    return _rows_to_snapshot(columns, rows, key_col, value_col, name)
+
+
+def _rows_to_snapshot(
+    columns: list[Any], rows: Iterable[Any], key_col: Any, value_col: Any, name: str | None
+) -> dict[str, Any]:
+    """Build a DATABASE source's ``{key: value}`` set, or refuse it whole.
+
+    A result that does not fit the declared columns is refused rather than built. The refusals are
+    listed on :class:`ReferenceColumnMismatch` and :class:`ReferenceKeyRefused`; a
+    ``value_column`` the result lacks, a NULL key, or two rows with one key would otherwise replace
+    the last-good snapshot with ``None`` values, a ``"None"`` key, or whichever duplicate came last,
+    and a column held twice, as a join can, leaves which one is meant untold. The refusals name the
+    set and, where one applies, a setting or row ordinals, never a column's name or a key: a key may
+    be PHI, and the sync logs these whole."""
+    where = "" if name is None else f"reference set {name!r}: "
+    for role, col in (("key_column", key_col), ("value_column", value_col)):
+        if col is None:
+            continue
+        count = columns.count(col)
+        if count != 1:
+            problem = "is not among" if count == 0 else "names more than one of"
+            raise ReferenceColumnMismatch(
+                f"{where}the DatabaseRef {role} {problem} the statement's result columns;"
+                " refusing the snapshot"
+            )
+    key_at = columns.index(key_col)
+    value_at = None if value_col is None else columns.index(value_col)
+    others = [(c, i) for i, c in enumerate(columns) if c != key_col] if value_at is None else []
+    if len({c for c, _ in others}) != len(others):
+        # The dict shape would keep only the last of two same-named columns.
+        raise ReferenceColumnMismatch(
+            f"{where}the statement's result holds a column name twice and no value_column is"
+            " set; alias the columns apart, or set value_column; refusing the snapshot"
+        )
     out: dict[str, Any] = {}
-    for row in rows:
-        record = dict(zip(columns, row))  # noqa: B905
-        key = str(record[key_col])
-        if value_col is not None:
-            out[key] = _cell(record.get(value_col))
+    for ordinal, row in enumerate(rows):
+        raw_key = row[key_at]
+        if raw_key is None:
+            raise ReferenceKeyRefused(
+                f"{where}row #{ordinal} has a NULL key_column; refusing the snapshot"
+            )
+        key = str(raw_key)
+        if key in out:
+            # Rare, so the first row is found by a rescan rather than a second map of every key.
+            first = list(out).index(key)
+            raise ReferenceKeyRefused(
+                f"{where}rows #{first} and #{ordinal} have the same key_column value; refusing the"
+                " snapshot (key value withheld: reference keys may be PHI)"
+            )
+        if value_at is not None:
+            out[key] = _cell(row[value_at])
         else:
-            out[key] = {c: _cell(record[c]) for c in columns if c != key_col}
+            out[key] = {c: _cell(row[i]) for c, i in others}
     return out
 
 
@@ -597,13 +740,19 @@ class ReferenceSyncRunner:
                 _load_file_source, settings
             )  # blocking file I/O off-loop
         elif kind == "database":
-            rows = await _load_database_source(  # async aioodbc dial
-                settings,
-                self._egress,
-                posture=self._hop_posture,
-                name=spec.name,
-                probed=self._roles_probed,
-            )
+            try:
+                rows = await _load_database_source(  # async aioodbc dial
+                    settings,
+                    self._egress,
+                    posture=self._hop_posture,
+                    name=spec.name,
+                    probed=self._roles_probed,
+                )
+            except (ReferenceColumnMismatch, ReferenceKeyRefused) as exc:
+                # Logged whole, as ReferenceKeyCollision is below: the text holds the set's name and,
+                # by refusal, the column setting, or the row ordinals, never a column name or a key.
+                log.error("%s (not synced)", exc)
+                raise
         else:
             raise ReferenceSyncError(
                 f"reference set {spec.name!r}: unknown source kind {kind!r} (file, database)"

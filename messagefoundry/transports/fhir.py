@@ -97,6 +97,7 @@ from messagefoundry.transports.bounded_read import (
     hop_identity,
     read_2xx_reply_text,
     read_bounded_text,
+    refused_error_body_phrase,
 )
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture
@@ -137,6 +138,7 @@ from messagefoundry.transports.rest import (
     refuse_cleartext_egress,
     refuse_held_dynamic_headers,
     refuse_unrevoked_verified_hop,
+    refuse_unsendable_static_request,
     refuse_url_credentials,
     refuse_verify_off,
     revocation_attestation_from_settings,
@@ -1121,9 +1123,9 @@ class FhirDestination(DestinationConnector):
         self.conditional_query: str | None = (
             _reject_config_control_chars(str(_q), "conditional_query") if _q else None
         )
-        if (
-            self.conditional in ("if-none-exist", "conditional-update")
-            and not self.conditional_query
+        if self.conditional in ("if-none-exist", "conditional-update") and not (
+            # BACKLOG #5911: all spaces is no search; the header form would send it as one.
+            self.conditional_query and self.conditional_query.strip()
         ):
             raise ValueError(
                 f"FHIR destination conditional={self.conditional!r} requires a 'conditional_query' "
@@ -1199,6 +1201,21 @@ class FhirDestination(DestinationConnector):
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
+        # BACKLOG #5911: a static url or header the wire refuses fails the connection here, as a
+        # bad conditional_query does, rather than every message at send time. Before any hop gate,
+        # so none audits a crossing for a connection that never builds (#5529). A static
+        # conditional that a wrapped update moves into the Bundle entry (#1965, below) is JSON
+        # there, never an HTTP header, so it is not judged by the header rules.
+        wrapped = self._is_update and not self._path_form
+        refuse_unsendable_static_request(
+            url,
+            {
+                name: value
+                for name, value in self._build_headers(s).items()
+                if not (wrapped and name.lower() in _ENTRY_CONDITIONAL_FIELDS)
+            },
+            setting="FHIR destination",
+        )
         self._proxy: ProxyConfig | None = egress_route_from_settings(
             s,
             dest_scheme=scheme,
@@ -1768,18 +1785,40 @@ class FhirDestination(DestinationConnector):
                     connector=f"{self._hop} error body",
                     encoding=self.encoding,
                 )
-            except EgressReplyError:
+            except EgressReplyError as refused:
                 # The FAMILY, not just the byte bound: a truncated error body is equally unusable
-                # and equally worth a named warning. Catching the member sent it to the bare
-                # `except Exception` below, where the operator got no signal at all.
+                # and equally worth a named warning. Catching only the member once sent the rest
+                # of the family to a bare `except Exception` that logged nothing.
                 logger.warning(
-                    "%s returned an HTTP %s error body the engine could not read whole; "
+                    "%s returned an HTTP %s %s; classifying on the status alone",
+                    self._hop,
+                    exc.code,
+                    refused_error_body_phrase(refused, "error body"),
+                )
+                body = ""
+            except (OSError, ValueError, http.client.HTTPException) as failed:
+                # BACKLOG #5910: what a socket read can raise, named so it logs as a failed read.
+                # By class only: no reply byte.
+                logger.warning(
+                    "%s returned an HTTP %s error body the read failed on (%s); classifying on "
+                    "the status alone",
+                    self._hop,
+                    exc.code,
+                    type(failed).__name__,
+                )
+                body = ""
+            except Exception as failed:  # noqa: BLE001 - a body we can't read becomes status-only
+                # Anything else, a defect included, still falls through to the status, as before
+                # BACKLOG #5910: a 5xx stays retryable and a 401 still invalidates the token,
+                # rather than the raise reaching the delivery worker as an internal error. Logged
+                # by class only: the exception text could carry reply bytes.
+                logger.warning(
+                    "%s returned an HTTP %s error body the read raised an unexpected %s on; "
                     "classifying on the status alone",
                     self._hop,
                     exc.code,
+                    type(failed).__name__,
                 )
-                body = ""
-            except Exception:  # noqa: BLE001 - a body we can't read just becomes status-only
                 body = ""
             if self._token_provider is not None and exc.code == 401:
                 # ADR 0024: the SMART token may have expired between mint and use — drop it and retry
@@ -2044,6 +2083,10 @@ class FhirLookupExecutor:
             # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
             # arrives in these settings, mirrored from the spec's typed fields by
             # wiring_runner._fhir_lookup_settings (never from a raw key in `spec.settings`, BACKLOG #2050).
+            # BACKLOG #5911: the destination's static-settings screen, at this sibling too (#1241).
+            refuse_unsendable_static_request(
+                url, self._build_headers(s), setting=f"FhirLookup {cname!r}"
+            )
             # Vault BACKLOG #3139: a refusal from either reader names the lookup, as the url checks do.
             try:
                 attested = hop_attestation_from_settings(s)

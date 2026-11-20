@@ -103,6 +103,7 @@ _MUST_NOT_BE_REQUIRED = (
     "mutation (advisory)",
     "gate liveness (advisory)",
     "SBOMs (CycloneDX, multi-ecosystem)",
+    "SBOM (CycloneDX, engine resolved on Windows)",
     "trivy (container image vulnerabilities)",
     # Coverage-guided parser fuzzing (ADR 0191). Paths-gated on a pull request AND advisory by
     # design: a fuzzer reports what it happened to reach inside a time budget, so its result is not

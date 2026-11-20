@@ -184,14 +184,16 @@ def first_unconfirmed_signature(
     """Whether this process now meets ``finding`` for the first time, for the file at ``path``
     whose bytes have ``fingerprint`` (vault BACKLOG #2905). Records it either way.
 
-    ``finding`` is what a start could not confirm about the signatures of the CRLs in the file:
-    one state per CRL, or a note that the judgment itself failed. ``harden_crl_check`` logs only
-    when this is True. It runs once per TLS context, and the Postgres store builds a context per
-    connection, so a line per call would repeat for as long as the engine runs. This keeps the
-    findings of one version of the file, the last one it was asked about, and logs each of them
-    once. So a version that returns after another was asked about is logged again (vault BACKLOG
-    #3506). It is asked only when there is a line to log, so a version that logged nothing does
-    not reset it. Hops with different CA lists can reach different findings for one file, and
+    ``finding`` is what a context build could not confirm about the signatures of the CRLs in the
+    file: one state per CRL, or a note that the judgment itself failed, or, since vault BACKLOG
+    #5896, a leaf hop's note of a verified CRL from a CA without ``cRLSign``. ``harden_crl_check``
+    asks only once its build has succeeded, and logs only when this is True. It runs once per TLS
+    context, and the Postgres store builds a context per connection, so a line per call would
+    repeat for as long as the engine runs. This keeps the findings of one version of the file, the
+    last one it was asked about, and logs each of them once. So a version that returns after
+    another was asked about is logged again (vault BACKLOG #3506). It is asked only when there is
+    a line to log, so a version that logged nothing, or was refused, does not reset it. Hops with
+    different CA lists can reach different findings for one file, and
     each of those is logged once. The record is per file, not per setting: a second setting that
     names the same file and reaches the same finding logs no line of its own. The state is in
     memory, so every start logs again, and each engine shard logs its own line."""

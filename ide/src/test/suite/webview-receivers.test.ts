@@ -1395,8 +1395,8 @@ suite("webview receivers discard a malformed payload and render a well-formed on
 
   test("Security Settings: a session limit is marked loosened only above the default the state carries", () => {
     // Vault BACKLOG #2600: security_loosenings() names each session limit above its shipped default,
-    // and 0 or less is stricter. The default is read from the state, so the control at the end moves
-    // it and the same value stops being a loosening.
+    // and a value down to the floor of 1 is stricter (BACKLOG #5772). The default is read from the
+    // state, so the control at the end moves it and the same value stops being a loosening.
     for (const key of ["sign_out_after_idle_minutes", "max_session_hours"]) {
       const field = FIELDS.find((f) => f.key === key);
       assert.ok(field?.looserAboveDefault, `${key}: not read against its default`);
@@ -1416,7 +1416,7 @@ suite("webview receivers discard a malformed payload and render a well-formed on
       assert.strictEqual(marked(shipped + 1), true, `${key}: above the default is not marked`);
       assert.strictEqual(marked(shipped), false, `${key}: the default is marked`);
       assert.strictEqual(marked(shipped - 1), false, `${key}: a stricter value is marked`);
-      assert.strictEqual(marked(0), false, `${key}: 0, which ends every session, is marked`);
+      assert.strictEqual(marked(1), false, `${key}: the floor of 1 is marked`);
       assert.strictEqual(marked(shipped + 1, shipped + 1), false, `${key}: read against a fixed number`);
       // An unsaved edit marks it too, as a Yes/No does.
       const p = security.load();
@@ -1457,7 +1457,11 @@ suite("webview receivers discard a malformed payload and render a well-formed on
 
   test("Security Settings: Save refuses a number below the minimum or not a whole number, and posts nothing", () => {
     const ints = FIELDS.filter((x) => x.type === "int");
-    assert.deepStrictEqual(ints.filter((x) => x.min !== undefined).map((x) => x.key), ["delete_message_bodies_after_days"]);
+    assert.deepStrictEqual(ints.filter((x) => x.min !== undefined).map((x) => x.key), [
+      "sign_out_after_idle_minutes",
+      "max_session_hours",
+      "delete_message_bodies_after_days",
+    ]);
     for (const f of ints) {
       // "unparseable" is what a browser holds for text it cannot read as a number, such as "1e": an
       // empty value with validity.badInput set. jsdom never sets badInput, so the case stubs it.
@@ -1484,13 +1488,12 @@ suite("webview receivers discard a malformed payload and render a well-formed on
         assert.strictEqual(p.posted[0].updates[f.key], 5);
       }
     }
-    // A session limit has no minimum: 0 or less is stricter, and the engine takes it, so a stored
-    // negative value does not block a Save of some other switch.
+    // A session limit takes 1 or more, the floor the engine refuses below at load (BACKLOG #5772),
+    // so Save never posts a value below it, even one the state carried in.
     const neg = security.load();
     neg.deliver(variant(STATE_OK, (c) => (c.state.values.max_session_hours = -1)));
     neg.window.document.getElementById("save").click();
-    assert.strictEqual(neg.posted.length, 1, "a stored negative session limit blocked Save");
-    assert.strictEqual(neg.posted[0].updates.max_session_hours, -1);
+    assert.strictEqual(neg.posted.length, 0, "a session limit below 1 was posted");
     // THE CONTROL: an explicit 0 the operator types is still sent as 0, and marked loosened.
     const p = security.load();
     p.deliver(STATE_OK);

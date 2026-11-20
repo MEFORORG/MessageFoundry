@@ -12,6 +12,7 @@ marshalling carries the scalar, and a snapshotted ``Send.message`` survives the 
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -108,17 +109,18 @@ def _fanout_registry_with_inbound() -> Registry:
     return reg
 
 
-def test_dry_run_previews_copy_on_send_only_when_opted_in() -> None:
+def test_dry_run_previews_copy_on_send_by_default_and_last_write_when_off() -> None:
     """Preview fidelity (adversarial-review fix): ``dry_run``/Test Bench previews the copy-on-Send
-    divergence when ``snapshot_on_send=True`` and collapses to last-write by default (the default engine
-    posture) — closing the preview/live gap where the shared ``RunContext`` had pinned the flag OFF."""
+    divergence by default, as the engine delivers it (BACKLOG #5794), and collapses to last-write
+    when ``snapshot_on_send=False`` — closing the preview/live gap where the shared ``RunContext``
+    had pinned the flag OFF."""
     reg = _fanout_registry_with_inbound()
-    off = dry_run(reg, _ADT, inbound="IB")
+    off = dry_run(reg, _ADT, inbound="IB", snapshot_on_send=False)
     assert {d.to: Message.parse(d.payload).field("MSH-5") for d in off.deliveries} == {
         "OB_A": "SYS_B",
         "OB_B": "SYS_B",
     }
-    on = dry_run(reg, _ADT, inbound="IB", snapshot_on_send=True)
+    on = dry_run(reg, _ADT, inbound="IB")
     assert {d.to: Message.parse(d.payload).field("MSH-5") for d in on.deliveries} == {
         "OB_A": "SYS_A",
         "OB_B": "SYS_B",
@@ -258,3 +260,37 @@ def test_message_copy_sugar_is_independent() -> None:
     c2 = m2.copy()
     m2.set("PID-5.1", "ORIGONLY")
     assert c2.field("PID-5.1") != "ORIGONLY" and m2.field("PID-5.1") == "ORIGONLY"
+
+
+@pytest.mark.parametrize("flag", ["snapshot_on_send", "batch_handoff_statements"])
+def test_programmatic_entry_points_default_as_pipeline_settings(flag: str) -> None:
+    # BACKLOG #5794: serve passes [pipeline] values, but an embedder on keyword defaults reads the
+    # signature defaults, which were False while PipelineSettings defaults both to True.
+    import inspect
+
+    from messagefoundry.api.app import create_managed_app
+    from messagefoundry.config.settings import PipelineSettings
+    from messagefoundry.pipeline import dryrun as dryrun_mod
+    from messagefoundry.pipeline.dryrun_trace import trace_dry_run
+    from messagefoundry.pipeline.engine import Engine
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+    from messagefoundry.verify.smoke import smoke_self
+
+    expected = getattr(PipelineSettings(), flag)
+    fns: list[Callable[..., object]] = [
+        create_managed_app,
+        Engine.__init__,
+        Engine.create,
+        RegistryRunner.__init__,
+    ]
+    if flag == "snapshot_on_send":
+        # The previews take only the copy-on-Send flag; batching is a store concern.
+        fns += [
+            dryrun_mod.dry_run,
+            dryrun_mod.route_message,
+            dryrun_mod._dry_run_raw,
+            trace_dry_run,
+            smoke_self,
+        ]
+    for fn in fns:
+        assert inspect.signature(fn).parameters[flag].default is expected, fn.__qualname__

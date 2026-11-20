@@ -11,7 +11,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from messagefoundry.config.settings import ServiceSettings, StoreBackend
+from messagefoundry.config.settings import PipelineSettings, ServiceSettings, StoreBackend
 from messagefoundry.redaction import codec_safe_str
 from messagefoundry.transports.db_endpoint import (
     SQLSERVER_DEFAULT_DRIVER,
@@ -552,9 +552,14 @@ def run_verify(
         if smoke_mode == "self":
             # Mirror the live engine's copy-on-Send posture (ADR 0104) so the self-smoke previews what
             # a default engine actually delivers: a default engine runs [pipeline].snapshot_on_send ON
-            # (PipelineSettings default True), while dry_run's library default is OFF. Keep that library
-            # default when no service settings resolve (#241 F3, #230 CLI parity).
-            snapshot_on_send = settings.pipeline.snapshot_on_send if settings is not None else False
+            # (PipelineSettings default True), as dry_run's library default now is too (BACKLOG
+            # #5794). With no service settings resolved, the PipelineSettings default applies
+            # (#241 F3, #230 CLI parity).
+            snapshot_on_send = (
+                settings.pipeline.snapshot_on_send
+                if settings is not None
+                else PipelineSettings().snapshot_on_send
+            )
             results.append(
                 smoke_self(
                     config_dir, inbound=inbound, snapshot_on_send=snapshot_on_send, graph=graph

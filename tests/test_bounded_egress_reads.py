@@ -78,7 +78,7 @@ from messagefoundry.transports.signing import (
     SigningError,
     _read_key_material,
 )
-from messagefoundry.transports.smart import SmartBackendTokenProvider
+from messagefoundry.transports.smart import TOKEN_REPLY_CODED_CODE, SmartBackendTokenProvider
 from messagefoundry.transports.soap import SoapDestination
 
 REST_URL = "https://api.example.com/ingest"
@@ -942,6 +942,244 @@ def test_a_truncated_error_body_still_warns_rather_than_going_silent(
     with caplog.at_level(logging.WARNING), pytest.raises(DeliveryError):
         dest._post(json.dumps({"resourceType": "Patient"}), "POST", f"{FHIR_BASE}/Patient", {})
     assert any("could not read whole" in r.getMessage() for r in caplog.records)
+
+
+# --- a content-coded reply on the token, AI broker and lookup reads (BACKLOG #5910 step 3) --------
+#
+# reply_framing_fault refuses any content coding but identity as an AmbiguousFramingError. These
+# pin what each reader that retypes, or lets through, that refusal does with it. A coded token
+# reply is a permanent configuration fault that stops the lane, by the owner ruling of 2026-11-18
+# on PR 3069.
+
+_CODED_200 = b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello"
+
+
+def _oauth2_coded() -> OAuth2ClientCredentialsProvider:
+    provider = OAuth2ClientCredentialsProvider(
+        token_url=TOKEN_URL, client_id="cid", client_secret="s3cr3t"
+    )
+    provider._opener = _FakeOpener(_wire(_CODED_200))  # type: ignore[assignment]
+    return provider
+
+
+def _smart_coded(ec_pem: str) -> SmartBackendTokenProvider:
+    provider = SmartBackendTokenProvider(
+        token_url=TOKEN_URL,
+        client_id="cid",
+        private_key=ec_pem,
+        algorithm=SignatureAlgorithm.ES256,
+        scope="system/*.rs",
+    )
+    provider._opener = _FakeOpener(_wire(_CODED_200))  # type: ignore[assignment]
+    return provider
+
+
+def _assert_coded_token_stops_the_lane(exc: BaseException) -> None:
+    """Owner ruling 2026-11-18 on PR 3069: "Stop the lane." A permanent configuration fault, which
+    the delivery worker's existing lane-stopping route takes."""
+    assert isinstance(exc, NegativeAckError)
+    assert exc.permanent is True
+    assert exc.config_fault is True
+    assert exc.credential_fault is False
+    assert exc.code == TOKEN_REPLY_CODED_CODE
+    assert "s3cr3t" not in str(exc)
+    assert exc.__context__ is None
+
+
+def test_the_coded_token_refusal_names_the_hop_and_no_url(ec_pem: str) -> None:
+    """BACKLOG #2060: a refusal of a reply body names the hop by a fixed label, never the token
+    URL, redacted or not. The text reaches the row's last_error and a lookup's error."""
+    for provider in (_oauth2_coded(), _smart_coded(ec_pem)):
+        with pytest.raises(NegativeAckError) as err:
+            provider.access_token()
+        text = str(err.value)
+        assert "auth.example.com" not in text
+        assert "/token" not in text
+        assert "token endpoint answered in a content coding" in text
+
+
+def test_an_oauth2_token_reply_in_a_content_coding_is_a_permanent_refusal() -> None:
+    with pytest.raises(NegativeAckError) as err:
+        _oauth2_coded().access_token()
+    _assert_coded_token_stops_the_lane(err.value)
+
+
+def test_a_smart_token_reply_in_a_content_coding_is_a_permanent_refusal(ec_pem: str) -> None:
+    with pytest.raises(NegativeAckError) as err:
+        _smart_coded(ec_pem).access_token()
+    _assert_coded_token_stops_the_lane(err.value)
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param(_FIXED_TRUNCATED, id="cut-short"),
+        pytest.param(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n"
+            b"5\r\nhello\r\n0\r\n\r\n",
+            id="misframed-not-coded",
+        ),
+    ],
+)
+def test_a_token_reply_refused_for_anything_but_its_coding_stays_retryable(raw: bytes) -> None:
+    """The control: only the coded refusal changed. A misframed reply is an AmbiguousFramingError
+    too, so this is what keeps the coded test from passing on the type alone."""
+    provider = OAuth2ClientCredentialsProvider(
+        token_url=TOKEN_URL, client_id="cid", client_secret="s3cr3t"
+    )
+    provider._opener = _FakeOpener(_wire(raw))  # type: ignore[assignment]
+    with pytest.raises(DeliveryError) as err:
+        provider.access_token()
+    assert not isinstance(err.value, NegativeAckError)
+
+
+def test_a_soap_delivery_whose_token_reply_is_coded_is_a_configuration_fault() -> None:
+    dest = _soap()
+    dest._token_provider = _oauth2_coded()
+    dest._opener = _RaisingOpener(AssertionError("the delivery must not be sent"))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as err:
+        dest._post("<env:Envelope/>")
+    _assert_coded_token_stops_the_lane(err.value)
+
+
+def test_a_rest_delivery_whose_token_reply_is_coded_is_a_configuration_fault() -> None:
+    dest = _rest()
+    dest._token_provider = _oauth2_coded()
+    dest._opener = _RaisingOpener(AssertionError("the delivery must not be sent"))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as err:
+        dest._post("<payload/>")
+    _assert_coded_token_stops_the_lane(err.value)
+
+
+def test_a_fhir_delivery_whose_token_reply_is_coded_is_a_configuration_fault(ec_pem: str) -> None:
+    dest = _fhir()
+    dest._token_provider = _smart_coded(ec_pem)
+    dest._opener = _RaisingOpener(AssertionError("the delivery must not be sent"))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as err:
+        dest._post(json.dumps({"resourceType": "Patient"}), "POST", f"{FHIR_BASE}/Patient", {})
+    _assert_coded_token_stops_the_lane(err.value)
+
+
+def test_the_ai_broker_maps_a_content_coded_reply_onto_its_own_error_type() -> None:
+    broker = AiBroker(
+        endpoint=AI_ENDPOINT,
+        api_key="sk-secret-key-value",
+        allowed_endpoints=["ai.internal"],
+        revocation_attested=True,
+        revocation_attested_reason=_AI_ATTESTED_REASON,
+    )
+    broker._opener = _FakeOpener(_wire(_CODED_200))  # type: ignore[assignment]
+    with pytest.raises(AiBrokerError, match="content coding") as err:
+        broker.chat("def handle(msg): ...")
+    assert "sk-secret-key-value" not in str(err.value)
+
+
+def test_fhir_lookup_maps_a_content_coded_reply_onto_fhir_lookup_error() -> None:
+    ex = FhirLookupExecutor(
+        {"epic": {"url": FHIR_BASE}}, egress=EgressSettings(deny_by_default=False)
+    )
+    ex._opener["epic"] = _FakeOpener(_wire(_CODED_200, method="GET"))  # type: ignore[assignment]
+    with pytest.raises(FhirLookupError, match="content coding"):
+        ex._get("epic", f"{FHIR_BASE}/Patient/123")
+
+
+# --- the SOAP and FHIR error-body reads (BACKLOG #5910 steps 1 and 2) ------------------------------
+# Step 2 is met by a logged catch-all that keeps main's retry: a raise the named arms do not catch
+# is logged by class only, and the reply is classified on its status.
+
+_CODED_500 = b"HTTP/1.1 500 Internal Server Error\r\nContent-Encoding: gzip\r\nContent-Length: 5\r\n\r\nhello"
+
+
+def _coded_500_error(url: str) -> urllib.error.HTTPError:
+    inner = _wire(_CODED_500)
+    return urllib.error.HTTPError(url, 500, "err", inner.headers, inner)
+
+
+def _post_soap(dest: SoapDestination) -> None:
+    dest._post("<env:Envelope/>")
+
+
+def _post_fhir(dest: FhirDestination) -> None:
+    dest._post(json.dumps({"resourceType": "Patient"}), "POST", f"{FHIR_BASE}/Patient", {})
+
+
+@pytest.mark.parametrize("which", ["soap", "fhir"])
+def test_a_content_coded_error_body_is_named_as_coded_not_as_unread(
+    which: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Step 1: a coded body is refused for its coding, not its length, so "could not read whole"
+    misnames it."""
+    if which == "soap":
+        soap = _soap()
+        soap._opener = _RaisingOpener(_coded_500_error(SOAP_URL))  # type: ignore[assignment]
+        post: Callable[[], None] = lambda: _post_soap(soap)  # noqa: E731
+    else:
+        fhir = _fhir()
+        fhir._opener = _RaisingOpener(_coded_500_error(FHIR_BASE))  # type: ignore[assignment]
+        post = lambda: _post_fhir(fhir)  # noqa: E731
+    with caplog.at_level(logging.WARNING), pytest.raises(DeliveryError):
+        post()
+    assert "in a content coding the engine does not decode" in caplog.text
+    assert "could not read whole" not in caplog.text
+
+
+class _FailingReadHTTPError(urllib.error.HTTPError):
+    """A non-2xx whose error-body read raises ``exc``."""
+
+    def __init__(self, url: str, exc: Exception) -> None:
+        super().__init__(url, 500, "err", email.message.Message(), io.BytesIO(b""))
+        self.exc = exc
+
+    def read(self, amt: int = -1) -> bytes:
+        raise self.exc
+
+
+@pytest.mark.parametrize("which", ["soap", "fhir"])
+@pytest.mark.parametrize("failure", [ConnectionResetError(), ValueError("closed")])
+def test_a_socket_failure_on_the_error_body_still_classifies_on_the_status(
+    which: str, failure: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Step 2: what a socket read raises is still dropped to status-only, and now logged."""
+    url = SOAP_URL if which == "soap" else FHIR_BASE
+    err = _FailingReadHTTPError(url, failure)
+    if which == "soap":
+        soap = _soap()
+        soap._opener = _RaisingOpener(err)  # type: ignore[assignment]
+        post: Callable[[], None] = lambda: _post_soap(soap)  # noqa: E731
+    else:
+        fhir = _fhir()
+        fhir._opener = _RaisingOpener(err)  # type: ignore[assignment]
+        post = lambda: _post_fhir(fhir)  # noqa: E731
+    with caplog.at_level(logging.WARNING), pytest.raises(DeliveryError) as raised:
+        post()
+    assert "500" in str(raised.value)
+    assert type(failure).__name__ in caplog.text
+
+
+@pytest.mark.parametrize("which", ["soap", "fhir"])
+@pytest.mark.parametrize("failure", [RuntimeError("defect PID|123"), KeyError("defect PID|123")])
+def test_an_unexpected_raise_in_the_error_body_read_still_retries_a_5xx(
+    which: str, failure: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5910 repair: a raise outside the named read failures falls through to the status,
+    as on main, so a 500 stays the retryable DeliveryError rather than reaching the delivery
+    worker as an internal error that dead-letters. Logged by class only, never its text."""
+    url = SOAP_URL if which == "soap" else FHIR_BASE
+    err = _FailingReadHTTPError(url, failure)
+    if which == "soap":
+        soap = _soap()
+        soap._opener = _RaisingOpener(err)  # type: ignore[assignment]
+        post: Callable[[], None] = lambda: _post_soap(soap)  # noqa: E731
+    else:
+        fhir = _fhir()
+        fhir._opener = _RaisingOpener(err)  # type: ignore[assignment]
+        post = lambda: _post_fhir(fhir)  # noqa: E731
+    with caplog.at_level(logging.WARNING), pytest.raises(DeliveryError) as raised:
+        post()
+    assert "500" in str(raised.value)
+    assert not getattr(raised.value, "permanent", False)
+    assert type(failure).__name__ in caplog.text
+    assert "PID|123" not in caplog.text
 
 
 def test_a_truncated_reply_never_carries_the_partial_body_on_the_exception_chain() -> None:

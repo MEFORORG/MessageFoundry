@@ -140,18 +140,23 @@ against one case that matters, described under
   and read topology A below for the revocation attestation `docker compose` requires.
 - **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
   — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set all three `image:` fields (`tls-dir`, `copy-tls` and `engine`) to your config-baked image.
-- **Both Kubernetes manifests need a ConfigMap you create:** `mefor-revocation-attestation`, key
-  `attested`, which feeds `MEFOR_TLS_REVOCATION_ATTESTED` with no default. Without it the kubelet
-  refuses the engine container with `CreateContainerConfigError`. Create it only if your PKI enforces
-  revocation ([SECURITY.md, API revocation gate](../docs/SECURITY.md#api-revocation-gate)):
-  `kubectl create configmap mefor-revocation-attestation --from-literal=attested=1`. The value must
-  read as true (`1`, `true`, `yes` or `on`). A value such as `0` passes the kubelet, and the engine
-  then exits 2 and the pod crash-loops: neither manifest checks the value before the engine starts.
+  An enforcing start needs more than the bind, and the manifest's block *what an enforcing start
+  needs* names at least the alert channel, verified-TLS log forwarding and the retention bounds as
+  commented entries. As shipped the engine refuses to start; uncomment each entry with your value. Bake the syslog CA and CRL it names under `/config/pki/`, and
+  add the Secret's `tls-revocation-attested` key, without which the pod does not start: the kubelet
+  refuses the engine container with `CreateContainerConfigError`. Set it only
+  if your PKI enforces revocation ([SECURITY.md, API revocation gate](../docs/SECURITY.md#api-revocation-gate)),
+  and to a value that reads as true (`1`, `true`, `yes` or `on`). A value such as `0` passes the
+  kubelet, and the engine then exits 2 and the pod crash-loops: neither Kubernetes manifest checks
+  the value before the engine starts.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
   Postgres-backed `replicas: 3` Deployment with `[cluster].enabled`, a PodDisruptionBudget, and
   lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)
   (the Postgres-led cloud guide, MLLP L4-LB recipe, and edge-relay topology) and
   [`docs/CLOUD-PHI-HIPAA.md`](../docs/CLOUD-PHI-HIPAA.md) (the cloud HIPAA posture) before deploying it.
+  Like the single-node manifest it carries a block *what an enforcing start needs* of commented
+  entries, which adds the store CRL, and it mounts a writable `log-spool` volume, since these pods
+  have no PVC.
   For a local taste of the HA shape: `docker compose --profile ha up` (adds a Postgres + a PAIR of
   clustered engines — `engine-ha` + `engine-standby` — that share one leader lease, so you can stop the
   leader and watch the other promote; the default `docker compose up` stays single-node SQLite, unchanged).

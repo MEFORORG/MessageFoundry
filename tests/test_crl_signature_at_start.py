@@ -227,7 +227,7 @@ def _server(tmp_path: Path, chain: bytes, key: ec.EllipticCurvePrivateKey) -> ss
     return ctx
 
 
-_WARNING = "could not confirm at start"
+_WARNING = "could not confirm that a CA this hop lists"
 
 
 def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
@@ -1400,11 +1400,16 @@ def test_a_failure_part_way_keeps_a_bad_verdict_already_reached(
         _crl(twins.stranger, names=twins.new_key)
         + _crl(twins.stranger, names=twins.stranger, name=_OTHER_NAME)
     )
-    with caplog.at_level("WARNING"), pytest.raises(ValueError, match="CRL block 1 of 2"):
+    with (
+        caplog.at_level("WARNING"),
+        pytest.raises(ValueError, match="CRL block 1 of 2") as refused,
+    ):
         twins.hop("new")
-    # The failure is still logged, with how far the judgment got.
-    (error,) = [r for r in caplog.records if "could not check the signatures" in r.getMessage()]
-    assert "after judging 1 of them" in error.getMessage() and error.exc_info is not None
+    # Vault BACKLOG #5896: the refused build logs no line about the file. The failure travels
+    # with the refusal, as its cause, instead.
+    assert not [r for r in caplog.records if "could not check the signatures" in r.getMessage()]
+    assert isinstance(refused.value.__cause__, RuntimeError)
+    assert "after the first 1 (RuntimeError)" in str(refused.value)
 
     # Control: the same failure with no proof reached first still loads, with the ERROR.
     calls = 0
@@ -1416,7 +1421,9 @@ def test_a_failure_part_way_keeps_a_bad_verdict_already_reached(
     with caplog.at_level("WARNING"):
         hop = twins.hop("new")
     assert hop.verify_flags & ssl.VERIFY_CRL_CHECK_LEAF
-    assert [r for r in caplog.records if "could not check the signatures" in r.getMessage()]
+    (error,) = [r for r in caplog.records if "could not check the signatures" in r.getMessage()]
+    assert "after judging 1 of them" in error.getMessage() and error.exc_info is not None
+    assert "This TLS context loaded the file and checks revocation" in error.getMessage()
 
 
 #: The name of the CA :func:`_zero_serial_ca` makes.

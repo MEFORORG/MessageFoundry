@@ -21,6 +21,7 @@ import ast
 import re
 import sys
 from pathlib import Path
+from typing import Any
 
 from tests._workflow_contexts import load_workflow
 
@@ -184,12 +185,10 @@ def test_the_resync_regenerates_the_closure_file() -> None:
 def test_the_resync_checks_out_the_triggering_sha() -> None:
     """RED when: the resync checks out the moving branch tip instead of the triggering SHA.
 
-    The closure step runs a repository script while the App token sits in the checkout's
-    credential config. Pinned to the SHA, a commit pushed after the trigger never runs, and the
-    push is refused if the branch has moved.
+    The closure step runs a repository script from this checkout. Pinned to the SHA, a commit
+    pushed after the trigger never runs, and the push is refused if the branch has moved.
     """
-    steps = load_workflow(_RESYNC.name)["jobs"]["resync"]["steps"]
-    checkouts = [s for s in steps if str(s.get("uses", "")).startswith("actions/checkout@")]
+    checkouts = _steps_using("actions/checkout@")
     assert len(checkouts) == 1, f"expected one checkout step, found {len(checkouts)}"
     assert checkouts[0]["with"]["ref"] == "${{ github.event.pull_request.head.sha }}"
 
@@ -284,3 +283,128 @@ def test_the_resync_gate_keeps_its_immutable_author_conjunct() -> None:
     assert "||" not in condition, (
         "a disjunction lets the spoofable actor check alone open the job — the dominating shape"
     )
+
+
+def _resync_steps() -> list[dict[str, Any]]:
+    steps = load_workflow(_RESYNC.name)["jobs"]["resync"]["steps"]
+    assert isinstance(steps, list) and steps, "the resync job parsed to no steps"
+    return steps
+
+
+def _steps_using(prefix: str) -> list[dict[str, Any]]:
+    return [s for s in _resync_steps() if str(s.get("uses", "")).startswith(prefix)]
+
+
+# What hands a step the minted token or the App key, in any spelling a step could use: the dotted or
+# indexed reference (both name the step id or the secret), or a dump of the whole context.
+_TOKEN_NEEDLES = ("steps.app-token", "steps['app-token']", 'steps["app-token"]', "tojson(steps")
+_KEY_NEEDLES = ("lock_resync_app_private_key", "tojson(secrets")
+
+
+def _strings_in(value: object) -> list[str]:
+    if isinstance(value, dict):
+        return [s for k, v in value.items() for s in _strings_in(k) + _strings_in(v)]
+    if isinstance(value, list):
+        return [s for v in value for s in _strings_in(v)]
+    return [str(value)]
+
+
+def _normalised(value: object) -> str:
+    return " | ".join(_strings_in(value)).casefold().replace(" ", "")
+
+
+def _steps_naming(needles: tuple[str, ...]) -> list[str]:
+    """Steps whose text (their own ``id`` aside) names any needle, case and spacing ignored."""
+    named = []
+    for s in _resync_steps():
+        text = _normalised({k: v for k, v in s.items() if k != "id"})
+        if any(n in text for n in needles):
+            named.append(str(s.get("id") or s.get("name") or s.get("uses")))
+    return named
+
+
+def test_the_resync_job_env_hands_out_no_credential() -> None:
+    """RED when: the workflow's or the job's ``env:`` names the token or the key, which hands it to
+    every step."""
+    workflow = load_workflow(_RESYNC.name)
+    for where, env in (
+        ("workflow", workflow.get("env")),
+        ("job", workflow["jobs"]["resync"].get("env")),
+    ):
+        text = _normalised(env or {})
+        assert not any(n in text for n in _TOKEN_NEEDLES + _KEY_NEEDLES), (
+            f"the resync {where}-level env names the App token or key"
+        )
+
+
+def test_the_resync_checkout_persists_no_credential() -> None:
+    """RED when: the checkout writes a credential into .git/config (BACKLOG #5477).
+
+    uv and a repository script run on the Dependabot-changed tree after the checkout. A persisted
+    contents-write App token would sit on disk for both; the push step takes it from its own
+    environment instead.
+    """
+    checkouts = _steps_using("actions/checkout@")
+    assert len(checkouts) == 1, f"expected one checkout step, found {len(checkouts)}"
+    with_ = checkouts[0].get("with") or {}
+    assert isinstance(with_, dict)
+    assert with_.get("persist-credentials") is False, (
+        "the resync checkout must set persist-credentials: false"
+    )
+    assert "token" not in with_, (
+        "the checkout needs no App token: the run's read-only token fetches the PR head"
+    )
+
+
+def test_only_the_push_step_receives_the_app_token() -> None:
+    """RED when: a step other than the push names the minted token's output (BACKLOG #5477).
+
+    This pins the expression reference only, dotted, indexed or as a ``toJSON(steps)`` dump. The token
+    is live on the runner from the mint step on; what this holds is that no other step is handed it.
+    """
+    readers = _steps_naming(_TOKEN_NEEDLES)
+    assert readers == ["Commit and push the resynced locks"], (
+        f"steps reading the App token: {readers}"
+    )
+
+
+# The uv the DEP-1 gate installs, e.g. `pip install --upgrade pip "uv==0.12.0"`.
+_GATE_UV_PIN_RE = re.compile(r"\buv==(?P<version>[0-9][0-9A-Za-z.+-]*)")
+
+
+def test_the_resync_installs_the_uv_the_gate_pins() -> None:
+    """RED when: setup-uv is unpinned or pinned to a uv other than DEP-1's (BACKLOG #5477).
+
+    The resync must write the bytes DEP-1 diffs. With no ``version:`` setup-uv installs the latest
+    uv, whose export format can move ahead of the gate's, so the bot would push locks the gate then
+    finds stale -- or, worse, an unreviewed uv would serialize the locks the project audits.
+    """
+    gate_pins = set(_GATE_UV_PIN_RE.findall(_GATE.read_text(encoding="utf-8")))
+    assert len(gate_pins) == 1, f"security.yml pins uv at {sorted(gate_pins)}; expected one version"
+    setups = _steps_using("astral-sh/setup-uv@")
+    assert len(setups) == 1, f"expected one setup-uv step, found {len(setups)}"
+    with_ = setups[0].get("with") or {}
+    assert isinstance(with_, dict)
+    assert str(with_.get("version", "")) == gate_pins.pop(), (
+        f"setup-uv installs uv {with_.get('version')!r}, not the uv security.yml's DEP-1 step pins"
+    )
+
+
+def test_the_app_key_is_used_before_any_step_runs_on_the_pr_tree() -> None:
+    """RED when: the mint step, which takes the App's long-lived private key, runs after the checkout,
+    or another step is handed the key.
+
+    Every step from the checkout on can run code from the Dependabot-changed tree as the runner user,
+    who could tamper with a later step's action or environment. Minting first means that code cannot
+    tamper with the mint itself. It does NOT keep the key off the runner while that code runs: the key
+    is a secret of this job, on the runner for the whole job, and create-github-app-token's post step
+    runs at job end with the key in its inputs. The minted token is live on the runner from the mint
+    on and is handed only to the push step (pinned above). Keeping the key and token away from that
+    code entirely needs the re-export in a separate job holding no secret, a follow-up not built.
+    """
+    steps = _resync_steps()
+    position = {str(s.get("id") or s.get("name")): i for i, s in enumerate(steps)}
+    checkout = position["Check out the PR head"]
+    assert position["app-token"] < checkout, "the App private key is used after the PR checkout"
+    key_readers = _steps_naming(_KEY_NEEDLES)
+    assert key_readers == ["app-token"], f"steps handed the App private key: {key_readers}"

@@ -340,17 +340,17 @@ durability (the WAN buffer) requires the store volume to **persist** like any at
 
 ---
 
-## 6. Off-box log forwarding — NOT in this manifest
+## 6. Off-box log forwarding — a required input, shipped commented out
 
-The built `[logging]` off-box forwarder (`[logging].forward_*` → syslog/SIEM) supports **native TLS**
-(`forward_protocol = "tls"`, RFC 5425 — ADR 0080; `SyslogProtocol.TLS` alongside the UDP/TCP variants in
-[`config/settings.py`](../messagefoundry/config/settings.py), with a CA anchor via `forward_tls_*`). The
-**default is UDP**, though, so enabling forwarding from an ephemeral cloud pod *without setting the protocol*
-would put PHI-adjacent log metadata on the wire in cleartext. It is therefore **deliberately omitted** from
-the HA manifest and is **not** turned on here. **Do not "flip it on" without also setting the transport.**
-For any prod-HA enablement, set `forward_protocol = "tls"` with a pinned CA — or, if your collector cannot
-terminate TLS, pair it with a **TLS-forwarding sidecar** (or rely on the container runtime's log driver to a
-TLS-terminating collector).
+An enforcing `serve --env prod` start, which is what the HA manifest runs, refuses until off-box log
+forwarding is configured: verified TLS (`forward_protocol = "tls"`, RFC 5425, ADR 0080, with a CA anchor
+in `forward_tls_ca_file` and a revocation check in `forward_tls_crl_file`) to a collector that is not
+on this host, and on the `[egress].allowed_syslog` list.
+The HA manifest names these inputs in its block *what an enforcing start needs*, but ships them
+commented out, so an unedited manifest is refused rather than started with a placeholder collector.
+Uncomment them with your own collector. The `log-spool` emptyDir holds the records the collector has
+not yet taken, as plaintext on the node's disk. Their redaction is best-effort, so they may hold PHI,
+and the engine's at-rest encryption does not cover them ([`PHI.md`](PHI.md) §2, the spool row).
 
 ---
 
@@ -363,27 +363,30 @@ TLS-terminating collector).
    `messagefoundry store provision-schema` as the provisioning role before the first start. The
    engine runs no schema DDL and refuses to start until it has (BACKLOG #305).
 2. **Build a config-baked image** (`FROM messagefoundry:<version>; COPY config /config`, root-owned files)
-   and push it to your private registry.
+   and push it to your private registry. Bake the syslog CA and CRL and the store CRL the
+   manifest names under `/config/pki/` into the same image.
 3. **Create the Secret** ([`docker/k8s/secret.example.yaml`](../docker/k8s/secret.example.yaml)) with
-   `store-encryption-key`, `store-password`, and the API TLS cert/key (and optional `api-tls-key-password`).
-4. **Create the revocation attestation ConfigMap, or the pods never start.** Both manifests,
-   `ha-postgres.yaml` and `statefulset.yaml`, read `MEFOR_TLS_REVOCATION_ATTESTED` from the ConfigMap
-   `mefor-revocation-attestation`, key `attested`, with no default and not optional. Until it exists
-   the kubelet refuses each engine container with `CreateContainerConfigError`, naming the ConfigMap.
-   No manifest here writes it, because the attestation is yours
-   ([SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate)). Create it only if your PKI
-   enforces revocation for the certificates the engine serves and accepts:
-   `kubectl create configmap mefor-revocation-attestation --from-literal=attested=1`.
-   The value must read as true to the engine (`1`, `true`, `yes` or `on`, in any case). A value that
-   does not, such as `0`, passes the kubelet and the engine then exits 2 at the revocation gate, so
-   the pod crash-loops. Neither Kubernetes manifest checks the value before the engine starts.
-5. **Apply** [`docker/k8s/ha-postgres.yaml`](../docker/k8s/ha-postgres.yaml) with all three `image:` fields
+   `store-encryption-key`, `store-password`, `tls-revocation-attested`, and the API TLS cert/key (and
+   optional `api-tls-key-password`). Both manifests, `ha-postgres.yaml` and `statefulset.yaml`, read
+   `MEFOR_TLS_REVOCATION_ATTESTED` from the `tls-revocation-attested` key, with no default and not
+   optional, so without it the kubelet refuses each engine container with
+   `CreateContainerConfigError`. The attestation is yours
+   ([SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate)): set the key only if your PKI
+   enforces revocation for the certificates the engine serves and accepts, and to a value that reads
+   as true to the engine (`1`, `true`, `yes` or `on`, in any case). A value that does not, such as
+   `0`, passes the kubelet and the engine then exits 2 at the revocation gate, so the pod
+   crash-loops. Neither Kubernetes manifest checks the value before the engine starts.
+4. **Apply** [`docker/k8s/ha-postgres.yaml`](../docker/k8s/ha-postgres.yaml) with all three `image:` fields
    (`tls-dir`, `copy-tls` and `engine`) set to your baked image and `MEFOR_STORE_SERVER` set to the managed-PG endpoint.
-6. **Stand up the L4 NLB** (one listener per MLLP port, primary-only TCP-connect health check at a ~10s
+   Uncomment every entry in its block *what an enforcing start needs* and give it your own value. They
+   ship commented, so as shipped the engine, which starts under `[security].enforcement = enforce`,
+   refuses to start until at least the alert channel, the log forwarding and the retention bounds
+   there are set.
+5. **Stand up the L4 NLB** (one listener per MLLP port, primary-only TCP-connect health check at a ~10s
    interval, deregistration delay ~60s) per [§3](#3-mllp-exposure--an-operator-built-l4-load-balancer-that-follows-failover).
-7. **Verify HA:** `GET /cluster/nodes` shows 3 nodes + one `leader_node_id`; delete the leader pod and
+6. **Verify HA:** `GET /cluster/nodes` shows 3 nodes + one `leader_node_id`; delete the leader pod and
    confirm a standby is promoted (`/cluster/status` `role` flips to `primary`) and the NLB VIP follows.
-8. **Read [`CLOUD-PHI-HIPAA.md`](CLOUD-PHI-HIPAA.md)** and complete the BAA / KMS / PrivateLink posture
+7. **Read [`CLOUD-PHI-HIPAA.md`](CLOUD-PHI-HIPAA.md)** and complete the BAA / KMS / PrivateLink posture
    before any PHI flows.
 
 ---

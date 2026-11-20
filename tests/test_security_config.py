@@ -937,3 +937,45 @@ def test_an_intermediary_list_never_satisfies_the_open_egress_gate(
 # BACKLOG #1967: this file's serve fixtures test other gates, so they bound the two warn-only
 # retention tiers that ship with no window (tests/conftest.py, bounded_warn_only_retention).
 pytestmark = pytest.mark.usefixtures("bounded_warn_only_retention", "verified_log_forwarding")
+
+
+# --- BACKLOG #5772: session limits are bounded ------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("sign_out_after_idle_minutes", 0),
+        ("sign_out_after_idle_minutes", -1),
+        ("sign_out_after_idle_minutes", 10**12),
+        ("max_session_hours", 0),
+        ("max_session_hours", -5),
+        ("max_session_hours", 10**12),
+    ],
+)
+def test_session_limits_refuse_zero_negative_and_huge(tmp_path: Path, key: str, value: int) -> None:
+    with pytest.raises(ValueError, match=key):
+        _load(tmp_path, f"security.{key} = {value}\n")
+    with pytest.raises(ValueError):
+        SecuritySettings.model_validate({key: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("session_idle_timeout_minutes", 0),
+        ("session_idle_timeout_minutes", 10**12),
+        ("session_absolute_hours", 0),
+        ("session_absolute_hours", 10**12),
+    ],
+)
+def test_auth_session_fields_take_the_same_bounds(field: str, value: int) -> None:
+    with pytest.raises(ValueError):
+        AuthSettings.model_validate({field: value})
+
+
+def test_session_limits_take_one_and_a_year(tmp_path: Path) -> None:
+    s = _load(
+        tmp_path, "security.sign_out_after_idle_minutes = 1\nsecurity.max_session_hours = 8760\n"
+    )
+    assert s.auth.session_idle_timeout_minutes == 1 and s.auth.session_absolute_hours == 8760

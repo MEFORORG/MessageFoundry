@@ -318,7 +318,7 @@ trust, which cannot verify an internal-CA or operator-installed engine cert.
 **Decision — separate the two concepts.**
 
 - `is_local_http` → **`is_local_engine`**, true for a loopback host on `http` **or** `https`; `monitor_only` keys
-  on that alone. Locality is what actually gates the degraded features (Start/Stop/Restart drive the *local* SCM;
+  on that alone (*amended 2026-11-19, see the amendment below*). Locality is what actually gates the degraded features (Start/Stop/Restart drive the *local* SCM;
   Open-Repo opens a *local* folder), and TLS-on-loopback changes neither. A remote host stays monitor-only
   regardless of scheme — unchanged, and still the reason the degrade exists.
 - `build_engine_url(host, port, *, tls=...)` emits the scheme instead of hardcoding `http` (and brackets a bare
@@ -326,6 +326,8 @@ trust, which cannot verify an internal-CA or operator-installed engine cert.
 - **Discovery learns the scheme.** There is no `serve` TLS *flag* to sniff — TLS is configured in the engine's
   service-settings TOML — so `load_config` now also reads that file, resolved exactly as `serve` resolves it
   (`--service-config`, relative paths against NSSM `AppDirectory`; else `<AppDirectory>/messagefoundry.toml`), and
+  (*amended 2026-11-19: a relative `--service-config` now resolves under `--project-root` when one is given, see
+  the amendment below*)
   takes **one boolean** from it: is `[api].tls_cert_file` set. Read-only, **fail-soft** (any missing/malformed
   file → "no TLS hint", never an exception into tray startup), and deliberately narrow — no hosts, paths, or
   secrets are lifted out of an operator file reached via an untrusted registry hint. An explicit `engine_url` in
@@ -446,3 +448,33 @@ apiclient takes it too. One copy serves the engine, the apiclient and the tray, 
 copy to drift. It acts on Python 3.15 only; on 3.14 it changes nothing.
 
 The **Must never import** list is unchanged.
+
+## Amendment (2026-11-19) -- a wildcard or host-only non-loopback bind is monitor-only, and a wildcard is probed on loopback (BACKLOG #5936)
+
+A fact record of the implementation. It changes no Decision in this ADR or in its earlier amendments,
+including the 2026-07-22 one, whose sentence that `monitor_only` keys on `is_local_engine` alone stands
+as written above and is no longer the whole implementation. It rests on decision
+d20261119T232951397-a601cd and its review outcome d20261119T234105025-5f3175.
+
+- **Locality is judged on the bind host.** For a URL the tray discovers from the service entry, that is
+  the host `serve --host` names; for an `engine_url` set in `tray.toml`, it is that URL's host.
+- **A wildcard bind is not loopback.** A `serve --host` naming an unspecified address, at least `0.0.0.0`
+  and `::` in any spelling `ipaddress` parses, listens on every interface, so the tray is monitor-only
+  for it.
+- **Service control tightens for a host-only non-loopback bind.** A `serve --host` naming any
+  non-loopback host, a wildcard included, with no `--port`, is now monitor-only. Before this change
+  `build_engine_url` returned no URL for that bind, so the tray fell back to the loopback default
+  `https://127.0.0.1:8765` and kept service control. This narrows service control; no bind shape gains
+  it.
+- **The status probe and Open Console go to loopback for a wildcard bind.** No client can connect to a
+  wildcard address, so `build_engine_url` substitutes the loopback address of the same family,
+  `127.0.0.1` or `::1`. The probe and Open Console both read that URL.
+- **`TrayConfig.bind_unspecified` is a second key beside `is_local_engine`.** `monitor_only` is
+  `bind_unspecified or not is_local_engine(engine_url)`. `compose_config` sets it only from the
+  `serve --host` registry hint, and a non-empty `engine_url` in `tray.toml` clears it, so that URL's own
+  host then decides.
+- **A relative `--service-config` resolves under `--project-root`.** The 2026-07-22 amendment's
+  discovery bullet above resolves a relative `--service-config` against NSSM `AppDirectory`.
+  `service_toml_path` now resolves it under `--project-root` when one is given, and against
+  `AppDirectory` otherwise, as `serve` resolves it. A relative `--project-root` is itself joined to
+  `AppDirectory`.

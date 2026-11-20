@@ -709,7 +709,7 @@ def route_message(
     ingest_time: float | None = None,
     tracer: TraceHook | None = None,
     sandbox: SandboxSession | None = None,
-    snapshot_on_send: bool = False,
+    snapshot_on_send: bool = True,
 ) -> RouteOutcome:
     """Run ``ic``'s Router then the named Handlers; return what they selected and would send.
 
@@ -730,13 +730,13 @@ def route_message(
     ``snapshot_on_send`` (ADR 0104) selects which posture the preview reproduces: ``True`` activates
     copy-on-Send so a divergent fan-out (mutate the same message between two ``Send``\\ s) previews
     per-destination bytes exactly as an engine with the flag enabled delivers them; ``False`` previews the
-    pre-ADR-0104 last-write-collapse behaviour. This param still defaults ``False`` (ADR 0104 §8.1: a
-    preview that doesn't opt in does not snapshot) — but note the **engine default is now ``True``**
-    (``[pipeline].snapshot_on_send`` flipped in BACKLOG #230). The ``messagefoundry dryrun`` / ``check``
-    CLIs therefore load the service settings best-effort and pass the resolved value here (falling back to
-    the Settings-model default, ON, when none load — #230 P4), so the CLI preview matches what the engine
-    actually delivers; a programmatic caller or the Test Bench should likewise pass
-    ``settings.pipeline.snapshot_on_send`` for parity with the live engine.
+    pre-ADR-0104 last-write-collapse behaviour. This param defaults ``True``, as
+    ``[pipeline].snapshot_on_send`` (flipped in BACKLOG #230) and the ``Engine`` keyword default do, so a
+    caller on keyword defaults previews what an engine on keyword defaults delivers (BACKLOG #5794). The
+    ``messagefoundry dryrun`` / ``check`` CLIs load the service settings best-effort and pass the resolved
+    value here (falling back to the Settings-model default, ON, when none load — #230 P4); a
+    programmatic caller or the Test Bench should likewise pass ``settings.pipeline.snapshot_on_send``
+    where the site has set it.
     """
     # Publish the graph's code sets so a call-time code_set(...) inside a Router/Handler resolves
     # during a dry-run / Test Bench / `messagefoundry check` preview (the loader only had them active
@@ -769,7 +769,7 @@ def route_message(
         ingest_time=ingest_time,
         # #162: a dry-run/preview has no persisted message, so message_id stays None — the
         # unmapped-capture drain has no id to key by (and the default sink is None here anyway).
-        snapshot_on_send=snapshot_on_send,  # ADR 0104: preview copy-on-Send iff the caller opts in
+        snapshot_on_send=snapshot_on_send,  # ADR 0104: preview copy-on-Send unless the caller opts out
     )
     with run_contexts(rc, phase="transform"):
         ct = ic.content_type.value
@@ -946,7 +946,7 @@ def _dry_run_raw(
     raw: str | bytes,
     *,
     tracer: TraceHook | None = None,
-    snapshot_on_send: bool = False,
+    snapshot_on_send: bool = True,
 ) -> DryRunResult:
     """Dry-run a non-HL7 inbound (ADR 0004): no HL7 peek/validate; route the body as a RawMessage.
 
@@ -1086,7 +1086,7 @@ def dry_run(
     *,
     inbound: str | None = None,
     tracer: TraceHook | None = None,
-    snapshot_on_send: bool = False,
+    snapshot_on_send: bool = True,
 ) -> DryRunResult:
     """Decode → guard → parse → (strict-validate) → route one message; return disposition + payloads.
 
@@ -1112,7 +1112,7 @@ def dry_run(
     it does not change the disposition or would-send payloads (byte-identical to ``tracer=None``).
 
     ``snapshot_on_send`` (ADR 0104) is threaded to :func:`route_message` — see its docstring. The library
-    default stays ``False`` (§8.1); the CLI passes its resolved ``[pipeline].snapshot_on_send`` (#230).
+    default is ``True``, as the engine's is (BACKLOG #5794); the CLI passes its resolved ``[pipeline].snapshot_on_send`` (#230).
 
     **THIS FUNCTION TAKES NO ``sandbox`` ARGUMENT AND ALWAYS RUNS ROUTERS/HANDLERS IN-PROCESS.** It is
     therefore blind to ``[sandbox].mode``. That matches ``serve`` on the shipped default (``off``),

@@ -1,13 +1,20 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Pin the cap on the worker count ``pytest -n auto`` starts, and both conftests that register it.
+"""Pin the cap on the worker count ``pytest -n auto`` starts, and the four places that register it.
 
-The module under test, ``tests/_xdist_worker_cap.py``, says why there are two registrations.
+The module under test, ``tests/_xdist_worker_cap.py``, says why there are four registrations: the
+``addopts`` of the root and web console pytest configs, and two conftests.
 """
 
 from __future__ import annotations
 
 import ast
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
 
@@ -18,6 +25,8 @@ from tests import _xdist_worker_cap as cap
 _ROOT = Path(__file__).resolve().parents[1]
 _TESTS_CONFTEST = _ROOT / "tests" / "conftest.py"
 _CONSOLE_CONFTEST = _ROOT / "packaging" / "messagefoundry-webconsole" / "tests" / "conftest.py"
+_PLUGIN_ARG = cap.__name__
+_CAP_FILE = _ROOT / "tests" / "_xdist_worker_cap.py"
 
 
 @pytest.mark.parametrize(
@@ -50,7 +59,10 @@ def test_the_tests_conftest_registers_the_cap_in_this_run(pytestconfig: pytest.C
             hook = plugin.pytest_xdist_auto_num_workers
             assert hook is cap.pytest_xdist_auto_num_workers
             return
-    pytest.fail(f"{_TESTS_CONFTEST} is not registered in this run, so -n auto is uncapped")
+    pytest.fail(
+        f"{_TESTS_CONFTEST} is not registered in this run, so a run that overrides addopts is "
+        "uncapped; tests/_xdist_worker_cap.py says what each registration covers"
+    )
 
 
 def _binds_the_cap(source: str) -> bool:
@@ -77,7 +89,10 @@ def _binds_the_cap(source: str) -> bool:
 
 
 def test_the_console_conftest_registers_the_cap_too() -> None:
-    """A run naming only the console tree never loads tests/conftest.py; its own must bind the hook.
+    """A run naming only the console tree never loads tests/conftest.py; its own binds the hook.
+
+    The console config's ``addopts`` caps such a run already. This binding is what still caps one
+    that overrides ``addopts``.
 
     Read by AST, not run: importing that conftest here would load the console suite's fixtures. It
     proves the import is written, not that a console-rooted run resolves it; the smoke run recorded
@@ -161,3 +176,185 @@ def test_the_real_hook_chain_caps_xdists_count(
     else:
         monkeypatch.setenv(cap.AUTO_WORKERS_ENV, override)
     assert hook_with_cpus(cpus) == expected
+
+
+def _loads_the_cap(addopts: str | list[str]) -> bool:
+    """Whether ``addopts`` leaves ``tests._xdist_worker_cap`` loaded as a ``-p`` plugin.
+
+    Takes the string form or the list form. Both ``-p NAME`` and ``-pNAME`` count. Read in order, as
+    pytest reads ``-p``: the word after a bare ``-p`` is its value whatever it looks like, and a later
+    ``-p NAME`` lifts an earlier ``-p no:NAME``.
+    """
+    words = shlex.split(addopts) if isinstance(addopts, str) else list(addopts)
+    loaded = False
+    i = 0
+    while i < len(words):
+        word = words[i]
+        value = None
+        if word == "-p":
+            value = words[i + 1] if i + 1 < len(words) else None
+            i += 1
+        elif word.startswith("-p") and not word.startswith("--"):
+            value = word[2:]
+        if value == _PLUGIN_ARG:
+            loaded = True
+        elif value == f"no:{_PLUGIN_ARG}":
+            loaded = False
+        i += 1
+    return loaded
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        _ROOT / "pyproject.toml",
+        _ROOT / "packaging" / "messagefoundry-webconsole" / "pyproject.toml",
+    ],
+    ids=["root", "console"],
+)
+def test_each_pytest_config_loads_the_cap_as_a_plugin(config: Path) -> None:
+    """The registration that reaches the runs no conftest is loaded in time for."""
+    cfg = tomllib.loads(config.read_text(encoding="utf-8"))
+    addopts = cfg["tool"]["pytest"]["ini_options"]["addopts"]
+    assert _loads_the_cap(addopts), f"{config} addopts no longer loads {_PLUGIN_ARG}: {addopts!r}"
+
+
+@pytest.mark.parametrize(
+    "addopts",
+    [
+        "--timeout=60",
+        "-p no:tests._xdist_worker_cap",
+        "-p tests._xdist_worker",
+        "tests._xdist_worker_cap",
+        "-p tests._xdist_worker_cap -p no:tests._xdist_worker_cap",
+        ["--timeout=60", "-p"],
+        # pytest takes `-ptests...` as the bare -p's value, an unknown plugin name.
+        "-p -ptests._xdist_worker_cap",
+    ],
+    ids=[
+        "absent",
+        "blocked",
+        "other-module",
+        "no-flag",
+        "loaded-then-blocked",
+        "list-dangling-p",
+        "value-of-a-bare-p",
+    ],
+)
+def test_the_addopts_check_goes_red_without_the_plugin(addopts: str | list[str]) -> None:
+    """Negative control: the check above must be able to fail."""
+    assert not _loads_the_cap(addopts)
+
+
+@pytest.mark.parametrize(
+    "addopts",
+    [
+        "-p tests._xdist_worker_cap",
+        "-ptests._xdist_worker_cap",
+        ["-p", "tests._xdist_worker_cap"],
+        "-p no:tests._xdist_worker_cap -p tests._xdist_worker_cap",
+    ],
+    ids=["spaced", "joined", "list", "blocked-then-loaded"],
+)
+def test_the_addopts_check_accepts_each_spelling(addopts: str | list[str]) -> None:
+    """Positive control: a spelling pytest accepts must pass, so a green above is not vacuous."""
+    assert _loads_the_cap(addopts)
+
+
+#: What the child's xdist reports as the machine's count: more than the cap, so a capped run differs.
+_FAKE_CPUS = 32
+
+# Loaded into the child with `-p`. It answers xdist's own hook ahead of xdist (tryfirst), so the count
+# the cap's wrapper sees is this fixed number rather than the host's cores. It then prints what xdist
+# resolved `-n auto` to, and the file the cap module came from, and ends the run inside
+# pytest_cmdline_main, before any worker is started.
+_PROBE = f"""\
+import sys
+
+import pytest
+
+
+@pytest.hookimpl(tryfirst=True, optionalhook=True)
+def pytest_xdist_auto_num_workers(config):
+    return {_FAKE_CPUS}
+
+
+def pytest_cmdline_main(config):
+    module = sys.modules.get("{_PLUGIN_ARG}")
+    print(f"CAP_MODULE={{getattr(module, '__file__', None)}}", flush=True)
+    print(f"RESOLVED_WORKERS={{config.option.numprocesses}}", flush=True)
+    return 0
+"""
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        # Root-configured, and it collects only the console suite, whose conftest loads after xdist
+        # has sized the run. Uncapped (32) before the root addopts loaded the cap. The module's
+        # docstring records the other rows measured by hand, `--noconftest` among them; each child
+        # costs a pytest startup, so only this one and its control run here.
+        (["packaging"], cap.MAX_AUTO_WORKERS),
+        # Control: block the plugin and the same run is uncapped, so the probe's count reaches xdist
+        # and the cap in the row above comes from the addopts plugin, not from something else.
+        (["-p", f"no:{_PLUGIN_ARG}", "packaging"], _FAKE_CPUS),
+    ],
+    ids=["packaging-from-root", "control-plugin-blocked"],
+)
+def test_a_root_configured_run_resolves_auto_to_the_cap(
+    tmp_path: Path, args: list[str], expected: int
+) -> None:
+    """Run a child pytest from the repository root and read the count xdist resolved ``-n auto`` to.
+
+    ``-P`` keeps the working directory off the child's ``sys.path``, as the ``pytest`` console script
+    does, so ``tests`` must import the way a real run imports it: through the editable install. That
+    install may name another checkout, so the child also reports where the cap module came from.
+    """
+    pytest.importorskip("xdist", reason="the child needs pytest-xdist to resolve -n auto")
+    assert _FAKE_CPUS > cap.MAX_AUTO_WORKERS
+    (tmp_path / "_mf_worker_count_probe.py").write_text(_PROBE, encoding="utf-8")
+    env = {
+        k: v
+        for k, v in os.environ.items()
+        if k
+        not in {
+            "PYTEST_ADDOPTS",
+            "PYTEST_PLUGINS",
+            "PYTEST_DISABLE_PLUGIN_AUTOLOAD",
+            cap.AUTO_WORKERS_ENV,
+        }
+    }
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(tmp_path), env.get("PYTHONPATH")]))
+    # A piped stdout is cp1252 on Windows; the probe prints a path, so pin the encoding both ends use.
+    env["PYTHONIOENCODING"] = "utf-8"
+    argv = [sys.executable, "-P", "-m", "pytest", "-p", "_mf_worker_count_probe"]
+    argv += ["-p", "no:cacheprovider", "-n", "auto", *args]
+    try:
+        proc = subprocess.run(
+            argv,
+            cwd=_ROOT,
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=50,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        pytest.fail(f"the child ran past {exc.timeout}s:\n{exc.stdout!r}\n{exc.stderr!r}")
+    found = re.findall(r"^RESOLVED_WORKERS=(\S+)$", proc.stdout, re.MULTILINE)
+    assert proc.returncode == 0 and found, (
+        f"the child did not report a count (exit {proc.returncode}):\n"
+        f"{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}"
+    )
+    sources = re.findall(r"^CAP_MODULE=(.+)$", proc.stdout, re.MULTILINE)
+    assert sources and sources[0] != "None", f"the child never imported {_PLUGIN_ARG}"
+    if Path(sources[0]).resolve() != _CAP_FILE.resolve():
+        # An environment fact, not a defect in the cap: this checkout's config was measured with
+        # another checkout's module, so the reading says nothing about this tree.
+        pytest.skip(
+            f"the child imported {_PLUGIN_ARG} from {sources[0]}, not {_CAP_FILE}: the editable "
+            "install names another checkout; run scripts/worktree/ensure-venv.ps1 here"
+        )
+    assert found == [str(expected)], f"{shlex.join(argv[3:])} resolved -n auto to {found}"

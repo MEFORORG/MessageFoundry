@@ -7,12 +7,11 @@
   At least `docker compose up --no-deps <engine>` and `docker compose run --no-deps` skip that
   check, so an engine started with `up --no-deps` and a false value would still restart forever.
   The Postgres password's missing-value message now says that `--env-file` reads its file instead of
-  the `.env` beside `compose.yaml`. Both Kubernetes manifests, `docker/k8s/statefulset.yaml` and
-  `docker/k8s/ha-postgres.yaml`, now take the value from a ConfigMap you create,
-  `mefor-revocation-attestation`, key `attested`, with no default: until it exists the kubelet
-  refuses the container with `CreateContainerConfigError` instead of the pod crash-looping.
-  Neither manifest checks the value itself, so a value such as `0` there still crash-loops. See
-  docs/CLOUD-DEPLOYMENT.md, section 7. (BACKLOG #5400)
+  the `.env` beside `compose.yaml`. The deploy docs for both Kubernetes manifests,
+  `docker/k8s/statefulset.yaml` and `docker/k8s/ha-postgres.yaml`, now say that the value they read
+  from the Secret's `tls-revocation-attested` key is checked by neither manifest, so a value such
+  as `0` there passes the kubelet and still crash-loops. See docs/CLOUD-DEPLOYMENT.md, section 7.
+  (BACKLOG #5400)
 - **`install-service.ps1` now counts a "Log on as a service" holder written as an account name.**
   It compared the exported `SeServiceLogonRight` holders with the account's SID only, so a row that
   named the account would have read as missing and the policy would have been re-imported with the

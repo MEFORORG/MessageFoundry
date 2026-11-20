@@ -225,7 +225,9 @@ canary for a check that would otherwise first fire during a release.
 
 Both workflow fixes land on paths **no PR CI leg runs**: `security.yml`'s SBOM job is
 `schedule`/`workflow_dispatch` only *and* `continue-on-error: true` (a failure there is yellow and
-swallowed), and `release.yml` runs only on a tag push. So the first real execution of either edit is a
+swallowed), and `release.yml` runs only on a tag push. *(Corrected for BACKLOG #5475: the SBOM jobs no
+longer carry `continue-on-error` on the job, only on their sbomqs score step, so a failed install or
+render now reddens the scheduled run. They are still `schedule`/`workflow_dispatch` only.)* So the first real execution of either edit is a
 nightly or **a release**. `tests/test_ci_venv_pinning.py` is a text guard over the workflow source, not
 an execution. Before the next tag, run `security.yml`'s sbom job via `workflow_dispatch` and read its
 log — the install command there is byte-identical to `release.yml`'s, and

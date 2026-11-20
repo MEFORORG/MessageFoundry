@@ -3604,8 +3604,8 @@ def _run_score_step(tmp_path: Path, body: str, fail: str) -> tuple[int, list[str
 
 
 #: Each workflow's two-SBOM score step: how to find it, the binary it must call, then the SBOM scored
-#: first and second. The release calls the binary its BLOCKING install verified, by absolute path, so
-#: no other `sbomqs` earlier on PATH can stand in for it.
+#: first and second. Each calls the binary its BLOCKING install verified, by absolute path, so no
+#: other `sbomqs` earlier on PATH can stand in for it (security.yml's since BACKLOG #5475).
 _SCORE_STEPS = {
     "release": (
         lambda: _release_step(_jobs()["release"], "sbomqs score"),
@@ -3615,7 +3615,7 @@ _SCORE_STEPS = {
     ),
     "security": (
         lambda: _release_step(_security_jobs()["sbom"], "sbomqs score"),
-        "sbomqs",
+        "/usr/local/bin/sbomqs",
         "sbom-python.cdx.json",
         "sbom-ide.cdx.json",
     ),
@@ -3658,10 +3658,13 @@ def test_the_windows_sbom_dry_run_scores_it_with_the_released_sbomqs_version() -
     """BACKLOG #2521 finding 4. security.yml's `sbom-windows` job is the pre-tag dry-run for this
     workflow's Windows SBOM, and it once never ran sbomqs on it, so sbomqs first read that file at a
     tag. Its score step must read the file the job builds, at the version the release pins."""
-    step = _release_step(_security_jobs()["sbom-windows"], "sbomqs.exe score")
-    body = _executed_shell(str(step["run"]))
+    job = _security_jobs()["sbom-windows"]
+    body = _executed_shell(str(_release_step(job, "sbomqs.exe score")["run"]))
     assert "score -b sbom-python-windows.cdx.json" in body
-    assert "sha256sum -c" in body, "the Windows sbomqs download is not verified"
+    # Since BACKLOG #5475 the download and pin check are their own unsoftened step.
+    verify = _release_step(job, "sha256sum -c")
+    assert "continue-on-error" not in verify, "the Windows sbomqs pin check is softened"
+    fetch = _executed_shell(str(verify["run"]))
 
     def version(text: str) -> str:
         found = re.findall(r"^\s*VER=(\S+)$", text, re.MULTILINE)
@@ -3669,7 +3672,7 @@ def test_the_windows_sbom_dry_run_scores_it_with_the_released_sbomqs_version() -
         return found[0]
 
     install = _release_step(_jobs()["release"], "sha256sum -c")
-    assert version(body) == version(_executed_shell(str(install["run"])))
+    assert version(fetch) == version(_executed_shell(str(install["run"])))
 
 
 def test_the_harness_smoke_runs_the_install_resolution_check() -> None:

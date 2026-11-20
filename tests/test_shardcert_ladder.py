@@ -78,6 +78,11 @@ def _step(
         sent=offered if sent is None else sent,
         deferred_backpressure=deferred_backpressure,
         deferred_schedule=deferred_schedule,
+        # BACKLOG #5441: the rest of the pass bar the ladder verdict reads; a healthy step saw several lanes
+        # and dead-lettered nothing.
+        lanes_observed=8,
+        engine_dead=0,
+        dead_total=0,
     )
 
 
@@ -382,6 +387,7 @@ def _report(**over: object) -> ShardCertReport:
         "achieved_intake": 1000,
         "delivering": 1,
         "acked_copies_missing": 0,
+        "dead_total": 0,
     }
     base.update(over)
     return ShardCertReport(**base)  # type: ignore[arg-type]
@@ -1190,9 +1196,8 @@ def test_colocated_ladder_report_rolls_up_the_void_rates(monkeypatch: pytest.Mon
 
     assert report.fidelity_void_rates == [80.0, 120.0]  # the shortfall AND the intake bind
     js = report.to_json_dict()
-    assert (
-        js["schema_version"] == 3
-    )  # v2: +sent +fidelity per record; v3 (#5575/#5576): copies, abort
+    # v2: +sent +fidelity per record; v3 (#5575/#5576): copies, abort; v4 (#5441): full pass bar
+    assert js["schema_version"] == 4
     fid = js["fidelity"]
     assert isinstance(fid, dict)
     assert fid["all_admissible"] is False
@@ -1215,7 +1220,8 @@ def test_colocated_report_records_the_pool_and_the_inbound_bands() -> None:
     )
     assert rep.inbound_bands == 4  # G = 4 shards x 1 lane
     js = rep.to_json_dict()
-    assert js["schema_version"] == 5  # v4: +store_pool, +topology G; v5 (#5575): +gated copy check
+    # v4: +store_pool, +topology G; v5 (#5575): +gated copy check; v6 (#5440): +gated dead_total
+    assert js["schema_version"] == 6
 
     topo = js["topology"]
     assert isinstance(topo, dict)

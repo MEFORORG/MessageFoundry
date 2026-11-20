@@ -42,6 +42,7 @@ import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -129,6 +130,9 @@ class EngineAttribution:
     #: the exact CI triple -- inbound_rows PASS, foreign_rows PASS, reads 0 FAIL -- and the engine
     #: reported `status: "failed"` on both lanes throughout. The information was present and discarded.
     failed_lanes: tuple[str, ...] = ()
+    #: The engine's `/connections` could not be read at attribution time, so the counters above are
+    #: zeros the harness filled in, not the engine's answer (BACKLOG #5438).
+    attribution_failed: bool = False
 
 
 @dataclass(frozen=True)
@@ -186,6 +190,52 @@ class MultiShardRecord:
         lane collision (the measurement would be invalid)."""
         return any(e.foreign_rows > 0 for e in self.per_engine)
 
+    @cached_property
+    def problems(self) -> tuple[str, ...]:
+        """Every reason this step cannot PASS; empty means it can (BACKLOG #5438).
+
+        The no-loss reconcile alone is not the step's verdict: it reads aggregate counters, so it
+        cannot see a cross-engine lane steal or an engine that never took traffic or was never
+        attributed, and the isolation proof is half of what this gate exists to show. The drain and
+        sent checks repeat the reconcile's own INCONCLUSIVE arms so a record built without them still
+        fails."""
+        out: list[str] = []
+        if not self.no_loss.ok:
+            kind = "INCONCLUSIVE" if self.no_loss.inconclusive else "LOSS"
+            out.append(f"no-loss {kind}: {self.no_loss.detail}")
+        if self.sent <= 0:
+            out.append("nothing was sent")
+        if self.drain_seconds is None:
+            out.append("the drain timed out")
+        if self.any_cross_engine_steal:
+            stolen = ", ".join(
+                f"{e.node_id}={e.foreign_rows}" for e in self.per_engine if e.foreign_rows
+            )
+            out.append(f"cross-engine lane steal (foreign inbound rows: {stolen})")
+        if len(self.per_engine) != self.engines:
+            out.append(f"{len(self.per_engine)} of {self.engines} engines attributed")
+        for e in self.per_engine:
+            if e.attribution_failed:
+                # Its lane counts are zeros the harness filled in, not the engine's answer.
+                out.append(f"{e.node_id}: /connections could not be read for attribution")
+                continue
+            if e.inbound_rows != self.count_per_engine:
+                out.append(
+                    f"{e.node_id}: {e.inbound_rows} inbound lanes attributed, "
+                    f"expected {self.count_per_engine}"
+                )
+            if e.reads <= 0:
+                out.append(f"{e.node_id}: read nothing on its own lanes")
+            if e.failed_lanes:
+                # The count only. The reasons come from the audited `/connections` reveal, a PHI
+                # read, so this line and the console report leave them to the JSON failed_lanes.
+                # The dataclass repr still carries them, so do not print a record or attribution.
+                out.append(
+                    f"{e.node_id}: {len(e.failed_lanes)} inbound lanes not listening "
+                    "(reasons in the JSON failed_lanes)"
+                )
+        return tuple(out)
+
     def to_json_dict(self) -> dict[str, object]:
         return {
             "engines": self.engines,
@@ -236,10 +286,12 @@ class MultiShardRecord:
                     # In the artifact as well as the assertion: a CI reader who has only the uploaded
                     # JSON must be able to attribute a zero-read engine without re-running anything.
                     "failed_lanes": list(e.failed_lanes),
+                    "attribution_failed": e.attribution_failed,
                 }
                 for e in self.per_engine
             ],
             "cross_engine_steal": self.any_cross_engine_steal,
+            "problems": list(self.problems),
         }
 
     def render_console(self) -> str:
@@ -276,8 +328,9 @@ class MultiShardReport:
 
     @property
     def result_ok(self) -> bool:
-        """PASS iff every step reconciled zero-loss (the mechanics + isolation held at every N)."""
-        return bool(self.records) and all(r.no_loss.ok for r in self.records)
+        """PASS iff every step has no :attr:`MultiShardRecord.problems`: zero-loss reconciled AND the
+        isolation held at every N (BACKLOG #5438)."""
+        return bool(self.records) and all(not r.problems for r in self.records)
 
     @property
     def exit_code(self) -> int:
@@ -285,7 +338,8 @@ class MultiShardReport:
 
     def to_json_dict(self) -> dict[str, object]:
         return {
-            "schema_version": 2,  # 1 -> 2: no_loss.inconclusive (BACKLOG #5574)
+            # 1 -> 2: no_loss.inconclusive (BACKLOG #5574); 2 -> 3: records[].problems (#5438)
+            "schema_version": 3,
             "kind": "multishard",
             "store_backend": self.store_backend,
             "cluster_enabled": self.cluster_enabled,
@@ -303,6 +357,7 @@ class MultiShardReport:
         ]
         for r in self.records:
             lines.append(r.render_console())
+            lines.extend(f"  problem: {p}" for p in r.problems)
         for note in self.notes:
             lines.append(f"note: {note}")
         lines.append("")
@@ -744,8 +799,6 @@ async def _attribute_engines(
 def _attribute_engines_sync(
     nodes: list[EngineNode], engine_index_base: int = 0
 ) -> list[EngineAttribution]:
-    from messagefoundry.apiclient import ApiError
-
     out: list[EngineAttribution] = []
     for k, node in enumerate(nodes):
         tag = f"E{k + engine_index_base}"
@@ -760,10 +813,11 @@ def _attribute_engines_sync(
                 reasons = _reveal_failed_reasons(client, rows)
             finally:
                 client.close()
-        except ApiError:
-            # A node unreachable at attribution time (already torn down / transient) surfaces as an
-            # empty attribution — the smoke asserts positive rows, so it won't silently pass.
-            out.append(EngineAttribution(node.node_id, tag, 0, 0, 0))
+        except SIGN_IN_ERRORS:
+            # A node unreachable at attribution time (already torn down / transient), or a refused
+            # or rate-limited rig sign-in, surfaces as a failed attribution that fails the step
+            # (`MultiShardRecord.problems`) rather than ending the sweep and losing earlier steps.
+            out.append(EngineAttribution(node.node_id, tag, 0, 0, 0, attribution_failed=True))
             continue
         failed: list[str] = []
         for row in rows:

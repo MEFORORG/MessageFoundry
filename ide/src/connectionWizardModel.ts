@@ -8,7 +8,7 @@
 // `connection upsert|remove` argv builders here are shared with the webview form and the
 // connections.toml custom editor, so every IDE writer names the same settings file (BACKLOG #2908).
 
-import { type ConnObj, type SavePlan, planSave } from "./connectionMerge";
+import { type ConnObj, type Direction, type SavePlan, planSave } from "./connectionMerge";
 
 /** The connection object the `connection upsert --data <json>` CLI consumes (ADR 0007). Mirrors the
  *  shape connectionEditor.ts builds; kept local so this module imports nothing from vscode/cli. */
@@ -234,13 +234,50 @@ export function connectionUpsertArgs(
 }
 
 /** The `messagefoundry connection remove` argv (sans `--json`). A remove is validated against the
- *  same settings as an upsert -- the remaining graph is re-checked -- so it names them too. */
+ *  same settings as an upsert -- the remaining graph is re-checked -- so it names them too. An inbound
+ *  and an outbound may share a name, so `direction` says which one goes (BACKLOG #5898). */
 export function connectionRemoveArgs(
   configDir: string,
   serviceConfig: string | undefined,
   name: string,
+  direction: Direction,
 ): string[] {
-  return ["connection", "remove", "--config", configDir, ...serviceConfigArgs(serviceConfig), "--name", name];
+  return [
+    "connection",
+    "remove",
+    "--config",
+    configDir,
+    ...serviceConfigArgs(serviceConfig),
+    "--name",
+    name,
+    "--direction",
+    direction,
+  ];
+}
+
+/** The direction a delete of `name` names, given the listed connections: the one that holds it, or
+ *  undefined when an inbound and an outbound share it or none does. The editors look a connection up
+ *  by name and so cannot tell which twin the operator opened; naming the first match would remove the
+ *  inbound when the outbound was meant (BACKLOG #5898). A delete always sends the direction, so the
+ *  engine never picks a connection the form did not show; on undefined the editor refuses instead,
+ *  with {@link sharedNameRemovalError}. */
+export function removalDirection(entries: readonly ConnObj[], name: string): Direction | undefined {
+  const held = new Set(entries.filter((c) => c.name === name).map((c) => c.direction));
+  return held.size === 1 ? [...held][0] : undefined;
+}
+
+/** The editors' refusal of a delete whose name an inbound and an outbound share (BACKLOG #5898). */
+export function sharedNameRemovalError(name: string): string {
+  return (
+    `"${name}" is both an inbound and an outbound in connections.toml, and this editor cannot tell ` +
+    "which one it shows. Nothing was removed. Remove it with `messagefoundry connection remove " +
+    `--name ${name} --direction inbound|outbound\`, or edit connections.toml by hand.`
+  );
+}
+
+/** The confirmation a delete asks before it removes `name`, naming its direction. */
+export function removeConfirmText(name: string, direction: Direction): string {
+  return `Remove ${direction} connection "${name}" from connections.toml?`;
 }
 
 /**

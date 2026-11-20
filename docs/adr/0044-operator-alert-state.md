@@ -94,12 +94,12 @@ Add an `alert_instance` table to `_SCHEMA` ([`store/store.py`](../../messagefoun
 shaped like the `connection_event` table (metadata-only, encrypted `reason` at rest via the existing
 `_CIPHER_COLUMNS` mechanism), keyed on the **same identity ADR 0014 already throttles by** — the
 `(event_type, connection)` pair from `_emit`'s `key = f"{event['type']}:{event['connection']}"`
-([`alert_sinks.py:446`](../../messagefoundry/pipeline/alert_sinks.py)). One open instance per key:
+([`alert_sinks.py:446`](../../messagefoundry/pipeline/alert_sinks.py)) (amended 2026-11-19, see below). One open instance per key:
 
 | Column | Notes |
 |---|---|
 | `id` | `INTEGER PRIMARY KEY AUTOINCREMENT` (SQLite) / backend-native identity |
-| `event_type` | the `AlertSink` event name (bounded enum — must be in `_ALERT_EVENT_TYPES`, [`config/settings.py:1034`](../../messagefoundry/config/settings.py)) |
+| `event_type` | the `AlertSink` event name (bounded enum — must be in `_ALERT_EVENT_TYPES`, [`config/settings.py:1034`](../../messagefoundry/config/settings.py)) (amended 2026-11-19, see below) |
 | `connection` | inbound/outbound connection name (or the cert/db/`engine-integrity` label that already stands in for `connection` in `_emit`) — **config metadata, never payload** |
 | `severity` | the effective ADR 0014 severity (`info`/`warning`/`critical`) — last write wins |
 | `status` | `open` \| `acknowledged` \| `resolved` |
@@ -410,3 +410,15 @@ close rule, `resolve_alert_instances_fenced` in `messagefoundry/store/store.py`,
 `NotifierAlertSink._run_state`, `_record_state`, `_resolve_settled` and
 `NotifierAlertSink.connection_started`) and the store's `upsert_alert_instance` and
 `open_alert_generations`.
+
+## Amendment (2026-11-19) -- a `config_fault` `connection_error` has an instance key of its own (BACKLOG #5910, PR 3069)
+
+D1 keys an instance on `event['type']` and the connection, and its `event_type` row says the column
+holds a name in `_ALERT_EVENT_TYPES`. Since PR 3069, a `connection_error` of kind `config_fault` is
+keyed and stored under the derived type `connection_error.config_fault` instead, which is not in
+that set; every other event keeps D1's key. `_instance_type` in
+[`pipeline/alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py) derives it, and a
+`connection_restored` of kind `config_fault` resolves it.
+
+The `event_type` row's `config/settings.py:1034` cite is stale: `_ALERT_EVENT_TYPES` is defined in
+[`config/settings.py`](../../messagefoundry/config/settings.py); find it by that name.

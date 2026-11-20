@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The deploy docs name the revocation attestation ConfigMap the k8s manifests require (BACKLOG #5400).
+"""The deploy docs name the revocation attestation Secret key the k8s manifests require (BACKLOG #5400).
 
-Both manifests read ``MEFOR_TLS_REVOCATION_ATTESTED`` from a required, non-optional ConfigMap
-reference. A deployer following docs that never mention it would hit ``CreateContainerConfigError``
-on the first apply, so each deploy doc a k8s deployer reads must name the ConfigMap and key the
-manifests read, give the create command, and say that a false value still crash-loops there. The
-compose one-shot check must also not inherit the image HEALTHCHECK, which probes an API it never
-serves. No doc may claim, unqualified, that a false value is refused before any engine starts: at
-least two compose commands skip the check, and no k8s manifest checks the value."""
+Both manifests read ``MEFOR_TLS_REVOCATION_ATTESTED`` from a required, non-optional Secret key
+reference, exactly once per container. A deployer following docs that never mention it would hit
+``CreateContainerConfigError`` on the first apply, so each deploy doc a k8s deployer reads must name
+the key the manifests read and say that a false value still crash-loops there. The compose one-shot
+check must also not inherit the image HEALTHCHECK, which probes an API it never serves. No doc may
+claim, unqualified, that a false value is refused before any engine starts: at least two compose
+commands skip the check, and no k8s manifest checks the value."""
 
 from __future__ import annotations
 
@@ -29,22 +29,26 @@ _DOCS = (
 )
 
 
-def _configmap_refs() -> set[tuple[str, str]]:
-    """Every (name, key) ConfigMap reference that feeds the attestation in a k8s manifest."""
-    refs: set[tuple[str, str]] = set()
+_SECRET = ("mefor-secrets", "tls-revocation-attested")
+
+
+def _attestation_entries() -> list[tuple[str, str, list[dict[str, Any]]]]:
+    """(manifest, container, env entries naming the attestation) for every container setting it."""
+    found: list[tuple[str, str, list[dict[str, Any]]]] = []
     for path in sorted(_K8S.glob("*.yaml")):
         for doc in yaml.safe_load_all(path.read_text(encoding="utf-8")):
             spec: dict[str, Any] = ((doc or {}).get("spec") or {}).get("template", {}).get(
                 "spec"
             ) or {}
-            for container in spec.get("containers") or []:
-                for entry in container.get("env") or []:
-                    if entry.get("name") != TLS_REVOCATION_ATTESTED_ENV:
-                        continue
-                    ref = (entry.get("valueFrom") or {}).get("configMapKeyRef") or {}
-                    if ref:
-                        refs.add((str(ref["name"]), str(ref["key"])))
-    return refs
+            for container in [*(spec.get("initContainers") or []), *(spec.get("containers") or [])]:
+                entries = [
+                    e
+                    for e in container.get("env") or []
+                    if e.get("name") == TLS_REVOCATION_ATTESTED_ENV
+                ]
+                if entries:
+                    found.append((path.name, str(container.get("name")), entries))
+    return found
 
 
 def _flat(path: Path) -> str:
@@ -58,21 +62,35 @@ def _check_comment() -> str:
     return " ".join(w for w in words if w != "#")
 
 
-def test_the_manifests_read_one_configmap() -> None:
-    # Positive control: the doc test below is vacuous if no manifest reads a ConfigMap.
-    assert len(_configmap_refs()) == 1
+def test_each_container_reads_the_attestation_once_from_the_secret() -> None:
+    found = _attestation_entries()
+    # Positive control: the doc tests below are vacuous if neither manifest wires the variable.
+    assert {manifest for manifest, _, _ in found} == {"ha-postgres.yaml", "statefulset.yaml"}, found
+    for manifest, container, entries in found:
+        where = f"{manifest}/{container}"
+        assert len(entries) == 1, f"{where} sets {TLS_REVOCATION_ATTESTED_ENV} {len(entries)} times"
+        source = entries[0].get("valueFrom") or {}
+        assert set(source) == {"secretKeyRef"}, f"{where}: not one Secret source: {source}"
+        ref = source["secretKeyRef"]
+        assert (ref.get("name"), ref.get("key")) == _SECRET, f"{where}: {ref}"
+        assert ref.get("optional") is not True, f"{where}: the attestation must not be optional"
 
 
 @pytest.mark.parametrize("doc", _DOCS, ids=lambda p: p.name)
-def test_each_deploy_doc_names_the_required_configmap(doc: Path) -> None:
+def test_each_deploy_doc_names_the_required_secret_key(doc: Path) -> None:
     text = _flat(doc)
-    for name, key in _configmap_refs():
-        assert name in text, f"{doc.name} never names the ConfigMap {name}"
-        assert f"kubectl create configmap {name} --from-literal={key}=1" in text, (
-            f"{doc.name} does not give the create command for {name}/{key}"
-        )
+    assert _SECRET[1] in text, f"{doc.name} never names the Secret key {_SECRET[1]}"
     assert "CreateContainerConfigError" in text
     assert "crash-loop" in text, f"{doc.name} does not say a false value still crash-loops"
+    # The caveat itself, not just the word: a value such as 0 passes the kubelet.
+    assert "such as 0" in text or "such as `0`" in text, f"{doc.name} lacks the 0 caveat"
+    assert "passes the kubelet" in text, f"{doc.name} does not say a 0 passes the kubelet"
+
+
+def test_the_secret_example_creates_the_key() -> None:
+    text = _flat(_K8S / "secret.example.yaml")
+    assert f"--from-literal={_SECRET[1]}=" in text
+    assert f"name: {_SECRET[0]}" in text
 
 
 def test_the_compose_check_disables_the_image_healthcheck() -> None:
@@ -144,8 +162,8 @@ def test_no_deploy_doc_carries_the_unqualified_refusal_claim(doc: Path) -> None:
 @pytest.mark.parametrize(
     ("doc", "anchor"),
     [
-        (_CLOUD, "**Create the revocation attestation ConfigMap"),
-        (_README, "**Both Kubernetes manifests need a ConfigMap you create:**"),
+        (_CLOUD, "**Create the Secret**"),
+        (_README, "**Kubernetes (single-node):**"),
     ],
     ids=["CLOUD-DEPLOYMENT.md", "README.md"],
 )

@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 from dataclasses import dataclass, field
 from itertools import pairwise
 
@@ -1074,37 +1075,165 @@ def _lat(s: LatencySummary) -> dict[str, float | int]:
 # --- baseline comparison -----------------------------------------------------
 
 
-def compare_to_baseline(
-    current: dict[str, object], baseline: dict[str, object], *, tolerance: float
-) -> list[str]:
+def tolerance_problem(tolerance: object) -> str | None:
+    """Why ``tolerance`` cannot be a baseline tolerance, or None when it is a fraction in
+    ``[0, 1)``. The CLI asks before the run so a bad value refuses at once (BACKLOG #5439). A bool
+    is refused, as :func:`_f` refuses one as a metric."""
+    if (
+        not isinstance(tolerance, bool)
+        and isinstance(tolerance, (int, float))
+        and 0.0 <= tolerance < 1.0
+    ):
+        return None
+    return f"tolerance {tolerance!r} is not a fraction in [0, 1)"
+
+
+def compare_to_baseline(current: object, baseline: object, *, tolerance: float) -> list[str]:
     """Return regression messages comparing a current report dict to a saved baseline dict. A
     regression is throughput below ``baseline*(1-tolerance)``, p99 above ``baseline*(1+tolerance)``,
-    or any worsening of error/loss. Empty list = no regression."""
+    errors, NAKs, timeouts or dead letters per message sent above ``baseline*(1+tolerance)``, or a
+    loss the baseline did not have. Empty list = no regression.
+
+    It fails closed (BACKLOG #5439): a report that is not a JSON object, a baseline with no phases,
+    a baseline phase the current run lacks, and a metric that is missing, boolean or not finite in
+    either report each come back as a message rather than a pass or a traceback, because a
+    comparison that cannot be made is not evidence of no regression. So is a tolerance outside
+    ``[0, 1)``: NaN passes every threshold, and 1.0 or more puts the throughput floor at zero."""
     out: list[str] = []
-    cur_phases = {p["name"]: p for p in _as_list(current.get("phases"))}
-    base_phases = {p["name"]: p for p in _as_list(baseline.get("phases"))}
-    for name, bp in base_phases.items():
-        cp = cur_phases.get(name)
-        if cp is None:
+    bad_tolerance = tolerance_problem(tolerance)
+    if bad_tolerance is not None:
+        return [bad_tolerance]
+    if not isinstance(baseline, dict):
+        return [f"baseline is not a JSON object (got {type(baseline).__name__})"]
+    if not isinstance(current, dict):
+        return [f"current report is not a JSON object (got {type(current).__name__})"]
+    base_phases = _phases("baseline", baseline, out)
+    cur_phases = _phases("current", current, out)
+    if base_phases == {}:
+        out.append("baseline has no phases to compare")
+    if base_phases is not None and cur_phases is not None:
+        for key, bp in base_phases.items():
+            name = key[0] if key[1] == 1 else f"{key[0]} ({key[1]})"
+            cp = cur_phases.get(key)
+            if cp is None:
+                out.append(f"{name}: phase is in the baseline but missing from the current run")
+                continue
+            _compare_phase(name, bp, cp, tolerance, out)
+    # Per message sent, not raw totals: a faster backend sends more on a closed loop, so the same
+    # NAK rate is a larger count.
+    sent = _pair("sent", _get(baseline, "totals", "sent"), _get(current, "totals", "sent"), out)
+    if sent is not None and (sent[0] < 0 or sent[1] < 0):
+        # Named here, not in the counter loop: a zero counter skips that loop before it reads sent.
+        out.append(f"sent: negative count ({sent[0]:.0f} baseline, {sent[1]:.0f} current)")
+    for label, path in (
+        ("errors", ("totals", "errors")),
+        ("NAKs", ("totals", "nak")),
+        # Unconfirmed sends: the no-loss reconcile excuses them up to its budget, so a rise here
+        # can hide a loss that reconcile passes.
+        ("timeouts", ("totals", "timeouts")),
+        ("dead letters", ("engine_side", "dead_letters")),
+    ):
+        counts = _pair(label, _get(baseline, *path), _get(current, *path), out)
+        if counts is None or sent is None:
             continue
-        b_rate, c_rate = _f(bp.get("achieved_msg_s")), _f(cp.get("achieved_msg_s"))
-        if b_rate > 0 and c_rate < b_rate * (1.0 - tolerance):
-            out.append(f"{name}: throughput regressed {c_rate:.0f} < {b_rate:.0f} msg/s")
-        b_p99 = _f(_get(bp, "e2e_ms", "p99"))
-        c_p99 = _f(_get(cp, "e2e_ms", "p99"))
-        if b_p99 > 0 and c_p99 > b_p99 * (1.0 + tolerance):
-            out.append(f"{name}: e2e p99 regressed {c_p99:.1f} > {b_p99:.1f} ms")
-    if _loss_ok(baseline) and not _loss_ok(current):
-        nl = current.get("no_loss")
-        if isinstance(nl, dict) and nl.get("inconclusive"):
-            out.append("no-loss regressed: baseline had no loss, current run is inconclusive")
-        else:
-            out.append("no-loss regressed: baseline had no loss, current run lost messages")
+        (b_n, c_n), (b_sent, c_sent) = counts, sent
+        if b_n < 0 or c_n < 0:
+            # A run delta below zero is a counter reset, and the real count is unknown.
+            out.append(f"{label}: negative count ({b_n:.0f} baseline, {c_n:.0f} current)")
+            continue
+        if c_n == 0:
+            continue
+        if b_sent <= 0 or c_sent <= 0:
+            out.append(f"{label}: {c_n:.0f} in the current run, and sent is not positive in both")
+            continue
+        b_rate, c_rate = b_n / b_sent, c_n / c_sent
+        if c_rate > b_rate * (1.0 + tolerance):
+            out.append(f"{label} worsened: {c_rate:.3%} of sent > {b_rate:.3%}")
+    b_ok, c_ok = _loss_ok(baseline), _loss_ok(current)
+    for which, flag in (("baseline", b_ok), ("current", c_ok)):
+        if flag is None:
+            out.append(f"{which} no_loss.ok is missing or not a boolean")
+    b_lost = b_ok is False and _get(baseline, "no_loss", "inconclusive") is not True
+    c_inconclusive = _get(current, "no_loss", "inconclusive") is True
+    if c_ok is False and not c_inconclusive and not b_lost:
+        # A proven loss is a regression against any baseline that did not itself lose messages,
+        # an INCONCLUSIVE one included.
+        out.append("no-loss regressed: baseline had no proven loss, current run lost messages")
+    elif b_ok is True and c_ok is False:
+        out.append("no-loss regressed: baseline had no loss, current run is inconclusive")
     return out
 
 
-def _as_list(value: object) -> list[dict[str, object]]:
-    return value if isinstance(value, list) else []
+def _compare_phase(
+    name: str, bp: dict[str, object], cp: dict[str, object], tolerance: float, out: list[str]
+) -> None:
+    rate = _pair(f"{name}: achieved_msg_s", bp.get("achieved_msg_s"), cp.get("achieved_msg_s"), out)
+    if rate is not None:
+        b_rate, c_rate = rate
+        if b_rate < 0 or c_rate < 0:
+            # A zero rate may be a phase that sends nothing; a negative one is a malformed report.
+            out.append(f"{name}: negative throughput ({b_rate:.0f} baseline, {c_rate:.0f} current)")
+        elif b_rate > 0 and c_rate < b_rate * (1.0 - tolerance):
+            out.append(f"{name}: throughput regressed {c_rate:.0f} < {b_rate:.0f} msg/s")
+    count = _pair(
+        f"{name}: e2e count", _get(bp, "e2e_ms", "count"), _get(cp, "e2e_ms", "count"), out
+    )
+    p99 = _pair(f"{name}: e2e p99", _get(bp, "e2e_ms", "p99"), _get(cp, "e2e_ms", "p99"), out)
+    if count is None or p99 is None:
+        return
+    (b_n, c_n), (b_p99, c_p99) = count, p99
+    # An empty histogram reports p99 0.0, so the sample count, not the p99, says whether a side
+    # measured anything. A baseline with no samples has nothing to compare against; a negative
+    # count is a malformed report, not an empty histogram.
+    if b_n < 0 or c_n < 0:
+        out.append(f"{name}: negative e2e count ({b_n:.0f} baseline, {c_n:.0f} current)")
+        return
+    if b_p99 < 0 or c_p99 < 0:
+        out.append(f"{name}: negative e2e p99 ({b_p99:.1f} baseline, {c_p99:.1f} current)")
+        return
+    if b_n == 0:
+        return
+    if c_n <= 0:
+        out.append(f"{name}: no e2e samples in the current run, the baseline had {b_n:.0f}")
+    elif c_p99 > b_p99 * (1.0 + tolerance):
+        out.append(f"{name}: e2e p99 regressed {c_p99:.1f} > {b_p99:.1f} ms")
+
+
+def _phases(
+    which: str, report: dict[str, object], out: list[str]
+) -> dict[tuple[str, int], dict[str, object]] | None:
+    """The report's phases keyed by (name, occurrence), or None after naming why they cannot be
+    read. A profile may repeat a phase name, so a repeat is matched by its place in run order; a
+    tuple key cannot collide with a phase whose own name looks like a numbered repeat."""
+    raw = report.get("phases")
+    if not isinstance(raw, list):
+        out.append(f"{which} report has no phases list")
+        return None
+    phases: dict[tuple[str, int], dict[str, object]] = {}
+    seen: dict[str, int] = {}
+    for p in raw:
+        name = p.get("name") if isinstance(p, dict) else None
+        if not isinstance(p, dict) or not isinstance(name, str):
+            out.append(f"{which} report has a phase with no name")
+            return None
+        seen[name] = seen.get(name, 0) + 1
+        phases[(name, seen[name])] = p
+    return phases
+
+
+def _pair(label: str, base: object, cur: object, out: list[str]) -> tuple[float, float] | None:
+    """Both values as finite numbers, or None after naming each one that is not."""
+    b, c = _f(base), _f(cur)
+    if b is None:
+        out.append(f"{label}: baseline value {_short(base)} is not a finite number")
+    if c is None:
+        out.append(f"{label}: current value {_short(cur)} is not a finite number")
+    return None if b is None or c is None else (b, c)
+
+
+def _short(value: object) -> str:
+    text = repr(value)
+    return text if len(text) <= 40 else f"{text[:37]}..."
 
 
 def _get(d: dict[str, object], *path: str) -> object:
@@ -1116,10 +1245,19 @@ def _get(d: dict[str, object], *path: str) -> object:
     return cur
 
 
-def _f(value: object) -> float:
-    return float(value) if isinstance(value, (int, float)) else 0.0
+def _f(value: object) -> float | None:
+    """A finite number, or None. A bool is an int to ``isinstance`` and is refused, as is NaN, which
+    every comparison answers False and so would pass any threshold."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:  # an int past float range, which JSON allows
+        return None
+    return number if math.isfinite(number) else None
 
 
-def _loss_ok(report: dict[str, object]) -> bool:
-    nl = report.get("no_loss")
-    return isinstance(nl, dict) and bool(nl.get("ok"))
+def _loss_ok(report: dict[str, object]) -> bool | None:
+    """``no_loss.ok`` when it is a real boolean, else None: a string ``"false"`` is truthy."""
+    ok = _get(report, "no_loss", "ok")
+    return ok if isinstance(ok, bool) else None

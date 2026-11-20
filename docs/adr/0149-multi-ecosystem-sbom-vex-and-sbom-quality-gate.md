@@ -143,7 +143,7 @@ line. Moving only `VER` fails the `sha256sum -c`. *Amended 2026-09-30 (owner rul
 this sentence used to say that step was `continue-on-error: true`, so the release still succeeded while
 shipping no sbomqs score, silently. That no longer holds in `release.yml`. The download, the in-repo pin
 check and the install are now their own step with no `continue-on-error`, so a pin failure **blocks the
-release**; only the `sbomqs score` step stays advisory. `security.yml`'s copy is unchanged. What no offline test can catch is whether a digest is the RIGHT one for a version —
+release**; only the `sbomqs score` step stays advisory. `security.yml`'s copy is unchanged. *(Corrected for BACKLOG #5475: `security.yml`'s SBOM jobs now split the same way, so a failed sbomqs checksum fails the scheduled run; `sbom` still verifies against the release's own `checksums.txt`.)* What no offline test can catch is whether a digest is the RIGHT one for a version —
 that means fetching the asset, the network dependency the in-repo pin exists to remove. What a test
 *could* catch, and does not today, is the two literals moving apart at all: pinning the `(VER,
 SBOMQS_SHA256)` pair, and asserting release.yml's `VER` matches security.yml's, would force both edits

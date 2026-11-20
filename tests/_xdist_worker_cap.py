@@ -2,32 +2,47 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Cap the worker count ``pytest -n auto`` starts, for every testpath.
 
-Two conftests register the hook below, because neither is loaded for every invocation:
+pytest-xdist resolves ``-n auto`` inside ``pytest_cmdline_main``, so only a plugin pytest has
+registered before that can take part, at least a ``-p`` plugin, an installed entry point, or an
+"initial conftest". That is why this cannot live in a fixture or in a later hook.
 
-* ``tests/conftest.py``, for runs whose arguments reach it before collection: no arguments (pytest
-  uses ``testpaths``), a ``tests/...`` argument, or ``.``, because pytest also loads the conftest of
-  each ``test*`` directory DIRECTLY under an argument;
-* ``packaging/messagefoundry-webconsole/tests/conftest.py``, because a run that names only that
-  tree takes the web console's own ``pyproject.toml`` as its config file and rootdir, and then never
-  loads ``tests/conftest.py``.
+The PRIMARY registration is ``-p tests._xdist_worker_cap`` in the ``addopts`` of both pytest
+configs, the root ``pyproject.toml`` and ``packaging/messagefoundry-webconsole/pyproject.toml``
+(a run that names only the console tree takes that file as its config and rootdir). It reaches the
+runs either file configures that keep its ``addopts``, including at least these runs no conftest
+reaches in time: ``pytest -n auto packaging`` from the repository root and ``pytest -n auto`` from
+``packaging/`` (each collects the console suite, whose conftest loads only during collection, after
+xdist has sized the run), and ``--noconftest`` under either config. Measured with the real core
+count on a 16-core box, the three root-configured ones resolved to 16 workers before the ``-p``
+entries were added; each run named here resolved to 8 after.
 
-pytest-xdist resolves ``-n auto`` inside ``pytest_cmdline_main``, so only a conftest pytest loads
-before that, an "initial conftest", can take part; that is why this cannot live in a fixture or in a
-later hook. Where both conftests are loaded the wrapper runs twice, which is harmless: capping an
-already capped count changes nothing, and an override passes through both.
+The two conftests, ``tests/conftest.py`` and the console suite's, still import the hook as well,
+so a run that overrides ``addopts`` (``-o addopts=...``) and loads one of them in time stays capped.
+Where more than one registration is loaded the wrapper runs once for each, which is harmless:
+capping an already capped count changes nothing, and an override passes through every one. pluggy
+accepts the shared function because each registration is a different plugin object.
+
+THE ``-p`` ENTRIES NEED ``tests`` IMPORTABLE AT STARTUP, before any conftest, from whatever working
+directory pytest runs in. The editable install gives that: it puts the checkout root on ``sys.path``.
+The CI jobs that ran pytest when this was written installed editable, and so does
+``scripts/worktree/ensure-venv.ps1``; a job that installs otherwise fails at startup. For a
+run that loads either conftest this is no new requirement, since both import ``tests`` already. A
+run under either config that loads neither, at least a root-configured one and a console-configured
+``--noconftest`` run, did not need it before, and under an install that does not put the checkout
+root on ``sys.path`` it now fails at startup.
 
 No repo-root ``conftest.py`` registers it: importing one under pytest's default ``prepend`` mode
 moves the repository root to the front of ``sys.path``, which silences the cross-checkout refusal
 in ``tests/conftest.py`` and changes where ``messagefoundry_webconsole`` is imported from.
 
-Both import it package-qualified, the house idiom ``tests/test_conftest_name_collision_guard.py``
-describes; the web console suite already reaches ``tests/_deadline_capture.py`` the same way.
+The conftests import it package-qualified, the house idiom
+``tests/test_conftest_name_collision_guard.py`` describes; the web console suite already reaches
+``tests/_deadline_capture.py`` the same way.
 
-At least these runs stay uncapped: ``pytest -n auto packaging`` from the repository root, and
-``pytest -n auto`` from ``packaging/`` (both root-configured; they collect the console suite, whose
-conftest loads only during collection, after xdist has sized the run; measured 16 workers),
-``--noconftest``, and a ``-c`` naming a config whose rootdir loads neither conftest. The cap is per
-run, not per machine: seven concurrent runs can still start seven times ``MAX_AUTO_WORKERS``.
+At least these runs stay uncapped: a ``-c`` naming a config other than the two above, and an
+``addopts`` override or ``-p no:tests._xdist_worker_cap`` on a run no conftest reaches in time
+(``-o addopts=--timeout=60`` with ``packaging`` from the root measured 16). The cap is per run, not
+per machine: seven concurrent runs can still start seven times ``MAX_AUTO_WORKERS``.
 
 WHY NOT xdist's ``--maxprocesses`` IN ``addopts``. It would cap without code, but it also caps an
 explicit ``-n N``, which this cap deliberately leaves alone, and a run under ``-p no:xdist`` (the web

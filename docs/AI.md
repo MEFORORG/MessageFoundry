@@ -77,13 +77,15 @@ The policy is two independent axes, then **clamped** by the instance's **product
    request exceeds it.
 2. **`phi` hard rule** — `phi` survives only under `managed_claude_baa`; otherwise it falls back to
    `code_only`.
-3. **`deidentified` hard rule** — `deidentified` always falls back to `code_only` today, because **no
+3. **`managed_endpoint` hard rule** — under `managed_endpoint` any scope falls back to `code_only`,
+   the only scope `POST /ai/chat` accepts in this release (BACKLOG #5773).
+4. **`deidentified` hard rule** — `deidentified` always falls back to `code_only` today, because **no
    de-identification is wired into the AI-assist path**. (A de-id framework,
    [`messagefoundry_toolkit/anon/`](../messagefoundry_toolkit/anon/) / ADR 0030, exists to build de-identified
    **test datasets**; it does not de-identify message bodies flowing to the assistant. Its output
    is de-identified, not guaranteed free of PHI: [PHI.md §9](PHI.md#9-de-identification) says what
    its leak-check refuses and what it lets through.)
-4. **`off` normalization** — when `mode == off`, `data_scope` is irrelevant and resolves to `code_only`.
+5. **`off` normalization** — when `mode == off`, `data_scope` is irrelevant and resolves to `code_only`.
 
 **`mode` is never clamped by posture** — only `data_scope` is. Every clamp is recorded in a
 human-readable `reason` so an operator can see *why* the effective policy differs from what was
@@ -98,6 +100,7 @@ configured. Representative results:
 | `managed_claude_baa`, `synthetic`, `true` | `synthetic` | under both ceiling and the phi rule |
 | `byo`, `phi`, `false` | `synthetic` | non-production ceiling |
 | `byo`, `deidentified`, `false` | `synthetic` | ceiling reached before the de-id rule |
+| `managed_endpoint`, `synthetic`, `false` | `code_only` | the engine broker is code_only |
 | `off`, `phi`, `true` | `code_only` | AI off → scope irrelevant |
 
 ---

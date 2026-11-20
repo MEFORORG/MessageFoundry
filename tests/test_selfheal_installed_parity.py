@@ -39,7 +39,7 @@ condition, not a repository one. The negative controls below DO run everywhere, 
 predicate against source bytes.
 
 Every test PRINTS what it compares BEFORE it can skip. A print placed after a skip never runs, and the
-repo's pytest config carries no ``-rs`` (``addopts`` is ``--timeout=60 --timeout-method=thread``), so the
+repo's pytest config carries no ``-rs`` (read ``addopts`` in ``pyproject.toml``), so the
 reason would not be shown either -- the run renders as a bare ``s`` and "nothing was compared" becomes
 indistinguishable from "the comparison passed".
 

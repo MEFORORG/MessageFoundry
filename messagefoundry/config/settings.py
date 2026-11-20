@@ -90,6 +90,7 @@ from messagefoundry.config.models import (
     StallThreshold,
     _check_flag_with_reason,
     _check_hop_attestation,
+    infinite_age_is_off,
 )
 from messagefoundry.config.retention_classification import PHI_RETENTION_WINDOWS
 from messagefoundry.config.tls_policy import (
@@ -2529,12 +2530,20 @@ class DeliverySettings(_Section):
     internal_error: InternalErrorPolicy = InternalErrorPolicy.CONTINUE
     # queue_buildup alert thresholds for every outbound. Mirror BuildupThreshold (a test guards the
     # sync); buildup_max_depth unset = depth dimension off; per-connection buildup= overrides.
-    buildup_max_depth: int | None = None
-    buildup_max_oldest_seconds: float | None = 300.0
+    buildup_max_depth: int | None = Field(default=None, ge=1)
+    buildup_max_oldest_seconds: float | None = Field(default=300.0, gt=0)
     # message_stall alert threshold (Corepoint "Max Message Stall") for every outbound. Mirror
     # StallThreshold (a test guards the sync); None (the default) = the stall alert is OFF — deny-by-
     # default, opt-in because it overlaps queue_buildup's age dimension. Per-connection stall= overrides.
-    stall_max_oldest_seconds: float | None = None
+    stall_max_oldest_seconds: float | None = Field(default=None, gt=0)
+
+    # BACKLOG #5778: `inf` (TOML has no null) is the age keys' spelling of off, read as None as the
+    # models they feed read it, so these fields hold None rather than inf.
+    @field_validator("buildup_max_oldest_seconds", "stall_max_oldest_seconds", mode="after")
+    @classmethod
+    def _inf_age_is_off(cls, value: float | None) -> float | None:
+        return infinite_age_is_off(value)
+
     # saturation alert threshold (#93, ADR 0014 amendment): fire when a lane's backlog is RISING
     # SUSTAINED over this many samples (the DERIVATIVE signal, distinct from buildup/stall's absolute
     # ceilings). None (the default) = OFF — deny-by-default, opt-in because it overlaps queue_buildup's
@@ -3621,6 +3630,12 @@ def _normalise_claim_value_list(v: object) -> object:
     return v
 
 
+#: The longest session limits ``[security]`` accepts (BACKLOG #5772): a year each. Generous against
+#: any real policy; they only refuse a value large enough to break the session arithmetic.
+SESSION_IDLE_MINUTES_MAX = 365 * 24 * 60
+SESSION_ABSOLUTE_HOURS_MAX = 365 * 24
+
+
 class AuthSettings(_Section):
     """Authentication + RBAC knobs. Secrets (the AD bind password) come from env, never the file.
 
@@ -3629,8 +3644,10 @@ class AuthSettings(_Section):
     with no settings at all. ``enabled`` passed in code is refused by the base class, like every
     other removed key (``_Section._refuse_removed_keys``)."""
 
-    session_idle_timeout_minutes: int = 30
-    session_absolute_hours: int = 12
+    # At least one, so a session can outlive its own sign-in; the [security] spellings below take
+    # the same bounds (BACKLOG #5772).
+    session_idle_timeout_minutes: int = Field(default=30, ge=1, le=SESSION_IDLE_MINUTES_MAX)
+    session_absolute_hours: int = Field(default=12, ge=1, le=SESSION_ABSOLUTE_HOURS_MAX)
     # Cap concurrent sessions per user (ASVS 7.1.2); a login beyond the cap revokes the user's oldest
     # live session; lapsed sessions neither count nor survive it (BACKLOG #1900). Sign-ins still
     # owing a second factor are capped apart, so they never evict a full session (BACKLOG #2076).
@@ -4193,9 +4210,11 @@ class AuthSettings(_Section):
         # And for the MFA floor: at or past the idle timeout, every pending session would idle out
         # before its code could be accepted, so no account with a factor could finish signing in.
         idle_seconds = self.session_idle_timeout_minutes * 60
-        if idle_seconds > 0 and self.mfa_verify_min_elapsed_seconds >= idle_seconds:
+        if self.mfa_verify_min_elapsed_seconds >= idle_seconds:
             raise ValueError(
-                "mfa_verify_min_elapsed_seconds must be shorter than session_idle_timeout_minutes"
+                # Named by the key an operator sets: the [auth] spelling is refused at load.
+                "[auth].mfa_verify_min_elapsed_seconds must be shorter than "
+                "[security].sign_out_after_idle_minutes"
             )
         return self
 
@@ -6258,8 +6277,9 @@ class AlertRule(BaseModel):
     id: str | None = None
     # #144 (ADR 0128): OPTIONAL auto-remediation control action fired when this rule matches — one of
     # "restart_inbound" / "restart_outbound" (whitelisted). None (default) = notify only, no control
-    # (byte-identical). Dispatched OFF the delivery worker + never-raise; throttled WITH the notification
-    # (≤ once per cooldown per event+connection); independent of transport suppression (transports=[] ⇒
+    # (byte-identical). Dispatched OFF the delivery worker + never-raise; throttled on its own, apart
+    # from the notification, per event+connection (the 2026-11-19 amendment to ADR 0128 section 4 states the bound and at least
+    # its limits, a zero cooldown and a schedule switch; owner ruling 2026-11-19); independent of transport suppression (transports=[] ⇒
     # quiet auto-remediation). Requires the notifier (≥1 transport). Pure data — no embedded code.
     # BACKLOG #1898: allowed only with an event_type in _ALERT_CONTROL_EVENT_TYPES; "any" and every
     # other type are refused at load (_check_control_scope below).
@@ -7998,8 +8018,9 @@ class SecuritySettings(_Section):
     allow_single_factor_admin_when_exposed: bool = (
         False  # ADR 0140: lift the require_mfa-off refusal at exposure under enforcement = enforce
     )
-    sign_out_after_idle_minutes: int = 30
-    max_session_hours: int = 12
+    # At least one: 0 or less would end every session at sign-in (BACKLOG #5772).
+    sign_out_after_idle_minutes: int = Field(default=30, ge=1, le=SESSION_IDLE_MINUTES_MAX)
+    max_session_hours: int = Field(default=12, ge=1, le=SESSION_ABSOLUTE_HOURS_MAX)
 
     # ── Data handling ────────────────────────────────────────────────
     block_unlisted_outbound: bool = (
@@ -9544,8 +9565,8 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
       keep one just removed. A caller that pairs a ``[security]`` with an ``[auth]`` from another
       read must copy the two in first, as ``messagefoundry security`` does (vault BACKLOG #2600).
       ``SessionRecord.is_live`` refuses a session idle past the first or older than the second (its
-      expiry is stamped from it at sign-in), so a longer one is looser, and 0 or less
-      ends every session at once, which is stricter.
+      expiry is stamped from it at sign-in), so a longer one is looser. A value below 1 is
+      refused at load (BACKLOG #5772).
     * The directory reconciler's knobs, named while ``reconciler_configured`` holds:
       ``ad_session_recheck_seconds`` above its default (a pass runs less often; 0 is the off value
       :func:`security_loosenings` names), ``ad_session_recheck_strikes`` above its default
@@ -10079,9 +10100,9 @@ def _auth_limit_loosenings(auth: AuthSettings) -> list[tuple[str, str]]:
         )
 
     # The [security] session limits. They desugar into these two [auth] fields, whose own spellings
-    # the load refuses, so each entry carries the [security] name an operator sets. A value of 0 or
-    # less ends every session at once, which is stricter. Read off the [auth] copy; the docstring
-    # names the caller that pays for it.
+    # the load refuses, so each entry carries the [security] name an operator sets. A value below 1
+    # is refused at load (BACKLOG #5772). Read off the [auth] copy; the docstring names the caller
+    # that pays for it.
     for switch, field, unit in (
         ("sign_out_after_idle_minutes", "session_idle_timeout_minutes", "minute(s)"),
         ("max_session_hours", "session_absolute_hours", "hour(s)"),

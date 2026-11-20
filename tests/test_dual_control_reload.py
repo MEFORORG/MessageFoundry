@@ -2771,13 +2771,15 @@ def _slow_writer(writer: str, store: _SlowAudit) -> tuple[Any, str]:
 
 async def _drain_mid_write(op: Any, store: _SlowAudit) -> None:
     """Run ``op`` as an outliving operation, and let a shutdown drain cancel it mid write."""
-    from messagefoundry.api.outlive import OutlivingOperations
+    from messagefoundry.api.outlive import OperationInterrupted, OutlivingOperations
 
     outliving = OutlivingOperations()
     caller = asyncio.create_task(outliving.run(op, "config reload"))
     await asyncio.wait_for(store.entered.wait(), 5.0)
     assert await outliving.drain(timeout=0.0, grace=5.0) == ["config reload"]
-    with pytest.raises(asyncio.CancelledError):
+    # The caller was never cancelled, so the drain's cancel reaches it as OperationInterrupted
+    # (BACKLOG #5903), not as a CancelledError of its own.
+    with pytest.raises(OperationInterrupted):
         await caller
     await asyncio.sleep(0.1)  # time for a write the cancel cut off to have landed, had it not been
 
@@ -2869,7 +2871,7 @@ async def test_a_row_wait_ends_inside_the_grace_the_drain_has_left(
     shorter than the row wait. The wait is cut to what the grace has left, so the reload's task
     ends while the drain still waits for it, and the row it could not land is logged at ERROR
     rather than holding the shutdown."""
-    from messagefoundry.api.outlive import OutlivingOperations
+    from messagefoundry.api.outlive import OperationInterrupted, OutlivingOperations
 
     store = _HeldAudit()
     op, action = _slow_writer(writer, store)
@@ -2882,7 +2884,7 @@ async def test_a_row_wait_ends_inside_the_grace_the_drain_has_left(
             # The pin: the drain saw the reload end inside its grace, with nothing left rolling back.
             assert outliving.inflight == []
             assert not [r for r in caplog.records if "finished rolling back" in r.getMessage()]
-            with pytest.raises(asyncio.CancelledError):
+            with pytest.raises(OperationInterrupted):
                 await caller
             store.release.set()  # the write left running now meets the closed store
             await _settle_unlanded()
@@ -2897,7 +2899,7 @@ async def test_a_drained_row_wait_is_not_cut_to_the_undrained_cap() -> None:
     """Under a drain the grace bounds the wait, so a row slower than the undrained cap, but inside
     the grace, still lands."""
     from messagefoundry.api.app import _ROW_CANCEL_WAIT_SECONDS
-    from messagefoundry.api.outlive import OutlivingOperations
+    from messagefoundry.api.outlive import OperationInterrupted, OutlivingOperations
 
     store = _HeldAudit(lands=True)
     op, action = _slow_writer("reload", store)
@@ -2908,7 +2910,7 @@ async def test_a_drained_row_wait_is_not_cut_to_the_undrained_cap() -> None:
         await asyncio.wait_for(store.entered.wait(), 5.0)
         loop.call_later(_ROW_CANCEL_WAIT_SECONDS + 0.3, store.release.set)
         await outliving.drain(timeout=0.0, grace=_ROW_CANCEL_WAIT_SECONDS + 0.8)
-        with pytest.raises(asyncio.CancelledError):
+        with pytest.raises(OperationInterrupted):
             await caller
         # Landed before the reload ended, so before a real shutdown would go on to close the store.
         assert store.rows == [action]

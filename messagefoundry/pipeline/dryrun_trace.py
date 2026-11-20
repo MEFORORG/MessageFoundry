@@ -490,7 +490,7 @@ def trace_dry_run(
     *,
     inbound: str | None = None,
     show_phi: bool = False,
-    snapshot_on_send: bool = False,
+    snapshot_on_send: bool = True,
 ) -> dict[str, Any]:
     """Dry-run ``raw`` against ``registry`` with the execution tracer installed; return the trace JSON.
 
@@ -501,8 +501,8 @@ def trace_dry_run(
     ``snapshot_on_send`` (ADR 0104) is passed straight through to the internal :func:`dry_run` so a
     traced preview runs under the same copy-on-Send posture as the plain one — without the passthrough,
     ``dryrun --trace`` would silently preview a different posture than plain ``dryrun`` and break the
-    byte-identical contract above. The *library* default stays ``False`` (ADR 0104 §8.1: a preview that
-    doesn't opt in does not snapshot); the ``dryrun`` CLI passes its resolved
+    byte-identical contract above. The *library* default is ``True``, as the engine's is (BACKLOG #5794,
+    ADR 0104 §8.1 as amended); the ``dryrun`` CLI passes its resolved
     ``[pipeline].snapshot_on_send`` to both paths (#230)."""
     tracer = _Tracer(show_phi=show_phi)
     with _patched_message_writes():

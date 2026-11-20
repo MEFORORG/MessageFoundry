@@ -429,3 +429,39 @@ suite("connectionMerge — RENDERED_FIELDS matches what build() renders (documen
     }
   });
 });
+
+suite("connectionMerge — a non-finite float tag is a leaf (BACKLOG #5778)", () => {
+  test("tag-valued keys survive the merge exactly, inside retry and outside the form", () => {
+    const initial = maximalOutbound();
+    initial.retry = { max_attempts: 5, max_backoff_seconds: { $toml: "inf" } };
+    initial.stall = { max_oldest_seconds: { $toml: "inf" } };
+    initial.metadata = { cap: { $toml: "-nan" }, nested: [{ $toml: "inf" }, 1.0] };
+    const posted: ConnObj = {
+      direction: "outbound",
+      name: "OB_ACME_ADT",
+      transport: "mllp",
+      settings: { host: "acme.example", port: 2575 },
+      retry: { max_attempts: 3 },
+    };
+    const merged = mergeFormIntoInitial(initial, posted);
+    assert.deepStrictEqual(merged.retry, { max_attempts: 3, max_backoff_seconds: { $toml: "inf" } });
+    assert.deepStrictEqual(merged.stall, { max_oldest_seconds: { $toml: "inf" } });
+    assert.deepStrictEqual(merged.metadata, {
+      cap: { $toml: "-nan" },
+      nested: [{ $toml: "inf" }, 1.0],
+    });
+  });
+
+  test("a tag is never merged into as a table: a file's retry = inf is kept for the upsert to refuse", () => {
+    const initial = maximalOutbound();
+    initial.retry = { $toml: "inf" } as unknown as ConnObj["retry"];
+    const posted: ConnObj = {
+      direction: "outbound",
+      name: "OB_ACME_ADT",
+      transport: "mllp",
+      settings: { host: "acme.example", port: 2575 },
+      retry: { max_attempts: 3 },
+    };
+    assert.deepStrictEqual(mergeFormIntoInitial(initial, posted).retry, { $toml: "inf" });
+  });
+});

@@ -130,7 +130,9 @@ def test_a_federated_floor_as_long_as_the_flow_ttl_is_refused_at_load() -> None:
 
 def test_an_mfa_floor_as_long_as_the_idle_timeout_is_refused_at_load() -> None:
     # Every pending session would idle out before its code could be accepted.
-    with pytest.raises(ValidationError, match="shorter than session_idle_timeout_minutes"):
+    with pytest.raises(
+        ValidationError, match=r"shorter than \[security\]\.sign_out_after_idle_minutes"
+    ):
         AuthSettings(session_idle_timeout_minutes=1, mfa_verify_min_elapsed_seconds=60.0)
     AuthSettings(session_idle_timeout_minutes=1, mfa_verify_min_elapsed_seconds=59.0)
 

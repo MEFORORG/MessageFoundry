@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import time
+import weakref
 from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -55,7 +56,7 @@ from messagefoundry.controlchars import scrub_log_argument
 # Imported, not redefined: the cert->principal matchers live in the neutral package-root leaf, which
 # the inbound connectors' `intake_auth` control (ADR 0154 D6) shares. Both planes key by issuer first
 # (BACKLOG #2237 here, #2287 for the intake plane's intake_client_subjects).
-from messagefoundry.credential import client_cert_principal_under_issuer
+from messagefoundry.credential import VERIFIED_ISSUER_KEY, client_cert_principal_under_issuer
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cert_expiry import peer_cert_expiry
 from messagefoundry.redaction import safe_exc
@@ -1631,6 +1632,33 @@ def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Ide
 # step-up / MFA controls. Activated by the scope-populating shim in api/tls_client_cert (ADR 0083).
 
 
+#: The fallback's verified read, kept per TLS connection, keyed on its ``ssl_object`` (BACKLOG #5788).
+#: The read parses the leaf and checks its issuer, so making it on every request would repeat that
+#: work on the event loop; the shim makes it once, at ``connection_made``. Weak keys, so an entry
+#: goes when its connection does. Each entry carries the leaf's DER, and a request whose peer now
+#: presents another leaf, as a renegotiation can, is read afresh. A read that found no certificate,
+#: or no verified issuer, is not kept, so a fault the issuer lookup swallowed is retried.
+_FALLBACK_PEERCERTS: weakref.WeakKeyDictionary[Any, tuple[bytes, Mapping[str, Any]]] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _fallback_peercert(ssl_object: Any) -> Mapping[str, Any] | None:
+    """:func:`peercert_from_ssl_object`, read once per connection and leaf (BACKLOG #5788). An
+    object that cannot take a weak reference, or whose leaf cannot be read, is read in full."""
+    try:
+        der = ssl_object.getpeercert(binary_form=True)
+        cached = _FALLBACK_PEERCERTS.get(ssl_object)
+    except (TypeError, ValueError):
+        return peercert_from_ssl_object(ssl_object)
+    if cached is not None and isinstance(der, bytes) and cached[0] == der:
+        return cached[1]
+    cert = peercert_from_ssl_object(ssl_object)
+    if cert is not None and isinstance(der, bytes) and cert.get(VERIFIED_ISSUER_KEY):
+        _FALLBACK_PEERCERTS[ssl_object] = (der, cert)
+    return cert
+
+
 def peer_cert_from_request(request: Request) -> Mapping[str, Any] | None:
     """Best-effort read of the verified peer certificate (``getpeercert()`` shape) for this request.
 
@@ -1665,8 +1693,8 @@ def peer_cert_from_request(request: Request) -> Mapping[str, Any] | None:
             return None  # a list that cannot be read: deny rather than fail the request
         if peer_is_trusted_proxy(transport, parsed):
             return None
-    # The same read the shim makes, verified issuer included (BACKLOG #2237).
-    return peercert_from_ssl_object(ssl_object)
+    # The same read the shim makes, verified issuer included (BACKLOG #2237), once per connection.
+    return _fallback_peercert(ssl_object)
 
 
 def note_client_cert_expiry(request: Request, peercert: Mapping[str, Any], label: str) -> None:
@@ -2257,12 +2285,19 @@ def _ws_origin_allowed(websocket: WebSocket) -> bool:
     No native client ships today. The shipped client is the browser web console. When the console
     is mounted, its same-origin handshake is tried first by the console's cookie hook
     (``authorize_ui_ws``), which checks the Origin itself and does not read ``ws_allowed_origins``.
-    A handshake the hook declines, or any handshake while the console is not mounted, comes here."""
-    origin = websocket.headers.get("origin")
-    if not origin:
+    A handshake the hook declines, or any handshake while the console is not mounted, comes here.
+
+    Only an ABSENT header counts as a native client. An empty or whitespace-only ``Origin``, or more
+    than one ``Origin`` header, is refused (BACKLOG #5789). Taking a blank one for absent would
+    pass a browser handshake as a native client's without the allow-list, and judging the first of
+    several copies would let this check and a reader of another copy disagree about the origin."""
+    origins = websocket.headers.getlist("origin")
+    if not origins:
         return True  # native client (no browser Origin)
+    if len(origins) > 1 or not origins[0].strip():
+        return False
     allowed = getattr(websocket.app.state, "ws_allowed_origins", ()) or ()
-    return origin in allowed
+    return origins[0] in allowed
 
 
 async def authorize_ws(websocket: WebSocket, *permissions: Permission) -> Identity | None:
