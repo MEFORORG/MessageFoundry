@@ -4322,27 +4322,27 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
     assert again == []
 
 
-def test_a_bind_move_back_to_a_name_the_pair_already_holds_reuses_it(tmp_path: Path) -> None:
-    """A wildcard's pair also names its loopback, so moving the bind to that loopback reuses it."""
-    ensure_api_tls_material(ApiSettings(host="0.0.0.0"), state_dir=tmp_path)
-    cert, _ = _generated_pair(tmp_path)
-    before = cert.read_bytes()
-    events: list[GeneratedPairReplaced] = []
-    ensure_api_tls_material(ApiSettings(host="127.0.0.1"), state_dir=tmp_path, replacements=events)
-    assert events == [] and cert.read_bytes() == before
-
-
-def test_a_shard_never_re_mints_for_a_bind_move(tmp_path: Path) -> None:
-    """``renew=False`` (an engine shard) reuses a loadable pair as found, the bind check included,
-    so a lone restarted shard cannot serve a different certificate from its siblings."""
-    ensure_api_tls_material(ApiSettings(host="127.0.0.1"), state_dir=tmp_path)
-    cert, _ = _generated_pair(tmp_path)
-    before = cert.read_bytes()
+@pytest.mark.parametrize(
+    ("first", "then", "renew"),
+    [
+        # A wildcard's pair also names its loopback, so moving the bind there reuses it.
+        ("0.0.0.0", "127.0.0.1", True),
+        # An engine shard (renew=False) reuses a loadable pair as found, the bind check included,
+        # so a lone restarted shard cannot serve a different certificate from its siblings.
+        ("127.0.0.1", "0.0.0.0", False),
+    ],
+)
+def test_a_bind_move_that_needs_no_new_name_or_is_a_shard_reuses_the_pair(
+    first: str, then: str, renew: bool, tmp_path: Path
+) -> None:
+    ensure_api_tls_material(ApiSettings(host=first), state_dir=tmp_path)
+    cert, key = _generated_pair(tmp_path)
+    before = _snapshot(cert, key)
     events: list[GeneratedPairReplaced] = []
     ensure_api_tls_material(
-        ApiSettings(host="0.0.0.0"), state_dir=tmp_path, replacements=events, renew=False
+        ApiSettings(host=then), state_dir=tmp_path, replacements=events, renew=renew
     )
-    assert events == [] and cert.read_bytes() == before
+    assert events == [] and _snapshot(cert, key) == before
 
 
 def test_a_pair_not_the_engines_shape_is_never_re_minted_for_a_bind_move(tmp_path: Path) -> None:

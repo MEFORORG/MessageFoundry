@@ -252,6 +252,12 @@ def _generated_sans(host: str) -> list[str]:
     return [] if loopback is None else [loopback]
 
 
+def _generated_names(host: str) -> list[str]:
+    """Every name a certificate minted for ``host`` carries: ``host`` first, then
+    :func:`_generated_sans`. The mint and the reuse check both read this, so they cannot drift."""
+    return [host, *_generated_sans(host)]
+
+
 #: Renew the generated pair at startup once less than this share of its OWN validity period is
 #: left: about 122 of 365 days (ADR 0172, 2026-09-26 amendment). Early rather than at expiry, so a
 #: renewal lands at an ordinary restart months before any client could see an expired certificate.
@@ -259,6 +265,12 @@ def _generated_sans(host: str) -> list[str]:
 _RENEW_REMAINING_FRACTION = 1 / 3
 #: Suffix of the new pair while it is staged beside the live one, before the two replaces.
 _STAGED_SUFFIX = ".renewing"
+
+#: Why a loadable generated pair is replaced at startup (:func:`_replacement_due`), and why any
+#: existing pair is (:class:`GeneratedPairReplaced`).
+_DueReason = Literal["renewal", "bind_changed"]
+_ReplacedReason = Literal["renewal", "bind_changed", "unusable", "half_pair"]
+type _Due = tuple[_DueReason, SelfSignedFacts]
 
 #: The audit action for every replacement of a generated pair that already existed: an early
 #: renewal, and the recovery of an unusable or half-written pair (ADR 0172 decision 6).
@@ -280,7 +292,7 @@ class GeneratedPairReplaced:
     #: certificate lacks a name a fresh mint for the current ``[api].host`` would carry, such as a
     #: bind moved to a wildcard after the mint (BACKLOG #5973). ``unusable``: a pair that would not
     #: load as one. ``half_pair``: one file of the two, left by an interrupted mint or renewal.
-    reason: Literal["renewal", "bind_changed", "unusable", "half_pair"]
+    reason: _ReplacedReason
     cert_file: str
     old_sha256: str | None
     old_not_after: str | None
@@ -770,7 +782,7 @@ def _settle_under_the_lock(
     if cert_path.exists() and key_path.exists():
         reason = _why_generated_pair_is_unusable(cert_path, key_path)
         if reason is None:
-            due = _renewal_due(api.host, cert_path) if renew else None
+            due = _replacement_due(api.host, cert_path) if renew else None
             if due is not None:
                 _renew_generated_pair(api, cert_path, key_path, due, events)
             return
@@ -807,7 +819,7 @@ def _reusable_without_the_lock(host: str, cert_path: Path, key_path: Path, *, re
     OS lock support, which is what it needed before the lock existed.
 
     A certificate at the generated path that is NOT the engine's shape is never due, so a pair
-    holding one is reused here as found, with the WARNING :func:`_renewal_due` logs when it is
+    holding one is reused here as found, with the WARNING :func:`_replacement_due` logs when it is
     near or past expiry. Nothing is ever written for it, so it needs no lock.
     """
     try:
@@ -815,7 +827,7 @@ def _reusable_without_the_lock(host: str, cert_path: Path, key_path: Path, *, re
             cert_path.exists()
             and key_path.exists()
             and _why_generated_pair_is_unusable(cert_path, key_path) is None
-            and (not renew or _renewal_due(host, cert_path) is None)
+            and (not renew or _replacement_due(host, cert_path) is None)
         )
     except OSError:
         return False
@@ -831,14 +843,12 @@ def _cert_facts(cert_path: Path) -> SelfSignedFacts | None:
         return None
 
 
-def _renewal_due(
-    host: str, cert_path: Path
-) -> tuple[Literal["renewal", "bind_changed"], SelfSignedFacts] | None:
+def _replacement_due(host: str, cert_path: Path) -> _Due | None:
     """Why the generated pair should be replaced now, with the old certificate's facts, else ``None``.
 
     ``renewal`` means expired, or less than :data:`_RENEW_REMAINING_FRACTION` of the certificate's
     own validity period left. ``bind_changed`` means the certificate lacks a name a fresh mint for
-    ``host`` would carry (:func:`_names_the_bind`), so a bind moved after the mint, for example to a
+    ``host`` would carry (:func:`_generated_names`), so a bind moved after the mint, for example to a
     wildcard whose loopback the tray dials, gets a certificate naming it at this start rather than at
     the next renewal (BACKLOG #5973). **Only the engine's own shape is ever due**: a certificate at the
     generated path that is not self-signed with ``CA=false`` was put there by someone else, so it is
@@ -846,8 +856,12 @@ def _renewal_due(
     the store deserves a reason in the log. ``None`` too when the certificate cannot be
     parsed, since nothing here may replace what it cannot identify.
     """
-    facts = _cert_facts(cert_path)
-    if facts is None:
+    from messagefoundry import pki
+
+    try:
+        pem = cert_path.read_bytes()
+        facts = pki.read_self_signed_facts(pem)
+    except (OSError, ValueError):
         return None
     lifetime = facts.not_after - facts.not_before
     expiring = facts.not_after - time.time() < lifetime * _RENEW_REMAINING_FRACTION
@@ -864,23 +878,9 @@ def _renewal_due(
         return None
     if expiring:
         return "renewal", facts
-    if not _names_the_bind(host, cert_path):
+    if not pki.names_all_of(pem, _generated_names(host)):
         return "bind_changed", facts
     return None
-
-
-def _names_the_bind(host: str, cert_path: Path) -> bool:
-    """True when the certificate names ``host`` and every name :func:`_generated_sans` adds for it,
-    the names :func:`_mint_generated_pair` would put in a fresh certificate for this bind.
-
-    ``True`` too when the certificate cannot be read or parsed, since nothing here may replace what
-    it cannot identify."""
-    from messagefoundry import pki
-
-    try:
-        return pki.names_all_of(cert_path.read_bytes(), [host, *_generated_sans(host)])
-    except (OSError, ValueError):
-        return True
 
 
 def _staged_pair(cert_path: Path, key_path: Path) -> tuple[Path, Path]:
@@ -907,12 +907,12 @@ def _renew_generated_pair(
     api: ApiSettings,
     cert_path: Path,
     key_path: Path,
-    due: tuple[Literal["renewal", "bind_changed"], SelfSignedFacts],
+    due: _Due,
     events: list[GeneratedPairReplaced],
 ) -> None:
     """Replace a loadable generated pair that is due, with a new key and certificate. Lock held.
 
-    ``due`` is :func:`_renewal_due`'s answer: why, and the old certificate's facts. A replacement
+    ``due`` is :func:`_replacement_due`'s answer: why, and the old certificate's facts. A replacement
     for a changed bind takes this same path, so its key is written exactly as a renewal's is.
 
     **Staged, then replaced, certificate first.** The new key is written under a temporary name with
@@ -932,7 +932,7 @@ def _renew_generated_pair(
 
     staged_cert, staged_key = _staged_pair(cert_path, key_path)
     cert_pem, key_pem = pki.make_self_signed(
-        api.host, _generated_sans(api.host), _GENERATED_LIFETIME_DAYS
+        api.host, _generated_names(api.host), _GENERATED_LIFETIME_DAYS
     )
     new = pki.read_self_signed_facts(cert_pem)
     try:
@@ -953,13 +953,12 @@ def _renew_generated_pair(
     reason, old = due
     event = _replaced(reason, cert_path, old, new)
     events.append(event)
+    verb = "renewed" if reason == "renewal" else "re-minted, for a bind the old one did not name,"
     log.warning(
         "%s the generated self-signed TLS certificate at %s: the old one (sha256 %s) expires "
         "%s, the new one (sha256 %s) expires %s. Any browser trust store or --cacert copy that "
         "holds the old certificate must import the new one.",
-        "renewed"
-        if reason == "renewal"
-        else f"re-minted, for the bind {api.host}, which the old one did not name,",
+        verb,
         cert_path,
         event.old_sha256,
         "at an unknown date" if event.old_not_after is None else log_timestamp(event.old_not_after),
@@ -969,7 +968,7 @@ def _renew_generated_pair(
 
 
 def _replaced(
-    reason: Literal["renewal", "bind_changed", "unusable", "half_pair"],
+    reason: _ReplacedReason,
     cert_path: Path,
     old: SelfSignedFacts | None,
     new: SelfSignedFacts,
@@ -992,7 +991,7 @@ def _mint_generated_pair(api: ApiSettings, cert_path: Path, key_path: Path) -> S
     from messagefoundry.__main__ import _write_private_key
 
     cert_pem, key_pem = pki.make_self_signed(
-        api.host, _generated_sans(api.host), _GENERATED_LIFETIME_DAYS
+        api.host, _generated_names(api.host), _GENERATED_LIFETIME_DAYS
     )
     _write_private_key(key_path, key_pem)
     paired = False
