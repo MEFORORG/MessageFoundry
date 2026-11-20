@@ -282,11 +282,11 @@ async def test_a_run_of_objects_under_the_cap_is_never_counted_together() -> Non
 def _next_pdu(sock: socket.socket, what: str) -> bytes:
     """The next whole PDU the SCP sends, read to the length its header gives. Each read is bounded,
     so a response the SCP never sends fails here within seconds."""
-    header = _first_bytes(sock, 6)
-    assert len(header) == 6, f"no {what} from the SCP within the wait: {header!r}"
+    header = _first_bytes(sock, 6, wait=10.0)
+    assert len(header) == 6, f"no {what} before the SCP closed or 10s ran out: {header!r}"
     length = int.from_bytes(header[2:6], "big")
     assert length <= 16384, f"{what} announced {length} bytes"  # before recv sizes a buffer to it
-    body = _first_bytes(sock, length)
+    body = _first_bytes(sock, length, wait=10.0)
     assert len(body) == length, f"{len(body)} of the {length} bytes {what} announced"
     return header + body
 
@@ -304,9 +304,15 @@ def _echo(sock: socket.socket, message_id: int) -> tuple[int, int, int]:
     pdu.decode(pdu_bytes)
     (item,) = pdu.presentation_data_value_items
     value = item.presentation_data_value
+    assert item.presentation_context_id == 1, f"answered on another context: {pdu_bytes!r}"
     assert value is not None and value[0] == 0x03, f"not one whole command: {pdu_bytes!r}"
     command = decode(BytesIO(value[1:]), True, True)
+    assert command.CommandDataSetType == 0x0101, f"a data set follows: {pdu_bytes!r}"
     return int(command.CommandField), int(command.MessageIDBeingRespondedTo), int(command.Status)
+
+
+_A_RELEASE_RQ = b"\x05\x00" + (4).to_bytes(4, "big") + bytes(4)
+_A_RELEASE_RP = b"\x06\x00" + (4).to_bytes(4, "big") + bytes(4)
 
 
 async def test_a_run_of_echoes_is_never_counted_together(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -318,8 +324,20 @@ async def test_a_run_of_echoes_is_never_counted_together(monkeypatch: pytest.Mon
     async with _running_scp({"timeout_seconds": 30.0}) as scp:
         sock = await _a_held_association(scp.sockport)
         try:
-            # One at a time: the SCP holds at most two pending requests per association.
+            # One at a time, as the pynetdicom SCU this replaced sent them.
             answers = await asyncio.to_thread(lambda: [_echo(sock, n) for n in range(1, 41)])
+            sock.sendall(_A_RELEASE_RQ)  # the association still releases after the run
+            released = await asyncio.to_thread(_next_pdu, sock, "A-RELEASE-RP")
+            assert released == _A_RELEASE_RP, released
+        finally:
+            sock.close()
+        # CONTROL: the patched bound is the one the SCP enforces, so one command set past it ends
+        # an association; under the shipped 64 KiB it would not.
+        sock = await _a_held_association(scp.sockport)
+        try:
+            sock.sendall(_p_data(0x01, b"\x00" * 1100))
+            answer = await asyncio.to_thread(_first_bytes, sock, len(_ABORT_OVER_LIMIT), wait=10.0)
+            assert answer == _ABORT_OVER_LIMIT, answer
         finally:
             sock.close()
     assert [field for field, _, _ in answers] == [0x8030] * 40, answers  # C-ECHO-RSP
