@@ -2704,9 +2704,9 @@ class Engine:
             # and StoreAcquireTimeout too), OSError, ValueError, sqlite3.DatabaseError, asyncpg's
             # PostgresError, InterfaceError and InternalClientError, pyodbc's DatabaseError,
             # CipherError, and pyodbc's Error root, which a deadlock victim raises; the asyncpg and
-            # pyodbc entries are there only when that driver is installed. A bug that raises any
-            # type in the sets reads as a refusal here. An AUDIT_WRITE_DEFECTS type is re-raised
-            # first, so it propagates, and so does any type outside the sets. As the convergence
+            # pyodbc entries are there only when that driver is installed. An AUDIT_WRITE_DEFECTS
+            # type is re-raised first, so it propagates, and so does any type outside the sets. A
+            # bug that raises any other type in the sets reads as a refusal here. As the convergence
             # pass does (state_convergence.py), the log and the alert carry the
             # exception CLASS only: a decrypt failure's text can carry a PHI-bearing key.
             try:
