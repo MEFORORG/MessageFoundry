@@ -9238,7 +9238,8 @@ class SqlServerStore:
                     # BACKLOG #5982: dead-lettered like a corrupt reference, then audited and
                     # alerted as a claim reports a tag failure, after the transaction. Queued
                     # first, so a dead-letter write that fails is still reported.
-                    queue_tag_rows.append((work_row, err))
+                    # Without its traceback, so the queued error holds no frame of this transaction.
+                    queue_tag_rows.append((work_row, err.with_traceback(None)))
                     return await _consume_dead(
                         "ingress_handoff(tag-failed)",
                         REINGRESS_TOKEN_TAG_FAILED,

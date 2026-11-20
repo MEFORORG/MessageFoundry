@@ -6314,9 +6314,8 @@ class PostgresStore:
         # breaking count-and-log.
         guard, guard_args = self._resolve_guard(6)
         tag_failures: list[CellTagError] = []
-        queue_tag_rows: list[
-            tuple[Any, QueueTagError]
-        ] = []  # BACKLOG #5982: reported after the transaction
+        # BACKLOG #5982: reported after the transaction.
+        queue_tag_rows: list[tuple[Any, QueueTagError]] = []
         try:
             async with self._timed_acquire() as conn:  # noqa: SIM117
                 async with conn.transaction():
@@ -6365,7 +6364,8 @@ class PostgresStore:
                         # BACKLOG #5982: dead-lettered like a corrupt reference, then audited and
                         # alerted as a claim reports a tag failure, after the transaction. Queued
                         # first, so a dead-letter write that fails is still reported.
-                        queue_tag_rows.append((wr, err))
+                        # Without its traceback, so the queued error holds no frame of this transaction.
+                        queue_tag_rows.append((wr, err.with_traceback(None)))
                         return await _consume_dead(
                             "ingress_handoff(tag-failed)",
                             REINGRESS_TOKEN_TAG_FAILED,

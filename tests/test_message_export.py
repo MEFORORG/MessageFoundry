@@ -533,7 +533,7 @@ async def test_a_row_the_keys_cannot_open_stops_the_export_on_the_record(
     assert [row["id"] for row in _ndjson(r.text)] == [mid_a]
     assert await _stop_rows(engine) == [{"selected": 2, "streamed": 1, "reason": reason}]
     assert [rec.getMessage() for rec in caplog.records if rec.levelno >= logging.ERROR] == []
-    # The refusal is logged by class only, never with the caller-supplied id.
+    # The refusal is logged by class only: no record at WARNING or above carries the caller's id.
     refused = [
         rec.getMessage() for rec in caplog.records if "could not be opened" in rec.getMessage()
     ]

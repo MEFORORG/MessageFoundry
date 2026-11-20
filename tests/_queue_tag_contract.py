@@ -17,11 +17,12 @@ refused everything, or bound nothing, fails this contract.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Awaitable, Callable
 from typing import Any
 
 from messagefoundry.store.crypto import cell_aad
-from messagefoundry.store.queue_tag import QUEUE_TAG_FAILED_ACTION, QueueTagError
+from messagefoundry.store.queue_tag import QUEUE_TAG_CAUSES, QUEUE_TAG_FAILED_ACTION, QueueTagError
 from messagefoundry.store.store import (
     REINGRESS_READ_TAG_FAILURE_OUTCOME,
     REINGRESS_TAG_FAILURE_OUTCOME,
@@ -357,13 +358,21 @@ async def _assert_response_stage(store: Any, raw: RawSql, fetch: RawFetch, hook:
 async def _assert_reported(
     fetch: RawFetch, hook: _Hook, row_id: str, outcome: str, label: str
 ) -> None:
-    """One audit row and an alert carrying ``outcome`` for ``row_id``."""
+    """One audit row and an alert carrying ``outcome`` for ``row_id``, both naming the cause of the
+    refusal that was caught (BACKLOG #5982: the report is handed that error, not a stand-in)."""
     audited = await fetch(
         "SELECT detail FROM audit_log WHERE action=? AND detail LIKE ?",
         (QUEUE_TAG_FAILED_ACTION, f"%{row_id[:12]}%"),
     )
     assert len(audited) == 1, (label, audited)
-    assert any(row_id[:12] in r and outcome in r for r in hook.reasons), (label, hook.reasons)
+    cause = json.loads(audited[0]["detail"])["cause"]
+    assert cause in QUEUE_TAG_CAUSES, (label, cause)
+    words = QUEUE_TAG_CAUSES[cause]
+    assert any(row_id[:12] in r and outcome in r and words in r for r in hook.reasons), (
+        label,
+        cause,
+        hook.reasons,
+    )
 
 
 async def _assert_store_once(store: Any, raw: RawSql, fetch: RawFetch, hook: _Hook) -> None:

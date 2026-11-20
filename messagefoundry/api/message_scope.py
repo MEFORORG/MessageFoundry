@@ -184,7 +184,7 @@ async def read_scoped_message(
         # The class name only: the cipher's text can echo fields cut from the stored value, and the
         # message id is the caller's, so neither the log line nor the error carries it.
         cause = f"a message could not be opened: {error_class}"
-        _log.warning("a message could not be opened: %s", error_class)
+        _log.warning("%s", cause)
         if not refuse_integrity:
             # The export stream does not skip such a row: an export that leaves out rows nothing
             # records would read as complete, so it records a stop instead. A fresh error, so no

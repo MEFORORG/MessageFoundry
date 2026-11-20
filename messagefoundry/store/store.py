@@ -16085,7 +16085,8 @@ class MessageStore:
                 # like a corrupt reference, then audited and alerted as a claim reports a tag
                 # failure, once the writer lock is released. Queued first, so a dead-letter write
                 # that fails is still reported.
-                queue_tag_rows.append((wr, err))
+                # Without its traceback, so the queued error holds no frame of this transaction.
+                queue_tag_rows.append((wr, err.with_traceback(None)))
                 return await _consume_dead(
                     REINGRESS_TOKEN_TAG_FAILED, "re-ingress work-row failed its integrity check"
                 )
