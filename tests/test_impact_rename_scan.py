@@ -356,3 +356,101 @@ def test_a_shared_helper_return_every_referrer_sends_is_rewritten(tmp_path: Path
     apply_rename(plan)
     assert '"OB_OLD"' not in _text(config_dir)
     load_config(config_dir)
+
+
+_TABLES_HEAD = (
+    "from messagefoundry import FileRef, MLLP, Reference, Send, code_set, handler, inbound, "
+    "outbound, reference, router\n\n"
+    'Reference("diets", source=FileRef(path="diets.csv"))\n'
+)
+_CSV = "code,value\nA,Apple\n"
+_H_DIETS = Reference("handler", "h_p", "code_set", "diets")
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # One module constant read by the code set's accessor and the reference's.
+        'NAME = "diets"\n\n\n@handler("h_p")\ndef h_p(msg):\n    a = code_set(NAME)\n'
+        '    b = reference(NAME)\n    return Send("OB_A", msg)\n',
+        # The reference's read sits in a helper the handler reaches.
+        'NAME = "diets"\n\n\ndef _ref():\n    return reference(NAME)\n\n\n'
+        '@handler("h_p")\ndef h_p(msg):\n    _ref()\n'
+        '    return Send("OB_A", code_set(NAME).get("A"))\n',
+    ],
+)
+def test_a_constant_two_table_kinds_read_is_not_rewritten(tmp_path: Path, body: str) -> None:
+    """Step 10: a code set and a reference share the name, so rewriting the constant would move
+    the reference's read to a table that does not exist."""
+    config_dir = _write(
+        tmp_path,
+        {"mod.py": _TABLES_HEAD + _WIRE + body, "codesets/diets.csv": _CSV, "diets.csv": _CSV},
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "code_set", "diets", "meals")
+    assert plan.unresolved == (_H_DIETS,)
+    apply_rename(plan)
+    assert 'NAME = "diets"' in _text(config_dir)
+
+
+@pytest.mark.parametrize(
+    "helper",
+    [
+        # The helper compares its table parameter with the name its caller passes.
+        'def _lookup(table, code):\n    if table == "diets":\n        code = code.upper()\n'
+        "    return code_set(table).get(code)\n",
+        # A table default whose parameter is also read in a comparison.
+        'def _lookup(code, table="diets"):\n    if table == "x":\n        return None\n'
+        "    return code_set(table).get(code)\n",
+    ],
+)
+def test_a_table_value_a_helper_also_compares_reports_the_referrer(
+    tmp_path: Path, helper: str
+) -> None:
+    """Step 11: the helper's other read of the table name was neither rewritten nor counted."""
+    call = '_lookup("diets", "A")' if helper.startswith("def _lookup(table") else '_lookup("A")'
+    config_dir = _write(
+        tmp_path,
+        {
+            "mod.py": _HEAD + _WIRE + helper + '\n\n@handler("h_p")\ndef h_p(msg):\n'
+            f"    {call}\n"
+            '    return Send("OB_A", msg)\n',
+            "codesets/diets.csv": _CSV,
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "code_set", "diets", "meals")
+    assert plan.unresolved == (_H_DIETS,)
+
+
+@pytest.mark.parametrize(
+    "direct", ["", '    if msg is None:\n        return Send("OB_OLD", msg)\n']
+)
+def test_a_container_built_from_a_constant_reports_the_referrer(
+    tmp_path: Path, direct: str
+) -> None:
+    """Step 11: ``ALL = [DEST, "OB_A"]`` holds the name with no literal of its own, so neither
+    binding was a counted occurrence and the handler kept sending to the old name."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "mod.py": _HEAD + _WIRE + 'DEST = "OB_OLD"\nALL = [DEST, "OB_A"]\n\n\n'
+            '@handler("h_p")\ndef h_p(msg):\n' + direct + "    return [Send(d, msg) for d in ALL]\n"
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == (_H_P,)
+
+
+def test_a_container_holding_the_literal_is_rewritten(tmp_path: Path) -> None:
+    """Step 11: the container's own literal is located, so the rename completes."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "mod.py": _HEAD + _WIRE + 'ALL = ["OB_OLD", "OB_A"]\n\n\n'
+            '@handler("h_p")\ndef h_p(msg):\n    return [Send(d, msg) for d in ALL]\n'
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert 'ALL = ["OB_NEW", "OB_A"]' in _text(config_dir)
+    load_config(config_dir)

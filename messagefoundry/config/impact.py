@@ -538,10 +538,12 @@ def _referrer_sites(
     target_kind: str,
     sources: SourceCache,
     toml_targets: set[tuple[str, str]],
+    held: list[bool] | None = None,
 ) -> tuple[list[_Site], bool] | None:
     """The ``.py`` sites one referent edge reads ``old`` from, and whether every value the referrer
     captures holding ``old`` was located; ``None`` for a ``connections.toml`` router binding
-    (recorded in ``toml_targets`` instead).
+    (recorded in ``toml_targets`` instead). ``held``, when given, gets ``True`` appended when a
+    module container a role reads holds ``old``, located or not.
 
     A router/handler's sites are its own body and, for a handler, its ``accepts=`` predicate's; for a
     table rename, the config-authored helpers either reaches; and each module-level statement that
@@ -607,21 +609,17 @@ def _referrer_sites(
         iter_attrs = {name for scan in scans for name in scan.iter_attrs}
         for (depth, func, file, span), scan in zip(funcs, scans, strict=True):
             rewritable = set(scan.positions)
-            # A non-table rename rewrites a default only for a parameter that reaches a referent
-            # role; a table rename rewrites every default equal to the old name.
-            role_params = (
-                None
-                if table_kind is not None
-                else {
-                    name
-                    for _i, name in scan.slots | scan.passes | scan.iter_slots | scan.iter_passes
-                }
-            )
+            # A default is rewritten only for a parameter that reaches a referent role, or, for a
+            # table rename, when it is itself the accessor's argument (``cs=code_set("diets")``);
+            # one read any other way (``if t == "x"``) is left and counted (BACKLOG #5980).
+            role_params = {
+                name for _i, name in scan.slots | scan.passes | scan.iter_slots | scan.iter_passes
+            }
+            defaults = _default_positions(sources, func, file, span, old)
+            kinds = sources.occurrences(file, old)
             rewritable |= _default_positions(sources, func, file, span, old, role_params)
-            if table_kind is None or depth == 0:
-                # ``ignored`` holds bare positions in the decorator's own file; a helper elsewhere
-                # at the same (line, col) is a referent and must stay counted.
-                own = ignored if file == own_file else frozenset()
+            if table_kind is not None:
+                rewritable |= {pos for pos in defaults if kinds.get(pos) == table_kind}
             # A helper's return value is read by its callers, each of which must be in a role.
             returned = frozenset(scan.returned) if depth > 0 else frozenset()
             helper = func.__name__ if depth > 0 else None
@@ -631,17 +629,23 @@ def _referrer_sites(
                 own = ignored if file == own_file else frozenset()
                 site = _Site(file, span, None, frozenset(rewritable), own, scan.reads)
             else:
-                allowed = _accessor_positions(sources, file, span, old, table_kind) | rewritable
-                site = _Site(file, span, frozenset(allowed), reads=scan.reads)
+                # A helper the referrer reaches counts its accessor calls, its role values and
+                # its defaults: a default left because its parameter is read in no role reports
+                # the referrer rather than leaving the helper reading the old table.
+                role = _accessor_positions(sources, file, span, old, table_kind) | rewritable
+                counted = role | {pos for pos in defaults if kinds.get(pos) in (None, table_kind)}
+                site = _Site(file, span, frozenset(counted), frozenset(role), reads=scan.reads)
             sites.append(replace(site, returned=returned, helper=helper))
         # A local that carries a rewritten literal into another read leaves the referrer unresolved.
         complete = complete and not any(scan.unsafe for scan in scans)
         for func in reached:
-            bound_sites, located = _module_binding_sites(
+            bound_sites, located, role_held = _module_binding_sites(
                 func, old, table_kind, sources, role_globals, role_attrs, iter_globals, iter_attrs
             )
             sites.extend(bound_sites)
             complete = complete and located
+            if role_held and held is not None:
+                held.append(True)
         return sites, complete
     if ref.referrer_kind == "inbound":
         conn = registry.inbound.get(ref.referrer)
@@ -688,8 +692,9 @@ def _scanned_referrers(
     out: list[Reference] = []
     for name in sorted(set(table) - known):
         ref = Reference(kind, name, target_kind, old)
-        found = _referrer_sites(registry, ref, old, target_kind, sources, set())
-        if found is not None and any(site.rewritable for site in found[0]):
+        held: list[bool] = []
+        found = _referrer_sites(registry, ref, old, target_kind, sources, set(), held)
+        if found is not None and (held or any(site.rewritable for site in found[0])):
             out.append(ref)
     return out
 
@@ -1589,7 +1594,7 @@ def _module_binding_sites(
     role_attrs: set[str],
     iter_names: set[str],
     iter_attrs: set[str],
-) -> tuple[list[_Site], bool]:
+) -> tuple[list[_Site], bool, bool]:
     """The module-level statements that bind a name ``func`` reads and hold ``old`` -- a global in
     ``func``'s own module, or an attribute of a config module it reads (``_consts.TARGET``) in that
     module -- and whether every such captured value whose value is ``old`` (or a code set named
@@ -1603,9 +1608,12 @@ def _module_binding_sites(
     rewritten, and only in its bound value: a bare global (``role_names``) in ``func``'s own module,
     a module attribute (``role_attrs``) in another, as :func:`_scan_referrer` found them; a name
     the referrer iterates (``iter_names``, ``iter_attrs``) gives its bound value's elements.
-    ``SKIP = "h"`` read only in a comparison is left, and counted (BACKLOG #5980)."""
+    ``SKIP = "h"`` read only in a comparison is left, and counted (BACKLOG #5980). A container a
+    role reads that holds ``old`` (``ALL = [DEST, "OB_A"]``) must be located the same way, and the
+    third value says whether there is one."""
     names_by_file: dict[str, set[str]] = {}
     required: set[tuple[str | None, str]] = set()
+    role_held = False
     for captured in captured_values(func, func.__module__):
         if captured.source == "default":
             continue
@@ -1614,8 +1622,17 @@ def _module_binding_sites(
         if file is not None and captured.source != "closure":
             names_by_file.setdefault(file, set()).add(captured.name)
         value = captured.value
-        if (isinstance(value, str) and value == old) or (
-            isinstance(value, CodeSet) and value.name == old and table_kind == "code_set"
+        # A container is required only when a role reads it: a label table beside a role
+        # (``LABELS = {"diets": ...}``) is not the referent.
+        role_read = captured.name in (
+            role_names | iter_names if captured.source != "attribute" else role_attrs | iter_attrs
+        )
+        contained = not isinstance(value, str) and role_read and _holds(value, old)
+        role_held = role_held or contained
+        if (
+            (isinstance(value, str) and value == old)
+            or contained
+            or (isinstance(value, CodeSet) and value.name == old and table_kind == "code_set")
         ):
             required.add((file if captured.source != "closure" else None, captured.name))
     sites: list[_Site] = []
@@ -1653,7 +1670,23 @@ def _module_binding_sites(
             sites.append(
                 _Site(file, span, frozenset(allowed) if allowed is not None else None, rewritable)
             )
-    return sites, required <= bound
+    return sites, required <= bound, role_held
+
+
+def _holds(value: object, old: str, depth: int = 0) -> bool:
+    """Whether ``value`` is ``old`` or a container holding it (a list, tuple, set, or a dict key
+    or value), a few levels down. A container global the referrer reads, built from another
+    name (``ALL = [DEST, "OB_A"]``), holds the old name with no literal at its own binding, so its
+    binding must be located like a string's or the referrer is unresolved (BACKLOG #5980)."""
+    if isinstance(value, str):
+        return value == old
+    if depth >= 4:
+        return False
+    if isinstance(value, dict):
+        return any(_holds(v, old, depth + 1) for pair in value.items() for v in pair)
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_holds(v, old, depth + 1) for v in value)
+    return False
 
 
 def _binding_read_only_by_referents(
