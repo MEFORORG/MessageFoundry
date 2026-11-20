@@ -148,60 +148,11 @@ if (-not $haveLib) {
 }
 if (-not $StateDir) { $StateDir = Get-UsageStateDir $rootInfo.Path }
 
-# HONESTY RULE 5, AND IT RUNS BEFORE ANYTHING IS READ. Checking availability after loading latest.json
-# would leave a leftover document able to answer first on the JSON path, and the whole hazard here is a
-# frozen low percentage on a dead account reading as headroom. There is no ordering in which a stale
-# number should win over "this account has no subscription", so the marker is consulted at the top.
-$avail = Get-RootUnavailability -StateDir $StateDir
-if ($avail.state -in @('UNAVAILABLE', 'MALFORMED')) {
-    $availRoot = Split-Path $StateDir -Parent
-    # NO seven_day KEY AT ALL, deliberately. Emitting it as null would let a consumer that reaches
-    # straight for a percentage read this as a window that merely has not published yet. Its absence
-    # is what forces the state to be looked at.
-    if ($Json) {
-        [ordered]@{
-            state          = "UNAVAILABLE"
-            exit_code      = 21
-            reason         = $avail.reason
-            marker_state   = $avail.state
-            marker_path    = $avail.marker_path
-            marked_at      = $avail.marked_at
-            marked_by      = $avail.marked_by
-            effective_from = $avail.effective_from
-            advice         = "There is no pool here to spend. Do not send work to this account, and do not read a quiet publish directory under it as spare capacity."
-            config_root    = $availRoot
-            config_root_source = $(if ($script:GaveStateDir) { "-StateDir" } elseif ($rootInfo) { $rootInfo.Source } else { "unknown" })
-            state_dir      = $StateDir
-        } | ConvertTo-Json -Compress | Write-Output
-    }
-    else {
-        Write-Host ""
-        Write-Host "Claude account usage  --  UNAVAILABLE" -ForegroundColor Magenta
-        Write-Host "  config root: $availRoot" -ForegroundColor DarkGray
-        Write-Host ""
-        Write-Host "  This account has NO SUBSCRIPTION. There is no pool here to be a percentage of." -ForegroundColor Magenta
-        Write-Host "  reason: $($avail.reason)"
-        if ($avail.marked_at) { Write-Host "  marked: $($avail.marked_at)$(if ($avail.marked_by) { " by $($avail.marked_by)" })" -ForegroundColor DarkGray }
-        Write-Host "  marker: $($avail.marker_path)" -ForegroundColor DarkGray
-        if ($avail.state -eq 'MALFORMED') {
-            Write-Host ""
-            Write-Host "  The marker itself is damaged, so this is a FAIL-CLOSED refusal." -ForegroundColor Yellow
-            Write-Host "  Fix or remove it:" -ForegroundColor Yellow
-            Write-Host "    pwsh -NoProfile -File scripts\coord\account-availability.ps1 -Status -ConfigDir `"$availRoot`"" -ForegroundColor DarkGray
-        }
-        Write-Host ""
-        Write-Host "  A dead account never burns quota, so a quiet publish directory under it looks exactly"
-        Write-Host "  like an idle account with a full pool. That is what this marker exists to stop."
-        Write-Host ""
-    }
-    exit 21
-}
-
-$latestPath = Join-Path $StateDir "latest.json"
-$histPath = Join-Path $StateDir "history.jsonl"
-
-$doc = $null
-try { $doc = Get-Content -LiteralPath $latestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { }
+# DEFINED BEFORE THE FIRST EARLY EXIT, because -AllRoots surveys every root on every route that
+# reaches a reading, and the routes that refuse this session's own root exit before the reading. A
+# survey that ran only when this root had a usable document was missing exactly when the operator
+# most needs the other roots (BACKLOG #5955).
+$readRoot = Split-Path $StateDir -Parent
 
 # WHY THE READER DIAGNOSES AND THE INSTALLER CANNOT. The reader is the only half that runs INSIDE the
 # pin, so it is the only one positioned to see which root a session really boots against. And because
@@ -319,79 +270,6 @@ function Get-StatusLineDiagnosis([string]$Root, [string]$ReadingFrom) {
         "and can never publish it.")
     return $o
 }
-
-$readRoot = Split-Path $StateDir -Parent
-$rootSource = if ($script:GaveStateDir) { "-StateDir" } elseif ($rootInfo) { $rootInfo.Source } else { "unknown" }
-
-# DIAGNOSED ON EVERY RUN, NOT ONLY WHEN THERE IS NOTHING TO READ. An earlier version computed this
-# inside the no-data branch, which made WIRED_ELSEWHERE -- the arm this diagnosis exists for --
-# unreachable in the case where it misleads most: a root now wired to publish into a SIBLING still has
-# its own older latest.json, so the reader served that stale percentage as current for twenty minutes
-# and then said "no live session is publishing", which is also false. The session is publishing; it is
-# publishing somewhere else, and nothing in the output said so.
-$dx = Get-StatusLineDiagnosis $readRoot $StateDir
-
-if (-not $doc) {
-    if ($Json) {
-        [ordered]@{
-            state             = "UNKNOWN"
-            reason            = "no data"
-            path              = $latestPath
-            config_root       = $readRoot
-            config_root_source = $rootSource
-            settings_path     = $dx.settings_path
-            statusline_state  = $dx.state
-            # THE CAUSE AND THE FIX TRAVEL WITH THE STATE (BACKLOG #1459). The spawn hook reads only
-            # this document, and a bare state name gave it nothing to say but UNKNOWN.
-            statusline_line   = $dx.line
-            statusline_remedy = @($dx.remedy)
-            state_dir         = $StateDir
-            wired_state_dir   = $dx.wired_state_dir
-            wired_collector   = $dx.wired_collector
-        } | ConvertTo-Json -Compress | Write-Output
-    }
-    else {
-        Write-Host ""
-        Write-Host "NO USAGE DATA. Nothing has published to $latestPath." -ForegroundColor Yellow
-        Write-Host "  config root : $readRoot   (from $rootSource)"
-        Write-Host "  settings    : $($dx.settings_path)"
-        Write-Host "  statusLine  : $($dx.line)"
-        Write-Host ""
-        foreach ($l in $dx.remedy) { Write-Host "  $l" }
-        Write-Host ""
-        Write-Host "  This reads the FILE. A file that carries the statusLine is not the same as a statusLine that FIRED."
-        Write-Host ""
-    }
-    exit 20
-}
-
-# RULE 4, THE REFUSAL. Compared against the READ-FROM root -- the root the document actually sits
-# under -- and NOT against the reader's own root. Those are identical on the default path, but
-# comparing against the reader's root would break the two invocations that exist precisely to look
-# elsewhere: the documented single-root peek (-StateDir <other root>) and every row of the -AllRoots
-# survey but one. It still catches the failure it exists for: a reader in A opens A's file, the stamp
-# says B, B is not A, refuse.
-#
-# THE STAMP IT GATES ON IS config_root_env, NOT config_root. config_root is derived from the write
-# path, so it agrees with the write path by construction and could never detect a mis-wire.
-$stampEnv = [string]$doc.published_by.config_root_env
-$provenance = "OK"
-if ($stampEnv -and $stampEnv -ne "unset") {
-    if (-not (Test-SameRoot $stampEnv $readRoot)) {
-        $reason = "published from a DIFFERENT config root ($stampEnv); this document sits under $readRoot -- refusing to report another account's headroom as this session's"
-        if ($Json) { [ordered]@{ state = "UNKNOWN"; reason = $reason; path = $latestPath; config_root = $readRoot; provenance = "FOREIGN" } | ConvertTo-Json -Compress | Write-Output }
-        else { Write-Host ""; Write-Host "UNKNOWN. $reason" -ForegroundColor Yellow; Write-Host "" }
-        exit 20
-    }
-}
-else {
-    # ABSENCE IS UNVERIFIABLE PROVENANCE, NOT WRONG PROVENANCE -- so the reading is used, and the fact
-    # that the guard could not run is stated on every line of output rather than assumed away. It is
-    # also what keeps every hand-written fixture and every pre-change document readable.
-    $provenance = "UNVERIFIED"
-}
-
-$nowUtc = (Get-Date).ToUniversalTime()
 
 function Get-AgeMinutes($v) {
     if (-not $v) { return $null }
@@ -513,6 +391,268 @@ function Get-Percentage($Value) {
 function Test-WindowHasNumber($w) {
     return ($null -ne (Get-Percentage $w.used_percentage))
 }
+
+# ONE LINE PER CONFIG ROOT, AND NOTHING COMPUTED ACROSS THEM. Each row is validated against ITS OWN
+# root, which is why the refusal below compares to the read-from root rather than the reader's -- with
+# the other comparison every row but this session's would render as a refusal.
+function Get-RootSummary([string]$Root) {
+    $sd = Get-UsageStateDir $Root
+    $lp = Join-Path $sd "latest.json"
+    $s = [ordered]@{ root = $Root; state_dir = $sd; published = $false; note = ""; seven = $null; age_min = $null; stale = $false; dated_ahead = $false; available = $true; pending_from = $null }
+    # THE SURVEY IS WHERE A CANCELLED ACCOUNT DOES ITS DAMAGE, because the survey is the only place
+    # accounts are COMPARED -- and a dead one presents as the emptiest pool in the list. Checked per
+    # row against that row's own root, before its document is opened, for the same ordering reason the
+    # single-root read states: a leftover latest.json under a cancelled root must never answer first.
+    $av = Get-RootUnavailability -StateDir $sd
+    if ($av.state -in @('UNAVAILABLE', 'MALFORMED')) {
+        $s.available = $false
+        $marked = if ($av.marked_at) { ", marked $($av.marked_at)" } else { "" }
+        $s.note = if ($av.state -eq 'MALFORMED') { "UNAVAILABLE -- the marker is damaged, refusing fail-closed" } else { "UNAVAILABLE -- $($av.reason)$marked" }
+        return $s
+    }
+    if ($av.state -eq 'PENDING') { $s.pending_from = $av.effective_from }
+    $d = $null
+    try { $d = Get-Content -LiteralPath $lp -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { }
+    # THIS ROW'S CLOCK, read after its document is opened, so Get-AgeMinutes and Test-DatedAfterNow
+    # below see the order Test-DatedAfterNow states: a reading written a moment ago is never dated after
+    # it. It shadows the script's $nowUtc for this function's callees only.
+    $nowUtc = (Get-Date).ToUniversalTime()
+    if (-not $d) {
+        $dx = Get-StatusLineDiagnosis $Root $sd
+        $s.note = "never published  [statusLine: $($dx.state)]"
+        return $s
+    }
+    $env_ = [string]$d.published_by.config_root_env
+    if ($env_ -and $env_ -ne "unset" -and -not (Test-SameRoot $env_ $Root)) {
+        $s.note = "REFUSED -- stamped with a different config root ($env_)"
+        return $s
+    }
+    $s.published = $true
+    # THE SURVEY IS THE ONLY PLACE ACCOUNTS ARE COMPARED, so it is where the cross-root refusal
+    # matters most -- and it was the one place it did not run. Checking only the DOCUMENT stamp passes
+    # a carry-forward: the document was written by this root and sits under this root, while the
+    # numbers inside came from another. Measured: the single-root reader refused the window and the
+    # survey four lines later printed it as this root's own.
+    $sevenOurs = Test-WindowFromRoot $d.seven_day $Root
+    $sevenGone = Test-WindowResetPassed $d.seven_day
+    $s.seven = if ($d.seven_day -and $sevenOurs -and -not $sevenGone -and (Test-WindowHasNumber $d.seven_day)) { Get-Percentage $d.seven_day.used_percentage } else { $null }
+    # AGED BY ITS WINDOW, NOT BY THE DOCUMENT. The collector rewrites the document stamp on EVERY
+    # fire, including a pure carry-forward, so it dates the last fire and not the observation -- a
+    # six-hour-old reading rendered as "[seen 0 min ago]".
+    $sa = if ($d.seven_day) { Get-AgeMinutes $d.seven_day.captured_at } else { $null }
+    # The document stamp is the fallback only when the window carries none, which keeps pre-change
+    # documents and hand-written fixtures readable.
+    $s.age_min = if ($null -ne $sa) { $sa } else { Get-AgeMinutes $d.captured_at }
+    # BOUNDED BOTH WAYS, as the single-root reader is. A reading dated after now has a negative age,
+    # which passes `age -gt max` unconditionally and rendered as fresh.
+    $aheadOf = if ($null -ne $sa) { $d.seven_day.captured_at } else { $d.captured_at }
+    $datedAhead = Test-DatedAfterNow $aheadOf
+    $s.dated_ahead = $datedAhead
+    $s.stale = ($null -eq $s.age_min) -or ($s.age_min -gt $MaxAgeMinutes) -or $datedAhead
+    if (-not $sevenOurs) {
+        $s.note = "REFUSED -- this window was observed under a DIFFERENT config root"
+    }
+    elseif ($sevenGone) { $s.note = "no current reading: this window's reset has passed" }
+    elseif (-not $env_ -or $env_ -eq "unset") { $s.note = "provenance UNVERIFIED" }
+    if ($datedAhead) {
+        $s.note = ("reading is dated in the FUTURE -- clock skew or a bad timestamp" + $(if ($s.note) { " -- $($s.note)" } else { "" }))
+    }
+    # A PENDING CANCELLATION RIDES BESIDE THE NUMBERS RATHER THAN REPLACING THEM. The pool is still
+    # live until that date, so suppressing the percentage would throw away a reading that is true and
+    # spendable today; the end date is what the reader would otherwise have no way to know.
+    if ($s.pending_from) {
+        $s.note = ("cancelled, still live until $($s.pending_from)" + $(if ($s.note) { " -- $($s.note)" } else { "" }))
+    }
+    return $s
+}
+
+function Write-Survey {
+    if ($survey) {
+        Write-Host ""
+        Write-Host "  Config roots under $HomeDir matching the launcher name shape, plus this session's."
+        Write-Host "  A survey -- nothing is summed across accounts:"
+        foreach ($s in $survey) {
+            $mark = if (Test-SameRoot $s.root $readRoot) { "  <- this session" } else { "" }
+            # AN UNAVAILABLE ROOT IS NOT PRINTED IN THE "nothing here" COLOUR. Every other unpublished row
+            # is DarkGray because it means "no reading yet", and a cancelled account rendered identically
+            # would be read as one more root waiting to warm up -- which is precisely the misreading the
+            # marker exists to end. It gets its own colour so the eye separates them in a five-row list.
+            if (-not $s.available) {
+                Write-Host ("    {0,-46} {1}{2}" -f $s.root, $s.note, $mark) -ForegroundColor Magenta
+            }
+            elseif ($s.published) {
+                $v = if ($null -ne $s.seven) { "7d {0,3:0}%" -f $s.seven } else { "7d   -" }
+                # Two branches rather than a computed -ForegroundColor: passing $null to that parameter
+                # throws ("Cannot convert null to type System.ConsoleColor"), measured.
+                if ($s.dated_ahead) {
+                    Write-Host ("    {0,-46} {1}   [STALE -- dated {2} min ahead of now]{3}" -f $s.root, $v, [math]::Abs([double]$s.age_min), $mark) -ForegroundColor DarkGray
+                }
+                elseif ($s.stale) {
+                    Write-Host ("    {0,-46} {1}   [STALE -- confirmed {2} min ago, max {3}]{4}" -f $s.root, $v, $s.age_min, $MaxAgeMinutes, $mark) -ForegroundColor DarkGray
+                }
+                else {
+                    Write-Host ("    {0,-46} {1}   [confirmed {2} min ago]{3}" -f $s.root, $v, $s.age_min, $mark)
+                }
+                if ($s.note) { Write-Host ("    {0,-46} {1}" -f "", $s.note) -ForegroundColor DarkGray }
+            }
+            else {
+                Write-Host ("    {0,-46} {1}{2}" -f $s.root, $s.note, $mark) -ForegroundColor DarkGray
+            }
+        }
+        # ENUMERATED BY A DIFFERENT RULE, so the survey cannot confirm its own predicate. The rows above
+        # come from an anchored, case-sensitive name shape; this pass finds every ~/.claude* directory
+        # carrying a settings.json and names any the survey did not cover. Without it, a root spelled
+        # `.Claude-Account-7` and burning quota would be absent from a list the operator reads as complete.
+        foreach ($c in @(Get-ClaudeConfigCandidates -HomeDir $HomeDir)) {
+            if ($survey | Where-Object { Test-SameRoot $_.root $c.FullName }) { continue }
+            Write-Host ("    {0,-46} not surveyed -- carries a settings.json but is not a launcher-shaped root name" -f $c.Name) -ForegroundColor Yellow
+        }
+    }
+}
+
+# HONESTY RULE 5, AND IT RUNS BEFORE ANYTHING IS READ. Checking availability after loading latest.json
+# would leave a leftover document able to answer first on the JSON path, and the whole hazard here is a
+# frozen low percentage on a dead account reading as headroom. There is no ordering in which a stale
+# number should win over "this account has no subscription", so the marker is consulted at the top.
+$avail = Get-RootUnavailability -StateDir $StateDir
+
+# The survey, taken before this root's own early exits so each of them can print it. Every row checks
+# its own root's marker before opening its document, as the read above does.
+$survey = $null
+if ($AllRoots) {
+    $survey = @()
+    foreach ($r in @(Get-LaunchableConfigRoots -HomeDir $HomeDir)) { $survey += Get-RootSummary $r }
+    if ($rootInfo -and -not ($survey | Where-Object { Test-SameRoot $_.root $readRoot })) {
+        $survey += Get-RootSummary $readRoot
+    }
+}
+
+if ($avail.state -in @('UNAVAILABLE', 'MALFORMED')) {
+    $availRoot = Split-Path $StateDir -Parent
+    # NO seven_day KEY AT ALL, deliberately. Emitting it as null would let a consumer that reaches
+    # straight for a percentage read this as a window that merely has not published yet. Its absence
+    # is what forces the state to be looked at.
+    if ($Json) {
+        [ordered]@{
+            state          = "UNAVAILABLE"
+            exit_code      = 21
+            reason         = $avail.reason
+            marker_state   = $avail.state
+            marker_path    = $avail.marker_path
+            marked_at      = $avail.marked_at
+            marked_by      = $avail.marked_by
+            effective_from = $avail.effective_from
+            advice         = "There is no pool here to spend. Do not send work to this account, and do not read a quiet publish directory under it as spare capacity."
+            config_root    = $availRoot
+            config_root_source = $(if ($script:GaveStateDir) { "-StateDir" } elseif ($rootInfo) { $rootInfo.Source } else { "unknown" })
+            state_dir      = $StateDir
+            roots          = $survey
+        } | ConvertTo-Json -Compress -Depth 6 | Write-Output
+    }
+    else {
+        Write-Host ""
+        Write-Host "Claude account usage  --  UNAVAILABLE" -ForegroundColor Magenta
+        Write-Host "  config root: $availRoot" -ForegroundColor DarkGray
+        Write-Host ""
+        Write-Host "  This account has NO SUBSCRIPTION. There is no pool here to be a percentage of." -ForegroundColor Magenta
+        Write-Host "  reason: $($avail.reason)"
+        if ($avail.marked_at) { Write-Host "  marked: $($avail.marked_at)$(if ($avail.marked_by) { " by $($avail.marked_by)" })" -ForegroundColor DarkGray }
+        Write-Host "  marker: $($avail.marker_path)" -ForegroundColor DarkGray
+        if ($avail.state -eq 'MALFORMED') {
+            Write-Host ""
+            Write-Host "  The marker itself is damaged, so this is a FAIL-CLOSED refusal." -ForegroundColor Yellow
+            Write-Host "  Fix or remove it:" -ForegroundColor Yellow
+            Write-Host "    pwsh -NoProfile -File scripts\coord\account-availability.ps1 -Status -ConfigDir `"$availRoot`"" -ForegroundColor DarkGray
+        }
+        Write-Host ""
+        Write-Host "  A dead account never burns quota, so a quiet publish directory under it looks exactly"
+        Write-Host "  like an idle account with a full pool. That is what this marker exists to stop."
+        Write-Survey
+        Write-Host ""
+    }
+    exit 21
+}
+
+$latestPath = Join-Path $StateDir "latest.json"
+$histPath = Join-Path $StateDir "history.jsonl"
+
+$doc = $null
+try { $doc = Get-Content -LiteralPath $latestPath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { }
+
+$rootSource = if ($script:GaveStateDir) { "-StateDir" } elseif ($rootInfo) { $rootInfo.Source } else { "unknown" }
+
+# DIAGNOSED ON EVERY RUN, NOT ONLY WHEN THERE IS NOTHING TO READ. An earlier version computed this
+# inside the no-data branch, which made WIRED_ELSEWHERE -- the arm this diagnosis exists for --
+# unreachable in the case where it misleads most: a root now wired to publish into a SIBLING still has
+# its own older latest.json, so the reader served that stale percentage as current for twenty minutes
+# and then said "no live session is publishing", which is also false. The session is publishing; it is
+# publishing somewhere else, and nothing in the output said so.
+$dx = Get-StatusLineDiagnosis $readRoot $StateDir
+
+if (-not $doc) {
+    if ($Json) {
+        [ordered]@{
+            state             = "UNKNOWN"
+            reason            = "no data"
+            path              = $latestPath
+            config_root       = $readRoot
+            config_root_source = $rootSource
+            settings_path     = $dx.settings_path
+            statusline_state  = $dx.state
+            # THE CAUSE AND THE FIX TRAVEL WITH THE STATE (BACKLOG #1459). The spawn hook reads only
+            # this document, and a bare state name gave it nothing to say but UNKNOWN.
+            statusline_line   = $dx.line
+            statusline_remedy = @($dx.remedy)
+            state_dir         = $StateDir
+            wired_state_dir   = $dx.wired_state_dir
+            wired_collector   = $dx.wired_collector
+            roots             = $survey
+        } | ConvertTo-Json -Compress -Depth 6 | Write-Output
+    }
+    else {
+        Write-Host ""
+        Write-Host "NO USAGE DATA. Nothing has published to $latestPath." -ForegroundColor Yellow
+        Write-Host "  config root : $readRoot   (from $rootSource)"
+        Write-Host "  settings    : $($dx.settings_path)"
+        Write-Host "  statusLine  : $($dx.line)"
+        Write-Host ""
+        foreach ($l in $dx.remedy) { Write-Host "  $l" }
+        Write-Host ""
+        Write-Host "  This reads the FILE. A file that carries the statusLine is not the same as a statusLine that FIRED."
+        Write-Survey
+        Write-Host ""
+    }
+    exit 20
+}
+
+# RULE 4, THE REFUSAL. Compared against the READ-FROM root -- the root the document actually sits
+# under -- and NOT against the reader's own root. Those are identical on the default path, but
+# comparing against the reader's root would break the two invocations that exist precisely to look
+# elsewhere: the documented single-root peek (-StateDir <other root>) and every row of the -AllRoots
+# survey but one. It still catches the failure it exists for: a reader in A opens A's file, the stamp
+# says B, B is not A, refuse.
+#
+# THE STAMP IT GATES ON IS config_root_env, NOT config_root. config_root is derived from the write
+# path, so it agrees with the write path by construction and could never detect a mis-wire.
+$stampEnv = [string]$doc.published_by.config_root_env
+$provenance = "OK"
+if ($stampEnv -and $stampEnv -ne "unset") {
+    if (-not (Test-SameRoot $stampEnv $readRoot)) {
+        $reason = "published from a DIFFERENT config root ($stampEnv); this document sits under $readRoot -- refusing to report another account's headroom as this session's"
+        if ($Json) { [ordered]@{ state = "UNKNOWN"; reason = $reason; path = $latestPath; config_root = $readRoot; provenance = "FOREIGN"; roots = $survey } | ConvertTo-Json -Compress -Depth 6 | Write-Output }
+        else { Write-Host ""; Write-Host "UNKNOWN. $reason" -ForegroundColor Yellow; Write-Survey; Write-Host "" }
+        exit 20
+    }
+}
+else {
+    # ABSENCE IS UNVERIFIABLE PROVENANCE, NOT WRONG PROVENANCE -- so the reading is used, and the fact
+    # that the guard could not run is stated on every line of output rather than assumed away. It is
+    # also what keeps every hand-written fixture and every pre-change document readable.
+    $provenance = "UNVERIFIED"
+}
+
+$nowUtc = (Get-Date).ToUniversalTime()
+
 
 # The band this reader calls "at the ceiling". A fresh reading here stops work on any provenance, so a
 # stale one with its reset ahead must too; see level_floor below. Get-DecisionCostRung holds its own 98.
@@ -741,76 +881,7 @@ $advice = switch ($overall) {
 
 $blindSpot = "NOT MEASURED: the model-scoped weekly bucket (Fable) and the plan tier are absent from the statusLine payload. Opus and Sonnet are NOT gaps -- they have no separate bucket and count against the 7d all-models window above, so Opus work is fully covered here."
 
-# ONE LINE PER CONFIG ROOT, AND NOTHING COMPUTED ACROSS THEM. Each row is validated against ITS OWN
-# root, which is why the refusal above compares to the read-from root rather than the reader's -- with
-# the other comparison every row but this session's would render as a refusal.
-function Get-RootSummary([string]$Root) {
-    $sd = Get-UsageStateDir $Root
-    $lp = Join-Path $sd "latest.json"
-    $s = [ordered]@{ root = $Root; state_dir = $sd; published = $false; note = ""; seven = $null; age_min = $null; stale = $false; available = $true; pending_from = $null }
-    # THE SURVEY IS WHERE A CANCELLED ACCOUNT DOES ITS DAMAGE, because the survey is the only place
-    # accounts are COMPARED -- and a dead one presents as the emptiest pool in the list. Checked per
-    # row against that row's own root, before its document is opened, for the same ordering reason the
-    # single-root read states: a leftover latest.json under a cancelled root must never answer first.
-    $av = Get-RootUnavailability -StateDir $sd
-    if ($av.state -in @('UNAVAILABLE', 'MALFORMED')) {
-        $s.available = $false
-        $marked = if ($av.marked_at) { ", marked $($av.marked_at)" } else { "" }
-        $s.note = if ($av.state -eq 'MALFORMED') { "UNAVAILABLE -- the marker is damaged, refusing fail-closed" } else { "UNAVAILABLE -- $($av.reason)$marked" }
-        return $s
-    }
-    if ($av.state -eq 'PENDING') { $s.pending_from = $av.effective_from }
-    $d = $null
-    try { $d = Get-Content -LiteralPath $lp -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop } catch { }
-    if (-not $d) {
-        $dx = Get-StatusLineDiagnosis $Root $sd
-        $s.note = "never published  [statusLine: $($dx.state)]"
-        return $s
-    }
-    $env_ = [string]$d.published_by.config_root_env
-    if ($env_ -and $env_ -ne "unset" -and -not (Test-SameRoot $env_ $Root)) {
-        $s.note = "REFUSED -- stamped with a different config root ($env_)"
-        return $s
-    }
-    $s.published = $true
-    # THE SURVEY IS THE ONLY PLACE ACCOUNTS ARE COMPARED, so it is where the cross-root refusal
-    # matters most -- and it was the one place it did not run. Checking only the DOCUMENT stamp passes
-    # a carry-forward: the document was written by this root and sits under this root, while the
-    # numbers inside came from another. Measured: the single-root reader refused the window and the
-    # survey four lines later printed it as this root's own.
-    $sevenOurs = Test-WindowFromRoot $d.seven_day $Root
-    $sevenGone = Test-WindowResetPassed $d.seven_day
-    $s.seven = if ($d.seven_day -and $sevenOurs -and -not $sevenGone -and (Test-WindowHasNumber $d.seven_day)) { Get-Percentage $d.seven_day.used_percentage } else { $null }
-    # AGED BY ITS WINDOW, NOT BY THE DOCUMENT. The collector rewrites the document stamp on EVERY
-    # fire, including a pure carry-forward, so it dates the last fire and not the observation -- a
-    # six-hour-old reading rendered as "[seen 0 min ago]".
-    $sa = if ($d.seven_day) { Get-AgeMinutes $d.seven_day.captured_at } else { $null }
-    # The document stamp is the fallback only when the window carries none, which keeps pre-change
-    # documents and hand-written fixtures readable.
-    $s.age_min = if ($null -ne $sa) { $sa } else { Get-AgeMinutes $d.captured_at }
-    $s.stale = ($null -eq $s.age_min) -or ($s.age_min -gt $MaxAgeMinutes)
-    if (-not $sevenOurs) {
-        $s.note = "REFUSED -- this window was observed under a DIFFERENT config root"
-    }
-    elseif ($sevenGone) { $s.note = "no current reading: this window's reset has passed" }
-    elseif (-not $env_ -or $env_ -eq "unset") { $s.note = "provenance UNVERIFIED" }
-    # A PENDING CANCELLATION RIDES BESIDE THE NUMBERS RATHER THAN REPLACING THEM. The pool is still
-    # live until that date, so suppressing the percentage would throw away a reading that is true and
-    # spendable today; the end date is what the reader would otherwise have no way to know.
-    if ($s.pending_from) {
-        $s.note = ("cancelled, still live until $($s.pending_from)" + $(if ($s.note) { " -- $($s.note)" } else { "" }))
-    }
-    return $s
-}
 
-$survey = $null
-if ($AllRoots) {
-    $survey = @()
-    foreach ($r in @(Get-LaunchableConfigRoots -HomeDir $HomeDir)) { $survey += Get-RootSummary $r }
-    if ($rootInfo -and -not ($survey | Where-Object { Test-SameRoot $_.root $readRoot })) {
-        $survey += Get-RootSummary $readRoot
-    }
-}
 
 if ($Json) {
     [ordered]@{
@@ -921,43 +992,6 @@ if ($provenance -eq "UNVERIFIED") {
 }
 Write-Host ""
 Write-Host "  $blindSpot" -ForegroundColor DarkGray
-if ($survey) {
-    Write-Host ""
-    Write-Host "  Config roots under $HomeDir matching the launcher name shape, plus this session's."
-    Write-Host "  A survey -- nothing is summed across accounts:"
-    foreach ($s in $survey) {
-        $mark = if (Test-SameRoot $s.root $readRoot) { "  <- this session" } else { "" }
-        # AN UNAVAILABLE ROOT IS NOT PRINTED IN THE "nothing here" COLOUR. Every other unpublished row
-        # is DarkGray because it means "no reading yet", and a cancelled account rendered identically
-        # would be read as one more root waiting to warm up -- which is precisely the misreading the
-        # marker exists to end. It gets its own colour so the eye separates them in a five-row list.
-        if (-not $s.available) {
-            Write-Host ("    {0,-46} {1}{2}" -f $s.root, $s.note, $mark) -ForegroundColor Magenta
-        }
-        elseif ($s.published) {
-            $v = if ($null -ne $s.seven) { "7d {0,3:0}%" -f $s.seven } else { "7d   -" }
-            # Two branches rather than a computed -ForegroundColor: passing $null to that parameter
-            # throws ("Cannot convert null to type System.ConsoleColor"), measured.
-            if ($s.stale) {
-                Write-Host ("    {0,-46} {1}   [STALE -- confirmed {2} min ago, max {3}]{4}" -f $s.root, $v, $s.age_min, $MaxAgeMinutes, $mark) -ForegroundColor DarkGray
-            }
-            else {
-                Write-Host ("    {0,-46} {1}   [confirmed {2} min ago]{3}" -f $s.root, $v, $s.age_min, $mark)
-            }
-            if ($s.note) { Write-Host ("    {0,-46} {1}" -f "", $s.note) -ForegroundColor DarkGray }
-        }
-        else {
-            Write-Host ("    {0,-46} {1}{2}" -f $s.root, $s.note, $mark) -ForegroundColor DarkGray
-        }
-    }
-    # ENUMERATED BY A DIFFERENT RULE, so the survey cannot confirm its own predicate. The rows above
-    # come from an anchored, case-sensitive name shape; this pass finds every ~/.claude* directory
-    # carrying a settings.json and names any the survey did not cover. Without it, a root spelled
-    # `.Claude-Account-7` and burning quota would be absent from a list the operator reads as complete.
-    foreach ($c in @(Get-ClaudeConfigCandidates -HomeDir $HomeDir)) {
-        if ($survey | Where-Object { Test-SameRoot $_.root $c.FullName }) { continue }
-        Write-Host ("    {0,-46} not surveyed -- carries a settings.json but is not a launcher-shaped root name" -f $c.Name) -ForegroundColor Yellow
-    }
-}
+Write-Survey
 Write-Host ""
 exit $rank[$overall]
