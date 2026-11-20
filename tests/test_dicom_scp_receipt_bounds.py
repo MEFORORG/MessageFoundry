@@ -279,25 +279,52 @@ async def test_a_run_of_objects_under_the_cap_is_never_counted_together() -> Non
     assert len(captured) == 5
 
 
+def _next_pdu(sock: socket.socket, what: str) -> bytes:
+    """The next whole PDU the SCP sends, read to the length its header gives. Each read is bounded,
+    so a response the SCP never sends fails here within seconds."""
+    header = _first_bytes(sock, 6)
+    assert len(header) == 6, f"no {what} from the SCP within the wait: {header!r}"
+    length = int.from_bytes(header[2:6], "big")
+    assert length <= 16384, f"{what} announced {length} bytes"  # before recv sizes a buffer to it
+    body = _first_bytes(sock, length)
+    assert len(body) == length, f"{len(body)} of the {length} bytes {what} announced"
+    return header + body
+
+
+def _echo(sock: socket.socket, message_id: int) -> tuple[int, int, int]:
+    """Send one C-ECHO-RQ and read its answer whole. Returns the answer's CommandField,
+    MessageIDBeingRespondedTo and Status."""
+    from pynetdicom.dsutils import decode
+    from pynetdicom.pdu import P_DATA_TF
+
+    sock.sendall(_c_echo_rq(message_id))
+    pdu_bytes = _next_pdu(sock, f"answer to C-ECHO-RQ {message_id}")
+    assert pdu_bytes[0] == 0x04, f"not a P-DATA-TF: {pdu_bytes[:10]!r}"
+    pdu = P_DATA_TF()
+    pdu.decode(pdu_bytes)
+    (item,) = pdu.presentation_data_value_items
+    value = item.presentation_data_value
+    assert value is not None and value[0] == 0x03, f"not one whole command: {pdu_bytes!r}"
+    command = decode(BytesIO(value[1:]), True, True)
+    return int(command.CommandField), int(command.MessageIDBeingRespondedTo), int(command.Status)
+
+
 async def test_a_run_of_echoes_is_never_counted_together(monkeypatch: pytest.MonkeyPatch) -> None:
     # A command with no data set completes its message at its own last fragment, as pynetdicom
-    # takes it, so the command-set count starts again there too.
-    from pynetdicom import AE
-    from pynetdicom.sop_class import Verification  # type: ignore[attr-defined]
-
+    # takes it, so the command-set count starts again there too. The SCU is a raw socket because
+    # pynetdicom 3.0.4's SCU reactor can take a C-ECHO-RSP meant for send_c_echo off its own queue
+    # between back-to-back echoes and drop it (vault BACKLOG #5083).
     monkeypatch.setattr(dicom_module, "_MAX_COMMAND_SET_BYTES", 1024)
     async with _running_scp({"timeout_seconds": 30.0}) as scp:
-
-        def echo_forty() -> list[int]:
-            ae = AE(ae_title="MODALITY1")
-            ae.add_requested_context(Verification)
-            assoc = ae.associate("127.0.0.1", scp.sockport, ae_title=_SCP_AE)
-            try:
-                return [int(assoc.send_c_echo().Status) for _ in range(40)]
-            finally:
-                assoc.release()
-
-        assert await asyncio.to_thread(echo_forty) == [0x0000] * 40
+        sock = await _a_held_association(scp.sockport)
+        try:
+            # One at a time: the SCP holds at most two pending requests per association.
+            answers = await asyncio.to_thread(lambda: [_echo(sock, n) for n in range(1, 41)])
+        finally:
+            sock.close()
+    assert [field for field, _, _ in answers] == [0x8030] * 40, answers  # C-ECHO-RSP
+    assert [answered for _, answered, _ in answers] == list(range(1, 41)), answers
+    assert [status for _, _, status in answers] == [0x0000] * 40, answers
     # The command set alone, without the PDU and item headers, is what the count adds up.
     command_set = len(_c_echo_rq(1)) - 12
     assert command_set < 1024 < 40 * command_set
