@@ -2686,7 +2686,21 @@ class Engine:
             # warmed its cache at open, so it would serve state as of its own start while the prior
             # leader went on writing. Re-read it whole here, before the workers start. A write the
             # prior leader commits after this read, while it winds down, is still missed.
-            await self.store.reload_state_cache()
+            #
+            # A failed re-read must not stop the bring-up. Raising here would abort _start_graph
+            # while this node holds the lease, and the supervisor would retry the whole start every
+            # poll with no graph running anywhere. The re-read fails closed and keeps the cache it
+            # warmed at open, so carrying on serves what the engine served before #5984, and the
+            # WARNING says so. Same as the reference-set sync below: a failure there never blocks
+            # intake either.
+            try:
+                await self.store.reload_state_cache()
+            except Exception:
+                log.warning(
+                    "engine: re-reading transform state on promotion failed; this node serves the "
+                    "state cache it loaded at open, which may miss the prior leader's later writes",
+                    exc_info=True,
+                )
         # A3 — dead-letter OUTBOUND/ROUTED rows whose destination/handler left the config (no worker
         # would ever drain them). Now part of graph bring-up, so in a cluster ONLY the leader (the one
         # node that runs the graph) sweeps — a restarting standby never dead-letters the primary's

@@ -16919,6 +16919,19 @@ class MessageStore:
             # Filter in Python (valid_names may be empty → NOT IN () is invalid SQL); the non-terminal
             # channel-keyed backlog is small relative to message history.
             orphans = [r for r in await cur.fetchall() if r["channel_id"] not in valid_names]
+            # queue.id is a nullable SQLite TEXT key. A NULL-id row has no cell to seal its reason
+            # against, so a keyed store's `_enc` refuses it (BACKLOG #5962), and raising here would
+            # abort graph bring-up. `WHERE id=NULL` matches nothing anyway, so the row cannot be
+            # dead-lettered by id: skip it and say so, rather than fail the sweep for every other row.
+            unkeyed = [r for r in orphans if r["id"] is None]
+            if unkeyed:
+                log.warning(
+                    "skipped %d orphaned ingress/routed/response row(s) with a NULL id at startup for"
+                    " missing inbound(s): %s; they cannot be dead-lettered by id",
+                    len(unkeyed),
+                    ", ".join(sorted({r["channel_id"] for r in unkeyed})),
+                )
+                orphans = [r for r in orphans if r["id"] is not None]
             if not orphans:
                 return 0
             error = "inbound removed from registry"

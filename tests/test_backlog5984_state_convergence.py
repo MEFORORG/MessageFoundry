@@ -195,6 +195,36 @@ async def test_active_passive_promotion_reloads_the_state_cache(tmp_path: Path) 
         await eng.stop()
 
 
+async def test_a_failed_promotion_reload_still_brings_the_graph_up(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A raise out of the re-read would abort _start_graph while this node holds the lease, and the
+    # supervisor would retry the whole start every poll with no graph running. The re-read keeps the
+    # cache it warmed at open, so the graph comes up on it and a WARNING says so.
+    cfgdir = tmp_path / "cfg"
+    _graph(cfgdir, tmp_path)
+    coord = _ClusterCoordinator(leader=False)
+    eng = await _engine(tmp_path, coordinator=coord)
+    eng.add_registry(load_config(cfgdir))
+    calls: list[int] = []
+
+    async def _reload() -> None:
+        calls.append(1)
+        raise RuntimeError("state table unreadable")
+
+    eng.store.reload_state_cache = _reload  # type: ignore[method-assign]
+    await eng.start()
+    try:
+        coord.leader = True
+        caplog.set_level(logging.WARNING)
+        await eng._reconcile_graph()  # promotion
+        assert calls == [1]
+        assert eng._registry_runner is not None and eng._registry_runner.running is True
+        assert "re-reading transform state on promotion failed" in caplog.text
+    finally:
+        await eng.stop()
+
+
 async def test_sqlserver_reload_state_cache_rereads_the_shared_table() -> None:
     from messagefoundry.store.sqlserver import SqlServerStore
 

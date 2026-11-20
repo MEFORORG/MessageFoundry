@@ -443,7 +443,7 @@ class Message:
             where = f"{seg!r}" + (f" occurrence {occurrence}" if occurrence > 1 else "")
             raise KeyError(f"cannot add a repetition to absent segment {where}")
         if _builtin_hl7.is_delimiter_field(seg, fld):
-            raise self._delimiter_write_refusal(seg, fld)
+            raise self._delimiter_write_refusal(seg, fld, repetition=True)
         _refuse_frame_bytes(value)
         field_sep, _comp_sep, rep_sep, _esc, _sub_sep = self._encoding_chars()
         if field_sep in value:
@@ -690,15 +690,27 @@ class Message:
         raise self._delimiter_write_refusal(seg, fld)
 
     @staticmethod
-    def _delimiter_write_refusal(seg: str, fld: int) -> ValueError:
+    def _delimiter_write_refusal(seg: str, fld: int, *, repetition: bool = False) -> ValueError:
         """The refusal of a write that would change a header's delimiter field (BACKLOG #5972). The
         parser reads the message's separators once, from the first line, and splits and re-encodes
         every other line on them, so a changed delimiter field would advertise delimiters the rest
-        of the message is not written in."""
+        of the message is not written in.
+
+        The text names what :meth:`_write_delimiter_field` accepts, so it stays true of the write
+        it refuses: ``repetition`` is for :meth:`add_repetition`, which accepts nothing there."""
+        if repetition:
+            accepted = "a repetition cannot be added to it"
+        elif fld == 2:
+            accepted = (
+                "a write there must leave it reading as it does, or keep its four encoding "
+                "characters and add, drop or change only the one v2.7 truncation character after "
+                "them, which must be printable, not a space and not a delimiter"
+            )
+        else:
+            accepted = "a write there must leave it reading as it does"
         return ValueError(
             f"{seg}-{fld} holds the message's delimiters, which every other line is written in; "
-            "it can only be written with the text it already holds. Re-encode the whole message "
-            "to send it under other delimiters"
+            f"{accepted}. Re-encode the whole message to send it under other delimiters"
         )
 
     def _encoding_chars(self) -> tuple[str, str, str, str, str]:

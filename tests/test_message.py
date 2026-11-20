@@ -181,6 +181,27 @@ def test_msh_2_past_its_four_encoding_characters_can_change() -> None:
     assert Message.parse(m.encode())["MSH-2"] == "^~\\&#"
 
 
+def test_a_delimiter_refusal_names_only_what_the_field_accepts() -> None:
+    """The refusal must be true of the write it refuses. Field 2 also accepts a changed v2.7
+    truncation character, so its text must not say only the text already there is accepted, and
+    ``add_repetition`` accepts nothing there."""
+    m = Message.parse(ADT)
+    with pytest.raises(ValueError) as field_1:
+        m.set("MSH-1", "#")
+    assert "must leave it reading as it does. Re-encode" in str(field_1.value)
+    with pytest.raises(ValueError) as field_2:
+        m.set("MSH-2", "#~\\&")
+    assert "change only the one v2.7 truncation character" in str(field_2.value)
+    with pytest.raises(ValueError) as added:
+        m.add_repetition("MSH-2", "x")
+    assert "a repetition cannot be added to it" in str(added.value)
+    for refusal in (field_1.value, field_2.value, added.value):
+        assert "already holds" not in str(refusal)
+    # The accepted truncation-character write the field-2 text names really is accepted.
+    m.set("MSH-2", "^~\\&#")
+    assert m["MSH-2"] == "^~\\&#"
+
+
 def test_a_delimiter_write_of_the_text_already_there_changes_nothing() -> None:
     """A passthrough copy of the header (``set("MSH-2", msg["MSH-2"])``) still works."""
     m = Message.parse(ADT)
