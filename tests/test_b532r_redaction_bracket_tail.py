@@ -121,11 +121,17 @@ def _corpus() -> list[str]:
     return lines
 
 
-def _stable(line: str) -> tuple[bool, bool]:
+def _reading(line: str) -> tuple[str, str, bool, bool]:
+    """A line's scrub, its bundle read, and whether a second pass keeps the scrub, and keeps the
+    bundle read of the chain line."""
     once = scrub_credentials(line)
-    chain = scrub_log_text(line)
-    bundle = redact_log_line(chain)
-    return scrub_credentials(once) == once, redact_log_line(bundle) == bundle
+    bundle = redact_log_line(scrub_log_text(line))
+    return (
+        once,
+        redact_log_line(line),
+        scrub_credentials(once) == once,
+        redact_log_line(bundle) == bundle,
+    )
 
 
 def test_the_tail_makes_no_line_of_the_corpus_unstable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -135,25 +141,26 @@ def test_the_tail_makes_no_line_of_the_corpus_unstable(monkeypatch: pytest.Monke
     import messagefoundry.support.redact as redact_mod
 
     lines = _corpus()
-    # The corpus is not empty, so "no line got worse" is a reading over lines, not over none.
-    assert len(lines) >= 1500
-    shipped = [_stable(line) for line in lines]
-    shipped_out = [scrub_credentials(line) for line in lines]
+    assert lines
+    shipped = [_reading(line) for line in lines]
     control = re.compile(
         scrub_mod._WIDE_DSN_PASSWORD.pattern.replace(scrub_mod._DSN_TAIL, ""),
         scrub_mod._WIDE_DSN_PASSWORD.flags,
     )
     monkeypatch.setattr(scrub_mod, "_WIDE_DSN_PASSWORD", control)
     monkeypatch.setattr(redact_mod, "_WIDE_DSN_PASSWORD", control)
-    without = [_stable(line) for line in lines]
+    without = [_reading(line) for line in lines]
+    # Positive controls, one per patched module: the tail changes some lines read by
+    # scrub_credentials, and some read by redact_log_line on its own, so the comparison below
+    # sets two different readings side by side, over lines the tail reaches.
+    assert sum(a[0] != b[0] for a, b in zip(shipped, without, strict=True)) >= 10
+    assert sum(a[1] != b[1] for a, b in zip(shipped, without, strict=True)) >= 10
     worse = [
         line
         for line, a, b in zip(lines, shipped, without, strict=True)
-        if (b[0] and not a[0]) or (b[1] and not a[1])
+        if (b[2] and not a[2]) or (b[3] and not a[3])
     ]
     assert not worse, worse[:5]
-    # Positive control: the tail changes the output of some lines of the corpus.
-    assert any(scrub_credentials(line) != out for line, out in zip(lines, shipped_out, strict=True))
 
 
 @pytest.mark.parametrize("call", _ENTRY_POINTS, ids=_IDS)
