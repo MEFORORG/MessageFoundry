@@ -4285,8 +4285,9 @@ _LOOPBACK_SANS = (("ip", "127.0.0.1"), ("ip", "::1"), ("dns", "localhost"))
         ("127.0.0.1", _LOOPBACK_SANS),
         ("::1", (("ip", "::1"), ("ip", "127.0.0.1"), ("dns", "localhost"))),
         ("localhost", (("dns", "localhost"), ("ip", "127.0.0.1"), ("ip", "::1"))),
-        ("10.0.0.9", (("ip", "10.0.0.9"), *_LOOPBACK_SANS)),
-        ("engine.example.test", (("dns", "engine.example.test"), *_LOOPBACK_SANS)),
+        # A specific off-loopback bind listens on no loopback, so it names no loopback name.
+        ("10.0.0.9", (("ip", "10.0.0.9"),)),
+        ("engine.example.test", (("dns", "engine.example.test"),)),
         # A wildcard is dialled on its own family's loopback (BACKLOG #5973), which stays named
         # right after the bind host, then the other loopback names (BACKLOG #5790).
         ("0.0.0.0", (("ip", "0.0.0.0"), *_LOOPBACK_SANS)),
@@ -4294,8 +4295,8 @@ _LOOPBACK_SANS = (("ip", "127.0.0.1"), ("ip", "::1"), ("dns", "localhost"))
         # Another spelling of a loopback name is the bind host's entry, not a second one.
         ("0:0:0:0:0:0:0:1", (("ip", "::1"), ("ip", "127.0.0.1"), ("dns", "localhost"))),
         ("LOCALHOST", (("dns", "LOCALHOST"), ("ip", "127.0.0.1"), ("ip", "::1"))),
-        # A bracketed host is written as a DNS name, so it does not stand in for the ::1 entry.
-        ("[::1]", (("dns", "[::1]"), *_LOOPBACK_SANS)),
+        # A bracketed host is written as a DNS name and is not a loopback host, so it gets none.
+        ("[::1]", (("dns", "[::1]"),)),
     ],
 )
 def test_the_minted_certificate_names_the_bind_host_and_every_loopback(
@@ -4305,8 +4306,9 @@ def test_the_minted_certificate_names_the_bind_host_and_every_loopback(
     d20261119T191457909-25c3aa).
 
     Mutation: mint with the SAN origin/main had before BACKLOG #5790, the bind host plus a wildcard
-    bind's own loopback. Red: every row, since each lacks at least ``localhost`` or a loopback
-    literal."""
+    bind's own loopback. Red: every loopback and wildcard row, since each lacks at least
+    ``localhost`` or a loopback literal. Mutation: add the loopback names for every bind. Red: the
+    three off-loopback rows."""
     cert, _ = ensure_api_tls_material(ApiSettings(host=host), state_dir=tmp_path)
     assert tuple(_san_entries(cert)) == names
 
