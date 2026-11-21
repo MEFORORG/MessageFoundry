@@ -10,13 +10,13 @@ delimiter, and each part's ``Content-Disposition`` gives its field name + (for a
 **hard size cap** is enforced on each part before any of its content is copied.
 
 What it refuses, at least: more than ``_MAX_PARTS`` parts, a part header block over
-``_MAX_PART_HEADER_BYTES``, a file part over the caller's cap, any other part over
-``_MAX_FIELD_BYTES`` (a nameless one included), a part with no header block at any size, a body
-with no
-closing delimiter line, a line before the close marker, the preamble included, that starts with
-``--<boundary>`` but is not a delimiter line (both BACKLOG #5787; the epilogue after the close marker
-is never read), and, in :func:`parse_single_file_upload`, a body with no file part or with more than
-one.
+``_MAX_PART_HEADER_BYTES``, a file part over the caller's cap, a text field over
+``_MAX_FIELD_BYTES``, and, in :func:`parse_single_file_upload`, a body with no file part or with
+more than one. BACKLOG #5787 adds, at least: a body with no closing delimiter line; a line before
+the close marker that starts with ``--<boundary>`` but is not a delimiter line; boundary text in the
+preamble, which would otherwise drop the first part; a line starting with ``--<boundary>`` after the
+close marker; a part with no header block; and a part whose header names neither a ``name`` nor a
+``filename`` (RFC 7578 requires a name). The last two are refused at any size.
 
 **What a delimiter line is** (BACKLOG #5787). ``--<boundary>`` counts only at the start of the body
 or right after a CR or an LF, so boundary text in the middle of a line is part content. After it come
@@ -27,14 +27,15 @@ still parse. A body cut inside its close marker, ending ``--<boundary>-``, is re
 A close-marker line with text after its padding (``--<boundary>--epilogue``) is refused, not taken as
 the close, because the same line inside a file would otherwise end the file there. A file line
 that is a plain delimiter line splits the file. Where the rest has no blank CRLF line, it has no
-header block, so it is refused; where it has one, see the next paragraph.
+header block; where it has one, the rest reads as a part with a header block but no name. Either
+way that part is refused.
 
 **What it still trusts.** A part's content must not hold a whole delimiter line. Because a bare CR is
 a line break, every HL7 segment start is a line start, so a file whose segment is a close-marker
 line (``--<boundary>--``, padding allowed) still ends there, and a body cut short after such a
-segment is taken as complete. At least that, and a split whose rest has a blank CRLF line in it,
-which then reads as a part with a header block: with no name it is dropped, up to
-``_MAX_FIELD_BYTES``, and the file is stored short.
+segment is taken as complete, unless the epilogue after it holds a line starting with the
+boundary, which a body with the real close marker later always does. At least that remains, and a
+split whose rest happens to read as a named part (its own ``Content-Disposition`` with a ``name``).
 A real client picks a boundary its content never holds (RFC 2046), so this is the same invariant
 every multipart parser rests on, narrowed from any boundary text to a whole line of it.
 
@@ -105,8 +106,8 @@ class MultipartError(ValueError):
 
 class MultipartTooLargeError(MultipartError):
     """A file part exceeds the caller's byte cap, or a non-file part with a header block exceeds
-    ``_MAX_FIELD_BYTES`` (HTTP 413). A part with no header block raises the base
-    :class:`MultipartError` instead (HTTP 400), at any size."""
+    ``_MAX_FIELD_BYTES`` (HTTP 413). A part with no header block, or with neither a name nor a
+    filename, raises the base :class:`MultipartError` instead (HTTP 400), at any size."""
 
 
 @dataclass(frozen=True)
@@ -198,7 +199,8 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     alive at once. Here the only copy of a part's content is the one the caller takes of a value it
     keeps. Two passes: the first counts parts, bounds each header block and refuses each part with no
     header block, all before any header is parsed; the second parses each header, which says
-    whether the part is a file, and applies the file and field caps to the part's length.
+    whether the part is a file, refuses one with neither a name nor a filename, and applies the
+    file and field caps to the part's length.
 
     Raises what :func:`parse_multipart_form` documents."""
     boundary = parse_boundary(content_type)
@@ -210,14 +212,28 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     spans: list[tuple[int, int, int, int]] = []
     count = 0
     closed = False
-    # Anything before the first delimiter line is the ignorable preamble, except that a preamble line
-    # starting with the boundary is read like any other and refused if it is not a delimiter line; the
-    # close marker ends the walk, and anything after it is the ignorable epilogue.
+    # Anything before the first delimiter line is the ignorable preamble, unless it holds boundary
+    # text; the close marker ends the walk, and anything after it is the ignorable epilogue, unless a
+    # line of it starts with the boundary.
     pos = lines.next(0)
     seen = pos != -1
+    if seen and body.find(delim, 0, pos) != -1:
+        # BACKLOG #5787: bytes before the first delimiter on its own line (a BOM, stray text) make
+        # that line preamble, so the first part would be dropped unseen. Main parsed or refused it.
+        raise MultipartError(
+            "multipart body has boundary text before its first delimiter line; the first part "
+            "would be lost"
+        )
     while pos != -1:
         start, closed = lines.tail(pos)
         if closed:
+            if lines.next(start) != -1:
+                # BACKLOG #5787: no client writes a delimiter after its close marker, and a file
+                # line that is a close-marker line, ahead of the real one, leaves exactly this.
+                raise MultipartError(
+                    "multipart body has a line starting with the boundary after its close "
+                    "marker; a file line may hold the close marker"
+                )
             break
         nxt = lines.next(start)
         end = len(body) if nxt == -1 else nxt
@@ -267,14 +283,20 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     for head_start, head_end, content_start, content_end in spans:
         name, filename = _disposition(body[head_start:head_end])
         size = content_end - content_start
+        if name is None and filename is None:
+            # BACKLOG #5787: refused at any size, not skipped. RFC 7578 requires a name, and a file
+            # split at a whole delimiter line, whose rest holds a blank CRLF line, leaves this
+            # shape: skipping it would store the file cut short.
+            raise MultipartError(
+                "multipart part has neither a name nor a filename in its Content-Disposition; "
+                "a file line that is a whole boundary delimiter line can leave one"
+            )
         if filename is not None:
             if size > max_file_bytes:
                 raise MultipartTooLargeError(
                     f"uploaded file part is {size} bytes; the limit is {max_file_bytes}"
                 )
         elif size > _MAX_FIELD_BYTES:
-            # Every non-file part, named or not: a part with neither name= nor filename= is kept by
-            # nobody, and it must not be the one shape whose length only the body cap bounds.
             raise MultipartTooLargeError(
                 f"multipart text field is {size} bytes; the limit is {_MAX_FIELD_BYTES}. "
                 f"{_FILE_AS_FIELD_HINT}"
@@ -367,14 +389,16 @@ def parse_multipart_form(
     """Parse a ``multipart/form-data`` body into file parts + text fields.
 
     Raises :class:`MultipartError` if the Content-Type is not multipart, the body is malformed, it
-    has no closing delimiter line, it holds more than ``_MAX_PARTS`` parts, a part with no header
-    block, or a line starts with the delimiter but is not a delimiter line (all HTTP 400 at the
-    route), and :class:`MultipartTooLargeError` if a file part exceeds ``max_file_bytes`` or a
+    has no closing delimiter line, it holds more than ``_MAX_PARTS`` parts, it has boundary text in
+    its preamble or a boundary line after its close marker, a part has no header block or neither a
+    name nor a filename, or a line starts with the delimiter but is not a delimiter line (all HTTP
+    400 at the route), and :class:`MultipartTooLargeError` if a file part exceeds ``max_file_bytes`` or a
     non-file part with a header block exceeds ``_MAX_FIELD_BYTES`` (HTTP 413 at the route).
 
-    The order, where a body has more than one fault: first the walk's refusals (the part count, an
-    oversized header block, a part with no header block, a misdelimited line), in body order; then
-    the size caps, part by part; then, last, a body with no delimiter line or no close marker. So an
+    The order, where a body has more than one fault: first the walk's refusals (preamble boundary
+    text, the part count, an oversized header block, a part with no header block, a misdelimited
+    line, a boundary line after the close marker), in body order; then, part by part, a part with
+    neither a name nor a filename and the size caps; then, last, a body with no delimiter line or no close marker. So an
     unclosed body with an oversized part gets the 413. The module docstring says what a delimiter
     line is and what the parser still trusts of a part's content.
 
