@@ -307,7 +307,8 @@ def _written(seps: Seps, *values: str) -> None:
     or every digit, not the one draw, so whether a message is refused depends on its MSH-1, MSH-2
     and the shape of its value, never on the salt. Text a surrogate copies from the sender is not
     checked here, at least a kept CX component, an identifier's or SSN's punctuation and a date's
-    year and TS.2; the adapters still check the whole field for the field separator."""
+    year and TS.2, except at least the date of birth's fraction dot, which is checked; the
+    adapters still check the whole field for the field separator."""
     checked = (("field separator", seps.field, "MSH-1"),) + tuple(
         (role, char, "MSH-2") for role, char in _declared(seps)
     )

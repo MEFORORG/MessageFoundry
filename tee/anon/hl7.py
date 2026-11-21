@@ -15,16 +15,15 @@ cases known to differ (a header not in capitals among them). A ``BHS`` or ``FHS`
 the same field on both sides, and both refuse a short later header line (BACKLOG #2998).
 
 Never string-slices in the forbidden sense: it splits only on the message's *actual* field separator
-(read from MSH) and replaces whole fields. A surrogate value CAN hold the field separator under a
-custom MSH-1. At least: the date fill writes ``+``, the free-text redaction writes ``[`` and ``]``,
-every street in the address pool holds a space, and the surrogate kinds write letters and digits.
-Joined back, such a value would add fields and renumber every later field for any reader of the
-output. So :func:`_whole_field` refuses the values a RULE writes that the engine adapter's
-whole-field ``Message.set`` refuses (BACKLOG #5540). The shared site-code pass that runs after
-the rules writes no digit the message declares as a separator. What a surrogate writes itself
-is also judged against the field separator and the MSH-2 delimiters, the same on both adapters,
-in the shared ``surrogates.surrogate_field_recorded`` (``surrogates._written`` says what it
-leaves to this check).
+(read from MSH) and replaces whole fields. Joined back, a field value holding the field
+separator would add fields and renumber every later field for any reader of the output. What a
+surrogate writes itself, such as the date fill's ``+``, the free-text redaction's ``[`` and ``]``
+and a street's space, is judged first, against the field separator and the MSH-2 delimiters, the
+same on both adapters, in the shared ``surrogates.surrogate_field_recorded`` (BACKLOG #5540).
+:func:`_whole_field` then checks the whole field a rule wrote, sender text it kept included, for
+the field separator, CR, LF, an MLLP frame byte or NUL, which the engine adapter's whole-field
+``Message.set`` refuses too. The shared site-code pass that runs after the rules writes no digit
+the message declares as a separator.
 """
 
 from __future__ import annotations
