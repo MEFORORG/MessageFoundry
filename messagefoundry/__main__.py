@@ -14982,10 +14982,14 @@ def _engine_refusal_text(exc: BaseException) -> str:
     A refusal such as the SQL Server open's READ_COMMITTED_SNAPSHOT check embeds the driver error
     it was raised from, and a server's text can quote a stored value. The chain is followed through
     ``__cause__``, or ``__context__`` where no cause was set. Each link that is not itself an engine
-    refusal has its ``repr``, its ``str`` and each of its string arguments replaced wherever the
-    refusal quotes them. Every occurrence is replaced: a short cause text that also appears in the
-    refusal's own prose costs that prose, which is the cheaper failure. A quotation in any other
-    shape is not caught; the refusal sites themselves are unchanged."""
+    refusal has its ``repr``, its ``str``, that ``str`` as :func:`redact_log_line` renders it, and
+    each of its string arguments replaced wherever the refusal quotes them. The redacted form is
+    there because the SQL Server options check quotes its driver errors that way (BACKLOG #5666).
+    Every occurrence is replaced: a short cause text that also appears in the refusal's own prose
+    costs that prose, which is the cheaper failure. A quotation in any other shape is not caught;
+    the refusal sites themselves are unchanged."""
+    from messagefoundry.support.redact import redact_log_line
+
     text = str(exc)
     renderings: list[str] = []
     link = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
@@ -14995,7 +14999,12 @@ def _engine_refusal_text(exc: BaseException) -> str:
         if not _is_engine_refusal(link):
             # Longest first, so a repr is replaced before the str inside it; a placeholder keeps a
             # rendering from being matched again by a later, shorter quotation.
-            quotations = {repr(link), str(link), *(a for a in link.args if isinstance(a, str))}
+            quotations = {
+                repr(link),
+                str(link),
+                redact_log_line(str(link)),
+                *(a for a in link.args if isinstance(a, str)),
+            }
             for quoted in sorted((q for q in quotations if len(q) > 5), key=len, reverse=True):
                 if quoted in text:
                     text = text.replace(quoted, f"\x00{len(renderings)}\x00")

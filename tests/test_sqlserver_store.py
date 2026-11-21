@@ -7273,6 +7273,63 @@ async def test_an_alert_ack_under_nocount_still_writes_its_audit_row(store) -> N
     assert len(await store.list_audit(action=action)) == 1
 
 
+async def test_writes_that_read_output_hold_under_nocount(store) -> None:
+    """BACKLOG #5672, #5675, #5692: ``delete_search_preset``, ``attachment_incref`` and
+    ``upsert_alert_instance`` read their match from ``OUTPUT``, so a session with ``SET NOCOUNT ON``
+    left on still reports a delete, refuses an incref of a missing blob, and inserts a first alert.
+    Each was red before its row on such a session, where ``rowcount`` is -1."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    await store.upsert_search_preset(
+        preset_id="nocount-preset", owner_user_id="alice", name="nocount", criteria="{}"
+    )
+    settings = load_settings(environ=os.environ).store
+    async with SqlServerStore._one_connection_store(settings, posture=None) as one:
+        try:
+            await one._fetchall("SET NOCOUNT ON; SELECT 1 AS one")
+            _, nocount = await _nocount_reading(one)
+            assert nocount == 512, "the control: the session the writes borrow has NOCOUNT on"
+            assert (
+                await one.delete_search_preset(preset_id="nocount-preset", owner_user_id="alice")
+                is True
+            )
+            with pytest.raises(KeyError):
+                await one.attachment_incref("e" * 64)
+            await one.upsert_alert_instance(
+                event_type="connection_error", connection="OB_NOCOUNT_5692", severity="warning"
+            )
+        finally:
+            await one._execute("SET NOCOUNT OFF;")
+    assert [
+        a
+        for a in await store.list_active_alert_instances(allowed_channels=None)
+        if a.connection == "OB_NOCOUNT_5692"
+    ], "the first fire under NOCOUNT was inserted"
+
+
+async def test_concurrent_first_alert_fires_do_not_collide(store) -> None:
+    """BACKLOG #5692: a per-key applock held to the commit makes concurrent first fires on one key
+    queue rather than both INSERT and fail on ``ux_alert_instance_open``. Every fire lands on one
+    live instance. Nothing here proves the fires overlapped, so a pass without the lock is
+    possible on a fast leg; the unit test pins that the lock is taken."""
+    fires = 8
+    await asyncio.gather(
+        *(
+            store.upsert_alert_instance(
+                event_type="connection_error", connection="OB_RACE_5692", severity="warning"
+            )
+            for _ in range(fires)
+        )
+    )
+    [alert] = [
+        a
+        for a in await store.list_active_alert_instances(allowed_channels=None)
+        if a.connection == "OB_RACE_5692"
+    ]
+    assert alert.count == fires
+
+
 async def test_backlog_2097_nocount_persistence_probe() -> None:
     """A MEASUREMENT, reported as a warning rather than asserted, because the answer is research.
 
