@@ -141,16 +141,19 @@ class _Raw:
 
 
 class _OptionsCursor:
+    """Its limit is the connection's ``timeout`` when it was created, as pyodbc's ``Cursor_New``
+    reads it; a later change to the connection does not reach it."""
+
     def __init__(
         self, raw: _Raw, row: tuple[int, int], timeouts: dict[str, int], alters_fail: bool
     ) -> None:
-        self._raw = raw
+        self._limit = raw.timeout
         self._row = row
         self._timeouts = timeouts
         self._alters_fail = alters_fail
 
     async def execute(self, sql: str, *params: Any) -> None:
-        self._timeouts[sql] = self._raw.timeout
+        self._timeouts[sql] = self._limit
         if self._alters_fail and sql.startswith("ALTER DATABASE"):
             raise RuntimeError(_DRIVER_TEXT)
 
@@ -164,10 +167,10 @@ class _OptionsCursor:
 class _OptionsConn:
     def __init__(self, row: tuple[int, int], timeouts: dict[str, int], alters_fail: bool) -> None:
         self._conn = _Raw()
-        self._cursor = _OptionsCursor(self._conn, row, timeouts, alters_fail)
+        self._args = (row, timeouts, alters_fail)
 
     async def cursor(self) -> _OptionsCursor:
-        return self._cursor
+        return _OptionsCursor(self._conn, *self._args)
 
     async def close(self) -> None:
         pass
@@ -197,29 +200,33 @@ def _install(
     return timeouts
 
 
-async def test_the_options_alters_run_under_the_command_timeout(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+_STATE_READ = (
+    "SELECT is_read_committed_snapshot_on, snapshot_isolation_state "
+    "FROM sys.databases WHERE name = DB_NAME()"
+)
+_REREAD = "SELECT is_read_committed_snapshot_on FROM sys.databases WHERE name = DB_NAME()"
+
+
+async def test_the_open_bounds_its_reads_and_not_its_alters(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Red before #5666: the one-shot connection kept pyodbc's default of no statement limit, so an
-    ALTER DATABASE waiting on a long transaction could stall the open without end. The re-read
-    connections are bounded too."""
+    """Red before #5666: the open's state read and re-read probes kept pyodbc's default of no
+    statement limit. They now run under ``[store].command_timeout``. The ALTERs keep no limit: a
+    cancel landing after ROLLBACK IMMEDIATE rolled back the peers would leave RCSI off, and the
+    retry at every restart would roll them back again."""
     timeouts = _install(monkeypatch, alters_fail=False)
-    caplog.set_level(logging.DEBUG, logger=sqlserver_module.log.name)
     await SqlServerStore._ensure_database_options(_settings())
-    assert timeouts[_ALTER_RCSI] == 17
-    assert timeouts[_ALTER_SNAPSHOT] == 17
-    assert all(seconds == 17 for seconds in timeouts.values()), timeouts
+    assert timeouts == {_STATE_READ: 17, _ALTER_RCSI: 0, _ALTER_SNAPSHOT: 0}, timeouts
     reread = _install(monkeypatch)  # the ALTER fails, so the re-read probes run
     with pytest.raises(RuntimeError, match="READ_COMMITTED_SNAPSHOT is OFF"):
         await SqlServerStore._ensure_database_options(_settings())
-    assert len(reread) == 3 and all(seconds == 17 for seconds in reread.values()), reread
+    assert reread == {_STATE_READ: 17, _ALTER_RCSI: 0, _REREAD: 17}, reread
 
 
 async def test_provision_schema_options_alters_keep_no_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """provision-schema (``fail_closed=False``) is a DBA's one-time run, so its ALTERs keep no
-    statement limit, as the schema batch's DDL does."""
+    """provision-schema (``fail_closed=False``) runs every statement with no limit, as on main."""
     timeouts = _install(monkeypatch, alters_fail=False)
     await SqlServerStore._ensure_database_options(_settings(), fail_closed=False)
     assert timeouts[_ALTER_RCSI] == 0

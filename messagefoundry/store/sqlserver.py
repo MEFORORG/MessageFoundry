@@ -1113,16 +1113,16 @@ def _options_error(exc: BaseException) -> str:
     return redact_log_line(str(exc))
 
 
-def _bound_one_shot(conn: Any, settings: StoreSettings) -> None:
-    """Apply ``[store].command_timeout`` to a one-shot options connection at an open (BACKLOG
-    #5666), as :meth:`SqlServerStore._acquire` does for a pooled one, so an ``ALTER DATABASE``
-    waiting on a long transaction ends at that limit. 0 means no limit here, as everywhere it applies. Where the
-    raw pyodbc connection is unreachable it warns, as the claim connection does (STORE-3), rather
-    than run unbounded in silence."""
+def _bound_one_shot(conn: Any, seconds: int) -> None:
+    """Set the statement limit, in seconds, of the cursors a one-shot options connection opens
+    from now on (BACKLOG #5666); pyodbc applies a connection's ``timeout`` to each cursor as it is
+    created. 0 means no limit. Where the raw pyodbc connection is unreachable and a limit was
+    asked for, it warns, as the claim connection does (STORE-3), rather than run unbounded in
+    silence."""
     raw = getattr(conn, "_conn", None)
     if raw is not None:
-        raw.timeout = settings.command_timeout
-    else:
+        raw.timeout = seconds
+    elif seconds:
         log.warning(
             "sqlserver: cannot reach the raw pyodbc connection to apply command_timeout on the"
             " database-options check; its statements run with no statement limit (STORE-3)"
@@ -4907,7 +4907,7 @@ class SqlServerStore:
                     try:
                         _require_call_gate(probe)  # BACKLOG #2394, as on `conn` below
                         if fail_closed:
-                            _bound_one_shot(probe, settings)
+                            _bound_one_shot(probe, settings.command_timeout)
                         pcur = await probe.cursor()
                         await pcur.execute(
                             "SELECT is_read_committed_snapshot_on FROM sys.databases"
@@ -4951,12 +4951,11 @@ class SqlServerStore:
             # its first call, and the `finally` closes it while nothing runs on it.
             _require_call_gate(conn)
             if fail_closed:
-                # BACKLOG #5666: an open is bounded, so an ALTER waiting on a long transaction ends
-                # the open at the limit and a restart retries. provision-schema is a DBA's one-time
-                # run, so its ALTERs keep no limit, as the schema batch's DDL does (B10/ADR 0060):
-                # cancelling the RCSI ALTER after its ROLLBACK IMMEDIATE has already disrupted the
-                # database would leave RCSI off for nothing.
-                _bound_one_shot(conn, settings)
+                # BACKLOG #5666: at an open, the state read and the re-read probes run under
+                # [store].command_timeout. The ALTERs below do not, at an open or under
+                # provision-schema: a cancel that lands after ROLLBACK IMMEDIATE has rolled back
+                # the peers leaves RCSI off, and the retry at every restart rolls them back again.
+                _bound_one_shot(conn, settings.command_timeout)
             await _assert_autocommit(conn)
             # Standalone one-shot connection (NOT pooled), so the EF-6 pool-bleed race `_cursor`
             # guards against cannot arise; `_close_one_shot` still closes the cursor first.
@@ -4979,6 +4978,13 @@ class SqlServerStore:
                 log.warning("%s", message)
                 return
             off = _options_off(row)
+            if off and fail_closed:
+                # The ALTERs run with no statement limit, as on a provision-schema run, so they get
+                # a cursor opened after the limit is lifted (see the comment at the state read).
+                await cur.close()
+                cur = None
+                _bound_one_shot(conn, 0)
+                cur = await conn.cursor()
             if "READ_COMMITTED_SNAPSHOT" in off:
                 try:
                     await cur.execute(
