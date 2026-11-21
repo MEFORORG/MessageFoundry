@@ -2046,6 +2046,7 @@ def test_a_pep562_getattr_import_is_a_module_export_for_the_scope_aware_reading(
         "    if name == 'legacy':\n        return seal\n    raise AttributeError(name)\n",
         "    if name in ('legacy', 'old'):\n        return seal\n    raise AttributeError(name)\n",
         "    if name in __all__:\n        return seal\n    raise AttributeError(name)\n",
+        "    if name != 'legacy':\n        raise AttributeError(name)\n    return seal\n",
     )
     for body in guarded:
         served = dict(sources)

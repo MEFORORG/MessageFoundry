@@ -622,9 +622,20 @@ def _returned_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     (``return wrap(seal)``) is not one. A ``return`` under an ``if`` that tests the hook's
     parameter counts only when that test admits the name as a string literal (``name == "seal"``,
     ``name in ("seal", ...)``); a test it cannot read admits none, so ``if name == "legacy":
-    return seal`` exports nothing, as before the hook was followed."""
+    return seal`` exports nothing, as before the hook was followed. A ``return`` under no such
+    ``if`` counts only when no other test in the hook reads the parameter, so an early
+    ``if name != "legacy": raise`` exports nothing either."""
     param = (fn.args.posonlyargs + fn.args.args)[:1]
     pname = param[0].arg if param else None
+    guarded = pname is not None and any(
+        (
+            isinstance(n, (ast.If, ast.While, ast.IfExp, ast.Assert))
+            and _reads_name(n.test, pname)
+            and not _admitted(n.test, pname)
+        )
+        or (isinstance(n, ast.Match) and _reads_name(n.subject, pname))
+        for n in _own_nodes(fn)
+    )
     out: set[str] = set()
     stack: list[tuple[ast.AST, frozenset[str] | None]] = [(n, None) for n in fn.body]
     while stack:
@@ -632,7 +643,9 @@ def _returned_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
             continue
         if isinstance(node, ast.Return):
-            if isinstance(node.value, ast.Name) and (allowed is None or node.value.id in allowed):
+            if isinstance(node.value, ast.Name) and (
+                not guarded if allowed is None else node.value.id in allowed
+            ):
                 out.add(node.value.id)
             continue
         if isinstance(node, ast.If) and pname is not None and _reads_name(node.test, pname):
@@ -642,6 +655,19 @@ def _returned_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
             stack.extend((n, allowed) for n in node.orelse)
             continue
         stack.extend((child, allowed) for child in ast.iter_child_nodes(node))
+    return out
+
+
+def _own_nodes(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.AST]:
+    """Every node of ``fn``'s own body, nested functions, lambdas and classes left out."""
+    out: list[ast.AST] = []
+    stack: list[ast.AST] = list(fn.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        out.append(node)
+        stack.extend(ast.iter_child_nodes(node))
     return out
 
 
