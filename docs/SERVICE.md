@@ -1139,13 +1139,13 @@ log as `api.tls_generated_pair_replaced`, with the old and new SHA-256 fingerpri
 renewal, import the new `api-generated-cert.pem` into the browser trust store again, and replace
 any copy of it you pass to `--cacert`.** A sharded service (`supervise`) renews once, before it
 starts its shards, and a shard it restarts never renews, so every shard serves the same certificate.
-The same replacement runs at startup, whatever the expiry, when the certificate lacks a name the
-current bind requires, matched without regard to case or an IPv6 zone. A wildcard `--host`
-requires only the loopback of its family, which a client on this box dials (`127.0.0.1` for
-`0.0.0.0`, `::1` for `::`). Any other bind requires its host without IPv6 brackets (`[::1]` is the
-address `::1`), and a loopback bind, any spelling of `127.0.0.1`, `::1` or `localhost`, also the
-other two of those three (BACKLOG #5790). So a move from a wildcard to a loopback bind replaces
-it, and a move from a loopback bind to a wildcard, or back, does not. The new
+The same replacement runs at startup, whatever the expiry, when the reused certificate lacks a
+name its current bind requires, matched without regard to case or an IPv6 zone. A wildcard
+`--host` requires only the loopback of its family, which a client on this box dials (`127.0.0.1`
+for `0.0.0.0`, `::1` for `::`). Any other bind requires its host without IPv6 brackets (`[::1]` is
+the address `::1`), and a loopback bind, any spelling of `127.0.0.1`, `::1` or `localhost`, also
+the other two of those three (BACKLOG #5790). For example, a certificate minted for `0.0.0.0` is
+replaced after a move to `127.0.0.1`, because it lacks `::1` and `localhost`. The new
 certificate names what a first-run mint for the current bind would. When a client on this box
 dials that bind through `localhost`, `127.0.0.1` or `::1`, a replacement, a renewal included,
 also keeps each of those three the old certificate named, and always `127.0.0.1`, which the CLI,

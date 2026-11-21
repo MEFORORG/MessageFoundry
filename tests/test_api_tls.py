@@ -4304,6 +4304,8 @@ _LOOPBACK_SANS = (("ip", "127.0.0.1"), ("ip", "::1"), ("dns", "localhost"))
             "localhost.",
             (("dns", "localhost."), ("ip", "127.0.0.1"), ("ip", "::1"), ("dns", "localhost")),
         ),
+        # A zoned IPv6 loopback: the SAN entry cannot carry the zone, so ::1 is written once.
+        ("::1%1", (("ip", "::1"), ("ip", "127.0.0.1"), ("dns", "localhost"))),
         # Another loopback address is not one of the three names.
         ("127.0.0.2", (("ip", "127.0.0.2"),)),
     ],
@@ -4474,7 +4476,24 @@ def test_a_loopback_to_wildcard_and_back_round_trip_reuses_the_pair(tmp_path: Pa
     assert tuple(_san_entries(cert)) == _LOOPBACK_SANS
 
 
-def test_a_renewal_keeps_the_loopback_names_a_bind_re_mint_kept(
+def test_a_bind_re_mint_keeps_a_non_default_loopback_name_the_old_pair_named(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5973. A pair minted for ``::`` names ``::1``; a move to ``0.0.0.0`` re-mints it,
+    because it lacks ``127.0.0.1``, and the re-mint keeps the ``::1`` the old pair named, which is
+    not the default host.
+
+    Mutation: keep only the default host. Red: ``::1`` is dropped."""
+    ensure_api_tls_material(ApiSettings(host="::"), state_dir=tmp_path)
+    events: list[GeneratedPairReplaced] = []
+    cert, _ = ensure_api_tls_material(
+        ApiSettings(host="0.0.0.0"), state_dir=tmp_path, replacements=events
+    )
+    assert [e.reason for e in events] == ["bind_changed"]
+    assert _san_entries(cert) == [("ip", "0.0.0.0"), ("ip", "127.0.0.1"), ("ip", "::1")]
+
+
+def test_a_renewal_keeps_the_loopback_names_a_reused_pair_carried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """BACKLOG #5973. A pair minted for ``::1`` is reused after a move to ``::``, which requires

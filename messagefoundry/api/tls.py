@@ -288,7 +288,11 @@ def _names_missing(host: str, pem: bytes) -> list[str]:
     lacks, matched by :func:`messagefoundry.pki.san_names`: the subject and
     :func:`_generated_sans`, except that a WILDCARD bind requires only its family's loopback, the
     address a client dials, since no client dials ``0.0.0.0`` or ``::``. Raises ``ValueError`` when
-    ``pem`` is not a parseable certificate."""
+    ``pem`` is not a parseable certificate.
+
+    OPEN EDGE: ``san_names`` ignores a trailing dot and hostname verification does not, so a pair
+    minted for ``localhost`` is reused after a move to ``localhost.``, or the reverse, though a
+    client dialling the new spelling fails verification."""
     from messagefoundry import pki
 
     subject = [] if wildcard_loopback(host) is not None else [unbracketed(host)]
@@ -321,8 +325,10 @@ def _make_generated(host: str, kept: Sequence[str] = ()) -> tuple[bytes, bytes]:
 
 
 def _host_key(name: str) -> object:
-    """``name`` as hostname verification compares it: an IP by address without an IPv6 zone, so
-    ``0:0:0:0:0:0:0:1`` is ``::1``, and a DNS name without regard to case or a trailing dot."""
+    """``name`` matched loosely, to decide which binds count as loopback: an IP by address without
+    an IPv6 zone, so ``0:0:0:0:0:0:0:1`` is ``::1``, and a DNS name without regard to case or a
+    trailing dot. Hostname verification (measured on OpenSSL 3.5) does not ignore a trailing dot,
+    so this is not what a client matches; :func:`_san_key` is the exact SAN entry."""
     try:
         return ipaddress.ip_address(name.split("%", 1)[0])
     except ValueError:
@@ -336,25 +342,28 @@ _LOOPBACK_KEYS = frozenset(_host_key(name) for name in _GENERATED_LOOPBACK_SANS)
 
 
 def _san_key(name: str) -> object:
-    """``name`` as the SAN entry ``make_self_signed`` writes for it: an IP literal by address, so
-    ``0:0:0:0:0:0:0:1`` and ``::1`` are one entry, and anything else as a DNS name without regard
-    to case. Unlike :func:`_host_key` it keeps a trailing dot and a zone, because hostname
-    verification does not match ``localhost`` against an entry ``localhost.``."""
+    """``name`` as the SAN entry ``make_self_signed`` writes for it: an IP literal by address
+    without an IPv6 zone, which the entry cannot carry, so ``0:0:0:0:0:0:0:1``, ``::1`` and
+    ``::1%1`` are one entry; anything else, ``127.0.0.1%x`` included, as a DNS name without regard
+    to case. Unlike :func:`_host_key` it keeps a trailing dot, because hostname verification does
+    not match ``localhost`` against an entry ``localhost.``."""
     try:
-        return ipaddress.ip_address(name)
+        address = ipaddress.ip_address(name)
     except ValueError:
         return name.lower()
+    return ipaddress.ip_address(str(address).split("%", 1)[0])
 
 
 def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
     """The loopback names a replacement of a loadable pair keeps (BACKLOG #5973).
 
     Only for a bind a client on this box dials through one of ``localhost``, ``127.0.0.1`` and
-    ``::1``, compared as hostname verification compares (:func:`_host_key`): of those three, every
-    one the old certificate names, and the default ``[api].host``, which the CLI, the IDE and the
-    harness dial by default, less the one the bind itself names. A loopback bind gets all three
-    from :func:`_generated_sans` anyway, so this matters for a wildcard bind: a move from ``::1``
-    to ``::`` would otherwise drop the ``127.0.0.1`` those clients verify. A renewal keeps
+    ``::1``, matched by :func:`_host_key` (:data:`_LOOPBACK_KEYS`): of those three, every one the
+    old certificate names, and the default ``[api].host``, which the CLI, the IDE and the harness
+    dial by default, less the one the bind itself names. A loopback bind gets all three from
+    :func:`_generated_sans` anyway, so this matters for a wildcard bind: a re-mint for a move from
+    ``::`` to ``0.0.0.0`` keeps the ``::1`` the old certificate named, and a renewal at ``::`` of a
+    pair minted for ``::1`` keeps its ``127.0.0.1`` and ``localhost``. A renewal keeps
     them as a bind re-mint does, or the next renewal would drop what the re-mint kept. The set is
     fixed, so repeated moves do not grow it. A bind off loopback keeps nothing. A first-run mint
     has no old certificate, so it keeps nothing.
@@ -408,8 +417,10 @@ class GeneratedPairReplaced:
     """
 
     #: ``renewal``: a loadable pair near or past its expiry. ``bind_changed``: a loadable pair whose
-    #: certificate lacks a name the current ``[api].host`` requires (:func:`_names_missing`), such as the ``::1`` of a bind moved to ``::`` after the mint
-    #: (BACKLOG #5973, #5790). ``unusable``: a pair that would not load as one. ``half_pair``: one file of the two, left by an interrupted mint or renewal.
+    #: certificate lacks a name the current ``[api].host`` requires (:func:`_names_missing`),
+    #: such as the ``::1`` of a bind moved to ``::`` after the mint (BACKLOG #5973, #5790).
+    #: ``unusable``: a pair that would not load as one. ``half_pair``: one file of the two, left
+    #: by an interrupted mint or renewal.
     reason: _ReplacedReason
     cert_file: str
     old_sha256: str | None
@@ -785,8 +796,9 @@ def ensure_api_tls_material(
     :func:`_renew_generated_pair` -- but only when it is still the engine's own shape (self-signed,
     ``CA=false``). Anything else at the generated path is served as found and never replaced.
     **A pair of that shape whose certificate lacks a name the current bind requires
-    (:func:`_names_missing`) is replaced the same way**, the report's reason ``bind_changed``: for example the
-    loopback of a wildcard bind (:func:`_replacement_due`, BACKLOG #5973, #5790). Only the engine's own
+    (:func:`_names_missing`) is replaced the same way**, the report's reason
+    ``bind_changed``: for example the loopback of a wildcard bind (:func:`_replacement_due`,
+    BACKLOG #5973, #5790). Only the engine's own
     generated pair is ever checked; an operator's ``[api].tls_cert_file`` never reaches this
     branch. Nothing renews mid-run: ``CertExpiryRunner`` watches the served certificate, because
     ``serve`` hands it the path this function RETURNS, and it stays the alarm for an engine never
