@@ -1139,24 +1139,21 @@ log as `api.tls_generated_pair_replaced`, with the old and new SHA-256 fingerpri
 renewal, import the new `api-generated-cert.pem` into the browser trust store again, and replace
 any copy of it you pass to `--cacert`.** A sharded service (`supervise`) renews once, before it
 starts its shards, and a shard it restarts never renews, so every shard serves the same certificate.
-The same replacement runs at startup, whatever the expiry, when the certificate does not name the
-address a client on this box dials for the current bind: the family's loopback for a wildcard
-`--host` (`127.0.0.1` for `0.0.0.0`, `::1` for `::`), else the host without IPv6 brackets
-(`[::1]` is the address `::1`), matched without regard to case or an IPv6 zone. A move from
-`0.0.0.0` to `::` replaces a certificate minted for `0.0.0.0`; a move from `127.0.0.1` to `0.0.0.0` or to `::` does not, because
-a certificate minted for a `127.0.0.1`, `::1` or `localhost` bind names all three (BACKLOG #5790).
-Only that one dialled address is tested, so a certificate that names it is kept even when it lacks
-names a first-run mint for the current bind would carry, until its renewal: at least a move from
-a wildcard to a loopback bind, such as `0.0.0.0` to `127.0.0.1` or `::` to `::1`, keeps a
-certificate that names neither `localhost` nor the other family's loopback. The new
+The same replacement runs at startup, whatever the expiry, when the certificate lacks a name a
+first-run mint for the current bind would carry, matched without regard to case or an IPv6 zone.
+That mint names the bind host without IPv6 brackets (`[::1]` is the address `::1`). A wildcard
+`--host` adds the loopback of its family, which a client on this box dials (`127.0.0.1` for
+`0.0.0.0`, `::1` for `::`). A loopback bind, any spelling of `127.0.0.1`, `::1` or `localhost`,
+adds the other two of those three (BACKLOG #5790). So at least a move between a wildcard and a
+loopback bind replaces it, in either direction. The new
 certificate names what a first-run mint for the current bind would. When a client on this box
 dials that bind through `localhost`, `127.0.0.1` or `::1`, a replacement, a renewal included,
 also keeps each of those three the old certificate named, and always `127.0.0.1`, which the CLI,
 the IDE and the harness dial by default. Its audit row's reason is `bind_changed`, a shard never
 makes it, and the new certificate must be imported the same way (BACKLOG #5973). At least a
 shard, a bind the certificate builder refuses (a WARNING names it), and a file or lock failure
-(a WARNING, and the next start tries again) keep serving the old certificate, which does not name
-the bind.
+(a WARNING, and the next start tries again) keep serving the old certificate, which lacks a name
+the bind needs.
 See
 [INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console". (The former PySide6 desktop
 console was retired — BACKLOG #103.)

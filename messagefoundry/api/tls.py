@@ -257,31 +257,38 @@ def _generated_sans(host: str) -> list[str]:
 
     ``host`` is ``[api].host`` as written, brackets included.
 
-    - A loopback bind, by the host set :attr:`ApiSettings.is_loopback` reads (the definition
-      ``serve``'s exposed-bind gate reads), carries :data:`_GENERATED_LOOPBACK_SANS` (BACKLOG
-      #5790). ``make_self_signed`` drops the one that repeats the subject.
     - A WILDCARD bind (``0.0.0.0``, ``::``) is not an address any client can dial, so a
       certificate naming it alone verifies against no URL at all. It carries the loopback of its
       own family (:func:`messagefoundry.api_tls_source.wildcard_loopback`), the address the tray
-      and any other client on this box reach it through (BACKLOG #5973), and no other name.
-    - Any other host carries no extra name from this function. That includes a host
-      ``is_loopback`` does not list, such as ``127.0.0.2``, ``LOCALHOST`` or ``[::1]``, even where
-      it listens on a loopback address, and such a host may itself be a loopback name.
+      and any other client on this box reach it through (BACKLOG #5973).
+    - A loopback bind carries :data:`_GENERATED_LOOPBACK_SANS` (BACKLOG #5790), less the one its
+      own subject already names. A host is loopback when hostname verification would compare it
+      equal to one of them (:func:`_host_key`), the same match :func:`_kept_loopback_names` uses,
+      so ``LOCALHOST``, ``[::1]`` and ``0:0:0:0:0:0:0:1`` count, and a mint and a renewal for one
+      bind agree.
+    - Any other host carries no extra name, ``127.0.0.2`` included.
 
-    A renewal or a re-mint for a changed bind adds the loopback names :func:`_kept_loopback_names`
-    keeps, so one for ``LOCALHOST`` or ``[::1]`` can name more than the bind host. The recovery of an
-    unusable or half-written pair adds none.
-
-    The names are read only when a pair is minted, at least on first run, at renewal, at the
-    recovery of an unusable or half-written pair, and at a re-mint for a bind the reused
-    certificate does not name (:func:`_replacement_due`). That re-mint tests only the host a client
-    dials, so a reused pair can lack names a fresh mint for the bind would add; docs/SERVICE.md
-    states when.
+    :func:`_replacement_due` re-mints a reused pair that lacks any of these names, and a renewal
+    or bind re-mint adds what :func:`_kept_loopback_names` keeps.
     """
-    if host in _LOOPBACK_HOSTS:
-        return list(_GENERATED_LOOPBACK_SANS)
     loopback = wildcard_loopback(host)
-    return [] if loopback is None else [loopback]
+    if loopback is not None:
+        return [loopback]
+    own = _host_key(unbracketed(host))
+    keys = [_host_key(name) for name in _GENERATED_LOOPBACK_SANS]
+    if own not in keys:
+        return []
+    return [name for name, key in zip(_GENERATED_LOOPBACK_SANS, keys, strict=True) if key != own]
+
+
+def _names_missing(host: str, pem: bytes) -> list[str]:
+    """The names a fresh mint for a bind on ``host`` would carry that the certificate in ``pem``
+    lacks, matched by :func:`messagefoundry.pki.san_names`: the subject and
+    :func:`_generated_sans`. Raises ``ValueError`` when ``pem`` is not a parseable certificate."""
+    from messagefoundry import pki
+
+    wanted = [unbracketed(host), *_generated_sans(host)]
+    return [name for name in wanted if not pki.san_names(pem, name)]
 
 
 def _make_generated(host: str, kept: Sequence[str] = ()) -> tuple[bytes, bytes]:
@@ -316,11 +323,9 @@ def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
     Only for a bind a client on this box dials through one of ``localhost``, ``127.0.0.1`` and
     ``::1``, compared as hostname verification compares (:func:`_host_key`): of those three, every
     one the old certificate names, and the default ``[api].host``, which the CLI, the IDE and the
-    harness dial by default, less the one the bind itself names. A bind
-    :attr:`ApiSettings.is_loopback` lists gets all three from :func:`_generated_sans` anyway, so
-    this matters for a wildcard bind and for a spelling that list lacks: a move from ``::`` to
-    ``LOCALHOST`` would otherwise drop the ``::1`` the old certificate named, and leave out the
-    ``127.0.0.1`` those clients verify. A renewal keeps
+    harness dial by default, less the one the bind itself names. A loopback bind gets all three
+    from :func:`_generated_sans` anyway, so this matters for a wildcard bind: a move from ``::1``
+    to ``::`` would otherwise drop the ``127.0.0.1`` those clients verify. A renewal keeps
     them as a bind re-mint does, or the next renewal would drop what the re-mint kept. The set is
     fixed, so repeated moves do not grow it. A bind off loopback keeps nothing. A first-run mint
     has no old certificate, so it keeps nothing.
@@ -357,7 +362,7 @@ _ReplacedReason = Literal["renewal", "bind_changed", "unusable", "half_pair"]
 type _Due = tuple[_DueReason, SelfSignedFacts, bytes]
 
 #: The audit action for every replacement of a generated pair that already existed: an early
-#: renewal, a re-mint for a bind the certificate does not name (BACKLOG #5973), and the recovery
+#: renewal, a re-mint of a pair that lacks a name the bind needs (BACKLOG #5973), and the recovery
 #: of an unusable or half-written pair (ADR 0172 decision 6).
 GENERATED_PAIR_REPLACED = "api.tls_generated_pair_replaced"
 
@@ -374,9 +379,9 @@ class GeneratedPairReplaced:
     """
 
     #: ``renewal``: a loadable pair near or past its expiry. ``bind_changed``: a loadable pair whose
-    #: certificate does not name the host a client dials for the current ``[api].host``, such as
-    #: the ``::1`` of a bind moved to ``::`` after the mint (BACKLOG #5973). ``unusable``: a pair that would not
-    #: load as one. ``half_pair``: one file of the two, left by an interrupted mint or renewal.
+    #: certificate lacks a name a fresh mint for the current ``[api].host`` would carry
+    #: (:func:`_names_missing`), such as the ``::1`` of a bind moved to ``::`` after the mint
+    #: (BACKLOG #5973, #5790). ``unusable``: a pair that would not load as one. ``half_pair``: one file of the two, left by an interrupted mint or renewal.
     reason: _ReplacedReason
     cert_file: str
     old_sha256: str | None
@@ -751,9 +756,9 @@ def ensure_api_tls_material(
     with less than a third of its lifetime left, or past it, is RENEWED at startup -- see
     :func:`_renew_generated_pair` -- but only when it is still the engine's own shape (self-signed,
     ``CA=false``). Anything else at the generated path is served as found and never replaced.
-    **A pair of that shape whose certificate does not name the address a client dials for the
-    current bind is replaced the same way**, the report's reason ``bind_changed``: for example the
-    loopback of a wildcard bind (:func:`_replacement_due`, BACKLOG #5973). Only the engine's own
+    **A pair of that shape whose certificate lacks a name a fresh mint for the current bind would
+    carry is replaced the same way**, the report's reason ``bind_changed``: for example the
+    loopback of a wildcard bind (:func:`_replacement_due`, BACKLOG #5973, #5790). Only the engine's own
     generated pair is ever checked; an operator's ``[api].tls_cert_file`` never reaches this
     branch. Nothing renews mid-run: ``CertExpiryRunner`` watches the served certificate, because
     ``serve`` hands it the path this function RETURNS, and it stays the alarm for an engine never
@@ -771,7 +776,7 @@ def ensure_api_tls_material(
     the start; refused on a re-mint for a changed bind, it keeps the old pair with a WARNING.
 
     **EVERY REPLACEMENT IS REPORTED, never silent (ADR 0172 decision 6).** At least a renewal, a
-    re-mint for a bind the certificate does not name, and the recovery of an unusable or
+    re-mint of a pair that lacks a name the bind needs, and the recovery of an unusable or
     half-written pair each append one :class:`GeneratedPairReplaced` to
     ``replacements`` and log a WARNING. ``serve`` passes a list and writes one audit row per entry
     once its store is open (:func:`record_generated_pair_replacements`). A first-run mint, which
@@ -935,13 +940,14 @@ def _replacement_due(host: str, cert_path: Path) -> _Due | None:
     """Why the generated pair should be replaced now, with the old certificate's facts, else ``None``.
 
     ``renewal`` means expired, or less than :data:`_RENEW_REMAINING_FRACTION` of the certificate's
-    own validity period left. ``bind_changed`` means the certificate does not name the host a client
-    dials for ``host`` (:func:`messagefoundry.api_tls_source.dialled_host`, matched by
-    :func:`messagefoundry.pki.san_names`), so a bind moved after the mint, for example to ``::``
-    from ``0.0.0.0``, gets a fresh certificate for the new bind at this start rather than at the
-    next renewal (BACKLOG #5973). Only that one name is tested; :func:`_generated_sans` says what
-    that leaves. It names the new bind, as a first-run mint for it would, plus
-    the loopback names :func:`_kept_loopback_names` keeps.
+    own validity period left. ``bind_changed`` means the certificate lacks a name a fresh mint for
+    ``host`` would carry (:func:`_names_missing`), among them the host a client dials for it
+    (:func:`messagefoundry.api_tls_source.dialled_host`). So a bind moved after the mint, for
+    example to ``::`` from ``0.0.0.0``, or to ``127.0.0.1`` from ``0.0.0.0``, gets a fresh
+    certificate for the new bind at this start rather than at the next renewal (BACKLOG #5973,
+    #5790). The new pair names the new bind, as a first-run mint for it would, plus the loopback
+    names :func:`_kept_loopback_names` keeps, so the next start finds nothing missing and reuses
+    it.
 
     **Only the engine's own shape is ever due**: a certificate at the generated path that is not
     self-signed with ``CA=false`` was put there by someone else, so it is served as found. That
@@ -971,7 +977,7 @@ def _replacement_due(host: str, cert_path: Path) -> _Due | None:
         return None
     if expiring:
         return "renewal", facts, pem
-    if not pki.san_names(pem, dialled_host(host)):
+    if _names_missing(host, pem):
         return "bind_changed", facts, pem
     return None
 
@@ -1055,11 +1061,11 @@ def _renew_generated_pair(
         if reason != "bind_changed":
             raise
         log.warning(
-            "serving the generated TLS certificate at %s, which does not name %r, the host a "
-            "client dials for the bind %r: a new certificate for that bind was refused (%s). "
-            "Clients that verify that host will fail until the bind or [api].tls_cert_file is fixed.",
+            "serving the generated TLS certificate at %s, which does not name %s, needed for the "
+            "bind %r: a new certificate for that bind was refused (%s). Clients that verify those "
+            "names will fail until the bind or [api].tls_cert_file is fixed.",
             cert_path,
-            dialled_host(api.host),
+            ", ".join(_names_missing(api.host, old_pem)),
             api.host,
             type(exc).__name__,
         )
@@ -1089,7 +1095,10 @@ def _renew_generated_pair(
     why = (
         ""
         if reason == "renewal"
-        else f" because it did not name {dialled_host(api.host)}, the host for the bind {api.host}"
+        else (
+            f" because it did not name {', '.join(_names_missing(api.host, old_pem))}, "
+            f"needed for the bind {api.host}"
+        )
     )
     log.warning(
         "%s the generated self-signed TLS certificate at %s%s: the old one (sha256 %s) expires "

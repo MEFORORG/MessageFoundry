@@ -1497,7 +1497,9 @@ class StoreSettings(_Section):
 #: Defined here rather than beside its ADR 0118 use because at least two security decisions in this
 #: module key on it and must not disagree: :attr:`ApiSettings.is_loopback`, which used to inline the
 #: same three hosts as a tuple, and ``_desugar_security``'s refusal of a non-loopback ``listen_address``
-#: under ``local_access_only = true``. This unifies THIS module only. Other packages carry same-named
+#: under ``local_access_only = true``. ``messagefoundry.api.tls`` also reads it as the names a
+#: generated API certificate carries for a loopback bind (BACKLOG #5790), so a name added here is
+#: added to that certificate too and must be one hostname verification can match. This unifies THIS module only. Other packages carry same-named
 #: frozensets for their own transports, with different contents (``::ffff:127.0.0.1`` in
 #: ``pipeline.wiring_runner`` and ``transports.dicom``, ``[::1]`` in the harness poller); reconciling
 #: those is a separate question, recorded in ADR 0154.
