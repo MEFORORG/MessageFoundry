@@ -547,3 +547,76 @@ def test_an_unreadable_ca_is_not_logged_as_having_a_row(
     refused = [m for m in grab.seen if m.startswith("the audited check refused [api]")]
     assert len(refused) == 1, grab.seen
     assert "row is written unless" in refused[0], refused
+
+
+def test_a_low_disk_refusal_writes_nothing_to_the_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grab: _Grab
+) -> None:
+    """The low-disk floor refuses a start so that nothing writes to a volume about to fill, so its
+    exit opens no store for the audit, and says the refused collector CA has no row. Red before
+    the floor marked its exit, when the audit created the store there."""
+    from messagefoundry.pipeline import retention
+
+    def low(_path: str, floor_mb: int) -> retention.DiskFloorReading:
+        return retention.DiskFloorReading(probed=str(tmp_path), free_bytes=1, floor_bytes=floor_mb)
+
+    monkeypatch.setattr(retention, "read_disk_floor", low)
+    extra = _collector_ca_refused(tmp_path, monkeypatch) + "[retention]\nmin_free_disk_mb = 100\n"
+    rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_toml=extra)
+    assert rc == 2
+    assert not db.exists()
+    head = "no audit row records the refused trust anchors: the start was refused because the store"
+    assert [m for m in grab.seen if m.startswith(head)], grab.seen
+
+
+def test_the_audit_writes_a_replaced_pairs_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A generated pair this start replaced gets its ``api.tls_generated_pair_replaced`` row once
+    the audit opens the store, as the lifespan would have written it (ADR 0172 decision 6). Red
+    before, when the audit wrote only anchor rows."""
+    from messagefoundry.api.tls import GENERATED_PAIR_REPLACED, GeneratedPairReplaced
+    from messagefoundry.config.settings import LoggingSettings, ServiceSettings, StoreSettings
+
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(True))
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    collector_ca = tmp_path / "collector-ca.pem"
+    collector_ca.write_bytes(_KEY_BLOCK)
+    db = tmp_path / "messagefoundry.db"
+    settings = ServiceSettings(
+        store=StoreSettings(path=str(db), encryption_key=generate_key()),
+        logging=LoggingSettings(
+            forward_enabled=True,
+            forward_host="collector.example.org",
+            forward_protocol="tls",
+            forward_tls_ca_file=str(collector_ca),
+        ),
+    )
+    event = GeneratedPairReplaced(
+        reason="renewal",
+        cert_file=str(tmp_path / "api-cert.pem"),
+        old_sha256="00" * 32,
+        old_not_after="2026-01-01",
+        new_sha256="11" * 32,
+        new_not_after="2027-01-01",
+    )
+    cli._audit_anchors_refused_before_the_store(
+        settings, enforcing=False, forward_ca_refused=True, api_ca_refusal=None, replaced=[event]
+    )
+    assert "pem_refused" in _anchor_events(db, "logging_forward_ca")
+
+    async def read() -> list[dict[str, Any]]:
+        store = await MessageStore.open(db)
+        try:
+            return await store.list_audit(action=GENERATED_PAIR_REPLACED, limit=10)
+        finally:
+            await store.close()
+
+    assert len(asyncio.run(read())) == 1
+
+
+def test_serve_without_its_hook_fails_loudly() -> None:
+    """The body asks for the hook's record and raises when there is none, so dropping the
+    decorator cannot silently turn the audit off."""
+    with pytest.raises(RuntimeError, match="pre-lifespan anchor audit hook"):
+        cli._pre_lifespan_anchor_audit()

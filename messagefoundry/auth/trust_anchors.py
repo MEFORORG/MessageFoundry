@@ -147,12 +147,15 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
       At least these run first: the API TLS pair is minted or renewed, the store is created and
       migrated, and the startup attestation runs and may alert. Their log records reach stdout
       and the log file but no collector. No listener binds, since uvicorn binds after the
-      lifespan. A start refused at a later step before uvicorn runs the lifespan, such as the API
-      TLS context build, runs none of that: ``serve``'s exit hook opens the store itself, at the
-      posture the lifespan's open passes, and runs this preflight on the collector CA, and on
-      ``[api].tls_client_ca_file`` where that build refused it (BACKLOG #5391). No attestation
-      runs. A row is written there when the file can be read, this preflight refuses it, and the
-      store opens and takes it. An interrupt runs no audit, so writes no row.
+      lifespan. A start refused for another reason before uvicorn runs the lifespan, such as at
+      the API TLS context build, runs no attestation and no lifespan, though the API TLS pair may
+      already be minted or renewed. ``serve``'s exit hook then opens the store itself, creating
+      and migrating it, at the posture the lifespan's open passes, and runs this preflight on the
+      collector CA, and on ``[api].tls_client_ca_file`` where that build refused it (BACKLOG
+      #5391). A row is written there when the file can be read, this preflight refuses it, and the
+      store opens and takes it. At least these write no row: an interrupt, an exit uvicorn takes
+      before the lifespan starts, and a refusal for low disk or an unconfirmed clock, which
+      opens no store.
     * ``supervise`` checks the same CA before it builds its own forwarder, and refuses on stderr
       before any engine shard spawns. Its process has no audited preflight, so no row is written.
     * The API lifespan checks the CA of :func:`smtp_hop_anchor_spec` before it builds an alert
