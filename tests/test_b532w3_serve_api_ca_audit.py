@@ -118,7 +118,9 @@ def test_a_store_that_does_not_open_leaves_the_clean_refusal(
         logger.removeHandler(grab)
     assert rc == 2
     assert "error: the API TLS context was not built:" in capsys.readouterr().err
-    assert [m for m in seen if "no audit row records the refused TLS context of the API" in m], seen
+    assert [m for m in seen if "no audit row records the refused [api].tls_client_ca_file" in m], (
+        seen
+    )
 
 
 def test_a_context_that_builds_opens_no_store_for_the_audit(
@@ -127,14 +129,31 @@ def test_a_context_that_builds_opens_no_store_for_the_audit(
     """The control: with the CA's own pin the context builds, the start goes on to uvicorn
     (stubbed), and this path runs no lifespan, so it opens no store."""
     calls: list[bool] = []
-    real = cli._audit_refused_api_tls_context
+    real = cli._audit_refused_api_client_ca
 
     def spy(*a: Any, **k: Any) -> None:
         calls.append(True)
         real(*a, **k)
 
-    monkeypatch.setattr(cli, "_audit_refused_api_tls_context", spy)
+    monkeypatch.setattr(cli, "_audit_refused_api_client_ca", spy)
     rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None)
     assert rc == 0
     assert calls == []
+    assert not db.exists()
+
+
+def test_a_refusal_that_is_not_the_client_cas_opens_no_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The context also refuses ``[api].tls_client_crl_file``, which the audited preflight leaves
+    out, so no row could come of it. With the CA itself sound, the refusal runs no startup."""
+    from messagefoundry.api import tls as api_tls
+
+    def refuse(*_a: object, **_k: object) -> object:
+        raise ta.TrustAnchorError("planted CRL refusal")
+
+    monkeypatch.setattr(api_tls, "build_api_ssl_context", refuse)
+    rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None)
+    assert rc == 2
+    assert "error: the API TLS context was not built:" in capsys.readouterr().err
     assert not db.exists()
