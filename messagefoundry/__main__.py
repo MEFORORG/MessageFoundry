@@ -1569,7 +1569,7 @@ def _offline_env_values(
     looked for. Raises :class:`~messagefoundry.config.wiring.WiringError` in at least these cases:
     for settings that do not load, as the fixed line ADR 0050's 2026-11-20 note describes, which
     holds no text from the failure; for a ``--service-config`` that does not exist, as ``service
-    config not found: <path>``, which the same note describes; and for a value file that cannot
+    config not found: <path>`` in place of the fixed line, which the same note describes; and for a value file that cannot
     be read, naming that file. The callers never print a resolved ``env()`` value."""
     from messagefoundry.config.anchor import resolve_project_root
     from messagefoundry.config.environments import resolve_values_base_dir, values_file_path

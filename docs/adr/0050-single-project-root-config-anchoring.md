@@ -498,8 +498,7 @@ those settings, and its Handlers still run with no active environment.
   - No connector is built, so a refusal only the build check makes, such as an egress or hop
     refusal, is still `check --env`'s, as is the posture check.
   - `dryrun`'s Handlers still run with no active environment.
-  - Settings that do not load print the fixed line above, where `serve` prints the settings error;
-    a `--service-config` that does not exist prints `service config not found`, as stated above.
+  - Settings that do not load print the fixed line above, where `serve` prints the settings error.
 
 **What "matches `serve`" covers.** The settings checks read the environment name `serve --env`
 reads. Value-file location is shared too: the offline `<env>.toml` check under `--project-root` now

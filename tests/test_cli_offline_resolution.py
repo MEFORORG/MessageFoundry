@@ -817,10 +817,10 @@ def test_offline_env_reports_an_unparseable_root_settings_file(
     if command == "graph":
         assert rc == 0, captured
         problems = json.loads(captured.out)["env_problems"]
-        assert any("could not load the service settings" in p for p in problems), problems
+        assert _FIXED_LINE in problems, problems
     else:
         assert rc == 1, captured
-        assert "could not load the service settings" in captured.out + captured.err, captured
+        assert _FIXED_LINE in captured.out + captured.err, captured
     assert _SECRET_HOST not in captured.out + captured.err
 
 
@@ -941,4 +941,5 @@ def test_offline_env_a_directory_as_the_service_config_prints_the_fixed_line(
     captured = capsys.readouterr()
     out = captured.out + captured.err
     assert _FIXED_LINE in out and "Traceback" not in out, out
+    assert not _shown(str(named), out), out
     assert rc == (0 if command == "graph" else 1), out
