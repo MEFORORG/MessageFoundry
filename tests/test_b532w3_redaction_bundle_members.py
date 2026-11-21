@@ -3,11 +3,13 @@
 """The support-bundle help and ``docs/PHI.md`` stream 14 name every member the bundle writes
 (BACKLOG #5385, added item 1).
 
-The member list each test walks is derived from the code, not copied: every ``members["<name>"] = ...`` assignment
-in :func:`messagefoundry.support.bundle.build_bundle`, read off its AST. A live bundle with a log
-tail is the control that the AST reading finds what the function really writes. The help must also
-describe ``status.json`` the way the manifest's ``phi_contract`` does, "metadata-only", and must not
-call it "PHI-free", which the contract does not claim. Synthetic values only.
+The member list each test walks is derived from the code, not copied: every
+``members["<name>"] = ...`` assignment in :func:`messagefoundry.support.bundle.build_bundle`,
+read off its AST. ``_KNOWN_MEMBERS`` is a hand-copied floor that reading must reach. A live
+bundle with a log tail is the control that the AST reading finds what the function really
+writes. The help must also describe ``status.json`` the way the manifest's ``phi_contract``
+does, "metadata-only", and must not call it "PHI-free", which the contract does not claim.
+Synthetic values only.
 """
 
 from __future__ import annotations
