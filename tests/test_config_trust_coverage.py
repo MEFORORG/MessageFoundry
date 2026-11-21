@@ -333,18 +333,18 @@ def test_a_dangling_data_link_refuses_the_load(
 
 
 @pytest.mark.parametrize(
-    "member", ["connections.toml", "codesets", "codesets/a.csv", "__pycache__"]
+    "member", ["connections.toml", "codesets", "codesets/a.csv", "__pycache__", "mod.py"]
 )
-def test_the_escape_downgrades_a_dangling_data_link(
+def test_the_escape_does_not_downgrade_a_dangling_link(
     member: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     fake_windows_readers: FakeReaders,
 ) -> None:
-    """The load's check hands the dangling-link refusal to the same refuse as its other refusals,
-    so the clamped dev/test escape downgrades it to a warning, and the load reads the name as
-    absent."""
+    """Nothing about what a dangling trust-list link leads to was vetted, so the honoured dev/test
+    escape still refuses the load, as the serve start check does for a chain it cannot walk
+    (Manager decision d20261121T195422910-02289f)."""
     monkeypatch.setenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "1")
     monkeypatch.setenv(SECURITY_ENFORCEMENT_ENV, "warn")
     cfg = tmp_path / "cfg"
@@ -360,18 +360,21 @@ def test_the_escape_downgrades_a_dangling_data_link(
     except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
         pytest.skip(f"cannot create a symlink here: {exc}")
     fake_windows_readers(lambda _path: False)
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"):
-        assert "o" in load_config(cfg).outbound
-    assert any(
+    with (
+        caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"),
+        pytest.raises(WiringError, match="leads to nothing"),
+    ):
+        load_config(cfg)
+    assert not any(
         "leads to nothing" in r.getMessage() and "dev/test override" in r.getMessage()
         for r in caplog.records
     )
 
 
-def test_the_escape_is_inert_for_a_dangling_link_under_enforce(
+def test_a_dangling_link_refuses_under_enforce_with_the_escape_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_windows_readers: FakeReaders
 ) -> None:
-    """Control for the test above: without the warn dial the escape does nothing."""
+    """Control for the test above: under enforce the escape is inert, and the link still refuses."""
     monkeypatch.setenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "1")
     monkeypatch.setenv(SECURITY_ENFORCEMENT_ENV, "enforce")
     cfg = tmp_path / "cfg"
@@ -382,7 +385,7 @@ def test_the_escape_is_inert_for_a_dangling_link_under_enforce(
     except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
         pytest.skip(f"cannot create a symlink here: {exc}")
     fake_windows_readers(lambda _path: False)
-    with pytest.raises(WiringError, match="leads to nothing.*not honoured"):
+    with pytest.raises(WiringError, match="leads to nothing"):
         load_config(cfg, allow_empty=True)
 
 

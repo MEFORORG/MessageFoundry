@@ -9883,9 +9883,9 @@ def _with_link_targets(
     A link whose target cannot be resolved, or that leads to nothing at check time, is refused: a
     writer of the folder it points into could create the missing name before the read (Manager
     decision under the owner's standing instruction of 2026-10-22). That refusal is handed to
-    ``refuse`` where one is given, so the load's check can downgrade it under the dev/test escape,
-    and the link is then listed with no target; with none given it raises ``OSError`` naming the
-    link.
+    ``refuse`` where one is given, and the link is listed with no target if ``refuse`` returns;
+    with none given it raises ``OSError`` naming the link. The load's check hands it
+    :func:`_refuse_unvetted_link`, which the dev/test escape does not downgrade.
 
     **Not vetted**, at least: the links in between, for a link to a link, the folders holding the
     links outside the config directory, from which a writer could re-point one, the folders above
@@ -11455,6 +11455,14 @@ def _refuse_unsafe_config_source(message: str) -> None:
     raise WiringError(message)
 
 
+def _refuse_unvetted_link(message: str) -> NoReturn:
+    """Raise ``WiringError(message)`` for a trust-list link that cannot be resolved or leads to
+    nothing at check time, whatever the dev/test escape says: nothing about what it leads to was
+    vetted, as the ``serve`` start check rules for a link chain it cannot walk (vault BACKLOG #6654
+    item 2; Manager decision d20261121T195422910-02289f)."""
+    raise WiringError(message)
+
+
 def _assert_safe_config_source(directory: Path) -> None:
     """Refuse to execute config Python from a writable-by-others location.
 
@@ -11491,7 +11499,7 @@ def _assert_safe_config_source(directory: Path) -> None:
     try:
         # Include _*.py: the loader skips them as top-level modules, but a sibling can import them,
         # so a writable/foreign-owned helper is just as much an injection vector (review M-21).
-        paths = config_source_trust_paths(directory, refuse=_refuse_unsafe_config_source)
+        paths = config_source_trust_paths(directory, refuse=_refuse_unvetted_link)
     except OSError as exc:
         if is_missing_directory(exc):
             # Moved away since the caller's own check: missing, as that check answers (#3157).

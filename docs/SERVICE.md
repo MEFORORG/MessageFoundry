@@ -857,7 +857,8 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     to and, for a file, the folder holding that file, on both platforms, and it refuses the load
     where a link it lists, a module, `__pycache__` entry, `connections.toml`, `codesets` or
     code-set table link among them, leads to nothing it can read at check time or cannot be
-    resolved (vault BACKLOG #2596). For a linked folder the folder holding its target is not
+    resolved (vault BACKLOG #2596), and the dev/test escape does not downgrade that refusal. For
+    a linked folder the folder holding its target is not
     checked. That
     resolution is not checked against what the load's open then reaches. It does not check the
     links in between, for a link to a link, a folder outside the config directory that holds a

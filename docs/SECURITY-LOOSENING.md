@@ -1690,12 +1690,12 @@ count is above `0` (vault BACKLOG #2613).
   ([ADR 0036](adr/0036-windows-config-source-trust.md)). The engine runs every `*.py` in the config
   directory as its own account, which holds the store credentials and reads PHI. The check refuses
   a directory or module that a broad or low-privilege principal can write, one owned by any
-  account other than root or the engine's own (only root when the engine runs as root), on
-  Windows one whose access list cannot be read, and at least a link in the directory, other than
-  the directory itself, that cannot be resolved or leads to nothing at check time. With the escape
-  honoured, each of those is a WARNING and the load goes on. Whoever can write there, or, for a
-  dangling link, the folder it points into, would then run code as the engine's account, or
-  change what it reads, at the next start, reload or worker respawn.
+  account other than root or the engine's own (only root when the engine runs as root), and on
+  Windows one whose access list cannot be read. With the escape
+  honoured, each of those is a WARNING and the load goes on. Whoever can write there would then run
+  code as the engine's account at the next start, reload or worker respawn. The escape does not
+  cover a link on the check's list that cannot be resolved or leads to nothing at check time: the
+  load is still refused.
 - **When acceptable:** a dev or CI checkout that is user-writable on purpose, with synthetic data.
   Never a deployment.
 - **Compensating controls:** none that substitute. Lock the directory instead:
