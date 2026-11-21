@@ -162,6 +162,7 @@ BROWSE_HOP_REFUSED_CODE = "browse_hop_refused"
 BROWSE_THROTTLED_CODE = "browse_throttled"
 UPLOADS_UNAVAILABLE_CODE = "uploads_unavailable"
 KEY_SERVICE_BUSY_CODE = "key_service_busy"
+STORAGE_UNREACHABLE_CODE = "storage_unreachable"
 
 #: The status the engine answers when the store cipher refuses an uploaded file (BACKLOG #1169).
 _LOCKED_STATUS = status.HTTP_423_LOCKED
@@ -305,6 +306,15 @@ KEY_SERVICE_BUSY_NOTICE = (
     "happening, an administrator should check that service."
 )
 
+#: 503 with ``Retry-After`` and ``storage_unreachable`` set: the uploads directory, or the share it
+#: is on, could not be reached, so nothing was opened, injected or removed (BACKLOG #5388 added item
+#: 3). One text serves browse, resend and delete, so it names no single action.
+STORAGE_UNREACHABLE_NOTICE = (
+    "That request did not complete, and nothing was opened, injected or removed. The engine could "
+    "not reach the storage that holds uploaded files. Try again in a moment. If it keeps "
+    "happening, an administrator should check the uploads folder on the server."
+)
+
 #: The allow-list itself: an EXACT-match lookup from code to fixed module text. ``e`` is compared, never
 #: rendered — an unrecognized value maps to no banner at all rather than being echoed.
 _LIST_NOTICES: dict[str, str] = {
@@ -326,6 +336,7 @@ _LIST_NOTICES: dict[str, str] = {
     BROWSE_HOP_REFUSED_CODE: BROWSE_HOP_REFUSED_NOTICE,
     BROWSE_THROTTLED_CODE: BROWSE_THROTTLED_NOTICE,
     KEY_SERVICE_BUSY_CODE: KEY_SERVICE_BUSY_NOTICE,
+    STORAGE_UNREACHABLE_CODE: STORAGE_UNREACHABLE_NOTICE,
     # UPLOADS_UNAVAILABLE_CODE is deliberately absent. With no uploads store the list page answers
     # 503 and renders UPLOADS_UNAVAILABLE_NOTICE without reading ``e``. A listing that loads proves
     # the store is back, so a banner saying it is missing would be false there.
@@ -417,6 +428,10 @@ def _refusal_code(exc: HTTPException, codes: dict[int, str]) -> str | None:
     import; the cost is that a later 503 with ``Retry-After`` from these handlers would read as an
     outage too. At least today, the handlers raise no other."""
     if exc.status_code == _UNAVAILABLE_STATUS and "Retry-After" in (exc.headers or {}):
+        # BACKLOG #5388 added item 3: the engine marks a storage it could not reach, a typed
+        # signal like ``upload_refusal``, so its notice does not blame the key service.
+        if getattr(exc, "storage_unreachable", False) is True:
+            return STORAGE_UNREACHABLE_CODE
         return KEY_SERVICE_BUSY_CODE
     code = codes.get(exc.status_code)
     kind = getattr(exc, _REFUSAL_ATTR, None)

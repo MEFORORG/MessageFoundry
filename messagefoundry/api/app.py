@@ -584,7 +584,9 @@ from messagefoundry.uploads import (
     UploadNotTextError,
     UploadPathError,
     UploadQuotaError,
+    UploadRemoval,
     UploadRetentionRunner,
+    UploadStorageUnreachableError,
     UploadStore,
     UploadTooLargeError,
     UploadUnavailableError,
@@ -9178,8 +9180,8 @@ def create_app(
         "shortly. If it keeps failing, an administrator checks what holds the file open"
     )
     _UPLOAD_PARTLY_DELETED = (
-        "this uploaded file was only partly deleted: its content is gone, but its record could not "
-        "be removed, so it is still listed. Try the delete again to finish it. If it keeps "
+        "this uploaded file was not fully deleted: its record on the server could not be removed, "
+        "and its content may already be gone. Try the delete again to finish it. If it keeps "
         "failing, an administrator removes the record on the server"
     )
     _UPLOAD_REFUSED_TEXT: dict[str, str] = {
@@ -9191,6 +9193,14 @@ def create_app(
     _UPLOAD_UNAVAILABLE = (
         "the store's key service could not complete the request, so nothing was read, stored or "
         "removed. Try again shortly"
+    )
+    # BACKLOG #5388 added item 3: the uploads directory, or the share it is on, could not be
+    # reached. The same 503 and Retry-After as the key-service outage, with its own text, and
+    # ``storage_unreachable`` set so the web console names it apart.
+    _UPLOAD_STORAGE_UNREACHABLE = (
+        "the uploads storage on the server could not be reached, so nothing was read, stored or "
+        "removed. Try again shortly. If it keeps happening, an administrator should check the "
+        "uploads directory and the share it is on"
     )
 
     class _UploadUnavailable(HTTPException):
@@ -9206,20 +9216,31 @@ def create_app(
         ``(503, detail)`` here, because Starlette's ``__init__`` leaves it as the call's own
         arguments; a copy rebuilds it through ``cls(*args)``, which logs nothing."""
 
-        def __init__(self, *_rebuilt: object) -> None:
+        def __init__(self, *_rebuilt: object, unreachable: bool = False) -> None:
+            # A copy rebuilds through cls(*args), whose detail says which outage it was.
+            unreachable = unreachable or _UPLOAD_STORAGE_UNREACHABLE in _rebuilt
+            detail = _UPLOAD_STORAGE_UNREACHABLE if unreachable else _UPLOAD_UNAVAILABLE
             super().__init__(
                 503,
-                _UPLOAD_UNAVAILABLE,
+                detail,
                 headers={"Retry-After": str(TEMPORARY_REFUSAL_RETRY_AFTER_SECONDS)},
             )
-            self.args = (503, _UPLOAD_UNAVAILABLE)
+            self.args = (503, detail)
+            self.storage_unreachable = unreachable
 
-    def _upload_unavailable(cause: str, op: str) -> _UploadUnavailable:
+    def _outage_of(exc: UploadUnavailableError) -> tuple[str, bool]:
+        """The text of outage ``exc`` and whether it is the storage, not the key service, that could
+        not be reached (BACKLOG #5388 added item 3). Only these are kept past the handler."""
+        return str(exc), isinstance(exc, UploadStorageUnreachableError)
+
+    def _upload_unavailable(outage: tuple[str, bool], op: str) -> _UploadUnavailable:
         """The outage 503, logged once at WARNING with the operation, so an outage that blocks
-        every upload is on the record. ``cause`` is the cipher's outage text, the key id and an
-        exception type name (``crypto_transit._transit_failure``); it goes to the log only."""
+        every upload is on the record. ``outage`` is :func:`_outage_of`'s: the cipher's outage text,
+        the key id and an exception type name (``crypto_transit._transit_failure``), or the
+        storage's, which go to the log only, and whether the storage could not be reached."""
+        cause, unreachable = outage
         _log.warning("upload %s answered 503: %s", op, cause)
-        return _UploadUnavailable()
+        return _UploadUnavailable(unreachable=unreachable)
 
     def _upload_refusal_kind(exc: UploadUnreadableError) -> str:
         """``"denied"``, ``"damaged"`` or ``"locked"``: which refusal ``exc`` is (BACKLOG #5388,
@@ -9277,7 +9298,7 @@ def create_app(
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
             # BACKLOG #3734: an outage, not the 423. Only its text is kept past this clause.
-            override_answer = partial(_upload_unavailable, str(exc), op)
+            override_answer = partial(_upload_unavailable, _outage_of(exc), op)
         except UploadUnreadableError as exc:
             override_answer = partial(_UploadSidecarRefused, _upload_refusal_kind(exc))
         if override_answer is not None:
@@ -9362,7 +9383,7 @@ def create_app(
             raise HTTPException(413, str(exc)) from None
         except MultipartError as exc:
             raise HTTPException(400, str(exc)) from None
-        outage: str | None = None
+        outage: tuple[str, bool] | None = None
         try:
             # uploader_id (the immutable account id) is the ownership + quota key; uploader (the
             # username) rides along as the display/audit label. See uploads.UploadedFileMeta.
@@ -9410,7 +9431,7 @@ def create_app(
             )
             raise HTTPException(409, str(exc)) from None
         except UploadUnavailableError as exc:
-            outage = str(exc)
+            outage = _outage_of(exc)
         if outage is not None:
             # BACKLOG #3734: nothing was written, so a retry stores the file once. Not audited as a
             # reject, because the file was not refused. Raised after the handler, from the text
@@ -9568,13 +9589,13 @@ def create_app(
             except ContentSearchError as exc:
                 raise HTTPException(400, str(exc)) from exc
         meta = await _authorized_upload_meta(request, engine, us, identity, file_id, "browse")
-        outage: str | None = None
+        outage: tuple[str, bool] | None = None
         try:
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
-            outage = str(exc)
+            outage = _outage_of(exc)
         except UploadUnreadableError as exc:
             raise _UploadRefused(_upload_refusal_kind(exc)) from None
         if outage is not None:
@@ -9727,13 +9748,13 @@ def create_app(
             raise HTTPException(404, f"no such inbound connection: {body.to}") from None
         # Object-level authorization on the SOURCE file, in ADDITION to the target-channel check above.
         await _authorized_upload_meta(request, engine, us, identity, file_id, "resend")
-        outage: str | None = None
+        outage: tuple[str, bool] | None = None
         try:
             data = await us.read_bytes(file_id)
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
         except UploadUnavailableError as exc:
-            outage = str(exc)
+            outage = _outage_of(exc)
         except UploadUnreadableError as exc:
             raise _UploadRefused(_upload_refusal_kind(exc)) from None
         if outage is not None:
@@ -9806,15 +9827,16 @@ def create_app(
         owner-only object check (ASVS 8.2.2 — another operator's file answers 404, and is never
         unlinked), and an ``upload.delete`` audit row.
 
-        The check reads the metadata FIRST, because ``UploadStore.delete`` returns the metadata only
-        after it has already unlinked the body and the sidecar — a check bolted onto that call
-        would fire too late. The age-based retention sweep is deliberately owner-blind and
-        unaffected.
+        The check reads the metadata FIRST, because ``UploadStore.delete`` returns only after it
+        has already unlinked the body and the sidecar — a check bolted onto that call would fire
+        too late. The age-based retention sweep is deliberately owner-blind and unaffected.
 
-        A delete the store could not finish answers 409 with nothing reported deleted (BACKLOG
-        #5388 added item 3): a body another handle held open, with nothing removed, or a sidecar
-        left after the body went, which keeps the upload listed. The latter still writes its
-        ``upload.delete`` row, marked ``sidecar_kept``, and a retry finishes the delete.
+        The ``upload.delete`` row records what this call removed (``UploadRemoval``), and none is
+        written when it removed nothing (BACKLOG #5388 added item 3). A delete the store could not
+        finish answers 409: a body another handle held open, with nothing removed, or a sidecar it
+        could not remove. The latter's row is marked ``sidecar_kept``, and a retry that then
+        removes only the sidecar is marked ``body_removed: false``. A storage that could not be
+        reached answers 503, with nothing reported removed.
 
         An override holder goes on to ``UploadStore.delete`` when the sidecar is refused. That call
         removes the kind it classes as never sealable, and refuses the rest (BACKLOG #2322)."""
@@ -9836,15 +9858,16 @@ def create_app(
             async def _unlink_then_row() -> UploadedFileMeta | UploadError:
                 nonlocal detail
                 partial: UploadDeleteIncompleteError | None = None
+                removal: UploadRemoval
                 try:
-                    removed = await us.delete(file_id, sidecar_refused=refused)
+                    removal = await us.delete(file_id, sidecar_refused=refused)
                 except UploadDeleteIncompleteError as exc:
-                    if exc.removed is None:
-                        # Nothing was removed, so no row is owed.
+                    if exc.removed is None or not exc.removed.removed_any:
+                        # This call removed nothing, so no row is owed.
                         return exc
-                    # The body is gone, so the row is owed for it, though the delete is answered
-                    # as unfinished.
-                    removed, partial = exc.removed, exc
+                    # This call removed the body, so the row is owed for it, though the delete
+                    # is answered as unfinished.
+                    removal, partial = exc.removed, exc
                 except (
                     UploadPathError,
                     UploadNotFoundError,
@@ -9856,9 +9879,12 @@ def create_app(
                     # body unlink that failed, which keeps the sidecar (BACKLOG #5388 added item
                     # 3). Returned, so the route still answers it.
                     return exc
+                removed = removal.meta
                 fields: dict[str, object] = {"file_id": removed.file_id, "size": removed.size}
-                if partial is not None:
+                if not removal.sidecar_removed:
                     fields["sidecar_kept"] = True
+                if not removal.body_removed:
+                    fields["body_removed"] = False
                 detail = json.dumps(fields)
                 await engine.store.record_audit(
                     "upload.delete", actor=actor, detail=detail, client=client
@@ -9881,7 +9907,7 @@ def create_app(
         # Vault BACKLOG #3178: the unlink and its row run as one operation that outlives the
         # request, so a deadline can no longer land between them and leave a removed file with no
         # row.
-        outage: str | None = None
+        outage: tuple[str, bool] | None = None
         unfinished: str | None = None
         try:
             meta = await outliving.run(_delete_and_record(), "upload delete")
@@ -9890,7 +9916,7 @@ def create_app(
         except UploadDeleteIncompleteError as exc:
             unfinished = _UPLOAD_DELETE_IN_USE if exc.removed is None else _UPLOAD_PARTLY_DELETED
         except UploadUnavailableError as exc:
-            outage = str(exc)
+            outage = _outage_of(exc)
         except UploadUnreadableError as exc:
             raise _UploadRefused(_upload_refusal_kind(exc)) from None
         if unfinished is not None:

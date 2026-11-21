@@ -105,7 +105,7 @@ async def test_a_body_held_open_briefly_is_deleted(
     meta = await _saved(store)
     blob = _blob(store, meta.file_id)
     _failing_unlink(monkeypatch, blob, _sharing_violation, times=1)
-    assert await store.delete(meta.file_id) == meta
+    assert (await store.delete(meta.file_id)).meta == meta
     assert not blob.exists() and not _sidecar(store, meta.file_id).exists()
 
 
@@ -206,17 +206,20 @@ def _regular(attributes: int, tag: int) -> Any:
 
 
 @pytest.mark.parametrize("read", ["get_meta", "read_bytes"])
-async def test_an_invalid_open_of_an_unlisted_reparse_point_is_damage(
+async def test_an_invalid_open_of_an_unlisted_reparse_point_is_re_raised(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read: str
 ) -> None:
-    # A Windows reparse tag _UNOPENABLE_REPARSE_TAGS does not list (finding 1). On 52c0fdef3ca the
-    # EINVAL was re-raised: a 500.
+    # Manager ruling, r4 item 5: a reparse tag _UNOPENABLE_REPARSE_TAGS does not list is re-raised
+    # as an error, never "damaged" with a notice that invites a delete. On e59bc518d5a it was
+    # answered damaged.
     store = _store(tmp_path / "uploads")
     meta = await _saved(store)
     part = _blob(store, meta.file_id) if read == "read_bytes" else _sidecar(store, meta.file_id)
     monkeypatch.setattr(uploads, "os", _OsInvalidOpen(part, _regular(0x420, 0x80000099)))
-    with pytest.raises(UploadDamagedError):
+    with pytest.raises(OSError) as raised:
         await getattr(store, read)(meta.file_id)
+    assert raised.value.errno == errno.EINVAL
+    assert not isinstance(raised.value, UploadDamagedError)
 
 
 @pytest.mark.parametrize(
@@ -245,54 +248,24 @@ async def test_an_invalid_open_of_a_readable_file_is_re_raised(
     assert not isinstance(raised.value, UploadDamagedError)
 
 
-async def test_a_part_whose_directory_went_is_not_called_gone(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # A share that dropped answers ENOENT for the part and its directory alike. That is not a part
-    # that was removed, so the open's own error is re-raised (round-4490f032 finding 3).
-    store = _store(tmp_path / "uploads")
-    meta = await _saved(store)
-    part = _blob(store, meta.file_id)
-
-    class _Dropped(_OsWith):
-        def lstat(self, path: Any, *args: Any, **kwargs: Any) -> Any:
-            if isinstance(path, str | os.PathLike) and Path(path) == part:
-                raise FileNotFoundError(errno.ENOENT, "No such file", str(path))
-            return os.lstat(path, *args, **kwargs)
-
-        @property
-        def path(self) -> Any:
-            return SimpleNamespace(
-                isdir=lambda d: False if Path(d) == part.parent else os.path.isdir(d),
-                dirname=os.path.dirname,
-            )
-
-    def _eio(target: Any, flags: int, *args: Any) -> int:
-        if Path(target) == part:
-            raise OSError(errno.EIO, "Input/output error", str(target))
-        return os.open(target, flags, *args)
-
-    monkeypatch.setattr(uploads, "os", _Dropped(_eio))
-    with pytest.raises(OSError) as raised:
-        await store.read_bytes(meta.file_id)
-    assert raised.value.errno == errno.EIO
-
-
 async def test_the_incomplete_error_copies_and_its_args_hold_no_filename(tmp_path: Path) -> None:
     meta = await _saved(_store(tmp_path / "uploads"))
-    exc = UploadDeleteIncompleteError(meta.file_id, meta)
-    assert copy.copy(exc).removed == meta and copy.copy(exc).args == exc.args
-    assert pickle.loads(pickle.dumps(exc)).removed == meta
+    removal = uploads.UploadRemoval(meta, True, False)
+    exc = UploadDeleteIncompleteError(meta.file_id, removal)
+    assert copy.copy(exc).removed == removal and copy.copy(exc).args == exc.args
+    assert pickle.loads(pickle.dumps(exc)).removed == removal
     # An orphaned operation logs the error's repr, so the uploader's filename must not be in it
     # (round-f03184d8 finding 4).
     assert exc.args == (meta.file_id,) and meta.filename not in repr(exc)
 
 
 async def test_a_body_gone_after_its_unlink_failed_lets_the_delete_finish(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Another remover held the body delete-pending, so its unlink was refused and it is gone by
-    # the re-check. On 3ac67f76c81 that answered access refused, leaving the sidecar listed.
+    # Another remover took the body after its unlink was refused. On 3ac67f76c81 that answered
+    # access refused, leaving the sidecar listed; on e59bc518d5a the unlink's error was dropped
+    # unlogged (r4 item 6) and the body counted as this call's removal.
+    caplog.set_level(logging.WARNING, logger=uploads._log.name)
     store = _store(tmp_path / "uploads")
     meta = await _saved(store)
     blob = _blob(store, meta.file_id)
@@ -305,8 +278,10 @@ async def test_a_body_gone_after_its_unlink_failed_lets_the_delete_finish(
         real(self, missing_ok=missing_ok)
 
     monkeypatch.setattr(Path, "unlink", _unlink)
-    assert await store.delete(meta.file_id) == meta
+    removal = await store.delete(meta.file_id)
+    assert (removal.meta, removal.body_removed, removal.sidecar_removed) == (meta, False, True)
     assert not _sidecar(store, meta.file_id).exists()
+    assert any("did not remove it" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.parametrize("met", [errno.ENXIO, errno.EINVAL], ids=["linux-socket", "windows-socket"])
@@ -411,22 +386,29 @@ async def test_the_route_answers_an_incomplete_delete_409_and_records_the_part_d
         assert "nothing was deleted" in r.json()["detail"]
         monkeypatch.setattr(Path, "unlink", real_unlink)
         _failing_unlink(monkeypatch, root / f"{partial}.meta", _sharing_violation)
-        r = await c.delete(f"/uploads/{partial}", headers=h)
-        assert r.status_code == 409, r.text
-        assert "only partly deleted" in r.json()["detail"]
+        # The retry while the sidecar still cannot go removes nothing, so it writes no row (r4
+        # item 3; on e59bc518d5a each retry wrote one).
+        for _ in range(2):
+            r = await c.delete(f"/uploads/{partial}", headers=h)
+            assert r.status_code == 409, r.text
+            assert "not fully deleted" in r.json()["detail"]
+            # It claims no listing, which is false for the never-sealable kind (r4 item 8).
+            assert "listed" not in r.json()["detail"]
         listed = (await c.get("/uploads", headers=h)).json()
         assert partial in json.dumps(listed)
         monkeypatch.setattr(Path, "unlink", real_unlink)
         assert (await c.delete(f"/uploads/{partial}", headers=h)).status_code == 200
     rows = [a for a in await engine.store.list_audit() if a["action"] == "upload.delete"]
     details = [json.loads(str(a["detail"])) for a in rows]
-    # No row for the held body, which lost nothing; one for the partial delete, marked, and one
-    # for the retry that finished it.
+    # No row for the held body, which lost nothing; one for the partial delete, which removed the
+    # body, and one for the retry that removed only the sidecar.
     assert all(d["file_id"] != held for d in details)
-    assert sorted(d.get("sidecar_kept", False) for d in details if d["file_id"] == partial) == [
-        False,
-        True,
-    ]
+    mine = sorted(
+        (d.get("sidecar_kept", False), d.get("body_removed", True))
+        for d in details
+        if d["file_id"] == partial
+    )
+    assert mine == [(False, False), (True, True)]
     assert (root / f"{held}.blob").is_file() and (root / f"{held}.meta").is_file()
     assert not (root / f"{partial}.meta").exists()
 
@@ -435,3 +417,144 @@ def test_the_web_console_names_an_incomplete_delete_apart_from_a_refusal() -> No
     code = ul._refusal_code(HTTPException(409, "x"), ul._DELETE_CODES)
     assert code == ul.DELETE_INCOMPLETE_CODE
     assert "did not finish" in ul._LIST_NOTICES[code]
+
+
+# --- r4: a delete reports only what it removed, and a storage it cannot reach is no answer -------
+
+
+def _unreachable_share(path: Path) -> FileNotFoundError:
+    """What Windows raises for a path on a share it cannot reach: ERROR_BAD_NETPATH, as ENOENT."""
+    exc = FileNotFoundError(errno.ENOENT, "The network path was not found", str(path))
+    exc.winerror = 53  # type: ignore[attr-defined,misc,unused-ignore]
+    return exc
+
+
+class _OsLstatRaises(_OsWith):
+    """``os`` as ``uploads`` sees it, where an ``lstat`` of ``path`` raises ``error(path)``."""
+
+    def __init__(self, path: Path, error: Any) -> None:
+        super().__init__(os.open)
+        self._path, self._error = path, error
+
+    def lstat(self, path: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(path, str | os.PathLike) and Path(path) == self._path:
+            raise self._error(Path(path))
+        return os.lstat(path, *args, **kwargs)
+
+
+async def test_a_body_unlink_on_a_dropped_share_is_no_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # r4 item 1. On e59bc518d5a the re-lstat's ENOENT read as "gone", so the delete returned
+    # success with both files still on disk.
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    blob = _blob(store, meta.file_id)
+    monkeypatch.setattr(uploads, "os", _OsLstatRaises(blob, _unreachable_share))
+    _failing_unlink(monkeypatch, blob, lambda p: OSError(errno.EIO, "Input/output error", str(p)))
+    with pytest.raises(uploads.UploadStorageUnreachableError):
+        await store.delete(meta.file_id)
+    assert blob.is_file() and _sidecar(store, meta.file_id).is_file()
+
+
+async def test_a_sidecar_on_a_dropped_share_in_the_lock_keeps_the_body(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # r4 item 2. On e59bc518d5a an ENOENT there read as absence, and the body was unlinked.
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    sidecar = _sidecar(store, meta.file_id)
+    real_lock = uploads._pair_lock
+    real_lstat = Path.lstat
+
+    def _lstat(self: Path) -> os.stat_result:
+        if self == sidecar:
+            raise _unreachable_share(self)
+        return real_lstat(self)
+
+    @contextlib.contextmanager
+    def _lock_then_drop(path: Path, **kwargs: Any) -> Iterator[None]:
+        with real_lock(path, **kwargs):
+            monkeypatch.setattr(Path, "lstat", _lstat)
+            yield
+
+    monkeypatch.setattr(uploads, "_pair_lock", _lock_then_drop)
+    with pytest.raises(uploads.UploadStorageUnreachableError):
+        await store.delete(meta.file_id)
+    monkeypatch.setattr(Path, "lstat", real_lstat)
+    assert _blob(store, meta.file_id).is_file() and sidecar.is_file()
+
+
+async def test_a_delete_that_removed_nothing_is_not_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # r4 item 2: a delete that raced another finds both parts gone in the lock. On e59bc518d5a it
+    # returned the metadata, so the route wrote a second upload.delete row.
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    real_lock = uploads._pair_lock
+
+    @contextlib.contextmanager
+    def _raced(path: Path, **kwargs: Any) -> Iterator[None]:
+        _blob(store, meta.file_id).unlink()
+        _sidecar(store, meta.file_id).unlink()
+        with real_lock(path, **kwargs):
+            yield
+
+    monkeypatch.setattr(uploads, "_pair_lock", _raced)
+    with pytest.raises(UploadNotFoundError):
+        await store.delete(meta.file_id)
+
+
+@pytest.mark.parametrize("read", ["get_meta", "read_bytes"])
+async def test_an_open_on_a_dropped_share_is_unreachable_not_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read: str
+) -> None:
+    # r4 item 9. On e59bc518d5a the open's ENOENT answered 404: an intact file read as gone.
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    part = _blob(store, meta.file_id) if read == "read_bytes" else _sidecar(store, meta.file_id)
+
+    def _dropped(target: Any, flags: int, *args: Any) -> int:
+        if Path(target) == part:
+            raise _unreachable_share(Path(target))
+        return os.open(target, flags, *args)
+
+    monkeypatch.setattr(uploads, "os", _OsWith(_dropped))
+    with pytest.raises(uploads.UploadStorageUnreachableError):
+        await getattr(store, read)(meta.file_id)
+
+
+async def test_the_route_answers_an_unreachable_storage_503_and_the_console_names_it(
+    engine: Engine,  # noqa: F811 - the imported fixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    root = tmp_path / "uploads"
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        fid = (
+            await c.post("/uploads", files={"file": ("x.hl7", ADT, "text/plain")}, headers=h)
+        ).json()["file_id"]
+        blob = root / f"{fid}.blob"
+        monkeypatch.setattr(uploads, "os", _OsLstatRaises(blob, _unreachable_share))
+        _failing_unlink(
+            monkeypatch, blob, lambda p: OSError(errno.EIO, "Input/output error", str(p))
+        )
+        r = await c.delete(f"/uploads/{fid}", headers=h)
+        assert r.status_code == 503, r.text
+        assert "could not be reached" in r.json()["detail"]
+    rows = [a for a in await engine.store.list_audit() if a["action"] == "upload.delete"]
+    assert not rows
+    busy = HTTPException(503, "x", headers={"Retry-After": "5"})
+    assert ul._refusal_code(busy, ul._DELETE_CODES) == ul.KEY_SERVICE_BUSY_CODE
+    busy.storage_unreachable = True  # type: ignore[attr-defined]
+    code = ul._refusal_code(busy, ul._DELETE_CODES)
+    assert code == ul.STORAGE_UNREACHABLE_CODE
+    assert "could not reach the storage" in ul._LIST_NOTICES[code]

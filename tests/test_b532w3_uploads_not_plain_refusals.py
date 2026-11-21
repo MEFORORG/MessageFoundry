@@ -310,7 +310,7 @@ async def test_a_sidecar_unlink_that_fails_after_the_body_went_is_no_success(
     tries = _failing_unlink(monkeypatch, sidecar, _sharing_violation)
     with pytest.raises(uploads.UploadDeleteIncompleteError) as raised:
         await store.delete(meta.file_id)
-    assert raised.value.removed == meta
+    assert raised.value.removed == uploads.UploadRemoval(meta, True, False)
     assert len(tries) == uploads._UNLINK_ATTEMPTS
     assert not _blob(store, meta.file_id).exists() and sidecar.is_file()
     assert any("delete it again" in r.getMessage() for r in caplog.records)
@@ -318,7 +318,8 @@ async def test_a_sidecar_unlink_that_fails_after_the_body_went_is_no_success(
     # sidecar can go, finishes the delete.
     assert [m.file_id for m in await store.list_files()] == [meta.file_id]
     monkeypatch.setattr(Path, "unlink", real_unlink)
-    await store.delete(meta.file_id)
+    removal = await store.delete(meta.file_id)
+    assert (removal.body_removed, removal.sidecar_removed) == (False, True)
     assert not sidecar.exists() and not await store.list_files()
 
 

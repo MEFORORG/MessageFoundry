@@ -1683,7 +1683,10 @@ async def test_an_override_holder_deletes_an_upload_rotate_key_cannot_seal(
     assert rows[0]["actor"] == "root"
     detail = json.loads(str(rows[0]["detail"]))
     assert detail["file_id"] == fid
-    assert set(detail) == {"file_id", "size"}  # no file name (vault BACKLOG #2619)
+    # No file name (vault BACKLOG #2619). A body already missing was not removed by this call,
+    # so its row says so (BACKLOG #5388 added item 3).
+    assert set(detail) - {"body_removed"} == {"file_id", "size"}
+    assert detail.get("body_removed", False) is False
     assert "acme" not in str(rows[0]["detail"])
 
 
