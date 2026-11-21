@@ -91,7 +91,7 @@ from messagefoundry.transports.base import (
     NegativeAckError,
     count_setting,
     encode_wire_body,
-    float_setting,
+    positive_seconds,
     register_destination,
 )
 from messagefoundry.transports.bounded_read import (
@@ -165,13 +165,15 @@ _WSSE_EXPIRED_RE = re.compile(r"MessageExpired", re.IGNORECASE)
 # NAME is a regex. BACKLOG #2827: the former `[^>]*>(.*?)</` tail rescanned to the end of the reply
 # from every start tag lacking a close, so a partner reply of repeated start tags cost the square of
 # its length. _code_text finds the `>` and `</` with str.find, once per read, at most twice (the
-# first-child read's, then the fallback's, which may be the same element), and only inside the Fault _find_fault took, up to
-# that Fault's close tag or the reply's end. BACKLOG #5912: the code element is the Fault's first child, a faultcode or a Code (_CODE_RE),
-# and for a Code the Value that is its own first child, up to its close tag (_CODE_END_RE);
+# first-child read's, then the fallback's, which may be the same element), and only inside the
+# Fault _find_fault took, up to that Fault's close tag or the reply's end. BACKLOG #5912: the code
+# element is the Fault's first child, a faultcode or a Code (_CODE_RE), and for a Code the Value
+# that is its own first child, up to its close tag (_CODE_END_RE);
 # _fault_code says why, and when it falls back to the earlier search (_searched_code). For the
 # first-child read the Fault and Code close tags are searched for outside markup, with
 # _FAULT_END_OUTSIDE_MARKUP_RE and _CODE_END_OUTSIDE_MARKUP_RE, which hold _FAULT_END_RE and
-# _CODE_END_RE; the fallback's range ends at the first plain _FAULT_END_RE match, markup not stepped over.
+# _CODE_END_RE; the fallback's range ends at the first plain _FAULT_END_RE match, markup not
+# stepped over.
 _FAULTCODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?faultcode\b", re.IGNORECASE)
 _CODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Code(?=[\s/>])", re.IGNORECASE)
 _CODEVALUE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Value\b", re.IGNORECASE)
@@ -193,6 +195,8 @@ _MARKUP_CLOSER = dict(_NON_ELEMENT_MARKUP)
 _FAULT_OUTSIDE_MARKUP_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|(?i:<\s*(?:[\w.\-]+:)?Fault[\s/>])")
 _FAULT_END_OUTSIDE_MARKUP_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|(?i:</\s*(?:[\w.\-]+:)?Fault\s*>)")
 _CODE_END_OUTSIDE_MARKUP_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|(?i:</\s*(?:[\w.\-]+:)?Code\s*>)")
+# _TAG_OPEN_RE among those openers: the first tag outside that markup (_child_code_text).
+_TAG_OPEN_OUTSIDE_MARKUP_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|<(?![!?])")
 # A <…:Header> element (any/no namespace prefix) smuggled into a <Body> fragment (purity-leak lint).
 _HEADER_EL_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Header[\s/>]", re.IGNORECASE)
 
@@ -345,9 +349,13 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     SOAP 1.1's ``faultcode`` or SOAP 1.2's ``Code``, which both schemas put first. For ``Code`` the
     code is the ``Value`` that is the Code's own first child, read only up to the Code's close tag.
     A ``Value`` anywhere else in the Fault, in a Subcode, Reason, Node, Role or Detail, never
-    decides permanent versus retryable when the first child yields a code. A Fault or Code close
-    tag inside a comment, a CDATA section or a processing instruction does not end either element
-    (:func:`_search_outside_markup`).
+    decides permanent versus retryable when the first child yields a code. For the first-child
+    read, a Fault or Code close tag inside a comment, a CDATA section or a processing instruction
+    does not end either element (:func:`_search_outside_markup`); the fallback below does not step
+    over markup.
+
+    One shape is read again: :func:`_child_code_text` says exactly when (BACKLOG #5912, closing
+    step 21).
 
     Where the first-child read yields no code, because the first child is neither element, it
     cannot hold a code, or a ``<!`` the read does not step over (a DOCTYPE, a lowercase
@@ -358,8 +366,9 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     took, such a reply reads as it did then. A plain Receiver code the first-child read cannot
     place, after a SOAP 1.1 ``faultstring`` or a SOAP 1.2 ``Reason`` say, is read and retried only
     where nothing ahead of it in that range ends the range or decides first: at least a Fault close
-    tag inside markup ends it, so the fault reads no code and dead-letters, and a ``faultcode`` or
-    ``Value`` inside markup decides; and, as before #5912, a ``Value`` ahead of
+    tag inside markup ends it, so the fault reads no code and dead-letters unless a ``faultcode``
+    or ``Value`` ahead of that close tag decides, and a ``faultcode`` or ``Value`` inside markup
+    decides; and, as before #5912, a ``Value`` ahead of
     the code element, or after a code element that holds no code, decides the class there, so a
     Sender fault of such a shape may read as a Receiver one and retry. Only where both reads find nothing is
     the code ``""``, which :func:`_classify_soap` reads as a permanent fault, never as delivered.
@@ -391,7 +400,7 @@ def _first_child_code(body: str, start: int, end: int) -> str:
         return ""
     faultcode = _FAULTCODE_RE.match(body, child, end)
     if faultcode is not None:
-        return _code_text(faultcode, _FAULTCODE_END_RE, body, end)
+        return _child_code_text(faultcode, _FAULTCODE_END_RE, body, end)
     code = _CODE_RE.match(body, child, end)
     code_gt = -1 if code is None else _start_tag_gt(body, code.end(), end)
     if code_gt < 0:
@@ -400,7 +409,62 @@ def _first_child_code(body: str, start: int, end: int) -> str:
     stop = end if code_end is None else code_end.start()
     child = _first_child(body, code_gt + 1, stop)
     value = None if child < 0 else _CODEVALUE_RE.match(body, child, stop)
-    return "" if value is None else _code_text(value, _CODEVALUE_END_RE, body, stop)
+    return "" if value is None else _child_code_text(value, _CODEVALUE_END_RE, body, stop)
+
+
+def _child_code_text(m: re.Match[str], end_re: re.Pattern[str], body: str, end: int) -> str:
+    """The first-child read's text for the code element ``m``: :func:`_code_text`'s, except in
+    the one shape below (BACKLOG #5912, closing step 21).
+
+    ``<faultcode><!-- </faultcode> -->soap:Server</faultcode>`` gave :func:`_code_text` the text
+    ``<!-- ``, read as an unrecognized, permanent fault, where the code before #5912 retried such
+    a reply through a ``Value`` ahead of it. The element is read again only where all of these
+    hold: the :func:`_code_text` text is not empty, so its first ``</`` is the element's own close
+    tag; that text matches neither ``_SENDER_RE`` nor ``_RECEIVER_RE``; and it opens a comment, a
+    CDATA section or a processing instruction it does not terminate, so that close tag lies
+    inside the markup. It is then read to the first tag outside such markup, when that tag is its
+    own close tag, with each terminated comment and processing instruction left out and CDATA
+    sections kept whole (``soap:Server`` here). Where that read finds no such tag, or leaves
+    nothing, the :func:`_code_text` text stands. So a Sender or Receiver reading is never changed,
+    and the class can change only from an unrecognized fault to a Sender or Receiver one. Each
+    pass is one scan forward (:func:`_scan_markup`, :func:`_search_outside_markup`), so the read
+    stays linear in the reply."""
+    text = _code_text(m, end_re, body, end)
+    if not text or _SENDER_RE.search(text) or _RECEIVER_RE.search(text):
+        return text
+    if not _scan_markup(text)[1]:
+        return text
+    gt = _start_tag_gt(body, m.end(), end)
+    tag = _search_outside_markup(_TAG_OPEN_OUTSIDE_MARKUP_RE, body, gt + 1, end)
+    if tag is None or not end_re.match(body, tag.start(), end):
+        return text
+    return _scan_markup(body[gt + 1 : tag.start()])[0] or text
+
+
+def _scan_markup(text: str) -> tuple[str, bool]:
+    """``text`` with each terminated comment and processing instruction left out, CDATA sections
+    kept whole, and whether ``text`` opens such markup, a CDATA section included, that it does
+    not terminate. An opener with no terminator is kept as text, as :func:`_search_outside_markup`
+    reads it; once one has none, no later opener of its kind can have one, so it is not searched
+    for again and the scan stays linear in ``text``."""
+    kept: list[str] = []
+    unterminated: set[str] = set()
+    pos = scan = 0
+    while (lt := text.find("<", scan)) >= 0:
+        scan = lt + 1
+        for opener, closer in _NON_ELEMENT_MARKUP:
+            if text.startswith(opener, lt):
+                close = -1 if opener in unterminated else text.find(closer, lt + len(opener))
+                if close < 0:
+                    unterminated.add(opener)
+                else:
+                    scan = close + len(closer)
+                    if opener != "<![CDATA[":
+                        kept.append(text[pos:lt])
+                        pos = scan
+                break
+    kept.append(text[pos:])
+    return "".join(kept), bool(unterminated)
 
 
 def _searched_code(body: str, start: int, end: int) -> str:
@@ -629,7 +693,8 @@ class SoapDestination(DestinationConnector):
         self.url = url
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("SOAP", config.name)
-        self.timeout: float = float_setting(
+        # BACKLOG #5959: above zero, as REST's; positive_seconds says why.
+        self.timeout: float = positive_seconds(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="SOAP destination"
         )
         self.encoding: str = s.get("encoding", "utf-8")

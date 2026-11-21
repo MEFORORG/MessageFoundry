@@ -179,6 +179,13 @@
       const n = Number(inp.value);
       return Number.isFinite(n) ? n : undefined;
     }
+    // The id of the projection this page shows (the mf-projection meta). Every edit echoes it, so the
+    // provider knows which projection's rows the edit was made on (BACKLOG #5943).
+    function projectionId() {
+      const meta = document.querySelector('meta[name="mf-projection"]');
+      const n = Number(meta ? meta.getAttribute('content') : NaN);
+      return Number.isSafeInteger(n) ? n : undefined;
+    }
     for (const inp of document.querySelectorAll('input.edit, select.edit')) {
       inp.addEventListener('change', () => {
         // A route's handlers field (data-list) posts its comma-separated names as a list, empties
@@ -207,6 +214,7 @@
           // The row's projection-time source (data-expect-src) — carried to lens rewrite as expect_src so a
           // stale coordinate (a shift in a dirty split view) is REFUSED, not silently mis-edited (F7).
           expectSrc: inp.dataset.expectSrc,
+          projection: projectionId(),
         });
       });
     }
@@ -289,7 +297,7 @@
           if (!fieldsReady(parts)) { setHint(box, true); return; }
           setHint(box, false);
           box.dataset.lastParts = json;
-          vscode.postMessage(Object.assign({ command: 'edit' }, coords(box), { value: { parts: parts } }));
+          vscode.postMessage(Object.assign({ command: 'edit' }, coords(box), { value: { parts: parts }, projection: projectionId() }));
         }
         // Ask the provider to pick a field into part `index`. The request carries every chip, typing
         // included, and the pick's write carries that pass, so `flush` does not write the same parts.
