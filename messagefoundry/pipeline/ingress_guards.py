@@ -75,10 +75,9 @@ from messagefoundry.parsing import RawMessage, normalize
 from messagefoundry.parsing.binary import MARKER as CARRIAGE_MARKER
 from messagefoundry.parsing.binary import (
     BinaryCarriageError,
+    colliding_marker_verdict,
     is_marked,
-    later_header_forms_over_limit,
     marker_under_base64_delimiters,
-    marker_under_colliding_delimiters,
 )
 from messagefoundry.parsing.binary import decode as decode_carriage
 from messagefoundry.parsing.message import Message
@@ -159,8 +158,9 @@ COLLIDING_DOC_REF_MARKER_REFUSED_REASON = (
 )
 
 #: The stored reason for an HL7 body under such a header whose later headers escape the handle
-#: marker in more distinct ways than the check looks for, so it is refused as if it held the
-#: marker without a scan per form (BACKLOG #5972). It names no byte of the body.
+#: marker in more distinct ways than the check looks for, and whose first line's forms are not
+#: found, so it is refused without a scan per form (BACKLOG #5972). It names no byte of the
+#: body.
 COLLIDING_HEADER_FORMS_REFUSED_REASON = (
     "document handle refused: its header fills a delimiter it does not name with one it already "
     "uses, and its later headers escape the handle marker in too many ways to look for each"
@@ -179,10 +179,11 @@ def doc_ref_marker_refusal(peek: Peek, text: str) -> str | None:
     message = Message(peek.message)
     if marker_under_base64_delimiters(message, text):
         return DOC_REF_MARKER_REFUSED_REASON
-    if marker_under_colliding_delimiters(message, text):
-        # Past the limit the body is judged without a scan per form, so its reason says so.
-        if later_header_forms_over_limit(message):
-            return COLLIDING_HEADER_FORMS_REFUSED_REASON
+    # One call names the reason, so the header fields are read once.
+    verdict = colliding_marker_verdict(message, text)
+    if verdict == "over-limit":
+        return COLLIDING_HEADER_FORMS_REFUSED_REASON
+    if verdict == "held":
         return COLLIDING_DOC_REF_MARKER_REFUSED_REASON
     return None
 

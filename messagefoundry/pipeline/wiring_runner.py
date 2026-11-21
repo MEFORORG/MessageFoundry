@@ -186,6 +186,7 @@ from messagefoundry.pipeline.dryrun import (
     UserCodeCalledSysExit as UserCodeCalledSysExit,  # re-exported, one definition (BACKLOG #5105)
 )
 from messagefoundry.pipeline.ingress_guards import (
+    COLLIDING_HEADER_FORMS_REFUSED_REASON,
     STRICT_VALIDATE_TIMEOUT_SECONDS,
     IngressBodyRejected,
     IngressCodecUnusable,
@@ -10316,9 +10317,7 @@ class RegistryRunner:
         attachment_refs: list[str] = []
         if streaming_over:
             try:
-                skeleton, attachment_refs = await self._detach_documents(
-                    ic, text, marker_checked=True
-                )
+                skeleton, attachment_refs = await self._detach_documents(ic, text)
             except _DETACH_REFUSALS as exc:
                 return await self._refuse(
                     ic,
@@ -10381,9 +10380,7 @@ class RegistryRunner:
         The rule lives in ``ingress_guards`` so the operator resend reads it the same way (#1911)."""
         return streaming_over_threshold(ic, text)
 
-    async def _detach_documents(
-        self, ic: InboundConnection, text: str, *, marker_checked: bool = False
-    ) -> tuple[str, list[str]]:
+    async def _detach_documents(self, ic: InboundConnection, text: str) -> tuple[str, list[str]]:
         """Detach every oversized OBX-5 ED base64 document from an over-threshold HL7 body into the
         store's content-addressed attachment substrate and return ``(skeleton_text, attachment_refs)``
         (#149, ADR 0105 Phase 1a, Approach B — VERBATIM).
@@ -10412,13 +10409,7 @@ class RegistryRunner:
         ``OBX-2`` is ``ED``, whether or not a document reads there (BACKLOG #5972) — each, as one of
         :data:`_DETACH_REFUSALS`, is turned
         into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
-        Phase-C); the budget bounds how many such buffers can be concurrent.
-
-        ``marker_checked`` is ``True`` only from a listener that ran
-        :func:`~messagefoundry.pipeline.ingress_guards.doc_ref_marker_refusal` on ``text`` and went
-        on because it refused nothing, as both do: the detach then does not repeat that check's
-        colliding-header marker test (BACKLOG #5972). Any other caller leaves it out and gets the
-        test."""
+        Phase-C); the budget bounds how many such buffers can be concurrent."""
         size = len(text)
         budget = self._stream_inflight_budget
         if budget and self._stream_inflight_bytes + size > budget:
@@ -10447,7 +10438,7 @@ class RegistryRunner:
             message = await asyncio.to_thread(Message.parse, text)
             # The received text rides along so a body holding the handle marker anywhere is refused
             # here, before the ACK, rather than dead-lettered after the splice (BACKLOG #5099).
-            documents = iter_obx_documents(message, received=text, marker_checked=marker_checked)
+            documents = iter_obx_documents(message, received=text)
 
             def _next_document() -> tuple[int, str, str] | None:
                 return next(documents, None)
@@ -10683,7 +10674,12 @@ class RegistryRunner:
                 build_ack(
                     peek,
                     code="AR",
-                    text="handle marker refused by its delimiters",
+                    # Judged without a scan per form, so no marker is named (BACKLOG #5972).
+                    text=(
+                        "too many header delimiter sets"
+                        if marker_refused == COLLIDING_HEADER_FORMS_REFUSED_REASON
+                        else "handle marker refused by its delimiters"
+                    ),
                     ack_mode=ack_mode,
                 )
                 if reply
@@ -10783,9 +10779,7 @@ class RegistryRunner:
         attachment_refs: list[str] = []
         if streaming_over:
             try:
-                skeleton, attachment_refs = await self._detach_documents(
-                    ic, text, marker_checked=True
-                )
+                skeleton, attachment_refs = await self._detach_documents(ic, text)
             except _DETACH_REFUSALS as exc:
                 detach_err = f"streaming detach failed: {safe_exc(exc)}"
                 mid = await self._record_refused(ic, raw, text, error=detach_err, peek=peek)
