@@ -43,6 +43,7 @@ from messagefoundry.store.store import (
     OutboxStatus,
     Stage,
     _GroupCommitter,
+    _Member,
 )
 
 RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
@@ -733,8 +734,34 @@ async def test_close_after_a_cancelled_committer_survives_a_caught_cancel(tmp_pa
     stopper = asyncio.create_task(_stopper())
     await asyncio.sleep(0)
     stopper.cancel()
-    await asyncio.wait_for(stopper, timeout=10.0)  # close raised nothing
-    assert s._read_conns == []
+    try:
+        await asyncio.wait_for(stopper, timeout=10.0)  # close raised nothing
+        assert s._read_conns == []
+    finally:
+        if s._read_conns:
+            await s.close()  # the regression case: release the handles so the run can exit
+
+
+async def test_committer_cancelled_before_its_first_step_still_rejects(tmp_path: Path) -> None:
+    """A committer task cancelled before it ever ran never enters its body, so the rejection must
+    not depend on code inside it."""
+    s = await MessageStore.open(tmp_path / "unstarted.db", group_commit_window_ms=GC_WINDOW_MS)
+    try:
+        gc = s._group_commit
+        assert gc is not None and gc._task is not None
+        await gc.aclose()
+        gc.start()  # a fresh task, not yet stepped
+        assert gc._task is not None
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+        gc._pending.append(_Member(run=functools.partial(_ret, 1), future=fut))
+        gc._task.cancel()  # before its first step
+        await asyncio.gather(gc._task, return_exceptions=True)
+        with pytest.raises(RuntimeError, match="stopped"):
+            await asyncio.wait_for(fut, timeout=5.0)
+        assert gc._closed
+    finally:
+        await s.close()
 
 
 async def test_committer_cancelled_mid_flush_rejects_members_beyond_the_batch(

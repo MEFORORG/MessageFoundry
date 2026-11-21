@@ -626,10 +626,31 @@ class _GroupCommitter:
         self._task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
-        if self._task is None:
-            # A committer that stopped marked itself closed (see _run); a new task reopens it.
+        if self._task is None or self._task.done():
+            # A committer that stopped marked itself closed (see _on_stopped); a new task reopens it.
             self._closed = False
             self._task = asyncio.create_task(self._run(), name="store-group-committer")
+            self._task.add_done_callback(self._on_stopped)
+
+    def _on_stopped(self, task: asyncio.Task[None]) -> None:
+        """However the committer task ends -- a cancel while parked on ``_wake``, a cancel before its
+        first step, or a BaseException out of :meth:`_flush`, which rejects only the batch it claimed --
+        no later :meth:`submit` may enrol, and every member still pending is rejected, or its caller
+        (the ACK gate among them) parks forever (BACKLOG #5664). A done-callback rather than a
+        ``finally`` in :meth:`_run`, because a task cancelled before its first step never enters its
+        body. On the clean :meth:`aclose` exit ``_pending`` is already empty."""
+        if task is not self._task:
+            return  # a stale task; a newer one owns the committer now
+        self._closed = True
+        stranded, self._pending = self._pending, []
+        if task.cancelled() or task.exception() is not None:
+            log.warning(
+                "store group committer stopped outside close; rejecting %d pending member(s)",
+                len(stranded),
+            )
+        for member in stranded:
+            if not member.future.done():
+                member.future.set_exception(RuntimeError("group committer stopped"))
 
     async def aclose(self) -> None:
         """Stop the committer, flushing any enrolled members first so nothing is stranded."""
@@ -642,7 +663,7 @@ class _GroupCommitter:
             try:
                 await task
             except asyncio.CancelledError:
-                # A committer cancelled earlier has already rejected its members (see _run); that
+                # A committer cancelled earlier has already rejected its members (_on_stopped); that
                 # stale cancel must not abort the store's close. A cancel of OUR task during the
                 # await still propagates; the baseline keeps a caller that already caught an
                 # earlier cancel of its own from reading as cancelled now.
@@ -675,22 +696,6 @@ class _GroupCommitter:
         return await fut
 
     async def _run(self) -> None:
-        try:
-            await self._drain_loop()
-        finally:
-            # However the committer exits -- a cancel while parked on _wake, or a BaseException from
-            # _flush, which rejects only the batch it claimed -- no later submit() may enrol, and every
-            # member still pending must be rejected, or its caller (the ACK gate among them) parks
-            # forever. On the clean aclose() exit _pending is already empty.
-            self._closed = True
-            stranded, self._pending = self._pending, []
-            for member in stranded:
-                # A future whose loop is already closed (the coroutine closed at teardown) has no
-                # caller left to wake, and set_exception would raise there.
-                if not member.future.done() and not member.future.get_loop().is_closed():
-                    member.future.set_exception(RuntimeError("group committer stopped"))
-
-    async def _drain_loop(self) -> None:
         while True:
             await self._wake.wait()
             self._wake.clear()
