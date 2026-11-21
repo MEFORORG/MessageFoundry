@@ -1030,6 +1030,23 @@ def structural_phi_hits(
 RETARGET_RESIDUE = "left by a retarget"
 #: What a hit in a component an identifier rule kept reads as, after its shape label.
 KEPT_COMPONENT = "in a component an identifier rule keeps"
+#: The two labels a hit of :func:`past_first_component_hits` carries.
+_MAPPED_FIELD_LABELS = (RETARGET_RESIDUE, KEPT_COMPONENT)
+#: The tail of such a hit: `` <label> in <address>``, the address one word.
+_MAPPED_FIELD_TAIL: re.Pattern[str] = re.compile(
+    "(?: (" + "|".join(re.escape(label) for label in _MAPPED_FIELD_LABELS) + ") in )[^ ]+$"
+)
+
+
+def mapped_field_label(hit: str) -> str | None:
+    """:data:`RETARGET_RESIDUE` or :data:`KEPT_COMPONENT` when ``hit`` reads as a hit of
+    :func:`past_first_component_hits`, whose text ends `` <label> in <address>``, else ``None``.
+    It is the one reading of that label, so a label's words elsewhere in a hit, such as in a
+    token's description, are not taken for it (BACKLOG #5533 items 4 and 27). A token hit can
+    still end that way, so a caller with a report also asks whether the hit is structural, as
+    :func:`has_other_cause` does."""
+    match = _MAPPED_FIELD_TAIL.search(hit)
+    return match.group(1) if match else None
 
 
 def past_first_component_hits(
@@ -1096,7 +1113,7 @@ def retarget_residue_hits(
     """The hits of :func:`past_first_component_hits` in what a retarget of a default field left
     (BACKLOG #3493)."""
     hits = past_first_component_hits(text, rules, version=version)
-    return [hit for hit in hits if RETARGET_RESIDUE in hit]
+    return [hit for hit in hits if mapped_field_label(hit) == RETARGET_RESIDUE]
 
 
 def kept_component_hits(
@@ -1105,7 +1122,7 @@ def kept_component_hits(
     """The hits of :func:`past_first_component_hits` in the components an ``id``, ``mrn``,
     ``ssn`` or ``dln`` rule kept, on a field no retarget names (BACKLOG #5533, #5534)."""
     hits = past_first_component_hits(text, rules, version=version)
-    return [hit for hit in hits if KEPT_COMPONENT in hit]
+    return [hit for hit in hits if mapped_field_label(hit) == KEPT_COMPONENT]
 
 
 def has_unreachable_line(text: str, mapped_paths: Iterable[str] = ()) -> bool:
@@ -1310,18 +1327,16 @@ def mapped_field_advice(report: LeakReport) -> list[str]:
     """The advice for each kind of hit in a mapped field that ``report`` holds
     (:func:`past_first_component_hits`), in a fixed order. Empty when it holds none. A keep is
     the wrong advice for every one of them: it would leave the whole field."""
-    return [
-        advice
-        for label, advice in _MAPPED_FIELD_ADVICE
-        if any(label in hit for hit in report.structural_hits)
-    ]
+    labels = {mapped_field_label(hit) for hit in report.structural_hits}
+    return [advice for label, advice in _MAPPED_FIELD_ADVICE if label in labels]
 
 
 def has_other_cause(report: LeakReport) -> bool:
     """True if ``report`` holds a hit that is not in a mapped field, such as a token or a shape
     in a field no rule maps, so its fix is not only the advice :func:`mapped_field_advice`
     gives."""
-    return any(not any(label in hit for label, _ in _MAPPED_FIELD_ADVICE) for hit in report.hits)
+    structural = set(report.structural_hits)
+    return any(hit not in structural or mapped_field_label(hit) is None for hit in report.hits)
 
 
 #: The address a header hit after the encoding characters names.
@@ -1342,8 +1357,7 @@ def refusal_advice(
     steps: list[str] = []
     token_hit = len(report.hits) > len(report.structural_hits)
     shape_hit = any(
-        hit not in (MALFORMED_LINE_HIT, REPEATED_ENCODING_HIT)
-        and not any(label in hit for label, _ in _MAPPED_FIELD_ADVICE)
+        hit not in (MALFORMED_LINE_HIT, REPEATED_ENCODING_HIT) and mapped_field_label(hit) is None
         for hit in report.structural_hits
     )
     if token_hit or shape_hit:
