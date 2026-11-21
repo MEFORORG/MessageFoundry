@@ -914,6 +914,7 @@ def _log_sink_health() -> list[LogSinkInfo]:
             last_event=status.last_event,
             last_event_at=status.last_event_at,
             rolled_aside=status.rolled_aside,
+            latch_only=status.latch_only,
         )
         for status in guard.status()
     ]

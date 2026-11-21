@@ -478,3 +478,22 @@ stage 2 then decides the stop as for any other stage-2 failure. `_GuardedSinkMix
 two guards, one with the latch switched off, and compares their events, recorded states, bound and
 `revalidate()` answers. It drives the guard directly, not real handlers, and it does not model
 threads.
+
+## Amendment D (2026-11-20) -- when a slow drip releases the flap latch, and what /status says about it (BACKLOG #5812)
+
+**Amendments B and C are unedited. Where this amendment disagrees with Amendment B, it is the
+newer text.** `_flap_latch` now holds two `time.monotonic()` readings per held sink: the one
+Amendment B describes, and the latest stage-2 failure while the latch held the sink.
+
+**A slow drip released.** Under Amendment B a roll within 60 seconds of the sink's last roll or
+stage-2 failure kept the latch, so a sink rolling once every 59 seconds stayed latched for as
+long as it kept rolling, though section 1's bound calls that rate a heal. Now a roll the bound
+calls a heal also releases the latch when it opens a new window of the bound after a whole window
+that held no more than 5 rolls and no stage-2 failure while the latch held the sink.
+`LogWriteGuard.record_rollover`'s docstring states the rule. A flap whose rolls straddle two of the
+bound's windows can be released where the bound does not trip either, so the latch is still never
+weaker than the bound, and no stronger than it in that case.
+
+**`GET /status` tells the two kinds of `unwritable` apart.** Each sink gains `latch_only`, true
+when its `state` reads `unwritable` only through the latch, while its own last record was a roll
+that landed. A sink whose own state is `unwritable` reads `latch_only` false, latched or not.

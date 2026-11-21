@@ -780,7 +780,7 @@ def test_the_latch_never_makes_the_guard_less_strict_than_the_bound_alone(
         guard.register("file", probe=probe)
         guard.register("stdout", probe=probe)
         if not latched:
-            guard._latch_after_roll = lambda sink, *, now, tripped: None  # type: ignore[method-assign]
+            guard._latch_after_roll = lambda sink, *, now, tripped, closed: None  # type: ignore[method-assign]
             guard._latch_after_failure = lambda sink: None  # type: ignore[method-assign]
         return guard, events
 
@@ -820,6 +820,74 @@ def test_the_latch_never_makes_the_guard_less_strict_than_the_bound_alone(
 
 def _without_stamps(guard: LogWriteGuard) -> dict[str, Any]:
     return {name: replace(s, last_event_at=None) for name, s in guard._sinks.items()}
+
+
+def test_a_slow_drip_of_rolls_the_bound_calls_healthy_releases_the_latch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5812 item 10. Six rolls trip the bound, then the sink rolls every 30 s: at most
+    # three rolls in each later window of the bound, which it calls healthy, and each within a
+    # minute of the last. The window from 65 s closes at the roll at 155 s with three rolls and no
+    # stage-2 failure, so that roll releases the latch, and the sink reads ``rolled`` again.
+    # NEGATIVE CONTROL: before the fix every roll within a minute of the last kept the latch, so
+    # the sink read ``unwritable`` for as long as the drip went on.
+    clock = _FakeClock()
+    guard, events = _guard_on(clock, monkeypatch)
+    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1), 35, 65, 95, 125)
+    assert guard.status()[0].state == "unwritable"  # the window from 0 s held seven rolls
+    paged = len(events)
+
+    _roll(guard, clock, 155)
+
+    assert guard.status()[0].state == "rolled"
+    assert guard.can_log() is True
+    assert [e.stage for e in events[paged:]] == ["rolled"]
+    for t in range(185, 1000, 30):
+        _roll(guard, clock, t)
+        assert guard.status()[0].state == "rolled"
+
+
+def test_a_stage2_failure_in_a_quiet_window_keeps_the_latch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The other side of the test above: the same drip, but the sink also fails stage 2 at 100 s,
+    # inside the window from 65 s. That window was not quiet, so the roll at 155 s keeps the latch,
+    # and the next window, from 155 s, closes quiet at 245 s and releases it there.
+    clock = _FakeClock()
+    guard, _events = _guard_on(clock, monkeypatch)
+    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1), 35, 65, 95)
+    _at(clock, 100)
+    guard.record_unwritable("file", reason="the replacement failed too")
+    _roll(guard, clock, 125, 155, 185, 215)
+    assert guard.status()[0].state == "unwritable"
+
+    _roll(guard, clock, 245)
+    assert guard.status()[0].state == "rolled"
+
+
+def test_status_tells_a_latch_only_sink_from_one_stage2_declared_dead(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5812 item 13. ``file`` is held by the flap latch alone; ``stdout`` failed stage 2.
+    # Both read ``unwritable``, and ``latch_only`` tells them apart, on the guard and on /status.
+    # NEGATIVE CONTROL: before the fix the two read identically.
+    from messagefoundry.api.app import _log_sink_health
+
+    clock = _FakeClock()
+    guard, _events = _guard_on(clock, monkeypatch, sinks=("file", "stdout"))
+    _roll(guard, clock, *range(_MAX_ROLLS_PER_WINDOW + 1), 62)
+    _at(clock, 63)
+    guard.record_unwritable("stdout", reason="the replacement failed too")
+
+    reported = {s.sink: (s.state, s.latch_only) for s in guard.status()}
+    assert reported == {"file": ("unwritable", True), "stdout": ("unwritable", False)}
+    monkeypatch.setattr(logging_guard, "_ACTIVE", guard)
+    published = {s.sink: (s.state, s.latch_only) for s in _log_sink_health()}
+    assert published == reported
+    # A sink whose own state is unwritable while the latch also holds it is not latch-only.
+    _at(clock, 64)
+    guard.record_unwritable("file", reason="the replacement failed too")
+    assert guard.status()[0].latch_only is False
 
 
 # --- BACKLOG #5813: a record that cannot be formatted is not a sink failure ----

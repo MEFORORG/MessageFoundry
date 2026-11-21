@@ -954,12 +954,17 @@ from typing import Any
 #: Re-derived with ``--write`` on the branch, from ``92b8db415d6730cc`` to ``0c684e8deb86b688``,
 #: and over the merge with BACKLOG #5931 above, from ``fb220e2a1ada115e`` to ``0cb66e183386b7c8``.
 #:
+#: BACKLOG #5812: ``LogSinkInfo`` gains the optional ``latch_only`` flag, so a ``GET /status``
+#: reader can tell a sink the flap latch alone holds from one stage 2 declared dead. The console
+#: does not render it. Re-derived with ``--write``, from ``0cb66e183386b7c8`` to
+#: ``7e0e885ad57f94b5``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders
 #: unconditionally while touching no seam file at all. Regenerate with
 #: ``python scripts/webconsole_seam_snapshot.py --write``; never hand-edit it to silence a gate.
-ENGINE_UI_SEAM: str = "0cb66e183386b7c8"
+ENGINE_UI_SEAM: str = "7e0e885ad57f94b5"
 
 
 @dataclass(frozen=True, slots=True)

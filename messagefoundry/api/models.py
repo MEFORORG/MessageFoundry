@@ -1092,10 +1092,11 @@ class LogSinkInfo(BaseModel):
     ``rolled`` (stage 1 absorbed a write failure and healed) / ``unwritable`` (stage 2 — the
     replacement failed too, or the sink keeps needing rolls; ADR 0162 section 1 and its amendment B
     say when). The published ``state`` may include the flap latch of amendment B, so a sink can
-    read ``unwritable`` here while its own state is ``rolled``. The stop decision does not read
-    this published state: it reads each sink's own state, under ``[logging].on_write_failure``,
-    so ``unwritable`` here does not by itself mean connections were stopped. **Metadata only —
-    never any log content** (no PHI): a sink label, a state, a count, a scrubbed reason and a path."""
+    read ``unwritable`` here while its own state is ``rolled``; ``latch_only`` says so. The stop
+    decision does not read this published state: it reads each sink's own state, under
+    ``[logging].on_write_failure``, so ``unwritable`` here does not by itself mean connections
+    were stopped. **Metadata only — never any log content** (no PHI): a sink label, a state, a
+    count, a scrubbed reason, a path and a flag."""
 
     sink: str  # "stdout" | "file"
     state: str  # "healthy" | "rolled" | "unwritable"
@@ -1103,6 +1104,9 @@ class LogSinkInfo(BaseModel):
     last_event: str | None = None  # safe_exc-scrubbed cause, never record content
     last_event_at: str | None = None  # ISO-8601 UTC
     rolled_aside: str | None = None  # where the broken file was renamed to
+    #: True when ``state`` reads ``unwritable`` only through amendment B's flap latch, not because
+    #: the sink's own last write failed, so the two causes of an ``unwritable`` reading differ here.
+    latch_only: bool = False
 
 
 class LogForwarderInfo(BaseModel):
