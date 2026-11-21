@@ -27,6 +27,12 @@ from messagefoundry.support import bundle as bundle_mod
 
 _REPO = Path(__file__).resolve().parents[1]
 
+#: The members build_bundle writes today when a log tail is written. Each test below checks
+#: that the AST reading holds at least these, so an empty or partial reading cannot pass it.
+_KNOWN_MEMBERS = frozenset(
+    {"version.txt", "config-summary.json", "status.json", "app-log.txt", "manifest.json"}
+)
+
 
 def _members_written_by_build_bundle() -> set[str]:
     """Every ``members["<literal>"] = ...`` in ``build_bundle``. It fails on a subscript store
@@ -97,7 +103,7 @@ def test_the_ast_reading_finds_every_member_a_live_bundle_writes(tmp_path: Path)
     assert written == derived, (written, derived)
     # manifest.json is written after its own listing is taken, so it lists the others only.
     assert set(manifest["members"]) == derived - {"manifest.json"}
-    assert {"version.txt", "manifest.json"} <= derived
+    assert derived >= _KNOWN_MEMBERS, derived
 
 
 def test_the_cli_help_names_every_member(capsys: pytest.CaptureFixture[str]) -> None:
@@ -107,7 +113,9 @@ def test_the_cli_help_names_every_member(capsys: pytest.CaptureFixture[str]) -> 
     clause = re.search(r"Its members: (.*?)\. The tail's", help_text)
     assert clause is not None, help_text
     members = _members_written_by_build_bundle()
-    assert len(members) >= 5, members
+    assert members >= _KNOWN_MEMBERS, members
+    # The shape test_vacuous_absence_assert_lint reads as a guard; the line above is the check.
+    assert members
     missing = sorted(name for name in members if name not in clause.group(1))
     assert not missing, f"support-bundle --help does not name: {missing}"
 
@@ -115,7 +123,9 @@ def test_the_cli_help_names_every_member(capsys: pytest.CaptureFixture[str]) -> 
 def test_phi_md_stream_14_names_every_member() -> None:
     row = _stream_14_row()
     members = _members_written_by_build_bundle()
-    assert len(members) >= 5, members
+    assert members >= _KNOWN_MEMBERS, members
+    # The shape test_vacuous_absence_assert_lint reads as a guard; the line above is the check.
+    assert members
     missing = sorted(name for name in members if f"`{name}`" not in row)
     assert not missing, f"docs/PHI.md stream 14 does not name: {missing}"
 
