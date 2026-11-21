@@ -2051,6 +2051,13 @@ def test_a_pep562_getattr_import_is_a_module_export_for_the_scope_aware_reading(
         "    return seal\n",
         "    key = name.lower()\n    if key != 'legacy':\n        raise AttributeError(name)\n"
         "    return seal\n",
+        "    a = name.strip()\n    key = a.lower()\n    if key != 'legacy':\n"
+        "        raise AttributeError(name)\n    return seal\n",
+        "    try:\n        _OK[name]\n    except KeyError:\n        raise AttributeError(name)\n"
+        "    return seal\n",
+        "    _ = {'legacy': 1}[name]\n    return seal\n",
+        "    for k in (name,):\n        if k != 'legacy':\n            raise AttributeError(name)\n"
+        "    return seal\n",
     )
     for body in guarded:
         served = dict(sources)

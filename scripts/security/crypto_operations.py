@@ -83,9 +83,11 @@ seen:
   modelled as bindings. A call only the scope-aware reading gives is not reported, because the
   gate reports the union reading's tokens and only judges them. A PEP 562 ``__getattr__`` export is
   followed only for an import it returns as it is under its own name (:func:`scoped_bindings`),
-  so one returned through a variable, or under a name test the hook reads that admits no literal
-  of that name, is marked out of scope, and one served as ``getattr(module, name)`` or
-  through ``importlib`` is not seen by either reading;
+  so at least one returned through a variable, one returned after any read of the hook's
+  parameter outside an ``if`` admitting that literal name (an early ``raise``, a lookup, a
+  fall-through after another name's ``return``), and one under a ``match`` case is marked out of
+  scope, though PEP 562 may serve it; one served as ``getattr(module, name)`` or through
+  ``importlib`` is not seen by either reading;
 * A union token is confirmed by its callee before ``[`` file-wide, so an out-of-scope label
   variant of a callee confirmed in scope elsewhere in the same file stays confirmed; per-site
   judgment would close it.
@@ -623,9 +625,10 @@ def _returned_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     parameter counts only when that test admits the name as a string literal (``name == "seal"``,
     ``name in ("seal", ...)``); a test it cannot read admits none, so ``if name == "legacy":
     return seal`` exports nothing, as before the hook was followed. A ``return`` under no such
-    ``if`` counts only when no test anywhere in the hook reads the parameter, directly or through
-    a name assigned from it (``key = name.lower()``), so an early ``if name != "legacy": raise``
-    exports nothing either. A hook with no named first parameter (``def __getattr__(*a)``)
+    ``if`` counts only when nothing in the hook reads the parameter, directly or through a name
+    bound from it in any number of steps (``key = name.lower()``), outside what a ``return`` hands
+    back, so an early ``if name != "legacy": raise`` or ``_OK[name]`` lookup exports nothing
+    either. A hook with no named first parameter (``def __getattr__(*a)``)
     exports nothing."""
     param = (fn.args.posonlyargs + fn.args.args)[:1]
     if not param:
@@ -633,22 +636,37 @@ def _returned_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     pname = param[0].arg
     nodes = _own_nodes(fn)
     readers = {pname}
-    for n in nodes:  # names assigned from the parameter, one level of indirection at least
-        if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
-            value = n.value
-            if value is not None and any(_reads_name(value, r) for r in tuple(readers)):
-                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
-                readers.update(
-                    t.id for tgt in targets for t in ast.walk(tgt) if isinstance(t, ast.Name)
-                )
+    grew = True
+    while grew:  # names bound from the parameter, through any number of steps
+        grew = False
+        for n in nodes:
+            value: ast.AST | None = None
+            targets: list[ast.AST] = []
+            if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+                value = n.value
+                targets = list(n.targets) if isinstance(n, ast.Assign) else [n.target]
+            elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+                value, targets = n.iter, [n.target]
+            elif isinstance(n, ast.withitem) and n.optional_vars is not None:
+                value, targets = n.context_expr, [n.optional_vars]
+            if value is None or not _reads_any(value, readers):
+                continue
+            bound = {x.id for tgt in targets for x in ast.walk(tgt) if isinstance(x, ast.Name)}
+            if not bound <= readers:
+                readers |= bound
+                grew = True
 
     def reads(test: ast.expr) -> bool:
-        return any(_reads_name(test, r) for r in readers)
+        return _reads_any(test, readers)
 
+    # Any read of the parameter, or of a name bound from it, outside what a ``return`` hands back
+    # is a gate on which name is served (an ``if``, a ``try`` lookup, a subscript), so a plain
+    # return under no admitting ``if`` is not taken to serve the name as itself.
+    returned = {
+        id(x) for r in nodes if isinstance(r, ast.Return) and r.value for x in ast.walk(r.value)
+    }
     guarded = any(
-        (isinstance(n, (ast.If, ast.While, ast.IfExp, ast.Assert)) and reads(n.test))
-        or (isinstance(n, ast.Match) and reads(n.subject))
-        for n in nodes
+        isinstance(n, ast.Name) and n.id in readers and id(n) not in returned for n in nodes
     )
     out: set[str] = set()
     stack: list[tuple[ast.AST, frozenset[str] | None]] = [(n, None) for n in fn.body]
@@ -683,6 +701,10 @@ def _own_nodes(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> list[ast.AST]:
         out.append(node)
         stack.extend(ast.iter_child_nodes(node))
     return out
+
+
+def _reads_any(node: ast.AST, names: set[str]) -> bool:
+    return any(isinstance(n, ast.Name) and n.id in names for n in ast.walk(node))
 
 
 def _reads_name(test: ast.expr, pname: str) -> bool:
