@@ -5513,7 +5513,7 @@ def _audit_refused_api_client_ca(
                         spec.setting,
                     )
         finally:
-            await store.close()
+            await _close_store_quietly(store)  # a failed close is not a missing row
 
     try:
         run_guarded(_audit())

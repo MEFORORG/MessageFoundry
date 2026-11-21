@@ -139,8 +139,11 @@ def test_a_refused_client_ca_writes_its_trust_anchor_row(
     assert "error: the API TLS context was not built:" in capsys.readouterr().err
     assert db.is_file(), "the refusal opened no store, so it wrote no audit row"
     assert "pin_mismatch" in _anchor_events(db, "api_client")
+    # The reason is safe_exc's length-bounded rendering, and it quotes the CA's path, so its tail is
+    # cut where the temp path is long (an xdist worker's is). Its head names the anchor either way.
     refused = [m for m in grab.seen if m.startswith("the audited check refused")]
-    assert refused and "does not match its configured SHA-256" in refused[0], grab.seen
+    head = "the audited check refused [api].tls_client_ca_file: TrustAnchorError: "
+    assert refused and refused[0].startswith(head), grab.seen
 
 
 def test_a_ca_refused_for_its_content_writes_its_row(
@@ -152,6 +155,82 @@ def test_a_ca_refused_for_its_content_writes_its_row(
     assert rc == 2
     assert "error: the API TLS context was not built:" in capsys.readouterr().err
     assert "pem_refused" in _anchor_events(db, "api_client")
+
+
+def _crl_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """Plant a context build that refuses ``[api].tls_client_crl_file`` with its tag, and return
+    the ``[api]`` line that configures that CRL."""
+    from messagefoundry.api import tls as api_tls
+
+    crl = tmp_path / "client.crl"
+    crl.write_bytes(b"planted")
+
+    def refuse(*_a: object, **_k: object) -> object:
+        raise ta.TrustAnchorError("planted CRL refusal", setting="[api].tls_client_crl_file")
+
+    monkeypatch.setattr(api_tls, "build_api_ssl_context", refuse)
+    return f"tls_client_crl_file = {json.dumps(str(crl))}\n"
+
+
+def _collector_ca_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """A TLS log forwarder whose collector CA ``_start_logging`` refused, so it left the CA's row
+    to the audited preflight (BACKLOG #3470). The CA holds a private-key block, which that preflight
+    refuses with a ``pem_refused`` row. The early check runs no content check on a CA its hop reads
+    by path, and under ``warn`` it refuses no ACL, so its refusal is planted here, as an
+    ``enforce`` start's ACL refusal would come."""
+    real = ta.anchor_refusal
+
+    def early(spec: ta.AnchorSpec, **kw: Any) -> ta.TrustAnchorError | None:
+        if spec.label == "logging_forward_ca":
+            return ta.TrustAnchorError("planted early refusal", setting=spec.setting)
+        return real(spec, **kw)
+
+    monkeypatch.setattr(ta, "anchor_refusal", early)
+    collector_ca = tmp_path / "collector-ca.pem"
+    collector_ca.write_bytes(_KEY_BLOCK)
+    return (
+        "[logging]\n"
+        "forward_enabled = true\n"
+        'forward_host = "collector.example.org"\n'
+        'forward_protocol = "tls"\n'
+        f"forward_tls_ca_file = {json.dumps(str(collector_ca))}\n"
+        "[egress]\n"
+        'allowed_syslog = ["collector.example.org"]\n'
+    )
+
+
+def test_a_refused_collector_ca_is_audited_beside_the_client_ca(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The start never runs the lifespan that would write the collector CA's row, so the audit
+    writes it too, beside the client CA's. Red with the collector CA left out of the audit."""
+    _no_lifespan(monkeypatch)
+    extra = _collector_ca_refused(tmp_path, monkeypatch)
+    rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=_WRONG_PIN, extra_toml=extra)
+    assert rc == 2
+    assert "error: the API TLS context was not built:" in capsys.readouterr().err
+    assert "pin_mismatch" in _anchor_events(db, "api_client")
+    assert "pem_refused" in _anchor_events(db, "logging_forward_ca")
+
+
+def test_a_refused_collector_ca_is_audited_when_the_crl_refused_the_build(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A build refused by the CRL alone audits no client CA, but the collector CA this start
+    refused still gets its row."""
+    crl_line = _crl_refused(tmp_path, monkeypatch)
+    _no_lifespan(monkeypatch)
+    rc, db = _serve_with_client_ca(
+        tmp_path,
+        monkeypatch,
+        pin=None,
+        extra_toml=_collector_ca_refused(tmp_path, monkeypatch),
+        extra_api=crl_line,
+    )
+    assert rc == 2
+    assert "error: the API TLS context was not built:" in capsys.readouterr().err
+    assert "pem_refused" in _anchor_events(db, "logging_forward_ca")
+    assert _anchor_events(db, "api_client") == []
 
 
 def test_a_store_that_does_not_open_leaves_the_clean_refusal(
@@ -192,16 +271,7 @@ def test_a_refused_crl_opens_no_store(
     """The context also refuses ``[api].tls_client_crl_file``, which the audited preflight leaves
     out, so no row could come of it. The build tags that refusal with the CRL's setting, and the
     audit reads the tag rather than checking the files again."""
-    from messagefoundry.api import tls as api_tls
-
-    crl = tmp_path / "client.crl"
-    crl.write_bytes(b"planted")
-
-    def refuse(*_a: object, **_k: object) -> object:
-        raise ta.TrustAnchorError("planted CRL refusal", setting="[api].tls_client_crl_file")
-
-    monkeypatch.setattr(api_tls, "build_api_ssl_context", refuse)
-    crl_line = f"tls_client_crl_file = {json.dumps(str(crl))}\n"
+    crl_line = _crl_refused(tmp_path, monkeypatch)
     rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_api=crl_line)
     assert rc == 2
     assert "error: the API TLS context was not built:" in capsys.readouterr().err
