@@ -70,13 +70,8 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 # The Content-Disposition tokenizer (:func:`_disposition_params`): one ``search`` of
-# ``_DISP_ITEM`` per item. This is the **ReDoS guard** (CodeQL py/polynomial-redos). The header block
-# is attacker-supplied, and the regex this replaced, ``(\w+)="([^"]*)"``, restarted at every offset
-# of a word run and was quadratic on one until a lookbehind guard was added. The scan is linear: the
-# only step that moves it back is a quoted value's literal reading, and a value's opening quote
-# follows ``=`` or a space, so it cannot be escaped, which bounds the rescan to about 2x. Running the
-# parse in a worker thread (BACKLOG #5522) does not make a quadratic scan safe, for the reason
-# ``parse_upload_off_loop``'s docstring states. ADR 0034's 2026-11-21 amendment records the cost.
+# ``_DISP_ITEM`` per item. It is the CodeQL py/polynomial-redos fix for an attacker-supplied header
+# block; ADR 0034's 2026-11-21 amendment says what replaced what and which tests pin its cost.
 #:
 #: One item: either a quoted-string where a key belongs, or a key (the run up to a space, separator,
 #: ``=`` or quote, or nothing right before an ``=``) then, optionally, spaces, ``=``, spaces and a
@@ -100,12 +95,9 @@ _DISPOSITION_HEADER = "content-disposition:"
 #: ``Content-Type``/``Content-Transfer-Encoding``, so 16 KiB is orders of magnitude more than any real
 #: client sends. Without it the block is bounded only by the request body cap — ``[store]
 #: .max_upload_bytes``, 25 MiB by default and up to 512 MiB — because that cap is applied to a part's
-#: *content*, only after its header has already been parsed. The scan is linear (see the guard above),
-#: but linear is not free at that size, and the worker thread since BACKLOG #5522 does not spare the
-#: event loop a scan (see ``parse_upload_off_loop``). Bounding the header bounds the cost and,
-#: incidentally, gives the ReDoS analysis a length-bounded source instead of an attacker-sized one.
-#: What a header at this cap costs, and what an uncapped one would, is recorded once, in ADR 0034's
-#: 2026-11-21 amendment (BACKLOG #5787).
+#: *content*, only after its header has already been parsed. Bounding the header bounds what its
+#: scan can cost and gives the ReDoS analysis a length-bounded source instead of an attacker-sized
+#: one. ADR 0034's 2026-11-21 amendment records what a header at this cap was measured to cost.
 _MAX_PART_HEADER_BYTES = 16 * 1024
 
 #: Cap on the number of parts in one body. The upload route keeps one file part and reads no other

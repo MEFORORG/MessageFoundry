@@ -69,7 +69,8 @@ Scorecard runs on the same mirror and surfaced **48 findings**. These are **repo
 - **AC-6** — WHEN the multipart parser reads an uploaded part, THE SYSTEM SHALL bound that part's header block before parsing it, so the header scan's input size is set by the parser and not by the request-body cap.
   → `tests/test_multipart.py::test_oversized_part_header_is_refused_not_parsed`
 - **AC-7** — WHEN the multipart parser scans a `Content-Disposition` line, THE SYSTEM SHALL do so without super-linear cost: the largest header block the parser admits SHALL be scanned in a small, bounded time, which bounds what the scan can take from the asyncio event loop. *(Reworded 2026-11-17 under BACKLOG #5520: it said "in a small, bounded slice of the asyncio event loop", from before the parse moved to a worker thread; `parse_upload_off_loop` in `messagefoundry/api/multipart.py` says why the scan still holds the loop. Reworded 2026-09-03 under BACKLOG #1385. The criterion used to say "in time linear in the line's length" and was verified by a growth-ratio assertion, which ejected PR 669 at ratio 8.02 against a bound of 8.0. A budget on the admitted worst case carries ~290x of headroom where that ratio carried 1.9x, and it is paired with a positive control so it cannot pass vacuously.)*
-  → `tests/test_multipart.py::test_a_hostile_disposition_header_stays_inside_the_scan_budget` · `tests/test_multipart.py::test_the_unguarded_pattern_blows_that_same_budget`
+  → `tests/test_multipart.py::test_a_hostile_disposition_header_stays_inside_the_scan_budget` · `tests/test_multipart.py::test_the_unguarded_pattern_blows_that_same_budget` · `tests/test_multipart.py::test_every_tokenizer_branch_stays_inside_the_scan_budget` (added 2026-11-21, BACKLOG #5787)
+  Superseded in part by the 2026-11-21 amendment below the second triage's Fixed table.
 - **AC-8** — WHERE a CI job installs a third-party quality or security tool that this repo routes through a PEP 735 dependency group, THE SYSTEM SHALL install it from a hash-pinned `uv export` with `--require-hashes`, and THAT lock SHALL be regenerated and diff-gated by the DEP-1 step rather than hand-maintained.
   → `tests/test_ci_venv_pinning.py` (`test_lock_installed_toolchain_*`, `test_moved_tools_are_declared_in_a_dependency_group`, `test_no_moved_tool_is_reinstalled_inline`) · `tests/test_dep1_lock_resync_lockstep.py`
 
@@ -120,35 +121,24 @@ renewed.** They were out of scope for this round (they are not among the 32 open
 | `PinnedDependenciesID` ×2 | `release.yml`, `security.yml` (SBOM scratch venv) | See the `PinnedDependenciesID` correction below. |
 | `py/incomplete-url-substring-sanitization` ×3 | `tests/test_cert_cli.py` | **Not** the modelled vulnerability — the flagged values are X.509 DNs, not URLs, and the `cert inventory` command makes no trust decision from them. Tightened rather than dismissed because the *assertions* were genuinely weak: `"good.example.org" in subject` also passes for a lookalike CN, and the same test mints the SAN `www.good.example.org`, which contains the asserted substring. Now exact-equality. |
 
-**Amendment 2026-11-21 (BACKLOG #5787), to the `py/polynomial-redos` row above and to AC-7.** Both
-are left as written at triage; this note carries what has changed since.
+The `py/polynomial-redos` row above is superseded in part by the 2026-11-21 amendment below.
 
-- The `(?<!\w)` lookbehind regex was removed. `_disposition_params` in
-  `messagefoundry/api/multipart.py` now reads each `Content-Disposition` line with one regex,
-  `_DISP_ITEM`, applied by `search` once per item. `_MAX_PART_HEADER_BYTES` still bounds the line.
-  The triage verdict, Fixed, is unchanged.
-- The scan is linear for this reason: the only step that moves it back is a quoted value's literal
-  reading, and a value's opening quote follows `=` or a space, so it cannot be escaped, which bounds
-  the rescan to about 2x.
-- AC-7 is now also verified by `tests/test_multipart.py::test_every_tokenizer_branch_stays_inside_the_scan_budget`,
-  which times each tokenizer branch on a 12,000-character line against the same 0.05 s budget. That
-  test has no positive control: nothing shows its budget would catch a super-linear tokenizer on
-  those shapes. `test_the_unguarded_pattern_blows_that_same_budget` controls only the word-run arm.
-  No test times a whole body.
-- Measured 2026-11-21 on an idle dev box, each figure the median of 9 runs of a best-of-5 (best-of-3
-  for whole bodies). This is the one record of these figures; the code comment and test docstrings
-  point here.
-  - The hostile word-run upload the scan-budget test times: 0.037 ms, about 1,300x under the budget.
-  - The slowest tokenizer shape timed, `=""` repeated: 2.4 ms on a 12,000-character line, about 20x
-    under the budget, and 3.3 ms on a line at the 16 KiB cap, about 15x.
-  - A body of 16 parts, the part cap, each with a header block of `=""` items near the 16 KiB cap:
-    55 ms of CPU, above the per-line budget, against 5.1 ms for origin/main's regex. With `a=b`
-    items, 22 ms against 4.7 ms.
-  - The positive control, the unguarded regex on the word-run upload: 0.45 s, about 9x over the
-    budget.
-  - Scaled linearly from the cap figure, not measured: an uncapped `=""` header would cost about 5 s
-    at 25 MiB and about 110 s at 512 MiB.
-  - AC-7's "~290x of headroom" was the regex's margin and is superseded by these figures.
+**Amendment 2026-11-21 (BACKLOG #5787).** This change removed the `(?<!\w)(\w+)="([^"]*)"` regex
+that `messagefoundry/api/multipart.py` carried at `4181ceae120` and replaced it with the
+`_disposition_params` tokenizer. `_MAX_PART_HEADER_BYTES` (16 KiB) still bounds the tokenizer's
+input. AC-7 is pinned by the three tests on its line above, one of them added for this change. That
+added test has no positive control, and no test times a whole body. The figures below are measured,
+not proved: each is the median of 9 runs of a best-of-5 (best-of-3 for a whole body), taken on one
+dev box on 2026-11-21, and another machine will give other numbers. The tests assert a 0.05 s
+budget.
+
+| What was timed | Tokenizer | Regex at `4181ceae120` |
+|---|---|---|
+| The word-run upload AC-7's first test times | 0.037 ms | 0.19 ms |
+| The slowest shape the branch test times (`=""` items filling a header block at the cap) | 3.4 ms | not timed |
+| A 16-part body, each header block `=""` items near the cap | 54 ms | 5.4 ms |
+| A 16-part body, each header block `a=b` items near the cap | 22 ms | 4.8 ms |
+| The positive control: the regex without its lookbehind, on the word-run upload | not applicable | 0.46 s |
 
 **Dismissed (25)** — see the class rationales below plus the per-alert dismissal comments, which remain
 canonical.

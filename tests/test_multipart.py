@@ -100,7 +100,8 @@ def test_no_file_part_rejected() -> None:
 # --- ReDoS guard on the Content-Disposition tokenizer (CodeQL py/polynomial-redos) ---------------
 
 #: The unguarded form of the regex origin/main read Content-Disposition with (origin/main carried a
-#: ``(?<!\w)`` lookbehind in front, which changed no match). It serves twice below: as the reader
+#: ``(?<!\w)`` lookbehind in front, which changed no match). In this file's BACKLOG #5787 tests,
+#: "origin/main" means the parser at ``4181ceae120``, before that change. It serves twice below: as the reader
 #: the tokenizer is compared against, and as the live positive control for the cost arms, where,
 #: swapped into the shipping parse path, it shows the budget they assert against is a line a
 #: quadratic scan cannot get under.
@@ -131,16 +132,9 @@ def _legacy_disposition(line: str) -> tuple[str | None, str | None]:
 #: 2026-11-21 amendment (BACKLOG #5787).
 _HOSTILE_HEADER_CHARS = 12_000
 
-#: The one line the cost arms are measured against, sitting between the costs ADR 0034's 2026-11-21
-#: amendment records. The margins run in OPPOSITE directions across it, which is why a single number
-#: does the work of two; that amendment gives each margin.
-#:
-#: **Above the line (the production arms) a stall turns a pass into a failure, so the margin must be
-#: wide,** and each estimate is best-of-5, so one stall cannot fake a red. The branch arm's margin is
-#: the narrowest of them, so a steady slowdown (a loaded or traced runner) reaches it first.
-#:
-#: **Below the line (the control arm) a stall can only help, so the margin stays tight,** and one
-#: sample is enough there because noise cannot deflate it.
+#: The one line the cost arms are measured against; ADR 0034's 2026-11-21 amendment records the
+#: costs. The production arms must stay under it and the control arm over it, so noise can fake a
+#: red only on a production arm: each of those is best-of-5, and the control is one sample.
 #:
 #: **Deliberately one number rather than a ceiling plus a lower floor.** A floor beneath the ceiling
 #: would open a band in which a half-fixed scan clears both arms; sharing the line makes the control
@@ -318,10 +312,9 @@ def test_a_hostile_disposition_header_stays_inside_the_scan_budget() -> None:
     the quotient one way, up. Re-run 15 times on an IDLE box on 2026-09-03 it ranged **3.73 to 6.80**,
     already 85 percent of the way to its own bound with nothing else competing for the core.
 
-    The separation between linear and quadratic on this input is thousands of times, not 4x, so an
-    absolute budget carries far more headroom than the ratio's 1.9x; ADR 0034's 2026-11-21 amendment
-    records the figures. It also times the shipping entry point rather than a detached regex, so the
-    cost claim is about the parse an upload really runs.
+    ADR 0034's 2026-11-21 amendment records what this arm and its control now cost. It also times
+    the shipping entry point rather than a detached regex, so the cost claim is about the parse an
+    upload really runs.
     """
     seconds = _parse_seconds(5)
     assert seconds < _SCAN_BUDGET_SECONDS, (
@@ -329,28 +322,77 @@ def test_a_hostile_disposition_header_stays_inside_the_scan_budget() -> None:
     )
 
 
-@pytest.mark.parametrize(
-    "unit",
-    ['"', 'a="\\', 'a="\\" ', " =", ";", "a ", "a   ", "\\x", "a  =  ", "=", "a=b ", '=""'],
-)
-def test_every_tokenizer_branch_stays_inside_the_scan_budget(unit: str) -> None:
-    """The word run above is the regex's worst case, not the tokenizer's, so each tokenizer branch
-    (stray and unclosed quotes, escapes, ``=`` with spaces, separators, bare items, tokens) is timed
-    too, on a line of that unit repeated near ``_MAX_PART_HEADER_BYTES``. ADR 0034's 2026-11-21
-    amendment records what each costs. This arm has no positive control: nothing here shows the
-    budget would catch a super-linear tokenizer on these shapes, and no test times a whole body."""
-    value = unit * (_HOSTILE_HEADER_CHARS // len(unit))
+#: The Content-Disposition values the branch arm times, as (prefix, unit repeated to fill the rest).
+#: The last two put one quoted value first whose escaped reading never closes: one with a later
+#: ``"`` for the literal reading, one with none.
+_TOKENIZER_BRANCH_SHAPES = [
+    ("", '"'),
+    ("", 'a="\\'),
+    ("", 'a="\\" '),
+    ("", " ="),
+    ("", ";"),
+    ("", "a "),
+    ("", "a   "),
+    ("", "\\x"),
+    ("", "a  =  "),
+    ("", "="),
+    ("", "a=b "),
+    ("", '=""'),
+    ("", 'a = "x" '),
+    ('a="', '\\"x'),
+    ('a="', "\\x"),
+]
+
+
+@pytest.mark.parametrize(("prefix", "unit"), _TOKENIZER_BRANCH_SHAPES)
+def test_every_tokenizer_branch_stays_inside_the_scan_budget(prefix: str, unit: str) -> None:
+    """The word run above is the regex's worst case, not the tokenizer's, so every line of
+    ``_disposition_params`` (the next test checks that these shapes reach each one) is timed too,
+    on a value that fills a header block at ``_MAX_PART_HEADER_BYTES``. ADR 0034's 2026-11-21
+    amendment says what this arm does not cover."""
+    value = _branch_value(prefix, unit)
     best = float("inf")
     for _ in range(5):
         start = time.perf_counter()
         multipart._disposition_params(value)
         best = min(best, time.perf_counter() - start)
-    assert best < _SCAN_BUDGET_SECONDS, f"{unit!r} * n cost {best:.4f}s"
+    assert best < _SCAN_BUDGET_SECONDS, f"{prefix!r} + {unit!r} * n cost {best:.4f}s"
+
+
+def _branch_value(prefix: str, unit: str) -> str:
+    """``prefix`` then ``unit`` repeated, cut to the longest value a header block at the cap holds."""
+    size = _MAX_PART_HEADER_BYTES - len("Content-Disposition: ")
+    return (prefix + unit * (size // len(unit) + 1))[:size]
+
+
+def test_the_branch_shapes_reach_every_line_of_the_tokenizer() -> None:
+    """Non-vacuity for the arm above: together its shapes execute every line of
+    ``_disposition_params``, so the claim above is measured, not assumed."""
+    code = multipart._disposition_params.__code__
+    body_lines = {line for _, _, line in code.co_lines() if line is not None}
+    body_lines.discard(code.co_firstlineno)
+    seen: set[int] = set()
+
+    def trace(frame: Any, event: str, arg: object) -> Any:
+        if frame.f_code is code:
+            if event == "line":
+                seen.add(frame.f_lineno)
+            return trace
+        return None
+
+    previous = sys.gettrace()
+    sys.settrace(trace)
+    try:
+        for prefix, unit in _TOKENIZER_BRANCH_SHAPES:
+            multipart._disposition_params(_branch_value(prefix, unit)[:200])
+    finally:
+        sys.settrace(previous)
+    assert body_lines - seen == set(), sorted(body_lines - seen)
 
 
 def test_the_unguarded_pattern_blows_that_same_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Live positive control: the SAME body and the SAME budget, with origin/main's regex, unguarded,
-    in place of the tokenizer on the shipping parse path.
+    """Live positive control: the SAME body and the SAME budget, with the regex at ``4181ceae120``,
+    unguarded, in place of the tokenizer on the shipping parse path.
 
     Without it the arm above is unfalsifiable. A budget nothing on this input could ever exceed would
     pass while measuring nothing, and so would an input that had quietly stopped being hostile — which
