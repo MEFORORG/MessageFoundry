@@ -497,8 +497,8 @@ SITES: dict[str, Site] = {
     "messagefoundry/api/tls.py::_generated_pair_lock": Site(
         1, INTERNAL, "A fixed name in the engine's state directory."
     ),
-    "messagefoundry/api/tls.py::_staged_pair": Site(
-        2, OPERATOR, "A fixed suffix on the certificate paths the operator configured."
+    "messagefoundry/api/tls.py::_staged_files": Site(
+        3, OPERATOR, "A fixed suffix on the certificate paths the operator configured."
     ),
     "messagefoundry/auth/anchor_path.py::posix_path_verdict": Site(
         2,

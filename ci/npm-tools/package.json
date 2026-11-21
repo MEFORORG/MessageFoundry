@@ -3,7 +3,7 @@
   "private": true,
   "description": "The npm tools CI runs: jscpd (quality-advisory.yml) and cyclonedx-npm (security.yml). CI installs them with `npm ci --ignore-scripts` from the committed package-lock.json, which pins every transitive dependency by integrity hash. The `npx --yes <tool>@<version>` this replaced pinned the top package only and resolved the rest fresh on every run (vault BACKLOG #2793). jscpd stays on 4.x: npm `latest` is a 5.x rewrite with a different CLI. ajv, ajv-formats and ajv-formats-draft2019 are optional peer dependencies of @cyclonedx/cyclonedx-library, the library cyclonedx-npm validates with; cyclonedx-npm 7.x no longer installs them, so they are declared here, and security.yml's `--validate` needs them (why: that workflow's comment on the extension SBOM step). Keep them on versions those peerDependencies accept. There are no overrides: the glob, minimatch and @isaacs/nonrecursive-glob-match ones held packages that only cyclonedx-npm 6.x's optional libxmljs2 chain pulled in, and 7.x installs none of them.",
   "dependencies": {
-    "@cyclonedx/cyclonedx-npm": "7.0.0",
+    "@cyclonedx/cyclonedx-npm": "7.0.1",
     "ajv": "8.20.0",
     "ajv-formats": "3.0.1",
     "ajv-formats-draft2019": "1.6.1",

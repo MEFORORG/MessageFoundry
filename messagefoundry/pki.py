@@ -1850,6 +1850,38 @@ def _general_names(names: list[str]) -> list[x509.GeneralName]:
     return out
 
 
+def san_names(pem: bytes, name: str) -> bool:
+    """True when the certificate's SubjectAlternativeName holds ``name`` (BACKLOG #5973).
+
+    ``name`` is classified as :func:`make_self_signed` classifies it (:func:`_general_names`), so a
+    certificate that function minted for ``name`` always answers ``True``. An IP is compared by
+    address without an IPv6 zone, which a SAN cannot carry; a DNS name without regard to case or a
+    trailing dot, as hostname verification compares it. ``False`` when the certificate has no
+    readable SAN; ``True`` when ``name`` cannot be classified at all, so a caller deciding whether
+    to replace the certificate never replaces it over a name the mint would refuse too. Raises
+    ``ValueError`` when ``pem`` is not a parseable certificate. Reads only the public certificate.
+    """
+    cert = x509.load_pem_x509_certificate(pem)
+    try:
+        held = list(cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value)
+    except (
+        x509.ExtensionNotFound,
+        x509.DuplicateExtension,
+        x509.UnsupportedGeneralNameType,
+        ValueError,
+    ):
+        return False
+    try:
+        (wanted,) = _general_names([name])
+    except ValueError:
+        return True
+    if isinstance(wanted, x509.IPAddress):
+        address = ipaddress.ip_address(str(wanted.value).split("%", 1)[0])
+        return any(isinstance(g, x509.IPAddress) and g.value == address for g in held)
+    dns = str(wanted.value).rstrip(".").lower()
+    return any(isinstance(g, x509.DNSName) and g.value.rstrip(".").lower() == dns for g in held)
+
+
 def make_self_signed(cn: str, sans: list[str], days: int) -> tuple[bytes, bytes]:
     """Mint a self-signed EC P-256 cert + key, a TLS PLACEHOLDER. Returns ``(cert_pem, key_pem)``.
 
