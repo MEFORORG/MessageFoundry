@@ -2076,3 +2076,94 @@ async def test_a_fault_in_the_marker_check_records_error_and_naks_at_both_listen
     assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
     assert all("peek read failed (IndexError)" in str(r["error"]) for r in rows)
     assert await _ingress_count(store, ic.name) == 0
+
+
+# --- PR 3135 findings B13b and B13g (BACKLOG #5972) ------------------------------------------
+
+#: A streaming ED body a sender wrote with ``^`` components under a header of ``MSH|~|``: ``~``
+#: is declared the component separator and filled in as the repetition one, so no OBX-5
+#: component reads where it was written and the scan finds no document there.
+_TILDE_HEADER_DOCUMENT = _hl7(_b64(2000)).replace("MSH|^~\\&|", "MSH|~|", 1)
+
+
+def test_the_detach_scan_refuses_an_ed_claim_under_a_colliding_header_it_cannot_read() -> None:
+    """B13b: the scan found no document under ``MSH|~|`` and so did not refuse, where a refusal
+    of every short MSH-2 turned the body away. The OBX-2 ``ED`` claim is now refused."""
+    from messagefoundry.parsing.binary import CollidingDelimitersError
+
+    body = _TILDE_HEADER_DOCUMENT
+    assert body.startswith("MSH|~|")
+    with pytest.raises(CollidingDelimitersError):
+        next(iter_obx_documents(Message.parse(body), received=body))
+    # The control: the same header over a message with no ED claim is read, not refused.
+    no_claim = "MSH|~|APP|FAC|RCV|RCVF|20260101120000||MDM~T02|MSGID001|P|2.5\rOBX|1|TX|||text\r"
+    assert list(iter_obx_documents(Message.parse(no_claim), received=no_claim)) == []
+
+
+async def test_a_streaming_ed_body_under_a_colliding_header_it_cannot_read_is_refused(
+    store: MessageStore,
+) -> None:
+    """B13b: such a body was ACKed AA and stored with its document undetached. It is refused
+    before the ACK with an ERROR row, nothing stored and nothing queued, as ``main`` refused it."""
+    ic = _streaming_ic()
+    body = _TILDE_HEADER_DOCUMENT
+    assert len(body) >= (ic.stream_threshold_bytes or 0)
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, body.encode("utf-8"))
+
+    assert _ack_code(ack) == "AR"
+    assert ack is not None and "MSH-2 default collides with a delimiter" in ack
+    assert [r["status"] for r in await _rows(store, ic.name)] == [MessageStatus.ERROR.value]
+    assert await _attachment_count(store) == 0
+    assert await _ingress_count(store, ic.name) == 0
+
+
+async def test_the_http_listener_refuses_a_streaming_ed_body_under_a_colliding_header_too(
+    store: MessageStore,
+) -> None:
+    """B13b on the receipt listener, which catches the detach's refusals on its own path."""
+    ic = _streaming_ic()
+    runner = _runner(store, ic)
+
+    from messagefoundry.transports.receipt import RefusalKind
+
+    receipt = await runner._handle_inbound_http(ic, _TILDE_HEADER_DOCUMENT.encode("utf-8"))
+
+    assert receipt.refusal is RefusalKind.PERMANENT
+    assert [r["status"] for r in await _rows(store, ic.name)] == [MessageStatus.ERROR.value]
+    assert await _attachment_count(store) == 0
+    assert await _ingress_count(store, ic.name) == 0
+
+
+async def test_no_address_is_named_for_a_handle_under_a_colliding_header() -> None:
+    """B13g: ``doc_ref_addresses_in_hl7`` named the address of a handle under a colliding header,
+    which the re-attach refuses whatever it names, so a child carrying it was linked to a document
+    its delivery can never send. ``main`` named none under any short MSH-2; under a colliding one
+    it now names none again."""
+    from messagefoundry.parsing.binary import (
+        UnreattachableDocumentError,
+        doc_ref_addresses_in_hl7,
+        reattach_documents_in_hl7,
+    )
+    from messagefoundry.store.store import attachments_named
+
+    ref = hashlib.sha256(b"x").hexdigest()
+    # ``^~&``: the OBX-5 components still read, so the handle is read as one.
+    payload = _hl7(make_doc_ref(ref, "Application"), msh2="^~&")
+    with pytest.raises(UnreattachableDocumentError, match="fills a delimiter it does not name"):
+        await reattach_documents_in_hl7(payload, _no_read, bound=frozenset({ref}))
+    assert doc_ref_addresses_in_hl7(payload) == frozenset()
+    assert attachments_named([ref], payload) == []
+
+
+def test_an_address_is_still_named_for_a_handle_the_re_attach_resolves() -> None:
+    """The control for B13g: an ordinary handle is still named, so no deliverable reference is
+    lost and the child keeps the document its delivery sends."""
+    from messagefoundry.parsing.binary import doc_ref_addresses_in_hl7
+    from messagefoundry.store.store import attachments_named
+
+    ref = hashlib.sha256(b"x").hexdigest()
+    payload = _hl7(make_doc_ref(ref, "Application"))
+    assert doc_ref_addresses_in_hl7(payload) == frozenset({ref})
+    assert attachments_named([ref], payload) == [ref]

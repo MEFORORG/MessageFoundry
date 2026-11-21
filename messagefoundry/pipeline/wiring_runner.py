@@ -10347,7 +10347,8 @@ class RegistryRunner:
         and :class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError` for a document
         delivery's splice would not set back verbatim (BACKLOG #5099), its subclass
         :class:`~messagefoundry.parsing.binary.CollidingDelimitersError` among them, for a body
-        whose short MSH-2 fills a delimiter with one it already uses (BACKLOG #5972) — each, as one of
+        whose short MSH-2 fills a delimiter with one it already uses and that has an OBX whose
+        ``OBX-2`` is ``ED``, whether or not a document reads there (BACKLOG #5972) — each, as one of
         :data:`_DETACH_REFUSALS`, is turned
         into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
         Phase-C); the budget bounds how many such buffers can be concurrent."""
@@ -11827,8 +11828,8 @@ class RegistryRunner:
         dead-lettered alone, and "all N" above means the rest. So is a member whose short MSH-2
         fills a delimiter with one it already uses, since neither the head's BHS nor a send's
         delimiter rewrite can write it (BACKLOG #5972): wherever it sits on an outbound that
-        rewrites delimiters, and only where it would head the envelope on one that sends each
-        member's own bytes. The envelope's head is then the
+        rewrites delimiters (``encoding_characters``), and only where it would head the envelope
+        on any other, one with ``hl7_raw_separators`` included. The envelope's head is then the
         first member that survived.
 
         **Invariants.** Every member is INFLIGHT throughout the window, so a crash recovers the whole set in
@@ -12042,8 +12043,9 @@ class RegistryRunner:
             # write, and encode_batch refuses the whole batch for it, so each would-be head is
             # refused alone and the next member heads. Later in the envelope, an outbound that
             # rewrites delimiters would rewrite the member under the BHS's and change what it
-            # reads as, so there it is refused wherever it sits; a verbatim outbound sends the
-            # member's own bytes, as it always has, so there only a would-be head is refused.
+            # reads as, so there it is refused wherever it sits. On any other outbound, one with
+            # hl7_raw_separators included (_rewrites_delimiters says what that one changes), only a
+            # would-be head is refused, as main carried the rest.
             # Each verdict reads a few characters of the member's first line, so it runs here
             # rather than in a thread.
             collides = [batch_member_collides(m) for m in members]
@@ -14796,11 +14798,13 @@ async def _read_from_store[T](what: str, read: Callable[[], Awaitable[T]]) -> T:
 
 def _rewrites_delimiters(connector: object) -> bool:
     """Whether ``connector`` rewrites a payload's delimiters before it sends it: an MLLP outbound
-    with ``encoding_characters`` or ``hl7_raw_separators`` set (BACKLOG #5972). Read off the
-    instance, so a connector with neither, or a test double, sends its payload's own bytes."""
-    return getattr(connector, "encoding_characters", None) is not None or bool(
-        getattr(connector, "hl7_raw_separators", False)
-    )
+    with ``encoding_characters`` set (BACKLOG #5972). Read off the instance, so a connector without
+    it, or a test double, sends its payload's own bytes. ``hl7_raw_separators`` is not one: it
+    re-joins the envelope on the delimiters it was split on, so a colliding member behind the head
+    is delivered, as ``main`` delivers it. It does emit a member's structural escapes as the
+    head's raw delimiters, so such a member's data can change on the wire; that holds for any
+    member whose delimiters differ from the head's, and is not judged here."""
+    return getattr(connector, "encoding_characters", None) is not None
 
 
 def _frames(connector: object) -> bool:

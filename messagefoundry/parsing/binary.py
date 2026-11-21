@@ -180,8 +180,9 @@ class NonVerbatimDocumentError(ValueError):
 
 
 class CollidingDelimitersError(NonVerbatimDocumentError, CollidingDelimitersRefused):
-    """A received body has a document to detach, and its header names too few encoding
-    characters while a default filled in for one is already another of its delimiters, as
+    """A received body claims a document, an OBX whose ``OBX-2`` is ``ED``, and its header names
+    too few encoding characters while a default filled in for one is already another of its
+    delimiters, as
     ``MSH|^~&|`` does: ``&`` is declared its escape character and filled in as its subcomponent
     separator (BACKLOG #5972). ``Message`` refuses every write to such a message, so the detach
     could not set its handle in, nor delivery set the document back. Refused at the detach,
@@ -190,9 +191,10 @@ class CollidingDelimitersError(NonVerbatimDocumentError, CollidingDelimitersRefu
     refusal ``Message``'s writes and ``extract_obx_document`` raise for the same header, so one
     ``except`` catches the header's refusal from any of them. The text names no byte of the body.
 
-    Raised only for a document the detach finds, so only under a header whose OBX-5 components
-    still read: under ``MSH|~|`` or ``MSH^^`` none does, so the detach finds no document and
-    does not raise this."""
+    Raised once for a body under such a header when any of its OBX segments has ``OBX-2``
+    ``ED``, whether or not its OBX-5 components still read: under ``MSH|~|`` none does, so the
+    scan finds no document, and the claim is refused rather than ACKed and carried undetached.
+    A received handle in an ``OBX-5.5`` is refused first, as :class:`InboundDocRefError`."""
 
 
 class Base64DelimiterError(InboundDocRefError):
@@ -598,6 +600,13 @@ def _obx_is_ed(message: Message, occurrence: int) -> bool:
     return (message.field("OBX-2", occurrence=occurrence) or "").upper() == "ED"
 
 
+def _holds_ed_claim(message: Message) -> bool:
+    """Whether any OBX of ``message`` has ``OBX-2`` ``ED``, the claim a colliding header's refusers
+    judge (BACKLOG #5972). ``OBX-2`` is a whole field, split on the field separator before any
+    other, so it reads as written under such a header too, where an OBX-5 component may not."""
+    return any(_obx_is_ed(message, occ) for occ in range(1, message.count_segments("OBX") + 1))
+
+
 def _is_base64_ed(message: Message, occurrence: int) -> bool:
     """Whether that OBX carries an ED value encoded ``Base64`` (``OBX-2`` and ``OBX-5.4``)."""
     if not _obx_is_ed(message, occurrence):
@@ -643,9 +652,15 @@ def iter_obx_documents(
     document's own value holds a character the splice would escape under the body's own
     delimiters: a document is detached only if splicing it back under them reproduces it exactly.
     A Handler that moves ``MSH-1`` or ``MSH-2`` afterwards is caught by the re-attach instead.
-    It raises :class:`CollidingDelimitersError`, a :class:`NonVerbatimDocumentError`, when a
-    document would be detached and the body's short MSH-2 leaves its separators not distinct,
-    since ``Message`` refuses every write to such a body (BACKLOG #5972).
+    It raises :class:`CollidingDelimitersError`, a :class:`NonVerbatimDocumentError`, when the
+    body's short MSH-2 leaves its separators not distinct and an OBX claims a document, its
+    ``OBX-2`` ``ED`` (:func:`_holds_ed_claim`): ``Message`` refuses every write to such a body, so
+    no document of it could be detached and set back (BACKLOG #5972). The claim is judged, not a
+    document the scan found, because under some such headers, ``MSH|~|`` among them, no OBX-5
+    component reads as written, so the scan finds none and the body would be ACKed with its
+    document in it. So an ED value the detach would not lift out under a readable header is
+    refused too, at least one not Base64, empty, a tombstone or under ``min_b64_len``, as every
+    OBX under a short MSH-2 was before.
 
     Each document's value is held one at a time, as the caller's in-flight budget assumes: each
     check reads a value inside :func:`_scan_obx`, whose frame ends before the next read, and the
@@ -667,11 +682,12 @@ def iter_obx_documents(
             value_holds_marker = value_holds_marker or holds_marker
             if alters and altered is None:
                 altered = occ
-    if documents and message._delimiters_collide():
+    # A detachable document is an ED claim, so the claim alone is judged.
+    if message._delimiters_collide() and _holds_ed_claim(message):
         raise CollidingDelimitersError(
-            "the header fills a delimiter it does not name with one it already uses, so the "
-            "message cannot be written and a detached document could not be set back; refusing "
-            "the detach"
+            "an OBX claims a document under a header that fills a delimiter it does not name with "
+            "one it already uses, so the message cannot be written and no document of it could be "
+            "detached and set back; refusing the detach"
         )
     if documents and _delimits_with_base64(message._encoding_chars()):
         raise Base64DelimiterError(
@@ -891,9 +907,7 @@ def _strip_obx_ed(
         # OBX whose OBX-2 is ED claims a document: OBX-2 is a whole field, which these headers
         # do not disturb. That document outlives its strip window, so it is reported, not
         # silent; the caller holds the row id and logs it, so this pure codec logs nothing.
-        if on_unwritable is not None and any(
-            _obx_is_ed(message, occ) for occ in range(1, message.count_segments("OBX") + 1)
-        ):
+        if on_unwritable is not None and _holds_ed_claim(message):
             on_unwritable()
         return raw, 0, 0
     stripped, reclaimed = strip_documents_in_hl7(message, pruned_at=pruned_at, min_bytes=min_bytes)
@@ -959,8 +973,10 @@ def doc_ref_addresses_in_hl7(text: str) -> frozenset[str]:
     """The content addresses named by the well-formed document handles in an HL7 body's
     ``OBX-5.5`` values, read as :func:`reattach_documents_in_hl7` reads them: the places delivery
     splices (BACKLOG #5099). A handle anywhere else, or a bare content address, is not one, since
-    delivery never resolves it. Empty for a body that does not parse as HL7: delivery resolves no
-    handle in it."""
+    delivery never resolves it. Empty for a body that does not parse as HL7, and for one whose
+    header fills a delimiter it does not name with one it already uses: the re-attach refuses
+    every handle in it (BACKLOG #5972), so none names a document its message can deliver, and a
+    child carrying one is not linked to it."""
     # Local import, as reattach_documents_in_hl7 does: message.py imports this module.
     from messagefoundry.parsing.message import Message
     from messagefoundry.parsing.peek import HL7PeekError
@@ -968,6 +984,10 @@ def doc_ref_addresses_in_hl7(text: str) -> frozenset[str]:
     try:
         message = Message.parse(text)
     except HL7PeekError:
+        return frozenset()
+    if message._delimiters_collide():
+        # The re-attach's own refusal of any handle under such a header (_COLLIDING_HANDLE),
+        # judged from the header alone, before any OBX-5 is read.
         return frozenset()
     found: set[str] = set()
     for occ in range(1, message.count_segments("OBX") + 1):
