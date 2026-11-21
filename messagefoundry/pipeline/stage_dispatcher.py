@@ -277,8 +277,10 @@ class _Stranded:
     whatever the lease, so the write fence is the episode's own check: a record's writes are sent
     only while this node leads under ``fence`` (:class:`RependFence` names the window that leaves),
     kept unwritten while it does not lead, and dropped
-    unwritten once it leads under another lease, because another node may hold those rows. A
-    stop clears every record with the rest of the lane state."""
+    unwritten once it leads under another lease, because another node may hold those rows. It is
+    dropped unwritten too once this engine no longer owns the lane (a reload moved it to another
+    engine shard or removed it), and a stop, a demotion's included, drops every record with the
+    rest of the lane state; each drop logs a WARNING."""
 
     head: tuple[str, float] | None
     tail: tuple[str, ...]
@@ -349,6 +351,9 @@ class _LaneState:
     unlanded: bool = False
     # BACKLOG #5744: rows a hold left in flight that this lane re-pends before its next claim.
     stranded: _Stranded | None = None
+    # Consecutive re-pend episodes of that record that sent nothing and parked, for their backoff
+    # and to log a lease-read fault once. Reset when the record clears.
+    stranded_waits: int = 0
 
 
 @dataclass
@@ -960,6 +965,16 @@ class StageDispatcher:
         await asyncio.gather(*tasks, return_exceptions=True)
         # Rows a dead claimer left claimed and its replacement had not yet released stay INFLIGHT
         # for reset_stale_inflight, exactly like a cancelled serializer's (the rule above).
+        # BACKLOG #5744: a stop, a demotion's included, ends this node's hold on every lane, so a
+        # stranded record is dropped with the state; say so, since its rows stay in flight.
+        if dropped := sum(st.stranded is not None for st in self._states.values()):
+            log.warning(
+                "StageDispatcher %s: stopping with %d lane(s) holding stranded claimed rows; the "
+                "records are dropped and the rows stay in flight for reset_stale_inflight or a "
+                "successor's recovery",
+                self._stage.value,
+                dropped,
+            )
         # POST-gather clear — safe now that every task is done (mirrors _teardown_unsafe:1187-1204).
         self._states.clear()
         self._timers.clear()
@@ -1719,20 +1734,27 @@ class StageDispatcher:
         left = stranded
         ended = HoldResult.LANDED
         due: float | None = None  # the date a landed head was re-pended with
-        # Not the leader, nothing is sent (the lane parks below); leading, the fence decides.
+        # A lane this engine no longer owns (a reload moved it to another engine shard, or removed
+        # it) is not this node's to write: the new owner may hold the rows. Not the leader, nothing
+        # is sent (the lane parks below); leading, the fence decides.
+        disowned = False
         try:
-            leading = fence.is_leader()
+            disowned = lane not in self._lane_provider()
+            leading = not disowned and fence.is_leader()
             moved = leading and fence.superseded()
         except Exception:  # noqa: BLE001 — a lease read fault must not wedge the held lane
-            log.warning(
-                "StageDispatcher %s lane %s: reading leadership for its stranded rows failed; "
-                "sending nothing and asking again after a backoff",
+            st0 = self._states.get(lane)
+            # Once per record, then quiet: the park below backs off, and its next pass reads again.
+            log.log(
+                logging.WARNING if st0 is None or st0.stranded_waits == 0 else logging.DEBUG,
+                "StageDispatcher %s lane %s: reading ownership or leadership for its stranded rows "
+                "failed; sending nothing and asking again after a backoff",
                 self._stage.value,
                 lane,
                 exc_info=True,
             )
             leading = moved = False
-        if moved:
+        if disowned or moved:
             ended = HoldResult.SUPERSEDED
         elif leading:
             if left.head is not None:
@@ -1769,16 +1791,19 @@ class StageDispatcher:
         self._drop_lane_episode(st, time.perf_counter_ns() if self._lane_episode_timing else 0)
         if ended is HoldResult.SUPERSEDED:
             log.warning(
-                "StageDispatcher %s lane %s: another node may have led since %d stranded row(s) "
-                "were claimed, so they are not re-pended here; they stay in flight for a store "
-                "recovery path, and this lane's claims may pass them",
+                "StageDispatcher %s lane %s: %s since %d stranded row(s) were claimed, so they are "
+                "not re-pended here; they stay in flight for a store recovery path, and this "
+                "lane's claims may pass them",
                 self._stage.value,
                 lane,
+                "this engine no longer owns the lane" if disowned else "another node may have led",
                 (left.head is not None) + len(left.tail),
             )
             st.stranded = None
         else:
             st.stranded = left if left.head is not None or left.tail else None
+        if st.stranded is None:
+            st.stranded_waits = 0
         if st.pause_pending:
             self._to_paused(lane, st)
         elif ended is HoldResult.EXHAUSTED:
@@ -1794,8 +1819,14 @@ class StageDispatcher:
                     is_infra_fault=True,
                 ),
             )
-        elif st.stranded is not None:  # not the leader, or a hold that ended unlanded: ask again
-            self._park(lane, st, self._clock() + _LANE_ERROR_BACKOFF_SECONDS)
+        elif st.stranded is not None:
+            # Not the leader, a lease-read fault, or a hold that ended unlanded: ask again on a
+            # capped backoff. _sweep_ready_due leaves this park to its own timer.
+            wait = _capped_backoff(
+                _LANE_ERROR_BACKOFF_SECONDS, st.stranded_waits, _REPEND_RETRY_CAP_SECONDS
+            )
+            st.stranded_waits += 1
+            self._park(lane, st, self._clock() + wait)
         elif due is not None and due > self._clock():
             self._park(lane, st, due)  # the head is not due yet, as _run_lane parks a T17 head
         else:  # a wake during the episode makes it wake-sourced, as T14 does
@@ -2524,6 +2555,15 @@ class StageDispatcher:
             self.mark_ready(lane, woken=False)  # T20
         elif phase is _LanePhase.PARKED and st.gated:
             st.dirty = True  # BACKLOG #5704: a gated park waits for release_gated, not a due head
+        elif (
+            phase is _LanePhase.PARKED
+            and st.stranded is not None
+            and st.park_until is not None
+            and st.park_until > self._clock()
+        ):
+            # BACKLOG #5744: the due row is the one behind the stranded rows, so it says nothing
+            # about this backoff; the park's own timer ends it.
+            st.dirty = True
         elif phase is _LanePhase.PARKED:
             self._unpark(lane, woken=False)  # T18 — backoff elapsed; the backstop
         elif phase in (_LanePhase.CLAIMING, _LanePhase.PROCESSING):

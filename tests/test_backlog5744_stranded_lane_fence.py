@@ -18,6 +18,7 @@ row it returns."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -60,8 +61,11 @@ class _Lease:
     def __init__(self) -> None:
         self.held = True
         self.epoch = 7
+        self.broken = False  # every read raises, as a lease read fault does
 
     def is_leader(self) -> bool:
+        if self.broken:
+            raise RuntimeError("simulated lease read fault")
         return self.held
 
     def current_epoch(self) -> int | None:
@@ -84,13 +88,20 @@ def _outage(monkeypatch: pytest.MonkeyPatch, store: MessageStore, attr: str) -> 
 
 
 def _dispatcher(
-    store: MessageStore, lease: _Lease, sink: _Sink, stops: list[str]
+    store: MessageStore,
+    lease: _Lease,
+    sink: _Sink,
+    stops: list[str],
+    owned: set[str] | None = None,
+    **kwargs: Any,
 ) -> stage_dispatcher.StageDispatcher:
+    lanes = {LANE} if owned is None else owned
     return stage_dispatcher.StageDispatcher(
         Stage.INGRESS,
         store,
         process_item=None,  # type: ignore[arg-type]  # the drain is stubbed; no body runs
-        lane_provider=set,
+        lane_provider=lambda: set(lanes),
+        **kwargs,
         per_lane_limit=1,
         alert_sink=sink,
         infra_fault_policy="stop",
@@ -374,3 +385,90 @@ async def test_a_tail_release_after_a_moved_lease_is_not_sent(
     assert released == []
     assert d._states[LANE].stranded is None
     assert await _status(store, tail.message_id) == "inflight"
+
+
+async def _recorded_head(
+    store: MessageStore, lease: _Lease
+) -> tuple[Any, stage_dispatcher._LaneState]:
+    """A head claimed and left in flight, with the row behind it PENDING and due, and an IDLE
+    lane state holding its record under ``lease``."""
+    await _enqueue(store, RAW, RAW_B)
+    head = await store.claim_next_fifo(LANE, stage=Stage.INGRESS.value, now=2.0)
+    assert head is not None
+    fence = stage_dispatcher.RependFence.capture(lease.is_leader, lease.current_epoch)
+    st = stage_dispatcher._LaneState(
+        stranded=stage_dispatcher._Stranded((head.id, time.time()), (), fence)
+    )
+    return head, st
+
+
+@pytest.mark.parametrize("fault", ["not-the-leader", "lease-read-raises"])
+async def test_a_recorded_lane_that_cannot_write_does_not_spin(
+    store: MessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fault: str,
+) -> None:
+    """A running dispatcher, sweeping every 10 ms, holds a record it may not write. The row behind
+    the stranded head is due, so before the fix every sweep unparked the lane for another empty
+    episode. Now its backoff timer alone ends each park and the backoff grows, so a 0.6 s window
+    holds a handful of passes, not one per sweep; a raising lease read logs one WARNING."""
+    monkeypatch.setattr(stage_dispatcher, "_REPEND_RETRY_CAP_SECONDS", 0.2)
+    lease = _Lease()
+    head, st = await _recorded_head(store, lease)
+    if fault == "not-the-leader":
+        lease.held = False
+    else:
+        lease.broken = True
+    d = _dispatcher(store, lease, _Sink(), [], sweep_interval=0.01)
+    d._states[LANE] = st
+    passes = 0
+    real = d._repend_stranded
+
+    async def counting(lane: str, stranded: Any) -> None:
+        nonlocal passes
+        passes += 1
+        await real(lane, stranded)
+
+    monkeypatch.setattr(d, "_repend_stranded", counting)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.stage_dispatcher"):
+        await d.start()
+        try:
+            await asyncio.sleep(0.6)
+        finally:
+            await d.stop()
+    assert 1 <= passes <= 10, passes
+    assert await _status(store, head.message_id) == "inflight"
+    faults = [r for r in caplog.records if "reading ownership or leadership" in r.getMessage()]
+    assert len(faults) == (1 if fault == "lease-read-raises" else 0)
+    assert "records are dropped" in caplog.text  # the stop says it dropped the record
+
+
+async def test_a_record_for_a_lane_this_engine_no_longer_owns_is_dropped_unwritten(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A reload moved the lane to another engine shard (or removed it) while it held a record.
+    Its new owner may hold the rows, so nothing is written: the record is dropped with a
+    WARNING. NullCoordinator gives no epoch, so ownership is the only fence here."""
+    lease = _Lease()
+    head, st = await _recorded_head(store, lease)
+    owned: set[str] = {LANE}
+    d = _dispatcher(store, lease, _Sink(), [], owned=owned)
+    writes: list[Any] = []
+
+    async def recording(*a: Any, **k: Any) -> None:
+        writes.append(a)
+
+    monkeypatch.setattr(store, "reschedule_claimed", recording)
+    monkeypatch.setattr(store, "release_claimed", recording)
+    st.phase = stage_dispatcher._LanePhase.READY
+    d._states[LANE] = st
+    d._enqueue(LANE)
+    owned.clear()  # the reload: this engine no longer owns the lane
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.pipeline.stage_dispatcher"):
+        assert d._assemble_chunk(d._claimers[0]) == []
+        await asyncio.wait_for(d._lane_tasks[LANE], timeout=5.0)
+    assert writes == []
+    assert d._states[LANE].stranded is None
+    assert "no longer owns the lane" in caplog.text
+    assert await _status(store, head.message_id) == "inflight"
