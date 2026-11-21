@@ -63,8 +63,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from harness.bounded_file import NOT_REGULAR, read_fd_capped
-from harness.bounded_file import _over as over_cap
+from harness.bounded_file import LINK_ERRNOS, NOT_REGULAR, over_cap, read_fd_capped
 from harness.endpoints import Endpoints
 from harness.sinks import Record, Sink
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
@@ -107,9 +106,6 @@ _DIR_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | _NOFOLLOW | _CLOEXEC
 _FILE_FLAGS = (
     os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0) | _NOFOLLOW | _CLOEXEC
 )
-
-#: What ``os.open`` with ``O_NOFOLLOW`` raises on a link: ELOOP, or EMLINK on FreeBSD.
-_LINK_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK})
 
 #: The ``refused`` reason for a listed name :func:`_unsafe_listed_name` refuses.
 UNSAFE_NAME = "unsafe name"
@@ -254,7 +250,7 @@ class FileSink(Sink):
             try:
                 root_fd = os.open(self.directory, _DIR_FLAGS)
             except OSError as exc:
-                if exc.errno in _LINK_ERRNOS or isinstance(exc, NotADirectoryError):
+                if exc.errno in LINK_ERRNOS or isinstance(exc, NotADirectoryError):
                     # A link or a non-directory, if something is at the path: present, and not
                     # the directory start() took. Otherwise an ancestor is missing or not a
                     # folder, and the next poll tries again.
@@ -394,7 +390,7 @@ class FileSink(Sink):
         except FileNotFoundError:
             return
         except OSError as exc:
-            if exc.errno in _LINK_ERRNOS or exc.errno == errno.ENOTDIR:
+            if exc.errno in LINK_ERRNOS or exc.errno == errno.ENOTDIR:
                 said = "file sink: not entering a folder that is no longer a plain folder (%s)"
                 self._warn("enter-link", path, said, _why(exc))
             else:
@@ -427,7 +423,7 @@ class FileSink(Sink):
         except FileNotFoundError:
             return None
         except OSError as exc:
-            if exc.errno in _LINK_ERRNOS:  # O_NOFOLLOW refused a link swapped in after the lstat
+            if exc.errno in LINK_ERRNOS:  # O_NOFOLLOW refused a link swapped in after the lstat
                 return self._not_the_file(path)
             self._warn(
                 "open", path, "file sink: cannot open a file, retried next scan (%s)", _why(exc)

@@ -24,10 +24,14 @@ NOT_REGULAR = "not a regular file; not read"
 
 
 #: What ``os.open`` with ``O_NOFOLLOW`` raises on a symlink, as ``transports/file.py`` lists them.
-_LINK_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK})
+LINK_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK})
 
 
-def _over(size: int, cap: int) -> str:
+#: The most one ``os.read`` asks for, so a large file is read in pieces of a bounded size.
+_CHUNK = 1 << 20
+
+
+def over_cap(size: int, cap: int) -> str:
     return f"{size} bytes, over the {cap}-byte cap; not read"
 
 
@@ -45,7 +49,7 @@ def read_capped(path: Path, cap: int, *, follow_symlinks: bool = True) -> tuple[
     if not stat.S_ISREG(st.st_mode):
         return b"", NOT_REGULAR
     if st.st_size > cap:
-        return b"", _over(st.st_size, cap)
+        return b"", over_cap(st.st_size, cap)
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
     if not follow_symlinks:
         flags |= getattr(os, "O_NOFOLLOW", 0)
@@ -54,7 +58,7 @@ def read_capped(path: Path, cap: int, *, follow_symlinks: bool = True) -> tuple[
     except OSError as exc:
         # O_NOFOLLOW refuses a symlink with ELOOP, or EMLINK on FreeBSD: the path was swapped for a
         # link after the lstat, so it is not a regular file now, and never will be by retrying.
-        if not follow_symlinks and exc.errno in _LINK_ERRNOS:
+        if not follow_symlinks and exc.errno in LINK_ERRNOS:
             return b"", NOT_REGULAR
         raise
     try:
@@ -73,17 +77,31 @@ def read_fd_capped(fd: int, cap: int) -> tuple[bytes, str]:
     if not stat.S_ISREG(st.st_mode):
         return b"", NOT_REGULAR
     if st.st_size > cap:
-        return b"", _over(st.st_size, cap)
+        return b"", over_cap(st.st_size, cap)
     if hasattr(os, "O_NONBLOCK"):
         # Non-blocking was only for the open; a filesystem that honoured it on a regular file
         # could otherwise answer a read with nothing (EAGAIN), which a buffered read returns as None.
         os.set_blocking(fd, True)
-    with open(fd, "rb", closefd=False) as fh:
-        # One byte past the size it reported, then top up to one past the cap only if it grew, so
-        # a small file costs a small read and a growing one is caught without reading it whole.
-        data = fh.read(st.st_size + 1)
-        if len(data) > st.st_size:
-            data += fh.read(cap + 1 - len(data))
+    # One byte past the size it reported, then top up to one past the cap only if it grew, so a
+    # small file costs a small read and a growing one is caught without reading it whole.
+    data = _read_at_most(fd, st.st_size + 1)
+    if len(data) > st.st_size:
+        data += _read_at_most(fd, cap + 1 - len(data))
     if len(data) > cap:
         return b"", f"grew past the {cap}-byte cap while read; not kept"
     return data, ""
+
+
+def _read_at_most(fd: int, limit: int) -> bytes:
+    """Up to ``limit`` bytes from ``fd``, fewer only at end of file. Unbuffered ``os.read`` calls,
+    so no more than ``limit`` bytes are taken from the file: a buffered reader fills its buffer
+    and can pull far past the size asked for from a file that is still growing."""
+    chunks: list[bytes] = []
+    left = limit
+    while left > 0:
+        chunk = os.read(fd, min(left, _CHUNK))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        left -= len(chunk)
+    return b"".join(chunks)
