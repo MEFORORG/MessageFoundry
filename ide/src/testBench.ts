@@ -18,7 +18,7 @@ import {
   sweepStaleCaseDirs,
 } from "./collectionCaseFiles";
 import { CollectionStore, CollectionStoreError } from "./collectionStore";
-import { INTERPRETER_OPTIONS } from "./engineControlModel";
+import { INTERPRETER_OPTIONS, TEST_BENCH_DEBUG_PROGRAM } from "./engineControlModel";
 import { hexdump } from "./hexdump";
 import { diffMessages } from "./hl7diff";
 import { buildTraceDetail, type TraceDetail, type TraceEntry } from "./traceView";
@@ -540,22 +540,39 @@ export class TestBench {
     if (!row?.path || !folder) {
       return;
     }
+    let program: string;
+    try {
+      program = await this.debugProgram();
+    } catch (e) {
+      void vscode.window.showErrorMessage(`MessageFoundry: Debug did not start: ${String(e)}`);
+      return;
+    }
     await vscode.debug.startDebugging(folder, {
       name: `MEFOR dry-run: ${row.source}`,
       type: "debugpy",
       request: "launch",
       // The interpreter options the CLI bridge launches with (BACKLOG #5409): `-P` keeps the working
       // directory, the workspace, off the import path, so a `messagefoundry.py` or a stdlib-named
-      // module in the workspace root does not shadow the installed one through it. debugpy's module
-      // runner adds the working directory itself unless `sys.flags.safe_path` is set, which `-P`
-      // sets; that check is read from debugpy's main branch, and an older debugpy may lack it.
+      // module in the workspace root does not shadow the installed one through it. The launch names
+      // a program the extension writes, not the module, so `-P` holds on every debugpy build;
+      // TEST_BENCH_DEBUG_PROGRAM says why.
       pythonArgs: [...INTERPRETER_OPTIONS],
-      module: "messagefoundry",
+      program,
       args: ["dryrun", "--config", configDir(), "--show-phi", "--messages", row.path],
       console: "integratedTerminal",
       justMyCode: false, // step into the config modules (Router/Handler)
       python: pythonPath(),
     });
+  }
+
+  /** Writes TEST_BENCH_DEBUG_PROGRAM into its own folder under the extension's global storage, every
+   *  launch so the file always holds this source, and returns its path. */
+  private async debugProgram(): Promise<string> {
+    const dir = vscode.Uri.joinPath(this.context.globalStorageUri, TEST_BENCH_DEBUG_PROGRAM.folder);
+    await vscode.workspace.fs.createDirectory(dir);
+    const file = vscode.Uri.joinPath(dir, TEST_BENCH_DEBUG_PROGRAM.file);
+    await vscode.workspace.fs.writeFile(file, new TextEncoder().encode(TEST_BENCH_DEBUG_PROGRAM.source));
+    return file.fsPath;
   }
 
   /**
