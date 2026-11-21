@@ -3,7 +3,7 @@
 """The support-bundle help and ``docs/PHI.md`` stream 14 name every member the bundle writes
 (BACKLOG #5385, added item 1).
 
-The member list is derived from the code, not copied: every ``members["<name>"] = ...`` assignment
+The member list each test walks is derived from the code, not copied: every ``members["<name>"] = ...`` assignment
 in :func:`messagefoundry.support.bundle.build_bundle`, read off its AST. A live bundle with a log
 tail is the control that the AST reading finds what the function really writes. The help must also
 describe ``status.json`` the way the manifest's ``phi_contract`` does, "metadata-only", and must not
@@ -27,8 +27,9 @@ from messagefoundry.support import bundle as bundle_mod
 
 _REPO = Path(__file__).resolve().parents[1]
 
-#: The members build_bundle writes today when a log tail is written. Each test below checks
-#: that the AST reading holds at least these, so an empty or partial reading cannot pass it.
+#: The members build_bundle writes today when a log tail is written, copied by hand as a floor.
+#: The three member tests below check the AST reading holds at least these, so an empty or
+#: partial reading cannot pass them.
 _KNOWN_MEMBERS = frozenset(
     {"version.txt", "config-summary.json", "status.json", "app-log.txt", "manifest.json"}
 )
