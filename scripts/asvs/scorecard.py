@@ -2605,18 +2605,24 @@ _FOREIGN: Final = "_scorecard_foreign_import"
 
 def _foreign_imports(source: str) -> frozenset[str]:
     """The names `source` binds by ``from <module> import`` where the module is not one of
-    :data:`_SHAPE_DECORATOR_MODULES`. Empty if `source` does not parse."""
+    :data:`_SHAPE_DECORATOR_MODULES`, or by its own ``def``, ``class`` or assignment (a local
+    ``def cache(fn)`` is not functools'). Empty if `source` does not parse."""
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return frozenset()
-    return frozenset(
-        alias.asname or alias.name
-        for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-        and (node.level or (node.module or "").split(".")[0] not in _SHAPE_DECORATOR_MODULES)
-        for alias in node.names
-    )
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and (
+            node.level or (node.module or "").split(".")[0] not in _SHAPE_DECORATOR_MODULES
+        ):
+            out.update(alias.asname or alias.name for alias in node.names)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out.add(node.name)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            out.update(t.id for tgt in targets for t in ast.walk(tgt) if isinstance(t, ast.Name))
+    return frozenset(out)
 
 
 def _toplevel(source: str, foreign: frozenset[str] = frozenset()) -> _Scope | None:
@@ -2713,7 +2719,11 @@ def _decorators(node: _DefNode) -> tuple[str, ...]:
     out = []
     for d in node.decorator_list:
         head, _, name = ast.unparse(d.func if isinstance(d, ast.Call) else d).rpartition(".")
-        accessor = name in _ACCESSORS
+        # An accessor counts only on the property's own def (``@x.setter def x``), as
+        # :func:`_is_accessor` reads it; ``@router.getter def handler`` is not a property.
+        accessor = name in _ACCESSORS and head == node.name
+        if name in _ACCESSORS and not accessor:
+            continue
         foreign = not head and getattr(d.func if isinstance(d, ast.Call) else d, _FOREIGN, False)
         if (
             name in _SHAPE_DECORATORS

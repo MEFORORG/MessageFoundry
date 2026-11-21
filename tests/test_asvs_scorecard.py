@@ -2663,6 +2663,11 @@ def test_screen_accepts_call_compatible_shapes_origin_main_accepted(tmp_path: Pa
     assert any(
         "different signature" in p for p in _screen("def handler(a, b): ...", routed, tmp_path)
     )
+    # ... and dropping that decorator is accepted, as on origin/main: it is not a property's.
+    assert _screen("def handler(a): ...", routed, tmp_path) == []
+    # A decorator the module defines itself is not functools', whatever its name.
+    local = "def cache(fn):\n    return fn\n\n@cache\ndef f(a): ...\n"
+    assert _screen("def f(a): ...", local, tmp_path) == []
     # Control: attrs' own spelling still counts.
     assert _screen("class P: ...\n", "@attrs.define\nclass P: ...\n", tmp_path)
 
