@@ -106,7 +106,7 @@ def _assert_reingress_edge(config_dir: Path) -> None:
     assert graph.targets("outbound", "OB_RESULT") == []
     assert not graph.dangling
     # The reference index behind delete impact sees the outbound as the loopback's referrer. (A
-    # rename does not yet rewrite reingress_to: impact.py has no outbound referrer branch.)
+    # rename rewrites reingress_to: tests/test_impact_toml_and_apply.py.)
     refs = build_reference_index(registry).referrers("inbound", "IB_LOOP")
     assert {(r.referrer_kind, r.referrer) for r in refs} == {("outbound", "OB_PARTNER")}
 

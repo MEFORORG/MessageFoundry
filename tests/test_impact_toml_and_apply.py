@@ -14,12 +14,14 @@ Each test loads a real config, and none was green before the fix."""
 
 from __future__ import annotations
 
+import contextlib
 import json
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
 
-from messagefoundry.config import codeset_edit, impact
+from messagefoundry.config import atomic_edit, codeset_edit, impact
 from messagefoundry.config.code_sets import load_code_set
 from messagefoundry.config.graph import build_wiring_graph
 from messagefoundry.config.impact import RenamePlan, apply_rename, plan_rename
@@ -453,6 +455,80 @@ def test_a_write_that_fails_restores_the_files_already_written(
         apply_rename(plan)
     monkeypatch.undo()
     assert {name: (config_dir / name).read_bytes() for name in SPLIT} == before
+
+
+def test_write_rename_holds_the_config_edit_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The writes run under the lock the other config editors take, so a connections.toml or code
+    set edit in another process cannot interleave with them (BACKLOG #5980)."""
+    config_dir = _config(tmp_path, SPLIT)
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
+    held: list[Path] = []
+    locked: list[Path] = []
+    real_lock = atomic_edit.edit_lock
+    real_write = Path.write_bytes
+
+    @contextlib.contextmanager
+    def recording_lock(path: Path, **kwargs: object) -> Iterator[None]:
+        with real_lock(path, **kwargs):  # type: ignore[arg-type]
+            held.append(path.parent)
+            try:
+                yield
+            finally:
+                held.remove(path.parent)
+
+    def write_under_lock(self: Path, data: bytes) -> int:
+        locked.extend(d for d in held if d == self.parent)
+        return real_write(self, data)
+
+    monkeypatch.setattr(atomic_edit, "edit_lock", recording_lock)
+    monkeypatch.setattr(Path, "write_bytes", write_under_lock)
+    assert len(apply_rename(plan)) == 2
+    monkeypatch.undo()
+    assert [p.resolve() for p in locked] == [config_dir.resolve()] * 2
+
+
+def test_write_rename_writes_nothing_when_a_file_changed_after_it_was_prepared(
+    tmp_path: Path,
+) -> None:
+    """An edit landing between prepare_rename and write_rename would be overwritten by the
+    prepared bytes; under the lock the file is read again, and the write refuses."""
+    config_dir = _config(tmp_path, SPLIT)
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
+    prepared = impact.prepare_rename(plan)
+    a = config_dir / "a.py"
+    a.write_text(a.read_text(encoding="utf-8") + "# edited by another editor\n", "utf-8")
+    before = {name: (config_dir / name).read_bytes() for name in SPLIT}
+    with pytest.raises(impact.RenameWriteError, match="Nothing was written") as caught:
+        impact.write_rename(prepared)
+    assert caught.value.unrestored == []
+    assert {name: (config_dir / name).read_bytes() for name in SPLIT} == before
+
+
+def test_codeset_rename_moves_the_table_back_when_the_rename_lock_is_busy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A referent directory's edit lock held past its timeout refuses the rewrite after the table
+    moved; the table moves back rather than leave every reference naming a table that is gone."""
+    mod = CODESET_MOD.replace("r_cs_misspelled", "r_cs")
+    config_dir = _config(tmp_path, {"mod.py": mod, "codesets/diets.csv": "code,value\nA,Apple\n"})
+    real_lock = atomic_edit.edit_lock
+    codesets = (config_dir / "codesets").resolve()
+
+    def busy_but_the_codeset_lock(
+        path: Path, **kwargs: object
+    ) -> contextlib.AbstractContextManager[None]:
+        if Path(path).resolve() != codesets:  # the codeset editor locks the folder itself
+            raise WiringError("another edit holds the lock")
+        return real_lock(path, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(atomic_edit, "edit_lock", busy_but_the_codeset_lock)
+    with pytest.raises(WiringError, match="moved back"):
+        codeset_edit.rename_code_set(config_dir, "diets", "meals", validate=_validate)
+    monkeypatch.undo()
+    assert sorted(p.name for p in (config_dir / "codesets").iterdir()) == ["diets.csv"]
+    assert 'code_set("diets")' in (config_dir / "mod.py").read_text(encoding="utf-8")
 
 
 def test_a_reply_from_env_default_naming_the_outbound_is_reported(tmp_path: Path) -> None:

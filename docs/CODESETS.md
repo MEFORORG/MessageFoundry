@@ -128,17 +128,20 @@ Editing a `codesets/` file changes nothing live; the running graph adopts the ch
 **existing audited `POST /config/reload`** (the IDE promote), exactly like a connection or handler
 change.
 
-**Renaming or removing a code set can break a handler reference.** A code set is referenced by **name**
-from a Handler (`code_set("epic_diets")`), and that reference is resolved at the loader/runner — not by
-`messagefoundry codeset`. So after a rename/remove, a `code_set("old_name")` call raises at run time
-(that message's `ERROR` disposition). A plain `validate` only confirms each *file* parses, so it
-**won't** catch a now-dangling reference.
+**Removing a code set can break a handler reference.** A code set is referenced by **name** from a
+Handler (`code_set("epic_diets")`), and that reference is resolved at the loader/runner. So after a
+remove, a `code_set("old_name")` call raises at run time (that message's `ERROR` disposition). The
+remove warns of the referrers it finds but deletes the table anyway. A plain `validate` only confirms
+each *file* parses, so it **won't** catch a now-dangling reference.
+
+**A rename rewrites the references it can find** (`impact`'s rename plan, BACKLOG #5980) and refuses,
+with nothing moved, when it finds one it cannot rewrite. It still cannot see a name computed at call
+time (`code_set(prefix + "_diets")`) or one reached through code the plan does not read.
 
 > **After a rename or remove, run `messagefoundry check` before promoting.** Its dry-run actually
 > executes the transforms, so it triggers the lookup and surfaces a broken `code_set(...)` reference at
-> the gate rather than at the first message in production. The editor deliberately does **not** scan
-> handler source for references (that would couple a data tool to code parsing and still miss a
-> call-time-computed name) — the `messagefoundry check` dry-run is the safety net.
+> the gate rather than at the first message in production. For a remove, and for a reference a
+> rename's plan cannot see, the `messagefoundry check` dry-run is the safety net.
 
 ## Out of scope
 

@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import ast
 import codecs
+import contextlib
 import io
 import logging
 import os
@@ -55,6 +56,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import FunctionType
 
+from messagefoundry.config import atomic_edit
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
 from messagefoundry.config.reachability import (
@@ -514,23 +516,81 @@ def prepare_rename(plan: RenamePlan) -> PreparedRename:
 def write_rename(prepared: PreparedRename) -> list[LiteralEdit]:
     """Write a :func:`prepare_rename` result and return the edits applied.
 
+    The writes run under the config editors' cross-process edit lock
+    (:func:`~messagefoundry.config.atomic_edit.edit_lock`) of every directory holding an edited
+    file, and each file is read again under it: one whose bytes are no longer those
+    :func:`prepare_rename` read was changed by another edit in between, and writing would drop that
+    edit, so that raises :class:`RenameWriteError` with nothing written (BACKLOG #5980). Blocking,
+    like the lock: call it off the event loop.
+
     A write that fails restores every file already written, and the failing one if it changed, from
     the bytes read, then raises :class:`RenameWriteError` naming any file it could not restore."""
     plan = prepared.plan
-    written: list[tuple[str, bytes]] = []
-    for file, raw, new_bytes in prepared.files:
-        try:
-            Path(file).write_bytes(new_bytes)
-        except OSError as exc:
-            unrestored = _restore([*written, (file, raw)])
-            left = f"; these still hold the new name: {', '.join(unrestored)}" if unrestored else ""
+    with _rename_locks(file for file, _raw, _new in prepared.files):
+        changed = [file for file, raw, _new in prepared.files if not _still_reads(file, raw)]
+        if changed:
             raise RenameWriteError(
-                f"cannot apply the rename of {plan.target_kind} {plan.old!r}: writing {file} "
-                f"failed ({type(exc).__name__}), so the files already written were restored{left}",
-                unrestored,
-            ) from exc
-        written.append((file, raw))
+                f"cannot apply the rename of {plan.target_kind} {plan.old!r}: "
+                f"{', '.join(changed)} changed or could not be read after the plan was checked. "
+                "Nothing was written; plan the rename again",
+                [],
+            )
+        written: list[tuple[str, bytes]] = []
+        for file, raw, new_bytes in prepared.files:
+            try:
+                Path(file).write_bytes(new_bytes)
+            except OSError as exc:
+                unrestored = _restore([*written, (file, raw)])
+                left = (
+                    f"; these still hold the new name: {', '.join(unrestored)}"
+                    if unrestored
+                    else ""
+                )
+                raise RenameWriteError(
+                    f"cannot apply the rename of {plan.target_kind} {plan.old!r}: writing {file} "
+                    f"failed ({type(exc).__name__}), so the files already written were "
+                    f"restored{left}",
+                    unrestored,
+                ) from exc
+            written.append((file, raw))
     return list(prepared.applied)
+
+
+def _still_reads(file: str, raw: bytes) -> bool:
+    """Whether ``file`` still holds ``raw``; one that cannot be read does not."""
+    try:
+        return Path(file).read_bytes() == raw
+    except OSError as exc:
+        _log.debug("rename could not re-read %s under the lock: %s", file, type(exc).__name__)
+        return False
+
+
+@contextlib.contextmanager
+def _rename_locks(files: Iterable[str]) -> Iterator[None]:
+    """Hold the edit lock of each directory holding one of ``files``, taken in one sorted order so
+    two renames cannot each hold one lock and wait on the other's. A lock that stays held past its
+    timeout, or a directory that refuses the lock file, raises :class:`RenameWriteError` with
+    nothing written, so a caller that moved a code set first moves it back."""
+    # Keyed as edit_lock keys its own lock file, so two files of one directory take one lock.
+    by_dir: dict[str, Path] = {}
+    with contextlib.ExitStack() as stack:
+        try:
+            for file in files:
+                path = Path(file)
+                lock = atomic_edit.lock_path_for(path).resolve()
+                by_dir.setdefault(os.path.normcase(str(lock)), path)
+            for key in sorted(by_dir):
+                stack.enter_context(
+                    atomic_edit.edit_lock(
+                        by_dir[key], busy_error=WiringError, refused_error=WiringError
+                    )
+                )
+        except (WiringError, OSError) as exc:
+            raise RenameWriteError(
+                f"cannot take the config edit lock for the rename ({exc}). Nothing was written",
+                [],
+            ) from exc
+        yield
 
 
 def _restore(files: list[tuple[str, bytes]]) -> list[str]:
@@ -2491,14 +2551,15 @@ def _in_any_span(line: int, spans: list[_Span]) -> bool:
 _TomlTarget = tuple[str, str, tuple[str, ...]]
 
 #: A table header line: ``[[inbound]]``, ``[outbound.settings]``. A quoted key part is not matched,
-#: so the lines under it are attributed to no table and are never rewritten.
-_TOML_HEADER = re.compile(
-    r"^\s*\[\[?\s*(?P<path>[A-Za-z0-9_-]+(?:\s*\.\s*[A-Za-z0-9_-]+)*)\s*\]\]?\s*(?:#.*)?$"
-)
+#: so the lines under it are attributed to no table and are never rewritten. The path is one flat
+#: character class, split and checked by :func:`_toml_key_path`: a ``part(.part)*`` group would be
+#: a nested quantifier, which the ReDoS gate refuses (tests/test_security_static.py).
+_TOML_HEADER = re.compile(r"^\s*\[\[?(?P<path>[A-Za-z0-9_.\s-]+)\]\]?\s*(?:#.*)?$")
 
-#: A bare or dotted key assigned a one-line string with no escape: ``router = "r"``.
+#: A bare or dotted key assigned a one-line string with no escape: ``router = "r"``. The key, its
+#: leading space included, is checked by :func:`_toml_key_path` as the header's path is.
 _TOML_STRING_KEY = re.compile(
-    r"^(?P<pre>\s*(?P<key>[A-Za-z0-9_-]+(?:\s*\.\s*[A-Za-z0-9_-]+)*)\s*=\s*)"
+    r"^(?P<pre>(?P<key>[A-Za-z0-9_.\s-]+)=\s*)"
     r"(?P<lit>(?P<q>[\"'])(?P<value>[^\"'\\\r\n]*)(?P=q))\s*(?:#.*)?$"
 )
 
@@ -2544,6 +2605,7 @@ def _toml_edits(
         line = raw_line.rstrip("\r\n")
         header_match = _TOML_HEADER.match(line)
         if header_match is not None:
+            # A path with an empty or spaced part is no header this reads: no table is known.
             header = _toml_key_path(header_match.group("path"))
             continue
         if line.lstrip().startswith("[") and line.rstrip().endswith("]"):
@@ -2554,7 +2616,8 @@ def _toml_edits(
         m = _TOML_STRING_KEY.match(line)
         if m is None or m.group("value") != old or header is None:
             continue
-        if (*header, *_toml_key_path(m.group("key"))) != wanted:
+        key_path = _toml_key_path(m.group("key"))
+        if key_path is None or (*header, *key_path) != wanted:
             continue
         lit, quote, col = m.group("lit"), m.group("q"), len(m.group("pre"))
         edits.append(
@@ -2579,9 +2642,17 @@ def _toml_edits(
     return edits if repr(after) == repr(expected) else None
 
 
-def _toml_key_path(key: str) -> tuple[str, ...]:
-    """A bare dotted TOML key's parts (``settings . reply_from`` -> ``("settings", "reply_from")``)."""
-    return tuple(part.strip() for part in key.split("."))
+#: The characters of a bare TOML key part.
+_TOML_BARE_KEY_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+
+
+def _toml_key_path(key: str) -> tuple[str, ...] | None:
+    """A bare dotted TOML key's parts (``settings . reply_from`` -> ``("settings", "reply_from")``),
+    or ``None`` when a part is empty or holds a character a bare key cannot (a space inside it)."""
+    parts = tuple(part.strip() for part in key.split("."))
+    if all(part and _TOML_BARE_KEY_CHARS.issuperset(part) for part in parts):
+        return parts
+    return None
 
 
 # --- apply -------------------------------------------------------------------
