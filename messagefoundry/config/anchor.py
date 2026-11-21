@@ -33,16 +33,15 @@ resolved ``--config`` dir (ADR 0007) — once ``--config`` follows the root, so 
 The fail-loud half lives in :func:`graph_references_env`: it lets ``serve`` (and the offline gate)
 distinguish a graph that *needs* the value file from a zero-``env()`` deployment that legitimately
 ships none, so a missing ``<env>.toml`` under an *explicit* root only hard-fails when the graph
-actually references ``env()`` (ADR 0050 §2 / AC-3); :func:`explicit_root_value_file_preflight`
+actually references ``env()`` (ADR 0050 §2 / AC-3); :func:`explicit_root_value_file_guard`
 runs the same rule at each reload. PHI-safe by construction: this module only ever
 handles file paths and env-reference *keys*, never values or message bodies.
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING, Any
 
@@ -52,6 +51,7 @@ from messagefoundry.config.environments import (
     resolve_values_base_dir,
 )
 from messagefoundry.config.wiring import EnvRef, WiringError
+from messagefoundry.redaction import safe_exc
 
 if TYPE_CHECKING:
     from messagefoundry.config.settings import ServiceSettings
@@ -66,7 +66,7 @@ __all__ = [
     "anchor_settings_store_path",
     "graph_references_env",
     "referenced_env_keys_in_graph",
-    "explicit_root_value_file_preflight",
+    "explicit_root_value_file_guard",
 ]
 
 
@@ -178,15 +178,26 @@ def _iter_settings_values(registry: Registry) -> Iterable[Any]:
     references as dict values (see the ``env()`` examples in ``wiring.py``). Routers/Handlers author
     *logic*, not transport settings, so they hold no ``EnvRef`` — they are not scanned.
 
-    A ``deployed=False`` connection is skipped (BACKLOG #5775): it is never built and its values
-    are never resolved (ADR 0111 AC-1), so an ``env()`` on it needs no value file, and counting it
-    failed the AC-3 check under an explicit root for a connection that is switched off. Turning it
-    on is a config change that takes a reload, and a reload runs the same check again
-    (:func:`explicit_root_value_file_preflight`), so the skip is not a way past it.
+    A ``deployed=False`` connection counts only for the settings its guarded directories come
+    from (BACKLOG #5775). It is never built (ADR 0111 AC-1), so counting all of it failed the AC-3
+    check under an explicit root for a connection that is switched off. The ``.processed`` archive
+    sweep's guard still resolves those directory settings on every connection, deployed or not
+    (``RegistryRunner.archive_guard_dirs``), and with a value missing there it deletes nothing, so
+    they still count. Turning the connection on is a config change that takes a reload, and a
+    reload runs the same check again (:func:`explicit_root_value_file_guard`).
     """
+    from messagefoundry.transports.base import guard_dir_settings
+
     for _kind, _name, settings, deployed in registry.settings_carriers():
         if deployed:
             yield from _mapping_values(settings)
+    for ic in registry.inbound.values():
+        if not ic.deployed:
+            yield from _mapping_values(guard_dir_settings(ic.spec.type, ic.spec.settings) or {})
+    for oc in registry.outbound.values():
+        if not oc.deployed:
+            guarded = guard_dir_settings(oc.spec.type, oc.spec.settings, outbound=True)
+            yield from _mapping_values(guarded or {})
 
 
 def _mapping_values(settings: Mapping[str, Any]) -> Iterable[Any]:
@@ -201,7 +212,8 @@ def _mapping_values(settings: Mapping[str, Any]) -> Iterable[Any]:
 
 def referenced_env_keys_in_graph(registry: Registry) -> list[str]:
     """The sorted, de-duplicated ``env()`` keys the loaded graph references, on its deployed
-    connections and on every lookup and reference set (:func:`_iter_settings_values`).
+    connections, in a switched-off connection's directory settings, and on every lookup and
+    reference set (:func:`_iter_settings_values`).
 
     The graph-wide analogue of :func:`messagefoundry.config.wiring.referenced_env_keys` (which is
     per-settings-dict). Empty ⇒ a zero-``env()`` deployment — the case ADR 0050 AC-3 must never
@@ -222,16 +234,16 @@ def graph_references_env(registry: Registry) -> bool:
     return any(isinstance(v, EnvRef) for v in _iter_settings_values(registry))
 
 
-def explicit_root_value_file_preflight(
-    settings: ServiceSettings | None, provider: object
-) -> Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None:
-    """The AC-3 check as a registry preflight, so a reload is judged by it as the start is.
+def explicit_root_value_file_guard(
+    settings: ServiceSettings | None, provider: Callable[[], Mapping[str, Any]] | None
+) -> Callable[[Registry], None] | None:
+    """The AC-3 check as a registry guard, so a reload is judged by it as the start is.
 
-    ``serve`` runs AC-3 once, at start (``_emit_anchor_diagnostics``). Since a ``deployed=False``
-    connection's ``env()`` no longer counts (:func:`_iter_settings_values`), a start can pass it
+    ``serve`` runs AC-3 at start (``_emit_anchor_diagnostics``). Since a ``deployed=False``
+    connection's ``env()`` counts only in part (:func:`_iter_settings_values`), a start can pass it
     with such a connection, and a later reload that turns the connection on would then run it on
     the values a missing file leaves, ``env(default=...)`` and ``MEFOR_VALUE_*`` alone, with no
-    refusal (BACKLOG #5775, from engine PR 3107). This preflight refuses that reload with the same
+    refusal (BACKLOG #5775, from engine PR 3107). This guard refuses that reload with the same
     rule: an explicit project root, a graph that references ``env()``, and no value file.
 
     ``settings`` is the resolved service configuration; its ``[environments].base_dir`` is the
@@ -240,8 +252,11 @@ def explicit_root_value_file_preflight(
     ``None``, no check, where there is no explicit root, or no provider naming a value file, as for
     an embedder that hands the engine its values directly.
 
-    The engine awaits a preflight at the first load, every real reload and a DR activation, and not
-    on a dry run, which applies nothing. The refusal names paths only, never a value."""
+    The engine runs its guard at the first load and on every reload, a dry run included, over the
+    whole graph before an engine shard's filter, so every engine shard reaches one verdict. Where
+    the load's config snapshot covers the value file, presence is the snapshot's, the read the
+    reload's values were parsed from; else it is a stat of the file. The refusal names paths only,
+    never a value."""
     if settings is None or not settings.environments.base_dir:
         return None
     if not isinstance(provider, SnapshotEnvValuesProvider):
@@ -249,18 +264,38 @@ def explicit_root_value_file_preflight(
     value_file = provider.value_file
     if value_file is None:
         return None
-    root = settings.environments.base_dir
 
-    async def _refuse_missing_value_file(registry: Registry, _values: Mapping[str, Any]) -> None:
+    def _refuse_missing_value_file(registry: Registry) -> None:
         if not graph_references_env(registry):
             return  # zero-env() graph: the silent-empty contract is preserved (AC-3).
-        # Off the event loop, as every other file the engine reads.
-        if await asyncio.to_thread(value_file.is_file):
-            return
-        raise WiringError(
-            f"the graph references env() but no value file was found at {value_file} under the "
-            f"project root {root!r}. Create it, or correct --project-root / "
-            "[environments].base_dir."
-        )
+        fault = ""
+        try:
+            present = _value_file_present(registry, value_file)
+        except OSError as exc:
+            fault = safe_exc(exc)
+        if fault:
+            # Raised outside the handler, so it carries no exception chain.
+            raise WiringError(
+                f"the graph references env() and the value file {value_file} could not be "
+                f"checked: {fault}"
+            )
+        if not present:
+            raise WiringError(
+                f"the graph references env() but no value file was found at {value_file}, and "
+                "[environments].base_dir names an explicit project root. Create the file, or "
+                "correct [environments].base_dir and restart."
+            )
 
     return _refuse_missing_value_file
+
+
+def _value_file_present(registry: Registry, value_file: Path) -> bool:
+    """Whether ``value_file`` is there for this load: as its config snapshot read it where the
+    snapshot covers it, else as a stat finds it now. Raises ``OSError`` for a fault, never reading
+    one as no file (:func:`~messagefoundry.config.snapshot.is_regular_file`)."""
+    from messagefoundry.config.snapshot import is_regular_file
+
+    snapshot = registry.config_snapshot
+    if snapshot is not None and snapshot.covers_environment_file(value_file):
+        return snapshot.environment_file(value_file) is not None
+    return is_regular_file(value_file)

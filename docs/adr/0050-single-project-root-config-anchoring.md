@@ -267,11 +267,12 @@ given** — which is exactly AC-6.
   → `tests/test_config_anchoring.py::test_explicit_root_with_env_refs_missing_file_fails_loud`
   → `tests/test_config_anchoring.py::test_no_env_refs_missing_file_stays_silent_empty`
 
-  **AMENDED 2026-11-20 (BACKLOG #5775):** an `env()` reference counts only on a deployed
-  connection, a lookup or a reference set, since a `deployed=False` connection never resolves its
-  values. A managed engine given an explicit `[environments].base_dir` also runs this check at
-  every real reload, so a reload that turns such a connection on is refused when the value file is
-  absent.
+  **AMENDED 2026-11-20 (BACKLOG #5775):** an `env()` reference counts on a deployed connection, a
+  lookup or a reference set. On a `deployed=False` connection, which is never built, it counts
+  only in a setting its guarded directories come from, because the `.processed` archive sweep's
+  guard still resolves those. A managed engine given an explicit `[environments].base_dir` also
+  runs this check at its first load and on every reload, a dry run included, so a reload that
+  turns such a connection on is refused when the value file is absent.
   → `tests/test_config_anchoring.py::test_explicit_root_env_only_on_not_deployed_connection_does_not_fail`
   → `tests/test_config_anchoring.py::test_reload_turning_on_an_env_connection_without_value_file_is_refused`
 - **AC-4** — WHEN a project root is set AND the working directory differs from the resolved root, THE
