@@ -129,8 +129,9 @@ export function hasColonInName(rel: string, win32: boolean = path.sep === "\\"):
   return someWin32Name(rel, win32, (part) => part.includes(":"));
 }
 
-/** The DOS device names Windows reserves, as CPython's `ntpath.isreserved` lists them: the
- *  superscript digits one to three are device digits too. Upper case. */
+/** The DOS device names Windows reserves: CPython's `ntpath.isreserved` list, where the superscript
+ *  digits one to three are device digits too, and COM0 and LPT0, which Microsoft's file-naming
+ *  guidance also lists. Upper case. */
 const RESERVED_DEVICE_NAMES: ReadonlySet<string> = new Set([
   "CON",
   "PRN",
@@ -138,7 +139,7 @@ const RESERVED_DEVICE_NAMES: ReadonlySet<string> = new Set([
   "NUL",
   "CONIN$",
   "CONOUT$",
-  ...["COM", "LPT"].flatMap((p) => [..."123456789¹²³"].map((d) => p + d)),
+  ...["COM", "LPT"].flatMap((p) => [..."0123456789\u00b9\u00b2\u00b3"].map((d) => p + d)),
 ]);
 
 /**

@@ -42,10 +42,14 @@ export function cliArgv(module: string, args: readonly string[]): string[] {
  * 1.8.21 the Python Debugger extension bundles at the time of writing, inserts the working
  * directory, the workspace, into `sys.path` when it runs a module, whatever `-P` says. For a
  * program it adds at most the program's own folder, which the extension writes and which holds
- * only this file, and the file runs the installed package through `runpy`. So `-P` keeps the
- * workspace off the import path on every debugpy build. The source is written at launch rather
- * than shipped, because the extension package holds no Python (the crypto inventory's ide/ arm
- * reads only TypeScript).
+ * only this file, and the file runs the installed package through `runpy`. So no debugpy build puts
+ * the working directory on the import path. The source is written at launch rather than shipped,
+ * because the extension package holds no Python (the crypto inventory's ide/ arm reads only
+ * TypeScript).
+ *
+ * Open limit: `-P` does not remove a PYTHONPATH entry, and the Python Debugger extension loads the
+ * workspace's `.env` file into the debuggee by default. A repository whose `.env` sets PYTHONPATH,
+ * or an inherited PYTHONPATH, can still put a workspace folder on the import path for this launch.
  */
 export const TEST_BENCH_DEBUG_PROGRAM = {
   folder: "testbench-debug",

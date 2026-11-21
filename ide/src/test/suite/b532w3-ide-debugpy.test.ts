@@ -80,7 +80,11 @@ suite("b532w3: the Test Bench Debug launch keeps -P on every debugpy build (BACK
     assert.ok(/\n\s*program,\n/.test(fn), fn);
     assert.ok(!/\bmodule\s*:/.test(fn), `debugRow still names a module: ${fn}`);
     // A failed write refuses the launch rather than falling back to the module form.
-    assert.ok(fn.indexOf("return;", fn.indexOf("catch (e)")) < fn.indexOf("startDebugging"), fn);
+    const caught = /try \{\s*program = await this\.debugProgram\(\);\s*\} catch \(e\) \{([\s\S]*?)\n\s*\}\n/.exec(fn);
+    assert.ok(caught, fn);
+    assert.ok(/\breturn;\s*$/.test(caught[1]), caught[1]);
+    assert.ok(fn.indexOf(caught[0]) < fn.indexOf("startDebugging"), fn);
+    assert.ok(fn.includes("cwd: folder.uri.fsPath"), fn);
     assert.ok(INTERPRETER_OPTIONS.includes("-P"));
   });
 
@@ -92,8 +96,12 @@ suite("b532w3: the Test Bench Debug launch keeps -P on every debugpy build (BACK
     );
     assert.ok(fn.includes("vscode.Uri.joinPath(dir, TEST_BENCH_DEBUG_PROGRAM.file)"), fn);
     assert.ok(fn.includes("TEST_BENCH_DEBUG_PROGRAM.source"), fn);
-    // One write: every debugpy build may put the folder on the import path, so nothing else goes in it.
+    // Every debugpy build may put the folder on the import path, so the only other entry it ever holds
+    // is the temporary file renamed over the program, whose name is no importable module.
     assert.strictEqual((fn.match(/writeFile\(/g) ?? []).length, 1, fn);
+    assert.ok(fn.includes("await vscode.workspace.fs.writeFile(temp, source)"), fn);
+    assert.ok(fn.includes("await vscode.workspace.fs.rename(temp, file, { overwrite: true })"), fn);
+    assert.ok(fn.includes(".tmp`"), fn);
     assert.strictEqual(path.basename(TEST_BENCH_DEBUG_PROGRAM.folder), TEST_BENCH_DEBUG_PROGRAM.folder);
     assert.ok(TEST_BENCH_DEBUG_PROGRAM.file.endsWith(".py"));
   });

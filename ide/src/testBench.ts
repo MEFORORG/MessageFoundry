@@ -554,10 +554,12 @@ export class TestBench {
       // The interpreter options the CLI bridge launches with (BACKLOG #5409): `-P` keeps the working
       // directory, the workspace, off the import path, so a `messagefoundry.py` or a stdlib-named
       // module in the workspace root does not shadow the installed one through it. The launch names
-      // a program the extension writes, not the module, so `-P` holds on every debugpy build;
-      // TEST_BENCH_DEBUG_PROGRAM says why.
+      // a program the extension writes, not the module, so debugpy adds no working directory on any
+      // build; TEST_BENCH_DEBUG_PROGRAM says why, and what still reaches the import path. `cwd` is
+      // set because for a program debugpy would otherwise start in the program's folder.
       pythonArgs: [...INTERPRETER_OPTIONS],
       program,
+      cwd: folder.uri.fsPath,
       args: ["dryrun", "--config", configDir(), "--show-phi", "--messages", row.path],
       console: "integratedTerminal",
       justMyCode: false, // step into the config modules (Router/Handler)
@@ -565,13 +567,25 @@ export class TestBench {
     });
   }
 
-  /** Writes TEST_BENCH_DEBUG_PROGRAM into its own folder under the extension's global storage, every
-   *  launch so the file always holds this source, and returns its path. */
+  /** Puts TEST_BENCH_DEBUG_PROGRAM in its own folder under the extension's global storage and returns
+   *  its path. A file that already holds the source is left alone; otherwise the source is written to
+   *  a temporary name and renamed over it, so a launch from another window never runs a half-written
+   *  file. */
   private async debugProgram(): Promise<string> {
     const dir = vscode.Uri.joinPath(this.context.globalStorageUri, TEST_BENCH_DEBUG_PROGRAM.folder);
-    await vscode.workspace.fs.createDirectory(dir);
     const file = vscode.Uri.joinPath(dir, TEST_BENCH_DEBUG_PROGRAM.file);
-    await vscode.workspace.fs.writeFile(file, new TextEncoder().encode(TEST_BENCH_DEBUG_PROGRAM.source));
+    const source = new TextEncoder().encode(TEST_BENCH_DEBUG_PROGRAM.source);
+    try {
+      if (Buffer.from(await vscode.workspace.fs.readFile(file)).equals(source)) {
+        return file.fsPath;
+      }
+    } catch {
+      // absent or unreadable: written below
+    }
+    await vscode.workspace.fs.createDirectory(dir);
+    const temp = vscode.Uri.joinPath(dir, `${TEST_BENCH_DEBUG_PROGRAM.file}.${process.pid}-${Date.now()}.tmp`);
+    await vscode.workspace.fs.writeFile(temp, source);
+    await vscode.workspace.fs.rename(temp, file, { overwrite: true });
     return file.fsPath;
   }
 
