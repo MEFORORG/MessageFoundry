@@ -268,11 +268,7 @@ def _generated_sans(host: str) -> list[str]:
       :func:`_host_key` matches it to one of them (:data:`_LOOPBACK_KEYS`, which
       :func:`_kept_loopback_names` uses too), so ``LOCALHOST``, ``[::1]``, ``0:0:0:0:0:0:0:1`` and
       ``localhost.`` count, and a mint and a renewal for one loopback bind agree.
-    - Any other DNS host, such as ``myhost``, carries its other trailing-dot spelling,
-      ``myhost.`` (or ``myhost`` for ``myhost.``), so a move between the two needs no new pair:
-      Python's ``ssl`` module (OpenSSL 3.5) treats the two as distinct names, though some clients,
-      such as curl and browsers, strip the dot. An IP host, ``127.0.0.2`` included, carries no
-      extra name, nor does a host with a ``%``.
+    - Any other host carries no extra name, ``127.0.0.2`` included.
 
     :func:`_replacement_due` re-mints a reused pair that lacks a name :func:`_names_missing`
     requires, and a renewal or bind re-mint adds what :func:`_kept_loopback_names` keeps.
@@ -282,20 +278,9 @@ def _generated_sans(host: str) -> list[str]:
         return [loopback]
     subject = unbracketed(host)
     if _host_key(subject) not in _LOOPBACK_KEYS:
-        return _other_dot_spelling(subject)
+        return []
     own = _san_key(subject)
     return [name for name in _GENERATED_LOOPBACK_SANS if _san_key(name) != own]
-
-
-def _other_dot_spelling(subject: str) -> list[str]:
-    """``[subject]`` with its trailing dot added or dropped, for a DNS subject; else ``[]``."""
-    if not subject.rstrip(".") or "%" in subject:
-        return []
-    try:
-        ipaddress.ip_address(subject)
-    except ValueError:
-        return [subject[:-1] if subject.endswith(".") else subject + "."]
-    return []
 
 
 def _names_missing(host: str, pem: bytes) -> list[str]:
@@ -336,11 +321,9 @@ def _make_generated(host: str, kept: Sequence[str] = ()) -> tuple[bytes, bytes]:
 
 
 def _host_key(name: str) -> object:
-    """``name`` matched loosely: an IP by address without an IPv6 zone, so ``0:0:0:0:0:0:0:1`` is
-    ``::1``, and a DNS name without regard to case or a trailing dot. It decides which binds count
-    as loopback (:data:`_LOOPBACK_KEYS`), and in :func:`_kept_loopback_names` which loopback name
-    the bind itself names, so a ``localhost.`` bind keeps no ``localhost`` there and gets it from
-    :func:`_generated_sans` instead. :func:`_san_key` is the exact SAN entry."""
+    """``name`` matched loosely, to decide which binds count as loopback: an IP by address without
+    an IPv6 zone, so ``0:0:0:0:0:0:0:1`` is ``::1``, and a DNS name without regard to case or a
+    trailing dot. It classifies binds only; :func:`_san_key` is the exact SAN entry."""
     try:
         return ipaddress.ip_address(name.split("%", 1)[0])
     except ValueError:
@@ -357,8 +340,7 @@ def _san_key(name: str) -> object:
     """``name`` as the SAN entry ``make_self_signed`` writes for it: an IP literal by address
     without an IPv6 zone, which the entry cannot carry, so ``0:0:0:0:0:0:0:1``, ``::1`` and
     ``::1%1`` are one entry; anything else, ``127.0.0.1%x`` included, as a DNS name without regard
-    to case, with a trailing dot significant, as Python's ``ssl`` module (OpenSSL 3.5) compares
-    it."""
+    to case, with a trailing dot significant, as hostname verification compares it."""
     try:
         address = ipaddress.ip_address(name)
     except ValueError:
