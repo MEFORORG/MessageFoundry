@@ -724,3 +724,32 @@ def test_every_route_of_the_sweep_answers_the_rule_off_redactor_masked() -> None
             fixed += any(value in before[path] and value not in out for value in _SWEEP_PLANTED)
     assert not broken, broken[:10]
     assert fixed > 2000, fixed
+
+
+#: ``(text, its synthetic glued value)``: a credential label and an unquoted MRN glued to a run.
+_BEFORE_A_NOTE = (
+    ("x^y^token= Kplm7abc", "Kplm7abc"),
+    ("a|b|secret: qwerty12", "qwerty12"),
+    ("a|b|mrn: zqxdoe", "zqxdoe"),
+)
+
+
+@pytest.mark.parametrize(("text", "value"), _BEFORE_A_NOTE)
+def test_a_glued_value_right_before_a_clamp_note_is_masked(text: str, value: str) -> None:
+    """A defect found in the #5925 review: the unquoted PHI arm and the credential arm found the
+    value's end on the text with the clamp's note on. The note is joined by a line break, and
+    :data:`redaction._GLUED_BARE_VALUE` needs a space or the text's end after the value, so the
+    value right before the note was not found and printed whole, with the label gone into the run.
+    It is masked now, as it is with no clamp."""
+    clamped = f"{text}\n{redaction._clamp_marker(70_000)}"
+    assert value not in redact(text)  # the premise: unclamped, the arm masks it
+    assert value not in redact(clamped)
+    assert value not in _through_the_chain(text + " " + "q" * 70_000)
+
+
+def test_a_value_before_a_space_joined_note_keeps_the_earlier_answer() -> None:
+    """The end is found on the note-free text, but the value is still judged on the text with the
+    note, so a value before a space-joined note is not read as ending the text: its end-of-text
+    refusals stay off, and it is masked as the earlier answer masked it."""
+    text = f"a|b|mrn: ZqMS {redaction._clamp_marker(70_000)}"
+    assert redact(text).startswith(f"{redaction._REDACTED} XxXX ")

@@ -2347,7 +2347,13 @@ def _glued_value(
     """The rest of a PHI or credential value that the field run ``run`` cut through, when it is safe
     to mask: the text after the token, up to the value's terminator. ``None`` leaves the plain
     scrub. ``body`` is ``text`` with this module's trailing bound note and its joiner set aside
-    (:func:`_without_trailing_note`); only the end-tag arm reads it.
+    (:func:`_without_trailing_note`). The end-tag arm reads only ``body``. The unquoted PHI arm and
+    the credential arm find where their value ends on ``body``, so a value right before a note
+    joined by a line break is still found (:data:`_GLUED_BARE_VALUE` needs a space or the text's
+    end after it), and judge it on ``text``, so the note still counts as text after the value. A
+    defect found in the #5925 review: with both read on ``text``, such a value printed whole behind
+    a clamp. Judging on ``body`` instead would read a value before a space-joined note as ending the
+    text, and keep some the earlier answer masked (``a|b|mrn: ZqMS`` then a space and the note).
 
     The PHI arms answer first, exactly as they did before BACKLOG #2968. Where they decline, a token
     that ends on a vocabulary end tag's name masks that tag's rest (:func:`_glued_end_tag_rest`,
@@ -2355,7 +2361,7 @@ def _glued_value(
     decline does a credential label at the token's end mask the next word, so the credential arm
     adds a mask to an answer and never takes one away."""
     token, end = run.group(), run.end()
-    stop = _glued_phi_value_end(text, token, end)
+    stop = _glued_phi_value_end(text, body, token, end)
     if stop is not None:
         rest = _maskable_rest(text, end, stop, field_run, credential=False)
         if rest is not None:
@@ -2365,7 +2371,7 @@ def _glued_value(
         return rest
     if not _ends_in_credential_label(token):
         return None
-    bare = _GLUED_BARE_VALUE.match(text, end)
+    bare = _GLUED_BARE_VALUE.match(body, end)
     return (
         None if bare is None else _maskable_rest(text, end, bare.end(), field_run, credential=True)
     )
@@ -2451,8 +2457,9 @@ def _ends_in_credential_label(token: str) -> bool:
     return _GLUED_CREDENTIAL_LABEL.search(token, max(0, len(token) - _GLUED_LABEL_SPAN)) is not None
 
 
-def _glued_phi_value_end(text: str, token: str, end: int) -> int | None:
-    """Where the PHI value a run's ``token`` ends inside stops, or ``None`` if it ends in none."""
+def _glued_phi_value_end(text: str, body: str, token: str, end: int) -> int | None:
+    """Where the PHI value a run's ``token`` ends inside stops, or ``None`` if it ends in none. An
+    unquoted value's end is found on ``body`` (:func:`_glued_value` says why)."""
     quote = max(token.rfind('"'), token.rfind("'"))
     if "<" in token[quote + 1 :]:
         if not _GLUED_XML_LABEL.fullmatch(token, token.rfind("<")):
@@ -2468,7 +2475,7 @@ def _glued_phi_value_end(text: str, token: str, end: int) -> int | None:
         return stop
     if not _GLUED_BARE_LABEL.search(token, max(0, len(token) - _GLUED_LABEL_SPAN)):
         return None
-    bare = _GLUED_BARE_VALUE.match(text, end)
+    bare = _GLUED_BARE_VALUE.match(body, end)
     return None if bare is None else bare.end()
 
 
