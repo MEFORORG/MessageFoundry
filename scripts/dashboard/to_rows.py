@@ -13,8 +13,9 @@ inside a git work tree with the collector's own guard (``refuse_reason``).
 A VALUE THAT IS NOT IN THE SNAPSHOT IS ``null``, never ``0`` or NaN: a metric that errored has no
 detail, and its facts read null rather than as a quiet zero.
 
-EXIT STATUS. 0 when both files were written; 1 when nothing was (a refused ``--out``, an unreadable
-snapshot); 2 is argparse's own usage error.
+EXIT STATUS. 0 when both files were written; 1 when they were not (a refused ``--out``, an unreadable
+snapshot, a failed write, which may leave metrics.json new beside an old series.json); 2 is
+argparse's own usage error.
 
 Usage::
 
@@ -24,6 +25,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import importlib.util
 import json
 import math
@@ -87,35 +89,35 @@ class Snapshot:
         return _dict(self.by_id.get(mid, {}).get("detail"))
 
     def _last_full_week(self) -> str | None:
-        """The week the collector valued its weekly metrics at; the window's second-last week when
-        no metric recorded one."""
+        """The week the collector valued its weekly metrics at. When no metric recorded one, the
+        collector's own rule, from the snapshot's ``through`` and the day it was generated."""
         for mid in ("prs_merged", "ci_main"):
             week = self.detail(mid).get("value_week")
             if isinstance(week, str):
                 return week
-        return self.weeks[-2] if len(self.weeks) >= 2 else None
+        try:
+            through = dt.date.fromisoformat(str(self.data["through"]))
+            made = dt.datetime.fromisoformat(str(self.data["generated_at"])).date()
+            week = _collector().last_full_week(through, self.weeks, made)
+        except (KeyError, ValueError, _collector().CollectError):
+            return None
+        return str(week)
 
 
-def asvs_refs(detail: dict[str, Any]) -> tuple[str, str]:
-    """``(scorecard sha, engine ref)`` as the collector recorded them, ``"unknown"`` when not."""
-    sha, engine = detail.get("scorecard_sha"), detail.get("engine_ref")
-    return (
-        sha[:12] if isinstance(sha, str) and sha else "unknown",
-        engine if isinstance(engine, str) and engine else "unknown",
-    )
+def asvs_pair(snap: Snapshot) -> str:
+    """The ref pair every ASVS number is quoted beside, rendered by the collector itself."""
+    return str(_collector().asvs_ref_pair(snap.detail("asvs")))
 
 
 def notes(snap: Snapshot) -> dict[str, str]:
     week = snap.last_full_week or "unknown"
-    sha, engine = asvs_refs(snap.detail("asvs"))
     return {
         "backlog_burn": "Counts ledger rows, not items.",
         "prs_merged": f"Engine + vault + korus, week {week}.",
         "flow_health": "Open engine PRs right now.",
         "ci_main": f"Pass rate of ci.yml push runs on main, week {week}. Cancelled and skipped "
         "runs not counted.",
-        "asvs": "Pass cells over cells not marked n/a. Scorecard: vault origin/main "
-        f"{sha}; engine tool ref {engine}.",
+        "asvs": f"Pass cells over cells not marked n/a. Measured at {asvs_pair(snap)}.",
         "dependency_vulns": "Open Dependabot alerts on the engine.",
         "owner_waiting": "Open ledger rows with verdict owner-ruling. Open class C questions not "
         "counted yet.",
@@ -181,6 +183,12 @@ def facts(weeks: int) -> list[Fact]:
 
 def metric_rows(snap: Snapshot) -> list[dict[str, Any]]:
     note = notes(snap)
+
+    def error(m: dict[str, Any]) -> Any:
+        # A part that could not be read reaches the dashboard with its reason, never as a bare null.
+        partial = _dict(m.get("detail")).get("partial_error")
+        return m.get("error") or (f"partial: {partial}" if partial else None)
+
     rows = [
         {
             "id": m["id"],
@@ -191,7 +199,7 @@ def metric_rows(snap: Snapshot) -> list[dict[str, Any]]:
             "status": m.get("status", "unknown"),
             "note": note.get(str(m["id"]), ""),
             "source": m.get("source", ""),
-            "error": m.get("error"),
+            "error": error(m),
         }
         for m in snap.metrics
     ]
@@ -206,7 +214,8 @@ def metric_rows(snap: Snapshot) -> list[dict[str, Any]]:
                 "value": read(snap.detail(mid)),
                 "unit": "",
                 "status": "",
-                "note": "",
+                # An ASVS count is quoted only beside its ref pair, on every row that carries one.
+                "note": f"Measured at {asvs_pair(snap)}." if mid == "asvs" else "",
                 "source": snap.by_id[mid].get("source", ""),
                 "error": None,
             }
@@ -276,12 +285,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     out = args.out.resolve()
     # Checked against the nearest directory that exists, BEFORE anything is created, so a refused
     # --out leaves no directory behind inside a repository.
-    reason = cm.refuse_reason(_nearest_existing(out) / "metrics.json")
+    # The DIRECTORY is checked, never a leaf name that a planted link could point elsewhere.
+    reason = cm.refuse_dir_reason(_nearest_existing(out).resolve())
     if reason is not None:
         print(f"ERROR: refusing out {args.out}: {reason}", file=sys.stderr)
         return 1
     try:
-        data = json.loads(args.snapshot.read_text(encoding="utf-8"))
+        # A NaN or infinity in the snapshot reads as null: it is no measurement, nor valid JSON.
+        data = json.loads(args.snapshot.read_text(encoding="utf-8"), parse_constant=lambda _: None)
     except (OSError, ValueError) as exc:
         print(f"ERROR: cannot read {args.snapshot}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
@@ -292,9 +303,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     info = meta(args.snapshot, snap)
     metrics = metric_rows(snap)
     series = series_rows(snap)
-    out.mkdir(parents=True, exist_ok=True)
-    cm.write_json_atomic(out / "metrics.json", {"rows": metrics, "meta": info})
-    cm.write_json_atomic(out / "series.json", {"rows": series, "meta": info})
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        cm.write_json_atomic(out / "metrics.json", {"rows": metrics, "meta": info})
+        cm.write_json_atomic(out / "series.json", {"rows": series, "meta": info})
+    except (OSError, ValueError) as exc:
+        print(f"ERROR: cannot write {out}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
     print(f"{len(metrics)} metric rows, {len(series)} series rows")
     return 0
 

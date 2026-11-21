@@ -494,7 +494,9 @@ def test_gh_fails_fast_on_a_non_transient_error(tmp_path: Path) -> None:
         ("gh exited 1: API rate limit exceeded for user", True),
         ("gh could not run: TimeoutExpired: timed out after 180 seconds", True),
         ("gh exited 1: read tcp: connection reset by peer", True),
+        ("gh exited 1: HTTP 429: Too Many Requests", True),
         ("gh exited 1: HTTP 404: Not Found", False),
+        ("gh exited 1: HTTP 404: Not Found (https://api.github.com/repos/x/502)", False),
         ("gh exited 1: HTTP 401: Bad credentials", False),
         ("gh could not run: FileNotFoundError: gh", False),
     ],
@@ -533,7 +535,9 @@ def test_ci_main_reads_push_runs_and_skips_ci_red_for_a_past_through(tmp_path: P
 def _flow_run(*, merged_fails: bool) -> Any:
     def run(argv: Sequence[str], cwd: Path | None) -> str:
         if "open" in argv:
-            return json.dumps([{"number": 1, "createdAt": "2026-11-17T00:00:00Z"}])
+            # One day old against the real clock, which c_flow_health reads for open-PR ages.
+            opened = dt.datetime.now(dt.UTC) - dt.timedelta(days=1)
+            return json.dumps([{"number": 1, "createdAt": opened.isoformat()}])
         if merged_fails:
             raise cm.CollectError("gh pr list exited 1: HTTP 403: Forbidden")
         if not argv[argv.index("--search") + 1].startswith("merged:2026-11-09"):
@@ -829,3 +833,67 @@ def test_main_refuses_and_writes_nothing(monkeypatch: pytest.MonkeyPatch, tmp_pa
     assert cm.main(["--vault", str(tmp_path), "--out", str(out), "--weeks", "1"]) == 1
     monkeypatch.setattr(cm, "refuse_reason", lambda out: None)
     assert cm.main(["--vault", str(tmp_path), "--out", str(out), "--through", "2999-01-01"]) == 1
+
+
+def test_ci_red_failure_degrades_only_that_count(tmp_path: Path) -> None:
+    def run(argv: Sequence[str], cwd: Path | None) -> str:
+        if "ci-red" in argv:
+            raise cm.CollectError("gh pr list exited 1: HTTP 403: Forbidden")
+        if argv[argv.index("--created") + 1].startswith("2026-11-09"):
+            return json.dumps([{"createdAt": "2026-11-10T00:00:00Z", "conclusion": "success"}])
+        return "[]"
+
+    m = cm.Metric("ci_main", "", "", "", "")
+    cm.c_ci_main(_ctx(tmp_path, run, weeks=2, today="2026-11-18"), m)
+    assert m.value == 100.0
+    assert m.status == "warn"  # an unread ci-red count caps a good pass rate at warn
+    assert m.detail["open_ci_red_prs"] is None
+    assert m.detail["partial_error"].startswith("ci-red count:")
+
+
+def test_a_merged_pr_failure_is_read_once(tmp_path: Path) -> None:
+    calls: list[str] = []
+
+    def run(argv: Sequence[str], cwd: Path | None) -> str:
+        calls.append(" ".join(argv))
+        raise cm.CollectError("gh pr list exited 1: HTTP 403: Forbidden")
+
+    ctx = _ctx(tmp_path, run, weeks=2)
+    for _ in range(2):
+        with pytest.raises(cm.CollectError, match="403"):
+            cm.merged_prs(ctx, cm.ENGINE_REPO)
+    assert len(calls) == 1
+
+
+def test_clipping_that_never_ran_is_refused(tmp_path: Path) -> None:
+    class Census:
+        rows = 5
+
+    class Report:
+        @staticmethod
+        def iso_week(date: str | None) -> str | None:
+            return None
+
+        @staticmethod
+        def census(sources: Any) -> Any:
+            return Census()  # dates nothing through iso_week
+
+    with pytest.raises(cm.CollectError, match="--through was not applied"):
+        cm._clipped_census(Report, [], dt.date(2026, 11, 18))
+
+
+def test_asvs_with_an_unattributable_engine_ref_is_partial(tmp_path: Path) -> None:
+    printed = "# asvs-status scorecard=NO-GIT engine=NO-GIT\ncells 2: 2 pass\n"
+    m = cm.Metric("asvs", "", "", "", "")
+    cm.c_asvs(_asvs_ctx(tmp_path, printed), m)
+    assert m.value == 100.0
+    assert "no attributable ref: engine=NO-GIT" in m.detail["partial_error"]
+
+
+def test_write_json_atomic_is_strict_and_leaves_no_temp(tmp_path: Path) -> None:
+    out = tmp_path / "x.json"
+    cm.write_json_atomic(out, {"a": 1})
+    assert json.loads(out.read_text(encoding="utf-8")) == {"a": 1}
+    with pytest.raises(ValueError):
+        cm.write_json_atomic(out, {"a": float("nan")})
+    assert [p.name for p in tmp_path.iterdir()] == ["x.json"]

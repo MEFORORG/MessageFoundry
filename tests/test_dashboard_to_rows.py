@@ -119,7 +119,12 @@ def test_metric_rows_contract() -> None:
     for row in rows.values():
         assert set(row) == METRIC_KEYS
     assert rows["asvs"]["note"].endswith(
-        "vault origin/main abcdef012345; engine tool ref deadbeef1234."
+        "Measured at scorecard=vault-origin-main@abcdef0123456789 engine=deadbeef1234."
+    )
+    # Every ASVS count row carries the ref pair too.
+    assert (
+        rows["asvs.pass"]["note"]
+        == "Measured at scorecard=vault-origin-main@abcdef0123456789 engine=deadbeef1234."
     )
     assert "week 2026-W46" in rows["prs_merged"]["note"]
     fact = rows["backlog_burn.filed_window"]
@@ -154,7 +159,8 @@ def test_missing_mttr_is_null_not_nan(raw: Any) -> None:
 def test_asvs_note_tolerates_missing_refs() -> None:
     snap = _snapshot()
     snap["metrics"][3]["detail"] = {"scorecard_ref": "", "provenance": ["# no ref here"]}
-    assert "origin/main unknown; engine tool ref unknown." in _rows(snap)["asvs"]["note"]
+    want = "scorecard=vault-origin-main@unknown engine=unknown"
+    assert want in _rows(snap)["asvs"]["note"]
 
 
 def test_series_rows() -> None:
@@ -169,7 +175,7 @@ def test_series_rows() -> None:
 
 def test_main_writes_both_files(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     cm = tr._collector()
-    monkeypatch.setattr(cm, "refuse_reason", lambda out: None)
+    monkeypatch.setattr(cm, "refuse_dir_reason", lambda out: None)
     src = tmp_path / "snap.json"
     src.write_text(json.dumps(_snapshot()), encoding="utf-8")
     out = tmp_path / "rows" / "nested"
@@ -195,17 +201,17 @@ def test_main_refuses_inside_a_repo_and_creates_nothing(
         checked.append(out)
         return "inside a git repository"
 
-    monkeypatch.setattr(cm, "refuse_reason", refuse)
+    monkeypatch.setattr(cm, "refuse_dir_reason", refuse)
     out = tmp_path / "new" / "dir"
     assert tr.main([str(tmp_path / "snap.json"), str(out)]) == 1
     assert not (tmp_path / "new").exists()
-    assert checked == [tmp_path.resolve() / "metrics.json"]
+    assert checked == [tmp_path.resolve()]  # the directory, never a leaf name
 
 
 def test_main_rejects_an_unreadable_snapshot(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.setattr(tr._collector(), "refuse_reason", lambda out: None)
+    monkeypatch.setattr(tr._collector(), "refuse_dir_reason", lambda out: None)
     bad = tmp_path / "bad.json"
     bad.write_text("[1, 2]", encoding="utf-8")
     assert tr.main([str(bad), str(tmp_path / "o")]) == 1
@@ -217,3 +223,48 @@ def test_real_guard_refuses_this_checkout(tmp_path: Path) -> None:
     src.write_text(json.dumps(_snapshot()), encoding="utf-8")
     assert tr.main([str(src), str(Path(__file__).resolve().parent / "no-such-dir")]) == 1
     assert not (Path(__file__).resolve().parent / "no-such-dir").exists()
+
+
+def test_partial_error_reaches_the_row() -> None:
+    snap = _snapshot()
+    snap["metrics"][1]["detail"]["partial_error"] = "stall count: TimeoutExpired"
+    assert _rows(snap)["prs_merged"]["error"] == "partial: stall count: TimeoutExpired"
+    assert _rows(snap)["release_distance"]["error"] == "GET failed"  # a full error wins
+    assert _rows(snap)["backlog_burn"]["error"] is None
+
+
+def test_last_full_week_falls_back_to_the_collector_rule() -> None:
+    snap = _snapshot()
+    for m in snap["metrics"]:
+        m["detail"].pop("value_week", None)
+    # A Sunday --through that had ended when the snapshot was generated completes its own week.
+    snap["through"] = "2026-11-22"
+    snap["generated_at"] = "2026-11-23T01:00:00+00:00"
+    snap["weeks"] = ["2026-W46", "2026-W47"]
+    assert tr.Snapshot(snap).last_full_week == "2026-W47"
+    snap["generated_at"] = "2026-11-22T12:00:00+00:00"
+    assert tr.Snapshot(snap).last_full_week == "2026-W46"
+    del snap["through"]
+    assert tr.Snapshot(snap).last_full_week is None
+
+
+def test_nan_in_the_snapshot_is_written_as_null(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(tr._collector(), "refuse_dir_reason", lambda out: None)
+    src = tmp_path / "snap.json"
+    src.write_text(
+        json.dumps(_snapshot()).replace('"value": 90.0', '"value": NaN'), encoding="utf-8"
+    )
+    assert tr.main([str(src), str(tmp_path / "o")]) == 0
+    rows = json.loads((tmp_path / "o" / "metrics.json").read_text(encoding="utf-8"))["rows"]
+    assert next(r for r in rows if r["id"] == "ci_main")["value"] is None
+
+
+def test_a_write_failure_exits_1(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(tr._collector(), "refuse_dir_reason", lambda out: None)
+    src = tmp_path / "snap.json"
+    src.write_text(json.dumps(_snapshot()), encoding="utf-8")
+    out = tmp_path / "o"
+    (out / "series.json").mkdir(parents=True)  # a directory where a file must go
+    assert tr.main([str(src), str(out)]) == 1

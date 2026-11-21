@@ -101,7 +101,7 @@ GH_BACKOFF_SECONDS = 2.0
 #: timeout. Anything else (a 404, an auth refusal, a bad flag, a missing ``gh``) fails on the first
 #: attempt, because a retry would only fail again, slower.
 _TRANSIENT = re.compile(
-    r"HTTP 5\d\d|\b50[0234]\b|rate limit|timed? ?out|TimeoutExpired|connection (?:reset|refused)"
+    r"HTTP 5\d\d|HTTP 429|rate limit|timed? ?out|TimeoutExpired|connection (?:reset|refused)"
     r"|\bEOF\b|dial tcp|TLS handshake|temporarily unavailable|Something went wrong",
     re.IGNORECASE,
 )
@@ -228,12 +228,13 @@ def status_flow(oldest_days: float | None, stalled: int | None) -> str:
     return "warn" if base == "good" and (stalled is None or stalled) else base
 
 
-def status_ci(pass_pct: float | None, ci_red: int) -> str:
+def status_ci(pass_pct: float | None, ci_red: int | None) -> str:
+    # An unread ci-red count (None) is not zero: it caps the status at warn, like a red PR.
     if pass_pct is None:
         return "unknown"
     t = THRESHOLDS["ci_main"]
     base = "good" if pass_pct >= t["good_pct"] else "warn" if pass_pct >= t["warn_pct"] else "bad"
-    return "warn" if base == "good" and ci_red else base
+    return "warn" if base == "good" and (ci_red is None or ci_red) else base
 
 
 def status_pct(pct: float | None, metric: str) -> str:
@@ -428,7 +429,7 @@ class Context:
     stall_runner: Callable[[list[str], float], str] | None = None
     today: dt.date = field(default_factory=lambda: dt.datetime.now(dt.UTC).date())
     gh_backoff: float = GH_BACKOFF_SECONDS
-    merged_cache: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    merged_cache: dict[str, list[dict[str, Any]] | CollectError] = field(default_factory=dict)
     _vault: VaultRead | CollectError | None = None
 
     @property
@@ -544,7 +545,11 @@ def _clipped_census(report: ModuleType, sources: Any, through: dt.date) -> Any:
     if not callable(original):
         raise CollectError("the vault census has no iso_week to clip at --through")
 
+    calls = 0
+
     def clipped(date: str | None) -> str | None:
+        nonlocal calls
+        calls += 1
         week: str | None = original(date)
         if week is not None and date is not None and dt.date.fromisoformat(date) > through:
             return AFTER_THROUGH
@@ -552,9 +557,14 @@ def _clipped_census(report: ModuleType, sources: Any, through: dt.date) -> Any:
 
     setattr(report, "iso_week", clipped)  # noqa: B010 - a vault module, typed only as ModuleType
     try:
-        return report.census(sources)
+        census = report.census(sources)
     finally:
         setattr(report, "iso_week", original)  # noqa: B010
+    # The wrap works only while the census dates through that global. A census that read rows but
+    # never called it has stopped doing so, and would count past --through without a sound.
+    if getattr(census, "rows", 0) and not calls:
+        raise CollectError("the vault census never called iso_week, so --through was not applied")
+    return census
 
 
 # --------------------------------------------------------------------------------------------------
@@ -634,14 +644,24 @@ def list_per_week(
 
 
 def merged_prs(ctx: Context, repo: str) -> list[dict[str, Any]]:
-    """Every PR merged in the window, cached per repo so two metrics share one read."""
+    """Every PR merged in the window, cached per repo so two metrics share one read.
+
+    A failure is cached too, like the vault read: a second metric would only repeat it, slower.
+    """
     if repo not in ctx.merged_cache:
-        ctx.merged_cache[repo] = list_per_week(
-            ctx,
-            ["pr", "list", "-R", repo, "--state", "merged", "--json", "number,createdAt,mergedAt"],
-            lambda lo, hi: ["--search", f"merged:{lo.isoformat()}..{hi.isoformat()}"],
-        )
-    return ctx.merged_cache[repo]
+        try:
+            ctx.merged_cache[repo] = list_per_week(
+                ctx,
+                ["pr", "list", "-R", repo, "--state", "merged"]
+                + ["--json", "number,createdAt,mergedAt"],
+                lambda lo, hi: ["--search", f"merged:{lo.isoformat()}..{hi.isoformat()}"],
+            )
+        except CollectError as exc:
+            ctx.merged_cache[repo] = exc
+    cached = ctx.merged_cache[repo]
+    if isinstance(cached, CollectError):
+        raise cached
+    return cached
 
 
 def c_prs_merged(ctx: Context, m: Metric) -> None:
@@ -754,19 +774,26 @@ def c_ci_main(ctx: Context, m: Metric) -> None:
     # is left unread, so it can never pass for a historical one.
     current = ctx.through >= ctx.today
     red: int | None = None
+    red_for_status: int | None = 0
+    red_error: str | None = None
     if current:
-        red = len(
-            gh_list(
-                ctx,
-                ["pr", "list", "-R", ENGINE_REPO, "--state", "open", "--label", "ci-red"]
-                + ["--json", "number"],
+        # An optional part: its failure caps the status at warn and never nulls the pass rate.
+        try:
+            red = red_for_status = len(
+                gh_list(
+                    ctx,
+                    ["pr", "list", "-R", ENGINE_REPO, "--state", "open", "--label", "ci-red"]
+                    + ["--json", "number"],
+                )
             )
-        )
+        except CollectError as exc:
+            red_for_status = None
+            red_error = f"ci-red count: {exc}"
     labels = ctx.labels
     series = ci_pass_series(runs, labels)
     week = last_full_week(ctx.through, labels, ctx.today)
     m.value = series_value(series, week)
-    m.status = status_ci(m.value, red or 0)
+    m.status = status_ci(m.value, red_for_status)
     m.series = series
     m.detail = {
         "workflow_file": "ci.yml (the workflow named CI), push events on main only",
@@ -779,6 +806,8 @@ def c_ci_main(ctx: Context, m: Metric) -> None:
         if current
         else "not read: --through is in the past and the label count is current state only",
     }
+    if red_error:
+        add_partial(m.detail, red_error)
     if m.value is None:
         m.error = f"no finished pass/fail run of main in {week}"
 
@@ -824,6 +853,10 @@ def c_asvs(ctx: Context, m: Metric) -> None:
     if engine_ref is None:
         # A score is quoted only beside its ref pair; without the engine half it cannot be.
         add_partial(m.detail, "scorecard provenance printed no engine= ref")
+    elif "NO-GIT" in engine_ref or engine_ref.endswith("+status-unknown"):
+        add_partial(
+            m.detail, f"scorecard provenance names no attributable ref: engine={engine_ref}"
+        )
 
 
 _ENGINE_REF = re.compile(r"\bengine=(\S+)")
@@ -1114,12 +1147,17 @@ def snapshot(
 
 
 def refuse_reason(out: Path, run: Runner = run_probe) -> str | None:
-    """Why ``out`` may not be written, or ``None``. Fails CLOSED when git cannot answer.
+    """Why the file ``out`` may not be written, or ``None``; see :func:`refuse_dir_reason`."""
+    return refuse_dir_reason(out.resolve().parent, run)
+
+
+def refuse_dir_reason(parent: Path, run: Runner = run_probe) -> str | None:
+    """Why no file may be written in the directory ``parent``, or ``None``. Fails CLOSED when git
+    cannot answer.
 
     git runs under :func:`probe_env`, so no ``GIT_*`` variable in the caller's environment can
-    steer the answer.
+    steer the answer. The caller passes the directory it will write into, already resolved.
     """
-    parent = out.resolve().parent
     if not parent.is_dir():
         return f"{parent} is not an existing directory"
     try:
@@ -1140,10 +1178,19 @@ def refuse_reason(out: Path, run: Runner = run_probe) -> str | None:
 
 
 def write_json_atomic(out: Path, payload: Any) -> None:
-    """Write ``payload`` as JSON through a sibling temporary file, so a reader never sees half."""
-    tmp_out = out.with_name(out.name + ".tmp")
-    tmp_out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    tmp_out.replace(out)
+    """Write ``payload`` as strict JSON through a sibling temporary file, so a reader never sees
+    half. The temporary name is fresh (``mkstemp``), so a planted link or a concurrent run cannot
+    redirect it. A NaN or infinity raises rather than write invalid JSON."""
+    text = json.dumps(payload, indent=2, allow_nan=False) + "\n"
+    fd, name = tempfile.mkstemp(prefix=out.name + ".", suffix=".tmp", dir=out.parent)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        tmp.replace(out)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def remove_tree(path: Path) -> None:
@@ -1197,7 +1244,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     tmp = Path(tempfile.mkdtemp(prefix="mf-metrics-"))
     try:
-        ctx = Context(vault=args.vault, through=through, weeks=args.weeks, workdir=tmp)
+        ctx = Context(vault=args.vault, through=through, weeks=args.weeks, workdir=tmp, today=today)
         metrics = collect(ctx)
         write_json_atomic(out, snapshot(ctx, metrics))
     finally:
