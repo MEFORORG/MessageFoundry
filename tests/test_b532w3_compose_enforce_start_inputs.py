@@ -37,6 +37,8 @@ from messagefoundry.pipeline.alert_sinks import (
 from messagefoundry.transports.egress import syslog_forward_refusal
 from tests.test_compose_revocation_attestation import _all_services, _serving_engines
 from tests.test_k8s_enforce_start_inputs import (
+    _BLOCK,
+    _FILLED,
     _channel_ready,
     _image_store_path,
     _load,
@@ -47,19 +49,19 @@ from tests.test_k8s_enforce_start_inputs import (
 
 _ROOT = Path(__file__).resolve().parents[1]
 _COMPOSE = _ROOT / "docker" / "compose.yaml"
-_ENGINES = ("engine", "engine-ha", "engine-standby")
-#: The ha engines share x-ha-engine-env, and only they run the Postgres store.
-_HA_BLOCK = "x-ha-engine-env: &ha-engine-env\n"
-_MANIFEST = {"engine": "statefulset.yaml"}  # the k8s parity target; the ha engines' is ha-postgres
+_HA_POSTGRES = "ha-postgres.yaml"
+#: Each serving engine -> (the text that opens its environment block, its k8s parity manifest).
+#: The ha engines share x-ha-engine-env; only they, like ha-postgres.yaml, run the Postgres store.
+_ENGINES = {
+    "engine": ("  engine:\n", "statefulset.yaml"),
+    "engine-ha": ("x-ha-engine-env: &ha-engine-env\n", _HA_POSTGRES),
+    "engine-standby": ("x-ha-engine-env: &ha-engine-env\n", _HA_POSTGRES),
+}
+_COMMENTED_ENTRY = re.compile(r'^\s*# (MEFOR_[A-Z0-9_]+): "([^"]*)"\s*$', re.MULTILINE)
 
 
 def _postgres(service: str) -> bool:
-    return service != "engine"
-
-
-_BLOCK = "# --- what an enforcing start needs"
-_COMMENTED_ENTRY = re.compile(r'^\s*# (MEFOR_[A-Z0-9_]+): "([^"]*)"\s*$', re.MULTILINE)
-_FILLED = {"REPLACE-days": "30"}
+    return _ENGINES[service][1] == _HA_POSTGRES
 
 
 def _literal_env(service: str) -> dict[str, str]:
@@ -71,8 +73,7 @@ def _literal_env(service: str) -> dict[str, str]:
 @functools.cache
 def _block_entries(service: str) -> tuple[tuple[str, str], ...]:
     text = _COMPOSE.read_text(encoding="utf-8")
-    opener = "  engine:\n" if service == "engine" else _HA_BLOCK
-    start = text.index(_BLOCK, text.index(opener))
+    start = text.index(_BLOCK, text.index(_ENGINES[service][0]))
     lines = text[start:].splitlines()
     block: list[str] = []
     for n, line in enumerate(lines):
@@ -95,12 +96,12 @@ def _settings(service: str, fill: bool) -> Iterator[tuple[str, ServiceSettings]]
         yield service, _load(env, tmp)
 
 
-@pytest.fixture(params=_ENGINES)
+@pytest.fixture(params=sorted(_ENGINES))
 def shipped(request: pytest.FixtureRequest) -> Iterator[tuple[str, ServiceSettings]]:
     yield from _settings(str(request.param), fill=False)
 
 
-@pytest.fixture(params=_ENGINES)
+@pytest.fixture(params=sorted(_ENGINES))
 def filled(request: pytest.FixtureRequest) -> Iterator[tuple[str, ServiceSettings]]:
     yield from _settings(str(request.param), fill=True)
 
@@ -176,14 +177,22 @@ def test_the_forwarding_spool_is_on_a_writable_mount(
     )
 
 
-def test_the_ha_engines_do_not_share_a_spool_volume() -> None:
-    # The spool locks its directory, so two engines on one named volume would leave one without
-    # a spool. A bare container path is an anonymous volume each container gets its own of.
-    root = posixpath.dirname(_image_store_path())
-    for name in ("engine-ha", "engine-standby"):
-        parts = [str(v).split(":", 2) for v in _all_services()[name].get("volumes") or []]
-        named = [p[0] for p in parts if len(p) > 1 and p[1] == root]
-        assert not named, f"{name} mounts a shared volume at {root}: {named}"
+def _writable_sources(service: str) -> set[str]:
+    """The named volumes and bind sources the service mounts writable."""
+    out: set[str] = set()
+    for vol in _all_services()[service].get("volumes") or []:
+        parts = str(vol).split(":")
+        if len(parts) > 1 and (len(parts) == 2 or "ro" not in parts[2].split(",")):
+            out.add(parts[0])
+    return out
+
+
+def test_the_ha_engines_share_no_writable_volume() -> None:
+    # The spool locks its directory, so two engines writing one volume, at the spool path or
+    # anywhere above it, would leave the second without a spool.
+    ha, standby = (_writable_sources(n) for n in ("engine-ha", "engine-standby"))
+    assert ha and standby, "positive control: each ha engine mounts a writable volume"
+    assert not ha & standby, f"the ha engines share a writable volume: {sorted(ha & standby)}"
 
 
 def test_retention_is_bounded(filled: tuple[str, ServiceSettings]) -> None:
@@ -213,7 +222,7 @@ def test_the_trust_files_are_under_the_read_only_config() -> None:
 def test_the_block_matches_the_k8s_manifests() -> None:
     # Parity: the compose block names the same inputs as the manifest with the same store.
     for name in _ENGINES:
-        manifest = _MANIFEST.get(name, "ha-postgres.yaml")
+        manifest = _ENGINES[name][1]
         expected = _k8s_site_entries(manifest)
         got = _site_entries(name)
         assert got == expected, f"{name} vs {manifest}: {set(got.items()) ^ set(expected.items())}"

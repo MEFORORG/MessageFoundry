@@ -44,9 +44,6 @@ x-ha-engine: &ha-engine
   volumes:
     - ./config:/config:ro
     - ./tls:/etc/mefor/tls:ro
-    # An anonymous volume, the container's own, for the log spool under a read-only root file
-    # system (the enforcing-start block in x-ha-engine-env below says why).
-    - /var/lib/mefor
   read_only: true
   tmpfs:
     - /tmp
@@ -118,15 +115,14 @@ x-ha-engine-env: &ha-engine-env
   # MEFOR_RETENTION_SEARCH_PRESET_DAYS: "REPLACE-days"
   # MEFOR_SECURITY_ALLOW_KEEPING_TRANSFORM_STATE_INDEFINITELY: "true"
   # The store hop checks revocation: under enforce, a verified Postgres hop with no CRL
-  # refuses at store open. The local Postgres above has no TLS set up, so this applies once
+  # refuses at store open. The local Postgres below has no TLS set up, so this applies once
   # the engines reach a Postgres that has it. Postgres only: a SQL Server store refuses
   # this setting at load.
   # MEFOR_STORE_SSL_CRL_FILE: "/config/pki/store-crl.pem"
-  # The log spool (ADR 0200) defaults to log-spool beside the store path, on the anonymous
-  # /var/lib/mefor volume x-ha-engine gives each engine, since the root file system is
-  # read-only. Each container gets its own, so the two engines never share a spool, which
-  # locks its directory. Records still spooled stay behind when `docker compose down`
-  # removes the container, in a volume no new container mounts.
+  # The log spool (ADR 0200) defaults to log-spool beside the store path, /var/lib/mefor, and
+  # the root file system is read-only, so engine-ha and engine-standby each mount their own
+  # named volume there (mefor-spool-ha, mefor-spool-standby). Never one shared volume: the spool
+  # locks its directory, so the second engine would run without one.
 
 services:
   engine:
@@ -377,6 +373,12 @@ services:
     <<: *ha-engine
     environment:
       <<: *ha-engine-env
+    # The anchor's volumes plus this engine's own log-spool volume (x-ha-engine-env says why). A
+    # service's volumes replace the anchor's, so the first two repeat it.
+    volumes:
+      - ./config:/config:ro
+      - ./tls:/etc/mefor/tls:ro
+      - mefor-spool-ha:/var/lib/mefor
     ports:
       - "8444:8443"     # API on a distinct host port (the default `engine` already owns 8443)
       - "2575:2575"     # MLLP — published only here; works while this node is the leader
@@ -387,9 +389,17 @@ services:
     <<: *ha-engine
     environment:
       <<: *ha-engine-env
+    # The anchor's volumes plus this engine's own log-spool volume (x-ha-engine-env says why). A
+    # service's volumes replace the anchor's, so the first two repeat it.
+    volumes:
+      - ./config:/config:ro
+      - ./tls:/etc/mefor/tls:ro
+      - mefor-spool-standby:/var/lib/mefor
     ports:
       - "8445:8443"     # API only; MLLP is reachable on the container network, not a host port, here
 
 volumes:
   mefor-store:
   mefor-pg:
+  mefor-spool-ha:
+  mefor-spool-standby:

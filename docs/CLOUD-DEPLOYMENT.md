@@ -369,8 +369,8 @@ and the engine's at-rest encryption does not cover them ([`PHI.md`](PHI.md) §2,
    `store-encryption-key`, `store-password`, `tls-revocation-attested`, and the API TLS cert/key (and
    optional `api-tls-key-password`). Both manifests, `ha-postgres.yaml` and `statefulset.yaml`, read
    `MEFOR_TLS_REVOCATION_ATTESTED` from the `tls-revocation-attested` key, with no default and not
-   optional, so without it the kubelet refuses each engine container with
-   `CreateContainerConfigError`. The attestation is yours
+   optional, so without it the kubelet refuses each pod with `CreateContainerConfigError`, at the
+   first container that reads it. The attestation is yours
    ([SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate)): set the key only if your PKI
    enforces revocation for the certificates the engine serves and accepts, and to a value that reads
    as true to the engine (`1`, `true`, `yes` or `on`, in any case). A value that does not, such as
@@ -378,8 +378,8 @@ and the engine's at-rest encryption does not cover them ([`PHI.md`](PHI.md) §2,
    then exits 1 naming the gate, so the pod stays in `Init:CrashLoopBackOff` and the engine never
    starts, rather than the engine itself crash-looping. Every value in the example Secret ships
    commented out, so applying it unedited leaves the kubelet refusing the pod.
-4. **Apply** [`docker/k8s/ha-postgres.yaml`](../docker/k8s/ha-postgres.yaml) with all four `image:` fields
-   (`revocation-attestation-check`, `tls-dir`, `copy-tls` and `engine`) set to your baked image and `MEFOR_STORE_SERVER` set to the managed-PG endpoint.
+4. **Apply** [`docker/k8s/ha-postgres.yaml`](../docker/k8s/ha-postgres.yaml) with every `image:` field
+   (at least `revocation-attestation-check`, `tls-dir`, `copy-tls` and `engine`) set to your baked image and `MEFOR_STORE_SERVER` set to the managed-PG endpoint.
    Uncomment every entry in its block *what an enforcing start needs* and give it your own value. They
    ship commented, so as shipped the engine, which starts under `[security].enforcement = enforce`,
    refuses to start until at least the alert channel, the log forwarding and the retention bounds
