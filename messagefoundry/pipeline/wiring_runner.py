@@ -4661,8 +4661,8 @@ class RegistryRunner:
         after this check. This door is not the fence there. What backs it includes at least the
         ``leader_gate`` a poll source reads at each tick (its contract is
         :meth:`~messagefoundry.transports.base.SourceConnector.start`), the L1 pre-send leadership
-        re-check (in :meth:`_process_delivery_item`, and :meth:`_may_send` on the coalesced-batch
-        path), and ``Engine._stop_graph`` itself. The store's H1 leader-epoch fence (ADR 0157; its
+        re-check (in :meth:`_process_delivery_item`, and :meth:`_may_send` right before both the
+        single-row and the coalesced-batch send), and ``Engine._stop_graph`` itself. The store's H1 leader-epoch fence (ADR 0157; its
         scope is :meth:`~messagefoundry.pipeline.cluster.ClusterCoordinator.current_epoch`) does
         not fire on this node's claims before at least a successor's acquire bumps the epoch, and
         it does not cover intake, the ingress commit a listener makes. A listen source does not read
@@ -11493,8 +11493,9 @@ class RegistryRunner:
         # L1 pre-send leadership re-check (active-passive HA). The graph runs on the leader
         # ONLY, but leadership can be lost (a self-fence) BETWEEN claiming this row and the
         # send below. A cheap, SYNCHRONOUS is_leader() read (cached state — no DB round-trip)
-        # closes that narrow window: a node that has stopped being leader must not emit egress
-        # as a stale ex-leader.
+        # narrows that window: a node that has stopped being leader must not emit egress
+        # as a stale ex-leader. The reads before the send are awaits, so the lane gate
+        # (_may_send) asks again right before it (BACKLOG #5906).
         #
         # RELEASE the claim (attempts--, next_attempt_at UNCHANGED, no last_error) rather than
         # mark_failed: losing leadership is NOT a delivery failure and must not spend a retry.
@@ -11576,6 +11577,10 @@ class RegistryRunner:
                             name,
                             type(exc).__name__,
                         )
+                    # BACKLOG #5906: the frame check's hydrate is an await too, so the same gate as
+                    # the live send's below, before the row is marked done.
+                    if not self._may_send(name):
+                        raise _SendGated
                 response = None
             else:
                 # PHASE (a): the connector send->ACK round-trip. On a real cross-box outbound this is

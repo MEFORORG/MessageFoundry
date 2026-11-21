@@ -2802,7 +2802,8 @@ every refused release does. The engine log carries the store's error. A reload o
 that has lost its lease, while its graph still runs, is refused as `lease_lost` (BACKLOG #5906).
 An inline reload answers **503**; a released one answers 422. The lease is read twice, on entry
 and before the reload stops any listener. Each read is point in time: a lease lost after the
-second read is not refused, and `Engine._stop_graph` takes that graph down.
+second read is not refused. That reload then binds listeners and resumes lanes on the node, and
+`Engine._stop_graph` takes them down only once the reload ends, since it waits on the same lock.
 
 **The same store fault would not read as a refused anchor on an operator start or on a connection
 test (vault BACKLOG #3746).** A start or restart whose CA check the store stopped would answer

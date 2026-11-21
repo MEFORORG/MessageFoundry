@@ -2869,6 +2869,12 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
 )
 
 
+#: The answer to a reload a cluster node refused because it lost its lease (BACKLOG #5906).
+_LEASE_LOST_RELOAD_DETAIL: Final = (
+    "this node no longer holds the cluster lease, so it applies no config reload; reload on the "
+    "leader instead"
+)
+
 #: The answer to a reload whose config directory the engine could not resolve or list: at the
 #: target check, or in the load after it (vault BACKLOG #5248).
 _UNREADABLE_DETAIL: Final = "the engine could not read the config directory; see the engine log"
@@ -3055,7 +3061,7 @@ async def _audit_refused_reload(
         # runner refused the reload before it changed any lane. Nothing is wrong with the config.
         warn("config reload refused: this node no longer holds the cluster lease")
         action, detail["reason"] = "config_reload_failed", "lease_lost"
-        status, answer = 503, str(exc)
+        status, answer = 503, _LEASE_LOST_RELOAD_DETAIL
     elif isinstance(exc, WiringError) and explicit_cause(exc, AnchorStoreUnavailable) is not None:
         # BACKLOG #3091: the store refused a trust-anchor check's audit read or write. Nothing is
         # known to be wrong with the anchor or the config, so neither of the reasons below fits.

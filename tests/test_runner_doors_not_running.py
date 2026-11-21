@@ -582,6 +582,24 @@ async def test_a_node_that_lost_its_lease_refuses_a_reload(
         await runner.stop()
 
 
+async def test_a_lease_lost_reload_is_refused_before_its_build_check(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """The entry read: refused before the build check, so the lock the demotion teardown waits on
+    is not held through it."""
+    runner, _ = await _lease_lost_runner(store, tmp_path, "pooled")
+
+    async def no_build_check(*args: Any, **kwargs: Any) -> None:
+        raise AssertionError("the build check ran on a lease-lost node")
+
+    runner.build_check_off_loop = no_build_check  # type: ignore[method-assign]
+    try:
+        with pytest.raises(RunnerLeaseLostError):
+            await runner.reload(_with_second_inbound(tmp_path))
+    finally:
+        await runner.stop()
+
+
 async def test_a_leader_reload_binds_the_inbound_it_adds(
     store: MessageStore, tmp_path: Path
 ) -> None:
