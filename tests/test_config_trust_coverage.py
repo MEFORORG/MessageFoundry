@@ -256,8 +256,8 @@ def test_a_link_that_cannot_be_resolved_refuses_the_load(
         return real(self, strict)
 
     monkeypatch.setattr(Path, "resolve", refusing)
-    with pytest.raises(OSError, match="could not be resolved"):
-        config_source_trust_paths(cfg)
+    # The listing names the link and no target; the check refuses it.
+    assert config_source_trust_paths(cfg) == [cfg, cfg / "cfg.py"]
     with pytest.raises(WiringError, match="could not be resolved"):
         load_config(cfg)
 
@@ -274,8 +274,7 @@ def test_a_dangling_module_link_refuses_the_load(
     except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
         pytest.skip(f"cannot create a symlink here: {exc}")
     fake_windows_readers(lambda _path: False)
-    with pytest.raises(OSError, match="leads to nothing"):
-        config_source_trust_paths(cfg)
+    assert config_source_trust_paths(cfg) == [cfg, cfg / "cfg.py"]
     with pytest.raises(WiringError, match="leads to nothing"):
         load_config(cfg)
     # Control: once the target exists, the same link loads.
@@ -310,8 +309,7 @@ def test_a_dangling_data_link_refuses_the_load(
     except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
         pytest.skip(f"cannot create a symlink here: {exc}")
     fake_windows_readers(lambda _path: False)
-    with pytest.raises(OSError, match="leads to nothing"):
-        config_source_trust_paths(cfg)
+    assert link in config_source_trust_paths(cfg)
     # The refusal's text is cut to a length, so a long temporary path can hide the name.
     with pytest.raises(WiringError, match="leads to nothing"):
         load_config(cfg)
@@ -324,3 +322,54 @@ def test_a_dangling_data_link_refuses_the_load(
     else:
         target.write_text("code,display\n", encoding="utf-8")
     assert "o" in load_config(cfg).outbound
+
+
+@pytest.mark.parametrize("member", ["connections.toml", "codesets", "codesets/a.csv"])
+def test_the_escape_downgrades_a_dangling_data_link(
+    member: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fake_windows_readers: FakeReaders,
+) -> None:
+    """The dangling-link refusal goes through the same refusal as the rest of the check, so the
+    clamped dev/test escape downgrades it to a warning, and the load reads the name as absent."""
+    monkeypatch.setenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "1")
+    monkeypatch.setenv(SECURITY_ENFORCEMENT_ENV, "warn")
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "cfg.py").write_text(
+        "from messagefoundry import outbound, File\noutbound('o', File(directory='./out'))\n",
+        encoding="utf-8",
+    )
+    link = cfg / member
+    link.parent.mkdir(exist_ok=True)
+    try:
+        link.symlink_to(tmp_path / "gone", target_is_directory=member == "codesets")
+    except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    fake_windows_readers(lambda _path: False)
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.config.wiring"):
+        assert "o" in load_config(cfg).outbound
+    assert any(
+        "leads to nothing" in r.getMessage() and "dev/test override" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_the_escape_is_inert_for_a_dangling_link_under_enforce(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_windows_readers: FakeReaders
+) -> None:
+    """Control for the test above: without the warn dial the escape does nothing."""
+    monkeypatch.setenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "1")
+    monkeypatch.setenv(SECURITY_ENFORCEMENT_ENV, "enforce")
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "cfg.py").write_text("", encoding="utf-8")
+    try:
+        (cfg / "connections.toml").symlink_to(tmp_path / "gone.toml")
+    except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    fake_windows_readers(lambda _path: False)
+    with pytest.raises(WiringError, match="not honoured"):
+        load_config(cfg, allow_empty=True)

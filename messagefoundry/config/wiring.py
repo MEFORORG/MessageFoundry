@@ -9822,8 +9822,8 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
     directory and are checked at ``serve`` start (:func:`assert_trusted_start_paths`), and the
     folders above ``directory``, except where a link's target or the folder holding it lies
     there. A link at ``connections.toml``, ``codesets`` or a code-set table is listed even when it
-    leads to nothing, so that :func:`_with_link_targets` refuses it, as it refuses a dangling module
-    link: a writer of the folder it points into could create the missing name before the read."""
+    leads to nothing, so that the check refuses it (:func:`_refuse_unvettable_links`), as it refuses
+    a dangling module link: a writer of the folder it points into could create the missing name before the read."""
     # Lazy: connections_file imports this module (no circular import at load time).
     from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
 
@@ -9868,7 +9868,8 @@ def _with_link_targets(paths: list[Path]) -> list[Path]:
     what :meth:`~pathlib.Path.resolve` answers: on POSIX that is Python's own ``realpath`` walk in
     userspace, and nothing here checks it against the object an open of the path reaches, as the
     ``serve`` start check does (:func:`_file_and_folder`). A link whose target cannot be resolved,
-    or that leads to nothing at check time, raises ``OSError`` naming it, which refuses the load: a
+    or that leads to nothing at check time, has no target listed; :func:`_refuse_unvettable_links`
+    refuses it, so the dev/test escape applies to it as to every other refusal of the check: a
     writer of the folder it points into could create the missing name before the read (Manager
     decision under the owner's standing instruction of 2026-10-22).
 
@@ -9881,28 +9882,40 @@ def _with_link_targets(paths: list[Path]) -> list[Path]:
     out: list[Path] = []
     for path in paths:
         out.append(path)
-        if not _is_link(path):
+        target = _resolved_link(path)
+        if not isinstance(target, Path):
             continue
-        unresolved = ""
-        target: Path | None = None
-        try:
-            target = path.resolve()
-        except (OSError, ValueError, RuntimeError) as exc:
-            # Not expected from a non-strict resolve on the interpreters this project supports;
-            # caught so an unforeseen failure refuses the load rather than escaping it.
-            unresolved = type(exc).__name__
-        if target is None:
-            raise OSError(errno.EINVAL, f"a link could not be resolved ({unresolved})", str(path))
-        if not target.exists():
-            # exists() is False for any stat failure, so this also covers a target the check
-            # cannot reach (a permission fault, a link loop), not only one that is gone.
-            raise OSError(
-                errno.EINVAL, "a link leads to nothing the check can read at check time", str(path)
-            )
         out.append(target)
         if not target.is_dir():
             out.append(target.parent)
     return list(dict.fromkeys(out))
+
+
+def _resolved_link(path: Path) -> Path | str | None:
+    """What the link at ``path`` resolves to: ``None`` where ``path`` is not a link, and the reason
+    as text where its target cannot be resolved or leads to nothing at check time."""
+    if not _is_link(path):
+        return None
+    try:
+        target = path.resolve()
+    except (OSError, ValueError, RuntimeError) as exc:
+        # Not expected from a non-strict resolve on the interpreters this project supports;
+        # caught so an unforeseen failure refuses the load rather than escaping it.
+        return f"a link could not be resolved ({type(exc).__name__})"
+    if not target.exists():
+        # exists() is False for any stat failure, so this also covers a target the check
+        # cannot reach (a permission fault, a link loop), not only one that is gone.
+        return "a link leads to nothing the check can read at check time"
+    return target
+
+
+def _refuse_unvettable_links(paths: Sequence[Path], refuse: Callable[[str], None]) -> None:
+    """Hand ``refuse`` a reason for each link in ``paths`` whose target :func:`_with_link_targets`
+    could not list."""
+    for path in paths:
+        fault = _resolved_link(path)
+        if isinstance(fault, str):
+            refuse(f"{_CONFIG_SOURCE_LEAD} {path}: {fault}")
 
 
 def _config_module_name(path: Path) -> str:
@@ -11474,6 +11487,7 @@ def _assert_safe_config_source(directory: Path) -> None:
             # Moved away since the caller's own check: missing, as that check answers (#3157).
             _require_config_dir(directory, strict=True)
         raise
+    _refuse_unvettable_links(paths, _refuse_unsafe_config_source)
     try:
         _check_trusted_paths(
             paths,
