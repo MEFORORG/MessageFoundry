@@ -1537,7 +1537,8 @@ worker can. *What this boundary does NOT cover*, below, holds for both modes.
 runs the config module bytes the engine loaded, which the engine sends it whenever it starts: on
 the first message an inbound receives, and after a worker is recycled by a wall-time or memory
 overrun or a crash (vault BACKLOG #2596). So an edit to a `*.py` on disk changes no module code the
-engine or its workers run until a reload. That is not all a worker can read: config code can
+engine or its workers run until a reload, with at least one exception: an engine shard that
+`supervise` restarts loads the directory from disk again. That is not all a worker can read: config code can
 itself open a file, such as one beside it, and a worker that starts after that file changed can
 read the new copy, reload or not. After an edit to a `*.py`, until a reload, `GET /config/provenance`
 reports `drift` as true, because the files on disk no longer match the ones the engine loaded.

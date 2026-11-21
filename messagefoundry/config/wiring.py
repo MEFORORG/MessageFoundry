@@ -9820,7 +9820,9 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
 
     **Not on the list:** the value file and the settings file, which sit outside the config
     directory and are checked at ``serve`` start (:func:`assert_trusted_start_paths`), and the
-    folders above ``directory``."""
+    folders above ``directory``, except where a link's target or the folder holding it lies
+    there. A link at ``connections.toml``, ``codesets`` or a code-set table that leads to nothing
+    is left off the list, so its target folder is not read."""
     # Lazy: connections_file imports this module (no circular import at load time).
     from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
 
@@ -9874,12 +9876,17 @@ def _with_link_targets(paths: list[Path]) -> list[Path]:
         try:
             target = path.resolve()
         except (OSError, ValueError, RuntimeError) as exc:
-            # ValueError: a target holding a NUL; RuntimeError: a link loop, on older interpreters.
+            # Not expected from a non-strict resolve on the interpreters this project supports;
+            # caught so an unforeseen failure refuses the load rather than escaping it.
             unresolved = type(exc).__name__
         if target is None:
             raise OSError(errno.EINVAL, f"a link could not be resolved ({unresolved})", str(path))
         if not target.exists():
-            raise OSError(errno.EINVAL, "a link leads to nothing at check time", str(path))
+            # exists() is False for any stat failure, so this also covers a target the check
+            # cannot reach (a permission fault, a link loop), not only one that is gone.
+            raise OSError(
+                errno.EINVAL, "a link leads to nothing the check can read at check time", str(path)
+            )
         out.append(target)
         if not target.is_dir():
             out.append(target.parent)
@@ -11424,8 +11431,9 @@ def _assert_safe_config_source(directory: Path) -> None:
     :func:`messagefoundry.auth.anchor_path.posix_path_verdict` applies to a trust anchor. A
     root-owned, read-only config is therefore accepted under a service-account engine. This check
     reads the paths :func:`config_source_trust_paths` lists (following links): the directory, its
-    ``*.py``, its ``__pycache__``, ``connections.toml`` and code-set tables. It does not read the
-    directories above it, as that function does; docs/SERVICE.md states what the layout then still
+    ``*.py``, its ``__pycache__``, ``connections.toml`` and code-set tables, and for a link what it
+    resolves to. It does not read the directories above it, except where that function lists a
+    link's target or the folder holding it there; docs/SERVICE.md states what the layout then still
     depends on. On Windows the equivalent NTFS-DACL check now runs in-process
     (:func:`_assert_safe_config_source_windows`, SEC-003): the owner and DACL of each of those
     paths is parsed via ctypes and a source is refused when its DACL grants a broad/low-privilege
