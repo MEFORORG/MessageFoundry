@@ -3653,9 +3653,9 @@ async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float) -> N
     connection goes back only once the write has returned (:func:`_return_when_settled`), or is
     discarded if the write then failed with a transient state. ``timeout`` bounds the wait for the
     write the same way, as a transient :class:`DeliveryError`, and the write is never waited for
-    without it. Every caller passes its borrow's whole ``acquire_timeout``, so a healthy write
-    always gets one full ``acquire_timeout`` however long the acquire before it took, and a write
-    slower than that fails the borrow.
+    without it. At least :func:`_acquire` and the ``DatabaseRef`` sync pass their borrow's whole
+    ``acquire_timeout``, so there a healthy write gets one full ``acquire_timeout`` however long
+    the acquire before it took, and a write slower than that fails the borrow.
 
     **A driver that refuses the value fails the borrow closed.** The connection goes back to
     ``pool`` first, since a refused write leaves the handle usable and no statement ran on it, and
@@ -3780,10 +3780,10 @@ def _retire_executor(pool: Any, closing: asyncio.Future[None]) -> None:
 # connection means pool_max is never legitimately exhausted, so an acquire that can't be satisfied
 # within the timeout means the pool is wedged or the DB is unresponsive — fail it transiently rather
 # than block the worker forever (which would let the queue back up unbounded). Override per connection
-# with the ``acquire_timeout`` setting. The borrow's statement_timeout write after the acquire is
-# bounded by its own full ``acquire_timeout`` (BACKLOG #5756), so a borrow that ends in that write
-# takes at most about twice ``acquire_timeout``; at least the close of a refused ungated
-# connection (:func:`_require_gate_or_discard`) is not bounded by either.
+# with the ``acquire_timeout`` setting. The statement_timeout write after the acquire is bounded
+# by its own ``acquire_timeout`` (BACKLOG #5756). Neither bounds the borrow as a whole: at least
+# the close of a refused ungated connection (:func:`_require_gate_or_discard`) and the close of a
+# discarded one wait unbounded.
 _DEFAULT_DB_ACQUIRE_TIMEOUT = 30.0
 
 
@@ -5747,7 +5747,8 @@ async def probe_login_roles(pool: Any, *, label: str, acquire_timeout: float) ->
     the statement failed or no row came back, warns and returns :attr:`LoginRoleVerdict.NOT_RUN`. A
     cancellation is let through.
 
-    The borrow is bounded by ``acquire_timeout``, as a lookup's is. The statement is bounded by the
+    The acquire, and the ``statement_timeout`` write after it, are each bounded by
+    ``acquire_timeout``, as a lookup's are. The statement is bounded by the
     pool's ``statement_timeout`` where it set one, as a lookup's pool does (BACKLOG #5756)."""
     reading = await _read_login_roles(pool, acquire_timeout)
     _log_login_role_reading(reading, label)
