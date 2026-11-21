@@ -254,8 +254,10 @@ class RetentionPass:
     documents_messages_stripped: int = 0
     documents_stripped: int = 0
     documents_bytes_reclaimed: int = 0
-    # BACKLOG #5651: the strip phase ended before its last batch, for one of two causes; the counts
-    # above are what it had committed, and the strip logs the early end at WARNING either way.
+    # BACKLOG #5651: the strip phase ended before its last batch, for one of three causes; the
+    # counts above are what it had committed, and the strip logs the early end at WARNING each way.
+    # The third, batch writes failing in a row, is a store-wide write fault, recorded through
+    # `documents_strip_write_failed` as below.
     # A key-service outage is recorded in the audit row when the pass writes one, but is not itself
     # work: an outage pass must not send an audit row through the failing key service. A failed
     # batch read is a database fault, so it is work (`documents_strip_read_failed`), and the pass
@@ -646,8 +648,8 @@ class RetentionRunner:
                 write_failed=strip.write_failed or part.write_failed,
             )
             if part.ended_early:
-                # BACKLOG #5651: a key-service outage or a failed batch read. End only this phase;
-                # the rest of the pass still runs.
+                # BACKLOG #5651: a key-service outage, a failed batch read, or batch writes failing
+                # in a row. End only this phase; the rest of the pass still runs.
                 break
         state_purged = 0
         if not _deadline_hit() and s.state_max_age_days > 0:
