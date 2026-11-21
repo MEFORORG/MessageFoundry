@@ -192,21 +192,17 @@ WARNING (not a refusal) for the advisory cases, so a deliberate cross-root layou
 
 ### 3. Extend the resolution flags to the offline subcommands — value resolution only, *not* serve's posture refusal
 
-*Value resolution, as this heading and this section state it, is not met for
-`validate`/`graph`/`dryrun`: see the 2026-11-14 correction under
+*For what `validate`/`graph`/`dryrun` resolve under `--env`, and where it still differs from
+`serve`, see the 2026-11-20 note under
 [Amendment A](#amendment-a-check---env-matches-serve-2026-11-09).*
 
 Add `--project-root`, `--env`, and `--service-config` to `validate`, `graph`, `dryrun`, and `check` (today
 they carry **only** `--config`, plus `--messages`). With these flags the gate resolves the **same project
 root and the same active-environment `env()` values** `serve` resolves, so `messagefoundry check` on a CI
-runner validates the view that will actually run. *(Not met for `validate`/`graph`/`dryrun`'s
-values: see the 2026-11-14 correction under
-[Amendment A](#amendment-a-check---env-matches-serve-2026-11-09).)*
+runner validates the view that will actually run.
 
 **Explicitly pinned — the offline gate resolves *values*, it does NOT inherit `serve`'s required-env /
-explicit-posture *refusal*** (`__main__.py:464-481`). *(The values half is not met for
-`validate`/`graph`/`dryrun`: see the 2026-11-14 correction under
-[Amendment A](#amendment-a-check---env-matches-serve-2026-11-09).)* `serve` refuses to start without an active
+explicit-posture *refusal*** (`__main__.py:464-481`). `serve` refuses to start without an active
 environment and demands an explicit posture for a custom env name; the offline tools **do not** adopt that
 refusal, because doing so would *break* the documented gate invocation `messagefoundry check --config config
 --messages messages/sets` (ADR 0017) — that has **no** `--env`. Therefore:
@@ -214,7 +210,7 @@ refusal, because doing so would *break* the documented gate invocation `messagef
 - With **no** `--env`, the offline gate behaves exactly as today (no env values loaded, no posture refusal).
 - With `--env`/`--project-root`/`--service-config`, the gate resolves the **identical root + active-env
   `env()` values** as `serve` for those flags, but never enforces the required-env-/posture-refusal.
-  *(Not met for `validate`/`graph`/`dryrun`'s values: see the 2026-11-14 correction under
+  *(Where `validate`/`graph`/`dryrun` still differ: the 2026-11-20 note under
   [Amendment A](#amendment-a-check---env-matches-serve-2026-11-09).)*
   **Amended for `check --env` alone** ([Amendment A](#amendment-a-check---env-matches-serve-2026-11-09)):
   given `--env`, `check`'s settings checks read the name as `serve --env` does.
@@ -285,8 +281,11 @@ given** — which is exactly AC-6.
   → `tests/test_checks_gate_parity.py::test_every_settings_leg_reads_an_instance_named_by_check_env`
   → `tests/test_checks_gate_parity.py::test_check_env_beats_mefor_ai_environment_and_the_file`
   → `tests/test_cli_offline_resolution.py::test_offline_does_not_inherit_serve_posture_refusal`
-  *Not met for `validate`/`graph`/`dryrun`'s value resolution: see the 2026-11-14 correction under
-  [Amendment A](#amendment-a-check---env-matches-serve-2026-11-09).*
+  → `tests/test_cli_offline_resolution.py::test_offline_env_resolves_the_named_environment_under_project_root`
+  → `tests/test_cli_offline_resolution.py::test_offline_env_without_project_root_reads_the_working_directory`
+  *Partly met for `validate`/`graph`/`dryrun`: the 2026-11-20 note under
+  [Amendment A](#amendment-a-check---env-matches-serve-2026-11-09) names where their value
+  resolution still differs from `serve`'s.*
 - **AC-7** — THE SYSTEM SHALL honor an explicit **absolute** `--config`/`--service-config`/`--db`/
   `[store].path` as-is even when a project root is set, AND SHALL resolve a **relative**
   `--db`/`[store].path` (indistinguishable post-merge from a file-set relative path) under the root.
@@ -455,9 +454,39 @@ those settings, and its Handlers still run with no active environment.
   them or narrow AC-6 is open, and vault BACKLOG #5554 owns that decision; this note decides
   neither.
 
+  **SUPERSEDED 2026-11-20 (vault BACKLOG #5554):** the 2026-11-14 note above describes the code
+  before this date. The choice is decision record d20261119T191501757-b23295, decided
+  2026-11-19 under the owner's delegation after an adversarial review; the question and the
+  owner's answer are in that record, not here. It chose to build value resolution into the three
+  commands, and not to refuse `--env` without `--project-root`. Given `--env`, `validate`, `graph`
+  and `dryrun` now run the service settings load `serve` runs, with `--env` as the
+  `[ai].environment` override and `--project-root` as the `[environments].base_dir` override that
+  `serve` applies. That one load names the value file for both the missing-file check (AC-3) and
+  the read. For `validate` and `dryrun` the check fires wherever that load names a project root,
+  a `base_dir` from the settings file or the environment included, as `serve`'s does; for `graph`
+  it fires under an explicit `--project-root` only, as before. They read the file with `serve`'s
+  own reader, so overrides such as `MEFOR_VALUE_*` apply. Settings that do not load are reported
+  as `serve`'s settings load renders them, naming the settings file where one exists; a value file
+  that cannot be read is reported naming that file. They resolve every `env()` reference of each
+  deployed connection and lookup, and report one that does not resolve by its key, never its
+  value. `validate` lists each of these failures with its other problems and `dryrun` stops on
+  it. `graph` lists it under `env_problems` beside the graph and exits as it would without it,
+  because it reports a graph and does not gate one (BACKLOG #1648); that is a Manager decision.
+  A reference set is left out, as `serve` and
+  `check` leave an unresolved one to its sync. Without `--env` nothing changes. Where they still
+  differ from `serve`, at least:
+
+  - Under `--project-root` with no `--service-config`, the settings file is
+    `<root>/messagefoundry.toml` where one exists, where `serve` reads `./messagefoundry.toml`.
+  - No connector is built, so a refusal only the build check makes, such as an egress or hop
+    refusal, is still `check --env`'s, as is the posture check.
+  - `dryrun`'s Handlers still run with no active environment.
+
 **What "matches `serve`" covers.** The settings checks read the environment name `serve --env`
 reads. Value-file location is shared too: the offline `<env>.toml` check under `--project-root` now
 reads `MEFOR_ENVIRONMENTS_DIR` above the file's `[environments].dir`, as `serve`'s settings load
-does. The file it reads that `dir` from can still differ from the one `serve` reads. It does not cover a `[environments].base_dir`
-set in the file or the environment without `--project-root`: `serve` fails loud on a missing value
-file under that root, and the offline check fires only under an explicit `--project-root`.
+does. The file it reads that `dir` from can still differ from the one `serve` reads. For `check`
+it does not cover a `[environments].base_dir` set in the file or the environment without
+`--project-root`: `serve` fails loud on a missing value file under that root, and `check`'s value-file
+check fires only under an explicit `--project-root`, and so does `graph`'s. `validate` and `dryrun`
+cover it since the 2026-11-20 note above.

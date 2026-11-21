@@ -753,9 +753,11 @@ def test_a_missing_service_config_is_named_before_the_value_file_check(
     rc, legs = _cli_check(capsys, *argv, *typo)
     assert rc == 1, legs
     assert "service config not found" in str(legs["posture"]["detail"]), legs["posture"]
-    # Control: validate reads no settings, so the value-file check still answers for it.
-    assert main(["validate", *argv, *typo]) == 2
-    assert "no value file" in capsys.readouterr().err
+    # validate, given --env, now loads the settings first too (vault BACKLOG #5554), so it names
+    # the missing settings file as well, among its problems, and not a guessed value folder.
+    assert main(["validate", *argv, *typo]) == 1
+    captured = capsys.readouterr()
+    assert "service config not found" in captured.out and "no value file" not in captured.err
 
 
 def test_a_graph_skip_is_not_tagged_as_an_environment_read(
