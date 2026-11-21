@@ -69,7 +69,7 @@ Scorecard runs on the same mirror and surfaced **48 findings**. These are **repo
 - **AC-6** — WHEN the multipart parser reads an uploaded part, THE SYSTEM SHALL bound that part's header block before parsing it, so the header scan's input size is set by the parser and not by the request-body cap.
   → `tests/test_multipart.py::test_oversized_part_header_is_refused_not_parsed`
 - **AC-7** — WHEN the multipart parser scans a `Content-Disposition` line, THE SYSTEM SHALL do so without super-linear cost: the largest header block the parser admits SHALL be scanned in a small, bounded time, which bounds what the scan can take from the asyncio event loop. *(Reworded 2026-11-17 under BACKLOG #5520: it said "in a small, bounded slice of the asyncio event loop", from before the parse moved to a worker thread; `parse_upload_off_loop` in `messagefoundry/api/multipart.py` says why the scan still holds the loop. Reworded 2026-09-03 under BACKLOG #1385. The criterion used to say "in time linear in the line's length" and was verified by a growth-ratio assertion, which ejected PR 669 at ratio 8.02 against a bound of 8.0. A budget on the admitted worst case carries ~290x of headroom where that ratio carried 1.9x, and it is paired with a positive control so it cannot pass vacuously.)*
-  → `tests/test_multipart.py::test_a_hostile_disposition_header_stays_inside_the_scan_budget` · `tests/test_multipart.py::test_the_unguarded_pattern_blows_that_same_budget` · `tests/test_multipart.py::test_every_tokenizer_branch_stays_inside_the_scan_budget` (added 2026-11-21, BACKLOG #5787)
+  → `tests/test_multipart.py::test_a_hostile_disposition_header_stays_inside_the_scan_budget` · `tests/test_multipart.py::test_the_unguarded_pattern_blows_that_same_budget` · `tests/test_multipart.py::test_every_tokenizer_branch_stays_inside_the_scan_budget` · `tests/test_multipart.py::test_the_branch_shapes_reach_every_line_of_the_tokenizer` · `tests/test_multipart.py::test_the_tokenizer_scans_each_branch_value_at_most_twice` · `tests/test_multipart.py::test_a_rewalking_tokenizer_exceeds_that_scan_bound` (the last four added 2026-11-21, BACKLOG #5787)
   Superseded in part by the 2026-11-21 amendment below the second triage's Fixed table.
 - **AC-8** — WHERE a CI job installs a third-party quality or security tool that this repo routes through a PEP 735 dependency group, THE SYSTEM SHALL install it from a hash-pinned `uv export` with `--require-hashes`, and THAT lock SHALL be regenerated and diff-gated by the DEP-1 step rather than hand-maintained.
   → `tests/test_ci_venv_pinning.py` (`test_lock_installed_toolchain_*`, `test_moved_tools_are_declared_in_a_dependency_group`, `test_no_moved_tool_is_reinstalled_inline`) · `tests/test_dep1_lock_resync_lockstep.py`
@@ -125,20 +125,33 @@ The `py/polynomial-redos` row above is superseded in part by the 2026-11-21 amen
 
 **Amendment 2026-11-21 (BACKLOG #5787).** This change removed the `(?<!\w)(\w+)="([^"]*)"` regex
 that `messagefoundry/api/multipart.py` carried at `4181ceae120` and replaced it with the
-`_disposition_params` tokenizer. `_MAX_PART_HEADER_BYTES` (16 KiB) still bounds the tokenizer's
-input. AC-7 is pinned by the three tests on its line above, one of them added for this change. That
-added test has no positive control, and no test times a whole body. The figures below are measured,
-not proved: each is the median of 9 runs of a best-of-5 (best-of-3 for a whole body), taken on one
-dev box on 2026-11-21, and another machine will give other numbers. The tests assert a 0.05 s
-budget.
+`_disposition_params` tokenizer. The Fixed verdict on the `py/polynomial-redos` row stands.
+`_MAX_PART_HEADER_BYTES` (16 KiB) still bounds the tokenizer's input. AC-7 is pinned by the tests on
+its line above; the last four were added for this change. No test times a body of `_MAX_PARTS`
+header blocks at the cap. The figures below are measured, not proved: each is the median of 9 runs
+of a best-of-5 (best-of-3 for a whole body), taken on one dev box on 2026-11-21, and another machine
+will give other numbers. The timed tests assert a 0.05 s budget.
 
-| What was timed | Tokenizer | Regex at `4181ceae120` |
-|---|---|---|
-| The word-run upload AC-7's first test times | 0.037 ms | 0.19 ms |
-| The slowest shape the branch test times (`=""` items filling a header block at the cap) | 3.4 ms | not timed |
-| A 16-part body, each header block `=""` items near the cap | 54 ms | 5.4 ms |
-| A 16-part body, each header block `a=b` items near the cap | 22 ms | 4.8 ms |
-| The positive control: the regex without its lookbehind, on the word-run upload | not applicable | 0.46 s |
+This amendment supersedes these statements above:
+
+- The row's "provably match-equivalent": the tokenizer reads some lines differently from the regex,
+  on purpose; `tests/test_multipart.py::test_where_the_tokenizer_reads_otherwise_than_origin_main`
+  pins each difference.
+- The row's "so the scan is linear": measured, not proved. On each value the branch test times, the
+  tokenizer's searches cover at most twice the value's length
+  (`test_the_tokenizer_scans_each_branch_value_at_most_twice`), and the table gives the times.
+- AC-7's "carries ~290x of headroom": on the word-run upload the tokenizer is about 1,300x under the
+  budget; on the slowest branch shape, about 15x.
+- AC-7's "paired with a positive control": that holds for the word-run test. The branch timing test
+  has no positive control; the scanned-character test has one,
+  `test_a_rewalking_tokenizer_exceeds_that_scan_bound`.
+
+| What was timed | Tokenizer | Regex at `4181ceae120` (with its lookbehind) | That regex without its lookbehind |
+|---|---|---|---|
+| The word-run upload AC-7's first test times | 0.037 ms | 0.19 ms | 0.46 s (AC-7's positive control) |
+| The slowest shape the branch test times (`=""` items filling a header block at the cap) | 3.4 ms | not timed | not timed |
+| A 16-part body, each header block `=""` items near the cap | 54 ms | 5.4 ms | not timed |
+| A 16-part body, each header block `a=b` items near the cap | 22 ms | 4.8 ms | not timed |
 
 **Dismissed (25)** — see the class rationales below plus the per-alert dismissal comments, which remain
 canonical.

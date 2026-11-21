@@ -101,10 +101,10 @@ def test_no_file_part_rejected() -> None:
 
 #: The unguarded form of the regex origin/main read Content-Disposition with (origin/main carried a
 #: ``(?<!\w)`` lookbehind in front, which changed no match). In this file's BACKLOG #5787 tests,
-#: "origin/main" means the parser at ``4181ceae120``, before that change. It serves twice below: as the reader
-#: the tokenizer is compared against, and as the live positive control for the cost arms, where,
-#: swapped into the shipping parse path, it shows the budget they assert against is a line a
-#: quadratic scan cannot get under.
+#: "origin/main" means the parser at ``4181ceae120``, before that change. It serves twice below:
+#: as the reader the tokenizer is compared against, and as the live positive control for the
+#: word-run cost arm, where, swapped into the shipping parse path, it shows the budget that arm
+#: asserts against is a line a quadratic scan cannot get under.
 _LEGACY_DISPOSITION_PARAM = re.compile(r'(\w+)="([^"]*)"')
 
 
@@ -125,20 +125,22 @@ def _legacy_disposition(line: str) -> tuple[str | None, str | None]:
     return name, filename
 
 
-#: Length of the hostile word run the cost arms measure. 12,000 word characters and no further ``="``
-#: is 73 percent of ``_MAX_PART_HEADER_BYTES``, so the arms measure close to the largest header the
-#: parser will actually admit rather than an arbitrary size. What this body costs, with the
+#: Length of the hostile word run the word-run arm and its control measure (the branch arm sizes
+#: its values by ``_branch_value``). 12,000 word characters and no further ``="`` is 73 percent of
+#: ``_MAX_PART_HEADER_BYTES``, so those arms measure close to the largest header the parser will
+#: actually admit rather than an arbitrary size. What this body costs, with the
 #: shipped tokenizer and with the unguarded regex in its place, is recorded once, in ADR 0034's
 #: 2026-11-21 amendment (BACKLOG #5787).
 _HOSTILE_HEADER_CHARS = 12_000
 
-#: The one line the cost arms are measured against; ADR 0034's 2026-11-21 amendment records the
-#: costs. The production arms must stay under it and the control arm over it, so noise can fake a
-#: red only on a production arm: each of those is best-of-5, and the control is one sample.
+#: The one line the timed cost arms are measured against; ADR 0034's 2026-11-21 amendment records
+#: the costs. The production arms must stay under it and the control arm over it. Each production
+#: arm is best-of-5, which absorbs a brief stall but not a steady slowdown of the whole run; the
+#: branch arm has the least room under the line, so a slow runner reds it first.
 #:
 #: **Deliberately one number rather than a ceiling plus a lower floor.** A floor beneath the ceiling
 #: would open a band in which a half-fixed scan clears both arms; sharing the line makes the control
-#: prove that this exact budget discriminates. If some future CPython makes the unguarded scan fast
+#: prove that this exact budget discriminates on the word-run arm's input. If some future CPython makes the unguarded scan fast
 #: enough to slip under it, the control reds -- which is the correct thing to be told, because at that
 #: point the instrument has stopped discriminating and the number needs re-deriving.
 _SCAN_BUDGET_SECONDS = 0.05
@@ -257,7 +259,7 @@ def _hostile_upload() -> tuple[str, bytes]:
     restarts at every offset inside the run and each restart walks the rest of it.
 
     The size invariant lives here rather than in one arm, because it is a property of the fixture and
-    every arm depends on it."""
+    both word-run arms depend on it."""
     assert _MAX_PART_HEADER_BYTES // 2 < _HOSTILE_HEADER_CHARS < _MAX_PART_HEADER_BYTES, (
         f"the hostile header must sit near the cap the parser admits, not merely under it: "
         f"{_HOSTILE_HEADER_CHARS} against a cap of {_MAX_PART_HEADER_BYTES}. Over the cap and the "
@@ -360,14 +362,16 @@ def test_every_tokenizer_branch_stays_inside_the_scan_budget(prefix: str, unit: 
 
 
 def _branch_value(prefix: str, unit: str) -> str:
-    """``prefix`` then ``unit`` repeated, cut to the longest value a header block at the cap holds."""
-    size = _MAX_PART_HEADER_BYTES - len("Content-Disposition: ")
+    """``prefix`` then ``unit`` repeated, cut to the longest value a header block at the cap holds
+    (a ``Content-Disposition:`` line with no space after the colon)."""
+    size = _MAX_PART_HEADER_BYTES - len("Content-Disposition:")
     return (prefix + unit * (size // len(unit) + 1))[:size]
 
 
 def test_the_branch_shapes_reach_every_line_of_the_tokenizer() -> None:
-    """Non-vacuity for the arm above: together its shapes execute every line of
-    ``_disposition_params``, so the claim above is measured, not assumed."""
+    """Non-vacuity for the arm above: together the values it times execute every line of
+    ``_disposition_params``. Python line events cannot see which regex alternative ran; the
+    scanned-character test below checks how far the searches reach."""
     code = multipart._disposition_params.__code__
     body_lines = {line for _, _, line in code.co_lines() if line is not None}
     body_lines.discard(code.co_firstlineno)
@@ -384,10 +388,71 @@ def test_the_branch_shapes_reach_every_line_of_the_tokenizer() -> None:
     sys.settrace(trace)
     try:
         for prefix, unit in _TOKENIZER_BRANCH_SHAPES:
-            multipart._disposition_params(_branch_value(prefix, unit)[:200])
+            multipart._disposition_params(_branch_value(prefix, unit))
     finally:
         sys.settrace(previous)
     assert body_lines - seen == set(), sorted(body_lines - seen)
+
+
+class _ScanCounter:
+    """Stands in for ``_DISP_ITEM`` and counts, for each ``search``, the characters from where the
+    search started to where its match ended (to the end of the value when nothing matched)."""
+
+    def __init__(self) -> None:
+        self.scanned = 0
+
+    def search(self, value: str, pos: int) -> re.Match[str] | None:
+        match = _REAL_DISP_ITEM.search(value, pos)
+        self.scanned += (len(value) if match is None else match.end()) - pos
+        return match
+
+
+_REAL_DISP_ITEM = multipart._DISP_ITEM
+
+#: The bound the scanned-character test asserts: at most twice the value's length, plus slack.
+_SCAN_BOUND = 2
+
+
+def _scanned(monkeypatch: pytest.MonkeyPatch, fn: Callable[[str], object], value: str) -> int:
+    counter = _ScanCounter()
+    monkeypatch.setattr(multipart, "_DISP_ITEM", counter)
+    try:
+        fn(value)
+    finally:
+        monkeypatch.setattr(multipart, "_DISP_ITEM", _REAL_DISP_ITEM)
+    return counter.scanned
+
+
+@pytest.mark.parametrize(("prefix", "unit"), _TOKENIZER_BRANCH_SHAPES)
+def test_the_tokenizer_scans_each_branch_value_at_most_twice(
+    monkeypatch: pytest.MonkeyPatch, prefix: str, unit: str
+) -> None:
+    """A deterministic cost check for the branch arm: on each value it times, the tokenizer's
+    searches cover at most ``_SCAN_BOUND`` times the value's length. It counts what the searches
+    start and match over, not every character the regex engine reads."""
+    value = _branch_value(prefix, unit)
+    scanned = _scanned(monkeypatch, multipart._disposition_params, value)
+    assert scanned <= _SCAN_BOUND * len(value) + 64, (scanned, len(value))
+
+
+def test_a_rewalking_tokenizer_exceeds_that_scan_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Positive control for the test above: a walk that starts over from the beginning after every
+    item, the shape a quadratic regression takes, is far over the same bound, so the counter and
+    the bound can tell the two apart."""
+
+    def rewalk(value: str) -> None:
+        pos = 0
+        while (item := multipart._DISP_ITEM.search(value, pos)) is not None:
+            again = 0
+            while again < item.start():
+                found = multipart._DISP_ITEM.search(value, again)
+                assert found is not None
+                again = found.end()
+            pos = item.end()
+
+    value = _branch_value("", '=""')[:1500]
+    scanned = _scanned(monkeypatch, rewalk, value)
+    assert scanned > 10 * (_SCAN_BOUND * len(value) + 64), (scanned, len(value))
 
 
 def test_the_unguarded_pattern_blows_that_same_budget(monkeypatch: pytest.MonkeyPatch) -> None:
