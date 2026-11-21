@@ -686,6 +686,68 @@ async def test_committer_submit_after_close_raises(tmp_path: Path) -> None:
         await gc.submit(lambda: _ret(1))
 
 
+async def test_committer_cancelled_while_parked_rejects_pending_and_closes(tmp_path: Path) -> None:
+    """BACKLOG #5664: a committer cancelled outside aclose(), here parked in its coalescing window
+    with members enrolled, must reject every pending member and mark itself closed, or each caller
+    (the ACK gate among them) parks on its future forever."""
+    s = await MessageStore.open(
+        tmp_path / "parked.db", group_commit_window_ms=60_000.0, group_commit_max_batch=64
+    )
+    try:
+        gc = s._group_commit
+        assert gc is not None and gc._task is not None
+        members = [asyncio.create_task(gc.submit(functools.partial(_ret, n))) for n in range(3)]
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert len(gc._pending) == 3  # enrolled, the committer waiting out its window
+
+        gc._task.cancel()
+        await asyncio.gather(gc._task, return_exceptions=True)
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(*members, return_exceptions=True), timeout=5.0
+        )
+        assert all(isinstance(o, RuntimeError) for o in outcomes), outcomes
+        assert gc._closed
+        with pytest.raises(RuntimeError, match="closed"):
+            await gc.submit(lambda: _ret(1))
+    finally:
+        await s.close()
+
+
+async def test_committer_cancelled_mid_flush_rejects_members_beyond_the_batch(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5664: _flush rejects only the batch it claimed on a cancel, so the members beyond
+    max_batch must be rejected by the committer's exit, not left pending."""
+    s = await MessageStore.open(
+        tmp_path / "midflush.db", group_commit_window_ms=GC_WINDOW_MS, group_commit_max_batch=1
+    )
+    try:
+        gc = s._group_commit
+        assert gc is not None and gc._task is not None
+        entered = asyncio.Event()
+
+        async def _park() -> int:
+            entered.set()
+            await asyncio.Event().wait()
+            return 0
+
+        first = asyncio.create_task(gc.submit(_park))
+        rest = [asyncio.create_task(gc.submit(functools.partial(_ret, n))) for n in range(2)]
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+        assert len(gc._pending) == 2  # beyond the claimed batch of one
+
+        gc._task.cancel()
+        await asyncio.gather(gc._task, return_exceptions=True)
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(first, *rest, return_exceptions=True), timeout=5.0
+        )
+        assert all(isinstance(o, RuntimeError) for o in outcomes), outcomes
+        assert gc._closed
+    finally:
+        await s.close()
+
+
 # --- regression: no member is stranded beyond one max_batch chunk (adversarial finding #1/#3) ----
 
 

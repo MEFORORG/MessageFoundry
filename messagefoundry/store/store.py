@@ -598,7 +598,8 @@ class _GroupCommitter:
     (a coordinated form of the crash-re-run the INFLIGHT-guarded idempotent handoffs already tolerate).
     Resolving the futures on the cancellation path matters as much as the rollback does: a member's
     caller parks on its future (the ACK gate among them), so a batch abandoned without rejection would
-    park every one of them forever.
+    park every one of them forever. For the same reason the committer, however it exits, marks itself
+    closed and rejects every member still pending beyond that batch (BACKLOG #5664).
 
     Enabled only when ``window_ms > 0``; otherwise the store never constructs one and each grouped
     method commits inline (byte-identical to the pre-feature path)."""
@@ -633,7 +634,15 @@ class _GroupCommitter:
         self._closed = True
         self._wake.set()
         if self._task is not None:
-            await self._task
+            task = self._task
+            try:
+                await task
+            except asyncio.CancelledError:
+                # A committer cancelled earlier has already rejected its members (see _run); that
+                # stale cancel must not abort the store's close. Our OWN cancellation still propagates.
+                current = asyncio.current_task()
+                if not task.cancelled() or (current is not None and current.cancelling()):
+                    raise
             self._task = None
 
     async def submit(
@@ -659,6 +668,20 @@ class _GroupCommitter:
         return await fut
 
     async def _run(self) -> None:
+        try:
+            await self._drain_loop()
+        finally:
+            # However the committer exits -- a cancel while parked on _wake, or a BaseException from
+            # _flush, which rejects only the batch it claimed -- no later submit() may enrol, and every
+            # member still pending must be rejected, or its caller (the ACK gate among them) parks
+            # forever. On the clean aclose() exit _pending is already empty.
+            self._closed = True
+            stranded, self._pending = self._pending, []
+            for member in stranded:
+                if not member.future.done():
+                    member.future.set_exception(RuntimeError("group committer stopped"))
+
+    async def _drain_loop(self) -> None:
         while True:
             await self._wake.wait()
             self._wake.clear()
