@@ -203,10 +203,11 @@ class SegmentGroup:
 
     def _delete_rows(self, rows: range) -> int:
         """Delete ``rows``, back-to-front, through the parent's positional delete, and return how
-        many. Every row is checked first, so a refused one, such as the leading header a
-        ``groups("BHS")`` group opens with, leaves the message unchanged (BACKLOG #5972)."""
-        for row in rows:
-            refusal = self._m._positional_delete_refusal(row)
+        many. The span keeps every row but the lowest in range, so that one is checked first: a
+        refused one, such as the leading header a ``groups("BHS")`` group opens with, leaves the
+        message unchanged (BACKLOG #5972)."""
+        if rows:
+            refusal = self._m._positional_delete_refusal(rows[-1])
             if refusal is not None:
                 raise refusal
         for row in rows:

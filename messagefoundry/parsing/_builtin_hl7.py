@@ -207,6 +207,17 @@ def _parse_msh(msh_line: str, seps: tuple[str, str, str, str, str]) -> Segment:
 _SHORT_HEADER = "message header is too short to read its encoding characters"
 
 
+def header_line_head(segment: Segment) -> str:
+    """A parsed MSH, BHS or FHS segment's id, field separator and encoding characters, closed by
+    the field separator: the head of the line :func:`_extract_separators` and
+    :func:`filled_default_collides` read, rebuilt from the parsed fields 1 and 2 rather than
+    sliced from raw text."""
+    fields = segment["fields"]
+    field_sep = _field_text(fields[1])
+    encoding = _field_text(fields[2]) if len(fields) > 2 else ""
+    return segment["id"] + field_sep + encoding + field_sep
+
+
 def filled_default_collides(line: str) -> bool:
     """Whether :func:`_extract_separators` fills a separator ``line`` does not declare with a
     default that is already one of its other separators, as ``MSH^^...`` (``^`` is the field

@@ -800,11 +800,8 @@ class Message:
         """Whether the first line fills a delimiter it does not declare with a default that is
         already another of its delimiters (:func:`~messagefoundry.parsing._builtin_hl7.filled_default_collides`),
         read from the header's parsed fields 1 and 2, never from a slice of the raw text."""
-        first = self._m["segments"][0]["fields"]
-        field_sep = _builtin_hl7._field_text(first[1])
-        encoding = _builtin_hl7._field_text(first[2]) if len(first) > 2 else ""
         return _builtin_hl7.filled_default_collides(
-            _builtin_hl7._field_text(first[0]) + field_sep + encoding + field_sep
+            _builtin_hl7.header_line_head(self._m["segments"][0])
         )
 
     @staticmethod

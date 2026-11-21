@@ -39,10 +39,10 @@ from messagefoundry.parsing._builtin_hl7 import (
     _SEPARATOR_HEAD,
     HEADER_IDS,
     _extract_separators,
-    _field_text,
     _whitespace_end,
     escape_leaf,
     escape_leaf_alters,
+    header_line_head,
 )
 
 if TYPE_CHECKING:
@@ -485,7 +485,10 @@ def _header_names_marker_char(text: str, start: int) -> bool:
     separator or the escape character, read as the parser reads them (its defaults fill a short
     MSH-2, which only opens the gate wider). The read stops at the end of that line, as the
     parser's does, so no separator is taken from the next line."""
-    line = _LINE_END.split(text[start : start + _SEPARATOR_HEAD], maxsplit=1)[0]
+    line = text[start : start + _SEPARATOR_HEAD]
+    end = _LINE_END.search(line)
+    if end is not None:
+        line = line[: end.start()]
     if len(line) < 4:
         return False
     return not _DOC_REF_MARKER_CHARS.isdisjoint(_extract_separators(line))
@@ -867,29 +870,20 @@ def _copy_names_address(text: str, marker: str) -> bool:
     return False
 
 
-def _later_header_escapes_marker(
-    message: Message, text: str, separators: tuple[str, str, str, str, str]
-) -> bool:
+def _later_header_escapes_marker(message: Message, text: str) -> bool:
     """Whether a header line after the first names delimiters, in its own fields 1 and 2, under
     which the handle marker is escaped differently, and ``text`` holds it so escaped. The
     message reads every line under the first line's delimiters (BACKLOG #5972), so a handle a
     Handler wrote under an inner MSH's own, then wrapped in an envelope of others, would not be
     read as one and would reach the wire unresolved. Reads the parsed fields only, never a
     slice of the raw text."""
-    field, comp, rep, esc, sub = separators
-    escaped_here = escape_leaf(DOC_REF_MARKER, (field, comp, rep, sub, esc))
+    escaped_here = escape_leaf(DOC_REF_MARKER, message._m["seps"])
     # One pass over the parsed segments: a header line is split eagerly, so its fields 1 and 2
     # are read in place, with no per-header occurrence scan.
     for segment in message._m["segments"][1:]:
-        seg_id = segment["id"]
-        if seg_id not in HEADER_IDS:
+        if segment["id"] not in HEADER_IDS:
             continue
-        fields = segment["fields"]
-        encoding = _field_text(fields[2]) if len(fields) > 2 else ""
-        field_sep = _field_text(fields[1])
-        escaped = escape_leaf(
-            DOC_REF_MARKER, _extract_separators(seg_id + field_sep + encoding + field_sep)
-        )
+        escaped = escape_leaf(DOC_REF_MARKER, _extract_separators(header_line_head(segment)))
         if escaped not in (DOC_REF_MARKER, escaped_here) and escaped in text:
             return True
     return False
@@ -1008,7 +1002,7 @@ async def reattach_documents_in_hl7(
         if found and message._delimiters_collide():
             # Message refuses every write to such a payload, the splice included (BACKLOG #5972).
             raise UnreattachableDocumentError(_COLLIDING_HANDLE)
-        if _later_header_escapes_marker(message, text, separators):
+        if _later_header_escapes_marker(message, text):
             raise UnreattachableDocumentError(_MIXED_HEADER_HANDLE)
         markers = _marker_forms(separators)
         # Under the same delimiters a copied content address is escaped too, so the address after
