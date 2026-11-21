@@ -122,6 +122,52 @@ def test_graph_references_env_false_for_zero_env_graph(tmp_path: Path) -> None:
     assert referenced_env_keys_in_graph(reg) == []
 
 
+# An env() reference on a deployed=False outbound only (BACKLOG #5775): never built, never resolved.
+_OFF_ENV_GRAPH = """
+    from messagefoundry import inbound, outbound, MLLP, router, handler, Send, env
+
+    inbound("IB_T", MLLP(port=2599), router="r")
+    outbound("OB_T", MLLP(host="10.0.0.1", port=6000))
+    outbound("OB_OFF", MLLP(host=env("peer_host"), port=6001), deployed=False)
+
+    @router(name="r")
+    def r(msg):
+        return ["h"]
+
+    @handler(name="h")
+    def h(msg):
+        return [Send("OB_T", msg.raw)]
+"""
+
+
+def test_graph_references_env_skips_a_not_deployed_connection(tmp_path: Path) -> None:
+    reg = load_config(_config_dir(tmp_path, _OFF_ENV_GRAPH))
+    assert reg.outbound["OB_OFF"].deployed is False, "control: the env() is on a switched-off hop"
+    assert graph_references_env(reg) is False
+    assert referenced_env_keys_in_graph(reg) == []
+
+
+def test_explicit_root_env_only_on_not_deployed_connection_does_not_fail(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # BACKLOG #5775: before, the switched-off OB_OFF's env() alone failed this with exit 2.
+    cfg = _config_dir(tmp_path, _OFF_ENV_GRAPH)
+    rc = main(
+        [
+            "validate",
+            "--project-root",
+            str(tmp_path),
+            "--config",
+            str(cfg),
+            "--env",
+            "prod",
+            "--json",
+        ]
+    )
+    assert rc == 0
+    assert capsys.readouterr().out.strip() == "[]"
+
+
 # --- AC-3: scoped fail-loud through the offline `validate` subcommand ----------------------------
 
 
@@ -1133,3 +1179,208 @@ def test_verify_checks_the_anchored_store(away_from_root: tuple[Path, Path]) -> 
     assert error is None and settings is not None
     assert settings.store.path == str(root / "mf.db")
     assert _writable_dir(settings) == root.resolve()
+
+
+# --- BACKLOG #5775: a reload that turns on an env()-bearing connection meets the AC-3 check ----------
+
+
+def _flip_config(cfg: Path, inbox: Path, outdir: Path, *, deployed: bool) -> None:
+    """A File graph whose second outbound reads its file name from env() with a default, so a
+    missing value file would not stop its build: only the AC-3 check can refuse it. The name is
+    not a directory setting, so the archive sweep's guard never resolves it."""
+    cfg.mkdir(parents=True, exist_ok=True)
+    inbox.mkdir(parents=True, exist_ok=True)
+    outdir.mkdir(parents=True, exist_ok=True)
+    (cfg / "cfg.py").write_text(
+        "from messagefoundry import inbound, outbound, router, handler, Send, File, env\n"
+        f"inbound('IB_T_ADT', File(directory={str(inbox)!r}, pattern='*.hl7', "
+        "poll_seconds=1.0), router='r')\n"
+        f"outbound('OB_T_ADT', File(directory={str(outdir)!r}))\n"
+        f"outbound('OB_OFF', File(directory={str(outdir)!r}, "
+        "filename=env('off_name', default='{MSH-10}.hl7')), "
+        f"deployed={deployed!r})\n"
+        "@router('r')\n"
+        "def route(msg):\n"
+        "    return ['h']\n"
+        "@handler('h')\n"
+        "def handle(msg):\n"
+        "    return Send('OB_T_ADT', msg)\n",
+        encoding="utf-8",
+    )
+
+
+def _managed_app(tmp_path: Path, cfg: Path, *, base_dir: str) -> Any:
+    from messagefoundry.__main__ import _environment_values_reader
+    from messagefoundry.api import create_managed_app
+    from messagefoundry.config.settings import (
+        EgressSettings,
+        EnvironmentsSettings,
+        ServiceSettings,
+    )
+
+    return create_managed_app(
+        db_path=tmp_path / "flip.db",
+        config_dir=cfg,
+        poll_interval=0.05,
+        allow_no_auth=True,
+        egress_settings=EgressSettings(deny_by_default=False),
+        env_values_provider=_environment_values_reader(
+            base_dir=tmp_path, dir_name="environments", environment="dev"
+        ),
+        static_credential_settings=ServiceSettings(
+            environments=EnvironmentsSettings(base_dir=base_dir)
+        ),
+    )
+
+
+async def _start_then_flip(tmp_path: Path, *, base_dir: str, dry_run: bool = False) -> object:
+    """Start a managed app on the switched-off graph, turn OB_OFF on and reload. Returns the
+    reload's outcome, or the WiringError that refused it."""
+    from messagefoundry.config.wiring import WiringError
+
+    cfg = tmp_path / "cfg"
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    _flip_config(cfg, inbox, outdir, deployed=False)
+    app = _managed_app(tmp_path, cfg, base_dir=base_dir)
+    async with app.router.lifespan_context(app):
+        engine = app.state.engine
+        assert engine.registry_runner is not None, "control: the start passed AC-3"
+        _flip_config(cfg, inbox, outdir, deployed=True)
+        try:
+            return await engine.reload_detail(cfg, dry_run=dry_run)
+        except WiringError as exc:
+            live = engine.registry_runner.registry
+            assert live.outbound["OB_OFF"].deployed is False, "a refusal leaves the old graph"
+            return exc
+
+
+def _assert_applied(result: object) -> None:
+    from messagefoundry.pipeline.engine import ReloadOutcome
+
+    assert isinstance(result, ReloadOutcome), result
+    assert result.applied and not result.failed_steps
+    assert result.registry.outbound["OB_OFF"].deployed is True
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+async def test_reload_turning_on_an_env_connection_without_value_file_is_refused(
+    tmp_path: Path, dry_run: bool
+) -> None:
+    """The bypass engine PR 3107 reverted its change over: a start that skipped the switched-off
+    connection's env(), then a reload that turns it on. The reload, and its dry run, now meet the
+    AC-3 check."""
+    from messagefoundry.config.wiring import WiringError
+
+    result = await _start_then_flip(tmp_path, base_dir=str(tmp_path), dry_run=dry_run)
+    assert isinstance(result, WiringError)
+    assert "references env()" in str(result)
+    assert "dev.toml" in str(result)
+
+
+async def test_reload_turning_on_an_env_connection_with_value_file_applies(tmp_path: Path) -> None:
+    envdir = tmp_path / "environments"
+    envdir.mkdir()
+    (envdir / "dev.toml").write_text('off_name = "x.hl7"\n', encoding="utf-8")
+    _assert_applied(await _start_then_flip(tmp_path, base_dir=str(tmp_path)))
+
+
+async def test_reload_turning_on_an_env_connection_without_root_applies(tmp_path: Path) -> None:
+    # No explicit root: the silent-empty contract stands, and env(default=...) supplies the value.
+    _assert_applied(await _start_then_flip(tmp_path, base_dir=""))
+
+
+async def test_managed_start_with_a_deployed_env_connection_and_no_value_file_is_refused(
+    tmp_path: Path,
+) -> None:
+    """The guard runs at the first load too, so an embedded managed app meets AC-3 as serve does."""
+    from messagefoundry.config.wiring import WiringError
+
+    cfg = tmp_path / "cfg"
+    _flip_config(cfg, tmp_path / "in", tmp_path / "out", deployed=True)
+    app = _managed_app(tmp_path, cfg, base_dir=str(tmp_path))
+    with pytest.raises(WiringError, match=r"references env\(\)"):
+        async with app.router.lifespan_context(app):
+            pass
+
+
+def test_a_not_deployed_connections_directory_env_still_counts(tmp_path: Path) -> None:
+    """The archive sweep's guard resolves a directory on every outbound, deployed or not, and
+    deletes nothing when it cannot, so a switched-off connection's directory env() still needs
+    the value file."""
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    out = tmp_path / "out"
+    (cfg / "cfg.py").write_text(
+        "from messagefoundry import inbound, outbound, router, handler, Send, File, env\n"
+        f"inbound('IB_T', File(directory={str(tmp_path / 'in')!r}), router='r')\n"
+        f"outbound('OB_T', File(directory={str(out)!r}))\n"
+        "outbound('OB_OFF', File(directory=env('off_dir')), deployed=False)\n"
+        "@router('r')\n"
+        "def route(msg):\n"
+        "    return ['h']\n"
+        "@handler('h')\n"
+        "def handle(msg):\n"
+        "    return Send('OB_T', msg)\n",
+        encoding="utf-8",
+    )
+    reg = load_config(cfg)
+    assert graph_references_env(reg) is True
+    assert referenced_env_keys_in_graph(reg) == ["off_dir"]
+
+
+def test_value_file_guard_is_off_without_a_root_or_value_file(tmp_path: Path) -> None:
+    from messagefoundry.__main__ import _environment_values_reader
+    from messagefoundry.config.anchor import explicit_root_value_file_guard
+    from messagefoundry.config.environments import SnapshotEnvValuesProvider
+    from messagefoundry.config.settings import EnvironmentsSettings, ServiceSettings
+
+    class _NoFile(SnapshotEnvValuesProvider):
+        def __call__(self) -> dict[str, Any]:
+            return {}
+
+        def from_snapshot(self, snapshot: Any) -> None:
+            return None
+
+    provider = _environment_values_reader(
+        base_dir=tmp_path, dir_name="environments", environment="dev"
+    )
+    rooted = ServiceSettings(environments=EnvironmentsSettings(base_dir=str(tmp_path)))
+    assert explicit_root_value_file_guard(None, provider) is None
+    assert explicit_root_value_file_guard(ServiceSettings(), provider) is None
+    assert explicit_root_value_file_guard(rooted, None) is None
+    assert explicit_root_value_file_guard(rooted, lambda: {}) is None
+    assert explicit_root_value_file_guard(rooted, _NoFile()) is None
+    assert explicit_root_value_file_guard(rooted, provider) is not None
+
+
+def test_value_file_guard_reads_disk_where_the_snapshot_left_the_file_out(tmp_path: Path) -> None:
+    """A start whose snapshot could not read the value file keeps the values read when the engine
+    was built, so the guard asks the disk rather than refusing a file that is there."""
+    from messagefoundry.__main__ import _environment_values_reader
+    from messagefoundry.config.anchor import explicit_root_value_file_guard
+    from messagefoundry.config.settings import EnvironmentsSettings, ServiceSettings
+    from messagefoundry.config.snapshot import ConfigSnapshot
+    from messagefoundry.config.wiring import WiringError
+
+    cfg = _config_dir(tmp_path, _ENV_GRAPH, name="cfg")
+    (cfg / "environments").mkdir()
+    value_file = cfg / "environments" / "dev.toml"
+    value_file.write_text('peer_host = "h"\n', encoding="utf-8")
+    reg = load_config(cfg)
+    snap = reg.config_snapshot
+    assert snap is not None
+    reg.config_snapshot = ConfigSnapshot(
+        directory=snap.directory,
+        files={k: v for k, v in snap.files.items() if k != "environments/dev.toml"},
+        unreadable=(*snap.unreadable, "environments/dev.toml"),
+    )
+    provider = _environment_values_reader(base_dir=cfg, dir_name="environments", environment="dev")
+    guard = explicit_root_value_file_guard(
+        ServiceSettings(environments=EnvironmentsSettings(base_dir=str(cfg))), provider
+    )
+    assert guard is not None
+    assert reg.config_snapshot.left_out_environment_file(value_file), "control: left out"
+    guard(reg)  # the file is there: no refusal
+    value_file.unlink()
+    with pytest.raises(WiringError, match="no value file was found"):
+        guard(reg)
