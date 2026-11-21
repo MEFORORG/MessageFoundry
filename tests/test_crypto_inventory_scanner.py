@@ -1323,6 +1323,17 @@ def test_the_plant_is_invisible_to_the_pre_2020_scanner(
     del patterns["suite"], patterns["cipher_string"], patterns["minDHSize"]
     patterns["ciphers"] = (re.compile(gate._B + r"ciphers\s*:" + gate._LIT), "tls_context")
     monkeypatch.setattr(gate, "NON_PYTHON_OPERATION_PATTERNS", patterns)
+    # The reconstruction has no ``suite`` pattern, so the lexer-verdict control's planted suite
+    # sources (BACKLOG #5578) are not part of it either.
+    monkeypatch.setattr(
+        gate,
+        "_VERDICT_SELF_TEST_OPERATIONS",
+        {
+            src: views
+            for src, views in gate._VERDICT_SELF_TEST_OPERATIONS.items()
+            if not any(t.startswith("tls_context:suite[") for t in views[0])
+        },
+    )
     rel = "ide/src/engineClient.ts"
     old_row = frozenset({"tls_context:minVersion", "tls_context:ciphers"})
     monkeypatch.setattr(gate, "NON_PYTHON_OPERATION_INVENTORY", {rel: old_row})
@@ -1950,6 +1961,199 @@ def test_the_lexer_verdict_positive_control_reds_when_the_verdict_is_dead(
     assert gate.lexer_verdict_self_test("operations")
     violations, _ = gate.check_non_python_randomness(_ROOT)
     assert any("lexer verdict POSITIVE CONTROL" in v for v in violations), violations
+
+
+@pytest.mark.parametrize(
+    ("text", "confirmed"),
+    [
+        pytest.param(
+            "const z = x! / y; const help = `\n * createHash('md5')\n`;\n",
+            False,
+            id="division-misread-as-an-unclosed-regex",
+        ),
+        pytest.param(
+            "const r = /[`]/;\nconst d = x\n  * createHash('md5')\n",
+            True,
+            id="control-closed-regex-keeps-its-backtick",
+        ),
+        pytest.param(
+            "const s = 'a`b';\nconst d = x\n  * createHash('md5')\n",
+            True,
+            id="control-closed-quote-keeps-its-backtick",
+        ),
+    ],
+)
+def test_a_literal_misread_does_not_swallow_a_templates_opening_backtick(
+    text: str, confirmed: bool
+) -> None:
+    # BACKLOG #5578 item 2: a division misread as a regex that swallowed a template's opening
+    # backtick made the template's later lines read as code, so a prose mention there was confirmed
+    # and kept a stale row green. On origin/main the misread case confirmed the token. The quote
+    # misread is not fixed (THE RESIDUAL lists it): reading an unclosed quote as one character let a
+    # JSX-style apostrophe open a template that ran to the next backtick in the file.
+    found, verified = _gate().non_python_operation_token_views(text)
+    token = "hash:createHash[md5]"
+    assert token in found
+    assert (token in verified) is confirmed, (found, verified)
+
+
+def test_a_template_in_a_hole_closes_where_it_should() -> None:
+    # ``${}`` holes are scanned as code, so a backtick inside a hole's quote, or a template nested
+    # in a hole, no longer flips the outer template's parity. On origin/main the first text's later
+    # comment survived blanking only by a second, cancelling misread; the first cut of item 2's fix
+    # turned that into a template running to the next backtick in the file.
+    from scripts.security import js_lexer
+
+    text = (
+        "const t = `${a ? '`' : ''}`;\nconst real = 1;\n// note createHash('sha1')\nconst u = 2;\n"
+    )
+    blanked, verdicts = js_lexer.classify_js(text)
+    assert "createHash" not in blanked
+    assert verdicts.split("\n")[1] == js_lexer.CODE * len("const real = 1;")
+    nested = "x = `<a>${items.map((i) => `<b>${i}</b>`).join('')}</a>`;\n * createHash('md5')\n"
+    found, verified = _gate().non_python_operation_token_views(nested)
+    assert "hash:createHash[md5]" in verified, (found, verified)
+    _, verdicts = js_lexer.classify_js(nested)
+    assert verdicts[nested.index("items")] == js_lexer.CODE
+    assert verdicts[nested.index("<b>")] == js_lexer.LITERAL
+
+
+def test_a_pep562_getattr_import_is_a_module_export_for_the_scope_aware_reading() -> None:
+    # BACKLOG #5578 item 3: a package __init__ that serves an attribute through a PEP 562
+    # ``__getattr__`` binds it by a function-local import. The scope-aware exports dropped it, so a
+    # genuine provider call through the package was marked "(out of scope)" on origin/main.
+    gate = _gate()
+    ops = gate.crypto_operations
+    sources = {
+        "messagefoundry/sec/__init__.py": (
+            "def __getattr__(name):\n    from messagefoundry.sec.impl import seal\n    return seal\n"
+        ),
+        "messagefoundry/sec/impl.py": "import hashlib\n\n\ndef seal(b):\n    return hashlib.sha256(b)\n",
+        "messagefoundry/caller.py": (
+            "from messagefoundry import sec\n\n\ndef f(b):\n    return sec.seal(b)\n"
+        ),
+    }
+    modules = ops.parse_sources(sources)
+    found = ops.aggregate(ops.discover_operations_in_modules(modules))
+    assert found["messagefoundry/caller.py"] == frozenset({"hash:via messagefoundry.sec.impl"})
+    assert gate.judge_operations(modules, found) == found
+    # Controls: an import the hook only uses itself, called or passed inside what it returns, is
+    # not a value it serves, so not an export.
+    # An import served only under ANOTHER attribute name: ``pkg.seal`` raises at runtime, so it
+    # stays out of scope, as on origin/main. Without the guard, or with one admitting "seal", it is
+    # served as ``pkg.seal``.
+    guarded = (
+        "    if name == 'legacy':\n        return seal\n    raise AttributeError(name)\n",
+        "    if name in ('legacy', 'old'):\n        return seal\n    raise AttributeError(name)\n",
+        "    if name in __all__:\n        return seal\n    raise AttributeError(name)\n",
+    )
+    for body in guarded:
+        served = dict(sources)
+        served["messagefoundry/sec/__init__.py"] = (
+            "def __getattr__(name):\n    from messagefoundry.sec.impl import seal\n" + body
+        )
+        modules = ops.parse_sources(served)
+        found = ops.aggregate(ops.discover_operations_in_modules(modules))
+        assert gate.judge_operations(modules, found)["messagefoundry/caller.py"] == frozenset(
+            {"hash:via messagefoundry.sec.impl" + gate.OUT_OF_SCOPE}
+        ), body
+    admits = dict(sources)
+    admits["messagefoundry/sec/__init__.py"] = (
+        "def __getattr__(name):\n    from messagefoundry.sec.impl import seal\n"
+        "    if name == 'seal':\n        return seal\n    raise AttributeError(name)\n"
+    )
+    modules = ops.parse_sources(admits)
+    found = ops.aggregate(ops.discover_operations_in_modules(modules))
+    assert gate.judge_operations(modules, found) == found
+    for body in ("    seal(b'')\n    raise AttributeError(name)\n", "    return str(seal)\n"):
+        helper = dict(sources)
+        helper["messagefoundry/sec/__init__.py"] = (
+            "def __getattr__(name):\n    from messagefoundry.sec.impl import seal\n" + body
+        )
+        modules = ops.parse_sources(helper)
+        found = ops.aggregate(ops.discover_operations_in_modules(modules))
+        assert gate.judge_operations(modules, found)["messagefoundry/caller.py"] == frozenset(
+            {"hash:via messagefoundry.sec.impl" + gate.OUT_OF_SCOPE}
+        ), body
+    # Control: the same import in any other function is still local to it, and not exported.
+    other = dict(sources)
+    other["messagefoundry/sec/__init__.py"] = other["messagefoundry/sec/__init__.py"].replace(
+        "__getattr__", "loader"
+    )
+    modules = ops.parse_sources(other)
+    found = ops.aggregate(ops.discover_operations_in_modules(modules))
+    assert gate.judge_operations(modules, found)["messagefoundry/caller.py"] == frozenset(
+        {"hash:via messagefoundry.sec.impl" + gate.OUT_OF_SCOPE}
+    )
+
+
+def test_a_weak_draw_the_lexer_reads_as_text_still_fails_and_says_how_to_clear_it(
+    tmp_path: Path,
+) -> None:
+    # BACKLOG #5578 item 6: the weak check read the unjudged set, so a mention the lexer reads as
+    # template text failed with a remedy (node:crypto) that does not apply. It still fails, since a
+    # misread could hide a real draw, but is judged and names the remedy that does: reword it.
+    gate = _gate()
+    repo = _ts_repo(
+        tmp_path,
+        {"ide/src/planted.ts": "export const help = `\n * never call Math.random()\n`;\n"},
+        with_anchor=False,
+    )
+    violations, _ = gate.check_non_python_randomness(repo)
+    weak = [v for v in violations if "WEAK randomness source" in v]
+    assert len(weak) == 1, violations
+    assert "Math.random (not code)" in weak[0] and "reword it" in weak[0], weak[0]
+    # Control: a real draw is unmarked and carries no reword advice.
+    repo = _ts_repo(tmp_path / "b", {"ide/src/planted.ts": "const n = Math.random();\n"})
+    weak = [v for v in gate.check_non_python_randomness(repo)[0] if "WEAK" in v]
+    assert len(weak) == 1 and "(not code)" not in weak[0] and "reword" not in weak[0], weak
+
+
+def test_a_patched_weak_pattern_table_reaches_the_randomness_arm(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5578 item 6: the tables were merged once at import, so patching either one no longer
+    # reached the arm.
+    gate = _gate()
+    monkeypatch.setattr(
+        gate, "WEAK_RANDOMNESS_PATTERNS", {"planted": re.compile(r"\bplantedDraw\(")}
+    )
+    assert gate.randomness_token_views("const n = plantedDraw();\n") == ({"planted"}, {"planted"})
+
+
+def test_the_lexer_verdict_positive_control_covers_the_in_literal_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5578 item 7: the planted sources did not exercise the suite/cipher-string path, so a
+    # dead ``in_literal`` passed the control. Either way of breaking it now reds it.
+    gate = _gate()
+    assert gate.lexer_verdict_self_test("operations") == []
+    monkeypatch.setattr(gate, "_LITERAL_PATTERNS", frozenset())
+    assert gate.lexer_verdict_self_test("operations")
+    monkeypatch.undo()
+    real = gate._matches
+
+    def accepts_continued(*args: object, in_literal: bool = False) -> object:
+        line, verdicts = args[1], args[2]
+        if in_literal and isinstance(verdicts, str) and isinstance(line, str):
+            verdicts = verdicts.replace(gate.js_lexer.CONTINUED, gate.js_lexer.LITERAL)
+        return real(args[0], line, verdicts, in_literal=in_literal)
+
+    monkeypatch.setattr(gate, "_matches", accepts_continued)
+    assert gate.lexer_verdict_self_test("operations")
+
+
+def test_blank_js_comments_is_classify_js_without_the_verdicts() -> None:
+    # BACKLOG #5578 item 8: blank_js_comments no longer builds the verdicts it discards; its text
+    # must stay exactly classify_js's.
+    from scripts.security import js_lexer
+
+    for text in (
+        "a = 'q' /* c */ + `t\n*` // d\n",
+        "const z = x! / y; const t = `\n// in\n`;\n",
+        "r = /[/`]/; // c\n",
+    ):
+        assert js_lexer.blank_js_comments(text) == js_lexer.classify_js(text)[0]
 
 
 def test_the_positive_control_reds_when_the_scope_aware_reading_marks_a_genuine_call(

@@ -62,12 +62,18 @@ seen:
   a line, and a misread lexer blanks it. At least these misread a literal: regex-versus-division
   decided from the previous token only (a TypeScript ``x! / y``, a ``)`` before a regex), a quoted
   string ended at a newline, and a U+2028 or U+2029 inside a string, which is folded to a newline;
-* for the TypeScript/JavaScript arms' per-token verdict (BACKLOG #5578): the lexer does not model a
-  template literal's ``${}`` holes. A template nested inside a hole flips its string parity, so
-  template text after it can read as code, and a mention there is confirmed as if it were a call.
-  Code inside a hole reads as template text, so a real call in a hole that the per-line view does
-  not also see is marked ``(not code)``, and so is a real call the per-line view skips inside any
-  region the lexer misreads as a literal (the misreads listed above). The per-line view's own false
+* for the TypeScript/JavaScript arms' per-token verdict (BACKLOG #5578): a lexer misread that
+  flips a template's parity makes template text after it read as code, and a mention there is
+  confirmed as if it were a call. ``${}`` holes are modelled, so a template nested in a hole no
+  longer does this, but a ``{`` or ``}`` the lexer misplaces in a hole (one inside a misread literal)
+  can still close the hole at the wrong brace. A literal misread that swallows a backtick does the
+  same, at least: a division read as a regex that a later ``/`` on the line closes, and a quote
+  misread from an apostrophe (one ending at the newline, or one another quote closes). An unclosed
+  regex read is read as a division instead, so the backtick opens its template (``js_lexer.py``);
+  that is the wrong reading at least when the backtick closes a template the lexer already
+  misread as code.
+  A real call the per-line view skips inside any region the lexer misreads as a literal (the
+  misreads listed above) is marked ``(not code)``. The per-line view's own false
   positives (at least a trailing comment or a mention inside a quoted string) are confirmed as
   before #5578.
   A cipher-string word's mark follows the file's admission rule, not the word's own position, so
@@ -75,7 +81,11 @@ seen:
 * for the scope-aware Python reading (BACKLOG #5578), at least: a PEP 695 type-parameter scope
   (names in it resolve to nothing), a walrus in a comprehension, and a ``match`` capture are not
   modelled as bindings. A call only the scope-aware reading gives is not reported, because the
-  gate reports the union reading's tokens and only judges them;
+  gate reports the union reading's tokens and only judges them. A PEP 562 ``__getattr__`` export is
+  followed only for an import it returns as it is under its own name (:func:`scoped_bindings`),
+  so one returned through a variable, or under a name test the hook reads that admits no literal
+  of that name, is marked out of scope, and one served as ``getattr(module, name)`` or
+  through ``importlib`` is not seen by either reading;
 * A union token is confirmed by its callee before ``[`` file-wide, so an out-of-scope label
   variant of a callee confirmed in scope elsewhere in the same file stays confirmed; per-site
   judgment would close it.
@@ -469,8 +479,13 @@ def scoped_bindings(
 
     Returns ``(names, module_reach, module_aliases)``: ``id(Name node) -> the import targets that
     reach it``; the ids of the names whose lookup reaches module scope, where a module-level ``def``
-    can answer too; and the module-scope import bindings alone, which are what another module
-    reaches through this one.
+    can answer too; and the import bindings another module reaches through this one: the
+    module-scope ones, plus those made inside a module-level ``def __getattr__`` that a ``return``
+    there hands back as it is under its own attribute name (``return seal``, :func:`_returned_names`),
+    because PEP 562 serves an attribute of the module through it. An import the hook only uses itself is not exported, and inside the module all of
+    them stay local to it. The forms that serve an attribute of an imported module
+    (``return getattr(app, name)``, as ``api/__init__.py`` does) or go through ``importlib`` (as
+    ``messagefoundry/__init__.py`` does) are not followed; THE RESIDUAL lists them.
 
     Python's own rule, for imports: an import binds its name in the scope it runs in, so a
     function-local ``from x import y as hashlib`` makes ``hashlib`` local to that whole function.
@@ -485,6 +500,8 @@ def scoped_bindings(
     The walk keeps its own stack rather than recursing, so a deeply nested expression (a long
     ``+`` chain) cannot exhaust the interpreter's recursion limit and crash the gate."""
     module = _Scope("module", None)
+    #: Each module-level ``def __getattr__`` (PEP 562): its scope, and the names its returns read.
+    lazy: list[tuple[_Scope, set[str]]] = []
     pending: list[tuple[_Scope, str, str]] = []
     names: list[tuple[ast.Name, _Scope]] = []
     stack: list[tuple[ast.AST, _Scope]] = [(top, module) for top in reversed(tree.body)]
@@ -502,6 +519,12 @@ def scoped_bindings(
             every += [a for a in (args.vararg, args.kwarg) if a]
             inner = _Scope("function", scope)
             inner.binds.update(a.arg for a in every)
+            if (
+                scope is module
+                and isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "__getattr__"
+            ):
+                lazy.append((inner, _returned_names(node)))
             if isinstance(node, ast.Lambda):
                 body: list[ast.AST] = [node.body]
             else:
@@ -582,7 +605,69 @@ def scoped_bindings(
             if hit or at is module:
                 break
             at = at.parent
-    return resolved, module_reach, {k: list(v) for k, v in module.imports.items()}
+    exported = {k: list(v) for k, v in module.imports.items()}
+    for scope, returned in lazy:
+        for local, targets in scope.imports.items():
+            if local not in returned:
+                continue  # a helper the hook uses itself, never a value it serves
+            for target in targets:
+                _bind(exported, local, target)
+    return resolved, module_reach, exported
+
+
+def _returned_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """The names a ``return`` in ``fn``'s own body hands back as they are (``return seal``) under
+    an attribute name equal to their own, nested functions and classes left out: the values a
+    PEP 562 ``__getattr__`` serves as ``pkg.<name>``. A name only used inside a returned expression
+    (``return wrap(seal)``) is not one. A ``return`` under an ``if`` that tests the hook's
+    parameter counts only when that test admits the name as a string literal (``name == "seal"``,
+    ``name in ("seal", ...)``); a test it cannot read admits none, so ``if name == "legacy":
+    return seal`` exports nothing, as before the hook was followed."""
+    param = (fn.args.posonlyargs + fn.args.args)[:1]
+    pname = param[0].arg if param else None
+    out: set[str] = set()
+    stack: list[tuple[ast.AST, frozenset[str] | None]] = [(n, None) for n in fn.body]
+    while stack:
+        node, allowed = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            continue
+        if isinstance(node, ast.Return):
+            if isinstance(node.value, ast.Name) and (allowed is None or node.value.id in allowed):
+                out.add(node.value.id)
+            continue
+        if isinstance(node, ast.If) and pname is not None and _reads_name(node.test, pname):
+            admitted = _admitted(node.test, pname)
+            inner = admitted if allowed is None else admitted & allowed
+            stack.extend((n, inner) for n in node.body)
+            stack.extend((n, allowed) for n in node.orelse)
+            continue
+        stack.extend((child, allowed) for child in ast.iter_child_nodes(node))
+    return out
+
+
+def _reads_name(test: ast.expr, pname: str) -> bool:
+    return any(isinstance(n, ast.Name) and n.id == pname for n in ast.walk(test))
+
+
+def _admitted(test: ast.expr, pname: str) -> frozenset[str]:
+    """The string literals ``test`` admits the parameter as: ``name == "x"`` and
+    ``name in ("x", "y")``. Anything else admits none."""
+    if (
+        isinstance(test, ast.Compare)
+        and len(test.ops) == 1
+        and isinstance(test.left, ast.Name)
+        and test.left.id == pname
+    ):
+        right, op = test.comparators[0], test.ops[0]
+        if isinstance(op, ast.Eq) and isinstance(right, ast.Constant):
+            return frozenset({right.value}) if isinstance(right.value, str) else frozenset()
+        if isinstance(op, ast.In) and isinstance(right, (ast.Tuple, ast.List, ast.Set)):
+            return frozenset(
+                e.value
+                for e in right.elts
+                if isinstance(e, ast.Constant) and isinstance(e.value, str)
+            )
+    return frozenset()
 
 
 def dotted(
@@ -646,7 +731,8 @@ class ParsedModule:
     @property
     def exports(self) -> dict[str, list[str]]:
         """The import bindings another module reaches through this one: every one for the union
-        reading, the module-scope ones for the scope-aware reading."""
+        reading, and for the scope-aware reading the ones :func:`scoped_bindings` exports (the
+        module-scope ones, and the imports a PEP 562 ``__getattr__`` returns as they are)."""
         return self.module_aliases if self.scope_aware else self.aliases
 
 
