@@ -14,8 +14,9 @@ import * as path from "node:path";
  * when it runs a module, whatever `-P` says. For a program it adds at most the program's own
  * folder. That folder holds only what {@link writeDebugProgram} puts there: one program per program
  * text, each named `mefor_testbench_debug_<checksum>.py`, so extension versions with different
- * texts never share a file, and `.tmp-` folders, one per write, which a failed removal or a killed
- * extension host can leave behind and no import statement can name. Nothing is ever pruned there.
+ * texts share a file only if their checksums collide (see textChecksum). It also holds `.tmp-`
+ * folders, one per write, which a failed removal or a killed extension host can leave behind and
+ * no import statement can name. Nothing is ever pruned there.
  * Nothing the launch imports has any of those names. The program runs the installed
  * package through `runpy`, so no debugpy build puts the working directory on the import path. The
  * source is written at launch rather than shipped, because the extension package holds no Python
