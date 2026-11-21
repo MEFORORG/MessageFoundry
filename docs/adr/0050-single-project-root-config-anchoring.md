@@ -479,9 +479,9 @@ those settings, and its Handlers still run with no active environment.
   quote the value it refused and these commands printed no settings failure before this note:
   "could not load the service settings; this command does not print the reason, because the
   error text can quote a configured value". It names no source. A `--service-config` that does
-  not exist is reported instead as `service config not found: <path>`, naming the path the load
-  looked for, which is joined under `--project-root` when it is relative. They report a value
-  file that cannot be read naming that file. They resolve every `env()` reference of each
+  not exist is reported instead as "could not load the service settings: service config not
+  found: <path>", naming the path the load looked for, which is joined under `--project-root`
+  when it is relative. They report a value file that cannot be read naming that file. They resolve every `env()` reference of each
   deployed connection and lookup, and report one that does not resolve by its key, never its
   value.
   `validate` lists each of these failures with its other problems and `dryrun` stops on it, so
@@ -498,7 +498,8 @@ those settings, and its Handlers still run with no active environment.
   - No connector is built, so a refusal only the build check makes, such as an egress or hop
     refusal, is still `check --env`'s, as is the posture check.
   - `dryrun`'s Handlers still run with no active environment.
-  - Settings that do not load print the fixed line above, where `serve` prints the settings error.
+  - Settings that do not load print the fixed line above, where `serve` prints the settings
+    error. A missing `--service-config` is the exception; the note above says what it prints.
 
 **What "matches `serve`" covers.** The settings checks read the environment name `serve --env`
 reads. Value-file location is shared too: the offline `<env>.toml` check under `--project-root` now

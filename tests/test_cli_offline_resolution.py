@@ -650,7 +650,7 @@ def test_offline_env_refuses_a_malformed_service_config(
     assert rc == 1, captured
     assert _SECRET_HOST not in captured.out + captured.err
     # The refusal is the fixed line, which names no source and quotes nothing of the failure.
-    assert any(d["message"] == _FIXED_LINE for d in json.loads(captured.out)), captured
+    _assert_prints_the_fixed_line("validate", captured.out)
 
 
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
@@ -685,8 +685,7 @@ def test_offline_env_reports_a_deeply_nested_settings_file(
     rc = main(["validate", "--config", str(cfg), "--env", "prod", "--json"])
     captured = capsys.readouterr()
     assert rc == 1, captured
-    diags = json.loads(captured.out)
-    assert isinstance(diags, list) and any(d["message"] == _FIXED_LINE for d in diags), diags
+    _assert_prints_the_fixed_line("validate", captured.out)
 
 
 def test_offline_env_check_and_read_name_one_dir_under_a_root(
@@ -814,13 +813,8 @@ def test_offline_env_reports_an_unparseable_root_settings_file(
     rc = main(_offline_argv(command, tmp_path, *argv))
     captured = capsys.readouterr()
     assert "Traceback" not in captured.err
-    if command == "graph":
-        assert rc == 0, captured
-        problems = json.loads(captured.out)["env_problems"]
-        assert _FIXED_LINE in problems, problems
-    else:
-        assert rc == 1, captured
-        assert _FIXED_LINE in captured.out + captured.err, captured
+    assert rc == (0 if command == "graph" else 1), captured
+    _assert_prints_the_fixed_line(command, captured.out)
     assert _SECRET_HOST not in captured.out + captured.err
 
 
@@ -867,6 +861,25 @@ def _shown(text: str, out: str) -> bool:
     return text in out or json.dumps(text)[1:-1] in out
 
 
+def _assert_prints_the_fixed_line(command: str, stdout: str) -> None:
+    """The ``--json`` output of ``command`` carries a settings failure that is exactly
+    :data:`_FIXED_LINE`: ``validate`` as a diagnostic's message, ``graph`` as an
+    ``env_problems`` entry, ``dryrun`` as its ``error``. Only the leading JSON value is read."""
+    doc, _ = json.JSONDecoder().raw_decode(stdout.lstrip())
+    if command == "validate":
+        assert any(d["message"] == _FIXED_LINE for d in doc), doc
+    elif command == "graph":
+        assert _FIXED_LINE in doc["env_problems"], doc["env_problems"]
+    else:
+        assert command == "dryrun" and doc["error"] == _FIXED_LINE, doc
+
+
+def _path_absent(path: Path, out: str) -> bool:
+    """No spelling of ``path`` is in ``out``: as written, as an OSError's repr quotes it, and each
+    of those as JSON escapes it."""
+    return not any(_shown(form, out) for form in (str(path), repr(str(path))))
+
+
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
 @pytest.mark.parametrize("failure", list(_QUOTING_FAILURES), ids=list(_QUOTING_FAILURES))
 def test_offline_env_prints_no_validator_text_for_settings_that_do_not_load(
@@ -892,7 +905,7 @@ def test_offline_env_prints_no_validator_text_for_settings_that_do_not_load(
     assert _URL_PASSWORD in settings_error_detail(caught.value)
     assert _URL_PASSWORD not in out, out
     assert "@host" not in out, out
-    assert _shown(_FIXED_LINE, out), out
+    _assert_prints_the_fixed_line(command, out)
     # The graph and its value file are good, so the exit code is the settings failure's alone.
     assert rc == (0 if command == "graph" else 1), out
 
@@ -940,6 +953,7 @@ def test_offline_env_a_directory_as_the_service_config_prints_the_fixed_line(
     rc = main(_offline_argv(command, tmp_path, *argv))
     captured = capsys.readouterr()
     out = captured.out + captured.err
-    assert _FIXED_LINE in out and "Traceback" not in out, out
-    assert not _shown(str(named), out), out
+    assert "Traceback" not in out, out
+    _assert_prints_the_fixed_line(command, captured.out)
+    assert _path_absent(named, out), out
     assert rc == (0 if command == "graph" else 1), out

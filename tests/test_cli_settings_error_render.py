@@ -41,7 +41,7 @@ from messagefoundry.__main__ import main
 from messagefoundry.config import security_edit
 from messagefoundry.config import settings as settings_module
 from messagefoundry.config.settings import BackupSettings, DrSettings
-from tests.test_cli_offline_resolution import _FIXED_LINE
+from tests.test_cli_offline_resolution import _assert_prints_the_fixed_line
 from tests.test_settings_errors_echo_no_input import _renderings
 
 #: Synthetic, never a real credential, and deliberately low-entropy so the secret scanner does not
@@ -222,7 +222,8 @@ _NO_DETAIL_ARMS = {"validate-env", "graph-env", "dryrun-env"}
 
 def _names_the_reason(arm: str, out: str, message: str) -> bool:
     if arm in _NO_DETAIL_ARMS:
-        return _FIXED_LINE in out and message not in out
+        _assert_prints_the_fixed_line(arm.removesuffix("-env"), out)
+        return message not in out
     return _FIELD in out and message in out
 
 
