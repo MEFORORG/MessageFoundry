@@ -416,8 +416,9 @@ def _ends_blank_class(line: str) -> bool:
 
     * an ordinary line (:func:`_is_ordinary_line`) under a name Windows itself sets, spelled as
       Windows spells it (:data:`_WINDOWS_NAMES`), such as ``Path=C:\\x``;
-    * an ordinary line under ``MEFOR_SECRETS_DIRECTORY`` in upper case, so the directory's entry
-      is still read as set;
+    * an ordinary line under ``MEFOR_SECRETS_DIRECTORY`` in upper case, so an item that sets the
+      directory is still read as setting it (a later line of one string never is, under the
+      line rule :func:`_variables` states);
     * a nameless entry Windows itself sets (:data:`_WINDOWS_NAMELESS`), such as ``=C:=C:\\x``.
 
     No other name ends the value, however conventional: ``HTTP_PROXY=x``, ``TZ=UTC``,
@@ -470,11 +471,9 @@ def _line_start(line: str, *, below_empty_class: bool = False) -> Literal["kept"
     only change the remedy, to removing that line and no longer naming the empty entry. The
     secrets directory's name is no secret, and reading the next line into it would take the
     directory as set."""
-    written, equals, rest = line.partition("=")
+    written, equals, _rest = line.partition("=")
     if not equals:
-        # A secret-class name alone on its line, as ``nssm set ... NAME =value`` writes it, is
-        # that name set to nothing so far (:func:`_blank_class`).
-        return "kept" if _blank_class(written, rest) else None
+        return None
     if _refused_name(written.strip().upper()):
         return "kept"
     ends = _ends_blank_class(line) if below_empty_class else _is_ordinary_line(line)
@@ -485,7 +484,8 @@ def _blank_class(written: str, rest: str) -> bool:
     """Whether a line split at its first equals sign into ``written`` and ``rest`` sets a
     secret-class name (:data:`_REFUSED_CLASS_NAMES`) to nothing but blanks so far, so the line
     below it is read under :func:`_ends_blank_class`. A line with no equals sign is all
-    ``written``, so a secret-class name alone on its line counts as one set to nothing."""
+    ``written``, so a secret-class name alone on its line, as ``nssm set ... NAME =value``
+    writes it, counts as one set to nothing."""
     return written.strip().upper() in _REFUSED_CLASS_NAMES and _still_blank(rest)
 
 
@@ -550,6 +550,16 @@ def _read_string(
     parts = first_parts  # the value the current line belongs to
     for number, line in enumerate(rest_lines, skip + 2):
         start = _line_start(line, below_empty_class=empty_class)
+        if (
+            start is None
+            and (first_sets or starts_seen)
+            and not empty_class
+            and _blank_class(line, "")
+        ):
+            # A secret-class name alone below another variable starts a variable of its own. Not
+            # below an empty secret-class value, which takes it, nor below a first line that
+            # starts none, where the whole-string reading names the variable instead.
+            start = "kept"
         if start is None:
             parts.append(line)
             empty_class = empty_class and _still_blank(line)
@@ -614,7 +624,7 @@ def _continues_string(entry: str, *, below_empty_class: bool = False) -> bool:
 
     Below an empty secret-class value, a first line continues the value unless
     :func:`_ends_blank_class` says it ends it, the same rule a later line of one string is read
-    under, so the two readings of one shape agree.
+    under, so the two readings of one shape agree on whether the secret-class value refuses.
 
     Below any other value, NSSM reading each item as its own variable, a first line with an
     equals sign continues the value only in the cases below. Its name is the text before its
@@ -664,9 +674,9 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     The reader cannot tell whether NSSM takes a line or the whole string as a variable, so it
     keeps what either reading would refuse. Each string's first non-blank line is a variable when
     it holds an equals sign, or is a secret-class name alone: blank lines above it are skipped,
-    as the whole-string reading's strip of the name skips them, so a secrets directory set below a blank first line is still read as
-    set. A later line is one when it sets a name the refusal is about, so a store key on a later
-    line still refuses. A later line that sets an ordinary variable (:func:`_is_ordinary_line`)
+    as the whole-string reading's strip of the name skips them, so a secrets directory set below
+    a blank first line is still read as set. A later line is one when it sets a name the refusal
+    is about, so a store key on a later line still refuses. A later line that sets an ordinary variable (:func:`_is_ordinary_line`)
     ends the value above it under the line reading, and is not kept, except below an empty
     secret-class value, where :func:`_ends_blank_class` decides instead: under the
     whole-string reading it sets nothing, so the secrets directory's name is never taken as set
@@ -690,9 +700,9 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     writes a key split from its name. An empty store key above an item whose first line ends it
     under :func:`_continues_string`, such as one that sets a variable under a name Windows itself
     sets (:func:`_ends_blank_class`), does not, and a value that is not empty in its own string
-    does not run on, so a path-form OIDC key above an item of PEM armour is still a path. Each string is
-    read alone first to decide this, and a joined group is read once more, so the work stays
-    linear."""
+    does not run on, so a path-form OIDC key above an item of PEM armour is still a path. Each
+    string is read alone first to decide this, and a joined group is read once more, so the work
+    stays linear."""
     # Each group: its registry value, its strings, its first string read alone, and for each
     # string but the last the variable it ends on, whose empty value the next string continues.
     groups: list[tuple[str, list[str], list[_Variable], list[_Variable]]] = []
@@ -741,8 +751,10 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
             line_on_string = None if local == 1 else local
             key = (index, variable.written, line_on_string, variable.broken)
             ran_on = key in ran and bool(variable.value.strip())
-            # Its value takes the next string's first line, which may set the directory.
-            holds = ran_on and _sets_directory_first(strings[index + 1])
+            # Its value takes the next string's first line, which may set the directory, past any
+            # string of equals signs alone, which keeps the value running on (_still_blank).
+            taken = next((s for s in strings[index + 1 :] if not _still_blank(s)), "")
+            holds = ran_on and _sets_directory_first(taken)
             read.append(
                 replace(variable, line=line_on_string, runs_on=ran_on, holds_directory=holds)
             )

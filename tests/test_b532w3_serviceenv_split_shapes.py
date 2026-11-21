@@ -256,6 +256,16 @@ def test_a_name_written_alone_above_its_value_refuses(items: list[str]) -> None:
         assert posture.value_runs_on, items
 
 
+def test_a_name_alone_below_an_empty_secret_is_read_into_its_value() -> None:
+    """A secret-class name alone below an empty secret-class value is that value's text, as it
+    was on origin/main 9421dcbf27, so the empty key above still refuses. Below a first line that
+    starts no variable it is not kept either, so the whole-string reading still names the
+    ``MEFOR_VALUE_*`` variable above it."""
+    key = KEY_CLASS_NAMES[0]
+    assert _read([f"Path=x\n{key}=\nMEFOR_STORE_PASSWORD"]).listed == (key,)
+    assert _read(["MEFOR_VALUE_A\nMEFOR_STORE_PASSWORD\nX=1"]).listed == ("MEFOR_VALUE_A",)
+
+
 def test_a_name_written_alone_with_nothing_below_it_does_not_refuse() -> None:
     """The control: a secret-class name alone carries no value, so it is not listed."""
     assert _read(["MEFOR_AUTH_AD_BIND_PASSWORD"]).listed == ()

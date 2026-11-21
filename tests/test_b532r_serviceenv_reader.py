@@ -406,12 +406,6 @@ def test_an_item_that_sets_the_secrets_directory_is_not_taken_into_the_value_abo
     posture_items = ["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=C:\\s"]
     posture = _read(posture_items)
     assert posture.listed == ("MEFOR_SECRETS_DIRECTORY",)
-    # With its path on a later line, the directory item's first line sets it to nothing, which
-    # is not positively a variable of its own, so the empty password above takes it and refuses
-    # (vault BACKLOG #5394); the remedy then says the directory string was read into it.
-    split = _read(["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=\nC:\\s"])
-    assert split.listed == ("MEFOR_STORE_PASSWORD",)
-    assert split.value_runs_on and split.directory_joined
     # A secret of its own makes the refusal speak; the remedy then reads the directory as set.
     # Without the directory item, the same refusal says the lists set none: the control.
     secret = "MEFOR_AUTH_OIDC_CLIENT_SECRET=synthetic"
@@ -420,6 +414,28 @@ def test_an_item_that_sets_the_secrets_directory_is_not_taken_into_the_value_abo
     assert "The service's lists set no" not in refusal
     control = service_env_refusal(_read(["MEFOR_STORE_PASSWORD=", secret]))
     assert control is not None and "The service's lists set no" in control
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        ["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=\nC:\\s"],
+        ["MEFOR_STORE_PASSWORD=", "=", "MEFOR_SECRETS_DIRECTORY=\nC:\\s"],
+        ["MEFOR_STORE_PASSWORD", "=", "MEFOR_SECRETS_DIRECTORY=\nC:\\s"],
+    ],
+)
+def test_a_directory_item_set_to_nothing_on_its_first_line_is_taken_into_an_empty_secret(
+    items: list[str],
+) -> None:
+    """With its path on a later line, the directory item's first line sets it to nothing, which
+    is not positively a variable of its own, so the empty password above takes it and refuses
+    (vault BACKLOG #5394). The remedy then says the directory string was read into it, past any
+    item of equals signs alone between them, and does not say the lists set no directory."""
+    posture = _read([*items, "MEFOR_VALUE_A=1"])
+    assert "MEFOR_STORE_PASSWORD" in posture.listed
+    assert posture.value_runs_on and posture.directory_joined
+    refusal = service_env_refusal(posture)
+    assert refusal is not None and "The service's lists set no" not in refusal
 
 
 #: A base64url secret with two ``=`` of padding and both ``-`` and ``_`` in it.
