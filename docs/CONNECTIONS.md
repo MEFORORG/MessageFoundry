@@ -164,9 +164,12 @@ transport = "mllp"
   A connector reads its `port` one way too: a whole number from 0 to 65535, as a number or in
   digits. A bool, a fraction or anything else is refused when the connector is built (BACKLOG
   #1650). That read sees what a `cast` left, so `cast = "int"` has already read `true` as 1 and cut
-  a fraction. At least `allowed_mllp` and `allowed_db`, among the host-and-port `[egress]` lists
-  that pin a port, compare the port as a number before the connector is built, so the text
-  `"06661"` matches a pin of `6661` (BACKLOG #5915).
+  a fraction. At least `allowed_mllp`, among the host-and-port `[egress]` lists that pin a port,
+  compares the port as a number before the connector is built, so the text `"06661"` matches a pin
+  of `6661` (BACKLOG #5915). `allowed_db` also compares the SQL Server preset's `port` setting as
+  a number when its check runs, but on `dialect="generic"` it refuses a `PORT` keyword with a
+  leading zero for a host an entry names
+  ([*The port an `allowed_db` entry binds*](#the-port-an-allowed_db-entry-binds)).
   **A numeric cap reads the text `"0"` exactly as it reads the number `0`** (BACKLOG #1872): where a
   cap documents `None`/`0` as "disabled" or "unlimited", `"0"` and an empty value disable it too. On
   those caps, and on the pacing rates and bursts, a negative or `nan` is refused at load in either
@@ -2122,8 +2125,11 @@ documentation says it reads `SERVER`.
 
 ##### The port an `allowed_db` entry binds
 
-An `[egress].allowed_db` entry is `host` or `host:port`. Its host is compared with the whole
-`server` text, in any case, and a host no entry names is refused. An entry with a port admits only
+An `[egress].allowed_db` entry is `host` or `host:port`, read by the same parser as
+`allowed_mllp` ([CONFIGURATION.md](CONFIGURATION.md#egress) says how). The entry's host is compared
+with the whole `server` text, without regard to case, and a `server` no entry names is refused, as
+is one holding a colon (below) or a `%`, which no entry can name. An entry with a
+port admits only
 the port the connection string sends, compared as a number (`db:05432` names port 5432). The two
 dialects send it differently (vault BACKLOG #2704):
 
