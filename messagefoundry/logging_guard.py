@@ -144,9 +144,7 @@ class LogSinkStatus:
     last_event: str | None = None
     last_event_at: str | None = None
     rolled_aside: str | None = None
-    #: True when ``state`` reads ``unwritable`` only because the flap latch holds the sink, after a
-    #: roll the bound called a heal. False whenever the sink's own state is ``unwritable``, whatever
-    #: made it so, and while the roll that trips the bound is still on its way to stage 2.
+    #: The flap latch's mark, set by :meth:`LogWriteGuard.status`; ADR 0162 amendment D defines it.
     latch_only: bool = False
 
 
@@ -278,7 +276,8 @@ class LogWriteGuard:
             return sorted((self._reported(s) for s in self._sinks.values()), key=lambda s: s.sink)
 
     def _reported(self, status: LogSinkStatus) -> LogSinkStatus:
-        """``status`` with the latch applied. The latch only ever adds an ``unwritable`` reading."""
+        """``status`` with the latch applied: an ``unwritable`` reading and the ``latch_only`` mark,
+        never anything else. Called under the lock."""
         if status.state != "unwritable" and status.sink in self._flap_latch:
             latch_only = status.sink not in self._trip_pending
             return replace(status, state="unwritable", latch_only=latch_only)
@@ -472,6 +471,7 @@ class LogWriteGuard:
             self._roll_flap.pop(sink, None)
             # A record landed, so the flap latch has nothing left to hold either.
             self._flap_latch.pop(sink, None)
+            self._trip_pending.discard(sink)
             self._unanswered.discard(sink)
             self._escalation_failure_said.discard(sink)
 

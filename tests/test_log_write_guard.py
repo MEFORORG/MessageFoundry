@@ -813,6 +813,11 @@ def test_the_latch_never_makes_the_guard_less_strict_than_the_bound_alone(
             assert with_latch._roll_flap == without._roll_flap
             for latched_s, plain_s in zip(with_latch.status(), without.status(), strict=True):
                 assert plain_s.state != "unwritable" or latched_s.state == "unwritable"
+                # latch_only marks exactly a latched sink whose own state is rolled (amendment D).
+                own = with_latch._sinks[latched_s.sink].state
+                held = latched_s.sink in with_latch._flap_latch
+                assert latched_s.latch_only is (held and own == "rolled")
+                assert plain_s.latch_only is False
             assert with_latch.can_log() <= without.can_log()
             latched_seen += bool(with_latch._flap_latch)
     assert latched_seen > 50  # the latch was really in play, not idle through the run
@@ -849,7 +854,8 @@ def test_status_tells_a_latch_only_sink_from_one_stage2_declared_dead(
 ) -> None:
     # BACKLOG #5812 item 13. ``file`` is held by the flap latch alone; ``stdout`` failed stage 2.
     # Both read ``unwritable``, and ``latch_only`` tells them apart, on the guard and on /status.
-    # NEGATIVE CONTROL: before the fix the two read identically.
+    # NEGATIVE CONTROL: before the fix LogSinkStatus had no field to tell them apart, so this
+    # test failed there with an AttributeError.
     from messagefoundry.api.app import _log_sink_health
 
     clock = _FakeClock()

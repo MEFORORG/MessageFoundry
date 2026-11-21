@@ -1092,7 +1092,7 @@ otherwise "restart it again" would be a way around the control.
 `GET /status` may report a flapping sink `unwritable` even when nothing was halted: from the roll
 that trips the flap bound until a roll more than 60 s after its last roll or failure, or until a
 re-validation of the log releases it (ADR 0162 amendments B and C say when one does). Such a
-sink's `latch_only` field says whether the latch alone holds it (ADR 0162 amendment D). The engine
+sink's `latch_only` field is defined in ADR 0162 amendment D. The engine
 re-validates at least when it starts and when a recovery action tries to lift a log-write halt; a
 recovery action with no halt in force does not re-validate.
 A `/config/reload` on its own is **not enough**: it re-arms the inbounds it re-binds, so messages
