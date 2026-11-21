@@ -971,6 +971,7 @@ def test_the_git_invocation_pattern_is_defined_EXACTLY_ONCE(repo: SimpleNamespac
     # in the same `git(?i:.exe)?` and is a different pattern.
     bare = "`])git(?i:" + chr(92) + ".exe)?"
     occurrences = source.count(bare)
+    assert source.count("`])git(" + chr(92) + ".exe)?") == 0, "the case-sensitive suffix is back"
     assert occurrences == 1, (
         f"found {occurrences} literal copies of the git-invocation class; expected 1 (the definition). "
         "A second copy is a rule that will not receive the next correction to this pattern."

@@ -663,6 +663,17 @@ def test_a_chdir_ahead_of_a_bracket_joined_invocation_is_read(
     assert text in reason, reason
 
 
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+def test_an_earlier_lines_chdir_ahead_of_a_bracket_joined_invocation_is_read(
+    rig: SimpleNamespace, tool: str
+) -> None:
+    # No separator before the bracket on this line, so the shell stands in the earlier line's chdir.
+    tail = "\ngit -C {o} log $(git reset --hard)"
+    reason = _reason(rig, _fmt(rig, "cd {p}" + tail), rig.outside, tool)
+    assert "SHARED PRIMARY" in reason, reason
+    assert _allowed(rig, _fmt(rig, "cd {o}" + tail), rig.outside, tool)
+
+
 def test_a_chdir_ahead_of_a_powershell_block_is_read(rig: SimpleNamespace) -> None:
     command = _fmt(rig, "cd {p}; if (git -C {o} diff --quiet) {{ git reset --hard }}")
     reason = _reason(rig, command, rig.outside, "PowerShell")

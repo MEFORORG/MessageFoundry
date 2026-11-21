@@ -960,8 +960,9 @@ function Get-ScanRawIndexMap($Seg) {
 # directory irrelevant -- an absolute `-C` is read past such a chdir, under the conditions in
 # Get-InvocationReading and the resolver's -OwnWindow branch; and git options after the verb.
 # Rules 3 and 3c do not reliably read a git word that rules 3 and 3c's case-sensitive match of
-# `$gitInvocation` misses, such as `GIT` (its `.exe` suffix is read in any case since BACKLOG #5655
-# step 3). At least these are ALLOWED from the primary (measured 2026-11-18): `GIT reset --hard`
+# `$gitInvocation` misses, such as `GIT` (an unquoted `.exe` suffix is read in any case since BACKLOG
+# #5655 step 3; a quoted program path ending `git.EXE` is still not, Remove-QuotedSpans says why).
+# At least these are ALLOWED from the primary (measured 2026-11-18): `GIT reset --hard`
 # and `GIT config core.hooksPath /nope` under the PowerShell tool. Also, at least: any line
 # after an earlier line whose chdir sits in parentheses, which makes the earlier-line reading answer
 # nothing, unless the invocation's `-C` fold ends absolute and its window names no work tree or git
@@ -1022,7 +1023,7 @@ function Get-ScanRawIndexMap($Seg) {
 # match, not from what the command does, so it can call a refused read "changing" or "setting" (`git
 # config --get core.hooksPath x y` and `git config --get core.hooksPath "a b"` from the primary).
 #
-# THE READINGS OF ONE INVOCATION, one to three (review round 3411eb8641; the bracket reading below). $At is the verb (or disarm)
+# THE READINGS OF ONE INVOCATION, none to two (review round 3411eb8641; the bracket reading below). $At is the verb (or disarm)
 # index on the scan. Where $GitAt is given -- the index the caller's own git match starts at -- the
 # window runs from the last separator before THAT git word, not from the last $gitInvocation token: a
 # `GIT` the case-sensitive token misses would otherwise reach back over `;` into an earlier
@@ -1075,6 +1076,15 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
     }
     if ($openAt -ge 0 -and $pfx.Substring($openAt) -notmatch $chdirAt) {
         $outerSeps = [regex]::Matches($pfx.Substring(0, $openAt), '(?:;|\|\|?|&&|(?<![<>&])&(?![>&]))')
+        # No separator ahead of the bracket on this line: the shell stands where the earlier lines left
+        # it, so the last earlier line's chdir is read, under the prior-lines reading's own conditions.
+        if ($outerSeps.Count -eq 0 -and $priorChdirs.Count -gt 0 -and $pfx.Substring(0, $openAt) -notmatch $chdirAt) {
+            $lastCd = $priorChdirs[$priorChdirs.Count - 1]
+            $lastCdTarget = Get-ChdirTargetRaw $lastCd
+            if ($lastCdTarget -and ([System.IO.Path]::IsPathRooted($lastCdTarget) -or $priorChdirs.Count -eq 1)) {
+                [pscustomobject]@{ ScanPrefix = "$lastCd ; "; Window = $win }
+            }
+        }
         if ($outerSeps.Count -gt 0) {
             $lastSep = $outerSeps[$outerSeps.Count - 1]
             $outerPfx = $pfx.Substring(0, $lastSep.Index + $lastSep.Length)
