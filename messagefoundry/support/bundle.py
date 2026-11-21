@@ -41,6 +41,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import stat
 import time
 import zipfile
@@ -76,8 +77,12 @@ def _diagnostic(code: str, exc: BaseException) -> str:
       file in it could not be stat'd.
     * ``MF-BUNDLE-LOG-002`` -- the newest app-log file could not be read. With ``_LogFileRefused``
       it was, twice, no longer the plain regular file the listing saw when it was opened
-      (BACKLOG #5383). With ``_LogLineTooLong`` no whole line fit in the bytes the read takes
-      from the end of the file (BACKLOG #5385).
+      (BACKLOG #5383). With ``_LogFileShrank`` it was, twice, shorter when read than when it was
+      opened: truncated in place, as a copytruncate rotation does (BACKLOG #5385).
+    * ``MF-BUNDLE-LOG-003`` -- the newest app-log file was read, but the bytes the read takes from
+      its end hold no line with anything in it but a line break: the newest line with content is
+      longer than the bound, and only blank lines, or none, follow it (``_LogLineTooLong``,
+      BACKLOG #5385).
 
     A type name is a class defined in this project or the standard library, so it is bounded input; an
     exception's ``str()`` is not, and the bundle is a file an operator hands outside the environment."""
@@ -232,15 +237,31 @@ _LOG_READ_ATTEMPTS = 2
 _LOG_TAIL_MAX_BYTES = 4 * 1024 * 1024
 
 
-class _LogFileRefused(OSError):
+#: A byte that is not a line break; a cut read with none left would render as an empty tail.
+_LOG_CONTENT_BYTE = re.compile(rb"[^\r\n]")
+
+
+class _LogFileChanged(OSError):
+    """The newest app-log file changed under the read, as a rotation does, so :func:`_log_tail`
+    lists and reads again once before it reports the subclass by its bounded name."""
+
+
+class _LogFileRefused(_LogFileChanged):
     """The newest app-log file was not, once opened, the plain regular file the listing saw: a
     different file or a special file swapped in at its name (BACKLOG #5383). A type of this
     module, so :func:`_diagnostic` reports it by its bounded name."""
 
 
-class _LogLineTooLong(OSError):
-    """No whole line of the app-log file fit in the bytes the read takes from its end, so the
-    tail would be empty although the file is not (BACKLOG #5385)."""
+class _LogFileShrank(_LogFileChanged):
+    """The newest app-log file held fewer bytes when read than ``fstat`` reported after the open:
+    the same file, truncated in place, as a copytruncate rotation does (BACKLOG #5385). Not a
+    :class:`_LogFileRefused`, whose diagnostic says another file was swapped in."""
+
+
+class _LogLineTooLong(ValueError):
+    """The bytes the read takes from the end of the app-log file hold no line with anything in
+    it but a line break, so the tail would show nothing although the file is not empty (BACKLOG
+    #5385). Not an :class:`OSError`: the read worked."""
 
 
 def _is_plain_file(st: os.stat_result) -> bool:
@@ -292,9 +313,10 @@ def _read_log_file(path: Path, listed: os.stat_result) -> str:
     after the listing, so the open itself reaches whatever the link names, and any effect of
     opening that target happens: connecting to a named pipe the link points at, for one. What the
     check after the open prevents is only the read: a target with another id is refused, and
-    none of its content enters the bundle. Raises :class:`OSError`: the identity refusal, or a
-    file that shrank while it was read, as :class:`_LogFileRefused`, and a file with no whole line
-    in the bound as :class:`_LogLineTooLong`."""
+    none of its content enters the bundle. Raises :class:`OSError`, the identity refusal as
+    :class:`_LogFileRefused` and a file that shrank while it was read as :class:`_LogFileShrank`;
+    and :class:`_LogLineTooLong` for a cut read that keeps no line with anything in it but a line
+    break."""
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     nonblocking = getattr(os, "O_NONBLOCK", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0) | nonblocking
@@ -319,8 +341,8 @@ def _read_log_file(path: Path, listed: os.stat_result) -> str:
             chunk = os.read(fd, want)
             if not chunk:
                 # Shorter than the fstat said: truncated in place, as a copytruncate rotation
-                # does. Reported as a swap, so the caller lists and reads again.
-                raise _LogFileRefused("the app-log file shrank while it was read")
+                # does, so the caller lists and reads again.
+                raise _LogFileShrank("the app-log file shrank while it was read")
             chunks.append(chunk)
             want -= len(chunk)
     finally:
@@ -334,9 +356,10 @@ def _read_log_file(path: Path, listed: os.stat_result) -> str:
         cut = (cr if cr >= 0 else lf) + 1
         if cut and data[cut - 1 : cut + 1] == b"\r\n":
             cut += 1
-        if cut == 0 or cut >= len(data):
-            raise _LogLineTooLong("no whole app-log line fits in the read bound")
-        data = data[cut:]
+        data = data[cut:] if cut else b""
+        # Only line breaks left would render as an empty tail, which reads as an empty log.
+        if _LOG_CONTENT_BYTE.search(data) is None:
+            raise _LogLineTooLong("no app-log line with content fits in the read bound")
     # Read tolerant of a legacy codepage; the redaction pass runs on the decoded text.
     return data.decode("utf-8", errors="replace")
 
@@ -344,8 +367,8 @@ def _read_log_file(path: Path, listed: os.stat_result) -> str:
 def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
     """A redacted tail of an app-log file under ``log_dir``. ``None`` at least when no log dir is
     configured or ``lines`` is not positive (BACKLOG #5384: a slice by zero or a negative count
-    would carry the whole file, or most of it). An :class:`OSError` from the listing or the read is
-    not propagated.
+    would carry the whole file, or most of it). An :class:`OSError` from the listing or the read,
+    and the read's :class:`_LogLineTooLong`, are not propagated.
 
     Only a plain regular file with one name is read: a link, a hard link or a special file with a
     log suffix is passed over (BACKLOG #5383), see :func:`_log_candidates` and
@@ -373,10 +396,12 @@ def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
         newest, listed = max(files, key=lambda item: item[1].st_mtime)
         try:
             text = _read_log_file(newest, listed)
+        except _LogLineTooLong as exc:
+            return redact_log_text(_diagnostic("MF-BUNDLE-LOG-003", exc))
         except OSError as exc:
             # A refusal, a file gone, or (POSIX) a link put at its name: each is what a rotation or
             # a swap between listing and opening leaves, so list again once before reporting it.
-            changed = isinstance(exc, (_LogFileRefused, FileNotFoundError)) or exc.errno == ELOOP
+            changed = isinstance(exc, (_LogFileChanged, FileNotFoundError)) or exc.errno == ELOOP
             if changed and attempt + 1 < _LOG_READ_ATTEMPTS:
                 continue
             return redact_log_text(_diagnostic("MF-BUNDLE-LOG-002", exc))
