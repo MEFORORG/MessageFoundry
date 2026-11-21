@@ -452,6 +452,51 @@ def test_guard_admits_what_peek_parse_admits_and_the_sniff_refuses(lead: str) ->
     admit_resubmitted_body(lead + ADT, _ic(ContentType.HL7V2))
 
 
+def test_guard_refuses_the_document_marker_the_listeners_refuse() -> None:
+    # BACKLOG #5099: both listeners refuse a body holding the handle marker under a base64
+    # delimiter before the ACK, so a resend of it is refused too, rather than left to delivery.
+    from messagefoundry.parsing.binary import DOC_REF_MARKER
+    from messagefoundry.pipeline.ingress_guards import DOC_REF_MARKER_REFUSED_REASON
+    from tests.test_sender_document_handle import _copy_in_nte_component
+
+    body = _copy_in_nte_component("|", "^~\\/", DOC_REF_MARKER + "x")
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(body, _ic(ContentType.HL7V2))
+    assert exc.value.phase == "parse"
+    assert exc.value.reason == DOC_REF_MARKER_REFUSED_REASON
+    # Controls: the same body without the marker, and the marker under ordinary delimiters, which
+    # the listeners' check does not refuse, are both admitted.
+    admit_resubmitted_body(_copy_in_nte_component("|", "^~\\/", "SYNTH"), _ic(ContentType.HL7V2))
+    admit_resubmitted_body(
+        _copy_in_nte_component("|", "^~\\&", DOC_REF_MARKER + "x"), _ic(ContentType.HL7V2)
+    )
+
+
+async def test_admission_refuses_the_document_marker_off_the_loop() -> None:
+    from messagefoundry.parsing.binary import DOC_REF_MARKER
+    from tests.test_sender_document_handle import _copy_in_nte_component
+
+    body = _copy_in_nte_component("|", "^~\\/", DOC_REF_MARKER + "x")
+    with pytest.raises(IngressGuardError) as exc:
+        await admit_resubmission(body, _ic(ContentType.HL7V2))
+    assert exc.value.phase == "parse"
+
+
+def test_guard_answers_a_fault_in_the_marker_read_as_a_parse_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.pipeline import ingress_guards
+
+    def faulting(_peek: object, _text: str) -> str | None:
+        raise IndexError("synthetic")
+
+    monkeypatch.setattr(ingress_guards, "doc_ref_marker_refusal", faulting)
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(ADT, _ic(ContentType.HL7V2))
+    assert exc.value.phase == "parse"
+    assert exc.value.reason == "parse error: peek read failed (IndexError)"
+
+
 def test_guard_stores_canonical_carriage() -> None:
     broken = carry(b"ABCDEFGHIJ")[:15] + "\r\n" + carry(b"ABCDEFGHIJ")[15:]
     assert admit_resubmitted_body(broken, _ic(ContentType.BINARY)) == carry(b"ABCDEFGHIJ")
