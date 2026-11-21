@@ -135,6 +135,8 @@ def test_the_tail_makes_no_line_of_the_corpus_unstable(monkeypatch: pytest.Monke
     import messagefoundry.support.redact as redact_mod
 
     lines = _corpus()
+    # The corpus is not empty, so "no line got worse" is a reading over lines, not over none.
+    assert len(lines) >= 1500
     shipped = [_stable(line) for line in lines]
     shipped_out = [scrub_credentials(line) for line in lines]
     control = re.compile(
