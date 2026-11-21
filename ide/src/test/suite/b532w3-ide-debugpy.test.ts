@@ -297,6 +297,38 @@ suite("b532w3: writeDebugProgram puts the Debug program on disk (BACKLOG #5409 i
     assert.deepStrictEqual(listing(), [], "a temporary entry was left behind");
   });
 
+  test("a first launch whose rename a scanner briefly blocks is retried, not refused", async () => {
+    // No program exists yet, so the identical-file check cannot rescue the failure.
+    let failures = 2;
+    const fsp: DebugProgramFs = {
+      ...fs.promises,
+      rename: async (from, to) => {
+        if (failures-- > 0) {
+          throw fsError("EBUSY");
+        }
+        return fs.promises.rename(from, to);
+      },
+    };
+    const file = await writeDebugProgram(local(), undefined, fsp);
+    assert.strictEqual(fs.readFileSync(file, "utf8"), TEST_BENCH_DEBUG_PROGRAM.source);
+    assert.deepStrictEqual(listing(), [path.basename(file)]);
+  });
+
+  test("a program that cannot be read for the moment is written again, not a refused launch", async () => {
+    let reads = 0;
+    const fsp: DebugProgramFs = {
+      ...fs.promises,
+      readFile: (async (...args: Parameters<typeof fs.promises.readFile>) => {
+        if (reads++ === 0) {
+          throw fsError("EBUSY");
+        }
+        return fs.promises.readFile(...args);
+      }) as typeof fs.promises.readFile,
+    };
+    const file = await writeDebugProgram(local(), undefined, fsp);
+    assert.strictEqual(fs.readFileSync(file, "utf8"), TEST_BENCH_DEBUG_PROGRAM.source);
+  });
+
   test("a program that already holds the source is not written again", async () => {
     const file = await writeDebugProgram(local());
     const fsp: DebugProgramFs = { ...fs.promises, writeFile: async () => Promise.reject(fsError("EACCES")) };

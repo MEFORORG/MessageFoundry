@@ -50,8 +50,9 @@ export const TEST_BENCH_DEBUG_PROGRAM = {
 export const LOCAL_STORAGE_SCHEMES: readonly string[] = ["file", "vscode-userdata"];
 
 /** A 32-bit FNV-1a checksum of `text`'s UTF-16 code units, as 8 hex digits. It names a file by its
- *  text, so two texts share a name only on a checksum collision, and then the content check in
- *  {@link writeDebugProgram} rewrites the file rather than running the wrong text. It is no security
+ *  text, so two texts share a name only on a checksum collision. Then the content check in
+ *  {@link writeDebugProgram} rewrites the file at each launch, and two windows launching at once can
+ *  still run each other's text; at 32 bits that is not expected to happen. It is no security
  *  control, which is why it is not node:crypto's createHash: that would be a crypto-inventory entry
  *  with no crypto purpose. */
 function textChecksum(text: string): string {
@@ -66,6 +67,9 @@ function textChecksum(text: string): string {
 export function debugProgramFileName(source: string): string {
   return `mefor_testbench_debug_${textChecksum(source)}.py`;
 }
+
+/** How many times a rename that fails with EBUSY or EPERM is tried again. */
+const RENAME_RETRIES = 3;
 
 /** The part of a `vscode.Uri` {@link writeDebugProgram} reads. */
 export interface LocalStorageUri {
@@ -95,9 +99,11 @@ async function holds(fsp: DebugProgramFs, file: string, bytes: Buffer): Promise<
  * `mkdtemp` makes, so two launches in one millisecond never share a temporary file, and renamed over
  * the program with Node's rename, which replaces the target in one step, so a launch from another
  * window never runs a half-written file. A failed rename is success when the program already holds
- * the source, as on Windows, where a rename over a file can fail with EPERM or EBUSY while another
- * process, such as a scanner, the indexer or a concurrent launch's rename, holds it. The temporary
- * folder is removed; failing to remove it is logged, never a failed launch.
+ * the source. On Windows a rename can fail with EPERM or EBUSY while another process, such as a
+ * scanner, the indexer or a concurrent launch's rename, holds the target or the new temporary file,
+ * so that failure is retried {@link RENAME_RETRIES} times 100 ms apart, as collectionCaseFiles.ts
+ * retries an unlink. The temporary folder is removed; failing to remove it is logged, never a failed
+ * launch.
  *
  * The path is read from `storage.with({ scheme: "file" }).fsPath`, not `storage.fsPath`: VS Code
  * keeps a URI's authority in `fsPath` only for the `file` scheme, so a `vscode-userdata` URI on a
@@ -114,7 +120,9 @@ export async function writeDebugProgram(
   const dir = path.join(storage.with({ scheme: "file" }).fsPath, TEST_BENCH_DEBUG_PROGRAM.folder);
   const file = path.join(dir, debugProgramFileName(source));
   const bytes = Buffer.from(source, "utf8");
-  if (await holds(fsp, file, bytes)) {
+  // A file that cannot be read now, as while a scanner holds it, is written again rather than
+  // refusing the launch; the write reports its own error if that fails too.
+  if (await holds(fsp, file, bytes).catch(() => false)) {
     return file;
   }
   await fsp.mkdir(dir, { recursive: true });
@@ -122,11 +130,19 @@ export async function writeDebugProgram(
   try {
     const temp = path.join(tempDir, "program.py");
     await fsp.writeFile(temp, bytes, { flag: "wx" });
-    try {
-      await fsp.rename(temp, file);
-    } catch (e) {
-      if (!(await holds(fsp, file, bytes).catch(() => false))) {
-        throw e;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await fsp.rename(temp, file);
+        break;
+      } catch (e) {
+        if (await holds(fsp, file, bytes).catch(() => false)) {
+          break;
+        }
+        const code = (e as NodeJS.ErrnoException).code;
+        if (attempt >= RENAME_RETRIES || (code !== "EBUSY" && code !== "EPERM")) {
+          throw e;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
       }
     }
   } finally {
