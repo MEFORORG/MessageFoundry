@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+from collections.abc import Mapping
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -26,14 +28,19 @@ from messagefoundry.api import create_app
 from messagefoundry.api.app import (
     _alert_control_action,
     _audit_refused_reload,
+    _build_approval_gate,
     _inbound_down_detail,
     _outbound_down_detail,
 )
+from messagefoundry.api.approvals import ApprovalError, ApprovalGate
+from messagefoundry.api.outlive import OutlivingOperations
+from messagefoundry.auth.permissions import Permission
 from messagefoundry.config.models import ConnectorType, RetryPolicy
-from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.settings import ApprovalsSettings, EgressSettings
 from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.cluster import NullCoordinator
+from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
 from messagefoundry.pipeline.wiring_runner import (
     RegistryRunner,
     RunnerLeaseLostError,
@@ -42,6 +49,7 @@ from messagefoundry.pipeline.wiring_runner import (
     _ItemOutcome,
 )
 from messagefoundry.store import MessageStore
+from tests._pending_approval_store_contract import _REQUESTER_ID, _resolve, _StandingStore
 from tests.test_reload_retired_connector_send import _Recorder as _SendRecorder
 from tests.test_shard_lane_ownership import _unsharded_registry
 
@@ -648,3 +656,202 @@ async def test_a_reload_refused_for_the_lease_audits_lease_lost_and_answers_503(
     assert status == 503 and "lease" in answer
     (row,) = await store.list_audit(action="config_reload_failed")
     assert json.loads(row["detail"])["reason"] == "lease_lost"
+
+
+# --- BACKLOG #5906 repair (Lander hold on engine PR 3136) -----------------------------------------
+
+
+class _FramingRecorder(_SendRecorder):
+    """A recording outbound that frames, so the shadow path runs its frame check's hydrate."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.checked: list[str] = []
+
+    def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
+        self.checked.append(payload)
+
+
+async def test_a_shadow_row_is_not_marked_done_when_the_lease_goes_during_its_frame_check(
+    store: MessageStore,
+) -> None:
+    """The shadow branch: its frame check's hydrate is an await, so the gate asks again after it,
+    and the row is released for the new leader rather than marked done."""
+    coordinator = _LeaseCoordinator()
+    runner, _, message_id, item = await _claimed_row(store, coordinator)
+    framing = _FramingRecorder()
+    runner._destinations[_OUT] = framing
+    runner._simulate[_OUT] = True
+    _demote_during_hydration(runner, coordinator)
+    try:
+        outcome, retry_until = await runner._process_delivery_item(_OUT, item)
+        assert len(framing.checked) == 1 and framing.sent == []  # the frame check did run
+        assert (outcome, retry_until) == (_ItemOutcome.STOPPED, None)
+        (row,) = await store.outbox_for(message_id)
+        assert row["status"] == "pending" and row["attempts"] == 0 and not row["last_error"]
+    finally:
+        await runner.stop()
+
+
+async def test_a_shadow_row_completes_while_the_lease_holds(store: MessageStore) -> None:
+    """The negative control: the same shadow path, the lease kept, marks the row done."""
+    coordinator = _LeaseCoordinator()
+    runner, _, message_id, item = await _claimed_row(store, coordinator)
+    framing = _FramingRecorder()
+    runner._destinations[_OUT] = framing
+    runner._simulate[_OUT] = True
+    try:
+        outcome, _ = await runner._process_delivery_item(_OUT, item)
+        assert outcome is _ItemOutcome.PROCESSED and len(framing.checked) == 1
+        (row,) = await store.outbox_for(message_id)
+        assert row["status"] == "done"
+    finally:
+        await runner.stop()
+
+
+async def test_a_single_row_is_not_sent_when_the_log_write_halt_lands_before_its_send(
+    store: MessageStore,
+) -> None:
+    """The #122 halt is part of the same gate: a halt that lands during the reads is not sent
+    through, and the leader hands the row back unsent and uncharged."""
+    coordinator = _LeaseCoordinator()
+    runner, recorder, message_id, item = await _claimed_row(store, coordinator)
+    hydrate = runner._hydrate_payload
+
+    async def halting(payload: str, message_id: str) -> str:
+        runner._log_write_stopped = True
+        return await hydrate(payload, message_id)
+
+    runner._hydrate_payload = halting  # type: ignore[method-assign]
+    try:
+        outcome, _ = await runner._process_delivery_item(_OUT, item)
+        assert recorder.sent == [] and outcome is _ItemOutcome.PROCESSED
+        (row,) = await store.outbox_for(message_id)
+        assert row["status"] == "pending" and row["attempts"] == 0 and not row["last_error"]
+    finally:
+        runner._log_write_stopped = False
+        await runner.stop()
+
+
+def _release_gate(engine: Any) -> ApprovalGate:
+    settings = ApprovalsSettings(enabled=True, operations=["config_reload"], min_dwell_seconds=0.0)
+    return _build_approval_gate(engine, settings, outliving=OutlivingOperations())
+
+
+async def test_a_release_on_a_lease_lost_node_is_refused_before_the_claim(
+    store: MessageStore,
+) -> None:
+    """Regression 1 of the hold: the reload's own refusal comes after the gate's claim, so the
+    approval was compensated to 'failed' and could not be released on the leader. The registered
+    hook refuses first with 409 and writes the lease_lost row, so the request stays pending."""
+    engine: Any = SimpleNamespace(store=store, registry_runner=SimpleNamespace(lease_lost=True))
+    hook = _release_gate(engine)._ops["config_reload"].before_claim
+    assert hook is not None
+    with pytest.raises(ApprovalError) as ei:
+        await hook({"requester": "maker", "config_dir": None})
+    assert ei.value.status == 409 and "pending" in ei.value.detail
+    (row,) = await store.list_audit(action="config_reload_failed")
+    assert json.loads(row["detail"])["reason"] == "lease_lost"
+    assert row["actor"] == "maker"
+
+
+@pytest.mark.parametrize("runner", [None, SimpleNamespace(lease_lost=False)])
+async def test_a_release_on_a_leading_or_graphless_node_passes_the_hook(
+    store: MessageStore, runner: Any
+) -> None:
+    """The negative control: nothing is refused or written where the lease is not lost."""
+    engine: Any = SimpleNamespace(store=store, registry_runner=runner)
+    hook = _release_gate(engine)._ops["config_reload"].before_claim
+    assert hook is not None
+    await hook({"requester": "maker", "config_dir": None})
+    assert await store.list_audit(action="config_reload_failed") == []
+
+
+async def test_the_gate_leaves_a_request_its_before_claim_refuses_pending(
+    store: MessageStore,
+) -> None:
+    """The gate's half: a raise from ``before_claim`` comes before the claim, so the executor does
+    not run and the row is still pending; once the hook passes, the same request releases."""
+    settings = ApprovalsSettings(
+        enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0
+    )
+    gate = ApprovalGate(_StandingStore(store), settings, resolve_identity=_resolve)
+    runs: list[str] = []
+    refuse = [True]
+
+    async def execute(_p: Mapping[str, Any]) -> dict[str, Any]:
+        runs.append("ran")
+        return {"requeued": 0}
+
+    async def before_claim(_p: Mapping[str, Any]) -> None:
+        if refuse[0]:
+            raise ApprovalError(409, "not on this node")
+
+    gate.register(
+        "dead_letter_replay",
+        "op",
+        execute,
+        permission=Permission.MESSAGES_REPLAY,
+        before_claim=before_claim,
+    )
+    await store.create_pending_approval(
+        approval_id="a1",
+        operation="dead_letter_replay",
+        params=json.dumps({"requester": "maker"}),
+        requester="maker",
+        requester_user_id=_REQUESTER_ID,
+        requested_at=1.0,
+        expires_at=None,
+    )
+    with pytest.raises(ApprovalError) as ei:
+        await gate.approve("a1", approver="checker", approver_user_id="checker-id")
+    assert ei.value.status == 409 and runs == []
+    row = await store.get_pending_approval("a1")
+    assert row is not None and str(row["status"]) == "pending"
+    refuse[0] = False
+    await gate.approve("a1", approver="checker", approver_user_id="checker-id")
+    assert runs == ["ran"]
+
+
+class _VersionCoordinator(NullCoordinator):
+    def __init__(self) -> None:
+        super().__init__("node-under-test")
+
+    def config_version_cached(self) -> int:
+        return 2
+
+
+async def test_a_convergence_pass_refused_for_the_lease_logs_once_without_a_traceback(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regression 3 of the hold: every pass on a lease-lost node logged an ERROR traceback for a
+    designed refusal. It now logs one INFO line per run of refused passes, and the version is not
+    marked applied, so the pass is retried. A real fault still logs its traceback."""
+    applied: list[int] = []
+    error: list[Exception] = [RunnerLeaseLostError.for_reload()]
+
+    async def reload(_version: int) -> None:
+        raise error[0]
+
+    runner = ConfigConvergenceRunner(
+        _VersionCoordinator(),
+        applied_version=lambda: 1,
+        set_applied_version=applied.append,
+        reload=reload,
+        interval_seconds=1.0,
+        refusals=(RunnerLeaseLostError,),
+    )
+    name = "messagefoundry.pipeline.config_convergence"
+    with caplog.at_level(logging.DEBUG, logger=name):
+        for _ in range(3):
+            await runner._pass_once()
+    refused = [r for r in caplog.records if r.name == name and "refused" in r.getMessage()]
+    assert len(refused) == 1 and refused[0].levelno == logging.INFO and refused[0].exc_info is None
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert applied == []
+    caplog.clear()
+    error[0] = ValueError("a bad local config")
+    with caplog.at_level(logging.DEBUG, logger=name):
+        await runner._pass_once()
+    (fault,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert fault.exc_info is not None

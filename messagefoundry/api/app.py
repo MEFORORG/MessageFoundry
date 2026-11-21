@@ -2104,6 +2104,32 @@ def _build_approval_gate(
         # BACKLOG #3157 item 4, which says when the row can still be lost).
         return await outliving.run(_apply(), "released config reload")
 
+    async def _config_reload_before_claim(p: Mapping[str, Any]) -> None:
+        # BACKLOG #5906: a node whose coordinator no longer reads it as leader, while its graph
+        # still runs, refuses the reload (RegistryRunner.reload). Asked here, before the gate's
+        # claim, so the request stays pending and can be released on the leader. Past the claim
+        # the same refusal is compensated to 'failed' and that approval is spent. A point in time
+        # read of the coordinator's cached flag: a flag that goes false after it, during the
+        # approver read, the claim or the executor's config load, is still refused by the reload
+        # itself, and then the approval is marked failed.
+        rr = engine.registry_runner
+        if rr is None or not rr.lease_lost:
+            return
+        actor = named_requester(p)
+        if (
+            actor is not None
+        ):  # the gate refused a hold naming none before this (requires_requester)
+            # The row the inline route writes for the same refusal, reason lease_lost; its status
+            # and answer are the inline route's, so this route answers its own below.
+            await _audit_refused_reload(
+                engine,
+                RunnerLeaseLostError.for_reload(),
+                actor=actor,
+                requested=p.get("config_dir"),
+                dry_run=False,
+            )
+        raise ApprovalError(409, _LEASE_LOST_RELEASE_DETAIL)
+
     def _replay_params_in_scope(identity: Identity, p: Mapping[str, Any]) -> bool:
         channel_id = p.get("channel_id")
         return _replay_in_scope(identity, channel_id if isinstance(channel_id, str) else None)
@@ -2131,6 +2157,7 @@ def _build_approval_gate(
         in_scope=lambda identity, _p: _cross_channel_in_scope(identity),
         requires_requester=True,
         requires_fingerprint=True,
+        before_claim=_config_reload_before_claim,
     )
     return gate
 
@@ -2873,6 +2900,13 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
 _LEASE_LOST_RELOAD_DETAIL: Final = (
     "this node no longer holds the cluster lease, so it applies no config reload; reload on the "
     "leader instead"
+)
+
+#: The approve route's answer to a release on such a node, refused before the gate claims the
+#: request, so it stays pending (BACKLOG #5906).
+_LEASE_LOST_RELEASE_DETAIL: Final = (
+    "this node no longer holds the cluster lease, so it releases no config reload; the request "
+    "is still pending, so approve it on the leader"
 )
 
 #: The answer to a reload whose config directory the engine could not resolve or list: at the

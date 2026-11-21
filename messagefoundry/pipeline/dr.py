@@ -70,6 +70,7 @@ from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.dr_backup import VerifyResult, join_before_checks, run_restore_verify
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
+from messagefoundry.pipeline.wiring_runner import RunnerLeaseLostError
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import Store
 from messagefoundry.store.store import OwnedLanes
@@ -509,12 +510,22 @@ class DrCoordinator:
                 log.warning("DR activation refused by a trust anchor: %s", exc, exc_info=exc)
             # A preflight that refused or timed out bound nothing, so its reason must not say a
             # bind failed (vault BACKLOG #3094).
-            reason = (
-                "DR activation stopped at its preflight, before any listener was bound"
-                if progress.in_preflight
-                else "DR run-profile activation failed (the engine could not bind the priority "
-                "feeds)"
-            ) + f": {_anchor_refused(named) if anchored else safe_exc(exc)}"
+            if isinstance(exc, RunnerLeaseLostError):
+                # BACKLOG #5906: the runner refused the profile's reload before it changed any
+                # lane, because this node's coordinator no longer reads it as leader. Nothing
+                # failed to bind, and an operator reload here would be refused the same way.
+                reason = (
+                    "DR run-profile activation refused: this node no longer holds the cluster "
+                    "lease, so its reload bound no listener and the box stays passive; run the "
+                    "activation on the node that holds the lease"
+                )
+            else:
+                reason = (
+                    "DR activation stopped at its preflight, before any listener was bound"
+                    if progress.in_preflight
+                    else "DR run-profile activation failed (the engine could not bind the "
+                    "priority feeds)"
+                ) + f": {_anchor_refused(named) if anchored else safe_exc(exc)}"
             if progress.hook_ran:
                 reason += _vip_note("The takeover hook ran")
             # The marker this attempt wrote stays, as audit rows do. Naming it here ties it to this

@@ -48,6 +48,11 @@ class ConfigConvergenceRunner:
     with the shared version it converges on, so its audit row can name it; vault BACKLOG #3109). The
     runner never imports the engine — it takes these as plain callbacks so the dependency direction
     stays one-way (pipeline only).
+
+    ``refusals`` names the exceptions a reload raises by design rather than as a fault, at least the
+    runner's lease-lost refusal (BACKLOG #5906). A pass that meets one is logged at INFO with no
+    traceback, once until a pass ends without one, and is retried next interval like any failure;
+    the applied version does not advance.
     """
 
     def __init__(
@@ -58,12 +63,15 @@ class ConfigConvergenceRunner:
         set_applied_version: Callable[[int], None],
         reload: Callable[[int], Awaitable[None]],
         interval_seconds: float,
+        refusals: tuple[type[Exception], ...] = (),
     ) -> None:
         self._coordinator = coordinator
         self._applied_version = applied_version
         self._set_applied_version = set_applied_version
         self._reload = reload
         self._interval_seconds = interval_seconds
+        self._refusals = refusals
+        self._refusal_logged = False  # an INFO line per run of refused passes, not one per pass
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -96,13 +104,28 @@ class ConfigConvergenceRunner:
         # One isolated pass per interval; an error in a pass (e.g. a bad local config) is logged and the
         # loop continues — a convergence hiccup must never take the node down. Cooperatively cancellable.
         while not self._stop.is_set():
-            try:
-                await self.converge_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("cluster: config convergence pass failed; will retry next interval")
+            await self._pass_once()
             await self._sleep(self._interval_seconds)
+
+    async def _pass_once(self) -> None:
+        """One isolated pass of :meth:`_run`: a fault is logged with its traceback, a designed
+        refusal (``refusals``) once per run of them without one."""
+        try:
+            await self.converge_once()
+        except asyncio.CancelledError:
+            raise
+        except self._refusals as exc:
+            if not self._refusal_logged:
+                self._refusal_logged = True
+                log.info(
+                    "cluster: config convergence refused on this node (%s); will retry next "
+                    "interval",
+                    exc,
+                )
+            return
+        except Exception:
+            log.exception("cluster: config convergence pass failed; will retry next interval")
+        self._refusal_logged = False
 
     async def _sleep(self, delay: float) -> None:
         """Sleep up to ``delay``, waking immediately on stop (so shutdown isn't held by the interval)."""

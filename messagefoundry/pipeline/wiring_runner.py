@@ -596,8 +596,10 @@ class RunnerNotRunningError(RuntimeError):
     An inbound stop is not refused, and neither is an outbound stop while a teardown that raised or
     was cancelled has left state behind (``has_residual_state``), or on a node that lost its lease:
     either may still have a live listener or lane to take down, and the next start tears that
-    state down again, pause records included. The API maps this to 503, as it does a missing
-    runner."""
+    state down again, pause records included. The connection control routes map this to 503, as
+    they do a missing runner. The reload routes map :class:`RunnerLeaseLostError` themselves:
+    503 inline, and the approve route's own status on a release (``_audit_refused_reload`` in
+    ``api/app.py``)."""
 
     def __init__(self, name: str, detail: str | None = None) -> None:
         super().__init__(
@@ -610,15 +612,16 @@ class RunnerNotRunningError(RuntimeError):
 
 
 class RunnerLeaseLostError(RunnerNotRunningError):
-    """A start or restart CONTROL reached a cluster node that no longer holds the leader lease while
-    its graph still runs, in the window before ``Engine._stop_graph`` tears it down (BACKLOG #5906,
-    #8214 item 16). A start there would bring intake or delivery up on a node about to stand by,
-    against the shared store the new leader drives. A subclass, so every handler of
-    :class:`RunnerNotRunningError` takes it, at least the control route's 503; its own text,
-    because this graph is running. The alert action catches it ahead of its parent, so its INFO
-    line names the lease.
-
-    :meth:`RegistryRunner.reload` raises it too, from :meth:`for_reload`, on a running graph."""
+    """A start or restart CONTROL, or a reload (:meth:`for_reload`), reached a cluster node whose
+    coordinator no longer reads it as leader while its graph still runs, in the window before
+    ``Engine._stop_graph`` tears it down (BACKLOG #5906, #8214 item 16). "The lease" here is the
+    coordinator's cached ``is_leader()`` flag (:attr:`RegistryRunner.lease_lost`), not a read of
+    the lease row, so it can lag that row. A start there would bring intake or delivery up on a
+    node about to stand by, against the shared store the new leader drives. A subclass, so every
+    handler of :class:`RunnerNotRunningError` takes it, at least the control route's 503; its own
+    text, because this graph is running. The alert action catches it ahead of its parent, so its
+    INFO line names the lease. A reload's refusal is mapped by the reload routes instead; the
+    parent's docstring says how."""
 
     def __init__(self, name: str, detail: str | None = None) -> None:
         super().__init__(
@@ -2565,6 +2568,15 @@ class RegistryRunner:
     @property
     def running(self) -> bool:
         return self._running
+
+    @property
+    def lease_lost(self) -> bool:
+        """Whether this graph runs on a node the coordinator no longer reads as leader (BACKLOG
+        #5906): the window before ``Engine._stop_graph`` tears it down. It reads the
+        coordinator's cached ``is_leader()`` flag, no store round-trip, so it can lag the lease
+        row itself; on a single node (``NullCoordinator``) it is always False. A start, a restart
+        and a reload refuse on it with :class:`RunnerLeaseLostError`."""
+        return self._running and not self._coordinator.is_leader()
 
     @property
     def has_residual_state(self) -> bool:
@@ -9601,15 +9613,18 @@ class RegistryRunner:
         park are bounded; :meth:`_build_lane_destinations_bounded` says what that bound holds and what it
         does not.
 
-        On a running graph whose node no longer holds the cluster lease, it raises
-        :class:`RunnerLeaseLostError`, read on entry and again just before step 1, with no lane
-        changed (BACKLOG #5906). Each read is point in time: a lease lost during steps 1 to 3a
-        is ``Engine._stop_graph``'s to take down.
+        On a running graph that :attr:`lease_lost` reads as lease-lost, it raises
+        :class:`RunnerLeaseLostError` with no lane changed (BACKLOG #5906). The flag is the
+        coordinator's cached ``is_leader()`` and is read twice: once this method holds the reload
+        lock, which is after ``Engine.reload_detail`` has loaded the config and run its
+        preflights, and again just before step 1. Each read is point in time: a flag that goes
+        false after the second read is not refused, and steps 1 to 3a then run on this node until
+        ``Engine._stop_graph``, which waits on the same lock, takes them down.
         """
         async with self._reload_lock:
             # BACKLOG #5906: refused at once too, so a lease-lost node does not hold the lock its
             # own demotion teardown waits on through the build check and the anchor reads below.
-            if self._running and not self._coordinator.is_leader():
+            if self.lease_lost:
                 raise RunnerLeaseLostError.for_reload()
             if new_registry is None:
                 new_registry = self.registry
@@ -9699,9 +9714,9 @@ class RegistryRunner:
                 # reload, as the start doors take no start (_require_running): steps 2 and 3 would
                 # bind listeners and resume lanes on a node whose graph is about to stop. Asked
                 # again here, after the last await before the quiesce, so the handler below undoes
-                # what any refusal here undoes and no lane has changed. A point in time read, as at
-                # the doors: a lease lost during the steps below is ``Engine._stop_graph``'s to take
-                # down.
+                # what any refusal here undoes and no lane has changed. A point in time read of the
+                # coordinator's cached flag, as at the doors: a flag that goes false during the
+                # steps below is not refused, and ``Engine._stop_graph`` takes them down after.
                 if not self._coordinator.is_leader():
                     raise RunnerLeaseLostError.for_reload()
             except BaseException:
@@ -11602,6 +11617,9 @@ class RegistryRunner:
                 # BACKLOG #5906: the lane gate once more, right before the send, since the reads
                 # above are awaits a demotion, a pause or the halt can land in, as the coalesced
                 # batch asks (#5706). Synchronous, so nothing between this read and the send awaits.
+                # It reads the coordinator's cached leadership flag, so a flag that goes false
+                # during the send itself, or a lease row that has moved before the cache does, is
+                # not caught here.
                 if not self._may_send(name):
                     raise _SendGated  # resolved after the try, out of the arms' reach
                 # BACKLOG #5718: the reads above are awaits a reload can land in. A connector it took
@@ -14377,9 +14395,11 @@ class RegistryRunner:
         return _to_lane_result(await self._process_delivery_item(lane, item))
 
     async def _refuse_claimed(self, name: str, ids: list[str]) -> tuple[_ItemOutcome, float | None]:
-        """Resolve claimed, unsent OUTBOUND rows of ``name`` that the lane gate
-        (:meth:`_lane_may_deliver`) has refused, and those :meth:`_release_retired` hands it
-        under a halt or on a demoted node. None is sent here, dead-lettered or charged an attempt.
+        """Resolve claimed, unsent OUTBOUND rows of ``name`` that the lane gate has refused
+        (:meth:`_lane_may_deliver`, or :meth:`_may_send`, which adds the coordinator's cached
+        leadership flag, right before the single-row and the coalesced-batch send), and those
+        :meth:`_release_retired` hands it under a halt or on a demoted node. None is sent here,
+        dead-lettered or charged an attempt.
 
         A leader hands them back through :meth:`_hand_back` and parks. A demoted node releases them
         and STOPs the lane for the new leader, as the send path's leadership check does and as the

@@ -107,6 +107,7 @@ from messagefoundry.pipeline.update_check import UpdateCheckResult, UpdateCheckR
 from messagefoundry.pipeline.wiring_runner import (
     FhirLookupAnchorPass,
     RegistryRunner,
+    RunnerLeaseLostError,
     TeardownReason,
     check_pt_backend_supported,
     check_reference_backend_supported,
@@ -2579,6 +2580,8 @@ class Engine:
                 set_applied_version=self._set_applied_config_version,
                 reload=self._converge_reload,
                 interval_seconds=self._cluster_settings.heartbeat_seconds,
+                # BACKLOG #5906: a lease-lost node refuses every pass until its graph stops.
+                refusals=(RunnerLeaseLostError,),
             )
             self._config_convergence.start()
         self._start_state_convergence()
