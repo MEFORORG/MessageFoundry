@@ -50,7 +50,6 @@ from pathlib import Path
 
 from tee import __version__, mefor_api, mllp
 from tee.anon import anonymize_checked
-from tee.anon.hl7 import SurrogateSeparatorRefused
 from tee.anon.keying import Keyer
 from tee.anon.leak import (
     MALFORMED_LINE_ADVICE,
@@ -68,7 +67,11 @@ from tee.anon.rules import (
     load_rules,
     retargeted_defaults,
 )
-from tee.anon.surrogates import SiteCodeSeparatorRefused, site_prefixes_loaded
+from tee.anon.surrogates import (
+    SiteCodeSeparatorRefused,
+    SurrogateSeparatorRefused,
+    site_prefixes_loaded,
+)
 from tee.controlchars import scrub_control_chars
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
@@ -854,8 +857,9 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     residue_advice: dict[str, None] = {}
     # Whether such a report also had another cause, which needs the general advice as well.
     residue_mixed = False
-    # Messages refused because a rule's surrogate would hold the field separator or a control
-    # byte (BACKLOG #5540). A keep is the wrong advice for one: it would emit the captured value.
+    # Messages refused because a rule's surrogate would hold the field separator, a control byte
+    # or a delimiter MSH-2 declares (BACKLOG #5540). A keep is the wrong advice for one: it would
+    # emit the captured value.
     separator_refused = 0
     separator_paths: dict[str, None] = {}
     # Messages refused because no site-code surrogate could avoid a declared separator digit. A
@@ -952,7 +956,8 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
             # A keep is the wrong advice here too: it would emit the captured value whole.
             steps = [
                 f"{separator_refused} of them were refused because the surrogate a rule wrote "
-                "would hold the message's field separator or a control byte, in "
+                "would hold the message's field separator, a control byte or a delimiter MSH-2 "
+                "declares, in "
                 f"{', '.join(separator_paths)}. A keep on such a field would emit the captured "
                 "value: point the field at drop in an overlay.",
                 *(
