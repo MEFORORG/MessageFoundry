@@ -284,3 +284,4 @@ tests/test_zizmor_config_hygiene.py
 tests/test_worktree_gate_per_invocation.py
 tests/test_cla_precheck.py
 tests/test_worktree_gate_quoted_and_every_invocation.py
+tests/test_dashboard_collect_metrics.py
