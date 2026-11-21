@@ -3303,7 +3303,9 @@ chains directly to a supplied anchor, or is a self-signed correspondent cert pin
 multi-level path building is deferred. On top of issuance, construction refuses at least:
 
 - a `recipient_cert` whose every issuing `trust_anchor` is **not a CA** (no `basicConstraints` asserting
-  `CA=true`, or a `keyUsage` that does not assert `keyCertSign`) or has extensions that cannot be read. An
+  `CA=true`, or a `keyUsage` that does not assert `keyCertSign`) or has extensions that cannot be read.
+  An X.509 **version 1** anchor is exempt: version 1 carries no extensions, so it cannot assert
+  `basicConstraints`, and RFC 5280 takes a trust anchor as an input to path validation. An
   issuing anchor that fails this is skipped, and the recipient is accepted when another issuing anchor in
   the file passes. A **pinned** correspondent is exempt: an anchor with the same subject and the same public
   key as the `recipient_cert` (the same cert, or an older copy of a renewed one), because it issues nothing
@@ -3326,13 +3328,16 @@ addresses `recipients` holds, counting each comma-joined address apart), never t
 a `subjectAltName` value, any of which can identify a patient's provider.
 
 **The validity window is checked at every send, not refused at construction.** The send refuses, before
-anything is built or dialled, when the `recipient_cert` is outside its window, or when every issuing
-`trust_anchor` is. A bundle may hold an older copy of a CA beside its renewal under the same name and key, and
-any one of them inside its window will do. No clock skew is allowed.
+anything is built or dialled, when the `recipient_cert` or the `signing_cert` is outside its window, or when
+every issuing `trust_anchor` is. A partner's verifier refuses a signature made under an out-of-window
+`signing_cert`, after the relay has accepted the message. A bundle may hold an older copy of a CA beside its
+renewal under the same name and key, and any one of them inside its window will do. A `notBefore` up to five
+minutes ahead of this host's clock still counts as valid, so a certificate a CA issued moments ago is not
+refused for a small clock difference. No allowance is given past `notAfter`.
 
 Either bound is a permanent `NegativeAckError` marked as a configuration fault, with code
 `direct-cert-validity:<setting>:expired` or `direct-cert-validity:<setting>:not-yet-valid`, `<setting>` being
-`recipient_cert` or `trust_anchor`. Under the default `credential_fault_policy = "stop"` the delivery worker
+`recipient_cert`, `trust_anchor` or `signing_cert`. Under the default `credential_fault_policy = "stop"` the delivery worker
 stops the lane and keeps the queue, spending none of a row's attempts, and its ERROR log line and
 `connection_stopped` alert carry that code, so they say which certificate failed and how. Under
 `credential_fault_policy = "dead_letter"` the message dead-letters, as other configuration faults do.
@@ -3340,11 +3345,13 @@ stops the lane and keeps the queue, spending none of a row's attempts, and its E
 - **Expired:** renew the certificate, point the setting at the new file, and reload, or restart.
 - **Not yet valid:** once `notBefore` has passed, an operator starts the lane again; the same connector then
   delivers, with no change to its settings.
-- Where the recipient cert and every issuing anchor both fail, an expiry is the one reported, because it is
-  the one that needs a renewal: a not-yet-valid recipient whose only anchor has expired reports the anchor.
+- Where more than one certificate fails, an expiry is the one reported, because it is the one that needs a
+  renewal: a not-yet-valid recipient whose only anchor has expired reports the anchor.
 
 Construction only **logs a WARNING** naming the setting and the bound, once every construction refusal has
-passed, so `messagefoundry check`, a reload and
+passed. It is logged once per process for the same connection and the same certificates, so a rebuild of
+an unchanged config does not repeat it, and a renewed certificate that is still out of its window warns
+again. So `messagefoundry check`, a reload and
 an engine start or restart still build the connection with an out-of-window certificate. That is deliberate:
 a build refusal would record the lane failed at start (ADR 0031) rather than stopped with its queue kept,
 which is what the send-time refusal does. `test_connection` does not read

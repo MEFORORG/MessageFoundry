@@ -2458,3 +2458,183 @@ async def test_a_cert_inside_its_window_at_send_still_delivers(
     await d.send(_SYNTHETIC_HL7)
     [smtp] = _FakeSMTP.instances
     assert len(smtp.sent) == 1
+
+
+# --- BACKLOG #5631, PR 2915's final-round findings: the signing cert's window, a notBefore skew
+# allowance, version 1 anchors, and one construction warning per connection and certificates.
+
+
+@pytest.fixture(autouse=True)
+def _fresh_window_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Each test starts as a fresh process would: no construction validity warning logged yet.
+    from messagefoundry.transports import direct
+
+    monkeypatch.setattr(direct, "_WARNED_WINDOWS", set())
+
+
+def _signer(pki: dict[str, Any], tmp_path: Path, tag: str, **mint: Any) -> dict[str, str]:
+    """A signing pair issued by the ``pki`` CA, minted with ``mint``, as setting overrides."""
+    key, cert = _mint_leaf("Sender Direct", pki["ca_key"], pki["ca_cert"], **mint)
+    key_path = tmp_path / f"{tag}_signer.key"
+    _write_key(key_path, key)
+    return {"signing_key": str(key_path), **_files(tmp_path, tag, signing_cert=cert)}
+
+
+@pytest.mark.parametrize(
+    "valid_from, valid_to, expected",
+    [
+        (datetime.timedelta(days=-30), datetime.timedelta(days=-1), "'signing_cert' has expired"),
+        (
+            datetime.timedelta(days=1),
+            datetime.timedelta(days=30),
+            "'signing_cert' is not yet valid",
+        ),
+    ],
+    ids=["expired", "not-yet-valid"],
+)
+async def test_a_signing_cert_outside_its_validity_window_warns_and_refuses_every_send(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    pki: dict[str, Any],
+    tmp_path: Path,
+    valid_from: datetime.timedelta,
+    valid_to: datetime.timedelta,
+    expected: str,
+) -> None:
+    """RED when: a send signs under a signing cert outside its window, which the partner's
+    verifier would refuse after the relay had accepted the message (BACKLOG #5631)."""
+    overrides = _signer(pki, tmp_path, "signer_window", valid_from=valid_from, valid_to=valid_to)
+    await _warns_then_refuses_every_send(monkeypatch, caplog, pki, expected, **overrides)
+
+
+async def test_an_expired_signing_cert_wins_over_a_not_yet_valid_recipient(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # Time cures the recipient's notBefore, never the signer's notAfter: the refusal names the
+    # certificate that needs renewing.
+    _install_fake(monkeypatch)
+    overrides = _signer(
+        pki,
+        tmp_path,
+        "signer_old",
+        valid_from=datetime.timedelta(days=-30),
+        valid_to=datetime.timedelta(days=-1),
+    )
+    overrides["recipient_cert"] = _recipient(
+        pki, tmp_path, "recipient_early", valid_from=datetime.timedelta(days=1)
+    )
+    d = DirectDestination(_dest(pki, **overrides))
+    with pytest.raises(NegativeAckError) as caught:
+        await d.send(_SYNTHETIC_HL7)
+    assert caught.value.code == "direct-cert-validity:signing_cert:expired"
+
+
+@pytest.mark.parametrize(
+    "ahead, refused",
+    [(datetime.timedelta(minutes=2), False), (datetime.timedelta(minutes=10), True)],
+    ids=["inside-the-allowance", "past-the-allowance"],
+)
+async def test_a_not_before_a_little_ahead_of_this_clock_is_allowed(
+    monkeypatch: pytest.MonkeyPatch,
+    pki: dict[str, Any],
+    tmp_path: Path,
+    ahead: datetime.timedelta,
+    refused: bool,
+) -> None:
+    """RED when: a cert issued moments ago by a CA whose clock runs a little ahead reads as not
+    yet valid (BACKLOG #5631). The allowance is five minutes, on notBefore only."""
+    _install_fake(monkeypatch)
+    path = _recipient(pki, tmp_path, "skew", valid_from=ahead)
+    d = DirectDestination(_dest(pki, recipient_cert=path))
+    if refused:
+        with pytest.raises(NegativeAckError) as caught:
+            await d.send(_SYNTHETIC_HL7)
+        assert caught.value.code == "direct-cert-validity:recipient_cert:not-yet-valid"
+        assert _FakeSMTP.instances == []
+    else:
+        await d.send(_SYNTHETIC_HL7)
+        assert len(_FakeSMTP.instances) == 1
+
+
+async def test_no_allowance_is_given_past_not_after(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # The allowance is notBefore's alone: one minute past notAfter is expired.
+    from messagefoundry.transports import direct
+
+    _install_fake(monkeypatch)
+    path = _recipient(pki, tmp_path, "edge", valid_to=datetime.timedelta(days=30))
+    d = DirectDestination(_dest(pki, recipient_cert=path))
+    cert = x509.load_pem_x509_certificate(Path(path).read_bytes())
+    later = cert.not_valid_after_utc + datetime.timedelta(minutes=1)
+    monkeypatch.setattr(direct, "_utcnow", lambda: later)
+    with pytest.raises(NegativeAckError) as caught:
+        await d.send(_SYNTHETIC_HL7)
+    assert caught.value.code == "direct-cert-validity:recipient_cert:expired"
+
+
+def _v1_root(key: rsa.RSAPrivateKey) -> x509.Certificate:
+    """A self-signed X.509 version 1 root named like the ``pki`` CA: no extensions at all.
+
+    ``CertificateBuilder`` has no public way to choose the version, so the private attribute is
+    set; the assertion below fails if a later ``cryptography`` stops honouring it."""
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test Direct CA")])
+    now = datetime.datetime.now(datetime.UTC)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+    )
+    builder._version = x509.Version.v1
+    cert = builder.sign(key, hashes.SHA256())
+    assert cert.version == x509.Version.v1 and len(cert.extensions) == 0
+    return cert
+
+
+def test_a_version_1_root_issuing_the_recipient_constructs(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    """RED when: a version 1 root, which cannot carry basicConstraints, is refused as not a CA
+    (BACKLOG #5631)."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    root = _v1_root(key)
+    _, recipient = _mint_leaf("recipient@hisp.example", key, root)
+    d = DirectDestination(
+        _dest(pki, **_files(tmp_path, "v1", recipient_cert=recipient, trust_anchor=root))
+    )
+    assert d._recipient_anchors == (root,)
+
+
+def test_a_version_3_anchor_without_basic_constraints_is_still_refused(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # The control for the version 1 exemption: a version 3 anchor must still assert CA=true.
+    ca_key, ca = _issuer(constraints=None)
+    assert ca.version == x509.Version.v3
+    _, recipient = _mint_leaf("recipient@hisp.example", ca_key, ca)
+    text = _refusal(pki, **_files(tmp_path, "v3", recipient_cert=recipient, trust_anchor=ca))
+    assert "not a CA certificate" in text
+
+
+def test_the_construction_warning_is_logged_once_per_connection_and_certificates(
+    pki: dict[str, Any], tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RED when: every rebuild of the same config, a reload or a check, repeats the validity
+    warning (BACKLOG #5631). A renewed certificate is new material and warns again."""
+    expired = {"valid_from": datetime.timedelta(days=-30), "valid_to": datetime.timedelta(days=-1)}
+    first = _recipient(pki, tmp_path, "warn_once", **expired)
+    renewed = _recipient(pki, tmp_path, "warn_renewed", **expired)
+
+    def warnings() -> int:
+        return len([r for r in caplog.records if "'recipient_cert' has expired" in r.getMessage()])
+
+    with caplog.at_level("WARNING", logger="messagefoundry.transports.direct"):
+        DirectDestination(_dest(pki, recipient_cert=first))
+        DirectDestination(_dest(pki, recipient_cert=first))
+        assert warnings() == 1
+        DirectDestination(_dest(pki, recipient_cert=renewed))
+        assert warnings() == 2
