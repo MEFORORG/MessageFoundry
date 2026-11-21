@@ -536,8 +536,10 @@ _KEY_MATERIAL = re.compile(
 # value's tail on every glue it tried. After the shared
 # vocabulary a value it hid is a placeholder, and the widened reading crosses one only where it is
 # the whole first segment of a password with a user, which is where the narrow pass above writes
-# its own: the run after the password stops at "[" and "]", and that first segment otherwise stops
-# at a bracket or an angle too (round 9). Nor does any segment of it cross a label: each stops
+# its own: the run after the password, and the ";"-split tail read after a user's placeholder,
+# stop at "[" and "]"; that first segment otherwise stops at a bracket or an angle too (round 9);
+# and an empty user's first segment stops at every angle and at each "[" that opens a bracketed run
+# of letters, the shape of every placeholder. Nor does any segment of it cross a label: each stops
 # where a key of the write-time query filter or a label word secretscrub reads starts, followed by
 # ":" or "=", and where a ``MEFOR_`` name starts, with no separator required after it
 # (``_DSN_RUN_STOP`` and ``_DSN_USER_FIRST_SEGMENT`` there say how, and why). So a value such a

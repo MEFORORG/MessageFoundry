@@ -8,7 +8,8 @@ reference, exactly once per container. A deployer following docs that never ment
 the key the manifests read and say that a false value still crash-loops there. The compose one-shot
 check must also not inherit the image HEALTHCHECK, which probes an API it never serves. No doc may
 claim, unqualified, that a false value is refused before any engine starts: at least two compose
-commands skip the check, and no k8s manifest checks the value."""
+commands skip the check. Each k8s manifest checks the value in an init container before the
+engine starts, and each k8s section says so."""
 
 from __future__ import annotations
 
@@ -190,9 +191,12 @@ def test_no_deploy_doc_carries_the_unqualified_refusal_claim(doc: Path) -> None:
 
 
 @pytest.mark.parametrize("doc", (_CLOUD, _README), ids=lambda p: p.name)
-def test_each_k8s_section_says_no_manifest_checks_the_value(doc: Path) -> None:
+def test_each_k8s_section_says_the_manifest_checks_the_value(doc: Path) -> None:
     section = _k8s_section(doc)
-    assert "anifest checks the value before the engine starts." in section, section
+    assert "Each Kubernetes manifest checks the value before the engine starts" in section, section
+    assert "`revocation-attestation-check` init container" in section, section
+    # The retired claim, which the init container made false.
+    assert "either Kubernetes manifest checks" not in section, section
 
 
 def test_the_readme_topology_a_bullet_names_the_skips() -> None:

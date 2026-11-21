@@ -349,20 +349,64 @@ _ORDINARY_LINE = re.compile(r"\s*[^=\s][^=]*=(?![=\s]*\Z)")
 #: refusing.
 _KEY_SHAPED_RUN = re.compile(r"[A-Za-z0-9+/]{43}")
 
+#: One 32-byte secret, whole (vault BACKLOG #5394 added items 6 and 12): 43 characters of the
+#: standard base64 alphabet and its one ``=``, as a store key is written, or 43 of the base64url
+#: alphabet with or without that ``=``. Length alone does not tell a secret from a name, a path or a
+#: service name, so :func:`_is_one_key_text` also asks for what a random secret of that length all
+#: but always holds: letters of both cases and, in base64url, whose alphabet a mixed-case name
+#: shares, a digit. A name or value of that exact shape that is not a secret is read as one too,
+#: an error toward refusing.
+_STANDARD_KEY_TEXT = re.compile(r"[A-Za-z0-9+/]{43}=")
+_URLSAFE_KEY_TEXT = re.compile(r"[A-Za-z0-9_-]{43}=?")
+
 
 #: Text of the standard base64 alphabet alone, as the body of a padded secret is.
 _BASE64_TEXT = re.compile(r"[A-Za-z0-9+/]+")
 
 
+def _mixed_case(text: str) -> bool:
+    """Whether ``text`` holds both an ASCII upper-case and an ASCII lower-case letter."""
+    return any("a" <= c <= "z" for c in text) and any("A" <= c <= "Z" for c in text)
+
+
+def _is_one_key_text(text: str) -> bool:
+    """Whether ``text`` is exactly one 32-byte secret (:data:`_STANDARD_KEY_TEXT`,
+    :data:`_URLSAFE_KEY_TEXT`)."""
+    if not _mixed_case(text):
+        return False
+    if _STANDARD_KEY_TEXT.fullmatch(text) is not None:
+        return True
+    return _URLSAFE_KEY_TEXT.fullmatch(text) is not None and any(c.isdigit() for c in text)
+
+
 def _holds_key_run(text: str) -> bool:
-    """Whether ``text`` holds a store-key-shaped run (:data:`_KEY_SHAPED_RUN`)."""
-    return _KEY_SHAPED_RUN.search(text) is not None
+    """Whether ``text`` holds a store-key-shaped run (:data:`_KEY_SHAPED_RUN`), or, stripped, is
+    one base64url secret less its padding (:func:`_is_one_key_text`), as the name a secret with one
+    ``=`` of padding reads as."""
+    return _KEY_SHAPED_RUN.search(text) is not None or _is_one_key_text(text.strip())
+
+
+def _is_key_value(text: str) -> bool:
+    """Whether ``text``, stripped and with one pair of surrounding quotes taken off, is one secret
+    or a comma-separated list of them with no empty entry (:func:`_is_one_key_text`; vault
+    BACKLOG #5394 added items 6 and 12). A retired-keys list the engine would load with an empty
+    entry, from a trailing or doubled comma, is not read as one, a known gap."""
+    value = text.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    return all(_is_one_key_text(part.strip()) for part in value.split(","))
 
 
 def _is_ordinary_line(line: str) -> bool:
-    """Whether ``line`` sets an ordinary variable (:data:`_ORDINARY_LINE`) and its name holds no
-    store key (:data:`_KEY_SHAPED_RUN`)."""
-    return bool(_ORDINARY_LINE.match(line)) and not _holds_key_run(line.partition("=")[0])
+    """Whether ``line`` sets an ordinary variable (:data:`_ORDINARY_LINE`), its name holds no key
+    material (:func:`_holds_key_run`), and its value is not one secret (:func:`_is_key_value`). A
+    line such as ``x=<key>`` below an empty secret is so read as that secret's value, not as a
+    variable that ends it (vault BACKLOG #5394 added item 6), an error toward refusing: an ordinary
+    variable whose whole value has a secret's shape makes an empty secret above it read as set."""
+    name, _equals, value = line.partition("=")
+    return (
+        bool(_ORDINARY_LINE.match(line)) and not _holds_key_run(name) and not _is_key_value(value)
+    )
 
 
 #: The secret-class names, the two lists above together, both taken from ``engine_secrets``.
@@ -508,13 +552,15 @@ def _continues_string(entry: str) -> bool:
     value in three cases only. Its name is the text before its first equals sign, stripped, and
     its value the text after it:
 
-    * the name holds a store-key-sized run (:data:`_KEY_SHAPED_RUN`), whatever the value;
+    * the name holds key material (:func:`_holds_key_run`), whatever the value, or the value is
+      one secret (:func:`_is_key_value`), so a base64url secret with one ``=``, ``x=<key>`` and
+      ``=<key>`` continue it (vault BACKLOG #5394 added items 6 and 12);
     * the name is standard base64 text, and the value holds only whitespace and equals signs;
     * the name is not blank, and the value holds an equals sign and nothing but equals signs
       and whitespace.
 
     So ``abc==`` continues it in any alphabet. ``abc=`` continues it only under the first two
-    cases, so ``ab-c_dE=`` ends it. ``PATH=`` continues it too. ``HTTP_PROXY=`` and Windows'
+    cases, so ``ab-c_dE=``, too short to be key material, ends it. ``PATH=`` continues it too. ``HTTP_PROXY=`` and Windows'
     own empty-named ``=C:=C:\\x`` entries end it. ``MEFOR_SECRETS_DIRECTORY=`` ends it, as it
     fits no case, but ``MEFOR_SECRETS_DIRECTORY==`` fits the third and continues it. In the
     three cases :func:`_line_start` reads the first line as starting no variable. So when the
@@ -530,7 +576,9 @@ def _continues_string(entry: str) -> bool:
     if not equals:
         return True
     name = written.strip()
-    could_be_key = _BASE64_TEXT.fullmatch(name) is not None or _holds_key_run(name)
+    could_be_key = (
+        _BASE64_TEXT.fullmatch(name) is not None or _holds_key_run(name) or _is_key_value(rest)
+    )
     # A secret outside the standard alphabet padded with ``==``, such as base64url, reads as a
     # name set to ``=``. The rule of 3085e1d5c55 continued on that, so this case keeps it. One
     # ``=`` of padding leaves the value empty, so this case does not take such a secret.

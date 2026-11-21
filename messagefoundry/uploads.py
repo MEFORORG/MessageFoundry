@@ -443,17 +443,27 @@ def _refused_read(exc: OSError) -> _ReadRefusal | None:
     ``"denied"`` for a ``PermissionError``: at least a permission or an ACL the engine lacks, and
     on Windows a file another program holds open (a sharing violation). That is not damage, so it
     is never answered as a file an operator should delete. A ``PermissionError`` whose path is now
-    a folder is ``"damaged"``, since Windows refuses an open of a folder that way. ``None`` for any other ``OSError``,
-    such as too many open files or an I/O error, which may pass on a retry, so the caller
-    re-raises it."""
-    if isinstance(exc, _NotPlainError) or exc.errno == errno.ELOOP:
+    a folder is ``"damaged"``, since Windows refuses an open of a folder that way. A part swapped
+    for a folder, a socket or a link after the ``lstat`` on POSIX is ``"damaged"`` too, read by
+    the codes the pair lock reads a planted file by (:func:`_not_a_file_errnos`), such as
+    ``EISDIR`` for a folder's descriptor and ``ENXIO`` for a socket on Linux, since no retry makes
+    either a plain file (BACKLOG #5388 added item 3). ``None`` for any other ``OSError``, such as
+    too many open files or an I/O error, which may pass on a retry, so the caller re-raises it."""
+    if isinstance(exc, _NotPlainError) or exc.errno == errno.ELOOP or exc.errno in _NOT_A_FILE:
         return "damaged"
     if isinstance(exc, PermissionError):
         # Windows answers an open of a folder with a PermissionError too, so a folder swapped in
         # after the lstat is a part that is not a plain file, not one the engine may not open.
         try:
             folder = exc.filename is not None and S_ISDIR(os.lstat(exc.filename).st_mode)
-        except (OSError, TypeError, ValueError):
+        except (OSError, TypeError, ValueError) as lstat_exc:
+            # The path cannot be checked again, so it is answered as the refusal it was. Logged at
+            # DEBUG, not swallowed: the caller already logs the refusal at WARNING. The class
+            # only, since the path names the upload.
+            _log.debug(
+                "upload part refused, and the check for a folder failed: %s",
+                type(lstat_exc).__name__,
+            )
             folder = False
         return "damaged" if folder else "denied"
     return None

@@ -139,17 +139,18 @@ against one case that matters, described under
   `secrets.env.example` → `secrets.env`, drop a cert/key under `./tls`, point `./config` at your repo,
   and read topology A below for the revocation attestation `docker compose` requires.
 - **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
-  — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set all three `image:` fields (`tls-dir`, `copy-tls` and `engine`) to your config-baked image.
+  — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set all four `image:` fields (`revocation-attestation-check`, `tls-dir`, `copy-tls` and `engine`) to your config-baked image.
   An enforcing start needs more than the bind, and the manifest's block *what an enforcing start
   needs* names at least the alert channel, verified-TLS log forwarding and the retention bounds as
   commented entries. As shipped the engine refuses to start; uncomment each entry with your value. Bake the syslog CA and CRL it names under `/config/pki/`, and
   add the Secret's `tls-revocation-attested` key, without which the pod does not start: the kubelet
-  refuses the engine container with `CreateContainerConfigError`. The HA manifest below,
+  refuses the pod's containers, the `revocation-attestation-check` init container first, with `CreateContainerConfigError`. The HA manifest below,
   `k8s/ha-postgres.yaml`, requires the same key. Set it only
   if your PKI enforces revocation ([SECURITY.md, API revocation gate](../docs/SECURITY.md#api-revocation-gate)),
   and to a value that reads as true (`1`, `true`, `yes` or `on`). A value such as `0` passes the
-  kubelet, and the engine then exits 2 and the pod crash-loops: neither Kubernetes manifest checks
-  the value before the engine starts.
+  kubelet. Each Kubernetes manifest checks the value before the engine starts: its
+  `revocation-attestation-check` init container exits 1 naming the gate, so the engine never
+  starts and the pod crash-loops in `Init:CrashLoopBackOff` until you fix the key.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
   Postgres-backed `replicas: 3` Deployment with `[cluster].enabled`, a PodDisruptionBudget, and
   lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)

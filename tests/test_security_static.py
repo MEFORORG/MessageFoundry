@@ -704,14 +704,20 @@ _UNSCANNABLE_RE_PATTERNS = {
     # ``tests/test_b532r_redaction_dsn.py`` holds the growth with a stopwatch. Since round 9 the
     # user's first segment is ``_DSN_USER_FIRST_SEGMENT``, an atomic group of three alternatives
     # that start on disjoint characters: a bracketed word, an angled word, or a possessive run of
-    # that lookahead and one class holding neither bracket nor angle.
+    # that lookahead and one class holding neither bracket nor angle. Since BACKLOG #5386's
+    # bracket and tail work the run is ``_DSN_RUN``, spliced into each alternative; the empty
+    # user's class admits a "]", and its character may also be a "[" behind a lookahead, which
+    # the class excludes; and where the user's first segment is a placeholder (a conditional on
+    # its named group), the alternative ends in tail groups (``_DSN_TAIL``), each an "@" then a
+    # possessive run of ``_DSN_GROUP_CHAR`` or of ``_DSN_TAIL_CHAR``, both refusing "@", before
+    # the next "@", so the repeats tile the text; the final "@" follows both alternatives.
     "messagefoundry/secretscrub.py": (
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_TOKEN_WORDS) + '))\\\\b(?:[\\'\\\\\"]\\\\s*:|\\\\s*[:=])\\\\s*(?:(?:bearer|basic|digest)\\\\s+)?(?:' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_VALUE + ')'",
         "'(?i)' + _LABEL_START + '(bearer)\\\\s+(?=[\\'\\\\\"]?[^\\\\s\\'\\\\\",;]{4})' + _PLAIN_SCHEME_VALUE",
         "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_NO_SPACE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]++[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _ODBC_BRACED + '|' + _KV_QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _KEY_LABEL_ALTERNATION + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_KEY_VALUE + ')'",
-        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*):(?:(?<=//:)(?:' + _DSN_RUN_STOP + '(?:[^\\\\s/@?#&=;,()|^~{}<>\\\\[\\\\]%\\\\x27\\\\x22]|%(?!7c|7e|5e|26|2c|3b|3f|23|27|22|28|29)))*+|(?<!//:)' + _DSN_USER_FIRST_SEGMENT + ')(?:' + _DSN_RUN_STOP + '[^\\\\s/;?#&,()|^~{}<>\\\\[\\\\]%\\\\x27\\\\x22])*@'",
+        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*):(?:(?<=//:)(?:' + _DSN_RUN_STOP + '(?:[^\\\\s/@?#&=;,()|^~{}<>\\\\[%\\\\x27\\\\x22]|%(?!7c|7e|5e|26|2c|3b|3f|23|27|22|28|29)|\\\\[(?![a-z]+\\\\])))*+' + _DSN_RUN + '|(?<!//:)' + _DSN_USER_FIRST_SEGMENT + _DSN_RUN + _DSN_TAIL + ')@'",
         "_camel_start('\\\\b[\\'\\\\\"]?\\\\s*+[:=]')",
         "source",
     ),
