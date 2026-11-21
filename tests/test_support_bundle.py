@@ -871,3 +871,66 @@ def test_read_log_file_refuses_a_directory_swapped_in(tmp_path: Path) -> None:
     expected: type[OSError] = OSError if os.name == "nt" else bundle_mod._LogFileRefused
     with pytest.raises(expected):
         bundle_mod._read_log_file(log, listed)
+
+
+# --- BACKLOG #5385: the log read is bounded, so a large log cannot exhaust memory and lose the zip --
+
+
+def test_log_tail_reads_only_a_bounded_tail_of_a_large_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole file used to be read into memory, so a large enough log raised ``MemoryError``,
+    which nothing catches, and no zip was written. Only the last ``_LOG_TAIL_MAX_BYTES`` bytes are
+    read now; the line the bound cuts into is dropped, so no partial line reaches the redactor."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 64)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    lines = [f"line-{n:04d} synthetic" for n in range(200)]
+    (log_dir / "engine.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tail = _tail_member(tmp_path, log_dir)
+    assert tail is not None
+    got = tail.split("\n")
+    assert len(tail.encode("utf-8")) <= 64, tail
+    # Whole lines only, and the newest ones, in order.
+    assert got == lines[-len(got) :], got
+    assert got[-1] == "line-0199 synthetic"
+
+
+def test_log_tail_bound_on_a_line_start_drops_no_whole_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bound that falls exactly on a line start keeps that line: only a cut line is dropped."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_bytes(b"aaaa\r\nbbbb\r\ncccc\r\n")
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 12)
+    assert _tail_member(tmp_path, log_dir) == "bbbb\ncccc"
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 11)
+    assert _tail_member(tmp_path, log_dir) == "cccc"
+
+
+def test_read_log_file_never_asks_for_more_than_the_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The read itself is bounded, not only the text kept: a read of the whole file is what ran
+    out of memory."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)
+    log = tmp_path / "engine.log"
+    log.write_bytes(b"x" * 10 + b"\n" + b"y" * 1000 + b"\nlast\n")
+    listed = os.lstat(log)
+    sizes: list[int] = []
+    real_read = os.read
+
+    def recording_read(fd: int, n: int) -> bytes:
+        sizes.append(n)
+        return real_read(fd, n)
+
+    monkeypatch.setattr(os, "read", recording_read)
+    assert bundle_mod._read_log_file(log, listed) == "last\n"
+    assert sizes and all(n <= 33 for n in sizes), sizes

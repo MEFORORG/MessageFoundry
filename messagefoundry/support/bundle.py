@@ -2,8 +2,8 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Assemble the offline support bundle zip (#49).
 
-:func:`build_bundle` writes a single ``.zip`` from purely **local** inputs — it touches no network and
-starts no server. Contents (each a small text/JSON member):
+:func:`build_bundle` writes a single ``.zip``; it starts no server. Contents (each a small text/JSON
+member):
 
 * ``version.txt`` / ``manifest.json`` — the engine :data:`messagefoundry.__version__` + generation
   timestamp + a content listing.
@@ -14,9 +14,8 @@ starts no server. Contents (each a small text/JSON member):
   (:class:`~messagefoundry.api.models.SystemStatus` / ``EngineInfo`` / ``DbInfo``), populated offline
   from the store. Metadata-only, the term the manifest's ``phi_contract`` uses;
   :func:`status_snapshot` says what it holds.
-* ``app-log.txt`` — a **redacted** tail of the newest ``.log`` or ``.txt`` file under
-  ``[logging].log_dir`` (see :mod:`messagefoundry.support.redact`); :func:`_log_tail` says when
-  a code replaces it or it is omitted. A log set only through ``[logging].file`` is not bundled.
+* ``app-log.txt`` — when written, a **redacted** app-log tail or an ``MF-BUNDLE-LOG-*`` code in its place (see
+  :mod:`messagefoundry.support.redact` and :func:`_log_tail`).
 
 HARD RULE (do not break): no member this module builds reads a message body from the store, and only
 the app-log tail can carry a secret or a body into the archive. The config summary loads the config but
@@ -142,11 +141,9 @@ def status_snapshot(settings: ServiceSettings | None) -> dict[str, Any]:
 
     The engine isn't running under the CLI, so ``EngineInfo`` carries the version with a zero uptime /
     no live channel counts; ``DbInfo`` is read from the store the settings point at (when reachable).
-    Metadata-only, the manifest ``phi_contract``'s term: at least the engine version and, when the
-    store is read, store metadata, never the store's host or database name. ``db`` is null when
-    ``settings`` is None or the store cannot be opened; in the second case a ``db_error`` member
-    holds a code instead of raising (e.g. the DB is missing or in use), so the bundle still
-    builds."""
+    Metadata-only, the manifest ``phi_contract``'s term. ``db`` is null when ``settings`` is None
+    or the store cannot be opened; in the second case a ``db_error`` member holds a code instead of
+    raising (e.g. the DB is missing or in use), so the bundle still builds."""
     import os
 
     from messagefoundry.api.models import EngineInfo, SystemStatus
@@ -228,6 +225,11 @@ _IO_REPARSE_TAG_NAME_SURROGATE = 0x20000000
 #: replaced the file between listing and opening, which reads as a swap to the identity check.
 _LOG_READ_ATTEMPTS = 2
 
+#: The most bytes from the end of the app-log file the tail is taken from; the read takes one
+#: byte more, to find where a line starts. The whole file used to be read, so a
+#: large enough log raised ``MemoryError`` and no zip was written (BACKLOG #5385).
+_LOG_TAIL_MAX_BYTES = 4 * 1024 * 1024
+
 
 class _LogFileRefused(OSError):
     """The newest app-log file was not, once opened, the plain regular file the listing saw: a
@@ -268,9 +270,10 @@ def _log_candidates(directory: Path) -> list[tuple[Path, os.stat_result]]:
 
 
 def _read_log_file(path: Path, listed: os.stat_result) -> str:
-    """The text of ``path``, checked after the open to be the same plain regular file that was
-    listed (BACKLOG #5383): ``fstat`` on the new descriptor must report a regular file with the
-    device and file id the listing saw. The descriptor is closed on every path out.
+    """The text of at most the last ``_LOG_TAIL_MAX_BYTES`` bytes of ``path``, less the line the
+    bound cuts into, checked after the open to be the same plain regular file that was listed
+    (BACKLOG #5383): ``fstat`` on the new descriptor must report a regular file with the device
+    and file id the listing saw. The descriptor is closed on every path out.
 
     On POSIX, ``O_NOFOLLOW`` makes the open fail with ``ELOOP`` when a symbolic link has been put
     at the name, so the open never reaches another file through one. ``O_NONBLOCK`` makes the open
@@ -298,21 +301,38 @@ def _read_log_file(path: Path, listed: os.stat_result) -> str:
             raise _LogFileRefused("the app-log file changed between listing and opening")
         if nonblocking:
             os.set_blocking(fd, True)
-        handle = os.fdopen(fd, "rb")
-    except BaseException:
+        # One byte before the bound is read too, so the line the bound cuts into can be told
+        # from one it starts exactly at: that byte is a line break only in the second case.
+        start = max(0, opened.st_size - _LOG_TAIL_MAX_BYTES - 1)
+        os.lseek(fd, start, os.SEEK_SET)
+        want = opened.st_size - start
+        chunks: list[bytes] = []
+        while want > 0:
+            chunk = os.read(fd, want)
+            if not chunk:
+                break  # truncated since the fstat, as a rotation can
+            chunks.append(chunk)
+            want -= len(chunk)
+    finally:
         os.close(fd)
-        raise
-    with handle:
-        data = handle.read()
+    data = b"".join(chunks)
+    if start:
+        # Drop through the first line break: what precedes it is the cut line, or nothing when
+        # the bound starts exactly after it. A CRLF counts as one break.
+        breaks = [i for i in (data.find(b"\n"), data.find(b"\r")) if i >= 0]
+        cut = min(breaks) + 1 if breaks else len(data)
+        if data[cut - 1 : cut + 1] == b"\r\n":
+            cut += 1
+        data = data[cut:]
     # Read tolerant of a legacy codepage; the redaction pass runs on the decoded text.
     return data.decode("utf-8", errors="replace")
 
 
 def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
-    """A redacted tail of the newest app-log file under ``log_dir`` (one level). ``None`` when no log
-    dir is configured, it holds no readable log file, or ``lines`` is not positive (BACKLOG #5384: a
-    slice by zero or a negative count would carry the whole file, or most of it). **Never** raises —
-    a log read problem is logged into the tail text, not propagated.
+    """A redacted tail of an app-log file under ``log_dir``. ``None`` at least when no log dir is
+    configured or ``lines`` is not positive (BACKLOG #5384: a slice by zero or a negative count
+    would carry the whole file, or most of it). An :class:`OSError` from the listing or the read is
+    reported in the tail text as a code, not propagated.
 
     Only a plain regular file with one name is read: a link, a hard link or a special file with a
     log suffix is passed over (BACKLOG #5383), see :func:`_log_candidates` and
@@ -360,7 +380,7 @@ def build_bundle(
     log_tail_lines: int = DEFAULT_LOG_TAIL_LINES,
     now: float | None = None,
 ) -> BundleResult:
-    """Write the support-bundle zip to ``out_path`` from local inputs only (no network, no server).
+    """Write the support-bundle zip to ``out_path``; it starts no server.
 
     ``config_dir`` (optional) drives the config summary, which holds no secret; ``settings``
     (optional) drives the status snapshot + the redacted log tail. Each member is best-effort — a

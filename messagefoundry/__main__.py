@@ -585,11 +585,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "write a support zip to hand to support (#49). Its members: version.txt (the engine "
         "version); manifest.json (at least the member list, the engine version, a generation "
         "time and the phi_contract); config-summary.json (counts/names only, holding no "
-        "secret); status.json (the metadata-only status models); and app-log.txt, a REDACTED "
-        "tail of the newest .log or .txt file under [logging].log_dir. An MF-BUNDLE-LOG-* code "
-        "replaces the tail, or app-log.txt is left out, at least when no log_dir is set, a file "
-        "there cannot be read or is refused, or --log-tail-lines is 0; a log set only through "
-        "[logging].file is not bundled. The tail's "
+        "secret); status.json (the metadata-only status models); and, when written, app-log.txt, "
+        "a REDACTED app-log tail or an MF-BUNDLE-LOG-* code in its place. The tail's "
         "redaction is BEST-EFFORT, and values survive it: at least a single-token identifier such "
         "as an operator username and, on a non-production instance logging at DEBUG, a message "
         "body the log recorded in a shape the redaction does not read. Handle the zip as a copy of "
@@ -616,8 +613,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--log-tail-lines",
         type=_non_negative_int,
         default=None,
-        help="number of trailing app-log lines to include (redacted); default 500; 0 omits the "
-        "app log",
+        help="most trailing app-log lines to include (redacted); default 500; 0 omits the app log",
     )
 
     sub.add_parser(
@@ -13902,16 +13898,10 @@ def _verify(args: argparse.Namespace) -> int:
 
 
 def _support_bundle(args: argparse.Namespace) -> int:
-    """Write a support zip (#49): ``version.txt``, ``manifest.json`` (with the ``phi_contract``), a
-    config summary (registry COUNTS/names only, holding no secret), a metadata-only ``/status``
-    snapshot built from the real status models, and a REDACTED app-log tail. The tail is neither
-    secret-free nor PHI-free, since its redaction is best-effort with a single-token residual
-    that includes an operator username (BACKLOG #1475; the argparse help above carries the
-    reasoning, and ``docs/PHI.md`` stream 14 is the record). Offline:
-    touches no network, starts no server. The status snapshot + log tail come from the service
-    settings (the configured store + ``[logging].log_dir``); the config summary comes from
-    ``--config``. A missing service config or store is tolerated — the bundle is still produced
-    (support is most wanted when something is already broken)."""
+    """Write a support zip (#49) with :func:`messagefoundry.support.build_bundle`. The members and
+    the log-tail residual are stated in the argparse help above and the manifest's
+    ``phi_contract``; ``docs/PHI.md`` stream 14 is the record (BACKLOG #1475, #5385). The status
+    snapshot + log tail come from the service settings, the config summary from ``--config``."""
     from pydantic import ValidationError
 
     from messagefoundry.config.anchor import anchor_settings_store_path
