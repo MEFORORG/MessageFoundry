@@ -91,6 +91,12 @@ export function committedRelativePath(ws: string, value: string): string | undef
   return rel === "" ? "." : rel.split(path.sep).join("/");
 }
 
+/** Whether, on Windows (`win32`), any folder or file name in `rel` meets `bad`. Either separator
+ *  splits `rel`, since Windows takes both. Spelling only, with no I/O. */
+function someWin32Name(rel: string, win32: boolean, bad: (name: string) => boolean): boolean {
+  return win32 && rel.split(/[\\/]/).some(bad);
+}
+
 /**
  * Whether `rel`, a path relative to a folder with its `..` components already collapsed, has a folder
  * or file name ending in a dot or a space, when `win32` (by default, on Windows). A `.` component,
@@ -100,11 +106,11 @@ export function committedRelativePath(ws: string, value: string): string | undef
  * what the CLI opens, a link out of the folder included. Either separator splits `rel`, since Windows
  * takes both. Spelling only, with no I/O. Shared by {@link escapesByLink} and securityConfigTarget.
  *
- * Open limit: at least a reserved device name such as `nul` is not refused here. A name holding a
- * colon is refused by {@link hasColonInName}.
+ * A name holding a colon is refused by {@link hasColonInName}, and a reserved device name by
+ * {@link hasReservedDeviceName}.
  */
 export function hasTrailingDotOrSpaceName(rel: string, win32: boolean = path.sep === "\\"): boolean {
-  return win32 && rel.split(/[\\/]/).some((part) => part !== "." && (part.endsWith(".") || part.endsWith(" ")));
+  return someWin32Name(rel, win32, (part) => part !== "." && (part.endsWith(".") || part.endsWith(" ")));
 }
 
 /**
@@ -120,7 +126,38 @@ export function hasTrailingDotOrSpaceName(rel: string, win32: boolean = path.sep
  * I/O. Shared by {@link escapesByLink} and securityConfigTarget (BACKLOG #5404 item 1).
  */
 export function hasColonInName(rel: string, win32: boolean = path.sep === "\\"): boolean {
-  return win32 && rel.split(/[\\/]/).some((part) => part.includes(":"));
+  return someWin32Name(rel, win32, (part) => part.includes(":"));
+}
+
+/** The DOS device names Windows reserves, as CPython's `ntpath.isreserved` lists them: the
+ *  superscript digits one to three are device digits too. Upper case. */
+const RESERVED_DEVICE_NAMES: ReadonlySet<string> = new Set([
+  "CON",
+  "PRN",
+  "AUX",
+  "NUL",
+  "CONIN$",
+  "CONOUT$",
+  ...["COM", "LPT"].flatMap((p) => [..."123456789¹²³"].map((d) => p + d)),
+]);
+
+/**
+ * Whether `rel`, a path relative to a folder, has a folder or file name that is a reserved DOS
+ * device name ({@link RESERVED_DEVICE_NAMES}, in any case), when `win32` (by default, on Windows).
+ * The name is read as CPython's `ntpath.isreserved` reads it: the part before its first dot, with trailing
+ * spaces dropped, so `nul.txt`, `con .toml` and `Com1.x` count too. A Win32 open of a bare device
+ * name opens the device, not a file in the folder: Python 3.14.7 on Windows 11 resolves `nul` to
+ * `\\.\nul` (measured 2026-11-20). There a stem with an extension is a plain file, but Windows 10
+ * and earlier map it to the device as well, so it is refused on every Windows version, the same
+ * fail-closed reading CPython takes and the engine's own `[environments].dir` check makes. A device
+ * opened in a file's place is a read or write the real-path check cannot see: Node finds no entry
+ * by that name and reports a missing path. Either separator splits `rel`. Spelling only, with no
+ * I/O. Shared by {@link escapesByLink} and securityConfigTarget (BACKLOG #5404 item 3).
+ */
+export function hasReservedDeviceName(rel: string, win32: boolean = path.sep === "\\"): boolean {
+  return someWin32Name(rel, win32, (part) =>
+    RESERVED_DEVICE_NAMES.has(part.split(".")[0].replace(/ +$/, "").toUpperCase()),
+  );
 }
 
 /** The workspace-relative path settings a writer checks. */
@@ -139,8 +176,8 @@ export type PathSettingKey = "configDir" | "serviceConfig" | "messageSetsDir";
  * At least these spellings are refused outright, before any I/O. A `..` component: the real-path check collapses
  * `..` by spelling, but on POSIX the CLI's kernel follows a link before it applies the `..` after it,
  * so `link/../x` could land outside the folder although its spelling is `x`. And, on Windows, a name
- * {@link hasTrailingDotOrSpaceName} or {@link hasColonInName} names, which the real-path check can
- * pass although the CLI's Win32 open reaches another entry.
+ * {@link hasTrailingDotOrSpaceName}, {@link hasColonInName} or {@link hasReservedDeviceName} names,
+ * which the real-path check can pass although the CLI's Win32 open reaches another entry or a device.
  *
  * Open limits. The check reads the named path only: a link BELOW it, such as a linked `codesets`
  * folder under `configDir`, is not caught here. The real-path reads are synchronous, because cli.ts
@@ -161,7 +198,7 @@ export function escapesByLink(ws: string | undefined, value: string, win32: bool
   if (value.split(win32 ? /[\\/]/ : /[/]/).includes("..")) {
     return true;
   }
-  if (hasTrailingDotOrSpaceName(rel, win32) || hasColonInName(rel, win32)) {
+  if (hasTrailingDotOrSpaceName(rel, win32) || hasColonInName(rel, win32) || hasReservedDeviceName(rel, win32)) {
     return true;
   }
   return resolveInsideWorkspace(ws, value) === undefined;
@@ -183,8 +220,9 @@ export function linkEscapeRefusal(key: PathSettingKey, fallback?: string): strin
       : `messagefoundry.${key} is blank, so the CLI opens ${fallback}, a path`;
   return (
     `MessageFoundry: nothing was written or started. ${subject} inside the workspace folder that may ` +
-    "lead out of it, or that Windows may open as another name. At least one of these holds: a symbolic " +
-    "link or junction on the path leads out, the path climbs with '..', a folder or file name on it " +
+    "lead out of it, or that Windows may open as another name or a device. At least one of these holds: " +
+    "a symbolic link or junction on the path leads out, the path climbs with '..', a folder or file name " +
+    "on it is a Windows device name such as nul or com1, a folder or file name on it " +
     "ends in a dot or a space or holds a colon, or its real path cannot be read. Remove the link, the " +
     "'..' or the colon, rename the folder or file, correct the setting value, or make the workspace " +
     "folder readable, so the path is a plain " +
@@ -231,8 +269,8 @@ export interface PathSettingScopes {
  *
  * Open limit: this compares spellings only, with no file-system call, because every CLI call reads
  * these settings. It does not catch at least a link or junction inside the folder that leads out of
- * it, a Windows name ending in a dot or a space, or a Windows name holding a colon. A writer that
- * needs those checks makes them itself
+ * it, a Windows name ending in a dot or a space, a Windows name holding a colon, or a Windows
+ * device name. A writer that needs those checks makes them itself
  * ({@link escapesByLink}, {@link resolveInsideWorkspace}, securityConfigTarget).
  */
 export function containedPathSetting(
