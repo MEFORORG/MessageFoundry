@@ -48,7 +48,7 @@ def wildcard_loopback(host: str) -> str | None:
     (:mod:`messagefoundry.tray.config`), so the address dialled and the name verified are one rule.
     """
     try:
-        ip = ipaddress.ip_address(host.strip("[]"))
+        ip = ipaddress.ip_address(unbracketed(host))
     except ValueError:
         return None
     if not ip.is_unspecified:
@@ -64,11 +64,12 @@ def unbracketed(host: str) -> str:
     the address, and a DNS name spelled ``[::1]`` matches no URL (BACKLOG #5973).
     """
     if host.startswith("[") and host.endswith("]"):
+        inner = host[1:-1]
         try:
-            ipaddress.ip_address(host[1:-1])
+            ipaddress.ip_address(inner)
         except ValueError:
             return host
-        return host[1:-1]
+        return inner
     return host
 
 
