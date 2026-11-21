@@ -1330,13 +1330,13 @@ async def test_a_remembered_reject_costs_no_stat_hop_of_its_own(
 async def test_an_undisposed_file_whose_stat_times_out_is_still_remembered(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A move to ``.processed`` that fails while the share drops: the stat after it fails too, for
-    a reason that is no evidence the file has gone, so the read's own mark stands in and the file
-    is not handed off again.
+    """A delete that fails while the share drops: the stat after it fails too, for a reason that
+    is no evidence the file has gone, so the read's own mark stands in and the file is not handed
+    off again. Under ``delete`` only: under ``move`` the archive stamp has changed the mtime.
 
     Mutation: return None from ``_undisposed`` on any stat failure. Red: nothing is remembered."""
-    rig = _Rig(tmp_path, monkeypatch, cap=10, fail_errno=None)
-    _fail_processed(rig, monkeypatch)
+    rig = _Rig(tmp_path, monkeypatch, cap=10, after_read="delete", fail_errno=None)
+    failing = _fail_delete(monkeypatch)
     path = rig.drop("a.hl7", _HL7)
     real_mark = file_mod._file_mark
     timing_out = [False]
@@ -1346,19 +1346,30 @@ async def test_an_undisposed_file_whose_stat_times_out_is_still_remembered(
             raise OSError(errno.ETIMEDOUT, "timed out")
         return real_mark(p)
 
-    real_archive_to = FileSource._archive_to
+    real_remove = file_mod._remove_pinned
 
-    def archive_to(self: FileSource, *args: Any, **kwargs: Any) -> Any:
-        done = real_archive_to(self, *args, **kwargs)
-        timing_out[0] = True  # the share drops right after the failed move
-        return done
+    def remove(pin: Any) -> None:
+        try:
+            real_remove(pin)
+        finally:
+            timing_out[0] = True  # the share drops right after the failed delete
 
     monkeypatch.setattr(file_mod, "_file_mark", mark)
-    monkeypatch.setattr(FileSource, "_archive_to", archive_to)
+    monkeypatch.setattr(file_mod, "_remove_pinned", remove)
     await rig.scan()
     await rig.scan()
     assert rig.handed_off == [_HL7]
     assert str(path) in rig.source._stuck
+    timing_out[0] = False  # the share is back; the delete still fails
+    for _ in range(4):
+        await rig.scan()
+    assert rig.handed_off == [_HL7], "not handed off again once the share is back"
+    failing[0] = False
+    _age_stuck(rig)
+    await rig.scan()
+    await rig.scan()
+    assert not path.exists()
+    assert rig.handed_off == [_HL7]
 
 
 async def test_a_retried_disposal_is_logged(

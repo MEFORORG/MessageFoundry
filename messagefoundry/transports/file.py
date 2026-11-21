@@ -236,7 +236,9 @@ SETTLE_MISS_LIMIT = 3
 # afresh, so a file that now passes is ingested. Retries run in their own pass after the scan's other
 # candidates, at most STUCK_RETRIES_PER_SCAN_MAX of them and often fewer
 # (FileSource._retry_allowance), and spend none of the per-tick budget, so they cannot crowd healthy
-# drops out of a scan however many rejects are stuck.
+# drops out of a scan however many rejects are stuck. A handed-off file whose move to .processed, or
+# delete, failed is remembered the same way, with the digest of the bytes handed off: its retry
+# reads it and, while they match, retries only the move or delete (FileSource._dispose).
 #
 # The back-off, stated here once. A stuck reject waits STUCK_RETRY_SECONDS when :func:`_lasting`
 # judged its failure lasting, or when a copy already sits in .error and only the original's removal
@@ -1487,14 +1489,12 @@ class FileSource(SourceConnector):
         if retry and key in self._stuck and (digest := self._stuck[key][0].digest) is not None:
             # A hand-off already took these bytes and only the move or delete failed (#5717).
             if await asyncio.to_thread(_digest, raw) == digest:
-                await self._dispose(path, read_sig, read_id, digest)
+                await self._dispose(path, read_sig, read_id, digest, unhashed=raw)
                 return _Step.FREE
             del self._stuck[key]  # other bytes than were handed off: judged and handed off afresh
-        # What a failed move or delete remembers the file by (#5717). Hashed now only where a
-        # gunzip is about to drop these bytes; otherwise they stay held and are hashed on failure.
-        digest = None
-        if self.decompress == "gzip" and self.after_read != "leave":
-            digest = await asyncio.to_thread(_digest, raw)
+        # The bytes read, kept past any gunzip: a failed move or delete remembers the file by
+        # their digest, taken only then (#5717).
+        read_bytes = raw
         if self.decompress == "gzip":
             # Decompress BEFORE the sniff, the AV/ICAP scan, and the batch split (ADR 0123): each
             # must see the REAL bytes, not the gzip container. The ceiling bounds the decompressed
@@ -1617,8 +1617,7 @@ class FileSource(SourceConnector):
                 safe_name(path.name),
             )
             return _Step.STOP
-        # Without a gunzip ``raw`` is still the bytes read; with one, ``digest`` is already set.
-        await self._dispose(path, read_sig, read_id, digest, unhashed=raw)
+        await self._dispose(path, read_sig, read_id, None, unhashed=read_bytes)
         if self.after_read == "leave" and file_key is not None:
             # Record AFTER emit success (the FILE — not each split message — is the dedup unit), so a
             # partial-emit crash re-reads and re-emits the whole file (at-least-once), never dropping.
@@ -1678,10 +1677,10 @@ class FileSource(SourceConnector):
         read_id: _FileId,
         digest: bytes | None,
         *,
-        unhashed: bytes = b"",
+        unhashed: bytes,
     ) -> None:
         """Move or delete a file whose hand-off completed (:meth:`_after_processing`). ``digest`` is
-        the :func:`_digest` of the bytes read, or None to hash ``unhashed`` only if it is needed.
+        the :func:`_digest` of ``unhashed``, the bytes read, or None to take it only if needed.
         Before BACKLOG #5717 a file that stayed because that failed was read, handed off and charged
         again on later scans. Now it is remembered with that digest: skipped unread and uncharged
         while unchanged, and once its retry falls due read again and, if its bytes still match,
@@ -1691,9 +1690,9 @@ class FileSource(SourceConnector):
         entry = self._stuck.get(key)
         retried = entry is not None and entry[0].digest is not None
         left = await self._run_fs(self._after_processing, path, read_sig, read_id)
-        if left is None:
+        if not isinstance(left, _Undisposed):
             self._stuck.pop(key, None)  # disposed of, gone, or no longer the file that was read
-            if retried and self.after_read != "leave":
+            if retried and left:
                 logger.info(
                     "file source %s: processed file %s, handed off earlier, is moved or deleted "
                     "now, without another hand-off",
@@ -2275,22 +2274,23 @@ class FileSource(SourceConnector):
 
     def _after_processing(
         self, path: Path, read_sig: _FileSig | None = None, read_id: _FileId | None = None
-    ) -> _Undisposed | None:
-        """Move or delete a file whose hand-off completed. An :class:`_Undisposed` when that failed
-        and the file that was read still sits at ``path``, which the scan remembers so a later scan
-        does not hand it off again (BACKLOG #5717); otherwise None."""
+    ) -> _Undisposed | bool:
+        """Move or delete a file whose hand-off completed. True when that was done. An
+        :class:`_Undisposed` when it failed and the file that was read still sits at ``path``,
+        which the scan remembers so a later scan does not hand it off again (BACKLOG #5717).
+        False otherwise: left in place on purpose, changed since the read, gone or replaced."""
         # ``read_sig`` and ``read_id`` None are a direct caller with no read to compare against:
         # dispose as before.
         if read_sig is not None and self._changed_since_read(path, read_sig):
-            return None
+            return False
         if self.after_read == "leave":
             # #142 process-in-place: never move or delete the source file — the durable dedup ledger
             # (recorded by _scan_once AFTER this returns) is what stops it being re-ingested next poll.
-            return None
+            return False
         if self.after_read == "delete":
             pin, lasting = self._try_pin(path, read_id)
             if pin is None:
-                return self._undisposed(path, read_sig, read_id, lasting=lasting)
+                return self._undisposed(path, read_sig, read_id, lasting=lasting, stamped=False)
             with pin:
                 try:
                     _remove_pinned(pin)
@@ -2303,34 +2303,43 @@ class FileSource(SourceConnector):
                     )
                     lasting = _lasting(exc)
                 else:
-                    return None
-            return self._undisposed(path, read_sig, read_id, lasting=lasting)
+                    return True
+            return self._undisposed(path, read_sig, read_id, lasting=lasting, stamped=False)
         done = self._archive_to(path, self.processed_dir, read_id, stamp=True, track=True)
         if done.stays:
             # A copy already in .processed waits as a lasting failure would, so a retry does not
             # write another copy on every scan (the back-off rule at STUCK_RETRY_SECONDS).
-            return self._undisposed(path, read_sig, read_id, lasting=done.lasting or done.archived)
-        return None
+            return self._undisposed(
+                path, read_sig, read_id, lasting=done.lasting or done.archived, stamped=True
+            )
+        return done.archived
 
     @staticmethod
     def _undisposed(
-        path: Path, read_sig: _FileSig | None, read_id: _FileId | None, *, lasting: bool
-    ) -> _Undisposed | None:
+        path: Path,
+        read_sig: _FileSig | None,
+        read_id: _FileId | None,
+        *,
+        lasting: bool,
+        stamped: bool,
+    ) -> _Undisposed | bool:
         """An :class:`_Undisposed` for ``path`` when it still names the file that was read
-        (``read_id``), else None: gone, replaced, or not stat'd for a reason that says so. A stat
-        failure :func:`_transient_stat_failure` names, such as a share that dropped, is no evidence
-        the file has gone, so the read's own ``read_sig`` stands in for its mark. A direct caller
-        with no ``read_id`` gets None, as before BACKLOG #5717."""
+        (``read_id``), else False: gone, replaced, or not stat'd. Under ``delete`` (``stamped``
+        False) a stat failure :func:`_transient_stat_failure` names, such as a share that dropped,
+        is no evidence the file has gone, so the read's own ``read_sig`` stands in for its mark.
+        Under ``move`` the archive stamp may have changed the mtime, so no stand-in is known and
+        the file is not remembered, as before. A direct caller with no ``read_id`` gets False, as
+        before BACKLOG #5717."""
         if read_id is None or read_sig is None:
-            return None
+            return False
         try:
             mark = _file_mark(path)
         except OSError as exc:
-            if not _transient_stat_failure(exc):
-                return None
+            if stamped or not _transient_stat_failure(exc):
+                return False
             mark = (*read_sig, *read_id)
         if mark[2:] != read_id:
-            return None
+            return False
         return _Undisposed(mark, lasting)
 
     def _move(

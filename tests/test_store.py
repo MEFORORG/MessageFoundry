@@ -1983,7 +1983,8 @@ async def test_a_generator_exit_in_the_cleanup_wait_still_forces_the_release() -
         coro.close()
     finally:
         unwedge.set()
-        await asyncio.sleep(0)
+        for _ in range(10):  # let the held cleanup finish, so none is left pending
+            await asyncio.sleep(0)
     assert forced == ["forced"]
 
 

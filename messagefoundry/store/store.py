@@ -2148,6 +2148,11 @@ async def cleanup_failed_open(
     it finishes. ``what`` names the cleanup in the WARNING lines."""
     if isinstance(exc, GeneratorExit):
         _force_failed_open_release(force_release)
+        if force_release is None:
+            # Nothing to force, so schedule the ordinary release: that needs no await here.
+            closing = asyncio.ensure_future(_run_to_completion(release, report=False))
+            closing.add_done_callback(functools.partial(_log_abandoned_end, what))
+            _hold_abandoned_open_cleanup(closing)
         return
 
     # Not reported there: an end it cuts short is reported below, with what follows it.
