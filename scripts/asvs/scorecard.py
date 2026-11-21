@@ -2518,11 +2518,20 @@ def _is_not_type_checking(test: ast.expr) -> bool:
     )
 
 
+#: The property accessor decorators, ``@x.setter`` and its siblings.
+_ACCESSORS: Final = frozenset({"setter", "getter", "deleter"})
+
+
 def _is_accessor(node: ast.stmt) -> bool:
-    """A ``@x.setter``, ``@x.getter`` or ``@x.deleter`` def: it adds an accessor to the property
-    ``x`` already names, so it does not replace that property's shape."""
+    """A ``@x.setter``, ``@x.getter`` or ``@x.deleter`` def named ``x`` itself: it adds an
+    accessor to the property ``x`` already names, so it does not replace that property's shape. A
+    def whose decorator base is any other name (``@router.getter def handler``) is an ordinary
+    definition."""
     return isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
-        isinstance(d, ast.Attribute) and d.attr in ("setter", "getter", "deleter")
+        isinstance(d, ast.Attribute)
+        and d.attr in _ACCESSORS
+        and isinstance(d.value, ast.Name)
+        and d.value.id == node.name
         for d in node.decorator_list
     )
 
@@ -2589,8 +2598,31 @@ def _scope_defs(body: list[ast.stmt]) -> _Scope:
     return _run_block(body, {})
 
 
-def _toplevel(source: str) -> _Scope | None:
+#: The attribute :func:`_toplevel` sets on a bare decorator name imported from a module outside
+#: :data:`_SHAPE_DECORATOR_MODULES`.
+_FOREIGN: Final = "_scorecard_foreign_import"
+
+
+def _foreign_imports(source: str) -> frozenset[str]:
+    """The names `source` binds by ``from <module> import`` where the module is not one of
+    :data:`_SHAPE_DECORATOR_MODULES`. Empty if `source` does not parse."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return frozenset()
+    return frozenset(
+        alias.asname or alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and (node.level or (node.module or "").split(".")[0] not in _SHAPE_DECORATOR_MODULES)
+        for alias in node.names
+    )
+
+
+def _toplevel(source: str, foreign: frozenset[str] = frozenset()) -> _Scope | None:
     """Module-scope function and class definitions by name. ``None`` if `source` does not parse.
+    A bare decorator name in `foreign` is marked so :func:`_decorators` does not take it for a
+    shape decorator.
 
     MODULE SCOPE ONLY, and that is the point rather than a simplification: the mutation is APPENDED
     to the module, so it can only shadow a module-level binding. A method is compared only when the
@@ -2600,6 +2632,12 @@ def _toplevel(source: str) -> _Scope | None:
         tree = ast.parse(source)
     except SyntaxError:
         return None
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            for d in node.decorator_list:
+                e = d.func if isinstance(d, ast.Call) else d
+                if isinstance(e, ast.Name) and e.id in foreign:
+                    setattr(e, _FOREIGN, True)
     return _scope_defs(tree.body)
 
 
@@ -2668,14 +2706,19 @@ _SHAPE_DECORATOR_MODULES: Final = frozenset(
 def _decorators(node: _DefNode) -> tuple[str, ...]:
     """The decorators in :data:`_SHAPE_DECORATORS`, by the last part of their name, in order.
     Arguments are left out for the reason default VALUES are, and so is a module prefix from
-    :data:`_SHAPE_DECORATOR_MODULES`, so ``@functools.cache`` and ``@cache`` are one decorator.
+    :data:`_SHAPE_DECORATOR_MODULES`, so ``@functools.cache`` and ``@cache`` are one decorator. A
+    bare name the module imports from any other module (``from acl import define``) is not one
+    (:func:`_foreign_imports`).
     """
     out = []
     for d in node.decorator_list:
         head, _, name = ast.unparse(d.func if isinstance(d, ast.Call) else d).rpartition(".")
-        accessor = name in ("setter", "getter", "deleter")
-        if name in _SHAPE_DECORATORS and (
-            not head or accessor or head.rsplit(".", 1)[-1] in _SHAPE_DECORATOR_MODULES
+        accessor = name in _ACCESSORS
+        foreign = not head and getattr(d.func if isinstance(d, ast.Call) else d, _FOREIGN, False)
+        if (
+            name in _SHAPE_DECORATORS
+            and not foreign
+            and (not head or accessor or head.rsplit(".", 1)[-1] in _SHAPE_DECORATOR_MODULES)
         ):
             out.append(name)
     return tuple(out)
@@ -2828,7 +2871,10 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
     """
     if target.suffix != ".py":
         return True  # nothing to parse; the append is opaque text by design
-    mutation = _toplevel(a.mutation)
+    target_text = target.read_text(encoding="utf-8", errors="replace")
+    # The mutation is appended, so a bare decorator name it uses can come from either import.
+    foreign = _foreign_imports(target_text) | _foreign_imports(a.mutation)
+    mutation = _toplevel(a.mutation, foreign)
     if mutation is None:
         findings.problems.append(
             f"{cell_id}: absence claim PROVE-ERROR — the mutation is not valid Python, so applying it "
@@ -2836,7 +2882,7 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
             "that imports inside a test body reddens at exit 1 and would be counted as a proof"
         )
         return False
-    source = _toplevel(target.read_text(encoding="utf-8", errors="replace"))
+    source = _toplevel(target_text, foreign)
     if source is None:
         # The TARGET does not parse. Not this claim's defect, and not something to refuse it over --
         # leave it to execution, where the baseline will already be red and fail closed.

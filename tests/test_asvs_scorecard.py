@@ -2631,12 +2631,14 @@ def test_screen_compares_only_the_definition_a_name_is_left_bound_to(tmp_path: P
 
 
 def test_screen_accepts_call_compatible_shapes_origin_main_accepted(tmp_path: Path) -> None:
-    """Shapes no call site can tell apart, each accepted on origin/main, which compared no class
-    member and walked no compound statement: a getter override of a property that also has a
-    setter, a method whose bound first parameter is renamed, a definition a loop's ``break``
-    leaves bound, and a dropped decorator that only shares a last name with a shape decorator. The
-    first cut of this fix refused them, and it let a mutation match the never-live stub under
-    ``if not TYPE_CHECKING:``'s ``else``, which is now refused."""
+    """Shapes origin/main accepted, since it compared no class member and walked no compound
+    statement, and the first cut of this fix refused: a getter override of a property that also
+    has a setter (it does drop the setter, so ``obj.x = v`` then raises; the screen does not
+    compare accessors, and accepts it as origin/main did), a method whose bound first parameter
+    is renamed, a definition a loop's ``break`` leaves bound, and a dropped decorator that only
+    shares a last name with a shape decorator, dotted or imported bare from another module. The
+    first cut also let a mutation match the never-live stub under ``if not TYPE_CHECKING:``'s
+    ``else``, which is now refused."""
     prop = "class C:\n    @property\n    def x(self): ...\n    @x.setter\n    def x(self, v): ...\n"
     assert (
         _screen("class C(C):\n    @property\n    def x(self):\n        return 2\n", prop, tmp_path)
@@ -2650,6 +2652,17 @@ def test_screen_accepts_call_compatible_shapes_origin_main_accepted(tmp_path: Pa
     assert any("different signature" in p for p in _screen("def f(x): ...", not_tc, tmp_path))
     assert _screen("@acl.define('admin')\ndef f(a): ...\n", "def f(a): ...\n", tmp_path) == []
     assert _screen("def f(a): ...\n", "@acl.define('admin')\ndef f(a): ...\n", tmp_path) == []
+    bare = "from acl import define\n\n@define('admin')\ndef f(a): ...\n"
+    assert _screen("def f(a): ...\n", bare, tmp_path) == []
+    # Control: the same bare name imported from attrs still counts.
+    attrs_bare = "from attrs import define\n\n@define\nclass P: ...\n"
+    assert _screen("class P: ...\n", attrs_bare, tmp_path)
+    # An accessor-shaped decorator on a def of another name is an ordinary definition, compared
+    # as origin/main compared it.
+    routed = "@router.getter\ndef handler(a): ...\n"
+    assert any(
+        "different signature" in p for p in _screen("def handler(a, b): ...", routed, tmp_path)
+    )
     # Control: attrs' own spelling still counts.
     assert _screen("class P: ...\n", "@attrs.define\nclass P: ...\n", tmp_path)
 
