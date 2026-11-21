@@ -3304,10 +3304,8 @@ multi-level path building is deferred. On top of issuance, construction refuses 
 
 - a `recipient_cert` whose every issuing `trust_anchor` is **not a CA** (no `basicConstraints` asserting
   `CA=true`, or a `keyUsage` that does not assert `keyCertSign`) or has extensions that cannot be read.
-  A self-issued X.509 **version 1** root (subject equal to issuer) that carries no extensions is exempt:
-  RFC 5280 defines extensions for version 3 only, so such a root has no way to assert `basicConstraints`,
-  and RFC 5280 takes a trust anchor as an input to path validation. Any other version 1 cert, one another
-  party issued or one that carries extensions anyway, is checked as a version 3 one is. An
+  An X.509 **version 1** root that carries no extensions, as such roots usually do, therefore has no
+  `basicConstraints` and is refused as not a CA. An
   issuing anchor that fails this is skipped, and the recipient is accepted when another issuing anchor in
   the file passes. A **pinned** correspondent is exempt: an anchor with the same subject and the same public
   key as the `recipient_cert` (the same cert, or an older copy of a renewed one), because it issues nothing

@@ -456,34 +456,9 @@ def _extension[E: x509.ExtensionType](
         ) from exc
 
 
-def _carries_no_extensions(cert: x509.Certificate) -> bool:
-    """Whether ``cert`` carries no extensions at all. Extensions that cannot be read count as
-    carried, so the checks that read them refuse the cert."""
-    try:
-        return len(cert.extensions) == 0
-    except _UNREAD_EXTENSIONS:
-        return False
-
-
 def _anchor_ca_problem(anchor: x509.Certificate) -> str | None:
     """Why the issuing ``anchor`` may not issue certificates, or None. A self-signed recipient
-    pinned as its own anchor never reaches this: it issues nothing else.
-
-    A self-issued (subject equal to issuer) X.509 version 1 root that carries no extensions passes
-    (BACKLOG #5631). RFC 5280 defines extensions for version 3 only, so such a root has no way to
-    assert basicConstraints, and RFC 5280 takes a trust anchor as an input to path validation
-    rather than a certificate whose extensions are checked (its section 6.1.1). Any other version
-    1 cert is checked as a version 3 one is: one some other party issued, an end-entity cert say,
-    or one that carries extensions anyway, which ``cryptography`` parses, so one asserting CA=false
-    is still refused. ``pki._strict_ca_faults`` reads a bare version 1 cert the same way and, for
-    its own strict verification, reports such a CA as a fault; Direct's one-level issuance check
-    accepts the root."""
-    if (
-        anchor.version == x509.Version.v1
-        and anchor.subject == anchor.issuer
-        and _carries_no_extensions(anchor)
-    ):
-        return None
+    pinned as its own anchor never reaches this: it issues nothing else."""
     constraints = _extension(anchor, x509.BasicConstraints, "trust_anchor")
     if constraints is None or not constraints.ca:
         return (

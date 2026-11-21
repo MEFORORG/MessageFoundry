@@ -2461,7 +2461,8 @@ async def test_a_cert_inside_its_window_at_send_still_delivers(
 
 
 # --- BACKLOG #5631, PR 2915's final-round findings: the signing cert's window, a notBefore skew
-# allowance, version 1 anchors, and one construction warning per connection and certificates.
+# allowance, version 1 anchors (refused, as on origin/main), and one construction warning per
+# connection and certificates.
 
 
 @pytest.fixture(autouse=True)
@@ -2595,24 +2596,24 @@ def _v1_root(key: rsa.RSAPrivateKey) -> x509.Certificate:
     return cert
 
 
-def test_a_version_1_root_issuing_the_recipient_constructs(
+def test_a_self_issued_version_1_root_is_refused_as_not_a_ca(
     pki: dict[str, Any], tmp_path: Path
 ) -> None:
-    """RED when: a version 1 root, which cannot carry basicConstraints, is refused as not a CA
-    (BACKLOG #5631)."""
+    """RED when: a self-issued version 1 root with no extensions, which carries no
+    basicConstraints, is trusted to issue recipients. The check is origin/main's: no exemption
+    for version 1 (Manager ruling, batch 224; BACKLOG #5631 keeps this item open)."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     root = _v1_root(key)
+    assert root.subject == root.issuer
     _, recipient = _mint_leaf("recipient@hisp.example", key, root)
-    d = DirectDestination(
-        _dest(pki, **_files(tmp_path, "v1", recipient_cert=recipient, trust_anchor=root))
-    )
-    assert d._recipient_anchors == (root,)
+    files = _files(tmp_path, "v1", recipient_cert=recipient, trust_anchor=root)
+    assert "not a CA certificate" in _refusal(pki, **files)
 
 
 def test_a_version_3_anchor_without_basic_constraints_is_still_refused(
     pki: dict[str, Any], tmp_path: Path
 ) -> None:
-    # The control for the version 1 exemption: a version 3 anchor must still assert CA=true.
+    # The same refusal for a version 3 anchor that does not assert CA=true.
     ca_key, ca = _issuer(constraints=None)
     assert ca.version == x509.Version.v3
     _, recipient = _mint_leaf("recipient@hisp.example", ca_key, ca)
@@ -2643,8 +2644,8 @@ def test_the_construction_warning_is_logged_once_per_connection_and_certificates
 def test_a_version_1_cert_carrying_ca_false_is_still_refused_as_an_anchor(
     pki: dict[str, Any], tmp_path: Path
 ) -> None:
-    """RED when: the version 1 exemption reaches a cert that carries extensions anyway, so one
-    asserting CA=false is trusted to issue recipients (BACKLOG #5631)."""
+    """RED when: a version 1 cert that carries extensions anyway, one asserting CA=false, is
+    trusted to issue recipients (BACKLOG #5631)."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test Direct CA")])
     now = datetime.datetime.now(datetime.UTC)
@@ -2683,8 +2684,8 @@ async def test_a_signing_cert_gets_no_not_before_allowance(
 def test_a_version_1_cert_another_party_issued_is_refused_as_an_anchor(
     pki: dict[str, Any], tmp_path: Path
 ) -> None:
-    """RED when: the version 1 exemption reaches a v1 cert that is not self-issued, such as an
-    end-entity cert a CA issued, so a recipient its key signs is trusted (BACKLOG #5631)."""
+    """RED when: a version 1 cert that is not self-issued, such as an end-entity cert a CA
+    issued, is trusted to issue recipients (BACKLOG #5631)."""
     ca_key, ca = pki["ca_key"], pki["ca_cert"]
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     now = datetime.datetime.now(datetime.UTC)

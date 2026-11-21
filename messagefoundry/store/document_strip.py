@@ -49,7 +49,8 @@ rolled back whole and passed over the same way, but logged at ERROR, and the cal
 A strip call ends early, flagged ``ended_early`` with what its batches committed, in three cases: a
 batch read fails (``read_failed`` is then set too), at least :data:`OUTAGE_MIN_ROWS` rows of one
 batch reached the key service and none got a verdict, or :data:`WRITE_FAULT_MAX_BATCHES` batch
-writes in a row failed (``write_failed`` is set by the first of them).
+writes in a row failed, counting only consecutive batches that had something to write
+(``write_failed`` is set by the first of them).
 The retention pass then skips the rest of its strip phase, and the strip logs the early end at
 WARNING. An outage alone is not counted as work for the pass's audit row, so it does not also send
 that row through the failing key service; a failed read is a database fault, not a key-service one,
@@ -104,8 +105,11 @@ OUTAGE_MIN_ROWS = 3
 #: batch. The call ends when it reads a batch past that many failures, so a scan whose last batches
 #: all failed still reached its end and is not reported as ended early. A write that returns has
 #: committed, so it resets the count, even when what it returns is malformed and the batch is passed
-#: over uncounted. So fewer failing batches in a row than this, two at
-#: the head of the keyset say, cannot stop the rows after them. The trade-off is accepted: this many
+#: over uncounted. "In a row" means consecutive batches that each had something to write: a batch
+#: with nothing to write, or whose transform failed, wrote nothing and also resets the count, so
+#: failures far apart across the keyset never add up. So fewer failing batches in a row than this,
+#: two at the head of the keyset say, cannot stop the rows after them. The trade-off is accepted:
+#: this many
 #: failing in a row at the head of the keyset stop every pass at the same place while the fault
 #: lasts, as a failed batch read does. That is a long lock on the oldest rows, say, and also a fault
 #: that never clears on its own, a corrupt page or a constraint those rows always trip, which then
@@ -298,6 +302,8 @@ async def run_strip_pass(
                     type(exc).__name__,
                 )
                 log.debug("document strip batch failure", exc_info=True)
+                # It wrote nothing, so it breaks a run of failed writes (see below).
+                failed_writes_in_a_row = 0
             else:
                 unreadable.extend(batch.unreadable)
                 if batch.outage:
@@ -306,7 +312,12 @@ async def run_strip_pass(
                     ended_early = True
                     _log_early_end("the key service gave no verdict", None, documents, messages)
                     break
-                if batch.updates:
+                if not batch.updates:
+                    # A batch with nothing to write breaks a run of failed writes: only failures
+                    # in consecutive batches that write count toward the breaker, so failures far
+                    # apart across the keyset never add up to a store-wide fault.
+                    failed_writes_in_a_row = 0
+                else:
                     try:
                         landed = await write(batch.updates)
                     except CipherError:

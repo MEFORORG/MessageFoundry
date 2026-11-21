@@ -1579,3 +1579,52 @@ async def test_a_committed_write_with_a_malformed_return_resets_the_breaker(
 
     assert writes == outcomes
     assert (result.ended_early, result.write_failed, result.messages_stripped) == (False, True, 2)
+
+
+async def test_a_batch_with_nothing_to_write_breaks_a_run_of_failed_writes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: write failures far apart across the keyset, with batches between them that had
+    nothing to write, add up to the breaker and end the call (BACKLOG #5651). Only consecutive
+    batches that write count."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    has_document = [True, True, False, True, False, True, True]
+    rows = [
+        {
+            "id": f"M-{i}",
+            "channel_id": "IB",
+            "raw": MFB64_BODY if doc else _BASE_HL7 + "\r",
+            "received_at": float(i),
+        }
+        for i, doc in enumerate(has_document)
+    ]
+    writes: list[str] = []
+
+    async def locked_rows(updates: Any) -> list[Any]:
+        writes.append(updates[0].message_id)
+        if updates[0].message_id != "M-6":
+            raise sqlite3.OperationalError("lock timeout on this row")
+        return list(updates)
+
+    result = await _run_pass(_keyset_fetch(rows), locked_rows, _no_report)
+
+    assert writes == ["M-0", "M-1", "M-3", "M-5", "M-6"]
+    assert (result.ended_early, result.write_failed, result.messages_stripped) == (False, True, 1)
+
+
+async def test_consecutive_writing_batches_that_fail_still_trip_the_breaker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The control: three writing batches in a row that fail, with a later batch to read, end the
+    # call, and the rows after them are not written.
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    writes: list[str] = []
+
+    async def read_only(updates: Any) -> list[Any]:
+        writes.append(updates[0].message_id)
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    result = await _run_pass(_keyset_fetch(_plain_rows(5)), read_only, _no_report)
+
+    assert writes == ["M-0", "M-1", "M-2"]
+    assert result == StripResult(ended_early=True, write_failed=True)
