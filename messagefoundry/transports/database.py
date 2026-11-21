@@ -3712,7 +3712,7 @@ async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float | Non
                 raise DeliveryError(
                     "DATABASE statement_timeout write did not finish within the borrow's "
                     "acquire_timeout"
-                ) from None
+                ) from exc
             raise
     failure = work.exception()  # done here; the thread resolved it, so it is never cancelled
     if failure is None:
