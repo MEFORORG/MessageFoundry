@@ -10,7 +10,7 @@ import * as os from "os";
 import * as path from "path";
 
 import { securityConfigTarget, type LinkFs } from "../../securityEditorModel";
-import { escapesByLink, linkEscapeRefusal } from "../../workspaceContainment";
+import { escapesByLink, linkEscapeRefusal, resolveInsideWorkspace } from "../../workspaceContainment";
 
 /** Runs `fn` with the synchronous file-system reads workspaceContainment makes replaced by spies that
  *  record the call and throw, and returns what was recorded. */
@@ -131,6 +131,9 @@ suite("b532w3: a reserved device name is refused on Windows (BACKLOG #5404 item 
         this.skip(); // the refusal is a Windows rule; the spelling half is driven above
       }
       for (const v of ["nul", "con", "COM1", "CONIN$", "nul.toml", "config/aux.toml"]) {
+        // THE CONTROL: the real-path check alone passes the name (measured on Windows 11 with Node 24,
+        // 2026-11-20: Node reads no entry by it and walks up to the folder).
+        assert.notStrictEqual(resolveInsideWorkspace(base, v), undefined, JSON.stringify(v));
         assert.strictEqual(escapesByLink(base, v), true, JSON.stringify(v));
       }
     } finally {

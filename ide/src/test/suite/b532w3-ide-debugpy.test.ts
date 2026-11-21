@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-// Batch 532 wave 3 (BACKLOG #5409 item 2): the Test Bench Debug launch keeps the workspace off the
-// import path on every debugpy build. debugpy 1.8.21 and older insert the working directory into
+// Batch 532 wave 3 (BACKLOG #5409 item 2): debugpy adds no working directory to the Test Bench Debug
+// launch's import path on any build. debugpy 1.8.21 and older insert the working directory into
 // `sys.path` when they run a MODULE, whatever `-P` says (debugpy commit 7959635126, first released
 // in 1.8.22, added the `safe_path` check), so the launch hands debugpy a PROGRAM the extension
 // writes into its own storage folder, for which those builds add only that folder. testBench.ts
 // imports vscode, so its wiring is pinned by reading its source; the program itself is run under a
-// stand-in for both debugpy 1.8.21 runners.
+// stand-in for both debugpy 1.8.21 runners. A PYTHONPATH entry, which `-P` keeps, is out of scope
+// (TEST_BENCH_DEBUG_PROGRAM's open limit).
 import * as assert from "assert";
 import { spawnSync } from "child_process";
 import * as fs from "fs";
@@ -63,7 +64,10 @@ const OLD_RUN_FILE = [
 /** A Python 3.11 or later on PATH, which `-P` needs, or undefined. */
 function python(): string | undefined {
   for (const exe of process.platform === "win32" ? ["python", "py"] : ["python3", "python"]) {
-    const r = spawnSync(exe, ["-c", "import sys; print(sys.version_info >= (3, 11))"], { encoding: "utf8" });
+    const r = spawnSync(exe, ["-c", "import sys; print(sys.version_info >= (3, 11))"], {
+      encoding: "utf8",
+      timeout: 20000,
+    });
     if (r.status === 0 && r.stdout.trim() === "True") {
       return exe;
     }
@@ -71,7 +75,7 @@ function python(): string | undefined {
   return undefined;
 }
 
-suite("b532w3: the Test Bench Debug launch keeps -P on every debugpy build (BACKLOG #5409 item 2)", () => {
+suite("b532w3: debugpy adds no working directory to the Test Bench Debug launch (BACKLOG #5409 item 2)", () => {
   test("debugRow hands debugpy the written program, not the module, and keeps the interpreter options", () => {
     const fn = body(testBench(), "private async debugRow(");
     assert.ok(fn.includes('type: "debugpy"'), fn);
@@ -88,22 +92,35 @@ suite("b532w3: the Test Bench Debug launch keeps -P on every debugpy build (BACK
     assert.ok(INTERPRETER_OPTIONS.includes("-P"));
   });
 
-  test("the program is written alone into its own folder under the extension's global storage", () => {
+  test("the program is written alone into its own folder under the extension's local global storage", () => {
     const fn = body(testBench(), "private async debugProgram(");
-    assert.ok(
-      fn.includes("vscode.Uri.joinPath(this.context.globalStorageUri, TEST_BENCH_DEBUG_PROGRAM.folder)"),
-      fn,
-    );
-    assert.ok(fn.includes("vscode.Uri.joinPath(dir, TEST_BENCH_DEBUG_PROGRAM.file)"), fn);
+    assert.ok(fn.includes('if (this.context.globalStorageUri.scheme !== "file")'), fn);
+    assert.ok(fn.includes("path.join(this.context.globalStorageUri.fsPath, TEST_BENCH_DEBUG_PROGRAM.folder)"), fn);
+    assert.ok(fn.includes("path.join(dir, TEST_BENCH_DEBUG_PROGRAM.file)"), fn);
     assert.ok(fn.includes("TEST_BENCH_DEBUG_PROGRAM.source"), fn);
+    // Only a missing file is written over; any other read error refuses the launch.
+    assert.ok(fn.includes('if ((e as NodeJS.ErrnoException).code !== "ENOENT")'), fn);
     // Every debugpy build may put the folder on the import path, so the only other entry it ever holds
-    // is the temporary file renamed over the program, whose name is no importable module.
+    // is the temporary file renamed over the program, whose name is no importable module, and which
+    // a failed rename does not leave behind.
     assert.strictEqual((fn.match(/writeFile\(/g) ?? []).length, 1, fn);
-    assert.ok(fn.includes("await vscode.workspace.fs.writeFile(temp, source)"), fn);
-    assert.ok(fn.includes("await vscode.workspace.fs.rename(temp, file, { overwrite: true })"), fn);
+    assert.ok(fn.includes("await fs.promises.writeFile(temp, source)"), fn);
+    assert.ok(fn.includes("await fs.promises.rename(temp, file)"), fn);
+    assert.ok(/\} finally \{\s*await fs\.promises\.rm\(temp, \{ force: true \}\);/.test(fn), fn);
     assert.ok(fn.includes(".tmp`"), fn);
     assert.strictEqual(path.basename(TEST_BENCH_DEBUG_PROGRAM.folder), TEST_BENCH_DEBUG_PROGRAM.folder);
     assert.ok(TEST_BENCH_DEBUG_PROGRAM.file.endsWith(".py"));
+  });
+
+  test("the program's source is exactly the runpy call, so a change to it is a reviewed test change", () => {
+    // The source is Python held in a TypeScript string, which neither crypto-inventory arm parses as
+    // Python, so it is pinned here word for word.
+    assert.strictEqual(
+      TEST_BENCH_DEBUG_PROGRAM.source,
+      "# Written by the MessageFoundry extension for the Test Bench Debug launch (BACKLOG #5409 item 2).\n" +
+        "import runpy\n\n" +
+        'runpy.run_module("messagefoundry", run_name="__main__", alter_sys=True)\n',
+    );
   });
 
   test("under debugpy 1.8.21's runners, the module form is shadowed by the workspace and the program is not", function () {
@@ -130,7 +147,12 @@ suite("b532w3: the Test Bench Debug launch keeps -P on every debugpy build (BACK
       fs.writeFileSync(program, TEST_BENCH_DEBUG_PROGRAM.source);
       const env = { ...process.env, PYTHONPATH: site, PYTHONSAFEPATH: "" };
       const run = (code: string, args: string[]): string => {
-        const r = spawnSync(exe!, [...INTERPRETER_OPTIONS, "-c", code, ...args], { cwd: ws, env, encoding: "utf8" });
+        const r = spawnSync(exe!, [...INTERPRETER_OPTIONS, "-c", code, ...args], {
+          cwd: ws,
+          env,
+          encoding: "utf8",
+          timeout: 20000,
+        });
         assert.strictEqual(r.status, 0, r.stderr);
         return r.stdout.trim();
       };

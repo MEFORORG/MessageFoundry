@@ -47,9 +47,10 @@ export function cliArgv(module: string, args: readonly string[]): string[] {
  * because the extension package holds no Python (the crypto inventory's ide/ arm reads only
  * TypeScript).
  *
- * Open limit: `-P` does not remove a PYTHONPATH entry, and the Python Debugger extension loads the
- * workspace's `.env` file into the debuggee by default. A repository whose `.env` sets PYTHONPATH,
- * or an inherited PYTHONPATH, can still put a workspace folder on the import path for this launch.
+ * Open limit: `-P` does not remove a PYTHONPATH entry, and the Python Debugger extension loads an
+ * env file into the debuggee, the workspace's `.env` by default. At least a PYTHONPATH that env file
+ * sets, whichever file `python.envFile` names, or one the window inherits, can still put a workspace
+ * folder on the import path for this launch.
  */
 export const TEST_BENCH_DEBUG_PROGRAM = {
   folder: "testbench-debug",

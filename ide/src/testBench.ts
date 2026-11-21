@@ -568,25 +568,36 @@ export class TestBench {
   }
 
   /** Puts TEST_BENCH_DEBUG_PROGRAM in its own folder under the extension's global storage and returns
-   *  its path. A file that already holds the source is left alone; otherwise the source is written to
-   *  a temporary name and renamed over it, so a launch from another window never runs a half-written
-   *  file. */
+   *  its path, which the debuggee's interpreter opens, so the storage must be a local `file:` folder.
+   *  A file that already holds the source is left alone; otherwise the source is written to a
+   *  temporary name and renamed over it with Node's rename, which replaces the target in one step,
+   *  so a launch from another window never runs a half-written file. A temporary file a failed
+   *  rename leaves is removed. */
   private async debugProgram(): Promise<string> {
-    const dir = vscode.Uri.joinPath(this.context.globalStorageUri, TEST_BENCH_DEBUG_PROGRAM.folder);
-    const file = vscode.Uri.joinPath(dir, TEST_BENCH_DEBUG_PROGRAM.file);
-    const source = new TextEncoder().encode(TEST_BENCH_DEBUG_PROGRAM.source);
-    try {
-      if (Buffer.from(await vscode.workspace.fs.readFile(file)).equals(source)) {
-        return file.fsPath;
-      }
-    } catch {
-      // absent or unreadable: written below
+    if (this.context.globalStorageUri.scheme !== "file") {
+      throw new Error("the extension's storage folder is not on this machine's file system");
     }
-    await vscode.workspace.fs.createDirectory(dir);
-    const temp = vscode.Uri.joinPath(dir, `${TEST_BENCH_DEBUG_PROGRAM.file}.${process.pid}-${Date.now()}.tmp`);
-    await vscode.workspace.fs.writeFile(temp, source);
-    await vscode.workspace.fs.rename(temp, file, { overwrite: true });
-    return file.fsPath;
+    const dir = path.join(this.context.globalStorageUri.fsPath, TEST_BENCH_DEBUG_PROGRAM.folder);
+    const file = path.join(dir, TEST_BENCH_DEBUG_PROGRAM.file);
+    const source = Buffer.from(TEST_BENCH_DEBUG_PROGRAM.source, "utf8");
+    try {
+      if ((await fs.promises.readFile(file)).equals(source)) {
+        return file;
+      }
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw e;
+      }
+    }
+    await fs.promises.mkdir(dir, { recursive: true });
+    const temp = path.join(dir, `${TEST_BENCH_DEBUG_PROGRAM.file}.${process.pid}-${Date.now()}.tmp`);
+    try {
+      await fs.promises.writeFile(temp, source);
+      await fs.promises.rename(temp, file);
+    } finally {
+      await fs.promises.rm(temp, { force: true });
+    }
+    return file;
   }
 
   /**
