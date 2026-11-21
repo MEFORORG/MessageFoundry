@@ -53,8 +53,6 @@ try {
         Write-Output "[seat] scripts/hooks/_hookinput.ps1 is missing beside this hook, so it cannot tell which worktree this session is in; nothing was recorded."
         exit 0
     }
-    # Read before Enter-CcxHookSession can move the hook into the session's directory.
-    $startDir = (Get-Location).ProviderPath
     . $hookInput
     # Read stdin ONCE and pass it on. The payload carries session_id, and without it seat.ps1 keys the
     # record on the literal string 'nosid' -- correct, but it collapses every unidentified session in
@@ -69,32 +67,32 @@ try {
     # leaves a trace beyond this turn's notice. Named explicitly either way, so seat.ps1 never falls
     # back to the payload's cwd as its hint.
     $recordArgs = $null
-    # THE LINKED WORKTREE THE SESSION WAS LAUNCHED IN, for an UNPINNED session only (BACKLOG #5961).
-    # A plain CLI session's CLAUDE_PROJECT_DIR is the directory it was launched in, and a `cd` or a
-    # /clear does not move it, so after a /clear in a sibling it still names the session's own
-    # worktree where the cwd no longer does. Under the desktop app it names the PRIMARY (the header
-    # of _hookinput.ps1 says so), which is no linked worktree, so that case is left as it was. With
-    # no CLAUDE_PROJECT_DIR the hook's own start directory stands in. A pin still wins: rule 3.
+    # THE LINKED WORKTREE A PLAIN CLI SESSION WAS LAUNCHED IN, for an UNPINNED session only
+    # (BACKLOG #5961). A plain CLI's CLAUDE_PROJECT_DIR is the directory it was launched in, and a
+    # `cd` or a /clear does not move it, so after a /clear in a sibling it still names the session's
+    # own worktree where the cwd no longer does. Only CLAUDE_CODE_ENTRYPOINT 'cli' takes it: the
+    # desktop app sets CLAUDE_PROJECT_DIR to the project it opened (the header of _hookinput.ps1
+    # says so), and that project can itself be a linked worktree holding the session's own
+    # worktree, so there it names no session's worktree and the cwd record below stands. No
+    # CLAUDE_PROJECT_DIR, no launch worktree. A pin still wins: rule 3.
     $launchRoot = $null
     $launchCommon = $null
-    if (-not $session.Pinned) {
-        $launchDir = if ($env:CLAUDE_PROJECT_DIR) { [string]$env:CLAUDE_PROJECT_DIR } else { $startDir }
-        $lr = Get-CcxWorktreeRoot $launchDir
+    if (-not $session.Pinned -and [string]$env:CLAUDE_CODE_ENTRYPOINT -eq 'cli' -and $env:CLAUDE_PROJECT_DIR) {
+        $lr = Get-CcxWorktreeRoot ([string]$env:CLAUDE_PROJECT_DIR)
         # `.git` is a FILE only in a linked worktree.
         if ($lr -and (Test-Path -LiteralPath (Join-Path $lr '.git') -PathType Leaf)) {
             $launchRoot = $lr
             $launchCommon = Get-CcxGitCommonDir $lr
         }
     }
-    # -Worktree with the launch worktree, when $Root is a worktree of the launch worktree's own
-    # repository; -Launched only when the session's cwd has left it. $null where none applies.
+    # -Worktree with the launch worktree when $Common, the common dir of the session's worktree, is
+    # the launch worktree's own. -Launched when the session's cwd has left it, or when -Refused says
+    # rule 4 refused that cwd, so the label names what chose the record. $null where none applies.
     $launchArgs = {
-        param([string] $Root)
-        if (-not $launchCommon -or -not $Root) { return $null }
-        $common = Get-CcxGitCommonDir $Root
-        if (-not $common -or -not (Test-CcxSamePath $common $launchCommon)) { return $null }
+        param([string] $Root, [string] $Common, [switch] $Refused)
+        if (-not $launchCommon -or -not $Common -or -not (Test-CcxSamePath $Common $launchCommon)) { return $null }
         $a = @('-Worktree', $launchRoot)
-        if (-not (Test-CcxSamePath $Root $launchRoot)) { $a += '-Launched' }
+        if ($Refused -or -not (Test-CcxSamePath $Root $launchRoot)) { $a += '-Launched' }
         return , $a
     }
     if ($session.Reason) {
@@ -111,12 +109,12 @@ try {
         # -Unpinned labels the record so (seat.ps1's -Unpinned says what the label does), except for
         # the start checkout itself, which rule 4 takes. tests/test_hook_payload_cwd.py pins both.
         $p = Get-CcxHookPayloadCwd -Payload $session.Payload
-        $startRoot = Get-CcxWorktreeRoot $startDir
+        $startRoot = Get-CcxWorktreeRoot (Get-Location).ProviderPath
         $startCommon = if ($startRoot) { Get-CcxGitCommonDir $startRoot } else { $null }
         $cwdRoot = if ($p.Cwd) { Get-CcxWorktreeRoot $p.Cwd } else { $null }
         $cwdCommon = if ($cwdRoot) { Get-CcxGitCommonDir $cwdRoot } else { $null }
         if (-not $session.Pinned -and $startCommon -and $cwdCommon -and (Test-CcxSamePath $cwdCommon $startCommon)) {
-            $recordArgs = & $launchArgs ([string]$cwdRoot)
+            $recordArgs = & $launchArgs ([string]$cwdRoot) ([string]$cwdCommon) -Refused
             if (-not $recordArgs) {
                 $recordArgs = @('-Worktree', [string]$cwdRoot)
                 if (-not (Test-CcxSamePath ([string]$cwdRoot) ([string]$startRoot))) { $recordArgs += '-Unpinned' }
@@ -129,15 +127,17 @@ try {
             # A Reason can quote payload text, so no double quote reaches the child's command line,
             # and it is cut to the 300 characters seat.ps1 keeps, so a long cwd cannot overrun it.
             $why = [string]$session.Reason -replace '"', "'"
-            if ($why.Length -gt 300) { $why = $why.Substring(0, 300) }
+            # Never between the halves of a surrogate pair, as seat.ps1's own cut (BACKLOG #5764).
+            if ($why.Length -gt 300) { $why = $why.Substring(0, $(if ([char]::IsHighSurrogate($why[299])) { 299 } else { 300 })) }
             $recordArgs = @('-Refused', $why)
         }
     }
     if (-not $recordArgs) {
         $worktree = if ($session.Dir) { [string]$session.Dir } else { (Get-Location).ProviderPath }
         # A hook whose working directory followed the session's `cd` takes that cwd under rule 4, so
-        # the launch worktree is checked here too.
-        $recordArgs = & $launchArgs (Get-CcxWorktreeRoot $worktree)
+        # the launch worktree is checked here too. Whether a plain CLI's hook does is unmeasured.
+        $wtRoot = Get-CcxWorktreeRoot $worktree
+        $recordArgs = if ($wtRoot) { & $launchArgs $wtRoot (Get-CcxGitCommonDir $wtRoot) } else { $null }
         if (-not $recordArgs) { $recordArgs = @('-Worktree', $worktree) }
     }
 

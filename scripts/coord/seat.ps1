@@ -140,8 +140,8 @@ param(
     # worktreeSource says so; no reader consults that label yet.
     [Parameter(ParameterSetName = 'Record')][switch]$Unpinned,
     # -Record only: scripts/hooks/seat-record.ps1's verdict that the -Worktree it passes is the LINKED
-    # WORKTREE THE SESSION WAS LAUNCHED IN (CLAUDE_PROJECT_DIR), recorded for an unpinned session whose
-    # cwd has moved to another worktree of this repository (BACKLOG #5961). The record's
+    # WORKTREE A PLAIN CLI SESSION WAS LAUNCHED IN (CLAUDE_PROJECT_DIR), recorded for an unpinned
+    # session whose cwd has left it for another worktree of this repository (BACKLOG #5961). The record's
     # worktreeSource says so. Wins over -Unpinned, which the hook never passes with it.
     [Parameter(ParameterSetName = 'Record')][switch]$Launched,
     # Precedence for the record's session key, highest first: this parameter, then the hook's stdin
@@ -1066,12 +1066,12 @@ try {
                 $hookFault = "the hook input could not be checked, recorded at -Worktree as passed: $($hookIn.Reason)"
             }
             if ($Launched) {
-                # The hook's verdict, as for -Unpinned below.
+                # The hook's verdict, as for -Unpinned below; see -Launched.
                 $script:WorktreeSource = 'session launch worktree, unpinned: CLAUDE_PROJECT_DIR (scripts/hooks/seat-record.ps1)'
             }
             elseif ($Unpinned) {
-                # The hook's verdict, passed rather than re-derived; see -Unpinned. Checked first, so a
-                # fault in this script's own second read cannot drop it.
+                # The hook's verdict, passed rather than re-derived; see -Unpinned. Checked before the
+                # pin, so a fault in this script's own second read cannot drop it.
                 $script:WorktreeSource = 'hook cwd, unpinned: no session pin vouches for it (scripts/hooks/seat-record.ps1)'
             }
             elseif ($hookIn.HintFromPin) {
