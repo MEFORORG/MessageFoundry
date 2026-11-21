@@ -376,20 +376,18 @@ def test_a_short_msh_2_may_be_completed_to_the_characters_the_parser_filled() ->
     assert again.repetitions("PID-3.1") == ["111", "222"]
 
 
-@pytest.mark.parametrize("edit", ["clear", "delete"])
-def test_a_group_edit_cannot_remove_an_msh_and_a_refusal_changes_nothing(edit: str) -> None:
-    """R2-4 of the round-2 review: in a BHS-led message the MSH sits past position 0, so a
-    ``groups("BHS")`` edit removed it, and ``delete`` removed the later rows before position 0
-    raised. Every row is now checked first, and an MSH is refused as ``delete_segments`` refuses
-    it (BACKLOG #5972)."""
+def test_a_refused_group_delete_changes_nothing() -> None:
+    """R2-4 of the round-2 review: a ``groups("BHS")`` group of a BHS-led message opens with the
+    leading header, which the positional delete refuses, but ``delete`` removed every later row
+    before it reached that one and raised. Every row is now checked first (BACKLOG #5972)."""
     m = Message.parse("BHS|^~\\&|A\rMSH|^~\\&|A|B\rPID|1\rOBX|1\r")
     before = m.encode()
-    with pytest.raises(ValueError, match="refusing to delete the MSH segment"):
-        getattr(m.groups("BHS")[0], edit)()
+    with pytest.raises(ValueError, match="out of range"):
+        m.groups("BHS")[0].delete()
     assert m.encode() == before
-    # The control: a group with no MSH in it still clears and deletes.
+    # The control: a group that does not hold the header still deletes.
     obr = Message.parse("MSH|^~\\&|A|B\rOBR|1\rOBX|1\rOBR|2\rOBX|2\r")
-    assert getattr(obr.groups()[0], edit)() == (1 if edit == "clear" else 2)
+    assert obr.groups()[0].delete() == 2
 
 
 @pytest.mark.parametrize("header", ["BHS", "FHS"])

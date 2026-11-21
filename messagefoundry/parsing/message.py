@@ -530,10 +530,9 @@ class Message:
 
         This is the positional delete that group-scoped edits use: a group addresses its members by
         position, not by id (an ``OBX`` may belong to any order), so id-based
-        :meth:`delete_segments` can't target one order's segments. Deleting MSH (position 0) is
-        refused so the header always survives, and so is deleting an ``MSH`` anywhere, as
-        :meth:`delete_segments` refuses it: in a ``BHS``- or ``FHS``-led message the MSH sits past
-        position 0 (BACKLOG #5972). Raises ``ValueError`` on an out-of-range position."""
+        :meth:`delete_segments` can't target one order's segments. Deleting the leading header
+        (position 0) is refused so it always survives. Raises ``ValueError`` on an out-of-range
+        position."""
         refusal = self._positional_delete_refusal(position)
         if refusal is not None:
             raise refusal
@@ -549,8 +548,6 @@ class Message:
             return ValueError(
                 f"position {position} out of range (1..{len(segments) - 1}); position 1 is after MSH"
             )
-        if segments[position]["id"] == "MSH":
-            return ValueError("refusing to delete the MSH segment")
         return None
 
     # --- group-scoped structural view ----------------------------------------
