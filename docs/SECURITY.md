@@ -2770,7 +2770,7 @@ row may have committed after all.
 **A reload's `config_reload_failed` row names why in `reason`.** At least these values are
 written: `trust_anchor`, `invalid_config`, `not_found`, `unreadable`, `digest_mismatch`,
 `no_approved_digest` (reached only past the gate's own check, below), `digest_unavailable`,
-`store_unavailable` and `reload_fault`. **An operator
+`store_unavailable`, `lease_lost` and `reload_fault`. **An operator
 reload's faults write a row too (BACKLOG #3157).** On the reload routes, inline, a dry run
 included, and released, any error the reload raises that none of the other reasons names is
 `reload_fault`, with the error's type name: at least a `FileNotFoundError` or a `PermissionError`
@@ -2798,7 +2798,9 @@ reason is written only for an anchor that passed them. An anchor they refuse is 
 `trust_anchor` when its audit row then fails, and so is an anchor file that cannot be read.
 Such a refusal may then have no `auth.trust_anchor` row behind it, so the engine log is the record
 of it. An inline reload answers **503** for `store_unavailable`; a released one answers 422, as
-every refused release does. The engine log carries the store's error.
+every refused release does. The engine log carries the store's error. A cluster node that lost
+its lease while its graph still runs refuses a reload before it changes any lane, as `lease_lost`
+(BACKLOG #5906): an inline reload answers **503**, a released one 422.
 
 **The same store fault would not read as a refused anchor on an operator start or on a connection
 test (vault BACKLOG #3746).** A start or restart whose CA check the store stopped would answer

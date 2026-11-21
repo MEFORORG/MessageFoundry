@@ -7,7 +7,8 @@ reach the runner. Before the fix the start doors bound a listener or spawned a d
 it, outside the engine lifecycle, and ``stop_outbound`` recorded a pause the next start inherited.
 
 A node that lost its lease before ``_stop_graph`` ran still has a running graph, so its start and
-restart doors also ask the coordinator for leadership (BACKLOG #5906, #8214 item 16).
+restart doors also ask the coordinator for leadership (BACKLOG #5906, #8214 item 16). So do a
+reload, the calendar resume a reload runs, and the single-row send right before it sends.
 """
 
 from __future__ import annotations
@@ -24,10 +25,13 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.api.app import (
     _alert_control_action,
+    _audit_refused_reload,
     _inbound_down_detail,
     _outbound_down_detail,
 )
+from messagefoundry.config.models import ConnectorType, RetryPolicy
 from messagefoundry.config.settings import EgressSettings
+from messagefoundry.config.wiring import ConnectionSpec, InboundConnection, Registry
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.wiring_runner import (
@@ -35,8 +39,10 @@ from messagefoundry.pipeline.wiring_runner import (
     RunnerLeaseLostError,
     RunnerNotRunningError,
     TeardownReason,
+    _ItemOutcome,
 )
 from messagefoundry.store import MessageStore
+from tests.test_reload_retired_connector_send import _Recorder as _SendRecorder
 from tests.test_shard_lane_ownership import _unsharded_registry
 
 _IN, _OUT = "file_in", "file_out"  # _unsharded_registry's names
@@ -446,3 +452,149 @@ async def test_a_leader_resend_refusal_still_says_start_it(
         assert "start it before resending" in _inbound_down_detail(runner, _IN)
     finally:
         await runner.stop()
+
+
+# --- BACKLOG #5906 closing steps 1 and 2: the send, the reload and the reload's resume -----------
+
+
+async def _claimed_row(
+    store: MessageStore, coordinator: _LeaseCoordinator
+) -> tuple[RegistryRunner, _SendRecorder, str, Any]:
+    """A bare runner wired to one recording outbound, with one row of it claimed."""
+    runner = RegistryRunner(
+        Registry(),
+        store,
+        poll_interval=0.02,
+        egress=EgressSettings(deny_by_default=False),
+        coordinator=coordinator,
+    )
+    recorder = _SendRecorder()
+    runner._destinations[_OUT] = recorder
+    runner._retry[_OUT] = RetryPolicy()
+    raw = "MSH|^~\\&|A|B|C|D|20260101000001||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^P\r"
+    message_id = await store.enqueue_message(
+        channel_id="c1", raw=raw, deliveries=[(_OUT, raw)], now=100.0
+    )
+    item = await store.claim_next_fifo(_OUT)
+    assert item is not None
+    return runner, recorder, message_id, item
+
+
+def _demote_during_hydration(runner: RegistryRunner, coordinator: _LeaseCoordinator) -> None:
+    """Make the re-attach read, an await after the send path's first lease read and before the
+    send, the moment this node loses its lease."""
+    hydrate = runner._hydrate_payload
+
+    async def demoting(payload: str, message_id: str) -> str:
+        coordinator.leader = False
+        return await hydrate(payload, message_id)
+
+    runner._hydrate_payload = demoting  # type: ignore[method-assign]
+
+
+async def test_a_single_row_is_not_sent_when_the_lease_goes_before_its_send(
+    store: MessageStore,
+) -> None:
+    """Closing step 1. The row is released for the new leader with no attempt spent, and the lane
+    stops, as at the path's first lease read."""
+    coordinator = _LeaseCoordinator()
+    runner, recorder, message_id, item = await _claimed_row(store, coordinator)
+    _demote_during_hydration(runner, coordinator)
+    outcome, retry_until = await runner._process_delivery_item(_OUT, item)
+    assert recorder.sent == []
+    assert (outcome, retry_until) == (_ItemOutcome.STOPPED, None)
+    (row,) = await store.outbox_for(message_id)
+    assert row["status"] == "pending" and row["attempts"] == 0 and not row["last_error"]
+
+
+async def test_a_single_row_is_sent_while_the_lease_holds(store: MessageStore) -> None:
+    """The negative control: the same path, with the lease kept, sends and completes the row."""
+    coordinator = _LeaseCoordinator()
+    runner, recorder, message_id, item = await _claimed_row(store, coordinator)
+    outcome, _ = await runner._process_delivery_item(_OUT, item)
+    assert outcome is _ItemOutcome.PROCESSED and len(recorder.sent) == 1
+    (row,) = await store.outbox_for(message_id)
+    assert row["status"] == "done"
+
+
+def _with_second_inbound(tmp_path: Path) -> Registry:
+    reg = _unsharded_registry(tmp_path)
+    inbox = tmp_path / "in2"
+    inbox.mkdir(exist_ok=True)
+    reg.add_inbound(
+        InboundConnection(
+            "file_in2",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.05},
+            ),
+            router="r",
+        )
+    )
+    return reg
+
+
+@pytest.mark.parametrize("claim_mode", CLAIM_MODES)
+async def test_a_node_that_lost_its_lease_refuses_a_reload(
+    store: MessageStore, tmp_path: Path, claim_mode: str
+) -> None:
+    """Closing step 2. The reload would unbind and rebind every listener and bind the one it adds;
+    it is refused before step 1, so the running listener is the same object and nothing binds."""
+    runner, _ = await _lease_lost_runner(store, tmp_path, claim_mode)
+    try:
+        before = runner._sources[_IN]
+        old_registry = runner.registry
+        with pytest.raises(RunnerLeaseLostError) as ei:
+            await runner.reload(_with_second_inbound(tmp_path))
+        assert "reload" in str(ei.value) and "graph is not running" not in str(ei.value)
+        assert runner._sources == {_IN: before}
+        assert runner.registry is old_registry
+    finally:
+        await runner.stop()
+
+
+async def test_a_leader_reload_binds_the_inbound_it_adds(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """The negative control: with the lease held, the same reload applies."""
+    runner, coordinator = await _lease_lost_runner(store, tmp_path, "pooled")
+    coordinator.leader = True
+    try:
+        await runner.reload(_with_second_inbound(tmp_path))
+        assert set(runner._sources) == {_IN, "file_in2"}
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_resumes_no_calendar_park_on_a_node_that_lost_its_lease(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    """Closing step 2, the resume half: the lease can go during the reload's awaits, after its own
+    read. The calendar's park stays, for a later reload to retry."""
+    runner, coordinator = await _lease_lost_runner(store, tmp_path, "pooled")
+    try:
+        coordinator.leader = True
+        await runner.stop_outbound(_OUT)
+        runner._schedule_parked.add(_OUT)
+        coordinator.leader = False
+        await runner._resume_unscheduled_outbound(_OUT)
+        assert _OUT in runner._outbound_paused and _OUT in runner._schedule_parked
+        coordinator.leader = True  # the control: a leader resumes the same park
+        await runner._resume_unscheduled_outbound(_OUT)
+        assert _OUT not in runner._outbound_paused
+    finally:
+        await runner.stop()
+
+
+async def test_a_reload_refused_for_the_lease_audits_lease_lost_and_answers_503(
+    store: MessageStore,
+) -> None:
+    """Not a bad graph and not a fault inside the reload: its own reason, and the 503 the start
+    doors answer on such a node."""
+    engine: Any = SimpleNamespace(store=store)
+    status, answer = await _audit_refused_reload(
+        engine, RunnerLeaseLostError.for_reload(), actor="t", requested=None, dry_run=False
+    )
+    assert status == 503 and "lease" in answer
+    (row,) = await store.list_audit(action="config_reload_failed")
+    assert json.loads(row["detail"])["reason"] == "lease_lost"
