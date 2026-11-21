@@ -241,6 +241,7 @@ from messagefoundry.store.store import (
     AD_SCOPE_MAP,
     ANY_CLAIM_OWNER,
     AUDIT_KEY_EPOCH_ACTION,
+    FAILED_OPEN_CANCEL_BOUND_S,
     GLOBAL_SESSION_EPOCH_SQL,
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
@@ -5730,23 +5731,21 @@ class SqlServerStore:
                         )
                 raise
 
-            close_failure: list[Exception] = []
-
             async def _release() -> None:
                 try:
                     await _graceful()
-                except Exception as cleanup:  # noqa: BLE001 — re-raised below, as main raised it
-                    close_failure.append(cleanup)
+                except Exception as cleanup:  # noqa: BLE001 — never mask the error
                     log.warning(
                         "closing a one-connection store after an error also failed (%s)",
                         type(cleanup).__name__,
                     )
                     # A close that raised before its own pool step leaves the pool and the
-                    # executor open, so release both here (BACKLOG #5720).
+                    # executor open, so release both here (BACKLOG #5720). The wait is bounded,
+                    # since a pool whose close just failed may never finish closing.
                     try:
                         pool.close()
-                        await pool.wait_closed()
-                    except Exception as released:  # noqa: BLE001 — keep the close's error
+                        await asyncio.wait_for(pool.wait_closed(), FAILED_OPEN_CANCEL_BOUND_S)
+                    except Exception as released:  # noqa: BLE001 — keep the error
                         log.warning(
                             "closing the pool after that also failed (%s)",
                             type(released).__name__,
@@ -5761,10 +5760,6 @@ class SqlServerStore:
                 cancels_before=cancels_before,
                 what="a one-connection store's cleanup",
             )
-            if close_failure:
-                # Main's finally raised the close's error in place of the block's; this keeps
-                # that, with the block's error as its cause.
-                raise close_failure[0] from exc
             raise
         await store.close()
 

@@ -2139,3 +2139,82 @@ async def test_an_abandoned_cleanup_that_later_ends_badly_is_logged(monkeypatch,
     for _ in range(5):
         await asyncio.sleep(0)
     assert "which an open stopped waiting for, later ended cancelled" in caplog.text
+
+
+async def test_a_cleanup_that_fails_is_still_logged_at_error(caplog) -> None:
+    """BACKLOG #5720: only a cleanup that ends cancelled moved to WARNING; one that fails is logged
+    at ERROR, as ``_run_to_completion`` logged it on main, by class only.
+
+    Mutation: log the failed branch at WARNING. Red: no ERROR record."""
+    from messagefoundry.store.store import cleanup_failed_open
+
+    async def failing_release() -> None:
+        raise OSError("release boom /secret/path")
+
+    await cleanup_failed_open(
+        RuntimeError("open boom"), failing_release, lambda: None, cancels_before=0
+    )
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert errors == [
+        "a failed store open's cleanup failed (OSError); what it had not closed was released "
+        "without waiting for it"
+    ]
+    assert "/secret/path" not in caplog.text
+
+
+async def test_an_abandoned_cleanup_that_later_fails_is_logged_at_error(
+    monkeypatch, caplog
+) -> None:
+    """BACKLOG #5720: a cleanup an open stopped waiting for that later fails is logged at ERROR, as
+    ``_run_to_completion`` logged it on main.
+
+    Mutation: log a later failure at WARNING. Red: no ERROR record."""
+    from messagefoundry.store import store as store_module
+
+    monkeypatch.setattr(store_module, "FAILED_OPEN_CANCEL_BOUND_S", 0.05)
+    fail = asyncio.Event()
+
+    async def wedged_release() -> None:
+        await fail.wait()
+        raise OSError("late boom")
+
+    task = asyncio.create_task(
+        store_module.cleanup_failed_open(
+            asyncio.CancelledError(), wedged_release, lambda: None, cancels_before=0
+        )
+    )
+    await asyncio.wait({task}, timeout=3)
+    assert task.done()
+    fail.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert [r.getMessage() for r in caplog.records if r.levelname == "ERROR"] == [
+        "a failed store open's cleanup, which an open stopped waiting for, later failed (OSError)"
+    ]
+
+
+def test_a_generator_exit_with_no_running_loop_schedules_nothing(caplog) -> None:
+    """BACKLOG #5720: with no forced release, a ``GeneratorExit`` schedules the ordinary release
+    on the running loop. A coroutine closed after its loop stopped has none, and
+    ``ensure_future`` would raise ``RuntimeError`` over the exit; it is logged instead.
+
+    Mutation: drop the running-loop check. Red: ``RuntimeError`` out of ``coro.send``."""
+    from messagefoundry.store.store import cleanup_failed_open
+
+    ran: list[str] = []
+
+    async def release() -> None:
+        ran.append("release")
+
+    # The loop a stopped run leaves behind: set as current, closed, so scheduling on it raises.
+    stopped = asyncio.new_event_loop()
+    stopped.close()
+    asyncio.set_event_loop(stopped)
+    try:
+        coro = cleanup_failed_open(GeneratorExit(), release, None, cancels_before=0)
+        with pytest.raises(StopIteration):
+            coro.send(None)
+    finally:
+        asyncio.set_event_loop(None)
+    assert ran == []
+    assert "a failed store open's cleanup could not run: no event loop is running" in caplog.text
