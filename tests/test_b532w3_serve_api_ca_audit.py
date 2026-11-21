@@ -280,7 +280,9 @@ def test_a_context_that_builds_opens_no_store_for_the_audit(
     """The control: with the CA's own pin the context builds, the start goes on to uvicorn
     (stubbed), and the audit does not run, so no store is opened."""
     calls: list[bool] = []
-    monkeypatch.setattr(cli, "_audit_refused_api_client_ca", lambda *a, **k: calls.append(True))
+    monkeypatch.setattr(
+        cli, "_audit_anchors_refused_before_the_store", lambda *a, **k: calls.append(True)
+    )
     rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None)
     assert rc == 0
     assert calls == []

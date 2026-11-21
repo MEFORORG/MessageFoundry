@@ -5382,12 +5382,11 @@ def _serve(args: argparse.Namespace) -> int:
             # the except block, so nothing the audit raises is chained to it. The refusal comes
             # before uvicorn runs the lifespan, so the lifespan's audited preflight would never write
             # the anchor's auth.trust_anchor row (BACKLOG #5391 added item 2).
-            _audit_refused_api_client_ca(
+            _audit_anchors_refused_before_the_store(
                 settings,
                 _anchor_refused,
                 enforcing=enforcing,
                 forward_ca_refused=bool(_forward_ca_refusals),
-                replaced=_replaced,
             )
             return 2
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx
@@ -5426,13 +5425,12 @@ def _serve(args: argparse.Namespace) -> int:
     return 0
 
 
-def _audit_refused_api_client_ca(
+def _audit_anchors_refused_before_the_store(
     settings: ServiceSettings,
     refused_at_build: TrustAnchorError,
     *,
     enforcing: bool,
     forward_ca_refused: bool,
-    replaced: Sequence[GeneratedPairReplaced],
 ) -> None:
     """Write the audit rows of a start the API TLS context refused for a trust anchor.
 
@@ -5452,8 +5450,9 @@ def _audit_refused_api_client_ca(
     * ``[logging].forward_tls_ca_file`` when ``forward_ca_refused``: ``_start_logging`` refused the
       collector's CA and left its row to the lifespan (BACKLOG #3470), which this start never runs.
 
-    It also writes the rows for any generated API pair this start replaced (``replaced``), which
-    the lifespan writes first (ADR 0172 decision 6).
+    No generated API pair can have been replaced here: a client CA needs an operator
+    ``[api].tls_cert_file``, and an operator pair is never minted or renewed, so no
+    ``api.tls_generated_pair_replaced`` row is owed.
 
     Every refusal the preflight raises is logged with its reason. A WARNING says a row may be
     missing in at least these cases: the store refused it, the check passed after the build
@@ -5461,7 +5460,6 @@ def _audit_refused_api_client_ca(
     that cannot be read is refused before any row is written. An ``Exception`` is logged and not
     raised, because a raise would turn the clean exit 2 into the uncaught floor's exit 1. An
     interrupt still propagates."""
-    from messagefoundry.api.tls import record_generated_pair_replacements
     from messagefoundry.auth.trust_anchors import (
         AnchorSpec,
         AnchorStoreUnavailable,
@@ -5486,7 +5484,7 @@ def _audit_refused_api_client_ca(
     forward_ca = log_forward_anchor_spec(settings.logging) if forward_ca_refused else None
     if forward_ca is not None:
         specs.append(forward_ca)
-    if not specs and not replaced:
+    if not specs:
         return
 
     async def _audit(posture: HopPosture | None) -> None:
@@ -5497,16 +5495,17 @@ def _audit_refused_api_client_ca(
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
         )
         try:
-            await record_generated_pair_replacements(store, replaced)
             for spec in specs:
                 try:
                     await run_anchor_preflight([spec], store, enforcing=enforcing)
                 except TrustAnchorError as refused:
                     reason = scrub_log_argument(safe_exc(refused))
+                    # A pin that does not parse is refused under the pin's setting, not the CA's.
+                    named = refused.setting or spec.setting
                     if refused.unaudited:
-                        log.warning("no audit row records the refused %s: %s", spec.setting, reason)
+                        log.warning("no audit row records the refused %s: %s", named, reason)
                     else:
-                        log.warning("the audited check refused %s: %s", spec.setting, reason)
+                        log.warning("the audited check refused %s: %s", named, reason)
                 except AnchorStoreUnavailable as unavailable:
                     # Not a TrustAnchorError: the check passed and the store refused its row. The
                     # next anchor is still checked.
@@ -14662,9 +14661,10 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
 
 
 async def _close_store_quietly(store: Store) -> None:
-    """Close ``store`` after ``audit-verify``, ``audit-anchor``, ``admin-unlock``,
-    ``cipher-audit``, ``store attest-transit-bound`` or ``store withdraw-transit-bound`` has its
-    result. A close that fails prints a warning naming its
+    """Close ``store`` once its caller has its result: at least ``audit-verify``,
+    ``audit-anchor``, ``admin-unlock``, ``cipher-audit``, ``store attest-transit-bound``,
+    ``store withdraw-transit-bound`` and ``serve``'s audit of an anchor refused before the store
+    opened. A close that fails prints a warning naming its
     class, and never replaces that result (vault BACKLOG #3054; BACKLOG #2337)."""
     try:
         await store.close()

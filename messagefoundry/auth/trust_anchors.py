@@ -148,8 +148,10 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
       migrated, and the startup attestation runs and may alert. Their log records reach stdout
       and the log file but no collector. No listener binds, since uvicorn binds after the
       lifespan. Where the API TLS context also refused a trust anchor, no lifespan runs: ``serve``
-      opens the store itself and runs this preflight on the collector CA, so its row is written
-      with no attestation run (BACKLOG #5391).
+      opens the store itself and runs this preflight on the collector CA, with no attestation
+      run (BACKLOG #5391). Its row is then written when the file can be read and the store
+      opens and takes it. A start refused at any other step before the lifespan writes no row
+      for it.
     * ``supervise`` checks the same CA before it builds its own forwarder, and refuses on stderr
       before any engine shard spawns. Its process has no audited preflight, so no row is written.
     * The API lifespan checks the CA of :func:`smtp_hop_anchor_spec` before it builds an alert
