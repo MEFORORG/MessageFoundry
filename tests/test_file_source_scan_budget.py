@@ -1389,3 +1389,33 @@ async def test_a_retried_disposal_is_logged(
         await rig.scan()
     assert rig.handed_off == [_HL7]
     assert "handed off earlier, is moved or deleted now, without another hand-off" in caplog.text
+
+
+async def test_with_no_file_id_an_identical_resend_is_handed_off(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a volume that reports no file ID (FAT, exFAT, some NAS: a zero ``st_ino`` stands in), a
+    file whose delete failed is not remembered, so a byte-identical resend under the same name and
+    mtime is handed off rather than deleted unhanded (the count-and-log invariant).
+
+    Mutation: drop the ``not mark[3]`` check in ``_undisposed``. Red: the resend is deleted with
+    no hand-off."""
+    real_file_id = file_mod._file_id
+    monkeypatch.setattr(file_mod, "_file_id", lambda st: (real_file_id(st)[0], 0))
+    rig = _Rig(tmp_path, monkeypatch, cap=10, after_read="delete", fail_errno=None)
+    failing = _fail_delete(monkeypatch)
+    path = rig.drop("a.hl7", _HL7)
+    await rig.scan()
+    await rig.scan()
+    assert rig.handed_off == [_HL7]
+    assert rig.source._stuck == {}, "with no file ID nothing is remembered"
+
+    old = path.stat()
+    path.unlink()  # the partner removes it and sends the same bytes again, mtime kept
+    path.write_bytes(_HL7)
+    os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns))
+    failing[0] = False
+    await rig.scan()
+    await rig.scan()
+    assert rig.handed_off == [_HL7, _HL7], "the resend is handed off"
+    assert not path.exists()

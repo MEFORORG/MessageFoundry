@@ -445,3 +445,36 @@ async def test_a_cancel_during_a_one_connection_stores_close_still_releases_it(
     assert pool.wait_closed_called == 1
     assert executor.shutdown_calls == [False]
     assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+async def test_an_aclose_closes_a_one_connection_store_gracefully_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: under ``aclose()`` the graceful close runs first, as on main: the pool is
+    closed and waited on, and the executor shut down once, by that close."""
+    pool = _FakePool()
+    _install_fake_aioodbc(monkeypatch, pool)
+    executor = _fake_executor(monkeypatch)
+    monkeypatch.setattr(sqlserver_module, "check_pinned_certificate", lambda *a, **k: None)
+    cm = SqlServerStore._one_connection_store(_settings(), posture=None)
+    await cm.__aenter__()
+    await cm.gen.aclose()
+    assert pool.closed == 1
+    assert pool.wait_closed_called == 1
+    assert executor.shutdown_calls == [False]
+
+
+async def test_an_aclose_whose_graceful_close_fails_forces_the_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: when the graceful close under ``aclose()`` fails, the forced release runs:
+    the pool is closed again and the executor shut down without waiting."""
+    pool = _FakePool(wait_closed_hangs=True)
+    _install_fake_aioodbc(monkeypatch, pool)
+    executor = _fake_executor(monkeypatch)
+    monkeypatch.setattr(sqlserver_module, "check_pinned_certificate", lambda *a, **k: None)
+    cm = SqlServerStore._one_connection_store(_settings(), posture=None)
+    await cm.__aenter__()
+    await cm.gen.aclose()
+    assert pool.closed == 2
+    assert executor.shutdown_calls == [False, False]  # the close's own, then the forced one

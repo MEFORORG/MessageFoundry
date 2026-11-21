@@ -2378,7 +2378,10 @@ class PostgresStore:
 
         On an error, a cancel included, the close runs through :func:`cleanup_failed_open`, so a
         cancel cannot cut it short and a close failure is logged by class rather than replacing
-        the error (BACKLOG #5720). On a clean exit a close failure is raised, as before."""
+        the error (BACKLOG #5720). On a clean exit a close failure is raised, as before. Under an
+        ``aclose()``, a ``GeneratorExit``, the graceful close runs first, as before, since an
+        async generator may await there; only if it fails or is interrupted does the forced
+        release run."""
         cancels_before = cancels_at_entry()
         pool = await cls._create_pool(settings, posture=posture, max_size=1)
         store: PostgresStore | None = None
@@ -2388,9 +2391,30 @@ class PostgresStore:
         except BaseException as exc:
             built = store
 
+            async def _graceful() -> None:
+                await (built.close() if built is not None else pool.close())
+
+            if isinstance(exc, GeneratorExit):
+                try:
+                    await _graceful()
+                except BaseException as cleanup:  # noqa: BLE001 — fall back, keep the exit
+                    log.warning(
+                        "closing a one-connection store at its close failed (%s); it is released "
+                        "without waiting",
+                        type(cleanup).__name__,
+                    )
+                    try:
+                        pool.terminate()
+                    except Exception as forced:  # noqa: BLE001 — keep the exit
+                        log.warning(
+                            "releasing a one-connection store without waiting also failed (%s)",
+                            type(forced).__name__,
+                        )
+                raise
+
             async def _release() -> None:
                 try:
-                    await (built.close() if built is not None else pool.close())
+                    await _graceful()
                 except Exception as cleanup:  # noqa: BLE001 — never mask the error
                     log.warning(
                         "closing a one-connection store after an error also failed (%s)",

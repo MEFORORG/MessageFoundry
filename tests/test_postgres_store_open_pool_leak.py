@@ -429,3 +429,34 @@ async def test_a_one_connection_store_close_failure_does_not_replace_the_error(
         in caplog.text
     )
     assert "pool close wedged" not in caplog.text
+
+
+async def test_an_aclose_closes_a_one_connection_store_gracefully_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: under ``aclose()`` an async generator may await, so the graceful close runs
+    first, as on main, and the forced release does not run when it works."""
+    pool = _FakePool()
+    terminated: list[str] = []
+    pool.terminate = lambda: terminated.append("terminated")  # type: ignore[method-assign]
+    _install_fake_asyncpg(monkeypatch, pool)
+    cm = PostgresStore._one_connection_store(_settings(), posture=None)
+    await cm.__aenter__()
+    await cm.gen.aclose()
+    assert pool.closed == 1
+    assert terminated == []
+
+
+async def test_an_aclose_whose_graceful_close_fails_forces_the_release(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: when the graceful close under ``aclose()`` fails, the forced release runs."""
+    pool = _FakePool(close_fails=True)
+    terminated: list[str] = []
+    pool.terminate = lambda: terminated.append("terminated")  # type: ignore[method-assign]
+    _install_fake_asyncpg(monkeypatch, pool)
+    cm = PostgresStore._one_connection_store(_settings(), posture=None)
+    await cm.__aenter__()
+    await cm.gen.aclose()
+    assert pool.closed == 1
+    assert terminated == ["terminated"]

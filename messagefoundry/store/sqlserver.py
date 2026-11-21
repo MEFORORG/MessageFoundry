@@ -5667,7 +5667,10 @@ class SqlServerStore:
 
         On an error, a cancel included, the close runs through :func:`cleanup_failed_open`, so a
         cancel cannot cut it short and a close failure is logged by class rather than replacing
-        the error (BACKLOG #5720). On a clean exit a close failure is raised, as before."""
+        the error (BACKLOG #5720). On a clean exit a close failure is raised, as before. Under an
+        ``aclose()``, a ``GeneratorExit``, the graceful close runs first, as before, since an
+        async generator may await there; only if it fails or is interrupted does the forced
+        release run."""
         cancels_before = cancels_at_entry()
         # Vault BACKLOG #2223: the pin's own checks, as :meth:`open` runs them.
         await asyncio.to_thread(check_pinned_certificate, settings, posture=posture)
@@ -5680,21 +5683,15 @@ class SqlServerStore:
         except BaseException as exc:
             built = store
 
-            async def _release() -> None:
+            async def _graceful() -> None:
+                if built is not None:
+                    await built.close()
+                    return
                 try:
-                    if built is not None:
-                        await built.close()
-                    else:
-                        try:
-                            pool.close()
-                            await pool.wait_closed()
-                        finally:
-                            executor.shutdown(wait=False)
-                except Exception as cleanup:  # noqa: BLE001 — never mask the error
-                    log.warning(
-                        "closing a one-connection store after an error also failed (%s)",
-                        type(cleanup).__name__,
-                    )
+                    pool.close()
+                    await pool.wait_closed()
+                finally:
+                    executor.shutdown(wait=False)
 
             def _force_release() -> None:
                 # Synchronous, so it cannot wait on a wedged pool: close() only marks it closing.
@@ -5702,6 +5699,33 @@ class SqlServerStore:
                     pool.close()
                 finally:
                     executor.shutdown(wait=False)
+
+            if isinstance(exc, GeneratorExit):
+                try:
+                    await _graceful()
+                except BaseException as cleanup:  # noqa: BLE001 — fall back, keep the exit
+                    log.warning(
+                        "closing a one-connection store at its close failed (%s); it is released "
+                        "without waiting",
+                        type(cleanup).__name__,
+                    )
+                    try:
+                        _force_release()
+                    except Exception as forced:  # noqa: BLE001 — keep the exit
+                        log.warning(
+                            "releasing a one-connection store without waiting also failed (%s)",
+                            type(forced).__name__,
+                        )
+                raise
+
+            async def _release() -> None:
+                try:
+                    await _graceful()
+                except Exception as cleanup:  # noqa: BLE001 — never mask the error
+                    log.warning(
+                        "closing a one-connection store after an error also failed (%s)",
+                        type(cleanup).__name__,
+                    )
 
             await cleanup_failed_open(
                 exc,

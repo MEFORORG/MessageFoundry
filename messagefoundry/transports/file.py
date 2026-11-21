@@ -2328,8 +2328,8 @@ class FileSource(SourceConnector):
         False) a stat failure :func:`_transient_stat_failure` names, such as a share that dropped,
         is no evidence the file has gone, so the read's own ``read_sig`` stands in for its mark.
         Under ``move`` the archive stamp may have changed the mtime, so no stand-in is known and
-        the file is not remembered, as before. A direct caller with no ``read_id`` gets False, as
-        before BACKLOG #5717."""
+        the file is not remembered, as before. Nor is a file on a volume that reports no file ID.
+        A direct caller with no ``read_id`` gets False, as before BACKLOG #5717."""
         if read_id is None or read_sig is None:
             return False
         try:
@@ -2339,6 +2339,11 @@ class FileSource(SourceConnector):
                 return False
             mark = (*read_sig, *read_id)
         if mark[2:] != read_id:
+            return False
+        if not mark[3]:
+            # No file ID on this volume (FAT, exFAT, some NAS): a later file under the same name,
+            # size and mtime could not be told from this one, and a byte-identical resend would be
+            # disposed of unhanded. Not remembered, so it is handed off again, as before #5717.
             return False
         return _Undisposed(mark, lasting)
 
