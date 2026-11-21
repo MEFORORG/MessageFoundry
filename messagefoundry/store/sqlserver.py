@@ -1109,7 +1109,8 @@ def _options_error(exc: BaseException) -> str:
     its text through ``redact_log_line``, since ODBC text can echo connection parameters. The
     redacted text keeps a driver's diagnosis, such as an untrusted certificate or a query timeout,
     readable. The CLI's ``_engine_refusal_text`` matches this rendering as well as the error's own
-    text, so it still prints its SQLSTATE form in place of either."""
+    text, so it prints its own rendering of the error in place of either: the class, SQLSTATE and
+    native number where the error carries a SQLSTATE."""
     return redact_log_line(str(exc))
 
 
@@ -4978,11 +4979,18 @@ class SqlServerStore:
                 log.warning("%s", message)
                 return
             off = _options_off(row)
-            if off and fail_closed:
+            if off and fail_closed and settings.command_timeout:
                 # The ALTERs run with no statement limit, as on a provision-schema run, so they get
                 # a cursor opened after the limit is lifted (see the comment at the state read).
-                await cur.close()
-                cur = None
+                # `cur` is cleared before the close, so a cancellation landing in it does not hand
+                # the same cursor to the gate a second time.
+                old, cur = cur, None
+                try:
+                    await old.close()
+                except Exception as exc:  # noqa: BLE001 - the ALTER below meets a dead session
+                    # A peer's ROLLBACK IMMEDIATE may have killed the session; the ALTER then
+                    # fails inside its own handler, which re-reads the state.
+                    log.debug("options state-read cursor close failed: %s", _options_error(exc))
                 _bound_one_shot(conn, 0)
                 cur = await conn.cursor()
             if "READ_COMMITTED_SNAPSHOT" in off:
