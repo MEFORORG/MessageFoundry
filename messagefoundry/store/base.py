@@ -165,6 +165,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only; both carry an optional driv
     from messagefoundry.store.sqlserver import SqlServerStore
 
 __all__ = [
+    "ATTACHMENT_CONTENT_TYPE_MAX",
     "AdminStore",
     "AuditStore",
     "AuthStore",
@@ -4627,6 +4628,13 @@ class SchemaDdlLockTimeout(SchemaLockTimeout):
 #: Server's retry waits again. ADR 0007, amendment of 2026-10-31, records at least what it does not
 #: cover.
 CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS = 5.0
+
+#: The widest ``attachment.content_type`` every backend holds, in UTF-16 code units: SQL Server's
+#: ``NVARCHAR(256)``, whose DDL is built from this value (SQLite and PostgreSQL use unbounded
+#: ``TEXT``). The stored value is a sender-controlled OBX-5.2 label, so the ingress detach downgrades
+#: a wider one before the write, and the download route serves a wider one as the generic type
+#: (BACKLOG #1619).
+ATTACHMENT_CONTENT_TYPE_MAX = 256
 
 
 class ConnectionFlagLockTimeout(RuntimeError):
