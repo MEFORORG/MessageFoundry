@@ -1742,7 +1742,7 @@ A custom role save checks the role name (BACKLOG #5785) after its gate. Where
 sessions, that gate has spent the single-use `save_ends_own_sessions` proof, so a refused name
 costs it: on `PUT /roles/custom/{role_id}` the answer is a 422, and on the console's
 `POST /ui/roles/custom/{role_id}/update` it is a 400 page re-rendering the form. The console's
-proof is also spent on a form the request model refuses, such as an unknown permission. Where
+proof is also spent on a form the request model refuses, such as a malformed permission id. Where
 the setting is off, or the save ends none of the caller's own sessions, the gate checks the
 step-up session window and spends nothing. The save reads the stored name only for a name the
 rule refuses, to tell a re-sent stored name, which is exempt, from a new one. That read checks

@@ -13803,7 +13803,9 @@ class AuthService:
     async def _load_custom_roles(self) -> list[tuple[RoleRow, bool]]:
         """Every custom role row, each with whether its seal holds. One that fails is reported, and
         listed with no permissions by the caller, so an administrator can still see it to save it
-        again or delete it, and never sees, or re-saves, a value written outside the store."""
+        again or delete it, and never sees, or re-saves, a permission set written outside the
+        store. Its name and description are listed as stored, so a save can re-send them, and a
+        save that does seals them (:meth:`custom_role_stored_name`)."""
         sealer = self._store.row_sealer()
         out: list[tuple[RoleRow, bool]] = []
         for found in await self._store.list_roles():
