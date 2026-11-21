@@ -237,9 +237,12 @@ def _run(
     return code, captured.out + captured.err, cfg, body
 
 
-def _field_only(arm: str, out: str) -> bool:
-    """A field-only arm names the field and the error type, never the validator's message."""
-    return arm in _FIELD_ONLY_ARMS and f"{_FIELD}value_error" in out and _MESSAGE not in out
+def _names_the_reason(arm: str, out: str, message: str) -> bool:
+    """An arm prints the validator's ``message``; a field-only arm prints the error type in its
+    place and never the message."""
+    if arm in _FIELD_ONLY_ARMS:
+        return f"{_FIELD}value_error" in out and message not in out
+    return message in out
 
 
 def _patch_leaky_load(monkeypatch: pytest.MonkeyPatch) -> list[int]:
@@ -274,7 +277,7 @@ def test_an_arm_renders_a_load_failure_without_its_input(
     assert calls, f"{arm} never reached load_settings, so this case proves nothing"
     assert _CANARY not in out, f"{arm} printed the input of a settings load failure: {out!r}"
     # Useful, not just quiet: the section and the reason are still named.
-    assert _FIELD in out and (_MESSAGE in out or _field_only(arm, out)), out
+    assert _FIELD in out and _names_the_reason(arm, out, _MESSAGE), out
     assert (code == 0) is (arm in _EXIT_0_ARMS), (arm, code)
     if arm in _EDIT_ARMS:
         # The post-write check refused, and the edit was rolled back. `security set` reports its
@@ -299,7 +302,7 @@ def test_a_real_store_failure_names_the_field_and_never_the_env_secret(
     code, out, cfg, _ = _run(arm, tmp_path, capsys, body)
 
     assert _CANARY not in out, f"{arm} printed an env-supplied secret: {out!r}"
-    assert _FIELD in out and ("server, database, username" in out or _field_only(arm, out)), out
+    assert _FIELD in out and _names_the_reason(arm, out, "server, database, username"), out
     assert "input_value" not in out and "errors.pydantic.dev" not in out, out
     if arm not in _EXIT_0_ARMS:
         assert code != 0

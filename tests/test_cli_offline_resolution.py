@@ -893,7 +893,9 @@ def test_offline_env_names_a_settings_path_holding_a_credential_label_as_it_is(
     rc = main(_offline_argv(command, tmp_path, *argv))
     captured = capsys.readouterr()
     out = captured.out + captured.err
-    assert str(named) in out or json.dumps(str(named))[1:-1] in out, out
+    # The path after the OS's reason, not the "(<settings file>)" prefix, which names it too.
+    shown = f": {named}"
+    assert shown in out or json.dumps(shown)[1:-1] in out, out
     assert "redacted" not in out, out
     assert rc == (0 if command == "graph" else 1), out
 
@@ -923,3 +925,27 @@ def test_the_settings_failure_rendering_keeps_a_missing_field_missing() -> None:
         shown
     )
     assert _URL_PASSWORD not in shown and "redacted" not in shown, shown
+
+
+def test_the_settings_failure_rendering_hides_a_custom_error_type_message() -> None:
+    # A PydanticCustomError keeps its own type and message, which can quote anything, so a type
+    # that is not one of pydantic's built-ins prints its type alone: the list fails closed.
+    from pydantic import BaseModel, ValidationError, field_validator
+    from pydantic_core import PydanticCustomError
+
+    from messagefoundry.__main__ import _settings_failure_fields
+
+    class _Model(BaseModel):
+        url: str
+
+        @field_validator("url")
+        @classmethod
+        def _refuse(cls, value: str) -> str:
+            raise PydanticCustomError("proxy_refused", "entry {entry} refused", {"entry": value})
+
+    with pytest.raises(ValidationError) as caught:
+        _Model(url=f"https://u:{_URL_PASSWORD}@host/")
+    assert _URL_PASSWORD in caught.value.errors()[0]["msg"]  # the control
+    shown = _settings_failure_fields(caught.value)
+    assert shown.startswith("url: proxy_refused (its message is not shown"), shown
+    assert _URL_PASSWORD not in shown, shown

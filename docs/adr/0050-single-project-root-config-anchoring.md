@@ -495,8 +495,9 @@ those settings, and its Handlers still run with no active environment.
   - Settings that fail to validate are printed by their failing field paths. Where `serve` prints a
     validator's message as written, these three print its error type in its place, because CI logs
     keep their output and the message can quote the refused value, at least the
-    `[api].trusted_proxies` refusal quoting a URL with its password. At least a mapping key in a
-    field path and a path the operator named still print.
+    `[api].trusted_proxies` refusal quoting a URL with its password. A refusal the settings loader
+    raises itself, such as an unrecognized key, prints as its exception type alone. At least a
+    mapping key in a field path and a path the operator named still print.
 
 **What "matches `serve`" covers.** The settings checks read the environment name `serve --env`
 reads. Value-file location is shared too: the offline `<env>.toml` check under `--project-root` now

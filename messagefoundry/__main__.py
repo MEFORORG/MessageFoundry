@@ -1542,9 +1542,8 @@ def _resolve_offline_anchor(
     return config_dir, service_config
 
 
-#: Pydantic error types whose message can quote the refused input: a validator's own text
-#: (``value_error``, ``assertion_error``), a discriminator tag and an attribute error. The others are
-#: pydantic's own templates, which name the expected form rather than the input.
+#: Pydantic error types whose message can quote the refused input, at least: a validator's own text
+#: (``value_error``, ``assertion_error``), a discriminator tag and an attribute error.
 _INPUT_QUOTING_ERROR_TYPES = frozenset(
     {"value_error", "assertion_error", "union_tag_invalid", "get_attribute_error"}
 )
@@ -1554,49 +1553,63 @@ def _settings_failure_fields(exc: Exception) -> str:
     """A settings-load failure as ``validate``/``graph``/``dryrun`` print it under ``--env``: the
     failing field paths and what failed, never a refused value (vault BACKLOG #5554).
 
-    These three commands print it where origin/main printed nothing, to output CI logs keep, and a
-    validator message can quote the value it refused: the ``[api].trusted_proxies`` refusal quotes
-    the entry, a URL's userinfo included. A credential scrub over the rendered text is not the
-    answer. Both :func:`~messagefoundry.secretscrub.scrub_credentials` and
+    These three commands print it where they printed nothing before vault BACKLOG #5554, to output
+    CI logs keep, and a validator message can quote the value it refused: the
+    ``[api].trusted_proxies`` refusal quotes the entry, a URL's userinfo included. A credential
+    scrub over the rendered text is not the answer. Both
+    :func:`~messagefoundry.secretscrub.scrub_credentials` and
     :func:`~messagefoundry.verify_leaf.safe_detail_text`, which runs it, read a field path as a
     credential label: ``store.password: Field required`` printed as ``store.password=<redacted>
-    required`` (``[redacted]`` through ``safe_detail_text``), so a missing secret read as a set
-    one, and a path holding ``api_key=`` printed as a file that does not exist. So no refused value is rendered at all. A pydantic error prints its
-    field path and pydantic's own message, except an error of a type in
-    :data:`_INPUT_QUOTING_ERROR_TYPES`, which prints its type in place of the message. At most
-    ``_ERROR_DETAIL_ROWS`` errors are shown.
+    required`` (``[redacted]`` through ``safe_detail_text``), so a missing secret read as a set one,
+    and a path holding ``api_key=`` printed as a file that does not exist. So a message that can
+    quote a refused value is not rendered at all.
 
-    Any other failure: an ``OSError`` or a TOML parse error as its own text, which names a path and
-    the OS's reason, or a line and a column with at most a key or one character; a
-    ``UnicodeDecodeError`` as its reason and byte offset; a ``RecursionError`` as a fixed line; and
-    anything else as its exception type alone. ``serve`` and ``check`` still print
-    :func:`_load_service_settings`'s text, the validator messages included.
+    A pydantic error prints its field path and, for a built-in pydantic error type outside
+    :data:`_INPUT_QUOTING_ERROR_TYPES`, pydantic's own message. Any other type, a custom
+    ``PydanticCustomError`` type included, prints its type in place of the message. At most
+    ``_ERROR_DETAIL_ROWS`` errors are shown. An ``OSError`` prints its type, the OS's reason and the
+    path it names; a TOML parse error its own text, a line and a column with at most a key or one
+    character; a ``UnicodeDecodeError`` its reason and byte offset; a ``RecursionError`` a fixed
+    line; and anything else, the loader's own refusals included, its exception type alone. Those
+    refusals, such as an unrecognized key, are written to name a key and not its value, so this
+    hides more than it must; ``serve`` and ``check`` still print :func:`_load_service_settings`'s
+    text, every message as written.
 
     What this still prints, at least: a mapping key that is part of a field path, a path the
-    operator named, and a key ``tomllib`` quotes."""
+    operator named, a key ``tomllib`` quotes, and a character of the input that some pydantic parse
+    messages quote."""
+    from typing import get_args
+
     from pydantic import ValidationError
+    from pydantic_core.core_schema import ErrorType
 
     from messagefoundry.config.settings import _ERROR_DETAIL_ROWS
 
     if isinstance(exc, ValidationError):
+        shown_types = frozenset(get_args(ErrorType)) - _INPUT_QUOTING_ERROR_TYPES
         errors = exc.errors(include_url=False)
         rows = []
         for err in errors[:_ERROR_DETAIL_ROWS]:
             field = ".".join(str(part) for part in err["loc"]) or "<root>"
             what = (
-                f"{err['type']} (its message is not shown, because it can quote the value)"
-                if err["type"] in _INPUT_QUOTING_ERROR_TYPES
-                else err["msg"]
+                err["msg"]
+                if err["type"] in shown_types
+                else f"{err['type']} (its message is not shown, because it can quote the value)"
             )
             rows.append(f"{field}: {what}")
         hidden = len(errors) - _ERROR_DETAIL_ROWS
         return "; ".join(rows) + (f" (+{hidden} more)" if hidden > 0 else "")
-    if isinstance(exc, (OSError, tomllib.TOMLDecodeError)):
+    if isinstance(exc, OSError):
+        # Not str(exc): it quotes the filename as a repr, doubling a Windows path's backslashes.
+        if exc.filename is not None and exc.strerror:
+            return f"{type(exc).__name__}: {exc.strerror}: {exc.filename}"
         return f"{type(exc).__name__}: {exc}"
+    if isinstance(exc, tomllib.TOMLDecodeError):
+        return f"TOMLDecodeError: {exc}"
     if isinstance(exc, UnicodeDecodeError):
         return f"UnicodeDecodeError: {exc.reason} at byte {exc.start}"
     if isinstance(exc, RecursionError):
-        return "RecursionError: the file nests too deeply to parse"
+        return "RecursionError: the settings nest too deeply to load"
     return f"{type(exc).__name__} (its message is not shown, because it can quote a value)"
 
 
@@ -1654,7 +1667,8 @@ def _offline_env_values(
         # Name the file only where there is one: with none, the failure is the environment's or
         # the command line's, and a named file would send the operator to the wrong place.
         source = f" ({settings_file})" if settings_file.exists() else ""
-        shown = _settings_failure_fields(failure) if failure is not None else "no detail"
+        assert failure is not None  # exactly one side is set
+        shown = _settings_failure_fields(failure)
         raise WiringError(f"could not load the service settings{source}: {shown}")
     cwd = Path.cwd()
     base_dir = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
@@ -2173,7 +2187,9 @@ def _load_service_settings_or_error(
 ) -> tuple[ServiceSettings | None, Exception | None]:
     """:func:`_load_service_settings`'s load and catch, returning the exception unrendered, for a
     caller that renders it its own way (:func:`_settings_failure_fields`). Exactly one side is
-    non-``None``. The catch is documented on :func:`_load_service_settings`."""
+    non-``None``. The catch is documented on :func:`_load_service_settings`. Never print, log or
+    chain the exception: ``str()`` of a ``ValidationError`` from a model outside
+    ``_InputHidingModel`` carries ``input_value=``, as that function says."""
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import load_settings
