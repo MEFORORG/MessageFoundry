@@ -24,6 +24,7 @@ the callers caring.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import sys
 import threading
@@ -5196,6 +5197,7 @@ async def _refuse_to_start_a_keyless_chain(
 ) -> None:
     """Close ``store`` and raise :class:`KeylessAuditChainRefused` when its next audit row would be a
     keyless row 1."""
+    cancels_before = _cancels_at_entry()
     try:
         count, _head = await store.audit_anchor()
         # A keyed chain is never empty, since it holds its genesis row. So an empty log is one
@@ -5204,15 +5206,36 @@ async def _refuse_to_start_a_keyless_chain(
     except BaseException as exc:
         # The anchor read is a read of the chain's newest row (vault BACKLOG #3054, item 10).
         note_audit_chain_read(exc)
-        await _close_quietly(store)
+        await _close_quietly(store, exc, cancels_before)
         raise
     if starts_keyless:
-        await _close_quietly(store)
-        raise KeylessAuditChainRefused(store.path, refused_by, key_named=key_named)
+        refusal = KeylessAuditChainRefused(store.path, refused_by, key_named=key_named)
+        await _close_quietly(store, refusal, cancels_before)
+        raise refusal
 
 
-async def _close_quietly(store: Store) -> None:
-    """Close ``store`` on an error path without letting a close failure replace the real error."""
+def _cancels_at_entry() -> int:
+    """:func:`~messagefoundry.store.store.cancels_at_entry`, imported when called."""
+    from messagefoundry.store.store import cancels_at_entry
+
+    return cancels_at_entry()
+
+
+async def _close_quietly(store: Store, exc: BaseException, cancels_before: int) -> None:
+    """Close ``store`` on an error path without letting a close failure replace the real error,
+    ``exc``. The close runs through :func:`~messagefoundry.store.store.cleanup_failed_open`, so a
+    cancel cannot cut it short (BACKLOG #5720); that raises a cancel that landed meanwhile when
+    ``exc`` is an ``Exception``. The ``Store`` protocol names no synchronous release, so past the
+    cancel's bound the close is left to finish on its own, and that is logged."""
+    from messagefoundry.store.store import cleanup_failed_open
+
+    await cleanup_failed_open(
+        exc, functools.partial(_close_logged, store), None, cancels_before=cancels_before
+    )
+
+
+async def _close_logged(store: Store) -> None:
+    """``store.close()``, a failure logged by class and SQLSTATE rather than raised."""
     try:
         await store.close()
     except Exception as exc:

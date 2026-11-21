@@ -4282,17 +4282,19 @@ class SqlServerStore:
             # A read-only open issues no ALTER either (#1780).
             await cls._ensure_database_options(settings)
         pool, executor = await cls._create_pool(settings, maxsize=settings.pool_size)
-        store = cls(
-            pool,
-            settings,
-            cipher=cipher,
-            audit_mac_key=audit_mac_key,
-            audit_mac_fn=audit_mac_fn,
-            message_events=message_events,
-        )
-        store._pool_executor = executor
-        store._read_only = read_only
         try:
+            # Inside the try, so a constructor that raises does not leak the pool or the
+            # executor (BACKLOG #5720).
+            store = cls(
+                pool,
+                settings,
+                cipher=cipher,
+                audit_mac_key=audit_mac_key,
+                audit_mac_fn=audit_mac_fn,
+                message_events=message_events,
+            )
+            store._pool_executor = executor
+            store._read_only = read_only
             await store._ensure_schema(create=create, read_only=read_only)
             # Right after the schema, so a later open step that fails still leaves the report
             # logged; read-only included, since it reads metadata only (BACKLOG #4917).
@@ -5663,16 +5665,110 @@ class SqlServerStore:
     ) -> AsyncIterator[SqlServerStore]:
         """A one-connection store with the identity cipher, closed on exit: what
         :meth:`provision_schema` and :meth:`probe_privileges` run on instead of :meth:`open`. It hands
-        the executor to the store, so :meth:`close` releases it."""
+        the executor to the store, so :meth:`close` releases it.
+
+        On an error, a cancel included, the close runs through :func:`cleanup_failed_open`, so a
+        cancel cannot cut it short and a close failure is logged by class rather than replacing
+        the error (BACKLOG #5720). On a clean exit a close failure is raised, as before. Under an
+        ``aclose()``, a ``GeneratorExit``, the graceful close runs first, as before, since an
+        async generator may await there; only if it fails or a cancel interrupts it does the
+        forced release run. A ``SystemExit`` or ``KeyboardInterrupt`` raised there propagates, as
+        it did before."""
+        cancels_before = cancels_at_entry()
         # Vault BACKLOG #2223: the pin's own checks, as :meth:`open` runs them.
         await asyncio.to_thread(check_pinned_certificate, settings, posture=posture)
         pool, executor = await cls._create_pool(settings, maxsize=1)
-        store = cls(pool, settings)
-        store._pool_executor = executor
+        store: SqlServerStore | None = None
         try:
+            store = cls(pool, settings)
+            store._pool_executor = executor
             yield store
-        finally:
-            await store.close()
+        except BaseException as exc:
+            built = store
+
+            async def _graceful() -> None:
+                if built is not None:
+                    await built.close()
+                    return
+                try:
+                    pool.close()
+                    await pool.wait_closed()
+                finally:
+                    executor.shutdown(wait=False)
+
+            def _force_release() -> None:
+                # Synchronous, so it cannot wait on a wedged pool: close() only marks it closing.
+                try:
+                    pool.close()
+                finally:
+                    executor.shutdown(wait=False)
+
+            if isinstance(exc, GeneratorExit):
+                try:
+                    await _graceful()
+                except asyncio.CancelledError:
+                    # A cancel during the close is raised, as main's unshielded close raised it,
+                    # once what the close left is released.
+                    try:
+                        _force_release()
+                    except Exception as forced:  # noqa: BLE001 — keep the cancel
+                        log.warning(
+                            "releasing a one-connection store without waiting also failed (%s)",
+                            type(forced).__name__,
+                        )
+                    raise
+                except Exception as cleanup:  # noqa: BLE001 — fall back, keep the exit
+                    log.warning(
+                        "closing a one-connection store at its close failed (%s); it is released "
+                        "without waiting",
+                        type(cleanup).__name__,
+                    )
+                    try:
+                        _force_release()
+                    except Exception as forced:  # noqa: BLE001 — keep the exit
+                        log.warning(
+                            "releasing a one-connection store without waiting also failed (%s)",
+                            type(forced).__name__,
+                        )
+                raise
+
+            close_failure: list[Exception] = []
+
+            async def _release() -> None:
+                try:
+                    await _graceful()
+                except Exception as cleanup:  # noqa: BLE001 — re-raised below, as main raised it
+                    close_failure.append(cleanup)
+                    log.warning(
+                        "closing a one-connection store after an error also failed (%s)",
+                        type(cleanup).__name__,
+                    )
+                    # A close that raised before its own pool step leaves the pool and the
+                    # executor open, so release both here (BACKLOG #5720).
+                    try:
+                        pool.close()
+                        await pool.wait_closed()
+                    except Exception as released:  # noqa: BLE001 — keep the close's error
+                        log.warning(
+                            "closing the pool after that also failed (%s)",
+                            type(released).__name__,
+                        )
+                    finally:
+                        executor.shutdown(wait=False)
+
+            await cleanup_failed_open(
+                exc,
+                _release,
+                _force_release,
+                cancels_before=cancels_before,
+                what="a one-connection store's cleanup",
+            )
+            if close_failure:
+                # Main's finally raised the close's error in place of the block's; this keeps
+                # that, with the block's error as its cause.
+                raise close_failure[0] from exc
+            raise
+        await store.close()
 
     @classmethod
     async def schema_meta_anywhere(
@@ -5825,8 +5921,14 @@ class SqlServerStore:
         try:
             if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
                 await self.checkpoint_cipher_invocations(settle=True)
-        except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
-            log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
+            # By class at WARNING, the traceback at DEBUG only: a driver's message may carry a
+            # path or a value, and the one-connection store's error path and open_store's keyless
+            # refusal run this close too (BACKLOG #5720).
+            log.warning(
+                "could not settle the AES-GCM invocation bound at close (%s)", type(exc).__name__
+            )
+            log.debug("the settle's failure at close", exc_info=exc)
         # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none were
         # opened, so it never affects the async path). ADR 0071 B5.
         self.close_sync_handoff_pool()
