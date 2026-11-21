@@ -1290,8 +1290,9 @@ def test_the_dsn_scan_still_reaches_every_scheme_shape_that_matters() -> None:
             "://svc:",
         ),
         # An empty user's password that starts with "=" or "@": the first segment had to take a
-        # character, so these printed whole (code review, round 2). With a user, the residual test
-        # below pins the same shape printing.
+        # character, so these printed whole (code review, round 2). With a user, the same shape is
+        # hidden too since BACKLOG #5386's wave 3, pinned by the ``lead_at`` assertion in
+        # test_an_empty_user_dsn_hides_an_equals_sign_and_states_its_residual.
         ("store dsn redis://:=Lead_Eq-75@db.invalid", ("Lead_Eq-75",), "redis://:"),
         ("store dsn redis://:@Lead_At-76@db.invalid", ("Lead_At-76",), "redis://:"),
         # Both at once, two "@" signs in the password.
@@ -1501,7 +1502,10 @@ def test_an_empty_user_dsn_hides_an_equals_sign_and_states_its_residual() -> Non
     assert "pw;Semi_Sec-83" in scrub_credentials("redis://:pw;Semi_Sec-83@host")
     assert "pw|Pipe_Sec-84" in scrub_credentials("redis://:pw|Pipe_Sec-84@host")
     assert "p%7CKv9x" in scrub_credentials("redis://:p%7CKv9x@host")
-    assert "Lead_At-74" in scrub_credentials("store dsn postgres://svc:@Lead_At-74@db.invalid/m")
+    # A user's password that starts with "@" printed here until BACKLOG #5386's wave 3; it is
+    # hidden now, so this pin asserts more is hidden, and the "@" stays before the placeholder.
+    lead_at = scrub_credentials("store dsn postgres://svc:@Lead_At-74@db.invalid/m")
+    assert "Lead_At-74" not in lead_at and "postgres://svc:@<redacted>@db.invalid/m" in lead_at
     # Round 4 review: a placeholder the PHI pass wrote first is a residual. BACKLOG #5386's added
     # item 3 hides the "%" line below; tests/test_b532r_redaction_segments.py holds the rest.
     chained = scrub_credentials(redact_untrusted("connect redis://:Zq7-19800505-Kv9x@host failed"))
