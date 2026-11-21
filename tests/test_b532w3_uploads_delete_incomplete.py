@@ -11,10 +11,12 @@ failed re-check is logged once (finding 4). Synthetic data only."""
 from __future__ import annotations
 
 import contextlib
+import copy
 import errno
 import json
 import logging
 import os
+import pickle
 import stat
 from collections.abc import Iterator
 from pathlib import Path
@@ -183,24 +185,97 @@ async def test_a_sidecar_that_cannot_be_checked_keeps_the_body(
 # --- findings 1, 3 and 14: a refused open, classed by what the name is now -------------------------
 
 
+class _OsInvalidOpen(_OsLstatAs):
+    """``_OsLstatAs``, where an open of ``path`` is refused with ``EINVAL``."""
+
+    def __init__(self, path: Path, info: Any) -> None:
+        super().__init__(path, info)
+
+        def _open(target: Any, flags: int, *args: Any) -> int:
+            if Path(target) == path:
+                raise OSError(errno.EINVAL, "Invalid argument", str(target))
+            return os.open(target, flags, *args)
+
+        self._open = _open
+
+
+def _regular(attributes: int, tag: int) -> Any:
+    return SimpleNamespace(
+        st_mode=stat.S_IFREG | 0o644, st_file_attributes=attributes, st_reparse_tag=tag
+    )
+
+
 @pytest.mark.parametrize("read", ["get_meta", "read_bytes"])
-async def test_an_invalid_open_of_a_name_still_regular_is_damage(
+async def test_an_invalid_open_of_an_unlisted_reparse_point_is_damage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read: str
 ) -> None:
-    # As a Windows reparse tag _UNOPENABLE_REPARSE_TAGS does not list answers. On 52c0fdef3ca the
+    # A Windows reparse tag _UNOPENABLE_REPARSE_TAGS does not list (finding 1). On 52c0fdef3ca the
     # EINVAL was re-raised: a 500.
     store = _store(tmp_path / "uploads")
     meta = await _saved(store)
     part = _blob(store, meta.file_id) if read == "read_bytes" else _sidecar(store, meta.file_id)
-
-    def _einval(path: Any, flags: int, *args: Any) -> int:
-        if Path(path) == part:
-            raise OSError(errno.EINVAL, "Invalid argument", str(path))
-        return os.open(path, flags, *args)
-
-    monkeypatch.setattr(uploads, "os", _OsWith(_einval))
+    monkeypatch.setattr(uploads, "os", _OsInvalidOpen(part, _regular(0x420, 0x80000099)))
     with pytest.raises(UploadDamagedError):
         await getattr(store, read)(meta.file_id)
+
+
+@pytest.mark.parametrize(
+    "info",
+    [_regular(0x20, 0), _regular(0x420, 0x9000101A), _regular(0x420, 0x80000013)],
+    ids=["plain-file", "cloud-placeholder", "dedup"],
+)
+async def test_an_invalid_open_of_a_readable_file_is_re_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, info: Any
+) -> None:
+    # Control: the Windows CRT answers EINVAL for every Win32 error it does not map, as a share
+    # fault or a placeholder whose filter is not running may be. That is not damage, which would
+    # invite an operator to delete a sound file.
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    monkeypatch.setattr(uploads, "os", _OsInvalidOpen(_blob(store, meta.file_id), info))
+    with pytest.raises(OSError) as raised:
+        await store.read_bytes(meta.file_id)
+    assert raised.value.errno == errno.EINVAL
+    assert not isinstance(raised.value, UploadDamagedError)
+
+
+async def test_a_part_whose_directory_went_is_not_called_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A share that dropped answers ENOENT for the part and its directory alike. That is not a part
+    # that was removed, so the open's own error is re-raised (round-4490f032 finding 3).
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    part = _blob(store, meta.file_id)
+
+    class _Dropped(_OsWith):
+        def lstat(self, path: Any, *args: Any, **kwargs: Any) -> Any:
+            if isinstance(path, str | os.PathLike) and Path(path) == part:
+                raise FileNotFoundError(errno.ENOENT, "No such file", str(path))
+            return os.lstat(path, *args, **kwargs)
+
+        @property
+        def path(self) -> Any:
+            return SimpleNamespace(
+                isdir=lambda d: False if Path(d) == part.parent else os.path.isdir(d),
+                dirname=os.path.dirname,
+            )
+
+    def _eio(target: Any, flags: int, *args: Any) -> int:
+        if Path(target) == part:
+            raise OSError(errno.EIO, "Input/output error", str(target))
+        return os.open(target, flags, *args)
+
+    monkeypatch.setattr(uploads, "os", _Dropped(_eio))
+    with pytest.raises(OSError) as raised:
+        await store.read_bytes(meta.file_id)
+    assert raised.value.errno == errno.EIO
+
+
+def test_the_incomplete_error_copies() -> None:
+    exc = UploadDeleteIncompleteError("f" * 32, None)
+    assert copy.copy(exc).args == exc.args
+    assert pickle.loads(pickle.dumps(exc)).removed is None
 
 
 @pytest.mark.parametrize("met", [errno.ENXIO, errno.EINVAL], ids=["linux-socket", "windows-socket"])

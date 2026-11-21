@@ -265,9 +265,10 @@ async def test_a_directory_swapped_in_for_the_sidecar_is_refused_before_the_body
 async def test_a_body_unlink_that_fails_on_a_file_is_not_damage(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: str
 ) -> None:
-    # Control: only a directory is answered as damage. A permission or a Windows sharing violation
-    # on the body is the access-refused answer a read gives, and any other failure is raised as it
-    # is; neither is a file an operator should delete.
+    # Control: only a directory is answered as damage. A permission on the body is the
+    # access-refused answer a read gives, and any other failure is raised as it is; neither is a
+    # file an operator should delete. A Windows sharing violation is the incomplete delete instead
+    # (tests/test_b532w3_uploads_delete_incomplete.py).
     store = _store(tmp_path / "uploads")
     meta = await _saved(store)
     blob = _blob(store, meta.file_id)

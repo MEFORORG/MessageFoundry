@@ -376,8 +376,8 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
     that ``_UNOPENABLE_REPARSE_TAGS`` does not list is. A refused open whose name is gone by that
     ``lstat`` raises ``FileNotFoundError``, whatever the open met, so the race answers the same
     on every platform. Raises :class:`_NotPlainError` for a refusal, and any other ``OSError`` the
-    filesystem gives, ``FileNotFoundError`` and ``PermissionError`` included, carrying the
-    re-check's verdict for :func:`_refused_read`."""
+    filesystem gives, ``FileNotFoundError`` and ``PermissionError`` included. An error of the open
+    itself carries the re-check's verdict for :func:`_refused_read`."""
     before = path.lstat()
     if _names_a_link(before) or not _is_regular(before):
         raise _NotPlainError(f"{path.name} is not a plain file")
@@ -390,10 +390,12 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
         # folder on Windows, and there a FileNotFoundError for a dangling link it followed. The
         # name is what decides, so every caller sees one refusal (BACKLOG #5388 added item 3).
         seen = _recheck(path, exc)
-        if seen == "plain" and exc.errno == errno.EINVAL:
-            # A name that still lstats as a regular file, which the open refuses as invalid, is
-            # at least a Windows reparse point _UNOPENABLE_REPARSE_TAGS does not list. No retry
-            # opens it, so it is damage, not a server error.
+        unopenable = seen == "reparse" and exc.errno == errno.EINVAL
+        if unopenable:
+            # A Windows reparse point of a kind no list here names, which the open refuses as
+            # invalid: no retry opens it, so it is damage, not a server error. Only that: the
+            # Windows CRT answers EINVAL for every Win32 error it does not map, so a plain file,
+            # or a cloud or dedup placeholder whose filter is not running, is re-raised as it is.
             seen = "unplain"
         # A refusal is converted when the name is now not plain, or is gone and the open met
         # something other than absence; anything else is re-raised as it is.
@@ -413,6 +415,8 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
             raise FileNotFoundError(
                 errno.ENOENT, f"{path.name} went after it was checked: {text}", str(path)
             )
+        if unopenable:
+            raise _NotPlainError(f"{path.name} is a reparse point the engine cannot open: {text}")
         raise _NotPlainError(f"{path.name} changed after it was checked: {text}")
     try:
         # Before the fdopen, which answers a directory swapped in after the lstat with its own
@@ -522,7 +526,19 @@ def _refused_read(exc: OSError) -> _ReadRefusal | None:
 
 
 #: What a fresh ``lstat`` shows of a part after an access to it was refused (:func:`_recheck`).
-_Recheck = Literal["unplain", "plain", "gone", "unnamed", "unchecked"]
+_Recheck = Literal["unplain", "plain", "reparse", "gone", "unnamed", "unchecked"]
+
+#: Windows reparse tags of files that are read as the file they are, though a filter serves them:
+#: at least data deduplication (``IO_REPARSE_TAG_DEDUP``) and the compressed files of WOF
+#: (``IO_REPARSE_TAG_WOF``). Cloud-files placeholders are matched by :func:`_readable_reparse`.
+_READABLE_REPARSE_TAGS = frozenset({0x80000013, 0x80000017})
+
+
+def _readable_reparse(tag: int) -> bool:
+    """Whether reparse ``tag`` is one a filter serves as the file it is: a listed tag, or any
+    cloud-files placeholder (``IO_REPARSE_TAG_CLOUD`` to ``_CLOUD_F``, which differ in bits 12-15)."""
+    return tag in _READABLE_REPARSE_TAGS or tag & 0xFFFF0FFF == 0x9000001A
+
 
 #: The attribute :func:`_open_plain` sets on an error it re-raises, holding its :func:`_recheck`.
 _RECHECKED = "_mefor_upload_recheck"
@@ -531,23 +547,35 @@ _RECHECKED = "_mefor_upload_recheck"
 def _recheck(name: object, cause: OSError) -> _Recheck:
     """What ``name`` is by a fresh ``lstat`` (BACKLOG #5388 added item 3), after ``cause`` refused
     an access to it: ``"unplain"`` for a link or a file that is not regular, ``"plain"`` for a
-    regular file, and ``"gone"`` for one that is not there. ``"unnamed"`` when ``name`` is no path
-    (``None``, or a descriptor), and ``"unchecked"`` when the ``lstat`` fails for any other reason
-    than absence, which is logged, never swallowed."""
+    regular file, ``"reparse"`` for a regular one that is a Windows reparse point of a kind
+    :func:`_readable_reparse` does not name, and ``"gone"`` for one that is not there while its
+    directory is. ``"unnamed"`` when ``name`` is no path (``None``, or a descriptor), and
+    ``"unchecked"`` when the ``lstat`` fails for any other reason, the directory gone or out of
+    reach included, as on a share that dropped, which is logged, never swallowed."""
     if not isinstance(name, str | bytes | os.PathLike):
         return "unnamed"
+    again: Exception
     try:
         info = os.lstat(name)
-    except FileNotFoundError:
-        return "gone"
-    except (OSError, ValueError) as again:
-        _log.warning(
-            "uploaded-file part could not be checked again after a refused access (%s): %s",
-            codec_safe_str(cause),
-            codec_safe_str(again),
-        )
-        return "unchecked"
-    return "unplain" if _names_a_link(info) or not _is_regular(info) else "plain"
+    except FileNotFoundError as exc:
+        if os.path.isdir(os.path.dirname(os.fspath(name))):
+            return "gone"
+        again = exc
+    except (OSError, ValueError) as exc:
+        again = exc
+    else:
+        if _names_a_link(info) or not _is_regular(info):
+            return "unplain"
+        reparse = getattr(info, "st_file_attributes", 0) & FILE_ATTRIBUTE_REPARSE_POINT
+        if reparse and not _readable_reparse(getattr(info, "st_reparse_tag", 0)):
+            return "reparse"
+        return "plain"
+    _log.warning(
+        "uploaded-file part could not be checked again after a refused access (%s): %s",
+        codec_safe_str(cause),
+        codec_safe_str(again),
+    )
+    return "unchecked"
 
 
 def _refused_unlink(exc: OSError, path: Path) -> _ReadRefusal | None:
@@ -604,6 +632,11 @@ def _unlink_retrying(path: Path) -> None:
         except OSError as exc:
             if attempt == _UNLINK_ATTEMPTS or not _in_use(exc):
                 raise
+            _log.info(
+                "uploaded-file part %s is in use, trying its unlink again: %s",
+                path.name,
+                codec_safe_str(exc),
+            )
         time.sleep(pause)
         pause *= 2
 
@@ -826,7 +859,9 @@ class UploadAccessError(UploadUnreadableError):
     #5388 added item 2): a ``PermissionError``, which is at least a permission or an ACL the engine
     lacks, or on Windows a file another program holds open. The file is not known to be damaged,
     and fixing the cause makes it readable again, so the API answers it with its own text, which
-    does not invite a delete. The listing scan skips such a sidecar and the prune never ages it."""
+    does not invite a delete. The listing scan skips such a sidecar and the prune never ages it.
+    A delete answers a body another handle holds open with :class:`UploadDeleteIncompleteError`
+    instead (BACKLOG #5388 added item 3)."""
 
 
 def _refusal(file_id: str, part: str, defect: str, kind: _ReadRefusal) -> UploadUnreadableError:
@@ -874,8 +909,8 @@ class UploadDeleteIncompleteError(UploadError):
     ``None`` when nothing was removed, because another handle held the body open, as the engine's
     own read of it does on Windows (:func:`_in_use`)."""
 
-    def __init__(self, file_id: str, removed: UploadedFileMeta | None) -> None:
-        super().__init__(file_id)
+    def __init__(self, file_id: str, removed: UploadedFileMeta | None = None) -> None:
+        super().__init__(file_id, removed)
         self.removed = removed
 
 
