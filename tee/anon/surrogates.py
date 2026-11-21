@@ -260,6 +260,54 @@ def _components(rep: str, seps: Seps) -> list[str]:
     return rep.split(seps.component) if rep else [""]
 
 
+class SurrogateSeparatorRefused(AnonError):
+    """A rule's surrogate would hold a character that splits or ends a field: the message's field
+    separator, a segment separator, an MLLP frame byte or NUL (checked by each adapter as it
+    writes the field), or a component, repetition or subcomponent separator or the escape
+    character the message declares, inside a value the surrogate wrote itself (checked here,
+    :func:`_written`). Writing it would add a field, a line or a component, or start an escape
+    sequence, and move what follows past its rule (BACKLOG #5540). A ``keep`` on that field does
+    not help: it would emit the captured value. ``path`` is the rule's field address, never a
+    value."""
+
+    def __init__(self, path: str, cause: str) -> None:
+        super().__init__(f"the surrogate for {path} would hold {cause} — refusing to emit")
+        self.path = path
+        self.cause = cause
+
+
+class _HeldDelimiter(AnonError):
+    """:func:`_written` found a declared delimiter in a written value. It carries the cause only;
+    :func:`surrogate_field_recorded` adds the rule's address and raises
+    :class:`SurrogateSeparatorRefused`. It is an ``AnonError`` itself, so a caller that reaches a
+    surrogate by another route still fails closed."""
+
+    def __init__(self, cause: str) -> None:
+        super().__init__(f"a surrogate would hold {cause} — refusing to emit")
+        self.cause = cause
+
+
+def _written(seps: Seps, *values: str) -> None:
+    """Refuse a value a surrogate wrote itself (a pool entry, a constant, a fabricated date or
+    number) that holds the component, repetition or subcomponent separator or the escape
+    character the message declares (:class:`_HeldDelimiter`). Under a custom MSH-2 whose
+    component separator is a space, every street in the pool holds one, so the written value
+    would gain a component and every later component would move (BACKLOG #5540). Text a
+    surrogate keeps as captured, such as a kept CX component or an identifier's punctuation, is
+    not checked: it held the same characters in the input. A written value is checked whole, so
+    a date whose fraction dot is the declared subcomponent separator is refused even though the
+    fill writes that dot where the sender's value held it. The field separator is the adapters'
+    to check, as they write the field."""
+    for role, char in (
+        ("component separator", seps.component),
+        ("repetition separator", seps.repetition),
+        ("subcomponent separator", seps.subcomponent),
+        ("escape character", seps.escape),
+    ):
+        if char and any(char in value for value in values):
+            raise _HeldDelimiter(f"the {role} the message declares (MSH-2)")
+
+
 def surrogate_name(rep: str, keyer: Keyer, seps: Seps) -> str:
     """XPN ``Family^Given^Middle`` from the fabricated name pools (trailing components dropped)."""
     rng = keyer.rng("name", rep)
@@ -267,6 +315,7 @@ def surrogate_name(rep: str, keyer: Keyer, seps: Seps) -> str:
     given = rng.choice(_pools.GIVEN_NAMES)
     middle = rng.choice(_pools.MIDDLE_INITIALS)
     parts = [family, given, middle] if middle else [family, given]
+    _written(seps, *parts)
     return seps.component.join(parts)
 
 
@@ -275,7 +324,9 @@ def surrogate_address(rep: str, keyer: Keyer, seps: Seps) -> str:
     rng = keyer.rng("address", rep)
     street = rng.choice(_pools.STREETS)
     city, state, zip_code = rng.choice(_pools.CITIES)
-    return seps.component.join([street, "", city, state, zip_code, "USA"])
+    parts = [street, "", city, state, zip_code, "USA"]
+    _written(seps, *parts)
+    return seps.component.join(parts)
 
 
 #: The 1-based CX components an identifier surrogate keeps as captured: CX.3 check-digit scheme,
@@ -377,7 +428,9 @@ def surrogate_phone(rep: str, keyer: Keyer, seps: Seps) -> str:
     area = rng.randrange(200, 1000)
     line = 100 + rng.randrange(100)  # 0100–0199, reserved for fictional use
     digits = f"{area:03d}555{line:04d}"
-    return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}" if "-" in rep else digits
+    phone = f"{digits[:3]}-{digits[3:6]}-{digits[6:]}" if "-" in rep else digits
+    _written(seps, phone)
+    return phone
 
 
 #: What may follow the eight date digits of a date of birth: hours, minutes and seconds, a
@@ -403,6 +456,13 @@ def surrogate_dob(rep: str, keyer: Keyer, seps: Seps) -> str:
     :func:`surrogate_date` writes. The shape, and so the precision, survives; none of the value does."""
     rng = keyer.rng("dob", rep)
     date8 = f"{rng.randrange(1920, 2022):04d}{rng.randrange(1, 13):02d}{rng.randrange(1, 29):02d}"
+    dob = _dob_written(rep, date8)
+    _written(seps, dob)
+    return dob
+
+
+def _dob_written(rep: str, date8: str) -> str:
+    """What :func:`surrogate_dob` writes for ``rep``, given its fabricated eight-digit date."""
     if len(rep) < 8:
         return date8[: len(rep)]  # match the original's precision/width
     # Only a time after eight digits is kept, and only as its shape. Anything else there (a name, a
@@ -463,7 +523,7 @@ def surrogate_date(rep: str, keyer: Keyer, seps: Seps) -> str:
     that also reads as a two-digit year, a month and a day (``_YYMMDD``). The HL7 explicit null
     ``""`` carries nothing and is kept.
     """
-    return _filled_date(rep, seps)
+    return _checked_date(rep, seps)
 
 
 def _filled_date(rep: str, seps: Seps) -> str:
@@ -480,15 +540,28 @@ def _filled_date(rep: str, seps: Seps) -> str:
     return year + _DATE_FILL[: len(rest or "")] + (_OFFSET_FILL if offset else "") + sep + ts2
 
 
+def _checked_date(rep: str, seps: Seps) -> str:
+    """:func:`_filled_date`, refused when the year, fill or offset it wrote holds a declared
+    delimiter (:func:`_written`). The TS.2 code and the separator before it are the sender's."""
+    filled = _filled_date(rep, seps)
+    if filled and rep != '""':
+        # A filled date ends with the sender's separator and TS.2 as captured; the rest is written.
+        _, sep, ts2 = rep.partition(seps.component)
+        _written(seps, filled[: len(filled) - len(sep + ts2)])
+    return filled
+
+
 def surrogate_provider(rep: str, keyer: Keyer, seps: Seps) -> str:
     """XCN ``Id^Family^Given`` drawn from the fabricated clinician pool."""
     rng = keyer.rng("provider", rep)
     cid, family, given = rng.choice(_pools.CLINICIANS)
+    _written(seps, cid, family, given)
     return seps.component.join([cid, family, given])
 
 
 def surrogate_freetext(rep: str, keyer: Keyer, seps: Seps) -> str:
     """Blunt full-redaction — narrative may embed identifiers field-surrogation can't reach."""
+    _written(seps, REDACTED)
     return REDACTED
 
 
@@ -554,7 +627,10 @@ def surrogate_field_recorded(
         and any(rep and not _filled_date(rep, seps) for rep in value.split(seps.repetition))
     ):
         blanked.append(path)
-    return surrogate_field(kind, value, keyer, seps)
+    try:
+        return surrogate_field(kind, value, keyer, seps)
+    except _HeldDelimiter as held:
+        raise SurrogateSeparatorRefused(path, held.cause) from None
 
 
 def _reads_as_site_code(part: str, seps: Seps, field_sep: str) -> bool:

@@ -421,7 +421,10 @@ def test_a_field_separator_refusal_is_not_told_to_add_a_keep(
     assert _run(path, tmp_path / "ds.jsonl") == 1
 
     (error,) = [line for line in capsys.readouterr().err.splitlines() if line.startswith("error:")]
-    assert "would hold the message's field separator or a control byte" in error
+    assert (
+        "would hold the message's field separator, a control byte or a delimiter MSH-2 declares"
+        in error
+    )
     assert "in NTE-3." in error and "point the field at drop" in error
     assert _GENERAL not in error
     assert "Then retry." in error

@@ -558,12 +558,14 @@ def test_a_plus_sign_as_the_repetition_separator_does_not_break_the_record(
     adapter: Callable[..., str],
 ) -> None:
     """The filled offset is +0000. Where the message declares + as its repetition separator, the
-    output holds more repetitions than the input, and the record must not be worked out from it."""
+    output would hold more repetitions than the input. The record must not be worked out from that
+    output, and since BACKLOG #5540 the message is refused rather than emitted with the extra
+    repetition."""
     message = (
         "MSH|^+\\&|SAPP|SFAC|RAPP|RFAC|20260315142233||ADT^A01|MSGCTRL|P|2.5.1"
         "\rEVN|A01|20260315120000-0500"
     )
     blanked: list[str] = []
-    out = adapter(message, salt=_SALT, blanked=blanked)
-    assert _field_of(out, "EVN-2") == "20260101000000+0000"
+    with pytest.raises(ValueError, match="EVN-2 would hold the repetition separator"):
+        adapter(message, salt=_SALT, blanked=blanked)
     assert blanked == []

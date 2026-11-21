@@ -21,8 +21,10 @@ every street in the address pool holds a space, and the surrogate kinds write le
 Joined back, such a value would add fields and renumber every later field for any reader of the
 output. So :func:`_whole_field` refuses the values a RULE writes that the engine adapter's
 whole-field ``Message.set`` refuses (BACKLOG #5540). The shared site-code pass that runs after
-the rules writes no digit the message declares as a separator. Neither adapter checks a rule's
-surrogate holding a component, repetition, subcomponent or escape character.
+the rules writes no digit the message declares as a separator. A component, repetition or
+subcomponent separator or escape character the message declares, in a value a surrogate writes
+itself, is refused on both adapters by the shared ``surrogates.surrogate_field_recorded``, with the
+same :class:`SurrogateSeparatorRefused`.
 """
 
 from __future__ import annotations
@@ -46,6 +48,11 @@ from .surrogates import (
     surrogate_field_recorded,
 )
 
+# Re-exported: ``tee/__main__.py`` names this refusal from here.
+from .surrogates import (
+    SurrogateSeparatorRefused as SurrogateSeparatorRefused,
+)
+
 
 def _segment_id(path: str) -> str:
     return path.split("-", 1)[0]
@@ -62,8 +69,9 @@ def anonymize_message(
 
     Pure + deterministic for a given ``keyer``. Raises :class:`AnonError` (carrying no body) when it
     cannot safely anonymize the message — fail closed, matching the engine adapter. The causes
-    include at least a message with no parseable MSH / encoding characters, and a surrogate that
-    would hold the field separator (see :func:`_whole_field`).
+    include at least a message with no parseable MSH / encoding characters, a surrogate that
+    would hold the field separator (see :func:`_whole_field`), and one that would hold a declared
+    delimiter in a value it wrote itself (``surrogates._written``).
 
     ``blanked``, when given, collects the address of every field the ``DATE`` kind scrubbed to empty
     (``surrogate_field_recorded``), as the engine adapter does.
@@ -110,16 +118,6 @@ def anonymize_message(
 #: Beside the field separator, what the engine's whole-field ``Message.set`` refuses: CR, LF, then
 #: its ``_STRUCTURE_REFUSED``, which the tee cannot import. A test pins the two refusing alike.
 _REFUSED_IN_FIELD = ("\r", "\n", "\x0b", "\x1c", "\x00")
-
-
-class SurrogateSeparatorRefused(AnonError):
-    """A rule's surrogate would hold the field separator or a character in ``_REFUSED_IN_FIELD``,
-    so writing it would add a field or a line (BACKLOG #5540). A ``keep`` on that field does not
-    help: it would emit the captured value. ``path`` is the rule's field address, never a value."""
-
-    def __init__(self, path: str, cause: str) -> None:
-        super().__init__(f"the surrogate for {path} would hold {cause} — refusing to emit")
-        self.path = path
 
 
 def _whole_field(path: str, value: str, field_sep: str) -> str:
