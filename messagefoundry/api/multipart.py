@@ -70,24 +70,30 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-# The Content-Disposition tokenizer's pieces. Each is applied with ``match`` at one offset and
-# consumes what it scans, so a line is read in one linear pass: this is the **ReDoS guard**
-# (CodeQL py/polynomial-redos). The header block is attacker-supplied, and the regex it replaced,
-# ``(\w+)="…"`` unanchored, restarted at every offset of a word run and was quadratic on one until a
-# lookbehind guard was added. Running the parse in a worker thread (BACKLOG #5522) does not make a
-# quadratic scan safe, for the reason ``parse_upload_off_loop``'s docstring states. The cost is
-# pinned by ``tests/test_multipart.py::test_a_hostile_disposition_header_stays_inside_the_scan_budget``.
-#: A key: every character up to whitespace, a separator, ``=`` or ``"``.
-_DISP_KEY = re.compile(r'[^ \t;,="]*+')
-#: An unquoted (token) value: every character up to whitespace, a separator or ``"``.
-_DISP_TOKEN = re.compile(r'[^ \t;,"]*+')
-#: A quoted-string from its opening quote: its text, then its closing quote, empty if the line ends
-#: first. A backslash takes the next character with it, so ``\"`` does not close the string.
-_DISP_QUOTED = re.compile(r'"((?:[^"\\]|\\[\s\S])*+)("?+)')
+# The Content-Disposition tokenizer (:func:`_disposition_params`). Each ``search`` of
+# ``_DISP_ITEM`` reads one item and consumes all it scans, with possessive quantifiers and
+# alternatives told apart by their first character, so a line is read in one linear pass: this is
+# the **ReDoS guard** (CodeQL py/polynomial-redos). The header block is attacker-supplied, and the
+# regex this replaced, ``(\w+)="…"`` unanchored, restarted at every offset of a word run and was
+# quadratic on one until a lookbehind guard was added. Running the parse in a worker thread
+# (BACKLOG #5522) does not make a quadratic scan safe, for the reason ``parse_upload_off_loop``'s
+# docstring states. The cost is pinned by the scan-budget tests in ``tests/test_multipart.py``.
+#:
+#: One item: either a quoted-string where a key belongs, or a key (the run up to a space, separator,
+#: ``=`` or quote, or nothing right before an ``=``) then, optionally, spaces, ``=``, spaces and a
+#: value: a quoted-string (groups 4 to 6: its opening quote, its text, its closing quote, empty if the
+#: line ends first) or a token (the run up to a space or separator). A backslash in a quoted-string
+#: takes the next character with it, so ``\"`` does not close the string.
+_DISP_ITEM = re.compile(
+    r'"(?:[^"\\]|\\[\s\S])*+"?+'
+    r'|([^ \t;,="]++|(?==))'
+    r'(?:([ \t]*+)=([ \t]*+)(?:(")((?:[^"\\]|\\[\s\S])*+)("?+)|[^ \t;,]*+))?'
+)
 #: The escapes a quoted value's text is decoded for. A backslash before any other character is kept,
 #: so a Windows path such as ``C:\logs\a.hl7`` reads as written.
 _DISP_ESCAPE = re.compile(r'\\([\\"])')
-_DISP_SPACE = re.compile(r"[ \t]*+")
+#: What may follow a quoted value's closing quote: the end of the line, a space or a separator.
+_DISP_AFTER_VALUE = frozenset(" \t;,")
 _DISPOSITION_HEADER = "content-disposition:"
 
 #: Cap on one part's header block. RFC 2388 part headers are ``Content-Disposition`` plus at most a
@@ -98,8 +104,11 @@ _DISPOSITION_HEADER = "content-disposition:"
 #: but it ran synchronously on the asyncio event loop that also drives every listener and worker, and
 #: linear is not free at that size: a single request would block the engine for ~0.35 s at 25 MiB and
 #: ~7 s at the ceiling (the worker thread since BACKLOG #5522 does not help a single scan; see
-#: ``parse_upload_off_loop``). Bounding the header keeps the cost microseconds and, incidentally,
-#: gives the ReDoS analysis a length-bounded source instead of an attacker-sized one.
+#: ``parse_upload_off_loop``). Bounding the header bounds the cost and, incidentally, gives the
+#: ReDoS analysis a length-bounded source instead of an attacker-sized one. The tokenizer that
+#: replaced the regex (BACKLOG #5787) loops in Python once per item: measured 2026-11-21 on a dev
+#: box, the worst shape found took ~1.5 ms for a 12,000-character line, and a body of 16 parts with
+#: header blocks near this cap ~25 ms, against ~5 ms for the regex.
 _MAX_PART_HEADER_BYTES = 16 * 1024
 
 #: Cap on the number of parts in one body. The upload route keeps one file part and reads no other
@@ -168,66 +177,57 @@ def parse_boundary(content_type: str | None) -> bytes | None:
     return None
 
 
-def _quoted(value: str, pos: int) -> tuple[str | None, int]:
-    """The quoted-string that opens at ``value[pos]``: its decoded text, or ``None`` if the line
-    ends before its closing quote, and the offset just past it (the end of the line if unclosed)."""
-    match = _DISP_QUOTED.match(value, pos)
-    assert match is not None  # value[pos] is a quote, and the rest of the pattern matches empty
-    if not match.group(2):
-        return None, len(value)
-    return _DISP_ESCAPE.sub(r"\1", match.group(1)), match.end()
-
-
 def _disposition_params(value: str) -> list[tuple[str, str | None]]:
-    """The parameters of one Content-Disposition value (the text after ``Content-Disposition:``),
+    r"""The parameters of one Content-Disposition value (the text after ``Content-Disposition:``),
     in order, as ``(key, value)`` pairs with the key lowercased (BACKLOG #5787).
 
     The value is read left to right as RFC 6266 and RFC 7578 write it, tolerantly. Spaces, tabs,
     ``;`` and ``,`` separate items. An item is a key, then, if an ``=`` follows it (spaces allowed
     around the ``=``), a value: a quoted-string, in which a backslash escapes the next character, or
-    else a token, which runs to the next space, separator or quote. A key with no ``=`` after it is
-    the disposition type, or stray text, and is not a parameter; so ``form-data`` is not, and a first
+    else a token, which runs to the next space or separator. A key with no ``=`` after it is the
+    disposition type, or stray text, and is not a parameter; so ``form-data`` is not, and a first
     item such as ``filename="a.hl7"`` is. A quoted-string where a key belongs is skipped. A key is
     the whole run before its ``=``, so ``x-name``, ``foo*name`` and the extended ``filename*`` are
     their own keys, and text inside a quoted value is never a key.
 
-    The pair's value is the quoted-string's text, with ``\\"`` and ``\\\\`` decoded and any other
-    backslash kept, when the quoted-string is written right after ``key=`` with no space and is
-    closed. Otherwise it is ``None``: a token, a value with spaces around its ``=`` and an unclosed
-    quoted-string give the key but no value, as the regex this replaced read none of them."""
+    **A browser does not escape a backslash** (the HTML form encoding percent-encodes only ``"``,
+    CR and LF), so a value that ends in one, ``name="a\"; filename="b.hl7"``, reads under the
+    escapes as one value running to the next quote, while a client that does escape, such as curl or
+    httpx, writes ``x="a\"b"``. The escaped reading wins where its closing quote is followed by the
+    end of the line, a space or a separator. Where it is not, or the string does not close, and the
+    value holds a backslash, the value is read as the regex this replaced read it, to the first
+    ``"`` with backslashes kept, if that quote is so followed.
+
+    The pair's value is the quoted-string's text, with ``\"`` and ``\\`` decoded under the escaped
+    reading and any other backslash kept, when the quoted-string is written right after ``key=``
+    with no space and closes. Otherwise it is ``None``: a token, a value with spaces around its
+    ``=`` and an unclosed quoted-string give the key but no value, as the regex this replaced read
+    none of them."""
     pairs: list[tuple[str, str | None]] = []
     pos, end = 0, len(value)
-    while pos < end:
-        char = value[pos]
-        if char in " \t;,":
-            pos += 1
-            continue
-        if char == '"':
-            pos = _quoted(value, pos)[1]
-            continue
-        key_end = _match_end(_DISP_KEY, value, pos)
-        eq = _match_end(_DISP_SPACE, value, key_end)
-        if eq == end or value[eq] != "=":
-            pos = key_end  # past at least ``char``, which is neither ``=`` nor a space
-            continue
-        key = value[pos:key_end].lower()
-        start = _match_end(_DISP_SPACE, value, eq + 1)
+    while (item := _DISP_ITEM.search(value, pos)) is not None:
+        pos = item.end()
+        key, before, after, quote = item.group(1, 2, 3, 4)
+        if key is None or before is None:
+            continue  # a quoted-string where a key belongs, or a key with no "="
         text: str | None = None
-        if start < end and value[start] == '"':
-            quoted, pos = _quoted(value, start)
-            if eq == key_end and start == eq + 1:
-                text = quoted
-        else:
-            pos = _match_end(_DISP_TOKEN, value, start)
-        pairs.append((key, text))
+        if quote is not None:
+            raw = item.group(5)
+            if item.group(6) and (pos == end or value[pos] in _DISP_AFTER_VALUE):
+                text = _DISP_ESCAPE.sub(r"\1", raw)
+            elif "\\" in raw:
+                opened = item.start(5)
+                closed = value.find('"', opened)
+                if closed != -1 and (closed + 1 == end or value[closed + 1] in _DISP_AFTER_VALUE):
+                    text, pos = value[opened:closed], closed + 1
+                elif item.group(6):
+                    text = _DISP_ESCAPE.sub(r"\1", raw)
+            elif item.group(6):
+                text = raw
+            if before or after:
+                text = None
+        pairs.append((key.lower(), text))
     return pairs
-
-
-def _match_end(pattern: re.Pattern[str], value: str, pos: int) -> int:
-    """Where ``pattern``, which matches the empty string, stops when matched at ``pos``."""
-    match = pattern.match(value, pos)
-    assert match is not None  # every pattern passed here matches the empty string
-    return match.end()
 
 
 def _disposition(head: bytes) -> tuple[str | None, str | None, bool]:
@@ -354,17 +354,18 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             # when a file line, such as an HL7 segment after a bare CR, is a whole delimiter line:
             # skipping it would store the file cut short there. A 400, not a 413: the size is not
             # what the client has to change, and the other likely cause is headers ended with bare
-            # LFs. Raising at once over the field cap bounds the walk; under it the refusal waits
-            # for the walk's end, so an unclosed body, often one cut inside a header block, is
-            # refused for that cause.
+            # LFs. Raising at once where the rule says so bounds the walk; otherwise the first such
+            # part's refusal waits for the walk's end, so an unclosed body, often one cut inside a
+            # header block, is refused for that cause.
             size = end - start - (2 if body.endswith(b"\r\n", start, end) else 0)
-            headerless = MultipartError(
-                f"multipart part of {size} bytes has no header block ended by a blank CRLF line; "
-                "a file line that is a whole boundary delimiter line leaves one"
-            )
-            if size > _MAX_FIELD_BYTES:
-                raise headerless
-            pending = pending or headerless
+            if size > _MAX_FIELD_BYTES or pending is None:
+                headerless = MultipartError(
+                    f"multipart part of {size} bytes has no header block ended by a blank CRLF "
+                    "line; a file line that is a whole boundary delimiter line leaves one"
+                )
+                if size > _MAX_FIELD_BYTES:
+                    raise headerless
+                pending = headerless
         else:
             if sep - start > _MAX_PART_HEADER_BYTES:
                 # Refuse rather than skip: a header this size is never a real client, and skipping
@@ -502,12 +503,12 @@ def parse_multipart_form(
     is refused as the module docstring's rule on them says, with a 400 or the field cap's 413.
 
     The order, where a body has more than one fault: first the walk's refusals (preamble boundary
-    text, the part count, an oversized header block, a part with no header block over the field
-    cap, a misdelimited line, a boundary line after the close marker), in body order; then, in a
-    closed body, a smaller part with no header block; then, part by part, a nameless part (closed
-    body only) and the size caps; then, last, a body with no delimiter line or no close marker. So
-    an unclosed body with a file or field part over its cap gets the 413, and an unclosed body cut
-    inside a header block gets the missing close marker refusal. The module docstring says what a
+    text, the part count, an oversized header block, a part with no header block that the rule
+    refuses at once, a misdelimited line, a boundary line after the close marker), in body order;
+    then the rest of the headerless rule; then, part by part, the nameless rule and the size caps;
+    then, last, a body with no delimiter line or no close marker. So an unclosed body with a file
+    or field part over its cap gets the 413, and an unclosed body cut inside a header block gets
+    the missing close marker refusal. The module docstring says what a
     delimiter line is, how a Content-Disposition is read, and what the parser still trusts of a
     part's content.
 

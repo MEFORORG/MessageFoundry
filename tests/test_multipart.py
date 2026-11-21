@@ -174,12 +174,19 @@ _SCAN_BUDGET_SECONDS = 0.05
         'Content-Disposition: form-data; name=upload; filename="a.hl7"',
         'Content-Disposition: form-data; name="abc',
         'Content-Disposition: form-data; filename="C:/logs/a.hl7"; name="f"',
+        # A browser does not escape a backslash: a value ending in one reads as origin/main read it.
+        'Content-Disposition: form-data; name="a\\"; filename="b.hl7"',
+        'Content-Disposition: form-data; name="file"; filename="foo\\"',
+        'Content-Disposition: form-data; filename="foo\\"; name="file"',
+        'Content-Disposition: form-data; x="a\\" name="b"',
+        'Content-Disposition: form-data; name="file"; filename="C:\\logs\\a.hl7"',
+        'Content-Disposition: form-data; x=ab"c; name="file"; filename="a.hl7"',
     ],
 )
 def test_the_tokenizer_reads_what_origin_main_read(line: str) -> None:
-    """On a line with no backslash and no key that merely ends in ``name`` or ``filename``, the
-    tokenizer reads the same ``name`` and ``filename`` origin/main's regex read (BACKLOG #5787). The
-    lines where the two differ on purpose are the next test's."""
+    """On each line here the tokenizer reads the same ``name`` and ``filename`` origin/main's regex
+    read (BACKLOG #5787), the backslash lines a browser sends included. The kinds of line where the
+    two differ on purpose are the next test's."""
     assert multipart._disposition(line.encode("latin-1"))[:2] == _legacy_disposition(line)
 
 
@@ -206,9 +213,11 @@ def test_the_tokenizer_reads_what_origin_main_read(line: str) -> None:
             ("file", "a\\\\b.hl7"),
             ("file", "a\\b.hl7", True),
         ),
-        ('Content-Disposition: form-data; x="a\\" name="b"', ("b", None), (None, None, False)),
+        # A double quote where a key belongs opens a quoted-string, which can hide the parameters
+        # after it; origin/main's regex read through it.
+        ('Content-Disposition: form-data; "abc; name="file"', ("file", None), (None, None, False)),
     ],
-    ids=["foo-star-name", "x-filename", "escaped-quote", "escaped-backslash", "name-in-escaped"],
+    ids=["foo-star-name", "x-filename", "escaped-quote", "escaped-backslash", "stray-quote"],
 )
 def test_where_the_tokenizer_reads_otherwise_than_origin_main(
     line: str, legacy: tuple[str | None, str | None], now: tuple[str | None, str | None, bool]
@@ -235,6 +244,8 @@ def test_where_the_tokenizer_reads_otherwise_than_origin_main(
         ('"stray" name="a"', [("name", "a")]),
         ("form-data; filename*=utf-8''a.hl7", [("filename*", None)]),
         ('form-data; filename="C:\\logs\\a.hl7"', [("filename", "C:\\logs\\a.hl7")]),
+        ('name="a\\"; filename="b.hl7"', [("name", "a\\"), ("filename", "b.hl7")]),
+        ('x=ab"c; name="f"', [("x", None), ("name", "f")]),
         ("form-data", []),
         ("", []),
     ],
@@ -318,7 +329,7 @@ def test_a_hostile_disposition_header_stays_inside_the_scan_budget() -> None:
 
 @pytest.mark.parametrize(
     "unit",
-    ['"', 'a="\\', " =", ";", "a ", "a   ", "\\x", "a  =  ", "=", "a=b "],
+    ['"', 'a="\\', 'a="\\" ', " =", ";", "a ", "a   ", "\\x", "a  =  ", "=", "a=b "],
 )
 def test_every_tokenizer_branch_stays_inside_the_scan_budget(unit: str) -> None:
     """The word run above is the regex's worst case, not the tokenizer's, so each tokenizer branch
@@ -891,7 +902,7 @@ _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "wk-field-at-cap": (
         "parsed",
         [("file", "a.hl7", b"MSH|body")],
-        [("note", _digest(b"x" * multipart._MAX_FIELD_BYTES))],
+        [("note", (16384, "1536c422c31cc98834759d7085cda394a3510a03d78188248986a6b1a7207d03"))],
     ),
     "wk-field-over-cap": (
         "refused",
@@ -1315,7 +1326,6 @@ def test_the_close_marker_prefix_line_residual_as_it_stands() -> None:
         b'Content-Disposition: form-data; x="a name=b"',
         b"Content-Disposition: form-data; x-name=y",
         b'Content-Disposition: form-data; foo*name="x"',
-        b'Content-Disposition: form-data; x="a\\" name="b"',
         b'Content-Disposition: form-data; x="abc; name="file"',
     ],
     ids=[
@@ -1324,7 +1334,6 @@ def test_the_close_marker_prefix_line_residual_as_it_stands() -> None:
         "name-inside-a-quoted-value",
         "x-name-key",
         "foo-star-name-key",
-        "name-after-an-escaped-quote",
         "name-inside-a-later-quote",
     ],
 )
