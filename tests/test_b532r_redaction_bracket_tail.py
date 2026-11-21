@@ -14,6 +14,7 @@ from __future__ import annotations
 import random
 import re
 from collections.abc import Callable
+from typing import NamedTuple
 
 import pytest
 
@@ -104,10 +105,13 @@ _CORPUS_LABELS = ("", "dbPassword=", "password: ", "accessToken=", "userPwd=", "
 _CORPUS_ENDS = (" failed", "; userPwd=x", ",userPwd='a;PWD=b'", "")
 
 
+_CORPUS_SIZE = 1500
+
+
 def _corpus() -> list[str]:
     rng = random.Random(5386)
     lines = []
-    for _ in range(1500):
+    for _ in range(_CORPUS_SIZE):
         body = "".join(rng.choice(_CORPUS_PIECES) for _ in range(rng.randint(2, 10)))
         host = rng.choice(("db", "h.invalid", "mail.local:587"))
         lines.append(
@@ -121,16 +125,21 @@ def _corpus() -> list[str]:
     return lines
 
 
-def _reading(line: str) -> tuple[str, str, bool, bool]:
-    """A line's scrub, its bundle read, and whether a second pass keeps the scrub, and keeps the
-    bundle read of the chain line."""
+class _Reading(NamedTuple):
+    scrub: str  # scrub_credentials of the line
+    bundle: str  # redact_log_line of the line on its own
+    scrub_stable: bool  # a second scrub keeps the scrub
+    chain_stable: bool  # a second bundle read keeps the bundle read of the chain line
+
+
+def _reading(line: str) -> _Reading:
     once = scrub_credentials(line)
-    bundle = redact_log_line(scrub_log_text(line))
-    return (
+    chain = redact_log_line(scrub_log_text(line))
+    return _Reading(
         once,
         redact_log_line(line),
         scrub_credentials(once) == once,
-        redact_log_line(bundle) == bundle,
+        redact_log_line(chain) == chain,
     )
 
 
@@ -141,7 +150,7 @@ def test_the_tail_makes_no_line_of_the_corpus_unstable(monkeypatch: pytest.Monke
     import messagefoundry.support.redact as redact_mod
 
     lines = _corpus()
-    assert lines
+    assert len(lines) >= _CORPUS_SIZE
     shipped = [_reading(line) for line in lines]
     control = re.compile(
         scrub_mod._WIDE_DSN_PASSWORD.pattern.replace(scrub_mod._DSN_TAIL, ""),
@@ -150,15 +159,16 @@ def test_the_tail_makes_no_line_of_the_corpus_unstable(monkeypatch: pytest.Monke
     monkeypatch.setattr(scrub_mod, "_WIDE_DSN_PASSWORD", control)
     monkeypatch.setattr(redact_mod, "_WIDE_DSN_PASSWORD", control)
     without = [_reading(line) for line in lines]
-    # Positive controls, one per patched module: the tail changes some lines read by
-    # scrub_credentials, and some read by redact_log_line on its own, so the comparison below
-    # sets two different readings side by side, over lines the tail reaches.
-    assert sum(a[0] != b[0] for a, b in zip(shipped, without, strict=True)) >= 10
-    assert sum(a[1] != b[1] for a, b in zip(shipped, without, strict=True)) >= 10
+    # Positive controls, one per patched module: the control pattern changes the output of some
+    # lines through scrub_credentials, and of some through redact_log_line on a raw line, which
+    # (measured) the secretscrub patch alone does not change. They show each patch took; they do
+    # not show the stability comparison below can come out non-empty.
+    assert sum(a.scrub != b.scrub for a, b in zip(shipped, without, strict=True)) >= 10
+    assert sum(a.bundle != b.bundle for a, b in zip(shipped, without, strict=True)) >= 10
     worse = [
         line
         for line, a, b in zip(lines, shipped, without, strict=True)
-        if (b[2] and not a[2]) or (b[3] and not a[3])
+        if (b.scrub_stable and not a.scrub_stable) or (b.chain_stable and not a.chain_stable)
     ]
     assert not worse, worse[:5]
 
