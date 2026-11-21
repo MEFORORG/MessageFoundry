@@ -139,6 +139,11 @@ def _derive_driver_done_timeout(
     return hold_seconds + drain_timeout + _DRIVER_DONE_MARGIN
 
 
+class DriveShapeError(ValueError):
+    """An offered rate or hold that is not a finite number above 0 (:func:`require_drive_shape`). Its own
+    class so a CLI can report this setup error without also swallowing every other ValueError."""
+
+
 def require_drive_shape(aggregate_rate: float, hold_seconds: float) -> None:
     """Refuse an offered rate or hold that is not a finite positive number (BACKLOG #5977, S27-64).
 
@@ -149,7 +154,7 @@ def require_drive_shape(aggregate_rate: float, hold_seconds: float) -> None:
     coord wait or child spawn, so a bad value is a setup error rather than a stall or a fake rung."""
     for name, value in (("aggregate_rate", aggregate_rate), ("hold_seconds", hold_seconds)):
         if not (math.isfinite(value) and value > 0):
-            raise ValueError(f"{name} must be a finite number above 0, got {value!r}")
+            raise DriveShapeError(f"{name} must be a finite number above 0, got {value!r}")
 
 
 #: B6: slack added on top of the SUM of the coordinator's own step timeouts, to absorb coord-file polling
@@ -4537,6 +4542,14 @@ async def _await_indexed(
 _CHILD_TAIL_CHARS = 400
 
 
+def _tail_end(tail: str) -> str:
+    """``tail`` (``"[label] ..."`` from :func:`_reap_child`) cut to its label and last characters."""
+    if len(tail) <= _CHILD_TAIL_CHARS:
+        return tail
+    label, _, rest = tail.partition(" ")
+    return f"{label} ...{rest[-_CHILD_TAIL_CHARS:]}"
+
+
 async def _reap_child(label: str, proc: Any, *, grace: float) -> str:
     """Best-effort reap ONE spawned child + capture a short stdout tail for the diagnostic log (never
     the authority — that is the coord DONE file). A child that hasn't exited within ``grace`` is killed
@@ -5269,16 +5282,15 @@ async def run_shardcert_drive(
             )
             notes.extend(child_tails)
     if coord_failure is not None:
-        tails = "; ".join(
-            escape_for_terminal(t[:_CHILD_TAIL_CHARS], single_line=True) for t in child_tails
-        )
-        # Rebuilt as one of the two classes this module raises, whose constructors take one message.
-        cls = (
-            ShardCertChildExited
-            if isinstance(coord_failure, ShardCertChildExited)
-            else CoordTimeout
-        )
-        raise cls(f"{coord_failure}; child output: {tails or '(none)'}") from coord_failure
+        # The LAST characters of each tail: the exception line is at its end. The label stays in front.
+        tails = "; ".join(escape_for_terminal(_tail_end(t), single_line=True) for t in child_tails)
+        # Rebuilt as its own class (every CoordTimeout here takes one message), so a caller that tells
+        # the subclasses apart, as the ladder does for EngineSetupFailed, still can.
+        enriched = type(coord_failure)(f"{coord_failure}; child output: {tails or '(none)'}")
+        # What crosses the box boundary (the ladder's RUNG_ABORTED detail) is the rendezvous message
+        # alone: the coord channel carries metadata only, and a child's output is not that.
+        enriched.coord_detail = str(coord_failure)  # type: ignore[attr-defined]
+        raise enriched from coord_failure
 
     # (6) Aggregate the children's coord DONE files (the authority) + the engine's REMOTE drain gauge.
     a = sum(int(d["acked"]) for d in driver_dones)

@@ -1423,6 +1423,7 @@ async def test_drive_fails_fast_with_the_tail_of_a_child_that_exited_before_post
     rather than leaving it in a note the unwinding CoordTimeout discards. Red on the unfixed code:
     the drive waits out the 60s child_ready_timeout, so the 10s outer bound fires."""
     coord, _ended = _gated_drive_fakes(monkeypatch, tmp_path, "crashedsink", poll_seconds=0.0)
+    monkeypatch.setattr(sc, "_CHILD_EXIT_GRACE", 0.05)
 
     async def crashed_spawn(argv: list[str]) -> _ExitedProc:
         return _ExitedProc(
@@ -1441,6 +1442,17 @@ async def test_drive_fails_fast_with_the_tail_of_a_child_that_exited_before_post
     text = str(raised.value)
     assert "sink-0" in text and "code 1" in text and f"{SINK_BOUND}.0" in text, text
     assert "ValueError: synthetic sink crash" in text, text
+    # The coord channel gets the rendezvous message alone, never the child's output.
+    detail = raised.value.coord_detail  # type: ignore[attr-defined]
+    assert "synthetic sink crash" not in detail and f"{SINK_BOUND}.0" in detail, detail
+
+
+def test_a_long_child_tail_keeps_its_label_and_its_last_line() -> None:
+    """BACKLOG #5977: the cap on a child's tail keeps the end, where the exception line is."""
+    tail = "[sink-3] " + "x" * 1000 + " / ValueError: synthetic last line"
+    cut = sc._tail_end(tail)
+    assert cut.startswith("[sink-3] ...") and cut.endswith("ValueError: synthetic last line")
+    assert len(cut) <= sc._CHILD_TAIL_CHARS + len("[sink-3] ...")
 
 
 async def test_drive_timeout_carries_the_tail_of_a_child_still_running(
@@ -1465,9 +1477,12 @@ async def test_drive_timeout_carries_the_tail_of_a_child_still_running(
     assert "[sink-0] sink: waiting on a port that never bound" in text, text
 
 
-async def test_await_indexed_sees_a_crashed_child_at_any_pending_index(tmp_path: Path) -> None:
+async def test_await_indexed_sees_a_crashed_child_at_any_pending_index(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     """BACKLOG #5977, S27-65: with child 0 still running and child 1 already exited, the wait names
     child 1 within the exit grace rather than waiting out child 0's timeout first."""
+    monkeypatch.setattr(sc, "_CHILD_EXIT_GRACE", 0.05)
     coord = FileDropCoord(tmp_path, run_id="anyindex")
     children = [("sink-0", _ExitedProc(None, b"")), ("sink-1", _ExitedProc(3, b""))]
     loop = asyncio.get_running_loop()

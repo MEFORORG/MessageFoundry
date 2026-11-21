@@ -460,6 +460,7 @@ suite("connectionForm — an untouched form writes nothing", () => {
     assert.strictEqual(coerce(flag, false), undefined, "an unticked defaultless checkbox writes nothing");
     assert.strictEqual(coerce(flag, true), true, "ticking it still writes");
     assert.strictEqual(coerce({ ...flag, value: false }, false), false, "a recorded false stays explicit");
+    assert.strictEqual(coerce({ ...flag, required: true }, false), false, "a required one always writes");
   });
 
   test("a value the record already carried stays explicit even when it equals the default", () => {

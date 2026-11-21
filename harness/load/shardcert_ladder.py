@@ -3839,7 +3839,10 @@ async def run_drive_ladder(
             # B3: also tell the ENGINE on the RUNG coord that THIS rung aborted, so its in-flight drain —
             # failing only because we reaped its sinks — marks the rung's store-truth INVALID rather than
             # posting a fabricated collapse. LADDER_STOP is polled only BETWEEN rungs; this is per-rung.
-            rung_coord.post(RUNG_ABORTED, {"reason": "drive_aborted", "detail": str(exc)})
+            rung_coord.post(
+                RUNG_ABORTED,
+                {"reason": "drive_aborted", "detail": getattr(exc, "coord_detail", str(exc))},
+            )
             notes.append(
                 f"{rung.run_suffix}: drive aborted ({escape_for_terminal(str(exc), single_line=True)}) — posted LADDER_STOP + RUNG_ABORTED, setup-abort"
             )
@@ -3958,7 +3961,10 @@ async def run_drive_ladder(
             # soak drain failure — from our reaped sinks — marks the soak store-truth INVALID, not a collapse
             # (B3).
             soak_aborted = True
-            soak_coord.post(RUNG_ABORTED, {"reason": "soak_drive_aborted", "detail": str(exc)})
+            soak_coord.post(
+                RUNG_ABORTED,
+                {"reason": "soak_drive_aborted", "detail": getattr(exc, "coord_detail", str(exc))},
+            )
             notes.append(
                 f"soak: drive aborted ({escape_for_terminal(str(exc), single_line=True)}) — soak ABORTED (setup-degraded, not a bench result)"
             )

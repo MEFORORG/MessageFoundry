@@ -515,9 +515,11 @@ export function connectionEditorScript(token: string, p: ConnectionEditorScriptI
           // A box with no schema default is drawn unticked for "never set", so for this rule its unset
           // position is unticked: an unticked box the record did not set posts nothing rather than
           // false. Ticked and unticked again looks the same as never touched, and posts the same.
+          // A REQUIRED one is the exception: omitting it is a missing setting the engine refuses, so
+          // it always posts what it shows.
           const dflt = f.defaultValue === undefined || f.defaultValue === null ? false : f.defaultValue;
           const fromRecord = f.value !== undefined && RECORDED_KEYS.has(key);
-          if (!fromRecord && el.checked === dflt) continue;
+          if (!fromRecord && !f.required && el.checked === dflt) continue;
           settings[key] = el.checked;
           continue;
         }

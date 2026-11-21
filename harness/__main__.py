@@ -1553,7 +1553,11 @@ def _run_shardcert_driver(argv: list[str]) -> int:
     from pathlib import Path
 
     from harness.load.coord import CoordTimeout, FileDropCoord
-    from harness.load.shardcert import RemoteEngineSignInError, run_shardcert_driver
+    from harness.load.shardcert import (
+        DriveShapeError,
+        RemoteEngineSignInError,
+        run_shardcert_driver,
+    )
     from messagefoundry.apiclient import ApiError
 
     coord = _coord_from_args(args)
@@ -1582,7 +1586,9 @@ def _run_shardcert_driver(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 2
-    except ValueError as exc:  # a rate or hold that is not a finite number above 0 — setup error
+    except (
+        DriveShapeError
+    ) as exc:  # a rate or hold that is not a finite number above 0 — setup error
         print(f"shardcert-driver: {exc}", file=sys.stderr)
         return 2
     except CoordTimeout as exc:
