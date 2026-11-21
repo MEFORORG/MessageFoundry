@@ -866,6 +866,15 @@ _MOVED_OUTCOMES: dict[str, tuple[Any, ...]] = {
 }
 
 
+#: The moved rows whose refusal is raised only for a closed body.
+_WAITS_FOR_CLOSE = {
+    "empty-part-then-close",
+    "no-header-part",
+    "wk-noheader-at-cap",
+    "delim-crlf-run",
+}
+
+
 def _expected(case: str) -> tuple[Any, ...]:
     return _MOVED_OUTCOMES.get(case, _MAIN_OUTCOMES[case])
 
@@ -911,9 +920,10 @@ def test_the_same_body_without_its_close_marker_is_refused(
     """#5787: each corpus body with its close marker turned into a plain delimiter is refused. A body
     that parses is refused for the missing close marker. A body that is refused keeps that refusal
     from ``parse_multipart_form``, class and all: the close check runs last, and the misdelimited-line
-    refusal is raised by the walk on the same line. The epilogue body is the exception: without the
-    close marker, the walk runs on into the delimiter lines that sat after it, and the first two hold
-    an empty part, so it gets the no header block refusal."""
+    refusal is raised by the walk on the same line. The exceptions are the rows whose refusal waits
+    for a closed body (a small part with no header block, a part that mentions no name): unclosed,
+    they get the missing close marker refusal, as main gave them. And the epilogue body, unclosed,
+    walks on into the delimiter lines of its old epilogue and is refused for the part cap."""
     marker = _close_marker(content_type)
     unterminated = body.replace(marker, marker[:-2])
     assert marker not in unterminated
@@ -921,8 +931,10 @@ def test_the_same_body_without_its_close_marker_is_refused(
         parse_multipart_form(content_type, unterminated, max_file_bytes=1024)
     expected = _expected(case)
     got = (type(caught.value).__name__, str(caught.value))
-    if case == "wk-epilogue-delims":
-        assert got == _HEADERLESS(0)[1:]
+    if case in _WAITS_FOR_CLOSE:
+        assert got == _NOT_CLOSED[1:]
+    elif case == "wk-epilogue-delims":
+        assert "more parts than the limit" in got[1]
     elif expected[0] == "refused":
         assert got == expected[1:]
     else:
@@ -1141,3 +1153,35 @@ def test_an_hl7_segment_that_is_a_whole_delimiter_line_is_refused_not_stored_sho
         with pytest.raises(MultipartError, match="no header block") as caught:
             parse(_CT_B, body, max_file_bytes=1024)
         assert type(caught.value) is MultipartError
+
+
+def test_an_unquoted_name_is_not_called_nameless() -> None:
+    """A field whose name the parser cannot read (``name=submit``, unquoted) is skipped as main
+    skipped it, not refused as a part with no name."""
+    unquoted = b"Content-Disposition: form-data; name=submit\r\n\r\ngo"
+    file = parse_single_file_upload(_CT_WK, _body([_FILE_PART, unquoted]), max_file_bytes=1024)
+    assert file.data == b"MSH|body"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [b'Content-Disposition: form-data; name="file"; filen', b"\r\n\r\n"],
+    ids=["cut-in-header", "cut-after-empty-header"],
+)
+def test_a_body_cut_in_a_header_block_is_called_truncated(tail: bytes) -> None:
+    """An unclosed body whose last part has no header block, or no name, is refused for the missing
+    close marker, the refusal that names the cause, as main refused it."""
+    body = b"--B\r\n" + _FP + b"MSH|x\r\n--B\r\n" + tail
+    for parse in (parse_multipart_form, parse_single_file_upload):
+        with pytest.raises(MultipartError, match="no closing boundary delimiter"):
+            parse(_CT_B, body, max_file_bytes=1024)
+
+
+def test_a_body_cut_right_after_a_close_marker_prefix_line_is_taken_as_complete() -> None:
+    """A limit the module docstring states: ``--B--note`` in a file is refused in a whole body, but
+    a body cut right after its ``--B--`` leaves a valid close and is taken as complete."""
+    body = b"--B\r\n" + _FP + b"MSH|x\r\n--B--note\r\nPID|1\r\n--B--\r\n"
+    with pytest.raises(MultipartError, match="not a delimiter line"):
+        parse_single_file_upload(_CT_B, body, max_file_bytes=1024)
+    cut = body[: body.index(b"note")]
+    assert parse_single_file_upload(_CT_B, cut, max_file_bytes=1024).data == b"MSH|x"
