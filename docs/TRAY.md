@@ -143,12 +143,12 @@ monitor-only for it, because that bind listens on every interface. A `--host` na
 non-loopback address, a wildcard included, with no `--port` is monitor-only too; before BACKLOG
 #5936 the tray fell back to the loopback default for that bind and kept service control. The
 certificate the engine mints for a wildcard bind names that same loopback, `127.0.0.1` or `::1`.
-A pair the engine minted earlier for another bind is replaced at the next start when it does not
-name the address a client dials for the current bind (the loopback for a wildcard, else the host);
-the new certificate keeps the old one's names beside the new ones, and the replacement is logged
-and audited like a renewal. An engine shard (`serve --shard`) never makes that replacement;
-`supervise` makes it before it starts the shards. An operator certificate is never replaced, and
-on a wildcard bind it verifies only if it names that loopback.
+A pair the engine minted earlier for another bind is replaced at the next start when its
+certificate does not name the address the tray dials for the current bind; the new one names the
+current bind as a first-run mint would, so a client that dials a name only the old one carried
+must change too. [SERVICE.md](SERVICE.md) states when the engine replaces its pair and what to
+re-import. An operator certificate is never replaced, and on a wildcard bind it verifies only if
+it names that loopback.
 (BACKLOG #5936, #5973)
 
 **What "View Service Log" will open.** Windows opens a file with whatever program owns its

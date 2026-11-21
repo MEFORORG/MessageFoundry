@@ -54,3 +54,13 @@ def wildcard_loopback(host: str) -> str | None:
     if not ip.is_unspecified:
         return None
     return "::1" if ip.version == 6 else "127.0.0.1"
+
+
+def dialled_host(host: str) -> str:
+    """The host a client on this box dials for an API bind on ``host`` (BACKLOG #5973).
+
+    The family's loopback for a wildcard (:func:`wildcard_loopback`), else ``host`` as written. ONE
+    copy: the tray dials it (:mod:`messagefoundry.tray.config`), and the engine re-mints a reused
+    generated certificate that does not name it (:mod:`messagefoundry.api.tls`).
+    """
+    return wildcard_loopback(host) or host

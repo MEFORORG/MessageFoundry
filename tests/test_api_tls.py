@@ -4287,15 +4287,14 @@ def test_the_minted_certificate_names_a_wildcard_binds_loopback(
 @pytest.mark.parametrize(
     ("first", "then", "names"),
     [
-        # The new bind's names first, then every name the old certificate carried, kept so a
-        # client still dialling one of them keeps verifying.
-        ("127.0.0.1", "::", ["::", "::1", "127.0.0.1"]),
-        ("10.0.0.9", "0.0.0.0", ["0.0.0.0", "127.0.0.1", "10.0.0.9"]),
-        ("127.0.0.1", "localhost", ["localhost", "127.0.0.1"]),
+        # Exactly what a first-run mint for the new bind names.
+        ("127.0.0.1", "::", ["::", "::1"]),
+        ("10.0.0.9", "0.0.0.0", ["0.0.0.0", "127.0.0.1"]),
+        ("127.0.0.1", "localhost", ["localhost"]),
     ],
 )
 def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
-    first: str, then: str, names: list[str], tmp_path: Path
+    first: str, then: str, names: list[str], tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5973. A pair minted for one bind, reused after the bind moved, must name what a
     client dials for the new bind (a wildcard's loopback, else the host), or that client (the
@@ -4308,23 +4307,26 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
     old_sha = _sha256(Path(old_cert))
     events: list[GeneratedPairReplaced] = []
 
-    cert, key = ensure_api_tls_material(
-        ApiSettings(host=then), state_dir=tmp_path, replacements=events
-    )
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.tls"):
+        cert, key = ensure_api_tls_material(
+            ApiSettings(host=then), state_dir=tmp_path, replacements=events
+        )
 
     assert (cert, key) == (old_cert, old_key)  # the same fixed names
+    reminted = [
+        r.getMessage() for r in caplog.records if "re-minted the generated" in r.getMessage()
+    ]
+    assert len(reminted) == 1 and f"the host for the bind {then}" in reminted[0]
     _load_pair(Path(cert), Path(key))
     loaded = x509.load_pem_x509_certificate(Path(cert).read_bytes())
     san = loaded.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
     assert [str(n.value) for n in san] == names
     assert [(e.reason, e.old_sha256) for e in events] == [("bind_changed", old_sha)]
     assert events[0].new_sha256 == _sha256(Path(cert)) != old_sha
-    # Once it names the bind, neither bind re-mints it again: two engines that share a state dir
-    # with these two binds converge on one certificate instead of replacing each other's.
-    for host in (then, first):
-        again: list[GeneratedPairReplaced] = []
-        ensure_api_tls_material(ApiSettings(host=host), state_dir=tmp_path, replacements=again)
-        assert again == []
+    # Once it names the bind, the next start reuses it and writes nothing.
+    again: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(ApiSettings(host=then), state_dir=tmp_path, replacements=again)
+    assert again == []
 
 
 @pytest.mark.parametrize(
@@ -4337,6 +4339,8 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
         # Hostname matching ignores case, and a SAN cannot carry an IPv6 zone.
         ("myhost", "MYHOST", True),
         ("fe80::1%12", "fe80::1%12", True),
+        # A bracketed host is minted as written, so the check classifies it the same way.
+        ("[::1]", "[::1]", True),
         # An engine shard (renew=False) reuses a loadable pair as found, the bind check included,
         # so a lone restarted shard cannot serve a different certificate from its siblings.
         ("127.0.0.1", "::", False),
@@ -4353,6 +4357,17 @@ def test_a_bind_move_that_needs_no_new_name_or_is_a_shard_reuses_the_pair(
         ApiSettings(host=then), state_dir=tmp_path, replacements=events, renew=renew
     )
     assert events == [] and _snapshot(cert, key) == before
+
+
+def test_an_engine_shaped_pair_with_no_san_is_re_minted(tmp_path: Path) -> None:
+    """A certificate with no SubjectAlternativeName verifies against no URL at all."""
+    cert, key = _plant_generated_pair(tmp_path, lived_days=1, left_days=300, sans=False)
+    events: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
+    assert [e.reason for e in events] == ["bind_changed"]
+    loaded = x509.load_pem_x509_certificate(cert.read_bytes())
+    san = loaded.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert [str(n.value) for n in san] == ["127.0.0.1"]
 
 
 def test_a_pair_not_the_engines_shape_is_never_re_minted_for_a_bind_move(tmp_path: Path) -> None:
@@ -5139,7 +5154,7 @@ _DAY = datetime.timedelta(days=1)
 
 
 def _plant_generated_pair(
-    state: Path, *, lived_days: float, left_days: float, shape: str = "engine"
+    state: Path, *, lived_days: float, left_days: float, shape: str = "engine", sans: bool = True
 ) -> tuple[Path, Path]:
     """Write a loadable pair at the GENERATED names, valid from ``lived_days`` ago to ``left_days``
     from now. ``shape`` is ``engine`` (what the engine mints: self-signed, CA=false), ``ca_true``
@@ -5153,7 +5168,7 @@ def _plant_generated_pair(
     if shape == "issued":
         signer = ec.generate_private_key(ec.SECP256R1())
         issuer_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Operator CA")])
-    cert = (
+    builder = (
         x509.CertificateBuilder()
         .subject_name(name)
         .issuer_name(issuer_name)
@@ -5164,14 +5179,15 @@ def _plant_generated_pair(
         .add_extension(
             x509.BasicConstraints(ca=shape == "ca_true", path_length=None), critical=True
         )
+    )
+    if sans:
         # The name a mint for the default bind carries, so a fresh planted pair is not replaced for
         # a bind it does not name (BACKLOG #5973).
-        .add_extension(
+        builder = builder.add_extension(
             x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
             critical=False,
         )
-        .sign(signer, hashes.SHA256())
-    )
+    cert = builder.sign(signer, hashes.SHA256())
     cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
     # Restricted, as the engine creates its own key (vault BACKLOG #2601). `serve` and `supervise`
     # refuse a generated key a broad account can read, and a plain write is group- and
