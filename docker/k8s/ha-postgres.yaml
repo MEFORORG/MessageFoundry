@@ -26,7 +26,7 @@
 #
 # CONFIG IS BAKED INTO THE IMAGE (same rule as statefulset.yaml): the engine (uid 10001) trusts a config
 # owner that is root or itself, and root-owned is the safer of the two. Build an adopter image (COPY
-# writes root-owned files; run chmod -R a+rX,go-w on it in the build context first) and set all three image: fields below (tls-dir, copy-tls and engine) to it:
+# writes root-owned files; run chmod -R a+rX,go-w on it in the build context first) and set all four image: fields below (revocation-attestation-check, tls-dir, copy-tls and engine) to it:
 #     FROM messagefoundry:<version>
 #     COPY config /config
 # The same baked image deploys to all 3 replicas (ADR 0017 same-commit-everywhere).
@@ -174,7 +174,39 @@ spec:
       # no sticky bit, since any of them could put another file in its place. The kubelet makes the
       # emptyDir's root, and its mode is the kubelet's, so tls-dir first makes the pair's own directory,
       # engine/, at 0700 as uid 10001, and copy-tls copies into that.
+      # revocation-attestation-check runs first and refuses a tls-revocation-attested value that does
+      # not read as true (BACKLOG #5400). The kubelet refuses only a missing key, so a value such as 0
+      # would otherwise start an engine that exits 2 at the revocation gate and restarts forever. It
+      # reads the value with serve's own parser (tls_revocation_attested), in the engine's image, with
+      # the command docker/compose.yaml's revocation-attestation-check service runs, and exits 1 naming
+      # the gate, so the pod stays in Init and the engine never starts. It reads no bind, so it refuses
+      # a false value even where serve's gate would not apply. Its message is in `kubectl describe pod`
+      # and `kubectl logs <pod> -c revocation-attestation-check`.
       initContainers:
+        - name: revocation-attestation-check
+          image: REPLACE_WITH_YOUR_CONFIG_BAKED_IMAGE   # the same image as the engine below
+          command:
+            - tini
+            - "--"
+            - /opt/venv/bin/python
+            - "-I"
+            - "-X"
+            - disable-remote-debug
+            - "-B"
+            - "-c"
+            - "import sys; from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV as V, tls_revocation_attested as ok; sys.exit(0 if ok() else 'error: refusing to start the engines: ' + V + ' does not read as true, so serve would refuse in-process TLS off loopback and restart forever (docs/SECURITY.md, API revocation gate). Set it to 1 only if your PKI enforces revocation for the certificates the engines serve and accept.')"
+          env:
+            - name: MEFOR_TLS_REVOCATION_ATTESTED
+              valueFrom: { secretKeyRef: { name: mefor-secrets, key: tls-revocation-attested } }
+          terminationMessagePolicy: FallbackToLogsOnError
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests: { cpu: "10m", memory: "32Mi" }
+            limits: { cpu: "200m", memory: "128Mi" }
         - name: tls-dir
           image: REPLACE_WITH_YOUR_CONFIG_BAKED_IMAGE   # the same image as the engine below
           command:
@@ -245,10 +277,10 @@ spec:
             # file never writes it. The key is NOT optional: without it the kubelet refuses to start
             # the container, rather than the engine exiting and restarting forever. Set it to 1 only
             # if your PKI enforces revocation for the certificates the engine serves and accepts. A
-            # value the engine reads as false, such as 0, passes the kubelet and then crash-loops the
-            # engine, which still refuses the bind. Outbound hops, the Postgres store hop among them,
-            # read the same variable with a different effect (docs/DEPLOYMENT.md, "Revocation-guard
-            # behavior").
+            # value the engine reads as false, such as 0, passes the kubelet, and the
+            # revocation-attestation-check initContainer above refuses it, so the engine never starts.
+            # Outbound hops, the Postgres store hop among them, read the same variable with a different
+            # effect (docs/DEPLOYMENT.md, "Revocation-guard behavior").
             - name: MEFOR_TLS_REVOCATION_ATTESTED
               valueFrom: { secretKeyRef: { name: mefor-secrets, key: tls-revocation-attested } }
             - { name: MEFOR_INBOUND_BIND_HOST, value: "0.0.0.0" }   # each MLLP() must set tls=True (exposure gate)
