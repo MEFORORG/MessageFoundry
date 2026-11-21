@@ -423,9 +423,13 @@ def test_the_detach_and_the_download_route_share_the_store_bound() -> None:
     # One width, owned by the store (BACKLOG #1619): the API once kept its own 255 beside it.
     from messagefoundry.api import app as api_app
 
-    # Each module reads the store's own name, not a copy of the number.
-    assert vars(wiring_runner)["ATTACHMENT_CONTENT_TYPE_MAX"] is ATTACHMENT_CONTENT_TYPE_MAX
-    assert vars(api_app)["ATTACHMENT_CONTENT_TYPE_MAX"] is ATTACHMENT_CONTENT_TYPE_MAX
+    # Each module imports the store's own name and keeps no copy of the number. Read in the source,
+    # since an identity test cannot tell a copy of a small int from the original.
+    for module in (wiring_runner, api_app):
+        source = Path(module.__file__ or "").read_text(encoding="utf-8")
+        assert "    ATTACHMENT_CONTENT_TYPE_MAX,\n" in source  # in the store.base import
+        assert "ATTACHMENT_CONTENT_TYPE_MAX =" not in source
+        assert "_MAX_ATTACHMENT_MIME_LEN" not in source
     widest = "application/" + "x" * (ATTACHMENT_CONTENT_TYPE_MAX - len("application/"))
     assert wiring_runner._label_fits_every_backend(widest)
     assert not wiring_runner._label_fits_every_backend(widest + "x")

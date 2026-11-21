@@ -701,17 +701,15 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
             refused = str(exc)
         if refused is not None:
             raise IngressGuardError(refused, phase="size")
+        # The listeners' marker refusal runs at the same point after the parse, so a resend does
+        # not rest on delivery's refusal alone (BACKLOG #5099). A fault in the parse or in the
+        # marker's header read is a parse refusal here as there, recorded by its type alone, as the
+        # listeners record it, rather than an error the caller cannot audit.
         try:
             peek = Peek.parse(text, max_bytes=ceiling)
-        except HL7PeekError as exc:
-            refused = f"parse error: {safe_exc(exc)}"
-        if refused is not None:
-            raise IngressGuardError(refused, phase="parse")
-        # The listeners' marker refusal, at the same point after the parse, so a resend does not
-        # rest on delivery's refusal alone (BACKLOG #5099). It reads the header, and a fault in that
-        # read is a parse refusal here as there, recorded by its type alone, as the listeners do.
-        try:
             refused = doc_ref_marker_refusal(peek, text)
+        except HL7PeekError as exc:  # a ValueError, so it is caught before the faults below
+            refused = f"parse error: {safe_exc(exc)}"
         except PEEK_READ_FAULTS as exc:
             refused = f"parse error: peek read failed ({type(exc).__name__})"
         if refused is not None:

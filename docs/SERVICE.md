@@ -852,8 +852,9 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     runs as root, only a root owner is trusted. A root-owned config that is not group/world-writable
     is the safest layout, because the engine's own account cannot rewrite it, provided the engine
     can still read every file. The loader checks the same paths as on Windows, following links, and
-    for a file that is a link it also checks the folder holding each link the open passes through
-    and the folder the link leads to (vault BACKLOG #2596). So the layout also depends on at least
+    for a path that is a link, the config directory included, it also checks the folder holding
+    each link the open passes through, what the link leads to and, for a file, the folder holding
+    that file (vault BACKLOG #2596). So the layout also depends on at least
     these, which it does not check: every directory above the config directory, and above each
     folder a link leads to, is writable only by root; and the file system reports real owners and
     modes (a network mount may synthesize them).
@@ -875,10 +876,11 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       take this walk either, but it does walk the links an open of each file passes through, as
       it models the open, and vets the folders holding them, as the value-file paragraph in
       [SECURITY.md](SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
-      states. The config load's trust list takes the same walk for each member of the config
-      directory that is itself a link, and vets what it names and the folder the link leads to
-      (vault BACKLOG #2596). A member that is not a link is still vetted by its own path, so a folder
-      link above the config directory is still not vetted, as the directories above it are not.
+      states. The config load's trust list takes the same walk for the config directory and each
+      member of it that is itself a link or a junction, and vets what it names and, for a file, the
+      folder the link leads to (vault BACKLOG #2596). A path that is not a link is still vetted by
+      its own path, so a folder link above the config directory is still not vetted, as the
+      directories above it are not.
     - **The exposure that leaves is a known limit, not a safe layout.** An account that can write
       any directory above the config directory can rename that directory and put a link or another
       directory in its place. A substitute put there after the check runs unchecked, and one put

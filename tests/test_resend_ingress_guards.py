@@ -472,7 +472,7 @@ def test_guard_refuses_the_document_marker_the_listeners_refuse() -> None:
     )
 
 
-async def test_admission_refuses_the_document_marker_off_the_loop() -> None:
+async def test_admission_refuses_the_document_marker() -> None:
     from messagefoundry.parsing.binary import DOC_REF_MARKER
     from tests.test_sender_document_handle import _copy_in_nte_component
 
@@ -480,6 +480,23 @@ async def test_admission_refuses_the_document_marker_off_the_loop() -> None:
     with pytest.raises(IngressGuardError) as exc:
         await admit_resubmission(body, _ic(ContentType.HL7V2))
     assert exc.value.phase == "parse"
+
+
+def test_guard_answers_a_fault_in_the_parse_as_a_parse_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.pipeline import ingress_guards
+
+    class _FaultingPeek:
+        @staticmethod
+        def parse(_text: str, **_kwargs: object) -> object:
+            raise LookupError("synthetic")
+
+    monkeypatch.setattr(ingress_guards, "Peek", _FaultingPeek)
+    with pytest.raises(IngressGuardError) as exc:
+        admit_resubmitted_body(ADT, _ic(ContentType.HL7V2))
+    assert exc.value.phase == "parse"
+    assert exc.value.reason == "parse error: peek read failed (LookupError)"
 
 
 def test_guard_answers_a_fault_in_the_marker_read_as_a_parse_refusal(

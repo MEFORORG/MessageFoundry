@@ -3957,9 +3957,10 @@ def _safe_attachment_content_type(content_type: str | None) -> str:
     copy is sanitized in the download route as well, beside this downgrade (see the comment there)."""
     ct = (content_type or "").strip()
     # The length bound is the store's column width (BACKLOG #1619), so the served type and the stored
-    # one share one limit. The token grammar is unbounded, and SQLite and PostgreSQL store a label of
-    # any length, so without it an arbitrarily long attacker string would be echoed into a response
-    # header. The screen admits ASCII only, where a character is one UTF-16 unit.
+    # one share one limit. SQLite and PostgreSQL store a label of any length, and the bound keeps the
+    # shape screen and the lookup from working over an arbitrarily long attacker string; no type on
+    # the allow-list comes close to it. The screen admits ASCII only, where a character is one UTF-16
+    # unit.
     if len(ct) > ATTACHMENT_CONTENT_TYPE_MAX or not _SAFE_MIME_RE.match(ct):
         return _DEFAULT_ATTACHMENT_MIME
     # The shape screen has already excluded parameters (``; charset=…``) and inner whitespace, so the

@@ -208,3 +208,64 @@ def test_posix_refuses_a_module_linked_into_a_group_writable_folder(
     with pytest.raises(WiringError, match="group/world-writable path") as excinfo:
         load_config(cfg)
     assert str(target.resolve().parent) in str(excinfo.value)
+
+
+def test_a_linked_config_directory_lists_the_real_directory(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "cfg.py").write_text("", encoding="utf-8")
+    link = tmp_path / "cfg"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    listed = config_source_trust_paths(link)
+    assert listed[0] == link
+    assert real.resolve() in listed
+    # The folder holding the link is the one a writer could re-point it from.
+    assert tmp_path.resolve() in listed
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="NTFS junctions")
+def test_a_junction_member_lists_the_real_folder(tmp_path: Path) -> None:
+    import _winapi
+
+    cfg, shared = tmp_path / "cfg", tmp_path / "shared"
+    cfg.mkdir()
+    shared.mkdir()
+    (cfg / "cfg.py").write_text("", encoding="utf-8")
+    (shared / "a.csv").write_text("code,display\n", encoding="utf-8")
+    vars(_winapi)["CreateJunction"](str(shared), str(cfg / "codesets"))  # not in linux stubs
+    listed = config_source_trust_paths(cfg)
+    assert cfg / "codesets" in listed
+    assert shared.resolve() in listed
+
+
+def test_a_link_the_walk_cannot_follow_refuses_the_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import messagefoundry.config.wiring as wiring
+
+    cfg, shared = tmp_path / "cfg", tmp_path / "shared"
+    _link_module_into(cfg, shared)
+
+    def nul_target(_path: Path) -> tuple[list[Path], Path | None]:
+        raise ValueError("embedded null byte")
+
+    monkeypatch.setattr(wiring, "_link_chain", nul_target)
+    with pytest.raises(OSError, match="could not be walked"):
+        config_source_trust_paths(cfg)
+
+
+def test_a_walk_that_reaches_another_object_than_the_open_refuses_the_list(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import messagefoundry.config.wiring as wiring
+
+    cfg, shared = tmp_path / "cfg", tmp_path / "shared"
+    _link_module_into(cfg, shared)
+    other = tmp_path / "other.py"
+    other.write_text("", encoding="utf-8")
+    monkeypatch.setattr(wiring, "_link_chain", lambda _path: ([other], other))
+    with pytest.raises(OSError, match="another object"):
+        config_source_trust_paths(cfg)
