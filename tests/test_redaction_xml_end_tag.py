@@ -170,6 +170,9 @@ def test_a_field_run_that_takes_the_end_tag_has_the_rest_masked(text: str, want:
         "a|b|<family>Smith</family userPwd>",  # a camel credential label
         "a|b|<other>Smith</other Zqxdoe>",  # no vocabulary end tag
         "<name>a|b|<b>c</b Zqxdoe></name>",  # a stated residual: the run hides the element
+        # A stated residual (code review round 1): the field-run pass reads the backstop's opener,
+        # which the JSON pass scrubs only later, so the arm keeps every rest in that text.
+        """{"name": "nonnumeric port: 'x"} a|b|</family Zqxdoe>""",
         # Code review round 1: the last word opens the next run's token, so a mask would split it.
         "a|b|</family Zqxdoe>|x|y",
     ],
@@ -202,10 +205,10 @@ def test_a_clamped_field_run_rest_is_judged_as_the_xml_pass_judges_it(shape: str
 
     The clamp's name walk drops a trailing capitalized word such as ``Kim`` whole, so for that
     shape the clamped text is built from the note directly."""
-    try:
-        clamped = _clamped_at(shape)
-    except AssertionError:
+    if shape.endswith("Kim"):
         clamped = f"{shape}\n{redaction._clamp_marker(500)}"
+    else:
+        clamped = _clamped_at(shape)
     assert redaction._TRAILING_NOTES.search(clamped) is not None  # the premise: the note is on
     with _main():
         main = redact(clamped)
@@ -241,6 +244,9 @@ class _CountingPattern:
     def search(self, text: str, *args: int) -> re.Match[str] | None:
         self.searches += 1
         return self.pattern.search(text, *args)
+
+    def __getattr__(self, name: str) -> object:
+        return getattr(self.pattern, name)
 
 
 def _note_searches(tokens: int) -> int:

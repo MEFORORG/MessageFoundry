@@ -1776,8 +1776,10 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     pass reads it; every rest of an end tag outside a walked element that names no vocabulary
     element (``<family>Smith</family></b Zqxdoe>``, :func:`_mask_stray_end_tags`); a rest whose end
     tag's name an HL7 field run took before this pass ran, which that run masks instead
-    (:func:`_glued_end_tag_rest`) only where these rules allow and the next run's token would not
-    open inside the mask, so it keeps at least what these rules refuse, while a run that took the
+    (:func:`_glued_end_tag_rest`) only where these rules allow, read on the text before the later
+    flat passes, where the next run's token would not open inside the mask, and where the text held
+    no backstop opener when that run read it, so it keeps at least what these rules refuse on that
+    text, while a run that took the
     name of an end tag outside the vocabulary leaves its rest as it stood, even inside a vocabulary
     element (``<name>a|b|<b>c</b Zqxdoe></name>``); and, where the rest ends the text, every
     refusal :func:`_maskable_rest` makes there, a last word with a digit or ending in ``m``, ``b``,
@@ -2056,10 +2058,10 @@ def _redact_unguarded(text: str) -> str:
         return out
     if _HL7_ENCODED_FIELD_RUN.search(out) is None:
         return out
-    # This module's own bound note is joined by a line break (:data:`_TRAILING_NOTES`). It is the one
-    # unprintable character that is not a peer's, so it is set aside before the test below.
-    note = _TRAILING_NOTES.search(out) if out.endswith("unscanned]") else None
-    body = out if note is None else out[: note.start()]
+    # This module's own bound note is joined by a line break when a clamp wrote it
+    # (:data:`_TRAILING_NOTES`). That is the one unprintable character that is not a peer's, so the
+    # note is set aside before the test below.
+    body = _without_trailing_note(out)
     if (
         not body.isprintable()
         or _USERINFO_OPENER in out
@@ -2373,17 +2375,31 @@ def _glued_end_tag_rest(
 ) -> str | None:
     """The rest of a vocabulary end tag a field run cut through, when its ``token`` ends on
     the tag's name (``a|b|<family>Smith</family`` before `` Zqxdoe>``), masked only where both of
-    these allow it: :func:`_end_tag_rest`'s rules, read on ``body``, the text as the XML pass reads
-    it (:func:`_without_trailing_note`), which that pass applies to the same rest when no run took
-    the tag; and the one field-run rule that applies here: a last word glued to what follows must
-    not open the next run's token, which would start inside the mask (BACKLOG #5925 item 1). The
-    flat passes run before the XML pass, so without this the run took the tag's name and the rest
-    it left was read by neither. ``None`` keeps the rest as it stood.
+    these allow it: :func:`_end_tag_rest`'s rules, read on ``body``, the text with this module's
+    trailing bound note set aside as the XML pass sets it aside (:func:`_without_trailing_note`);
+    and, of the field-run rules, at least this one: a last word glued to what follows must not open
+    the next run's token, which would start inside the mask (BACKLOG #5925 item 1). The flat
+    passes run before the XML pass, so without this the run took the tag's name and the rest it
+    left was read by neither. ``None`` keeps the rest as it stood.
+
+    **The rules are the walk's, but the text they read is not always the walk's.** This arm reads
+    the rest before the date, SSN, name and structured passes, and the walk reads what they left.
+    So the two can answer differently, at least these ways: a rest a later pass scrubs in part
+    (``</family Zq Doe Vandt 4455>``) keeps its digits in the walk and loses them here; and a text
+    holding the backstop's opener (:data:`_USERINFO_OPENER`) when the field-run pass reads it keeps
+    every rest here (:func:`_scrub_field_runs`), where the walk can still mask one once the JSON
+    pass has scrubbed the opener. The #3318 rule refusing a last word of two letters or fewer
+    glued to what follows is not applied: it guards a string prefix before a quote, and the walk
+    masks such a word before ``>`` (``a|b|</family Li>``).
 
     **The rest ends inside ``body``.** A bound note joined by a space is on the tag's line, so a rest
     read on ``text`` ran into the note, and was judged as followed by it rather than as ending the
     text. ``body`` is found once per :func:`_scrub_field_runs` call, never once per token, which
     made the cost grow with the square of the text's tokens.
+
+    **The arm masks only where :func:`_end_tag_rest` masks the whole rest**, which is the only mask
+    it makes; any other answer from it keeps the rest as it stood, so the two cannot drift apart
+    unseen.
 
     Only a vocabulary end tag is read, as :func:`_mask_stray_end_tags` reads one outside a walked
     element. This arm tracks no open elements, so the rest of any other end tag a run took stays as
@@ -2391,20 +2407,19 @@ def _glued_end_tag_rest(
     lt = token.rfind("<")
     if lt == -1 or end >= len(body):
         return None
-    tag = _XML_PHI_END_OPEN.match(body, end - len(token) + lt)
-    if tag is None or tag.end() != end:
+    # The token holds no whitespace and the pattern ends before a space, so a match from the
+    # token's last `<` ends at the token's end.
+    if _XML_PHI_END_OPEN.match(body, end - len(token) + lt) is None:
         return None
     line = _END_TAG_LINE.match(body, end, min(len(body), end + _GLUED_VALUE_MAX + 1))
     assert line is not None  # the pattern matches the empty string
     stop = line.end()
     rest = body[end:stop]
-    # _end_tag_rest returns the line masked, or unchanged where its rules refuse.
-    if _end_tag_rest(body, end, stop, True) == rest:
+    masked = rest.translate(_SHAPE)
+    if masked == rest or _end_tag_rest(body, end, stop, True) != masked:
         return None
-    words = _GLUED_WORD.findall(rest)
-    if not words:  # _end_tag_rest masks only a rest with a word; a stand-in for it may not
-        return None
-    if not rest.endswith(" ") and field_run.match(text, stop - len(words[-1])) is not None:
+    last = _GLUED_WORD.findall(rest)[-1]  # a rest the mask changed holds a word
+    if not rest.endswith(" ") and field_run.match(text, stop - len(last)) is not None:
         return None
     return rest
 
