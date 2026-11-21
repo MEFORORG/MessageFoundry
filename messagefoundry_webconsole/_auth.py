@@ -736,18 +736,23 @@ def _origin_matches(app_state: object, origin: str, host: str | None) -> bool:
     Otherwise compare the ``Origin`` host[:port] to the request ``Host``, except where
     :func:`proxied_loopback_host` holds: there this FAILS CLOSED (BACKLOG #2217). A direct browser off
     loopback sends its own Host, so that fallback stays (serve only warns, ADR 0068 section 8).
+    An ``Origin`` that ``urlsplit`` cannot parse (an invalid IPv6 literal such as ``http://[x``)
+    matches nothing, so it gets a foreign origin's refusal rather than a 500.
     """
+    try:
+        parts = urlsplit(origin)
+    except ValueError:
+        return False
     public_origin: str | None = getattr(app_state, "public_origin", None)
     if public_origin:
         # Scheme + host are case-INSENSITIVE (RFC 6454 §4 / RFC 3986 §3.2.2). Canonicalize the incoming
         # Origin the same way the validator canonicalizes public_origin (lowercased), so a case variant
         # is treated as the same origin — fail-closed either way, but this avoids rejecting a legit
         # browser (browsers lowercase the host) or a mixed-case configured public_origin.
-        parts = urlsplit(origin)
         return f"{parts.scheme.lower()}://{parts.netloc.lower()}" == public_origin
     if proxied_loopback_host(app_state):
         return False
-    return host is not None and urlsplit(origin).netloc.lower() == host.lower()
+    return host is not None and parts.netloc.lower() == host.lower()
 
 
 def _fetch_site_lines_disagree(values: Sequence[str]) -> bool:

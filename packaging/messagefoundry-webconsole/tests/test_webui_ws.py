@@ -111,6 +111,28 @@ async def test_ws_cookie_auth_rejects_cross_origin(engine: Engine) -> None:
     assert identity is None
 
 
+async def test_ws_cookie_auth_refuses_an_unparseable_origin(engine: Engine) -> None:
+    """``urlsplit`` raises on ``http://[x`` (an invalid IPv6 literal). The cookie gate refuses that
+    handshake as it refuses a foreign origin, rather than raising, on the ``Host`` fallback and
+    with a configured public origin alike. Control: each posture admits its own origin."""
+    from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import authorize_ui_ws
+
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    _, token = await _token(engine, service, "op")
+    for public_origin in (None, "http://t"):
+        app = create_app(engine, auth=service, serve_ui=True, public_origin=public_origin)
+        ws = _FakeWS(origin="http://[x", host="t", cookie=token, app=app)
+        record_ws_gate(ws, admitted=True)  # type: ignore[arg-type]  # the refusal must clear it
+        identity, _ = await authorize_ui_ws(ws, Permission.MONITORING_READ)  # type: ignore[arg-type]
+        assert identity is None, public_origin
+        assert not ws_accept_allowed(ws.scope)
+        ok = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
+        assert (await authorize_ui_ws(ok, Permission.MONITORING_READ))[0] is not None  # type: ignore[arg-type]
+        assert ws_accept_allowed(ok.scope)
+
+
 async def test_ws_cookie_auth_rejects_a_repeated_or_blank_origin(engine: Engine) -> None:
     """BACKLOG #5789: the cookie gate judges every Origin copy, as the header path does. A second
     copy is refused even after our own origin, and a blank one is refused, not taken for absent."""
@@ -1103,3 +1125,23 @@ def test_public_origin_matching_is_case_insensitive() -> None:
 
     assert _origin_matches(_NoPO(), "http://T", "t")  # Host fallback is case-insensitive too
     assert not _origin_matches(_NoPO(), "http://evil", "t")
+
+
+def test_an_unparseable_origin_matches_nothing_on_public_host_and_proxied_postures() -> None:
+    """Each of these makes ``urlsplit`` raise ValueError, with more than one message. On the
+    public-origin and Host-fallback postures ``_origin_matches`` answers False for them rather
+    than raising, and the control shows each still matches its own origin. The proxied-loopback
+    rows check only that nothing raises."""
+    from messagefoundry_webconsole._auth import _origin_matches
+
+    postures = {
+        "public origin": SimpleNamespace(public_origin="http://t"),
+        "host fallback": SimpleNamespace(public_origin=None),
+        "proxied loopback": SimpleNamespace(
+            public_origin=None, loopback=True, webauthn_rp_from_request=False
+        ),
+    }
+    for name, state in postures.items():
+        for origin in ("http://[x", "http://x]", "http://[x]", "http://[::1]x"):
+            assert not _origin_matches(state, origin, "t"), (name, origin)
+        assert _origin_matches(state, "http://t", "t") is (name != "proxied loopback"), name

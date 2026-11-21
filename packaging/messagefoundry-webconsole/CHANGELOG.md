@@ -261,6 +261,10 @@ this line.**
 
 ### Fixed
 
+- **Where the /ui origin check compares the `Origin` header, an unparseable value is refused as a
+  foreign origin, not a 500.** The check compares it at least on a write with no
+  `Sec-Fetch-Site`, on a GET with no recognised `Sec-Fetch-Site` and on the browser WebSocket
+  handshake.
 - **The High Availability pages degrade when the store does not answer.** The page, its live
   fragment and both step-down confirm pages read the cluster membership and lease rows with no error
   handling, so a store timeout or outage answered with an error body in place of the page. The page

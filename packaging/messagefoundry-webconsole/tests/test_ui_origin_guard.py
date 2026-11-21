@@ -127,6 +127,44 @@ async def test_login_rejects_foreign_origin_without_sec_fetch(engine: Engine) ->
         assert "set-cookie" not in {k.lower() for k in r.headers}
 
 
+async def test_login_refuses_an_unparseable_origin_as_it_refuses_a_foreign_one(
+    engine: Engine,
+) -> None:
+    """``urlsplit`` raises on an invalid IPv6 literal such as ``http://[x``. That Origin matches
+    nothing, so it gets a foreign origin's 403 and body rather than a 500, on the ``Host`` fallback
+    and with a configured public origin alike. Control: each posture signs in its own origin, so
+    the refusals come from the Origin comparison."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    for public_origin in (None, "http://t"):
+        app = create_app(engine, auth=service, serve_ui=True, public_origin=public_origin)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            foreign = await c.post("/ui/login", data=_creds(), headers={"Origin": EVIL_ORIGIN})
+            bad = await c.post("/ui/login", data=_creds(), headers={"Origin": "http://[x"})
+            ours = await c.post("/ui/login", data=_creds(), headers={"Origin": "http://t"})
+        assert (foreign.status_code, foreign.json()["detail"]) == (403, _CROSS_ORIGIN), (
+            public_origin
+        )
+        assert (bad.status_code, bad.text) == (foreign.status_code, foreign.text), public_origin
+        assert "set-cookie" not in {k.lower() for k in bad.headers}
+        assert ours.status_code == 303, public_origin
+
+
+def test_a_get_with_an_unparseable_origin_is_refused_as_cross_origin() -> None:
+    """The GET arm reads ``Origin`` when no recognised ``Sec-Fetch-Site`` settles it. An Origin
+    ``urlsplit`` cannot parse is refused there as a foreign one is, and the predicate form used
+    by the step-up continuation answers False rather than raising."""
+    bad = origin_check_request("GET", {"host": "t", "origin": "http://[x"})
+    with pytest.raises(HTTPException) as refused:
+        webconsole_auth.assert_same_origin(bad)
+    assert (refused.value.status_code, refused.value.detail) == (403, _CROSS_ORIGIN)
+    assert webconsole_auth._request_is_same_origin(bad) is False
+    # control: the same GET with our own origin passes
+    ours = origin_check_request("GET", {"host": "t", "origin": "http://t"})
+    assert webconsole_auth._request_is_same_origin(ours) is True
+
+
 async def test_login_rejection_precedes_the_rate_limiter(engine: Engine) -> None:
     """The guard is the FIRST statement, so a cross-site flood burns no per-address login budget: a
     legitimate same-origin login still succeeds immediately after many rejected cross-site POSTs."""
