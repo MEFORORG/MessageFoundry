@@ -71,8 +71,17 @@ _ACCEPTED = ["Bob", "Jane Doe", " edge ", "Zo\u00eb", "\u0645\u06cc\u200c\u0631\
 @pytest.mark.parametrize("name", _REFUSED)
 def test_the_rule_refuses(name: str) -> None:
     assert name_refusal(name) is not None
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as refused:
         DirectoryUserCreateRequest(username=name)
+    # The directory username's Field refuses an empty name and a NUL itself, before the name rule
+    # runs (it keeps main's published schema); every other case here reaches the name rule.
+    if name == "":
+        expected = "string_too_short"
+    elif "\x00" in name:
+        expected = "string_pattern_mismatch"
+    else:
+        expected = "value_error"
+    assert [e["type"] for e in refused.value.errors()] == [expected]
     with pytest.raises(ValidationError):
         UserCreateRequest(username="newuser", display_name=name, email="n@example.org")
 

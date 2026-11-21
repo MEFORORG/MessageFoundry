@@ -411,10 +411,14 @@ class DirectoryUserCreateRequest(RequestModel):
     cannot point the holder's notices away from the directory's (ASVS 6.3.7).
     """
 
-    # vault BACKLOG #5342, BACKLOG #5784: refused, 422, by :func:`name_refusal` before the
-    # directory is asked. The NUL case is pinned by tests/test_auth_federated_identity_routes.py::
-    # test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory. The bounds and
-    # pattern on the Field keep the published schema's ``minLength`` and ``pattern``.
+    # vault BACKLOG #5342, BACKLOG #5784: a refused name answers 422 before the directory is
+    # asked. The Field's own checks run first: ``min_length`` refuses an empty name and the NUL
+    # pattern a name holding a NUL, which also keeps the published schema's ``minLength`` and
+    # ``pattern``. :func:`name_refusal` then refuses the rest, such as white space alone or a
+    # tab. tests/test_auth_federated_identity_routes.py::
+    # test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory pins that a NUL
+    # name is refused and the directory not asked, which the pattern alone now answers; the name
+    # rule's own cases on this model are in tests/test_auth_name_rule.py.
     username: Annotated[
         str,
         Field(min_length=1, max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN),
