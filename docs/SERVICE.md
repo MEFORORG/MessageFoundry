@@ -1152,10 +1152,11 @@ renewal included, also keeps each of those three the old certificate named, and 
 which the CLI, the IDE and the harness dial by default. A replacement for a missing name is audited
 with reason `bind_changed`, unless the pair is also due for renewal, which is audited with reason
 `renewal`. An engine shard makes neither. The audit row may be missing, at least if its write fails,
-which logs an ERROR; the WARNING line is logged either way. Import the certificate from either
-replacement as after a renewal (BACKLOG #5973). At least a shard, a bind the certificate builder
-refuses (a WARNING names it), and a file or lock failure (a WARNING, and the next start tries again)
-keep serving the old certificate, which lacks a name the current bind needs.
+which logs an ERROR, or if the start fails after the replacement and before the row is written,
+which leaves the WARNING line as the only record (ADR 0172 decision 6). Import the certificate from
+either replacement as after a renewal (BACKLOG #5973). At least an engine shard, a bind the
+certificate builder refuses (a WARNING names it), and a file or lock failure (a WARNING, and the
+next start tries again) keep serving the old certificate, which lacks a name the current bind needs.
 See
 [INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console". (The former PySide6 desktop
 console was retired — BACKLOG #103.)

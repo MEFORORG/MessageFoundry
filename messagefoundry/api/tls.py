@@ -972,12 +972,11 @@ def _replacement_due(host: str, cert_path: Path) -> _Due | None:
     ``renewal`` means expired, or less than :data:`_RENEW_REMAINING_FRACTION` of the certificate's
     own validity period left. ``bind_changed`` means the pair is not due for renewal and its
     certificate lacks a name ``host`` requires (:func:`_names_missing`), among them the host a
-    client dials for it (:func:`messagefoundry.api_tls_source.dialled_host`). So a bind moved after the mint, for
-    example to ``::`` from ``0.0.0.0``, or to ``127.0.0.1`` from ``0.0.0.0``, gets a fresh
-    certificate for the new bind at this start rather than at the next renewal (BACKLOG #5973,
+    client dials for it (:func:`messagefoundry.api_tls_source.dialled_host`). So a bind moved after
+    the mint, for example to ``::`` from ``0.0.0.0``, or to ``127.0.0.1`` from ``0.0.0.0``, gets a
+    fresh certificate for the new bind at this start rather than at the next renewal (BACKLOG #5973,
     #5790). The new pair names the new bind, as a first-run mint for it would, plus the loopback
-    names :func:`_kept_loopback_names` keeps, so the next start finds nothing missing and reuses
-    it.
+    names :func:`_kept_loopback_names` keeps, so the next start finds nothing missing and reuses it.
 
     **Only the engine's own shape is ever due**: a certificate at the generated path that is not
     self-signed with ``CA=false`` was put there by someone else, so it is served as found. That
