@@ -794,9 +794,9 @@ def test_a_walk_the_refined_reading_finds_inside_double_quotes_is_denied(command
     assert_denied(run_guard(bash(command)))
 
 
-# A GLUED SHIFT IN ARITHMETIC STAYS DENIED. Each row was denied before the -Refined reading, because
-# the reading without it opens no heredoc at a glued `<<`. The refined reading opens heredocs at a
-# glued `<<`, and denies these only because it blanks the arithmetic around the shift first.
+# A GLUED SHIFT IN ARITHMETIC STAYS DENIED. Each row is denied by the bash reading without
+# -Refined, so the refined view, built only once the other two views allow, never runs on it.
+# The rows pin that adding the late view keeps a deny the earlier views reach.
 REFINED_FLOOR_DENY = [
     pytest.param('echo "$( (( a<<b ))\nfind /proc)"', id="glued-shift-in-an-arithmetic-command"),
     pytest.param('echo "$(echo $[a<<b]\nfind /proc)"', id="glued-shift-in-old-style-arithmetic"),
@@ -824,14 +824,30 @@ def test_arithmetic_that_reads_like_a_walk_is_still_allowed() -> None:
 
 # EACH ROW IS ALLOWED ON origin/main AND WAS A FALSE DENY OF AN EARLIER CUT OF -Refined. The first
 # put enough nested subshells ahead of the arithmetic to spend a shared scan budget, after which
-# every `$((` read as a subshell. The second read a glued `<<` in an array subscript as a heredoc,
-# whose body blanked the opening quote and exposed the prose it holds.
+# every `$((` read as a subshell. The others read a glued `<<` as a heredoc in an array subscript
+# or in arithmetic glued to a reserved word, whose body blanked the opening quote and exposed the
+# prose it holds, or blanked a comment in a command with no quote.
 REFINED_FALSE_DENY_ALLOW = [
     pytest.param(
         "(" * 250 + "true" + ") " * 250 + '; echo "$(( find / 2 ))"',
         id="arithmetic-after-many-nested-subshells",
     ),
     pytest.param('a[x<<y]=1\necho "\ny\nfind /proc\n"', id="glued-shift-in-an-array-subscript"),
+    pytest.param(
+        'a[(i<<k)]=v\necho "\nk\nfind /proc\n"', id="glued-shift-in-parens-in-a-subscript"
+    ),
+    pytest.param(
+        'for i in 1; do((x<<y)); done\necho "\ny\nfind /proc\n"', id="arithmetic-glued-to-do"
+    ),
+    pytest.param(
+        'if true; then((x<<y)); fi\necho "\ny\nfind /proc\n"', id="arithmetic-glued-to-then"
+    ),
+    pytest.param(
+        'if false; then :; else((x<<y)); fi\necho "\ny\nfind /proc\n"',
+        id="arithmetic-glued-to-else",
+    ),
+    # Blanking a comment in a command with no quote joined the words after its `;` to `find`.
+    pytest.param("cat <<EOF\nx\nEOF\nfind . # see; ls /proc", id="comment-in-a-quote-free-command"),
 ]
 
 
@@ -846,18 +862,19 @@ def _guard_seconds(command: str) -> float:
     return time.monotonic() - started
 
 
-def test_a_long_run_of_open_parens_is_read_in_linear_time() -> None:
-    """Get-ParenMatches is one pass, so doubling a run of `((` does not quadruple the time.
+def test_many_arithmetic_commands_are_read_in_linear_time() -> None:
+    """Get-ParenMatches is one pass, so doubling the `(( 1 ))` sites does not quadruple the time.
 
-    An earlier cut scanned forward from every `((`, and 40000 of them took about 98 seconds here,
-    past the dispatcher's hook timeout; a timed-out hook lets the command run. The word `find` keeps
-    the guard from returning early, so every view, the refined one included, is built. The bound
-    allows for the fixed cost of starting pwsh, which both runs pay.
+    Every site takes the refined reading's `((` check, because the quote in `"find"` sends the
+    command through the masker and nothing ahead of the sites is left open. An earlier cut scanned
+    forward from every `((`, and a long run of them took about 98 seconds, past the dispatcher's
+    hook timeout; a timed-out hook lets the command run. The bound allows for the fixed cost of
+    starting pwsh, which both runs pay, and is loose because both runs are wall-clock timings.
     """
-    half = _guard_seconds('echo find; echo "$(' + "(" * 20000 + '"')
-    full = _guard_seconds('echo find; echo "$(' + "(" * 40000 + '"')
+    half = _guard_seconds('echo "find"; ' + "(( 1 )); " * 3000)
+    full = _guard_seconds('echo "find"; ' + "(( 1 )); " * 6000)
     assert full < 30
-    assert full < 2.5 * half + 2
+    assert full < 3 * half + 3
 
 
 # ============================================ the corpora must not quietly shrink
@@ -891,7 +908,7 @@ EXPECTED_ROW_COUNTS = {
     "COMMENT_BOUNDARY_DENY": 6,
     "REFINED_READING_DENY": 13,
     "REFINED_FLOOR_DENY": 2,
-    "REFINED_FALSE_DENY_ALLOW": 2,
+    "REFINED_FALSE_DENY_ALLOW": 7,
 }
 
 

@@ -170,7 +170,7 @@ function Get-ArithmeticVerdict([int[]]$Table, [string]$Text, [int]$Open) {
 # as a heredoc opener. A substitution inside it still runs, so that is left visible, and so is the
 # `#` of a comment, whose body is blanked.
 #
-# -Refined CHANGES FOUR READINGS (BACKLOG #5607), each of which the reading without it misreads
+# -Refined CHANGES AT LEAST THESE READINGS (BACKLOG #5607), each of which the reading without it misreads
 # into blanking a walk inside a double-quoted substitution, where the plain toggle blanks it too.
 # A `$((` is a subshell inside a substitution when Get-ParenMatches closes its second `(` with
 # something other than `))`, as in `"$((find /proc) )"`; that pass's own limits are stated on it.
@@ -182,9 +182,9 @@ function Get-ArithmeticVerdict([int[]]$Table, [string]$Text, [int]$Open) {
 # the reading without it, it masks a command with no quote too. The switch is a third view, not a
 # replacement, and the call site says what that does and does not guarantee.
 function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
-    # A command with no quote masks to itself, except that -Refined still blanks arithmetic.
+    # A command with no quote masks to itself, except that -Refined still blanks arithmetic and
+    # heredoc bodies.
     if (-not $Refined -and $Text.IndexOf('"') -lt 0 -and $Text.IndexOf("'") -lt 0) { return $Text }
-    $keywordBefore = [regex]::new('(?:^|[\s;&|(])(?:if|elif|while|until|for)$')
     if ($Plain) {
         $sb = [System.Text.StringBuilder]::new($Text.Length)
         $quote = $null
@@ -216,9 +216,16 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
     # with -Refined, `cat <<A <<B` reads A's body to its terminator, then B's.
     $pending = [System.Collections.Generic.List[string]]::new()
     $bodyTerms = [System.Collections.Generic.List[string]]::new()
-    $delimiterAt = [regex]::new('\G-?[ \t]*(?:''([^''\n]+)''|"([^"\n]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))')
+    $delimiterAt = [regex]::new('^-?[ \t]*(?:''([^''\n]+)''|"([^"\n]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))')
     # Built on the first `$((` or `((` -Refined meets; see Get-ParenMatches.
     $parenTable = $null
+    # A reserved word or `!` or `{` glued to `((` leaves it in command position.
+    $keywordBefore = if ($Refined) {
+        [regex]::new('(?:(?:^|[\s;&|(])(?:if|elif|while|until|for|do|then|else|time)|[!{])$')
+    } else { $null }
+    # In a command with no quote a comment's apostrophe can open nothing, so -Refined does not
+    # blank comments there: blanking one would join the words after its `;` to the segment.
+    $quoteFree = $Text.IndexOf([char]34) -lt 0 -and $Text.IndexOf([char]39) -lt 0
     # The depth of an unquoted `[...]` in the current word, such as an array subscript, where a
     # glued `<<` is a shift and never opens a heredoc (`a[x<<y]=1`).
     $bracketDepth = 0
@@ -334,8 +341,10 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
             ($n -eq 0 -or [char]::IsWhiteSpace($Text[$n - 1]) -or
              ($Refined -and $Text[$n - 1] -cne '<' -and $braceDepth -eq 0 -and $bracketDepth -eq 0)) -and
             -not ($n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '<')) {
-            # Matched in place: a Substring of the rest at every opener made a long command quadratic.
-            $d = $delimiterAt.Match($Text, $n + 2)
+            # Matched on a bounded slice: matching against the whole text costs its length per call
+            # in PowerShell, which made a command with many openers quadratic. A delimiter that
+            # runs past the slice is not read, so its heredoc opens nothing.
+            $d = $delimiterAt.Match($Text.Substring($n + 2, [Math]::Min(1024, $Text.Length - $n - 2)))
             if ($d.Success) {
                 if (-not $Refined) { $pending.Clear() }
                 # Exactly one alternative matched, so the other two groups are empty.
@@ -349,7 +358,7 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
         # backtick), keeping the `#`. A word starts after unquoted, unescaped whitespace, `;`, `&`,
         # `|`, `(` or an opening `$(` or backtick -- never after a `)`, a quote or an escape, nor
         # inside `${...}`, where bash carries the word on (`$(echo a)#b` and `a\ #b` are words).
-        if ($ch -ceq '#' -and $wordStart -and $braceDepth -eq 0) {
+        if ($ch -ceq '#' -and $wordStart -and $braceDepth -eq 0 -and -not ($Refined -and $quoteFree)) {
             $end = $Text.IndexOf("`n", $n)
             if ($end -lt 0) { $end = $Text.Length }
             if ($kind -ceq 'bt') {
@@ -388,7 +397,7 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
         elseif ($ch -ceq '}' -and $braceDepth -gt 0) { $braceDepth-- }
         [void]$sb.Append($ch)
         $wordStart = [char]::IsWhiteSpace($ch) -or ';&|('.IndexOf($ch) -ge 0
-        if ($wordStart) { $bracketDepth = 0 }
+        if ([char]::IsWhiteSpace($ch) -or ';&|'.IndexOf($ch) -ge 0) { $bracketDepth = 0 }
         elseif ($ch -ceq '[') { $bracketDepth++ }
         elseif ($ch -ceq ']' -and $bracketDepth -gt 0) { $bracketDepth-- }
         $prevDollar = ($ch -ceq '$') -and -not $prevDollar
