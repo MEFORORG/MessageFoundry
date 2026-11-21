@@ -377,44 +377,47 @@ def test_a_linked_author_with_a_null_or_malformed_committer_passes_past_page_one
     assert "refused::" not in out and "fault::" not in out, out
 
 
-@pytest.mark.parametrize("author", ["null", "absent", False, 0, ""])
-def test_an_absent_or_null_author_is_refused_and_not_also_a_fault(
-    author: object, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("page", [1, 2])
+def test_a_null_author_is_refused_and_not_also_a_fault(
+    page: int, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A null author (schema-legal) has no account linked, so rule 1 refuses it. An absent key, or
-    another value JavaScript's `||` passes over, is read the same way, so the shapes agree; and the
-    refusal is not also reported as a fault about a valid reply."""
-    commit: dict[str, object] = {"oid": f"{2:040x}", "committer": {"name": "C", "user": None}}
-    if author != "absent":
-        commit["author"] = None if author == "null" else author
-    assert _run(_ENV, _serve([_linked_page_one(), _page([commit], 2, False)])) == EXIT_REFUSED
+    """A null author (schema-legal) has no account linked, so rule 1 refuses it, on the action's
+    page or past it, and the refusal is not also reported as a fault about a valid reply."""
+    commit = {"oid": f"{2:040x}", "author": None, "committer": {"name": "C", "user": None}}
+    if page == 1:
+        pages = [_page([commit, _commit(3, "Octo", "octo-contributor", 90000001)], 2, False)]
+    else:
+        pages = [_linked_page_one(), _page([commit], 2, False)]
+    assert _run(_ENV, _serve(pages)) == EXIT_REFUSED
     out = capsys.readouterr().out
     assert f"commit {2:040x} has no git author GitHub reports" in out
     assert "fault::" not in out, out
 
 
-@pytest.mark.parametrize("user", ["absent", False, 0, ""])
-def test_a_user_javascript_passes_over_is_unlinked(
-    user: object, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """An author with no ``user`` key, or a falsy one, is unlinked as the action's ``||`` reads it:
-    refused under rule 1, never a fault."""
-    author: dict[str, object] = {"name": "Mallory"}
-    if user != "absent":
-        author["user"] = user
-    commit = {"oid": f"{2:040x}", "author": author, "committer": {"name": "C", "user": None}}
+def test_an_author_with_no_user_key_is_unlinked(capsys: pytest.CaptureFixture[str]) -> None:
+    commit = {"oid": f"{2:040x}", "author": {"name": "Mallory"}, "committer": None}
     assert _run(_ENV, _serve([_linked_page_one(), _page([commit], 2, False)])) == EXIT_REFUSED
     out = capsys.readouterr().out
     assert "'Mallory'" in out and "fault::" not in out, out
 
 
-def test_a_malformed_author_is_a_fault_naming_its_commit() -> None:
-    """A truthy value that is not an object is a reply in the wrong shape, not an unlinked author."""
-    commit = {"oid": f"{2:040x}", "author": "not-an-object", "committer": None}
+@pytest.mark.parametrize(
+    "commit",
+    [
+        {"oid": f"{2:040x}", "committer": None},
+        {"oid": f"{2:040x}", "author": "not-an-object", "committer": None},
+        {"oid": f"{2:040x}", "author": {"name": "M", "user": ""}, "committer": None},
+    ],
+    ids=["absent-author-key", "author-not-an-object", "user-not-an-object"],
+)
+def test_a_reply_in_the_wrong_shape_is_a_fault_naming_its_commit(commit: Mapping[str, Any]) -> None:
+    """The query always selects author and user, so their absence or a non-object value is a reply
+    in the wrong shape: a fault (warn and pass, owner ruling 2026-11-13), never a refusal, which
+    would fail every pull request if GitHub's reply changed shape."""
     read = fetch_commits(_serve([_linked_page_one(), _page([commit], 2, False)]), "M", "N", 7)
     verdict = evaluate(read, _ALLOWLIST, _no_signatures)
     assert verdict.refusals == ()
-    assert verdict.fault == f"commit {2:040x}: a commit's author is not an object"
+    assert verdict.fault and verdict.fault.startswith(f"commit {2:040x}: "), verdict.fault
 
 
 def test_both_rules_reach_the_first_annotations_and_the_rest_reach_the_log(

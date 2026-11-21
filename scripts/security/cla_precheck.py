@@ -26,9 +26,9 @@ EVERY commit, paging on ``hasNextPage``:
   1. A commit whose AUTHOR is linked to no GitHub account is refused, whatever its committer or
      git name. The CLA binds the author, and an unlinked author can never be shown to have signed
      (owner ruling 2026-11-13). Measured before the ruling: every commit on merged PRs 2909 and
-     2432 has a linked author, so the rule refuses nothing in current flows. An author, or an
-     author's ``user``, that is absent, null, or another value JavaScript's ``||`` passes over
-     (false, 0, "") counts as unlinked; any other value that is not an object is a fault.
+     2432 has a linked author, so the rule refuses nothing in current flows. A null author, and an
+     author whose ``user`` is null or absent, are refused; an absent ``author`` key, or a value of
+     either that is neither null nor an object, is a reply in the wrong shape and a fault.
   2. A linked author first seen past the action's one page is refused only when absent from the
      signature file the action keeps (below). The action's list is built as the action builds it,
      from the FIRST PAGE only, first commit seen under each key.
@@ -179,29 +179,24 @@ class Verdict:
     fault: str | None = None
 
 
-def _js_falsy(value: object) -> bool:
-    """What JavaScript's ``||`` passes over, of what JSON can carry: null (or an absent key, which
-    reads as undefined), false, 0 and "". An empty object or list is NOT passed over."""
-    if value is None or value is False or value == "":
-        return True
-    return type(value) in (int, float) and value == 0
-
-
 def _person(commit: Mapping[str, Any], role: str) -> Mapping[str, Any] | None:
-    """The commit's ``author`` or ``committer``: None where JavaScript's ``||`` would pass over it,
-    an absent key included, and a fault for any other value that is not an object."""
-    person = commit.get(role)
-    if _js_falsy(person):
+    """The commit's ``author`` or ``committer``: None for a null one, which the schema allows. An
+    absent key, or any value that is not an object, is a reply in the wrong shape: a fault."""
+    if role not in commit:
+        raise PrecheckFault(f"a commit has no {role} key")
+    person = commit[role]
+    if person is None:
         return None
     if not isinstance(person, Mapping):
         raise PrecheckFault(f"a commit's {role} is not an object")
     return person
 
 
-def _user(person: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
-    """A person's linked account: None for no person, or where ``||`` would pass over the user."""
-    user = None if person is None else person.get("user")
-    if _js_falsy(user):
+def _user(person: Mapping[str, Any]) -> Mapping[str, Any] | None:
+    """A person's linked account, or None when none is linked (a null or absent ``user``). Any
+    other value that is not an object is a fault."""
+    user = person.get("user")
+    if user is None:
         return None
     if not isinstance(user, Mapping):
         raise PrecheckFault("a commit's user is not an object")
@@ -211,14 +206,14 @@ def _user(person: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
 def attribute(commit: Mapping[str, Any]) -> Attribution:
     """Mirror ``extractUserFromCommit``: ``author.user || committer.user || author || committer``.
 
-    Every value is tested as JavaScript's ``||`` tests it (``_js_falsy``), so an empty ``{}`` user is
-    still chosen. The bundle reads ``author.user``, and ``committer.user`` when the first is falsy,
-    so a missing person there leaves the action no key for the commit: that is a fault here, so the
-    commit keys nothing in the action's view. Rule 1 refuses such a commit whatever its key.
+    A null is passed over, as ``||`` passes it; an empty ``{}`` user is still chosen, as ``||``
+    chooses it. The bundle reads ``author.user``, and ``committer.user`` when that is null, so a
+    null person there would throw in the action: that is a fault here, and the commit keys nothing
+    in the action's view.
     """
     author = _person(commit, "author")
     if author is None:
-        raise PrecheckFault("a commit's author is missing, so the action has no key for it")
+        raise PrecheckFault("a commit's author is null, so the action has no key for it")
     author_user = _user(author)
     committer: Mapping[str, Any] | None = None
     # The action never reads the committer when the author is linked, so neither does this: a
@@ -226,8 +221,8 @@ def attribute(commit: Mapping[str, Any]) -> Attribution:
     if author_user is None:
         committer = _person(commit, "committer")
         if committer is None:
-            raise PrecheckFault("a commit's committer is missing, so the action has no key for it")
-    committer_user = _user(committer)
+            raise PrecheckFault("a commit's committer is null, so the action has no key for it")
+    committer_user = None if committer is None else _user(committer)
     # Each is None or an object, and `is not None` rather than Python truthiness keeps an empty {}.
     chosen = next(c for c in (author_user, committer_user, author) if c is not None)
     login = chosen.get("login")
@@ -421,9 +416,10 @@ def evaluate(
         if refusal is not None:
             # Judged before the key below, so a commit whose committer cannot be read is refused.
             rule_one.append(refusal)
-            if index >= read.first_page:
-                # Past the action's view, and rule 2 judges linked authors only, so no rule reads
-                # this commit's key, and an unreadable committer here is not a fault.
+            # Past the action's view, rule 2 judges linked authors only, so no rule reads this
+            # commit's key, and an unreadable committer here is not a fault. A null author, which
+            # the schema allows, has no key anywhere: the action would throw on it.
+            if index >= read.first_page or commit["author"] is None:
                 slots.append(None)
                 continue
         try:
