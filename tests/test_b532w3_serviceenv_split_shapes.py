@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Split secrets that the service-environment reader let through (vault BACKLOG #5394, added
-item 12).
+items 6 and 12).
 
-A secret split from its empty name, into the next ``REG_MULTI_SZ`` item or onto a later line of
-one string below another variable, refuses when it is one-``=`` base64url, quoted, comma-trailed
-or ``=``-led. The controls are the ordinary items that still end the empty value. Each test drives
+A secret split from its empty secret-class name, into the next ``REG_MULTI_SZ`` item or onto a
+later line of one string below another variable, refuses unless the line below the name is
+positively an ordinary variable's: the reader fails closed. The controls are the items under a
+plain name that still end the empty value, and the ``MEFOR_VALUE_*`` and secrets-directory
+values, which keep the plain line rule so their remedy text stays true. Each test drives
 :func:`messagefoundry.serviceenv.read_service_env_posture` through a probe, so every one runs on
 every platform. Synthetic values only: the stand-ins decode to synthetic text, never a real key.
 """
@@ -88,8 +90,9 @@ def test_the_stand_ins_have_the_shapes_they_stand_for() -> None:
 @pytest.mark.parametrize("name", [KEY_CLASS_NAMES[0], "MEFOR_AUTH_OIDC_CLIENT_SECRET"])
 def test_a_split_secret_in_the_next_item_refuses(name: str, shape: str) -> None:
     """``nssm set`` writes each argument as its own string, so a secret split from its name lands
-    in the next item. Before this fix most shapes here ended the empty value above it; the
-    standard-alphabet key shapes already refused through the key-run rule, and stay as pins."""
+    in the next item. On origin/main 9421dcbf27 most shapes here ended the empty value above it,
+    the ``=``-led standard key among them; the quoted and comma-trailed standard keys already
+    refused through the key-run rule, and stay as pins."""
     posture = _read([f"{name}=", _SHAPES[shape]])
     assert posture.listed == (name,), shape
     assert posture.value_runs_on, shape
@@ -120,9 +123,10 @@ def test_a_split_secret_on_a_later_line_below_another_variable_refuses(
 
 
 #: Items that still end an empty value above them, because NSSM reads each item as its own
-#: variable and none of these is a split secret's shape. Taken from the item 1 control in
-#: ``tests/test_b532r_serviceenv_reader.py``, with lower-case spellings, Windows' ``=::`` entry,
-#: a one-case nameless entry and ordinary comma-led values added.
+#: variable and each is under a plain name or is a nameless entry of its own. Taken from the
+#: item 1 control in ``tests/test_b532r_serviceenv_reader.py``, with lower-case spellings,
+#: Windows' ``=::`` and ``=ExitCode`` entries, a one-case nameless entry, names Windows sets and
+#: ordinary comma-led values added.
 _ORDINARY_ITEMS = (
     "MEFOR_AI_ENVIRONMENT=prod",
     "ProgramFiles(x86)=C:\\x",
@@ -140,6 +144,10 @@ _ORDINARY_ITEMS = (
     "NO_PROXY=,localhost",
     "no_proxy=,localhost",
     "A" * 42 + "_B=1",
+    "=ExitCode=00000000",
+    "PATH=C:\\x",
+    "Path=C:\\x",
+    "PATH=,C:\\x",
 )
 
 
@@ -150,13 +158,80 @@ def test_an_ordinary_item_still_ends_the_empty_value_above_it(item: str) -> None
     assert service_env_refusal(posture) is None, item
 
 
+#: Lines below an empty secret-class value that are not positively an ordinary variable's, so the
+#: reader cannot tell them from the secret and fails closed (added items 6 and 12). Typographic
+#: quotes are written as escapes, so this file holds no glyph.
+_FAIL_CLOSED = (
+    "x=y",
+    "Winter=2026!",
+    "Http_Proxy=",
+    "Http_Proxy=x",
+    "ProgramFile=C:\\x",
+    "\u201cabc\u201d=x",
+    "\u2018abc\u2019=x",
+    "`abc`=x",
+    "abc`=x",
+    "p@ss=word",
+    "=abc123",
+    "=AbCdEf",
+)
+
+
+@pytest.mark.parametrize("line", _FAIL_CLOSED)
+@pytest.mark.parametrize("name", [KEY_CLASS_NAMES[0], "MEFOR_AUTH_AD_BIND_PASSWORD"])
+def test_a_line_that_may_be_the_secret_refuses_as_an_item_and_on_a_later_line(
+    name: str, line: str
+) -> None:
+    """Finding 1 of the round-2 review: ``Winter=2026!`` below the bind password escaped. Each
+    reading refuses, and the two read the same."""
+    items = _read([f"{name}=", line])
+    later = _read([f"PATH=x\n{name}=\n{line}"])
+    assert items.listed == later.listed == (name,), line
+    assert items.value_runs_on, line
+    assert service_env_refusal(items) is not None
+    assert service_env_refusal(later) is not None
+
+
+def test_an_empty_secret_kept_on_a_later_line_reads_the_line_below_it_too() -> None:
+    """The fail-closed rule follows a kept variable, not only a string's first line."""
+    name = "MEFOR_STORE_PASSWORD"
+    posture = _read([f"PATH=x\n{KEY_CLASS_NAMES[0]}=\n{name}=\nWinter=2026!"])
+    assert posture.listed == (name,)
+
+
 def test_an_ordinary_comma_led_value_on_a_later_line_is_still_its_own_variable() -> None:
-    """The line rule gains the split shapes too, so its negative control: a conventional name
-    with a comma-led value still ends the empty directory above it, which then reads as unset."""
+    """A conventional name with a comma-led value still ends the empty directory above it, which
+    then reads as unset."""
     posture = _read(["MEFOR_SECRETS_DIRECTORY=\nNO_PROXY=,localhost", "MEFOR_VALUE_A=1"])
     assert posture.listed == ("MEFOR_VALUE_A",)
     refusal = service_env_refusal(posture)
     assert refusal is not None and "The service's lists set no" in refusal
+
+
+@pytest.mark.parametrize("line", ['"x"=y', "PATH=,C:\\x", "Http_Proxy=,x", "\u201cx\u201d=y"])
+def test_an_empty_directory_above_an_ordinary_line_still_reads_as_unset(line: str) -> None:
+    """Finding 3 of the round-2 review, a regression at 7b2d038666: the directory's name is no
+    secret, so a later line ends its empty value under the plain line rule, and the remedy still
+    says the lists set no directory."""
+    posture = _read([f"MEFOR_SECRETS_DIRECTORY=\n{line}", "MEFOR_VALUE_A=1"])
+    assert posture.listed == ("MEFOR_VALUE_A",), line
+    refusal = service_env_refusal(posture)
+    assert refusal is not None and "The service's lists set no" in refusal, line
+
+
+@pytest.mark.parametrize("item", ["Http_Proxy=", "=ExitCode=0", "=abc123", "ab-c_dE="])
+def test_an_empty_value_name_does_not_take_the_next_item(item: str) -> None:
+    """Finding 4 of the round-2 review, a regression at 7b2d038666: an empty ``MEFOR_VALUE_*``
+    name refuses whatever it holds, so the next item keeps the plain rule, the empty entry is
+    still named, and the remedy does not say to remove the item."""
+    posture = _read(["MEFOR_VALUE_X=", item])
+    assert posture.listed == ("MEFOR_VALUE_X",), item
+    assert posture.empty_value_names == ("MEFOR_VALUE_X",), item
+    assert not posture.value_runs_on, item
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert "An empty or blank MEFOR_VALUE_* entry is refused too" in refusal
+    assert "runs on into" not in refusal
 
 
 def test_a_hex_secret_led_by_an_equals_sign_in_the_next_item_refuses() -> None:
@@ -172,15 +247,11 @@ def test_an_empty_key_on_its_strings_first_line_above_an_ordinary_line_refuses()
     assert _read([f"{key}=\nx=y"]).listed_keys == (key,)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "vault BACKLOG #5394 added item 6, not built: refusing this input breaks the one-string "
-        "and next-item parity that tests/test_b532r_serviceenv_reader.py pins for the same shape"
-    ),
-)
 def test_a_later_empty_secret_above_an_ordinary_line_refuses() -> None:
-    """Added item 6: the same empty key on the string's first line refuses (the control above),
-    so the reading is position-dependent."""
+    """Added item 6: the same empty key below another variable refuses too, as one string and as
+    items, since the reader cannot tell whether ``x=y`` is the key. Failed on origin/main
+    9421dcbf27, where it was a strict xfail pin at 7b2d038666."""
     key = KEY_CLASS_NAMES[0]
     assert _read([f"PATH=x\n{key}=\nx=y"]).listed_keys == (key,)
+    assert _read([f"PATH=x\n{key}=", "x=y"]).listed_keys == (key,)
+    assert _read([f"{key}=", "x=y"]).listed_keys == (key,)
