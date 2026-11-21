@@ -307,9 +307,11 @@ class BlankCellError(CellTagError):
 
 
 class NonTextCellError(CellTagError):
-    """A preset's ``criteria`` cell holds a value that is not text, a planted BLOB say (BACKLOG
-    #5523). The store writes criteria as text only, so this was written outside the store. A keyed
-    cipher handed it would fail with a ``TypeError``. Drift, as :class:`BlankCellError` is."""
+    """A tagged cell holds a value that is not text, a planted BLOB say: a preset's ``criteria``
+    (BACKLOG #5523) or a ``messages`` cell (BACKLOG #5650). The store writes these cells as text
+    only, so this was written outside the store. A keyed cipher handed it would fail with a
+    ``TypeError``, and a keyless one would return it unchanged. Drift, as :class:`BlankCellError`
+    is."""
 
     def _describe(self) -> str:
         return (
@@ -355,7 +357,7 @@ def _declares_tag_refusals(cipher: object) -> bool:
 
 def open_tagged_cell(
     cipher: Cipher,
-    stored: str | None,
+    stored: object,
     aad: bytes,
     *,
     table: str,
@@ -364,7 +366,9 @@ def open_tagged_cell(
     channel_id: str | None = None,
 ) -> str | None:
     """Open ``stored`` under ``aad``. ``None`` reads as ``None``, and a blank or unmarked value goes to
-    the cipher's own policy, as the store's ``_dec`` does.
+    the cipher's own policy, as the store's ``_dec`` does. A value that is not text, a planted BLOB
+    say, raises :class:`NonTextCellError` on a keyed and a keyless store alike, rather than a
+    ``TypeError`` out of the cipher or a non-text value back to the caller (BACKLOG #5650).
 
     A marked value whose AEAD tag fails under a key this process holds (:func:`is_tag_failure`)
     raises :class:`CellTagError` and raises the ``integrity_drift`` alert. So does one the Vault
@@ -380,6 +384,10 @@ def open_tagged_cell(
     _require_tagged_table(table)
     if stored is None:
         return None
+    if not isinstance(stored, str):
+        refused = NonTextCellError(table, column, row_id, channel_id)
+        _alert(cipher, refused)
+        raise refused
     try:
         return cipher.decrypt(stored, aad=aad)
     except CipherError as exc:
@@ -392,7 +400,7 @@ def open_tagged_cell(
 
 
 def open_message_cell(
-    cipher: Cipher, column: str, stored: str | None, *, message_id: str, channel_id: str
+    cipher: Cipher, column: str, stored: object, *, message_id: str, channel_id: str
 ) -> str | None:
     """Open one ``messages`` cell under the tag its row's id and channel build."""
     return open_tagged_cell(
@@ -431,24 +439,21 @@ def open_preset_criteria(
     logged here, alerted here on a keyed store only, and audited by the store's read, before the
     caller reads the cell or stamps the preset as used. The store's whole-surface cell walks do not run this check."""
     if stored is None or stored == "":
-        refused: CellTagError = BlankCellError("search_presets", "criteria", preset_id, None)
-    elif not isinstance(stored, str):
-        refused = NonTextCellError("search_presets", "criteria", preset_id, None)
-    else:
-        # open_tagged_cell returns None only for a None cell, refused above.
-        return cast(
-            str,
-            open_tagged_cell(
-                cipher,
-                stored,
-                preset_criteria_aad(preset_id=preset_id, owner_user_id=owner_user_id),
-                table="search_presets",
-                column="criteria",
-                row_id=preset_id,
-            ),
-        )
-    _alert(cipher, refused)
-    raise refused
+        refused = BlankCellError("search_presets", "criteria", preset_id, None)
+        _alert(cipher, refused)
+        raise refused
+    # open_tagged_cell refuses a non-text cell, and returns None only for a None cell, refused above.
+    return cast(
+        str,
+        open_tagged_cell(
+            cipher,
+            stored,
+            preset_criteria_aad(preset_id=preset_id, owner_user_id=owner_user_id),
+            table="search_presets",
+            column="criteria",
+            row_id=preset_id,
+        ),
+    )
 
 
 def withhold_message_cells(
