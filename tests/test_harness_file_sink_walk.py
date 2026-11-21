@@ -733,12 +733,17 @@ def test_a_swap_is_read_again_through_the_held_folder(
     assert [r.payload for r in records] == [_LATER]
 
 
-@pytest.mark.skipif(not file_sink._DIR_FD, reason="no dir_fd here (Windows): the walk is by path")
-def test_a_file_read_through_held_folders_is_inside_whatever_happens_to_its_path_after(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="Windows refuses to rename a folder holding an open file"
+)
+@pytest.mark.parametrize("by_path", [False, True], ids=["native-walk", "by-path-walk"])
+def test_a_file_whose_folder_moves_out_after_its_read_is_not_taken_as_inside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, by_path: bool
 ) -> None:
-    """Its folder moved away right after the read: the file was read through handles held from
-    the sink directory down, so it was inside, not an escape."""
+    """Its folder moved out of the sink directory right after the read: the file is judged by its
+    folder's resolved path, so it is not recorded as inside, on either walk."""
+    if by_path:
+        monkeypatch.setattr(file_sink, "_DIR_FD", False)
     (tmp_path / "sub").mkdir()
     real_read = bounded_file.read_fd_capped
 
@@ -752,4 +757,4 @@ def test_a_file_read_through_held_folders_is_inside_whatever_happens_to_its_path
         monkeypatch.setattr(file_sink, "read_fd_capped", read_then_move)
         records = sink.records()
     assert not (tmp_path / "sub").exists(), "the folder never moved: the test proves nothing"
-    assert [(r.payload, r.meta["inside"]) for r in records] == [(_BODY, "true")]
+    assert [(r.payload, r.meta["inside"]) for r in records] == [(_BODY, "false")]

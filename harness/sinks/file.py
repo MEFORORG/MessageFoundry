@@ -9,8 +9,9 @@ identity, file type, size and modification time, and a file that changes while i
 recorded once it settles, not twice. The scan enters only what ``lstat`` reads as a plain
 directory, never a link or a junction, except in the Windows folder-swap race this module names
 as open, and records each file's path relative to it
-(``meta["relpath"]``) and whether it stays inside it (``meta["inside"]``, decided as
-:meth:`FileSink._inside` says). A file written OUTSIDE the directory is not looked for
+(``meta["relpath"]``) and whether its resolved path, symlinks followed, stays inside it
+(``meta["inside"]``). A link that cannot be resolved strictly (a loop, a dangling link, a race) is
+recorded as not inside, never as inside. A file written OUTSIDE the directory is not looked for
 here; a scenario that tests for an escape must look where it would land, and a link the sink
 records unread carries no control id, so a scenario must check ``meta["symlink"]`` itself.
 
@@ -198,9 +199,6 @@ class FileSink(Sink):
         #: Whether :meth:`start` has finished, and whether its first scan is running.
         self._started = False
         self._starting = False
-        #: Whether the running scan holds the root by a handle whose file id is the one
-        #: :meth:`start` found, so what it reaches through held handles is inside.
-        self._held_root = False
         #: The most one file may hold and still be read: the engine's per-message cap.
         self.max_file_bytes = DEFAULT_MAX_MESSAGE_BYTES
 
@@ -267,7 +265,6 @@ class FileSink(Sink):
         there to record or to ignore. The directory itself gone before it is listed is a failed
         scan."""
         scan = _Scan()
-        self._held_root = False
         if _DIR_FD:
             try:
                 root_fd = os.open(self.directory, _DIR_FLAGS)
@@ -288,8 +285,6 @@ class FileSink(Sink):
                     return self._root_gone(None)
                 if (identity := _identity(st)) is not None:
                     scan.entered.add(identity)
-                    # The held root is the directory start() found, shown by its file id.
-                    self._held_root = identity == self._root_id
                 if not self._walk(root_fd, self.directory, 0, visit, scan):
                     scan.failed = True
             except OSError as exc:
@@ -514,17 +509,12 @@ class FileSink(Sink):
         return None
 
     def _inside(self, path: Path, link: bool, root: Path) -> bool:
-        """Whether ``path`` stays inside ``root``; False where that cannot be shown. A link is
-        resolved strictly, symlinks followed, so a loop or a dangling link is not inside. A file
-        the walk reached through held folder handles, from a held root whose file id is the one
-        :meth:`start` found, is inside: each folder on the way was opened relative to its parent,
-        never through a link. A file the by-path walk read is judged by its folder, which the walk reached
-        through what ``lstat`` read as plain directories, so a file that vanishes after its read
-        is not mistaken for an escape. Where the walk lists by path (Windows), a folder swapped for
-        a link and back during the scan defeats this check: the open race in the module
-        docstring."""
-        if self._held_root and not link:
-            return True
+        """Whether ``path`` resolves inside ``root``; False where that cannot be shown. A link is
+        resolved strictly, so a loop or a dangling link is not inside. A file is judged by its folder,
+        which the walk reached through what ``lstat`` read as plain directories, so a file that
+        vanishes after its read is not mistaken for an escape. Where the walk lists by path (Windows),
+        a folder swapped for a link and back during the scan defeats this check: the open race in
+        the module docstring."""
         try:
             if link:
                 return path.resolve(strict=True).is_relative_to(root)
