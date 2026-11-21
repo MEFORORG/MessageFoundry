@@ -672,6 +672,11 @@ def test_an_earlier_lines_chdir_ahead_of_a_bracket_joined_invocation_is_read(
     reason = _reason(rig, _fmt(rig, "cd {p}" + tail), rig.outside, tool)
     assert "SHARED PRIMARY" in reason, reason
     assert _allowed(rig, _fmt(rig, "cd {o}" + tail), rig.outside, tool)
+    # A separator before the bracket on this line, with no chdir ahead of it.
+    joined = "\necho hi; git -C {o} log $(git reset --hard)"
+    reason = _reason(rig, _fmt(rig, "cd {p}" + joined), rig.outside, tool)
+    assert "SHARED PRIMARY" in reason, reason
+    assert _allowed(rig, _fmt(rig, "cd {o}" + joined), rig.outside, tool)
 
 
 def test_a_chdir_ahead_of_a_powershell_block_is_read(rig: SimpleNamespace) -> None:

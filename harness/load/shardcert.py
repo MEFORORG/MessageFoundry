@@ -931,7 +931,7 @@ def _copies_missing(tracker: FailoverTracker, *, routing: str, dests: int, deliv
     """Copies of ACKed messages that never arrived, against exactly the destinations the served router
     picks for each seq (:func:`destinations_for_seq`), read from each copy's lane label. O(A x D) under
     broadcast and O(A x dests) under the partitioned modes, so an async caller runs it off the loop."""
-    fanout = max(delivering, 0)
+    fanout = delivering
     # Unmeasured, never a guess: the walk would raise on a routing or fan-out the router never serves.
     if fanout < 1 or fanout_refusal(routing, dests=dests, fanout=fanout) is not None:
         return -1
@@ -4575,7 +4575,8 @@ class ShardCertDriveReport:
     #: #5577). Only then is ``sink_received`` a post-drain count; a gate that lands on disk after the wait
     #: timed out does not make an early tally late. False = no barrier (default OFF, or timed out).
     tallied_behind_gate: bool = False
-    #: Whether the engine box refused this drive's sign-in (:class:`RigSignInRefused`), or an earlier
+    #: Whether the engine box refused this drive's sign-in (:class:`RigSignInRefused`, a 429's
+    #: :class:`RigSignInRateLimited` excepted), or an earlier
     #: refusal kept it from trying (``sign_in=False``). The ladder reads it to stop retrying a refused
     #: sign-in on every rung.
     sign_in_refused: bool = False

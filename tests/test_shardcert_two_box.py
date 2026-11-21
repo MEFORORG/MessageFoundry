@@ -1261,6 +1261,7 @@ async def test_drive_ladder_refuses_an_empty_cacert_before_any_rung(tmp_path: Pa
             sink_host="127.0.0.1",
             base_coord=FileDropCoord(tmp_path, run_id="emptyca"),
             cacert="",
+            shards_ready_timeout=0.5,
         )
 
 

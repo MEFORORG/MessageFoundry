@@ -1206,8 +1206,10 @@ async def test_gated_drive_flags_only_a_refused_sign_in_and_can_skip_it(
     again; and ``sign_in=False`` skips the sign-in altogether, with a note, so a ladder that saw a
     refusal does not retry it on every rung and lock the rig Administrator out.
 
+    A 429 is transient too, so it is not a refusal either.
+
     Mutation: flag every sign-in error as refused, or open the poller under ``sign_in=False``.
-    Red: the unreachable case reads refused, or the skipped case builds a poller."""
+    Red: the unreachable or rate-limited case reads refused, or the skipped case builds a poller."""
     import types
 
     from harness.load.rigadmin import RigSignInRateLimited, RigUnreachable

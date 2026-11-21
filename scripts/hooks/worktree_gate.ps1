@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.20.1"
+$GateVersion = "2026.11.20.2"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -1091,6 +1091,14 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
             $outerCd = $(if ($outerPfx -match $chdirAt) { Get-ChdirTargetRaw $outerPfx } else { "" })
             if ($outerCd -and ($priorChdirs.Count -eq 0 -or [System.IO.Path]::IsPathRooted($outerCd))) {
                 [pscustomobject]@{ ScanPrefix = $outerPfx; Window = $win }
+            }
+            elseif ($outerPfx -notmatch $chdirAt -and $priorChdirs.Count -gt 0) {
+                # No chdir on this line before the bracket: stand in the earlier line's, as above.
+                $lastCd = $priorChdirs[$priorChdirs.Count - 1]
+                $lastCdTarget = Get-ChdirTargetRaw $lastCd
+                if ($lastCdTarget -and ([System.IO.Path]::IsPathRooted($lastCdTarget) -or $priorChdirs.Count -eq 1)) {
+                    [pscustomobject]@{ ScanPrefix = "$lastCd ; $outerPfx"; Window = $win }
+                }
             }
         }
     }
