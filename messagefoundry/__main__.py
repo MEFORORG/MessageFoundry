@@ -1566,11 +1566,11 @@ def _offline_env_values(
     are read by :func:`_read_environment_values`, serve's own reader, so overrides such as
     ``MEFOR_VALUE_*`` apply. A value file that is absent reads as no values, as serve's read does,
     so each reference it would have supplied is reported missing; a note on stderr names the file
-    looked for. Raises :class:`~messagefoundry.config.wiring.WiringError` for settings that do not
-    load, as the fixed line ADR 0050's 2026-11-20 note describes, which holds no text from the
-    failure; for a ``--service-config`` that does not exist, as ``service config not found:
-    <path>``, which the same note describes; and for a value file that cannot be read, naming that
-    file. The callers never print a resolved ``env()`` value."""
+    looked for. Raises :class:`~messagefoundry.config.wiring.WiringError` in at least these cases:
+    for settings that do not load, as the fixed line ADR 0050's 2026-11-20 note describes, which
+    holds no text from the failure; for a ``--service-config`` that does not exist, as ``service
+    config not found: <path>``, which the same note describes; and for a value file that cannot
+    be read, naming that file. The callers never print a resolved ``env()`` value."""
     from messagefoundry.config.anchor import resolve_project_root
     from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
     from messagefoundry.config.settings import settings_file_path

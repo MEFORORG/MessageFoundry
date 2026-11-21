@@ -650,7 +650,7 @@ def test_offline_env_refuses_a_malformed_service_config(
     assert rc == 1, captured
     assert _SECRET_HOST not in captured.out + captured.err
     # The refusal is the fixed line, which names no source and quotes nothing of the failure.
-    assert "this command does not print the reason" in captured.out, captured
+    assert any(d["message"] == _FIXED_LINE for d in json.loads(captured.out)), captured
 
 
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
@@ -686,9 +686,7 @@ def test_offline_env_reports_a_deeply_nested_settings_file(
     captured = capsys.readouterr()
     assert rc == 1, captured
     diags = json.loads(captured.out)
-    assert isinstance(diags, list) and any(
-        "could not load the service settings" in d["message"] for d in diags
-    )
+    assert isinstance(diags, list) and any(d["message"] == _FIXED_LINE for d in diags), diags
 
 
 def test_offline_env_check_and_read_name_one_dir_under_a_root(
@@ -879,7 +877,7 @@ def test_offline_env_prints_no_validator_text_for_settings_that_do_not_load(
     failure: str,
 ) -> None:
     # These three commands printed no settings failure before --env read values, so they print
-    # one fixed line naming the file, and no text of the failure.
+    # one fixed line that names no source and holds no text of the failure.
     rc, out = _settings_failure_output(
         command, tmp_path, monkeypatch, capsys, _QUOTING_FAILURES[failure]
     )
@@ -920,4 +918,27 @@ def test_offline_env_names_a_missing_settings_path_holding_a_credential_label_un
     out = captured.out + captured.err
     assert _shown(f"service config not found: {root / relative}", out), out
     assert "redacted" not in out, out
-    assert rc != 0 if command != "graph" else rc == 0, out
+    assert rc == (0 if command == "graph" else 1), out
+
+
+@pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
+def test_offline_env_a_directory_as_the_service_config_prints_the_fixed_line(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    # A directory passes the load's exists() guard and fails at the open, so it is not the
+    # not-found case: it prints the fixed line, which names no path (an open finding).
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    cwd = tmp_path / "cwd"
+    _values_file(cwd, "prod", f'peer_host = "{_SECRET_HOST}"\n')
+    named = tmp_path / "settings.toml"
+    named.mkdir()
+    monkeypatch.chdir(cwd)
+    argv = ["--config", str(cfg), "--service-config", str(named), "--env", "prod"]
+    rc = main(_offline_argv(command, tmp_path, *argv))
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert _FIXED_LINE in out and "Traceback" not in out, out
+    assert rc == (0 if command == "graph" else 1), out
