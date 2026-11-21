@@ -857,8 +857,9 @@ _QUOTING_FAILURES = {
 
 def _fixed_line(settings_file: Path) -> str:
     return (
-        f'could not load the service settings ("{settings_file.resolve()}"); this command does '
-        "not print the reason, because the error text can quote a configured value"
+        f'could not load the service settings (from "{settings_file.resolve()}", the MEFOR_* '
+        "environment and command-line values); this command does not print the reason, because "
+        "the error text can quote a configured value"
     )
 
 
@@ -898,7 +899,7 @@ def test_offline_env_prints_no_validator_text_for_settings_that_do_not_load(
 
 
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
-def test_offline_env_names_a_settings_path_holding_a_credential_label_as_it_is(
+def test_offline_env_names_a_settings_path_holding_a_credential_label_unscrubbed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
