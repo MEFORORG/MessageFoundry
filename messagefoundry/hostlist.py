@@ -4,10 +4,14 @@
 (BACKLOG #5915).
 
 One parse serves both sides of the rule. :mod:`messagefoundry.transports.egress` matches with it,
-and :mod:`messagefoundry.config.settings` refuses at load an entry it cannot read, so an entry that
-loads is one the matcher reads. A leaf module at the package root for that reason: the settings
-module may not import the transports package, which imports every connector. It imports nothing
-outside the standard library.
+and :mod:`messagefoundry.config.settings` refuses at load every entry it cannot read, so an entry
+that loads is one the matcher reads. The load refuses some entries the matcher does read as well,
+at least some URLs and paths, a host holding a character such as ``*``, ``,`` or a space, and a
+port outside 1 to 65535: :func:`allow_entry_problem` says which.
+
+A leaf module at the package root because one parse serves both: the settings module may not
+import the transports package, which imports every connector. It imports nothing outside the
+standard library.
 """
 
 from __future__ import annotations
@@ -113,10 +117,38 @@ def parse_allow_entry(entry: str) -> tuple[HostKey, str] | None:
 
 
 def _is_host_name(text: str) -> bool:
-    """True if ``text`` holds only what a host name holds: letters, combining marks, digits,
-    ``.``, ``-`` and ``_``. Any script passes, its marks included, so an internationalized name a
+    """True if ``text`` holds only characters in the Unicode categories L (letters), M (marks)
+    and N (numbers, not only ASCII digits: a superscript or a Roman numeral passes), and ``.``,
+    ``-`` and ``_``. Any script passes, its marks included, so an internationalized name a
     connection writes unencoded is still listed as written."""
     return all(unicodedata.category(char)[0] in "LMN" or char in "._-" for char in text)
+
+
+def _without_zone(text: str) -> str | None:
+    """``text`` with its one ``%zone`` cut out, or ``None`` when it holds no ``%``, more than one,
+    or a zone that, once stripped of blanks at either end, is empty or still holds a blank. The
+    zone runs from the ``%`` to the next ``]`` or ``:``, even inside brackets. A ``%`` after the
+    ``]`` is cut out too. An unbracketed address that holds a ``:`` comes back bracketed, so ``fe80::1%eth0:443``
+    is ``[fe80::1]:443``; :func:`parse_allow_entry` then judges the rest. Nothing here reads the
+    address itself."""
+    if text.count("%") != 1:
+        return None
+    head, _, tail = text.partition("%")
+    ends = [index for index in (tail.find("]"), tail.find(":")) if index != -1]
+    end = min(ends, default=len(tail))
+    zone, rest = tail[:end].strip(), tail[end:]
+    if not zone or any(char.isspace() for char in zone):
+        return None
+    if head.startswith("["):
+        return head + rest
+    address = head.strip()
+    return (f"[{address}]" if ":" in address else address) + rest
+
+
+_HOST_CHARACTER_REASON = (
+    "its host holds a character no host name does, such as '*', ',' or a space; list each host by "
+    "name, since no pattern is read"
+)
 
 
 def allow_entry_problem(entry: str) -> str | None:
@@ -131,20 +163,30 @@ def allow_entry_problem(entry: str) -> str | None:
         return "it is a URL or a path, not a host; list the host alone, with ':port' to pin a port"
     parsed = parse_allow_entry(text)
     if parsed is None:
-        if text.startswith("[") and "%" in text:
-            return "it carries a '%' zone id, which no host is matched with"
-        if not text.startswith("[") and text.count(":") > 1:
+        # A '%' suffix is named only where cutting it out leaves an entry whose host is an IP
+        # address, and a fault that bracketed entry has is named first. An unbracketed IPv6
+        # address is bracketed before that check, so its missing brackets are named only on the
+        # next load; told to write [v6] first, the operator would be refused for the zone then.
+        unzoned = _without_zone(text)
+        reread = parse_allow_entry(unzoned) if unzoned is not None else None
+        if unzoned is not None and reread is not None and not isinstance(reread[0], str):
+            return allow_entry_problem(unzoned) or (
+                "its address carries a '%' suffix, such as an IPv6 zone id, which no host is "
+                "matched with"
+            )
+        bracketed = text.startswith("[")
+        if not bracketed and text.count(":") > 1:
             return "it holds more than one ':' outside brackets; write an IPv6 address as [v6]"
+        if not bracketed and "%" in text.partition(":")[0]:
+            # A name holding '%', such as a percent-encoded one, is no zoned address.
+            return _HOST_CHARACTER_REASON
         return (
             "it is not 'host', 'host:port', '[v6]' or '[v6]:port': brackets hold an IPv6 address "
             "alone, and a ':' needs a port after it"
         )
     host, port = parsed
     if isinstance(host, str) and not _is_host_name(host):
-        return (
-            "its host holds a character no host name does, such as '*', ',' or a space; list "
-            "each host by name, since no pattern is read"
-        )
+        return _HOST_CHARACTER_REASON
     if port and not port_or_zero(port):
         return "its port is not a number from 1 to 65535"
     return None
