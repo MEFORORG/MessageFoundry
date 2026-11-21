@@ -1005,9 +1005,12 @@ class FileSource(SourceConnector):
         # Set by _candidates when this scan's listing failed, so the scan prunes no memory on it.
         self._listing_failed = False
         # The lstat the listing took of each remembered stuck reject this scan, so the fresh pass
-        # skips an unchanged one without a stat hop of its own (BACKLOG #5717). Refilled by each
-        # listing, so it holds no more than the stuck memory does.
+        # skips an unchanged one without a stat hop of its own (BACKLOG #5717). A fresh dict per
+        # scan, bound on the loop once the listing returns, so a listing thread a stop left behind
+        # writes only into its own scan's dict. It holds no more than the stuck memory does.
         self._listed_marks: dict[str, _FileMark] = {}
+        # The dict the next listing fills; _scan_once binds a fresh one before each listing.
+        self._marks_for_listing: dict[str, _FileMark] = {}
         # The cause of the last listing failure, or None when the last listing worked, so a WARNING
         # is written once per outage and again when its cause changes (_candidates).
         self._listing_down: tuple[object, ...] | None = None
@@ -1315,7 +1318,10 @@ class FileSource(SourceConnector):
             0  # #142: files marked processed THIS tick — gates a single end-of-tick prune
         )
         self._listing_failed = False
+        marks: dict[str, _FileMark] = {}
+        self._marks_for_listing = marks
         candidates = await self._run_fs(self._candidates)
+        self._listed_marks = marks
         if (self._settle_seen or self._refused or self._stuck) and not self._listing_failed:
             # A listing that failed lists nothing, which is no evidence a file has gone (#5717).
             listed = {str(p) for p in candidates}
@@ -2020,7 +2026,7 @@ class FileSource(SourceConnector):
         count the ceiling's log line carries. Not folded in here: it changes what the screens mean
         for the ceiling's budget, and this method's contract is worth keeping simple."""
         globber = self.directory.rglob if self.recursive else self.directory.glob
-        self._listed_marks = {}
+        marks = self._marks_for_listing  # read once: this listing's own dict (BACKLOG #5717)
         try:
             matched = list(globber(self.pattern))
             if not matched and (self.recursive or glob.has_magic(self.pattern)):
@@ -2064,7 +2070,7 @@ class FileSource(SourceConnector):
             for p in matched
             if self.processed_dir not in p.parents
             and self.error_dir not in p.parents
-            and self._listable(p)
+            and self._listable(p, marks)
         ]
         # Decorate-sort-undecorate under `sort="mtime"`: the min-age filter and the sort key are the
         # SAME stat, and reading it twice per candidate doubled the syscalls on the one path that
@@ -2085,7 +2091,7 @@ class FileSource(SourceConnector):
         files.sort(key=lambda p: p.name)
         return files
 
-    def _listable(self, path: Path) -> bool:
+    def _listable(self, path: Path, marks: dict[str, _FileMark] | None = None) -> bool:
         """Whether a listed name is a candidate, judged without following a link at that name
         (BACKLOG #2535).
 
@@ -2104,8 +2110,9 @@ class FileSource(SourceConnector):
         if stat.S_ISLNK(st.st_mode) or _names_another_path(st):
             return not getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_DIRECTORY
         regular = stat.S_ISREG(st.st_mode)
-        if regular and str(path) in self._stuck:
-            self._listed_marks[str(path)] = _mark_of(st)
+        if regular and marks is not None and str(path) in self._stuck:
+            # The mark of a remembered reject, for the fresh pass (BACKLOG #5717).
+            marks[str(path)] = _mark_of(st)
         return regular
 
     def _read_settled(self, path: Path) -> tuple[bytes, _FileSig, _FileId]:
