@@ -1376,13 +1376,16 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # item 4). In ``postgres://svc:Kv9x@Zq7;w@db`` the narrow pass writes ``svc:<placeholder>@`` and the
 # run after it stops at the ";", so ``Zq7;w`` printed. Where the match so far ends in a bracket or
 # angle and its "@", which with a user only the placeholder alternative of the first segment can
-# give, since the run holds no bracket or angle, the match goes on over runs joined by ";" and ending
-# at an "@", each run holding none of the run's stops nor ".", ":", "=" or "@". So a host, a port
-# and a ``key=`` member are never in it, and ``smtp://ops:pw@mail.local:587;alerts@corp`` keeps its
-# host. The rule sits on the user's alternative only, so an empty user's match never takes it, and
-# the declined ";" lines above, each with an empty user, read as before. The cost: a host with no "."
-# or ":" before a ";" and a later "@", as in ``smtp://ops:pw@mail;alerts@corp``, is hidden with the
-# password; and a tail holding ".", ":" or "=", or reached after a further "@" with no ";" before
+# give, since the run holds no bracket or angle, the match goes on over every following group that
+# ends at an "@" and holds only ";" and characters outside the run's stops and ".", ":", "=" and
+# "@". A group may hold several ";", lead or end with one, or hold none, and all such groups are
+# taken at once, so a second redaction of the output finds none left to take and reads it as the
+# first left it. A group holding a ".", a ":" or a ``key=`` member is not taken, so
+# ``smtp://ops:pw@mail.local:587;alerts@corp`` keeps its host, which the declined ";" reading named
+# wrongly. The rule sits on the user's alternative only, so an empty user's match never takes it,
+# and the declined camelCase lines above, each with an empty user, read as before. The cost: a host
+# with no "." or ":" before a later "@", as in ``smtp://ops:pw@mail;alerts@corp``, is hidden with
+# the password. What it leaves, at least: a group holding ".", ":" or "=", and every group after
 # it, prints, as it did before.
 # Without the user the pattern reads ``ws://:8765?accessToken=Tail@Tok`` as a password-only DSN, and
 # a review measured the token's tail print where the old pattern, matching nothing, left the query
@@ -1408,9 +1411,9 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # CLASSES OVERLAP. Backtracking into it
 # would try every split of a run that reaches no "@", which is quadratic; possessive, it gives
 # nothing back, so the run after it is the only walk and backs off to its last "@". Written flat,
-# not as a repeated "@"-led group, so no quantifier nests under another, except in the ";"-split
-# tail after a user's placeholder: there each repeat opens with a ";" its runs refuse and each run
-# is possessive, so the repeats tile the text and none can split another. The static ReDoS gate in
+# not as a repeated "@"-led group, so no quantifier nests under another, except in the tail after
+# a user's placeholder: there each repeat is a possessive run that refuses "@", then an "@", so the
+# repeats tile the text and none can split another. The static ReDoS gate in
 # ``tests/test_security_static.py`` DOES NOT SCAN this pattern: it splices ``_DSN_RUN_STOP`` below,
 # so that gate lists it among the patterns it cannot resolve, and the shape is held by inspection,
 # stated there. The growth is held by a stopwatch, against a backtracking control, in
@@ -1452,23 +1455,22 @@ _DSN_RUN_STOP = (
 )
 _DSN_USER_FIRST_SEGMENT = r"(?>\[[a-z]+\]|<[a-z]+>|(?:" + _DSN_RUN_STOP + r"[^\s/@<>\[\]])++)"
 _DSN_RUN = r"(?:" + _DSN_RUN_STOP + r"[^\s/;?#&,()|^~{}<>\[\]%\x27\x22])*@"
-# One character of a ";"-split tail after a user's placeholder (BACKLOG #5386, the
-# ``svc:Kv9x@Zq7;w@db`` shape): the run's class without ".", ":", "=" or "@", so a host, a port or a
-# ``key=`` member is never part of it. The comment above says why.
-_DSN_TAIL_CHAR = r"(?:" + _DSN_RUN_STOP + r"[^\s/;?#&,()|^~{}<>\[\]%\x27\x22.:=@])"
+# One character of a tail group after a user's placeholder (BACKLOG #5386, the
+# ``svc:Kv9x@Zq7;w@db`` shape): a ";", or a character of the run's class but ".", ":", "=" or "@",
+# so a group holding a host's dot, a port or a ``key=`` member is not taken. The comment above says
+# why.
+_DSN_TAIL_CHAR = r"(?:;|" + _DSN_RUN_STOP + r"[^\s/;?#&,()|^~{}<>\[\]%\x27\x22.:=@])"
 _WIDE_DSN_PASSWORD = re.compile(
     r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):"
-    r"(?:(?<=//:)(?:" + _DSN_RUN_STOP + r"(?:[^\s/@?#&=;,()|^~{}<>\[\]%\x27\x22]|%(?!7c|7e|5e|26|"
-    r"2c|3b|3f|23|27|22|28|29)|\[(?![a-z]+\])|\]))*+"
+    r"(?:(?<=//:)(?:" + _DSN_RUN_STOP + r"(?:[^\s/@?#&=;,()|^~{}<>\[%\x27\x22]|%(?!7c|7e|5e|26|"
+    r"2c|3b|3f|23|27|22|28|29)|\[(?![a-z]+\])))*+"
     + _DSN_RUN
     + r"|(?<!//:)"
     + _DSN_USER_FIRST_SEGMENT
     + _DSN_RUN
-    + r"(?:(?<=[>\]]@)"
+    + r"(?:(?<=[>\]]@)(?:"
     + _DSN_TAIL_CHAR
-    + r"++(?:;"
-    + _DSN_TAIL_CHAR
-    + r"++)++@)?)"
+    + r"++@)++)?)"
 )
 
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG

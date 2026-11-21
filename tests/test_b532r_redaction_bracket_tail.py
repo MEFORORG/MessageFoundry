@@ -42,7 +42,28 @@ _NOW_HIDDEN = (
         "postgres://svc:",
     ),
     ("connect postgres://svc:Kv9x@Zq7;w;Mx4@db failed", ("Kv9x", "Zq7", "Mx4"), "@db failed"),
+    ("connect postgres://svc:Kv9x@;Wq4@db failed", ("Kv9x", "Wq4"), "@db failed"),
+    ("connect postgres://svc:Kv9x@Zq7;;Wq4@db failed", ("Zq7", "Wq4"), "@db failed"),
+    ("connect postgres://svc:Kv9x@Zq7;Wq4;@db failed", ("Zq7", "Wq4"), "@db failed"),
+    ("connect postgres://svc:Kv9@Aa1;Bb2@Cc3;Dd4@h2 failed", ("Aa1", "Bb2", "Cc3", "Dd4"), "@h2"),
 )
+
+
+#: Lines whose first redaction a second one must leave as it is, so the bundle of a chain line
+#: matches the chain line.
+_TWICE = (
+    "connect postgres://svc:Kv9@a;b@h1;u2@h2 failed",
+    "connect postgres://svc:Kv9x@Zq7;w@db.example.invalid/x failed",
+    "connect postgres://svc:Kv9x@Zq7;w@mail.local:587;x@corp failed",
+)
+
+
+@pytest.mark.parametrize("line", _TWICE)
+def test_a_second_redaction_leaves_the_tail_rules_output_as_it_is(line: str) -> None:
+    once = scrub_credentials(line)
+    assert scrub_credentials(once) == once, once
+    chain = scrub_log_text(line)
+    assert redact_log_line(chain) == chain.replace(CREDENTIAL_PLACEHOLDER, REDACTION_PLACEHOLDER)
 
 
 @pytest.mark.parametrize("call", _ENTRY_POINTS, ids=_IDS)
