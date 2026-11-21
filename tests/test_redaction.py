@@ -3164,17 +3164,22 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     assert secretscrub._DSN_PASSWORD.pattern.replace(")", "").endswith(url_arm)
     # The widened reading (BACKLOG #5386) has no arm. With a user, its first segment takes one
     # character or more, each of them in the arm's class, and past it the pattern adds only a run
-    # that cannot hold whitespace or "/", then the "@": so every text it rewrites with a user, the
-    # arm reads.
+    # that cannot hold whitespace or "/", then the "@", and after a placeholder an optional
+    # ";"-split tail that cannot hold either, then an "@": so every text it rewrites with a user,
+    # the arm reads.
     wide = secretscrub._WIDE_DSN_PASSWORD.pattern
     assert r"://[^\s:/@]*):" in wide
     first = secretscrub._DSN_USER_FIRST_SEGMENT
     assert first == (
         r"(?>\[[a-z]+\]|<[a-z]+>|(?:" + secretscrub._DSN_RUN_STOP + r"[^\s/@<>\[\]])++)"
     )
-    tail = wide.split(r"(?<!//:)" + first + ")", 1)[1]
     run_head = "(?:" + secretscrub._DSN_RUN_STOP + r"[^\s/"
-    assert tail.startswith(run_head) and tail.endswith("])*@"), tail
+    run = secretscrub._DSN_RUN
+    assert run.startswith(run_head) and run.endswith("])*@"), run
+    tail_char = secretscrub._DSN_TAIL_CHAR
+    assert tail_char.startswith(run_head) and tail_char.endswith("])"), tail_char
+    tail = wide.split(r"(?<!//:)" + first, 1)[1]
+    assert tail == (run + r"(?:(?<=[>\]]@)" + tail_char + "++(?:;" + tail_char + "++)++@)?)"), tail
 
 
 def test_an_empty_user_dsn_does_not_switch_the_encoded_run_off() -> None:
