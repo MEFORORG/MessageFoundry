@@ -627,6 +627,8 @@ class _GroupCommitter:
 
     def start(self) -> None:
         if self._task is None:
+            # A committer that stopped marked itself closed (see _run); a new task reopens it.
+            self._closed = False
             self._task = asyncio.create_task(self._run(), name="store-group-committer")
 
     async def aclose(self) -> None:
@@ -635,13 +637,18 @@ class _GroupCommitter:
         self._wake.set()
         if self._task is not None:
             task = self._task
+            current = asyncio.current_task()
+            baseline = current.cancelling() if current is not None else 0
             try:
                 await task
             except asyncio.CancelledError:
                 # A committer cancelled earlier has already rejected its members (see _run); that
-                # stale cancel must not abort the store's close. Our OWN cancellation still propagates.
-                current = asyncio.current_task()
-                if not task.cancelled() or (current is not None and current.cancelling()):
+                # stale cancel must not abort the store's close. A cancel of OUR task during the
+                # await still propagates; the baseline keeps a caller that already caught an
+                # earlier cancel of its own from reading as cancelled now.
+                if not task.cancelled() or (
+                    current is not None and current.cancelling() > baseline
+                ):
                     raise
             self._task = None
 
@@ -678,7 +685,9 @@ class _GroupCommitter:
             self._closed = True
             stranded, self._pending = self._pending, []
             for member in stranded:
-                if not member.future.done():
+                # A future whose loop is already closed (the coroutine closed at teardown) has no
+                # caller left to wake, and set_exception would raise there.
+                if not member.future.done() and not member.future.get_loop().is_closed():
                     member.future.set_exception(RuntimeError("group committer stopped"))
 
     async def _drain_loop(self) -> None:

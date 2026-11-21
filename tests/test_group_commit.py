@@ -28,6 +28,7 @@ listener→worker path is unaffected because the API is byte-identical with the 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 from pathlib import Path
 from typing import Any
@@ -712,6 +713,28 @@ async def test_committer_cancelled_while_parked_rejects_pending_and_closes(tmp_p
             await gc.submit(lambda: _ret(1))
     finally:
         await s.close()
+
+
+async def test_close_after_a_cancelled_committer_survives_a_caught_cancel(tmp_path: Path) -> None:
+    """The store's close must finish when the committer was cancelled earlier, even from a caller
+    that had already caught a cancel of its own (as Engine.stop does before closing the store)."""
+    s = await MessageStore.open(tmp_path / "late.db", group_commit_window_ms=GC_WINDOW_MS)
+    gc = s._group_commit
+    assert gc is not None and gc._task is not None
+    gc._task.cancel()
+    await asyncio.gather(gc._task, return_exceptions=True)
+
+    async def _stopper() -> None:
+        # Caught, not uncancelled: cancelling() stays at 1.
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.Event().wait()
+        await s.close()
+
+    stopper = asyncio.create_task(_stopper())
+    await asyncio.sleep(0)
+    stopper.cancel()
+    await asyncio.wait_for(stopper, timeout=10.0)  # close raised nothing
+    assert s._read_conns == []
 
 
 async def test_committer_cancelled_mid_flush_rejects_members_beyond_the_batch(
