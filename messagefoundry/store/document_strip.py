@@ -103,8 +103,11 @@ OUTAGE_MIN_ROWS = 3
 #: on every pass, each seal counting toward the AES-GCM invocation ceiling, and logged one ERROR per
 #: batch. A write that lands resets the count, so fewer failing batches in a row than this, two at
 #: the head of the keyset say, cannot stop the rows after them. The trade-off is accepted: this many
-#: failing in a row at the head of the keyset, a long lock on its oldest rows say, stop every pass at
-#: the same place while the fault lasts, as a failed batch read does.
+#: failing in a row at the head of the keyset stop every pass at the same place while the fault
+#: lasts, as a failed batch read does. That is a long lock on the oldest rows, say, and also a fault
+#: that never clears on its own, a corrupt page or a constraint those rows always trip, which then
+#: holds every younger row unstripped until it is repaired; each pass logs its ERROR lines and the
+#: early-end WARNING.
 WRITE_FAULT_MAX_BATCHES = 3
 
 
@@ -307,9 +310,10 @@ async def run_strip_pass(
                             type(exc).__name__,
                         )
                         log.debug("document strip batch write failure", exc_info=True)
-                        if failed_writes_in_a_row >= WRITE_FAULT_MAX_BATCHES:
+                        if failed_writes_in_a_row >= WRITE_FAULT_MAX_BATCHES and len(rows) == limit:
                             # A store-wide write fault, which every later batch would meet too:
                             # end the call rather than re-seal the rest of the store for nothing.
+                            # Not on a short batch: that was the last, so the scan reached its end.
                             ended_early = True
                             _log_early_end(
                                 f"{failed_writes_in_a_row} batch writes in a row failed",

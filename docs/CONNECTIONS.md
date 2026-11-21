@@ -3333,10 +3333,11 @@ a `subjectAltName` value, any of which can identify a patient's provider.
 anything is built or dialled, when the `recipient_cert` or the `signing_cert` is outside its window, or when
 every issuing `trust_anchor` is. A partner's verifier refuses a signature made under an out-of-window
 `signing_cert`, after the relay has accepted the message. A bundle may hold an older copy of a CA beside its
-renewal under the same name and key, and any one of them inside its window will do. For the `recipient_cert`
-and the anchors, a `notBefore` up to five minutes ahead of this host's clock still counts as valid, so a
-certificate a CA issued moments ago is not refused for a small clock difference. The `signing_cert` gets no
-such allowance, because the partner judges it on the partner's clock. No allowance is given past `notAfter`.
+renewal under the same name and key, and any one of them inside its window will do. A `notBefore` up to five
+minutes ahead of this host's clock still counts as valid, so a certificate a CA issued moments ago is not
+refused for a small clock difference. That holds for the `signing_cert` too, though its partner verifies it on
+the partner's own clock: a partner as far behind the CA can still refuse a signature made in those minutes.
+No allowance is given past `notAfter`.
 
 Either bound is a permanent `NegativeAckError` marked as a configuration fault, with code
 `direct-cert-validity:<setting>:expired` or `direct-cert-validity:<setting>:not-yet-valid`, `<setting>` being
@@ -5115,7 +5116,7 @@ reading this page already applies to a file the scan never opened.
 | DICOM C-STORE SCP (inbound) | `max_associations` default 10; `max_pdu_size` 16384; `max_object_bytes` 128 MiB, capped at the engine's 16 MiB binary ingress ceiling | over the association cap pynetdicom rejects the association; `max_pdu_size` is the fragment size the SCP offers, not a limit on an object, so `max_object_bytes` is charged against the raw received Data Set **before** it is decoded — and so before the durable commit. A PDU longer than `max_pdu_size`, or an object past twice the effective `max_object_bytes`, aborts the association | the modality re-sends; nothing is half-committed |
 | DICOM C-STORE SCU / C-ECHO | one association per delivery, bounded by the lane budget | the association request fails on `connect_timeout` | out-of-resources status → retry; a hard refusal → dead-letter; an object over 32 MiB whose store ends with no response three times in a row → dead-letter, whatever `RetryPolicy` says (vault BACKLOG #4908) |
 | EMAIL (SMTP) destination | one SMTP connection per send, bounded by the lane budget | the relay's own limit surfaces as an SMTP error | transient → retry; permanent → dead-letter |
-| DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL, plus the send-time certificate check: a `recipient_cert` or issuing `trust_anchor` outside its validity window is a configuration fault (`direct-cert-validity:<setting>:expired` or `:not-yet-valid`) that stops the lane and keeps the queue under the default `credential_fault_policy` |
+| DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL, plus the send-time certificate check: a `recipient_cert`, issuing `trust_anchor` or `signing_cert` outside its validity window is a configuration fault (`direct-cert-validity:<setting>:expired` or `:not-yet-valid`) that stops the lane and keeps the queue under the default `credential_fault_policy` |
 | DATABASE destination / poll source / `db_lookup` | `pool_max` default 5 connections per connection definition; the poll source additionally fetches at most `poll_max_rows` (500) rows per poll, [deferring the rest](#per-tick-poll-ceilings); a `db_lookup` call fetches at most `max_rows` (500) plus one, and [refuses a larger result](#a-lookup-that-selects-too-many-rows-fails-the-message) | a borrow that cannot be satisfied within `acquire_timeout` (default 30 s) fails **transiently** with a PHI-free "pool exhausted or DB unresponsive" error | the row re-queues into the `RetryPolicy` path; the pool self-heals as borrows return |
 | Reference-set sync (`DatabaseRef`) | `pool_max` default 5, in a **throwaway pool built per sync** | a borrow that cannot be satisfied within `DatabaseRef(acquire_timeout=…)` (default 30 s) raises `StoreAcquireTimeout`, failing that set's sync | the sync task is isolated per reference set; the previous snapshot keeps serving reads and the AlertSink fires. The bound also keeps one wedged source from stalling the sequential pass over the other sets |
 | Internal sources — Timer / Loopback / PassThrough | n/a — they open no socket and reach no external system | n/a | n/a |

@@ -2666,15 +2666,27 @@ def test_a_version_1_cert_carrying_ca_false_is_still_refused_as_an_anchor(
     assert "not a CA certificate" in _refusal(pki, **files)
 
 
-async def test_a_signing_cert_gets_no_not_before_allowance(
-    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], tmp_path: Path
+@pytest.mark.parametrize(
+    "ahead, refused",
+    [(datetime.timedelta(minutes=2), False), (datetime.timedelta(minutes=10), True)],
+    ids=["inside-the-allowance", "past-the-allowance"],
+)
+async def test_a_signing_cert_takes_the_same_not_before_allowance(
+    monkeypatch: pytest.MonkeyPatch,
+    pki: dict[str, Any],
+    tmp_path: Path,
+    ahead: datetime.timedelta,
+    refused: bool,
 ) -> None:
-    # The partner judges the signer on its own clock, so a signer two minutes early is refused
-    # even though a recipient two minutes early is not.
+    # A freshly renewed signer on a host a little behind the CA must not stop the lane.
     _install_fake(monkeypatch)
-    overrides = _signer(pki, tmp_path, "signer_early", valid_from=datetime.timedelta(minutes=2))
+    overrides = _signer(pki, tmp_path, "signer_early", valid_from=ahead)
     d = DirectDestination(_dest(pki, **overrides))
-    with pytest.raises(NegativeAckError) as caught:
+    if refused:
+        with pytest.raises(NegativeAckError) as caught:
+            await d.send(_SYNTHETIC_HL7)
+        assert caught.value.code == "direct-cert-validity:signing_cert:not-yet-valid"
+        assert _FakeSMTP.instances == []
+    else:
         await d.send(_SYNTHETIC_HL7)
-    assert caught.value.code == "direct-cert-validity:signing_cert:not-yet-valid"
-    assert _FakeSMTP.instances == []
+        assert len(_FakeSMTP.instances) == 1

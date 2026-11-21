@@ -954,6 +954,11 @@ from typing import Any
 #: Re-derived with ``--write`` on the branch, from ``92b8db415d6730cc`` to ``0c684e8deb86b688``,
 #: and over the merge with BACKLOG #5931 above, from ``fb220e2a1ada115e`` to ``0cb66e183386b7c8``.
 #:
+#: BACKLOG #5646: the console's ``require_ui`` takes ``step_up_new_address``, and the five step-up
+#: factories hand it their new-address question, so a refused request spends no budget. The
+#: snapshot hashes those gates' bodies and closures, so the digest moved. No engine surface
+#: changed. Re-derived with ``--write``, from ``0cb66e183386b7c8`` to ``3ada6b29fc47e480``.
+#:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
 #: proof is that commit 40a4d5d9 added a REQUIRED ``UploadedFileList.scope`` field the console renders

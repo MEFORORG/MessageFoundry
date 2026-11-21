@@ -674,9 +674,11 @@ def require_ui(
         # Vault BACKLOG #2620: require_phi_read's and require_paced's new-address refusal on this
         # plane, asked once for a PHI read or a write. After provenance, so a cross-site page cannot
         # make the engine write an audit row or send a notice; before both charges below, so a
-        # refused request spends nothing. Not for a must-change session: /ui/reauth sends it back to
-        # its confinement page, so a refusal would loop. Such a session reaches this point only on
-        # the password page, whose JSON twin /me/password is neither paced nor asked.
+        # refused request spends nothing. The plain branch skips a must-change session: /ui/reauth
+        # sends it back to its confinement page, so a refusal would loop. Such a session reaches
+        # that branch only on the password page, whose JSON twin /me/password is neither paced nor
+        # asked. The step-up branch asks it, as the factories always did; a must-change session
+        # reaches it only on an enrol-first route (ENROL_FIRST_UI_ROUTES).
         if step_up_new_address is not None:
             # A step-up factory's own question (BACKLOG #5646): on every request, with no
             # must-change skip, as each factory asked it before it moved here. The continuation is

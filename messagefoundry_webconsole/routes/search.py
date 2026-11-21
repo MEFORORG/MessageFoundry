@@ -47,12 +47,15 @@ register_ui_action(
 )
 # The layered run (ADR 0136) is likewise a step-up-gated GET that composes + decrypts; register it as
 # an UNLOCK form too. Its query carries only preset IDS (never the PHI needle — that's server-composed
-# from the encrypted column), so the deliberate-drop posture is preserved. The pattern is
-# query-tolerant and a refusal carries the query (:func:`_layered_continuation`, BACKLOG #5646): the
-# run's whole input is ``?presets=``, so a continuation without it landed on the run's 400.
+# from the encrypted column), so the deliberate-drop posture is preserved. The pattern admits a
+# query of ``presets`` parameters and nothing else, and a refusal carries that query
+# (:func:`_layered_continuation`, BACKLOG #5646): the run's whole input is ``?presets=``, so a
+# continuation without it landed on the run's 400. Any other parameter fails the pattern, so its
+# continuation is the search form. The handler still caps the layers and reads only the caller's
+# own presets.
 _SEARCH = "/ui/messages/search"
 register_ui_action(
-    r"^/ui/messages/search/layered(\?[^#]*)?$",
+    r"^/ui/messages/search/layered(\?presets=[^&#]*(&presets=[^&#]*)*)?$",
     Permission.MESSAGES_READ,
     auto_retry=False,
     unlock=True,

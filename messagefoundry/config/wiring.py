@@ -4646,7 +4646,7 @@ def Direct(
     anchor that is not a CA (a version 1 anchor with no extensions excepted), a ``recipient_cert`` that is itself
     a CA unless pinned as its own anchor, a ``recipient_cert`` whose keyUsage or extendedKeyUsage
     rules out S/MIME encryption, and one that does not name every address in ``recipients`` in its
-    subjectAltName. The full list is under *Recipient trust* in ``docs/CONNECTIONS.md``.
+    subjectAltName. *Recipient trust* in ``docs/CONNECTIONS.md`` lists what it refuses, at least.
 
     **The relay's TLS certificate is verified** (``tls_verify=True``, #323 — ``smtplib``'s own default
     verifies nothing). Note the two trust settings are unrelated and easy to confuse: ``trust_anchor``

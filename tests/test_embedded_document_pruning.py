@@ -1522,3 +1522,19 @@ async def test_a_failed_server_fixture_setup_closes_and_raises_the_setup_error(
         await opener(None)
     assert fake.close_calls == 1
     assert any("CLOSE-FAILED" in r.getMessage() for r in caplog.records)
+
+
+async def test_the_breaker_does_not_trip_on_the_last_batch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A third failed write on a short, last batch: the scan did reach its end, so the call does
+    not report an early end, and a retention pass goes on to its other thresholds."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 2)
+    writes: list[int] = []
+
+    async def read_only(updates: Any) -> list[Any]:
+        writes.append(len(updates))
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    result = await _run_pass(_keyset_fetch(_plain_rows(5)), read_only, _no_report)
+
+    assert writes == [2, 2, 1]
+    assert result == StripResult(write_failed=True)

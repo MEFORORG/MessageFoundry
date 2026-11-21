@@ -228,3 +228,21 @@ async def test_every_search_route_is_covered(engine: Engine) -> None:
     # The control: the walk found the routes it exists for, so an empty set is not a pass.
     assert (SEARCH, "GET") in mounted, mounted
     assert mounted == covered, mounted ^ covered
+
+
+@pytest.mark.parametrize(
+    ("target", "admitted"),
+    [
+        (SEARCH + "/layered", True),
+        (SEARCH + "/layered?presets=a", True),
+        (SEARCH + "/layered?presets=a&presets=b", True),
+        (SEARCH + "/layered?presets=a&other=1", False),
+        (SEARCH + "/layered?other=1", False),
+    ],
+)
+def test_the_layered_continuation_admits_only_presets(target: str, admitted: bool) -> None:
+    """The layered unlock pattern takes the run's ``presets`` query and nothing else (BACKLOG
+    #5646), so a continuation carrying any other parameter is not one /ui/reauth will follow."""
+    from messagefoundry_webconsole._auth import is_unlock_action
+
+    assert is_unlock_action(target) is admitted

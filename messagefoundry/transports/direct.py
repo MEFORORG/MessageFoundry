@@ -342,20 +342,19 @@ def _same_name_and_key(a: x509.Certificate, b: x509.Certificate) -> bool:
 #: (BACKLOG #5631). A partner's CA stamps notBefore from its own clock, so a certificate issued
 #: moments ago would otherwise read as not yet valid on a host whose clock is a little behind. Only
 #: notBefore takes it: an allowance on notAfter would extend trust in a certificate past its expiry.
-#: The signing cert takes none: the partner's verifier judges it on the partner's clock, so an
-#: allowance here would let a send go out that the partner then refuses.
+#: The signing cert takes it too, for the same reason. Its partner verifies it on the partner's own
+#: clock, so a partner whose clock lags the CA's as this host's does can still refuse a signature
+#: made in those minutes. Without it, a host a little behind the CA stops the lane on a freshly
+#: renewed signing cert, and the lane stays stopped until an operator starts it again.
 _NOT_BEFORE_SKEW = datetime.timedelta(minutes=5)
 
 
 def _window_problem(
-    cert: x509.Certificate,
-    setting: str,
-    now: datetime.datetime,
-    skew: datetime.timedelta = _NOT_BEFORE_SKEW,
+    cert: x509.Certificate, setting: str, now: datetime.datetime
 ) -> _WindowProblem | None:
-    """Why ``cert`` is outside its validity window at ``now``, or None. A notBefore up to ``skew``
-    ahead of ``now`` is allowed."""
-    if now + skew < cert.not_valid_before_utc:
+    """Why ``cert`` is outside its validity window at ``now``, or None. A notBefore up to
+    :data:`_NOT_BEFORE_SKEW` ahead of ``now`` is allowed."""
+    if now + _NOT_BEFORE_SKEW < cert.not_valid_before_utc:
         return _WindowProblem(setting, expired=False)
     if now > cert.not_valid_after_utc:
         return _WindowProblem(setting, expired=True)
@@ -394,7 +393,7 @@ def _validity_refusal(
         for p in (
             _window_problem(recipient, "recipient_cert", now),
             anchor_problem,
-            _window_problem(signer, "signing_cert", now, skew=datetime.timedelta(0)),
+            _window_problem(signer, "signing_cert", now),
         )
         if p
     ]
