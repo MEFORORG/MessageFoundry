@@ -407,3 +407,12 @@ async def test_on_a_keyless_store_a_name_written_outside_the_store_is_exempt(
     held, stored = await service.custom_role_stored_name(role.id)
     assert (held, stored) == (True, "Administrator")
     assert custom_role_name_refusal("Administrator", stored) is None
+
+
+def test_the_literal_pattern_agrees_with_the_shared_one() -> None:
+    """``auth_models._PRINTABLE_NAME`` spells ``validation.PRINTABLE_TEXT_PATTERN`` as a literal so
+    the ReDoS scan can read it; the two must be the same pattern."""
+    from messagefoundry.api import auth_models
+    from messagefoundry.api.validation import PRINTABLE_TEXT_PATTERN
+
+    assert auth_models._PRINTABLE_NAME.pattern == PRINTABLE_TEXT_PATTERN

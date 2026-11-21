@@ -20,7 +20,6 @@ from pydantic import AfterValidator, BaseModel, Field
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
     MAX_MAP_ENTRIES,
-    PRINTABLE_TEXT_PATTERN,
     ChannelScopeEntry,
     PermissionId,
     RoleId,
@@ -288,6 +287,11 @@ _BIDI_CONTROLS = (
     | frozenset({0x061C, 0x200E, 0x200F})
 )
 
+#: :data:`~messagefoundry.api.validation.PRINTABLE_TEXT_PATTERN` (C0, DEL and C1 refused), spelled
+#: as a literal here because tests/test_security_static.py's ReDoS scan reads a pattern per file
+#: and cannot resolve an imported constant. tests/test_auth_name_rule.py pins that the two agree.
+_PRINTABLE_NAME = re.compile(r"^[^\x00-\x1f\x7f-\x9f]+$")
+
 #: What a browser reads a NUL in an HTML attribute as.
 _REPLACEMENT_CHARACTER = chr(0xFFFD)
 
@@ -308,7 +312,7 @@ def name_refusal(name: str) -> str | None:
     echoes the value."""
     if not "".join(c for c in name if not renders_as_nothing(c)).strip():
         return "must not be blank"
-    if re.fullmatch(PRINTABLE_TEXT_PATTERN, name) is None or any(
+    if _PRINTABLE_NAME.fullmatch(name) is None or any(
         unicodedata.category(c) in ("Zl", "Zp") or ord(c) in _BIDI_CONTROLS for c in name
     ):
         return "must not contain a control, line separator or bidirectional control character"
