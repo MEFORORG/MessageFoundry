@@ -339,10 +339,9 @@ _ROLE_READERS = frozenset(
 _LOADERS: dict[str, frozenset[str]] = {
     "_load_role": frozenset({"get_role"}),
     "_load_custom_roles": frozenset({"list_roles"}),
-    # Unchecked, for two callers: _custom_role_held lets only a bool out, and
-    # custom_role_stored_name only the name, which the name rule's exemption compares (BACKLOG
-    # #5785); neither acts on the row's authority.
-    "_held_custom_role_row": frozenset({"get_role"}),
+    # Unchecked: only the name leaves it, which the name rule's exemption compares (BACKLOG
+    # #5785), and _custom_role_held turns into a bool, an existence question.
+    "custom_role_stored_name": frozenset({"get_role"}),
     # Also an existence question (BACKLOG #5968): only the role ids leave it, to tell which
     # requested custom ids a failed role write no longer finds; no row's content is acted on.
     "_role_write_refusal": frozenset({"list_roles"}),

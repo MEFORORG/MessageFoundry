@@ -13787,7 +13787,7 @@ class AuthService:
 
     async def _load_role(self, role_id: str) -> RoleRow | None:
         """The ``roles`` row ``role_id`` names, its integrity seal checked, or ``None``. With
-        :meth:`_load_custom_roles`, :meth:`_held_custom_role_row`, :meth:`_role_write_refusal`
+        :meth:`_load_custom_roles`, :meth:`custom_role_stored_name`, :meth:`_role_write_refusal`
         and :meth:`_sealed_ad_map`, the ONLY callers of the store's role and AD role-map readers
         in this service; ``tests/test_role_seal.py`` holds that. A row that fails is reported and read as absent, so
         it grants nothing."""
@@ -13827,20 +13827,8 @@ class AuthService:
         compares in its database collation (SQL Server) finds the stored row from at least a case
         or trailing-space variant too, and a collation may fold more. A variant is not the role: a
         save under it would seal the stored row under another id, and the SQL Server delete
-        refuses it."""
-        return await self._held_custom_role_row(role_id) is not None
-
-    async def _held_custom_role_row(self, role_id: str) -> RoleRow | None:
-        """The ``roles`` row :meth:`_custom_role_held` answers yes for, its seal NOT checked, or
-        ``None`` when it answers no. Two callers read it: :meth:`_custom_role_held`, which lets
-        only a ``bool`` out, and :meth:`custom_role_stored_name`, which lets out the name alone,
-        for a comparison."""
-        if not is_custom_role_id(role_id):
-            return None
-        found = await self._store.get_role(role_id)
-        if found is None or str(found["id"]) != role_id or bool(found["builtin"]):
-            return None
-        return RoleRow.from_mapping(found)
+        refuses it. The test is :meth:`custom_role_stored_name`'s, which reads the row."""
+        return await self.custom_role_stored_name(role_id) is not None
 
     async def _role_seal_failed(self, role_id: str) -> None:
         """Report a custom role whose row failed its integrity seal (BACKLOG #2592), through
@@ -20814,18 +20802,23 @@ class AuthService:
 
     async def custom_role_stored_name(self, role_id: str) -> str | None:
         """The display name the custom role row holding ``role_id`` stores, or ``None`` when no
-        custom role row holds that id (:meth:`_custom_role_held`'s test). The API's name rule
-        exempts a save that re-sends this name (BACKLOG #5785), so a role stored under a name the
-        rule refuses can still have its permissions edited, as before the rule existed.
+        custom role row holds that id: a custom role id, a row whose id equals it exactly, and
+        whose ``builtin`` column is not set (:meth:`_custom_role_held` says why). The API's name
+        rule exempts a save that re-sends this name (BACKLOG #5785), so a role stored under a name
+        the rule refuses can still have its permissions edited, as before the rule existed.
 
         Its seal is NOT checked, on purpose. A save writes the whole row and seals it, whatever the
         row held, and never checked this row's seal before the rule; a check here would add one,
         and with it the log lines a Vault transit Outage brings and a refusal the save never gave.
         So a name written outside the store is exempt like any other, and saving it re-seals it,
-        as such a save did before the rule. Only the name leaves here, and the caller only
-        compares it."""
-        row = await self._held_custom_role_row(role_id)
-        return None if row is None else row.display_name
+        as such a save did before the rule. Only the name leaves here, never the row, so nothing
+        can grant from it."""
+        if not is_custom_role_id(role_id):
+            return None
+        found = await self._store.get_role(role_id)
+        if found is None or str(found["id"]) != role_id or bool(found["builtin"]):
+            return None
+        return str(found["display_name"])
 
     async def create_custom_role(
         self,

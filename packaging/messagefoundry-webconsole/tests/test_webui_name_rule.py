@@ -80,7 +80,7 @@ async def test_the_console_refuses_a_new_display_name_the_rule_refuses(engine: E
         uid = await _uid(service, "u1")
         r = await _save(c, uid, {"display_name": "a\tb", "email": ""})
         assert r.status_code == 400
-        assert "display_name" in r.text
+        assert "must not contain a control" in r.text
         user = await service.store.get_user(uid)
         assert user is not None and user.display_name is None
 
@@ -217,6 +217,9 @@ async def test_a_re_sent_stored_name_the_rule_refuses_is_answered_as_a_clean_one
     assert refused.status_code == clean.status_code, (refused.text, clean.text)
     assert refused.headers.get("retry-after") == clean.headers.get("retry-after")
     assert refused_logs == clean_logs
+    if state == "outage":
+        # Control: the capture sees what an Outage logs, so an empty capture elsewhere is a reading.
+        assert [line for line in clean_logs if "row_seal" in line], clean_logs
     if state == "outage_role_only":
         # Control: the save never checks the role row's seal, so this state is invisible to it.
         assert clean.status_code in (200, 303)

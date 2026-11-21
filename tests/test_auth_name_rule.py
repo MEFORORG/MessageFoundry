@@ -2,10 +2,10 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """The account and custom-role name rule (BACKLOG #5784, #5785), ``api.auth_models.name_refusal``.
 
-A blank name, one of white space alone, or one holding a C0 control (NUL included), DEL or a C1
-control is refused with a 422 on ``POST /users`` (``display_name``), ``POST /users/directory``
-(``username``), ``PATCH /users/{id}`` (``display_name``) and ``POST``/``PUT /roles/custom``
-(``display_name``), and a custom role may not take a built-in role's name.
+A name ``name_refusal`` refuses, which states the rule, is refused with a 422 on ``POST /users``
+(``display_name``), ``POST /users/directory`` (``username``), ``PATCH /users/{id}``
+(``display_name``) and ``POST``/``PUT /roles/custom`` (``display_name``), and a custom role may
+not take a built-in role's name (``custom_role_name_refusal``).
 
 An edit that re-sends the STORED name is exempt. Engine PR 3110 built the rule without that
 exemption and took it off again: a client re-sending a stored name another writer put there would
@@ -398,18 +398,31 @@ async def test_a_save_under_a_name_the_rule_takes_reads_no_stored_name(
         return await original(role_id)
 
     monkeypatch.setattr(service, "custom_role_stored_name", _counted)
+    # The baseline: what the save itself reads, the route's gate read and the service's write.
+    ended = await service.sessions_ended_by_custom_role_save(role.id)
+    await service.update_custom_role(
+        role.id,
+        display_name="Readers",
+        description=None,
+        permissions=perms,
+        actor="t",
+        ended=ended,
+    )
+    baseline = len(reads)
+    assert baseline >= 1  # control: the counter sees the service's own existence check
+    reads.clear()
     url = f"/roles/custom/{role.id}"
-    clean, refused = await _calls(
-        engine,
-        service,
-        [
-            ("PUT", url, {"display_name": "Readers", "permissions": perms}),
-            ("PUT", url, {"display_name": "Auditor", "permissions": perms}),
-        ],
+    [clean] = await _calls(
+        engine, service, [("PUT", url, {"display_name": "Readers", "permissions": perms})]
     )
     assert clean.status_code == 200, clean.text
+    assert len(reads) == baseline
+    reads.clear()
+    [refused] = await _calls(
+        engine, service, [("PUT", url, {"display_name": "Auditor", "permissions": perms})]
+    )
     assert refused.status_code == 422, refused.text
-    assert reads == [role.id]  # the refused name alone
+    assert reads == [role.id]  # the name check's one read; the 422 comes before the write
 
 
 async def test_a_name_whose_row_fails_its_seal_is_exempt_and_the_save_repairs_it(

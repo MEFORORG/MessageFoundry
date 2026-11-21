@@ -13,8 +13,9 @@ page. At least four rules in the table are written, in whole or in part, elsewhe
 connection-name pattern is defined in
 [`messagefoundry/connection_names.py`](../messagefoundry/connection_names.py) and imported by that
 module, because the config loader enforces the same rule. The account and role name rule is
-`name_refusal` in [`messagefoundry/api/auth_models.py`](../messagefoundry/api/auth_models.py),
-built on this module's printable pattern.
+`name_refusal` in [`messagefoundry/api/auth_models.py`](../messagefoundry/api/auth_models.py). It
+spells this module's printable pattern again as a literal, so a change to the pattern here does
+not reach it; `tests/test_auth_name_rule.py` fails until the two agree again.
 The HL7 field-path grammar is `parse_path` in
 [`messagefoundry/parsing/peek.py`](../messagefoundry/parsing/peek.py). The layered preset ids'
 pattern is in `validation.py`, but their 1024-character bound is set on the route in
