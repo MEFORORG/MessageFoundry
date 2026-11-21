@@ -703,8 +703,9 @@ def admit_resubmitted_body(raw: str, ic: InboundConnection | None) -> str:
             raise IngressGuardError(refused, phase="size")
         # The listeners' marker refusal runs at the same point after the parse, so a resend does
         # not rest on delivery's refusal alone (BACKLOG #5099). A fault in the parse or in the
-        # marker's header read is a parse refusal here as there, recorded by its type alone, as the
-        # listeners record it, rather than an error the caller cannot audit.
+        # marker's header read is a parse refusal, recorded by its type alone as the listeners
+        # record theirs, rather than an error the caller cannot audit. The listeners' own field
+        # reads in that block are not run here.
         try:
             peek = Peek.parse(text, max_bytes=ceiling)
             refused = doc_ref_marker_refusal(peek, text)

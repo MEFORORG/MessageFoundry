@@ -347,10 +347,9 @@ It does hold them to a structure when it loads them. The rules live in
   the top-level `*.py` files the loader may run or import (`config_py_files`, which skips a
   dot-named file), helpers included, and, where they exist, its `__pycache__` folder and the
   entries in it, `connections.toml`, and the `codesets` folder and the code-set tables the loader
-  reads from it. Each of those that is a symbolic link or a junction, the directory included, is
-  followed by what the link walk `_link_chain` names for it, the real folder holding each link and
-  the object it leads to, and for a file that file's folder, which can lie outside the directory
-  (vault BACKLOG #2596). Any other path in the directory is not on it. A dev and test escape turns the
+  reads from it, and, for each of those that is a link, what it resolves to and, for a file, that
+  file's folder, which can lie outside the directory; [SERVICE.md](SERVICE.md), in
+  its POSIX loader bullet, says what that leaves unchecked (vault BACKLOG #2596). Any other path is not on it. A dev and test escape turns the
   refusal into a warning; the conditions it needs are under *Dev/test escape* in
   [SERVICE.md](SERVICE.md#lock-down-the-config-directory-config-2), which also states what the
   check reads and what it leaves out.

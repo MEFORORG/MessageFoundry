@@ -9807,8 +9807,8 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
     The directory and each ``*.py`` (:func:`config_py_files`), and, when they exist, the
     ``__pycache__`` folder and each entry in it, ``connections.toml``, and the ``codesets`` folder
     with each table the loader reads from it. Each of those that is a symbolic link or a junction,
-    the directory included, is followed by the real folder holding each link a walk of it follows,
-    the object it leads to and, for a file, that file's folder (:func:`_with_link_targets`). Both config-source trust checks
+    the directory included, is followed by the object it resolves to and, for a file, that file's
+    folder (:func:`_with_link_targets`). Both config-source trust checks
     walk this list (vault BACKLOG #2626 step 3, #2596 step 4).
 
     **The cache folder is on the list although no load reads it.** The loader compiles each module
@@ -9845,40 +9845,40 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
 
 def _with_link_targets(paths: list[Path]) -> list[Path]:
     """``paths`` with, after each one that is a symbolic link or a junction, the config directory
-    included, what :func:`_link_chain` names for it and, for a file, the folder holding the file it
-    leads to (vault BACKLOG #2596).
+    included, the object it resolves to and, for a file, the folder holding that file (vault
+    BACKLOG #2596).
 
     A load reads a link's target, so vetting the link alone let a config module that is a link into
     a writable folder pass: whoever can write that folder can swap the code the load runs, and on
-    Windows the link object's own access list was read rather than the target's. The walk is the
-    one the ``serve`` start check runs for its files, so the real folder holding each link it
-    follows is vetted too. As there, the walk's end is checked against the kernel's own answer: an
-    open and a walk that disagree on whether the path leads anywhere, or reach two objects, raise
-    ``OSError``, as does a layout the walk cannot follow, and either refuses the load. A path that
-    is not itself a link adds nothing, though a folder link above the config directory then goes
-    unvetted, as the folders above it do. A path already listed is not repeated."""
+    Windows the link object's own access list was read rather than the target's. The target is the
+    kernel's own answer (:meth:`~pathlib.Path.resolve`). A link that leads nowhere adds nothing,
+    since nothing reads it, and the link itself stays listed, as before. A link whose target cannot
+    be resolved raises ``OSError`` naming it, which refuses the load.
+
+    **Not vetted**, at least: the links in between, for a link to a link, the folders holding the
+    links outside the config directory, from which a writer could re-point one, and the folders
+    above each target's folder, as the folders above the config directory are not. The ``serve``
+    start check walks the links of its own files further (:func:`_link_chain`). A path already
+    listed is not repeated."""
     out: list[Path] = []
     for path in paths:
         out.append(path)
         if not (path.is_symlink() or path.is_junction()):
             continue
-        walked: tuple[list[Path], Path | None] | None = None
-        unwalkable = ""
+        unresolved = ""
+        target: Path | None = None
         try:
-            walked = _link_chain(path)
-        except ValueError as exc:
-            # A link target holding a NUL, which lstat refuses: the start check refuses it too.
-            unwalkable = type(exc).__name__
-        if walked is None:
-            raise OSError(errno.EINVAL, f"a link could not be walked ({unwalkable})", str(path))
-        chain, end = walked
-        if os.path.exists(path) != (end is not None):
-            raise OSError(errno.EINVAL, "the open and the walk disagree on the link", str(path))
-        if end is not None and not os.path.samefile(path, end):
-            raise OSError(errno.EINVAL, "the open reaches another object than the walk", str(path))
-        out += chain
-        if end is not None and not end.is_dir():
-            out.append(end.parent)
+            target = path.resolve()
+        except (OSError, ValueError, RuntimeError) as exc:
+            # ValueError: a target holding a NUL; RuntimeError: a link loop, on older interpreters.
+            unresolved = type(exc).__name__
+        if target is None:
+            raise OSError(errno.EINVAL, f"a link could not be resolved ({unresolved})", str(path))
+        if not target.exists():
+            continue
+        out.append(target)
+        if not target.is_dir():
+            out.append(target.parent)
     return list(dict.fromkeys(out))
 
 

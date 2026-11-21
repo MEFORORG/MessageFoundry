@@ -222,8 +222,8 @@ def test_a_linked_config_directory_lists_the_real_directory(tmp_path: Path) -> N
     listed = config_source_trust_paths(link)
     assert listed[0] == link
     assert real.resolve() in listed
-    # The folder holding the link is the one a writer could re-point it from.
-    assert tmp_path.resolve() in listed
+    # A folder's own parent is not added, as the folders above the config directory are not.
+    assert real.resolve().parent not in listed
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="NTFS junctions")
@@ -241,31 +241,32 @@ def test_a_junction_member_lists_the_real_folder(tmp_path: Path) -> None:
     assert shared.resolve() in listed
 
 
-def test_a_link_the_walk_cannot_follow_refuses_the_list(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_a_link_that_cannot_be_resolved_refuses_the_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_windows_readers: FakeReaders
 ) -> None:
-    import messagefoundry.config.wiring as wiring
-
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
     cfg, shared = tmp_path / "cfg", tmp_path / "shared"
     _link_module_into(cfg, shared)
+    fake_windows_readers(lambda _path: False)
+    real = Path.resolve
 
-    def nul_target(_path: Path) -> tuple[list[Path], Path | None]:
-        raise ValueError("embedded null byte")
+    def refusing(self: Path, strict: bool = False) -> Path:
+        if self.name == "cfg.py" and self.parent.name == "cfg":
+            raise ValueError("embedded null byte")
+        return real(self, strict)
 
-    monkeypatch.setattr(wiring, "_link_chain", nul_target)
-    with pytest.raises(OSError, match="could not be walked"):
+    monkeypatch.setattr(Path, "resolve", refusing)
+    with pytest.raises(OSError, match="could not be resolved"):
         config_source_trust_paths(cfg)
+    with pytest.raises(WiringError, match="cfg.py"):
+        load_config(cfg)
 
 
-def test_a_walk_that_reaches_another_object_than_the_open_refuses_the_list(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    import messagefoundry.config.wiring as wiring
-
-    cfg, shared = tmp_path / "cfg", tmp_path / "shared"
-    _link_module_into(cfg, shared)
-    other = tmp_path / "other.py"
-    other.write_text("", encoding="utf-8")
-    monkeypatch.setattr(wiring, "_link_chain", lambda _path: ([other], other))
-    with pytest.raises(OSError, match="another object"):
-        config_source_trust_paths(cfg)
+def test_a_dangling_module_link_adds_nothing(tmp_path: Path) -> None:
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    try:
+        (cfg / "cfg.py").symlink_to(tmp_path / "gone.py")
+    except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    assert config_source_trust_paths(cfg) == [cfg, cfg / "cfg.py"]
