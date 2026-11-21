@@ -4,8 +4,9 @@
 
 ``serve`` builds the API TLS context before uvicorn runs the lifespan, so a refused client CA used
 to stop the start before the store opened, and the lifespan's audited preflight never wrote the
-anchor's ``auth.trust_anchor`` row. The forwarder's CA kept its row (BACKLOG #3470). Each test
-here drives ``serve`` itself, with the real context build, and reads the store afterwards.
+anchor's ``auth.trust_anchor`` row. ``serve`` now runs that audited preflight against the store
+directly, with no lifespan. Each test drives ``serve`` itself, with the real context build unless
+it says otherwise, and reads the store afterwards. Every PEM here is synthetic.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +30,10 @@ from messagefoundry.store.store import MessageStore
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 _WRONG_PIN = "00" * 32
+# A synthetic private-key block: the anchors' content check refuses a file holding one.
+# Built from parts, so the secret scanner does not read a fake label as a key.
+_KEY_LABEL = b"PRIVATE " + b"KEY"
+_KEY_BLOCK = b"-----BEGIN " + _KEY_LABEL + b"-----\nQUFBQQ==\n-----END " + _KEY_LABEL + b"-----\n"
 
 
 def _serve_with_client_ca(
@@ -35,15 +41,19 @@ def _serve_with_client_ca(
     monkeypatch: pytest.MonkeyPatch,
     *,
     pin: str | None,
+    ca_bytes: bytes | None = None,
+    extra_toml: str = "",
     extra_api: str = "",
 ) -> tuple[int, Path]:
     """Run ``serve`` in ``tmp_path`` with a client CA pinned to ``pin``, or to its own bytes when
-    ``pin`` is None. uvicorn is stubbed, so nothing binds; the managed app and the API context are
-    real."""
+    ``pin`` is None. The CA holds ``ca_bytes``, or a real self-signed certificate. uvicorn is
+    stubbed, so nothing binds."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     ca = tmp_path / "client-ca.pem"
-    ca.write_bytes(make_self_signed("client-ca.example", [], 30)[0])
+    ca.write_bytes(
+        ca_bytes if ca_bytes is not None else make_self_signed("client-ca.example", [], 30)[0]
+    )
     if pin is None:
         pin = ta.anchor_fingerprint(ca)
     cert_pem, key_pem = make_self_signed("localhost", ["127.0.0.1"], 30)
@@ -52,6 +62,7 @@ def _serve_with_client_ca(
     key.write_bytes(key_pem)
     (tmp_path / "messagefoundry.toml").write_text(
         'security.enforcement = "warn"\n'
+        f"{extra_toml}"
         "[api]\n"
         f"tls_cert_file = {json.dumps(str(cert))}\n"
         f"tls_key_file = {json.dumps(str(key))}\n"
@@ -68,7 +79,7 @@ def _serve_with_client_ca(
     return rc, tmp_path / "messagefoundry.db"
 
 
-def _anchor_rows(db: Path) -> list[dict[str, Any]]:
+def _anchor_events(db: Path, label: str) -> list[str]:
     async def read() -> list[dict[str, Any]]:
         store = await MessageStore.open(db)
         try:
@@ -77,24 +88,77 @@ def _anchor_rows(db: Path) -> list[dict[str, Any]]:
             await store.close()
         return [json.loads(r["detail"]) for r in rows]
 
-    return asyncio.run(read())
+    return [str(r.get("event")) for r in asyncio.run(read()) if r.get("label") == label]
+
+
+class _Grab(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(logging.WARNING)
+        self.seen: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.seen.append(record.getMessage())
+
+
+@pytest.fixture
+def grab() -> Iterator[_Grab]:
+    """What this module's logger handles at WARNING and above, with a positive control."""
+    handler = _Grab()
+    logger = logging.getLogger(cli.__name__)
+    logger.addHandler(handler)
+    try:
+        logger.warning("probe")
+        assert handler.seen == ["probe"]
+        handler.seen.clear()
+        yield handler
+    finally:
+        logger.removeHandler(handler)
+
+
+def _no_lifespan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fail the test if the managed app's lifespan opens its store: the audit must not run it."""
+    from messagefoundry.api import app as api_app
+
+    def refuse(*_a: object, **_k: object) -> object:
+        raise AssertionError("the audit ran the managed lifespan's store open")
+
+    monkeypatch.setattr(api_app, "open_store", refuse)
 
 
 def test_a_refused_client_ca_writes_its_trust_anchor_row(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    grab: _Grab,
 ) -> None:
-    """Red on main: the refusal returned 2 before any store opened, so no store, and no row."""
+    """Red on main: the refusal returned 2 before any store opened, so no store, and no row. The
+    row is written with no lifespan run, and the refusal's reason is logged."""
+    _no_lifespan(monkeypatch)
     rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=_WRONG_PIN)
     assert rc == 2
-    err = capsys.readouterr().err
-    assert "error: the API TLS context was not built:" in err
+    assert "error: the API TLS context was not built:" in capsys.readouterr().err
     assert db.is_file(), "the refusal opened no store, so it wrote no audit row"
-    events = [r.get("event") for r in _anchor_rows(db) if r.get("label") == "api_client"]
-    assert "pin_mismatch" in events, events
+    assert "pin_mismatch" in _anchor_events(db, "api_client")
+    refused = [m for m in grab.seen if m.startswith("the audited check refused")]
+    assert refused and "does not match its configured SHA-256" in refused[0], grab.seen
+
+
+def test_a_ca_refused_for_its_content_writes_its_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A CA refused for what its bytes hold, here a private-key block pinned to its own bytes, is
+    the CA's refusal, and the audited preflight writes its ``pem_refused`` row."""
+    rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, ca_bytes=_KEY_BLOCK)
+    assert rc == 2
+    assert "error: the API TLS context was not built:" in capsys.readouterr().err
+    assert "pem_refused" in _anchor_events(db, "api_client")
 
 
 def test_a_store_that_does_not_open_leaves_the_clean_refusal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    grab: _Grab,
 ) -> None:
     """The audit is best-effort on a start already refused: a store that fails to open is logged,
     and the exit stays the clean 2 rather than the uncaught floor's 1."""
@@ -102,70 +166,41 @@ def test_a_store_that_does_not_open_leaves_the_clean_refusal(
     async def refuse_open(*_a: object, **_k: object) -> object:
         raise OSError("planted store open failure")
 
-    monkeypatch.setattr("messagefoundry.api.app.open_store", refuse_open)
-    seen: list[str] = []
-
-    class _Grab(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            seen.append(record.getMessage())
-
-    grab = _Grab(logging.WARNING)
-    logger = logging.getLogger(cli.__name__)
-    logger.addHandler(grab)
-    try:
-        logger.warning("probe")
-        assert seen == ["probe"]
-        rc, _db = _serve_with_client_ca(tmp_path, monkeypatch, pin=_WRONG_PIN)
-    finally:
-        logger.removeHandler(grab)
+    monkeypatch.setattr("messagefoundry.store.open_store", refuse_open)
+    rc, _db = _serve_with_client_ca(tmp_path, monkeypatch, pin=_WRONG_PIN)
     assert rc == 2
     assert "error: the API TLS context was not built:" in capsys.readouterr().err
-    assert [m for m in seen if "no audit row records the refused [api].tls_client_ca_file" in m], (
-        seen
-    )
+    assert [m for m in grab.seen if "no audit row records the refused trust anchor" in m], grab.seen
 
 
 def test_a_context_that_builds_opens_no_store_for_the_audit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The control: with the CA's own pin the context builds, the start goes on to uvicorn
-    (stubbed), and this path runs no lifespan, so it opens no store."""
+    (stubbed), and the audit does not run, so no store is opened."""
     calls: list[bool] = []
-    real = cli._audit_refused_api_client_ca
-
-    def spy(*a: Any, **k: Any) -> None:
-        calls.append(True)
-        real(*a, **k)
-
-    monkeypatch.setattr(cli, "_audit_refused_api_client_ca", spy)
+    monkeypatch.setattr(cli, "_audit_refused_api_client_ca", lambda *a, **k: calls.append(True))
     rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None)
     assert rc == 0
     assert calls == []
     assert not db.exists()
 
 
-def test_a_refused_crl_beside_a_sound_ca_opens_no_store(
+def test_a_refused_crl_opens_no_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The context also refuses ``[api].tls_client_crl_file``, which the audited preflight leaves
-    out, so no row could come of it. With that CRL refused and the CA sound, no startup runs."""
+    out, so no row could come of it. The build tags that refusal with the CRL's setting, and the
+    audit reads the tag rather than checking the files again."""
     from messagefoundry.api import tls as api_tls
 
     crl = tmp_path / "client.crl"
     crl.write_bytes(b"planted")
 
     def refuse(*_a: object, **_k: object) -> object:
-        raise ta.TrustAnchorError("planted CRL refusal")
-
-    real_refusal = ta.anchor_refusal
-
-    def crl_refused(spec: ta.AnchorSpec, **kw: Any) -> ta.TrustAnchorError | None:
-        if spec.label == "api_client_crl":
-            return ta.TrustAnchorError("planted CRL refusal")
-        return real_refusal(spec, **kw)
+        raise ta.TrustAnchorError("planted CRL refusal", setting="[api].tls_client_crl_file")
 
     monkeypatch.setattr(api_tls, "build_api_ssl_context", refuse)
-    monkeypatch.setattr(ta, "anchor_refusal", crl_refused)
     crl_line = f"tls_client_crl_file = {json.dumps(str(crl))}\n"
     rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_api=crl_line)
     assert rc == 2
@@ -173,18 +208,31 @@ def test_a_refused_crl_beside_a_sound_ca_opens_no_store(
     assert not db.exists()
 
 
-def test_a_ca_refused_for_its_content_writes_its_row(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+def test_the_build_tags_a_crl_refusal_with_its_setting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A CA refused for what its bytes hold passes the pin, ACL and path checks, and is still the
-    CA's refusal: the audited preflight writes its row. Round 2 review finding 1."""
-    from messagefoundry.api import tls as api_tls
+    """The tag the audit reads: ``build_api_ssl_context`` names the CRL on its refusal. Red before
+    the tag, when the refusal carried no setting."""
+    from messagefoundry.api.tls import build_api_ssl_context
+    from messagefoundry.config.settings import ApiSettings
 
-    def refuse(*_a: object, **_k: object) -> object:
-        raise ta.TrustAnchorError("planted content refusal")
-
-    monkeypatch.setattr(api_tls, "build_api_ssl_context", refuse)
-    rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None)
-    assert rc == 2
-    assert "error: the API TLS context was not built:" in capsys.readouterr().err
-    assert db.is_file(), "the CA's refusal ran no audited startup"
+    ca_pem = make_self_signed("client-ca.example", [], 30)[0]
+    cert_pem, key_pem = make_self_signed("localhost", ["127.0.0.1"], 30)
+    ca, cert, key = tmp_path / "ca.pem", tmp_path / "cert.pem", tmp_path / "key.pem"
+    ca.write_bytes(ca_pem)
+    cert.write_bytes(cert_pem)
+    key.write_bytes(key_pem)
+    crl = tmp_path / "client.crl"
+    crl.write_bytes(b"planted")
+    # The CA passes its checks; the CRL's ACL check refuses it under enforce.
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(True))
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda p: str(p) != str(crl))
+    api = ApiSettings(
+        tls_cert_file=str(cert),
+        tls_key_file=str(key),
+        tls_client_ca_file=str(ca),
+        tls_client_crl_file=str(crl),
+    )
+    with pytest.raises(ta.TrustAnchorError) as err:
+        build_api_ssl_context(api, enforcing=True)
+    assert err.value.setting == "[api].tls_client_crl_file"
