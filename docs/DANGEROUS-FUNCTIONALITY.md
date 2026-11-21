@@ -843,6 +843,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 |---|---|---|
 | Replies from an engine address | Whatever answers at the engine URL setting. The file's own comment says that is not necessarily the engine, and a plain `http` URL gets no TLS. The Python clients' replies sit in the first table above for that reason too. Unlike `apiclient/client.py`, this client puts no size cap on a reply before it parses it, and a POST has no timeout. | `engineClient.ts` |
 | An HL7 sample, and what a dry run made of it | The sample file you pick, which [`CONNECTIONS.md`](CONNECTIONS.md) lists as an upload feature, and the output a dry run built from it. The Test Bench diff splits them into segments and fields by hand, and the Steps view pulls the segment names out of the sample. A saved test case's recorded output is diffed the same way. `hl7diff.ts` does the same job as `messagefoundry_toolkit/anon/surrogates.py` in the hand-read table above. | `hl7diff.ts`, `hl7scope.ts` |
+| A path setting's folder and file names | The path settings, which a workspace's own `.vscode/settings.json` can set. The Windows name checks split the path into names and read each name's characters by hand, to find a trailing dot or space, a colon, or a device name. The device-name check strips trailing spaces in linear time, because the value is the workspace's (BACKLOG #5404). | `workspaceContainment.ts` |
 
 **Extension parse sites left out, and why.**
 
@@ -857,6 +858,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 | It reads back the saved Test Bench collections it stored itself, as JSON, in VS Code SecretStorage. It checks each collection's shape and drops a malformed one. The case bodies inside go on to `hl7diff.ts`, in the table above, when a collection is rerun | `collectionStore.ts` |
 | It takes the first line of hover text it built, for a menu title. That text can carry words from the engine's reply, which `engineClient.ts` already parsed. | `statusBar.ts` |
 | It splits what the MessageFoundry command line and git printed into lines, to put a time stamp on each for the "MessageFoundry Checks" output. It reads nothing out of them. | `checksLog.ts` |
+| It reads the characters of the Test Bench Debug program's text, which the extension holds itself, to name the program's file by a checksum (BACKLOG #5409) | `testBenchDebugProgram.ts` |
 
 **Extension files that parse text the patterns cannot see.**
 
@@ -1078,7 +1080,12 @@ a command line: the engine's `serve`, and `provision-admin`. The other two type 
 
 **Debug sessions.** The test bench's debug action starts a Python debug session. It runs
 `messagefoundry dryrun` with `--show-phi` on one sample message, in a VS Code terminal. The config
-folder it passes comes from the `messagefoundry.configDir` setting.
+folder it passes comes from the `messagefoundry.configDir` setting. To run it, the extension writes
+a small Python program into its own global storage folder, under `testbench-debug`, and has the
+debugger run that program. debugpy 1.8.21 and older put that folder at `sys.path[0]`, so a module
+placed there shadows any module of that name the debuggee has not yet imported, the installed
+`messagefoundry` package and the standard library included. The folder is not pruned, and nothing
+checks its contents. `ide/src/testBenchDebugProgram.ts` says what it holds (BACKLOG #5409).
 
 **Links.** `openExternal` hands a URL to the operating system, which opens it with whatever program
 is registered for its scheme. The extension opens web console pages and the Git download page this

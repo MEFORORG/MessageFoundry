@@ -22,6 +22,7 @@ import { INTERPRETER_OPTIONS } from "./engineControlModel";
 import { hexdump } from "./hexdump";
 import { diffMessages } from "./hl7diff";
 import { buildTraceDetail, type TraceDetail, type TraceEntry } from "./traceView";
+import { writeDebugProgram } from "./testBenchDebugProgram";
 import { testBenchScript } from "./testBenchWebview";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import {
@@ -540,17 +541,31 @@ export class TestBench {
     if (!row?.path || !folder) {
       return;
     }
+    let program: string;
+    try {
+      program = await writeDebugProgram(this.context.globalStorageUri);
+    } catch (e) {
+      // An fs error's code only, as newRoute.ts shows: its message names the global storage path,
+      // which holds the account's home folder. writeDebugProgram's own refusal carries no path.
+      const code = (e as { code?: unknown })?.code;
+      const why = typeof code === "string" ? code.replace(/[^A-Za-z0-9_]/g, "") : e instanceof Error ? e.message : "unknown error";
+      void vscode.window.showErrorMessage(`MessageFoundry: Debug did not start: ${why}`);
+      return;
+    }
     await vscode.debug.startDebugging(folder, {
       name: `MEFOR dry-run: ${row.source}`,
       type: "debugpy",
       request: "launch",
       // The interpreter options the CLI bridge launches with (BACKLOG #5409): `-P` keeps the working
       // directory, the workspace, off the import path, so a `messagefoundry.py` or a stdlib-named
-      // module in the workspace root does not shadow the installed one through it. debugpy's module
-      // runner adds the working directory itself unless `sys.flags.safe_path` is set, which `-P`
-      // sets; that check is read from debugpy's main branch, and an older debugpy may lack it.
+      // module in the workspace root does not shadow the installed one through it. The launch names
+      // a program the extension writes, not the module, so debugpy adds no working directory on any
+      // build; TEST_BENCH_DEBUG_PROGRAM in testBenchDebugProgram.ts says why, and what still reaches the
+      // import path. `cwd` names the workspace explicitly, so the dry-run's relative paths do not rest
+      // on the debugger's own default.
       pythonArgs: [...INTERPRETER_OPTIONS],
-      module: "messagefoundry",
+      program,
+      cwd: folder.uri.fsPath,
       args: ["dryrun", "--config", configDir(), "--show-phi", "--messages", row.path],
       console: "integratedTerminal",
       justMyCode: false, // step into the config modules (Router/Handler)
