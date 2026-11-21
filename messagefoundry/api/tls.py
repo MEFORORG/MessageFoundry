@@ -263,7 +263,7 @@ def _generated_sans(host: str) -> list[str]:
       and any other client on this box reach it through (BACKLOG #5973).
     - A bind the engine treats as loopback, by the exact test :attr:`ApiSettings.is_loopback`
       uses (``127.0.0.1``, ``::1``, ``localhost``), carries the other two of
-      :data:`_GENERATED_LOOPBACK_SANS` (BACKLOG #5790), so the certificate and the exposed-bind
+      :data:`_GENERATED_LOOPBACK_SANS` (BACKLOG #5790), so a first mint and the exposed-bind
       gate agree on which binds are loopback.
     - Any other host carries no extra name, ``LOCALHOST``, ``[::1]`` and ``127.0.0.2`` included.
 

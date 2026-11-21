@@ -144,14 +144,9 @@ non-loopback address, a wildcard included, with no `--port` is monitor-only too;
 #5936 the tray fell back to the loopback default for that bind and kept service control. The
 certificate the engine mints for a wildcard bind names that same loopback, `127.0.0.1` or `::1`.
 A pair the engine minted earlier for another bind is replaced at the next start when its certificate
-lacks a name the current bind requires. The new one names the current bind's names, plus, for a bind
-a client dials through `127.0.0.1`, `::1` or `localhost` (at least a wildcard, or another letter
-case or IPv6 spelling of one of those), each of those three that the old pair named and the bind
-does not itself name (compared without regard to case or a trailing dot), and always `127.0.0.1`; no
-other old name is kept, so a client that dials any other name only the old one carried must change
-too. SERVICE.md states which names a bind requires, when the engine replaces its pair, and what to
-re-import. An operator certificate is never replaced, and on a wildcard bind it verifies only if it
-names that loopback.
+lacks a name the current bind requires. SERVICE.md states which names a bind requires, when the
+engine replaces its pair, and what to re-import. An operator certificate is never replaced, and on a
+wildcard bind it verifies only if it names that loopback.
 (BACKLOG #5936, #5973)
 
 **What "View Service Log" will open.** Windows opens a file with whatever program owns its

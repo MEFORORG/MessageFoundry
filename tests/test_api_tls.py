@@ -4495,8 +4495,8 @@ def test_a_renewal_keeps_the_loopback_names_a_reused_pair_carried(
     """BACKLOG #5973. A pair minted for ``::1`` is reused after a move to ``::``, which requires
     only ``::1``, so it still names ``127.0.0.1``, which the CLI, IDE and harness dial by default,
     and ``localhost``. The renewal months later must keep them, or those clients fail hostname
-    verification then. A loopback bind gets all three names anyway (BACKLOG #5790), so a wildcard
-    is where keeping shows.
+    verification then. A bind ``ApiSettings.is_loopback`` lists gets all three names anyway
+    (BACKLOG #5790), so keeping shows at a wildcard or another spelling.
 
     Mutation: keep the names on a bind re-mint only. Red: the renewal names only ``::`` and
     ``::1``."""

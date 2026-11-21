@@ -1147,13 +1147,12 @@ address `::1`). A bind the engine treats as loopback (`127.0.0.1`, `::1`, `local
 three, and so requires all three (BACKLOG #5790). For example, a certificate from a first-run mint
 for `0.0.0.0` is replaced after a move to `127.0.0.1`, because it lacks `::1` and `localhost`. A
 certificate minted for a loopback bind is not replaced by a move to a wildcard, nor by a later move
-from that wildcard back to `127.0.0.1`, `::1` or `localhost`. A replacement, a renewal included,
-names the current bind's names, plus, for a bind a client dials through `127.0.0.1`, `::1` or
-`localhost` (at least a wildcard, or another letter case or IPv6 spelling of one of those), each of
-those three that the old pair named and the bind does not itself name (compared without regard to
-case or a trailing dot), and always `127.0.0.1`; no other old name is kept, so a name added by hand
-to a pair at the generated path is dropped. `127.0.0.1` is the host the CLI, the IDE and the harness
-dial by default. Its audit row's reason is `bind_changed`, a shard never makes it, and the new
+from that wildcard back to `127.0.0.1`, `::1` or `localhost`. The new certificate names what a
+first-run mint for the current bind would name. A replacement, a renewal included, may also keep
+loopback names the old certificate carried, and add `127.0.0.1`, which the CLI, the IDE and the
+harness dial by default, as it did before this change; it keeps no other old name, so a name added
+by hand to a pair at the generated path is dropped. A re-mint for a changed bind is audited with
+reason `bind_changed` (a renewal's reason is `renewal`); a shard never makes one, and the new
 certificate must be imported the same way (BACKLOG #5973). At least a shard, a bind the certificate
 builder refuses (a WARNING names it), and a file or lock failure (a WARNING, and the next start
 tries again) keep serving the old certificate, which lacks a name the bind requires.
