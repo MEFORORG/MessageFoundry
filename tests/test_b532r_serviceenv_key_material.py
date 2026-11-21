@@ -61,6 +61,9 @@ _SHAPES = (
     pytest.param(_URL_ONE_PAD, id="base64url-one-pad"),
     pytest.param(f"={_KEY_B64}", id="equals-led"),
     pytest.param(f"={_URL_ONE_PAD}", id="equals-led-base64url"),
+    # Review round 2: a retired-keys list and a quoted key as an ordinary variable's value.
+    pytest.param(f"x={_KEY_B64},{_KEY_B64}", id="ordinary-name-set-to-a-key-list"),
+    pytest.param(f'x="{_KEY_B64}"', id="ordinary-name-set-to-a-quoted-key"),
 )
 
 
@@ -88,6 +91,10 @@ def test_key_material_in_the_next_item_makes_the_empty_key_read_as_set(shape: st
         "PYTHONPYCACHEPREFIX=C:/ProgramData/MessageFoundry/pycache/cachedir",
         "OTEL_SERVICE_NAME=messagefoundry-integration-engine-production-east",
         "MEFOR_SECRETS_DIRECTORY=D:/MessageFoundrySecrets/ProductionEngineSecretsDirectory",
+        # Review round 2: mixed case alone does not make these secrets.
+        "HOME_DIR=/opt/MessageFoundry/ConfigDirectory/ProductionEnvironment",
+        "OTEL_SERVICE_NAME=MessageFoundry-Integration-Engine-Production-East",
+        "Mefor_Security_Require_Memory_Encryption_Declaration=1",
     ],
 )
 def test_an_ordinary_line_still_ends_the_empty_key(line: str) -> None:

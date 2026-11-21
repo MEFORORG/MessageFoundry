@@ -349,19 +349,15 @@ _ORDINARY_LINE = re.compile(r"\s*[^=\s][^=]*=(?![=\s]*\Z)")
 #: refusing.
 _KEY_SHAPED_RUN = re.compile(r"[A-Za-z0-9+/]{43}")
 
-#: A run of 43 or more base64url characters, the length of a 32-byte secret in that alphabet with
-#: its one ``=`` of padding left off (vault BACKLOG #5394 added item 12). Names and ordinary values
-#: are runs of this alphabet too, some longer than 43 characters, such as an engine name or a
-#: hyphenated service name, but in one case of letters only, so a run is read as key material only
-#: when it holds both an upper-case and a lower-case letter (:func:`_mixed_case`), as a random
-#: secret of that length all but always does. Any other run of 43 such characters in both cases is
-#: read as key material too, an error toward refusing.
-_URLSAFE_RUN = re.compile(r"[A-Za-z0-9_-]{43,}")
-
-#: A whole value that is one secret: 43 or more characters of either base64 alphabet, then at most
-#: two ``=`` of padding (:func:`_is_key_value`). A value holding anything else, such as a path's
-#: ":" or ".", or a space, is not one.
-_KEY_VALUE = re.compile(r"(?:[A-Za-z0-9+/]{43,}|[A-Za-z0-9_-]{43,})={0,2}")
+#: One 32-byte secret, whole (vault BACKLOG #5394 added items 6 and 12): 43 characters of the
+#: standard base64 alphabet and its one ``=``, as a store key is written, or 43 of the base64url
+#: alphabet with or without that ``=``. Length alone does not tell a secret from a name, a path or a
+#: service name, so :func:`_is_one_key_text` also asks for what a random secret of that length all
+#: but always holds: letters of both cases and, in base64url, whose alphabet a mixed-case name
+#: shares, a digit. A name or value of that exact shape that is not a secret is read as one too,
+#: an error toward refusing.
+_STANDARD_KEY_TEXT = re.compile(r"[A-Za-z0-9+/]{43}=")
+_URLSAFE_KEY_TEXT = re.compile(r"[A-Za-z0-9_-]{43}=?")
 
 
 #: Text of the standard base64 alphabet alone, as the body of a padded secret is.
@@ -373,19 +369,31 @@ def _mixed_case(text: str) -> bool:
     return any("a" <= c <= "z" for c in text) and any("A" <= c <= "Z" for c in text)
 
 
-def _holds_key_run(text: str) -> bool:
-    """Whether ``text`` holds a store-key-shaped run (:data:`_KEY_SHAPED_RUN`), or a base64url
-    run of a secret's length in both cases of letters (:data:`_URLSAFE_RUN`)."""
-    if _KEY_SHAPED_RUN.search(text) is not None:
+def _is_one_key_text(text: str) -> bool:
+    """Whether ``text`` is exactly one 32-byte secret (:data:`_STANDARD_KEY_TEXT`,
+    :data:`_URLSAFE_KEY_TEXT`)."""
+    if not _mixed_case(text):
+        return False
+    if _STANDARD_KEY_TEXT.fullmatch(text) is not None:
         return True
-    return any(_mixed_case(run.group()) for run in _URLSAFE_RUN.finditer(text))
+    return _URLSAFE_KEY_TEXT.fullmatch(text) is not None and any(c.isdigit() for c in text)
+
+
+def _holds_key_run(text: str) -> bool:
+    """Whether ``text`` holds a store-key-shaped run (:data:`_KEY_SHAPED_RUN`), or, stripped, is
+    one base64url secret less its padding (:func:`_is_one_key_text`), as the name a secret with one
+    ``=`` of padding reads as."""
+    return _KEY_SHAPED_RUN.search(text) is not None or _is_one_key_text(text.strip())
 
 
 def _is_key_value(text: str) -> bool:
-    """Whether ``text``, stripped, is one secret as a value (:data:`_KEY_VALUE`) in both cases of
-    letters (vault BACKLOG #5394 added items 6 and 12)."""
+    """Whether ``text``, stripped and with one pair of surrounding quotes taken off, is one secret
+    or a comma-separated list of them, as a retired-keys list is (:func:`_is_one_key_text`; vault
+    BACKLOG #5394 added items 6 and 12)."""
     value = text.strip()
-    return _KEY_VALUE.fullmatch(value) is not None and _mixed_case(value)
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+        value = value[1:-1]
+    return all(_is_one_key_text(part.strip()) for part in value.split(","))
 
 
 def _is_ordinary_line(line: str) -> bool:
