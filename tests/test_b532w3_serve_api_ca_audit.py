@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -44,10 +44,12 @@ def _serve_with_client_ca(
     ca_bytes: bytes | None = None,
     extra_toml: str = "",
     extra_api: str = "",
+    enforcement: str = "warn",
+    uvicorn_run: Callable[..., None] | None = None,
 ) -> tuple[int, Path]:
     """Run ``serve`` in ``tmp_path`` with a client CA pinned to ``pin``, or to its own bytes when
     ``pin`` is None. The CA holds ``ca_bytes``, or a real self-signed certificate. uvicorn is
-    stubbed, so nothing binds."""
+    stubbed by ``uvicorn_run``, or by a no-op, so nothing binds."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     ca = tmp_path / "client-ca.pem"
@@ -61,7 +63,7 @@ def _serve_with_client_ca(
     cert.write_bytes(cert_pem)
     key.write_bytes(key_pem)
     (tmp_path / "messagefoundry.toml").write_text(
-        'security.enforcement = "warn"\n'
+        f'security.enforcement = "{enforcement}"\n'
         f"{extra_toml}"
         "[api]\n"
         f"tls_cert_file = {json.dumps(str(cert))}\n"
@@ -74,7 +76,7 @@ def _serve_with_client_ca(
     # The host's temp directory decides the path and ACL verdicts, not the test (BACKLOG #1142).
     monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(True))
     monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
-    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    monkeypatch.setattr("uvicorn.run", uvicorn_run or (lambda *a, **k: None))
     rc = main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"])
     return rc, tmp_path / "messagefoundry.db"
 
@@ -330,3 +332,218 @@ def test_the_build_tags_a_crl_refusal_with_its_setting(
     with pytest.raises(ta.TrustAnchorError) as err:
         build_api_ssl_context(api, enforcing=True)
     assert err.value.setting == "[api].tls_client_crl_file"
+
+
+def test_the_no_lifespan_guard_fires_when_the_lifespan_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The positive control for ``_no_lifespan``: a start that reaches uvicorn, stubbed here to
+    run the managed app's lifespan, trips the guard. So a test that passes with the guard in
+    place shows the audit ran no lifespan, not that the guard could never fire."""
+    _no_lifespan(monkeypatch)
+    tripped: list[BaseException] = []
+
+    def run_lifespan(app: Any, **_k: object) -> None:
+        async def go() -> None:
+            async with app.router.lifespan_context(app):
+                pass
+
+        try:
+            asyncio.run(go())
+        except BaseException as exc:
+            tripped.append(exc)
+            raise
+
+    rc, _db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, uvicorn_run=run_lifespan)
+    assert rc != 0
+    assert any("the audit ran the managed lifespan's store open" in str(e) for e in tripped), (
+        tripped
+    )
+
+
+def _store_posture_spy(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Record the ``posture`` each ``messagefoundry.store.open_store`` call passes."""
+    import messagefoundry.store as store_pkg
+
+    real = store_pkg.open_store
+    seen: list[object] = []
+
+    async def spy(*a: Any, **k: Any) -> Any:
+        seen.append(k.get("posture"))
+        return await real(*a, **k)
+
+    monkeypatch.setattr(store_pkg, "open_store", spy)
+    return seen
+
+
+@pytest.mark.parametrize("enforcement", ["warn", "enforce"])
+def test_the_audit_opens_the_store_at_the_lifespans_posture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, enforcement: str
+) -> None:
+    """Manager decision Q1: the audit's store open passes the posture the lifespan's own open
+    passes, ``hop_posture_from_ai`` at the instance's enforcement, so it is never stricter than
+    serve (at warn) and never looser (at enforce, where the open refuses what serve's refuses).
+    The refused CA gets its row under either. Called directly, since an ``enforce`` serve start
+    over the sample config is refused by earlier gates. Red at warn before, when the audit passed
+    ``_command_hop_posture``'s None there."""
+    from messagefoundry.config.settings import (
+        ApiSettings,
+        SecurityEnforcement,
+        SecuritySettings,
+        ServiceSettings,
+        StoreSettings,
+        hop_posture_from_ai,
+    )
+
+    monkeypatch.setattr(ta, "anchor_path_verdict", lambda _p: PathVerdict(True))
+    monkeypatch.setattr(ta, "dacl_is_owner_only", lambda _p: True)
+    ca = tmp_path / "client-ca.pem"
+    ca.write_bytes(make_self_signed("client-ca.example", [], 30)[0])
+    db = tmp_path / "messagefoundry.db"
+    settings = ServiceSettings(
+        store=StoreSettings(path=str(db), encryption_key=generate_key()),
+        api=ApiSettings(
+            tls_cert_file=str(tmp_path / "api-cert.pem"),
+            tls_client_ca_file=str(ca),
+            tls_client_ca_pin=_WRONG_PIN,
+        ),
+        security=SecuritySettings(enforcement=SecurityEnforcement(enforcement)),
+    )
+    seen = _store_posture_spy(monkeypatch)
+    cli._audit_anchors_refused_before_the_store(
+        settings,
+        enforcing=enforcement == "enforce",
+        forward_ca_refused=False,
+        api_ca_refusal=ta.TrustAnchorError("planted build refusal"),
+    )
+    expected = hop_posture_from_ai(settings.ai, enforcement=SecurityEnforcement(enforcement))
+    assert seen == [expected], seen
+    assert expected.enforcing is (enforcement == "enforce")
+    assert "pin_mismatch" in _anchor_events(db, "api_client")
+
+
+def test_serve_at_warn_passes_the_lifespans_posture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same through ``serve`` itself, at warn, where the two postures differ."""
+    seen = _store_posture_spy(monkeypatch)
+    rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=_WRONG_PIN)
+    assert rc == 2
+    assert len(seen) == 1 and seen[0] is not None, seen
+    assert seen[0].enforcing is False  # type: ignore[attr-defined]
+    assert "pin_mismatch" in _anchor_events(db, "api_client")
+
+
+def _plant_exit(monkeypatch: pytest.MonkeyPatch, exit_kind: str, tmp_path: Path) -> str:
+    """Plant one way out of ``serve`` between ``_start_logging`` and uvicorn, and return any
+    extra ``[logging]`` lines it needs."""
+    from messagefoundry.api import tls as api_tls
+    from messagefoundry.keywrap import KeyWrapRefused
+
+    def build(exc: BaseException) -> None:
+        def refuse(*_a: object, **_k: object) -> object:
+            raise exc
+
+        monkeypatch.setattr(api_tls, "build_api_ssl_context", refuse)
+
+    if exit_kind == "logging-file":
+        return f"file = {json.dumps(str(tmp_path))}\n"  # a directory: configure_logging refuses it
+    if exit_kind == "key-wrap":
+        build(KeyWrapRefused("planted key-wrap refusal"))
+    elif exit_kind == "tls-oserror":
+        build(OSError("planted TLS material failure"))
+    elif exit_kind == "diagnostics":
+        monkeypatch.setattr(cli, "_emit_anchor_diagnostics", lambda **_k: (2, None))
+    elif exit_kind == "raise":
+
+        def boom(**_k: object) -> object:
+            raise RuntimeError("planted defect")
+
+        monkeypatch.setattr(cli, "_emit_anchor_diagnostics", boom)
+    else:
+        raise AssertionError(exit_kind)
+    return ""
+
+
+@pytest.mark.parametrize(
+    "exit_kind", ["logging-file", "key-wrap", "tls-oserror", "diagnostics", "raise"]
+)
+def test_every_way_out_before_the_lifespan_audits_the_collector_ca(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_kind: str
+) -> None:
+    """Manager decision Q2: one exit hook over the span from ``_start_logging`` to uvicorn, so a
+    refused collector CA gets its row whichever way the start leaves before the lifespan runs:
+    ``_start_logging``'s own refusal, a key-wrap refusal and an ``OSError`` from the API TLS
+    build, a gate's ``return 2``, and a raise. The client CA, which nothing refused, is not
+    audited. Red before on every case: none of these exits opened a store."""
+    _no_lifespan(monkeypatch)
+    extra = _collector_ca_refused(tmp_path, monkeypatch)
+    extra = extra.replace(
+        "[egress]\n", _plant_exit(monkeypatch, exit_kind, tmp_path) + "[egress]\n"
+    )
+    rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_toml=extra)
+    # The CLI's floor turns the raise into its own exit code; every refusal here is a clean 2.
+    assert rc == (1 if exit_kind == "raise" else 2), rc
+    assert db.is_file(), "the exit opened no store, so it wrote no audit row"
+    assert "pem_refused" in _anchor_events(db, "logging_forward_ca")
+    assert _anchor_events(db, "api_client") == []
+
+
+def test_an_interrupt_runs_no_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An interrupt is not a refusal: it propagates at once, and no store opens for the audit."""
+    extra = _collector_ca_refused(tmp_path, monkeypatch)
+
+    def interrupt(**_k: object) -> object:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli, "_emit_anchor_diagnostics", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_toml=extra)
+    assert not (tmp_path / "messagefoundry.db").exists()
+
+
+def test_a_memory_fault_on_one_anchor_does_not_stop_the_next(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grab: _Grab
+) -> None:
+    """Finding 5: the collector CA's check runs out of memory (planted), and the client CA is
+    still checked and gets its row. The ``MemoryError`` is raised once both are checked. Red
+    before, when the first anchor's ``MemoryError`` ended the loop."""
+    real = ta.run_anchor_preflight
+
+    async def preflight(specs: list[ta.AnchorSpec], store: Any, **kw: Any) -> object:
+        if specs[0].label == "logging_forward_ca":
+            raise MemoryError("planted")
+        return await real(specs, store, **kw)
+
+    monkeypatch.setattr(ta, "run_anchor_preflight", preflight)
+    extra = _collector_ca_refused(tmp_path, monkeypatch)
+    rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=_WRONG_PIN, extra_toml=extra)
+    assert rc not in (0, 2), "the MemoryError was swallowed into the clean refusal"
+    assert "pin_mismatch" in _anchor_events(db, "api_client")
+    head = "no audit row records the refused [logging].forward_tls_ca_file: out of memory"
+    assert head in grab.seen, grab.seen
+
+
+def test_an_unreadable_ca_is_not_logged_as_having_a_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grab: _Grab
+) -> None:
+    """Finding 3: a CA file that cannot be read is refused before any row is written, so the
+    WARNING must not say a row records it. The file is removed after the build refused it, so
+    the audit's read fails."""
+    from messagefoundry.api import tls as api_tls
+
+    real_build = api_tls.build_api_ssl_context
+
+    def build_then_remove(api: Any, **k: Any) -> Any:
+        try:
+            return real_build(api, **k)
+        finally:
+            Path(api.tls_client_ca_file).unlink()
+
+    monkeypatch.setattr(api_tls, "build_api_ssl_context", build_then_remove)
+    rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=_WRONG_PIN)
+    assert rc == 2
+    assert _anchor_events(db, "api_client") == []
+    refused = [m for m in grab.seen if m.startswith("the audited check refused [api]")]
+    assert len(refused) == 1, grab.seen
+    assert "row is written unless" in refused[0], refused
