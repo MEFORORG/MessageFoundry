@@ -154,17 +154,12 @@ def test_the_attribution_order_is_author_then_committer_then_raw_author() -> Non
     assert (who.name, who.database_id) == ("committer-acct", 2)
     neither = {**committer_only, "committer": {"name": "C", "user": None}}
     who = attribute(neither)
-    assert (who.name, who.database_id, who.author_linked, who.committer_linked) == (
-        "A",
-        None,
-        False,
-        False,
-    )
+    assert (who.name, who.database_id, who.author_linked) == ("A", None, False)
 
 
 def test_an_empty_user_object_is_chosen_as_javascript_chooses_it() -> None:
-    """JavaScript's `||` passes over null only, so an empty `{}` user is still chosen, and its name
-    is empty, never the committer's login."""
+    """JavaScript's `||` passes over null and the falsy primitives but never an object, so an empty
+    `{}` user is still chosen, and its name is empty, never the committer's login."""
     commit = {
         "oid": "a",
         "author": {"name": "A", "user": {}},
@@ -341,47 +336,116 @@ def test_a_linked_author_with_a_malformed_committer_is_not_a_fault() -> None:
         assert attribute({**commit, "committer": committer}).name == "a"
 
 
-_LINKED_PAGE_ONE = _page([_commit(1, "Octo", "octo-contributor", 90000001)], 2, True)
+def _linked_page_one() -> Mapping[str, Any]:
+    """A fresh page one by one linked account, so no test can mutate another's copy."""
+    return _page([_commit(1, "Octo", "octo-contributor", 90000001)], 2, True)
 
 
-@pytest.mark.parametrize(
-    "committer", [None, "not-an-object", {"name": "C", "user": "not-an-object"}, "absent"]
-)
+_COMMITTERS = [None, "not-an-object", {"name": "C", "user": "not-an-object"}, "absent"]
+
+
+@pytest.mark.parametrize("committer", _COMMITTERS)
 def test_an_unlinked_author_with_a_null_or_malformed_committer_is_refused(
     committer: object, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """BACKLOG #5644 added item 1: rule 1 refuses an unlinked author whatever the committer. The
     commit sits past the action's one page, where nothing else refuses it; before the fix an
-    unreadable committer made this a fault (exit 3), which the workflow passes."""
+    unreadable committer made this a fault (exit 3), which the workflow passes. No rule reads the
+    key of a commit past that page, so its committer is not a fault either."""
     commit: dict[str, object] = {"oid": f"{2:040x}", "author": {"name": "Mallory", "user": None}}
     if committer != "absent":
         commit["committer"] = committer
-    pages = [_LINKED_PAGE_ONE, _page([commit], 2, False)]
+    pages = [_linked_page_one(), _page([commit], 2, False)]
     assert _run(_ENV, _serve(pages)) == EXIT_REFUSED
     out = capsys.readouterr().out
     assert "refused::" in out and "'Mallory'" in out
+    assert "fault::" not in out, out
 
 
-def test_a_null_author_is_refused_and_an_absent_one_is_a_fault(
+@pytest.mark.parametrize("committer", _COMMITTERS)
+def test_a_linked_author_with_a_null_or_malformed_committer_passes_past_page_one(
+    committer: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The negative control for the test above: the same committers under a LINKED author, the
+    account page one already holds, refuse nothing and fault nothing."""
+    octo = {"name": "Octo", "user": {"databaseId": 90000001, "login": "octo-contributor"}}
+    commit: dict[str, object] = {"oid": f"{2:040x}", "author": octo}
+    if committer != "absent":
+        commit["committer"] = committer
+    assert _run(_ENV, _serve([_linked_page_one(), _page([commit], 2, False)])) == EXIT_PASS
+    out = capsys.readouterr().out
+    assert "refused::" not in out and "fault::" not in out, out
+
+
+@pytest.mark.parametrize("author", ["null", "absent", False, 0, ""])
+def test_an_absent_or_null_author_is_refused_and_not_also_a_fault(
+    author: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A null author (schema-legal) has no account linked, so rule 1 refuses it. An absent key, or
+    another value JavaScript's `||` passes over, is read the same way, so the shapes agree; and the
+    refusal is not also reported as a fault about a valid reply."""
+    commit: dict[str, object] = {"oid": f"{2:040x}", "committer": {"name": "C", "user": None}}
+    if author != "absent":
+        commit["author"] = None if author == "null" else author
+    assert _run(_ENV, _serve([_linked_page_one(), _page([commit], 2, False)])) == EXIT_REFUSED
+    out = capsys.readouterr().out
+    assert f"commit {2:040x} has no git author GitHub reports" in out
+    assert "fault::" not in out, out
+
+
+@pytest.mark.parametrize("user", ["absent", False, 0, ""])
+def test_a_user_javascript_passes_over_is_unlinked(
+    user: object, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An author with no ``user`` key, or a falsy one, is unlinked as the action's ``||`` reads it:
+    refused under rule 1, never a fault."""
+    author: dict[str, object] = {"name": "Mallory"}
+    if user != "absent":
+        author["user"] = user
+    commit = {"oid": f"{2:040x}", "author": author, "committer": {"name": "C", "user": None}}
+    assert _run(_ENV, _serve([_linked_page_one(), _page([commit], 2, False)])) == EXIT_REFUSED
+    out = capsys.readouterr().out
+    assert "'Mallory'" in out and "fault::" not in out, out
+
+
+def test_a_malformed_author_is_a_fault_naming_its_commit() -> None:
+    """A truthy value that is not an object is a reply in the wrong shape, not an unlinked author."""
+    commit = {"oid": f"{2:040x}", "author": "not-an-object", "committer": None}
+    read = fetch_commits(_serve([_linked_page_one(), _page([commit], 2, False)]), "M", "N", 7)
+    verdict = evaluate(read, _ALLOWLIST, _no_signatures)
+    assert verdict.refusals == ()
+    assert verdict.fault == f"commit {2:040x}: a commit's author is not an object"
+
+
+def test_both_rules_reach_the_first_annotations_and_the_rest_reach_the_log(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """A null author (schema-legal) has no account linked, so rule 1 refuses it rather than
-    faulting; before the fix this exited 3 past the action's page. An absent ``author`` key is a
-    reply in the wrong shape, which stays a fault."""
-    commit: dict[str, object] = {"oid": f"{2:040x}", "committer": {"name": "C", "user": None}}
-    assert _run(_ENV, _serve([_LINKED_PAGE_ONE, _page([commit], 2, False)])) == EXIT_FAULT
-    capsys.readouterr()
-    commit["author"] = None
-    assert _run(_ENV, _serve([_LINKED_PAGE_ONE, _page([commit], 2, False)])) == EXIT_REFUSED
-    assert f"commit {2:040x} has no git author GitHub reports" in capsys.readouterr().out
+    """GitHub keeps 10 error annotations a step. Twelve rule-1 refusals must not push the rule-2
+    one past them, and none is dropped from the log."""
+    unlinked = [_commit(i, f"Unlinked {i}") for i in range(1, 13)]
+    page_one = _page([_commit(100, "Octo", "octo-contributor", 90000001), *unlinked], 14, True)
+    page_two = _page([_commit(200, "New Person", "new-person", 90000003)], 14, False)
+    assert _run(_ENV, _serve([page_one, page_two])) == EXIT_REFUSED
+    lines = capsys.readouterr().out.splitlines()
+    annotated = [line for line in lines if line.startswith("::error title=CLA pre-check refused::")]
+    assert len(annotated) == 10
+    assert "new-person" in annotated[1], annotated[:2]
+    assert "4 more refusal(s)" in annotated[-1]
+    logged = [line for line in lines if line.startswith("CLA pre-check refused: ")]
+    assert len(logged) == 4
 
 
 @pytest.mark.parametrize(
     ("committer", "refusals"),
-    [({"name": "C", "user": "not-an-object"}, 2), ({"name": "C", "user": None}, 1)],
+    [
+        ({"name": "C", "user": "not-an-object"}, 2),
+        (None, 2),
+        ({"name": "C", "user": None}, 1),
+    ],
+    ids=["unreadable-user", "null-committer", "readable"],
 )
 def test_only_a_readable_unlinked_commit_keys_the_actions_view(
-    committer: Mapping[str, Any], refusals: int
+    committer: Mapping[str, Any] | None, refusals: int
 ) -> None:
     """A page-one unlinked commit is filed under its author name when its committer reads, as the
     action files it, and shields a linked namesake on page two from rule 2. With an unreadable
