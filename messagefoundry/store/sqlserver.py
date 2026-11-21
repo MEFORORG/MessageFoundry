@@ -1105,28 +1105,28 @@ def _rcsi_remedy(database: str | None) -> str:
 
 
 def _options_error(exc: BaseException) -> str:
-    """How the database-options check renders an error into its refusals and logs (BACKLOG #5666).
-
-    ODBC text can echo connection parameters, and a server message can quote a stored value. So an
-    error that carries a SQLSTATE renders as its class, SQLSTATE and native error number and no
-    text, the form the CLI's ``_store_error_text`` prints; any other keeps its type and its text
-    through ``redact_log_line``, as ``probe_failure`` renders it."""
-    state = driver_sqlstate(exc)
-    if state is None:
-        return f"{type(exc).__name__}: {redact_log_line(str(exc))[:300]}"
-    native = re.findall(r"\((\d{1,6})\)\s*\(SQL[A-Za-z]+\)", str(exc))
-    return f"{type(exc).__name__} [SQLSTATE {state}]" + (
-        f" native error {native[-1]}" if native else ""
-    )
+    """How the database-options check renders an error into its refusals and logs (BACKLOG #5666):
+    its text through ``redact_log_line``, since ODBC text can echo connection parameters. The
+    redacted text keeps a driver's diagnosis, such as an untrusted certificate or a query timeout,
+    readable. Where redaction changes nothing the text is the error's own, so the CLI's
+    ``_engine_refusal_text`` still finds and replaces it."""
+    return redact_log_line(str(exc))
 
 
 def _bound_one_shot(conn: Any, settings: StoreSettings) -> None:
     """Apply ``[store].command_timeout`` to a one-shot options connection (BACKLOG #5666), as
     :meth:`SqlServerStore._acquire` does for a pooled one, so an ``ALTER DATABASE`` waiting on a
-    long transaction ends at that limit. 0 means no limit here, as everywhere it applies."""
+    long transaction ends at that limit. 0 means no limit here, as everywhere it applies. Where the
+    raw pyodbc connection is unreachable it warns, as the claim connection does (STORE-3), rather
+    than run unbounded in silence."""
     raw = getattr(conn, "_conn", None)
     if raw is not None:
         raw.timeout = settings.command_timeout
+    else:
+        log.warning(
+            "sqlserver: cannot reach the raw pyodbc connection to apply command_timeout on the"
+            " database-options check; its statements run with no statement limit (STORE-3)"
+        )
 
 
 def _upload_quota_lock(uploader_id: str) -> str:
@@ -1586,12 +1586,12 @@ class _SyncHandoffPool:
             raise
         finally:
             if broken:
-                try:
-                    conn.close()
-                except Exception:  # noqa: BLE001 - best-effort discard
-                    log.debug("sync handoff connection close on discard failed", exc_info=True)
                 fresh: Any = None
                 try:
+                    try:
+                        conn.close()
+                    except Exception:  # noqa: BLE001 - best-effort discard
+                        log.debug("sync handoff connection close on discard failed", exc_info=True)
                     fresh = self._factory()  # refill the slot with a fresh connection
                 except Exception:  # noqa: BLE001 - reconnect may itself fail (server down)
                     log.debug(
@@ -4922,8 +4922,9 @@ class SqlServerStore:
                             await _close_one_shot(probe, pcur)
                 except UngatedConnectionError:
                     raise  # a refusal, not an unreadable state: the open must say why it failed
-                except Exception:  # noqa: BLE001 - an unreadable state is an unverified one
-                    log.debug("RCSI re-read on %r failed", db, exc_info=True)
+                except Exception as exc:  # noqa: BLE001 - an unreadable state is an unverified one
+                    # No traceback: its text is the driver's, unredacted (BACKLOG #5666).
+                    log.debug("RCSI re-read on %r failed: %s", db, _options_error(exc))
                     continue
                 if prow is not None and prow[0]:
                     return True

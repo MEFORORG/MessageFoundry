@@ -2867,9 +2867,9 @@ async def _real_rcsi_refusal(monkeypatch: pytest.MonkeyPatch, driver: Exception)
 def test_cli_an_engine_refusal_quoting_a_driver_error_prints_the_remedy_not_the_driver_text(
     transit_db: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """The SQL Server open's READ_COMMITTED_SNAPSHOT refusal names the driver error it was raised
-    from by the error's class, SQLSTATE and native number (BACKLOG #5666). Its remedy prints, and
-    the driver's text does not."""
+    """The SQL Server open's READ_COMMITTED_SNAPSHOT refusal quotes the driver error it was raised
+    from. Its remedy prints; the quoted driver text is replaced by the error's class, SQLSTATE and
+    native number."""
     import asyncio
 
     import messagefoundry.store.base as store_base
@@ -2881,10 +2881,7 @@ def test_cli_an_engine_refusal_quoting_a_driver_error_prints_the_remedy_not_the_
         "42000", f"[42000] permission denied on {_ROW_TEXT} (5011) (SQLExecDirectW)"
     )
     refusal = asyncio.run(_real_rcsi_refusal(monkeypatch, driver))
-    # BACKLOG #5666: the refusal itself now names the driver error by class, SQLSTATE and native
-    # number and quotes none of its text, so the CLI has nothing left to replace.
-    assert _ROW_TEXT not in str(refusal)
-    assert "(_ServerDriverError [SQLSTATE 42000] native error 5011)" in str(refusal)
+    assert _ROW_TEXT in str(refusal)  # the control: the refusal does quote the driver's text
 
     async def refusing(*_a: object, **_k: object) -> object:
         raise refusal

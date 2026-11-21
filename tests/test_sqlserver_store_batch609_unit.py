@@ -99,6 +99,20 @@ def test_a_base_exception_from_the_refill_keeps_the_slot() -> None:
     assert pool._free.get_nowait() is None
 
 
+def test_a_base_exception_from_the_discard_close_keeps_the_slot() -> None:
+    """A close of the discarded connection that raises a BaseException still leaves the slot."""
+
+    class _Stubborn(_Conn):
+        def close(self) -> None:
+            raise KeyboardInterrupt
+
+    pool = _SyncHandoffPool(lambda: _Stubborn(1), 1, conn_timeout=5)
+    with pytest.raises(KeyboardInterrupt), pool.acquire():
+        raise RuntimeError("handoff failed")
+    assert pool._free.qsize() == 1
+    assert pool._free.get_nowait() is None
+
+
 # --- #5666: the database-options check ---------------------------------------------------------
 
 _ALTER_RCSI = "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
@@ -156,11 +170,16 @@ class _OptionsConn:
         pass
 
 
-def _install(monkeypatch: pytest.MonkeyPatch, *, connect_fails: bool = False) -> dict[str, int]:
+def _install(
+    monkeypatch: pytest.MonkeyPatch, *, connect_fails: bool = False, reread_fails: bool = False
+) -> dict[str, int]:
     timeouts: dict[str, int] = {}
+    connects = 0
 
     async def _connect(**kwargs: Any) -> _OptionsConn:
-        if connect_fails:
+        nonlocal connects
+        connects += 1
+        if connect_fails or (reread_fails and connects > 1):
             raise RuntimeError(_DRIVER_TEXT)
         return _OptionsConn((0, 0), timeouts)
 
@@ -168,8 +187,6 @@ def _install(monkeypatch: pytest.MonkeyPatch, *, connect_fails: bool = False) ->
     module.connect = _connect  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "aioodbc", module)
     monkeypatch.setattr(sqlserver_module, "_RCSI_REREAD_DELAY_S", 0.0)
-    # The stand-in carries no call gate; the gate itself is pinned by the #2394 tests.
-    monkeypatch.setattr(sqlserver_module, "_require_call_gate", lambda conn: None)
     return timeouts
 
 
@@ -197,7 +214,7 @@ async def test_the_options_refusal_redacts_the_driver_text(
     with pytest.raises(RuntimeError, match="READ_COMMITTED_SNAPSHOT is OFF") as info:
         await SqlServerStore._ensure_database_options(_settings())
     assert _SECRET not in str(info.value)
-    assert "RuntimeError: " in str(info.value)  # the type still names the fault
+    assert "permission denied" in str(info.value)  # the diagnosis itself survives redaction
     await SqlServerStore._ensure_database_options(_settings(), fail_closed=False)
     messages = [record.getMessage() for record in caplog.records]
     assert any("ALLOW_SNAPSHOT_ISOLATION" in m for m in messages), "the control: it warned"
@@ -314,3 +331,16 @@ async def test_upsert_alert_instance_inserts_a_first_fire_under_nocount() -> Non
         event_type="connection_error", connection="OB_X", severity="warning", now=2.0
     )
     assert len(repeat.executed) == 1, "a matched UPDATE inserts nothing"
+
+
+async def test_the_options_reread_failure_logs_no_driver_text(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The re-read after a failed ALTER logged its traceback, whose text is the driver's own."""
+    _install(monkeypatch, reread_fails=True)
+    caplog.set_level(logging.DEBUG, logger=sqlserver_module.log.name)
+    with pytest.raises(RuntimeError, match="READ_COMMITTED_SNAPSHOT is OFF"):
+        await SqlServerStore._ensure_database_options(_settings())
+    rereads = [r for r in caplog.records if "RCSI re-read" in r.getMessage()]
+    assert rereads, "the control: the re-read failed and logged"
+    assert all(r.exc_info is None and _SECRET not in r.getMessage() for r in rereads)
