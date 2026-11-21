@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -441,17 +443,44 @@ def test_a_write_that_fails_restores_the_files_already_written(
     config_dir = _config(tmp_path, SPLIT)
     plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
     before = {name: (config_dir / name).read_bytes() for name in SPLIT}
-    real_write = Path.write_bytes
+    real_replace = atomic_edit.replace_validated
     writes: list[str] = []
 
-    def second_write_fails(self: Path, data: bytes) -> int:
-        writes.append(self.name)
+    def second_write_fails(path: Path, data: bytes, *args: Any, **kwargs: Any) -> None:
+        writes.append(path.name)
         if len(writes) == 2:
             raise PermissionError("held open")
-        return real_write(self, data)
+        real_replace(path, data, *args, **kwargs)
 
-    monkeypatch.setattr(Path, "write_bytes", second_write_fails)
+    monkeypatch.setattr(atomic_edit, "replace_validated", second_write_fails)
     with pytest.raises(WiringError, match="already written were restored"):
+        apply_rename(plan)
+    monkeypatch.undo()
+    assert {name: (config_dir / name).read_bytes() for name in SPLIT} == before
+
+
+def test_a_write_interrupted_part_way_leaves_each_file_whole(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A rename killed while it writes a file must not leave that file truncated: each file is
+    written to a candidate and renamed over the live one, so the live file holds its old bytes,
+    never part of its new ones (BACKLOG #5980). The kill is simulated where either write path
+    passes: an in-place write half done, and the candidate's flush to disk."""
+    config_dir = _config(tmp_path, SPLIT)
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
+    before = {name: (config_dir / name).read_bytes() for name in SPLIT}
+    real_write = Path.write_bytes
+
+    def half_then_killed(self: Path, data: bytes) -> int:
+        real_write(self, data[: len(data) // 2])
+        raise KeyboardInterrupt
+
+    def killed(_fd: int) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(Path, "write_bytes", half_then_killed)
+    monkeypatch.setattr(os, "fsync", killed)
+    with pytest.raises(KeyboardInterrupt):
         apply_rename(plan)
     monkeypatch.undo()
     assert {name: (config_dir / name).read_bytes() for name in SPLIT} == before
@@ -467,7 +496,7 @@ def test_write_rename_holds_the_config_edit_lock(
     held: list[Path] = []
     locked: list[Path] = []
     real_lock = atomic_edit.edit_lock
-    real_write = Path.write_bytes
+    real_replace = atomic_edit.replace_validated
 
     @contextlib.contextmanager
     def recording_lock(path: Path, **kwargs: object) -> Iterator[None]:
@@ -478,12 +507,12 @@ def test_write_rename_holds_the_config_edit_lock(
             finally:
                 held.remove(path.parent)
 
-    def write_under_lock(self: Path, data: bytes) -> int:
-        locked.extend(d for d in held if d == self.parent)
-        return real_write(self, data)
+    def write_under_lock(path: Path, data: bytes, *args: Any, **kwargs: Any) -> None:
+        locked.extend(d for d in held if d == path.parent)
+        real_replace(path, data, *args, **kwargs)
 
     monkeypatch.setattr(atomic_edit, "edit_lock", recording_lock)
-    monkeypatch.setattr(Path, "write_bytes", write_under_lock)
+    monkeypatch.setattr(atomic_edit, "replace_validated", write_under_lock)
     assert len(apply_rename(plan)) == 2
     monkeypatch.undo()
     assert [p.resolve() for p in locked] == [config_dir.resolve()] * 2
@@ -660,3 +689,15 @@ def test_codeset_rename_says_so_when_the_table_cannot_be_moved_back(
     message = str(caught.value)
     assert message.startswith("writing mod.py failed. Nothing was written. The code set was then")
     assert "left as meals.csv" in message and "still name 'diets'" in message
+
+
+def test_the_codeset_rename_row_spells_its_steps_in_words() -> None:
+    """CLAUDE.md section 11: the rename row of docs/CODESETS.md says its steps in words, with no
+    arrow glyph standing in for "then" or "to"."""
+    docs = Path(__file__).resolve().parents[1] / "docs" / "CODESETS.md"
+    row = next(
+        line
+        for line in docs.read_text(encoding="utf-8").splitlines()
+        if line.startswith("| `messagefoundry codeset rename")
+    )
+    assert not any(ord(ch) > 0x7F for ch in row), row

@@ -545,8 +545,8 @@ def write_rename(prepared: PreparedRename) -> list[LiteralEdit]:
         written: list[tuple[str, bytes]] = []
         for file, raw, new_bytes in prepared.files:
             try:
-                Path(file).write_bytes(new_bytes)
-            except OSError as exc:
+                _replace(file, new_bytes)
+            except (OSError, WiringError) as exc:
                 unrestored = _restore([*written, (file, raw)])
                 left = (
                     f"; these still hold the new name: {', '.join(unrestored)}"
@@ -600,6 +600,18 @@ def _rename_locks(files: Iterable[str]) -> Iterator[None]:
         yield
 
 
+def _replace(file: str, data: bytes) -> None:
+    """Replace ``file`` with ``data`` through the config editors' atomic write: a candidate beside
+    it, flushed to disk, renamed over it. A write that fails or is interrupted part way leaves the
+    live file whole, never truncated (BACKLOG #5980). The plan's bytes were checked when it was
+    prepared, so the candidate needs no further validation."""
+    atomic_edit.replace_validated(Path(file), data, _accept_candidate, refused_error=WiringError)
+
+
+def _accept_candidate(_candidate: Path) -> None:
+    """:func:`_replace`'s validation: :func:`prepare_rename` has already checked the bytes."""
+
+
 def _restore(files: list[tuple[str, bytes]]) -> list[str]:
     """Write each file's original bytes back where they changed, returning the files that could
     not be. A file whose write failed before it changed anything is left alone."""
@@ -611,8 +623,8 @@ def _restore(files: list[tuple[str, bytes]]) -> list[str]:
         except OSError as exc:
             _log.debug("rename could not re-read %s: %s", file, type(exc).__name__)
         try:
-            Path(file).write_bytes(raw)
-        except OSError as exc:
+            _replace(file, raw)
+        except (OSError, WiringError) as exc:
             _log.warning("rename could not restore %s: %s", file, type(exc).__name__)
             failed.append(file)
     return failed
@@ -885,12 +897,17 @@ def _referrer_sites(
         # that may hold the old name leaves the referrer unresolved (BACKLOG #5980).
         taint_globals = {name for scan in scans for name in scan.taint_globals}
         taint_attrs = {name for scan in scans for name in scan.taint_attrs}
-        tainted = any(scan.tainted for scan in scans) or any(
-            _holds(captured.value, old) or _holds(captured.value, old, elements=True)
-            for func in reached
-            for captured in captured_values(func, func.__module__)
-            if captured.source != "default"
-            and captured.name in (taint_attrs if captured.source == "attribute" else taint_globals)
+        tainted = (
+            any(scan.tainted for scan in scans)
+            or bool(taint_globals or taint_attrs)
+            and any(
+                _holds_either(captured.value, old)
+                for func in reached
+                for captured in captured_values(func, func.__module__)
+                if captured.source != "default"
+                and captured.name
+                in (taint_attrs if captured.source == "attribute" else taint_globals)
+            )
         )
         complete = complete and not tainted
         if held is not None and tainted:
@@ -1038,7 +1055,7 @@ def _captures(fn: object, old: str) -> bool:
     """Whether a function ``fn`` reaches captures a value holding ``old``, as a value or an
     element."""
     return any(
-        _holds(captured.value, old) or _holds(captured.value, old, elements=True)
+        _holds_either(captured.value, old)
         for func in reached_functions(fn)
         for captured in captured_values(func, func.__module__)
     )
@@ -1056,7 +1073,7 @@ def _may_read(fn: object, old: str, sources: SourceCache) -> bool:
         if any(
             span.start <= line <= span.end for line, _col in sources.occurrences(file, old)
         ) or any(
-            _holds(captured.value, old) or _holds(captured.value, old, elements=True)
+            _holds_either(captured.value, old)
             for captured in captured_values(func, func.__module__)
         ):
             return True
@@ -1193,6 +1210,28 @@ class _Flow:
     iter_calls: set[str] = field(default_factory=set)
     # The keys of the name and attribute nodes the flow read.
     read: set[_Key] = field(default_factory=set)
+
+    def is_empty(self) -> bool:
+        """Whether the flow carried no value: no constant, name, attribute or helper return."""
+        return not any(
+            (
+                self.consts,
+                self.unbound,
+                self.iterated,
+                self.attrs,
+                self.iter_attrs,
+                self.calls,
+                self.iter_calls,
+            )
+        )
+
+
+def _role_flow(params: frozenset[str], role: _Role) -> _Flow:
+    """A fresh :class:`_Flow` over ``params`` that follows ``role``'s module names and
+    pass-through helpers."""
+    return _Flow(
+        params=params, modules=role.names.modules, passes=role.passes, iter_passes=role.iter_passes
+    )
 
 
 @dataclass
@@ -1412,12 +1451,8 @@ def _scan_function(
     # Two flows: what reaches a role inside this function (``sink``), and what reaches only its
     # return value (``back``). A parameter in ``sink`` makes every call's argument a referent; one
     # only in ``back`` does so only for a call that is itself carried into a role (BACKLOG #5980).
-    sink = _Flow(
-        params=params, modules=role.names.modules, passes=role.passes, iter_passes=role.iter_passes
-    )
-    back = _Flow(
-        params=params, modules=role.names.modules, passes=role.passes, iter_passes=role.iter_passes
-    )
+    sink = _role_flow(params, role)
+    back = _role_flow(params, role)
     returned: list[ast.expr] = []
     if role.give_back or role.iterate_returns:
         if isinstance(node, ast.Lambda):
@@ -1427,9 +1462,7 @@ def _scan_function(
             for child in _own_nodes(node)
             if isinstance(child, (ast.Return, ast.Yield, ast.YieldFrom)) and child.value is not None
         )
-    taint = _Flow(
-        params=params, modules=role.names.modules, passes=role.passes, iter_passes=role.iter_passes
-    )
+    taint = _role_flow(params, role)
     body = _body(node)
     roots: list[ast.expr] = []
     for stmt in body:
@@ -1438,6 +1471,8 @@ def _scan_function(
                 for root in _call_roots(child, role):
                     roots.append(root)
                     _carried(root, values, set(), sink)
+                if not role.taints:
+                    continue
                 helper = _helper_name(child.func, role.names.modules) or ""
                 for arg in _slot_arguments(child, role.taints.get(helper, ())):
                     _carried(arg, values, set(), taint)
@@ -1543,19 +1578,9 @@ def _carries_nothing(
 ) -> bool:
     """Whether a role expression carries no value the scan can follow: no constant, name,
     attribute or helper return (``p[1]`` over ``.items()`` pairs, an f-string)."""
-    probe = _Flow(
-        params=params, modules=role.names.modules, passes=role.passes, iter_passes=role.iter_passes
-    )
+    probe = _role_flow(params, role)
     _carried(root, values, set(), probe)
-    return not (
-        probe.consts
-        or probe.unbound
-        or probe.iterated
-        or probe.attrs
-        or probe.iter_attrs
-        or probe.calls
-        or probe.iter_calls
-    )
+    return probe.is_empty()
 
 
 def _body(node: _FunctionNode) -> list[ast.AST]:
@@ -2236,6 +2261,11 @@ def _holds(value: object, old: str, depth: int = 0, *, elements: bool = False) -
     if isinstance(value, (list, tuple, set, frozenset)):
         return any(_holds(v, old, depth + 1) for v in value)
     return False
+
+
+def _holds_either(value: object, old: str) -> bool:
+    """Whether ``value`` holds ``old`` read either way: for its values or for its elements."""
+    return _holds(value, old) or _holds(value, old, elements=True)
 
 
 def _binding_read_only_by_referents(
