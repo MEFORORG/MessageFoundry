@@ -106,15 +106,17 @@ def test_the_cli_help_names_every_member(capsys: pytest.CaptureFixture[str]) -> 
     help_text = _help_text(capsys)
     clause = re.search(r"Its members: (.*?)\. The tail's", help_text)
     assert clause is not None, help_text
-    missing = sorted(
-        name for name in _members_written_by_build_bundle() if name not in clause.group(1)
-    )
+    members = _members_written_by_build_bundle()
+    assert len(members) >= 5, members
+    missing = sorted(name for name in members if name not in clause.group(1))
     assert not missing, f"support-bundle --help does not name: {missing}"
 
 
 def test_phi_md_stream_14_names_every_member() -> None:
     row = _stream_14_row()
-    missing = sorted(name for name in _members_written_by_build_bundle() if f"`{name}`" not in row)
+    members = _members_written_by_build_bundle()
+    assert len(members) >= 5, members
+    missing = sorted(name for name in members if f"`{name}`" not in row)
     assert not missing, f"docs/PHI.md stream 14 does not name: {missing}"
 
 
