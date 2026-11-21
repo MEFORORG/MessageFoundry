@@ -6414,13 +6414,25 @@ class PostgresStore:
                             "re-ingress reply erased",
                             erased=True,
                         )
-                    body = (
-                        self._dec(
-                            art["body"],
-                            aad=cell_aad("response", "body", origin_msg_id, dest, seq),
+                    # BACKLOG #5689: a reply or an origin cell that will never open or parse
+                    # dead-letters the token, so the loopback lane moves. A key service that gave no
+                    # verdict says nothing about the cell, so it propagates and the token is retried.
+                    try:
+                        body = (
+                            self._dec(
+                                art["body"],
+                                aad=cell_aad("response", "body", origin_msg_id, dest, seq),
+                            )
+                            or ""
                         )
-                        or ""
-                    )
+                    except CipherError as exc:
+                        if is_transient_open_failure(exc):
+                            raise
+                        return await _consume_dead(
+                            "ingress_handoff(reply-unopenable)",
+                            "re-ingress reply does not decrypt",
+                            "re-ingress reply undecryptable",
+                        )
                     mrow = await conn.fetchrow(
                         "SELECT channel_id, metadata FROM messages WHERE id=$1", origin_id
                     )
@@ -6446,11 +6458,28 @@ class PostgresStore:
                             str(err),
                             "re-ingress origin failed its integrity check",
                         )
-                    if meta_json:
-                        loaded = json.loads(meta_json)
-                        if isinstance(loaded, dict):
-                            origin_meta = loaded
-                    child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
+                    except CipherError as exc:
+                        if is_transient_open_failure(exc):
+                            raise
+                        return await _consume_dead(
+                            "ingress_handoff(origin-unopenable)",
+                            "re-ingress origin metadata does not decrypt",
+                            "re-ingress origin metadata undecryptable",
+                        )
+                    try:
+                        if meta_json:
+                            loaded = json.loads(meta_json)
+                            if isinstance(loaded, dict):
+                                origin_meta = loaded
+                        child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
+                    except (ValueError, TypeError, OverflowError, RecursionError):
+                        # Corrupt JSON, or a depth that is not an integer (a string, a list, an
+                        # infinity): the lineage is unreadable, so the child's depth is unknowable.
+                        return await _consume_dead(
+                            "ingress_handoff(origin-metadata)",
+                            "re-ingress origin metadata is unparseable",
+                            "re-ingress origin metadata unparseable",
+                        )
                     root = origin_meta.get("correlation_root_id") or origin_id
                     if child_depth > correlation_depth_cap:
                         await self._exec_terminal(

@@ -6038,6 +6038,113 @@ async def test_undecryptable_reply_contract(store, spoil) -> None:
         await sealed.close()
 
 
+async def _spoil_origin_metadata(raw: RawSql, bad: str, value: str) -> None:
+    await raw("UPDATE messages SET metadata=? WHERE id=?", (value, bad))
+
+
+async def _spoil_origin_metadata_foreign_key(
+    _fetch: RawFetch, raw: RawSql, bad: str, _good: str
+) -> None:
+    """The right cell, sealed under a key the store was never given: a plain ``CipherError``, not a
+    tag failure, since the store holds no key the value names."""
+    foreign = make_cipher(generate_key(), write_v2=True)
+    sealed = foreign.encrypt(
+        '{"correlation_depth": 0}',
+        aad=message_cell_aad("metadata", message_id=bad, channel_id="IB_REAL"),
+    )
+    await _spoil_origin_metadata(raw, bad, sealed)
+
+
+def _unparseable_metadata(value: str) -> Any:
+    async def spoil(_fetch: RawFetch, raw: RawSql, bad: str, _good: str) -> None:
+        await _spoil_origin_metadata(raw, bad, value)
+
+    return spoil
+
+
+# (id, keyed, spoil, the dead event's detail). Each spoils the HEAD token's origin or reply only.
+_HANDOFF_POISON_CASES = [
+    ("metadata-not-json", False, _unparseable_metadata("not json"), "unparseable"),
+    (
+        "depth-not-a-number",
+        False,
+        _unparseable_metadata('{"correlation_depth": "deep"}'),
+        "unparseable",
+    ),
+    ("depth-a-list", False, _unparseable_metadata('{"correlation_depth": [1]}'), "unparseable"),
+    (
+        "depth-infinite",
+        False,
+        _unparseable_metadata('{"correlation_depth": Infinity}'),
+        "unparseable",
+    ),
+    ("metadata-foreign-key", True, _spoil_origin_metadata_foreign_key, "metadata undecryptable"),
+    ("reply-foreign-key", True, None, "reply undecryptable"),
+]
+
+
+@pytest.mark.parametrize(
+    ("keyed", "spoil", "detail"),
+    [c[1:] for c in _HANDOFF_POISON_CASES],
+    ids=[c[0] for c in _HANDOFF_POISON_CASES],
+)
+async def test_ingress_handoff_dead_letters_a_token_it_can_never_hand_off(
+    store, keyed, spoil, detail
+) -> None:
+    """BACKLOG #5689: an origin whose metadata does not decrypt, is not JSON, or holds a depth that
+    is not an integer, and a reply that does not decrypt inside the handoff, each raised out of
+    ``ingress_handoff``, so the token re-pended at the head of the loopback lane on every pass. Each
+    now dead-letters the token and ERRORs its origin. CONTROL: the good token behind it re-ingresses,
+    so the lane moves and the handoff did not dead-letter everything."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests import _undecryptable_reply_contract as contract
+    from tests._erased_reply_contract import LOOP, children
+
+    raw, fetch = _raw_adapters(store)
+    s = store
+    if keyed:
+        s = await PostgresStore.open(
+            load_settings(environ=os.environ).store,
+            cipher=make_cipher(generate_key(), write_v2=True),
+        )
+    try:
+        bad = await contract.captured(s, control="HP-BAD", now=1.0)
+        good = await contract.captured(s, control="HP-GOOD", now=2.0)
+        # The handoff's own body read; the worker's earlier read is BACKLOG #4995's contract.
+        await (spoil or contract.spoil_with_a_foreign_key)(fetch, raw, bad, good)
+        for _ in range(2):
+            item = await s.claim_next_fifo(LOOP, now=3.0, stage=Stage.RESPONSE.value)
+            assert item is not None
+            assert (
+                await s.ingress_handoff(
+                    response_row_id=item.id,
+                    loopback_channel_id=LOOP,
+                    correlation_depth_cap=8,
+                    control_id=None,
+                    message_type=None,
+                    summary=None,
+                    now=4.0,
+                )
+                is True
+            )
+        assert await s.claim_next_fifo(LOOP, now=5.0, stage=Stage.RESPONSE.value) is None
+
+        assert (await contract.token_of(fetch, bad))["status"] == OutboxStatus.DEAD.value
+        # Read raw: a keyed get_message would refuse the spoiled metadata cell itself.
+        [origin] = await fetch("SELECT status FROM messages WHERE id=?", (bad,))
+        assert origin["status"] == MessageStatus.ERROR.value
+        events = await s.events_for(bad)
+        assert [e for e in events if e["event"] == "dead" and detail in str(e["detail"])]
+
+        [control] = await fetch("SELECT status FROM messages WHERE id=?", (good,))
+        assert control["status"] == MessageStatus.PROCESSED.value
+        assert len(await children(fetch)) == 1
+    finally:
+        if keyed:
+            await s.close()
+
+
 async def test_pool_isolation_pin_outranks_a_role_default(store) -> None:
     """BACKLOG #5674: the finalizer's read after its advisory lock sees a sibling's commit only under
     READ COMMITTED. With the role's default set to REPEATABLE READ, a freshly opened pool still runs
