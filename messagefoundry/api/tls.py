@@ -678,7 +678,8 @@ def ensure_api_tls_material(
     **A file or lock failure never costs a start the old pair can still serve**: any ``OSError`` on
     the locked path -- including a lock it could not take -- falls back to that pair with a WARNING,
     and only a pair that does not load or has expired lets the error propagate. Other errors, such
-    as a ``[api].host`` the certificate builder refuses, still stop the start.
+    as a ``[api].host`` the certificate builder refuses on a first mint or a renewal, still stop
+    the start; refused on a re-mint for a changed bind, it keeps the old pair with a WARNING.
 
     **EVERY REPLACEMENT IS REPORTED, never silent (ADR 0172 decision 6).** At least a renewal, a
     re-mint for a bind the certificate does not name, and the recovery of an unusable or

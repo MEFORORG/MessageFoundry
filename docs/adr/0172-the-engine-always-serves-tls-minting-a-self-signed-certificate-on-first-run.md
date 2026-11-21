@@ -162,7 +162,8 @@ early, at startup, and audits every replacement.** This amends decisions 5 and 6
 nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
 
 1. **Decision 5 now reads: mint once, reuse while fresh, renew early.** A start that finds a pair
-   with at least a third of its own lifetime left reuses it and writes nothing. A start that finds
+   with at least a third of its own lifetime left reuses it and writes nothing, unless its
+   certificate does not name the bind (BACKLOG #5973, item 6). A start that finds
    less than a third left, or an expired pair, renews it: a new key and a new certificate under the
    same two file names. For the 365-day pair a third is about 122 days. The threshold is a share of
    the certificate's own validity period, so it does not hang on the 365 constant.
