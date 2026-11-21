@@ -73,7 +73,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.11.18.2"
+$GateVersion = "2026.11.20.1"
 
 # THE SHELL ENTRY'S TIMEOUT, STATED ONCE (review round 56f5830e). Several notes below say the install
 # gives this hook 15 s and that a killed hook lets the command through. That is NOT true of the
@@ -960,10 +960,9 @@ function Get-ScanRawIndexMap($Seg) {
 # directory irrelevant -- an absolute `-C` is read past such a chdir, under the conditions in
 # Get-InvocationReading and the resolver's -OwnWindow branch; and git options after the verb.
 # Rules 3 and 3c do not reliably read a git word that rules 3 and 3c's case-sensitive match of
-# `$gitInvocation` misses, such as `git.EXE` or `GIT`. At least these are ALLOWED from the primary
-# (measured 2026-11-18):
-# `git.EXE reset --hard` and `git.EXE config core.hooksPath /nope` under Bash, and `GIT reset
-# --hard` and `GIT config core.hooksPath /nope` under the PowerShell tool. Also, at least: any line
+# `$gitInvocation` misses, such as `GIT` (its `.exe` suffix is read in any case since BACKLOG #5655
+# step 3). At least these are ALLOWED from the primary (measured 2026-11-18): `GIT reset --hard`
+# and `GIT config core.hooksPath /nope` under the PowerShell tool. Also, at least: any line
 # after an earlier line whose chdir sits in parentheses, which makes the earlier-line reading answer
 # nothing, unless the invocation's `-C` fold ends absolute and its window names no work tree or git
 # dir. Under Bash `(cd x && ls)` is a subshell and the shell does not move; under the PowerShell
@@ -973,9 +972,10 @@ function Get-ScanRawIndexMap($Seg) {
 # relative `--git-dir` or `--work-tree` against the `-C` directory, not against the unknown one, but
 # the $absC test excludes every such window, so `git -C '<p>' --work-tree=<rel> reset --hard` and
 # `git -C '<p>' --git-dir=<rel> config <key>` are allowed there (fail-open, f0e49f45c5c has it too).
-# Also: a `--git-dir` after a `-c <key>=<v>` disarm, which is not promoted; a chdir ahead of an
-# invocation joined by a bracket (`cd <p> && git -C <o> log $(git reset --hard)`), whose prefix the
-# chdir follower cannot read; a `-C` re-quoted inside a `bash -c` payload with `'\''` or `'"'"'`,
+# Also: a chdir ahead of an invocation joined by a bracket (`cd <p> && git -C <o> log $(git reset
+# --hard)`) where the text before the bracket holds no chdir the follower can read on its own, for
+# example two chdirs, or a relative one after an earlier line's (Get-InvocationReading's bracket
+# reading says which it reads); a `-C` re-quoted inside a `bash -c` payload with `'\''` or `'"'"'`,
 # because the payload's extraction stops at the first joint, as it did at f0e49f45c5c; and A GIT BASH
 # DRIVE SPELLING, `/c/<primary>`, which no reading maps to the primary, so `git -C /c/<primary> reset
 # --hard` is allowed (fail-open, f0e49f45c5c has it too). And a `config` disarm whose first `config`
@@ -1022,10 +1022,10 @@ function Get-ScanRawIndexMap($Seg) {
 # match, not from what the command does, so it can call a refused read "changing" or "setting" (`git
 # config --get core.hooksPath x y` and `git config --get core.hooksPath "a b"` from the primary).
 #
-# THE READINGS OF ONE INVOCATION, one or two (review round 3411eb8641). $At is the verb (or disarm)
+# THE READINGS OF ONE INVOCATION, one to three (review round 3411eb8641; the bracket reading below). $At is the verb (or disarm)
 # index on the scan. Where $GitAt is given -- the index the caller's own git match starts at -- the
 # window runs from the last separator before THAT git word, not from the last $gitInvocation token: a
-# `git.EXE` the case-sensitive token misses would otherwise reach back over `;` into an earlier
+# `GIT` the case-sensitive token misses would otherwise reach back over `;` into an earlier
 # command's `-C`. Without it the shared owning-token window is used, as rule 3c's chain uses it.
 #
 # A SECOND READING STANDS IN THE PRIOR LINES' DIRECTORY. A segment is a line, so a chdir on an earlier
@@ -1034,7 +1034,8 @@ function Get-ScanRawIndexMap($Seg) {
 # command position, a second reading prefixes it, each line ending as a separator. Both are judged,
 # since each can only add a deny.
 #
-# REVISED IN REVIEW ROUND b62475f26d. It returns ONE reading or none, never both: standing in the
+# REVISED IN REVIEW ROUND b62475f26d. Besides the bracket reading, it returns ONE reading or none,
+# never both: standing in the
 # session cwd after an earlier line moved the shell refused a later command for a tree it never
 # touches. The earlier lines are read one at a time, because the chdir follower bails on any paren or
 # brace and on a second chdir anywhere in its text, so joining every earlier line switched the reading
@@ -1058,6 +1059,31 @@ function Get-InvocationReading([string]$Scan, [int]$At, [int]$GitAt = -1, [strin
     $win = $Scan.Substring($start, $At - $start)
     $chdirAt = Get-ChdirAtCommandPattern
     $priorChdirs = @(($Prior -split '\r?\n') | Where-Object { $_ -match $chdirAt })
+    # A CHDIR AHEAD OF A BRACKET-JOINED INVOCATION (BACKLOG #5655 step 3). In `cd <p> && git -C <o> log
+    # $(git reset --hard)` the inner git runs in <p>, but its prefix holds the `$(`, and the chdir
+    # follower reads nothing past a bracket. So one more reading stands in the prefix cut at the last
+    # true separator before the innermost bracket still open here, where that cut holds a chdir the
+    # follower can read and nothing between the bracket and this invocation moves the shell. Its target
+    # must be absolute where an earlier line moved the shell. It is emitted beside the others, and every
+    # caller uses a reading only to add a deny.
+    $openAt = -1
+    $depth = 0
+    for ($i = $pfx.Length - 1; $i -ge 0; $i--) {
+        $c = $pfx[$i]
+        if ($c -eq ')' -or $c -eq '}') { $depth++ }
+        elseif ($c -eq '(' -or $c -eq '{') { if ($depth -eq 0) { $openAt = $i; break }; $depth-- }
+    }
+    if ($openAt -ge 0 -and $pfx.Substring($openAt) -notmatch $chdirAt) {
+        $outerSeps = [regex]::Matches($pfx.Substring(0, $openAt), '(?:;|\|\|?|&&|(?<![<>&])&(?![>&]))')
+        if ($outerSeps.Count -gt 0) {
+            $lastSep = $outerSeps[$outerSeps.Count - 1]
+            $outerPfx = $pfx.Substring(0, $lastSep.Index + $lastSep.Length)
+            $outerCd = $(if ($outerPfx -match $chdirAt) { Get-ChdirTargetRaw $outerPfx } else { "" })
+            if ($outerCd -and ($priorChdirs.Count -eq 0 -or [System.IO.Path]::IsPathRooted($outerCd))) {
+                [pscustomobject]@{ ScanPrefix = $outerPfx; Window = $win }
+            }
+        }
+    }
     $plain = [pscustomobject]@{ ScanPrefix = $pfx; Window = $win }
     if ($priorChdirs.Count -eq 0) { return $plain }
     # A `-C` FOLD THAT ENDS ABSOLUTE DOES NOT DEPEND ON WHERE THE SHELL STANDS (BACKLOG #5655 step 3),
@@ -3721,7 +3747,12 @@ re-dispatch. If you were only going to READ, do it directly -- reads are never b
 # ...}` or `. {git ...}`, had no recognised git token, so no rule saw it. Recognising the token is
 # all this does: whether a rule then refuses the command depends on that rule reading the rest of it,
 # and rule 3d's own limits are in its residual list.
-$gitInvocation = '(^|[\s;&|({''"\\/`])git(\.exe)?["'']?(\s|$)'
+#
+# AND THE `.exe` SUFFIX IN ANY CASE (BACKLOG #5655 step 3). The rules match this case-sensitively, so
+# `git.EXE reset --hard` and `git.EXE config core.hooksPath /nope` from the primary had no git token
+# and were allowed, while `git.exe` denied. Windows runs git.exe for either spelling. Only the suffix
+# is case-blind: the word itself stays `git`, so `GIT` is still not read here.
+$gitInvocation = '(^|[\s;&|({''"\\/`])git(?i:\.exe)?["'']?(\s|$)'
 
 # ---------------------------------------------------------------------------------------------------
 # THE VERB SPLIT RULE 3 DID NOT HAVE (BACKLOG #1869). Which of rule 3's verbs MOVE THE HEAD of the
@@ -4436,7 +4467,7 @@ What to do instead:
             # governed answer is used, so this can add a deny and never remove one. See THE ADDED READINGS.
             #
             # Its first window starts after the last separator before the last git word ahead of the disarm
-            # (a `git.EXE` or `GIT` the token pattern misses must not reach back over `;`). That word comes
+            # (a `GIT` the token pattern misses must not reach back over `;`). That word comes
             # from Get-AnyGitWordBefore, which can match a `.git` path segment, the git in `--git-dir`, or a
             # git inside a closed `$( )` that owns nothing, so this window is not always the owning
             # invocation's. That makes false denies, and THE ADDED READINGS lists at least some of them,
@@ -4468,10 +4499,21 @@ What to do instead:
                     $span = $seg.Scan.Substring($base + $ownAt, $dis.Index - $base - $ownAt)
                     if (([regex]::Matches($span, '[({]')).Count -le ([regex]::Matches($span, '[)}]')).Count) { $gitWords += $base + $ownAt }
                 }
+                # A `--git-dir` AFTER A `-c <key>=<v>` DISARM IS PROMOTED TOO (BACKLOG #5655 step 3). The
+                # window above reaches it, but $ownGitDir reads only up to the disarm, so the session cwd
+                # answered first and `git -c core.hooksPath=/nope --git-dir=<p>/.git commit` was allowed
+                # from outside. The promoted order is asked AFTER the unpromoted one, never instead of it,
+                # and only a governed answer is used, so the promotion can add a deny and never remove one.
+                $orders = @($ownGitDir)
+                if (-not $ownGitDir -and $readTo -gt $dis.Index -and
+                    $seg.Scan.Substring($dis.Index, $readTo - $dis.Index) -match '(?:^|\s)--git-dir[=\s]') { $orders += $true }
                 $readings = foreach ($gw in $gitWords) { Get-InvocationReading $seg.Scan $readTo -GitAt $gw -Prior $seg.Prior }
-                foreach ($reading in @($readings)) {
-                    $govCfg = Find-FirstAnsweringRoot (Get-InvocationCandidates $reading $cwdRaw `
-                                  -ExplicitFirst:$ownGitDir -CarriedGitDir $carriedGitDir) $cwdRaw
+                foreach ($explicitFirst in $orders) {
+                    foreach ($reading in @($readings)) {
+                        $govCfg = Find-FirstAnsweringRoot (Get-InvocationCandidates $reading $cwdRaw `
+                                      -ExplicitFirst:$explicitFirst -CarriedGitDir $carriedGitDir) $cwdRaw
+                        if ($govCfg) { break }
+                    }
                     if ($govCfg) { break }
                 }
             }

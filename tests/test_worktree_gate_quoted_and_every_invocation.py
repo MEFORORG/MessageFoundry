@@ -638,3 +638,105 @@ def test_a_long_run_of_glued_pairs_costs_about_what_a_short_line_does(rig: Simpl
     assert _allowed(rig, long, rig.outside)
     long_s = time.monotonic() - started
     assert long_s < 3 * short_s + 20, (short_s, long_s)
+
+
+# ------------------------------------------------------------------ BACKLOG #5655 step 3, three gaps
+# Each DENY row below was measured ALLOW on origin/main 9421dcbf272 (2026-11-20). The ALLOW rows
+# beside them aim the same spellings at the ungoverned repository, so a gate that refused every such
+# spelling would fail them.
+
+
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    ("template", "text"),
+    [
+        ("cd {p} && git -C {o} log $(git reset --hard)", "SHARED PRIMARY"),
+        ("cd {p} && git -C {o} log $(git config {k})", "SHARED git configur"),
+    ],
+)
+def test_a_chdir_ahead_of_a_bracket_joined_invocation_is_read(
+    rig: SimpleNamespace, template: str, text: str, tool: str
+) -> None:
+    # The substitution's git runs in <p>; its prefix holds the `$(`, which the chdir follower does
+    # not read past, so the inner command stood in the session cwd.
+    reason = _reason(rig, _fmt(rig, template), rig.outside, tool)
+    assert text in reason, reason
+
+
+def test_a_chdir_ahead_of_a_powershell_block_is_read(rig: SimpleNamespace) -> None:
+    command = _fmt(rig, "cd {p}; if (git -C {o} diff --quiet) {{ git reset --hard }}")
+    reason = _reason(rig, command, rig.outside, "PowerShell")
+    assert "SHARED PRIMARY" in reason, reason
+
+
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "template",
+    [
+        "cd {o} && git -C {o} log $(git reset --hard)",
+        "cd {o} && git -C {o} log $(git config {k})",
+    ],
+)
+def test_a_chdir_ahead_of_a_bracket_into_an_ungoverned_repository_is_allowed(
+    rig: SimpleNamespace, template: str, tool: str
+) -> None:
+    assert _allowed(rig, _fmt(rig, template), rig.outside, tool)
+
+
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    "template",
+    [
+        "git -c {d} --git-dir={p}/.git commit -m x",
+        "git -c {d} --git-dir {p}/.git commit -m x",
+        "git -c {d} --git-dir='{p}/.git' commit -m x",
+    ],
+)
+def test_a_git_dir_after_a_dash_c_disarm_is_promoted(
+    rig: SimpleNamespace, template: str, tool: str
+) -> None:
+    # The `--git-dir` follows the disarm, so the window read up to the disarm never saw it and the
+    # session cwd answered first.
+    command = _fmt(rig, template.replace("{d}", "core.hooksPath=/nope"))
+    reason = _reason(rig, command, rig.outside, tool)
+    assert "SHARED git configur" in reason, reason
+
+
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+def test_a_git_dir_after_a_dash_c_disarm_into_an_ungoverned_repository_is_allowed(
+    rig: SimpleNamespace, tool: str
+) -> None:
+    command = _fmt(rig, "git -c core.hooksPath=/nope --git-dir={o}/.git commit -m x")
+    assert _allowed(rig, command, rig.outside, tool)
+
+
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    ("command", "where", "text"),
+    [
+        ("git.EXE reset --hard", "primary", "SHARED PRIMARY"),
+        ("git.EXE config {k}", "primary", "SHARED git configur"),
+        ("git.Exe -C {p} reset --hard", "outside", "SHARED PRIMARY"),
+    ],
+)
+def test_a_git_word_with_an_upper_case_suffix_is_read(
+    rig: SimpleNamespace, command: str, where: str, text: str, tool: str
+) -> None:
+    # Windows runs git.exe for `git.EXE`; the case-sensitive token read only `git.exe`.
+    reason = _reason(rig, _fmt(rig, command), _cwd(rig, where), tool)
+    assert text in reason, reason
+
+
+@pytest.mark.parametrize("tool", ["Bash", "PowerShell"])
+@pytest.mark.parametrize(
+    ("command", "where"),
+    [
+        ("git.EXE reset --hard", "outside"),
+        ("git.EXE config {k}", "outside"),
+        ("git.EXE status", "primary"),
+    ],
+)
+def test_a_git_word_with_an_upper_case_suffix_elsewhere_is_allowed(
+    rig: SimpleNamespace, command: str, where: str, tool: str
+) -> None:
+    assert _allowed(rig, _fmt(rig, command), _cwd(rig, where), tool)
