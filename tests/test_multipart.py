@@ -727,19 +727,12 @@ def _outcome(content_type: str, body: bytes) -> tuple[Any, ...]:
     try:
         form = parse_multipart_form(content_type, body, max_file_bytes=1024)
     except MultipartError as exc:
-        return ("refused", type(exc).__name__, _no_numbers(str(exc)))
-    fields = [(name, _digest(value.encode())) for name, value in sorted(form.fields.items())]
+        return ("refused", type(exc).__name__, str(exc))
     return (
         "parsed",
         [(f.name, f.filename, _digest(f.data)) for f in form.files],
-        # A long list as its count: its names come from the corpus builder, not from the parser.
-        fields if len(fields) <= 2 else ("fields", len(fields)),
+        [(name, _digest(value.encode())) for name, value in sorted(form.fields.items())],
     )
-
-
-def _no_numbers(text: str) -> str:
-    """A refusal's text with each number as ``N``, so the record pins which refusal, not the caps."""
-    return re.sub(r"\d+", "N", text)
 
 
 def _digest(value: bytes) -> bytes | tuple[int, str]:
@@ -747,8 +740,9 @@ def _digest(value: bytes) -> bytes | tuple[int, str]:
     return value if len(value) <= 64 else (len(value), hashlib.sha256(value).hexdigest())
 
 
-#: origin/main's outcome for each corpus body, recorded at ec75a5f61bf with each refusal's numbers
-#: as ``N``. Every body here carries close-marker text.
+#: origin/main's outcome for each corpus body, recorded at ec75a5f61bf. Every body here carries
+#: close-marker text. A number that is a cap is written as its constant, so a cap change moves no row;
+#: a computed size is written as main printed it.
 _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "plain": ("parsed", [("file", "a.hl7", b"MSH|x")], []),
     "delim-cr-run": ("parsed", [("file", "a.hl7", b"MSH|x")], []),
@@ -772,7 +766,7 @@ _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "file-too-large": (
         "refused",
         "MultipartTooLargeError",
-        "uploaded file part is N bytes; the limit is N",
+        "uploaded file part is 2000 bytes; the limit is 1024",
     ),
     "not-multipart": (
         "refused",
@@ -785,12 +779,12 @@ _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "wk-at-part-cap": (
         "parsed",
         [("file", "a.hl7", b"MSH|body")],
-        ("fields", multipart._MAX_PARTS - 1),
+        sorted((f"f{i}", b"v") for i in range(multipart._MAX_PARTS - 1)),
     ),
     "wk-over-part-cap": (
         "refused",
         "MultipartError",
-        "multipart body has more parts than the limit of N",
+        f"multipart body has more parts than the limit of {multipart._MAX_PARTS}",
     ),
     "wk-field-at-cap": (
         "parsed",
@@ -800,18 +794,22 @@ _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "wk-field-over-cap": (
         "refused",
         "MultipartTooLargeError",
-        'multipart text field is N bytes; the limit is N. Send a file as a file part with a plain filename parameter (filename="...")',
+        f"multipart text field is {multipart._MAX_FIELD_BYTES + 1} bytes; the limit is "
+        f"{multipart._MAX_FIELD_BYTES}. {multipart._FILE_AS_FIELD_HINT}",
     ),
     "wk-noheader-at-cap": ("parsed", [("file", "a.hl7", b"MSH|body")], []),
     "wk-noheader-over-cap": (
         "refused",
         "MultipartError",
-        "multipart part of N bytes has no header block ended by a blank CRLF line; a part without one is skipped only up to N bytes",
+        f"multipart part of {multipart._MAX_FIELD_BYTES + 1} bytes has no header block ended by a "
+        f"blank CRLF line; a part without one is skipped only up to {multipart._MAX_FIELD_BYTES} bytes",
     ),
     "wk-header-over-cap": (
         "refused",
         "MultipartError",
-        "multipart part header block is N bytes; the limit is N",
+        # The block is the pad line (its 9 framing bytes plus the cap) and the file part's header.
+        f"multipart part header block is {_MAX_PART_HEADER_BYTES + 9 + len(_FP) - 4} bytes; "
+        f"the limit is {_MAX_PART_HEADER_BYTES}",
     ),
     "wk-epilogue-delims": ("parsed", [("file", "a.hl7", b"MSH|body")], []),
 }
@@ -896,7 +894,7 @@ def test_the_same_body_without_its_close_marker_is_refused(
     with pytest.raises(MultipartError) as caught:
         parse_multipart_form(content_type, unterminated, max_file_bytes=1024)
     expected = _expected(case)
-    got = (type(caught.value).__name__, _no_numbers(str(caught.value)))
+    got = (type(caught.value).__name__, str(caught.value))
     if expected[0] == "refused":
         assert got == expected[1:]
     elif case == "wk-epilogue-delims":
@@ -1053,3 +1051,22 @@ def test_mid_line_boundary_text_costs_no_more_finds() -> None:
     body = _FindCounter(b"--B\r\n" + _FP + content + b"\r\n--B--\r\n")
     assert parse_single_file_upload(_CT_B, body, max_file_bytes=1 << 20).data == content
     assert 0 < body.finds <= 8, body.finds
+
+
+def test_delimiters_alternating_between_cr_and_lf_lines_are_each_found() -> None:
+    """The two line-break streams take turns: each part here starts after the other stream's kind
+    of line break than the part before it, so a cached hit is reused after the other stream won."""
+    body = (
+        b"--B\n" + _FP + b"1\r--B\r\n" + _FP + b"2\n--B\r" + _FP + b"3\r\n--B\n" + _FP + b"4\r--B--"
+    )
+    form = parse_multipart_form(_CT_B, body, max_file_bytes=1024)
+    assert [f.data for f in form.files] == [b"1\r", b"2\n", b"3", b"4\r"]
+
+
+def test_the_delimiter_finder_walks_forward_only() -> None:
+    """A rewound search would reuse a cached hit past the delimiters it skipped, so it is refused."""
+    lines = multipart._DelimiterLines(b"--B\r\nx\r\n--B\r\ny\r\n--B--", b"--B")
+    assert lines.next(0) == 0
+    assert lines.next(5) == 8
+    with pytest.raises(ValueError, match="forward only"):
+        lines.next(1)

@@ -12,8 +12,8 @@ delimiter, and each part's ``Content-Disposition`` gives its field name + (for a
 What it refuses, at least: more than ``_MAX_PARTS`` parts, a part header block over
 ``_MAX_PART_HEADER_BYTES``, a file part over the caller's cap, any other part over
 ``_MAX_FIELD_BYTES`` (a nameless one, and one with no header block, included), a body with no
-closing delimiter line, a line that starts with ``--<boundary>`` but is not a delimiter line (both
-BACKLOG #5787), and, in :func:`parse_single_file_upload`, a body with no file part or with more than
+closing delimiter line, a line before the close marker that starts with ``--<boundary>`` but is
+not a delimiter line (both BACKLOG #5787; the epilogue after the close marker is never read), and, in :func:`parse_single_file_upload`, a body with no file part or with more than
 one.
 
 **What a delimiter line is** (BACKLOG #5787). ``--<boundary>`` counts only at the start of the body
@@ -151,8 +151,8 @@ _FILE_AS_FIELD_HINT = 'Send a file as a file part with a plain filename paramete
 #: it).
 _NOT_CRLF = re.compile(rb"[^\r\n]")
 
-#: What follows ``--<boundary>`` on a delimiter line, up to its line break: the close marker, if any,
-#: then transport padding (RFC 2046). Both quantifiers are possessive, so a long padding run is walked
+#: The rest of a delimiter line after ``--<boundary>``, up to its line break (the module docstring
+#: defines the line): the close marker, if any, then transport padding. Both quantifiers are possessive, so a long padding run is walked
 #: once and never backtracked into. It always matches; the byte after it decides the line.
 _DELIM_TAIL = re.compile(rb"(--)?+[ \t]*+")
 
@@ -272,8 +272,10 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     # the walk, so close-marker text in the middle of a line does not pass a cut-short body.
     if not closed:
         if not seen:
-            # No delimiter line at all. At least an empty body, one built with another boundary than
-            # the Content-Type names, and one whose only boundary text sits mid-line land here.
+            # No delimiter line at all. At least an empty body, one built with a boundary the
+            # declared one is not a prefix of, and one whose only boundary text sits mid-line land
+            # here. A body built with a longer boundary (declared B, body uses BX) does not: its
+            # lines start with ``--B``, so ``_DelimiterLines.tail`` refuses the first of them.
             raise MultipartError(
                 "multipart body holds no delimiter for the boundary its Content-Type names"
             )
@@ -284,12 +286,12 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
 
 
 class _DelimiterLines:
-    """Finds each ``--<boundary>`` that starts a line of one body, in order (BACKLOG #5787).
+    """Finds each ``--<boundary>`` that starts a line of one body, in order (BACKLOG #5787; the
+    module docstring defines a delimiter line).
 
-    A line starts at offset 0 or right after a CR or an LF. There are two ``find`` streams, one per
-    line-break byte, and each keeps its last hit until the walk passes it, so each stream scans the
-    body about once however many delimiters it holds. Boundary text in the middle of a line is never
-    a candidate."""
+    There are two ``find`` streams, one per line-break byte, and each keeps its last hit until the
+    walk passes it, so each stream scans the body about once however many delimiters it holds. That
+    cache is why :meth:`next` must be called with a ``frm`` that never decreases."""
 
     def __init__(self, body: bytes, delim: bytes) -> None:
         self._body = body
@@ -297,9 +299,14 @@ class _DelimiterLines:
         self._needles = (b"\n" + delim, b"\r" + delim)
         # Each stream's last hit: the offset of its line-break byte, -1 for none left, -2 unread.
         self._hits = [-2, -2]
+        self._frm = 0
 
     def next(self, frm: int) -> int:
-        """The offset of the first ``--<boundary>`` at or after ``frm`` that starts a line, or -1."""
+        """The offset of the first ``--<boundary>`` at or after ``frm`` that starts a line, or -1.
+        ``frm`` must be at least the previous call's: a cached hit past it is not searched behind."""
+        if frm < self._frm:
+            raise ValueError("_DelimiterLines.next walks forward only")
+        self._frm = frm
         if frm == 0 and self._body.startswith(self._delim):
             return 0
         best = -1
@@ -324,18 +331,19 @@ class _DelimiterLines:
         first one, so only real delimiter lines, which the part cap bounds, keep the walk going."""
         body = self._body
         name_end = pos + len(self._delim)
-        if body.endswith(b"-", name_end) and name_end == len(body) - 1:
+        if name_end == len(body) - 1 and body[name_end] == 0x2D:  # a "-", read without a slice copy
             # A body cut inside its close marker: an unclosed delimiter line, not a foreign one, so
             # the walk refuses it for the missing close marker, the refusal that names the cause.
             return len(body), False
         match = _DELIM_TAIL.match(body, name_end)
-        after = match.end() if match is not None else name_end
+        assert match is not None  # the pattern matches the empty string
+        after = match.end()
         if after < len(body) and body[after] not in b"\r\n":
             raise MultipartError(
                 "multipart body has a line that starts with the boundary delimiter but is not a "
                 "delimiter line; the body may use another boundary than its Content-Type names"
             )
-        return after, match is not None and match.group(1) is not None
+        return after, match.group(1) is not None
 
 
 def parse_multipart_form(
