@@ -614,14 +614,28 @@ class RunnerLeaseLostError(RunnerNotRunningError):
     its graph still runs, in the window before ``Engine._stop_graph`` tears it down (BACKLOG #5906,
     #8214 item 16). A start there would bring intake or delivery up on a node about to stand by,
     against the shared store the new leader drives. A subclass, so every handler of
-    :class:`RunnerNotRunningError` (the API's 503, the alert action's INFO line) takes it as is; its
-    own text, because this graph is running."""
+    :class:`RunnerNotRunningError` takes it, at least the control route's 503; its own text,
+    because this graph is running. The alert action catches it ahead of its parent, so its INFO
+    line names the lease.
 
-    def __init__(self, name: str) -> None:
+    :meth:`RegistryRunner.reload` raises it too, from :meth:`for_reload`, on a running graph."""
+
+    def __init__(self, name: str, detail: str | None = None) -> None:
         super().__init__(
             name,
-            f"connection {name!r}: this node no longer holds the cluster lease, so it starts no "
-            "connection; its graph stops shortly, and the leader runs it",
+            detail
+            or f"connection {name!r}: this node no longer holds the cluster lease, so it starts "
+            "no connection; its graph stops shortly, and the leader runs it",
+        )
+
+    @classmethod
+    def for_reload(cls) -> RunnerLeaseLostError:
+        """The refusal of a reload on such a node (BACKLOG #5906). ``name`` is empty: a reload
+        names no one connection."""
+        return cls(
+            "",
+            "this node no longer holds the cluster lease, so it applies no config reload; its "
+            "graph stops shortly; reload on the leader instead",
         )
 
 
@@ -629,6 +643,14 @@ class _ConnectorRetired(Exception):
     """Raised inside the single-row send path's ``try`` when a reload retired its connector before
     the send (:meth:`RegistryRunner._connector_retired`). Its own arm only records it, so the hand
     back runs after the ``try``, where a store fault cannot reach the internal-error arm."""
+
+
+class _SendGated(Exception):
+    """Raised inside the single-row send path's ``try`` when the lane gate
+    (:meth:`RegistryRunner._may_send`) refuses the send after the awaits before it: a pause, the
+    #122 halt, or a node that stopped leading (BACKLOG #5906). Its own arm only records it;
+    :meth:`RegistryRunner._refuse_claimed` resolves the row after the ``try``, as the batch path
+    does."""
 
 
 # A delivery worker backs off this long after an *unexpected* error (e.g. the store being briefly
@@ -4639,11 +4661,12 @@ class RegistryRunner:
         after this check. This door is not the fence there. What backs it includes at least the
         ``leader_gate`` a poll source reads at each tick (its contract is
         :meth:`~messagefoundry.transports.base.SourceConnector.start`), the L1 pre-send leadership
-        re-check (in :meth:`_process_delivery_item`, and :meth:`_may_send` on the coalesced-batch
-        path), and ``Engine._stop_graph`` itself. The store's H1 leader-epoch fence (ADR 0157; its
-        scope is :meth:`~messagefoundry.pipeline.cluster.ClusterCoordinator.current_epoch`) does
-        not fire on this node's claims before at least a successor's acquire bumps the epoch, and
-        it does not cover intake, the ingress commit a listener makes. A listen source does not read
+        re-check (in :meth:`_process_delivery_item`, and :meth:`_may_send` right before both the
+        single-row and the coalesced-batch send), and ``Engine._stop_graph`` itself. The store's H1
+        leader-epoch fence (ADR 0157; its scope is
+        :meth:`~messagefoundry.pipeline.cluster.ClusterCoordinator.current_epoch`) does not fire
+        on this node's claims before at least a successor's acquire bumps the epoch, and it does
+        not cover intake, the ingress commit a listener makes. A listen source does not read
         ``leader_gate``, so a listener a start brings up after the lease drops keeps taking messages
         until ``Engine._stop_graph`` stops it, whether or not a successor has acquired."""
         if not self._running and not (stop and self.has_residual_state):
@@ -9577,8 +9600,17 @@ class RegistryRunner:
         they delay the inbound binds. The builds for the lanes a DR activation takes out of the
         park are bounded; :meth:`_build_lane_destinations_bounded` says what that bound holds and what it
         does not.
+
+        On a running graph whose node no longer holds the cluster lease, it raises
+        :class:`RunnerLeaseLostError`, read on entry and again just before step 1, with no lane
+        changed (BACKLOG #5906). Each read is point in time: a lease lost during steps 1 to 3a
+        is ``Engine._stop_graph``'s to take down.
         """
         async with self._reload_lock:
+            # BACKLOG #5906: refused at once too, so a lease-lost node does not hold the lock its
+            # own demotion teardown waits on through the build check and the anchor reads below.
+            if self._running and not self._coordinator.is_leader():
+                raise RunnerLeaseLostError.for_reload()
             if new_registry is None:
                 new_registry = self.registry
             # ``env_values`` go live with the graph, under the same lock. A refused or rolled-back
@@ -9663,6 +9695,15 @@ class RegistryRunner:
                 # 3 itself awaits nothing unless a lane changed meanwhile. That keeps its lane
                 # changes in the same tick as step 2b's dispatcher nudge, as they were.
                 await self._prepare_outbound_reconcile(old, new_registry, outbound_plan)
+                # BACKLOG #5906: a node that lost its lease while its graph still runs takes no
+                # reload, as the start doors take no start (_require_running): steps 2 and 3 would
+                # bind listeners and resume lanes on a node whose graph is about to stop. Asked
+                # again here, after the last await before the quiesce, so the handler below undoes
+                # what any refusal here undoes and no lane has changed. A point in time read, as at
+                # the doors: a lease lost during the steps below is ``Engine._stop_graph``'s to take
+                # down.
+                if not self._coordinator.is_leader():
+                    raise RunnerLeaseLostError.for_reload()
             except BaseException:
                 self._close_detached(outbound_plan.take_all())
                 self._env_values = old_env_values
@@ -11453,8 +11494,9 @@ class RegistryRunner:
         # L1 pre-send leadership re-check (active-passive HA). The graph runs on the leader
         # ONLY, but leadership can be lost (a self-fence) BETWEEN claiming this row and the
         # send below. A cheap, SYNCHRONOUS is_leader() read (cached state — no DB round-trip)
-        # closes that narrow window: a node that has stopped being leader must not emit egress
-        # as a stale ex-leader.
+        # narrows that window: a node that has stopped being leader must not emit egress
+        # as a stale ex-leader. The reads before the send are awaits, so the lane gate
+        # (_may_send) asks again right before it (BACKLOG #5906).
         #
         # RELEASE the claim (attempts--, next_attempt_at UNCHANGED, no last_error) rather than
         # mark_failed: losing leadership is NOT a delivery failure and must not spend a retry.
@@ -11501,6 +11543,7 @@ class RegistryRunner:
         # dead-letters the row at the retry cap. None until a live send is attempted.
         sent: str | None = None
         retired = False  # a reload retired `connector` before the send (_connector_retired)
+        gated = False  # the lane gate refused the send (_may_send, BACKLOG #5906)
         try:
             if self._simulate.get(name, False):
                 # Shadow / parallel-run (#15): suppress the real egress entirely — no bytes/
@@ -11535,6 +11578,10 @@ class RegistryRunner:
                             name,
                             type(exc).__name__,
                         )
+                    # BACKLOG #5906: the frame check's hydrate is an await too, so the same gate as
+                    # the live send's below, before the row is marked done.
+                    if not self._may_send(name):
+                        raise _SendGated
                 response = None
             else:
                 # PHASE (a): the connector send->ACK round-trip. On a real cross-box outbound this is
@@ -11552,6 +11599,11 @@ class RegistryRunner:
                 # read touches only the small metadata column (never the raw body).
                 consumes = getattr(connector, "consumes_metadata", False)
                 metadata = await self._user_metadata_for(item.message_id) if consumes else None
+                # BACKLOG #5906: the lane gate once more, right before the send, since the reads
+                # above are awaits a demotion, a pause or the halt can land in, as the coalesced
+                # batch asks (#5706). Synchronous, so nothing between this read and the send awaits.
+                if not self._may_send(name):
+                    raise _SendGated  # resolved after the try, out of the arms' reach
                 # BACKLOG #5718: the reads above are awaits a reload can land in. A connector it took
                 # out of the lane since `connector` was read is not sent on.
                 if self._connector_retired(name, connector):
@@ -11566,6 +11618,8 @@ class RegistryRunner:
                     self._delivery_phase_stats.record_send_ack(time.perf_counter_ns() - _send_t0)
         except _ConnectorRetired:
             retired = True
+        except _SendGated:
+            gated = True
         except NegativeAckError as exc:
             # Partner rejection. AR/CR (permanent) → fail-fast: the partner will never
             # accept this message, so dead-letter it now rather than block the FIFO lane
@@ -11783,6 +11837,8 @@ class RegistryRunner:
             # neither phase, so there is nothing new to summarize).
             if self._delivery_phase_timing:
                 self._delivery_phase_stats.maybe_emit(stage="outbound")
+        if gated:
+            return await self._refuse_claimed(name, [item.id])
         if retired:
             return await self._release_retired(name, [item.id])
         return _ItemOutcome.PROCESSED, retry_until
