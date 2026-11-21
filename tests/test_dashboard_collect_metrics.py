@@ -30,18 +30,39 @@ def _load() -> ModuleType:
 cm = _load()
 
 
+#: Every network or subprocess call a test did not fake is recorded here, so a test can assert none
+#: happened. Raising alone is not enough: `collect()` catches it and turns it into a metric error.
+REACHED: list[str] = []
+
+
 def _no_fetch(url: str) -> bytes:
-    raise AssertionError(f"network reached in a test: {url}")
+    REACHED.append(url)
+    raise cm.CollectError(f"network reached in a test: {url}")
 
 
-def _ctx(tmp_path: Path, run: Any, *, weeks: int = 3, through: str = "2026-11-18") -> Any:
+def _no_raw(argv: Sequence[str]) -> bytes:
+    REACHED.append(" ".join(argv))
+    raise cm.CollectError("subprocess reached in a test")
+
+
+def _no_stall(cmd: list[str], timeout: float) -> str:
+    REACHED.append(" ".join(cmd))
+    raise cm.CollectError("stall runner reached in a test")
+
+
+def _ctx(
+    tmp_path: Path, run: Any, *, weeks: int = 3, through: str = "2026-11-18", today: str = ""
+) -> Any:
     return cm.Context(
         vault=tmp_path / "vault",
         through=dt.date.fromisoformat(through),
         weeks=weeks,
         workdir=tmp_path,
         run=run,
+        run_raw=_no_raw,
         fetch=_no_fetch,
+        stall_runner=_no_stall,
+        today=dt.date.fromisoformat(today or "2026-11-19"),
     )
 
 
@@ -68,12 +89,15 @@ def test_window_and_start() -> None:
 
 def test_last_full_week() -> None:
     labels = cm.window(dt.date(2026, 11, 18), 3)
-    assert cm.last_full_week(dt.date(2026, 11, 18), labels) == ("2026-W46", False)
-    # A Sunday completes its own week.
+    today = dt.date(2026, 11, 19)
+    assert cm.last_full_week(dt.date(2026, 11, 18), labels, today) == "2026-W46"
     sunday = dt.date(2026, 11, 22)
-    assert cm.last_full_week(sunday, cm.window(sunday, 2)) == ("2026-W47", False)
-    # One mid-week week: no full week in the window, so it is flagged partial.
-    assert cm.last_full_week(dt.date(2026, 11, 18), ["2026-W47"]) == ("2026-W47", True)
+    labels = cm.window(sunday, 2)
+    # A Sunday that has ended completes its own week; a run ON that Sunday does not.
+    assert cm.last_full_week(sunday, labels, dt.date(2026, 11, 23)) == "2026-W47"
+    assert cm.last_full_week(sunday, labels, sunday) == "2026-W46"
+    with pytest.raises(cm.CollectError):
+        cm.last_full_week(dt.date(2026, 11, 18), ["2026-W47"], today)
 
 
 def test_bucket_zero_fills_and_drops_out_of_window() -> None:
@@ -105,6 +129,7 @@ def test_status_thresholds() -> None:
     assert cm.status_merged(5, [10, 10]) == "good"
     assert cm.status_flow(7, 0) == "good"
     assert cm.status_flow(7, 1) == "warn"
+    assert cm.status_flow(7, None) == "warn"  # an unread stall count is not zero stalls
     assert cm.status_flow(14, 0) == "warn"
     assert cm.status_flow(14.1, 0) == "bad"
     assert cm.status_ci(90, 0) == "good"
@@ -149,6 +174,7 @@ def _failing(argv: Sequence[str], cwd: Path | None) -> str:
 
 
 def test_a_failing_source_gives_null_not_zero(tmp_path: Path) -> None:
+    REACHED.clear()
     ctx = _ctx(tmp_path, _failing)
     metrics = cm.collect(ctx)
     assert [m.id for m in metrics] == [s.id for s in cm.SPECS]
@@ -157,6 +183,8 @@ def test_a_failing_source_gives_null_not_zero(tmp_path: Path) -> None:
         assert m.status == "unknown", m.id
         assert m.error, m.id
         assert m.series is None, m.id
+    # Only release_distance reaches the (faked) network; nothing else escaped the fakes.
+    assert REACHED == [cm.PYPI_URL]
 
 
 def test_one_failure_does_not_abort_the_rest(tmp_path: Path) -> None:
@@ -219,20 +247,35 @@ def test_release_distance_with_fakes(tmp_path: Path) -> None:
 
     def run(argv: Sequence[str], cwd: Path | None) -> str:
         seen.append(list(argv))
-        return "42\n" if "rev-list" in argv else ""
+        if "ls-remote" in argv:
+            # An annotated tag: the peeled `^{}` commit is the one counted from.
+            tab, nl = chr(9), chr(10)
+            return nl.join(
+                f"{c}{tab}refs/tags/{r}"
+                for c, r in [("aaa", "v1.2.3"), ("bbb", "v1.2.3^{}"), ("ccc", "v1.2.30")]
+            )
+        return "42" if "rev-list" in argv else ""
 
     ctx = _ctx(tmp_path, run)
     ctx.fetch = lambda url: json.dumps(
-        {
-            "info": {"version": "1.2.3"},
-            "releases": {"1.2.3": [{"upload_time_iso_8601": "2026-10-01T00:00:00Z"}]},
-        }
+        {"info": {"version": "1.2.3"}, "urls": [{"upload_time_iso_8601": "2026-10-01T00:00:00Z"}]}
     ).encode()
     m = cm.Metric("release_distance", "", "", "", "")
     cm.c_release_distance(ctx, m)
     assert (m.value, m.status) == (42, "good")
     assert m.detail["tag"] == "v1.2.3"
-    assert any("v1.2.3..origin/main" in a for a in seen[-1])
+    assert m.detail["tag_commit"] == "bbb"
+    assert m.detail["uploaded"] == "2026-10-01T00:00:00Z"
+    assert seen[-1][-1] == "bbb..origin/main"
+    # No local tag is created: nothing fetches into refs/tags.
+    assert not any("refs/tags/" in a and ":" in a for argv in seen for a in argv)
+
+    def no_tag(argv: Sequence[str], cwd: Path | None) -> str:
+        return ""
+
+    ctx.run = no_tag
+    with pytest.raises(cm.CollectError, match="no tag v1.2.3"):
+        cm.c_release_distance(ctx, cm.Metric("x", "", "", "", ""))
 
 
 # -- the --out guard -----------------------------------------------------------------------------
@@ -266,8 +309,23 @@ def test_out_guard_fails_closed(tmp_path: Path) -> None:
 
 
 def test_real_git_refuses_this_checkout() -> None:
-    # The test file itself lives in a work tree, so its directory must be refused for real.
-    assert cm.refuse_reason(Path(__file__)) is not None
+    # The test file itself lives in a work tree, so its directory must be refused for real, and
+    # for the inside-a-repo reason, not because git failed some other way.
+    reason = cm.refuse_reason(Path(__file__))
+    assert reason is not None and "inside a git repository" in reason
+
+
+def test_real_git_allows_a_directory_outside_any_repo(tmp_path: Path) -> None:
+    # The negative control for the test above, through real git: a directory in no repository.
+    outside = tmp_path / "out"
+    outside.mkdir()
+    probe = cm.run_bytes  # real git; skip rather than mis-assert where tmp is itself in a repo
+    try:
+        probe(["git", "-C", str(outside), "rev-parse", "--is-inside-work-tree"])
+    except cm.CollectError:
+        assert cm.refuse_reason(outside / "x.json") is None
+    else:
+        pytest.skip("the temporary directory is inside a git work tree on this machine")
 
 
 # -- snapshot schema -----------------------------------------------------------------------------

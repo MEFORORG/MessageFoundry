@@ -15,8 +15,17 @@ A METRIC THAT COULD NOT BE READ IS ``null``, NEVER ``0``. Each collector runs is
 raises leaves its metric at ``value: null``, ``status: "unknown"`` and its ``error`` text, and the
 others still run. A zero would read exactly like a quiet week.
 
-READ-ONLY apart from two fetches that only update remote-tracking refs: ``git fetch origin`` in the
-vault and in the engine checkout, so both reads are of the current ``origin/main``.
+WHAT IT WRITES outside ``--out``: two ``git fetch --no-tags origin main``, one in the vault and one
+in the engine checkout, which update only ``refs/remotes/origin/main``, so both reads are of the
+current ``origin/main``. No local tag or branch is created; the release tag is resolved with
+``git ls-remote``. Everything else is read into a temporary directory removed at exit.
+
+WINDOWED AND CURRENT METRICS. ``--weeks``/``--through`` bound the weekly series. The state metrics
+(open PRs, open alerts, ASVS counts, open ledger rows, release distance) are read as they stand at
+run time whatever ``--through`` says, and each says so in its detail.
+
+EXIT STATUS. 0 when every metric was read; 2 when any metric carries an error (the snapshot is still
+written), so a scheduled caller goes red on an outage rather than publishing nulls quietly.
 
 Usage::
 
@@ -32,6 +41,7 @@ import datetime as dt
 import importlib.util
 import io
 import json
+import os
 import statistics
 import subprocess
 import sys
@@ -41,7 +51,7 @@ import urllib.request
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import ModuleType
 from typing import Any
 
@@ -64,14 +74,11 @@ CMD_TIMEOUT = 180.0
 #: the collector refuses it rather than under-report.
 PR_LIST_LIMIT = 1000
 
-#: The vault paths archived from ``origin/main``. ``ledger_weekly_report.py`` imports its sibling
-#: ``backlog_status_check.py`` by bare name, so all of ``scripts/docs`` comes along.
-VAULT_PATHS = (
-    "scripts/docs",
-    "docs/BACKLOG.md",
-    "docs/archive/backlog",
-    "docs/security/asvs-scorecard.toml",
-)
+#: The vault paths archived from ``origin/main`` before the ledger files are known.
+#: ``ledger_weekly_report.py`` imports its sibling ``backlog_status_check.py`` by bare name, so all
+#: of ``scripts/docs`` comes along. The ledger files themselves are listed from the tree against the
+#: checker's own ``LEDGER_FILE_GLOBS``, so a new ledger file is archived too and its floors see it.
+VAULT_PATHS = ("scripts/docs", "docs/security/asvs-scorecard.toml")
 
 #: Run conclusions that count toward the CI pass rate. ``cancelled`` and ``skipped`` are left out of
 #: both sides: a run superseded by a newer push says nothing about whether main is green.
@@ -93,8 +100,8 @@ THRESHOLDS: dict[str, dict[str, float]] = {
     "ci_main": {"good_pct": 90, "warn_pct": 75},
     # ASVS pass cells over applicable (non-na) cells.
     "asvs": {"good_pct": 90, "warn_pct": 50},
-    # open Dependabot alerts: any critical/high is bad; any other open alert is warn.
-    "dependency_vulns": {},
+    # dependency_vulns has no number to tune: any open critical/high alert is bad, any other open
+    # alert is warn (status_vulns).
     # open owner-ruling rows: good at zero, warn up to five.
     "owner_waiting": {"warn_max": 5},
     # engine commits on origin/main since the latest PyPI release.
@@ -136,16 +143,19 @@ def window_start(through: dt.date, weeks: int) -> dt.date:
     return first - dt.timedelta(days=first.weekday())
 
 
-def last_full_week(through: dt.date, labels: Sequence[str]) -> tuple[str, bool]:
-    """``(label, partial)``: the newest window week that is complete by ``through``.
+def last_full_week(through: dt.date, labels: Sequence[str], today: dt.date) -> str:
+    """The newest window week that is complete.
 
-    ``through``'s own week is complete only when ``through`` is a Sunday. When no full week is in
-    the window (one week, mid-week), the window's only week is returned flagged partial.
+    ``through``'s own week is complete only when ``through`` is a Sunday that has already ended,
+    that is, earlier than ``today`` (UTC): a run on a Sunday is still inside that week. The CLI
+    requires at least two weeks, so the week before ``through``'s is always in the window.
     """
-    full = iso_week(through if through.weekday() == 6 else through - dt.timedelta(days=7))
-    if full in labels:
-        return full, False
-    return labels[-1], True
+    if through.weekday() == 6 and through < today:
+        return iso_week(through)
+    full = iso_week(through - dt.timedelta(days=7))
+    if full not in labels:
+        raise CollectError(f"the window {labels[0]}..{labels[-1]} holds no complete week")
+    return full
 
 
 def bucket(stamps: Sequence[str], labels: Sequence[str]) -> list[dict[str, Any]]:
@@ -184,7 +194,8 @@ def status_flow(oldest_days: float | None, stalled: int | None) -> str:
         base = "warn"
     else:
         base = "bad"
-    return "warn" if base == "good" and stalled else base
+    # An unread stall count (None) is not zero stalls: it caps the status at warn, like a stall.
+    return "warn" if base == "good" and (stalled is None or stalled) else base
 
 
 def status_ci(pass_pct: float | None, ci_red: int) -> str:
@@ -280,9 +291,11 @@ Fetcher = Callable[[str], bytes]
 
 def run_bytes(argv: Sequence[str], cwd: Path | None = None) -> bytes:
     """Run one command; its raw stdout. Raises :class:`CollectError` on any failure."""
+    # git under the C locale, so the one stderr message read back (refuse_reason) is not localized.
+    env = {**os.environ, "LC_ALL": "C", "LANGUAGE": "C"} if argv[0] == "git" else None
     try:
         proc = subprocess.run(  # nosec B603 - argv list from this module, no shell
-            list(argv), cwd=cwd, capture_output=True, timeout=CMD_TIMEOUT, check=False
+            list(argv), cwd=cwd, env=env, capture_output=True, timeout=CMD_TIMEOUT, check=False
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise CollectError(f"{argv[0]} could not run: {type(exc).__name__}: {exc}") from None
@@ -333,6 +346,9 @@ class Context:
     run_raw: BytesRunner = run_bytes
     fetch: Fetcher = fetch_url
     engine_root: Path = ENGINE_ROOT
+    #: The stalled-PR checker's runner; None uses its own retrying `gh` runner.
+    stall_runner: Callable[[list[str], float], str] | None = None
+    today: dt.date = field(default_factory=lambda: dt.datetime.now(dt.UTC).date())
     merged_cache: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     _vault: VaultRead | CollectError | None = None
 
@@ -347,7 +363,7 @@ class Context:
                 self._vault = _read_vault(self)
             except CollectError as exc:
                 self._vault = exc
-            except (OSError, ValueError, ImportError, tarfile.TarError) as exc:
+            except Exception as exc:  # noqa: BLE001 - cached so a retry cannot mask the cause
                 self._vault = CollectError(f"vault read failed: {type(exc).__name__}: {exc}")
         if isinstance(self._vault, CollectError):
             raise self._vault
@@ -373,15 +389,19 @@ def _on_path(directory: Path) -> Iterator[None]:
         sys.path.remove(str(directory))
 
 
-def _read_vault(ctx: Context) -> VaultRead:
-    vault = str(ctx.vault)
-    ctx.run(["git", "-C", vault, "fetch", "-q", "origin"], None)
-    sha = ctx.run(["git", "-C", vault, "rev-parse", "origin/main"], None).strip()
-    tar_bytes = ctx.run_raw(["git", "-C", vault, "archive", "--format=tar", sha, *VAULT_PATHS])
-    root = ctx.workdir / "vault"
-    root.mkdir()
+def _archive_into(ctx: Context, vault: str, sha: str, paths: Sequence[str], root: Path) -> None:
+    tar_bytes = ctx.run_raw(["git", "-C", vault, "archive", "--format=tar", sha, "--", *paths])
     with tarfile.open(fileobj=io.BytesIO(tar_bytes)) as tar:
         tar.extractall(root, filter="data")
+
+
+def _read_vault(ctx: Context) -> VaultRead:
+    vault = str(ctx.vault)
+    ctx.run(["git", "-C", vault, "fetch", "-q", "--no-tags", "origin", "main"], None)
+    sha = ctx.run(["git", "-C", vault, "rev-parse", "origin/main"], None).strip()
+    root = ctx.workdir / "vault"
+    root.mkdir()
+    _archive_into(ctx, vault, sha, VAULT_PATHS, root)
 
     docs = root / "scripts" / "docs"
     # The vault's bare `from backlog_status_check import ...` must resolve to the ARCHIVED copy, so a
@@ -389,14 +409,28 @@ def _read_vault(ctx: Context) -> VaultRead:
     sys.modules.pop("backlog_status_check", None)
     with _on_path(docs):
         report = _load_module("vault_ledger_weekly_report", docs / "ledger_weekly_report.py")
+    checker = sys.modules["backlog_status_check"]
+    tree = ctx.run(["git", "-C", vault, "ls-tree", "-r", "--name-only", sha, "--", "docs"], None)
+    ledger = [
+        name
+        for name in tree.splitlines()
+        if any(
+            PurePosixPath(name).full_match(g, case_sensitive=True)
+            for g in checker.LEDGER_FILE_GLOBS
+        )
+    ]
+    if not ledger:
+        raise CollectError(f"no ledger file matches the checker's globs at vault {sha}")
+    _archive_into(ctx, vault, sha, ledger, root)
+
     paths = [root / p for p in report.DEFAULT_SOURCES]
     sources = report.read_sources(paths, root, explicit=True)
     census = report.census(sources)
-    # The checker's anti-narrowing floors, applied by hand: `default_corpus_errors` asks git for the
-    # tracked ledger files, and the archive is not a git tree.
-    empty = [label for label, n in census.per_source if n == 0]
-    if empty:
-        raise CollectError(f"ledger source(s) parsed to no rows: {', '.join(empty)}")
+    # The checker's anti-narrowing floors, reused: a dropped, emptied or unscanned ledger file, then
+    # the row-count floor. The archive is no git top level, so the checker globs it from disk.
+    structural = report.default_corpus_errors(root, census.per_source)
+    if structural:
+        raise CollectError("; ".join(structural))
     if census.rows < report.MIN_TOTAL_ITEMS:
         raise CollectError(
             f"{census.rows} ledger rows read, below the floor of {report.MIN_TOTAL_ITEMS}"
@@ -501,12 +535,12 @@ def c_prs_merged(ctx: Context, m: Metric) -> None:
     total = [
         {"week": w, "value": sum(series_value(s, w) for s in per_repo.values())} for w in labels
     ]
-    week, partial = last_full_week(ctx.through, labels)
+    week = last_full_week(ctx.through, labels, ctx.today)
     full_values = [p["value"] for p in total if p["week"] <= week]
     m.value = series_value(total, week)
     m.status = status_merged(m.value, full_values)
     m.series = total
-    m.detail = {"value_week": week, "value_week_partial": partial, "per_repo": per_repo}
+    m.detail = {"value_week": week, "per_repo": per_repo}
 
 
 def c_flow_health(ctx: Context, m: Metric) -> None:
@@ -529,8 +563,9 @@ def c_flow_health(ctx: Context, m: Metric) -> None:
         raise CollectError(f"gh pr list returned {type(rows).__name__}")
     if len(rows) >= PR_LIST_LIMIT:
         raise CollectError("open PR count hit the list limit; truncated")
-    now = dt.datetime.combine(ctx.through, dt.time(23, 59, 59), dt.UTC)
-    now = min(now, dt.datetime.now(dt.UTC))
+    # Open PRs are today's set, so their ages are measured from now, never from --through: a past
+    # --through would give a PR opened after it a negative age.
+    now = dt.datetime.now(dt.UTC)
     ages = [
         (
             now - dt.datetime.fromisoformat(str(r["createdAt"]).replace("Z", "+00:00"))
@@ -563,32 +598,24 @@ def c_flow_health(ctx: Context, m: Metric) -> None:
             "dashboard_check_stalled_prs",
             ctx.engine_root / "scripts" / "ci" / "check_stalled_prs.py",
         )
-        prs = checker._fetch(ENGINE_REPO, None, lambda cmd, _timeout: ctx.run(cmd, None))
+        # The checker's own `_fetch` (private, but the one definition of the split query and its
+        # fail-closed guards). Its retrying runner is used unless a test injects one.
+        prs = checker._fetch(ENGINE_REPO, None, ctx.stall_runner)
         stalled = len(checker.scan(prs))
         detail["green_but_unmergeable"] = stalled
         detail["green_but_unmergeable_rule"] = (
             "scripts/ci/check_stalled_prs.py signature: OPEN, BEHIND, no failing or pending check"
         )
-    except (CollectError, RuntimeError, OSError, ValueError, ImportError) as exc:
+    except Exception as exc:  # noqa: BLE001 - an optional part; recorded, and the status is capped
         detail["green_but_unmergeable"] = None
         detail["green_but_unmergeable_error"] = f"{type(exc).__name__}: {exc}"
+    detail["state_as_of"] = "run time; --through does not apply to open PRs"
     m.value = len(rows)
     m.status = status_flow(oldest, stalled)
     m.detail = detail
 
 
 def c_ci_main(ctx: Context, m: Metric) -> None:
-    workflow = ctx.engine_root / ".github" / "workflows" / "ci.yml"
-    name = next(
-        (
-            line.split(":", 1)[1].strip().strip("'\"")
-            for line in workflow.read_text(encoding="utf-8").splitlines()
-            if line.startswith("name:")
-        ),
-        None,
-    )
-    if name is None:
-        raise CollectError(f"{workflow} carries no top-level name")
     runs = list_per_week(
         ctx,
         [
@@ -626,15 +653,13 @@ def c_ci_main(ctx: Context, m: Metric) -> None:
         raise CollectError(f"gh pr list (ci-red) returned {type(red).__name__}")
     labels = ctx.labels
     series = ci_pass_series(runs, labels)
-    week, partial = last_full_week(ctx.through, labels)
+    week = last_full_week(ctx.through, labels, ctx.today)
     m.value = series_value(series, week)
     m.status = status_ci(m.value, len(red))
     m.series = series
     m.detail = {
-        "workflow_name": name,
-        "workflow_file": "ci.yml",
+        "workflow_file": "ci.yml (the workflow named CI)",
         "value_week": week,
-        "value_week_partial": partial,
         "runs_read": len(runs),
         "counted": "success passes; failure, timed_out, startup_failure, action_required fail; "
         "cancelled, skipped and in-progress runs are not counted",
@@ -671,12 +696,15 @@ def c_asvs(ctx: Context, m: Metric) -> None:
         "value_means": "pass cells over cells not marked na",
         "provenance": [ln for ln in lines if ln.startswith("#")],
         "scorecard_ref": f"vault origin/main {v.sha} (archived, so the tool prints NO-GIT)",
+        "tool": "scripts/asvs/scorecard.py from this engine checkout, whose ref the provenance "
+        "line names",
         "history": "none: --status reads one ref and keeps no history",
+        "state_as_of": "run time; --through does not apply",
     }
 
 
 def parse_asvs_cells(line: str) -> dict[str, int]:
-    """``cells 345: 139 pass, 140 partial, 0 fail`` -> ``{"total": 345, "pass": 139, ...}``."""
+    """``cells 10: 4 pass, 6 partial`` -> ``{"total": 10, "pass": 4, "partial": 6}``."""
     head, _, rest = line.partition(":")
     try:
         out = {"total": int(head.split()[1])}
@@ -709,7 +737,11 @@ def c_dependency_vulns(ctx: Context, m: Metric) -> None:
         by_severity[sev] = by_severity.get(sev, 0) + 1
     m.value = len(flat)
     m.status = status_vulns(by_severity)
-    m.detail = {"open_by_severity": by_severity, "kpis": _vuln_kpis(ctx)}
+    m.detail = {
+        "open_by_severity": by_severity,
+        "kpis": _vuln_kpis(ctx),
+        "state_as_of": "run time; --through does not apply",
+    }
 
 
 def _vuln_kpis(ctx: Context) -> dict[str, Any]:
@@ -756,7 +788,7 @@ def _vuln_kpis(ctx: Context) -> dict[str, Any]:
         if not rows:
             raise CollectError("vuln-metrics.csv holds no rows")
         return {"run_id": run_id, "run_date": runs[0]["createdAt"], "row": rows[-1], "error": None}
-    except (CollectError, OSError, KeyError) as exc:
+    except Exception as exc:  # noqa: BLE001 - an attachment; its failure must not null the alerts
         return {"run_id": None, "row": None, "error": f"{type(exc).__name__}: {exc}"}
 
 
@@ -772,6 +804,7 @@ def c_owner_waiting(ctx: Context, m: Metric) -> None:
         "class_c_note": "not read: open class C questions are bundled only by "
         "scripts/coord/digest.ps1, which writes a digest file and is not a read-only query, so "
         "this counts the ledger part only",
+        "state_as_of": "vault origin/main at run time; --through does not apply",
     }
 
 
@@ -779,23 +812,38 @@ def c_release_distance(ctx: Context, m: Metric) -> None:
     try:
         info = json.loads(ctx.fetch(PYPI_URL))
         version = str(info["info"]["version"])
-        files = info["releases"].get(version) or []
-        uploaded = min((f["upload_time_iso_8601"] for f in files), default=None)
     except (ValueError, KeyError, TypeError) as exc:
         raise CollectError(f"unreadable PyPI JSON: {type(exc).__name__}: {exc}") from None
+    try:
+        # `urls` lists the latest version's files; the deprecated `releases` map is not needed.
+        uploaded = min((str(f["upload_time_iso_8601"]) for f in info["urls"]), default=None)
+    except (KeyError, TypeError):
+        uploaded = None
     # Release tags are `v<version>` (webconsole-v* tag the other distribution; rescue/auto/* are
     # backup tags and are never consulted, since the tag is named from the PyPI version).
     tag = f"v{version}"
     root = str(ctx.engine_root)
-    ctx.run(["git", "-C", root, "fetch", "-q", "origin", "main"], None)
-    ctx.run(
-        ["git", "-C", root, "fetch", "-q", "origin", f"refs/tags/{tag}:refs/tags/{tag}"],
-        None,
-    )
-    count = int(ctx.run(["git", "-C", root, "rev-list", "--count", f"{tag}..origin/main"], None))
+    ctx.run(["git", "-C", root, "fetch", "-q", "--no-tags", "origin", "main"], None)
+    # ls-remote, not a tag fetch: it creates no local ref. An annotated tag also prints its peeled
+    # commit as `<ref>^{}`, which is preferred.
+    listed = ctx.run(["git", "-C", root, "ls-remote", "origin", f"refs/tags/{tag}*"], None)
+    refs: dict[str, str] = {}
+    for line in listed.splitlines():
+        commit, _, ref = line.partition("\t")
+        refs[ref.strip()] = commit.strip()
+    sha = refs.get(f"refs/tags/{tag}^{{}}") or refs.get(f"refs/tags/{tag}")
+    if sha is None:
+        raise CollectError(f"origin carries no tag {tag} for PyPI version {version}")
+    count = int(ctx.run(["git", "-C", root, "rev-list", "--count", f"{sha}..origin/main"], None))
     m.value = count
     m.status = status_max(count, "release_distance")
-    m.detail = {"pypi_version": version, "uploaded": uploaded, "tag": tag}
+    m.detail = {
+        "pypi_version": version,
+        "uploaded": uploaded,
+        "tag": tag,
+        "tag_commit": sha,
+        "state_as_of": "run time; --through does not apply",
+    }
 
 
 @dataclass(frozen=True)
@@ -924,6 +972,7 @@ def refuse_reason(out: Path, run: Runner = run_cmd) -> str | None:
     except CollectError as exc:
         text = str(exc)
         # git's own answer for a directory in no repository: the one failure that means "safe".
+        # run_bytes runs git under LC_ALL=C, so the message is not localized.
         if "not a git repository" in text:
             return None
         return f"cannot tell whether {parent} is inside a git repository: {text}"
@@ -950,10 +999,14 @@ def main(argv: list[str] | None = None) -> int:
         help="last day of the window (default: today, UTC)",
     )
     args = ap.parse_args(argv)
-    if not 1 <= args.weeks <= 104:
-        print("ERROR: --weeks must be from 1 to 104", file=sys.stderr)
+    # At least two, so the window always holds one complete week for the weekly values.
+    if not 2 <= args.weeks <= 104:
+        print("ERROR: --weeks must be from 2 to 104", file=sys.stderr)
         return 2
-    reason = refuse_reason(args.out)
+    # Resolved ONCE, and the resolved path is both the one checked and the one written: a symlinked
+    # --out must not pass the check on its target and then be written beside the link.
+    out = args.out.resolve()
+    reason = refuse_reason(out)
     if reason is not None:
         print(f"ERROR: refusing --out {args.out}: {reason}", file=sys.stderr)
         return 2
@@ -962,14 +1015,15 @@ def main(argv: list[str] | None = None) -> int:
         ctx = Context(vault=args.vault, through=through, weeks=args.weeks, workdir=Path(tmp))
         metrics = collect(ctx)
         snap = snapshot(ctx, metrics)
-    tmp_out = args.out.with_name(args.out.name + ".tmp")
+    tmp_out = out.with_name(out.name + ".tmp")
     tmp_out.write_text(json.dumps(snap, indent=2) + "\n", encoding="utf-8")
-    tmp_out.replace(args.out)
+    tmp_out.replace(out)
     for m in metrics:
         print(
             f"{m.id}: value={m.value} status={m.status}" + (f" error={m.error}" if m.error else "")
         )
-    return 0
+    # 2 when any metric could not be read, after the snapshot is written: an outage goes red.
+    return 2 if any(m.error for m in metrics) else 0
 
 
 if __name__ == "__main__":  # pragma: no cover
