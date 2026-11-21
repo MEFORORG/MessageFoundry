@@ -805,13 +805,15 @@ def _impact(args: argparse.Namespace) -> int:
     return 0
 
 
-def _reference_dict(ref: Any) -> dict[str, str]:
-    """JSON view of a :class:`~messagefoundry.config.reachability.Reference` (referrer -> target edge)."""
+def _reference_dict(ref: Any) -> dict[str, str | None]:
+    """JSON view of a :class:`~messagefoundry.config.reachability.Reference` (referrer -> target
+    edge), with its relation, so an ``Http`` inbound's ``reply_from`` reads as one (BACKLOG #5966)."""
     return {
         "referrer_kind": ref.referrer_kind,
         "referrer": ref.referrer,
         "target_kind": ref.target_kind,
         "target": ref.target,
+        "relation": ref.relation,
     }
 
 

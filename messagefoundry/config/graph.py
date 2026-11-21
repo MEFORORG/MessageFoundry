@@ -3,14 +3,18 @@
 """The authoritative static wiring graph over a loaded :class:`Registry` (ADR 0091 D1).
 
 One derivation of the inbound → router → handler → outbound edges (plus the ``reingress_to``
-outbound → inbound back-edge, so the graph can hold a cycle), consumed by the ``graph`` CLI
+outbound → inbound back-edge, so the graph can hold a cycle, and the ``reply_from`` inbound →
+outbound reference), consumed by the ``graph`` CLI
 (the IDE's CONNECTIONS view), the reverse-reachability index (#152/#176), and the ``send-target``
 advisory check — previously three divergent extractors. Edges are **AST-first** (the ADR 0076 static
 discipline: parse the defining module, never re-import it) with the compiled-``co_consts`` string
 scan retained as a fallback tier, and every edge carries its **provenance**:
 
 * ``declared`` — the structured ``inbound -> router`` binding on the Registry, and an outbound's
-  ``reingress_to`` naming the Loopback inbound its captured reply re-enters (``outbound -> inbound``);
+  ``reingress_to`` naming the Loopback inbound its captured reply re-enters (``outbound -> inbound``),
+  and an ``Http`` inbound's ``reply_from`` naming the outbound whose captured reply answers its
+  caller (``inbound -> outbound``: an edge points from the element that NAMES to the one NAMED, so
+  the reply's own data flow runs the other way);
 * ``literal`` — AST-proven: a string literal, a module-level ``NAME = "..."`` constant (validated
   against the WHOLE module: a ``global NAME`` in any function or any second module-scope binding —
   ``NAME += ...``, ``for NAME in ...``, an import alias — disqualifies it), or a
@@ -25,6 +29,14 @@ scan retained as a fallback tier, and every edge carries its **provenance**:
   references a **demoted** module constant — a disqualified ``NAME = "..."`` candidate keeps its
   once-literal value at this tier rather than vanishing (edges must never shrink below the
   ``co_consts`` tier: a dropped edge is a false dead-config report).
+
+Every edge also carries its **relation**, what the naming means: ``router`` (an inbound's router
+binding), ``routes`` (a Router returning a Handler), ``sends`` (a Handler's ``Send`` to an outbound or
+a pass-through inbound), and ``reingress_to`` and ``reply_from`` (the two connection settings). A
+message travels along every relation in :data:`DATA_FLOW_RELATIONS`. ``reply_from`` is a name
+reference only: no message travels from the inbound to the outbound it names. So a consumer that
+walks or draws data flow (the reachability walk, the web console's flow graph) skips it, and a
+consumer that asks who NAMES an element (delete impact, rename) keeps it (BACKLOG #5966).
 
 A Router return / ``Send`` target the AST cannot resolve to a string (a computed name) marks the
 element **dynamic** — surfaced explicitly, never silently dropped (AC-3); so does a **generator**
@@ -50,37 +62,56 @@ from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.wiring import Registry
 
 __all__ = [
+    "DATA_FLOW_RELATIONS",
     "DanglingRef",
     "EdgeProvenance",
+    "EdgeRelation",
     "WiringEdge",
     "WiringGraph",
     "build_wiring_graph",
 ]
 
 EdgeProvenance = Literal["declared", "literal", "heuristic"]
+EdgeRelation = Literal["router", "routes", "sends", "reingress_to", "reply_from"]
+
+#: The relations a message travels along. ``reply_from`` is not one: the inbound names the outbound
+#: whose captured reply answers its caller, but sends it nothing.
+DATA_FLOW_RELATIONS: frozenset[EdgeRelation] = frozenset(
+    {"router", "routes", "sends", "reingress_to"}
+)
 
 
 @dataclass(frozen=True)
 class WiringEdge:
-    """One directed wiring edge: ``source`` (a ``source_kind``) names ``target`` (a ``target_kind``)."""
+    """One directed wiring edge: ``source`` (a ``source_kind``) names ``target`` (a ``target_kind``),
+    as its ``relation`` says."""
 
     source_kind: str
     source: str
     target_kind: str
     target: str
     provenance: EdgeProvenance
+    relation: EdgeRelation
+
+    @property
+    def carries_data(self) -> bool:
+        """Whether a message travels along this edge (see :data:`DATA_FLOW_RELATIONS`)."""
+        return self.relation in DATA_FLOW_RELATIONS
 
 
 @dataclass(frozen=True)
 class DanglingRef:
     """A **literal** Router/Handler target that resolves to nothing registered (a typo the runtime
-    would dead-letter), or an outbound's declared ``reingress_to`` naming no Loopback inbound (which
-    build-check refuses on a deployed outbound)."""
+    would dead-letter), an outbound's declared ``reingress_to`` naming no Loopback inbound (which
+    build-check refuses on a deployed outbound), or an inbound's ``reply_from`` naming no outbound
+    (which build-check refuses on a deployed inbound)."""
 
     source_kind: str
     source: str
     target: str
-    expected: str  # "handler" | "outbound/pass-through" | "loopback inbound" (a reingress_to)
+    # "handler" | "outbound/pass-through" | "loopback inbound" (a reingress_to) | "outbound" (a
+    # reply_from)
+    expected: str
 
 
 @dataclass(frozen=True)
@@ -1150,7 +1181,7 @@ def build_wiring_graph(registry: Registry) -> WiringGraph:
     pt_names = _pt_inbound_names(registry)
 
     for conn in registry.inbound.values():
-        edges.append(WiringEdge("inbound", conn.name, "router", conn.router, "declared"))
+        edges.append(WiringEdge("inbound", conn.name, "router", conn.router, "declared", "router"))
 
     for rname, rfn in sorted(registry.routers.items()):
         ast_result = _router_returns(rfn, cache)
@@ -1164,13 +1195,13 @@ def build_wiring_graph(registry: Registry) -> WiringGraph:
                 dynamic.add(("router", rname))
         for name in sorted(literal):
             if name in handler_names:
-                edges.append(WiringEdge("router", rname, "handler", name, "literal"))
+                edges.append(WiringEdge("router", rname, "handler", name, "literal", "routes"))
             else:
                 dangling.append(DanglingRef("router", rname, name, "handler"))
         code = _code_of(rfn)
         consts = _string_consts(code) if code is not None else set()
         for name in sorted(((consts | extra) & handler_names) - literal):
-            edges.append(WiringEdge("router", rname, "handler", name, "heuristic"))
+            edges.append(WiringEdge("router", rname, "handler", name, "heuristic", "routes"))
 
     for hname, hfn in sorted(registry.handlers.items()):
         ast_result = _handler_sends(hfn, cache)
@@ -1184,17 +1215,17 @@ def build_wiring_graph(registry: Registry) -> WiringGraph:
                 dynamic.add(("handler", hname))
         for name in sorted(literal):
             if name in outbound_names:
-                edges.append(WiringEdge("handler", hname, "outbound", name, "literal"))
+                edges.append(WiringEdge("handler", hname, "outbound", name, "literal", "sends"))
             elif name in pt_names:
-                edges.append(WiringEdge("handler", hname, "inbound", name, "literal"))
+                edges.append(WiringEdge("handler", hname, "inbound", name, "literal", "sends"))
             else:
                 dangling.append(DanglingRef("handler", hname, name, "outbound/pass-through"))
         code = _code_of(hfn)
         consts = _string_consts(code) if code is not None else set()
         for name in sorted(((consts | extra) & outbound_names) - literal):
-            edges.append(WiringEdge("handler", hname, "outbound", name, "heuristic"))
+            edges.append(WiringEdge("handler", hname, "outbound", name, "heuristic", "sends"))
         for name in sorted(((consts | extra) & pt_names) - literal):
-            edges.append(WiringEdge("handler", hname, "inbound", name, "heuristic"))
+            edges.append(WiringEdge("handler", hname, "inbound", name, "heuristic", "sends"))
 
     # An outbound's `reingress_to` (ADR 0013) re-enters its captured reply on the named Loopback
     # inbound; a .py factory and a connections.toml entry both land it in `spec.settings`. Without
@@ -1211,6 +1242,21 @@ def build_wiring_graph(registry: Registry) -> WiringGraph:
         if target not in loopback_names:
             dangling.append(DanglingRef("outbound", oname, target, "loopback inbound"))
         elif target in registry.inbound:
-            edges.append(WiringEdge("outbound", oname, "inbound", target, "declared"))
+            edges.append(
+                WiringEdge("outbound", oname, "inbound", target, "declared", "reingress_to")
+            )
+
+    # An Http inbound's `reply_from` (ADR 0154 D4) names the outbound whose captured reply answers the
+    # caller. Without this edge the outbound's referrer is invisible to the reference index, so a
+    # delete-impact report would miss it (BACKLOG #5966). Every engine shard's view shares the whole
+    # outbound map, so a name missing from it is a typo; build-check skips a not-deployed inbound.
+    for iname, iconn in sorted(registry.inbound.items()):
+        target = iconn.spec.settings.get("reply_from")
+        if not isinstance(target, str) or not target:
+            continue
+        if target in outbound_names:
+            edges.append(WiringEdge("inbound", iname, "outbound", target, "declared", "reply_from"))
+        else:
+            dangling.append(DanglingRef("inbound", iname, target, "outbound"))
 
     return WiringGraph(edges=tuple(edges), dynamic=frozenset(dynamic), dangling=tuple(dangling))

@@ -772,6 +772,8 @@ _SETTING_REFERENCES = (
     ("outbound", "reingress_to", "inbound"),
     ("inbound", "reply_from", "outbound"),
 )
+#: Those settings' names, which are also the relation an index edge carries for each.
+_SETTING_NAMES = frozenset(setting for _kind, setting, _target in _SETTING_REFERENCES)
 
 
 def _all_referrers(
@@ -780,12 +782,17 @@ def _all_referrers(
     """Every referrer of ``(target_kind, old)``, each with the connection setting it names the
     target in, or ``None`` for a referrer read from its code or its router binding.
 
-    The settings are read from the registry, not inferred from the index's edges: the index carries
-    an outbound's literal ``reingress_to`` as an ``outbound -> inbound`` edge, but has no edge for an
-    inbound's ``reply_from`` (an ``Http`` inbound naming the outbound whose reply it returns), nor
-    for either written as an ``env()`` reference whose default names the target (BACKLOG #5966). The
-    registry's reading replaces an index edge for the same referrer rather than adding a second."""
-    out: dict[Reference, str | None] = dict.fromkeys(index.referrers(target_kind, old))
+    An index edge names its setting by its relation: the index carries an outbound's literal
+    ``reingress_to`` as an ``outbound -> inbound`` edge and an ``Http`` inbound's literal
+    ``reply_from`` as an ``inbound -> outbound`` one, each tagged with that setting, so neither is
+    read as a router binding (BACKLOG #5966). The registry is read as well, for what the index has
+    no edge for: a setting written as an ``env()`` reference whose default names the target, and a
+    ``reingress_to`` naming an inbound that is no Loopback, which the graph reports as dangling. A
+    referrer the index already holds keeps its edge's reading, rather than gaining a second."""
+    out: dict[Reference, str | None] = {
+        ref: ref.relation if ref.relation in _SETTING_NAMES else None
+        for ref in index.referrers(target_kind, old)
+    }
     for kind, setting, setting_target in _SETTING_REFERENCES:
         if setting_target != target_kind:
             continue
@@ -793,7 +800,7 @@ def _all_referrers(
         for name in sorted(table):
             value = table[name].spec.settings.get(setting)
             if value == old or (isinstance(value, EnvRef) and value.default == old):
-                out[Reference(kind, name, target_kind, old)] = setting
+                out.setdefault(Reference(kind, name, target_kind, old, setting), setting)
     return list(out.items())
 
 

@@ -157,7 +157,12 @@ def test_graph_cli_carries_the_reingress_edge(
     data = json.loads(capsys.readouterr().out)
     outbound = {o["name"]: o for o in data["outbound"]}
     assert outbound["OB_PARTNER"]["edges"] == [
-        {"target": "IB_LOOP", "target_kind": "inbound", "provenance": "declared"}
+        {
+            "target": "IB_LOOP",
+            "target_kind": "inbound",
+            "provenance": "declared",
+            "relation": "reingress_to",
+        }
     ]
     assert outbound["OB_RESULT"]["edges"] == []
     inbound = {i["name"]: i for i in data["inbound"]}
