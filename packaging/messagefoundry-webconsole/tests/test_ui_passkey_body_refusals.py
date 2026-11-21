@@ -139,7 +139,12 @@ def test_a_csp_report_nested_too_deep_is_malformed_not_a_500(
     with caplog.at_level("WARNING", logger="messagefoundry_webconsole"):
         r = _on_a_small_stack(_post)
     assert r.status_code == 204
-    assert any("malformed-json" in rec.getMessage() for rec in caplog.records)
+    assert any(
+        rec.name == "messagefoundry_webconsole.routes.core"
+        and rec.levelname == "WARNING"
+        and rec.getMessage().endswith(": malformed-json")
+        for rec in caplog.records
+    )
 
 
 def _spy_login(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> list[str]:

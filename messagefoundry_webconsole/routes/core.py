@@ -631,7 +631,10 @@ def _is_expected_csp_probe_report(report: dict[str, object], origin: str | None)
         blocked = report.get("blockedURL")
     if not isinstance(blocked, str):
         return False
-    parts = urlsplit(blocked)
+    try:
+        parts = urlsplit(blocked)
+    except ValueError:  # an unparseable host, such as an unclosed IPv6 bracket: not ours, so warn
+        return False
     # Compare paths: browsers report the absolute URL, but tolerate a bare path too. Query/fragment are
     # stripped so a cache-buster can never smuggle a non-probe URL past the match.
     if parts.path != CSP_PROBE_SRC:
