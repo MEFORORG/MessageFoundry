@@ -80,19 +80,23 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # Whether the `(` at $Open, the second of `$((` or `((`, closes with `))`, which is when bash reads
 # arithmetic; otherwise, as in `$((find /proc) )`, it is a subshell. The scan skips a backslash
 # escape and a single- or double-quoted string, so a quoted paren (`'foo('`) does not move the
-# match. It does not read comments, heredoc bodies or a substitution nested in a quoted string, and
-# it stops after 8192 characters. An unmatched or cut-off scan returns false, which -Refined reads
-# as a subshell, the reading that leaves the text visible.
+# match. It does not read at least comments, heredoc bodies, backtick substitutions, `$'...'`
+# strings or a substitution nested in a quoted string. Every call shares one budget of 65536
+# characters, so a long run of `((` cannot make the scans quadratic; once it is spent, every call
+# returns false. An unmatched or cut-off scan returns false too, which -Refined reads as a
+# subshell, the reading that leaves the text visible.
+$script:ArithmeticBudget = 65536
 function Test-ArithmeticClose([string]$Text, [int]$Open) {
     $depth = 1
-    $limit = [Math]::Min($Text.Length, $Open + 8192)
+    $limit = [Math]::Min($Text.Length, $Open + 1 + $script:ArithmeticBudget)
     $k = $Open + 1
+    try {
     while ($k -lt $limit) {
         $c = $Text[$k]
         if ($c -ceq '\') { $k += 2; continue }
         if ($c -ceq "'") {
             $k = $Text.IndexOf("'", $k + 1)
-            if ($k -lt 0) { return $false }
+            if ($k -lt 0) { $k = $limit; return $false }
         } elseif ($c -ceq '"') {
             $k++
             while ($k -lt $limit -and $Text[$k] -cne '"') { $k += $(if ($Text[$k] -ceq '\') { 2 } else { 1 }) }
@@ -104,6 +108,9 @@ function Test-ArithmeticClose([string]$Text, [int]$Open) {
         $k++
     }
     return $false
+    } finally {
+        $script:ArithmeticBudget = [Math]::Max(0, $script:ArithmeticBudget - ([Math]::Min($k, $limit) - $Open))
+    }
 }
 
 # Blank the CONTENTS of quoted spans, keeping the quotes and the length, so a separator or a
@@ -138,11 +145,14 @@ function Test-ArithmeticClose([string]$Text, [int]$Open) {
 # is a subshell inside a substitution; that test's own limits are stated on it. A `<<` glued to a
 # word opens a heredoc (`"$(cat<<'EOF'"`). Every heredoc opened on one line has a body, read in
 # order to its own terminator (`cat <<A <<B`), where the reading without it keeps only the last
-# delimiter. And the arithmetic command `(( ... ))` and `$[ ... ]` are blanked as `$((` is, so a
-# shift in them opens no heredoc. The switch is a third view, not a replacement, so a misreading
-# of its own can only cost a deny the other two views also miss.
+# delimiter. And the arithmetic command `(( ... ))`, also glued to `if`, `elif`, `while`, `until`
+# or `for`, and `$[ ... ]` are blanked as `$((` is, so a shift in them opens no heredoc. Unlike
+# the reading without it, it masks a command with no quote too. The switch is a third view, not a
+# replacement, and the call site says what that does and does not guarantee.
 function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
-    if ($Text.IndexOf('"') -lt 0 -and $Text.IndexOf("'") -lt 0) { return $Text }
+    # A command with no quote masks to itself, except that -Refined still blanks arithmetic.
+    if (-not $Refined -and $Text.IndexOf('"') -lt 0 -and $Text.IndexOf("'") -lt 0) { return $Text }
+    $keywordBefore = [regex]::new('(?:^|[\s;&|(])(?:if|elif|while|until|for)$')
     if ($Plain) {
         $sb = [System.Text.StringBuilder]::new($Text.Length)
         $quote = $null
@@ -226,10 +236,12 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
             $kinds.Add('arith'); $depths.Add(0); [void]$sb.Append('$(('); $prevDollar = $false
             $n += 3; continue
         }
-        # With -Refined, the arithmetic command `(( ... ))` at a word start and the old-style
-        # `$[ ... ]` are blanked as `$((` is, so a `<<` in them opens no heredoc.
+        # With -Refined, the arithmetic command `(( ... ))` at a word start or glued to a keyword
+        # (`if((`, `while((`), and the old-style `$[ ... ]`, are blanked as `$((` is, so a `<<` in
+        # them opens no heredoc.
         if ($Refined -and ($kind -ceq 'top' -or $kind -ceq 'sub' -or $kind -ceq 'bt')) {
-            if ($ch -ceq '(' -and $next -ceq '(' -and $wordStart -and $braceDepth -eq 0 -and
+            if ($ch -ceq '(' -and $next -ceq '(' -and $braceDepth -eq 0 -and
+                ($wordStart -or $keywordBefore.IsMatch($Text.Substring([Math]::Max(0, $n - 7), [Math]::Min($n, 7)))) -and
                 (Test-ArithmeticClose $Text ($n + 1))) {
                 $kinds.Add('arith'); $depths.Add(0); [void]$sb.Append('(('); $prevDollar = $false
                 $n += 2; continue
@@ -689,7 +701,10 @@ try {
     # a misreading still allows it. The -Refined reading is a third view under the same rule, for
     # the `$((cmd) )`, `cat<<`, two-heredoc and arithmetic-shift forms inside such a span; see
     # Hide-QuotedSpans. It reads differently only where `((`, `<<` or `$[` appears, so it runs only
-    # there. At least these still blank a walk in a double-quoted span under all three views: a
+    # there, and, like the PowerShell reading below, it is built only once every segment of the
+    # other two views allows, so a slow path in it can delay an allow but never their deny. Its own
+    # misreadings can still add a false deny, or miss a walk the other two views also miss.
+    # At least these still blank a walk in a double-quoted span under all three views: a
     # `$((cmd) )` nested in arithmetic, a `case` pattern's `)` inside "$(...)", which closes it
     # early, a heredoc terminator compared after trimming its spaces where bash compares the whole
     # line, and a delimiter word longer than the leading name or quoted part read from it
@@ -700,11 +715,9 @@ try {
     if ($tool -cne 'PowerShell') {
         $bashScan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd)
         if ($bashScan -cne $scans[0]) { $scans += $bashScan }
-        if ($cmd.Contains('((') -or $cmd.Contains('<<') -or $cmd.Contains('$[')) {
-            $refinedScan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd -Refined)
-            if ($scans -cnotcontains $refinedScan) { $scans += $refinedScan }
-        }
     }
+    $refinedPending = @{ Value = ($tool -cne 'PowerShell' -and
+        ($cmd.Contains('((') -or $cmd.Contains('<<') -or $cmd.Contains('$['))) }
     # The PowerShell tool's reading, beside the toggle under the same rule (BACKLOG #5451). Without
     # a backtick, `#`, `@` or `${` it masks exactly as the toggle does, so it is skipped. THE TOGGLE
     # IS JUDGED FIRST, and this reading is built only once every toggle segment allows, so a slow
@@ -723,15 +736,22 @@ try {
         }
         $bounds.Add(@($Scan, $cursor, ($Scan.Length - $cursor)))
     }
-    # Called once the loop below has judged every bound it holds; true when it added more.
-    function Add-PowerShellBounds {
-        if (-not $psPending.Value) { return $false }
-        $psPending.Value = $false
-        $psScan = Hide-HeredocBodies $cmd (Hide-PowerShellSpans $cmd)
-        if ($psScan -ceq $scans[0]) { return $false }
+    # Called once the loop below has judged every bound it holds; true when it added more. Each
+    # deferred reading is built at most once, the refined one before the PowerShell one; the two
+    # never apply to the same tool.
+    function Add-LateBounds {
+        $late = $null
+        if ($refinedPending.Value) {
+            $refinedPending.Value = $false
+            $late = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd -Refined)
+        } elseif ($psPending.Value) {
+            $psPending.Value = $false
+            $late = Hide-HeredocBodies $cmd (Hide-PowerShellSpans $cmd)
+        } else { return $false }
+        if ($scans -ccontains $late) { return (Add-LateBounds) }
         $before = $bounds.Count
-        Add-ScanBounds $psScan
-        return $bounds.Count -gt $before
+        Add-ScanBounds $late
+        return ($bounds.Count -gt $before) -or (Add-LateBounds)
     }
     foreach ($scan in $scans) { Add-ScanBounds $scan }
 
@@ -758,7 +778,7 @@ try {
 
     # A segment both views mask alike is checked once.
     $checked = [System.Collections.Generic.HashSet[string]]::new()
-    for ($bi = 0; $bi -lt $bounds.Count -or (Add-PowerShellBounds); $bi++) {
+    for ($bi = 0; $bi -lt $bounds.Count -or (Add-LateBounds); $bi++) {
         $b = $bounds[$bi]
         if ($b[2] -le 0) { continue }
         $seg = $b[0].Substring($b[1], $b[2])

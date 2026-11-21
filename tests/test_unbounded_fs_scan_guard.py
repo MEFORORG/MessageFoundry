@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -774,6 +775,11 @@ REFINED_READING_DENY = [
     pytest.param(
         'echo "$(echo $[ a << b ]\nfind /proc)"', id="spaced-shift-in-old-style-arithmetic"
     ),
+    pytest.param(
+        'echo "$(if((x << y)); then :; fi\nfind /proc)"', id="shift-in-arithmetic-glued-to-if"
+    ),
+    # With no quote at all, the masker used to return the text as it was, arithmetic unblanked.
+    pytest.param("(( a << b ))\nfind /proc", id="spaced-shift-in-arithmetic-with-no-quote"),
 ]
 
 
@@ -782,9 +788,9 @@ def test_a_walk_the_refined_reading_finds_inside_double_quotes_is_denied(command
     assert_denied(run_guard(bash(command)))
 
 
-# THE -Refined READING IS A THIRD VIEW, NOT A REPLACEMENT. Each row was denied before it, because
-# the reading without it opens no heredoc at a glued `<<`. The refined reading opens one there, and
-# denies these only because it blanks the arithmetic around the shift, so they pin that reading.
+# A GLUED SHIFT IN ARITHMETIC STAYS DENIED. Each row was denied before the -Refined reading, because
+# the reading without it opens no heredoc at a glued `<<`. The refined reading opens heredocs at a
+# glued `<<`, and denies these only because it blanks the arithmetic around the shift first.
 REFINED_FLOOR_DENY = [
     pytest.param('echo "$( (( a<<b ))\nfind /proc)"', id="glued-shift-in-an-arithmetic-command"),
     pytest.param('echo "$(echo $[a<<b]\nfind /proc)"', id="glued-shift-in-old-style-arithmetic"),
@@ -792,17 +798,25 @@ REFINED_FLOOR_DENY = [
 
 
 @pytest.mark.parametrize("command", REFINED_FLOOR_DENY)
-def test_a_walk_only_the_reading_without_refined_sees_is_still_denied(command: str) -> None:
+def test_a_glued_shift_in_arithmetic_is_still_denied(command: str) -> None:
     assert_denied(run_guard(bash(command)))
 
 
-def test_arithmetic_that_reads_like_a_walk_is_still_allowed() -> None:
-    """The control for Test-ArithmeticClose: `$(( find / 2 ))` divides a variable by two.
+def test_both_bodies_of_two_heredocs_on_one_line_are_still_blanked() -> None:
+    """The control for the delimiter queue: each body is data, so the walk it names is not run."""
+    assert_allowed(run_guard(bash('echo "$(cat <<A <<B\nfind /proc\nA\nfind /proc\nB\n)"')))
 
-    It closes with `))`, so it is arithmetic and runs nothing. Read as a subshell instead, its
-    `find /` would sit in program position and be denied.
+
+def test_a_long_run_of_open_parens_is_read_in_linear_time() -> None:
+    """Every arithmetic-close scan shares one budget, so 40000 `((` cost one bounded pass.
+
+    Without the budget each scan read up to 8192 characters, about 98 seconds here, which is past
+    the dispatcher's hook timeout, and a timed-out hook lets the command run. The word `find` keeps
+    the guard from returning early, so every view, the refined one included, is built.
     """
-    assert_allowed(run_guard(bash('echo "$(( find / 2 ))"')))
+    started = time.monotonic()
+    run_guard(bash('echo find; echo "$(' + "(" * 40000 + '"'))
+    assert time.monotonic() - started < 30
 
 
 # ============================================ the corpora must not quietly shrink
@@ -834,7 +848,7 @@ EXPECTED_ROW_COUNTS = {
     "POWERSHELL_QUOTE_DENY": 2,
     "TOGGLE_FLOOR_DENY": 5,
     "COMMENT_BOUNDARY_DENY": 6,
-    "REFINED_READING_DENY": 10,
+    "REFINED_READING_DENY": 12,
     "REFINED_FLOOR_DENY": 2,
 }
 
