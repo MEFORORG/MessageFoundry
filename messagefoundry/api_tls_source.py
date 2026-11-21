@@ -56,11 +56,28 @@ def wildcard_loopback(host: str) -> str | None:
     return "::1" if ip.version == 6 else "127.0.0.1"
 
 
+def unbracketed(host: str) -> str:
+    """``host`` without the brackets a URL puts round an IPv6 literal, so ``[::1]`` reads ``::1``.
+
+    Only a bracketed IP literal loses them; any other host is returned as written. A certificate
+    must name ``::1`` as an IP address, because hostname verification of ``https://[::1]`` compares
+    the address, and a DNS name spelled ``[::1]`` matches no URL (BACKLOG #5973).
+    """
+    if host.startswith("[") and host.endswith("]"):
+        try:
+            ipaddress.ip_address(host[1:-1])
+        except ValueError:
+            return host
+        return host[1:-1]
+    return host
+
+
 def dialled_host(host: str) -> str:
     """The host a client on this box dials for an API bind on ``host`` (BACKLOG #5973).
 
-    The family's loopback for a wildcard (:func:`wildcard_loopback`), else ``host`` as written. ONE
-    copy: the tray dials it (:mod:`messagefoundry.tray.config`), and the engine re-mints a reused
-    generated certificate that does not name it (:mod:`messagefoundry.api.tls`).
+    The family's loopback for a wildcard (:func:`wildcard_loopback`), else ``host`` without IPv6
+    brackets (:func:`unbracketed`). ONE copy: the tray dials it (:mod:`messagefoundry.tray.config`),
+    and the engine re-mints a reused generated certificate that does not name it
+    (:mod:`messagefoundry.api.tls`).
     """
-    return wildcard_loopback(host) or host
+    return wildcard_loopback(host) or unbracketed(host)

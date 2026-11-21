@@ -4287,10 +4287,16 @@ def test_the_minted_certificate_names_a_wildcard_binds_loopback(
 @pytest.mark.parametrize(
     ("first", "then", "names"),
     [
-        # Exactly what a first-run mint for the new bind names.
-        ("127.0.0.1", "::", ["::", "::1"]),
+        # What a first-run mint for the new bind names, plus, for a bind dialled on loopback, the
+        # loopback names the old certificate carried and the default host 127.0.0.1.
+        ("127.0.0.1", "::", ["::", "::1", "127.0.0.1"]),
         ("10.0.0.9", "0.0.0.0", ["0.0.0.0", "127.0.0.1"]),
-        ("127.0.0.1", "localhost", ["localhost"]),
+        ("127.0.0.1", "localhost", ["localhost", "127.0.0.1"]),
+        ("::1", "localhost", ["localhost", "127.0.0.1", "::1"]),
+        # A bracketed IPv6 bind is named by the address, not a DNS name spelled "[::1]".
+        ("127.0.0.1", "[::1]", ["::1", "127.0.0.1"]),
+        # Off loopback, nothing is kept: the CLI defaults cannot reach this bind anyway.
+        ("127.0.0.1", "myhost.example", ["myhost.example"]),
     ],
 )
 def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
@@ -4321,6 +4327,14 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
     loaded = x509.load_pem_x509_certificate(Path(cert).read_bytes())
     san = loaded.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
     assert [str(n.value) for n in san] == names
+    # An IP literal is an iPAddress entry, which is all hostname verification of an IP URL reads.
+    for entry in san:
+        try:
+            ipaddress.ip_address(str(entry.value))
+        except ValueError:
+            assert isinstance(entry, x509.DNSName)
+        else:
+            assert isinstance(entry, x509.IPAddress)
     assert [(e.reason, e.old_sha256) for e in events] == [("bind_changed", old_sha)]
     assert events[0].new_sha256 == _sha256(Path(cert)) != old_sha
     # Once it names the bind, the next start reuses it and writes nothing.
@@ -4339,8 +4353,10 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
         # Hostname matching ignores case, and a SAN cannot carry an IPv6 zone.
         ("myhost", "MYHOST", True),
         ("fe80::1%12", "fe80::1%12", True),
-        # A bracketed host is minted as written, so the check classifies it the same way.
+        # A bracketed host is minted and checked without its brackets, as the address.
         ("[::1]", "[::1]", True),
+        ("::1", "[::1]", True),
+        ("[::1]", "::1", True),
         # An engine shard (renew=False) reuses a loadable pair as found, the bind check included,
         # so a lone restarted shard cannot serve a different certificate from its siblings.
         ("127.0.0.1", "::", False),
@@ -5396,32 +5412,74 @@ def test_concurrent_starts_renew_a_due_pair_exactly_once(
     assert _sha256(Path(material[0])) == reported[0].new_sha256
 
 
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost"])
+def test_a_failed_key_replace_puts_the_previous_certificate_back(
+    host: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5973. An ``OSError`` on the key's replace, after the certificate's, would leave a
+    new certificate beside the old key, and that start would fail. The swap rolls the certificate
+    back instead, so the pair on disk always matches, and the start serves the previous pair. Both a
+    renewal (``127.0.0.1``, near expiry) and a bind re-mint (``localhost``) take this path.
+
+    Mutation: drop the rollback in ``_renew_generated_pair``. Red: the start raises, and the pair
+    does not load."""
+    import messagefoundry.api.tls as tls
+
+    renewal = host == "127.0.0.1"
+    cert, key = _plant_generated_pair(
+        tmp_path, lived_days=300 if renewal else 1, left_days=65 if renewal else 300
+    )
+    before = _snapshot(cert, key)
+    real = tls._replace_generated
+
+    def refuse_the_key(staged: Path, live: Path) -> None:
+        if live == key:
+            raise PermissionError(13, "simulated refusal of the key replace")
+        real(staged, live)
+
+    monkeypatch.setattr(tls, "_replace_generated", refuse_the_key)
+    events: list[GeneratedPairReplaced] = []
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.tls"):
+        material = ensure_api_tls_material(
+            ApiSettings(host=host), state_dir=tmp_path, replacements=events
+        )
+    assert material == (str(cert), str(key))
+    _load_pair(cert, key)
+    assert _snapshot(cert, key) == before
+    assert events == []
+    assert "put the previous certificate back" in caplog.text
+    assert not list(tmp_path.glob("*.renewing")) and not list(tmp_path.glob("*.prior"))
+
+
 def test_a_renewal_interrupted_between_its_replaces_recovers_and_is_reported(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A crash after the certificate's replace and before the key's leaves a new certificate beside
-    the old key. That pair does not load, so the next start discards and re-mints it, and reports
-    it as an unusable pair. The staged key the crash left is discarded first, or the next renewal's
-    O_EXCL write would refuse it."""
+    """A crash after the certificate's replace and before the key's, with no rollback, leaves a new
+    certificate beside the old key: here the key's replace AND the rollback fail. That pair does not
+    load, so the next start discards and re-mints it, and reports it as an unusable pair. The staged
+    files the crash left are discarded first, or the next renewal's O_EXCL write would refuse the
+    key."""
     import messagefoundry.api.tls as tls
 
     cert, key = _plant_generated_pair(tmp_path, lived_days=300, left_days=65)
     real = tls._replace_generated
     calls = [0]
 
-    def die_on_the_key(staged: Path, live: Path) -> None:
+    def die_after_the_cert(staged: Path, live: Path) -> None:
         calls[0] += 1
-        if calls[0] == 2:
+        if calls[0] >= 2:
             raise OSError("simulated crash between the two replaces")
         real(staged, live)
 
-    monkeypatch.setattr(tls, "_replace_generated", die_on_the_key)
+    monkeypatch.setattr(tls, "_replace_generated", die_after_the_cert)
+    monkeypatch.setattr(tls, "_remove_quietly", lambda *paths: None)  # a crash cleans up nothing
     with pytest.raises(OSError, match="simulated crash"):
         ensure_api_tls_material(ApiSettings(), state_dir=tmp_path)
     with pytest.raises(ssl.SSLError):  # CONTROL: the interruption really left a mismatched pair
         _load_pair(cert, key)
     assert (tmp_path / (key.name + ".renewing")).exists()
-    monkeypatch.setattr(tls, "_replace_generated", real)
+    assert (tmp_path / (cert.name + ".prior")).exists()
+    monkeypatch.undo()
 
     events: list[GeneratedPairReplaced] = []
     assert ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events) == (
@@ -5431,7 +5489,7 @@ def test_a_renewal_interrupted_between_its_replaces_recovers_and_is_reported(
     _load_pair(cert, key)
     assert [e.reason for e in events] == ["unusable"]
     assert events[0].old_sha256 is not None  # the half-installed new certificate, identified
-    assert not list(tmp_path.glob("*.renewing"))
+    assert not list(tmp_path.glob("*.renewing")) and not list(tmp_path.glob("*.prior"))
 
 
 @pytest.mark.parametrize(("left", "keeps_old"), [(65, True), (-5, False)])

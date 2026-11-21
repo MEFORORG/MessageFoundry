@@ -27,6 +27,7 @@ from messagefoundry.api_tls_source import (
     ApiTlsSource,
     api_tls_source,
     dialled_host,
+    unbracketed,
     wildcard_loopback,
 )
 from messagefoundry.audit_write import write_audit_soft
@@ -36,7 +37,7 @@ from messagefoundry.auth.trust_anchors import (
     api_client_crl_spec,
     verified_anchor_cadata,
 )
-from messagefoundry.config.settings import ApiSettings
+from messagefoundry.config.settings import _LOOPBACK_HOSTS, ApiSettings
 from messagefoundry.config.tls_policy import (
     TLS_REVOCATION_ATTESTED_ENV,
     apply_operator_tls_ciphers,
@@ -253,6 +254,43 @@ def _generated_sans(host: str) -> list[str]:
     return [] if loopback is None else [loopback]
 
 
+def _make_generated(host: str, kept: Sequence[str] = ()) -> tuple[bytes, bytes]:
+    """Mint the generated pair for a bind on ``host``: ``(cert_pem, key_pem)``. Writes nothing.
+
+    The subject is ``host`` without IPv6 brackets (:func:`messagefoundry.api_tls_source.unbracketed`),
+    so a ``[::1]`` bind is named by the IP address ``::1`` a client's hostname check compares,
+    not by a DNS name spelled ``[::1]`` that matches no URL (BACKLOG #5973). ``kept`` adds names a
+    re-mint for a changed bind carries over (:func:`_kept_loopback_names`). Raises ``ValueError``
+    for a host the certificate builder refuses.
+    """
+    from messagefoundry import pki
+
+    subject = unbracketed(host)
+    return pki.make_self_signed(
+        subject, [*_generated_sans(subject), *kept], _GENERATED_LIFETIME_DAYS
+    )
+
+
+def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
+    """The loopback names a re-mint for a changed bind keeps (BACKLOG #5973).
+
+    Only for a bind a client on this box dials through a loopback: of ``localhost``, ``127.0.0.1``
+    and ``::1``, every one the old certificate names, and the default ``[api].host``, which the
+    CLI, the IDE and the harness dial by default. A move from ``127.0.0.1`` to ``localhost`` would
+    otherwise drop the ``127.0.0.1`` those clients verify. The set is fixed, so repeated moves do
+    not grow it. A bind off loopback keeps nothing, as a first-run mint for it would name nothing
+    else.
+    """
+    from messagefoundry import pki
+
+    if dialled_host(host) not in _LOOPBACK_HOSTS:
+        return []
+    default = ApiSettings.model_fields["host"].default
+    return [
+        name for name in sorted(_LOOPBACK_HOSTS) if name == default or pki.san_names(old_pem, name)
+    ]
+
+
 #: Renew the generated pair at startup once less than this share of its OWN validity period is
 #: left: about 122 of 365 days (ADR 0172, 2026-09-26 amendment). Early rather than at expiry, so a
 #: renewal lands at an ordinary restart months before any client could see an expired certificate.
@@ -260,12 +298,16 @@ def _generated_sans(host: str) -> list[str]:
 _RENEW_REMAINING_FRACTION = 1 / 3
 #: Suffix of the new pair while it is staged beside the live one, before the two replaces.
 _STAGED_SUFFIX = ".renewing"
+#: Suffix of the copy of the live certificate a replacement keeps until its key is in place, so a
+#: failed key replace can put the old certificate back beside the old key (BACKLOG #5973).
+_PRIOR_SUFFIX = ".prior"
 
 #: Why a loadable generated pair is replaced at startup (:func:`_replacement_due`), and why any
 #: existing pair is (:class:`GeneratedPairReplaced`).
 _DueReason = Literal["renewal", "bind_changed"]
 _ReplacedReason = Literal["renewal", "bind_changed", "unusable", "half_pair"]
-type _Due = tuple[_DueReason, SelfSignedFacts]
+#: Why, the old certificate's facts, and its PEM, read once.
+type _Due = tuple[_DueReason, SelfSignedFacts, bytes]
 
 #: The audit action for every replacement of a generated pair that already existed: an early
 #: renewal, a re-mint for a bind the certificate does not name (BACKLOG #5973), and the recovery
@@ -879,30 +921,43 @@ def _replacement_due(host: str, cert_path: Path) -> _Due | None:
         )
         return None
     if expiring:
-        return "renewal", facts
+        return "renewal", facts, pem
     if not pki.san_names(pem, dialled_host(host)):
-        return "bind_changed", facts
+        return "bind_changed", facts, pem
     return None
 
 
-def _staged_pair(cert_path: Path, key_path: Path) -> tuple[Path, Path]:
-    """Where a renewal writes the new pair before moving it over the live one."""
+def _staged_files(cert_path: Path, key_path: Path) -> tuple[Path, Path, Path]:
+    """Where a renewal writes the new pair before moving it over the live one, and where it keeps a
+    copy of the live certificate until the new key is in place: ``(cert, key, prior cert)``."""
     return (
         cert_path.with_name(cert_path.name + _STAGED_SUFFIX),
         key_path.with_name(key_path.name + _STAGED_SUFFIX),
+        cert_path.with_name(cert_path.name + _PRIOR_SUFFIX),
     )
 
 
 def _discard_staged_leftovers(cert_path: Path, key_path: Path) -> None:
-    """Remove a staged pair left by a renewal that died before its replaces. Only under the lock.
+    """Remove the files a renewal that died left beside the pair. Only under the lock.
 
     Under the lock no renewal is running, so a staged file is debris. The staged key must go before
     the next renewal, whose ``O_EXCL`` write would otherwise refuse it on every later start.
     """
-    for leftover in _staged_pair(cert_path, key_path):
+    for leftover in _staged_files(cert_path, key_path):
         if leftover.exists():
             log.warning("discarding %s, left by an interrupted certificate renewal", leftover)
             unlink_generated(leftover)
+
+
+def _remove_quietly(*paths: Path) -> None:
+    """Remove each path that exists, logging a failure rather than raising it, so a cleanup never
+    masks the error that called for it. The next start's locked pass discards what is left."""
+    for leftover in paths:
+        try:
+            if leftover.exists():
+                unlink_generated(leftover)
+        except OSError as cleanup:
+            log.warning("could not remove %s after a failed renewal: %s", leftover, cleanup)
 
 
 def _renew_generated_pair(
@@ -925,19 +980,23 @@ def _renew_generated_pair(
 
     **A renewal that fails before the first replace has changed nothing.** The staged files are
     removed and the error propagates; :func:`ensure_api_tls_material` then keeps the old pair if it
-    still serves, and the next start tries again. A failure BETWEEN the two replaces leaves a new
-    certificate beside the old key, which does not load, so that start fails; the next one discards
-    and re-mints it as an unusable pair, and reports that too.
+    still serves, and the next start tries again. **A failure BETWEEN the two replaces is rolled
+    back** (BACKLOG #5973): a copy of the old certificate, staged with the new pair, is moved back
+    over the new one, so the old certificate is again beside the old key, which the failed replace
+    never moved. The rollback is logged at ERROR and the error propagates to the same fallback. Only
+    if the rollback fails too is a new certificate left beside the old key; that start fails, and
+    the next one discards and re-mints it as an unusable pair, and reports that.
+
+    A re-mint for a changed bind keeps the loopback names :func:`_kept_loopback_names` gives.
     """
     from messagefoundry import pki
     from messagefoundry.__main__ import _write_private_key
 
-    reason, old = due
-    staged_cert, staged_key = _staged_pair(cert_path, key_path)
+    reason, old, old_pem = due
+    staged_cert, staged_key, prior_cert = _staged_files(cert_path, key_path)
+    kept = _kept_loopback_names(api.host, old_pem) if reason == "bind_changed" else []
     try:
-        cert_pem, key_pem = pki.make_self_signed(
-            api.host, _generated_sans(api.host), _GENERATED_LIFETIME_DAYS
-        )
+        cert_pem, key_pem = _make_generated(api.host, kept)
     except ValueError as exc:
         # A RE-MINT FOR A CHANGED BIND IS NEVER WORTH A START (BACKLOG #5973). The old pair still
         # loads and is fresh, so a host the certificate builder refuses (a CN over 64 characters,
@@ -960,17 +1019,20 @@ def _renew_generated_pair(
         _write_private_key(staged_key, key_pem)
         staged_cert.write_bytes(cert_pem)
         _let_local_users_read_cert(staged_cert)
+        # The old certificate's bytes, read under this lock, with the grant the live one carries.
+        prior_cert.write_bytes(old_pem)
+        _let_local_users_read_cert(prior_cert)
         _replace_generated(staged_cert, cert_path)
     except OSError:
-        for leftover in (staged_cert, staged_key):
-            try:
-                if leftover.exists():
-                    unlink_generated(leftover)
-            except OSError as cleanup:
-                # Never mask the renewal's own error. The next start's locked pass discards it.
-                log.warning("could not remove %s after a failed renewal: %s", leftover, cleanup)
+        _remove_quietly(staged_cert, staged_key, prior_cert)
         raise
-    _replace_generated(staged_key, key_path)
+    try:
+        _replace_generated(staged_key, key_path)
+    except OSError as exc:
+        _roll_back_certificate(prior_cert, cert_path, key_path, exc)
+        _remove_quietly(staged_key, prior_cert)
+        raise
+    _remove_quietly(prior_cert)
     event = _replaced(reason, cert_path, old, new)
     events.append(event)
     why = (
@@ -989,6 +1051,36 @@ def _renew_generated_pair(
         "at an unknown date" if event.old_not_after is None else log_timestamp(event.old_not_after),
         event.new_sha256,
         log_timestamp(event.new_not_after),
+    )
+
+
+def _roll_back_certificate(prior_cert: Path, cert_path: Path, key_path: Path, exc: OSError) -> None:
+    """Put the old certificate back after the new key could not replace the old one. Never raises.
+
+    The new certificate is already live, and the old key is still live, so until this runs the two
+    do not load as a pair. Moving the staged copy of the old certificate back restores the pair the
+    engine served before. Either outcome is logged at ERROR, since the caller's fallback then names
+    only the original error.
+    """
+    try:
+        _replace_generated(prior_cert, cert_path)
+    except OSError as restore:
+        log.error(
+            "could not replace the generated TLS key at %s (%s), and could not put the previous "
+            "certificate back at %s (%s): the certificate and key do not match, so this start "
+            "fails and the next one discards and re-mints them.",
+            key_path,
+            exc,
+            cert_path,
+            restore,
+        )
+        return
+    log.error(
+        "could not replace the generated TLS key at %s (%s); put the previous certificate back at "
+        "%s, so the previous pair still serves and the next start tries again.",
+        key_path,
+        exc,
+        cert_path,
     )
 
 
@@ -1015,9 +1107,7 @@ def _mint_generated_pair(api: ApiSettings, cert_path: Path, key_path: Path) -> S
     from messagefoundry import pki
     from messagefoundry.__main__ import _write_private_key
 
-    cert_pem, key_pem = pki.make_self_signed(
-        api.host, _generated_sans(api.host), _GENERATED_LIFETIME_DAYS
-    )
+    cert_pem, key_pem = _make_generated(api.host)
     _write_private_key(key_path, key_pem)
     paired = False
     try:
