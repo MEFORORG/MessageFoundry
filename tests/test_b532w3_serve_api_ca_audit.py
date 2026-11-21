@@ -162,8 +162,9 @@ def test_the_store_guard_fires_on_a_store_open(no_store_open: list[str]) -> None
     """The positive control for ``no_store_open``: a store open is caught and recorded."""
     import messagefoundry.store as store_pkg
 
+    opener: Callable[..., Any] = store_pkg.open_store  # the spy, which raises before any await
     with pytest.raises(AssertionError, match="opened the store"):
-        store_pkg.open_store(object())
+        opener(object())
     assert no_store_open == ["messagefoundry.store.open_store"]
 
 
