@@ -435,13 +435,13 @@ def test_the_detach_and_the_download_route_share_the_store_bound() -> None:
     assert not wiring_runner._label_fits_every_backend(widest + "x")
 
 
-@pytest.mark.parametrize("lead", ["", " " * 4000])
-async def test_a_magic_byte_head_after_whitespace_is_read_off_the_event_loop(
-    lead: str, store: MessageStore, monkeypatch: pytest.MonkeyPatch
+async def test_the_magic_byte_head_is_read_off_the_event_loop(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The head's work grows with sender-controlled whitespace before the prefix, so such a head
-    # runs in a thread, as the rest of the detach's body-scaled work does; a head with none is a
-    # fixed read on the loop, with no thread hop per document (BACKLOG #1619).
+    # The head's work grows with sender-controlled whitespace, so it runs in a thread, as the rest
+    # of the detach's body-scaled work does, and in the scan's own hop rather than one of its own,
+    # so a document costs no extra hop for it (BACKLOG #1619).
+    import asyncio
     import threading
 
     loop_thread = threading.get_ident()
@@ -452,15 +452,24 @@ async def test_a_magic_byte_head_after_whitespace_is_read_off_the_event_loop(
         seen.append(threading.get_ident())
         return real(b64, max_bytes)
 
-    monkeypatch.setattr(wiring_runner, "b64_head", recording)
-    runner, ic = _runner(store, ConnectorType.MLLP)
-    b64 = lead + base64.b64encode(b"P" * 2000).decode("ascii")
+    hops: list[object] = []
+    real_to_thread = asyncio.to_thread
 
-    ack = await runner._handle_inbound(ic, _doc_hl7(b64=b64).encode("utf-8"))
+    async def counting(func: Any, /, *args: Any, **kwargs: Any) -> Any:
+        hops.append(func)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(wiring_runner, "b64_head", recording)
+    monkeypatch.setattr(asyncio, "to_thread", counting)
+    runner, ic = _runner(store, ConnectorType.MLLP)
+
+    ack = await runner._handle_inbound(ic, _doc_hl7().encode("utf-8"))
 
     assert _ack_code(ack) == "AA"
     assert seen, "the head was never read"
-    assert (loop_thread in seen) is (not lead)
+    assert loop_thread not in seen
+    assert hops, "no thread hop was counted, so this measured nothing"
+    assert recording not in hops
 
 
 # --- what each retrying source does with the propagated fault ------------------------------------

@@ -22,6 +22,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config import wiring
 from messagefoundry.config.settings import (
     INSECURE_CONFIG_SOURCE_ESCAPE_ENV,
     SECURITY_ENFORCEMENT_ENV,
@@ -256,8 +257,8 @@ def test_a_link_that_cannot_be_resolved_refuses_the_load(
         return real(self, strict)
 
     monkeypatch.setattr(Path, "resolve", refusing)
-    # The listing names the link and no target; the check refuses it.
-    assert config_source_trust_paths(cfg) == [cfg, cfg / "cfg.py"]
+    with pytest.raises(OSError, match="could not be resolved"):
+        config_source_trust_paths(cfg)
     with pytest.raises(WiringError, match="could not be resolved"):
         load_config(cfg)
 
@@ -274,7 +275,8 @@ def test_a_dangling_module_link_refuses_the_load(
     except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
         pytest.skip(f"cannot create a symlink here: {exc}")
     fake_windows_readers(lambda _path: False)
-    assert config_source_trust_paths(cfg) == [cfg, cfg / "cfg.py"]
+    with pytest.raises(OSError, match="leads to nothing"):
+        config_source_trust_paths(cfg)
     with pytest.raises(WiringError, match="leads to nothing"):
         load_config(cfg)
     # Control: once the target exists, the same link loads.
@@ -309,7 +311,8 @@ def test_a_dangling_data_link_refuses_the_load(
     except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
         pytest.skip(f"cannot create a symlink here: {exc}")
     fake_windows_readers(lambda _path: False)
-    assert link in config_source_trust_paths(cfg)
+    with pytest.raises(OSError, match="leads to nothing"):
+        config_source_trust_paths(cfg)
     # The refusal's text is cut to a length, so a long temporary path can hide the name.
     with pytest.raises(WiringError, match="leads to nothing"):
         load_config(cfg)
@@ -332,8 +335,9 @@ def test_the_escape_downgrades_a_dangling_data_link(
     caplog: pytest.LogCaptureFixture,
     fake_windows_readers: FakeReaders,
 ) -> None:
-    """The dangling-link refusal goes through the same refusal as the rest of the check, so the
-    clamped dev/test escape downgrades it to a warning, and the load reads the name as absent."""
+    """The load's check hands the dangling-link refusal to the same refuse as its other refusals,
+    so the clamped dev/test escape downgrades it to a warning, and the load reads the name as
+    absent."""
     monkeypatch.setenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, "1")
     monkeypatch.setenv(SECURITY_ENFORCEMENT_ENV, "warn")
     cfg = tmp_path / "cfg"
@@ -373,3 +377,17 @@ def test_the_escape_is_inert_for_a_dangling_link_under_enforce(
     fake_windows_readers(lambda _path: False)
     with pytest.raises(WiringError, match="not honoured"):
         load_config(cfg, allow_empty=True)
+
+
+def test_a_dangling_config_directory_link_raises_whatever_refuse_is_given(tmp_path: Path) -> None:
+    """The directory itself is judged again as missing or unreadable by the load's callers, so its
+    fault is raised rather than handed to the escape."""
+    link = tmp_path / "cfg"
+    try:
+        link.symlink_to(tmp_path / "gone", target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    handed: list[str] = []
+    with pytest.raises(OSError, match="leads to nothing"):
+        wiring._with_link_targets([link], refuse=handed.append)
+    assert handed == []

@@ -175,7 +175,6 @@ from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7MessageTooLarge
 from messagefoundry.parsing.sniff import (
     attachment_mime_agrees,
     b64_head,
-    b64_head_is_bounded,
     text_sniff_head,
 )
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
@@ -10366,30 +10365,28 @@ class RegistryRunner:
             documents = iter_obx_documents(message, received=text)
 
             def _next_document() -> tuple[int, str, str] | None:
-                return next(documents, None)
-
-            refs: list[str] = []
-            detached = 0
-            while (document := await asyncio.to_thread(_next_document)) is not None:
+                document = next(documents, None)
+                if document is None:
+                    return None
                 occ, verbatim_b64, content_type = document
                 # ASVS 1.3.4/5.2.2: OBX-5.2 is a sender-controlled MIME label. If it names a sniffable
                 # family (image/pdf/zip/xml/json) whose magic bytes the document contradicts, store the
                 # generic octet-stream so the download route can never serve a mislabelled active-content
                 # payload as its claimed inert type. Non-sniffable labels are kept as declared.
                 # A label some backend's column cannot hold is downgraded the same way (BACKLOG #1619),
-                # tested first so an over-long label is never copied by the MIME check.
-                # The magic-byte head's work grows with any whitespace before the prefix, which the
-                # sender controls, so only a head with whitespace in its first window is read in a
-                # thread; the common one is a fixed read here (BACKLOG #1619).
-                safe_ct = content_type
-                if b64_head_is_bounded(verbatim_b64):
-                    head = b64_head(verbatim_b64)
-                else:
-                    head = await asyncio.to_thread(b64_head, verbatim_b64)
+                # tested first so an over-long label is never copied by the MIME check. Judged in the
+                # scan's own thread hop: the magic-byte head's work grows with any whitespace before
+                # the prefix, which the sender controls.
                 if not _label_fits_every_backend(content_type) or not attachment_mime_agrees(
-                    content_type, head
+                    content_type, b64_head(verbatim_b64)
                 ):
-                    safe_ct = _DEFAULT_ATTACHMENT_MIME
+                    return occ, verbatim_b64, _DEFAULT_ATTACHMENT_MIME
+                return occ, verbatim_b64, content_type
+
+            refs: list[str] = []
+            detached = 0
+            while (document := await asyncio.to_thread(_next_document)) is not None:
+                occ, verbatim_b64, safe_ct = document
                 ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)
                 # Dropped once stored, before the splice below copies OBX-5 and before the scan
                 # reads the next document, so the loop holds one copy at a time, as the budget

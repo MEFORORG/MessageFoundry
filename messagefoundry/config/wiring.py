@@ -9801,15 +9801,17 @@ _CONFIG_SOURCE_LEAD = "refusing to load config from"
 _BYTECODE_CACHE_DIR = "__pycache__"
 
 
-def config_source_trust_paths(directory: Path) -> list[Path]:
+def config_source_trust_paths(
+    directory: Path, *, refuse: Callable[[str], None] | None = None
+) -> list[Path]:
     """Every path in ``directory`` whose writer could change what a load of it runs or reads.
 
     The directory and each ``*.py`` (:func:`config_py_files`), and, when they exist, the
     ``__pycache__`` folder and each entry in it, ``connections.toml``, and the ``codesets`` folder
     with each table the loader reads from it. Each of those that is a symbolic link or a junction,
     the directory included, is followed by the object it resolves to and, for a file, that file's
-    folder (:func:`_with_link_targets`). Both config-source trust checks
-    walk this list (vault BACKLOG #2626 step 3, #2596 step 4).
+    folder (:func:`_with_link_targets`, which says what ``refuse`` is handed). Both config-source
+    trust checks walk this list (vault BACKLOG #2626 step 3, #2596 step 4).
 
     **The cache folder is on the list although no load reads it.** The loader compiles each module
     from the bytes of its snapshot (:func:`load_config`), so a ``.pyc`` there never runs in place of
@@ -9822,8 +9824,8 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
     directory and are checked at ``serve`` start (:func:`assert_trusted_start_paths`), and the
     folders above ``directory``, except where a link's target or the folder holding it lies
     there. A link at ``connections.toml``, ``codesets`` or a code-set table is listed even when it
-    leads to nothing, so that the check refuses it (:func:`_refuse_unvettable_links`), as it refuses
-    a dangling module link: a writer of the folder it points into could create the missing name before the read."""
+    leads to nothing, so that it is refused, as a dangling module link is: a writer of the folder
+    it points into could create the missing name before the read."""
     # Lazy: connections_file imports this module (no circular import at load time).
     from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
 
@@ -9848,7 +9850,7 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
         )
     elif _is_link(codesets):
         paths.append(codesets)
-    return _with_link_targets(paths)
+    return _with_link_targets(paths, refuse=refuse)
 
 
 def _is_link(path: Path) -> bool:
@@ -9857,7 +9859,9 @@ def _is_link(path: Path) -> bool:
     return path.is_symlink() or path.is_junction()
 
 
-def _with_link_targets(paths: list[Path]) -> list[Path]:
+def _with_link_targets(
+    paths: list[Path], *, refuse: Callable[[str], None] | None = None
+) -> list[Path]:
     """``paths`` with, after each one that is a symbolic link or a junction, the config directory
     included, the object it resolves to and, for a file, the folder holding that file (vault
     BACKLOG #2596).
@@ -9867,11 +9871,16 @@ def _with_link_targets(paths: list[Path]) -> list[Path]:
     Windows the link object's own access list was read rather than the target's. The target is
     what :meth:`~pathlib.Path.resolve` answers: on POSIX that is Python's own ``realpath`` walk in
     userspace, and nothing here checks it against the object an open of the path reaches, as the
-    ``serve`` start check does (:func:`_file_and_folder`). A link whose target cannot be resolved,
-    or that leads to nothing at check time, has no target listed; :func:`_refuse_unvettable_links`
-    refuses it, so the dev/test escape applies to it as to every other refusal of the check: a
+    ``serve`` start check does (:func:`_file_and_folder`).
+
+    A link whose target cannot be resolved, or that leads to nothing at check time, is refused: a
     writer of the folder it points into could create the missing name before the read (Manager
-    decision under the owner's standing instruction of 2026-10-22).
+    decision under the owner's standing instruction of 2026-10-22). For any link but the first
+    path, the config directory, that refusal is handed to ``refuse`` where one is given, so the
+    load's check can downgrade it under the dev/test escape, and the link is then listed with no
+    target; with none given, or for the config directory, it raises ``OSError`` naming the link,
+    so a directory link that dangles is judged again as missing or unreadable, as one that is not
+    a link is.
 
     **Not vetted**, at least: the links in between, for a link to a link, the folders holding the
     links outside the config directory, from which a writer could re-point one, the folders above
@@ -9880,10 +9889,15 @@ def _with_link_targets(paths: list[Path]) -> list[Path]:
     followed (the start check's :func:`_link_chain` refuses one). The start check walks the links
     of its own files further. A path already listed is not repeated."""
     out: list[Path] = []
-    for path in paths:
+    for index, path in enumerate(paths):
         out.append(path)
         target = _resolved_link(path)
-        if not isinstance(target, Path):
+        if target is None:
+            continue
+        if isinstance(target, str):
+            if refuse is None or index == 0:
+                raise OSError(errno.EINVAL, target, str(path))
+            refuse(f"{_CONFIG_SOURCE_LEAD} {path}: {target}")
             continue
         out.append(target)
         if not target.is_dir():
@@ -9907,15 +9921,6 @@ def _resolved_link(path: Path) -> Path | str | None:
         # cannot reach (a permission fault, a link loop), not only one that is gone.
         return "a link leads to nothing the check can read at check time"
     return target
-
-
-def _refuse_unvettable_links(paths: Sequence[Path], refuse: Callable[[str], None]) -> None:
-    """Hand ``refuse`` a reason for each link in ``paths`` whose target :func:`_with_link_targets`
-    could not list."""
-    for path in paths:
-        fault = _resolved_link(path)
-        if isinstance(fault, str):
-            refuse(f"{_CONFIG_SOURCE_LEAD} {path}: {fault}")
 
 
 def _config_module_name(path: Path) -> str:
@@ -11481,13 +11486,12 @@ def _assert_safe_config_source(directory: Path) -> None:
     try:
         # Include _*.py: the loader skips them as top-level modules, but a sibling can import them,
         # so a writable/foreign-owned helper is just as much an injection vector (review M-21).
-        paths = config_source_trust_paths(directory)
+        paths = config_source_trust_paths(directory, refuse=_refuse_unsafe_config_source)
     except OSError as exc:
         if is_missing_directory(exc):
             # Moved away since the caller's own check: missing, as that check answers (#3157).
             _require_config_dir(directory, strict=True)
         raise
-    _refuse_unvettable_links(paths, _refuse_unsafe_config_source)
     try:
         _check_trusted_paths(
             paths,

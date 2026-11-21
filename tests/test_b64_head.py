@@ -10,7 +10,7 @@ import tracemalloc
 
 import pytest
 
-from messagefoundry.parsing.sniff import b64_head, b64_head_is_bounded
+from messagefoundry.parsing.sniff import b64_head
 
 PNG = b"\x89PNG\r\n\x1a\n" + bytes(range(64))
 
@@ -57,23 +57,3 @@ def test_b64_head_refuses_a_character_outside_the_alphabet() -> None:
     rest of the window lines up into the PNG signature."""
     forged = "****" + base64.b64encode(PNG).decode("ascii")
     assert b64_head(forged) == b""
-
-
-@pytest.mark.parametrize(
-    ("b64", "bounded"),
-    [
-        ("", True),
-        ("iVBORw0K", True),
-        ("A" * 44 + " " * 4000 + "A" * 4, True),  # the whitespace lies past the first window
-        ("A" * 43 + " " + "A" * 4, False),
-        (" " * 4000 + "A" * 44, False),
-        ("AAAA\r\nAAAA", False),
-    ],
-)
-def test_b64_head_is_bounded_answers_whether_the_first_window_holds_whitespace(
-    b64: str, bounded: bool
-) -> None:
-    assert b64_head_is_bounded(b64) is bounded
-    # Where it says bounded, the head is what the first window alone decodes to.
-    if bounded:
-        assert b64_head(b64) == b64_head(b64[:44])
