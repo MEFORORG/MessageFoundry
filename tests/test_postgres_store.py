@@ -6038,6 +6038,196 @@ async def test_undecryptable_reply_contract(store, spoil) -> None:
         await sealed.close()
 
 
+async def _spoil_origin_metadata(raw: RawSql, bad: str, value: str) -> None:
+    await raw("UPDATE messages SET metadata=? WHERE id=?", (value, bad))
+
+
+async def _spoil_origin_metadata_foreign_key(
+    _fetch: RawFetch, raw: RawSql, bad: str, _good: str
+) -> None:
+    """The right cell, sealed under a key the store was never given: a plain ``CipherError``, not a
+    tag failure, since the store holds no key the value names."""
+    foreign = make_cipher(generate_key(), write_v2=True)
+    sealed = foreign.encrypt(
+        '{"correlation_depth": 0}',
+        aad=message_cell_aad("metadata", message_id=bad, channel_id="IB_REAL"),
+    )
+    await _spoil_origin_metadata(raw, bad, sealed)
+
+
+def _unparseable_metadata(value: str) -> Any:
+    async def spoil(_fetch: RawFetch, raw: RawSql, bad: str, _good: str) -> None:
+        await _spoil_origin_metadata(raw, bad, value)
+
+    return spoil
+
+
+# (id, keyed, spoil, the dead event's detail). Each spoils the HEAD token's origin or reply only.
+_HANDOFF_POISON_CASES = [
+    ("metadata-not-json", False, _unparseable_metadata("not json"), "unparseable"),
+    (
+        "depth-not-a-number",
+        False,
+        _unparseable_metadata('{"correlation_depth": "deep"}'),
+        "unparseable",
+    ),
+    ("depth-a-list", False, _unparseable_metadata('{"correlation_depth": [1]}'), "unparseable"),
+    (
+        "depth-infinite",
+        False,
+        _unparseable_metadata('{"correlation_depth": Infinity}'),
+        "unparseable",
+    ),
+    ("metadata-foreign-key", True, _spoil_origin_metadata_foreign_key, "metadata undecryptable"),
+    ("reply-foreign-key", True, None, "reply undecryptable"),
+]
+
+
+@pytest.mark.parametrize(
+    ("keyed", "spoil", "detail"),
+    [c[1:] for c in _HANDOFF_POISON_CASES],
+    ids=[c[0] for c in _HANDOFF_POISON_CASES],
+)
+async def test_ingress_handoff_dead_letters_a_token_it_can_never_hand_off(
+    store, keyed, spoil, detail
+) -> None:
+    """BACKLOG #5689: an origin whose metadata does not decrypt, is not JSON, or holds a depth that
+    is not an integer, and a reply that does not decrypt inside the handoff, each raised out of
+    ``ingress_handoff``, so the token re-pended at the head of the loopback lane on every pass. Each
+    now dead-letters the token and ERRORs its origin. CONTROL: the good token behind it re-ingresses,
+    so the lane moves and the handoff did not dead-letter everything."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from tests import _undecryptable_reply_contract as contract
+    from tests._erased_reply_contract import LOOP, children
+
+    raw, fetch = _raw_adapters(store)
+    s = store
+    if keyed:
+        s = await PostgresStore.open(
+            load_settings(environ=os.environ).store,
+            cipher=make_cipher(generate_key(), write_v2=True),
+        )
+    try:
+        bad = await contract.captured(s, control="HP-BAD", now=1.0)
+        good = await contract.captured(s, control="HP-GOOD", now=2.0)
+        # The handoff's own body read; the worker's earlier read is BACKLOG #4995's contract.
+        await (spoil or contract.spoil_with_a_foreign_key)(fetch, raw, bad, good)
+        before = await contract.token_of(fetch, bad)
+        for _ in range(2):
+            item = await s.claim_next_fifo(LOOP, now=3.0, stage=Stage.RESPONSE.value)
+            assert item is not None
+            assert (
+                await s.ingress_handoff(
+                    response_row_id=item.id,
+                    loopback_channel_id=LOOP,
+                    correlation_depth_cap=8,
+                    control_id=None,
+                    message_type=None,
+                    summary=None,
+                    now=4.0,
+                )
+                is True
+            )
+        assert await s.claim_next_fifo(LOOP, now=5.0, stage=Stage.RESPONSE.value) is None
+
+        after = await contract.token_of(fetch, bad)
+        # Dead with its reference kept, so a replay can retry it once the cause is fixed.
+        assert after["status"] == OutboxStatus.DEAD.value
+        assert after["payload"] == before["payload"] and after["payload"] != ""
+        # Read raw: a keyed get_message would refuse the spoiled metadata cell itself.
+        [origin] = await fetch("SELECT status FROM messages WHERE id=?", (bad,))
+        assert origin["status"] == MessageStatus.ERROR.value
+        events = await s.events_for(bad)
+        assert [e for e in events if e["event"] == "dead" and detail in str(e["detail"])]
+
+        [control] = await fetch("SELECT status FROM messages WHERE id=?", (good,))
+        assert control["status"] == MessageStatus.PROCESSED.value
+        assert len(await children(fetch)) == 1
+    finally:
+        if keyed:
+            await s.close()
+
+
+_ISOLATION_LEVELS = ("read uncommitted", "read committed", "repeatable read", "serializable")
+
+
+async def _role_isolation_default(conn: Any) -> str | None:
+    """This role's own default_transaction_isolation in this database, lower-cased, or ``None``.
+    The catalog keeps the text as it was written, so ``READ COMMITTED`` reads back as itself."""
+    configs = await conn.fetchval(
+        "SELECT setconfig FROM pg_db_role_setting"
+        " WHERE setrole = (SELECT oid FROM pg_roles WHERE rolname = current_user)"
+        " AND setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database())"
+    )
+    for entry in configs or []:
+        name, _, value = entry.partition("=")
+        if name.strip().lower() == "default_transaction_isolation":
+            return " ".join(value.strip().strip("'\"").lower().split())
+    return None
+
+
+async def _set_role_isolation_default(conn: Any, value: str | None) -> None:
+    """Set, or with ``None`` reset, this role's default in this database only."""
+    # A DO block, since ALTER ROLE takes no bind parameters and the database is named by value.
+    # format() quotes both the name (%I) and the value (%L); the value is a fixed level, never input.
+    if value is None:
+        stmt = (
+            "format('ALTER ROLE CURRENT_USER IN DATABASE %I RESET default_transaction_isolation',"
+        )
+        stmt += " current_database())"
+    else:
+        assert value in _ISOLATION_LEVELS, value
+        stmt = "format('ALTER ROLE CURRENT_USER IN DATABASE %I SET default_transaction_isolation"
+        stmt += f" = %L', current_database(), '{value}')"
+    await conn.execute(f"DO $do$ BEGIN EXECUTE {stmt}; END $do$")
+
+
+async def test_finalizer_isolation_outranks_a_role_default(store) -> None:
+    """BACKLOG #5674: the finalizer's read after its advisory lock sees a sibling's commit only under
+    READ COMMITTED. With the role's default in this database set to REPEATABLE READ, the
+    transaction a final delivery finalizes in still runs READ COMMITTED. CONTROL: on the same handle
+    a transaction that names no isolation runs REPEATABLE READ, so the role default is in force and
+    the finalizer's own pin is what held.
+
+    The role's prior setting is restored in a ``finally``. A hard kill, such as pytest-timeout's
+    thread method ending the process, skips that restore and leaves the default changed."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    async with store._pool.acquire() as conn:
+        prior = await _role_isolation_default(conn)
+        await _set_role_isolation_default(conn, "repeatable read")
+    try:
+        # Opened after the change, so every connection it holds takes the role default.
+        s = await PostgresStore.open(load_settings(environ=os.environ).store)
+        try:
+            async with s._pool.acquire() as conn, conn.transaction():
+                assert await conn.fetchval("SHOW transaction_isolation") == "repeatable read"
+
+            seen: list[str] = []
+            finalize = s._maybe_finalize_message
+
+            async def spy(conn: Any, message_id: str, now: float) -> None:
+                seen.append(await conn.fetchval("SHOW transaction_isolation"))
+                await finalize(conn, message_id, now)
+
+            s._maybe_finalize_message = spy  # type: ignore[method-assign]
+            mid = await s.enqueue_message(
+                channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+            )
+            [item] = await s.claim_ready(now=200.0)
+            await s.mark_done(item.id, now=300.0)
+            assert seen and set(seen) == {"read committed"}, seen
+            [row] = await s._pool.fetch("SELECT status FROM messages WHERE id=$1", mid)
+            assert row["status"] == MessageStatus.PROCESSED.value
+        finally:
+            await s.close()
+    finally:
+        async with store._pool.acquire() as conn:
+            await _set_role_isolation_default(conn, prior if prior in _ISOLATION_LEVELS else None)
+
+
 @pytest.mark.parametrize("case", KEYLESS_BLANK_CASES, ids=lambda c: c.__name__)
 async def test_keyless_blank_contract(store, case) -> None:
     """BACKLOG #3495: the first keyed open seals a live empty row, the same contract the SQLite suite
