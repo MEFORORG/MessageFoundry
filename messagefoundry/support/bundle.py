@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Assemble the offline support bundle zip (#49).
+"""Assemble the support bundle zip (#49).
 
 :func:`build_bundle` writes a single ``.zip``; it starts no server. Contents (each a small text/JSON
 member):
@@ -11,7 +11,7 @@ member):
   (inbound/outbound/router/handler counts + the connection NAMES + transport TYPE), never a settings
   value, host, path, credential, or any ``env()``-resolved data.
 * ``status.json`` — a ``/status`` snapshot built from the REAL status models
-  (:class:`~messagefoundry.api.models.SystemStatus` / ``EngineInfo`` / ``DbInfo``), populated offline
+  (:class:`~messagefoundry.api.models.SystemStatus` / ``EngineInfo`` / ``DbInfo``), populated
   from the store. Metadata-only, the term the manifest's ``phi_contract`` uses;
   :func:`status_snapshot` says what it holds.
 * ``app-log.txt`` — when written, a **redacted** app-log tail or an ``MF-BUNDLE-LOG-*`` code in its place (see
@@ -138,7 +138,7 @@ def config_summary(config_dir: str | Path) -> dict[str, Any]:
 
 
 def status_snapshot(settings: ServiceSettings | None) -> dict[str, Any]:
-    """A ``/status`` snapshot built from the REAL status models, populated offline from the store.
+    """A ``/status`` snapshot built from the REAL status models, populated from the store.
 
     The engine isn't running under the CLI, so ``EngineInfo`` carries the version with a zero uptime /
     no live channel counts; ``DbInfo`` is read from the store the settings point at (when reachable).
@@ -292,8 +292,9 @@ def _read_log_file(path: Path, listed: os.stat_result) -> str:
     after the listing, so the open itself reaches whatever the link names, and any effect of
     opening that target happens: connecting to a named pipe the link points at, for one. What the
     check after the open prevents is only the read: a target with another id is refused, and
-    none of its content enters the bundle. Raises :class:`OSError`, the identity refusal as
-    :class:`_LogFileRefused`."""
+    none of its content enters the bundle. Raises :class:`OSError`: the identity refusal, or a
+    file that shrank while it was read, as :class:`_LogFileRefused`, and a file with no whole line
+    in the bound as :class:`_LogLineTooLong`."""
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     nonblocking = getattr(os, "O_NONBLOCK", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0) | nonblocking
@@ -317,7 +318,9 @@ def _read_log_file(path: Path, listed: os.stat_result) -> str:
         while want > 0:
             chunk = os.read(fd, want)
             if not chunk:
-                break  # truncated since the fstat, as a rotation can
+                # Shorter than the fstat said: truncated in place, as a copytruncate rotation
+                # does. Reported as a swap, so the caller lists and reads again.
+                raise _LogFileRefused("the app-log file shrank while it was read")
             chunks.append(chunk)
             want -= len(chunk)
     finally:
@@ -329,10 +332,10 @@ def _read_log_file(path: Path, listed: os.stat_result) -> str:
         lf = data.find(b"\n")
         cr = data.find(b"\r", 0, lf if lf >= 0 else len(data))
         cut = (cr if cr >= 0 else lf) + 1
-        if cut == 0 or not data[cut:].strip(b"\r\n"):
-            raise _LogLineTooLong("no whole app-log line fits in the read bound")
-        if data[cut - 1 : cut + 1] == b"\r\n":
+        if cut and data[cut - 1 : cut + 1] == b"\r\n":
             cut += 1
+        if cut == 0 or cut >= len(data):
+            raise _LogLineTooLong("no whole app-log line fits in the read bound")
         data = data[cut:]
     # Read tolerant of a legacy codepage; the redaction pass runs on the decoded text.
     return data.decode("utf-8", errors="replace")
@@ -428,7 +431,8 @@ def build_bundle(
         # An explicit, auditable statement of what is and isn't in the bundle (the PHI contract). It
         # is machine-readable and a reviewer may rely on it, so it claims no more than every member
         # meets. The CLI help repeats its log-tail residual (BACKLOG #1475, #5385), and
-        # tests/test_support_bundle.py holds the two to the same terms, so change both together.
+        # tests/test_support_bundle.py and tests/test_b532w3_redaction_bundle_members.py hold
+        # the two to the same terms, so change both together.
         "phi_contract": (
             "no member reads a message body from the store; config summary is counts/names only and "
             "holds no secret; status is the metadata-only status models; the app-log tail is a "

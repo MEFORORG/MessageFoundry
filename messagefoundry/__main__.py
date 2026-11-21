@@ -579,7 +579,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     # control -- see BACKLOG #1475 and the exclusion table in
     # tests/test_log_redaction_secret_domain.py for why the username class stays out. The help
     # repeats the manifest phi_contract's log-tail residual because an operator reads it before the
-    # zip exists; tests/test_support_bundle.py holds the two to the same terms (BACKLOG #5385).
+    # zip exists; tests/test_support_bundle.py and tests/test_b532w3_redaction_bundle_members.py
+    # hold the two to the same terms (BACKLOG #5385).
     # Both the command list and `support-bundle --help` print it.
     support_bundle_help = (
         "write a support zip to hand to support (#49). Its members: version.txt (the engine "

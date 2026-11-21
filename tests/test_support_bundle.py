@@ -887,7 +887,7 @@ def test_log_tail_reads_only_a_bounded_tail_of_a_large_log(
 ) -> None:
     """The whole file used to be read into memory, so a large enough log raised ``MemoryError``,
     which nothing catches, and no zip was written. Only the last ``_LOG_TAIL_MAX_BYTES`` bytes are
-    read now; the line the bound cuts into is dropped, so no partial line reaches the redactor."""
+    read now; the line the bound cuts into is dropped."""
     from messagefoundry.support import bundle as bundle_mod
 
     monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 64)
@@ -931,12 +931,21 @@ def test_read_log_file_never_asks_for_more_than_the_bound(
     log.write_bytes(b"x" * 10 + b"\n" + b"y" * 1000 + b"\nlast\n")
     listed = os.lstat(log)
     sizes: list[int] = []
-    real_read = os.read
+    opened: list[int] = []
+    real_open, real_read = os.open, os.read
+
+    def recording_open(*args: Any, **kwargs: Any) -> int:
+        fd = real_open(*args, **kwargs)
+        opened.append(fd)
+        return fd
 
     def recording_read(fd: int, n: int) -> bytes:
-        sizes.append(n)
+        # Only the descriptor the read opened, so another thread's read is not counted.
+        if fd in opened:
+            sizes.append(n)
         return real_read(fd, n)
 
+    monkeypatch.setattr(os, "open", recording_open)
     monkeypatch.setattr(os, "read", recording_read)
     assert bundle_mod._read_log_file(log, listed) == "last\n"
     assert sizes and all(n <= 33 for n in sizes), sizes
@@ -968,3 +977,56 @@ def test_log_tail_a_last_line_longer_than_the_bound_reports_a_code(
     log_dir.mkdir()
     (log_dir / "engine.log").write_bytes(body)
     assert _tail_member(tmp_path, log_dir) == "MF-BUNDLE-LOG-002 _LogLineTooLong"
+
+
+def test_log_tail_a_window_of_empty_lines_is_not_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)
+    log = tmp_path / "engine.log"
+    log.write_bytes(b"x" * 40 + b"\n" * 21)
+    assert bundle_mod._read_log_file(log, os.lstat(log)) == "\n" * 20
+
+
+def test_log_tail_a_file_truncated_while_it_is_read_is_read_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copytruncate rotation between the fstat and the read leaves the read short; that is a
+    swap, so the tail is listed and read again rather than reported as a long line."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    log = log_dir / "engine.log"
+    log.write_bytes(b"old line\n" * 10)
+    real_lseek = os.lseek
+    calls = [0]
+
+    def truncating_lseek(fd: int, pos: int, how: int) -> int:
+        calls[0] += 1
+        if calls[0] == 1:
+            log.write_bytes(b"")  # truncated in place after the fstat, before the read
+        return real_lseek(fd, pos, how)
+
+    monkeypatch.setattr(os, "lseek", truncating_lseek)
+    assert _tail_member(tmp_path, log_dir) == ""
+    assert calls[0] == 2
+
+
+def test_the_help_and_phi_md_state_the_read_bound(capsys: pytest.CaptureFixture[str]) -> None:
+    """The byte bound is restated in the operator help and the PHI record; both follow the
+    constant."""
+    from messagefoundry.__main__ import _build_parser
+    from messagefoundry.support import bundle as bundle_mod
+
+    mib = f"{bundle_mod._LOG_TAIL_MAX_BYTES // (1024 * 1024)} MiB"
+    parser, _ = _build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["support-bundle", "--help"])
+    assert mib in " ".join(capsys.readouterr().out.split())
+    phi = (Path(__file__).resolve().parents[1] / "docs" / "PHI.md").read_text(encoding="utf-8")
+    row = next(line for line in phi.splitlines() if line.startswith("| **14. "))
+    assert mib in row

@@ -1480,8 +1480,8 @@ _ALLOWED_SINK_MODULES: dict[str, str] = {
     # of its own. It calls logging_setup's `configure_stderr_logging`, so the handler — and the filter
     # chain on it — is built by the module already listed above, and stream 2 covers it.
     # 16.2.3's other half: a module that WRITES log CONTENT to an operator-chosen destination is a
-    # log sink even though it constructs no logging handler. The support bundle copies a 500-line
-    # app-log tail out of the ACL'd directory into a zip whose whole purpose is to be handed off.
+    # log sink even though it constructs no logging handler. The support bundle copies an app-log
+    # tail out of the ACL'd directory into a zip whose whole purpose is to be handed off.
     "messagefoundry/support/bundle.py": "stream 14 — the support-bundle app-log.txt member",
 }
 
@@ -1580,7 +1580,7 @@ def test_every_alert_broadcast_transport_has_an_inventory_row() -> None:
 def test_the_support_bundle_stream_is_inventoried() -> None:
     """The one shipped log-egress path §7 mentioned only inside another row's prose.
 
-    ``messagefoundry support-bundle`` writes a 500-line app-log tail into an operator-chosen zip,
+    ``messagefoundry support-bundle`` writes an app-log tail into an operator-chosen zip,
     redacted by a FOURTH redactor the inventory never named, with no access control, no retention and
     no filter-chain coverage. 16.2.3 is "only store/broadcast logs to documented sinks".
     """
