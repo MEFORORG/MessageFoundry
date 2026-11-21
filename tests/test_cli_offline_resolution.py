@@ -840,6 +840,12 @@ def _settings_failure_output(
     return rc, captured.out + captured.err
 
 
+#: A refused [api].trusted_proxies list whose second entry is a URL with a password in it.
+_PROXY_BODY = f'[api]\ntrusted_proxies = ["10.0.0.7", "https://u:{_URL_PASSWORD}@host/"]\n'
+#: How the refusal names that entry: by its position, never its value (vault BACKLOG #5554).
+_PROXY_REFUSAL = "[api].trusted_proxies entry 2 is not a valid IP address or CIDR network"
+
+
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
 def test_offline_env_never_prints_a_refused_trusted_proxy_url(
     tmp_path: Path,
@@ -847,15 +853,55 @@ def test_offline_env_never_prints_a_refused_trusted_proxy_url(
     capsys: pytest.CaptureFixture[str],
     command: str,
 ) -> None:
-    # The [api].trusted_proxies refusal quotes the entry it refused. Under --env these three
-    # commands print a settings failure where origin/main printed none, to stdout, which CI logs
-    # keep, so the field and the error type print and the message, which holds the URL, does not.
-    body = f'[api]\ntrusted_proxies = ["https://u:{_URL_PASSWORD}@host/"]\n'
-    rc, out = _settings_failure_output(command, tmp_path, monkeypatch, capsys, body)
+    # Under --env these three commands print a settings failure where they printed none before,
+    # to output CI logs keep. The refusal names the entry by position and quotes no part of it.
+    rc, out = _settings_failure_output(command, tmp_path, monkeypatch, capsys, _PROXY_BODY)
     assert _URL_PASSWORD not in out, out
     assert "host/" not in out, out
-    assert "api.trusted_proxies: value_error (its message is not shown" in out, out
+    assert f"api.trusted_proxies: Value error, {_PROXY_REFUSAL}" in out, out
     assert rc == (0 if command == "graph" else 1), out
+
+
+def test_check_never_prints_a_refused_trusted_proxy_url(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    cfg = _config_dir(tmp_path, body=_NO_ENV_GRAPH)
+    settings_file = tmp_path / "messagefoundry.toml"
+    settings_file.write_text(_PROXY_BODY, encoding="utf-8")
+    rc = main(["check", "--config", str(cfg), "--service-config", str(settings_file)])
+    captured = capsys.readouterr()
+    out = captured.out + captured.err
+    assert _URL_PASSWORD not in out and "host/" not in out, out
+    assert _PROXY_REFUSAL in out, out
+    assert rc != 0, out
+
+
+def test_serves_settings_load_never_renders_a_refused_trusted_proxy_url(tmp_path: Path) -> None:
+    # serve prints settings_error_detail's text for a load that fails (_load_service_settings).
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import load_settings, settings_error_detail
+
+    settings_file = tmp_path / "messagefoundry.toml"
+    settings_file.write_text(_PROXY_BODY, encoding="utf-8")
+    with pytest.raises(ValidationError) as caught:
+        load_settings(config_path=str(settings_file), environ={})
+    for text in (str(caught.value), settings_error_detail(caught.value)):
+        assert _URL_PASSWORD not in text and "host/" not in text, text
+        assert _PROXY_REFUSAL in text, text
+
+
+def test_an_allowed_client_networks_refusal_never_quotes_the_entry() -> None:
+    # The same shape as the trusted_proxies refusal: a list of networks, one that does not parse.
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import SecuritySettings, settings_error_detail
+
+    with pytest.raises(ValidationError) as caught:
+        SecuritySettings(allowed_client_networks=["10.0.0.0/8", f"https://u:{_URL_PASSWORD}@h/"])
+    for text in (str(caught.value), settings_error_detail(caught.value)):
+        assert _URL_PASSWORD not in text, text
+        assert "[security].allowed_client_networks entry 2 is not a valid CIDR network" in text
 
 
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
@@ -893,74 +939,21 @@ def test_offline_env_names_a_settings_path_holding_a_credential_label_as_it_is(
     rc = main(_offline_argv(command, tmp_path, *argv))
     captured = capsys.readouterr()
     out = captured.out + captured.err
-    # The path after the OS's reason, not the "(<settings file>)" prefix, which names it too.
-    shown = f": {named}"
+    # The OSError's own spelling of the path, not the "(<settings file>)" prefix.
+    shown = repr(str(named))
     assert shown in out or json.dumps(shown)[1:-1] in out, out
     assert "redacted" not in out, out
     assert rc == (0 if command == "graph" else 1), out
 
 
-def test_the_settings_failure_rendering_keeps_a_missing_field_missing() -> None:
+def test_a_missing_secret_field_still_reads_as_missing() -> None:
     # "store.password: Field required" became "store.password=<redacted> required" through a
-    # credential scrub. The field-path rendering prints pydantic's own message as written.
+    # credential scrub; serve's rendering prints the field and pydantic's message as written.
     from pydantic import ValidationError
 
-    from messagefoundry.__main__ import _settings_failure_fields
+    from messagefoundry.config.settings import settings_error_detail
 
     exc = ValidationError.from_exception_data(
-        "ServiceSettings",
-        [
-            {"type": "missing", "loc": ("store", "password"), "input": {}},
-            {
-                "type": "value_error",
-                "loc": ("api", "trusted_proxies"),
-                "input": f"https://u:{_URL_PASSWORD}@host/",
-                "ctx": {"error": ValueError(f"entry 'https://u:{_URL_PASSWORD}@host/' refused")},
-            },
-        ],
+        "ServiceSettings", [{"type": "missing", "loc": ("store", "password"), "input": {}}]
     )
-    assert _URL_PASSWORD in str(exc)  # the control: the raw text carries it
-    shown = _settings_failure_fields(exc)
-    assert shown.startswith("store.password: Field required; api.trusted_proxies: value_error"), (
-        shown
-    )
-    assert _URL_PASSWORD not in shown and "redacted" not in shown, shown
-
-
-def test_the_settings_failure_rendering_of_other_failures(tmp_path: Path) -> None:
-    # A loader refusal prints its type alone; a TOML parse error, its own line and column text.
-    import tomllib
-
-    from messagefoundry.__main__ import _settings_failure_fields
-
-    shown = _settings_failure_fields(ValueError(f"refused https://u:{_URL_PASSWORD}@host/"))
-    assert shown == "ValueError (its message is not shown, because it can quote a value)", shown
-    with pytest.raises(tomllib.TOMLDecodeError) as caught:
-        tomllib.loads("[environments\n")
-    assert _settings_failure_fields(caught.value) == f"TOMLDecodeError: {caught.value}"
-    assert "RecursionError" in _settings_failure_fields(RecursionError(_URL_PASSWORD))
-    assert _URL_PASSWORD not in _settings_failure_fields(RecursionError(_URL_PASSWORD))
-
-
-def test_the_settings_failure_rendering_hides_a_custom_error_type_message() -> None:
-    # A PydanticCustomError keeps its own type and message, which can quote anything, so a type
-    # that is not one of pydantic's built-ins prints its type alone: the list fails closed.
-    from pydantic import BaseModel, ValidationError, field_validator
-    from pydantic_core import PydanticCustomError
-
-    from messagefoundry.__main__ import _settings_failure_fields
-
-    class _Model(BaseModel):
-        url: str
-
-        @field_validator("url")
-        @classmethod
-        def _refuse(cls, value: str) -> str:
-            raise PydanticCustomError("proxy_refused", "entry {entry} refused", {"entry": value})
-
-    with pytest.raises(ValidationError) as caught:
-        _Model(url=f"https://u:{_URL_PASSWORD}@host/")
-    assert _URL_PASSWORD in caught.value.errors()[0]["msg"]  # the control
-    shown = _settings_failure_fields(caught.value)
-    assert shown.startswith("url: proxy_refused (its message is not shown"), shown
-    assert _URL_PASSWORD not in shown, shown
+    assert settings_error_detail(exc) == "store.password: Field required"

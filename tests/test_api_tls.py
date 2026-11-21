@@ -719,7 +719,7 @@ def test_trusted_proxies_refuses_a_host_bits_cidr(entry: str, address: str, netw
     with pytest.raises(ValidationError) as exc:
         ApiSettings(trusted_proxies=["10.0.0.7", entry], tls_terminated_upstream=True)
     message = str(exc.value)
-    assert f"[api].trusted_proxies entry {entry!r} has host bits set" in message
+    assert "[api].trusted_proxies entry 2 has host bits set" in message
     named_address = f"List the proxy's own address '{address}'"
     named_network = f"'{network}'"
     assert named_address in message
@@ -802,7 +802,7 @@ def test_trusted_proxies_refuses_a_zoned_host_uvicorn_parses_and_never_matches(
     with pytest.raises(ValidationError) as exc:
         ApiSettings(trusted_proxies=["10.0.0.7", entry], tls_terminated_upstream=True)
     message = str(exc.value)
-    assert f"[api].trusted_proxies entry {entry!r} is an IPv6 entry with a zone" in message
+    assert "[api].trusted_proxies entry 2 is an IPv6 entry with a zone" in message
     assert f"List {peer!r} instead" in message
     ApiSettings(trusted_proxies=[peer], tls_terminated_upstream=True)
 
@@ -951,7 +951,7 @@ def test_trusted_proxies_refuses_a_zoned_network_whose_zone_uvicorn_ignores(
     with pytest.raises(ValidationError) as exc:
         ApiSettings(trusted_proxies=[entry], tls_terminated_upstream=True)
     message = str(exc.value)
-    assert f"[api].trusted_proxies entry {entry!r} is an" in message
+    assert "[api].trusted_proxies entry 1 is an" in message
     assert spans in message
 
 

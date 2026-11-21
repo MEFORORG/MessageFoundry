@@ -15,16 +15,14 @@ its own and is not the control: it proves the output stays USEFUL. The leg that 
 ``load_settings`` to raise a ``ValidationError`` from a plain model that DOES carry the secret -- the
 shape a section added later outside ``_InputHidingModel`` would raise -- and asserts its control
 first: the planted secret is in ``str(exc)``. Each arm must then render it through
-``settings_error_detail`` and print the field and message without the value, except the
-``_FIELD_ONLY_ARMS``, which print the field and the error type in place of a validator's message.
+``settings_error_detail`` and print the field and message without the value.
 
 ``_ARMS`` holds at least the operator commands vault BACKLOG #2760 moved onto the renderer and
 the ones that already used it, except ``serve`` and ``supervise``, which start the engine. A new
 CLI arm that loads the whole settings file belongs in it.
 
 The URL refusal cases (vault BACKLOG #2850) go at the models instead of through an arm. Every arm
-but the ``_FIELD_ONLY_ARMS`` prints a validator's message as written, so a message that quotes
-nothing is what they rest on.
+prints a validator's message as written, so a message that quotes nothing is what they rest on.
 """
 
 from __future__ import annotations
@@ -202,10 +200,6 @@ def _offline_env_arm(command: str, cfg: Path, tmp: Path) -> list[str]:
     return argv
 
 
-#: The arms that print a field's error type in place of a validator's message, because the message
-#: can quote the refused value: `__main__._settings_failure_fields` (vault BACKLOG #5554).
-_FIELD_ONLY_ARMS = {"validate-env", "graph-env", "dryrun-env"}
-
 #: The file each arm starts from. ``alert remove`` needs a rule to remove before it reloads.
 _STARTING_FILE = {"alert-remove": '[[alerts.rules]]\nevent_type = "connection_stopped"\n'}
 
@@ -236,14 +230,6 @@ def _run(
     code = main(argv_for(cfg, work))
     captured = capsys.readouterr()
     return code, captured.out + captured.err, cfg, body
-
-
-def _names_the_reason(arm: str, out: str, message: str) -> bool:
-    """An arm prints the validator's ``message``; a field-only arm prints the error type in its
-    place and never the message."""
-    if arm in _FIELD_ONLY_ARMS:
-        return f"{_FIELD}value_error" in out and message not in out
-    return message in out
 
 
 def _patch_leaky_load(monkeypatch: pytest.MonkeyPatch) -> list[int]:
@@ -278,7 +264,7 @@ def test_an_arm_renders_a_load_failure_without_its_input(
     assert calls, f"{arm} never reached load_settings, so this case proves nothing"
     assert _CANARY not in out, f"{arm} printed the input of a settings load failure: {out!r}"
     # Useful, not just quiet: the section and the reason are still named.
-    assert _FIELD in out and _names_the_reason(arm, out, _MESSAGE), out
+    assert _FIELD in out and _MESSAGE in out, out
     assert (code == 0) is (arm in _EXIT_0_ARMS), (arm, code)
     if arm in _EDIT_ARMS:
         # The post-write check refused, and the edit was rolled back. `security set` reports its
@@ -303,7 +289,7 @@ def test_a_real_store_failure_names_the_field_and_never_the_env_secret(
     code, out, cfg, _ = _run(arm, tmp_path, capsys, body)
 
     assert _CANARY not in out, f"{arm} printed an env-supplied secret: {out!r}"
-    assert _FIELD in out and _names_the_reason(arm, out, "server, database, username"), out
+    assert _FIELD in out and "server, database, username" in out, out
     assert "input_value" not in out and "errors.pydantic.dev" not in out, out
     if arm not in _EXIT_0_ARMS:
         assert code != 0

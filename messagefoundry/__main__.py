@@ -1542,92 +1542,6 @@ def _resolve_offline_anchor(
     return config_dir, service_config
 
 
-#: Pydantic error types whose message can quote the refused input, at least: a validator's own text
-#: (``value_error``, ``assertion_error``), a discriminator tag, an attribute name, and an ``{error}``
-#: taken from another exception's text.
-_INPUT_QUOTING_ERROR_TYPES = frozenset(
-    {
-        "value_error",
-        "assertion_error",
-        "union_tag_invalid",
-        "get_attribute_error",
-        "no_such_attribute",
-        "iteration_error",
-        "mapping_type",
-        "datetime_object_invalid",
-        "json_invalid",
-    }
-)
-
-
-def _settings_failure_fields(exc: Exception) -> str:
-    """A settings-load failure as ``validate``/``graph``/``dryrun`` print it under ``--env``: the
-    failing field paths and what failed, never a refused value (vault BACKLOG #5554).
-
-    These three commands print it where they printed nothing before vault BACKLOG #5554, to output
-    CI logs keep, and a validator message can quote the value it refused: the
-    ``[api].trusted_proxies`` refusal quotes the entry, a URL's userinfo included. A credential
-    scrub over the rendered text is not the answer. Both
-    :func:`~messagefoundry.secretscrub.scrub_credentials` and
-    :func:`~messagefoundry.verify_leaf.safe_detail_text`, which runs it, read a field path as a
-    credential label: ``store.password: Field required`` printed as ``store.password=<redacted>
-    required`` (``[redacted]`` through ``safe_detail_text``), so a missing secret read as a set one,
-    and a path holding ``api_key=`` printed as a file that does not exist. So a message that can
-    quote a refused value is not rendered at all.
-
-    A pydantic error prints its field path and, for a built-in pydantic error type outside
-    :data:`_INPUT_QUOTING_ERROR_TYPES`, pydantic's own message. Any other type, a
-    ``PydanticCustomError`` type name of a validator's own included, prints its type in place of
-    the message. At most ``_ERROR_DETAIL_ROWS`` errors are shown. An ``OSError`` that names a file
-    prints its type, the OS's reason and that path, and one that names none prints its own text,
-    which at least the loader's ``service config not found`` refusal uses; a TOML parse error its
-    own text, a line and a column with at most a key or one
-    character; a ``UnicodeDecodeError`` its reason and byte offset; a ``RecursionError`` a fixed
-    line; and anything else, the loader's own refusals included, its exception type alone. Those
-    refusals, such as an unrecognized key, are written to name a key and not its value, so this
-    hides more than it must; ``serve`` and ``check`` still print :func:`_load_service_settings`'s
-    text, every message as written.
-
-    What this still prints, at least: a mapping key that is part of a field path, a path the
-    operator named, a key ``tomllib`` quotes, a character of the input that some pydantic parse
-    messages quote, the text of an ``OSError`` that names no file, and the message of a custom
-    error a validator raises under a built-in type's name, since the type is a string its author
-    picks."""
-    from typing import get_args
-
-    from pydantic import ValidationError
-    from pydantic_core.core_schema import ErrorType
-
-    from messagefoundry.config.settings import _ERROR_DETAIL_ROWS
-
-    if isinstance(exc, ValidationError):
-        shown_types = frozenset(get_args(ErrorType)) - _INPUT_QUOTING_ERROR_TYPES
-        errors = exc.errors(include_url=False)
-        rows = []
-        for err in errors[:_ERROR_DETAIL_ROWS]:
-            field = ".".join(str(part) for part in err["loc"]) or "<root>"
-            what = (
-                err["msg"]
-                if err["type"] in shown_types
-                else f"{err['type']} (its message is not shown, because it can quote the value)"
-            )
-            rows.append(f"{field}: {what}")
-        hidden = len(errors) - _ERROR_DETAIL_ROWS
-        return "; ".join(rows) + (f" (+{hidden} more)" if hidden > 0 else "")
-    if isinstance(exc, OSError):
-        # Not str(exc): it quotes the filename as a repr, doubling a Windows path's backslashes.
-        if exc.filename is not None and exc.strerror:
-            return f"{type(exc).__name__}: {exc.strerror}: {exc.filename}"
-        return f"{type(exc).__name__}: {exc}"
-    if isinstance(exc, tomllib.TOMLDecodeError):
-        return f"TOMLDecodeError: {exc}"
-    if isinstance(exc, UnicodeDecodeError):
-        return f"UnicodeDecodeError: {exc.reason} at byte {exc.start}"
-    if isinstance(exc, RecursionError):
-        return "RecursionError: the settings nest too deeply to load"
-    return f"{type(exc).__name__} (its message is not shown, because it can quote a value)"
-
-
 def _offline_env_values(
     args: argparse.Namespace,
     config_dir: str,
@@ -1653,9 +1567,9 @@ def _offline_env_values(
     ``MEFOR_VALUE_*`` apply. A value file that is absent reads as no values, as serve's read does,
     so each reference it would have supplied is reported missing; a note on stderr names the file
     looked for. Raises :class:`~messagefoundry.config.wiring.WiringError` for settings that do not
-    load, rendered by :func:`_settings_failure_fields` and naming the settings file when one exists,
-    and for a value file that cannot be read, naming that file. The callers never print a resolved
-    ``env()`` value."""
+    load, with the text :func:`_load_service_settings` renders for ``serve`` (``serve`` prefixes
+    ``error:``), naming the settings file when one exists, and for a value file that cannot be
+    read, naming that file. The callers never print a resolved ``env()`` value."""
     from messagefoundry.config.anchor import resolve_project_root
     from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
     from messagefoundry.config.settings import settings_file_path
@@ -1666,7 +1580,8 @@ def _offline_env_values(
     cli: dict[str, dict[str, object]] = {"ai": {"environment": args.env}}  # as serve --env
     if args.project_root is not None:
         cli["environments"] = {"base_dir": args.project_root}  # as serve applies the flag
-    settings, failure = _load_service_settings_or_error(service_config, cli=cli)
+    # Rendered, never stringified: see _load_service_settings.
+    settings, detail = _load_service_settings(service_config, cli=cli)
     if settings is None:
         # Settings that do not load name no value dir, so under an explicit --project-root the
         # settings-free pre-check runs first: a graph with env() and no value file still exits 2,
@@ -1682,9 +1597,7 @@ def _offline_env_values(
         # Name the file only where there is one: with none, the failure is the environment's or
         # the command line's, and a named file would send the operator to the wrong place.
         source = f" ({settings_file})" if settings_file.exists() else ""
-        assert failure is not None  # exactly one side is set
-        shown = _settings_failure_fields(failure)
-        raise WiringError(f"could not load the service settings{source}: {shown}")
+        raise WiringError(f"could not load the service settings{source}: {detail or 'no detail'}")
     cwd = Path.cwd()
     base_dir = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
     dir_name = settings.environments.dir
@@ -2189,35 +2102,16 @@ def _load_service_settings(
     both of them would want is ``config/settings.py``, beside ``settings_error_detail`` -- a
     follow-up, not this change.
     """
-    from messagefoundry.config.settings import settings_error_detail
-
-    settings, exc = _load_service_settings_or_error(config_path, cli=cli)
-    return settings, None if exc is None else settings_error_detail(exc)
-
-
-def _load_service_settings_or_error(
-    config_path: str | None,
-    *,
-    cli: Mapping[str, Mapping[str, object]] | None = None,
-) -> tuple[ServiceSettings | None, Exception | None]:
-    """:func:`_load_service_settings`'s load and catch, returning the exception unrendered, for a
-    caller that renders it its own way (:func:`_settings_failure_fields`). Exactly one side is
-    non-``None``. The catch is documented on :func:`_load_service_settings`. Never print, log or
-    chain the exception: ``str()`` of a ``ValidationError`` from a model outside
-    ``_InputHidingModel`` carries ``input_value=``, as that function says."""
     from pydantic import ValidationError
 
-    from messagefoundry.config.settings import load_settings
+    from messagefoundry.config.settings import load_settings, settings_error_detail
 
     try:
         return load_settings(config_path=config_path, cli=cli), None
     except (FileNotFoundError, ValueError, ValidationError, OSError, RecursionError) as exc:
         # RecursionError: a deeply nested TOML document recurses past the limit in tomllib, as
         # _read_environment_values measures for a value file (vault BACKLOG #5554).
-        # Drop the traceback and the chain: load_settings' frames hold the input mapping, env
-        # secrets included, and the caller raises its own error while this one is still live.
-        exc.__cause__ = exc.__context__ = None
-        return None, exc.with_traceback(None)
+        return None, settings_error_detail(exc)
 
 
 def _post_write_settings_check(
