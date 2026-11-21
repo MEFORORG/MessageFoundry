@@ -577,12 +577,13 @@ def test_the_timer_scenario_fails_on_a_file_read_from_outside_the_directory(
     fake = _Fake()
     for _ in range(scenario.arrivals):
         fake._add(Record(timer))
-    fake._add(_escaped_record())
     monkeypatch.setattr(sinks, "build", lambda *args: fake)
     monkeypatch.setattr(
         TimerScenario, "_statuses_since", lambda *args: ["processed"] * scenario.arrivals
     )
     ctx: Any = SimpleNamespace(endpoints=None, client=None, timeout=0.5)
+    assert scenario.run(ctx).ok
+    fake._add(_escaped_record())
     result = scenario.run(ctx)
     assert not result.ok and "outside the sink directory" in result.detail
 
@@ -750,4 +751,5 @@ def test_a_file_read_through_held_folders_is_inside_whatever_happens_to_its_path
         (tmp_path / "sub" / "a.hl7").write_bytes(_BODY)
         monkeypatch.setattr(file_sink, "read_fd_capped", read_then_move)
         records = sink.records()
+    assert not (tmp_path / "sub").exists(), "the folder never moved: the test proves nothing"
     assert [(r.payload, r.meta["inside"]) for r in records] == [(_BODY, "true")]

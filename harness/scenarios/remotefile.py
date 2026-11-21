@@ -100,8 +100,8 @@ def verify_written(
         cid = control_id_of(record.payload)
         if cid is None or cid not in sent:
             continue
-        if "/" in where:  # sink_faults above already failed a file recorded as not inside
-            problems.append(f"{cid} written below the outbox top level ({where})")
+        if record.meta.get("inside") != "true" or "/" in where:
+            problems.append(f"{cid} written outside the outbox top level ({where})")
         elif record.payload != sent[cid]:
             problems.append(
                 f"{cid} differs from the upload ({len(record.payload)} vs {len(sent[cid])} bytes)"

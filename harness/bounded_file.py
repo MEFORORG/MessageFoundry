@@ -23,11 +23,14 @@ from pathlib import Path
 NOT_REGULAR = "not a regular file; not read"
 
 
-#: What ``os.open`` with ``O_NOFOLLOW`` raises on a symlink, as ``transports/file.py`` lists them.
+#: What ``os.open`` of a file with ``O_NOFOLLOW`` raises on a symlink: ELOOP, or EMLINK on
+#: FreeBSD. A directory opened with ``O_DIRECTORY`` raises ENOTDIR on Linux too, which
+#: ``transports/file.py`` adds to its set and this one leaves out.
 LINK_ERRNOS = frozenset({errno.ELOOP, errno.EMLINK})
 
 
-#: The most one ``os.read`` asks for, so a large file is read in pieces of a bounded size.
+#: The most one ``os.read`` asks for while topping up past a file's reported size, so a cap
+#: far above what is there does not allocate the whole cap at once.
 _CHUNK = 1 << 20
 
 
@@ -84,22 +87,23 @@ def read_fd_capped(fd: int, cap: int) -> tuple[bytes, str]:
         os.set_blocking(fd, True)
     # One byte past the size it reported, then top up to one past the cap only if it grew, so a
     # small file costs a small read and a growing one is caught without reading it whole.
-    data = _read_at_most(fd, st.st_size + 1)
+    data = _read_at_most(fd, st.st_size + 1, st.st_size + 1)
     if len(data) > st.st_size:
-        data += _read_at_most(fd, cap + 1 - len(data))
+        data += _read_at_most(fd, cap + 1 - len(data), _CHUNK)
     if len(data) > cap:
         return b"", f"grew past the {cap}-byte cap while read; not kept"
     return data, ""
 
 
-def _read_at_most(fd: int, limit: int) -> bytes:
-    """Up to ``limit`` bytes from ``fd``, fewer only at end of file. Unbuffered ``os.read`` calls,
-    so no more than ``limit`` bytes are taken from the file: a buffered reader fills its buffer
-    and can pull far past the size asked for from a file that is still growing."""
+def _read_at_most(fd: int, limit: int, chunk_size: int) -> bytes:
+    """Up to ``limit`` bytes from ``fd``, fewer only at end of file, asking for at most
+    ``chunk_size`` per call. Unbuffered ``os.read`` calls, so no more than ``limit`` bytes are
+    taken from the file: a buffered reader fills its buffer and can pull far past the size asked
+    for from a file that is still growing. A file read whole in one call is not copied again."""
     chunks: list[bytes] = []
     left = limit
     while left > 0:
-        chunk = os.read(fd, min(left, _CHUNK))
+        chunk = os.read(fd, min(left, chunk_size))
         if not chunk:
             break
         chunks.append(chunk)
