@@ -4292,6 +4292,7 @@ _LOOPBACK_SANS = (("ip", "127.0.0.1"), ("ip", "::1"), ("dns", "localhost"))
         # and nothing more: what origin/main gave it.
         ("0.0.0.0", (("ip", "0.0.0.0"), ("ip", "127.0.0.1"))),
         ("::", (("ip", "::"), ("ip", "::1"))),
+        # Other spellings of a loopback get all three loopback names, each written once.
         ("0:0:0:0:0:0:0:1", (("ip", "::1"), ("ip", "127.0.0.1"), ("dns", "localhost"))),
         ("LOCALHOST", (("dns", "LOCALHOST"), ("ip", "127.0.0.1"), ("ip", "::1"))),
         # Named by its address without brackets (BACKLOG #5973).

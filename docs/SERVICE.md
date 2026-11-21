@@ -1145,8 +1145,9 @@ name its current bind requires, matched without regard to case or an IPv6 zone. 
 for `0.0.0.0`, `::1` for `::`). Any other bind requires its host without IPv6 brackets (`[::1]` is
 the address `::1`). A loopback bind also requires the other two of `127.0.0.1`, `::1` and
 `localhost` (BACKLOG #5790). At least these spellings count as loopback for the generated
-certificate (not for the exposed-bind gate, which uses its own test): `127.0.0.1`, `::1`,
-`localhost`, `LOCALHOST`, `localhost.`, `[::1]` and `0:0:0:0:0:0:0:1`. For example, a
+certificate: `127.0.0.1`, `::1`, `localhost`, `LOCALHOST`, `localhost.`, `[::1]` and
+`0:0:0:0:0:0:0:1`. Of these, `[::1]`, `LOCALHOST`, `localhost.` and `0:0:0:0:0:0:0:1` get the
+loopback certificate but count as an exposed bind for the exposed-bind gate. For example, a
 certificate from a first-run mint for `0.0.0.0` is replaced after a move to `127.0.0.1`, because
 it lacks `::1` and `localhost`. A certificate minted for a loopback bind is not replaced by a move
 to a wildcard, nor by a later move from that wildcard back to `127.0.0.1`, `::1` or `localhost`.
