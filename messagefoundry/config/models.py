@@ -940,7 +940,7 @@ class WindowsCredential(_InputHidingModel):
         return cls.model_validate(data)
 
 
-class Destination(_InputHidingModel):
+class Destination(_InputHidingModel, NumbersRefuseBool):
     """An outbound connector endpoint. Each outbound connection queues independently
     so a slow/failed one never blocks the others.
 

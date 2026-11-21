@@ -4,8 +4,8 @@
 
 Apart from ``config.settings`` because ``config.models`` needs it too, and ``config.settings``
 imports ``config.models``. The settings sections and the connection policy models
-(at least ``RetryPolicy``, the alert thresholds, ``ActiveWindow``, ``BatchConfig`` and
-``Validation``) share this one guard."""
+(at least ``RetryPolicy``, the alert thresholds, ``ActiveWindow``, ``BatchConfig``,
+``Validation`` and ``Destination``) share this one guard."""
 
 from __future__ import annotations
 
@@ -20,10 +20,20 @@ from pydantic import (
     field_validator,
 )
 
-#: pydantic error types a number's own bound raises. One raised where a bool was given means the
-#: bool was read as a number first, so the bool refusal names it instead (BACKLOG #5509).
+#: pydantic error types that can stand in for a bool on a number. A number's own bound raises one
+#: where lax mode read the bool as a number first; strict mode, as the ``connections.toml`` policy
+#: tables validate, raises the type error instead. Either way the bool refusal names it instead
+#: (BACKLOG #5509).
 _NUMBER_BOUND_ERRORS: Final = frozenset(
-    {"greater_than", "greater_than_equal", "less_than", "less_than_equal", "multiple_of"}
+    {
+        "greater_than",
+        "greater_than_equal",
+        "less_than",
+        "less_than_equal",
+        "multiple_of",
+        "int_type",
+        "float_type",
+    }
 )
 
 
@@ -73,19 +83,19 @@ def _bool_read_as_number(given: Any, got: Any, where: str) -> str | None:
             if found := _bool_read_as_number(inner_given, inner_got, path):
                 return found
         return None
-    if isinstance(given, list | tuple):
-        if isinstance(got, list | tuple) and len(got) == len(given):
-            for index, (inner_given, inner_got) in enumerate(zip(given, got, strict=True)):
-                if found := _bool_read_as_number(inner_given, inner_got, f"{where}[{index}]"):
-                    return found
-        # A set reorders and merges, so no element pairs with its input: a bool given where none
-        # survived was read as a number.
-        elif (
-            isinstance(got, set | frozenset)
-            and any(isinstance(item, bool) for item in given)
-            and not any(isinstance(item, bool) for item in got)
-        ):
-            return where
+    if isinstance(given, list | tuple) and isinstance(got, list | tuple) and len(got) == len(given):
+        for index, (inner_given, inner_got) in enumerate(zip(given, got, strict=True)):
+            if found := _bool_read_as_number(inner_given, inner_got, f"{where}[{index}]"):
+                return found
+    # A set reorders and merges, so no element pairs with its input: a bool given where none
+    # survived was read as a number. The input may itself be a set, as code-first ``days`` is.
+    elif (
+        isinstance(given, list | tuple | set | frozenset)
+        and isinstance(got, set | frozenset)
+        and any(isinstance(item, bool) for item in given)
+        and not any(isinstance(item, bool) for item in got)
+    ):
+        return where
     return None
 
 

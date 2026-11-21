@@ -1029,7 +1029,8 @@ def _policy(  # noqa: UP047
     ``strict``, the default, refuses a value of the wrong TOML type instead of coercing it, so
     ``max_attempts = "3"``, ``max_depth = true`` or ``max_count = 10.0`` is a load error rather than
     a number. The schedule table passes ``strict=False``, so its values are coerced, not strictly
-    typed: a window's ``days`` arrive as a TOML array, which strict mode refuses for the model's
+    typed, except that a boolean in a window's ``days`` is refused rather than read as a weekday
+    (BACKLOG #5509): a window's ``days`` arrive as a TOML array, which strict mode refuses for the model's
     ``frozenset``, and its ``start``/``end`` times arrive as strings such as ``"07:00:00"``, which
     strict mode refuses for the model's ``time``. ``connections_edit.list_connections`` writes them
     back in that string form, so every schedule the editor saves carries string times."""
