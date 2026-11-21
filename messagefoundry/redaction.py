@@ -1761,8 +1761,8 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
     **Which words may be masked depends on what follows them** (:func:`_rest_words` holds the rules
     both share). Where only whitespace follows the line, :func:`_maskable_rest` decides with its
     rules for an answer's end, and also with its rules for a value glued to what follows where that
-    whitespace opens with anything but a space, such as a line break (``</family Li`` then a line
-    break keeps ``Li``); :func:`_ends_in_camel_head` can refuse the last word too. Where
+    whitespace opens with a line break, the only whitespace the line leaves after it (``</family
+    Li`` then a line break keeps ``Li``); :func:`_ends_in_camel_head` can refuse the last word too. Where
     the tag's ``>``, a ``<`` or a line break follows, a last word ending in a whole boundary-free
     word is refused too, and a surname such as ``Johnson`` is masked there.
 
@@ -2350,10 +2350,13 @@ def _glued_value(
     (:func:`_without_trailing_note`). The end-tag arm reads only ``body``. The unquoted PHI arm and
     the credential arm find where their value ends on ``body``, so a value right before a note
     joined by a line break is still found (:data:`_GLUED_BARE_VALUE` needs a space or the text's
-    end after it), and judge it on ``text``, so the note still counts as text after the value. A
-    defect found in the #5925 review: with both read on ``text``, such a value printed whole behind
-    a clamp. Judging on ``body`` instead would read a value before a space-joined note as ending the
-    text, and keep some the earlier answer masked (``a|b|mrn: ZqMS`` then a space and the note).
+    end after it). A defect found in the #5925 review: with both read on ``text``, such a value
+    printed whole behind a clamp. Every PHI and credential value is then judged on ``body`` where
+    the note is joined by a line break, so it is judged as the same value with no clamp is, and on
+    ``text`` otherwise. Judged on ``text`` there, a value before the line break read as glued to it,
+    and a last word of two characters or fewer was refused (``a|b|mrn: qw``). Judged on ``body``
+    before a space-joined note, it would read as ending the text, and keep some values the earlier
+    answer masked (``a|b|mrn: ZqMS`` then a space and the note).
 
     The PHI arms answer first, exactly as they did before BACKLOG #2968. Where they decline, a token
     that ends on a vocabulary end tag's name masks that tag's rest (:func:`_glued_end_tag_rest`,
@@ -2361,9 +2364,10 @@ def _glued_value(
     decline does a credential label at the token's end mask the next word, so the credential arm
     adds a mask to an answer and never takes one away."""
     token, end = run.group(), run.end()
+    judged = body if text.startswith("\n", len(body)) else text
     stop = _glued_phi_value_end(text, body, token, end)
     if stop is not None:
-        rest = _maskable_rest(text, end, stop, field_run, credential=False)
+        rest = _maskable_rest(judged, end, stop, field_run, credential=False)
         if rest is not None:
             return rest
     rest = _glued_end_tag_rest(body, token, end, field_run)
@@ -2373,7 +2377,9 @@ def _glued_value(
         return None
     bare = _GLUED_BARE_VALUE.match(body, end)
     return (
-        None if bare is None else _maskable_rest(text, end, bare.end(), field_run, credential=True)
+        None
+        if bare is None
+        else _maskable_rest(judged, end, bare.end(), field_run, credential=True)
     )
 
 
@@ -2404,8 +2410,9 @@ def _glued_end_tag_rest(body: str, token: str, end: int, field_run: re.Pattern[s
     read on ``text`` ran into the note, took its punctuation, and was refused where the walk masks
     the same words. A note joined by a line break is not on the line, but read on ``text`` the rest
     is followed by that line break rather than ending the text, so the end-of-text refusals did not
-    apply and the arm masked words the walk keeps (``zqxP``, ``Kim``). ``body`` is found once per :func:`_scrub_field_runs` call, never once per token, which
-    made the cost grow with the square of the text's tokens.
+    apply and the arm masked words the walk keeps (``zqxP``, ``Kim``). ``body`` is found once per
+    :func:`_scrub_field_runs` call. Finding it once per token, as an earlier attempt did, made the
+    cost grow with the square of the text's tokens.
 
     **The arm masks only where :func:`_end_tag_rest` masks the whole rest**, which is the only mask
     it makes; any other answer from it keeps the rest as it stood, so the two cannot drift apart

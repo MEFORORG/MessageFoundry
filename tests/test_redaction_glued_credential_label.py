@@ -731,6 +731,10 @@ _BEFORE_A_NOTE = (
     ("x^y^token= Kplm7abc", "Kplm7abc"),
     ("a|b|secret: qwerty12", "qwerty12"),
     ("a|b|mrn: zqxdoe", "zqxdoe"),
+    # Code review: a short last word, which a value judged as glued to the note's line break kept.
+    ("a|b|mrn: qw", "qw"),
+    ("x^y^secret: k7", "k7"),
+    ("a|b|PatientID: Li", "Li"),
 )
 
 
