@@ -320,8 +320,8 @@ def _failed_sop_state(datasets: list[dict[str, Any]]) -> tuple[bool, bool]:
 
     ``proven``: some dataset's sequence is well formed and holds an item, a rejection the reply
     proves. ``malformed``: some dataset's sequence is in a shape dicom+json does not allow, so it
-    proves nothing: one :func:`_element_values` refuses, or one holding an item whose ``vr`` is
-    absent or not ``SQ`` or whose items are not all dataset objects (BACKLOG #5914). Each dataset is judged
+    proves nothing: one :func:`_element_values` refuses, or one that holds an item while its own
+    ``vr`` is absent or not ``SQ``, or whose items are not all dataset objects (BACKLOG #5914). Each dataset is judged
     alone, so a malformed sequence in one does not hide a proven rejection in another. An absent
     element, or one :func:`_element_values` passes with no item, is neither, whatever its ``vr``.
     Only the shape is read, never an item's contents (PHI-safe)."""

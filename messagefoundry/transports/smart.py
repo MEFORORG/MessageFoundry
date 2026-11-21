@@ -404,13 +404,17 @@ class _TokenEndpointProvider(abc.ABC):
         self.expiry_skew_seconds = max(0.0, expiry_skew_seconds)
         # BACKLOG #5959: checked here too, so a provider built directly, not through a settings
         # reader, is held to the same rule; positive_seconds says why. Raised as the provider's own
-        # error, as its other configuration refusals are.
+        # error, as its other configuration refusals are, outside the except block so it carries no
+        # context (positive_seconds withholds the value either way).
+        refusal: str | None = None
         try:
             self.timeout_seconds = positive_seconds(
                 timeout_seconds, knob="timeout_seconds", transport=f"{self._LABEL} token endpoint"
             )
         except ValueError as exc:
-            raise self._ERROR(str(exc)) from None
+            refusal = str(exc)
+        if refusal is not None:
+            raise self._ERROR(refusal)
         # ADR 0126: route the token-endpoint POST through the connection's forward proxy — resolved
         # for the TOKEN host (its own bypass decision, #128). None / bypassed → the shared opener and
         # no Proxy-Authorization (byte-identical). None with an ECH sidecar too: the POST goes to the
