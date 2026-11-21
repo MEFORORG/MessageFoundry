@@ -515,11 +515,12 @@ def test_every_catalogue_body_and_mutation_seed_carries_the_sentinel() -> None:
 
 def test_every_mutated_payload_keeps_the_sentinel() -> None:
     """Vault BACKLOG #5581, #8240 item 37: a mutation that cut or flipped a byte of the sentinel left
-    a body the log_body detector could not recognise. Before this repair, 13 of the policy's 24
-    mutations at seed 318 lost it, so this went red there. Each mutated payload must carry its
-    bytes, fit the limit, and an X12 one must still sit between the untouched ISA and IEA. This
-    reads payload bytes, not decoded frames: a framing byte a mutation inserts can still leave a
-    frame without it, which the module docstring lists as not covered."""
+    a body the log_body detector could not recognise. Before mutation_cases put the sentinel back,
+    13 of the policy's 24 mutations at seed 318 lost it, and this test failed on that code. Each
+    mutated payload must carry its bytes, fit the limit, and an X12 one must still sit between the
+    untouched ISA and IEA. This reads payload bytes, not decoded frames: a framing byte a mutation
+    inserts can still leave a frame without it, which the docstring of
+    scripts/security/dast_ingress_sweep.py lists as not covered."""
     policy = _policy()
     seed = int(policy["seed"])
     sentinel = run_sentinel(seed)
@@ -529,7 +530,8 @@ def test_every_mutated_payload_keeps_the_sentinel() -> None:
     per_seed = max(48, int(policy["mutations"]))
     seeds = (seed, seed + 1, seed + 2)
     cases = [c for s in seeds for c in mutation_cases(s, per_seed, _CAP, sentinel)]
-    # Every seed's cases were built, so the absence check below cannot pass on an empty walk.
+    # The walk is not empty, so the absence check below cannot pass on nothing. The planes check
+    # after it is what shows every seed contributed.
     assert len(cases) >= 3 * per_seed, len(cases)
     # Each seed covers both planes. An origin reads mutation:<seed>:<index>.
     planes = {(c.origin.rsplit(":", 1)[0], c.plane) for c in cases}
@@ -754,8 +756,9 @@ def test_the_ingress_job_is_not_required_and_its_name_is_unique() -> None:
     name = _ingress_job()["name"]
     assert "${{" not in name
     assert name not in required_contexts()
-    # The walk must find this job itself and nothing else: finding it is the positive control, so an
-    # empty walk or a comparison that never matches fails here instead of passing.
+    # The walk must find this job itself and no other job declaring the same literal name: finding
+    # it is the positive control, so an empty walk or a comparison that never matches fails here.
+    # A templated name elsewhere that would expand to this one is not compared.
     declaring = [
         (path.name, key)
         for path in sorted([*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")])
