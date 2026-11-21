@@ -22,6 +22,7 @@ import {
   debugProgramFileName,
   writeDebugProgram,
   type DebugProgramFs,
+  type LocalStorageUri,
 } from "../../testBenchDebugProgram";
 
 const SRC = path.join(__dirname, "..", "..", "..", "src");
@@ -185,21 +186,37 @@ suite("b532w3: writeDebugProgram puts the Debug program on disk (BACKLOG #5409 i
     fs.rmSync(base, { recursive: true, force: true });
   });
 
-  const local = () => ({ scheme: "file", fsPath: base });
+  /** A storage URI stand-in whose `file` form's fsPath is `fsPath`. */
+  const uri = (scheme: string, fsPath: string): LocalStorageUri => ({ scheme, with: () => ({ fsPath }) });
+  const local = () => uri("file", base);
   /** What the program folder holds, so a leftover temporary entry shows. */
   const listing = (): string[] => fs.readdirSync(path.join(base, TEST_BENCH_DEBUG_PROGRAM.folder)).sort();
 
   test("vscode-userdata storage, which a local desktop window gets, is written like file storage", async () => {
     for (const scheme of ["file", "vscode-userdata"]) {
-      const file = await writeDebugProgram({ scheme, fsPath: path.join(base, scheme) });
+      const file = await writeDebugProgram(uri(scheme, path.join(base, scheme)));
       assert.strictEqual(fs.readFileSync(file, "utf8"), TEST_BENCH_DEBUG_PROGRAM.source, scheme);
       assert.strictEqual(path.dirname(file), path.join(base, scheme, TEST_BENCH_DEBUG_PROGRAM.folder));
     }
   });
 
+  test("the folder is read from the URI's file form, which keeps a UNC share's server", async () => {
+    // VS Code drops the authority from fsPath for any scheme but file, so a vscode-userdata URI on
+    // \\server\share reports a path with no server; its file form keeps it.
+    const right = path.join(base, "right");
+    const storage = {
+      scheme: "vscode-userdata",
+      fsPath: path.join(base, "wrong"),
+      with: (change: { scheme: string }) => ({ fsPath: change.scheme === "file" ? right : path.join(base, "wrong") }),
+    };
+    const file = await writeDebugProgram(storage);
+    assert.strictEqual(path.dirname(file), path.join(right, TEST_BENCH_DEBUG_PROGRAM.folder));
+    assert.ok(!fs.existsSync(path.join(base, "wrong")));
+  });
+
   test("a scheme with no local path is refused before anything is written", async () => {
     for (const scheme of ["vscode-remote", "vscode-vfs", "untitled"]) {
-      await assert.rejects(writeDebugProgram({ scheme, fsPath: base }), /not on this machine's file system/);
+      await assert.rejects(writeDebugProgram(uri(scheme, base)), /not on this machine's file system/);
     }
     assert.ok(!fs.existsSync(path.join(base, TEST_BENCH_DEBUG_PROGRAM.folder)));
   });

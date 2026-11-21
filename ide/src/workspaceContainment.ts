@@ -149,8 +149,9 @@ const RESERVED_DEVICE_NAMES: ReadonlySet<string> = new Set([
  * spaces dropped, so `nul.txt`, `con .toml` and `Com1.x` count too. A Win32 open of a bare device
  * name opens the device, not a file in the folder: Python 3.14.7 on Windows 11 resolves `nul` to
  * `\\.\nul` (measured 2026-11-20). There a stem with an extension is a plain file, but Windows 10
- * and earlier map it to the device as well, so it is refused on every Windows version, the same
- * fail-closed reading CPython takes and the engine's own `[environments].dir` check makes. A device
+ * and earlier map it to the device as well, so it is refused on every Windows version. That is
+ * how `ntpath.isreserved` reads a device name; this check covers device names only, not the
+ * reserved characters `isreserved` also refuses, and its list adds COM0 and LPT0. A device
  * opened in a file's place is a read or write the real-path check cannot see: Node finds no entry
  * by that name and reports a missing path. Either separator splits `rel`. Spelling only, with no
  * I/O. Shared by {@link escapesByLink} and securityConfigTarget (BACKLOG #5404 item 3).

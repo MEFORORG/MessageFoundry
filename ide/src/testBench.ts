@@ -557,7 +557,8 @@ export class TestBench {
       // module in the workspace root does not shadow the installed one through it. The launch names
       // a program the extension writes, not the module, so debugpy adds no working directory on any
       // build; TEST_BENCH_DEBUG_PROGRAM in testBenchDebugProgram.ts says why, and what still reaches the
-      // import path. `cwd` is set because for a program debugpy would otherwise start in its folder.
+      // import path. `cwd` names the workspace explicitly, so the dry-run's relative paths do not rest
+      // on the debugger's own default.
       pythonArgs: [...INTERPRETER_OPTIONS],
       program,
       cwd: folder.uri.fsPath,

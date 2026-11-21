@@ -14,8 +14,9 @@ import * as path from "node:path";
  * when it runs a module, whatever `-P` says. For a program it adds at most the program's own
  * folder. That folder holds only what {@link writeDebugProgram} puts there: one program per program
  * text, each named `mefor_testbench_debug_<checksum>.py`, so extension versions with different
- * texts never share a file, and, while a write runs, a `.tmp-` folder, which no import statement
- * can name. Nothing the launch imports has any of those names. The program runs the installed
+ * texts never share a file, and `.tmp-` folders, one per write, which a failed removal or a killed
+ * extension host can leave behind and no import statement can name. Nothing is ever pruned there.
+ * Nothing the launch imports has any of those names. The program runs the installed
  * package through `runpy`, so no debugpy build puts the working directory on the import path. The
  * source is written at launch rather than shipped, because the extension package holds no Python
  * (the crypto inventory's ide/ arm reads only TypeScript).
@@ -49,7 +50,10 @@ export const TEST_BENCH_DEBUG_PROGRAM = {
 export const LOCAL_STORAGE_SCHEMES: readonly string[] = ["file", "vscode-userdata"];
 
 /** A 32-bit FNV-1a checksum of `text`'s UTF-16 code units, as 8 hex digits. It names a file by its
- *  text so different texts get different names; it is no security control. */
+ *  text, so two texts share a name only on a checksum collision, and then the content check in
+ *  {@link writeDebugProgram} rewrites the file rather than running the wrong text. It is no security
+ *  control, which is why it is not node:crypto's createHash: that would be a crypto-inventory entry
+ *  with no crypto purpose. */
 function textChecksum(text: string): string {
   let h = 0x811c9dc5;
   for (let i = 0; i < text.length; i++) {
@@ -58,9 +62,15 @@ function textChecksum(text: string): string {
   return h.toString(16).padStart(8, "0");
 }
 
-/** The program's file name: content-addressed, so two texts never share one file. */
+/** The program's file name, named by its text (see textChecksum). */
 export function debugProgramFileName(source: string): string {
   return `mefor_testbench_debug_${textChecksum(source)}.py`;
+}
+
+/** The part of a `vscode.Uri` {@link writeDebugProgram} reads. */
+export interface LocalStorageUri {
+  readonly scheme: string;
+  with(change: { scheme: string }): { readonly fsPath: string };
 }
 
 /** The fs calls {@link writeDebugProgram} makes, so a test can make one of them fail. */
@@ -85,19 +95,23 @@ async function holds(fsp: DebugProgramFs, file: string, bytes: Buffer): Promise<
  * `mkdtemp` makes, so two launches in one millisecond never share a temporary file, and renamed over
  * the program with Node's rename, which replaces the target in one step, so a launch from another
  * window never runs a half-written file. A failed rename is success when the program already holds
- * the source, as on Windows, where a rename can fail with EPERM while another launch's debuggee
- * holds the file. The temporary folder is removed; failing to remove it is logged, never a failed
- * launch.
+ * the source, as on Windows, where a rename over a file can fail with EPERM or EBUSY while another
+ * process, such as a scanner, the indexer or a concurrent launch's rename, holds it. The temporary
+ * folder is removed; failing to remove it is logged, never a failed launch.
+ *
+ * The path is read from `storage.with({ scheme: "file" }).fsPath`, not `storage.fsPath`: VS Code
+ * keeps a URI's authority in `fsPath` only for the `file` scheme, so a `vscode-userdata` URI on a
+ * UNC share would otherwise lose its server and name a folder on the current drive.
  */
 export async function writeDebugProgram(
-  storage: { readonly scheme: string; readonly fsPath: string },
+  storage: LocalStorageUri,
   source: string = TEST_BENCH_DEBUG_PROGRAM.source,
   fsp: DebugProgramFs = fs.promises,
 ): Promise<string> {
   if (!LOCAL_STORAGE_SCHEMES.includes(storage.scheme)) {
     throw new Error(`the extension's storage folder (scheme "${storage.scheme}") is not on this machine's file system`);
   }
-  const dir = path.join(storage.fsPath, TEST_BENCH_DEBUG_PROGRAM.folder);
+  const dir = path.join(storage.with({ scheme: "file" }).fsPath, TEST_BENCH_DEBUG_PROGRAM.folder);
   const file = path.join(dir, debugProgramFileName(source));
   const bytes = Buffer.from(source, "utf8");
   if (await holds(fsp, file, bytes)) {

@@ -200,11 +200,11 @@ and uses your user value or the default instead, until you trust the workspace (
   `-P -X disable-remote-debug` as serve does, so the working directory is not put on the import
   path: a config module can import its `_`-prefixed siblings, but not a top-level workspace package
   that the interpreter cannot otherwise import. The Test Bench's Debug launch goes through debugpy
-  and passes it the same options. It runs a small program the extension writes into its own storage
-  folder, not the module, because debugpy before 1.8.22 puts the working directory on the import
-  path when it runs a module, whatever `-P` says. `-P` does not remove a PYTHONPATH entry: at least
-  one set in the environment, or in the env file the Python Debugger loads (a workspace `.env` by
-  default, or the file `python.envFile` names), still applies to the Debug launch.
+  and passes it the same options. It runs a small program in the extension's storage folder, not
+  the module. debugpy before 1.8.22 ignores `-P` when it runs a module, and puts the working
+  directory on the import path. `-P` does not remove a PYTHONPATH entry. At least one set in the
+  environment, or in the env file the Python Debugger loads, still applies to the Debug launch. That
+  file is a workspace `.env` by default, or the file `python.envFile` names.
 - `messagefoundry.configDir` (default `samples/config`) — config modules directory. This,
   `serviceConfig` and `messageSetsDir` are relative to the workspace folder. A value set in workspace
   settings whose spelling names a path outside the first workspace folder is not used, nor is a user
@@ -225,7 +225,7 @@ and uses your user value or the default instead, until you trust the workspace (
   - on Windows, a folder or file name on it holds a colon, which Windows opens as a stream on
     another entry;
   - on Windows, a folder or file name on it is a device name such as `nul`, `con` or `com1`,
-    with or without an extension, which Windows can open as the device.
+    with or without an extension. Windows can open such a name as the device.
 
   The fix is a plain folder or file inside the workspace folder. Commands other than New Route and
   the commit hook also take a link's target as an absolute path in user settings, once any
