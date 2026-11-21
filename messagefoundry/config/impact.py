@@ -751,11 +751,14 @@ def _referrer_sites(
     sources: SourceCache,
     toml_targets: dict[_TomlTarget, list[Reference]],
     held: list[bool] | None = None,
+    opaque: list[bool] | None = None,
 ) -> tuple[list[_Site], bool] | None:
     """The ``.py`` sites one referent edge reads ``old`` from, and whether every value the referrer
     captures holding ``old`` was located; ``None`` for a ``connections.toml`` router binding
     (recorded in ``toml_targets`` instead). ``held``, when given, gets ``True`` appended when a
-    module container a role reads holds ``old``, located or not.
+    module container a role reads holds ``old``, located or not, or a value passed where it is
+    never rewritten may hold it; ``opaque`` gets ``True`` when a role reads a value the scan cannot
+    follow.
 
     A router/handler's sites are its own body and, for a handler, its ``accepts=`` predicate's; for a
     table rename, the config-authored helpers either reaches; and each module-level statement that
@@ -819,7 +822,7 @@ def _referrer_sites(
         used = {name for scan in scans for name in scan.calls | scan.iter_calls} | {
             func.__name__
             for (_depth, func, *_rest), scan in zip(funcs, scans, strict=True)
-            if scan.slots or scan.passes or scan.iter_slots or scan.iter_passes
+            if scan.slots or scan.passes or scan.iter_slots or scan.iter_passes or scan.taints
         }
         complete = complete and not any(
             len(codes) > 1 and name in used for name, codes in by_name.items()
@@ -878,6 +881,22 @@ def _referrer_sites(
             )
         # A local that carries a rewritten literal into another read leaves the referrer unresolved.
         complete = complete and not any(scan.unsafe for scan in scans)
+        # An argument for a role parameter that is also read elsewhere is never rewritten, so one
+        # that may hold the old name leaves the referrer unresolved (BACKLOG #5980).
+        taint_globals = {name for scan in scans for name in scan.taint_globals}
+        taint_attrs = {name for scan in scans for name in scan.taint_attrs}
+        tainted = any(scan.tainted for scan in scans) or any(
+            _holds(captured.value, old) or _holds(captured.value, old, elements=True)
+            for func in reached
+            for captured in captured_values(func, func.__module__)
+            if captured.source != "default"
+            and captured.name in (taint_attrs if captured.source == "attribute" else taint_globals)
+        )
+        complete = complete and not tainted
+        if held is not None and tainted:
+            held.append(True)
+        if opaque is not None and any(scan.opaque for scan in scans):
+            opaque.append(True)
         for func in reached:
             bound_sites, located, role_held = _module_binding_sites(
                 func, old, table_kind, sources, role_globals, role_attrs, iter_globals, iter_attrs
@@ -991,13 +1010,16 @@ def _scanned_referrers(
                 continue
             ref = Reference(kind, name, target_kind, old)
             held: list[bool] = []
+            opaque: list[bool] = []
             # A router or handler never takes the connections.toml branch, so no toml target is lost.
-            found = _referrer_sites(registry, ref, old, target_kind, sources, {}, held)
+            found = _referrer_sites(registry, ref, old, target_kind, sources, {}, held, opaque)
             if found is not None and (held or any(site.rewritable for site in found[0])):
                 out.append((ref, found))
-            elif any(_captures(root, old) for root in roots):
-                # It holds a container with the name and reads it in a form the scan does not
-                # follow (enumerate, a tuple index): reported, never left on the old name.
+            elif opaque and any(_captures(root, old) for root in roots):
+                # It holds a container with the name and a role reads a value in a form the scan
+                # does not follow (enumerate, a tuple index): reported, never left on the old name.
+                # A container no role could be reading it through (a label dict beside a literal
+                # Send) is not a referent, so it is left.
                 out.append((ref, ([], False)))
     return out
 
@@ -1198,6 +1220,19 @@ class _Scan:
     unsafe: bool = False
     # The referent positions this function hands back as its return value.
     returned: set[tuple[int, int]] = field(default_factory=set)
+    # A parameter whose value reaches a role but is also read elsewhere (a log line, a comparison)
+    # gives no role slot, so a caller's argument there is not rewritten. A literal argument in the
+    # caller's own lines is still counted; one reached through a module name, a module attribute
+    # or a helper's return is not, so these record what such an argument reads: whether it carries
+    # the old name or a helper's return (``tainted``), and the module names and attributes it
+    # reads, whose bound values the caller checks (BACKLOG #5980).
+    taints: set[tuple[int, str]] = field(default_factory=set)
+    tainted: bool = False
+    taint_globals: set[str] = field(default_factory=set)
+    taint_attrs: set[str] = field(default_factory=set)
+    # A role read the scan cannot follow to any value: a name bound in a form it does not track
+    # (``for _i, d in enumerate(DESTS)``), or an expression that carries nothing (``p[1]``).
+    opaque: bool = False
 
 
 @dataclass(frozen=True)
@@ -1273,7 +1308,7 @@ def _scan_referrer(
     # helper name -> its role parameters: read for their value, then read for their elements; and
     # its pass-through parameters, the same two ways.
     maps: dict[str, dict[str, set[tuple[int, str]]]] = {
-        key: {} for key in ("slots", "iter_slots", "passes", "iter_passes")
+        key: {} for key in ("slots", "iter_slots", "passes", "iter_passes", "taints")
     }
     while True:
         scans: list[_Scan] = []
@@ -1322,6 +1357,8 @@ class _Role:
     passes: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
     iter_slots: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
     iter_passes: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
+    # The parameters whose value reaches a role but is also read elsewhere (``_Scan.taints``).
+    taints: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
     iterate_returns: bool = False
 
 
@@ -1390,17 +1427,36 @@ def _scan_function(
             for child in _own_nodes(node)
             if isinstance(child, (ast.Return, ast.Yield, ast.YieldFrom)) and child.value is not None
         )
+    taint = _Flow(
+        params=params, modules=role.names.modules, passes=role.passes, iter_passes=role.iter_passes
+    )
     body = _body(node)
+    roots: list[ast.expr] = []
     for stmt in body:
         for child in ast.walk(stmt):
             if isinstance(child, ast.Call):
                 for root in _call_roots(child, role):
+                    roots.append(root)
                     _carried(root, values, set(), sink)
+                helper = _helper_name(child.func, role.names.modules) or ""
+                for arg in _slot_arguments(child, role.taints.get(helper, ())):
+                    _carried(arg, values, set(), taint)
+                    _carried_elements(arg, values, set(), taint)
     for root in returned:
+        roots.append(root)
         if role.iterate_returns:
             _carried_elements(root, values, set(), back)
         if role.give_back:
             _carried(root, values, set(), back)
+    stored = {
+        child.id
+        for child in _own_nodes(node)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
+    }
+    role_reads = sink.unbound | sink.iterated | back.unbound | back.iterated
+    opaque = bool((role_reads & stored) - set(values) - params) or any(
+        _carries_nothing(root, values, params, role) for root in roots
+    )
 
     def in_span(consts: list[ast.Constant]) -> set[_Pos]:
         return {
@@ -1453,6 +1509,12 @@ def _scan_function(
 
     own_slots = slots_of(sink.unbound)
     own_iter_slots = slots_of(sink.iterated)
+    # A parameter a role reads and something else reads too, or one a caller's tainted argument
+    # is handed on through: its callers' arguments there are checked, never rewritten.
+    taint_params = (role_reads & loose & params) | ((taint.unbound | taint.iterated) & params)
+    taints = {(positional.index(p), p) for p in taint_params if p in positional} | {
+        (-1, p) for p in taint_params if p in keyword_only
+    }
     return _Scan(
         positions,
         (sink.unbound | back.unbound) - params,
@@ -1468,6 +1530,31 @@ def _scan_function(
         reads=frozenset(reads),
         unsafe=unsafe,
         returned=returned_positions,
+        taints=taints,
+        tainted=any(c.value == old for c in taint.consts) or bool(taint.calls | taint.iter_calls),
+        taint_globals=(taint.unbound | taint.iterated) - params,
+        taint_attrs=taint.attrs | taint.iter_attrs,
+        opaque=opaque,
+    )
+
+
+def _carries_nothing(
+    root: ast.expr, values: Mapping[str, list[ast.expr]], params: frozenset[str], role: _Role
+) -> bool:
+    """Whether a role expression carries no value the scan can follow: no constant, name,
+    attribute or helper return (``p[1]`` over ``.items()`` pairs, an f-string)."""
+    probe = _Flow(
+        params=params, modules=role.names.modules, passes=role.passes, iter_passes=role.iter_passes
+    )
+    _carried(root, values, set(), probe)
+    return not (
+        probe.consts
+        or probe.unbound
+        or probe.iterated
+        or probe.attrs
+        or probe.iter_attrs
+        or probe.calls
+        or probe.iter_calls
     )
 
 

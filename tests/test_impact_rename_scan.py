@@ -660,3 +660,101 @@ def test_a_captured_container_the_scan_cannot_follow_reports_the_referrer(
     )
     plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
     assert Reference("handler", "h_p", "outbound", "OB_OLD") in plan.unresolved
+
+
+# --- r3 repairs (findings 1 and 3 of b617r-5980-r2) ----------------------------------------------
+
+_LOGGED_LOOKUP = (
+    "def _lookup(table, code):\n    print(table)\n    return code_set(table).get(code)\n"
+)
+
+
+@pytest.mark.parametrize(
+    ("prelude", "call", "extra"),
+    [
+        ('TABLES = {"x": "diets"}\n' + _LOGGED_LOOKUP, '_lookup(TABLES["x"], "A")', {}),
+        ("import _t\n" + _LOGGED_LOOKUP, '_lookup(_t.NAME, "A")', {"_t.py": 'NAME = "diets"\n'}),
+        ('def _name():\n    return "diets"\n\n\n' + _LOGGED_LOOKUP, '_lookup(_name(), "A")', {}),
+        (
+            'TABLES = {"x": "diets"}\n'
+            + _LOGGED_LOOKUP
+            + '\n\ndef _via(table):\n    return _lookup(table, "A")\n',
+            '_via(TABLES["x"])',
+            {},
+        ),
+    ],
+    ids=["module_dict", "module_attribute", "helper_return", "handed_on"],
+)
+def test_a_table_value_passed_to_a_logged_helper_parameter_reports_the_referrer(
+    tmp_path: Path, prelude: str, call: str, extra: dict[str, str]
+) -> None:
+    """A helper parameter that reaches the accessor and is also logged gives no role slot, so the
+    caller's argument is never rewritten. Reached through a module name, a module attribute or a
+    helper's return it was not counted either, so the rename reported success while the handler
+    kept reading the old table. The handler's own direct read gives the index an edge from it."""
+    config_dir = _write(
+        tmp_path,
+        {
+            **extra,
+            "mod.py": _HEAD + _WIRE + prelude + '\n\n@handler("h_p")\ndef h_p(msg):\n'
+            f"    {call}\n"
+            '    code_set("diets").get("A")\n'
+            '    return Send("OB_A", msg)\n',
+            "codesets/diets.csv": _CSV,
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "code_set", "diets", "meals")
+    assert plan.unresolved == (_H_DIETS,)
+
+
+def test_a_table_value_passed_to_a_helper_parameter_only_the_accessor_reads_is_rewritten(
+    tmp_path: Path,
+) -> None:
+    """The control: with no other read of the parameter, the module constant is the table."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "mod.py": _HEAD + _WIRE + 'NAME = "diets"\n'
+            "def _lookup(table, code):\n    return code_set(table).get(code)\n"
+            '\n\n@handler("h_p")\ndef h_p(msg):\n'
+            '    _lookup(NAME, "A")\n'
+            '    code_set("diets").get("A")\n'
+            '    return Send("OB_A", msg)\n',
+            "codesets/diets.csv": _CSV,
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "code_set", "diets", "meals")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert '"diets"' not in _text(config_dir)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '    note = LABELS.get("OB_A")\n    return Send("OB_A", msg)\n',
+        '    return Send("OB_A", msg) if LABELS else None\n',
+        '    return [Send(d, msg) for d in ["OB_A"] if d in LABELS]\n',
+    ],
+    ids=["get", "truthiness", "membership"],
+)
+def test_a_label_dict_holding_the_name_beside_a_followed_send_is_not_refused(
+    tmp_path: Path, body: str
+) -> None:
+    """A handler the index has no edge from holds a label dict whose value is the name, and sends
+    only to values the scan follows: no role reads the dict, so the rename completes and the label
+    is left. A label written in the handler's own lines is still counted, by design."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "mod.py": _HEAD
+            + 'LABELS = {"OB_A": "OB_OLD"}\n\n'
+            + _WIRE
+            + '@handler("h_p")\ndef h_p(msg):\n'
+            + body
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert 'LABELS = {"OB_A": "OB_OLD"}' in _text(config_dir)
