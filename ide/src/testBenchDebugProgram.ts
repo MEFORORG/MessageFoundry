@@ -18,8 +18,11 @@ import * as path from "node:path";
  * folders, one per write, which a failed removal or a killed extension host can leave behind and
  * no import statement can name. Nothing is ever pruned there, and nothing checks what else is
  * there. It also holds whatever another process running as the same OS user puts there, such as a
- * stdlib-named module, which then shadows that module on every Debug launch. Such a process is
- * outside the trust boundary, which is the OS account (docs/SESSION-MAIL.md). None of the names
+ * stdlib-named module. Under a debugpy before 1.8.22, which puts the folder on `sys.path`, such a
+ * module shadows a module of that name that the debuggee has not yet imported. This code does not
+ * defend against a writer running as the same OS user: that writer can already change the
+ * extension, the interpreter and the workspace. Neither docs/SECURITY.md nor .github/SECURITY.md
+ * states this for the extension. None of the names
  * writeDebugProgram writes is one the launch imports. The program runs the installed
  * package through `runpy`, so no debugpy build puts the working directory on the import path. The
  * source is written at launch rather than shipped, because the extension package holds no Python
