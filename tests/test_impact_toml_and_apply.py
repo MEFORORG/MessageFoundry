@@ -539,3 +539,124 @@ def test_a_reply_from_env_default_naming_the_outbound_is_reported(tmp_path: Path
     config_dir = _config(tmp_path, {"conn.py": body})
     plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_PARTNER", "OB_UPSTREAM")
     assert plan.unresolved == (Reference("inbound", "IB_HTTP", "outbound", "OB_PARTNER"),)
+
+
+# --- review round 1 (round-97e5c019) -------------------------------------------------------------
+
+
+def test_a_toml_reply_from_env_table_beside_a_literal_is_reported(tmp_path: Path) -> None:
+    """An env() table naming the outbound is reported per entry: a sibling entry's literal edit no
+    longer hides it (BACKLOG #5966)."""
+    toml = """\
+[[inbound]]
+name = "IB_HTTP"
+transport = "http"
+router = "r"
+content_type = "json"
+[inbound.settings]
+port = 18080
+reply_from = "OB_PARTNER"
+
+[[inbound]]
+name = "IB_HTTP2"
+transport = "http"
+router = "r"
+content_type = "json"
+[inbound.settings]
+port = 18081
+reply_from = { env = "REPLY_OB", default = "OB_PARTNER" }
+"""
+    logic = PY_REPLY.split("\n\n\n", 1)[1]
+    head = "from messagefoundry import Rest, Send, handler, outbound, router\n\n"
+    ob = 'outbound("OB_PARTNER", Rest(url="https://partner.example/ingest", capture_response=True))\n'
+    config_dir = _config(tmp_path, {"connections.toml": toml, "logic.py": head + ob + logic})
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_PARTNER", "OB_UPSTREAM")
+    assert Reference("inbound", "IB_HTTP2", "outbound", "OB_PARTNER") in plan.unresolved
+
+
+def test_a_multi_line_literal_in_a_crlf_file_applies(tmp_path: Path) -> None:
+    """The plan reads a backslash-continued literal with universal newlines; apply compares it with
+    the same line ends, so an untouched CRLF file is not taken as changed."""
+    body = SPLIT["b.py"].replace('Send("OB_X", msg)', 'Send("OB_\\\nX", msg)')
+    config_dir = _config(tmp_path, {**SPLIT, "b.py": body})
+    b = config_dir / "b.py"
+    b.write_bytes(b.read_bytes().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n"))
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
+    assert plan.unresolved == ()
+    assert len(apply_rename(plan)) == 2
+    assert b'Send("OB_Y", msg)\r\n' in b.read_bytes()
+
+
+def test_the_snapshot_holds_the_bytes_the_plan_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A save landing after the plan read a file and before it took the snapshot is refused at
+    apply: the snapshot is the bytes the edits were computed from, not a later read."""
+    config_dir = _config(tmp_path, SPLIT)
+    real = impact._file_bytes
+
+    def save_then_snapshot(*args: object) -> object:
+        # Appended below every edit, so each planned span still holds its literal.
+        b = config_dir / "b.py"
+        b.write_text(b.read_text(encoding="utf-8") + '\nLATE = "OB_X"\n', "utf-8")
+        return real(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(impact, "_file_bytes", save_then_snapshot)
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
+    monkeypatch.undo()
+    with pytest.raises(WiringError, match="changed after the plan"):
+        apply_rename(plan)
+
+
+def test_a_file_the_snapshot_does_not_hold_is_refused(tmp_path: Path) -> None:
+    config_dir = _config(tmp_path, SPLIT)
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
+    partial = RenamePlan(
+        plan.target_kind,
+        plan.old,
+        plan.new,
+        edits=plan.edits,
+        sources=tuple(s for s in plan.sources if Path(s[0]).name != "b.py"),
+    )
+    before = {name: (config_dir / name).read_bytes() for name in SPLIT}
+    with pytest.raises(WiringError, match="changed after the plan"):
+        apply_rename(partial)
+    assert {name: (config_dir / name).read_bytes() for name in SPLIT} == before
+
+
+def test_a_rename_write_error_survives_pickling() -> None:
+    import pickle
+
+    exc = impact.RenameWriteError("writing a.py failed", ["a.py"])
+    back = pickle.loads(pickle.dumps(exc))
+    assert (str(back), back.unrestored) == ("writing a.py failed", ["a.py"])
+
+
+def test_codeset_rename_says_so_when_the_table_cannot_be_moved_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The rewrite fails, and so does the move back: the message keeps the rewrite's own text,
+    then says where the table was left and that its references still name the old table."""
+    from messagefoundry import restricted_file
+
+    mod = CODESET_MOD.replace("r_cs_misspelled", "r_cs")
+    config_dir = _config(tmp_path, {"mod.py": mod, "codesets/diets.csv": "code,value\nA,Apple\n"})
+    real_move = restricted_file.replace_generated
+    moves: list[str] = []
+
+    def second_move_fails(src: Path, dest: Path) -> None:
+        moves.append(Path(dest).name)
+        if len(moves) == 2:
+            raise PermissionError("held open")
+        real_move(src, dest)
+
+    def write_fails(prepared: impact.PreparedRename) -> list[impact.LiteralEdit]:
+        raise impact.RenameWriteError("writing mod.py failed. Nothing was written", [])
+
+    monkeypatch.setattr(restricted_file, "replace_generated", second_move_fails)
+    monkeypatch.setattr(impact, "write_rename", write_fails)
+    with pytest.raises(WiringError) as caught:
+        codeset_edit.rename_code_set(config_dir, "diets", "meals", validate=_validate)
+    message = str(caught.value)
+    assert message.startswith("writing mod.py failed. Nothing was written. The code set was then")
+    assert "left as meals.csv" in message and "still name 'diets'" in message

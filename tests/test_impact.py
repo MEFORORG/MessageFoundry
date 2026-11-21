@@ -338,7 +338,8 @@ def test_apply_rename_multi_line_edit_keeps_an_earlier_edit_on_its_line_after_u2
         LiteralEdit(str(path), 1, aa, 1, aa + 4, '"AA"', '"CC"'),
         LiteralEdit(str(path), 1, bb, 2, 3, '"BB\\\nBB"', '"DD"'),
     )
-    applied = apply_rename(RenamePlan("outbound", "x", "y", edits=edits))
+    plan = RenamePlan("outbound", "x", "y", edits=edits, sources=((str(path), path.read_bytes()),))
+    applied = apply_rename(plan)
 
     assert len(applied) == 2
     assert path.read_bytes().decode("utf-8") == 's = "\u2028"; t = "CC"; u = "DD"\n'

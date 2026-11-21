@@ -182,8 +182,8 @@ def rename_code_set(
 
     **Both** ``old`` and ``new`` are checked with the same name-safety rules as ``upsert``; the rename
     is rejected if **any** supported file already exists for ``new`` (a stem collision). Raises
-    :class:`WiringError` if ``old``/``new`` is missing or unsafe, the source is absent, or the stem
-    collides."""
+    :class:`WiringError` on at least a missing or unsafe ``old``/``new``, an absent source, a stem
+    collision, and a reference rewrite the rename cannot make (see ``docs/CODESETS.md``)."""
     # Here, not at module top, so importing the config layer does not import the auth package.
     from messagefoundry.restricted_file import replace_generated
 
@@ -250,8 +250,8 @@ def rename_code_set(
                     replace_generated(dest, src)
             except (WiringError, OSError) as back:
                 raise WiringError(
-                    f"{exc} The code set was then left as {dest.name}, because moving it back "
-                    f"failed ({back}), while the restored references name {old!r}: rename "
+                    f"{exc}. The code set was then left as {dest.name}, because moving it back "
+                    f"failed ({back}), while its references still name {old!r}: rename "
                     f"{dest.name} back to {src.name} by hand"
                 ) from exc
             raise WiringError(f"{exc}. The code set was moved back to {src.name}") from exc

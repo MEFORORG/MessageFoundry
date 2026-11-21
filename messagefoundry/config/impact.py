@@ -350,7 +350,7 @@ def plan_rename(
         file_sites = [site for site in ref_sites if site.file == file]
         spans = file_def + [site.span for site in file_sites]
         kinds = sources.occurrences(file, old)
-        for edit in _py_literal_edits(file, old, new, spans):
+        for edit in _py_literal_edits(sources, file, old, new, spans):
             pos = _source_position(edit, bom_files)
             is_def = pos in def_positions.get(file, ())
             if not is_def and not any(
@@ -382,7 +382,7 @@ def plan_rename(
     toml_unresolved: list[Reference] = []
     for toml_path, table, keys in sorted(toml_targets):
         toml_refs = toml_targets[(toml_path, table, keys)]
-        toml_edits = _toml_edits(toml_path, table, keys, old, new)
+        toml_edits = _toml_edits(sources, toml_path, table, keys, old, new)
         if keys == ("name",) and not toml_edits:
             unlocated.append(toml_path)
         elif toml_edits is None or (toml_refs and not toml_edits):
@@ -419,18 +419,18 @@ def plan_rename(
         new=new,
         edits=tuple(ordered),
         unresolved=unresolved,
-        sources=_file_bytes({e.file for e in ordered}),
+        sources=_file_bytes(sources, {e.file for e in ordered}),
     )
 
 
-def _file_bytes(files: Iterable[str]) -> tuple[tuple[str, bytes], ...]:
-    """Each readable file's bytes; one that cannot be read gets none, and fails at apply."""
+def _file_bytes(sources: SourceCache, files: Iterable[str]) -> tuple[tuple[str, bytes], ...]:
+    """Each edited file's bytes as the plan read them, the ones its edits were computed from. A
+    file with none gets no entry, and :func:`prepare_rename` refuses it."""
     out: list[tuple[str, bytes]] = []
     for file in sorted(files):
-        try:
-            out.append((file, Path(file).read_bytes()))
-        except OSError as exc:
-            _log.debug("rename could not read %s at plan time: %s", file, type(exc).__name__)
+        raw = sources.raw(file)
+        if raw is not None:
+            out.append((file, raw))
     return tuple(out)
 
 
@@ -455,6 +455,10 @@ class RenameWriteError(WiringError):
     def __init__(self, message: str, unrestored: list[str]) -> None:
         super().__init__(message)
         self.unrestored = unrestored
+
+    def __reduce__(self) -> tuple[type[RenameWriteError], tuple[str, list[str]]]:
+        # Exception pickles as cls(*args), and args holds only the message.
+        return (type(self), (str(self), self.unrestored))
 
 
 def prepare_rename(plan: RenamePlan) -> PreparedRename:
@@ -488,7 +492,7 @@ def prepare_rename(plan: RenamePlan) -> PreparedRename:
                 f"cannot apply the rename of {plan.target_kind} {plan.old!r}: {file} could not "
                 f"be read ({type(exc).__name__}). Nothing was written"
             ) from exc
-        unchanged = planned.get(file, raw) == raw
+        unchanged = planned.get(file) == raw
         missing = [e for e in file_edits if _span_text(lines, e) != e.old_literal]
         if unchanged and not missing:
             for edit in sorted(file_edits, key=lambda e: (e.start_line, e.start_col), reverse=True):
@@ -960,6 +964,10 @@ def _setting_sites(
         )
         return [_Site(conn.source_file, span, binding)], True
     if conn.source_file and _is_connections_toml(conn.source_file):
+        if not isinstance(conn.spec.settings.get(setting), str):
+            # An env() table whose default names the target holds no literal to rewrite; left to
+            # the file-wide toml check, a sibling entry's literal edit would hide it (BACKLOG #5966).
+            return [], False
         key = (conn.source_file, ref.referrer_kind, ("settings", setting))
         toml_targets.setdefault(key, []).append(ref)
         return None
@@ -973,28 +981,36 @@ def _scanned_referrers(
     old: str,
     sources: SourceCache,
 ) -> list[tuple[Reference, tuple[list[_Site], bool]]]:
-    """The handlers (for an outbound) or routers (for a handler) the reverse index has no edge
-    from, whose role scan still finds ``old`` in a referent role: a name a helper returns
+    """The handlers (for an outbound or inbound), routers (for a handler) or both (for a table) the
+    reverse index has no edge from, whose role scan still finds ``old`` in a referent role: a name a helper returns
     (``Send(_route("ADT"), msg)``), one read out of a module table, and other forms the wiring
     graph does not follow. Left out, their literal would keep the old name while the plan reported
     success (BACKLOG #5980); taken in, each is rewritten or reported unresolved like any other.
     Each comes with its sites, so the plan does not scan it twice."""
-    kind = {"outbound": "handler", "handler": "router"}.get(target_kind)
-    if kind is None:
-        return []
-    known = {ref.referrer for ref in indexed if ref.referrer_kind == kind}
     out: list[tuple[Reference, tuple[list[_Site], bool]]] = []
-    table = _table(registry, kind)
-    for name in sorted(set(table) - known):
-        if not _may_read(table[name], old, sources):
-            continue
-        ref = Reference(kind, name, target_kind, old)
-        held: list[bool] = []
-        # A router or handler never takes the connections.toml branch, so no toml target is lost.
-        found = _referrer_sites(registry, ref, old, target_kind, sources, {}, held)
-        if found is not None and (held or any(site.rewritable for site in found[0])):
-            out.append((ref, found))
+    for kind in _SCANNED_REFERRER_KINDS.get(target_kind, ()):
+        known = {ref.referrer for ref in indexed if ref.referrer_kind == kind}
+        table = _table(registry, kind)
+        for name in sorted(set(table) - known):
+            if not _may_read(table[name], old, sources):
+                continue
+            ref = Reference(kind, name, target_kind, old)
+            held: list[bool] = []
+            # A router or handler never takes the connections.toml branch, so no toml target is lost.
+            found = _referrer_sites(registry, ref, old, target_kind, sources, {}, held)
+            if found is not None and (held or any(site.rewritable for site in found[0])):
+                out.append((ref, found))
     return out
+
+
+#: The code kinds that may name a target of each kind without an index edge: a handler sends to
+#: an outbound or a Loopback inbound, a router returns a handler, and either reads a table.
+_SCANNED_REFERRER_KINDS: dict[str, tuple[str, ...]] = {
+    "outbound": ("handler",),
+    "inbound": ("handler",),
+    "handler": ("router",),
+    **dict.fromkeys(_TABLE_KINDS, ("router", "handler")),
+}
 
 
 def _may_read(fn: object, old: str, sources: SourceCache) -> bool:
@@ -2169,7 +2185,7 @@ def _binding_read_only_by_referents(
             return False
         # In a covered body, only a read a role takes, or one that does not depend on the value:
         # ``if msg.x == TARGET`` beside ``Send(TARGET, msg)`` would change with it (BACKLOG #5980).
-        if not any(_key(node) in site.reads for site in covering):
+        if not any(site.file == reader_file and _key(node) in site.reads for site in covering):
             return False
     return True
 
@@ -2448,15 +2464,20 @@ def _source_position(edit: LiteralEdit, bom_files: frozenset[str]) -> tuple[int,
     return edit.start_line, edit.start_col
 
 
-def _py_literal_edits(file: str, old: str, new: str, spans: list[_Span]) -> list[LiteralEdit]:
+def _py_literal_edits(
+    sources: SourceCache, file: str, old: str, new: str, spans: list[_Span]
+) -> list[LiteralEdit]:
     """Every plain-``str`` literal whose decoded value == ``old`` inside one of ``spans`` in ``file``.
 
     tokenize is the authority: an f-string (its own token kinds), a bytes literal, or a fragment of an
     implicit adjacent-string concatenation is never matched — only a lone plain ``str`` whose value is
     exactly ``old``."""
     try:
-        text = Path(file).read_text(encoding="utf-8")
-    except OSError:
+        # Through the cache, so the plan's snapshot holds the bytes these edits were computed from.
+        text = sources.text(file)
+    except UnicodeDecodeError:
+        return []
+    if text is None:
         return []
     try:
         toks = list(tokenize.generate_tokens(io.StringIO(text).readline))
@@ -2565,7 +2586,7 @@ _TOML_STRING_KEY = re.compile(
 
 
 def _toml_edits(
-    toml_path: str, table: str, keys: tuple[str, ...], old: str, new: str
+    sources: SourceCache, toml_path: str, table: str, keys: tuple[str, ...], old: str, new: str
 ) -> list[LiteralEdit] | None:
     """Rewrite, as text (no TOML round-trip), every ``<table>`` entry's value at ``keys`` equal to
     ``old`` in ``toml_path``: ``[]`` when no entry holds it, ``None`` when the edits cannot be proved.
@@ -2578,10 +2599,14 @@ def _toml_edits(
     is reported rather than left reading the old name (BACKLOG #5980). The quote style and every
     other byte survive."""
     try:
-        # Decoded as apply_rename decodes it, so line numbers agree.
-        text = Path(toml_path).read_bytes().decode("utf-8")
+        # Decoded as apply_rename decodes it, so line numbers agree, from the cached bytes the
+        # plan's snapshot holds.
+        raw = sources.raw(toml_path)
+        if raw is None:
+            return None
+        text = raw.decode("utf-8")
         before = tomllib.loads(text)
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         _log.debug("rename could not read %s: %s", toml_path, type(exc).__name__)
         return None
     # ``before`` becomes the expected result: the original with exactly those values changed.
@@ -2674,11 +2699,13 @@ def _apply_one(lines: list[str], edit: LiteralEdit) -> None:
 
 
 def _span_text(lines: list[str], edit: LiteralEdit) -> str | None:
-    """The text ``edit`` spans in ``lines``, or ``None`` past the end."""
+    """The text ``edit`` spans in ``lines``, or ``None`` past the end, with its line ends as
+    ``\\n``: the plan read the literal with universal newlines, so a literal continued over a CRLF
+    line end still matches it."""
     if edit.end_line > len(lines):
         return None
     region, end = _region(lines, edit)
-    return region[edit.start_col : end]
+    return region[edit.start_col : end].replace("\r\n", "\n").replace("\r", "\n")
 
 
 def _already_renamed(lines: list[str], edits: list[LiteralEdit]) -> bool:

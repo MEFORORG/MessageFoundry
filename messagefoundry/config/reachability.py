@@ -271,13 +271,36 @@ class SourceCache:
     def __init__(self) -> None:
         self._parsed: dict[str, tuple[ast.Module, list[str]] | None] = {}
         self._occurrences: dict[tuple[str, str], dict[tuple[int, int], str | None]] = {}
+        self._raw: dict[str, bytes | None] = {}
+
+    def raw(self, file: str) -> bytes | None:
+        """``file``'s bytes as first read through this cache, or ``None`` when unreadable. Every
+        later read of the file through the cache sees the same bytes, so a plan built from them
+        can be checked against the file as it was when the plan read it."""
+        if file not in self._raw:
+            try:
+                self._raw[file] = Path(file).read_bytes()
+            except OSError as exc:
+                _log.debug("reference analysis could not read %s: %s", file, type(exc).__name__)
+                self._raw[file] = None
+        return self._raw[file]
+
+    def text(self, file: str, encoding: str = "utf-8") -> str | None:
+        """``file``'s cached bytes decoded with universal newlines, as ``Path.read_text`` reads it;
+        ``None`` when unreadable. A decode error propagates."""
+        raw = self.raw(file)
+        if raw is None:
+            return None
+        return raw.decode(encoding).replace("\r\n", "\n").replace("\r", "\n")
 
     def parse(self, file: str) -> tuple[ast.Module, list[str]] | None:
         """``file``'s module tree and its lines, or ``None`` when unreadable or unparseable."""
         if file not in self._parsed:
             try:
                 # utf-8-sig: a BOM-encoded module (common from Windows editors) parses too.
-                text = Path(file).read_text(encoding="utf-8-sig")
+                text = self.text(file, "utf-8-sig")
+                if text is None:
+                    raise FileNotFoundError(file)
                 lines = source_lines(text)
                 self._parsed[file] = (ast.parse(text), lines)
             except (OSError, SyntaxError, ValueError, MemoryError, RecursionError) as exc:

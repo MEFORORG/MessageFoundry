@@ -531,3 +531,71 @@ def test_a_helper_module_constant_a_helper_returns_is_rewritten(tmp_path: Path) 
     assert plan.unresolved == ()
     apply_rename(plan)
     assert _text(config_dir, "_hc.py").startswith('DEST = "OB_NEW"')
+
+
+# --- review round 1 (round-97e5c019) -------------------------------------------------------------
+
+
+def test_a_table_a_handler_reads_out_of_a_module_dict_reports_the_referrer(tmp_path: Path) -> None:
+    """Step 8 for a table: the index has no edge from ``code_set(TABLES["x"])``, so the referrer was
+    never scanned and the rename reported success with the handler still reading the old table."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "mod.py": _HEAD + 'TABLES = {"x": "diets"}\n\n' + _WIRE + '@handler("h_p")\n'
+            "def h_p(msg):\n"
+            '    label = code_set(TABLES["x"]).get("A")\n'
+            '    return Send("OB_A", msg)\n',
+            "codesets/diets.csv": "code,value\nA,Apple\n",
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "code_set", "diets", "meals")
+    assert plan.unresolved == (Reference("handler", "h_p", "code_set", "diets"),)
+
+
+def test_a_loopback_a_handler_sends_to_through_a_helper_is_rewritten(tmp_path: Path) -> None:
+    """Step 8 for an inbound: a Loopback inbound a handler reaches only through a helper's table."""
+    body = (
+        "from messagefoundry import MLLP, Loopback, Send, handler, inbound, outbound, router\n\n"
+        'TARGETS = {"ADT": "IB_OLD"}\n\n\n'
+        "def _route(k):\n"
+        "    return TARGETS[k]\n\n\n"
+        'inbound("IB_A", MLLP(port=2932), router="r_a")\n'
+        'inbound("IB_OLD", Loopback(), router="r_b")\n'
+        'outbound("OB_B", MLLP(host="127.0.0.1", port=6931))\n\n\n'
+        '@router("r_a")\ndef r_a(msg):\n    return ["h_a"]\n\n\n'
+        '@router("r_b")\ndef r_b(msg):\n    return ["h_b"]\n\n\n'
+        '@handler("h_a")\ndef h_a(msg):\n    return Send(_route("ADT"), msg)\n\n\n'
+        '@handler("h_b")\ndef h_b(msg):\n    return Send("OB_B", msg)\n'
+    )
+    config_dir = _write(tmp_path, {"mod.py": body})
+    plan = plan_rename(load_config(config_dir), config_dir, "inbound", "IB_OLD", "IB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert 'TARGETS = {"ADT": "IB_NEW"}' in _text(config_dir)
+    load_config(config_dir)
+
+
+def test_a_read_at_a_role_reads_coordinates_in_another_file_reports_the_referrer(
+    tmp_path: Path,
+) -> None:
+    """A role read is keyed by its file as well as its position: a comparison in ``b.py`` at the
+    same line and columns as ``a.py``'s Send is not that Send."""
+    head = "from messagefoundry import Send, handler\n\nimport _consts\n\n"
+    config_dir = _write(
+        tmp_path,
+        {
+            "_consts.py": 'TARGET = "OB_OLD"\n',
+            "wire.py": _HEAD + _WIRE.replace('["h_p"]', '["h_a", "h_b"]'),
+            "a.py": head + '@handler("h_a")\ndef h_a(msg):\n    return Send(_consts.TARGET, msg)\n',
+            "b.py": head + '@handler("h_b")\ndef h_b(msg):\n'
+            "    if msg.xx ==_consts.TARGET: return None\n"
+            "    return Send(_consts.TARGET, msg)\n",
+        },
+    )
+    a_line = _text(config_dir, "a.py").splitlines()[6]
+    b_line = _text(config_dir, "b.py").splitlines()[6]
+    assert a_line.index("_consts.TARGET") == b_line.index("_consts.TARGET")
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved != ()
+    assert not any(Path(e.file).name == "_consts.py" for e in plan.edits)
