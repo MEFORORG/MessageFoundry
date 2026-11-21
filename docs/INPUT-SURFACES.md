@@ -350,7 +350,7 @@ It does hold them to a structure when it loads them. The rules live in
   reads from it, and, for each of those that is a link, what it resolves to and, for a file, that
   file's folder, which can lie outside the directory; [SERVICE.md](SERVICE.md), in
   its POSIX loader bullet, says what that leaves unchecked (vault BACKLOG #2596). Any other path is not on it. A dev and test escape
-  turns those two refusals into a warning. It does not cover the check's refusal of a link on that
+  turns at least those refusals into a warning. It does not cover the check's refusal of a link on that
   list that cannot be resolved or leads to nothing at check time. The escape's conditions are
   under *Dev/test escape* in [SERVICE.md](SERVICE.md#lock-down-the-config-directory-config-2), which also states what the
   check reads and what it leaves out.

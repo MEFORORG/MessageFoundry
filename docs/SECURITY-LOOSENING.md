@@ -1692,8 +1692,10 @@ count is above `0` (vault BACKLOG #2613).
   a directory or module that a broad or low-privilege principal can write, one owned by any
   account other than root or the engine's own (only root when the engine runs as root), and on
   Windows one whose access list cannot be read. With the escape
-  honoured, each of those is a WARNING and the load goes on. Whoever can write there would then run
-  code as the engine's account at the next start, reload or worker respawn. The escape does not
+  honoured, each of those is a WARNING and the load goes on, and so is at least the same fault on
+  `connections.toml`, `__pycache__`, the `codesets` folder and its tables, and the target of a link
+  among them. Whoever can write there would then run code as the engine's account, or change what
+  it reads, at the next start, reload or worker respawn. The escape does not
   cover a link on the check's list that cannot be resolved or leads to nothing at check time: the
   load is still refused.
 - **When acceptable:** a dev or CI checkout that is user-writable on purpose, with synthetic data.

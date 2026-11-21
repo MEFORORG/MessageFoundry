@@ -788,7 +788,9 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     it cannot read. The refusal names the path and the Win32 error where there is one. The cure is
     to fix what made the read fail. Where it is honoured (see *Dev/test escape* below),
     `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` downgrades the refusal to a
-    WARNING for a dev/CI checkout only, as it does every refusal here. A `*.py` deleted while the
+    WARNING for a dev/CI checkout only, as it does every refusal of this owner and access-list
+    read. It does not downgrade the refusal of a trust-list link that cannot be resolved or leads
+    to nothing at check time, on either platform. A `*.py` deleted while the
     load runs is skipped, as on POSIX (ADR 0036 Amendment B).
   - **The OWNER is checked too, and this arm REFUSES rather than warning.** An owner holds
     `WRITE_DAC` implicitly, so it can rewrite the DACL and the executed `.py` whatever the ACEs

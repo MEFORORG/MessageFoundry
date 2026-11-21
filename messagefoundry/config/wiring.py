@@ -9827,7 +9827,7 @@ def config_source_trust_paths(
     leads to nothing, so that it is refused, as a dangling module link is: a writer of the folder
     it points into could create the missing name before the read. So is a ``__pycache__`` link.
     The directory's own link is followed with no ``refuse``, so one that dangles raises ``OSError``
-    whatever the escape says; a lax read (:func:`read_trusted_snapshot`) then lists the directory
+    rather than a refusal; a lax read (:func:`read_trusted_snapshot`) then lists the directory
     again, and refuses one that is gone as missing."""
     # Lazy: connections_file imports this module (no circular import at load time).
     from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
@@ -11458,8 +11458,9 @@ def _refuse_unsafe_config_source(message: str) -> None:
 def _refuse_unvetted_link(message: str) -> NoReturn:
     """Raise ``WiringError(message)`` for a trust-list link that cannot be resolved or leads to
     nothing at check time, whatever the dev/test escape says: nothing about what it leads to was
-    vetted, as the ``serve`` start check rules for a link chain it cannot walk (vault BACKLOG #6654
-    item 2; Manager decision d20261121T195422910-02289f)."""
+    vetted (Manager decision d20261121T195422910-02289f, after vault BACKLOG #6654 item 2). The
+    ``serve`` start check differs for a link it can walk to a missing name: it vets the folder
+    that name would sit in, through the escape-aware refusal."""
     raise WiringError(message)
 
 
