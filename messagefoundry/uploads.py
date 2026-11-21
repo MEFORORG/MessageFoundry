@@ -300,7 +300,7 @@ def _not_a_plain_file(path: Path) -> str | None:
         return None
     if _names_a_link(info):
         return "it is a link and was not followed"
-    if not S_ISREG(info.st_mode):
+    if not _is_regular(info):
         return "it is not a regular file"
     return None
 
@@ -311,6 +311,18 @@ def _names_a_link(info: os.stat_result) -> bool:
     return S_ISLNK(info.st_mode) or bool(
         reparse and getattr(info, "st_reparse_tag", 0) & _NAME_SURROGATE_TAG
     )
+
+
+#: The reparse tag of a Windows ``AF_UNIX`` socket (``IO_REPARSE_TAG_AF_UNIX``), which the
+#: ``stat`` module does not name.
+_AF_UNIX_REPARSE_TAG = 0x80000023
+
+
+def _is_regular(info: os.stat_result) -> bool:
+    """Whether an ``lstat`` result is a regular file. Windows reports an ``AF_UNIX`` socket as one
+    by ``st_mode``, and only its reparse tag tells it apart; an open of it fails with ``EINVAL``,
+    so it is no plain file (BACKLOG #5388 added item 3)."""
+    return S_ISREG(info.st_mode) and getattr(info, "st_reparse_tag", 0) != _AF_UNIX_REPARSE_TAG
 
 
 #: How a sidecar or body is opened (BACKLOG #5387 added item 1). ``O_NOFOLLOW`` refuses a final
@@ -353,18 +365,18 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
     An open the filesystem refuses is a :class:`_NotPlainError` too when a fresh ``lstat`` shows
     the name is now a link or not a regular file (BACKLOG #5388 added item 3), as at least a
     dangling link Windows followed, which answers ``FileNotFoundError``, a Windows folder, which
-    answers ``PermissionError``, and a socket are. Raises :class:`_NotPlainError` for a refusal,
+    answers ``PermissionError``, and a socket, which Windows answers with ``EINVAL``, are. Raises :class:`_NotPlainError` for a refusal,
     and any other ``OSError`` the filesystem gives, ``FileNotFoundError`` and ``PermissionError``
     included."""
     before = path.lstat()
-    if _names_a_link(before) or not S_ISREG(before.st_mode):
+    if _names_a_link(before) or not _is_regular(before):
         raise _NotPlainError(f"{path.name} is not a plain file")
     met: str | None = None
     try:
         fd = os.open(path, _PLAIN_OPEN_FLAGS)
     except OSError as exc:
         # What the open meets when the name is swapped after the lstat varies by platform: at
-        # least ENXIO or EOPNOTSUPP for a socket, a PermissionError for a folder on Windows, and
+        # least ENXIO or EOPNOTSUPP for a socket (EINVAL on Windows), a PermissionError for a folder on Windows, and
         # there a FileNotFoundError for a dangling link it followed. The name is what decides,
         # so every caller sees one refusal (BACKLOG #5388 added item 3).
         if not _unplain_now(path, exc):
@@ -378,6 +390,7 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
         # Before the fdopen, which answers a directory swapped in after the lstat with its own
         # IsADirectoryError, naming the descriptor rather than the path (BACKLOG #5388 added
         # item 3). POSIX opens a directory for reading, so this check is the one that refuses it.
+        # S_ISREG, not _is_regular: a Windows socket never gets this far, since its open fails.
         after = os.fstat(fd)
         if not S_ISREG(after.st_mode):
             raise _NotPlainError(f"{path.name} changed after it was checked")
@@ -498,7 +511,7 @@ def _unplain_now(name: object, cause: OSError) -> bool | None:
             codec_safe_str(again),
         )
         return None
-    return _names_a_link(info) or not S_ISREG(info.st_mode)
+    return _names_a_link(info) or not _is_regular(info)
 
 
 def _lstat_is_dir(path: Path) -> bool:
@@ -1838,7 +1851,7 @@ class UploadStore:
         except OSError as exc:
             self._body_unread(blob, exc)
             return None
-        if _names_a_link(before) or not S_ISREG(before.st_mode):
+        if _names_a_link(before) or not _is_regular(before):
             _log.warning("uploaded file %s: not a regular file; it was not read", blob.name)
             return None
         if before.st_size > self._stored_limit:
@@ -3199,7 +3212,7 @@ class UploadStore:
                     kind,
                 )
                 return _Half.SKIPPED
-            if not S_ISREG(info.st_mode):
+            if not _is_regular(info):
                 _log.warning("uploaded file %s (%s): not a file; left as it is", fid, kind)
                 return _Half.NOT_REGULAR
             # For a body, read the MARKER first, not the file. The idempotency test is a prefix
@@ -3479,7 +3492,7 @@ class UploadStore:
             info = body.lstat()
         except OSError:
             return False
-        if not S_ISREG(info.st_mode) or info.st_size > self._stored_limit:
+        if not _is_regular(info) or info.st_size > self._stored_limit:
             return False
         return self._lost_body_size(body) is None
 

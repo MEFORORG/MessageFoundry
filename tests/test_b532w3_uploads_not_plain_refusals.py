@@ -19,6 +19,7 @@ import socket
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -265,6 +266,125 @@ async def test_a_socket_swapped_in_after_its_check_is_damage(
     finally:
         for sock in held:
             sock.close()
+
+
+# --- a Windows AF_UNIX socket ---------------------------------------------------------------------
+
+# What Windows reports for an AF_UNIX socket file, as measured on Windows 11: an lstat st_mode
+# of a regular file, the reparse-point attribute, and the AF_UNIX reparse tag. Its open then
+# fails with EINVAL. Before the fix that read as a regular file refusing for a transient
+# reason, so the route answered 500.
+_WINDOWS_SOCKET_STAT = SimpleNamespace(
+    st_mode=0o100666, st_file_attributes=0x420, st_reparse_tag=0x80000023
+)
+
+
+def test_a_windows_socket_stat_is_not_a_regular_file() -> None:
+    socket_stat: Any = _WINDOWS_SOCKET_STAT
+    assert not uploads._is_regular(socket_stat)
+    # Controls: a plain file, and a reparse point of another kind, such as a cloud placeholder.
+    plain: Any = SimpleNamespace(st_mode=0o100666, st_file_attributes=0x20, st_reparse_tag=0)
+    cloud: Any = SimpleNamespace(
+        st_mode=0o100666, st_file_attributes=0x420, st_reparse_tag=0x9000001A
+    )
+    assert uploads._is_regular(plain) and uploads._is_regular(cloud)
+
+
+class _OsWithSocket(_OsWith):
+    """``_OsWith``, where a path in ``sockets`` lstats as a Windows AF_UNIX socket and refuses its
+    open with ``EINVAL``, as a socket swapped in after the check would on Windows. Runs on every
+    platform."""
+
+    def __init__(self, sockets: set[Path]) -> None:
+        def _open(path: Any, flags: int, *args: Any) -> int:
+            if Path(path) in sockets:
+                raise OSError(errno.EINVAL, "Invalid argument", str(path))
+            return os.open(path, flags, *args)
+
+        super().__init__(_open)
+        self._sockets = sockets
+
+    def lstat(self, path: Any, *args: Any, **kwargs: Any) -> Any:
+        if isinstance(path, str | os.PathLike) and Path(path) in self._sockets:
+            return _WINDOWS_SOCKET_STAT
+        return os.lstat(path, *args, **kwargs)
+
+
+@pytest.mark.parametrize("read", ["get_meta", "read_bytes", "delete"])
+async def test_a_windows_socket_swapped_in_after_its_check_is_damage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read: str
+) -> None:
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    part = _blob(store, meta.file_id) if read == "read_bytes" else _sidecar(store, meta.file_id)
+    sockets: set[Path] = set()
+    monkeypatch.setattr(uploads, "os", _OsWithSocket(sockets))
+    # Control: under the patched module, a sound upload still reads.
+    assert await store.read_bytes(meta.file_id)
+    sockets.add(part)
+    with pytest.raises(UploadDamagedError):
+        await getattr(store, read)(meta.file_id)
+
+
+def _bind_windows_socket(path: Path) -> Any:
+    """A Windows AF_UNIX socket bound at ``path``, a name relative to the working directory, since
+    an AF_UNIX path is short, through Winsock, since CPython offers no ``socket.AF_UNIX`` on
+    Windows. Returns its closer. Skips where Winsock refuses one, as before Windows 10 1803."""
+    import ctypes
+    import struct
+
+    ws2 = ctypes.WinDLL("ws2_32")  # type: ignore[attr-defined,unused-ignore]
+    if ws2.WSAStartup(0x0202, ctypes.create_string_buffer(512)) != 0:
+        pytest.skip("Winsock did not start")
+    ws2.socket.restype = ctypes.c_size_t
+    sock = ws2.socket(1, 1, 0)  # AF_UNIX, SOCK_STREAM
+    if sock == ctypes.c_size_t(-1).value:
+        pytest.skip("Winsock offers no AF_UNIX socket here")
+    name = os.fsencode(path)
+    if len(name) >= 108:
+        ws2.closesocket(ctypes.c_size_t(sock))
+        pytest.skip("the socket path is longer than sockaddr_un holds")
+    addr = struct.pack("H", 1) + name.ljust(108, b"\0")
+    if ws2.bind(ctypes.c_size_t(sock), addr, len(addr)) != 0:
+        ws2.closesocket(ctypes.c_size_t(sock))
+        pytest.skip("Winsock could not bind an AF_UNIX socket here")
+    return lambda: ws2.closesocket(ctypes.c_size_t(sock))
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="a Windows AF_UNIX socket needs Windows")
+@pytest.mark.parametrize("swapped", [False, True], ids=["before-the-check", "after-the-check"])
+@pytest.mark.parametrize("read", ["get_meta", "read_bytes", "delete"])
+async def test_a_real_windows_socket_is_damage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read: str, swapped: bool
+) -> None:
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    part = _blob(store, meta.file_id) if read == "read_bytes" else _sidecar(store, meta.file_id)
+    closers: list[Any] = []
+
+    monkeypatch.chdir(part.parent)
+
+    def _plant() -> None:
+        part.unlink()
+        closers.append(_bind_windows_socket(Path(part.name)))
+
+    if swapped:
+
+        def _socket_then_open(path: Any, flags: int, *args: Any) -> int:
+            if Path(path) == part and not closers:
+                _plant()
+            return os.open(path, flags, *args)
+
+        monkeypatch.setattr(uploads, "os", _OsWith(_socket_then_open))
+    else:
+        _plant()
+    try:
+        with pytest.raises(UploadDamagedError):
+            await getattr(store, read)(meta.file_id)
+        assert closers, "the socket was never planted"
+    finally:
+        for close in closers:
+            close()
 
 
 # --- the route ------------------------------------------------------------------------------------
