@@ -4264,10 +4264,13 @@ def test_the_minted_certificate_names_the_bind_host(tmp_path: Path) -> None:
 
 
 def _san_entries(cert: str | Path) -> list[tuple[str, str]]:
-    """The certificate's SAN as ``(kind, value)``, kind ``ip`` or ``dns``, in certificate order."""
+    """The certificate's SAN as ``(kind, value)`` in certificate order: kind ``ip`` for an
+    iPAddress, ``dns`` for a DNSName, and the class name for any other type, so none passes as
+    either."""
     loaded = x509.load_pem_x509_certificate(Path(cert).read_bytes())
     san = loaded.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-    return [("ip" if isinstance(n, x509.IPAddress) else "dns", str(n.value)) for n in san]
+    kinds = {x509.IPAddress: "ip", x509.DNSName: "dns"}
+    return [(kinds.get(type(n), type(n).__name__), str(n.value)) for n in san]
 
 
 #: The three loopback names every generated certificate carries whatever the bind (BACKLOG #5790):
@@ -4291,6 +4294,8 @@ _LOOPBACK_SANS = (("ip", "127.0.0.1"), ("ip", "::1"), ("dns", "localhost"))
         # Another spelling of a loopback name is the bind host's entry, not a second one.
         ("0:0:0:0:0:0:0:1", (("ip", "::1"), ("ip", "127.0.0.1"), ("dns", "localhost"))),
         ("LOCALHOST", (("dns", "LOCALHOST"), ("ip", "127.0.0.1"), ("ip", "::1"))),
+        # A bracketed host is written as a DNS name, so it does not stand in for the ::1 entry.
+        ("[::1]", (("dns", "[::1]"), *_LOOPBACK_SANS)),
     ],
 )
 def test_the_minted_certificate_names_the_bind_host_and_every_loopback(
@@ -4300,7 +4305,8 @@ def test_the_minted_certificate_names_the_bind_host_and_every_loopback(
     d20261119T191457909-25c3aa).
 
     Mutation: mint with the SAN origin/main had before BACKLOG #5790, the bind host plus a wildcard
-    bind's own loopback. Red: every row but the two wildcard ones lacks a loopback name."""
+    bind's own loopback. Red: every row, since each lacks at least ``localhost`` or a loopback
+    literal."""
     cert, _ = ensure_api_tls_material(ApiSettings(host=host), state_dir=tmp_path)
     assert tuple(_san_entries(cert)) == names
 

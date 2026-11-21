@@ -10,7 +10,6 @@ isolation. The ``tls_min_version`` floor (NIST SP 800-52r2: 1.2+) is enforced vi
 
 from __future__ import annotations
 
-import ipaddress
 import json
 import logging
 import os
@@ -48,6 +47,7 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.file_lock import lock_exclusive as _try_lock
 from messagefoundry.file_lock import unlock as _unlock
+from messagefoundry.hostlist import canonical_host
 from messagefoundry.keywrap import load_checked_cert_chain
 from messagefoundry.redaction import log_timestamp
 from messagefoundry.restricted_file import replace_generated, unlink_generated
@@ -240,21 +240,19 @@ _MINT_LOCK_POLL_S = 0.05
 _GENERATED_LIFETIME_DAYS = 365
 
 
-#: The loopback names every generated certificate carries, whatever the bind (BACKLOG #5790): a
-#: client on this box may dial either loopback literal or ``localhost``. Never the machine's own
+#: The loopback names every generated certificate carries, whatever the bind (BACKLOG #5790), so a
+#: client on this box verifies it at whichever of them it dials where the engine listens there. Never the machine's own
 #: host name: the certificate goes to every peer in the handshake, before any sign-in, so it names
 #: only the bind host and these fixed names, which say nothing about the machine (decision
 #: d20261119T191457909-25c3aa).
 _GENERATED_LOOPBACK_SANS = ("127.0.0.1", "::1", "localhost")
 
 
-def _same_name_key(name: str) -> str:
-    """One spelling per name, for de-duplication: an IP literal in compressed form, brackets
-    dropped, and any other name in lower case, as hostname verification compares DNS names."""
-    try:
-        return ipaddress.ip_address(name.strip("[]")).compressed
-    except ValueError:
-        return name.lower()
+def _same_name_key(name: str) -> object:
+    """One key per name, for de-duplication: :func:`messagefoundry.hostlist.canonical_host` (an IP
+    literal as its address, any other name lowercased), or the name as written where that reads
+    none, as for ``[::1]``, which ``make_self_signed`` writes as a DNS name and not as ``::1``."""
+    return canonical_host(name) or name
 
 
 def _generated_sans(host: str) -> list[str]:
