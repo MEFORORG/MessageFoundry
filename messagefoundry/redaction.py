@@ -2346,7 +2346,8 @@ def _glued_value(
 ) -> str | None:
     """The rest of a PHI or credential value that the field run ``run`` cut through, when it is safe
     to mask: the text after the token, up to the value's terminator. ``None`` leaves the plain
-    scrub. ``body`` is ``text`` as the XML pass reads it (:func:`_without_trailing_note`).
+    scrub. ``body`` is ``text`` with this module's trailing bound note and its joiner set aside
+    (:func:`_without_trailing_note`); only the end-tag arm reads it.
 
     The PHI arms answer first, exactly as they did before BACKLOG #2968. Where they decline, a token
     that ends on a vocabulary end tag's name masks that tag's rest (:func:`_glued_end_tag_rest`,
@@ -2375,7 +2376,7 @@ def _glued_end_tag_rest(body: str, token: str, end: int, field_run: re.Pattern[s
     the tag's name (``a|b|<family>Smith</family`` before `` Zqxdoe>``), masked only where both of
     these allow it: :func:`_end_tag_rest`'s rules, read on ``body``, the text with this module's
     trailing bound note set aside as the XML pass sets it aside (:func:`_without_trailing_note`);
-    and, of the field-run rules, at least this one: a last word glued to what follows must not open
+    and, of the field-run rules, this one alone: a last word glued to what follows must not open
     the next run's token, which would start inside the mask (BACKLOG #5925 item 1). ``body`` holds
     every position the arm reads, so it is read alone. The flat
     passes run before the XML pass, so without this the run took the tag's name and the rest it
@@ -2394,8 +2395,10 @@ def _glued_end_tag_rest(body: str, token: str, end: int, field_run: re.Pattern[s
     break (``a|b|</family Li`` then a line break keeps ``Li``).
 
     **The rest ends inside ``body``.** A bound note joined by a space is on the tag's line, so a rest
-    read on ``text`` ran into the note, and was judged as followed by it rather than as ending the
-    text. ``body`` is found once per :func:`_scrub_field_runs` call, never once per token, which
+    read on ``text`` ran into the note, took its punctuation, and was refused where the walk masks
+    the same words. A note joined by a line break is not on the line, but read on ``text`` the rest
+    is followed by that line break rather than ending the text, so the end-of-text refusals did not
+    apply and the arm masked words the walk keeps (``zqxP``, ``Kim``). ``body`` is found once per :func:`_scrub_field_runs` call, never once per token, which
     made the cost grow with the square of the text's tokens.
 
     **The arm masks only where :func:`_end_tag_rest` masks the whole rest**, which is the only mask
@@ -2426,8 +2429,9 @@ def _glued_end_tag_rest(body: str, token: str, end: int, field_run: re.Pattern[s
 
 
 def _without_trailing_note(text: str) -> str:
-    """``text`` without this module's trailing bound note and its joiner (:data:`_TRAILING_NOTES`),
-    as :func:`_redact_structured` hands it to the XML pass."""
+    """``text`` without this module's trailing bound note and its joiner (:data:`_TRAILING_NOTES`).
+    :func:`_redact_structured` sets the same note aside before its passes, the JSON pass first and
+    the XML pass last; those passes then read what the earlier ones left."""
     if not text.endswith("unscanned]"):  # a cheap test before a search of the whole text
         return text
     note = _TRAILING_NOTES.search(text)
@@ -2500,8 +2504,8 @@ def _maskable_rest(
 
 def _scrub_field_runs(text: str, field_run: re.Pattern[str] | None = None) -> str:
     """``field_run`` (:data:`_HL7_FIELD_RUN` by default, read at call time) replaced by the
-    placeholder, and the rest of a PHI or credential value a run cut through masked in place
-    (:func:`_glued_value`)."""
+    placeholder, and masked in place after a run: the rest of a PHI or credential value it cut
+    through, and the rest of a vocabulary end tag whose name it took (:func:`_glued_value`)."""
     if field_run is None:
         field_run = _HL7_FIELD_RUN
     if _USERINFO_OPENER in text:
