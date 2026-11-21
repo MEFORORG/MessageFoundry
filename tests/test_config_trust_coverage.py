@@ -39,6 +39,9 @@ pytestmark = pytest.mark.usefixtures("real_config_source_readers")
 
 _CACHE_FILE = f"cfg.{sys.implementation.cache_tag}.pyc"
 
+#: The trust-list members that are folders, so a link to one is a directory link.
+_FOLDERS = frozenset({"codesets", "__pycache__"})
+
 
 def _write_tree(directory: Path) -> None:
     """A config directory with every member the trust list names, and one it must not."""
@@ -287,7 +290,9 @@ def test_a_dangling_module_link_refuses_the_load(
     assert "o" in load_config(cfg).outbound
 
 
-@pytest.mark.parametrize("member", ["connections.toml", "codesets", "codesets/a.csv"])
+@pytest.mark.parametrize(
+    "member", ["connections.toml", "codesets", "codesets/a.csv", "__pycache__"]
+)
 def test_a_dangling_data_link_refuses_the_load(
     member: str,
     tmp_path: Path,
@@ -307,7 +312,7 @@ def test_a_dangling_data_link_refuses_the_load(
     link.parent.mkdir(exist_ok=True)
     target = tmp_path / "shared" / Path(member).name
     try:
-        link.symlink_to(target, target_is_directory=member == "codesets")
+        link.symlink_to(target, target_is_directory=member in _FOLDERS)
     except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
         pytest.skip(f"cannot create a symlink here: {exc}")
     fake_windows_readers(lambda _path: False)
@@ -318,7 +323,7 @@ def test_a_dangling_data_link_refuses_the_load(
         load_config(cfg)
     # Control: once the target exists, the same link loads.
     target.parent.mkdir(exist_ok=True)
-    if member == "codesets":
+    if member in _FOLDERS:
         target.mkdir()
     elif member == "connections.toml":
         target.write_text("", encoding="utf-8")
@@ -327,7 +332,9 @@ def test_a_dangling_data_link_refuses_the_load(
     assert "o" in load_config(cfg).outbound
 
 
-@pytest.mark.parametrize("member", ["connections.toml", "codesets", "codesets/a.csv"])
+@pytest.mark.parametrize(
+    "member", ["connections.toml", "codesets", "codesets/a.csv", "__pycache__"]
+)
 def test_the_escape_downgrades_a_dangling_data_link(
     member: str,
     tmp_path: Path,
@@ -349,7 +356,7 @@ def test_the_escape_downgrades_a_dangling_data_link(
     link = cfg / member
     link.parent.mkdir(exist_ok=True)
     try:
-        link.symlink_to(tmp_path / "gone", target_is_directory=member == "codesets")
+        link.symlink_to(tmp_path / "gone", target_is_directory=member in _FOLDERS)
     except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
         pytest.skip(f"cannot create a symlink here: {exc}")
     fake_windows_readers(lambda _path: False)
@@ -375,19 +382,23 @@ def test_the_escape_is_inert_for_a_dangling_link_under_enforce(
     except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
         pytest.skip(f"cannot create a symlink here: {exc}")
     fake_windows_readers(lambda _path: False)
-    with pytest.raises(WiringError, match="not honoured"):
+    with pytest.raises(WiringError, match="leads to nothing.*not honoured"):
         load_config(cfg, allow_empty=True)
 
 
-def test_a_dangling_config_directory_link_raises_whatever_refuse_is_given(tmp_path: Path) -> None:
-    """The directory itself is judged again as missing or unreadable by the load's callers, so its
-    fault is raised rather than handed to the escape."""
+def test_a_dangling_config_directory_link_raises_whatever_refuse_is_given(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A lax read lists the directory again and refuses one that is gone as missing, so the
+    directory's own fault is raised rather than handed to the escape. The module listing is
+    stubbed, as if the link lost its target after it ran."""
     link = tmp_path / "cfg"
     try:
         link.symlink_to(tmp_path / "gone", target_is_directory=True)
     except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
         pytest.skip(f"cannot create a symlink here: {exc}")
+    monkeypatch.setattr(wiring, "config_py_files", lambda _directory: [])
     handed: list[str] = []
     with pytest.raises(OSError, match="leads to nothing"):
-        wiring._with_link_targets([link], refuse=handed.append)
+        config_source_trust_paths(link, refuse=handed.append)
     assert handed == []

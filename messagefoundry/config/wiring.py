@@ -9825,7 +9825,10 @@ def config_source_trust_paths(
     folders above ``directory``, except where a link's target or the folder holding it lies
     there. A link at ``connections.toml``, ``codesets`` or a code-set table is listed even when it
     leads to nothing, so that it is refused, as a dangling module link is: a writer of the folder
-    it points into could create the missing name before the read."""
+    it points into could create the missing name before the read. So is a ``__pycache__`` link.
+    The directory's own link is followed with no ``refuse``, so one that dangles raises ``OSError``
+    whatever the escape says; a lax read (:func:`read_trusted_snapshot`) then lists the directory
+    again, and refuses one that is gone as missing."""
     # Lazy: connections_file imports this module (no circular import at load time).
     from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
 
@@ -9834,6 +9837,8 @@ def config_source_trust_paths(
     if cache.is_dir():
         paths.append(cache)
         paths.extend(sorted(cache.iterdir()))
+    elif _is_link(cache):
+        paths.append(cache)
     connections = directory / CONNECTIONS_FILE_NAME
     # A dangling link is listed too, so the link check refuses it rather than leaving it unread.
     if connections.exists() or _is_link(connections):
@@ -9850,7 +9855,9 @@ def config_source_trust_paths(
         )
     elif _is_link(codesets):
         paths.append(codesets)
-    return _with_link_targets(paths, refuse=refuse)
+    # The directory raises rather than being handed to refuse: see _with_link_targets.
+    listed = _with_link_targets(paths[:1]) + _with_link_targets(paths[1:], refuse=refuse)
+    return list(dict.fromkeys(listed))
 
 
 def _is_link(path: Path) -> bool:
@@ -9875,12 +9882,10 @@ def _with_link_targets(
 
     A link whose target cannot be resolved, or that leads to nothing at check time, is refused: a
     writer of the folder it points into could create the missing name before the read (Manager
-    decision under the owner's standing instruction of 2026-10-22). For any link but the first
-    path, the config directory, that refusal is handed to ``refuse`` where one is given, so the
-    load's check can downgrade it under the dev/test escape, and the link is then listed with no
-    target; with none given, or for the config directory, it raises ``OSError`` naming the link,
-    so a directory link that dangles is judged again as missing or unreadable, as one that is not
-    a link is.
+    decision under the owner's standing instruction of 2026-10-22). That refusal is handed to
+    ``refuse`` where one is given, so the load's check can downgrade it under the dev/test escape,
+    and the link is then listed with no target; with none given it raises ``OSError`` naming the
+    link.
 
     **Not vetted**, at least: the links in between, for a link to a link, the folders holding the
     links outside the config directory, from which a writer could re-point one, the folders above
@@ -9889,13 +9894,13 @@ def _with_link_targets(
     followed (the start check's :func:`_link_chain` refuses one). The start check walks the links
     of its own files further. A path already listed is not repeated."""
     out: list[Path] = []
-    for index, path in enumerate(paths):
+    for path in paths:
         out.append(path)
         target = _resolved_link(path)
         if target is None:
             continue
         if isinstance(target, str):
-            if refuse is None or index == 0:
+            if refuse is None:
                 raise OSError(errno.EINVAL, target, str(path))
             refuse(f"{_CONFIG_SOURCE_LEAD} {path}: {target}")
             continue
