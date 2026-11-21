@@ -257,9 +257,13 @@ def _generated_sans(api: ApiSettings) -> list[str]:
       certificate naming it alone verifies against no URL at all. It carries the loopback of its
       own family (:func:`messagefoundry.api_tls_source.wildcard_loopback`), the address the tray
       and any other client on this box reach it through (BACKLOG #5973), and no other name.
-    - Any other host carries no extra name, so the placeholder vouches for no loopback name on a
-      machine that imports it. That includes a host ``is_loopback`` does not list, such as
-      ``127.0.0.2``, ``LOCALHOST`` or ``[::1]``, even where it listens on a loopback address.
+    - Any other host carries no extra name, so a pair minted or renewed for it names nothing
+      beyond the bind host. That includes a host ``is_loopback`` does not list, such as
+      ``127.0.0.2``, ``LOCALHOST`` or ``[::1]``, even where it listens on a loopback address, and
+      such a host may itself be a loopback name.
+
+    The names are read at mint and renewal only: a fresh pair is reused as found, whatever bind it
+    was minted for.
     """
     if api.is_loopback:
         return list(_GENERATED_LOOPBACK_SANS)
