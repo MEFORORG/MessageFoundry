@@ -708,7 +708,7 @@ _UNSCANNABLE_RE_PATTERNS = {
     # the empty user's segment is ``_DSN_EMPTY_USER_SEGMENT``, which also takes a "[" behind a
     # lookahead (a possessive run of letters then "]") and a "]", each starting on a character
     # no other alternative takes; it also serves a user holding one "@", whose host word
-    # ``[a-z0-9.\\-]++`` is possessive and stops at the ":" it needs, chosen by the conditional
+    # ``[a-z0-9.\-]++`` is possessive and stops at the ":" it needs, chosen by the conditional
     # ``(?(2)...)``; and a user's password may open with a possessive run of "@" the first segment
     # cannot start with. No quantifier nests under another. The stopwatch for these shapes is
     # ``tests/test_b532w3_redaction_5386.py``.

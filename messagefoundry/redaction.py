@@ -272,7 +272,8 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: already reads. A user holding an "@", and a password starting with one, this arm reads neither
 #: before the rewrite nor after it, which keeps those "@" signs. With an empty user it reads a DSN
 #: this arm does not, and its rewrite, ``scheme://:<redacted>@``, this arm does not read either,
-#: since its user may not be empty. So a password-only DSN does not switch the encoded run off, and a PID run
+#: since its user may not be empty. So a password-only DSN does not switch the encoded run off, and
+#: a PID run
 #: beside it is still hidden. The price is that run's own: where such a DSN sits in the run's token,
 #: the run takes it, as it did before #5386. The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``.
 #:

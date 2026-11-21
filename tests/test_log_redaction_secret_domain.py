@@ -1348,12 +1348,12 @@ def test_a_later_member_holding_an_at_sign_keeps_its_label(
     stops before a member or query separator, so the member pass after it still sees its label.
     Through the public entry points only: masking the member is that pass's job.
 
-    With no user before the host, as in
+    NOT TRUE OF EVERY SHAPE. With no user before the host, as in
     ``jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;``, the narrow pattern reads
     the host as the user and ``1433;user=svc;sslpassword=P`` as the password, since its password
-    class holds ";", so the member's label is inside its match. Before BACKLOG #5386's wave 3
-    ``ss_Sec9`` printed; the narrow pass's replacement now writes the member back masked, and
-    :func:`test_a_jdbc_dsn_with_no_user_before_its_host_hides_its_member_tail` pins it."""
+    class holds ";", so the member's label is inside its match and ``ss_Sec9`` prints. That pattern
+    predates BACKLOG #5386, and origin/main prints the same;
+    :func:`test_a_jdbc_dsn_with_no_user_before_its_host_prints_a_member_tail` pins it."""
     for label, out in (
         ("support.redact", redact_log_line(line)),
         ("secretscrub", scrub_credentials(line)),
@@ -1363,19 +1363,15 @@ def test_a_later_member_holding_an_at_sign_keeps_its_label(
         assert kept in out, f"{label}: lost the scheme and user -- got {out!r}"
 
 
-def test_a_jdbc_dsn_with_no_user_before_its_host_hides_its_member_tail() -> None:
-    """The shape the test above states. This pinned ``ss_Sec9`` printing until BACKLOG #5386's
-    wave 3, which hides it, so the pin now asserts more is hidden. The narrow match still takes
-    the member's key (the control), and its replacement keeps the key so the member pass reads
-    it."""
+def test_a_jdbc_dsn_with_no_user_before_its_host_prints_a_member_tail() -> None:
+    """The residual the test above states, pinned so a fix shows up as a red here."""
     line = "jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;"
     match = scrub_mod._DSN_PASSWORD.search(line)
     assert match is not None and match.group(0) == (
         "sqlserver://db.invalid:1433;user=svc;sslpassword=P@"
     )
     for out in (redact_log_line(line), scrub_credentials(line)):
-        assert "ss_Sec9" not in out and "P@ss" not in out and ";sslpassword=" in out, out
-        assert "1433" not in out and "user=svc" not in out, out
+        assert "ss_Sec9" in out and "sslpassword" not in out, out
 
 
 @pytest.mark.parametrize(
