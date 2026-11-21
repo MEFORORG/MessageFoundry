@@ -165,7 +165,23 @@ def _ref_searched_code(inner: str) -> str:
     return _ref_code_text(old_faultcode, inner, soap._FAULTCODE_END_RE)
 
 
+#: A code text read as tokens: each terminated markup whole, else an opener with no terminator
+#: (group 1), else one character (BACKLOG #5912, closing step 21).
+_REF_UNTERMINATED_RE = re.compile(rf"(?>{_REF_MARKUP})|(<!--|<!\[CDATA\[|<\?)|.", re.DOTALL)
+
+
+def _ref_outside_markup(code: str) -> str:
+    """``code``, or ``""`` when an opener in it has no terminator, so its text ends in markup."""
+    if any(t.group(1) for t in _REF_UNTERMINATED_RE.finditer(code)):
+        return ""
+    return code
+
+
 def _ref_first_child_code(inner: str) -> str:
+    return _ref_outside_markup(_ref_first_child_text(inner))
+
+
+def _ref_first_child_text(inner: str) -> str:
     lead = _REF_BEFORE_THE_CHILD_RE.match(inner)
     child = inner[lead.end() :] if lead is not None else ""
     faultcode = _OLD_FAULTCODE_RE.match(child)
@@ -490,7 +506,8 @@ def test_a_commented_fault_close_ends_the_fallback_range() -> None:
     """The PR 2936 hold of 2026-11-14 (head 8c5a940a17): the shape the #5912 changelog and
     CONNECTIONS.md name. The first child is a faultstring, so the fallback reads the code, and its
     range ends at the commented Fault close tag, as main's did: no code, a permanent fault.
-    Control: without the comment the same reply reads the Server code and retries."""
+    Control: with the comment's close tag replaced by text, the same reply reads the Server code
+    and retries."""
     body = (
         "<soap:Fault><faultstring>busy</faultstring><!-- </soap:Fault> -->"
         "<faultcode>soap:Server</faultcode></soap:Fault>"
@@ -503,10 +520,11 @@ def test_a_commented_fault_close_ends_the_fallback_range() -> None:
         "<soap:Fault><faultstring>busy</faultstring><!-- </soap:Fault> -->"
         "<faultcode>soap:Server</faultcode>"
     )
-    assert _fault_code(literal) == ""
+    assert _fault_code(literal) == "" == _ref_fault_code(literal)
     assert _outcome(_classify_soap(200, literal)) == "soap-fault"
-    plain = body.replace("<!-- </soap:Fault> -->", "")
-    assert _fault_code(plain) == "soap:Server"
+    # Only the close tag goes; the comment stays, so the close tag is what ended the range.
+    plain = body.replace("<!-- </soap:Fault> -->", "<!-- note -->")
+    assert _fault_code(plain) == "soap:Server" == _ref_fault_code(plain)
     assert _outcome(_classify_soap(200, plain)) == "transient"
 
 
@@ -519,11 +537,64 @@ def test_with_no_body_a_fault_only_in_markup_is_still_read() -> None:
     body = "<Envelope><!-- <Fault><faultcode>soap:Server</faultcode></Fault> --></Envelope>"
     assert soap._BODY_RE.search(body) is None
     assert soap._search_outside_markup(soap._FAULT_OUTSIDE_MARKUP_RE, body, 0, len(body)) is None
-    assert _fault_code(body) == "soap:Server" == _ref_fault_code(body)
+    assert _fault_code(body) == "soap:Server" == _ref_fault_code(body) == _pr2790_fault_code(body)
     assert _outcome(_classify_soap(200, body)) == "transient"
     assert _outcome(_classify_soap(500, body)) == "transient"
     no_fault = "<Envelope><!-- note --></Envelope>"
     assert _classify_soap(200, no_fault) is None
+
+
+#: BACKLOG #5912, closing step 21: a first-child code element whose own close tag is first found
+#: inside markup it opens, so its text ends inside that markup. Main read the Value ahead of it.
+_CODE_TEXT_ENDS_IN_MARKUP = {
+    "soap11-commented-own-close-first": (
+        "<soap:Fault><!-- <Value>soap:Server</Value> --><faultcode><!-- </faultcode> -->"
+        "soap:Server</faultcode></soap:Fault>"
+    ),
+    "soap11-commented-own-close-after-text": (
+        "<Fault><!-- <Value>Server</Value> --><faultcode>soap:Client<!-- </faultcode> -->"
+        "</faultcode></Fault>"
+    ),
+    "soap12-commented-own-close-first": (
+        "<env:Fault><!-- <env:Value>env:Receiver</env:Value> --><env:Code><env:Value>"
+        "<!-- </env:Value> -->env:Receiver</env:Value></env:Code></env:Fault>"
+    ),
+    "soap11-cdata-own-close-first": (
+        "<Fault><!-- <Value>Server</Value> --><faultcode><![CDATA[</faultcode>]]>"
+        "soap:Server</faultcode></Fault>"
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "body", list(_CODE_TEXT_ENDS_IN_MARKUP.values()), ids=list(_CODE_TEXT_ENDS_IN_MARKUP)
+)
+def test_a_code_text_ending_inside_markup_falls_back_as_main_read_it(body: str) -> None:
+    """Engine PR 2936 hold repair 4, open item 2: the first-child read took the text up to the
+    ``</`` inside the comment, ``<!-- `` say, as the code, skipped the fallback and dead-lettered a
+    reply main retried through the Value ahead. Such text is now no code, so the fallback reads the
+    reply as the PR 2790 reading did. Control: with the check patched out, each reads the text up
+    to the markup and dead-letters, as the merged PR 2936 head did."""
+    reading = _pr2790_fault_code(body)
+    assert soap._RECEIVER_RE.search(reading), "the shape must hold a retryable reading"
+    assert _fault_code(body) == reading == _ref_fault_code(body)
+    assert _outcome(_classify_soap(200, body)) == "transient"
+    assert _outcome(_classify_soap(500, body)) == "transient"
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(soap, "_outside_markup_text", lambda text: text)
+        assert _outcome(_classify_soap(200, body)) in {"soap-fault", "soap-sender"}
+
+
+def test_a_code_text_with_terminated_markup_is_still_the_code() -> None:
+    """Control for the test above: markup terminated inside the code text does not send the read
+    to the fallback, so the Value ahead does not decide it."""
+    body = (
+        "<Fault><!-- <Value>Server</Value> --><faultcode><!-- c -->soap:Client</faultcode></Fault>"
+    )
+    assert _fault_code(body) == "<!-- c -->soap:Client" == _ref_fault_code(body)
+    assert _outcome(_classify_soap(200, body)) == "soap-sender"
+    assert soap._outside_markup_text("a<!-- b") == ""
+    assert soap._outside_markup_text("a<!-- b -->c<?d?>") == "a<!-- b -->c<?d?>"
 
 
 #: BACKLOG #5912: where the first child holds the code, a Value outside the Code, here inside markup

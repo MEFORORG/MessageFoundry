@@ -3000,14 +3000,16 @@ follow-on and is **not** built.
 request is rejected; a retry won't help). A **Receiver/Server** fault → `DeliveryError` → **retry**. The
 Sender/Receiver class is read first from the Fault's first child element: SOAP 1.2's `Code`, then the
 `Value` that is that Code's own first child, or SOAP 1.1's `faultcode`. A comment, CDATA section or
-processing instruction before either child is stepped over, with at least these exceptions, the first two of
-which leave that read with no code: such markup that has no terminator; a `<!` that opens anything
-else, such as a DOCTYPE or a lowercase `<![cdata[`; and a `</` inside such markup within the
-`faultcode` or `Value` itself, which still ends the code text. Where that read yields no code, for
+processing instruction before either child is stepped over, with at least these exceptions, each of
+which leaves that read with no code: such markup that has no terminator; a `<!` that opens anything
+else, such as a DOCTYPE or a lowercase `<![cdata[`; and a first `</` inside such markup within the
+`faultcode` or `Value` itself, so that the code text would end inside the markup, as in
+`<faultcode><!-- </faultcode> -->soap:Server</faultcode>`. Where that read yields no code, for
 those shapes, for a first child that is neither element (a SOAP 1.1 `faultstring` before the
 `faultcode`, a SOAP 1.2 `Reason` before the `Code`), or for a code element that holds no code, the
 code falls back to the earlier search's rule, from the Fault start tag to the first `</Fault>`
-after it, or the reply's end: the first `Value` ahead of the Fault's first `faultcode`, else that `faultcode`. Like the earlier
+after it, or the reply's end: the first `Value` ahead of the Fault's first `faultcode`, else that
+`faultcode`, and an empty one is not passed over for a later one. Like the earlier
 search, the fallback steps over no markup: a `faultcode` or `Value` inside a comment counts, and a
 `</Fault>` inside one ends its range. For example,
 `<soap:Fault><faultstring>busy</faultstring><!-- </soap:Fault> --><faultcode>soap:Server</faultcode>`
