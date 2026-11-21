@@ -488,8 +488,8 @@ shape (transform cost, message size, disk, SQL-box sizing).
   connection-/license-constrained site).
   A pooler in front of Postgres must accept or ignore the `default_transaction_isolation` startup
   parameter the engine sends (BACKLOG #5674); PgBouncer refuses one it is not configured for. Where the
-  pooler ignores it, the server's own default must be READ COMMITTED, PostgreSQL's default, or a writing
-  open refuses.
+  pooler ignores it, the server's own default must be READ COMMITTED, PostgreSQL's default: nothing
+  checks this.
 - **Commit-depth at high interface counts (`fifo_claim_batch`):** the pool is not the only per-engine wall —
   above ~48 inbound interfaces an engine becomes bound by *commits per message* on the shared store (WRITELOG
   + the per-message finalizer applock), which a bigger pool **cannot** fix. For a **high-interface-count,

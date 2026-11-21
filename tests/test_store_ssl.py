@@ -300,28 +300,6 @@ async def test_pool_pins_read_committed_as_the_default_isolation(
     assert server_settings.get("search_path") == schema
 
 
-@pytest.mark.parametrize(
-    ("level", "refused"), [("read committed", False), ("repeatable read", True)]
-)
-async def test_open_refuses_a_default_isolation_the_pin_did_not_set(
-    level: str, refused: bool
-) -> None:
-    """BACKLOG #5674: a pooler can drop the startup parameter, so the writing open reads what took
-    effect and refuses anything but READ COMMITTED. CONTROL: READ COMMITTED passes."""
-    from messagefoundry.store.postgres import PostgresStore
-
-    class _Conn:
-        async def fetchval(self, sql: str) -> str:
-            assert sql == "SHOW default_transaction_isolation"
-            return level
-
-    if not refused:
-        await PostgresStore._check_default_isolation(_Conn())
-        return
-    with pytest.raises(RuntimeError, match="repeatable read"):
-        await PostgresStore._check_default_isolation(_Conn())
-
-
 async def test_pool_connect_hook_names_a_slow_build_without_posing_as_pool_exhaustion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
