@@ -515,11 +515,11 @@ def test_every_catalogue_body_and_mutation_seed_carries_the_sentinel() -> None:
 
 def test_every_mutated_payload_keeps_the_sentinel() -> None:
     """Vault BACKLOG #5581, #8240 item 37: a mutation that cut or flipped a byte of the sentinel left
-    a body the log_body detector could not recognise. On origin/main 13 of the policy's 24 mutations
-    at seed 318 lost it, so this went red there. Each mutated payload must carry its bytes, fit the
-    limit, and an X12 one must still sit between the untouched ISA and IEA. This reads payload
-    bytes, not decoded frames: a framing byte a mutation inserts can still leave a frame without it,
-    which the module docstring lists as not covered."""
+    a body the log_body detector could not recognise. Before this repair, 13 of the policy's 24
+    mutations at seed 318 lost it, so this went red there. Each mutated payload must carry its
+    bytes, fit the limit, and an X12 one must still sit between the untouched ISA and IEA. This
+    reads payload bytes, not decoded frames: a framing byte a mutation inserts can still leave a
+    frame without it, which the module docstring lists as not covered."""
     policy = _policy()
     seed = int(policy["seed"])
     sentinel = run_sentinel(seed)
@@ -527,21 +527,20 @@ def test_every_mutated_payload_keeps_the_sentinel() -> None:
     _, x12 = mutation_seeds(sentinel)
     isa, iea = x12[:_ISA_LEN], x12[x12.rindex(b"IEA") :]
     per_seed = max(48, int(policy["mutations"]))
-    cases = [
-        (s, c)
-        for s in (seed, seed + 1, seed + 2)
-        for c in mutation_cases(s, per_seed, _CAP, sentinel)
-    ]
-    # The positive control: three seeds' worth of cases, so an empty walk cannot pass the check below.
+    seeds = (seed, seed + 1, seed + 2)
+    cases = [c for s in seeds for c in mutation_cases(s, per_seed, _CAP, sentinel)]
+    # Every seed's cases were built, so the absence check below cannot pass on an empty walk.
     assert len(cases) >= 3 * per_seed, len(cases)
-    assert {c.plane for _, c in cases} == {"mllp", "x12"}
-    lost = [(s, c.name) for s, c in cases if marker not in c.payload]
-    assert not lost, f"mutations (seed, name) that lost the sentinel: {lost}"
-    for _, c in cases:
+    # Each seed covers both planes. An origin reads mutation:<seed>:<index>.
+    planes = {(c.origin.rsplit(":", 1)[0], c.plane) for c in cases}
+    assert planes == {(f"mutation:{s}", p) for s in seeds for p in ("mllp", "x12")}, planes
+    lost = [c.origin for c in cases if marker not in c.payload]
+    assert not lost, f"mutations that lost the sentinel: {lost}"
+    for c in cases:
         if c.plane == "x12":
-            assert c.payload.startswith(isa) and c.payload.endswith(iea), c.name
+            assert c.payload.startswith(isa) and c.payload.endswith(iea), c.origin
         # An MLLP payload is the body plus three framing bytes.
-        assert len(c.payload) <= _CAP // 2 + 3, (c.name, len(c.payload))
+        assert len(c.payload) <= _CAP // 2 + 3, (c.origin, len(c.payload))
 
 
 def test_keep_sentinel_appends_after_a_cut_and_respects_the_limit() -> None:
@@ -755,13 +754,12 @@ def test_the_ingress_job_is_not_required_and_its_name_is_unique() -> None:
     name = _ingress_job()["name"]
     assert "${{" not in name
     assert name not in required_contexts()
-    workflows = sorted(WORKFLOWS.glob("*.yml"))
-    # The positive control: the walk reaches the workflow files, so it cannot pass on nothing.
-    assert len(workflows) >= 1, WORKFLOWS
-    elsewhere = [
+    # The walk must find this job itself and nothing else: finding it is the positive control, so an
+    # empty walk or a comparison that never matches fails here instead of passing.
+    declaring = [
         (path.name, key)
-        for path in workflows
+        for path in sorted([*WORKFLOWS.glob("*.yml"), *WORKFLOWS.glob("*.yaml")])
         for key, job in jobs_of(path.name).items()
-        if context_of(key, job) == name and key != "dast-ingress"
+        if context_of(key, job) == name
     ]
-    assert not elsewhere, elsewhere
+    assert declaring == [("dast.yml", "dast-ingress")], declaring
