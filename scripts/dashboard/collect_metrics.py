@@ -26,7 +26,9 @@ removed at exit.
 
 WINDOWED AND CURRENT METRICS. ``--weeks``/``--through`` bound the weekly series. The state metrics
 (open PRs, open alerts, ASVS counts, open ledger rows, release distance) are read as they stand at
-run time whatever ``--through`` says, and each says so in its detail.
+run time whatever ``--through`` says, and each says so in its detail. The open ``ci-red`` PR count
+is the exception: for a past ``--through`` it is not read at all, so it cannot pass for history.
+The final window week ends at ``--through``, for the ledger counts as for the GitHub ones.
 
 EXIT STATUS. 0 when every metric and every optional part was read. 3 when the snapshot WAS written
 but a metric carries an error or a detail carries a ``partial_error``, so a scheduled caller goes red
@@ -48,6 +50,8 @@ import importlib.util
 import io
 import json
 import os
+import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -92,6 +96,19 @@ VAULT_SCORECARD = "docs/security/asvs-scorecard.toml"
 #: 502s on split ``gh`` queries; a collector making ~35 sequential calls retries the same way.
 GH_ATTEMPTS = 3
 GH_BACKOFF_SECONDS = 2.0
+
+#: The failures worth a retry: a gateway or server error, a rate limit, a network drop or a
+#: timeout. Anything else (a 404, an auth refusal, a bad flag, a missing ``gh``) fails on the first
+#: attempt, because a retry would only fail again, slower.
+_TRANSIENT = re.compile(
+    r"HTTP 5\d\d|\b50[0234]\b|rate limit|timed? ?out|TimeoutExpired|connection (?:reset|refused)"
+    r"|\bEOF\b|dial tcp|TLS handshake|temporarily unavailable|Something went wrong",
+    re.IGNORECASE,
+)
+
+#: The week label a vault date AFTER ``--through`` is counted under, so the final window week is
+#: clipped at ``--through`` without the date reading as undated.
+AFTER_THROUGH = "after-through"
 
 #: Run conclusions that count toward the CI pass rate. ``cancelled`` and ``skipped`` are left out of
 #: both sides: a run superseded by a newer push says nothing about whether main is green.
@@ -302,10 +319,24 @@ BytesRunner = Callable[[Sequence[str]], bytes]
 Fetcher = Callable[[str], bytes]
 
 
-def run_bytes(argv: Sequence[str], cwd: Path | None = None) -> bytes:
+def probe_env() -> dict[str, str]:
+    """The environment for the ``--out`` probe: every ``GIT_*`` variable dropped.
+
+    ``GIT_DIR``, ``GIT_WORK_TREE`` or ``GIT_CEILING_DIRECTORIES`` would let the caller's environment
+    tell git that a directory inside a repository is in none. Discovery across filesystems is turned
+    ON, so a mount boundary never hides an enclosing repository either.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.upper().startswith("GIT_")}
+    return {**env, "GIT_DISCOVERY_ACROSS_FILESYSTEM": "1", "LC_ALL": "C", "LANGUAGE": "C"}
+
+
+def run_bytes(
+    argv: Sequence[str], cwd: Path | None = None, *, env: dict[str, str] | None = None
+) -> bytes:
     """Run one command; its raw stdout. Raises :class:`CollectError` on any failure."""
     # git under the C locale, so the one stderr message read back (refuse_reason) is not localized.
-    env = {**os.environ, "LC_ALL": "C", "LANGUAGE": "C"} if argv[0] == "git" else None
+    if env is None and argv[0] == "git":
+        env = {**os.environ, "LC_ALL": "C", "LANGUAGE": "C"}
     try:
         proc = subprocess.run(  # nosec B603 - argv list from this module, no shell
             list(argv), cwd=cwd, env=env, capture_output=True, timeout=CMD_TIMEOUT, check=False
@@ -323,6 +354,11 @@ def run_cmd(argv: Sequence[str], cwd: Path | None = None) -> str:
     return run_bytes(argv, cwd).decode("utf-8", "replace")
 
 
+def run_probe(argv: Sequence[str], cwd: Path | None = None) -> str:
+    """:func:`run_cmd` under :func:`probe_env`, for the ``--out`` guard."""
+    return run_bytes(argv, cwd, env=probe_env()).decode("utf-8", "replace")
+
+
 def fetch_url(url: str) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     try:
@@ -333,19 +369,41 @@ def fetch_url(url: str) -> bytes:
         raise CollectError(f"GET {url} failed: {type(exc).__name__}: {exc}") from None
 
 
+def is_transient(error: CollectError) -> bool:
+    """Whether a failed ``gh`` call is worth another attempt; see :data:`_TRANSIENT`."""
+    return _TRANSIENT.search(str(error)) is not None
+
+
 def gh_json(ctx: Context, args: Sequence[str]) -> Any:
     for attempt in range(1, GH_ATTEMPTS + 1):
         try:
             text = ctx.run(["gh", *args], None)
             break
-        except CollectError:
-            if attempt == GH_ATTEMPTS:
+        except CollectError as exc:
+            if attempt == GH_ATTEMPTS or not is_transient(exc):
                 raise
             time.sleep(ctx.gh_backoff)
     try:
         return json.loads(text) if text.strip() else None
     except json.JSONDecodeError as exc:
         raise CollectError(f"gh {' '.join(args[:2])} returned non-JSON: {exc}") from None
+
+
+def gh_list(ctx: Context, args: Sequence[str]) -> list[dict[str, Any]]:
+    """One ``gh`` list call at :data:`PR_LIST_LIMIT`, refused when it is not a list or is capped."""
+    rows = gh_json(ctx, [*args, "--limit", str(PR_LIST_LIMIT)])
+    what = " ".join(str(a) for a in args[:4])
+    if not isinstance(rows, list):
+        raise CollectError(f"gh {what} returned {type(rows).__name__}")
+    if len(rows) >= PR_LIST_LIMIT:
+        raise CollectError(f"gh {what} hit the limit of {PR_LIST_LIMIT}; truncated")
+    return rows
+
+
+def add_partial(detail: dict[str, Any], text: str) -> None:
+    """Record an optional part that could not be read; several join into one ``partial_error``."""
+    prior = detail.get("partial_error")
+    detail["partial_error"] = f"{prior}; {text}" if prior else text
 
 
 @dataclass
@@ -443,11 +501,15 @@ def _read_vault(ctx: Context) -> VaultRead:
     with _on_path(docs):
         report = _load_module("vault_ledger_weekly_report", docs / "ledger_weekly_report.py")
     checker = sys.modules["backlog_status_check"]
-    tree = ctx.run(["git", "-C", vault, "ls-tree", "-r", "--name-only", sha, "--", "docs"], None)
+    # -z: a path git would otherwise quote (a space, a non-ASCII byte) comes back as written.
+    tree = ctx.run(
+        ["git", "-C", vault, "ls-tree", "-r", "-z", "--name-only", sha, "--", "docs"], None
+    )
     ledger = [
         name
-        for name in tree.splitlines()
-        if any(
+        for name in tree.split("\0")
+        if name
+        and any(
             PurePosixPath(name).full_match(g, case_sensitive=True)
             for g in checker.LEDGER_FILE_GLOBS
         )
@@ -458,7 +520,7 @@ def _read_vault(ctx: Context) -> VaultRead:
 
     paths = [root / p for p in report.DEFAULT_SOURCES]
     sources = report.read_sources(paths, root, explicit=True)
-    census = report.census(sources)
+    census = _clipped_census(report, sources, ctx.through)
     # The checker's anti-narrowing floors, reused: a dropped, emptied or unscanned ledger file, then
     # the row-count floor. The archive is no git top level, so the checker globs it from disk.
     structural = report.default_corpus_errors(root, census.per_source)
@@ -469,6 +531,30 @@ def _read_vault(ctx: Context) -> VaultRead:
             f"{census.rows} ledger rows read, below the floor of {report.MIN_TOTAL_ITEMS}"
         )
     return VaultRead(sha=sha, root=root, census=census, report=report)
+
+
+def _clipped_census(report: ModuleType, sources: Any, through: dt.date) -> Any:
+    """The vault's census, with every date after ``through`` counted under :data:`AFTER_THROUGH`.
+
+    The census buckets by ISO week alone, so a past ``--through`` would otherwise count the rest of
+    its own week. Its ``Census.count`` resolves the module-level ``iso_week`` at call time, which
+    is wrapped for the one call and restored after.
+    """
+    original = getattr(report, "iso_week", None)
+    if not callable(original):
+        raise CollectError("the vault census has no iso_week to clip at --through")
+
+    def clipped(date: str | None) -> str | None:
+        week: str | None = original(date)
+        if week is not None and date is not None and dt.date.fromisoformat(date) > through:
+            return AFTER_THROUGH
+        return week
+
+    setattr(report, "iso_week", clipped)  # noqa: B010 - a vault module, typed only as ModuleType
+    try:
+        return report.census(sources)
+    finally:
+        setattr(report, "iso_week", original)  # noqa: B010
 
 
 # --------------------------------------------------------------------------------------------------
@@ -516,6 +602,8 @@ def c_backlog_burn(ctx: Context, m: Metric) -> None:
         "rows_total": c.rows,
         "undated": dict(c.undated),
         "series_is": "closed minus filed, per week",
+        "clipped_at": ctx.through.isoformat(),
+        "after_through": dict(c.weeks.get(AFTER_THROUGH, {})),
     }
 
 
@@ -539,12 +627,10 @@ def list_per_week(
     """
     out: list[dict[str, Any]] = []
     for lo, hi in week_ranges(ctx):
-        rows = gh_json(ctx, [*args, *qualifier(lo, hi), "--limit", str(PR_LIST_LIMIT)])
-        if not isinstance(rows, list):
-            raise CollectError(f"gh {' '.join(args[:4])} returned {type(rows).__name__}")
-        if len(rows) >= PR_LIST_LIMIT:
-            raise CollectError(f"gh {' '.join(args[:4])} week of {lo}: hit the limit; truncated")
-        out += rows
+        try:
+            out += gh_list(ctx, [*args, *qualifier(lo, hi)])
+        except CollectError as exc:
+            raise CollectError(f"week of {lo}: {exc}") from None
     return out
 
 
@@ -576,54 +662,34 @@ def c_prs_merged(ctx: Context, m: Metric) -> None:
     m.detail = {"value_week": week, "per_repo": per_repo}
 
 
+def _parse_stamp(stamp: Any) -> dt.datetime:
+    return dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+
+
 def c_flow_health(ctx: Context, m: Metric) -> None:
-    rows = gh_json(
-        ctx,
-        [
-            "pr",
-            "list",
-            "-R",
-            ENGINE_REPO,
-            "--state",
-            "open",
-            "--limit",
-            str(PR_LIST_LIMIT),
-            "--json",
-            "number,createdAt",
-        ],
+    rows = gh_list(
+        ctx, ["pr", "list", "-R", ENGINE_REPO, "--state", "open", "--json", "number,createdAt"]
     )
-    if not isinstance(rows, list):
-        raise CollectError(f"gh pr list returned {type(rows).__name__}")
-    if len(rows) >= PR_LIST_LIMIT:
-        raise CollectError("open PR count hit the list limit; truncated")
     # Open PRs are today's set, so their ages are measured from now, never from --through: a past
     # --through would give a PR opened after it a negative age.
     now = dt.datetime.now(dt.UTC)
-    ages = [
-        (
-            now - dt.datetime.fromisoformat(str(r["createdAt"]).replace("Z", "+00:00"))
-        ).total_seconds()
-        / 86400
-        for r in rows
-    ]
+    ages = [(now - _parse_stamp(r["createdAt"])).total_seconds() / 86400 for r in rows]
     oldest = round(max(ages), 1) if ages else None
+    detail: dict[str, Any] = {"open_prs": len(rows), "oldest_open_days": oldest}
 
-    merged = merged_prs(ctx, ENGINE_REPO)
-    hours = [
-        (
-            dt.datetime.fromisoformat(str(r["mergedAt"]).replace("Z", "+00:00"))
-            - dt.datetime.fromisoformat(str(r["createdAt"]).replace("Z", "+00:00"))
-        ).total_seconds()
-        / 3600
-        for r in merged
-        if r.get("mergedAt") and r.get("createdAt")
-    ]
-    detail: dict[str, Any] = {
-        "open_prs": len(rows),
-        "oldest_open_days": oldest,
-        "median_open_to_merge_hours": round(statistics.median(hours), 1) if hours else None,
-        "merged_prs_measured": len(hours),
-    }
+    # The merged-PR read feeds only the time-to-merge fields, so its failure nulls those alone.
+    try:
+        hours = [
+            (_parse_stamp(r["mergedAt"]) - _parse_stamp(r["createdAt"])).total_seconds() / 3600
+            for r in merged_prs(ctx, ENGINE_REPO)
+            if r.get("mergedAt") and r.get("createdAt")
+        ]
+        detail["median_open_to_merge_hours"] = round(statistics.median(hours), 1) if hours else None
+        detail["merged_prs_measured"] = len(hours)
+    except (CollectError, ValueError, TypeError) as exc:
+        detail["median_open_to_merge_hours"] = None
+        detail["merged_prs_measured"] = None
+        add_partial(detail, f"merged PRs: {type(exc).__name__}: {exc}")
 
     stalled: int | None = None
     try:
@@ -648,10 +714,13 @@ def c_flow_health(ctx: Context, m: Metric) -> None:
         AttributeError,
         TypeError,
         ImportError,
+        # The checker's own runner calls subprocess.run with a timeout, so a hung `gh` surfaces
+        # as TimeoutExpired, which is none of the above.
+        subprocess.SubprocessError,
     ) as exc:
         # An optional part: the status is capped at warn and the run exits 3, never a quiet null.
         detail["green_but_unmergeable"] = None
-        detail["partial_error"] = f"stall count: {type(exc).__name__}: {exc}"
+        add_partial(detail, f"stall count: {type(exc).__name__}: {exc}")
     detail["state_as_of"] = "run time; --through does not apply to open PRs"
     m.value = len(rows)
     m.status = status_flow(oldest, stalled)
@@ -670,43 +739,41 @@ def c_ci_main(ctx: Context, m: Metric) -> None:
             "main",
             "--workflow",
             "ci.yml",
+            # Pushes only: a scheduled run on main tests the same commit again and would weigh a
+            # quiet week toward whatever the nightly legs did.
+            "--event",
+            "push",
             "--json",
             "conclusion,createdAt",
         ],
         lambda lo, hi: ["--created", f"{lo.isoformat()}..{hi.isoformat()}"],
     )
-    red = gh_json(
-        ctx,
-        [
-            "pr",
-            "list",
-            "-R",
-            ENGINE_REPO,
-            "--state",
-            "open",
-            "--label",
-            "ci-red",
-            "--limit",
-            str(PR_LIST_LIMIT),
-            "--json",
-            "number",
-        ],
-    )
-    if not isinstance(red, list):
-        raise CollectError(f"gh pr list (ci-red) returned {type(red).__name__}")
+    # The ci-red label is today's state. A past --through window is not judged by it: the count
+    # is left unread, so it can never pass for a historical one.
+    current = ctx.through >= ctx.today
+    red: list[dict[str, Any]] | None = None
+    if current:
+        red = gh_list(
+            ctx,
+            ["pr", "list", "-R", ENGINE_REPO, "--state", "open", "--label", "ci-red"]
+            + ["--json", "number"],
+        )
     labels = ctx.labels
     series = ci_pass_series(runs, labels)
     week = last_full_week(ctx.through, labels, ctx.today)
     m.value = series_value(series, week)
-    m.status = status_ci(m.value, len(red))
+    m.status = status_ci(m.value, len(red) if red is not None else 0)
     m.series = series
     m.detail = {
-        "workflow_file": "ci.yml (the workflow named CI)",
+        "workflow_file": "ci.yml (the workflow named CI), push events on main only",
         "value_week": week,
         "runs_read": len(runs),
         "counted": "success passes; failure, timed_out, startup_failure, action_required fail; "
         "cancelled, skipped and in-progress runs are not counted",
-        "open_ci_red_prs": len(red),
+        "open_ci_red_prs": len(red) if red is not None else None,
+        "open_ci_red_prs_as_of": "run time"
+        if current
+        else "not read: --through is in the past and the label count is current state only",
     }
     if m.value is None:
         m.error = f"no finished pass/fail run of main in {week}"
@@ -734,18 +801,43 @@ def c_asvs(ctx: Context, m: Metric) -> None:
     counts = parse_asvs_cells(cells)
     applicable = counts["total"] - counts.get("na", 0)
     pass_pct = round(100.0 * counts.get("pass", 0) / applicable, 1) if applicable else None
+    provenance = [ln for ln in lines if ln.startswith("#")]
+    engine_ref = asvs_engine_ref(provenance)
     m.value = pass_pct
     m.status = status_pct(pass_pct, "asvs")
     m.detail = {
         "counts": counts,
         "value_means": "pass cells over cells not marked na",
-        "provenance": [ln for ln in lines if ln.startswith("#")],
+        "provenance": provenance,
+        "scorecard_sha": v.sha,
+        "engine_ref": engine_ref,
         "scorecard_ref": f"vault origin/main {v.sha} (archived, so the tool prints NO-GIT)",
         "tool": "scripts/asvs/scorecard.py from this engine checkout, whose ref the provenance "
         "line names",
         "history": "none: --status reads one ref and keeps no history",
         "state_as_of": "run time; --through does not apply",
     }
+    if engine_ref is None:
+        # A score is quoted only beside its ref pair; without the engine half it cannot be.
+        add_partial(m.detail, "scorecard provenance printed no engine= ref")
+
+
+_ENGINE_REF = re.compile(r"\bengine=(\S+)")
+
+
+def asvs_engine_ref(provenance: Sequence[str]) -> str | None:
+    """The ``engine=<ref>`` the scorecard tool's provenance header names, or ``None``."""
+    for line in provenance:
+        found = _ENGINE_REF.search(line)
+        if found:
+            return found.group(1)
+    return None
+
+
+def asvs_ref_pair(detail: dict[str, Any]) -> str:
+    """``scorecard=<vault sha> engine=<ref>``, ``unknown`` for a half not recorded."""
+    sha = detail.get("scorecard_sha") or "unknown"
+    return f"scorecard=vault-origin-main@{sha} engine={detail.get('engine_ref') or 'unknown'}"
 
 
 def parse_asvs_cells(line: str) -> dict[str, int]:
@@ -804,6 +896,9 @@ def _vuln_kpis(ctx: Context) -> dict[str, Any]:
                 ENGINE_REPO,
                 "--workflow",
                 "vuln-metrics.yml",
+                # main only: a run on a PR branch measures that branch's lockfile, not main's.
+                "--branch",
+                "main",
                 "--status",
                 "success",
                 "--limit",
@@ -862,11 +957,13 @@ def c_release_distance(ctx: Context, m: Metric) -> None:
         version = str(info["info"]["version"])
     except (ValueError, KeyError, TypeError) as exc:
         raise CollectError(f"unreadable PyPI JSON: {type(exc).__name__}: {exc}") from None
+    uploaded_error: str | None = None
     try:
         # `urls` lists the latest version's files; the deprecated `releases` map is not needed.
         uploaded = min((str(f["upload_time_iso_8601"]) for f in info["urls"]), default=None)
-    except (KeyError, TypeError):
+    except (KeyError, TypeError) as exc:
         uploaded = None
+        uploaded_error = f"PyPI upload time unreadable: {type(exc).__name__}: {exc}"
     # Release tags are `v<version>` (webconsole-v* tag the other distribution; rescue/auto/* are
     # backup tags and are never consulted, since the tag is named from the PyPI version).
     tag = f"v{version}"
@@ -892,6 +989,8 @@ def c_release_distance(ctx: Context, m: Metric) -> None:
         "tag_commit": sha,
         "state_as_of": "run time; --through does not apply",
     }
+    if uploaded_error:
+        add_partial(m.detail, uploaded_error)
 
 
 @dataclass(frozen=True)
@@ -1010,8 +1109,12 @@ def snapshot(
 # --------------------------------------------------------------------------------------------------
 
 
-def refuse_reason(out: Path, run: Runner = run_cmd) -> str | None:
-    """Why ``out`` may not be written, or ``None``. Fails CLOSED when git cannot answer."""
+def refuse_reason(out: Path, run: Runner = run_probe) -> str | None:
+    """Why ``out`` may not be written, or ``None``. Fails CLOSED when git cannot answer.
+
+    git runs under :func:`probe_env`, so no ``GIT_*`` variable in the caller's environment can
+    steer the answer.
+    """
     parent = out.resolve().parent
     if not parent.is_dir():
         return f"{parent} is not an existing directory"
@@ -1030,6 +1133,25 @@ def refuse_reason(out: Path, run: Runner = run_cmd) -> str | None:
     return (
         f"{parent} is inside a git repository (rev-parse said {answer!r}); the snapshot is private"
     )
+
+
+def write_json_atomic(out: Path, payload: Any) -> None:
+    """Write ``payload`` as JSON through a sibling temporary file, so a reader never sees half."""
+    tmp_out = out.with_name(out.name + ".tmp")
+    tmp_out.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    tmp_out.replace(out)
+
+
+def remove_tree(path: Path) -> None:
+    """Remove a temporary tree; each path that will not go is warned about on stderr, not raised."""
+
+    def warn(func: Callable[..., Any], target: str, exc: BaseException) -> None:
+        print(
+            f"WARNING: could not remove temporary {target}: {type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+
+    shutil.rmtree(path, onexc=warn)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1069,19 +1191,20 @@ def main(argv: list[str] | None = None) -> int:
     if through > today:
         print(f"ERROR: --through {through} is after today ({today}, UTC)", file=sys.stderr)
         return 1
-    # Cleanup errors are ignored (a scanner holding a downloaded file), and the snapshot is written
-    # inside the block, so a cleanup failure can never discard a finished run.
-    with tempfile.TemporaryDirectory(prefix="mf-metrics-", ignore_cleanup_errors=True) as tmp:
-        ctx = Context(vault=args.vault, through=through, weeks=args.weeks, workdir=Path(tmp))
+    tmp = Path(tempfile.mkdtemp(prefix="mf-metrics-"))
+    try:
+        ctx = Context(vault=args.vault, through=through, weeks=args.weeks, workdir=tmp)
         metrics = collect(ctx)
-        snap = snapshot(ctx, metrics)
-        tmp_out = out.with_name(out.name + ".tmp")
-        tmp_out.write_text(json.dumps(snap, indent=2) + "\n", encoding="utf-8")
-        tmp_out.replace(out)
+        write_json_atomic(out, snapshot(ctx, metrics))
+    finally:
+        # A cleanup failure (a scanner holding a downloaded file) never discards a finished run.
+        remove_tree(tmp)
     for m in metrics:
-        print(
-            f"{m.id}: value={m.value} status={m.status}" + (f" error={m.error}" if m.error else "")
-        )
+        line = f"{m.id}: value={m.value} status={m.status}"
+        if m.id == "asvs" and m.detail:
+            # An ASVS number is quoted only beside the ref pair it was measured at.
+            line += f" {asvs_ref_pair(m.detail)}"
+        print(line + (f" error={m.error}" if m.error else ""))
     # 3 when anything could not be read, after the snapshot is written: an outage goes red.
     return 3 if any(m.error or m.detail.get("partial_error") for m in metrics) else 0
 
