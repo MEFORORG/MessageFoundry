@@ -587,3 +587,39 @@ def test_offline_env_without_project_root_reads_the_dir_named_in_the_working_dir
     (cwd / "messagefoundry.toml").unlink()
     rc = main(["validate", "--config", str(cfg), "--env", "prod", "--json"])
     assert rc == 1 and "peer_host" in capsys.readouterr().out
+
+
+def test_offline_env_reads_the_base_dir_serve_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # serve reads the value file under [environments].base_dir when no --project-root is given. A
+    # stale value file in the working directory must not stand in for it.
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    deploy = tmp_path / "deploy"
+    _values_file(deploy, "prod", 'other = "x"\n')
+    cwd = tmp_path / "cwd"
+    _values_file(cwd, "prod", f'peer_host = "{_SECRET_HOST}"\n')
+    (cwd / "messagefoundry.toml").write_text(
+        f"[environments]\nbase_dir = {str(deploy)!r}\n", encoding="utf-8"
+    )
+    monkeypatch.chdir(cwd)
+    rc = main(["validate", "--config", str(cfg), "--env", "prod", "--json"])
+    assert rc == 1 and "peer_host" in capsys.readouterr().out
+    # --project-root overrides base_dir, as serve applies it.
+    rc = main(["validate", "--project-root", str(cwd), "--config", str(cfg), "--env", "prod"])
+    assert rc == 0, capsys.readouterr()
+
+
+def test_offline_env_refuses_a_malformed_service_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # serve refuses settings that do not parse; the offline commands must not guess a value folder.
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    cwd = tmp_path / "cwd"
+    _values_file(cwd, "prod", f'peer_host = "{_SECRET_HOST}"\n')
+    (cwd / "messagefoundry.toml").write_text("[environments\n", encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    rc = main(["validate", "--config", str(cfg), "--env", "prod", "--json"])
+    captured = capsys.readouterr()
+    assert rc == 1, captured
+    assert _SECRET_HOST not in captured.out + captured.err

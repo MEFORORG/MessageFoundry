@@ -1432,9 +1432,10 @@ def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str | None = None
         default=None,
         help=env_help
         or "active environment NAME. The command resolves every env() reference of each deployed "
-        "connection and lookup against that environment's values. It reads them with serve's "
-        "reader: the value file <env>.toml in the [environments].dir folder under --project-root "
-        "(default: the working directory), plus MEFOR_VALUE_* variables. A reference that does not "
+        "connection and lookup against that environment's values. It finds and reads them as serve "
+        "does: the value file <env>.toml in the [environments].dir folder under --project-root, "
+        "else [environments].base_dir (default: the working directory), plus overrides such as "
+        "MEFOR_VALUE_* variables. A reference that does not "
         "resolve fails the command, which names its key. A resolved value is never printed. Under "
         "--project-root, a graph that references env() also fails when that file is missing. No "
         "connector is built: the build and posture checks are left to check --env.",
@@ -1509,39 +1510,37 @@ def _offline_env_values(
     """The ``env()`` values ``validate``/``graph``/``dryrun`` resolve against, or ``None`` with no
     ``--env`` (vault BACKLOG #5554, ADR 0050 §3).
 
-    Read by :func:`_read_environment_values`, serve's own reader: the value file under the explicit
-    ``--project-root``, else under the working directory, serve's default root, plus the
-    ``MEFOR_VALUE_*`` variables. A value file that is absent reads as no values, as serve's read
-    does, so each reference it would have supplied is reported missing; a note on stderr names the
-    file looked for. Raises :class:`~messagefoundry.config.wiring.WiringError` for a value file
-    that cannot be read, naming the file and never a value, and for a ``--service-config`` that is
-    no file, which serve refuses too. The callers never print a resolved value."""
-    from messagefoundry.config.anchor import resolve_project_root
-    from messagefoundry.config.environments import values_file_path
+    The value file is located as serve locates it: the service settings load serve runs, with
+    ``--project-root`` as the ``[environments].base_dir`` override serve applies, so the file's or
+    the environment's ``base_dir`` and ``dir`` apply too. ``service_config`` is the file
+    :func:`_resolve_offline_anchor` chose. The values are read by :func:`_read_environment_values`,
+    serve's own reader, so the ``MEFOR_VALUE_*`` overrides apply. A value file that is absent
+    reads as no values, as serve's read does, so each reference it would have supplied is reported
+    missing; a note on stderr names the file looked for. Raises
+    :class:`~messagefoundry.config.wiring.WiringError` for settings that do not load, which serve
+    refuses too, and for a value file that cannot be read, naming the file and never a value. The
+    callers never print a resolved value."""
+    from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
     from messagefoundry.config.wiring import WiringError
 
     if args.env is None:
         return None
-    # exists(), as serve's load_settings tests it. Without this the dir name below would fall back
-    # to the default and read a value file serve never would.
-    if service_config is not None and not Path(service_config).exists():
-        raise WiringError(f"service config not found: {service_config}")
-    cwd = Path.cwd()
-    base_dir = resolve_project_root(args.project_root, cwd=cwd) or cwd
-    # With no root and no settings file named, serve reads ./messagefoundry.toml when it exists. Under
-    # a root the file is the one _resolve_offline_anchor chose, so this names the directory its
-    # value-file check named.
-    named = service_config
-    if named is None and args.project_root is None:
-        named = "messagefoundry.toml"
-    dir_name = _env_dir_name(named)
+    cli: dict[str, dict[str, object]] = {}
+    if args.project_root is not None:
+        cli["environments"] = {"base_dir": args.project_root}  # as serve applies the flag
+    # Rendered, never stringified: see _load_service_settings.
+    settings, detail = _load_service_settings(service_config, cli=cli)
+    if settings is None:
+        raise WiringError(detail or "could not load the service settings")
+    base_dir = resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd())
+    dir_name = settings.environments.dir
     values = _read_environment_values(base_dir=base_dir, dir_name=dir_name, environment=args.env)
     # The read above refused a path values_file_path refuses, so this call does not raise.
     env_file = values_file_path(base_dir, dir_name, args.env)
     if not env_file.is_file():
         print(
-            f"note: no value file at {env_file} for --env {args.env!r}; only MEFOR_VALUE_* "
-            "variables supply env() values",
+            f"note: no value file at {env_file} for --env {args.env!r}; env() values come only "
+            "from overrides such as MEFOR_VALUE_* variables",
             file=sys.stderr,
         )
     return values

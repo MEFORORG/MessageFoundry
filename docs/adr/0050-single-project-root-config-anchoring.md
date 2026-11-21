@@ -283,8 +283,8 @@ given** — which is exactly AC-6.
   → `tests/test_cli_offline_resolution.py::test_offline_does_not_inherit_serve_posture_refusal`
   → `tests/test_cli_offline_resolution.py::test_offline_env_resolves_the_named_environment_under_project_root`
   → `tests/test_cli_offline_resolution.py::test_offline_env_without_project_root_reads_the_working_directory`
-  *For `validate`/`graph`/`dryrun`, see the 2026-11-20 note under
-  [Amendment A](#amendment-a-check---env-matches-serve-2026-11-09), which names where their value
+  *Partly met for `validate`/`graph`/`dryrun`: the 2026-11-20 note under
+  [Amendment A](#amendment-a-check---env-matches-serve-2026-11-09) names where their value
   resolution still differs from `serve`'s.*
 - **AC-7** — THE SYSTEM SHALL honor an explicit **absolute** `--config`/`--service-config`/`--db`/
   `[store].path` as-is even when a project root is set, AND SHALL resolve a **relative**
@@ -459,20 +459,19 @@ those settings, and its Handlers still run with no active environment.
   2026-11-19 under the owner's delegation after an adversarial review; the question and the
   owner's answer are in that record, not here. It chose to build value resolution into the three
   commands, and not to refuse `--env` without `--project-root`. Given `--env`, `validate`, `graph`
-  and `dryrun` now read the named environment's values with `serve`'s own reader, so the
-  `MEFOR_VALUE_*` variables apply. A value file that cannot be read, or a `--service-config` that
-  names no file, fails the command, naming the file and no value. They resolve every `env()`
+  and `dryrun` now find the named environment's value file through the service settings load
+  `serve` runs, with `--project-root` as the `[environments].base_dir` override `serve` applies.
+  They read it with `serve`'s own reader, so overrides such as `MEFOR_VALUE_*` apply. Settings
+  that do not load, or a value file that cannot be read, fail the command, naming the file and no
+  value. They resolve every `env()`
   reference of each deployed connection and lookup, and report one that does not resolve by its
   key, never its value. `validate` lists it with its other problems; `graph` and `dryrun` exit
   with it as an error. A reference set is left out, as `serve` and `check` leave an unresolved
   one to its sync. Without `--env` nothing changes. Where they still differ from `serve`, at least:
 
-  - The value file sits under `--project-root`, else under the working directory. A
-    `[environments].base_dir` set in the settings file or the environment is not read; `serve`
-    reads it.
-  - Under `--project-root` with no `--service-config`, the `[environments].dir` name comes from
-    `<root>/messagefoundry.toml` where one exists, else the default, as the value-file check
-    above reads it, where `serve` reads `./messagefoundry.toml`.
+  - Under `--project-root` with no `--service-config`, the settings file is
+    `<root>/messagefoundry.toml` where one exists, as the value-file check above reads it, where
+    `serve` reads `./messagefoundry.toml`.
   - No connector is built, so a refusal only the build check makes, such as an egress or hop
     refusal, is still `check --env`'s, as is the posture check.
   - `dryrun`'s Handlers still run with no active environment.

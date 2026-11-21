@@ -753,7 +753,8 @@ def test_a_missing_service_config_is_named_before_the_value_file_check(
     rc, legs = _cli_check(capsys, *argv, *typo)
     assert rc == 1, legs
     assert "service config not found" in str(legs["posture"]["detail"]), legs["posture"]
-    # Control: validate reads no settings, so the value-file check still answers for it.
+    # Control: validate's value-file check runs before its settings load, so it still answers
+    # for it (vault BACKLOG #5554 added that load, which runs only after the check passes).
     assert main(["validate", *argv, *typo]) == 2
     assert "no value file" in capsys.readouterr().err
 
