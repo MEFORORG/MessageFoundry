@@ -5493,8 +5493,18 @@ def _salvage_late_borrow(pool: Any, backend: str, borrow: asyncio.Future[Any]) -
     task.add_done_callback(_LATE_RELEASES.discard)
 
 
-#: Strong references to in-flight :func:`_salvage_late_borrow` releases (see the comment there).
+#: Strong references to in-flight releases nobody awaits: :func:`_salvage_late_borrow`'s (see the
+#: comment there) and the stuck warm-up releases :func:`_drain_and_release` abandons.
 _LATE_RELEASES: set[asyncio.Future[None]] = set()
+
+
+def _discard_late_release(release: asyncio.Future[None]) -> None:
+    """Drop an abandoned release's strong reference once it ends, retrieving its outcome so the loop
+    never logs "exception was never retrieved" for it. :func:`_release_one` already absorbs an
+    ordinary release error, so what is left here is at most the cancellation."""
+    _LATE_RELEASES.discard(release)
+    if not release.cancelled():
+        release.exception()
 
 
 async def acquire_pooled(
@@ -5646,21 +5656,24 @@ async def _drain_and_release(
     await asyncio.gather(*tasks, return_exceptions=True)
     if not held:
         return
+    #
+    # ``asyncio.wait`` rather than ``wait_for``, and no await on the cancelled releases afterwards
+    # (BACKLOG #5687): both of those wait for a cancelled release to FINISH, so a driver release that
+    # ignored the cancel would hang right through the bound. An abandoned release is cancelled and
+    # parked in ``_LATE_RELEASES``, whose done-callback retrieves its outcome whenever it ends.
     releases = [asyncio.ensure_future(_release_one(pool, conn, backend)) for conn in held]
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(*releases, return_exceptions=True), _CLEANUP_TIMEOUT_SECONDS
-        )
-    except TimeoutError:
+    _done, stuck = await asyncio.wait(releases, timeout=_CLEANUP_TIMEOUT_SECONDS)
+    if stuck:
         log.warning(
             "%s: pool warm-up release did not finish within %gs; abandoning the stuck release(s) "
             "(a bounded partial strand the pool discards)",
             backend,
             _CLEANUP_TIMEOUT_SECONDS,
         )
-        for release in releases:
+        for release in stuck:
             release.cancel()
-        await asyncio.gather(*releases, return_exceptions=True)
+            _LATE_RELEASES.add(release)
+            release.add_done_callback(_discard_late_release)
 
 
 async def _release_one(pool: Any, conn: Any, backend: str) -> None:

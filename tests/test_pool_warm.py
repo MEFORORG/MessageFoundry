@@ -280,6 +280,37 @@ async def test_warm_cancelled_in_the_turn_the_acquire_resolves_strands_nothing()
     assert pool.checked_out == [], "a connection the pool handed over was stranded"
 
 
+async def test_warm_release_that_ignores_cancellation_cannot_hang_the_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5687: past _CLEANUP_TIMEOUT_SECONDS the stuck releases are cancelled, and a release
+    # that swallows the cancel must not hold the warm-up open anyway.
+    monkeypatch.setattr("messagefoundry.store.base._CLEANUP_TIMEOUT_SECONDS", 0.05)
+    unstick = asyncio.Event()
+
+    class _DeafReleasePool(StubPool):
+        async def release(self, conn: str) -> None:
+            self.release_attempts += 1
+            while not unstick.is_set():
+                try:
+                    await unstick.wait()
+                except asyncio.CancelledError:
+                    continue  # a driver that ignores the cancel
+
+    pool = _DeafReleasePool()
+    task = asyncio.create_task(warm_pool_connections(pool, target=2, timeout=5.0, backend="stub"))
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=2.0)
+        assert task in done, "the warm-up cleanup hung on a release that ignored its cancel"
+        assert task.result() == 2
+    finally:
+        unstick.set()  # let the abandoned releases end so the loop closes clean
+        await _settle()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
 # --- warm_pool_target: headroom sizing --------------------------------------
 
 
