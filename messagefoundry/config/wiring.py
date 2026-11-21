@@ -7194,6 +7194,25 @@ class Registry:
         for name, ref in self.references.items():
             yield "reference set", name, ref.source.settings, True
 
+    def env_resolution_problems(self, values: Mapping[str, Any]) -> list[str]:
+        """One message per deployed settings carrier whose ``env()`` references do not resolve
+        against ``values``, by :func:`resolve_env_settings`, which names keys and settings and never
+        a value. A ``deployed=False`` connection is skipped, as the engine never builds one.
+
+        For the offline ``validate``, ``graph`` and ``dryrun`` given ``--env`` (vault BACKLOG #5554).
+        It is not the build check: no connector is constructed, so a problem only a build finds,
+        such as an egress refusal, is still ``check --env``'s."""
+        problems: list[str] = []
+        for kind, name, settings, deployed in self.settings_carriers():
+            if not deployed:
+                continue
+            connection = name if kind in (_INBOUND_ENCODING_KIND, "outbound connection") else None
+            try:
+                resolve_env_settings(settings, values, connection=connection)
+            except WiringError as exc:
+                problems.append(f"{kind} {name!r}: {exc}")
+        return problems
+
     def encoding_problems(self) -> list[str]:
         """Human-readable messages for declared ``encoding`` values naming no usable text codec.
 
@@ -12331,7 +12350,12 @@ def _exec_module(path: Path, helpers: _HelperImporter) -> None:
     raise withheld from cause
 
 
-def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list[Diagnostic]:
+def validate_config(
+    directory: str | Path,
+    *,
+    allow_empty: bool = False,
+    env_values: Mapping[str, Any] | None = None,
+) -> list[Diagnostic]:
     """Load ``directory`` best-effort and return **all** problems (not just the first).
 
     Unlike :func:`load_config`, a bad module is recorded and loading continues, and every
@@ -12341,6 +12365,9 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
     ``allow_empty`` suppresses the empty-graph rule, for ``messagefoundry check
     --allow-empty-config`` (BACKLOG #1648). The rules themselves live in
     :meth:`Registry.graph_problems`, shared with :meth:`Registry.validate`.
+
+    ``env_values``, when given, also reports each ``env()`` reference that does not resolve against
+    them (:meth:`Registry.env_resolution_problems`), for ``validate --env`` (vault BACKLOG #5554).
     """
     directory = Path(directory)
     try:
@@ -12465,4 +12492,8 @@ def validate_config(directory: str | Path, *, allow_empty: bool = False) -> list
     # `checks._check_validate` filters it out, leaving its own `load_config` to raise unhandled.
     problems = registry.graph_problems(allow_empty=allow_empty or declaring_source_failed)
     diagnostics.extend(Diagnostic(message=m) for m in problems)
+    if env_values is not None:
+        diagnostics.extend(
+            Diagnostic(message=m) for m in registry.env_resolution_problems(env_values)
+        )
     return diagnostics

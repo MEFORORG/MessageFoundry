@@ -6,7 +6,8 @@ suppresses its messagefoundry.toml upward-walk when --service-config / --project
 WITHOUT adopting serve's required-active-env / explicit-posture refusal. ADR 0050 Amendment A makes
 one exception: `check --env`'s settings checks read the name as `serve --env` does
 (tests/test_checks_gate_parity.py covers it through run_checks; the vault BACKLOG #5554 tests at the
-end of this file pin it from the command line, and pin what --env does on the other three).
+end of this file pin it from the command line, and pin that --env on the other three resolves
+the named environment's env() values).
 """
 
 from __future__ import annotations
@@ -372,37 +373,171 @@ def _rendered_help(command: str, monkeypatch: pytest.MonkeyPatch) -> str:
 
 
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
-def test_offline_env_help_says_the_flag_loads_no_values(
+def test_offline_env_help_says_the_flag_resolves_values(
     command: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # validate, graph and dryrun read --env only for the value-file check under --project-root.
-    # Their help said it selected the file's values, which a site could take as an environment
-    # check; it must name what it does and point at check --env, which reads the values.
+    # validate, graph and dryrun resolve env() against the --env value file (vault BACKLOG #5554).
+    # The help must say so, name the working-directory default, say no value is printed, and leave
+    # the posture checks to check --env.
     rendered = _rendered_help(command, monkeypatch)
     # argparse breaks help on hyphens; a reader copying the flag must not get "--project-".
     assert "--project-\n" not in rendered
     text = " ".join(rendered.split())
-    assert "selects environments/<env>.toml values" not in text
-    assert "It selects no values: at least" in text and "left to check --env" in text
-    assert "without --project-root it does nothing" in text
+    assert "It selects no values" not in text
+    assert "resolves every env() reference" in text
+    assert "default: the working directory" in text
+    assert "never printed" in text and "left to check --env" in text
     # Control: check's own help still says it reads the name as serve does.
     assert "read as serve --env reads it" in " ".join(_rendered_help("check", monkeypatch).split())
 
 
-def test_validate_env_resolves_no_value_where_check_env_does(
+_MSG = (
+    "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
+    "EVN|A01|20260101\rPID|1||100^^^H^MR||DOE^JANE\r"
+)
+
+#: A value no command may print: a resolved value is never shown (vault BACKLOG #5554).
+_SECRET_HOST = "10.77.66.55"
+
+
+def _offline_argv(command: str, tmp_path: Path, *extra: str) -> list[str]:
+    argv = [command, *extra, "--json"]
+    if command == "dryrun":
+        msg = tmp_path / "adt.hl7"
+        msg.write_text(_MSG, encoding="utf-8")
+        argv += ["--messages", str(msg)]
+    return argv
+
+
+def _values_file(base: Path, env_name: str, body: str) -> None:
+    (base / "environments").mkdir(parents=True, exist_ok=True)
+    (base / "environments" / f"{env_name}.toml").write_text(body, encoding="utf-8")
+
+
+@pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
+def test_offline_env_resolves_the_named_environment_under_project_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    # A value file that lacks a key the graph references: serve would refuse to build OB_T, so the
+    # offline command must fail on that environment too, naming the key, not exit 0.
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    _values_file(tmp_path, "dev", 'other = "x"\n')
+    _values_file(tmp_path, "prod", f'peer_host = "{_SECRET_HOST}"\n')
+    _empty_cwd(tmp_path, monkeypatch)
+    anchor = ["--project-root", str(tmp_path), "--config", str(cfg)]
+    rc = main(_offline_argv(command, tmp_path, *anchor, "--env", "dev"))
+    captured = capsys.readouterr()
+    assert rc != 0, captured
+    assert "peer_host" in captured.out + captured.err
+    # The environment that has the key passes, and its value is never printed.
+    rc = main(_offline_argv(command, tmp_path, *anchor, "--env", "prod"))
+    captured = capsys.readouterr()
+    assert rc == 0, captured
+    assert _SECRET_HOST not in captured.out + captured.err
+    # Control: with no --env no values are loaded, so the command behaves as before.
+    rc = main(_offline_argv(command, tmp_path, *anchor))
+    captured = capsys.readouterr()
+    assert rc == 0, captured
+
+
+@pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
+def test_offline_env_without_project_root_reads_the_working_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    # serve's default root is the working directory, so --env alone resolves against
+    # ./environments/<env>.toml there; it no longer does nothing (vault BACKLOG #5554).
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    cwd = tmp_path / "cwd"
+    _values_file(cwd, "dev", 'other = "x"\n')
+    _values_file(cwd, "prod", f'peer_host = "{_SECRET_HOST}"\n')
+    monkeypatch.chdir(cwd)
+    rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), "--env", "dev"))
+    captured = capsys.readouterr()
+    assert rc != 0, captured
+    assert "peer_host" in captured.out + captured.err
+    rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), "--env", "prod"))
+    captured = capsys.readouterr()
+    assert rc == 0, captured
+    assert _SECRET_HOST not in captured.out + captured.err
+    # A name with no value file in the working directory resolves nothing, as serve's silent-empty
+    # read does, so the referenced key is reported missing.
+    rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), "--env", "qa"))
+    captured = capsys.readouterr()
+    assert rc != 0 and "peer_host" in captured.out + captured.err, captured
+
+
+def test_offline_env_reads_mefor_value_variables(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # The behaviour the validate help now states: a value file that lacks a key the graph references
-    # passes validate --env, and fails check --env's build check, which resolves the values. This
-    # pins today's code, which ADR 0050's 2026-11-14 note records as short of AC-6. If value
-    # resolution is built into validate, this assertion changes with it, by design.
+    # serve's reader overlays MEFOR_VALUE_* on the value file; the offline commands use that reader.
     cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
-    (tmp_path / "environments").mkdir()
-    (tmp_path / "environments" / "dev.toml").write_text('other = "x"\n', encoding="utf-8")
-    _empty_cwd(tmp_path, monkeypatch)
-    argv = ["--project-root", str(tmp_path), "--config", str(cfg), "--env", "dev"]
-    assert main(["validate", *argv, "--json"]) == 0, capsys.readouterr()
-    capsys.readouterr()
-    rc, legs = _cli_check(capsys, *argv)
-    assert rc == 1 and not legs["build-check"]["ok"], legs["build-check"]
-    assert "peer_host" in str(legs["build-check"]["detail"])
+    cwd = tmp_path / "cwd"
+    _values_file(cwd, "dev", 'other = "x"\n')
+    monkeypatch.chdir(cwd)
+    monkeypatch.setenv("MEFOR_VALUE_PEER_HOST", _SECRET_HOST)
+    rc = main(["validate", "--config", str(cfg), "--env", "dev", "--json"])
+    captured = capsys.readouterr()
+    assert rc == 0, captured
+    assert _SECRET_HOST not in captured.out + captured.err
+
+
+def test_offline_env_skips_a_not_deployed_connection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The engine never builds a deployed=False connection, so its env() references are not resolved
+    # there; the offline commands must not fail an environment on one either.
+    body = _ENV_GRAPH.replace(
+        'outbound("OB_T", MLLP(host=env("peer_host"), port=6000))',
+        'outbound("OB_T", MLLP(host="10.0.0.1", port=6000))\n'
+        '    outbound("OB_OFF", MLLP(host=env("off_host"), port=6001), deployed=False)',
+    )
+    assert "OB_OFF" in body
+    cfg = _config_dir(tmp_path, body=body)
+    cwd = tmp_path / "cwd"
+    _values_file(cwd, "dev", 'other = "x"\n')
+    monkeypatch.chdir(cwd)
+    rc = main(["validate", "--config", str(cfg), "--env", "dev", "--json"])
+    assert rc == 0, capsys.readouterr()
+
+
+@pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
+def test_offline_env_reports_a_malformed_value_file_without_its_content(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    cwd = tmp_path / "cwd"
+    _values_file(cwd, "dev", f'peer_host = "{_SECRET_HOST}\n')
+    monkeypatch.chdir(cwd)
+    rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), "--env", "dev"))
+    captured = capsys.readouterr()
+    assert rc != 0, captured
+    assert "dev.toml" in captured.out + captured.err, captured
+    assert _SECRET_HOST not in captured.out + captured.err, captured
+
+
+def test_offline_env_without_project_root_reads_the_dir_named_in_the_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # With no root and no --service-config, serve reads ./messagefoundry.toml, so its
+    # [environments].dir names the folder the value file is read from.
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    cwd = tmp_path / "cwd"
+    (cwd / "envs").mkdir(parents=True)
+    (cwd / "envs" / "prod.toml").write_text(f'peer_host = "{_SECRET_HOST}"\n', encoding="utf-8")
+    (cwd / "messagefoundry.toml").write_text('[environments]\ndir = "envs"\n', encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    rc = main(["validate", "--config", str(cfg), "--env", "prod", "--json"])
+    assert rc == 0, capsys.readouterr()
+    # Control: without the settings file, the default environments/ holds no value file.
+    (cwd / "messagefoundry.toml").unlink()
+    rc = main(["validate", "--config", str(cfg), "--env", "prod", "--json"])
+    assert rc == 1 and "peer_host" in capsys.readouterr().out

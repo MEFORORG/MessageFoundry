@@ -185,15 +185,18 @@ def test_env_refs_with_present_file_does_not_fail(
     assert capsys.readouterr().out.strip() == "[]"
 
 
-def test_env_refs_missing_file_without_root_does_not_fail(
+def test_env_refs_missing_file_without_root_is_not_the_missing_file_failure(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # env()-referencing graph + --env but NO --project-root -> the silent-empty default is preserved
-    # (the fail-loud is scoped to an EXPLICIT root). No hard failure.
+    # (the fail-loud is scoped to an EXPLICIT root). No missing-file hard failure (exit 2). The
+    # empty values then leave peer_host unresolved, which validate --env reports as serve would
+    # refuse to build the connection on it (vault BACKLOG #5554).
     cfg = _config_dir(tmp_path, _ENV_GRAPH)
     rc = main(["validate", "--config", str(cfg), "--env", "prod", "--json"])
-    assert rc == 0
-    assert capsys.readouterr().out.strip() == "[]"
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "missing: peer_host" in out and "no value file" not in out
 
 
 # --- precedence: relative --config resolves under the root ---------------------------------------

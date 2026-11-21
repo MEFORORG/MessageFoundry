@@ -1413,8 +1413,9 @@ def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str | None = None
     ``validate``/``graph``/``dryrun``/``check`` carried only ``--config`` before, so the commit/CI gate
     could resolve a DIFFERENT environment view than ``serve`` (review C3). These flags let the gate
     anchor the same bundle root, WITHOUT adopting serve's required-active-env / explicit-posture
-    refusal (AC-6). On ``validate``/``graph``/``dryrun``, ``--env`` feeds only the value-file check in
-    :func:`_resolve_offline_anchor`, as the default help says (vault BACKLOG #5554). ``check`` is the
+    refusal (AC-6). On ``validate``/``graph``/``dryrun``, ``--env`` feeds the value-file check in
+    :func:`_resolve_offline_anchor` and the ``env()`` resolution of :func:`_offline_env_values`, as
+    the default help says (vault BACKLOG #5554). ``check`` is the
     exception, by ADR 0050's amended AC-6: its settings legs read it as ``serve --env`` does (vault
     BACKLOG #2355). ``env_help`` replaces the ``--env`` help for it.
     """
@@ -1430,10 +1431,13 @@ def _add_anchor_flags(p: argparse.ArgumentParser, *, env_help: str | None = None
         "--env",
         default=None,
         help=env_help
-        or "active environment NAME. Here it feeds ADR 0050's value-file check under --project-root, "
-        "which can fail the command when that environment's value file is missing, and without "
-        "--project-root it does nothing. It selects no values: at least loading env() values, "
-        "resolving env() references and the posture check are left to check --env.",
+        or "active environment NAME. The command resolves every env() reference of a deployed "
+        "connection, lookup and reference set against that environment's value file, "
+        "environments/<env>.toml under --project-root (default: the working directory), plus "
+        "MEFOR_VALUE_* variables, as serve reads them, and fails on a reference that does not "
+        "resolve, naming its key; a resolved value is never printed. Under --project-root it also "
+        "fails when the graph references env() and that file is missing. It builds no connector: "
+        "the build and posture checks are left to check --env.",
     )
     p.add_argument(
         "--service-config",
@@ -1497,6 +1501,57 @@ def _resolve_offline_anchor(
         if rc is not None:
             return rc
     return config_dir, service_config
+
+
+def _offline_env_values(
+    args: argparse.Namespace, service_config: str | None
+) -> dict[str, Any] | None:
+    """The ``env()`` values ``validate``/``graph``/``dryrun`` resolve against, or ``None`` with no
+    ``--env`` (vault BACKLOG #5554, ADR 0050 §3).
+
+    Read by :func:`_read_environment_values`, serve's own reader: the value file under the explicit
+    ``--project-root``, else under the working directory, serve's default root, plus the
+    ``MEFOR_VALUE_*`` variables. A value file that is absent reads as no values, as serve's read
+    does, so each reference it would have supplied is reported missing. Raises
+    :class:`~messagefoundry.config.wiring.WiringError` for a value file that cannot be read, naming
+    the file and never a value. The callers never print a resolved value."""
+    from messagefoundry.config.anchor import resolve_project_root
+
+    if args.env is None:
+        return None
+    cwd = Path.cwd()
+    base_dir = resolve_project_root(args.project_root, cwd=cwd) or cwd
+    # With no root and no settings file named, serve reads ./messagefoundry.toml when it exists. Under
+    # a root the file is the one _resolve_offline_anchor chose, so this names the directory its
+    # value-file check named.
+    named = service_config
+    if named is None and args.project_root is None:
+        named = "messagefoundry.toml"
+    dir_name = _env_dir_name(named)
+    return _read_environment_values(base_dir=base_dir, dir_name=dir_name, environment=args.env)
+
+
+def _offline_env_refusal(
+    args: argparse.Namespace, service_config: str | None, registry: Registry
+) -> int | None:
+    """``graph`` and ``dryrun`` given ``--env``: the exit code, already reported, when the value
+    file cannot be read or an ``env()`` reference does not resolve against the named environment,
+    else ``None``. The values are only resolved, never shown (vault BACKLOG #5554)."""
+    from messagefoundry.config.wiring import WiringError
+
+    try:
+        env_values = _offline_env_values(args, service_config)
+    except WiringError as exc:
+        return _emit_error(str(exc), as_json=args.json)
+    if env_values is None:
+        return None
+    problems = registry.env_resolution_problems(env_values)
+    if problems:
+        return _emit_error(
+            f"env() does not resolve for --env {args.env!r}: " + "; ".join(problems),
+            as_json=args.json,
+        )
+    return None
 
 
 def _env_dir_name(service_config: str | None) -> str:
@@ -5962,13 +6017,20 @@ def _fleet_connection_key_file_refusal(
 
 
 def _validate(args: argparse.Namespace) -> int:
-    from messagefoundry.config.wiring import validate_config
+    from messagefoundry.config.wiring import Diagnostic, WiringError, validate_config
 
     resolved = _resolve_offline_anchor(args)
     if isinstance(resolved, int):
         return resolved
-    config_dir, _ = resolved
-    diags = validate_config(config_dir)
+    config_dir, service_config = resolved
+    unreadable: list[Diagnostic] = []
+    try:
+        env_values = _offline_env_values(args, service_config)
+    except WiringError as exc:
+        # Reported beside the other problems; the graph is still validated, with no values.
+        unreadable.append(Diagnostic(message=str(exc)))
+        env_values = None
+    diags = [*unreadable, *validate_config(config_dir, env_values=env_values)]
     if args.json:
         print(
             json.dumps(
@@ -5990,7 +6052,7 @@ def _graph(args: argparse.Namespace) -> int:
     resolved = _resolve_offline_anchor(args)
     if isinstance(resolved, int):
         return resolved
-    config_dir, _ = resolved
+    config_dir, service_config = resolved
     try:
         # allow_empty: `graph` REPORTS a graph, it does not gate one (BACKLOG #1648), and its edges
         # come from Routers and Handlers, which a connection-less config still has. Refusing here
@@ -5998,6 +6060,9 @@ def _graph(args: argparse.Namespace) -> int:
         reg = load_config(config_dir, allow_empty=True)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
+    refused = _offline_env_refusal(args, service_config, reg)
+    if refused is not None:
+        return refused
     # Edges come from the one authoritative static extractor (ADR 0091 D1): AST-first with the
     # legacy string-constant scan as a fallback tier, provenance-tagged, plus reverse adjacency.
     # v1 fields ("handlers"/"sends" name lists, per-element file/line) are preserved unchanged;
@@ -6154,6 +6219,9 @@ def _dryrun(args: argparse.Namespace) -> int:
         reg = load_config(config_dir)
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
+    refused = _offline_env_refusal(args, service_config, reg)
+    if refused is not None:
+        return refused
     try:
         messages = read_messages(args.messages, cap=fixture_cap(reg))
     except (FileNotFoundError, ValueError) as exc:
