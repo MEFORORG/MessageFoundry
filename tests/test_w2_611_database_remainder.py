@@ -51,6 +51,10 @@ async def rig() -> AsyncIterator[_Rig]:
     finally:
         r.release.set()  # never leave a worker parked if an arm failed early
         executor.shutdown(wait=True)
+        for pool in r.pools:  # each connector's pool executor, which few arms close themselves
+            pool_executor = database._tracked(database._POOL_EXECUTORS, pool)
+            if pool_executor is not None:
+                pool_executor.shutdown(wait=True)
 
 
 _RECORD = {"code": 1, "value": "x"}
@@ -133,6 +137,38 @@ async def test_a_reference_sync_whose_cursor_is_refused_is_classified_and_discar
         await _load_database_source(settings, EgressSettings(deny_by_default=False))
     assert not isinstance(caught.value, NegativeAckError), caught.value
     assert _discarded(rig), rig.log
+
+
+async def test_the_login_role_probe_discards_a_connection_that_cannot_make_a_cursor(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """Red before: an HY000 there is no class 08 failure, so the handle went back to the pool, for
+    the first lookup to fail on."""
+    _aioodbc_serving(
+        monkeypatch, rig, pool_type=_WakingPool, raw_type=_BusyCursorRefused, blocks=never
+    )
+    pool = await database._make_pool("DSN=x", 1, autocommit=False, login_timeout=5)
+    reading = await database.probe_login_roles(pool, label="db_lookup:x", acquire_timeout=5.0)
+    assert reading.verdict is database.LoginRoleVerdict.NOT_RUN
+    assert _discarded(rig), rig.log
+
+
+class _NoQueryTimeout(_BusyCursorRefused):
+    state = "HYC00"
+
+
+async def test_a_static_cursor_refusal_keeps_its_connection(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """The control: a driver refusing the query timeout refuses every cursor on every connection,
+    so a discard would only add a login per poll. It is still the named configuration fault."""
+    _aioodbc_serving(
+        monkeypatch, rig, pool_type=_WakingPool, raw_type=_NoQueryTimeout, blocks=never
+    )
+    with pytest.raises(NegativeAckError) as caught:
+        await _source()._select()
+    assert caught.value.config_fault and "statement_timeout" in str(caught.value)
+    assert rig.pools[0].free == [rig.conn] and not rig.conn.closed
 
 
 # --- BACKLOG #5748 -------------------------------------------------------------------------------
@@ -257,6 +293,58 @@ async def test_a_borrower_cancelled_during_the_timeout_write_returns_it_only_onc
     rig.release.set()
     assert await wait_until(lambda: rig.pools[0].free == [rig.conn]), rig.log
     assert "execute:start" not in rig.log
+
+
+class _TimeoutWriteLosesLink(_RecordsTimeoutThread):
+    """The held write then fails with a communication-link failure."""
+
+    @property
+    def timeout(self) -> int:
+        return 0
+
+    @timeout.setter
+    def timeout(self, value: int) -> None:
+        if value:
+            self.note("timeout:start")
+            self.hold()
+            raise _DriverError("08S01", "[08S01] communication link failure")
+
+
+async def test_a_timeout_write_that_fails_after_its_borrower_left_discards_the_connection(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """The borrower is cancelled during the write, which then loses its link: the dead handle is
+    discarded once the write ends, not returned open."""
+    _aioodbc_serving(
+        monkeypatch, rig, pool_type=_WakingPool, raw_type=_TimeoutWriteLosesLink, blocks=never
+    )
+    task = await cancel_once_started(rig.started, _destination().send('{"a": 1}'))
+    done, _pending = await asyncio.wait({task}, timeout=WAIT)
+    assert done and task.cancelled(), task
+    assert rig.pools[0].free == [] and not rig.conn.closed
+    rig.release.set()
+    assert await wait_until(lambda: _discarded(rig)), rig.log
+    assert await wait_until(lambda: database._holds_back(rig.pools[0]) == 0)
+
+
+async def test_acquire_timeout_bounds_a_hung_timeout_write(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """The write sits inside the borrow, so the borrow's bound covers it: a hung write fails the
+    borrow transiently, and the connection goes back once the write returns."""
+    monkeypatch.setattr(_RecordsTimeoutThread, "writes", [], raising=False)
+    _aioodbc_serving(
+        monkeypatch, rig, raw_type=_RecordsTimeoutThread, blocks=never, block_autocommit=True
+    )
+    dest = _destination()
+    dest._acquire_timeout = 0.2
+    with pytest.raises(DeliveryError) as caught:
+        await asyncio.wait_for(dest.send('{"a": 1}'), WAIT)
+    assert not isinstance(caught.value, NegativeAckError)
+    assert "statement_timeout write timed out" in str(caught.value)
+    assert rig.pools[0].free == []
+    rig.release.set()
+    assert await wait_until(lambda: rig.pools[0].free == [rig.conn]), rig.log
 
 
 async def test_the_cursor_close_and_autocommit_set_run_on_the_pools_executor(

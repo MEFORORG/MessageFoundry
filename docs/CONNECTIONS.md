@@ -4815,9 +4815,10 @@ Facts that are easy to get wrong, stated plainly first:
   state from that write is the connection's failure instead: the borrow fails transiently and
   the connection is discarded. The transient states are every state the connector retries:
   SQLSTATE class `08`, class `40`, `HYT00` and `HYT01`. A driver that takes it on the
-  connection but refuses the ODBC query timeout on a cursor refuses every cursor; a send, the
-  connection test, a poll, a mark and a lookup read `HYC00` or `HY092` there as the same
-  configuration fault, naming `statement_timeout`. Such a connection needs `0`. Both
+  connection but refuses the ODBC query timeout on a cursor refuses every cursor; a send and the
+  connection test read `HYC00` or `HY092` there as the same configuration fault, while a poll,
+  mark or lookup reports it as an ordinary failure whose error names `statement_timeout`. Such a
+  connection needs `0`. Both
   refusals are readings of pyodbc's documentation and source, not measurements. A `DatabaseRef` reference sync
   takes `statement_timeout` too, 30 s unset, by the SQL Server preset's rule (*A `DatabaseRef`
   statement passes the same gate, and a row ceiling*). The connector also exposes `connect_timeout` (default 15 s, a
