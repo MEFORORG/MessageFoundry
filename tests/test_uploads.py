@@ -116,7 +116,7 @@ async def test_missing_file_ids_are_not_found(tmp_path: Path) -> None:
 async def test_delete_removes_both_sidecars(tmp_path: Path) -> None:
     store = _store(tmp_path, key=True)
     meta = await store.save(data=_ADT.encode(), filename="x.hl7", uploader="op", uploader_id="u-op")
-    deleted = await store.delete(meta.file_id)
+    deleted = (await store.delete(meta.file_id)).meta
     assert deleted.file_id == meta.file_id
     assert not (tmp_path / "uploads" / f"{meta.file_id}.blob").exists()
     assert not (tmp_path / "uploads" / f"{meta.file_id}.meta").exists()

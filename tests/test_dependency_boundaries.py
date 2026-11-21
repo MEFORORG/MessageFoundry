@@ -847,6 +847,15 @@ def test_the_file_lock_leaf_imports_only_the_standard_library() -> None:
     assert sorted(m for m in modules if m.split(".")[0] not in sys.stdlib_module_names) == []
 
 
+def test_the_path_reach_leaf_imports_only_the_standard_library() -> None:
+    # BACKLOG #5388 added item 3: config/ and the uploads store share its absent-or-unreachable
+    # answer, so an engine import here would reach both.
+    path = _ENGINE_ROOT / "path_reach.py"
+    modules = _imported_modules(path, path.parent)
+    assert "typing" in modules, "control: the walk did not read the module's imports"
+    assert sorted(m for m in modules if m.split(".")[0] not in sys.stdlib_module_names) == []
+
+
 def test_the_leaf_check_fires_on_a_root_import_and_a_third_party_one(tmp_path: Path) -> None:
     planted = tmp_path / "messagefoundry" / "leaf.py"
     planted.parent.mkdir()
