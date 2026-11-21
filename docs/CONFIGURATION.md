@@ -172,7 +172,7 @@ backend-limited.
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `backend` | enum | `sqlite` | `sqlite` · `postgres` · `sqlserver` · (later `mysql`/`oracle`) — all three implemented; see the [capability matrix](#per-backend-capability-matrix) |
-| `path` | str | `./messagefoundry.db` | The SQLite store file. A server backend opens no file here, but the engine keeps at least the API TLS pair it generates, when it generates one, in the directory that holds this path. A relative value is anchored as the `[environments].base_dir` row says. For a SQLite store, at least these values are refused, by their spelling, when the settings load (BACKLOG #5926): one whose last part is empty, `.` or `..`, such as an empty path, `data/` or `..`, which names a directory; and on Windows, one whose last part ends in a dot or a space, and one with a colon anywhere except right after the drive letter of a fully-qualified path, such as the drive-relative `C:mf.db` or the file stream `mf.db:x`. The refusal does not test the disk, so a plain name such as `data` that is an existing directory is not refused. SQLite's `:memory:` is accepted. |
+| `path` | str | `./messagefoundry.db` | The SQLite store file. A server backend opens no file here, but the engine keeps at least the API TLS pair it generates, when it generates one, in the parent directory of this path once it is anchored and resolved. Resolving follows a symlink, so for a symlinked store file that is the target's directory, and for `:memory:` it is the process working directory, not the root. A relative value is anchored as the `[environments].base_dir` row says. For a SQLite store, at least these values are refused, by their spelling, when the settings load (BACKLOG #5926): one whose last part is empty, `.` or `..`, such as an empty path, `data/` or `..`, which names a directory; and on Windows, one whose last part ends in a dot or a space, and one with a colon anywhere except right after the drive letter of a fully-qualified path, such as the drive-relative `C:mf.db` or the file stream `mf.db:x`. The refusal does not test the disk, so a plain name such as `data` that is an existing directory is not refused. SQLite's `:memory:` is accepted. |
 | `synchronous` | enum | `normal` | SQLite: `normal`/`full` |
 | `secure_delete` | bool | `true` | **SQLite only** (vault BACKLOG #2619). Sets `PRAGMA secure_delete` on the writer connection, so SQLite overwrites a deleted row or a purged body with zeros. With it off, a retention purge or a consumed queue row leaves the old bytes in the file's free space, readable by anyone holding the file and, for a sealed body, the key. The cost is extra write I/O for each page a delete frees: measured on one Windows machine, a 6 KB insert-then-delete went from about 0.15 ms to about 0.20 ms in a bare SQLite loop. Pages freed before it was on keep their bytes until a `VACUUM`. Off on a file-backed store is a loosening that `security_loosenings()` names; see [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). Ignored by the server-DB backends. |
 | `group_commit_window_ms` | float (ms) | `0.0` | **SQLite only** ([ADR 0055](adr/0055-group-commit-durable-write.md)). When `> 0` a dedicated committer coroutine **coalesces** the grouped stage-handoff mutations (`enqueue_ingress`, `route_handoff`, `transform_handoff`, `mark_done`, `complete_with_response`, `dead_letter_now`, `mark_failed`) into **one** durable commit, amortizing the per-commit fsync (a large win under `synchronous = full`, muted under the default `normal`). A member waits up to this window for siblings to join before the batch commits; the claim / reference-snapshot / audit writes stay **standalone** (never grouped — the hash chain must not batch). `0` (the default) = **off**, byte-identical to the inline-commit path. Ignored by the server-DB backends, which coalesce through their connection pool instead. |
@@ -1710,14 +1710,17 @@ an address, so `[0:0:0:0:0:0:0:1]` names `::1`; a name compares without regard t
 looser matches: an IPv4-mapped IPv6 address does not name its IPv4 address, and `127.1` is a name,
 not `127.0.0.1`. The lists named here refuse an entry when the settings load, naming the list and
 the entry's position (BACKLOG #5915), at least when it is unbracketed and holds more than one colon
-(write `::1` as `[::1]`), when its brackets hold anything but an IPv6 literal, when a colon has no
-port after it, when its port is not a number from 1 to 65535, when it carries a `%` zone id, when it
-is a URL or holds a `/` or `@`, or when its host holds anything but letters, combining marks,
-digits, `.`, `-` and `_`, such as a `*` pattern. A blank entry in a TOML list is refused the same
-way. The comma-separated environment form of the `[egress]` lists drops blank items instead, as it
-always has, so a variable holding only commas or spaces leaves its list unset. A host being checked
-that carries a `%` zone id matches no entry either, so while its list is set a zoned IPv6
-destination is refused whatever the entries say. The host being checked must name an IPv6 literal
+(write `::1` as `[::1]`, except in `allowed_db`, which refuses an IPv6 entry in any form), when
+its brackets hold anything but an IPv6 literal, when a colon has no port after it, when its port is
+not a number from 1 to 65535 written in ASCII digits, when it carries a `%` zone id, when it is a
+URL or holds a `/` or `@`, or when its host holds anything but letters, combining marks, numbers
+(the Unicode categories L, M and N), `.`, `-` and `_`, such as a `*` pattern. A blank entry in a
+TOML list is refused the same way. The comma-separated environment form of the `[egress]` lists
+drops blank items instead, as it always has, and counts an entry's position after dropping them.
+So a variable holding only commas or spaces sets its list empty, in place of any list the file
+sets, and an empty list is read as an unset one. A host being checked
+that carries a `%` zone id matches no entry, so while its list is set a zoned IPv6 destination is
+refused whatever the entries say. The host being checked must name an IPv6 literal
 bare, as `::1`, at least in a connection's `host` setting and in `[logging].forward_host`: a
 bracketed `[::1]` there matches no entry. A URL brackets its IPv6 host, and that is read correctly.
 
@@ -1726,9 +1729,10 @@ check as text, such as an uncast `env()` value supplied by a `MEFOR_VALUE_*` var
 string in `<env>.toml`, matches the entry for the port it names: `06661` matches `host:6661`
 (BACKLOG #5915). An `http://` or `https://` URL that names no port is matched at the port the
 connector dials for it, 80 or 443, so `host:443` admits `https://host/`. At least a `proxy_url` is
-not read that way: with no port it matches only an entry that names no port. `Sftp()` and `Ftp()`
-write their default port, 22 or 21, into the settings, and an `Email()` or `Direct()` connection
-with no `port` is checked as port 587, so those compare like a pinned port. `allowed_db` reads its
+not read that way: with no port it matches only an entry that names no port. At least `Sftp()`,
+`Ftp()` and `DICOM()` write their default port, 22, 21 or 104, into the settings, and an `Email()`
+or `Direct()` connection with no `port` is checked as port 587, so those compare like a pinned
+port. `allowed_db` reads its
 entries this way, but refuses an IPv6 entry at load, never lists a `server` holding a colon, and
 compares the port the connection string sends, not the `port` setting alone
 ([CONNECTIONS.md](CONNECTIONS.md#the-port-an-allowed_db-entry-binds)).
