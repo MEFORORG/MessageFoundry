@@ -162,10 +162,6 @@ _RULE = '[[alerts.rules]]\nevent_type = "queue_buildup"\n'
         ("min_oldest_seconds = false\n", "rules[0].min_oldest_seconds"),
         ("[[alerts.rules.escalate]]\nafter_count = false\n", "rules[0].escalate[0].after_count"),
         ("[[alerts.rules.escalate]]\nafter_count = true\n", "rules[0].escalate[0].after_count"),
-        (
-            '[[alerts.rules.schedule.windows]]\ndays = [false]\nstart = "08:00"\nend = "17:00"\n',
-            "rules[0].schedule.windows[0].days",
-        ),
     ],
 )
 def test_a_bool_in_a_nested_alert_rule_refuses_naming_its_path(
@@ -176,6 +172,19 @@ def test_a_bool_in_a_nested_alert_rule_refuses_naming_its_path(
     with pytest.raises(ValidationError) as caught:
         load_settings(config_path=cfg, environ={})
     assert f"{path} {_REFUSAL}" in str(caught.value)
+
+
+def test_a_bool_in_an_alert_schedule_window_refuses_at_its_location(tmp_path: Path) -> None:
+    """``ActiveWindow`` refuses the bool itself, so the message names its own field and the
+    error's location names the rest of the path."""
+    cfg = tmp_path / "messagefoundry.toml"
+    window = '[[alerts.rules.schedule.windows]]\ndays = [false]\nstart = "08:00"\nend = "17:00"\n'
+    cfg.write_text(_RULE + window, encoding="utf-8")
+    with pytest.raises(ValidationError) as caught:
+        load_settings(config_path=cfg, environ={})
+    (err,) = caught.value.errors()
+    assert err["loc"] == ("alerts", "rules", 0, "schedule", "windows", 0, "days")
+    assert f"days {_REFUSAL}" in err["msg"]
 
 
 def test_a_number_and_an_environment_string_still_parse(tmp_path: Path) -> None:
