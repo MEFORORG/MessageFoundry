@@ -201,10 +201,13 @@ nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
    lifespan writes the row as soon as the store opens, before any listener binds. A WARNING is also
    logged at the moment of the renewal, with both fingerprints. A failed audit write cannot undo the
    replacement, so it does not stop the engine; it is logged at ERROR with the whole record. **The
-   row needs that start to reach its store.** A start that fails between the renewal and the store
-   opening, for example on an unreachable database, leaves the WARNING line as the only record,
-   because the next start finds a fresh pair and has nothing to report. A first-run mint replaces
-   nothing and writes no row.
+   row needs that start to reach its store.** A start refused between the renewal and the
+   lifespan writes the row only where `serve`'s pre-lifespan exit hook opens the store: when that
+   start also refused a trust anchor, and the store exists with a current schema (BACKLOG #5391).
+   At least these starts leave the WARNING line as the only record: one that refused no trust
+   anchor, one whose store does not open, for example on an unreachable database, and one whose
+   store is absent or not current. The next start finds a fresh pair and has nothing to report.
+   A first-run mint replaces nothing and writes no row.
 7. **One pair for all engine shards is now DECIDED, not accidental.** `supervise` gives every
    shard the same state directory, which is why they already shared one pair; BACKLOG #1276 called
    that accidentally correct. It is correct because the minted identity is `[api].host` and the
