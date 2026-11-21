@@ -1127,10 +1127,11 @@ def test_public_origin_matching_is_case_insensitive() -> None:
     assert not _origin_matches(_NoPO(), "http://evil", "t")
 
 
-def test_an_unparseable_origin_matches_nothing_on_any_posture() -> None:
-    """Each of these makes ``urlsplit`` raise ValueError, with more than one message. On every
-    posture ``_origin_matches`` answers False for them rather than raising, and the control shows
-    each posture still matches its own origin where it matches any."""
+def test_an_unparseable_origin_matches_nothing_on_public_host_and_proxied_postures() -> None:
+    """Each of these makes ``urlsplit`` raise ValueError, with more than one message. On the
+    public-origin and Host-fallback postures ``_origin_matches`` answers False for them rather
+    than raising, and the control shows each still matches its own origin. The proxied-loopback
+    posture answers False for every Origin, so its rows check only that nothing raises."""
     from messagefoundry_webconsole._auth import _origin_matches
 
     postures = {
