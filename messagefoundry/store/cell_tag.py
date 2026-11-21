@@ -439,24 +439,25 @@ def open_preset_criteria(
     :class:`NonTextCellError`, on a keyed and a keyless store alike (BACKLOG #5523). Both are drift:
     logged here, alerted here on a keyed store only, and audited by the store's read, before the
     caller reads the cell or stamps the preset as used. The store's whole-surface cell walks do not run this check."""
-    if stored is None or stored == "":
-        refused = BlankCellError("search_presets", "criteria", preset_id, None)
-        _alert(cipher, refused)
-        raise refused
-    # open_tagged_cell refuses a non-text cell, and returns None only for a None cell, refused above.
-    opened = cast(
-        str,
-        open_tagged_cell(
-            cipher,
-            stored,
-            preset_criteria_aad(preset_id=preset_id, owner_user_id=owner_user_id),
-            table="search_presets",
-            column="criteria",
-            row_id=preset_id,
-        ),
+    # A blank cell is not opened: a keyed cipher passes it through. open_tagged_cell refuses a
+    # non-text cell, and returns None only for a None cell, which is not opened either.
+    opened = (
+        ""
+        if stored is None or stored == ""
+        else cast(
+            str,
+            open_tagged_cell(
+                cipher,
+                stored,
+                preset_criteria_aad(preset_id=preset_id, owner_user_id=owner_user_id),
+                table="search_presets",
+                column="criteria",
+                row_id=preset_id,
+            ),
+        )
     )
     if opened == "":
-        # A marked cell that opens to "": sealed outside the store, which never writes it.
+        # Blank, or a marked cell that opens to "": either way written outside the store.
         refused = BlankCellError("search_presets", "criteria", preset_id, None)
         _alert(cipher, refused)
         raise refused
