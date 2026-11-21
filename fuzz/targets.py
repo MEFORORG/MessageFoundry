@@ -75,6 +75,7 @@ from messagefoundry.parsing import HL7PeekError, Peek, TreeNode, parse_tree
 from messagefoundry.parsing.binary import MARKER as CARRIAGE_MARKER
 from messagefoundry.parsing.binary import (
     BinaryCarriageError,
+    CollidingDelimitersRefused,
     DocRefError,
     EscapedDocumentError,
     InboundDocRefError,
@@ -261,6 +262,12 @@ SHORT_MSH2_REPRODUCER = (
     b"MSH|^~|A|B|C|D|20260101||ORU^R01|X1|P|2.5\rOBX|1|ED|X||^Application^pdf^Base64^JVBERi0=\r"
 )
 BATCH_HEADER_REPRODUCER = b"FHS|^~\\&|A|B\rOBX|1|ED|X||^Application^pdf^Base64^JVBERi0=\r"
+
+#: An ED document under ``MSH|^~&|``: ``&`` is declared the escape character and filled in as the
+#: subcomponent separator, so the header's filled default collides while its OBX-5 components
+#: still read. The extract refuses it as ``CollidingDelimitersRefused``, the target's expected
+#: rejection on such a header (BACKLOG #5972), so it is a seed rather than a finding.
+COLLIDING_HEADER_SEED = SHORT_MSH2_REPRODUCER.replace(b"MSH|^~|", b"MSH|^~&|", 1)
 
 KNOWN_FINDINGS: tuple[KnownFinding, ...] = ()
 
@@ -623,9 +630,13 @@ def _binary_carriage(data: bytes) -> None:
       document-detach scan, whose refusals are ``EscapedDocumentError``, for a handle a sender
       wrote into ``OBX-5.5`` ``InboundDocRefError``, for a value the splice would not set back
       verbatim ``NonVerbatimDocumentError`` (BACKLOG #5099) -- and ``extract_obx_document`` on
-      every OBX, whose refusal is ``BinaryCarriageError`` for an OBX that is not a Base64 ED
-      document. A body the parser accepts always has readable delimiters (BACKLOG #5972), so a
-      ``ValueError`` out of either is a defect, not a refusal.
+      every OBX, whose refusals are ``BinaryCarriageError`` for an OBX that is not a Base64 ED
+      document and, for an ED OBX under a short MSH-2 whose filled default is already another of
+      its delimiters, ``CollidingDelimitersRefused`` (BACKLOG #5972), which is not a
+      ``BinaryCarriageError`` and is accepted only on such a header. The detach scan's refusal of
+      such a header, ``CollidingDelimitersError``, is a ``NonVerbatimDocumentError``. A body the
+      parser accepts always has readable delimiters, so any other ``ValueError`` out of either is
+      a defect, not a refusal.
 
     There is no carve-out.
     """
@@ -650,8 +661,19 @@ def _strip_and_scan_hl7(text: str) -> None:
     with contextlib.suppress(EscapedDocumentError, InboundDocRefError, NonVerbatimDocumentError):
         list(iter_obx_documents(message, received=text))
     for occurrence in range(1, message.count_segments("OBX") + 1):
-        with contextlib.suppress(BinaryCarriageError):
+        try:
             extract_obx_document(message, occurrence=occurrence)
+        except CollidingDelimitersRefused:
+            # The header's refusal, so the header must be one whose filled default collides; a
+            # refusal of any other body is a defect, not a refusal (BACKLOG #5972). The oracle
+            # is the engine's own verdict, so it catches a guard that over-refuses but not a
+            # regression in that verdict itself.
+            if not message._delimiters_collide():
+                raise AssertionError(
+                    "extract_obx_document refused a header whose delimiters do not collide"
+                ) from None
+        except BinaryCarriageError:
+            pass
 
 
 @dataclass(frozen=True)
@@ -726,13 +748,15 @@ _COMPRESSION_SEEDS = (
 
 #: Binary-carriage seeds: an HL7 message with one OBX-5 ED Base64 document (a PDF header, synthetic),
 #: a bare base64 value, a live document handle with a 64-hex content address, and the two retired
-#: findings' reproducers (:data:`SHORT_MSH2_REPRODUCER`, :data:`BATCH_HEADER_REPRODUCER`).
+#: findings' reproducers (:data:`SHORT_MSH2_REPRODUCER`, :data:`BATCH_HEADER_REPRODUCER`), and a
+#: colliding header's document (:data:`COLLIDING_HEADER_SEED`).
 _BINARY_SEEDS = (
     _MINIMAL_HL7 + b"OBX|1|ED|DOC^Document||^Application^pdf^Base64^JVBERi0xLjQKJQ==\r",
     b"JVBERi0xLjQKJQ==",
     b"mfdoc:v1:ref:" + b"0" * 64 + b":application/pdf",
     SHORT_MSH2_REPRODUCER,
     BATCH_HEADER_REPRODUCER,
+    COLLIDING_HEADER_SEED,
 )
 
 

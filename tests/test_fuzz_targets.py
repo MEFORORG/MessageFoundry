@@ -43,6 +43,7 @@ from fuzz.targets import (
     _X12_ISA_PROPERTIES,
     BATCH_HEADER_REPRODUCER,
     BLANK_SEGMENT_HL7,
+    COLLIDING_HEADER_SEED,
     DEFAULT_MAX_LEN,
     KNOWN_FINDINGS,
     SHORT_MSH2_REPRODUCER,
@@ -674,6 +675,34 @@ def test_the_binary_carriage_target_has_no_carve_out_left_on_a_retired_reproduce
             patch.setattr(fuzz_targets, name, planted)
             with pytest.raises(ValueError, match="planted"):
                 TARGETS_BY_NAME["binary_carriage"].run(reproducer)
+
+
+def test_the_binary_carriage_target_accepts_the_collision_refusal_on_a_colliding_header() -> None:
+    """Review finding 1: the extract's refusal of a colliding header was a plain ``ValueError``, so
+    the target reported a crash on every such body. It is ``CollidingDelimitersRefused`` now, an
+    expected rejection on such a header (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import CollidingDelimitersRefused
+
+    assert COLLIDING_HEADER_SEED in TARGETS_BY_NAME["binary_carriage"].seeds
+    message = Message.parse(COLLIDING_HEADER_SEED.decode("ascii"))
+    with pytest.raises(CollidingDelimitersRefused):
+        extract_obx_document(message)
+    TARGETS_BY_NAME["binary_carriage"].run(COLLIDING_HEADER_SEED)
+
+
+def test_the_binary_carriage_target_refuses_a_collision_refusal_of_a_readable_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The negative control: the refusal is accepted only where the header collides, so one
+    planted on a body whose delimiters do not collide fails the target."""
+    from messagefoundry.parsing.binary import CollidingDelimitersRefused
+
+    TARGETS_BY_NAME["binary_carriage"].run(SHORT_MSH2_REPRODUCER)  # control: runs clean
+    monkeypatch.setattr(
+        fuzz_targets, "extract_obx_document", _boom(CollidingDelimitersRefused("planted"))
+    )
+    with pytest.raises(AssertionError, match="do not collide"):
+        TARGETS_BY_NAME["binary_carriage"].run(SHORT_MSH2_REPRODUCER)
 
 
 def test_write_seed_corpus_materialises_every_seed(tmp_path: Path) -> None:

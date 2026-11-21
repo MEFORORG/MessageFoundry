@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import base64
 import binascii
-import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator
@@ -39,14 +38,13 @@ from messagefoundry.parsing._builtin_hl7 import (
     _HEX_ESCAPED_CONTROLS,
     _SEPARATOR_HEAD,
     HEADER_IDS,
+    CollidingDelimitersRefused,
     _extract_separators,
     _whitespace_end,
     escape_leaf,
     escape_leaf_alters,
     header_line_head,
 )
-
-log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     # Type-only import: keep parsing.message out of this module's *runtime* imports so the dependency
@@ -106,6 +104,7 @@ __all__ = [
     "InboundDocRefError",
     "NonVerbatimDocumentError",
     "CollidingDelimitersError",
+    "CollidingDelimitersRefused",
     "Base64DelimiterError",
     "UnreattachableDocumentError",
     "encode",
@@ -183,10 +182,15 @@ class NonVerbatimDocumentError(ValueError):
 class CollidingDelimitersError(NonVerbatimDocumentError):
     """A received body has a document to detach, and its header names too few encoding
     characters while a default filled in for one is already another of its delimiters, as
-    ``MSH|~|`` does (BACKLOG #5972). ``Message`` refuses every write to such a message, so the
-    detach could not set its handle in, nor delivery set the document back. Refused at the detach,
+    ``MSH|^~&|`` does: ``&`` is declared its escape character and filled in as its subcomponent
+    separator (BACKLOG #5972). ``Message`` refuses every write to such a message, so the detach
+    could not set its handle in, nor delivery set the document back. Refused at the detach,
     before anything is stored and before the ACK. A subclass of :class:`NonVerbatimDocumentError`,
-    so both listeners refuse it the same way. The text names no byte of the body."""
+    so both listeners refuse it the same way. The text names no byte of the body.
+
+    Raised only for a document the detach finds, so only under a header whose OBX-5 components
+    still read: under ``MSH|~|`` or ``MSH^^`` none does, so the detach finds no document and
+    does not raise this."""
 
 
 class Base64DelimiterError(InboundDocRefError):
@@ -313,18 +317,22 @@ def extract_obx_document(message: Message, *, occurrence: int = 1) -> bytes:
     :class:`BinaryCarriageError` if ``OBX-2`` is not ``ED``, the encoding is not ``Base64``, or the
     data is corrupt — so a Handler can dead-letter rather than mis-decode.
 
-    Raises a plain ``ValueError``, not a :class:`BinaryCarriageError`, on a message whose short
+    Raises :class:`CollidingDelimitersRefused`, a ``ValueError`` and not a
+    :class:`BinaryCarriageError`, when that OBX's ``OBX-2`` is ``ED`` and the message's short
     MSH-2 leaves its separators not distinct (BACKLOG #5972): under ``MSH|~|`` no OBX-5
     component reads where it was written, so a Handler that skips a ``BinaryCarriageError``
-    would drop every document of it with no trace, where this error escapes to ``ERROR``."""
+    would drop the document with no trace, where this error escapes to ``ERROR``. ``OBX-2`` is
+    a whole field, split on the field separator before any other, so it reads as written under
+    such a header too. An OBX that is absent or not ``ED`` is refused as it is in any message,
+    with a ``BinaryCarriageError``."""
+    if not _obx_is_ed(message, occurrence):
+        obx2 = message.field("OBX-2", occurrence=occurrence)
+        raise BinaryCarriageError(f"OBX-2 is {obx2!r}, not 'ED' — not an embedded document")
     if message._delimiters_collide():
-        raise ValueError(
+        raise CollidingDelimitersRefused(
             "the message header leaves two of its delimiters one character, so its OBX-5 "
             "components cannot be read as written; refusing rather than report no document"
         )
-    obx2 = message.field("OBX-2", occurrence=occurrence)
-    if (obx2 or "").upper() != "ED":
-        raise BinaryCarriageError(f"OBX-2 is {obx2!r}, not 'ED' — not an embedded document")
     encoding = message.field("OBX-5.4", occurrence=occurrence)
     if (encoding or "").strip().lower() != _ED_ENCODING.lower():
         raise BinaryCarriageError(f"OBX-5 Encoding component is {encoding!r}, not '{_ED_ENCODING}'")
@@ -396,10 +404,8 @@ _DOC_REF_MARKER_CHARS = frozenset(DOC_REF_MARKER)
 #: headers' own may then have escaped the handle. The gate finds each header id with
 #: ``str.find``, one scan per id, and checks the character before it: one regex scan of a large
 #: payload cost some twenty times the marker's own substring test.
+#: The same two characters end the parser's read of a header line.
 _SEGMENT_BREAKS = frozenset("\r\n")
-
-#: A segment break, where the parser's read of a header line ends.
-_LINE_END = re.compile(r"[\r\n]")
 
 #: The re-attach's refusal of a payload whose later header names other delimiters than its
 #: first line, and holds the handle marker as those escape it (BACKLOG #5972).
@@ -505,9 +511,7 @@ def _header_names_marker_char(text: str, start: int) -> bool:
     MSH-2, which only opens the gate wider). The read stops at the end of that line, as the
     parser's does, so no separator is taken from the next line."""
     line = text[start : start + _SEPARATOR_HEAD]
-    end = _LINE_END.search(line)
-    if end is not None:
-        line = line[: end.start()]
+    line = line.split("\r", 1)[0].split("\n", 1)[0]
     if len(line) < 4:
         return False
     return not _DOC_REF_MARKER_CHARS.isdisjoint(_extract_separators(line))
@@ -587,9 +591,14 @@ def _obx_5_5_holds_escape(message: Message, occurrence: int) -> bool:
     )
 
 
+def _obx_is_ed(message: Message, occurrence: int) -> bool:
+    """Whether that OBX's ``OBX-2`` is ``ED``, the claim that it carries an embedded document."""
+    return (message.field("OBX-2", occurrence=occurrence) or "").upper() == "ED"
+
+
 def _is_base64_ed(message: Message, occurrence: int) -> bool:
     """Whether that OBX carries an ED value encoded ``Base64`` (``OBX-2`` and ``OBX-5.4``)."""
-    if (message.field("OBX-2", occurrence=occurrence) or "").upper() != "ED":
+    if not _obx_is_ed(message, occurrence):
         return False
     encoding = message.field("OBX-5.4", occurrence=occurrence) or ""
     return encoding.strip().lower() == _ED_ENCODING.lower()
@@ -765,6 +774,7 @@ def strip_documents(
     pruned_at: float | None = None,
     min_bytes: int = 0,
     content_type: str | None = None,
+    on_unwritable: Callable[[], object] | None = None,
 ) -> tuple[str, int, int]:
     """Strip embedded documents from a stored ``raw`` body in place, returning
     ``(new_raw, documents_stripped, bytes_reclaimed)`` (#47, ADR 0042).
@@ -784,7 +794,12 @@ def strip_documents(
     evicting; ``0`` = strip every embed). ``content_type`` (the connection's declared format) labels a
     bare-mfb64 tombstone; an OBX-5 ED tombstone is labelled from the segment's own ED type component.
     ``bytes_reclaimed`` is the *base64* length removed (the stored, on-disk cost), not the decoded
-    size."""
+    size.
+
+    ``on_unwritable`` is called, with nothing, once for an HL7 body returned unchanged because its
+    short MSH-2 fills a delimiter with one it already uses, so no write to it can be read back
+    (BACKLOG #5972), when one of its OBX segments has ``OBX-2`` ``ED``: the document it claims
+    outlives its strip window, whatever its size against ``min_bytes``."""
     pruned_at = time.time() if pruned_at is None else pruned_at
     if is_document_tombstone(raw):
         return raw, 0, 0  # already stripped — idempotent
@@ -794,7 +809,7 @@ def strip_documents(
         # Only attempt the HL7/OBX path on something that looks like an HL7 message (starts with MSH).
         # A non-HL7 body that merely contains the substring "OBX" is left untouched by the parse guard
         # below (a parse failure / no OBX-5 ED → returned unchanged).
-        return _strip_obx_ed(raw, pruned_at, min_bytes)
+        return _strip_obx_ed(raw, pruned_at, min_bytes, on_unwritable)
     return raw, 0, 0
 
 
@@ -852,10 +867,13 @@ def strip_documents_in_hl7(
     return stripped, reclaimed
 
 
-def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int, int]:
+def _strip_obx_ed(
+    raw: str, pruned_at: float, min_bytes: int, on_unwritable: Callable[[], object] | None
+) -> tuple[str, int, int]:
     """Parse ``raw`` as HL7, strip its OBX-5 ED embeds, and re-encode. Returns the original unchanged on
     a parse failure, on a header ``Message`` refuses every write to (a short MSH-2 whose separators
-    repeat, BACKLOG #5972), or when nothing was stripped (so the caller skips the write)."""
+    repeat, BACKLOG #5972; calling ``on_unwritable`` first where an OBX claims a document), or when
+    nothing was stripped (so the caller skips the write)."""
     # Local import keeps the one-way dependency (message.py imports binary.py, never the reverse) — the
     # cycle is broken by importing inside the function, not at module top.
     from messagefoundry.parsing.message import Message
@@ -865,21 +883,18 @@ def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int,
     except Exception:
         # A malformed body that merely looked like HL7 — never crash a retention pass on it.
         return raw, 0, 0
-    try:
-        stripped, reclaimed = strip_documents_in_hl7(
-            message, pruned_at=pruned_at, min_bytes=min_bytes
-        )
-    except ValueError:
-        if not message._delimiters_collide():
-            raise
-        # The first write refused the body before changing it (BACKLOG #5972). Reported, not
-        # silent: the document it holds now outlives its strip window. The text names the shape
-        # only, never a byte of the body.
-        log.warning(
-            "document strip skipped a body whose short MSH-2 leaves its delimiters not "
-            "distinct, so it cannot be written; its embedded document stays (BACKLOG #5972)"
-        )
+    if message._delimiters_collide():
+        # No write to it can be read back, so no document of it can be tombstoned, and under
+        # some such headers, MSH|~| among them, no OBX-5 component even reads as written. An
+        # OBX whose OBX-2 is ED claims a document: OBX-2 is a whole field, which these headers
+        # do not disturb. That document outlives its strip window, so it is reported, not
+        # silent; the caller holds the row id and logs it, so this pure codec logs nothing.
+        if on_unwritable is not None and any(
+            _obx_is_ed(message, occ) for occ in range(1, message.count_segments("OBX") + 1)
+        ):
+            on_unwritable()
         return raw, 0, 0
+    stripped, reclaimed = strip_documents_in_hl7(message, pruned_at=pruned_at, min_bytes=min_bytes)
     if stripped == 0:
         return raw, 0, 0
     return message.encode(), stripped, reclaimed

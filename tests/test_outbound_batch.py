@@ -637,6 +637,53 @@ async def test_a_member_holding_two_messages_is_dead_lettered_alone(
     assert "more than one MSH segment" in error and "DOE" not in error and "MSG" not in error
 
 
+#: A member whose short MSH-2, ``~``, leaves the parser's default repetition separator the same
+#: character as its declared component one, so its header cannot be written (BACKLOG #5972).
+_COLLIDING = "MSH|~|A|B|C|D|20260101000009||ADT~A01|MSGX|P|2.5.1\rPID|1||900\r"
+
+
+@pytest.mark.parametrize("simulate", [False, True], ids=["live", "shadow"])
+async def test_a_colliding_head_is_dead_lettered_alone_and_the_rest_batch(
+    store: Any, simulate: bool
+) -> None:
+    # The envelope's BHS is written in its head's delimiters, which a colliding head cannot give.
+    # encode_batch refused the whole batch for it, so every member went to the internal-error
+    # arm (BACKLOG #5972, review finding 2). Only the head is refused now; the next member heads.
+    mids = await _enqueue_bodies(store, [_COLLIDING, _msg(2), _msg(3)])
+    rec = await _run_one_batch(store, simulate=simulate)
+    if simulate:
+        assert rec.sent == []
+    else:
+        (envelope,) = rec.sent
+        assert [m.split("|")[9] for m in split_batch(envelope)] == ["MSG2", "MSG3"]
+        assert envelope.startswith("BHS|^~\\&|") and envelope.endswith("BTS|2\r")
+    assert await _states(store, mids) == [DEAD_LETTERED, DELIVERED, DELIVERED]
+    (row,) = await store.outbox_for(mids[0])
+    error = str(row["last_error"])
+    assert "cannot head a batch" in error and "MSGX" not in error and "ADT" not in error
+
+
+async def test_each_colliding_head_in_turn_is_refused_and_a_colliding_member_is_carried(
+    store: Any,
+) -> None:
+    # Two colliding members in front: each would head the envelope in turn, so each is refused.
+    # One behind the member that heads it is carried verbatim, as every member is: only the
+    # head's delimiters are written.
+    mids = await _enqueue_bodies(store, [_COLLIDING, _COLLIDING, _msg(3), _COLLIDING])
+    rec = await _run_one_batch(store, simulate=False)
+    (envelope,) = rec.sent
+    assert envelope.split("\r")[0].split("|")[10] == "MSG3"  # BHS-11, the first kept member
+    assert _COLLIDING in envelope and envelope.endswith("BTS|2\r")
+    assert await _states(store, mids) == [DEAD_LETTERED, DEAD_LETTERED, DELIVERED, DELIVERED]
+
+
+async def test_a_batch_of_colliding_members_only_sends_nothing(store: Any) -> None:
+    mids = await _enqueue_bodies(store, [_COLLIDING, _COLLIDING])
+    rec = await _run_one_batch(store, simulate=False)
+    assert rec.sent == []
+    assert await _states(store, mids) == [DEAD_LETTERED, DEAD_LETTERED]
+
+
 async def test_the_batch_envelope_still_goes_out_through_the_real_send(
     store: Any, monkeypatch: pytest.MonkeyPatch
 ) -> None:

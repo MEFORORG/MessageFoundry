@@ -177,6 +177,7 @@ from messagefoundry.parsing.sniff import (
     b64_head,
     text_sniff_head,
 )
+from messagefoundry.parsing.split import batch_head_collides
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
@@ -353,15 +354,33 @@ the log line reads (BACKLOG #3043)."""
 #: document (vault BACKLOG #2809): :meth:`RegistryRunner._hydrate_payload` raises it.
 _REATTACH_CODE = "reattach"
 
+#: The :class:`NegativeAckError` code of a batch member that would head the envelope and whose
+#: short MSH-2 fills a delimiter with one it already uses, so the BHS cannot be written in its
+#: delimiters (BACKLOG #5972): :func:`_colliding_head_refusal` raises it.
+_COLLIDING_HEAD_CODE = "colliding-head"
+
+
+def _colliding_head_refusal() -> NegativeAckError:
+    """The permanent refusal of a batch member that cannot head the envelope (BACKLOG #5972). Its
+    text names the header's shape only, never a byte of the member."""
+    return NegativeAckError(
+        "its short MSH-2 fills a delimiter with one it already uses, so it cannot head a batch",
+        code=_COLLIDING_HEAD_CODE,
+        permanent=True,
+    )
+
+
 #: The reason a refused batch member's log line gives, by the refusal's code: ``framing`` is
 #: ADR 0205 rule 1, ``multiple-messages`` ADR 0209, ``encoding`` ``encode_wire_body``'s, and
-#: ``reattach`` the batch path's own re-attach refusal, which no frame check raised.
+#: ``reattach`` the batch path's own re-attach refusal, which no frame check raised, and
+#: ``colliding-head`` a would-be head whose delimiters the BHS cannot be written in.
 #: A code not named here, or none, reads as the neutral reason below; the line names the code too.
 _MEMBER_REFUSAL_REASONS: Mapping[str, str] = {
     FRAMING_CODE: "its frame cannot carry it",
     MULTIPLE_MESSAGES_CODE: "it holds more than one message",
     ENCODING_CODE: "its charset cannot encode it",
     _REATTACH_CODE: "its document cannot be re-attached",
+    _COLLIDING_HEAD_CODE: "its header's delimiters cannot head a batch",
 }
 _MEMBER_REFUSAL_REASON_OTHER = "its frame check refused it"
 
@@ -11804,7 +11823,9 @@ class RegistryRunner:
         The one exception (ADR 0205 rule 1): a member whose payload the frame or its charset cannot
         carry, that holds more than one message (ADR 0209), or that itself breaks the re-attach of
         its detached document (vault BACKLOG #2809), is taken out before the envelope is built and
-        dead-lettered alone, and "all N" above means the rest. The envelope's head is then the
+        dead-lettered alone, and "all N" above means the rest. So is a member that would head the
+        envelope and whose short MSH-2 fills a delimiter with one it already uses, since the BHS
+        is written in the head's delimiters (BACKLOG #5972). The envelope's head is then the
         first member that survived.
 
         **Invariants.** Every member is INFLIGHT throughout the window, so a crash recovers the whole set in
@@ -12013,9 +12034,22 @@ class RegistryRunner:
                 current = None
             else:
                 kept, members = hydrated_items, list[Message | str](hydrated)
-            # Assigned only once both loops are done, so a fault in either leaves it empty and its
+            # The envelope's BHS is written in its head's delimiters, so a member whose short
+            # MSH-2 fills a delimiter with one it already uses cannot head it (BACKLOG #5972).
+            # encode_batch would refuse the whole batch for it; each such would-be head is
+            # refused alone instead, and the next member heads. A later member is carried
+            # verbatim, as every member is, so it is not judged.
+            leading = 0
+            while leading < len(kept) and batch_head_collides(members[leading]):
+                leading += 1
+            colliding = [
+                self._refuse_alone_or_raise(it.id, _colliding_head_refusal())
+                for it in kept[:leading]
+            ]
+            kept, members = kept[leading:], members[leading:]
+            # Assigned only once every loop is done, so a fault in one leaves it empty and its
             # arm takes every member. In claim order, so the refusal lines follow the lane's FIFO.
-            by_id = {r[0]: r for r in unhydratable + unframeable}
+            by_id = {r[0]: r for r in unhydratable + unframeable + colliding}
             refused = [by_id[it.id] for it in items if it.id in by_id]
             ids = [it.id for it in kept]
             if kept:

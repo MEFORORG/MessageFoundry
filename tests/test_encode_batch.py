@@ -15,8 +15,9 @@ import tracemalloc
 import pytest
 
 from messagefoundry.parsing import encode_batch, split_batch
-from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.message import COLLIDING_DELIMITERS_WRITE, Message
 from messagefoundry.parsing.peek import normalize
+from messagefoundry.parsing.split import batch_head_collides
 
 M1 = "MSH|^~\\&|A|B|C|D|20260101010101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JOHN\r"
 M2 = "MSH|^~\\&|A|B|C|D|20260101010102||ADT^A02|MSG2|P|2.5.1\rPID|1||200||ROE^JANE\r"
@@ -152,35 +153,52 @@ def _batch_reading(head: str) -> _Reading:
     return bhs[3], bhs[4], bhs[5], bhs[6], bhs[7]
 
 
-@pytest.mark.parametrize(
-    "head",
-    [
-        "  \r\n" + M1,  # leading whitespace, as the parser strips it
-        M1.replace("\r", "\n"),  # LF line endings
-        "MSH|^~\\&#|A|B|C|D|20260101||ADT^A01|MSG1|P|2.7\r",  # MSH-2 with a fifth char (v2.7)
-        "MSH#@~\\&#A#B\r",  # custom delimiters
-        "MSH|^~\\&|A\rOBX|1|TX|||\\.in5\\\r",  # a counted escape under the budget still frames
-        "MSH#@~$&#A\rOBX#1#TX###$.in5$" + "\\.in9999999\\" * 20 + "\r",  # not its escape char
-        "MSH|^~\\&",  # MSH-2 and nothing more
-        "MSH|^~\\ \r",  # a trailing space the parser's strip removes, leaving MSH-2 short
-        "MSH|^~\\\t",
-        "MSH|^~\\ \rPID|1\r",  # the same space kept, as more follows it
-        "MSH\r",
-        "MSH|^~\r",
-        "MSH|^~|A|B\r",
-        "MSH|~|A|B\r",  # a filled default the head already uses, refused as a write
-        "MSH^^A^B\r",
-        "MSH|",
-        "not an HL7 message",
-        "\N{ZERO WIDTH NO-BREAK SPACE}" + M1,  # a byte order mark, which the parser refuses
-        "BHS|^~\\&\rMSH#@~\\&#A#B\r",  # an envelope-led head, parsed as before
-        "BHS|^~\\&\rPID|1\r",
-    ],
-)
+#: Heads a header-only read must judge as a parse does.
+_HEADS = [
+    "  \r\n" + M1,  # leading whitespace, as the parser strips it
+    M1.replace("\r", "\n"),  # LF line endings
+    "MSH|^~\\&#|A|B|C|D|20260101||ADT^A01|MSG1|P|2.7\r",  # MSH-2 with a fifth char (v2.7)
+    "MSH#@~\\&#A#B\r",  # custom delimiters
+    "MSH|^~\\&|A\rOBX|1|TX|||\\.in5\\\r",  # a counted escape under the budget still frames
+    "MSH#@~$&#A\rOBX#1#TX###$.in5$" + "\\.in9999999\\" * 20 + "\r",  # not its escape char
+    "MSH|^~\\&",  # MSH-2 and nothing more
+    "MSH|^~\\ \r",  # a trailing space the parser's strip removes, leaving MSH-2 short
+    "MSH|^~\\\t",
+    "MSH|^~\\ \rPID|1\r",  # the same space kept, as more follows it
+    "MSH\r",
+    "MSH|^~\r",
+    "MSH|^~|A|B\r",
+    "MSH|~|A|B\r",  # a filled default the head already uses, refused as a write
+    "MSH^^A^B\r",
+    "MSH|",
+    "not an HL7 message",
+    "\N{ZERO WIDTH NO-BREAK SPACE}" + M1,  # a byte order mark, which the parser refuses
+    "BHS|^~\\&\rMSH#@~\\&#A#B\r",  # an envelope-led head, parsed as before
+    "BHS|^~\\&\rPID|1\r",
+    "MSH|~\nPID|1\n",  # a colliding head with LF line endings
+    "  \nMSH|^~&|A\r",  # a colliding head after whitespace
+    "BHS|~|A\rMSH|^~\\&|A\r",  # a colliding envelope-led head
+]
+
+
+@pytest.mark.parametrize("head", _HEADS)
 def test_the_head_separators_match_the_parser(head: str) -> None:
     # The contract Message._encoding_chars kept: the separators it reads, or a refusal rather than
     # a guess.
     assert _batch_reading(head) == _parser_reading(head)
+
+
+@pytest.mark.parametrize("head", _HEADS)
+def test_batch_head_collides_is_the_parse_verdict(head: str) -> None:
+    # The delivery stage refuses a head alone on this verdict (BACKLOG #5972), so it must match
+    # what the parse and the write read decide, without parsing the head.
+    try:
+        expected = Message.parse(head)._delimiters_collide()
+    except ValueError:  # HL7PeekError is one: encode_batch still refuses it as a parse does
+        expected = False
+    assert batch_head_collides(head) is expected
+    if expected:
+        assert _batch_reading(head)[1] == COLLIDING_DELIMITERS_WRITE
 
 
 def test_a_message_head_whose_filled_default_collides_is_refused() -> None:

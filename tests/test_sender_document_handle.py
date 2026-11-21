@@ -23,6 +23,7 @@ Synthetic HL7 only.
 from __future__ import annotations
 
 import base64
+import functools
 import hashlib
 from pathlib import Path
 
@@ -904,23 +905,58 @@ def test_the_detach_refuses_a_marker_escaped_under_a_later_header() -> None:
 def test_an_obx_document_under_a_colliding_short_msh2_is_not_reported_absent() -> None:
     """Under ``MSH|~|`` no OBX-5 component reads where it was written, so the extract raised a
     BinaryCarriageError a Handler may skip, and every document was dropped with no trace. It now
-    raises a plain ValueError, which escapes such a skip (BACKLOG #5972)."""
-    from messagefoundry.parsing.binary import BinaryCarriageError, extract_obx_document
+    raises CollidingDelimitersRefused, a ValueError, which escapes such a skip (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import (
+        BinaryCarriageError,
+        CollidingDelimitersRefused,
+        extract_obx_document,
+    )
 
     message = Message.parse(_hl7(_b64(10), msh2="~"))
-    with pytest.raises(ValueError, match="cannot be read as written") as caught:
+    with pytest.raises(CollidingDelimitersRefused, match="cannot be read as written") as caught:
         extract_obx_document(message)
     assert not isinstance(caught.value, BinaryCarriageError)
     assert extract_obx_document(Message.parse(_hl7(_b64(10)))) == b"P" * 10
 
 
+@pytest.mark.parametrize("occurrence", [1, 2], ids=["not-ed", "absent"])
+def test_a_colliding_message_with_no_obx_document_is_refused_as_any_message_is(
+    occurrence: int,
+) -> None:
+    """Review finding 3: the extract refused a colliding message before it read OBX-2, so a
+    message with no OBX document there met the header refusal, where any other message meets
+    the BinaryCarriageError a Handler skips. Only an OBX whose OBX-2 is ED is refused for the
+    header now (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import (
+        BinaryCarriageError,
+        CollidingDelimitersRefused,
+        extract_obx_document,
+    )
+
+    message = Message.parse(_hl7(_b64(10), msh2="~").replace("|ED|", "|TX|", 1))
+    with pytest.raises(BinaryCarriageError, match="not 'ED'") as caught:
+        extract_obx_document(message, occurrence=occurrence)
+    assert not isinstance(caught.value, CollidingDelimitersRefused)
+
+
 def test_the_retention_strip_leaves_a_body_it_cannot_write() -> None:
     """A stored body whose short MSH-2 leaves its separators not distinct cannot be written, so the
-    strip returns it unchanged, as its contract says, rather than raise (BACKLOG #5972)."""
+    strip returns it unchanged, as its contract says, rather than raise, and reports it through
+    ``on_unwritable`` once (BACKLOG #5972)."""
     from messagefoundry.parsing.binary import strip_documents
 
-    body = _hl7(_b64(2000), msh2="^~&")
-    assert strip_documents(body, pruned_at=0.0) == (body, 0, 0)
+    calls: list[str] = []
+    for msh2 in ("^~&", "~"):
+        body = _hl7(_b64(2000), msh2=msh2)
+        assert strip_documents(
+            body, pruned_at=0.0, on_unwritable=functools.partial(calls.append, msh2)
+        ) == (body, 0, 0)
+    assert calls == ["^~&", "~"]
+    # The control: a readable body is stripped and reported as nothing.
+    body = _hl7(_b64(2000))
+    report = functools.partial(calls.append, "readable")
+    assert strip_documents(body, pruned_at=0.0, on_unwritable=report)[1] == 1
+    assert calls == ["^~&", "~"]
 
 
 def test_the_gate_reads_a_header_line_only_to_its_end() -> None:

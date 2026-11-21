@@ -800,7 +800,7 @@ class Message:
         here too, since its BHS writes the head's delimiters, so such a head is refused at frame
         time."""
         if self._delimiters_collide():
-            raise ValueError(COLLIDING_DELIMITERS_WRITE)
+            raise _builtin_hl7.CollidingDelimitersRefused(COLLIDING_DELIMITERS_WRITE)
         return self._encoding_chars()
 
     def _delimiters_collide(self) -> bool:

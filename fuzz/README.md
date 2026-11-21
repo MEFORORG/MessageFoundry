@@ -186,7 +186,9 @@ the engine code the target drives; for `hl7_tree`, `dicom_peek` and `stream_fram
 entry call itself, which shows less, and the table's comment says so. Further tests break the
 split-invariance, cap, ceiling and deflate-tail properties on purpose and assert the target says so,
 and others assert that a separators `ValueError` planted on either retired binary-carriage
-reproducer escapes, whether planted in the detach scan or in the extract. A fuzz harness nobody has seen catch anything measures nothing.
+reproducer escapes, whether planted in the detach scan or in the extract, and that the target
+refuses a `CollidingDelimitersRefused` out of the extract on a body whose delimiters do not
+collide. A fuzz harness nobody has seen catch anything measures nothing.
 
 ## Where the files go
 
@@ -268,8 +270,12 @@ body with no MSH (BACKLOG #2873 and #2874). BACKLOG #2873 first refused both by 
 helpers; BACKLOG #5972 then made `Message._encoding_chars` read the delimiters the parser recorded
 from the first line, filling a short MSH-2 as the parser does, so every `Message` read and write
 now agrees with the parse and with `Peek.field`, and neither body is refused. A write, not a
-read, is refused on a short MSH-2 whose filled default is already another of its delimiters. The entries and the
-carve-out in `_binary_carriage` are gone. Both reproducers stay on as `binary_carriage` seeds,
+read, is refused on a short MSH-2 whose filled default is already another of its delimiters.
+On such a header `extract_obx_document` also refuses an OBX whose OBX-2 is `ED`, since its
+OBX-5 components may not read as written, with `CollidingDelimitersRefused`, a `ValueError`
+that is not a `BinaryCarriageError`. `binary_carriage` accepts that refusal only where
+`Message._delimiters_collide` says the header collides, and the seed `COLLIDING_HEADER_SEED`
+drives it. The entries and the carve-out in `_binary_carriage` are gone. Both reproducers stay on as `binary_carriage` seeds,
 so a regression to a bare `ValueError` cannot come back quietly.
 
 The short-MSH-2 body is accepted by `Peek.parse` and `Message.parse`. ADR 0054 is the source of

@@ -59,6 +59,7 @@ __all__ = [
     "FieldEntry",
     "HL7ParseError",
     "DelimiterRewriteRefused",
+    "CollidingDelimitersRefused",
     "parse",
     "clone",
     "extract_field",
@@ -99,6 +100,16 @@ class HL7ParseError(ValueError):
 class DelimiterRewriteRefused(ValueError):
     """:func:`encode_with_separators` met a value the target delimiters cannot carry as data (ADR
     0206 rule 4). Its text is fixed and quotes nothing from the message."""
+
+
+class CollidingDelimitersRefused(ValueError):
+    """A message's first line names too few encoding characters, and a default filled in for one
+    is already another of its delimiters (:func:`filled_default_collides`, BACKLOG #5972), so a
+    write to it, or an OBX-5 document read from it, could not be what the sender wrote. Raised by
+    ``Message``'s writes, by a batch header written in such a head's delimiters, and by
+    ``extract_obx_document`` on an OBX that holds an ED document. Deliberately not a
+    ``BinaryCarriageError``: a Handler that skips an OBX on that error does not skip, and
+    silently drop, such a document. Its text is fixed and quotes nothing from the message."""
 
 
 class FieldEntry(TypedDict):

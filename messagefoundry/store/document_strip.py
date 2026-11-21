@@ -59,6 +59,7 @@ so it is counted, and the audit row records it. How the pass treats ``write_fail
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -78,6 +79,7 @@ __all__ = [
     "StripResult",
     "StripUpdate",
     "cutoff_for",
+    "log_unwritable_skips",
     "run_strip_pass",
     "transform_strip_batch",
 ]
@@ -133,6 +135,26 @@ def cutoff_for(
     return global_cutoff
 
 
+def log_unwritable_skips(message_ids: Sequence[object]) -> None:
+    """Log, once per ``strip_embedded_documents`` call and at WARNING, the rows it skipped because
+    their short MSH-2 fills a delimiter with one it already uses, so no write to them can be read
+    back (``strip_documents``' ``on_unwritable``, BACKLOG #5972): a document such a row holds
+    stays past its strip window, so the skip must not be
+    silent (CLAUDE.md section 6). One record per call rather than one per row, since the same rows
+    are selected again on every pass until their bodies are purged; the retention runner makes one
+    call per distinct ``min_bytes`` threshold, so a pass may log more than one. It names the count
+    and the first message id, never a byte of a body. Nothing is logged when none was skipped."""
+    if not message_ids:
+        return
+    log.warning(
+        "document strip skipped %d stored HL7 bodies whose short MSH-2 leaves their delimiters "
+        "not distinct, so they cannot be written (first: message %s); any document they hold "
+        "stays past the strip window",
+        len(message_ids),
+        message_ids[0],
+    )
+
+
 @dataclass(frozen=True)
 class StripUpdate:
     """One row's guarded write-back, as :func:`transform_strip_batch` builds it: the message id, the
@@ -180,8 +202,10 @@ async def run_strip_pass(
     A store-wide :class:`CipherError` from a batch's transform or from its ``write``, a
     cancellation, or a failure of ``report`` itself, is re-raised after a WARNING with the
     committed counts, which no audit row then records. The refused cells every batch's transform found are collected as the transform
-    finds them, even when that transform then raises. They are audited by one ``report`` call,
-    after the loop (or in the handler that re-raises).
+    finds them, even when that transform then raises; the unwritable rows are collected as each
+    transform returns, even when that batch's write then fails. They are audited by one
+    ``report`` call and logged by one :func:`log_unwritable_skips` call, after the loop (or, for the
+    report, in the handler that re-raises).
 
     The scan is bounded by the loosest finite cutoff (the global one or the largest override; a
     keep-forever ``-inf`` never widens it), and the precise per-connection cutoff is re-checked per
@@ -192,6 +216,7 @@ async def run_strip_pass(
     scan_cutoff = max(finite)
     messages = documents = reclaimed = 0
     failures: list[CellTagError] = []
+    unwritable: list[object] = []
     after: StripCursor = None
     reported = False
     ended_early = read_failed = write_failed = False
@@ -239,6 +264,7 @@ async def run_strip_pass(
                 )
                 log.debug("document strip batch failure", exc_info=True)
             else:
+                unwritable.extend(batch.unwritable)
                 if batch.outage:
                     # Every row that reached the key service got no verdict: an outage, which
                     # every later batch would meet too. End the call.
@@ -308,6 +334,8 @@ async def run_strip_pass(
                     type(exc).__name__,
                 )
         raise
+    finally:
+        log_unwritable_skips(unwritable)
     return StripResult(
         messages_stripped=messages,
         documents_stripped=documents,
@@ -332,11 +360,12 @@ def _log_early_end(why: str, exc: BaseException | None, documents: int, messages
 @dataclass(frozen=True)
 class StripBatch:
     """What :func:`transform_strip_batch` made of one batch: the guarded write-backs it needs, the
-    refused cells, and whether at least
+    refused cells, the ids of rows whose HL7 header cannot be written, and whether at least
     :data:`OUTAGE_MIN_ROWS` rows reached the key service and none got a verdict (``outage``)."""
 
     updates: list[StripUpdate]
     refused: list[CellTagError]
+    unwritable: list[object]
     outage: bool
 
 
@@ -362,12 +391,14 @@ def transform_strip_batch(
     :class:`CipherError`, a no-verdict one included, is logged with the message id and the error's
     text. A row whose strip raises, or whose encrypt the key service gives no verdict on, is
     logged with the message id and the error's type only, and skipped. Any other
-    :class:`CipherError` from ``encrypt`` is store-wide and is raised. A body holding no embedded document needs no write.
+    :class:`CipherError` from ``encrypt`` is store-wide and is raised. A row whose HL7 header
+    cannot be written is returned for :func:`log_unwritable_skips`. A body holding no embedded document needs no write.
 
     ``refused_into``, when given, is the list the refused cells are appended to as they are found,
     and is returned as ``refused``, so a caller still holds them when a later row raises."""
     updates: list[StripUpdate] = []
     failures: list[CellTagError] = [] if refused_into is None else refused_into
+    unwritable: list[object] = []
     asked = no_verdict = 0  # rows that reached the key service, and those it gave no verdict on
     for row in rows:
         message_id = row["id"]
@@ -403,6 +434,7 @@ def transform_strip_batch(
                 pruned_at=now,
                 min_bytes=min_bytes,
                 content_type=content_types.get(channel_id),
+                on_unwritable=functools.partial(unwritable.append, message_id),
             )
         except Exception as exc:
             # One row's own failure skips that row. The type only: an error raised over a body
@@ -431,4 +463,4 @@ def transform_strip_batch(
             continue
         updates.append(StripUpdate(message_id, stored, new_cell, n_docs, n_bytes))
     outage = asked >= OUTAGE_MIN_ROWS and no_verdict == asked
-    return StripBatch(updates, failures, outage=outage)
+    return StripBatch(updates, failures, unwritable, outage=outage)

@@ -31,6 +31,8 @@ import re
 from dataclasses import dataclass
 
 from messagefoundry.parsing._builtin_hl7 import (
+    HEADER_IDS,
+    CollidingDelimitersRefused,
     _extract_separators,
     _first_line_head,
     filled_default_collides,
@@ -40,6 +42,7 @@ from messagefoundry.parsing.peek import enforce_expansion_budget, normalize, sta
 from messagefoundry.parsing.sniff import _LEADING_WS_STR
 
 __all__ = [
+    "batch_head_collides",
     "encode_batch",
     "split_batch",
     "split_batch_bytes",
@@ -431,6 +434,34 @@ def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: s
     return "".join(pieces)
 
 
+def batch_head_collides(member: Message | str) -> bool:
+    """Whether :func:`encode_batch` would refuse ``member`` as a batch's head because its first line
+    names too few encoding characters and a default filled in for one is already another of its
+    delimiters (BACKLOG #5972). The batch header is written in the head's delimiters, so such a
+    head cannot lead an envelope, though as a later member it is carried verbatim like any other.
+    The delivery stage asks this of each would-be head, so it refuses that member alone rather than
+    let ``encode_batch`` refuse the whole batch.
+
+    The same verdict as a parse followed by :meth:`Message._delimiters_collide`, read from the
+    first line's opening characters alone, as :func:`_head_separators` reads them, so a large
+    hydrated head is not copied. ``member`` need not be normalized: the read stops at the first
+    ``\\r`` or ``\\n``, where :func:`~messagefoundry.parsing.peek.normalize` would end the line.
+    ``False`` for a head a parse refuses, such as one led by a byte order mark or a non-HL7 one,
+    which ``encode_batch`` still refuses as it did."""
+    if isinstance(member, Message):
+        return member._delimiters_collide()
+    return _head_line_collides(_first_line_head(member).split("\n", 1)[0])
+
+
+def _head_line_collides(line: str) -> bool:
+    """The one collision verdict on a head's first line, as :func:`_first_line_head` reads it,
+    shared by :func:`batch_head_collides` and :func:`_head_separators`: an MSH, BHS or FHS line
+    the parse reads separators from, whose filled default is already another of them."""
+    return (
+        line[:3] in HEADER_IDS and len(line) >= _SEPARATORS_WIDTH and filled_default_collides(line)
+    )
+
+
 #: The shortest MSH line the parser reads separators from: the id, MSH-1 and one more
 #: character, which may be the field separator again (an empty MSH-2). A shorter one is refused
 #: by the parse, so it goes there.
@@ -464,9 +495,9 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
     # read takes the fast read; one whose filled default collides takes the write's refusal.
     if not line.startswith(_MSH) or len(line) < _SEPARATORS_WIDTH:
         return Message.parse(norm)._write_encoding_chars()
-    if filled_default_collides(line):
+    if _head_line_collides(line):
         # The parse would only reach the same write refusal, at the cost of parsing the head.
-        raise ValueError(COLLIDING_DELIMITERS_WRITE)
+        raise CollidingDelimitersRefused(COLLIDING_DELIMITERS_WRITE)
     # A parse checks the budget before it reads anything, so a head it refuses for its escapes is
     # refused here too, with the same error. The parse above checks it for itself.
     enforce_expansion_budget(norm)
