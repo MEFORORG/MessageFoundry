@@ -407,8 +407,8 @@ class GeneratedPairReplaced:
 
     #: ``renewal``: a loadable pair near or past its expiry. ``bind_changed``: a loadable pair, not
     #: due for renewal, whose certificate lacks a name the current ``[api].host`` requires
-    #: (:func:`_names_missing`),
-    #: such as the ``::1`` of a bind moved to ``::`` after the mint (BACKLOG #5973, #5790).
+    #: (:func:`_names_missing`), such as the ``::1`` of a bind moved to ``::`` after the mint
+    #: (BACKLOG #5973, #5790).
     #: ``unusable``: a pair that would not load as one. ``half_pair``: one file of the two, left
     #: by an interrupted mint or renewal.
     reason: _ReplacedReason
@@ -786,9 +786,9 @@ def ensure_api_tls_material(
     :func:`_renew_generated_pair` -- but only when it is still the engine's own shape (self-signed,
     ``CA=false``). Anything else at the generated path is served as found and never replaced.
     **A pair of that shape whose certificate lacks a name the current bind requires
-    (:func:`_names_missing`) is replaced the same way**, the report's reason
-    ``bind_changed``, or ``renewal`` when it is also due: for example the loopback of a wildcard bind (:func:`_replacement_due`,
-    BACKLOG #5973, #5790). Only the engine's own
+    (:func:`_names_missing`), for example the loopback of a wildcard bind, is replaced the same
+    way** (:func:`_replacement_due`, BACKLOG #5973, #5790), the report's reason ``bind_changed``,
+    or ``renewal`` when it is also due. Only the engine's own
     generated pair is ever checked; an operator's ``[api].tls_cert_file`` never reaches this
     branch. Nothing renews mid-run: ``CertExpiryRunner`` watches the served certificate, because
     ``serve`` hands it the path this function RETURNS, and it stays the alarm for an engine never
@@ -970,8 +970,8 @@ def _replacement_due(host: str, cert_path: Path) -> _Due | None:
     """Why the generated pair should be replaced now, with the old certificate's facts, else ``None``.
 
     ``renewal`` means expired, or less than :data:`_RENEW_REMAINING_FRACTION` of the certificate's
-    own validity period left. ``bind_changed`` means the certificate lacks a name ``host`` requires
-    (:func:`_names_missing`), among them the host a client dials for it
+    own validity period left. ``bind_changed`` means the pair is not due for renewal and its certificate
+    lacks a name ``host`` requires (:func:`_names_missing`), among them the host a client dials for it
     (:func:`messagefoundry.api_tls_source.dialled_host`). So a bind moved after the mint, for
     example to ``::`` from ``0.0.0.0``, or to ``127.0.0.1`` from ``0.0.0.0``, gets a fresh
     certificate for the new bind at this start rather than at the next renewal (BACKLOG #5973,
