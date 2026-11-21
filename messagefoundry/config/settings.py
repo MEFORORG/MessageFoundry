@@ -1618,7 +1618,7 @@ def _as_matched(parsed: _TrustedProxy) -> _TrustedProxy:
     return parsed if matching is None else matching
 
 
-def _parse_trusted_proxy(entry: str, position: int | None = None) -> _TrustedProxy:
+def _parse_trusted_proxy(entry: str) -> _TrustedProxy:
     """Read one ``[api].trusted_proxies`` entry the way uvicorn's ``_TrustedHosts`` does (``uvicorn``
     is pinned exactly in ``pyproject.toml``), and refuse the forms known to load there and match
     other than as written. It is the one reader of the list: at least the load check, the
@@ -1630,23 +1630,14 @@ def _parse_trusted_proxy(entry: str, position: int | None = None) -> _TrustedPro
     collapse every client source IP to the proxy and degrade the audit source IP, the per-IP login
     limiter and the new-client-IP step-up signal. ``'*'`` trusts every peer. Each raises
     :class:`TrustedProxyRefusal` with its own message, and so does a form :func:`_matching_form`
-    names.
-
-    THE MESSAGE NEVER QUOTES THE ENTRY (vault BACKLOG #5554, as #2850 did for ``[backup]`` and
-    ``[dr]``). An entry that does not parse is arbitrary text, at least a URL whose userinfo holds a
-    password, and every arm that prints a settings failure prints this message as written. It
-    names the entry by its 1-based ``position`` in the list where the caller passes one. The
-    advice for an entry that did parse names the address or network it computes from it, which is
-    an IP address and not the text the operator wrote."""
-    label = "[api].trusted_proxies entry" + ("" if position is None else f" {position}")
+    names."""
     if entry == "*":
         raise TrustedProxyRefusal(_TRUST_ALL_PROXIES_REFUSAL, "is '*', which trusts every peer")
     parsed: _TrustedProxy
     try:
         parsed = ipaddress.ip_network(entry) if "/" in entry else ipaddress.ip_address(entry)
-    except ValueError:
-        # Not chained: ipaddress's text quotes the entry.
-        raise _trusted_proxy_refusal(entry, label) from None
+    except ValueError as exc:
+        raise _trusted_proxy_refusal(entry, exc) from exc
     form = _matching_form(parsed)
     if form is not None:
         if isinstance(form, ipaddress.IPv6Network):
@@ -1660,11 +1651,11 @@ def _parse_trusted_proxy(entry: str, position: int | None = None) -> _TrustedPro
         else:
             host = form.network_address if isinstance(form, ipaddress.IPv6Network) else form
             fix = f"List '{host}' instead. {_ZONED_HOP_CAVEAT.format(host=host)}"
-        raise TrustedProxyRefusal(f"{label} is {why} {fix}", reason)
+        raise TrustedProxyRefusal(f"[api].trusted_proxies entry {entry!r} is {why} {fix}", reason)
     return parsed
 
 
-def _trusted_proxy_refusal(entry: str, label: str) -> TrustedProxyRefusal:
+def _trusted_proxy_refusal(entry: str, exc: ValueError) -> TrustedProxyRefusal:
     """The message for an ``[api].trusted_proxies`` entry that uvicorn's own parse refuses.
 
     A host-bits CIDR such as ``10.0.0.1/24`` gets its own message naming the single proxy address
@@ -1676,9 +1667,9 @@ def _trusted_proxy_refusal(entry: str, label: str) -> TrustedProxyRefusal:
         network = ipaddress.ip_network(entry, strict=False)
     except ValueError:
         return TrustedProxyRefusal(
-            f"{label} is not a valid IP address or CIDR network (value withheld; uvicorn "
-            "would silently treat it as a literal that never matches, collapsing every client "
-            "source IP to the proxy)",
+            f"[api].trusted_proxies entry {entry!r} is not a valid IP address or CIDR network: "
+            f"{exc} (uvicorn would silently treat it as a literal that never matches, "
+            "collapsing every client source IP to the proxy)",
             "is not a valid IP address or CIDR network",
         )
     written = ipaddress.ip_address(entry.partition("/")[0])
@@ -1687,7 +1678,7 @@ def _trusted_proxy_refusal(entry: str, label: str) -> TrustedProxyRefusal:
     # A zoned entry gets the zoned-hop caveat here too: the advice is the same zoneless host.
     caveat = f" {_ZONED_HOP_CAVEAT.format(host=host)}" if host != written else ""
     return TrustedProxyRefusal(
-        f"{label} has host bits set. uvicorn parses a CIDR strictly, "
+        f"[api].trusted_proxies entry {entry!r} has host bits set. uvicorn parses a CIDR strictly, "
         "so it would treat this entry as a literal that never matches, collapsing every client "
         f"source IP to the proxy. List the proxy's own address '{host}'.{caveat} "
         f"{_span_wording(spanned)}",
@@ -2145,8 +2136,8 @@ class ApiSettings(_Section):
         # every peer, and the rest load and match no peer, which still satisfies the
         # tls_terminated_upstream pairing check below while trusting nothing. Refuse them here
         # rather than discover them from a poisoned audit trail (BACKLOG #2488, #3042).
-        for position, entry in enumerate(v, 1):
-            _parse_trusted_proxy(entry, position)
+        for entry in v:
+            _parse_trusted_proxy(entry)
         return v
 
     @field_validator("ws_allowed_origins", mode="after")
@@ -8214,21 +8205,19 @@ class SecuritySettings(_Section):
         # GET /security/posture display exactly what is enforced — an operator who wrote "10.1.2.3/24"
         # sees it become "10.1.2.0/24" instead of quietly matching a wider range than they typed.
         out: list[str] = []
-        # A refusal names the entry by position and never quotes it, nor ipaddress's text, which
-        # does: an entry that does not parse is arbitrary text, at least a pasted URL (#5554).
-        for position, entry in enumerate(v, 1):
+        for entry in v:
             try:
                 network = ipaddress.ip_network(entry, strict=False)
-            except ValueError:
+            except ValueError as exc:
                 raise ValueError(
-                    f"[security].allowed_client_networks entry {position} is not a valid CIDR "
-                    "network or host address (value withheld)"
-                ) from None
+                    f"[security].allowed_client_networks entry {entry!r} is not a valid CIDR network "
+                    f"or host address: {exc}"
+                ) from exc
             if isinstance(network, ipaddress.IPv6Network) and network.network_address.ipv4_mapped:
                 # An IPv4-mapped literal like ::ffff:10.20.0.0/112 can never match: the matcher unmaps a
                 # dual-stack peer to its IPv4 form before testing. Say so rather than fail silently.
                 raise ValueError(
-                    f"[security].allowed_client_networks entry {position} is an IPv4-mapped IPv6 "
+                    f"[security].allowed_client_networks entry {entry!r} is an IPv4-mapped IPv6 "
                     "network; write the plain IPv4 CIDR instead (dual-stack peers are unmapped before "
                     "matching, so a mapped literal can never match)"
                 )
@@ -8324,12 +8313,12 @@ class ServiceSettings(_InputHidingModel):
         an existing deployment. Spans ``[security]`` and ``[api]``, so it lives here."""
         if not self.security.allowed_client_networks:
             return self
-        for position, entry in enumerate(self.api.trusted_proxies, 1):
+        for entry in self.api.trusted_proxies:
             # Already validated by ApiSettings, so it parses; a host is its one-address network.
             net = ipaddress.ip_network(_parse_trusted_proxy(entry))
             if net.num_addresses != 1:
                 raise ValueError(
-                    f"[api].trusted_proxies entry {position} covers {net.num_addresses} addresses. "
+                    f"[api].trusted_proxies entry {entry!r} covers {net.num_addresses} addresses. "
                     "With [security].allowed_client_networks set, every trusted proxy must be a "
                     "single host (a bare address, /32 or /128): any host inside a trusted range can "
                     "forge its own X-Forwarded-For and defeat the allow-list. List the proxy's exact "
@@ -11777,11 +11766,9 @@ def settings_error_detail(exc: Exception) -> str:
     reads the environment.
 
     THE MESSAGE IS NOT HIDDEN, AND THIS FUNCTION RETURNS IT. A validator that quotes the value it
-    refused still shows it, here and in ``str(exc)``: at least several path and enum refusals do,
-    and the ``[auth]`` ``oidc_allowed_endpoints`` refusal, which quotes the host and the
-    allow-list. The ``[api].trusted_proxies`` entry refusals do not quote the entry as written
-    since vault BACKLOG #5554: they name it by its position, and the advice for an entry that
-    parsed names the address or network it parses to (:func:`_parse_trusted_proxy`). A URL can carry a credential, so a validator
+    refused still shows it, here and in ``str(exc)``: at least the ``[api].trusted_proxies`` entry
+    refusals do, several path and enum refusals, and the ``[auth]`` ``oidc_allowed_endpoints``
+    refusal, which quotes the host and the allow-list. A URL can carry a credential, so a validator
     message must name the setting and never quote a secret value. Callers print the returned text
     to at least stderr, a service log and ``security show``'s JSON. At least the ``[backup]`` and
     ``[dr]`` URL refusals quote no part of the URL for that reason, the text in front of ``://``

@@ -475,11 +475,11 @@ those settings, and its Handlers still run with no active environment.
   `dir = "envs"`, `graph` exits 2 over a missing `<root>/environments/<env>.toml`, as it did before
   this note, while `validate` reads `<root>/envs/<env>.toml` and can pass. They read the file with
   `serve`'s own reader, so overrides such as `MEFOR_VALUE_*` apply. Where the settings do not
-  load, they report the failure with the text `serve` prints for it, naming the settings file
-  where one exists. A validator message that quotes the value it refused prints here as it does
-  for `serve`; `settings_error_detail` in `config/settings.py` names at least the ones that do.
-  They report a value file that cannot be read naming that file. They resolve every `env()` reference of each deployed
-  connection and lookup, and report one that does not resolve by its key, never its value.
+  load, they print one fixed line with no text of the failure, because a validator message can
+  quote the value it refused and these commands printed no settings failure before this note. It
+  names the settings file where one exists and the `messagefoundry check --env <env>` command that
+  prints the reason. They report a value file that cannot be read naming that file. They resolve
+  every `env()` reference of each deployed connection and lookup, and report one that does not resolve by its key, never its value.
   `validate` lists each of these failures with its other problems and `dryrun` stops on it, so
   both exit 1 on settings that do not load where they exited 0 before this note, for example an
   unparseable settings file with the value file present. `graph` lists it under `env_problems`
@@ -494,6 +494,7 @@ those settings, and its Handlers still run with no active environment.
   - No connector is built, so a refusal only the build check makes, such as an egress or hop
     refusal, is still `check --env`'s, as is the posture check.
   - `dryrun`'s Handlers still run with no active environment.
+  - Settings that do not load print the fixed line above, where `serve` prints the settings error.
 
 **What "matches `serve`" covers.** The settings checks read the environment name `serve --env`
 reads. Value-file location is shared too: the offline `<env>.toml` check under `--project-root` now

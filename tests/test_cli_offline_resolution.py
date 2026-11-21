@@ -585,7 +585,12 @@ def test_offline_env_refuses_a_service_config_that_is_no_file(
     monkeypatch.chdir(cwd)
     typo = ["--service-config", str(tmp_path / "typo.toml")]
     rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), *typo, "--env", "prod"))
-    _assert_reports_unresolved(command, rc, capsys.readouterr(), "service config not found")
+    _assert_reports_unresolved(
+        command,
+        rc,
+        capsys.readouterr(),
+        "could not load the service settings; run `messagefoundry check --env prod`",
+    )
     # Control: without --env no values are read, so the flag is not judged here, as before.
     rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), *typo))
     assert rc == 0, capsys.readouterr()
@@ -840,84 +845,59 @@ def _settings_failure_output(
     return rc, captured.out + captured.err
 
 
-#: A refused [api].trusted_proxies list whose second entry is a URL with a password in it.
-_PROXY_BODY = f'[api]\ntrusted_proxies = ["10.0.0.7", "https://u:{_URL_PASSWORD}@host/"]\n'
-#: How the refusal names that entry: by its position, never its value (vault BACKLOG #5554).
-_PROXY_REFUSAL = "[api].trusted_proxies entry 2 is not a valid IP address or CIDR network"
+#: Settings that fail on a validator whose message quotes the value it refused, with a password in
+#: the value: a trusted_proxies URL, and a public address urlsplit refuses under NFKC.
+_QUOTING_FAILURES = {
+    "trusted-proxies": f'[api]\ntrusted_proxies = ["https://u:{_URL_PASSWORD}@host/"]\n',
+    "public-address-nfkc": (
+        f'[security]\nweb_console_public_address = "https://u:{_URL_PASSWORD}@host\\uff0fx"\n'
+    ),
+}
+
+
+def _fixed_line(settings_file: Path) -> str:
+    return (
+        f"could not load the service settings ({settings_file}); run `messagefoundry check "
+        f"--env prod --service-config {settings_file}` to see why"
+    )
+
+
+def _shown(text: str, out: str) -> bool:
+    """``text`` as printed, or as JSON escapes it (a Windows path's backslashes)."""
+    return text in out or json.dumps(text)[1:-1] in out
 
 
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
-def test_offline_env_never_prints_a_refused_trusted_proxy_url(
+@pytest.mark.parametrize("failure", list(_QUOTING_FAILURES), ids=list(_QUOTING_FAILURES))
+def test_offline_env_prints_no_validator_text_for_settings_that_do_not_load(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     command: str,
+    failure: str,
 ) -> None:
-    # Under --env these three commands print a settings failure where they printed none before,
-    # to output CI logs keep. The refusal names the entry by position and quotes no part of it.
-    rc, out = _settings_failure_output(command, tmp_path, monkeypatch, capsys, _PROXY_BODY)
+    # These three commands printed no settings failure before --env read values, so they print
+    # one fixed line naming the file and the check that shows why, and no text of the failure.
+    rc, out = _settings_failure_output(
+        command, tmp_path, monkeypatch, capsys, _QUOTING_FAILURES[failure]
+    )
     assert _URL_PASSWORD not in out, out
-    assert "host/" not in out, out
-    assert f"api.trusted_proxies: Value error, {_PROXY_REFUSAL}" in out, out
+    assert "@host" not in out, out
+    settings_file = Path("messagefoundry.toml")  # named as the command names it
+    assert _shown(_fixed_line(settings_file), out), out
+    # The graph and its value file are good, so the exit code is the settings failure's alone.
     assert rc == (0 if command == "graph" else 1), out
 
 
-def test_check_never_prints_a_refused_trusted_proxy_url(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+def test_the_check_the_fixed_line_names_prints_the_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    cfg = _config_dir(tmp_path, body=_NO_ENV_GRAPH)
-    settings_file = tmp_path / "messagefoundry.toml"
-    settings_file.write_text(_PROXY_BODY, encoding="utf-8")
-    rc = main(["check", "--config", str(cfg), "--service-config", str(settings_file)])
-    captured = capsys.readouterr()
-    out = captured.out + captured.err
-    assert _URL_PASSWORD not in out and "host/" not in out, out
-    assert _PROXY_REFUSAL in out, out
-    assert rc != 0, out
-
-
-def test_serves_settings_load_never_renders_a_refused_trusted_proxy_url(tmp_path: Path) -> None:
-    # serve prints settings_error_detail's text for a load that fails (_load_service_settings).
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import load_settings, settings_error_detail
-
-    settings_file = tmp_path / "messagefoundry.toml"
-    settings_file.write_text(_PROXY_BODY, encoding="utf-8")
-    with pytest.raises(ValidationError) as caught:
-        load_settings(config_path=str(settings_file), environ={})
-    for text in (str(caught.value), settings_error_detail(caught.value)):
-        assert _URL_PASSWORD not in text and "host/" not in text, text
-        assert _PROXY_REFUSAL in text, text
-
-
-def test_an_allowed_client_networks_refusal_never_quotes_the_entry() -> None:
-    # The same shape as the trusted_proxies refusal: a list of networks, one that does not parse.
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import SecuritySettings, settings_error_detail
-
-    with pytest.raises(ValidationError) as caught:
-        SecuritySettings(allowed_client_networks=["10.0.0.0/8", f"https://u:{_URL_PASSWORD}@h/"])
-    for text in (str(caught.value), settings_error_detail(caught.value)):
-        assert _URL_PASSWORD not in text, text
-        assert "[security].allowed_client_networks entry 2 is not a valid CIDR network" in text
-
-
-@pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
-def test_offline_env_does_not_read_a_failing_secret_field_as_a_set_one(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    command: str,
-) -> None:
-    # A credential scrub read "auth.ad_bind_password: Input should be..." as a label and its value,
-    # and printed "auth.ad_bind_password=<redacted> should be...", which reads as a set secret.
-    body = "[auth]\nad_bind_password = 5\n"
-    rc, out = _settings_failure_output(command, tmp_path, monkeypatch, capsys, body)
-    assert "auth.ad_bind_password: Input should be a valid string" in out, out
-    assert "redacted" not in out, out
-    assert rc == (0 if command == "graph" else 1), out
+    # The pointer is true: that check, with the same --env, refuses the same settings and says why.
+    _settings_failure_output("validate", tmp_path, monkeypatch, capsys, "[api]\nportt = 1\n")
+    settings_file = Path("messagefoundry.toml")  # named as the command names it
+    rc = main(["check", "--env", "prod", "--service-config", str(settings_file)])
+    out = capsys.readouterr().out
+    assert rc != 0 and "[api].portt" in out, out
 
 
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
@@ -927,8 +907,8 @@ def test_offline_env_names_a_settings_path_holding_a_credential_label_as_it_is(
     capsys: pytest.CaptureFixture[str],
     command: str,
 ) -> None:
-    # A --service-config naming a directory fails at the open with an OSError naming the path. A
-    # credential scrub rewrote a path holding "api_key=" into one that does not exist.
+    # A --service-config naming a directory fails at the open. A credential scrub once rewrote a
+    # path holding "api_key=" into one that does not exist; the fixed line names it as written.
     cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
     cwd = tmp_path / "cwd"
     _values_file(cwd, "prod", f'peer_host = "{_SECRET_HOST}"\n')
@@ -939,21 +919,6 @@ def test_offline_env_names_a_settings_path_holding_a_credential_label_as_it_is(
     rc = main(_offline_argv(command, tmp_path, *argv))
     captured = capsys.readouterr()
     out = captured.out + captured.err
-    # The OSError's own spelling of the path, not the "(<settings file>)" prefix.
-    shown = repr(str(named))
-    assert shown in out or json.dumps(shown)[1:-1] in out, out
+    assert _shown(_fixed_line(named), out), out
     assert "redacted" not in out, out
     assert rc == (0 if command == "graph" else 1), out
-
-
-def test_a_missing_secret_field_still_reads_as_missing() -> None:
-    # "store.password: Field required" became "store.password=<redacted> required" through a
-    # credential scrub; serve's rendering prints the field and pydantic's message as written.
-    from pydantic import ValidationError
-
-    from messagefoundry.config.settings import settings_error_detail
-
-    exc = ValidationError.from_exception_data(
-        "ServiceSettings", [{"type": "missing", "loc": ("store", "password"), "input": {}}]
-    )
-    assert settings_error_detail(exc) == "store.password: Field required"

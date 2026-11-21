@@ -97,9 +97,7 @@ def test_trusted_proxies_host_bits_entry_is_refused_from_the_file(tmp_path: Path
         tmp_path / "messagefoundry.toml",
         '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1/24"]\n',
     )
-    with pytest.raises(
-        ValidationError, match=re.escape("[api].trusted_proxies entry 1 has host bits set")
-    ) as exc:
+    with pytest.raises(ValidationError, match=re.escape("'10.0.0.1/24' has host bits set")) as exc:
         load_settings(config_path=cfg, environ={})
     assert "'10.0.0.0/24'" in str(exc.value) and "'10.0.0.1'" in str(exc.value)
 
@@ -112,9 +110,7 @@ def test_trusted_proxies_host_bits_entry_is_refused_from_env(
     monkeypatch.chdir(tmp_path)  # no ./messagefoundry.toml here
     env = {"MEFOR_API_TLS_TERMINATED_UPSTREAM": "true"}
     refused = "10.0.0.7,10.0.0.1/24"
-    with pytest.raises(
-        ValidationError, match=re.escape("[api].trusted_proxies entry 2 has host bits set")
-    ):
+    with pytest.raises(ValidationError, match=re.escape("'10.0.0.1/24' has host bits set")):
         load_settings(environ={**env, "MEFOR_API_TRUSTED_PROXIES": refused})
     # Control: the network it meant loads through the same path.
     accepted = "10.0.0.7, 10.0.0.0/24"

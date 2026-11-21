@@ -15,14 +15,16 @@ its own and is not the control: it proves the output stays USEFUL. The leg that 
 ``load_settings`` to raise a ``ValidationError`` from a plain model that DOES carry the secret -- the
 shape a section added later outside ``_InputHidingModel`` would raise -- and asserts its control
 first: the planted secret is in ``str(exc)``. Each arm must then render it through
-``settings_error_detail`` and print the field and message without the value.
+``settings_error_detail`` and print the field and message without the value, except the
+``_NO_DETAIL_ARMS``, which print no text of the failure at all.
 
 ``_ARMS`` holds at least the operator commands vault BACKLOG #2760 moved onto the renderer and
 the ones that already used it, except ``serve`` and ``supervise``, which start the engine. A new
 CLI arm that loads the whole settings file belongs in it.
 
 The URL refusal cases (vault BACKLOG #2850) go at the models instead of through an arm. Every arm
-prints a validator's message as written, so a message that quotes nothing is what they rest on.
+but the ``_NO_DETAIL_ARMS`` prints a validator's message as written, so a message that quotes
+nothing is what they rest on.
 """
 
 from __future__ import annotations
@@ -211,6 +213,17 @@ _EDIT_ARMS = {"security-set", "alert-add", "alert-remove"}
 #: ``env_problems`` beside the graph.
 _EXIT_0_ARMS = {"support-bundle", "security-show", "graph-env"}
 
+#: The arms that print no text of the failure, only a fixed line naming the settings file and the
+#: `check` that prints the reason: they printed no settings failure before vault BACKLOG #5554.
+_NO_DETAIL_ARMS = {"validate-env", "graph-env", "dryrun-env"}
+
+
+def _names_the_reason(arm: str, out: str, message: str) -> bool:
+    if arm in _NO_DETAIL_ARMS:
+        return "could not load the service settings" in out and message not in out
+    return _FIELD in out and message in out
+
+
 #: How ``settings_error_detail`` names the failing section. Pydantic's own text puts the location on
 #: a line of its own, and a bare ``store`` would also match a temporary path.
 _FIELD = "store: "
@@ -264,7 +277,7 @@ def test_an_arm_renders_a_load_failure_without_its_input(
     assert calls, f"{arm} never reached load_settings, so this case proves nothing"
     assert _CANARY not in out, f"{arm} printed the input of a settings load failure: {out!r}"
     # Useful, not just quiet: the section and the reason are still named.
-    assert _FIELD in out and _MESSAGE in out, out
+    assert _names_the_reason(arm, out, _MESSAGE), out
     assert (code == 0) is (arm in _EXIT_0_ARMS), (arm, code)
     if arm in _EDIT_ARMS:
         # The post-write check refused, and the edit was rolled back. `security set` reports its
@@ -289,7 +302,7 @@ def test_a_real_store_failure_names_the_field_and_never_the_env_secret(
     code, out, cfg, _ = _run(arm, tmp_path, capsys, body)
 
     assert _CANARY not in out, f"{arm} printed an env-supplied secret: {out!r}"
-    assert _FIELD in out and "server, database, username" in out, out
+    assert _names_the_reason(arm, out, "server, database, username"), out
     assert "input_value" not in out and "errors.pydantic.dev" not in out, out
     if arm not in _EXIT_0_ARMS:
         assert code != 0
