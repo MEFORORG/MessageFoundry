@@ -33,11 +33,17 @@ from messagefoundry.api.auth_models import (
     name_refusal,
 )
 from messagefoundry.auth import Permission, Role
+from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import validate_custom_role_permissions
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.row_seal import (
+    RowSealError,
+    TransitSealUnavailableError,
+    TransitSealUnverifiableError,
+)
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
 
@@ -370,8 +376,9 @@ async def test_a_role_whose_seal_fails_has_no_exempt_name(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """On a store with an integrity key, a name written outside the store fails the row's seal, so
-    it is never the exemption's stored name: a re-save under it takes the rule. The seal failure is
-    stood in for by patching ``_load_role``; the keyless case is the next test."""
+    it is never the exemption's stored name: a re-save under it takes the rule. The read is quiet:
+    it reports no seal failure. The seal failure is stood in for by patching the seal check; the
+    keyless case is the next test."""
     service, _ = await _setup(engine)
     role = await service.create_custom_role(
         display_name="Administrator", description=None, permissions=["monitoring:read"], actor="t"
@@ -379,13 +386,65 @@ async def test_a_role_whose_seal_fails_has_no_exempt_name(
     assert await service.custom_role_stored_name(role.id) == (True, "Administrator")
     assert await service.custom_role_stored_name("custom:" + "0" * 32) == (False, None)
 
-    async def _seal_fails(role_id: str) -> None:
-        return None
+    async def _seal_fails(_sealer: object, _row: object) -> bool:
+        return False
 
-    monkeypatch.setattr(service, "_load_role", _seal_fails)
+    reports = _count_seal_reports(service, monkeypatch)
+    monkeypatch.setattr(service_module, "role_seal_ok_async", _seal_fails)
     held, stored = await service.custom_role_stored_name(role.id)
     assert (held, stored) == (True, None)
     assert custom_role_name_refusal("Administrator", stored) is not None
+    assert reports == []
+
+
+def _count_seal_reports(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Every seal-failure report the service makes from here on, by subject."""
+    reports: list[str] = []
+    original = service._report_seal_failure
+
+    async def _record(subject: str, *args: Any, **kwargs: Any) -> Any:
+        reports.append(subject)
+        return await original(subject, *args, **kwargs)
+
+    monkeypatch.setattr(service, "_report_seal_failure", _record)
+    return reports
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        TransitSealUnavailableError(),
+        TransitSealUnverifiableError("role", 1, 2),
+        RowSealError("role", "r"),
+    ],
+)
+async def test_a_seal_check_that_raises_gives_no_exempt_name_and_no_report(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """A Vault transit Outage or Unverifiable answer, or a forged seal, on the pre-save read
+    neither escapes nor reports: the save goes on as it did before the read existed, so a
+    re-save under a clean name lands."""
+    service, _ = await _setup(engine)
+    perms = ["monitoring:read"]
+    role = await service.create_custom_role(
+        display_name="Readers", description=None, permissions=perms, actor="t"
+    )
+
+    async def _seal_raises(_sealer: object, _row: object) -> bool:
+        raise error
+
+    reports = _count_seal_reports(service, monkeypatch)
+    monkeypatch.setattr(service_module, "role_seal_ok_async", _seal_raises)
+    assert await service.custom_role_stored_name(role.id) == (True, None)
+    [saved] = await _calls(
+        engine,
+        service,
+        [("PUT", f"/roles/custom/{role.id}", {"display_name": "Readers", "permissions": perms})],
+    )
+    assert saved.status_code == 200, saved.text
+    assert reports == []
+    audit = await engine.store.list_audit(limit=200)
+    assert not any("seal" in str(r["action"]) for r in audit)
 
 
 async def test_on_a_keyless_store_a_name_written_outside_the_store_is_exempt(

@@ -20810,11 +20810,30 @@ class AuthService:
         seal holds (``None`` when it fails). The API's name rule exempts a save that re-sends this
         name (BACKLOG #5785), so on a store with an integrity key a name written outside the store,
         which fails the seal, is never exempt. A store with no integrity key checks no seal, so
-        there a name written outside the store is returned, and is exempt, like any other."""
+        there a name written outside the store is returned, and is exempt, like any other.
+
+        QUIET BY DESIGN: it is a pre-save read for an exemption, not an authority read, so it does
+        not go through :meth:`_load_role`. A seal that fails, or a seal check that raises (a
+        Vault transit Outage or Unverifiable answer, a forged or retired seal), gives no exempt
+        name and nothing else: no seal-failure report, no audit row, no alert, no exception. The
+        save then proceeds as it did before this read existed, and the write's own seal answers
+        as it always has."""
         if not await self._custom_role_held(role_id):
             return False, None
-        row = await self._load_role(role_id)
-        return True, (row.display_name if row is not None else None)
+        found = await self._store.get_role(role_id)
+        if found is None or str(found["id"]) != role_id:
+            return True, None
+        row = RoleRow.from_mapping(found)
+        try:
+            holds = await role_seal_ok_async(self._store.row_sealer(), row)
+        except (
+            RowSealError,
+            RowSealUnverifiableError,
+            TransitSealUnavailableError,
+            TransitSealUnverifiableError,
+        ):
+            return True, None
+        return True, (row.display_name if holds else None)
 
     async def create_custom_role(
         self,
