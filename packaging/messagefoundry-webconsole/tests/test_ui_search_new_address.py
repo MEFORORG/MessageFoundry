@@ -264,10 +264,15 @@ def test_the_route_bound_matches_the_json_routes_cap() -> None:
     # the layer cap its unlock pattern carries) must not drift from them.
     from messagefoundry.api import app as api_app
     from messagefoundry.api.validation import LAYERED_PRESET_IDS_PATTERN
+    from messagefoundry_webconsole._auth import is_unlock_action
     from messagefoundry_webconsole.routes import search
 
     assert search._MAX_LAYERS == api_app._MAX_PRESET_LAYERS
     assert rf"^{search._PRESET_ID}(,{search._PRESET_ID})*$" == LAYERED_PRESET_IDS_PATTERN
+    # The unlock pattern spells its repeat bound out (see _LAYERED_UNLOCK); it must admit exactly
+    # _MAX_LAYERS presets and refuse one more.
+    assert is_unlock_action(_layered_query(search._MAX_LAYERS))
+    assert not is_unlock_action(_layered_query(search._MAX_LAYERS + 1))
 
 
 @pytest.mark.parametrize(

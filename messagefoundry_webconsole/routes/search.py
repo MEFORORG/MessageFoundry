@@ -53,7 +53,7 @@ register_ui_action(
 # refusal carries that query (:func:`_layered_continuation`, BACKLOG #5646): the run's whole input is
 # ``?presets=``, so a continuation without it landed on the run's 400. Any other query fails the
 # pattern, so its continuation is the search form. The route applies the same bound to what it is
-# sent (:func:`_layered_ids`), so it runs nothing past the bound the pattern admits.
+# sent (:func:`_layered_refusal`), so it runs nothing past the bound the pattern admits.
 _SEARCH = "/ui/messages/search"
 #: The most presets one layered run composes: the JSON route's own cap (``_MAX_PRESET_LAYERS`` in
 #: ``messagefoundry/api/app.py``), which its handler body also enforces on a direct call. Copied so
@@ -62,8 +62,15 @@ _MAX_LAYERS = 8
 #: One preset id, as ``LAYERED_PRESET_IDS_PATTERN`` spells each comma-separated item. That pattern
 #: sits in the JSON route's ``Query`` declaration, which the console's direct call skips.
 _PRESET_ID = r"[0-9a-f]{32}"
+#: The layered unlock pattern. The repeat bound ``{0,7}`` is ``_MAX_LAYERS - 1`` written out, because
+#: the ReDoS scanner in ``tests/test_security_static.py`` resolves an f-string only when every
+#: interpolation is a string constant; ``test_the_route_bound_matches_the_json_routes_cap`` holds the
+#: two equal.
+_LAYERED_UNLOCK = (
+    rf"^/ui/messages/search/layered(\?presets={_PRESET_ID}(&presets={_PRESET_ID}){{0,7}})?$"
+)
 register_ui_action(
-    rf"^/ui/messages/search/layered(\?presets={_PRESET_ID}(&presets={_PRESET_ID}){{0,{_MAX_LAYERS - 1}}})?$",
+    _LAYERED_UNLOCK,
     Permission.MESSAGES_READ,
     auto_retry=False,
     unlock=True,
