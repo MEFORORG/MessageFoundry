@@ -371,9 +371,9 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
     An open the filesystem refuses is a :class:`_NotPlainError` too when a fresh ``lstat`` shows
     the name is now a link or not a regular file (BACKLOG #5388 added item 3), as at least a
     dangling link Windows followed, which answers ``FileNotFoundError``, a Windows folder, which
-    answers ``PermissionError``, and a socket, which Windows answers with ``EINVAL``, are. Raises :class:`_NotPlainError` for a refusal,
-    and any other ``OSError`` the filesystem gives, ``FileNotFoundError`` and ``PermissionError``
-    included."""
+    answers ``PermissionError``, and a socket, which Windows answers with ``EINVAL``, are. Raises
+    :class:`_NotPlainError` for a refusal, and any other ``OSError`` the filesystem gives,
+    ``FileNotFoundError`` and ``PermissionError`` included."""
     before = path.lstat()
     if _names_a_link(before) or not _is_regular(before):
         raise _NotPlainError(f"{path.name} is not a plain file")
@@ -382,9 +382,9 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
         fd = os.open(path, _PLAIN_OPEN_FLAGS)
     except OSError as exc:
         # What the open meets when the name is swapped after the lstat varies by platform: at
-        # least ENXIO or EOPNOTSUPP for a socket (EINVAL on Windows), a PermissionError for a folder on Windows, and
-        # there a FileNotFoundError for a dangling link it followed. The name is what decides,
-        # so every caller sees one refusal (BACKLOG #5388 added item 3).
+        # least ENXIO or EOPNOTSUPP for a socket (EINVAL on Windows), a PermissionError for a
+        # folder on Windows, and there a FileNotFoundError for a dangling link it followed. The
+        # name is what decides, so every caller sees one refusal (BACKLOG #5388 added item 3).
         if not _unplain_now(path, exc):
             raise
         met = codec_safe_str(exc)
@@ -2977,22 +2977,34 @@ class UploadStore:
                 # already removed and no refusal the route answers.
                 if _lstat_is_dir(meta_path):
                     raise _damaged(file_id, "sidecar", "it is a directory")
-                body_defect: str | None = None
+                body_refusal: tuple[str, _ReadRefusal] | None = None
                 try:
                     blob_path.unlink(missing_ok=True)
                 except OSError as exc:
-                    # A directory swapped in for the body after the check above (BACKLOG #5388
-                    # added item 3), which every platform refuses to unlink, though by different
-                    # errors. Decided by what the name is, so any other unlink failure, such as a
-                    # read-only volume, is raised as it is. The sidecar is kept, so the upload
-                    # stays listed.
-                    if not _lstat_is_dir(blob_path):
+                    # Nothing is removed yet, so the body's refusal is answered as a read's is
+                    # (BACKLOG #5388 added item 3): a directory swapped in after the check above is
+                    # damage, a permission or a Windows sharing violation on a file is denied, and
+                    # any other failure, such as a read-only volume, is raised as it is. The
+                    # sidecar is kept, so the upload stays listed.
+                    refused = _refused_read(exc)
+                    if refused is None:
                         raise
-                    body_defect = codec_safe_str(exc)
-                if body_defect is not None:
-                    # After the handler, as _damaged requires, so the error is on no chain.
-                    raise _damaged(file_id, "body", body_defect)
-                meta_path.unlink(missing_ok=True)
+                    body_refusal = (codec_safe_str(exc), refused)
+                if body_refusal is not None:
+                    # After the handler, as _refusal requires, so the error is on no chain.
+                    raise _refusal(file_id, "body", *body_refusal)
+                try:
+                    meta_path.unlink(missing_ok=True)
+                except OSError as exc:
+                    # The body is gone, so the delete happened and is returned, and the route
+                    # records it, as the prune does for the same case. The sidecar is left
+                    # listing an upload with no body, so the log names it for removal.
+                    _log.warning(
+                        "uploaded file %s: its body was deleted but its sidecar was not, so it "
+                        "stays listed; remove the sidecar: %s",
+                        file_id,
+                        codec_safe_str(exc),
+                    )
             return meta
 
         return await asyncio.to_thread(_delete)

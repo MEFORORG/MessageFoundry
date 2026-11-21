@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""A part that is not a plain file is a handled refusal on every platform (BACKLOG #5388 added
-item 3).
+"""A part that is not a plain file is a handled refusal, for at least the kinds these tests
+plant, on every platform (BACKLOG #5388 added item 3).
 
 On origin/main 9421dcbf27 ``_refused_read`` knew only ``_NotPlainError``, ``ELOOP`` and
 ``PermissionError``. A directory swapped in after the check made POSIX ``fdopen`` raise
@@ -28,7 +28,7 @@ import pytest
 import messagefoundry.uploads as uploads
 from messagefoundry.auth import Role
 from messagefoundry.pipeline import Engine
-from messagefoundry.uploads import UploadDamagedError
+from messagefoundry.uploads import UploadAccessError, UploadDamagedError
 from tests._bound_proof import reproving_transport
 from tests.test_b532r_uploads_sidecar_reads import _blob, _OsWith, _saved, _sidecar, _store
 from tests.test_upload_api import (
@@ -259,11 +259,13 @@ async def test_a_directory_swapped_in_for_the_sidecar_is_refused_before_the_body
     assert sidecar.is_dir() and _blob(store, meta.file_id).is_file()
 
 
-async def test_a_body_unlink_that_fails_on_a_file_is_raised_as_it_is(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("error", ["denied", "eio"])
+async def test_a_body_unlink_that_fails_on_a_file_is_not_damage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: str
 ) -> None:
-    # Control: only a directory is answered as damage; a read-only volume or a sharing violation
-    # on the body is not a file an operator should delete.
+    # Control: only a directory is answered as damage. A permission or a Windows sharing violation
+    # on the body is the access-refused answer a read gives, and any other failure is raised as it
+    # is; neither is a file an operator should delete.
     store = _store(tmp_path / "uploads")
     meta = await _saved(store)
     blob = _blob(store, meta.file_id)
@@ -271,13 +273,42 @@ async def test_a_body_unlink_that_fails_on_a_file_is_raised_as_it_is(
 
     def _unlink(self: Path, missing_ok: bool = False) -> None:
         if self == blob:
+            if error == "denied":
+                raise PermissionError(errno.EACCES, "Permission denied", str(self))
+            raise OSError(errno.EIO, "Input/output error", str(self))
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _unlink)
+    if error == "denied":
+        with pytest.raises(UploadAccessError):
+            await store.delete(meta.file_id)
+    else:
+        with pytest.raises(OSError) as raised:
+            await store.delete(meta.file_id)
+        assert raised.value.errno == errno.EIO
+    assert blob.is_file() and _sidecar(store, meta.file_id).is_file()
+
+
+async def test_a_sidecar_unlink_that_fails_after_the_body_went_returns_the_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Before, the body was gone and the sidecar's failure raised a raw OSError: a 500 with no
+    # audit row for a deleted body. Now the delete is returned, so the route records it.
+    caplog.set_level(logging.WARNING, logger=uploads._log.name)
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    sidecar = _sidecar(store, meta.file_id)
+    real_unlink = Path.unlink
+
+    def _unlink(self: Path, missing_ok: bool = False) -> None:
+        if self == sidecar:
             raise PermissionError(errno.EACCES, "Permission denied", str(self))
         real_unlink(self, missing_ok=missing_ok)
 
     monkeypatch.setattr(Path, "unlink", _unlink)
-    with pytest.raises(PermissionError):
-        await store.delete(meta.file_id)
-    assert blob.is_file() and _sidecar(store, meta.file_id).is_file()
+    assert await store.delete(meta.file_id) == meta
+    assert not _blob(store, meta.file_id).exists() and sidecar.is_file()
+    assert any("remove the sidecar" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.parametrize("read", ["get_meta", "read_bytes"])
@@ -504,7 +535,8 @@ async def test_the_route_answers_the_damaged_423_not_a_500(
         assert r.status_code == 423, r.text
         assert r.json()["detail"] == _DAMAGED_TEXT
         # A sidecar hides its owner, so the override holder gets the 423, on browse and delete,
-        # each meeting the swap at its own open.
+        # each on its own upload. The delete meets the swap at the route's own read; the store
+        # delete's in-lock refusals are covered by the store tests above.
         for r in (
             await c.get(f"/uploads/{meta_fids[0]}/messages", headers=ha),
             await c.delete(f"/uploads/{meta_fids[1]}", headers=ha),

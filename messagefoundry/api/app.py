@@ -9824,9 +9824,9 @@ def create_app(
                     UploadUnreadableError,
                 ) as exc:
                     # Each is raised before anything is removed, so no row is owed, and a cancel
-                    # landing meanwhile must not log one as lost. That includes the damaged refusal
-                    # of a body unlink that failed, which keeps the sidecar (BACKLOG #5388 added
-                    # item 3). Returned, so the route still answers it.
+                    # landing meanwhile must not log one as lost. That includes the refusal of a
+                    # body unlink that failed, which keeps the sidecar (BACKLOG #5388 added item
+                    # 3). Returned, so the route still answers it.
                     return exc
                 detail = json.dumps({"file_id": removed.file_id, "size": removed.size})
                 await engine.store.record_audit(
