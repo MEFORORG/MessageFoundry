@@ -63,6 +63,7 @@ def _ctx(
         fetch=_no_fetch,
         stall_runner=_no_stall,
         today=dt.date.fromisoformat(today or "2026-11-19"),
+        gh_backoff=0.0,
     )
 
 
@@ -300,6 +301,14 @@ def test_out_outside_a_repo_is_allowed(tmp_path: Path) -> None:
     assert cm.refuse_reason(tmp_path / "x.json", outside) is None
 
 
+def test_pruned_worktree_message_is_not_safe(tmp_path: Path) -> None:
+    # git's answer for a pruned worktree's gitdir shares the short phrase but is inside a repo.
+    def pruned(argv: Sequence[str], cwd: Path | None) -> str:
+        raise cm.CollectError("git exited 128: fatal: not a git repository: D:/r/.git/worktrees/x")
+
+    assert cm.refuse_reason(tmp_path / "x.json", pruned) is not None
+
+
 def test_out_guard_fails_closed(tmp_path: Path) -> None:
     def broken(argv: Sequence[str], cwd: Path | None) -> str:
         raise cm.CollectError("git could not run: FileNotFoundError")
@@ -312,7 +321,7 @@ def test_real_git_refuses_this_checkout() -> None:
     # The test file itself lives in a work tree, so its directory must be refused for real, and
     # for the inside-a-repo reason, not because git failed some other way.
     reason = cm.refuse_reason(Path(__file__))
-    assert reason is not None and "inside a git repository" in reason
+    assert reason is not None and "rev-parse said 'true'" in reason
 
 
 def test_real_git_allows_a_directory_outside_any_repo(tmp_path: Path) -> None:
@@ -353,3 +362,111 @@ def test_snapshot_schema(tmp_path: Path) -> None:
         "owner_waiting",
         "release_distance",
     ]
+
+
+# -- success paths with fakes --------------------------------------------------------------------
+
+
+def test_gh_retries_a_transient_failure(tmp_path: Path) -> None:
+    calls: list[int] = []
+
+    def flaky(argv: Sequence[str], cwd: Path | None) -> str:
+        calls.append(1)
+        if len(calls) < cm.GH_ATTEMPTS:
+            raise cm.CollectError("gh exited 1: HTTP 502")
+        return "[1]"
+
+    assert cm.gh_json(_ctx(tmp_path, flaky), ["api", "x"]) == [1]
+    assert len(calls) == cm.GH_ATTEMPTS
+
+
+def test_dependency_vulns_counts_slurped_pages(tmp_path: Path) -> None:
+    def run(argv: Sequence[str], cwd: Path | None) -> str:
+        if "api" in argv:
+            page = [
+                {"security_advisory": {"severity": "high"}},
+                {"security_advisory": {"severity": "low"}},
+            ]
+            return json.dumps([page, [{"security_advisory": {"severity": "low"}}]])
+        raise cm.CollectError("no vuln-metrics run in this test")
+
+    m = cm.Metric("dependency_vulns", "", "", "", "")
+    cm.c_dependency_vulns(_ctx(tmp_path, run), m)
+    assert m.value == 3
+    assert m.status == "bad"
+    assert m.detail["open_by_severity"] == {"critical": 0, "high": 1, "medium": 0, "low": 2}
+    # The KPI attachment failed: its own error, and a partial_error so the run exits 3.
+    assert m.detail["kpis"]["error"]
+    assert m.detail["partial_error"].startswith("vuln-metrics KPIs:")
+
+
+def test_ci_main_per_week(tmp_path: Path) -> None:
+    def run(argv: Sequence[str], cwd: Path | None) -> str:
+        if "run" in argv:
+            created = argv[argv.index("--created") + 1]
+            if created.startswith("2026-11-09"):
+                return json.dumps(
+                    [
+                        {"createdAt": "2026-11-10T00:00:00Z", "conclusion": "success"},
+                        {"createdAt": "2026-11-11T00:00:00Z", "conclusion": "success"},
+                        {"createdAt": "2026-11-12T00:00:00Z", "conclusion": "failure"},
+                        {"createdAt": "2026-11-12T00:00:00Z", "conclusion": "cancelled"},
+                    ]
+                )
+            return "[]"
+        return json.dumps([{"number": 7}])  # one open ci-red PR
+
+    m = cm.Metric("ci_main", "", "", "", "")
+    cm.c_ci_main(_ctx(tmp_path, run, weeks=2), m)
+    assert m.value == 66.7
+    assert m.status == "bad"
+    assert m.detail["open_ci_red_prs"] == 1
+    assert m.series == [{"week": "2026-W46", "value": 66.7}, {"week": "2026-W47", "value": None}]
+
+
+class _Census:
+    def __init__(self) -> None:
+        from collections import Counter
+
+        self.rows = 2000
+        self.weeks = {
+            "2026-W46": Counter({"filed": 4, "closed": 2, "declined": 1}),
+            "2026-W47": Counter({"filed": 1, "superseded": 3}),
+        }
+        self.open_by_verdict = Counter(
+            {"build": 5, "owner-ruling": 2, "demand-gate": 3, "none": 1, "other": 1}
+        )
+        self.undated = Counter({"filed": 9})
+
+    @property
+    def open_rows(self) -> int:
+        return sum(self.open_by_verdict.values())
+
+
+class _Report:
+    ACTIVE_VERDICTS = ("build", "research", "decide", "owner-ruling")
+    DEFERRED_VERDICT = "demand-gate"
+
+
+def _vault_ctx(tmp_path: Path) -> Any:
+    ctx = _ctx(tmp_path, _failing, weeks=2)
+    ctx._vault = cm.VaultRead(sha="abc", root=tmp_path, census=_Census(), report=_Report())
+    return ctx
+
+
+def test_backlog_burn_from_census(tmp_path: Path) -> None:
+    m = cm.Metric("backlog_burn", "", "", "", "")
+    cm.c_backlog_burn(_vault_ctx(tmp_path), m)
+    assert m.value == 1  # closed 6 minus filed 5
+    assert m.status == "good"
+    assert m.series == [{"week": "2026-W46", "value": -1}, {"week": "2026-W47", "value": 2}]
+    d = m.detail
+    assert (d["open_active"], d["open_deferred"], d["open_unclassified"]) == (7, 3, 2)
+    assert d["vault_origin_main"] == "abc"
+    assert "ROWS" in d["counts"]
+
+
+def test_owner_waiting_from_census(tmp_path: Path) -> None:
+    m = cm.Metric("owner_waiting", "", "", "", "")
+    cm.c_owner_waiting(_vault_ctx(tmp_path), m)
+    assert (m.value, m.status) == (2, "warn")

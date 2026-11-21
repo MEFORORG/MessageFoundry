@@ -3,9 +3,11 @@
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
 """Gather project-progress metrics into ONE JSON snapshot for a private dashboard.
 
-WHAT IT READS. The engine repository (this checkout's ``origin/main``), the private vault at its
-``origin/main`` (never its working tree, which may be dirty or on another branch), GitHub through an
-already-authenticated ``gh``, and the public PyPI JSON for the ``messagefoundry`` package.
+WHAT IT READS, at least: the private vault at its ``origin/main`` (never its working tree, which
+may be dirty or on another branch); GitHub through an already-authenticated ``gh``; the public PyPI
+JSON for the ``messagefoundry`` package; the engine's ``origin/main`` for the release distance; and,
+from THIS engine checkout's working tree, ``scripts/asvs/scorecard.py`` and
+``scripts/ci/check_stalled_prs.py``, which it runs and imports.
 
 THE SNAPSHOT IS PRIVATE. It quotes counts read from the vault, so it must never land inside a git
 repository, where a ``git add .`` would publish it. ``--out`` is refused when its directory is inside
@@ -15,17 +17,21 @@ A METRIC THAT COULD NOT BE READ IS ``null``, NEVER ``0``. Each collector runs is
 raises leaves its metric at ``value: null``, ``status: "unknown"`` and its ``error`` text, and the
 others still run. A zero would read exactly like a quiet week.
 
-WHAT IT WRITES outside ``--out``: two ``git fetch --no-tags origin main``, one in the vault and one
-in the engine checkout, which update only ``refs/remotes/origin/main``, so both reads are of the
-current ``origin/main``. No local tag or branch is created; the release tag is resolved with
-``git ls-remote``. Everything else is read into a temporary directory removed at exit.
+WHAT IT WRITES outside ``--out``, at least: two ``git fetch --no-tags origin main``, one in the
+vault and one in the engine checkout. Each moves ``refs/remotes/origin/main`` and also writes
+``FETCH_HEAD`` and fetched objects, and may start git's own auto-maintenance. No local tag or branch
+is created; the release tag is resolved with ``git ls-remote``. Importing the stalled-PR checker can
+write ``__pycache__`` in the engine checkout. Vault files and downloads go to a temporary directory
+removed at exit.
 
 WINDOWED AND CURRENT METRICS. ``--weeks``/``--through`` bound the weekly series. The state metrics
 (open PRs, open alerts, ASVS counts, open ledger rows, release distance) are read as they stand at
 run time whatever ``--through`` says, and each says so in its detail.
 
-EXIT STATUS. 0 when every metric was read; 2 when any metric carries an error (the snapshot is still
-written), so a scheduled caller goes red on an outage rather than publishing nulls quietly.
+EXIT STATUS. 0 when every metric and every optional part was read. 3 when the snapshot WAS written
+but a metric carries an error or a detail carries a ``partial_error``, so a scheduled caller goes red
+on an outage rather than publishing nulls quietly. 1 when nothing was written (a refused ``--out``, a
+bad ``--weeks`` or ``--through``); 2 is argparse's own usage error, and nothing was written either.
 
 Usage::
 
@@ -47,6 +53,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.request
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
@@ -78,7 +85,13 @@ PR_LIST_LIMIT = 1000
 #: ``ledger_weekly_report.py`` imports its sibling ``backlog_status_check.py`` by bare name, so all
 #: of ``scripts/docs`` comes along. The ledger files themselves are listed from the tree against the
 #: checker's own ``LEDGER_FILE_GLOBS``, so a new ledger file is archived too and its floors see it.
-VAULT_PATHS = ("scripts/docs", "docs/security/asvs-scorecard.toml")
+VAULT_PATHS = ("scripts/docs",)
+VAULT_SCORECARD = "docs/security/asvs-scorecard.toml"
+
+#: Attempts per ``gh`` call, and the pause between them. check_stalled_prs.py measured transient
+#: 502s on split ``gh`` queries; a collector making ~35 sequential calls retries the same way.
+GH_ATTEMPTS = 3
+GH_BACKOFF_SECONDS = 2.0
 
 #: Run conclusions that count toward the CI pass rate. ``cancelled`` and ``skipped`` are left out of
 #: both sides: a run superseded by a newer push says nothing about whether main is green.
@@ -321,7 +334,14 @@ def fetch_url(url: str) -> bytes:
 
 
 def gh_json(ctx: Context, args: Sequence[str]) -> Any:
-    text = ctx.run(["gh", *args], None)
+    for attempt in range(1, GH_ATTEMPTS + 1):
+        try:
+            text = ctx.run(["gh", *args], None)
+            break
+        except CollectError:
+            if attempt == GH_ATTEMPTS:
+                raise
+            time.sleep(ctx.gh_backoff)
     try:
         return json.loads(text) if text.strip() else None
     except json.JSONDecodeError as exc:
@@ -349,6 +369,7 @@ class Context:
     #: The stalled-PR checker's runner; None uses its own retrying `gh` runner.
     stall_runner: Callable[[list[str], float], str] | None = None
     today: dt.date = field(default_factory=lambda: dt.datetime.now(dt.UTC).date())
+    gh_backoff: float = GH_BACKOFF_SECONDS
     merged_cache: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     _vault: VaultRead | CollectError | None = None
 
@@ -363,7 +384,16 @@ class Context:
                 self._vault = _read_vault(self)
             except CollectError as exc:
                 self._vault = exc
-            except Exception as exc:  # noqa: BLE001 - cached so a retry cannot mask the cause
+            except (
+                OSError,
+                ValueError,
+                KeyError,
+                AttributeError,
+                TypeError,
+                ImportError,
+                tarfile.TarError,
+            ) as exc:
+                # Cached too: a retry would only fail again, slower.
                 self._vault = CollectError(f"vault read failed: {type(exc).__name__}: {exc}")
         if isinstance(self._vault, CollectError):
             raise self._vault
@@ -399,8 +429,11 @@ def _read_vault(ctx: Context) -> VaultRead:
     vault = str(ctx.vault)
     ctx.run(["git", "-C", vault, "fetch", "-q", "--no-tags", "origin", "main"], None)
     sha = ctx.run(["git", "-C", vault, "rev-parse", "origin/main"], None).strip()
-    root = ctx.workdir / "vault"
-    root.mkdir()
+    # A fresh directory per attempt, so an uncaught failure retried by the next metric reports its
+    # own cause, never a FileExistsError. RESOLVED, because the vault's read_sources labels a source
+    # by path.resolve().relative_to(root): an unresolved temp path (a junction, an 8.3 short TEMP,
+    # macOS /var) makes every label absolute, which its floors read as dropped files.
+    root = Path(tempfile.mkdtemp(prefix="vault-", dir=ctx.workdir)).resolve()
     _archive_into(ctx, vault, sha, VAULT_PATHS, root)
 
     docs = root / "scripts" / "docs"
@@ -606,9 +639,19 @@ def c_flow_health(ctx: Context, m: Metric) -> None:
         detail["green_but_unmergeable_rule"] = (
             "scripts/ci/check_stalled_prs.py signature: OPEN, BEHIND, no failing or pending check"
         )
-    except Exception as exc:  # noqa: BLE001 - an optional part; recorded, and the status is capped
+    except (
+        CollectError,
+        RuntimeError,
+        OSError,
+        ValueError,
+        KeyError,
+        AttributeError,
+        TypeError,
+        ImportError,
+    ) as exc:
+        # An optional part: the status is capped at warn and the run exits 3, never a quiet null.
         detail["green_but_unmergeable"] = None
-        detail["green_but_unmergeable_error"] = f"{type(exc).__name__}: {exc}"
+        detail["partial_error"] = f"stall count: {type(exc).__name__}: {exc}"
     detail["state_as_of"] = "run time; --through does not apply to open PRs"
     m.value = len(rows)
     m.status = status_flow(oldest, stalled)
@@ -671,7 +714,9 @@ def c_ci_main(ctx: Context, m: Metric) -> None:
 
 def c_asvs(ctx: Context, m: Metric) -> None:
     v = ctx.vault_read()
-    toml = v.root / "docs" / "security" / "asvs-scorecard.toml"
+    # Archived here, not with the ledger: a moved scorecard must null this metric alone.
+    _archive_into(ctx, str(ctx.vault), v.sha, [VAULT_SCORECARD], v.root)
+    toml = v.root / VAULT_SCORECARD
     out = ctx.run(
         [
             sys.executable,
@@ -737,11 +782,14 @@ def c_dependency_vulns(ctx: Context, m: Metric) -> None:
         by_severity[sev] = by_severity.get(sev, 0) + 1
     m.value = len(flat)
     m.status = status_vulns(by_severity)
+    kpis = _vuln_kpis(ctx)
     m.detail = {
         "open_by_severity": by_severity,
-        "kpis": _vuln_kpis(ctx),
+        "kpis": kpis,
         "state_as_of": "run time; --through does not apply",
     }
+    if kpis["error"]:
+        m.detail["partial_error"] = f"vuln-metrics KPIs: {kpis['error']}"
 
 
 def _vuln_kpis(ctx: Context) -> dict[str, Any]:
@@ -788,7 +836,7 @@ def _vuln_kpis(ctx: Context) -> dict[str, Any]:
         if not rows:
             raise CollectError("vuln-metrics.csv holds no rows")
         return {"run_id": run_id, "run_date": runs[0]["createdAt"], "row": rows[-1], "error": None}
-    except Exception as exc:  # noqa: BLE001 - an attachment; its failure must not null the alerts
+    except (CollectError, OSError, ValueError, KeyError, TypeError, csv.Error) as exc:
         return {"run_id": None, "row": None, "error": f"{type(exc).__name__}: {exc}"}
 
 
@@ -862,8 +910,8 @@ SPECS: tuple[Spec, ...] = (
         "Backlog burn",
         "Is the ledger shrinking: rows closed against rows filed?",
         "rows (closed minus filed)",
-        "vault origin/main: scripts/docs/ledger_weekly_report.py census() over docs/BACKLOG.md "
-        "and docs/archive/backlog/BACKLOG-CLOSED.md (git archive)",
+        "vault origin/main: scripts/docs/ledger_weekly_report.py census() over its "
+        "DEFAULT_SOURCES (git archive of every file LEDGER_FILE_GLOBS matches)",
         c_backlog_burn,
     ),
     Spec(
@@ -871,7 +919,7 @@ SPECS: tuple[Spec, ...] = (
         "PRs merged",
         "How many pull requests merged per week across engine, vault and korus?",
         "PRs per week",
-        "gh pr list -R <repo> --state merged --search merged:<week> --json number,mergedAt, "
+        "gh pr list -R <repo> --state merged --search merged:<week> --json number,createdAt,mergedAt, "
         f"for {', '.join(MERGED_REPOS)}",
         c_prs_merged,
     ),
@@ -973,7 +1021,9 @@ def refuse_reason(out: Path, run: Runner = run_cmd) -> str | None:
         text = str(exc)
         # git's own answer for a directory in no repository: the one failure that means "safe".
         # run_bytes runs git under LC_ALL=C, so the message is not localized.
-        if "not a git repository" in text:
+        # The full phrase: a bare "not a git repository" is also git's answer for a pruned
+        # worktree's gitdir or a bad GIT_DIR, which ARE inside a repository's tree.
+        if "not a git repository (or any" in text:
             return None
         return f"cannot tell whether {parent} is inside a git repository: {text}"
     # "true" is a work tree; "false" is inside a .git directory. Both are a repository.
@@ -1000,30 +1050,40 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = ap.parse_args(argv)
     # At least two, so the window always holds one complete week for the weekly values.
+    # Error text can quote a ledger line or a git message; a cp1252 console must not raise on it.
+    for stream in (sys.stdout, sys.stderr):
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     if not 2 <= args.weeks <= 104:
         print("ERROR: --weeks must be from 2 to 104", file=sys.stderr)
-        return 2
+        return 1
     # Resolved ONCE, and the resolved path is both the one checked and the one written: a symlinked
     # --out must not pass the check on its target and then be written beside the link.
     out = args.out.resolve()
     reason = refuse_reason(out)
     if reason is not None:
         print(f"ERROR: refusing --out {args.out}: {reason}", file=sys.stderr)
-        return 2
-    through = args.through or dt.datetime.now(dt.UTC).date()
-    with tempfile.TemporaryDirectory(prefix="mf-metrics-") as tmp:
+        return 1
+    today = dt.datetime.now(dt.UTC).date()
+    through = args.through or today
+    if through > today:
+        print(f"ERROR: --through {through} is after today ({today}, UTC)", file=sys.stderr)
+        return 1
+    # Cleanup errors are ignored (a scanner holding a downloaded file), and the snapshot is written
+    # inside the block, so a cleanup failure can never discard a finished run.
+    with tempfile.TemporaryDirectory(prefix="mf-metrics-", ignore_cleanup_errors=True) as tmp:
         ctx = Context(vault=args.vault, through=through, weeks=args.weeks, workdir=Path(tmp))
         metrics = collect(ctx)
         snap = snapshot(ctx, metrics)
-    tmp_out = out.with_name(out.name + ".tmp")
-    tmp_out.write_text(json.dumps(snap, indent=2) + "\n", encoding="utf-8")
-    tmp_out.replace(out)
+        tmp_out = out.with_name(out.name + ".tmp")
+        tmp_out.write_text(json.dumps(snap, indent=2) + "\n", encoding="utf-8")
+        tmp_out.replace(out)
     for m in metrics:
         print(
             f"{m.id}: value={m.value} status={m.status}" + (f" error={m.error}" if m.error else "")
         )
-    # 2 when any metric could not be read, after the snapshot is written: an outage goes red.
-    return 2 if any(m.error for m in metrics) else 0
+    # 3 when anything could not be read, after the snapshot is written: an outage goes red.
+    return 3 if any(m.error or m.detail.get("partial_error") for m in metrics) else 0
 
 
 if __name__ == "__main__":  # pragma: no cover
