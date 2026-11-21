@@ -646,9 +646,10 @@ def _binary_carriage(data: bytes) -> None:
     if is_doc_ref(text):
         with contextlib.suppress(DocRefError):
             parse_doc_ref(text)
-    # The retention pass calls strip_documents bare, so no raise is allowed.
+    # The retention pass calls strip_documents bare, so no raise is allowed. It passes
+    # on_unwritable, which opens a branch of its own (BACKLOG #5972), so this call does too.
     strip_documents(CARRIAGE_MARKER + text, pruned_at=0.0)
-    strip_documents(text, pruned_at=0.0)
+    strip_documents(text, pruned_at=0.0, on_unwritable=_ignore)
     _strip_and_scan_hl7(text)
 
 
@@ -658,22 +659,42 @@ def _strip_and_scan_hl7(text: str) -> None:
         message = Message.parse(text)
     except HL7PeekError:
         return
-    with contextlib.suppress(EscapedDocumentError, InboundDocRefError, NonVerbatimDocumentError):
+    # The header-collision refusals are the header's, so each must come from a header whose
+    # filled default collides, and such a header must not yield a document read under it (BACKLOG
+    # #5972). The oracle is the engine's own verdict, so it catches a guard that over-refuses or
+    # under-refuses, but not a regression in that verdict itself.
+    colliding = message._delimiters_collide()
+    try:
         list(iter_obx_documents(message, received=text))
+    except CollidingDelimitersRefused:  # the detach's CollidingDelimitersError is one
+        _require_colliding(colliding, "iter_obx_documents")
+    except (EscapedDocumentError, InboundDocRefError, NonVerbatimDocumentError):
+        pass
     for occurrence in range(1, message.count_segments("OBX") + 1):
         try:
             extract_obx_document(message, occurrence=occurrence)
         except CollidingDelimitersRefused:
-            # The header's refusal, so the header must be one whose filled default collides; a
-            # refusal of any other body is a defect, not a refusal (BACKLOG #5972). The oracle
-            # is the engine's own verdict, so it catches a guard that over-refuses but not a
-            # regression in that verdict itself.
-            if not message._delimiters_collide():
-                raise AssertionError(
-                    "extract_obx_document refused a header whose delimiters do not collide"
-                ) from None
+            _require_colliding(colliding, "extract_obx_document")
+            continue
         except BinaryCarriageError:
-            pass
+            # An OBX that is not ED is refused so in any message; an ED one under a colliding
+            # header must meet the header's refusal instead, never this skippable one.
+            ed = (message.field("OBX-2", occurrence=occurrence) or "").upper() == "ED"
+            if not (colliding and ed):
+                continue
+        if colliding:
+            raise AssertionError("extract_obx_document read a document under colliding delimiters")
+
+
+def _ignore() -> None:
+    """An ``on_unwritable`` that records nothing: the target needs the branch run, not the call."""
+
+
+def _require_colliding(colliding: bool, refuser: str) -> None:
+    """A header-collision refusal of a header whose delimiters do not collide is a defect, not a
+    refusal (BACKLOG #5972)."""
+    if not colliding:
+        raise AssertionError(f"{refuser} refused a header whose delimiters do not collide")
 
 
 @dataclass(frozen=True)

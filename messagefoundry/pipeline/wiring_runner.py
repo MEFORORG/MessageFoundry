@@ -177,7 +177,7 @@ from messagefoundry.parsing.sniff import (
     b64_head,
     text_sniff_head,
 )
-from messagefoundry.parsing.split import batch_head_collides
+from messagefoundry.parsing.split import batch_member_collides
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
@@ -354,18 +354,18 @@ the log line reads (BACKLOG #3043)."""
 #: document (vault BACKLOG #2809): :meth:`RegistryRunner._hydrate_payload` raises it.
 _REATTACH_CODE = "reattach"
 
-#: The :class:`NegativeAckError` code of a batch member that would head the envelope and whose
-#: short MSH-2 fills a delimiter with one it already uses, so the BHS cannot be written in its
-#: delimiters (BACKLOG #5972): :func:`_colliding_head_refusal` raises it.
-_COLLIDING_HEAD_CODE = "colliding-head"
+#: The :class:`NegativeAckError` code of a batch member whose short MSH-2 fills a delimiter with
+#: one it already uses, so it cannot be written in its own delimiters, as the head's BHS or as a
+#: send's delimiter rewrite would (BACKLOG #5972): :func:`_colliding_member_refusal` raises it.
+_COLLIDING_MEMBER_CODE = "colliding-delimiters"
 
 
-def _colliding_head_refusal() -> NegativeAckError:
-    """The permanent refusal of a batch member that cannot head the envelope (BACKLOG #5972). Its
+def _colliding_member_refusal() -> NegativeAckError:
+    """The permanent refusal of a batch member whose header cannot be written (BACKLOG #5972). Its
     text names the header's shape only, never a byte of the member."""
     return NegativeAckError(
-        "its short MSH-2 fills a delimiter with one it already uses, so it cannot head a batch",
-        code=_COLLIDING_HEAD_CODE,
+        "its short MSH-2 fills a delimiter with one it already uses, so it cannot be batched",
+        code=_COLLIDING_MEMBER_CODE,
         permanent=True,
     )
 
@@ -373,14 +373,14 @@ def _colliding_head_refusal() -> NegativeAckError:
 #: The reason a refused batch member's log line gives, by the refusal's code: ``framing`` is
 #: ADR 0205 rule 1, ``multiple-messages`` ADR 0209, ``encoding`` ``encode_wire_body``'s, and
 #: ``reattach`` the batch path's own re-attach refusal, which no frame check raised, and
-#: ``colliding-head`` a would-be head whose delimiters the BHS cannot be written in.
+#: ``colliding-delimiters`` a member whose header cannot be written.
 #: A code not named here, or none, reads as the neutral reason below; the line names the code too.
 _MEMBER_REFUSAL_REASONS: Mapping[str, str] = {
     FRAMING_CODE: "its frame cannot carry it",
     MULTIPLE_MESSAGES_CODE: "it holds more than one message",
     ENCODING_CODE: "its charset cannot encode it",
     _REATTACH_CODE: "its document cannot be re-attached",
-    _COLLIDING_HEAD_CODE: "its header's delimiters cannot head a batch",
+    _COLLIDING_MEMBER_CODE: "its header cannot be written in its own delimiters",
 }
 _MEMBER_REFUSAL_REASON_OTHER = "its frame check refused it"
 
@@ -11823,9 +11823,9 @@ class RegistryRunner:
         The one exception (ADR 0205 rule 1): a member whose payload the frame or its charset cannot
         carry, that holds more than one message (ADR 0209), or that itself breaks the re-attach of
         its detached document (vault BACKLOG #2809), is taken out before the envelope is built and
-        dead-lettered alone, and "all N" above means the rest. So is a member that would head the
-        envelope and whose short MSH-2 fills a delimiter with one it already uses, since the BHS
-        is written in the head's delimiters (BACKLOG #5972). The envelope's head is then the
+        dead-lettered alone, and "all N" above means the rest. So is a member whose short MSH-2
+        fills a delimiter with one it already uses, wherever it sits, since neither the head's
+        BHS nor a send's delimiter rewrite can write it (BACKLOG #5972). The envelope's head is then the
         first member that survived.
 
         **Invariants.** Every member is INFLIGHT throughout the window, so a crash recovers the whole set in
@@ -12034,19 +12034,23 @@ class RegistryRunner:
                 current = None
             else:
                 kept, members = hydrated_items, list[Message | str](hydrated)
-            # The envelope's BHS is written in its head's delimiters, so a member whose short
-            # MSH-2 fills a delimiter with one it already uses cannot head it (BACKLOG #5972).
-            # encode_batch would refuse the whole batch for it; each such would-be head is
-            # refused alone instead, and the next member heads. A later member is carried
-            # verbatim, as every member is, so it is not judged.
-            leading = 0
-            while leading < len(kept) and batch_head_collides(members[leading]):
-                leading += 1
+            # A member whose short MSH-2 fills a delimiter with one it already uses cannot be
+            # written in its own delimiters (BACKLOG #5972). As the head, the BHS would be such a
+            # write, and encode_batch refuses the whole batch for it; later, a send that
+            # rewrites the envelope's delimiters would rewrite the member under the BHS's and
+            # change what it reads as. Each such member is refused alone wherever it sits, so its
+            # disposition does not depend on which member the window put first, and the rest
+            # batch. Judged in a thread: a member may be large, and its first line ends where
+            # its first CR or LF is.
+            collides = await asyncio.to_thread(lambda: [batch_member_collides(m) for m in members])
             colliding = [
-                self._refuse_alone_or_raise(it.id, _colliding_head_refusal())
-                for it in kept[:leading]
+                self._refuse_alone_or_raise(it.id, _colliding_member_refusal())
+                for it, hit in zip(kept, collides, strict=True)
+                if hit
             ]
-            kept, members = kept[leading:], members[leading:]
+            if colliding:
+                kept = [it for it, hit in zip(kept, collides, strict=True) if not hit]
+                members = [m for m, hit in zip(members, collides, strict=True) if not hit]
             # Assigned only once every loop is done, so a fault in one leaves it empty and its
             # arm takes every member. In claim order, so the refusal lines follow the lane's FIFO.
             by_id = {r[0]: r for r in unhydratable + unframeable + colliding}
@@ -12241,8 +12245,9 @@ class RegistryRunner:
         return None
 
     def _refuse_alone_or_raise(self, outbox_id: str, exc: NegativeAckError) -> _RefusedMember:
-        """The ``(id, error, refusal)`` of a batch member refused alone, by the re-attach or the
-        frame check, which share this one rule (vault BACKLOG #5100). A refusal that is not
+        """The ``(id, error, refusal)`` of a batch member refused alone, by the re-attach, the
+        frame check or the header-collision check, which share this one rule (vault BACKLOG
+        #5100, BACKLOG #5972). A refusal that is not
         permanent, or one that must stop the lane, is the whole batch's, so it is re-raised for
         the batch's own arm, as a send would raise it."""
         if not exc.permanent or self._lane_stopping_fault(exc) is not None:
@@ -12252,15 +12257,16 @@ class RegistryRunner:
         return outbox_id, safe_exc(exc), exc.with_traceback(None)
 
     async def _dead_letter_refused(self, name: str, refused: Sequence[_RefusedMember]) -> None:
-        """Dead-letter each batch member :meth:`_check_member_frame` or the batch re-attach
-        refused, alone, then log it. The line used to be written in the frame check, before any write, so
+        """Dead-letter each batch member :meth:`_check_member_frame`, the batch re-attach or the
+        header-collision check refused, alone, then log it. The line used to be written in the frame check, before any write, so
         a member a later refusal sent back with the whole batch was logged as dead-lettered when it
         was not. It goes through the same throttle as the other permanent-refusal lines (BACKLOG
         #3043). Its reason
         follows the refusal's code (``_MEMBER_REFUSAL_REASONS``): a ``framing`` member is one its
         frame cannot carry (ADR 0205 rule 1), a ``multiple-messages`` one holds more than one
         message (ADR 0209), an ``encoding`` one is not in the charset, a ``reattach`` one is a
-        payload that itself breaks its document's re-attach (vault BACKLOG #2809), and any other reads as
+        payload that itself breaks its document's re-attach (vault BACKLOG #2809), a
+        ``colliding-delimiters`` one has a header that cannot be written (BACKLOG #5972), and any other reads as
         refused by the frame check, with its code beside it."""
         for outbox_id, error, exc in refused:
             await self.store.dead_letter_now(outbox_id, error)

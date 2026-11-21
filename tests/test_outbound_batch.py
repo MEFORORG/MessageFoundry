@@ -660,21 +660,29 @@ async def test_a_colliding_head_is_dead_lettered_alone_and_the_rest_batch(
     assert await _states(store, mids) == [DEAD_LETTERED, DELIVERED, DELIVERED]
     (row,) = await store.outbox_for(mids[0])
     error = str(row["last_error"])
-    assert "cannot head a batch" in error and "MSGX" not in error and "ADT" not in error
+    assert "cannot be batched" in error and "MSGX" not in error and "ADT" not in error
 
 
-async def test_each_colliding_head_in_turn_is_refused_and_a_colliding_member_is_carried(
-    store: Any,
-) -> None:
-    # Two colliding members in front: each would head the envelope in turn, so each is refused.
-    # One behind the member that heads it is carried verbatim, as every member is: only the
-    # head's delimiters are written.
-    mids = await _enqueue_bodies(store, [_COLLIDING, _COLLIDING, _msg(3), _COLLIDING])
-    rec = await _run_one_batch(store, simulate=False)
+@pytest.mark.parametrize("rewrite", [False, True], ids=["verbatim", "raw-separators"])
+async def test_a_colliding_member_is_refused_wherever_it_sits(store: Any, rewrite: bool) -> None:
+    # Round-3 review: refused only as the head, a later colliding member was carried, and a send
+    # that rewrites the envelope's delimiters rewrote it under the BHS's, so MSH-9 "ADT~A01" read
+    # as two repetitions on the wire. Its disposition also hung on which member the window put
+    # first. Every colliding member is refused alone now, wherever it sits.
+    field = {"hl7_raw_separators": True} if rewrite else {}
+    mids = await _enqueue_bodies(store, [_COLLIDING, _COLLIDING, _msg(3), _COLLIDING, _msg(5)])
+    rec = await _run_one_batch(store, simulate=False, **field)
     (envelope,) = rec.sent
     assert envelope.split("\r")[0].split("|")[10] == "MSG3"  # BHS-11, the first kept member
-    assert _COLLIDING in envelope and envelope.endswith("BTS|2\r")
-    assert await _states(store, mids) == [DEAD_LETTERED, DEAD_LETTERED, DELIVERED, DELIVERED]
+    assert [m.split("|")[9] for m in split_batch(envelope)] == ["MSG3", "MSG5"]
+    assert "MSGX" not in envelope and envelope.endswith("BTS|2\r")
+    assert await _states(store, mids) == [
+        DEAD_LETTERED,
+        DEAD_LETTERED,
+        DELIVERED,
+        DEAD_LETTERED,
+        DELIVERED,
+    ]
 
 
 async def test_a_batch_of_colliding_members_only_sends_nothing(store: Any) -> None:

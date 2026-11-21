@@ -179,14 +179,16 @@ class NonVerbatimDocumentError(ValueError):
     value."""
 
 
-class CollidingDelimitersError(NonVerbatimDocumentError):
+class CollidingDelimitersError(NonVerbatimDocumentError, CollidingDelimitersRefused):
     """A received body has a document to detach, and its header names too few encoding
     characters while a default filled in for one is already another of its delimiters, as
     ``MSH|^~&|`` does: ``&`` is declared its escape character and filled in as its subcomponent
     separator (BACKLOG #5972). ``Message`` refuses every write to such a message, so the detach
     could not set its handle in, nor delivery set the document back. Refused at the detach,
     before anything is stored and before the ACK. A subclass of :class:`NonVerbatimDocumentError`,
-    so both listeners refuse it the same way. The text names no byte of the body.
+    so both listeners refuse it the same way, and of :class:`CollidingDelimitersRefused`, the
+    refusal ``Message``'s writes and ``extract_obx_document`` raise for the same header, so one
+    ``except`` catches the header's refusal from any of them. The text names no byte of the body.
 
     Raised only for a document the detach finds, so only under a header whose OBX-5 components
     still read: under ``MSH|~|`` or ``MSH^^`` none does, so the detach finds no document and
@@ -799,7 +801,9 @@ def strip_documents(
     ``on_unwritable`` is called, with nothing, once for an HL7 body returned unchanged because its
     short MSH-2 fills a delimiter with one it already uses, so no write to it can be read back
     (BACKLOG #5972), when one of its OBX segments has ``OBX-2`` ``ED``: the document it claims
-    outlives its strip window, whatever its size against ``min_bytes``."""
+    outlives its strip window. The claim is all it judges, since under some such headers no OBX-5
+    component reads as written, so it is called too for an ED value the strip would not strip
+    under a readable header, such as one under ``min_bytes``, not Base64, or empty."""
     pruned_at = time.time() if pruned_at is None else pruned_at
     if is_document_tombstone(raw):
         return raw, 0, 0  # already stripped — idempotent
@@ -841,9 +845,7 @@ def strip_documents_in_hl7(
     reclaimed = 0
     count = message.count_segments("OBX")
     for occ in range(1, count + 1):
-        if (message.field("OBX-2", occurrence=occ) or "").upper() != "ED":
-            continue
-        if (message.field("OBX-5.4", occurrence=occ) or "").strip().lower() != _ED_ENCODING.lower():
+        if not _is_base64_ed(message, occ):
             continue  # not Base64-encoded ED — leave it
         data_b64 = message.field("OBX-5.5", occurrence=occ) or ""
         if not data_b64 or is_document_tombstone(data_b64):

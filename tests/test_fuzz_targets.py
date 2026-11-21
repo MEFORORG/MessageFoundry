@@ -705,6 +705,38 @@ def test_the_binary_carriage_target_refuses_a_collision_refusal_of_a_readable_he
         TARGETS_BY_NAME["binary_carriage"].run(SHORT_MSH2_REPRODUCER)
 
 
+@pytest.mark.parametrize("plant", ["returns", "skips"])
+def test_the_binary_carriage_target_refuses_a_document_read_under_a_colliding_header(
+    plant: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The converse control: under a colliding header an ED OBX must meet the header's refusal, so
+    an extract that reads it, or skips it as not a document, fails the target (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import BinaryCarriageError
+
+    TARGETS_BY_NAME["binary_carriage"].run(COLLIDING_HEADER_SEED)  # control: runs clean
+
+    def planted(*_args: object, **_kwargs: object) -> bytes:
+        if plant == "skips":
+            raise BinaryCarriageError("planted")
+        return b"%PDF-"
+
+    monkeypatch.setattr(fuzz_targets, "extract_obx_document", planted)
+    with pytest.raises(AssertionError, match="under colliding delimiters"):
+        TARGETS_BY_NAME["binary_carriage"].run(COLLIDING_HEADER_SEED)
+
+
+def test_the_binary_carriage_target_refuses_a_detach_collision_refusal_of_a_readable_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from messagefoundry.parsing.binary import CollidingDelimitersError
+
+    monkeypatch.setattr(
+        fuzz_targets, "iter_obx_documents", _boom(CollidingDelimitersError("planted"))
+    )
+    with pytest.raises(AssertionError, match="iter_obx_documents refused"):
+        TARGETS_BY_NAME["binary_carriage"].run(SHORT_MSH2_REPRODUCER)
+
+
 def test_write_seed_corpus_materialises_every_seed(tmp_path: Path) -> None:
     target = TARGETS_BY_NAME["hl7_peek"]
     written = write_seed_corpus(target, tmp_path / "corpus")

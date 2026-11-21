@@ -14,10 +14,10 @@ import tracemalloc
 
 import pytest
 
-from messagefoundry.parsing import encode_batch, split_batch
+from messagefoundry.parsing import HL7PeekError, encode_batch, split_batch
 from messagefoundry.parsing.message import COLLIDING_DELIMITERS_WRITE, Message
 from messagefoundry.parsing.peek import normalize
-from messagefoundry.parsing.split import batch_head_collides
+from messagefoundry.parsing.split import batch_member_collides
 
 M1 = "MSH|^~\\&|A|B|C|D|20260101010101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JOHN\r"
 M2 = "MSH|^~\\&|A|B|C|D|20260101010102||ADT^A02|MSG2|P|2.5.1\rPID|1||200||ROE^JANE\r"
@@ -189,16 +189,33 @@ def test_the_head_separators_match_the_parser(head: str) -> None:
 
 
 @pytest.mark.parametrize("head", _HEADS)
-def test_batch_head_collides_is_the_parse_verdict(head: str) -> None:
-    # The delivery stage refuses a head alone on this verdict (BACKLOG #5972), so it must match
-    # what the parse and the write read decide, without parsing the head.
+def test_batch_member_collides_is_the_parse_verdict(head: str) -> None:
+    # The delivery stage refuses a member alone on this verdict (BACKLOG #5972), so on every head
+    # the parse accepts it must match what the parse and the write read decide, without parsing.
     try:
         expected = Message.parse(head)._delimiters_collide()
     except ValueError:  # HL7PeekError is one: encode_batch still refuses it as a parse does
         expected = False
-    assert batch_head_collides(head) is expected
+    assert batch_member_collides(head) is expected
     if expected:
         assert _batch_reading(head)[1] == COLLIDING_DELIMITERS_WRITE
+
+
+@pytest.mark.parametrize(
+    "head",
+    [
+        "MSH|~|A\rOBX|1|TX|||" + "\\.in9999999\\" * 20 + "\r",  # over the escape budget
+        "BHS|~|A\rMSH",  # a later header line too short to read
+    ],
+)
+def test_a_colliding_first_line_is_judged_alone_whatever_a_parse_refuses_later(head: str) -> None:
+    # The verdict reads the first line only, as documented, so a parse refusal later in the text
+    # does not change it; encode_batch still raises the parse's own refusal for such a head, the
+    # budget checked before the collision, as a parse checks it before it reads anything.
+    with pytest.raises(HL7PeekError):
+        Message.parse(head)
+    assert batch_member_collides(head) is True
+    assert _batch_reading(head)[0] == "HL7PeekError"
 
 
 def test_a_message_head_whose_filled_default_collides_is_refused() -> None:
