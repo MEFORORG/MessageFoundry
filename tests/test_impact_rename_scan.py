@@ -599,3 +599,64 @@ def test_a_read_at_a_role_reads_coordinates_in_another_file_reports_the_referrer
     plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
     assert plan.unresolved != ()
     assert not any(Path(e.file).name == "_consts.py" for e in plan.edits)
+
+
+# --- review round 2 (round-f12b8401) -------------------------------------------------------------
+
+
+def test_a_table_only_an_accepts_predicate_reads_reports_the_referrer(tmp_path: Path) -> None:
+    """The cheap gate reads the handler's ``accepts=`` predicate as the scan does, so a handler
+    whose predicate is its only reader of the table is scanned, not skipped."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "mod.py": _HEAD
+            + 'TABLES = {"k": "diets"}\n\n'
+            + _WIRE
+            + '@handler("h_p", accepts=lambda m: code_set(TABLES["k"]).get("x") is not None)\n'
+            "def h_p(msg):\n"
+            '    return Send("OB_A", msg)\n',
+            "codesets/diets.csv": "code,value\nA,Apple\n",
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "code_set", "diets", "meals")
+    assert plan.unresolved == (Reference("handler", "h_p", "code_set", "diets"),)
+
+
+def test_a_module_helper_called_with_no_arguments_is_read_for_its_elements(
+    tmp_path: Path,
+) -> None:
+    """``_routes.all()`` is a helper call, not a dict method: a dict it returns is iterated for its
+    keys, which are the names sent."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "_routes.py": 'def all():\n    return {"OB_OLD": 1}\n',
+            "mod.py": _HEAD + "import _routes\n\n" + _WIRE + '@handler("h_p")\n'
+            "def h_p(msg):\n"
+            "    return [Send(d, msg) for d in _routes.all()]\n",
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    assert any(Path(e.file).name == "_routes.py" for e in plan.edits)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'DESTS = ["OB_A", "OB_OLD"]\n\n\n|    return [Send(d, msg) for _i, d in enumerate(DESTS)]\n',
+        'ROUTES = {"ADT": "OB_OLD"}\n\n\n|    return [Send(p[1], msg) for p in ROUTES.items()]\n',
+    ],
+    ids=["enumerate", "items_index"],
+)
+def test_a_captured_container_the_scan_cannot_follow_reports_the_referrer(
+    tmp_path: Path, body: str
+) -> None:
+    prelude, send = body.split("|")
+    config_dir = _write(
+        tmp_path,
+        {"mod.py": _HEAD + prelude + _WIRE + '@handler("h_p")\ndef h_p(msg):\n' + send},
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert Reference("handler", "h_p", "outbound", "OB_OLD") in plan.unresolved

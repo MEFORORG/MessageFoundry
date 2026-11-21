@@ -37,8 +37,9 @@ reported unresolved, since it still reads the old name.
 ``plan_rename`` is a pure computation (it reads files but writes nothing); ``apply_rename`` performs the
 writes, preserving each file's exact bytes outside the replaced spans (newline style and the original
 quote delimiter of every literal are kept). A dry-run followed by ``--apply`` on an unchanged tree
-produces identical edits, and re-applying a plan is idempotent (a span already carrying the new literal
-is skipped)."""
+produces identical edits. Re-applying a plan to a file it wholly renamed already is a no-op; a file
+holding only some of its edits, or otherwise changed since the plan read it, is refused with
+nothing written (BACKLOG #5980)."""
 
 from __future__ import annotations
 
@@ -154,8 +155,8 @@ class LiteralEdit:
 
     Positions are ``tokenize``/text coordinates — ``start_line``/``end_line`` are 1-based, the columns
     0-based, ``end_col`` exclusive. ``old_literal`` is the exact source text being replaced (including
-    its quotes), so :func:`apply_rename` can assert the span before writing and no-op if it already
-    carries ``new_literal`` (idempotency)."""
+    its quotes), so :func:`apply_rename` can assert the span before writing; a file whose every span
+    already carries ``new_literal`` is left alone."""
 
     file: str
     start_line: int
@@ -344,7 +345,9 @@ def plan_rename(
     # the listing failed, so no binding literal is rewritten.
     listed: list[tuple[str, ...] | None] = []
     files = set(def_spans) | {site.file for site in ref_sites}
-    bom_files = frozenset(file for file in files if _has_bom(file))
+    bom_files = frozenset(
+        file for file in files if (sources.raw(file) or b"")[:3] == codecs.BOM_UTF8
+    )
     for file in sorted(files):
         file_def = def_spans.get(file, [])
         file_sites = [site for site in ref_sites if site.file == file]
@@ -992,7 +995,10 @@ def _scanned_referrers(
         known = {ref.referrer for ref in indexed if ref.referrer_kind == kind}
         table = _table(registry, kind)
         for name in sorted(set(table) - known):
-            if not _may_read(table[name], old, sources):
+            roots = [table[name]]
+            if kind == "handler" and name in registry.handler_accepts:
+                roots.append(registry.handler_accepts[name])
+            if not any(_may_read(root, old, sources) for root in roots):
                 continue
             ref = Reference(kind, name, target_kind, old)
             held: list[bool] = []
@@ -1000,6 +1006,10 @@ def _scanned_referrers(
             found = _referrer_sites(registry, ref, old, target_kind, sources, {}, held)
             if found is not None and (held or any(site.rewritable for site in found[0])):
                 out.append((ref, found))
+            elif any(_captures(root, old) for root in roots):
+                # It holds a container with the name and reads it in a form the scan does not
+                # follow (enumerate, a tuple index): reported, never left on the old name.
+                out.append((ref, ([], False)))
     return out
 
 
@@ -1011,6 +1021,16 @@ _SCANNED_REFERRER_KINDS: dict[str, tuple[str, ...]] = {
     "handler": ("router",),
     **dict.fromkeys(_TABLE_KINDS, ("router", "handler")),
 }
+
+
+def _captures(fn: object, old: str) -> bool:
+    """Whether a function ``fn`` reaches captures a value holding ``old``, as a value or an
+    element."""
+    return any(
+        _holds(captured.value, old) or _holds(captured.value, old, elements=True)
+        for func in reached_functions(fn)
+        for captured in captured_values(func, func.__module__)
+    )
 
 
 def _may_read(fn: object, old: str, sources: SourceCache) -> bool:
@@ -1763,18 +1783,11 @@ def _carried_elements(
     elif isinstance(expr, ast.Attribute):
         flow.read.add(_key(expr))
         flow.iter_attrs.add(expr.attr)
-    elif isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute) and not expr.args:
-        if expr.func.attr in ("keys", "copy"):
-            # A dict's keys, or a copy of a container, iterate as the container does.
-            _carried_elements(expr.func.value, values, seen, flow)
-        elif expr.func.attr == "values":
-            _carried(expr.func.value, values, seen, flow)
-        elif expr.func.attr != "items":
-            _carried(expr, values, seen, flow)
     elif isinstance(expr, ast.Call) and (
         (helper := _helper_name(expr.func, flow.modules)) is not None
         and not (_call_name(expr.func) in _COPY_CALLS and isinstance(expr.func, ast.Name))
     ):
+        # Before the dict methods, so ``_routes.all()`` is a helper call, not a method.
         # A helper's return taken for its elements: the helper is scanned for its returned
         # elements, and a pass-through argument is iterated with it.
         flow.iter_calls.add(helper)
@@ -1783,6 +1796,14 @@ def _carried_elements(
             expr, [*flow.passes.get(helper, ()), *flow.iter_passes.get(helper, ())]
         ):
             _carried_elements(root, values, seen, flow)
+    elif isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute) and not expr.args:
+        if expr.func.attr in ("keys", "copy"):
+            # A dict's keys, or a copy of a container, iterate as the container does.
+            _carried_elements(expr.func.value, values, seen, flow)
+        elif expr.func.attr == "values":
+            _carried(expr.func.value, values, seen, flow)
+        elif expr.func.attr != "items":
+            _carried(expr, values, seen, flow)
     else:
         # A list, a tuple, a set, a comprehension or anything else: its value's parts are its
         # elements.
@@ -2444,17 +2465,6 @@ def _unresolved_referrers(
 # --- python literal rewriting (tokenize) -------------------------------------
 
 
-def _has_bom(file: str) -> bool:
-    """Whether ``file`` starts with a UTF-8 byte-order mark."""
-    try:
-        with open(file, "rb") as fh:
-            return fh.read(3) == codecs.BOM_UTF8
-    except OSError as exc:
-        # The tokenizer cannot read it either, so it yields no edit for the shift to apply to.
-        _log.debug("rename could not read %s for a byte-order mark: %s", file, type(exc).__name__)
-        return False
-
-
 def _source_position(edit: LiteralEdit, bom_files: frozenset[str]) -> tuple[int, int]:
     """``edit``'s position as the AST positions count it. An edit is tokenized from a plain UTF-8
     read, which keeps a byte-order mark as the first character of line 1, while ``SourceCache``
@@ -2475,7 +2485,8 @@ def _py_literal_edits(
     try:
         # Through the cache, so the plan's snapshot holds the bytes these edits were computed from.
         text = sources.text(file)
-    except UnicodeDecodeError:
+    except UnicodeDecodeError as exc:
+        _log.debug("rename could not decode %s: %s", file, type(exc).__name__)
         return []
     if text is None:
         return []
