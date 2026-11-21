@@ -359,6 +359,7 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
     before = path.lstat()
     if _names_a_link(before) or not S_ISREG(before.st_mode):
         raise _NotPlainError(f"{path.name} is not a plain file")
+    met: str | None = None
     try:
         fd = os.open(path, _PLAIN_OPEN_FLAGS)
     except OSError as exc:
@@ -366,12 +367,13 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
         # least ENXIO or EOPNOTSUPP for a socket, a PermissionError for a folder on Windows, and
         # there a FileNotFoundError for a dangling link it followed. The name is what decides,
         # so every caller sees one refusal (BACKLOG #5388 added item 3).
-        if _unplain_now(path, exc):
-            # The open's own error is named, so the log says what was met.
-            raise _NotPlainError(
-                f"{path.name} changed after it was checked: {codec_safe_str(exc)}"
-            ) from None
-        raise
+        if not _unplain_now(path, exc):
+            raise
+        met = codec_safe_str(exc)
+    if met is not None:
+        # Raised after the handler, so the open's error is on no chain; its text names what the
+        # open met, so the log says so.
+        raise _NotPlainError(f"{path.name} changed after it was checked: {met}")
     try:
         # Before the fdopen, which answers a directory swapped in after the lstat with its own
         # IsADirectoryError, naming the descriptor rather than the path (BACKLOG #5388 added
@@ -2944,6 +2946,7 @@ class UploadStore:
             # listing key, so once it is gone the file is invisible even if the blob lingers).
             # Under the pair lock, so a rotate-key re-seal cannot put either back (BACKLOG #3181).
             with _pair_lock(meta_path):
+                body_defect: str | None = None
                 try:
                     blob_path.unlink(missing_ok=True)
                 except OSError as exc:
@@ -2954,7 +2957,10 @@ class UploadStore:
                     # stays listed.
                     if not _lstat_is_dir(blob_path):
                         raise
-                    raise _damaged(file_id, "body", codec_safe_str(exc)) from None
+                    body_defect = codec_safe_str(exc)
+                if body_defect is not None:
+                    # After the handler, as _damaged requires, so the error is on no chain.
+                    raise _damaged(file_id, "body", body_defect)
                 meta_path.unlink(missing_ok=True)
             return meta
 
