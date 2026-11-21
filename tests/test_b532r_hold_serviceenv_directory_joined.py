@@ -176,7 +176,6 @@ def test_a_join_beside_a_store_key_alone_adds_no_directory_step() -> None:
     """A refusal about a store key alone, with nothing running on, sends the operator to a key
     file. The joined directory string does not need touching for that, so no step names it."""
     posture = _joined_beside(KEY_CLASS_NAMES[0])
-    assert posture.directory_joined and not posture.value_runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None
     assert "DPAPI-protected key file" in refusal

@@ -461,3 +461,46 @@ def test_a_value_name_set_to_equals_signs_does_not_run_on(item: str) -> None:
 def test_an_empty_value_name_still_runs_on_into_a_key_like_item() -> None:
     """The control: ``MEFOR_VALUE_X=`` with nothing after it runs on as on origin/main."""
     assert _read(["MEFOR_VALUE_X=", "abc=="]).value_runs_on
+
+
+def test_a_value_name_alone_joined_to_the_next_item_is_not_taken_as_misspelled() -> None:
+    """Round-3 review finding 1: the join puts a line break into the whole-string name, but NSSM
+    reads the name's own item alone, so the remedy must not say to rename the key."""
+    for items in (["MEFOR_VALUE_X", "Winter=2026!"], ["MEFOR_VALUE_X", "HTTP_PROXY=x"]):
+        posture = _read(items)
+        assert posture.listed == ("MEFOR_VALUE_X",), items
+        assert posture.unplain_value_names == (), items
+        assert posture.empty_value_names == (), items
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        ["MEFOR_STORE_PASSWORD=", "mefor_auth_oidc_client_private_key=C:\\k.pem"],
+        ["MEFOR_STORE_PASSWORD=", "Mefor_Auth_Oidc_Client_Private_Key=Summer!"],
+        ["Path=x\nMEFOR_STORE_PASSWORD=\nmefor_auth_oidc_client_private_key=x"],
+    ],
+)
+def test_a_mixed_case_refused_name_below_an_empty_secret_is_its_value(items: list[str]) -> None:
+    """Round-3 review finding 4: below an empty secret-class value, only an upper-case refused
+    name starts a variable of its own. Read as the path-form OIDC key, mixed-case secret text was
+    dropped, and the empty password above it with it, so nothing refused."""
+    posture = _read(items)
+    assert "MEFOR_STORE_PASSWORD" in posture.listed, items
+    assert service_env_refusal(posture) is not None
+
+
+def test_an_upper_case_path_form_key_still_ends_an_empty_secret() -> None:
+    """The control: the engine's own name in upper case is a variable of its own, a path."""
+    posture = _read(["MEFOR_STORE_PASSWORD=", f"{_PEM}=C:\\k.pem"])
+    assert posture.listed == ()
+
+
+def test_a_secret_name_alone_in_a_later_item_below_a_value_name_alone_is_kept() -> None:
+    """Round-3 review finding 6: once joined, the whole-string reading names the
+    ``MEFOR_VALUE_*`` name, but NSSM reads the store key's item as its own, so the key is still
+    listed and the remedy keeps its key-file step."""
+    posture = _read(["MEFOR_VALUE_X", KEY_CLASS_NAMES[0], "=QUJDREVG"])
+    assert posture.listed_keys == (KEY_CLASS_NAMES[0],)
+    refusal = service_env_refusal(posture)
+    assert refusal is not None and "DPAPI-protected key file" in refusal

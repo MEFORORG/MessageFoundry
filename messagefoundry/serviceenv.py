@@ -166,7 +166,7 @@ class ServiceEnvPosture:
     value_runs_on: bool = False
     #: Whether a string read as part of a value that runs on sets ``MEFOR_SECRETS_DIRECTORY`` on
     #: its first line, as ``MEFOR_SECRETS_DIRECTORY==`` does (:func:`_continues_string`), whether
-    #: or not :func:`_names` keeps the variable it was joined to, such as a path-form OIDC key.
+    #: or not :func:`_names` keeps the variable it was joined to.
     #: NSSM may read that string as its own variable, so the refusal must not say to remove every
     #: such string, nor that the lists set no secrets directory.
     directory_joined: bool = False
@@ -419,8 +419,9 @@ def _ends_blank_class(line: str) -> bool:
     ``MEFOR_AI_ENVIRONMENT=prod``, ``Public=Summer!``, ``PATH=,C:\\x`` and ``=orphan`` all refuse,
     and the refusal names the secret-class variable. A line led by blanks is not exact either.
     Nor does any equals-led line, Windows' own nameless entries such as ``=C:=C:\\x`` and
-    ``=ExitCode=0`` among them: origin/main 9421dcbf27 read such a later line of one string as
-    the value above it, and so refused, and this rule must refuse every shape that did. What
+    ``=ExitCode=0`` among them: the plain line rule reads such a later line of one string as the
+    value above it, and so refuses, and this rule refuses no less
+    (``tests/test_b532w3_serviceenv_split_shapes.py`` pins it). What
     this misses, at least: a secret whose own text is exactly such a line, such as
     ``OS=Summer!``."""
     name = line.partition("=")[0]
@@ -452,6 +453,17 @@ def _refused_name(name: str) -> bool:
     return name in _REFUSED_CLASS_NAMES or name.startswith(_VALUE_PREFIX)
 
 
+def _starts_refused(written: str, *, below_empty_class: bool) -> bool:
+    """Whether the text before a line's first equals sign, ``written``, names a variable the
+    refusal is about (:func:`_refused_name`), so the line starts a variable of its own. Below an
+    empty secret-class value it must be in upper case, as the engine's names are: mixed-case text
+    such as ``Mefor_Auth_Oidc_Client_Private_Key=Summer!`` may be the secret split from its name,
+    and read as that path-form key it would be dropped and the empty value above it with it, so
+    it is read as the value instead, which refuses."""
+    name = written.strip()
+    return _refused_name(name.upper()) and not (below_empty_class and name != name.upper())
+
+
 def _line_start(line: str, *, below_empty_class: bool = False) -> Literal["kept", "ends"] | None:
     """How a line below a registry string's first is read: ``"kept"`` when it sets a name the
     refusal is about, so it is a variable of its own; ``"ends"`` when it sets an ordinary
@@ -466,11 +478,12 @@ def _line_start(line: str, *, below_empty_class: bool = False) -> Literal["kept"
     equals sign, refuses whatever it holds, so reading the next line into it would only change
     the remedy, to removing that line and no longer naming the empty entry. The secrets
     directory's name is no secret, and reading the next line into it would take the directory as
-    set."""
+    set. Below such a value a refused name starts a variable of its own only in upper case
+    (:func:`_starts_refused`)."""
     written, equals, _rest = line.partition("=")
     if not equals:
         return None
-    if _refused_name(written.strip().upper()):
+    if _starts_refused(written, below_empty_class=below_empty_class):
         return "kept"
     ends = _ends_blank_class(line) if below_empty_class else _is_ordinary_line(line)
     return "ends" if ends else None
@@ -494,7 +507,7 @@ def _still_blank(text: str) -> bool:
     takes a path-form key as no path (:func:`_path_form`), and set where an empty value would not
     be kept (:func:`_names`), so ``MEFOR_STORE_PASSWORD==`` refuses alone. Below a
     ``MEFOR_VALUE_*`` name, which refuses whatever it holds, it is set, so the value does not run
-    on into the next item, as on origin/main 9421dcbf27."""
+    on into the next item."""
     return not text.replace("=", "").strip()
 
 
@@ -589,11 +602,17 @@ def _read_string(
         # A refused name alone below another variable, or below lines that start none, starts a
         # variable of its own. Not below an empty secret-class value, which takes it, nor inside
         # a name the whole-string reading keeps, such as ``MEFOR_VALUE_A<LF>`` on the first
-        # line, which names the variable instead.
+        # line, which names the variable instead, unless the line is in a later string of a
+        # joined group, which NSSM reads as its own variable.
         alone = (
             start is None
             and not empty_class
-            and (first_sets or starts_seen or not whole_kept)
+            and (
+                first_sets
+                or starts_seen
+                or not whole_kept
+                or (own_lines is not None and number > own_lines)
+            )
             and _name_alone(line)
         )
         if alone:
@@ -685,7 +704,7 @@ def _continues_string(entry: str, *, below_empty_class: bool = False) -> bool:
     if first is None:
         return False
     whole, whole_equals, _value = entry.partition("=")
-    if whole_equals and _refused_name(whole.strip().upper()):
+    if whole_equals and _starts_refused(whole, below_empty_class=below_empty_class):
         return False
     if below_empty_class:
         return not _ends_blank_class(first)
@@ -782,14 +801,12 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
         # The variables that ran on: each string's ending, and its whole-string twin, which has
         # the same name, line and spelling and was as empty. Only these make the refusal say to
         # remove the strings after them.
+        ran = {(i, v.written, v.line, v.broken) for i, v in enumerate(endings)}
         # A name written alone has no line variable once joined, only the whole-string one,
         # whose name holds a line break when the next string's first line has an equals sign
-        # after other text, as ``Winter=2026!`` does, so it matches either spelling.
-        ran = {
-            (i, v.written, v.line, broken)
-            for i, v in enumerate(endings)
-            for broken in {v.broken, v.broken or v.alone}
-        }
+        # after other text, as ``Winter=2026!`` does. That break is the join's: NSSM reads the
+        # name's own string alone, so the twin is not taken as broken.
+        joined_breaks = {(i, v.written, v.line, True) for i, v in enumerate(endings) if v.alone}
         # ``\r\n`` between strings: a string ending in a lone ``\r`` then still ends a line of
         # its own, so each line keeps the number ``starts`` gives it.
         joined, _ends = _read_string(where, "\r\n".join(strings), own_lines=starts[1] - 1)
@@ -798,7 +815,8 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
             local = (variable.line or 1) - starts[index] + 1
             line_on_string = None if local == 1 else local
             key = (index, variable.written, line_on_string, variable.broken)
-            ran_on = key in ran and bool(variable.value.strip())
+            joined_break = key in joined_breaks
+            ran_on = (key in ran or joined_break) and bool(variable.value.strip())
             # Its value takes the next string's first line, which may set the directory, past any
             # string of equals signs alone, which keeps the value running on (_still_blank).
             holds = False
@@ -813,7 +831,13 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
                 )
                 holds = _sets_directory_first(taken)
             read.append(
-                replace(variable, line=line_on_string, runs_on=ran_on, holds_directory=holds)
+                replace(
+                    variable,
+                    line=line_on_string,
+                    broken=variable.broken and not joined_break,
+                    runs_on=ran_on,
+                    holds_directory=holds,
+                )
             )
     return read
 
@@ -938,7 +962,7 @@ def read_service_env_posture(
         unplain_value_names=unplain,
         value_runs_on=any(variable.runs_on and _names([variable]) for variable in variables),
         # Not filtered through ``_names``: the directory string is in the lists whichever
-        # variable it was joined to, so a dropped one, such as a path-form OIDC key, counts too.
+        # variable it was joined to, so one ``_names`` drops counts too.
         directory_joined=any(variable.holds_directory for variable in variables),
     )
 
