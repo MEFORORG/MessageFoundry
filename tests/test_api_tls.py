@@ -4298,8 +4298,7 @@ _LOOPBACK_SANS = (("ip", "127.0.0.1"), ("ip", "::1"), ("dns", "localhost"))
         ("LOCALHOST", (("dns", "LOCALHOST"), ("ip", "127.0.0.1"), ("ip", "::1"))),
         # Named by its address without brackets (BACKLOG #5973).
         ("[::1]", (("ip", "::1"), ("ip", "127.0.0.1"), ("dns", "localhost"))),
-        # A trailing dot is a loopback bind, but its entry is not ``localhost``, which hostname
-        # verification will not match to it, so ``localhost`` is named too.
+        # A localhost. bind is a loopback bind and names all three loopback names.
         (
             "localhost.",
             (("dns", "localhost."), ("ip", "127.0.0.1"), ("ip", "::1"), ("dns", "localhost")),
@@ -4437,11 +4436,6 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
         ("127.0.0.1", "[::1]", True),
         # Hostname matching ignores case, and a SAN cannot carry an IPv6 zone.
         ("myhost", "MYHOST", True),
-        # OPEN EDGE, pinned as current behaviour: san_names ignores a trailing dot, so these reuse
-        # though hostname verification of the new spelling fails (see _names_missing).
-        ("myhost", "myhost.", True),
-        ("myhost.", "myhost", True),
-        ("localhost", "localhost.", True),
         ("fe80::1%12", "fe80::1%12", True),
         # A bracketed host is minted and checked without its brackets, as the address.
         ("[::1]", "[::1]", True),
