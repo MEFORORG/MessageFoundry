@@ -275,6 +275,13 @@ def b64_head(b64: str, max_bytes: int = 32) -> bytes:
         return b""
 
 
+def b64_head_is_bounded(b64: str, max_bytes: int = 32) -> bool:
+    """Whether :func:`b64_head` reads at most its first window of ``b64``: true when that window
+    holds no whitespace, so the call does a fixed amount of work whatever the text's length."""
+    window = b64[: ((max_bytes + 2) // 3) * 4]
+    return "".join(window.split()) == window
+
+
 # --- archive-member admission (ASVS 5.2.2 "within an archive", 5.3.2) --------------------------------
 # ASVS 5.2.2 asks that an accepted file, "either on its own or within an archive such as a zip file",
 # have its extension checked against an expected extension and its contents validated as corresponding

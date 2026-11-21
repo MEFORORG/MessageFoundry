@@ -175,6 +175,7 @@ from messagefoundry.parsing.peek import PEEK_READ_FAULTS, HL7MessageTooLarge
 from messagefoundry.parsing.sniff import (
     attachment_mime_agrees,
     b64_head,
+    b64_head_is_bounded,
     text_sniff_head,
 )
 from messagefoundry.pipeline.alerts import REMINDER_SECONDS, AlertSink, LoggingAlertSink
@@ -10377,11 +10378,16 @@ class RegistryRunner:
                 # payload as its claimed inert type. Non-sniffable labels are kept as declared.
                 # A label some backend's column cannot hold is downgraded the same way (BACKLOG #1619),
                 # tested first so an over-long label is never copied by the MIME check.
-                # The magic-byte head is read in a thread too: its work grows with any whitespace
-                # before the prefix, which the sender controls (BACKLOG #1619).
+                # The magic-byte head's work grows with any whitespace before the prefix, which the
+                # sender controls, so only a head with whitespace in its first window is read in a
+                # thread; the common one is a fixed read here (BACKLOG #1619).
                 safe_ct = content_type
+                if b64_head_is_bounded(verbatim_b64):
+                    head = b64_head(verbatim_b64)
+                else:
+                    head = await asyncio.to_thread(b64_head, verbatim_b64)
                 if not _label_fits_every_backend(content_type) or not attachment_mime_agrees(
-                    content_type, await asyncio.to_thread(b64_head, verbatim_b64)
+                    content_type, head
                 ):
                     safe_ct = _DEFAULT_ATTACHMENT_MIME
                 ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)
