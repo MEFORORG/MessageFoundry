@@ -365,7 +365,8 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   under a new message id, so the store links each child to the parent's documents a handle in its
   `OBX-5.5` names, read as delivery reads one (behind its gate), with one reference of its own, in
   the commit that makes it (`_inherit_attachments`). An address the body carries anywhere else,
-  bare or as a copied handle, is not linked. A document whose header a purge collected first is
+  bare or as a copied handle, is not linked, nor is any handle under a header whose filled
+  default collides with another of its delimiters, which the re-attach refuses (BACKLOG #5972). A document whose header a purge collected first is
   not linked either, so `refcount` still equals the live linkage rows. Purging either message then
   releases only its own reference. A handle naming a document the parent does not hold is not
   linked, and is refused at delivery. A transform with several pass-through Sends makes several

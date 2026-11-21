@@ -180,8 +180,9 @@ class NonVerbatimDocumentError(ValueError):
 
 
 class CollidingDelimitersError(NonVerbatimDocumentError, CollidingDelimitersRefused):
-    """A received body has a document to detach, and its header names too few encoding
-    characters while a default filled in for one is already another of its delimiters, as
+    """A received body claims a document, an OBX whose ``OBX-2`` is ``ED``, and its header names
+    too few encoding characters while a default filled in for one is already another of its
+    delimiters, as
     ``MSH|^~&|`` does: ``&`` is declared its escape character and filled in as its subcomponent
     separator (BACKLOG #5972). ``Message`` refuses every write to such a message, so the detach
     could not set its handle in, nor delivery set the document back. Refused at the detach,
@@ -983,6 +984,10 @@ def doc_ref_addresses_in_hl7(text: str) -> frozenset[str]:
         message = Message.parse(text)
     except HL7PeekError:
         return frozenset()
+    if message._delimiters_collide():
+        # The re-attach's own refusal of any handle under such a header (_COLLIDING_HANDLE),
+        # judged from the header alone, before any OBX-5 is read.
+        return frozenset()
     found: set[str] = set()
     for occ in range(1, message.count_segments("OBX") + 1):
         value = message.field("OBX-5.5", occurrence=occ) or ""
@@ -991,9 +996,6 @@ def doc_ref_addresses_in_hl7(text: str) -> frozenset[str]:
                 found.add(parse_doc_ref(value)[0])
             except DocRefError:
                 continue  # malformed: delivery refuses it, and it names nothing to hold
-    if found and message._delimiters_collide():
-        # The re-attach's own refusal of any handle under such a header (_COLLIDING_HANDLE).
-        return frozenset()
     return frozenset(found)
 
 

@@ -2119,6 +2119,21 @@ async def test_a_streaming_ed_body_under_a_colliding_header_it_cannot_read_is_re
     assert await _ingress_count(store, ic.name) == 0
 
 
+async def test_the_http_listener_refuses_a_streaming_ed_body_under_a_colliding_header_too(
+    store: MessageStore,
+) -> None:
+    """B13b on the receipt listener, which catches the detach's refusals on its own path."""
+    ic = _streaming_ic()
+    runner = _runner(store, ic)
+
+    receipt = await runner._handle_inbound_http(ic, _TILDE_HEADER_DOCUMENT.encode("utf-8"))
+
+    assert receipt.refusal is not None
+    assert [r["status"] for r in await _rows(store, ic.name)] == [MessageStatus.ERROR.value]
+    assert await _attachment_count(store) == 0
+    assert await _ingress_count(store, ic.name) == 0
+
+
 async def test_no_address_is_named_for_a_handle_under_a_colliding_header() -> None:
     """B13g: ``doc_ref_addresses_in_hl7`` named the address of a handle under a colliding header,
     which the re-attach refuses whatever it names, so a child carrying it was linked to a document

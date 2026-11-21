@@ -725,6 +725,17 @@ def test_the_binary_carriage_target_refuses_a_document_read_under_a_colliding_he
         TARGETS_BY_NAME["binary_carriage"].run(COLLIDING_HEADER_SEED)
 
 
+def test_the_binary_carriage_target_refuses_a_detach_that_accepts_a_colliding_ed_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The negative control for B13b: a detach that returns no document for an ED claim under a
+    colliding header, rather than refusing it, fails the target (BACKLOG #5972)."""
+    TARGETS_BY_NAME["binary_carriage"].run(COLLIDING_HEADER_SEED)  # control: runs clean
+    monkeypatch.setattr(fuzz_targets, "iter_obx_documents", lambda *_a, **_k: iter(()))
+    with pytest.raises(AssertionError, match="accepted an ED claim under colliding delimiters"):
+        TARGETS_BY_NAME["binary_carriage"].run(COLLIDING_HEADER_SEED)
+
+
 def test_the_binary_carriage_target_refuses_a_detach_collision_refusal_of_a_readable_header(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

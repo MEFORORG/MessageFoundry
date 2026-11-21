@@ -637,7 +637,8 @@ def _binary_carriage(data: bytes) -> None:
       document and, for an ED OBX under a short MSH-2 whose filled default is already another of
       its delimiters, ``CollidingDelimitersRefused`` (BACKLOG #5972), which is not a
       ``BinaryCarriageError`` and is accepted only on such a header. The detach scan's refusal of
-      such a header, ``CollidingDelimitersError``, is a ``NonVerbatimDocumentError``. A body the
+      such a header, ``CollidingDelimitersError``, is a ``NonVerbatimDocumentError``, and must
+      come for every such header with an OBX whose ``OBX-2`` is ``ED``, read or not. A body the
       parser accepts always has readable delimiters, so any other ``ValueError`` out of either is
       a defect, not a refusal.
 
@@ -677,10 +678,9 @@ def _strip_and_scan_hl7(text: str) -> None:
     except (EscapedDocumentError, InboundDocRefError, NonVerbatimDocumentError):
         pass
     else:
-        if colliding and detached:
-            raise AssertionError("iter_obx_documents yielded a document under colliding delimiters")
-        if colliding and _holds_ed_claim(message):
-            # An ED claim it could not read must be refused, never ACKed undetached (B13b).
+        # A detached document is an ED claim, so one check covers both: under a colliding
+        # header any ED claim must be refused, never yielded or ACKed undetached.
+        if colliding and (detached or _holds_ed_claim(message)):
             raise AssertionError(
                 "iter_obx_documents accepted an ED claim under colliding delimiters"
             )

@@ -10347,7 +10347,8 @@ class RegistryRunner:
         and :class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError` for a document
         delivery's splice would not set back verbatim (BACKLOG #5099), its subclass
         :class:`~messagefoundry.parsing.binary.CollidingDelimitersError` among them, for a body
-        whose short MSH-2 fills a delimiter with one it already uses (BACKLOG #5972) — each, as one of
+        whose short MSH-2 fills a delimiter with one it already uses and that has an OBX whose
+        ``OBX-2`` is ``ED``, whether or not a document reads there (BACKLOG #5972) — each, as one of
         :data:`_DETACH_REFUSALS`, is turned
         into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
         Phase-C); the budget bounds how many such buffers can be concurrent."""
