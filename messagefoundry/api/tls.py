@@ -263,8 +263,9 @@ def _generated_sans(host: str) -> list[str]:
       and any other client on this box reach it through (BACKLOG #5973).
     - A bind the engine treats as loopback, by the exact test :attr:`ApiSettings.is_loopback`
       uses (``127.0.0.1``, ``::1``, ``localhost``), carries the other two of
-      :data:`_GENERATED_LOOPBACK_SANS` (BACKLOG #5790), so a first mint and the exposed-bind
-      gate agree on which binds are loopback.
+      :data:`_GENERATED_LOOPBACK_SANS` (BACKLOG #5790), so a mint, renewal or re-mint gives
+      all three exactly to the binds the exposed-bind gate treats as loopback. Kept names
+      (:func:`_kept_loopback_names`) can still add loopback names for another bind.
     - Any other host carries no extra name, ``LOCALHOST``, ``[::1]`` and ``127.0.0.2`` included.
 
     :func:`_replacement_due` re-mints a reused pair that lacks a name :func:`_names_missing`
