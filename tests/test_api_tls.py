@@ -4330,6 +4330,19 @@ def test_a_pair_minted_for_a_127_bind_verifies_at_each_loopback_name(
     assert _handshake(server_ctx, client_ctx, client_cert=None, server_hostname=dialled)
 
 
+def test_a_pair_minted_for_a_127_bind_fails_verification_at_a_name_it_lacks(
+    tmp_path: Path,
+) -> None:
+    """The negative control for the handshake above: the same harness refuses a name absent from
+    the SAN, so its passes prove the hostname check ran."""
+    cert, key = ensure_api_tls_material(ApiSettings(), state_dir=tmp_path)
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(cert, key)
+    client_ctx = ssl.create_default_context(cafile=cert)
+    with pytest.raises(ssl.SSLCertVerificationError):
+        _handshake(server_ctx, client_ctx, client_cert=None, server_hostname="127.0.0.2")
+
+
 @pytest.mark.parametrize(
     ("first", "then", "names"),
     [
@@ -4456,9 +4469,7 @@ def test_a_renewal_keeps_the_loopback_names_a_bind_re_mint_kept(
         ApiSettings(host="LOCALHOST"), state_dir=tmp_path, replacements=events
     )
     assert [e.reason for e in events] == ["renewal"]
-    loaded = x509.load_pem_x509_certificate(Path(cert).read_bytes())
-    san = loaded.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-    assert [str(n.value) for n in san] == ["LOCALHOST", "127.0.0.1", "::1"]
+    assert _san_entries(cert) == [("dns", "LOCALHOST"), ("ip", "127.0.0.1"), ("ip", "::1")]
 
 
 def test_a_kept_loopback_name_the_bind_already_names_is_not_repeated(
@@ -4471,9 +4482,7 @@ def test_a_kept_loopback_name_the_bind_already_names_is_not_repeated(
     ensure_api_tls_material(ApiSettings(host="::1"), state_dir=tmp_path)
     monkeypatch.setattr(tls, "_RENEW_REMAINING_FRACTION", 1.01)
     cert, _ = ensure_api_tls_material(ApiSettings(host="0:0:0:0:0:0:0:1"), state_dir=tmp_path)
-    loaded = x509.load_pem_x509_certificate(Path(cert).read_bytes())
-    san = loaded.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-    assert [str(n.value) for n in san] == ["::1", "127.0.0.1", "localhost"]
+    assert _san_entries(cert) == [("ip", "::1"), ("ip", "127.0.0.1"), ("dns", "localhost")]
 
 
 def test_an_engine_shaped_pair_with_no_san_is_re_minted(tmp_path: Path) -> None:
@@ -5321,8 +5330,9 @@ def _plant_generated_pair(
         )
     )
     if sans:
-        # The name a mint for the default bind carries, so a fresh planted pair is not replaced for
-        # a bind it does not name (BACKLOG #5973).
+        # The name a mint for the default bind carried before BACKLOG #5790 added ::1 and
+        # localhost: a legacy-shaped pair. It names the address a client dials for the default
+        # bind, so a fresh planted pair is not replaced for a bind it does not name (BACKLOG #5973).
         builder = builder.add_extension(
             x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
             critical=False,
@@ -5392,7 +5402,7 @@ def test_a_generated_pair_renews_inside_its_last_third_and_not_before(
     assert event.old_sha256 == old_sha and event.new_sha256 == _sha256(cert)
     assert event.old_sha256 != event.new_sha256
     assert event.new_not_after == new.not_valid_after_utc.isoformat()
-    # A renewal names what a mint names (BACKLOG #5790); the planted pair carried no SAN at all.
+    # A renewal names what a mint names (BACKLOG #5790); the planted pair named 127.0.0.1 alone.
     assert tuple(_san_entries(cert)) == _LOOPBACK_SANS
     renewed = [r for r in caplog.records if "renewed the generated" in r.getMessage()]
     assert len(renewed) == 1 and renewed[0].levelno == logging.WARNING

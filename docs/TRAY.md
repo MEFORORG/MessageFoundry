@@ -144,9 +144,10 @@ non-loopback address, a wildcard included, with no `--port` is monitor-only too;
 #5936 the tray fell back to the loopback default for that bind and kept service control. The
 certificate the engine mints for a wildcard bind names that same loopback, `127.0.0.1` or `::1`.
 A pair the engine minted earlier for another bind is replaced at the next start when its
-certificate does not name the address the tray dials for the current bind. The new one names the
-current bind, and keeps only the loopback names [SERVICE.md](SERVICE.md) lists, so a client that
-dials any other name only the old one carried must change too. SERVICE.md states when the engine
+certificate does not name the address the tray dials for the current bind. The new one names what
+a first-run mint for the current bind names, and keeps only the loopback names
+[SERVICE.md](SERVICE.md) lists, so a client that dials any other name only the old one carried must
+change too. SERVICE.md states when the engine
 replaces its pair and what to re-import. An operator certificate is never replaced, and on a wildcard bind it verifies only if
 it names that loopback.
 (BACKLOG #5936, #5973)
