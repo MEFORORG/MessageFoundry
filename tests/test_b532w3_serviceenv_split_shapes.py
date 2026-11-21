@@ -5,9 +5,9 @@ items 6 and 12).
 
 A secret split from its empty secret-class name, into the next ``REG_MULTI_SZ`` item or onto a
 later line of one string below another variable, refuses unless the line below the name is
-positively an ordinary variable's: the reader fails closed. The controls are the items under a
-plain name that still end the empty value, and the ``MEFOR_VALUE_*`` and secrets-directory
-values, which keep the plain line rule so their remedy text stays true. Each test drives
+one of the few shapes ``serviceenv._ends_blank_class`` names: the reader fails closed. The
+controls are those shapes, and the ``MEFOR_VALUE_*`` and secrets-directory values, which keep
+the plain line rule so their remedy text stays true. Each test drives
 :func:`messagefoundry.serviceenv.read_service_env_posture` through a probe, so every one runs on
 every platform. Synthetic values only: the stand-ins decode to synthetic text, never a real key.
 """
@@ -122,51 +122,73 @@ def test_a_split_secret_on_a_later_line_below_another_variable_refuses(
     assert service_env_refusal(posture) is not None
 
 
-#: Items that still end an empty value above them, because NSSM reads each item as its own
-#: variable and each is under a plain name or is a nameless entry of its own. Taken from the
-#: item 1 control in ``tests/test_b532r_serviceenv_reader.py``, with lower-case spellings,
-#: Windows' ``=::`` and ``=ExitCode`` entries, a one-case nameless entry, names Windows sets and
-#: ordinary comma-led values added.
+#: Items and lines that still end an empty secret-class value above them: a variable Windows
+#: itself sets, spelled exactly as Windows spells it, the secrets directory in upper case, and
+#: Windows' own nameless entries. ``=ExitCode=0`` ends it, since ``=ExitCode`` is Windows' own
+#: name, whatever the value; that is a residual hole the reader accepts.
 _ORDINARY_ITEMS = (
-    "MEFOR_AI_ENVIRONMENT=prod",
     "ProgramFiles(x86)=C:\\x",
+    "CommonProgramFiles(x86)=C:\\x",
+    "Path=C:\\x",
+    "Path=,C:\\x",
+    "SystemRoot=C:\\Windows",
+    "windir=C:\\Windows",
+    "TEMP=C:\\t",
+    "PUBLIC=C:\\Users\\Public",
+    "NUMBER_OF_PROCESSORS=8",
+    "MEFOR_SECRETS_DIRECTORY=C:\\s",
     "=C:=C:\\x",
     "=::=::\\",
-    "=orphan",
-    "HTTP_PROXY=",
-    "http_proxy=",
-    "NO_PROXY=",
-    "HTTP_PROXY= ",
-    "NO_PROXY=\t",
-    "no_proxy=\t",
-    "MEFOR_SECRETS_DIRECTORY=",
-    "Mefor_Secrets_Directory=",
-    "NO_PROXY=,localhost",
-    "no_proxy=,localhost",
-    "A" * 42 + "_B=1",
     "=ExitCode=00000000",
-    "PATH=C:\\x",
-    "Path=C:\\x",
-    "PATH=,C:\\x",
+    "=ExitCode=0",
+    "=ExitCodeAscii=A",
 )
 
 
 @pytest.mark.parametrize("item", _ORDINARY_ITEMS)
 def test_an_ordinary_item_still_ends_the_empty_value_above_it(item: str) -> None:
-    posture = _read([f"{KEY_CLASS_NAMES[0]}=", item])
-    assert posture.listed_keys == (), item
-    assert service_env_refusal(posture) is None, item
+    """As the next item and as a later line of one string alike."""
+    for posture in (
+        _read([f"{KEY_CLASS_NAMES[0]}=", item]),
+        _read([f"MEFOR_AI_ENVIRONMENT=prod\n{KEY_CLASS_NAMES[0]}=\n{item}"]),
+    ):
+        assert posture.listed_keys == (), item
+        assert service_env_refusal(posture) is None, item
 
 
-#: Lines below an empty secret-class value that are not positively an ordinary variable's, so the
-#: reader cannot tell them from the secret and fails closed (added items 6 and 12). Typographic
-#: quotes are written as escapes, so this file holds no glyph.
+#: Lines below an empty secret-class value that are not positively a variable of their own, so
+#: the reader cannot tell them from the secret and fails closed. Typographic quotes are written as
+#: escapes, so this file holds no glyph. Among them: conventionally spelled names, a ``MEFOR_``
+#: name that is no secret, names without an underscore that Windows does not set, such as ``TZ``
+#: and ``HOME``, Windows' names in another case, such as ``Public`` and ``PATH``, a long s that
+#: ``str.upper`` folds onto ``SYSTEMROOT``, a name led by a blank, and equals-led text that is not
+#: one of Windows' own nameless entries, such as ``=orphan``, ``=letmein`` and a bare ``=``.
 _FAIL_CLOSED = (
     "x=y",
     "Winter=2026!",
     "Http_Proxy=",
     "Http_Proxy=x",
+    "HTTP_PROXY=",
+    "HTTP_PROXY=x",
+    "NO_PROXY=,localhost",
+    "no_proxy=\t",
+    "A" * 42 + "_B=1",
+    "MEFOR_AI_ENVIRONMENT=prod",
+    "MEFOR_SECRETS_DIRECTORY=",
+    "Mefor_Secrets_Directory=C:\\s",
+    "TZ=UTC",
+    "HOME=C:\\x",
+    "PYTHONUTF8=1",
     "ProgramFile=C:\\x",
+    "Public=Summer!",
+    "Temp=Summer!",
+    "Os=Summer!",
+    "username=bob",
+    "PATH=C:\\x",
+    "PATH=,C:\\x",
+    "\u017fystemroot=x",
+    " Path=C:\\x",
+    "Path=",
     "\u201cabc\u201d=x",
     "\u2018abc\u2019=x",
     "`abc`=x",
@@ -174,6 +196,12 @@ _FAIL_CLOSED = (
     "p@ss=word",
     "=abc123",
     "=AbCdEf",
+    "=orphan",
+    "=letmein",
+    "=PASSWORD",
+    "=exitcode=0",
+    "=c:=c:\\x",
+    "=",
 )
 
 
@@ -182,14 +210,70 @@ _FAIL_CLOSED = (
 def test_a_line_that_may_be_the_secret_refuses_as_an_item_and_on_a_later_line(
     name: str, line: str
 ) -> None:
-    """Finding 1 of the round-2 review: ``Winter=2026!`` below the bind password escaped. Each
-    reading refuses, and the two read the same."""
+    """``Winter=2026!`` below the bind password once escaped. Each reading refuses, and the two
+    read the same."""
     items = _read([f"{name}=", line])
-    later = _read([f"PATH=x\n{name}=\n{line}"])
+    later = _read([f"Path=x\n{name}=\n{line}"])
     assert items.listed == later.listed == (name,), line
     assert items.value_runs_on, line
     assert service_env_refusal(items) is not None
     assert service_env_refusal(later) is not None
+
+
+@pytest.mark.parametrize("line", ["TZ=UTC", "HTTP_PROXY=x", "MEFOR_AI_ENVIRONMENT=prod"])
+def test_an_ordinary_line_below_a_non_secret_value_still_ends_it(line: str) -> None:
+    """The control for the fail-closed rows above: below a value that is set, the plain line rule
+    still ends it, so a later empty secret-class name stays unlisted."""
+    posture = _read([f"Path=x\n{line}"])
+    assert posture.listed == (), line
+    assert service_env_refusal(posture) is None
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        ["MEFOR_AUTH_AD_BIND_PASSWORD", "=Winter2026"],
+        ["MEFOR_AUTH_AD_BIND_PASSWORD", "=", "Winter2026"],
+        ["MEFOR_AUTH_AD_BIND_PASSWORD=", "=", "Winter2026"],
+        ["MEFOR_AUTH_AD_BIND_PASSWORD ", "Winter=2026!"],
+        ["MEFOR_AUTH_AD_BIND_PASSWORD\nWinter=2026!"],
+        ["Path=x\nMEFOR_AUTH_AD_BIND_PASSWORD\n=Winter2026"],
+        ["Path=x\nMEFOR_AUTH_AD_BIND_PASSWORD", "=Winter2026"],
+        ["MEFOR_AUTH_AD_BIND_PASSWORD=\n=\nWinter=2026!"],
+        ["Path=x", "MEFOR_AUTH_AD_BIND_PASSWORD", "=Winter2026"],
+    ],
+)
+def test_a_name_written_alone_above_its_value_refuses(items: list[str]) -> None:
+    """``nssm set <svc> AppEnvironmentExtra NAME =value`` writes the name as an item of its own,
+    with no equals sign, and the value led by one in the next item; ``NAME = value`` puts a bare
+    ``=`` between them. A secret-class name alone is read as that name set to nothing so far, so
+    the value below it refuses, and the remedy names every item it ran on into."""
+    posture = _read(items)
+    assert posture.listed == ("MEFOR_AUTH_AD_BIND_PASSWORD",), items
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    if len(items) > 1:
+        assert posture.value_runs_on, items
+
+
+def test_a_name_written_alone_with_nothing_below_it_does_not_refuse() -> None:
+    """The control: a secret-class name alone carries no value, so it is not listed."""
+    assert _read(["MEFOR_AUTH_AD_BIND_PASSWORD"]).listed == ()
+    assert _read(["MEFOR_AUTH_AD_BIND_PASSWORD", "Path=C:\\x"]).listed == ()
+
+
+def test_a_long_name_below_an_empty_secret_reads_in_linear_time() -> None:
+    """The name rule once backtracked quadratically, about 0.13 s for one name of 8,000
+    characters, so 32,000-character items took seconds each. Read linearly, the whole set takes a
+    small fraction of a second; the bound is loose, so a slow runner does not flake it."""
+    import time
+
+    long_items = ["_" * 32_000 + "a=x", "A" * 32_000 + "a=x", "a_" * 16_000 + "!=x"]
+    started = time.perf_counter()
+    for item in long_items:
+        posture = _read([f"{KEY_CLASS_NAMES[0]}=", item])
+        assert posture.listed_keys == (KEY_CLASS_NAMES[0],)
+    assert time.perf_counter() - started < 1.0
 
 
 def test_an_empty_secret_kept_on_a_later_line_reads_the_line_below_it_too() -> None:
@@ -210,8 +294,8 @@ def test_an_ordinary_comma_led_value_on_a_later_line_is_still_its_own_variable()
 
 @pytest.mark.parametrize("line", ['"x"=y', "PATH=,C:\\x", "Http_Proxy=,x", "\u201cx\u201d=y"])
 def test_an_empty_directory_above_an_ordinary_line_still_reads_as_unset(line: str) -> None:
-    """Finding 3 of the round-2 review, a regression at 7b2d038666: the directory's name is no
-    secret, so a later line ends its empty value under the plain line rule, and the remedy still
+    """A regression an earlier repair of this item made: the directory's name is no secret, so
+    a later line ends its empty value under the plain line rule, and the remedy still
     says the lists set no directory."""
     posture = _read([f"MEFOR_SECRETS_DIRECTORY=\n{line}", "MEFOR_VALUE_A=1"])
     assert posture.listed == ("MEFOR_VALUE_A",), line
@@ -221,7 +305,7 @@ def test_an_empty_directory_above_an_ordinary_line_still_reads_as_unset(line: st
 
 @pytest.mark.parametrize("item", ["Http_Proxy=", "=ExitCode=0", "=abc123", "ab-c_dE="])
 def test_an_empty_value_name_does_not_take_the_next_item(item: str) -> None:
-    """Finding 4 of the round-2 review, a regression at 7b2d038666: an empty ``MEFOR_VALUE_*``
+    """A regression an earlier repair of this item made: an empty ``MEFOR_VALUE_*``
     name refuses whatever it holds, so the next item keeps the plain rule, the empty entry is
     still named, and the remedy does not say to remove the item."""
     posture = _read(["MEFOR_VALUE_X=", item])
@@ -250,7 +334,7 @@ def test_an_empty_key_on_its_strings_first_line_above_an_ordinary_line_refuses()
 def test_a_later_empty_secret_above_an_ordinary_line_refuses() -> None:
     """Added item 6: the same empty key below another variable refuses too, as one string and as
     items, since the reader cannot tell whether ``x=y`` is the key. Failed on origin/main
-    9421dcbf27, where it was a strict xfail pin at 7b2d038666."""
+    9421dcbf27."""
     key = KEY_CLASS_NAMES[0]
     assert _read([f"PATH=x\n{key}=\nx=y"]).listed_keys == (key,)
     assert _read([f"PATH=x\n{key}=", "x=y"]).listed_keys == (key,)
