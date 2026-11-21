@@ -934,13 +934,14 @@ def test_read_log_file_never_asks_for_more_than_the_bound(
     opened: list[int] = []
     real_open, real_read = os.open, os.read
 
-    def recording_open(*args: Any, **kwargs: Any) -> int:
-        fd = real_open(*args, **kwargs)
-        opened.append(fd)
+    def recording_open(path: Any, *args: Any, **kwargs: Any) -> int:
+        fd = real_open(path, *args, **kwargs)
+        if Path(path) == log:
+            opened.append(fd)
         return fd
 
     def recording_read(fd: int, n: int) -> bytes:
-        # Only the descriptor the read opened, so another thread's read is not counted.
+        # Only a descriptor opened on the log, so another thread's read is not counted.
         if fd in opened:
             sizes.append(n)
         return real_read(fd, n)
@@ -982,8 +983,8 @@ def test_log_tail_a_last_line_longer_than_the_bound_reports_a_code(
 def test_read_log_file_a_cut_window_of_only_empty_lines_is_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Round 2 kept such a window, but a tail of blank lines renders as an empty member, which
-    reads as an empty log; the newest line with content was cut by the bound (BACKLOG #5385)."""
+    """A tail of blank lines renders as an empty member, which reads as an empty log; the
+    newest line with content was cut by the bound, so the read refuses (BACKLOG #5385)."""
     from messagefoundry.support import bundle as bundle_mod
 
     monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)
@@ -1046,9 +1047,9 @@ def test_log_tail_a_file_truncated_while_it_is_read_is_read_again(
 def test_log_tail_a_file_that_shrinks_twice_reports_a_shrink_not_a_swap(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A file shorter than its fstat on both reads used to be reported as ``_LogFileRefused``,
-    whose diagnostic says the file was replaced. It was truncated in place, so it is reported
-    by its own name (BACKLOG #5385)."""
+    """A file shorter than its fstat on both reads is reported by its own name, not as
+    ``_LogFileRefused``, whose diagnostic says the file was replaced: it was truncated in place
+    (BACKLOG #5385)."""
     from messagefoundry.support import bundle as bundle_mod
 
     monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)
@@ -1065,9 +1066,9 @@ def test_log_tail_a_file_that_shrinks_twice_reports_a_shrink_not_a_swap(
 def test_log_tail_a_long_last_line_then_a_blank_line_reports_a_code(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ending: bytes
 ) -> None:
-    """A line longer than the bound followed by one blank line used to leave only that blank
-    line in the bytes kept: an empty tail with no code, which reads as an empty log (BACKLOG
-    #5385)."""
+    """A line longer than the bound followed by one blank line leaves only that blank line in
+    the bytes kept; an empty tail with no code would read as an empty log, so the code is
+    reported (BACKLOG #5385)."""
     from messagefoundry.support import bundle as bundle_mod
 
     monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)

@@ -75,10 +75,12 @@ def _diagnostic(code: str, exc: BaseException) -> str:
       no store exists at the configured path, and the bundle did not create one (BACKLOG #1780).
     * ``MF-BUNDLE-LOG-001`` -- the configured ``[logging].log_dir`` could not be listed, or a log
       file in it could not be stat'd.
-    * ``MF-BUNDLE-LOG-002`` -- the newest app-log file could not be read. With ``_LogFileRefused``
-      it was, twice, no longer the plain regular file the listing saw when it was opened
-      (BACKLOG #5383). With ``_LogFileShrank`` it was, twice, shorter when read than when it was
-      opened: truncated in place, as a copytruncate rotation does (BACKLOG #5385).
+    * ``MF-BUNDLE-LOG-002`` -- the newest app-log file could not be read. The type is the
+      second attempt's, after a first that also failed as the file changing under the read.
+      With ``_LogFileRefused`` the file was, on that attempt, no longer the plain regular file
+      the listing saw when it was opened (BACKLOG #5383). With ``_LogFileShrank`` it was, on
+      that attempt, shorter when read than when it was opened: truncated in place, as a
+      copytruncate rotation does (BACKLOG #5385).
     * ``MF-BUNDLE-LOG-003`` -- the newest app-log file was read, but the bytes the read takes from
       its end, less the line the bound cuts into, hold nothing but line breaks: the newest line with
       content is cut by the bound or starts before it (``_LogLineTooLong``, BACKLOG #5385). The
@@ -371,8 +373,9 @@ def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
 
     Only a plain regular file with one name is read: a link, a hard link or a special file with a
     log suffix is passed over (BACKLOG #5383), see :func:`_log_candidates` and
-    :func:`_read_log_file`. A file replaced between listing and opening, as a rotation does, is
-    listed and opened again once before the refusal is reported.
+    :func:`_read_log_file`. A file replaced between listing and opening, or truncated in place
+    while it is read, as a rotation does, is listed and opened again once before the failure is
+    reported.
 
     EVERY returned string leaves through ``redact_log_text``, and that is what makes the manifest's
     ``phi_contract`` claim about this member true. The two failure branches used to ``return`` ahead of
