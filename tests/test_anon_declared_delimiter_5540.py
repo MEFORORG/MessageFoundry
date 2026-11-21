@@ -163,8 +163,9 @@ def test_a_digit_delimiter_refuses_under_every_salt(
     """Under a digit escape character, what a phone or date-of-birth surrogate COULD write is
     judged, not the digits one salt drew, so the refusal does not depend on the secret salt."""
     message = _message("^~5&", "PID", fields)
+    path = "PID-7" if 7 in fields else "PID-13"
     for n in range(8):
-        with pytest.raises(anon.AnonError, match="escape character the message declares"):
+        with pytest.raises(anon.AnonError, match=f"{path} would hold the escape character"):
             anon.anonymize(message, salt=f"{_SALT}-{n}")
 
 
@@ -250,3 +251,29 @@ def test_the_guard_refuses_what_the_engine_refuses_under_the_message_delimiters(
     # The control: the header's own field separator is refused on both sides.
     if char == field_sep:
         assert tee_refuses
+
+
+@_SIDES
+@pytest.mark.parametrize("encoding", ["^~-&", "-~\\&", "^~\\-"], ids=["escape", "component", "sub"])
+def test_a_phones_written_dashes_are_checked(anon: ModuleType, encoding: str) -> None:
+    """A dashed phone is written ``NNN-NNN-NNNN`` whatever the sender's dash places, so a dash the
+    message declares is refused rather than emitted as a new escape sequence or component."""
+    message = _message(encoding, "PID", {1: "1", 13: "555-1234", 15: _MARK})
+    with pytest.raises(anon.AnonError, match="PID-13 would hold the"):
+        anon.anonymize(message, salt=_SALT)
+
+
+@_SIDES
+def test_a_field_separator_a_pool_could_write_refuses_under_every_salt(anon: ModuleType) -> None:
+    """Under MSH-1 ``Z``, some names in the pool hold a ``Z``: the whole pool is judged, so both
+    adapters refuse under every salt, with the one shared refusal naming the rule."""
+    header = "Z".join(
+        ("MSH", "^~\\&", "APP", "FAC", "RCV", "RFAC", "20260101", "", "ADT^A01", "M1", "P", "2.5.1")
+    )
+    message = f"{header}\rPIDZ1ZZZZDOE^JANE"
+    surrogates = engine_surrogates if anon is engine_anon else tee_surrogates
+    for n in range(8):
+        with pytest.raises(
+            surrogates.SurrogateSeparatorRefused, match="PID-5 would hold the field"
+        ):
+            anon.anonymize(message, salt=f"{_SALT}-{n}")

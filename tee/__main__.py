@@ -858,7 +858,8 @@ async def _anonymize_captures(args: argparse.Namespace) -> int:
     # Whether such a report also had another cause, which needs the general advice as well.
     residue_mixed = False
     # Messages refused because a rule's surrogate would hold the field separator, a control byte
-    # or a delimiter MSH-2 declares (BACKLOG #5540). A keep is the wrong advice for one: it would emit the captured value.
+    # or a delimiter MSH-2 declares (BACKLOG #5540). A keep is the wrong advice for one: it would
+    # emit the captured value.
     separator_refused = 0
     separator_paths: dict[str, None] = {}
     # Messages refused because no site-code surrogate could avoid a declared separator digit. A

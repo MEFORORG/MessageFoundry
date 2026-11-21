@@ -273,16 +273,13 @@ def _components(rep: str, seps: Seps) -> list[str]:
 
 
 class SurrogateSeparatorRefused(AnonError):
-    """A rule's surrogate would hold a character that splits or ends a field: the message's field
-    separator, a segment separator, an MLLP frame byte or NUL, or a component, repetition or
-    subcomponent separator or the escape character the message declares, inside a value the
-    surrogate wrote itself. The first group is checked by each adapter as it writes the field:
-    the tee raises this class for them, while the engine adapter's ``Message.set`` refusal comes
-    out as a plain :class:`AnonError` with no address. The second group is checked here, the same
-    on both adapters (:func:`_written`). Writing it would add a field, a line or a component, or start an escape
-    sequence, and move what follows past its rule (BACKLOG #5540). A ``keep`` on that field does
-    not help: it would emit the captured value. ``path`` is the rule's field address, never a
-    value."""
+    """A rule's surrogate would hold a character that splits or ends a field, so writing it would
+    add a field, a line or a component, or start an escape sequence, and move what follows past
+    its rule (BACKLOG #5540). What a surrogate writes itself is judged here, the same on both
+    adapters (:func:`_written`). The whole written field is checked by each adapter as it writes
+    it: the tee raises this class, while the engine adapter's ``Message.set`` refusal comes out
+    as a plain :class:`AnonError` with no address. A ``keep`` on that field does not help: it
+    would emit the captured value. ``path`` is the rule's field address, never a value."""
 
     def __init__(self, path: str, cause: str) -> None:
         super().__init__(f"the surrogate for {path} would hold {cause} — refusing to emit")
@@ -302,21 +299,21 @@ class _HeldDelimiter(AnonError):
 
 
 def _written(seps: Seps, *values: str) -> None:
-    """Refuse a value a surrogate writes itself (a pool, a constant, a date's fill and offset, the
-    digits of a fabricated date or phone number) that could hold the component, repetition or
-    subcomponent separator or the escape character the message declares (:class:`_HeldDelimiter`).
-    Under a custom MSH-2 whose component separator is a space, every street in the pool holds one,
-    so the written value would gain a component and every later component would move (BACKLOG
-    #5540). A caller passes what it COULD write, a whole pool or every digit, not the one draw, so
-    whether a message is refused depends on its MSH-2 and the shape of its value, never on the
-    salt. Text a surrogate copies from the sender is not checked: a kept CX component, an
-    identifier's punctuation, a date's year and TS.2, and the dashes of a phone number or SSN,
-    which sit where the sender's did. The fill writes a date's fraction dot where the sender's
-    value held it, but it is checked with the fill, so a fraction dot that MSH-2 declares is
-    refused. The field separator is the adapters' to check, as they write the field."""
-    for role, char in _declared(seps):
+    """Refuse what a surrogate writes itself when it could hold the field separator, or the
+    component, repetition or subcomponent separator or the escape character, the message
+    declares (:class:`_HeldDelimiter`). Under a custom MSH-2 whose component separator is a space,
+    every street in the pool holds one, so the written value would gain a component and every
+    later component would move (BACKLOG #5540). A caller passes what it COULD write, a whole pool
+    or every digit, not the one draw, so whether a message is refused depends on its MSH-1, MSH-2
+    and the shape of its value, never on the salt. Text a surrogate copies from the sender is not
+    checked here, at least a kept CX component, an identifier's or SSN's punctuation and a date's
+    year and TS.2; the adapters still check the whole field for the field separator."""
+    checked = (("field separator", seps.field, "MSH-1"),) + tuple(
+        (role, char, "MSH-2") for role, char in _declared(seps)
+    )
+    for role, char, source in checked:
         if char and any(char in value for value in values):
-            raise _HeldDelimiter(f"the {role} the message declares (MSH-2)")
+            raise _HeldDelimiter(f"the {role} the message declares ({source})")
 
 
 @functools.cache
@@ -328,8 +325,10 @@ def _pool_text(pool: str) -> str:
         values = (*_pools.FAMILY_NAMES, *_pools.GIVEN_NAMES, *_pools.MIDDLE_INITIALS)
     elif pool == "address":
         values = (*_pools.STREETS, *(v for row in _pools.CITIES for v in row), "USA")
-    else:
+    elif pool == "provider":
         values = tuple(v for row in _pools.CLINICIANS for v in row)
+    else:
+        raise AnonError(f"no surrogate pool named {pool!r} — refusing to emit")
     return "".join(sorted(set("".join(values))))
 
 
@@ -453,8 +452,10 @@ def surrogate_phone(rep: str, keyer: Keyer, seps: Seps) -> str:
     area = rng.randrange(200, 1000)
     line = 100 + rng.randrange(100)  # 0100–0199, reserved for fictional use
     digits = f"{area:03d}555{line:04d}"
-    _written(seps, _ALL_DIGITS)
-    return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}" if "-" in rep else digits
+    # The dashes are written at fixed places, not where the sender's were, so they are checked.
+    dashed = "-" in rep
+    _written(seps, _ALL_DIGITS, "-" if dashed else "")
+    return f"{digits[:3]}-{digits[3:6]}-{digits[6:]}" if dashed else digits
 
 
 #: What may follow the eight date digits of a date of birth: hours, minutes and seconds, a

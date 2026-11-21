@@ -21,10 +21,10 @@ every street in the address pool holds a space, and the surrogate kinds write le
 Joined back, such a value would add fields and renumber every later field for any reader of the
 output. So :func:`_whole_field` refuses the values a RULE writes that the engine adapter's
 whole-field ``Message.set`` refuses (BACKLOG #5540). The shared site-code pass that runs after
-the rules writes no digit the message declares as a separator. A component, repetition or
-subcomponent separator or escape character the message declares, in a value a surrogate writes
-itself, is refused on both adapters by the shared ``surrogates.surrogate_field_recorded``, with the
-same :class:`SurrogateSeparatorRefused`.
+the rules writes no digit the message declares as a separator. What a surrogate writes itself
+is also judged against the field separator and the MSH-2 delimiters, the same on both adapters,
+in the shared ``surrogates.surrogate_field_recorded`` (``surrogates._written`` says what it
+leaves to this check).
 """
 
 from __future__ import annotations
