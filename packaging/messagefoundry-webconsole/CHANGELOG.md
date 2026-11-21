@@ -83,7 +83,7 @@ this line.**
   writes. The base now asks it, before either charge. The preset save's refusal now continues to
   the search form, where it used to continue to its own POST path, which `/ui/reauth` refuses. The
   layered search's refusal now keeps its `?presets=` query, without which the run answers 400.
-  (`BACKLOG #5646`)
+  The supported engine seam moved with it. (`BACKLOG #5646`)
 - **The cookie WebSocket gate refuses a blank or repeated `Origin`.** `authorize_ui_ws` read
   only the first `Origin` header. It now reads every copy and refuses a blank `Origin`, or more
   than one, as the engine's header path does; an absent header still leaves the handshake to the

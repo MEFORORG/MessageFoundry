@@ -4643,7 +4643,7 @@ def Direct(
     except the certificates' validity window: construction only warns on it, and each send refuses
     a recipient cert, issuing anchor or signing cert outside it (code ``direct-cert-validity``,
     BACKLOG #5631). Beyond issuance by ``trust_anchor``, construction refuses at least an issuing
-    anchor that is not a CA (an X.509 version 1 root excepted), a ``recipient_cert`` that is itself
+    anchor that is not a CA (a version 1 anchor with no extensions excepted), a ``recipient_cert`` that is itself
     a CA unless pinned as its own anchor, a ``recipient_cert`` whose keyUsage or extendedKeyUsage
     rules out S/MIME encryption, and one that does not name every address in ``recipients`` in its
     subjectAltName. The full list is under *Recipient trust* in ``docs/CONNECTIONS.md``.

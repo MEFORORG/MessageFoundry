@@ -679,8 +679,12 @@ def require_ui(
         # the password page, whose JSON twin /me/password is neither paced nor asked.
         if step_up_new_address is not None:
             # A step-up factory's own question (BACKLOG #5646): on every request, with no
-            # must-change skip, as each factory asked it before it moved here.
-            await _refuse_from_new_address(auth, request, next_path=step_up_new_address(request))
+            # must-change skip, as each factory asked it before it moved here. The continuation is
+            # worked out only for a refusal.
+            if await auth.flag_new_client_ip(
+                session_token(request), client_ip(request), path=request.url.path
+            ):
+                raise _reauth_redirect(request, step_up_new_address(request))
         elif new_address_check and not identity.must_change_password and (phi or write):
             await _refuse_from_new_address(
                 auth,
@@ -1604,7 +1608,8 @@ async def _refuse_from_new_address(
     verified from (vault BACKLOG #2620). The cookie twin of ``api.security``'s refusal of the same
     name; :func:`require_ui` says which requests ask. ``next_path`` is as for
     :func:`_reauth_redirect`. Records the signal (``auth.new_address_reverify_required`` and a notice on a
-    first sighting) the way the step-up factories do."""
+    first sighting) through ``flag_new_client_ip``, as the step-up factories' question in
+    :func:`require_ui` does."""
     if await auth.flag_new_client_ip(
         session_token(request), client_ip(request), path=request.url.path
     ):
@@ -1630,9 +1635,10 @@ def _reauth_refusal(
     """The ``mfa_refusal`` a step-up factory hands :func:`require_ui`: the same 303 to ``/ui/reauth``
     its own freshness check sends, carrying the same continuation. The gate that raises it is still
     ``require_ui``'s, so the refusal is audited and runs above the permission loop."""
+    continuation = _step_up_continuation(reauth_next)
 
     def refuse(request: Request) -> HTTPException:
-        return _reauth_redirect(request, reauth_next(request) if reauth_next is not None else None)
+        return _reauth_redirect(request, continuation(request))
 
     return refuse
 

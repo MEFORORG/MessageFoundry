@@ -342,15 +342,20 @@ def _same_name_and_key(a: x509.Certificate, b: x509.Certificate) -> bool:
 #: (BACKLOG #5631). A partner's CA stamps notBefore from its own clock, so a certificate issued
 #: moments ago would otherwise read as not yet valid on a host whose clock is a little behind. Only
 #: notBefore takes it: an allowance on notAfter would extend trust in a certificate past its expiry.
+#: The signing cert takes none: the partner's verifier judges it on the partner's clock, so an
+#: allowance here would let a send go out that the partner then refuses.
 _NOT_BEFORE_SKEW = datetime.timedelta(minutes=5)
 
 
 def _window_problem(
-    cert: x509.Certificate, setting: str, now: datetime.datetime
+    cert: x509.Certificate,
+    setting: str,
+    now: datetime.datetime,
+    skew: datetime.timedelta = _NOT_BEFORE_SKEW,
 ) -> _WindowProblem | None:
-    """Why ``cert`` is outside its validity window at ``now``, or None. A notBefore up to
-    :data:`_NOT_BEFORE_SKEW` ahead of ``now`` is allowed."""
-    if now + _NOT_BEFORE_SKEW < cert.not_valid_before_utc:
+    """Why ``cert`` is outside its validity window at ``now``, or None. A notBefore up to ``skew``
+    ahead of ``now`` is allowed."""
+    if now + skew < cert.not_valid_before_utc:
         return _WindowProblem(setting, expired=False)
     if now > cert.not_valid_after_utc:
         return _WindowProblem(setting, expired=True)
@@ -389,7 +394,7 @@ def _validity_refusal(
         for p in (
             _window_problem(recipient, "recipient_cert", now),
             anchor_problem,
-            _window_problem(signer, "signing_cert", now),
+            _window_problem(signer, "signing_cert", now, skew=datetime.timedelta(0)),
         )
         if p
     ]
@@ -397,19 +402,20 @@ def _validity_refusal(
     return max(problems, key=lambda p: p.expired, default=None)
 
 
-#: The construction validity warnings this process has logged, by connection name, refusal code and
-#: the certificates read. A connector is built again by every reload, test build and probe build
-#: of the same config, and each build repeated the same line (BACKLOG #5631). The send-time refusal
-#: is not deduplicated: the delivery worker logs it once per lane stop.
+#: The construction validity warnings this process has logged, by connection (its name and the
+#: relay the line names), refusal code and the certificates read. A connector is built again by
+#: every reload, test build and probe build of the same config, and each build repeated the same
+#: line (BACKLOG #5631). The send-time refusal is not deduplicated: the delivery worker logs it once
+#: per lane stop. Never pruned: an entry is a few fingerprints, one per distinct configuration.
 _WARNED_WINDOWS: set[tuple[str, str, tuple[bytes, ...]]] = set()
 
 
 def _first_window_warning(
-    name: str, window: _WindowProblem, certs: Sequence[x509.Certificate]
+    connection: str, window: _WindowProblem, certs: Sequence[x509.Certificate]
 ) -> bool:
-    """Whether this process has not yet logged ``window`` for connection ``name`` built from
-    ``certs``, recording it when not. A renewed certificate, or a change of bound, warns again."""
-    key = (name, window.code, tuple(c.fingerprint(hashes.SHA256()) for c in certs))
+    """Whether this process has not yet logged ``window`` for ``connection`` built from ``certs``,
+    recording it when not. A renewed certificate, a change of bound or of relay warns again."""
+    key = (connection, window.code, tuple(c.fingerprint(hashes.SHA256()) for c in certs))
     if key in _WARNED_WINDOWS:
         return False
     _WARNED_WINDOWS.add(key)
@@ -448,15 +454,26 @@ def _extension[E: x509.ExtensionType](
         ) from exc
 
 
+def _carries_no_extensions(cert: x509.Certificate) -> bool:
+    """Whether ``cert`` carries no extensions at all. Extensions that cannot be read count as
+    carried, so the checks that read them refuse the cert."""
+    try:
+        return len(cert.extensions) == 0
+    except _UNREAD_EXTENSIONS:
+        return False
+
+
 def _anchor_ca_problem(anchor: x509.Certificate) -> str | None:
     """Why the issuing ``anchor`` may not issue certificates, or None. A self-signed recipient
     pinned as its own anchor never reaches this: it issues nothing else.
 
-    An X.509 version 1 anchor passes (BACKLOG #5631). Version 1 has no extensions, so it cannot
-    carry basicConstraints, and RFC 5280 takes a trust anchor as an input to path validation
-    rather than a certificate whose extensions are checked (its section 6.1.1). A version 3 anchor
-    must still assert CA=true."""
-    if anchor.version == x509.Version.v1:
+    An X.509 version 1 anchor that carries no extensions passes (BACKLOG #5631). RFC 5280 defines
+    extensions for version 3 only, so such a root has no way to assert basicConstraints, and RFC
+    5280 takes a trust anchor as an input to path validation rather than a certificate whose
+    extensions are checked (its section 6.1.1). A version 1 cert that carries extensions anyway,
+    which ``cryptography`` parses, is checked as a version 3 one is, so one asserting CA=false is
+    still refused."""
+    if anchor.version == x509.Version.v1 and _carries_no_extensions(anchor):
         return None
     constraints = _extension(anchor, x509.BasicConstraints, "trust_anchor")
     if constraints is None or not constraints.ca:
@@ -781,7 +798,7 @@ class DirectDestination(DestinationConnector):
             self._recipient_cert, self._recipient_anchors, self._signing_cert
         )
         if window is not None and _first_window_warning(
-            config.name,
+            f"{config.name} {self.host}:{self.port}",
             window,
             (self._recipient_cert, self._signing_cert, *self._recipient_anchors),
         ):

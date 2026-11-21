@@ -98,13 +98,13 @@ STRIP_BATCH_ROWS = 200
 #: the service always refuses cannot stop the strip (BACKLOG #5651).
 OUTAGE_MIN_ROWS = 3
 
-#: How many batch writes in a row may fail before the call reads it as a store-wide write fault (a
-#: full disk, a read-only store) and ends early (BACKLOG #5651). Without it such a fault re-sealed
-#: every candidate on every pass, each seal counting toward the AES-GCM invocation ceiling, and
-#: logged one ERROR per batch. A write that lands in between resets the count, so failures on
-#: particular rows, two batches at the head of the keyset say, still cannot stop the rows after them.
-#: This many failing batches in a row do end it, so a fault on that many batches at the head of the
-#: keyset stops every pass at the same place.
+#: How many failed batch writes in a row the call reads as a store-wide write fault (a full disk, a
+#: read-only store), ending early (BACKLOG #5651). Without it such a fault re-sealed every candidate
+#: on every pass, each seal counting toward the AES-GCM invocation ceiling, and logged one ERROR per
+#: batch. A write that lands resets the count, so fewer failing batches in a row than this, two at
+#: the head of the keyset say, cannot stop the rows after them. The trade-off is accepted: this many
+#: failing in a row at the head of the keyset, a long lock on its oldest rows say, stop every pass at
+#: the same place while the fault lasts, as a failed batch read does.
 WRITE_FAULT_MAX_BATCHES = 3
 
 
@@ -319,7 +319,6 @@ async def run_strip_pass(
                             )
                             break
                     else:
-                        failed_writes_in_a_row = 0
                         try:
                             # Totalled first, so a malformed return adds nothing.
                             landed_counts = [(d.documents, d.reclaimed) for d in landed]
@@ -333,6 +332,9 @@ async def run_strip_pass(
                             )
                             log.debug("document strip batch failure", exc_info=True)
                         else:
+                            # Only a write that landed resets the breaker; a malformed return,
+                            # passed over above, neither resets nor counts toward it.
+                            failed_writes_in_a_row = 0
                             for n_docs, n_bytes in landed_counts:
                                 messages += 1
                                 documents += n_docs
@@ -341,7 +343,7 @@ async def run_strip_pass(
                 failures.extend(refused)
             if len(rows) < limit:
                 break
-            del rows, batch, landed
+            del rows  # batch and landed are reset at the top of the loop, before the next read
         reported = True
         await report(failures)  # inside the try, so its own failure still logs the WARNING
     except BaseException:

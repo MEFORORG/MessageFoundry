@@ -16,15 +16,17 @@ arms are not otherwise identical: they run in turn, and a delete or layered arm 
 preset. Each REFUSE arm also requires the ``auth.new_address_reverify_required`` audit row for its
 request path, so a refusal for some other reason does not pass.
 
-Mutants, run by hand when this landed: replacing the ``flag_new_client_ip`` call in
-``require_ui_step_up`` with ``False`` failed the four step-up routes' cases; making
-``_refuse_from_new_address`` return without asking failed the delete case.
+Mutants, run by hand: replacing the ``flag_new_client_ip`` call in ``require_ui``'s
+``step_up_new_address`` branch with ``False`` fails the four step-up routes' cases (until BACKLOG
+#5646 that call sat in ``require_ui_step_up`` itself); making ``_refuse_from_new_address`` return
+without asking fails the delete case.
 
 **A refused request spends nothing** (BACKLOG #5646). Each REFUSE arm also requires that neither
 the admin-write nor the PHI-read budget was asked for while it ran. The step-up gate used to ask
 the address question after its ``require_ui`` base had returned, so a refused write had already
-spent the actor's admin-write budget. The ALLOW arm of each write is the control that the count
-moves at all.
+spent the actor's admin-write budget. The ALLOW arms are the control that the spy sees each
+charge at all: each write's charges the admin-write budget, and each of the three searches' (form,
+run, layered) the PHI-read one.
 
 All data here is synthetic.
 """
@@ -182,9 +184,12 @@ async def test_a_search_route_refuses_a_session_from_a_new_address(
             assert "Saved presets" in ok.text
         assert await _new_address_paths(engine) == []
         after_allow = await preset_ids()
-        # The control for the spend check below: an admitted write does charge the write budget.
+        # The controls for the spend check below: an admitted write does charge the write budget,
+        # and an admitted search the PHI-read one.
         if case.method == "POST":
             assert "admin_write" in charges, charges
+        if case.id in ("form", "run", "layered"):
+            assert "phi_read" in charges, charges
 
     charges.clear()
     async with browser(ELSEWHERE) as away:

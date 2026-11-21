@@ -2638,3 +2638,43 @@ def test_the_construction_warning_is_logged_once_per_connection_and_certificates
         assert warnings() == 1
         DirectDestination(_dest(pki, recipient_cert=renewed))
         assert warnings() == 2
+
+
+def test_a_version_1_cert_carrying_ca_false_is_still_refused_as_an_anchor(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    """RED when: the version 1 exemption reaches a cert that carries extensions anyway, so one
+    asserting CA=false is trusted to issue recipients (BACKLOG #5631)."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test Direct CA")])
+    now = datetime.datetime.now(datetime.UTC)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+    )
+    builder._version = x509.Version.v1
+    end_entity = builder.sign(key, hashes.SHA256())
+    assert end_entity.version == x509.Version.v1 and len(end_entity.extensions) == 1
+    _, recipient = _mint_leaf("recipient@hisp.example", key, end_entity)
+    files = _files(tmp_path, "v1_ee", recipient_cert=recipient, trust_anchor=end_entity)
+    assert "not a CA certificate" in _refusal(pki, **files)
+
+
+async def test_a_signing_cert_gets_no_not_before_allowance(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], tmp_path: Path
+) -> None:
+    # The partner judges the signer on its own clock, so a signer two minutes early is refused
+    # even though a recipient two minutes early is not.
+    _install_fake(monkeypatch)
+    overrides = _signer(pki, tmp_path, "signer_early", valid_from=datetime.timedelta(minutes=2))
+    d = DirectDestination(_dest(pki, **overrides))
+    with pytest.raises(NegativeAckError) as caught:
+        await d.send(_SYNTHETIC_HL7)
+    assert caught.value.code == "direct-cert-validity:signing_cert:not-yet-valid"
+    assert _FakeSMTP.instances == []

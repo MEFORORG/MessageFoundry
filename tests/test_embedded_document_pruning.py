@@ -100,7 +100,7 @@ async def _open_sqlite(tmp_path) -> MessageStore:
     return await MessageStore.open(tmp_path / _DB_NAME)
 
 
-async def _open_postgres(_tmp_path):  # pragma: no cover - only runs when gated on
+async def _open_postgres(_tmp_path):
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.postgres import PostgresStore
 
@@ -119,7 +119,7 @@ async def _open_postgres(_tmp_path):  # pragma: no cover - only runs when gated 
     return s
 
 
-async def _open_sqlserver(_tmp_path):  # pragma: no cover - only runs when gated on
+async def _open_sqlserver(_tmp_path):
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.sqlserver import SqlServerStore
 
