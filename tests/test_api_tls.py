@@ -4370,6 +4370,31 @@ def test_an_engine_shaped_pair_with_no_san_is_re_minted(tmp_path: Path) -> None:
     assert [str(n.value) for n in san] == ["127.0.0.1"]
 
 
+@pytest.mark.parametrize("host", ["a" * 70 + ".example.com", ""])
+def test_a_bind_the_mint_refuses_still_starts_on_the_existing_pair(
+    host: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5973. A re-mint for a changed bind that the certificate builder refuses (a CN over
+    64 characters, an empty host) must not stop the start: the old pair still loads and is fresh,
+    so it is served, with a WARNING naming the mismatch and the refusal class.
+
+    Mutation: let the refusal propagate (fc22bef7204). Red: ``ValueError`` out of the start."""
+    cert, key = _plant_generated_pair(tmp_path, lived_days=1, left_days=300)
+    before = _snapshot(cert, key)
+    events: list[GeneratedPairReplaced] = []
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.api.tls"):
+        material = ensure_api_tls_material(
+            ApiSettings(host=host), state_dir=tmp_path, replacements=events
+        )
+    assert material == (str(cert), str(key))
+    assert events == [] and _snapshot(cert, key) == before
+    refused = [
+        r.getMessage() for r in caplog.records if "was refused (ValueError)" in r.getMessage()
+    ]
+    assert len(refused) == 1 and repr(host) in refused[0]
+    assert "PRIVATE KEY" not in caplog.text
+
+
 def test_a_pair_not_the_engines_shape_is_never_re_minted_for_a_bind_move(tmp_path: Path) -> None:
     """A certificate at the generated path that the engine did not mint is served as found."""
     cert, key = _plant_generated_pair(tmp_path, lived_days=1, left_days=300, shape="issued")

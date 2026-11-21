@@ -931,10 +931,29 @@ def _renew_generated_pair(
     from messagefoundry import pki
     from messagefoundry.__main__ import _write_private_key
 
+    reason, old = due
     staged_cert, staged_key = _staged_pair(cert_path, key_path)
-    cert_pem, key_pem = pki.make_self_signed(
-        api.host, _generated_sans(api.host), _GENERATED_LIFETIME_DAYS
-    )
+    try:
+        cert_pem, key_pem = pki.make_self_signed(
+            api.host, _generated_sans(api.host), _GENERATED_LIFETIME_DAYS
+        )
+    except ValueError as exc:
+        # A RE-MINT FOR A CHANGED BIND IS NEVER WORTH A START (BACKLOG #5973). The old pair still
+        # loads and is fresh, so a host the certificate builder refuses (a CN over 64 characters,
+        # an empty host) keeps serving it, as it did before the bind check existed. Nothing has
+        # been written yet. A renewal has no such fallback here, so its refusal still propagates.
+        if reason != "bind_changed":
+            raise
+        log.warning(
+            "serving the generated TLS certificate at %s, which does not name %r, the host a "
+            "client dials for the bind %r: a new certificate for that bind was refused (%s). "
+            "Clients that verify that host will fail until the bind or [api].tls_cert_file is fixed.",
+            cert_path,
+            dialled_host(api.host),
+            api.host,
+            type(exc).__name__,
+        )
+        return
     new = pki.read_self_signed_facts(cert_pem)
     try:
         _write_private_key(staged_key, key_pem)
@@ -951,7 +970,6 @@ def _renew_generated_pair(
                 log.warning("could not remove %s after a failed renewal: %s", leftover, cleanup)
         raise
     _replace_generated(staged_key, key_path)
-    reason, old = due
     event = _replaced(reason, cert_path, old, new)
     events.append(event)
     why = (
