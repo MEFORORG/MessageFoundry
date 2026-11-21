@@ -23,15 +23,14 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 from harness import sinks
-from harness.bounded_file import NOT_REGULAR
 from harness.scenarios._core import (
     Scenario,
     ScenarioContext,
     ScenarioResult,
     _verify_sink,
     control_id_of,
+    sink_faults,
 )
-from harness.sinks.file import UNSAFE_NAME
 
 
 @dataclass(frozen=True)
@@ -89,21 +88,14 @@ def verify_written(
     prior: str,
 ) -> ScenarioResult:
     """Every file written for a sent control id equals what was sent, byte for byte, and was
-    published directly inside the outbox."""
+    published directly inside the outbox. Any entry :func:`sink_faults` names (a link, an unread
+    entry, an incomplete scan, a file read from outside) fails the check whatever it carries."""
+    faults = sink_faults(records)
+    if faults:
+        return ScenarioResult(scenario, False, f"{prior}; {faults}")
     problems: list[str] = []
     for record in records:
         where = record.meta.get("relpath", record.meta.get("name", "?"))
-        refused = record.meta.get("refused")
-        if record.meta.get("symlink") == "true" or refused in (NOT_REGULAR, UNSAFE_NAME):
-            # Unread, so it carries no control id; a link, FIFO or device in the outbox, or a name
-            # the sink refused to join, is a problem whatever it names.
-            problems.append(f"a link or other non-file entry appeared in the outbox ({where})")
-            continue
-        if refused:
-            # Any other refusal (over the cap, or a scan that could not finish) left it unread too,
-            # so its bytes were never compared: a problem whatever it was.
-            problems.append(f"an entry in the outbox was not read ({where}): {refused}")
-            continue
         cid = control_id_of(record.payload)
         if cid is None or cid not in sent:
             continue

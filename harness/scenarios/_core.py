@@ -285,7 +285,8 @@ def _verify_sink(
     def arrived(records: list[sinks.Record]) -> set[str]:
         return {cid for r in records if (cid := control_id_of(r.payload)) in wanted}
 
-    records = sink.wait_for(lambda rs: arrived(rs) >= wanted, timeout)
+    # A sink fault fails the check whatever else arrives, so the wait ends on one too.
+    records = sink.wait_for(lambda rs: arrived(rs) >= wanted or bool(sink_faults(rs)), timeout)
     got = arrived(records)
     detail = f"{prior}; {len(got)}/{len(wanted)} delivered to the {scenario.sink} sink"
     links = sink_faults(records)
@@ -296,23 +297,41 @@ def _verify_sink(
 
 def sink_faults(records: Iterable[sinks.Record]) -> str:
     """A failure note naming the records a sink took as a link (``meta["symlink"]``), the other
-    entries the file sink recorded unread (a FIFO or device, a refused name), and its scan-wide
-    refusals (a replaced directory, a bounded scan), or "" when there are none. Each is recorded
-    unread, so it carries no control id, and a scan that did not cover the directory may have
-    missed a link: any of them would otherwise be invisible to a check that counts control ids."""
+    entries the file sink recorded unread (a FIFO or device, a refused name, an over-cap file), its
+    scan-wide refusals (a replaced directory, a bounded scan), and any file it read whose path
+    resolves outside its directory (``meta["inside"]`` false), or "" when there are none. An unread
+    entry carries no control id, a scan that did not cover the directory may have missed a link,
+    and a file read from outside the directory may carry any control id: each would otherwise be
+    invisible to a check that counts control ids. Names are quoted with ``repr``, since a File
+    outbound can render one from HL7 fields."""
     links: list[str] = []
     unread: list[str] = []
+    other: list[str] = []
     incomplete: list[str] = []
+    outside: list[str] = []
     for r in records:
         refused = r.meta.get("refused")
+        where = r.meta.get("relpath", r.meta.get("name", "?"))
         if r.meta.get("symlink") == "true":
-            links.append(r.meta.get("relpath", r.meta.get("name", "?")))
+            links.append(where)
         elif refused in (NOT_REGULAR, file_sink.UNSAFE_NAME):
-            unread.append(r.meta.get("relpath", r.meta.get("name", "?")))
+            unread.append(where)
         elif refused in (file_sink.ROOT_CHANGED, file_sink.WALK_BOUND):
             incomplete.append(refused)
-    notes = [f"a link appeared in the sink ({', '.join(links)})"] if links else []
+        elif "inside" not in r.meta:
+            continue  # not a file sink's record: no other check here reads it
+        elif refused:
+            other.append(where)  # over the cap, or grew past it while read: bytes never compared
+        elif r.meta["inside"] != "true":
+            outside.append(where)
+    notes = [f"a link appeared in the sink ({', '.join(map(repr, links))})"] if links else []
     if unread:
         notes.append(f"a non-file entry appeared in the sink ({', '.join(map(repr, unread))})")
+    if other:
+        notes.append(f"an entry in the sink was not read ({', '.join(map(repr, other))})")
+    if outside:
+        notes.append(
+            f"a file outside the sink directory was read ({', '.join(map(repr, outside))})"
+        )
     notes += [f"the file sink's scan was incomplete: {reason}" for reason in incomplete]
     return "; ".join(notes)

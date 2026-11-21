@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -336,7 +337,7 @@ def test_verify_written_fails_on_an_over_cap_record() -> None:
     over = Record(b"", {"relpath": "big.hl7", "inside": "true", "refused": "9 bytes, over the cap"})
     assert verify_written(scenario, [good], {"X1": _BODY}, "p").ok
     result = verify_written(scenario, [good, over], {"X1": _BODY}, "p")
-    assert not result.ok and "was not read (big.hl7)" in result.detail
+    assert not result.ok and "was not read ('big.hl7')" in result.detail
 
 
 class _Fake(Sink):
@@ -355,7 +356,7 @@ def test_verify_sink_fails_on_a_link_in_the_sink() -> None:
     assert _verify_sink(scenario, fake, ["X1"], 0.2, "p").ok
     fake._add(_link_record())
     result = _verify_sink(scenario, fake, ["X1"], 0.2, "p")
-    assert not result.ok and "a link appeared in the sink (L.hl7)" in result.detail
+    assert not result.ok and "a link appeared in the sink ('L.hl7')" in result.detail
 
 
 def test_the_timer_scenario_fails_on_a_link_in_the_sink(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -374,7 +375,7 @@ def test_the_timer_scenario_fails_on_a_link_in_the_sink(monkeypatch: pytest.Monk
     assert scenario.run(ctx).ok
     fake._add(_link_record())
     result = scenario.run(ctx)
-    assert not result.ok and "a link appeared in the sink (L.hl7)" in result.detail
+    assert not result.ok and "a link appeared in the sink ('L.hl7')" in result.detail
 
 
 # --- step 6: the errors it logs ----------------------------------------------------------------
@@ -544,3 +545,67 @@ def test_a_volume_with_no_file_id_gives_no_identity() -> None:
     zero = os.stat_result((0o040755, 0, 7, 1, 0, 0, 0, 0, 0, 0))
     assert file_sink._identity(zero) is None
     assert file_sink._identity(os.stat_result((0o040755, 5, 7, 1, 0, 0, 0, 0, 0, 0))) == (7, 5)
+
+
+# --- the checks that read its records (PR 3076's known defects 2 and 7) -------------------------
+
+
+def _escaped_record() -> Record:
+    """A regular file the sink read whose path resolves outside the directory: no link and no
+    refusal, only ``inside`` false."""
+    return Record(_SECRET, {"relpath": "sub/x.hl7", "inside": "false"})
+
+
+def test_verify_sink_fails_on_a_file_read_from_outside_the_directory() -> None:
+    scenario = Scenario("s", "", "ADT", "A01", 1, sink="file", sink_endpoint="file_out")
+    fake = _Fake()
+    fake._add(Record(_BODY))
+    assert _verify_sink(scenario, fake, ["X1"], 0.2, "p").ok
+    fake._add(_escaped_record())
+    result = _verify_sink(scenario, fake, ["X1"], 0.2, "p")
+    assert not result.ok and "outside the sink directory was read ('sub/x.hl7')" in result.detail
+
+
+def test_the_timer_scenario_fails_on_a_file_read_from_outside_the_directory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from harness import sinks
+
+    scenario = TimerScenario("t", "")
+    timer = _BODY.replace(b"|X1|", f"|{scenario.control_id}|".encode())
+    fake = _Fake()
+    for _ in range(scenario.arrivals):
+        fake._add(Record(timer))
+    fake._add(_escaped_record())
+    monkeypatch.setattr(sinks, "build", lambda *args: fake)
+    monkeypatch.setattr(
+        TimerScenario, "_statuses_since", lambda *args: ["processed"] * scenario.arrivals
+    )
+    ctx: Any = SimpleNamespace(endpoints=None, client=None, timeout=0.5)
+    result = scenario.run(ctx)
+    assert not result.ok and "outside the sink directory" in result.detail
+
+
+def test_sink_faults_flags_an_over_cap_file_the_sink_left_unread() -> None:
+    over = {"relpath": "big.hl7", "inside": "true", "refused": "9 bytes, over the 8-byte cap"}
+    assert "was not read ('big.hl7')" in sink_faults([Record(_BODY), Record(b"", over)])
+    # A record that carries no ``inside`` is not a file sink's: its own refusal is that sink's
+    # business, and an unread delivery carries no control id either way.
+    assert sink_faults([Record(b"", {"refused": "over the cap"})]) == ""
+
+
+def test_sink_faults_quotes_a_link_name() -> None:
+    meta = {"relpath": "a\nb.hl7", "inside": "false", "symlink": "true", "refused": NOT_REGULAR}
+    note = sink_faults([Record(b"", meta)])
+    assert "\n" not in note and "'a\\nb.hl7'" in note
+
+
+def test_verify_sink_stops_waiting_on_a_sink_fault() -> None:
+    """A link in the sink fails the check whatever else arrives, so the wait ends there rather than
+    running out the timeout."""
+    scenario = Scenario("s", "", "ADT", "A01", 1, sink="file", sink_endpoint="file_out")
+    fake = _Fake()
+    fake._add(_link_record())
+    started = time.monotonic()
+    result = _verify_sink(scenario, fake, ["X1"], 30.0, "p")
+    assert not result.ok and time.monotonic() - started < 5.0
