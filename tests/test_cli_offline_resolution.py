@@ -649,8 +649,8 @@ def test_offline_env_refuses_a_malformed_service_config(
     captured = capsys.readouterr()
     assert rc == 1, captured
     assert _SECRET_HOST not in captured.out + captured.err
-    # The refusal names the settings file it could not load.
-    assert "messagefoundry.toml" in captured.out, captured
+    # The refusal is the fixed line, which names no source and quotes nothing of the failure.
+    assert "this command does not print the reason" in captured.out, captured
 
 
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
@@ -686,7 +686,9 @@ def test_offline_env_reports_a_deeply_nested_settings_file(
     captured = capsys.readouterr()
     assert rc == 1, captured
     diags = json.loads(captured.out)
-    assert isinstance(diags, list) and any("messagefoundry.toml" in d["message"] for d in diags)
+    assert isinstance(diags, list) and any(
+        "could not load the service settings" in d["message"] for d in diags
+    )
 
 
 def test_offline_env_check_and_read_name_one_dir_under_a_root(
@@ -855,12 +857,11 @@ _QUOTING_FAILURES = {
 }
 
 
-def _fixed_line(settings_file: Path) -> str:
-    return (
-        f'could not load the service settings (from "{settings_file.resolve()}", the MEFOR_* '
-        "environment and command-line values); this command does not print the reason, because "
-        "the error text can quote a configured value"
-    )
+#: The whole line these commands print for settings that do not load (ADR 0050, 2026-11-20 note).
+_FIXED_LINE = (
+    "could not load the service settings; this command does not print the reason, because the "
+    "error text can quote a configured value"
+)
 
 
 def _shown(text: str, out: str) -> bool:
@@ -893,30 +894,30 @@ def test_offline_env_prints_no_validator_text_for_settings_that_do_not_load(
     assert _URL_PASSWORD in settings_error_detail(caught.value)
     assert _URL_PASSWORD not in out, out
     assert "@host" not in out, out
-    assert _shown(_fixed_line(settings_file), out), out
+    assert _shown(_FIXED_LINE, out), out
     # The graph and its value file are good, so the exit code is the settings failure's alone.
     assert rc == (0 if command == "graph" else 1), out
 
 
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
-def test_offline_env_names_a_settings_path_holding_a_credential_label_unscrubbed(
+def test_offline_env_names_a_missing_settings_path_holding_a_credential_label_unscrubbed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     command: str,
 ) -> None:
-    # A --service-config naming a directory fails at the open. A credential scrub once rewrote a
-    # path holding "api_key=" into one that does not exist; the fixed line names it, resolved.
-    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
-    cwd = tmp_path / "cwd"
-    _values_file(cwd, "prod", f'peer_host = "{_SECRET_HOST}"\n')
-    named = tmp_path / "api_key=ZqPath5554" / "settings.toml"
-    named.mkdir(parents=True)
-    monkeypatch.chdir(cwd)
-    argv = ["--config", str(cfg), "--service-config", str(named), "--env", "prod"]
+    # A credential scrub once rewrote a path holding "api_key=" into one that does not exist. The
+    # not-found line names the path the load looked for, a relative one joined under the root.
+    root = tmp_path / "R"
+    cfg = _config_dir(root, body=_ENV_GRAPH)
+    _values_file(root, "prod", f'peer_host = "{_SECRET_HOST}"\n')
+    _empty_cwd(tmp_path, monkeypatch)
+    relative = Path("api_key=ZqPath5554") / "settings.toml"
+    argv = ["--project-root", str(root), "--config", str(cfg)]
+    argv += ["--service-config", str(relative), "--env", "prod"]
     rc = main(_offline_argv(command, tmp_path, *argv))
     captured = capsys.readouterr()
     out = captured.out + captured.err
-    assert _shown(_fixed_line(named), out), out
+    assert _shown(f"service config not found: {root / relative}", out), out
     assert "redacted" not in out, out
-    assert rc == (0 if command == "graph" else 1), out
+    assert rc != 0 if command != "graph" else rc == 0, out

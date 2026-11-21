@@ -476,13 +476,12 @@ those settings, and its Handlers still run with no active environment.
   this note, while `validate` reads `<root>/envs/<env>.toml` and can pass. They read the file with
   `serve`'s own reader, so overrides such as `MEFOR_VALUE_*` apply. Where the settings do not
   load, they print one fixed line with no text of the failure, because a validator message can
-  quote the value it refused and these commands printed no settings failure before this note.
-  The line names what the load read: the settings file, resolved and quoted, where one exists,
-  and the `MEFOR_*` environment and command-line values. It says the reason is not printed
-  because the error text can quote a configured value. A `--service-config` that does not exist
-  is reported as `service config not found: <path>`, naming the path the load looked for, which
-  is joined under `--project-root` when one is given. They report
-  a value file that cannot be read naming that file. They resolve every `env()` reference of each
+  quote the value it refused and these commands printed no settings failure before this note:
+  "could not load the service settings; this command does not print the reason, because the
+  error text can quote a configured value". It names no source. A `--service-config` that does
+  not exist is reported instead as `service config not found: <path>`, naming the path the load
+  looked for, which is joined under `--project-root` when it is relative. They report a value
+  file that cannot be read naming that file. They resolve every `env()` reference of each
   deployed connection and lookup, and report one that does not resolve by its key, never its
   value.
   `validate` lists each of these failures with its other problems and `dryrun` stops on it, so

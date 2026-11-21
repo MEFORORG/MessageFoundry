@@ -213,8 +213,9 @@ _EDIT_ARMS = {"security-set", "alert-add", "alert-remove"}
 #: ``env_problems`` beside the graph.
 _EXIT_0_ARMS = {"support-bundle", "security-show", "graph-env"}
 
-#: The arms that print no text of the failure, only a fixed line naming the settings file and
-#: saying the reason is not printed: they printed no settings failure before vault BACKLOG #5554.
+#: The arms that print a fixed line in place of the failure, because they printed no settings
+#: failure before vault BACKLOG #5554. ``_names_the_reason`` checks that line and that the
+#: message is absent.
 _NO_DETAIL_ARMS = {"validate-env", "graph-env", "dryrun-env"}
 
 
