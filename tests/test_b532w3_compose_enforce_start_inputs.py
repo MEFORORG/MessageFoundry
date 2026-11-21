@@ -181,10 +181,24 @@ def _writable_sources(service: str) -> set[str]:
     """The named volumes and bind sources the service mounts writable."""
     out: set[str] = set()
     for vol in _all_services()[service].get("volumes") or []:
+        if isinstance(vol, dict):
+            if vol.get("source") and not vol.get("read_only"):
+                out.add(str(vol["source"]))
+            continue
         parts = str(vol).split(":")
         if len(parts) > 1 and (len(parts) == 2 or "ro" not in parts[2].split(",")):
             out.add(parts[0])
     return out
+
+
+def test_the_ha_engines_keep_every_anchor_mount() -> None:
+    # Each serving ha engine replaces x-ha-engine's volumes to add its spool, so it must still
+    # carry every mount the anchor declares (schema-provision inherits them unchanged).
+    anchor = _all_services()["schema-provision"].get("volumes") or []
+    assert anchor, "positive control: x-ha-engine declares mounts"
+    for name in ("engine-ha", "engine-standby"):
+        mounts = _all_services()[name].get("volumes") or []
+        assert all(m in mounts for m in anchor), f"{name} dropped an anchor mount"
 
 
 def test_the_ha_engines_share_no_writable_volume() -> None:

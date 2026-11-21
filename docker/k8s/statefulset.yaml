@@ -97,8 +97,8 @@ spec:
       # the command docker/compose.yaml's revocation-attestation-check service runs, and exits 1 naming
       # the gate, so the pod stays in Init and the engine never starts. It reads no bind, so it refuses
       # a false value even where serve's gate would not apply: if you bind the engine to loopback
-      # behind a same-pod TLS sidecar (Topology B, header above), delete this initContainer rather
-      # than attest something your PKI does not do. Its message is in `kubectl describe pod`
+      # behind a same-pod TLS sidecar (topology b, docs/CONTAINER-EXPOSURE-EVALUATION.md section 1),
+      # delete this initContainer rather than attest something your PKI does not do. Its message is in `kubectl describe pod`
       # and `kubectl logs <pod> -c revocation-attestation-check`.
       initContainers:
         - name: revocation-attestation-check
@@ -123,7 +123,7 @@ spec:
             capabilities:
               drop: ["ALL"]
           resources:
-            requests: { cpu: "10m", memory: "32Mi" }
+            requests: { cpu: "10m", memory: "64Mi" }
             limits: { cpu: "200m", memory: "128Mi" }
         - name: tls-dir
           image: REPLACE_WITH_YOUR_CONFIG_BAKED_IMAGE   # the same image as the engine below

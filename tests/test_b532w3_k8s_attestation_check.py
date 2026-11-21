@@ -9,10 +9,10 @@ crash-looped the engine at the revocation gate (item 4). Each manifest now runs 
 ``revocation-attestation-check`` initContainer, the command ``docker/compose.yaml``'s one-shot
 service runs, in the engine's image, so the engine never starts on such a value (item 6).
 
-``secret.example.yaml`` shipped placeholder strings for every key, so applying it unedited
-created a Secret the kubelet accepted, and the engine started on placeholders (item 5). Its
-values now ship commented: an unedited apply creates a Secret holding no key a manifest reads,
-and the kubelet refuses the pod.
+``secret.example.yaml`` shipped placeholder strings for every key, so applying it unedited, with
+the TLS files it leaves out added, created a Secret the kubelet accepted, and the engine started
+and crash-looped on its placeholders (item 5). Its values now ship commented: an unedited apply
+creates a Secret holding no key a manifest reads, and the kubelet refuses the pod.
 """
 
 from __future__ import annotations
@@ -84,10 +84,9 @@ def test_the_refusal_reaches_kubectl_describe(name: str) -> None:
 
 @pytest.mark.parametrize("name", _MANIFESTS)
 def test_the_check_is_locked_down(name: str) -> None:
-    ctx = _init(name).get("securityContext") or {}
-    assert ctx.get("allowPrivilegeEscalation") is False, name
-    assert ctx.get("readOnlyRootFilesystem") is True, name
-    assert (ctx.get("capabilities") or {}).get("drop") == ["ALL"], name
+    # The engine's own hardening; test_k8s_tls_key_copy holds every initContainer to it too.
+    [engine] = [c for c in _pod(name)["containers"] if c["name"] == "engine"]
+    assert _init(name).get("securityContext") == engine["securityContext"], name
     assert not _init(name).get("volumeMounts"), f"{name}: the check needs no volume"
 
 

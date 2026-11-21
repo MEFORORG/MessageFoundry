@@ -140,9 +140,9 @@ against one case that matters, described under
   and read topology A below for the revocation attestation `docker compose` requires. Like the
   Kubernetes manifests, the `engine` and both `ha` engines carry a block *what an enforcing start
   needs* of commented entries (the alert channel, verified-TLS log forwarding and the retention
-  bounds, and for the `ha` engines the store CRL, and each `ha` engine mounts its own spool
-  volume); as shipped `serve --env prod` refuses to start,
-  so uncomment each with your value and put the trust files it names under `./config/pki/`.
+  bounds, and for the `ha` engines the store CRL); as shipped `serve --env prod` refuses to start,
+  so uncomment each with your value and put the trust files it names under `./config/pki/`. Each
+  `ha` engine also mounts its own named log-spool volume, live as shipped.
 - **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
   — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set every `image:` field (at least `revocation-attestation-check`, `tls-dir`, `copy-tls` and
   `engine`) to your config-baked image.
@@ -157,7 +157,8 @@ against one case that matters, described under
   kubelet, and each manifest's `revocation-attestation-check` initContainer then exits 1 naming the
   gate: the pod stays in `Init:CrashLoopBackOff` and the engine never starts, rather than the engine
   itself crash-looping. Every value in `k8s/secret.example.yaml` ships commented out, so applying it
-  unedited creates a Secret the kubelet refuses the pod over, not one that starts on a placeholder.
+  unedited creates a Secret the kubelet refuses the pod over, not one whose placeholders crash-loop
+  the engine.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
   Postgres-backed `replicas: 3` Deployment with `[cluster].enabled`, a PodDisruptionBudget, and
   lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)

@@ -42,8 +42,8 @@ x-ha-engine: &ha-engine
     - path: ./secrets.env
       required: false
   volumes:
-    - ./config:/config:ro
-    - ./tls:/etc/mefor/tls:ro
+    - &ha-config-mount ./config:/config:ro
+    - &ha-tls-mount ./tls:/etc/mefor/tls:ro
   read_only: true
   tmpfs:
     - /tmp
@@ -374,10 +374,10 @@ services:
     environment:
       <<: *ha-engine-env
     # The anchor's volumes plus this engine's own log-spool volume (x-ha-engine-env says why). A
-    # service's volumes replace the anchor's, so the first two repeat it.
+    # service's volumes replace the anchor's, so the first two alias its entries.
     volumes:
-      - ./config:/config:ro
-      - ./tls:/etc/mefor/tls:ro
+      - *ha-config-mount
+      - *ha-tls-mount
       - mefor-spool-ha:/var/lib/mefor
     ports:
       - "8444:8443"     # API on a distinct host port (the default `engine` already owns 8443)
@@ -390,10 +390,10 @@ services:
     environment:
       <<: *ha-engine-env
     # The anchor's volumes plus this engine's own log-spool volume (x-ha-engine-env says why). A
-    # service's volumes replace the anchor's, so the first two repeat it.
+    # service's volumes replace the anchor's, so the first two alias its entries.
     volumes:
-      - ./config:/config:ro
-      - ./tls:/etc/mefor/tls:ro
+      - *ha-config-mount
+      - *ha-tls-mount
       - mefor-spool-standby:/var/lib/mefor
     ports:
       - "8445:8443"     # API only; MLLP is reachable on the container network, not a host port, here
