@@ -554,31 +554,23 @@ From an **elevated (Administrator)** PowerShell, use the helper:
 
 This script needs PowerShell 7.1 or later (pwsh); it refuses to run under Windows PowerShell 5.1.
 
-The helper shows every certificate in the file, and refuses the whole file in at least these cases:
-any one is not a CA or carries a private key, any one does not chain to a self-signed root in the
-same file, a root in it is outside its validity period, or a DER value in it does not end where its
-bytes end. The helper's own help lists the rest.
+The helper shows every certificate in the file, and refuses the whole file, importing nothing,
+unless every certificate in it passes its checks. What it checks, what it refuses and what it only
+warns of are stated once, in the DESCRIPTION of the help block at the top of the script; read it
+in the file.
 
-**Where each CA goes.** This paragraph and the helper's own help are the statement of it; other
-documents point here. A self-signed root, whose signature verifies under its own key, goes into
-`LocalMachine\Root`; the helper asks .NET's chain engine (`X509Chain`) whether that signature
-verifies. Any other CA in the file, such as an issuing CA in a `.p7b` chain, or a
-self-issued certificate another key signed, goes into the intermediate store `LocalMachine\CA`.
-The Windows chain engine needs an authority key identifier to link a self-issued certificate to its
-signer; without one it reads the certificate as self-signed with a signature that fails, so the
-file is refused. `LocalMachine\CA` is **not** a trust anchor for SChannel or ODBC Driver 18 chain
-building, so the SQL Server hop still checks the chain up to the root. It **is** usable as a trust anchor by the
-engine's Python TLS on Windows: CPython's `ssl.create_default_context()`, which the PostgreSQL
-system-trust path calls, loads the `CA` and `ROOT` system stores, and Python 3.13 and later set
-partial-chain verification, so a chain that reaches a certificate in `LocalMachine\CA` validates
-there without its root. So the helper refuses a file unless the chain engine, given every
-certificate in the file, builds a chain from each one to a self-signed root in the same file with
-every signature verifying and no fault reported but an untrusted root or a time status, and every
-self-signed root in it is within its validity period. Only the file's own roots anchor that chain,
-and the helper turns off fetching a missing issuer from a URL a certificate names. It warns of,
-but does not refuse, an expired issuing CA, and it does not check revocation. With `-Confirm`
-you may still decline the root and accept another CA, so give it the root of the CA you mean to
-trust, alone or in that CA's own `.p7b` chain, and accept every certificate it offers.
+**Where each CA goes.** This paragraph is the statement of it; other documents point here. A
+self-signed root goes into `LocalMachine\Root`. Any other CA in the file, such as an issuing CA in
+a `.p7b` chain, or a self-issued certificate another key signed, goes into the intermediate store
+`LocalMachine\CA`. `LocalMachine\CA` is **not** a trust anchor for SChannel or ODBC Driver 18
+chain building, so the SQL Server hop still checks the chain up to the root. It **is** usable as a
+trust anchor by the engine's Python TLS on Windows: CPython's `ssl.create_default_context()`,
+which the PostgreSQL system-trust path calls, loads the `CA` and `ROOT` system stores, and Python
+3.13 and later set partial-chain verification, so a chain that reaches a certificate in
+`LocalMachine\CA` validates there without its root. That is why the helper refuses a file in
+which a CA does not chain to a self-signed root in the same file. With `-Confirm` you may still
+decline the root and accept another CA, so give it the root of the CA you mean to trust, alone or
+in that CA's own `.p7b` chain, and accept every certificate it offers.
 
 The built-ins below check none of that, so use them only for a file holding one self-signed root
 CA you have checked yourself:
@@ -611,9 +603,20 @@ connection fails validation** (NIST SP 800-52r2: rotate certificates before expi
 2. **Roll the DB server certificate** to one issued by the new CA (a DB-administrator action). Because
    both CAs are trusted, connections keep validating across the swap.
 3. **Remove the old CA** once every host trusts the new one and the server cert has rolled:
-   - **SQL Server:** delete the old CA from whichever machine store holds it, `LocalMachine\Root` for
-     a root or `LocalMachine\CA` for an issuing CA (e.g.
-     `Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA | Where-Object Thumbprint -eq <old> | Remove-Item`).
+   - **SQL Server:** delete **every** certificate the old CA's file put in the machine stores: its
+     root from `LocalMachine\Root` and each of its issuing CAs from `LocalMachine\CA`. Removing the
+     root alone is not enough. An old issuing CA left in `LocalMachine\CA` stays a trust anchor for
+     the engine's Python TLS (§5.2, "Where each CA goes"), so a server certificate it issued would
+     still validate there. The helper prints each certificate's thumbprint; run it with `-WhatIf` on
+     the old file to list them again (it prints the list before it refuses a file for a CA, chain
+     or validity check, so it lists them even once the old root has expired). Then remove
+     them all at once:
+
+     ```powershell
+     $old = @('<old root thumbprint>', '<old issuing CA thumbprint>')  # every one the old file holds
+     Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA |
+         Where-Object Thumbprint -in $old | Remove-Item
+     ```
    - **PostgreSQL:** drop the old CA from the PEM bundle and reload.
 
 **Rotating only the server leaf cert** (same CA): no trust-store change is needed — the new leaf still

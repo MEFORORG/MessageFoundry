@@ -19,28 +19,24 @@
     account) sees it. It is the supported full-chain-trust path: trust_server_certificate stays
     false and the engine validates the full chain.
 
-    Where each CA goes. This is the one statement of it; docs/DEPLOY-SERVER-DB.md section 5.2
-    repeats it for operators, and every other document points there. A self-signed root, whose
-    signature verifies under its own key as .NET's chain engine (X509Chain) reads it, goes into
-    LocalMachine\Root. Any other CA in the file, such as an issuing CA in a .p7b chain, or a
-    self-issued certificate another key signed, goes into the intermediate store
-    LocalMachine\CA. The Windows chain engine needs an authority key identifier to link a
-    self-issued certificate to its signer; without one it reads the certificate as self-signed
-    with a signature that fails, so the file is refused. LocalMachine\CA is not a trust anchor
-    for SChannel or ODBC Driver 18 chain building, so the SQL Server hop still checks the chain
-    up to the root. It IS usable as a trust anchor by the engine's Python TLS on Windows:
-    CPython's ssl.create_default_context(), which the PostgreSQL system-trust path calls, loads
-    the CA and ROOT system stores, and Python 3.13 and later set partial-chain verification, so a
-    chain that reaches a certificate in LocalMachine\CA validates there without its root. So a
-    file is refused unless the chain engine, given every certificate in the file as extra certificates,
-    builds a chain from each certificate in it to a self-signed root in the same file, with no
-    chain status other than an untrusted root or a time status. Only the file's own self-signed
-    roots anchor that chain (CustomRootTrust), so a root this machine already trusts cannot
-    stand in for them, and the engine fetches no missing issuer from a URL a certificate names
-    (DisableCertificateDownloads). Every self-signed root in the file must also be within its
-    validity period. The validity of any other CA is only warned of, and revocation is not
-    checked. With -Confirm the operator may still decline the root and accept another CA. The
-    PowerShell version this needs is stated in docs/DEPLOY-SERVER-DB.md section 5.2.
+    Which store each CA goes into, and what each store is a trust anchor for, is stated once, in
+    docs/DEPLOY-SERVER-DB.md section 5.2 ("Where each CA goes"), and so is the PowerShell version
+    this needs.
+
+    What this script checks. This is the one statement of it; other documents point here. A
+    certificate is a self-signed root when the chain .NET's chain engine (X509Chain) builds for it
+    is that certificate alone and its signature verifies under its own key. The Windows chain
+    engine needs an authority key identifier to link a self-issued certificate to its signer;
+    without one it reads the certificate as self-signed with a signature that fails, so the file
+    is refused. A file is refused unless the chain engine, given every certificate in the file as
+    extra certificates, builds a chain from each certificate in it to a self-signed root in the
+    same file, with no chain status other than an untrusted root or a time status. Only the
+    file's own self-signed roots anchor that chain (CustomRootTrust), so a root this machine
+    already trusts cannot stand in for them, and the engine fetches no missing issuer from a URL a
+    certificate names (DisableCertificateDownloads). Every self-signed root in the file must also
+    be within its validity period. The validity of any other CA, expired or not yet valid, is
+    only warned of, and revocation is not checked. With -Confirm the operator may still decline
+    the root and accept another CA.
 
     PostgreSQL can alternatively pin a CA by file via [store].ssl_root_cert (no machine import
     needed). This machine-store import is the path SQL Server REQUIRES; Postgres can use either.
@@ -49,7 +45,7 @@
     nothing reaches a store that the operator was not shown. The whole file is refused, and
     nothing is imported, when any certificate in it is not marked as a CA by its basic
     constraints, has a key usage that cannot sign certificates, carries a private key, or fails
-    the chain and root checks in "Where each CA goes", when a DER value in it (the whole file, a
+    the chain and root checks in "What this script checks", when a DER value in it (the whole file, a
     PEM block, or decoded base64) does not end where its bytes end, or when a control character
     other than tab, CR or LF sits outside its PEM blocks. Other text outside PEM blocks, bare
     base64 among them, is ignored, not refused. At least a .pfx, and a well-formed PEM block
@@ -103,7 +99,7 @@ if (-not ($chainPolicy.PSObject.Properties['TrustMode'] -and
 # The machine stores -- NOT the per-user ones. The engine runs as a service principal
 # (LocalSystem / gMSA / dedicated account), which only reads the machine stores, so a CurrentUser
 # import would be invisible to it. Which CA goes into which store, and what each store is a trust
-# anchor for, is stated once, in the help's "Where each CA goes". Each store is built unopened
+# anchor for, is stated once, in docs/DEPLOY-SERVER-DB.md section 5.2. Each store is built unopened
 # here, and the label every prompt names is read from it, so the store the operator approves and
 # the one written cannot drift apart.
 $stores = @{}
@@ -220,13 +216,19 @@ function Read-CaBundle {
     param([Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes)
     $bundle = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2Collection
     if ($Bytes.Length -eq 0) { throw "The file is empty." }
+    # The byte-order mark is left out of the text, so bare base64 behind one is still read.
     $encoding = [System.Text.Encoding]::ASCII
+    $skip = 0
     if ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFF -and $Bytes[1] -eq 0xFE) {
         $encoding = [System.Text.Encoding]::Unicode
+        $skip = 2
     } elseif ($Bytes.Length -ge 2 -and $Bytes[0] -eq 0xFE -and $Bytes[1] -eq 0xFF) {
         $encoding = [System.Text.Encoding]::BigEndianUnicode
+        $skip = 2
+    } elseif ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) {
+        $skip = 3
     }
-    $text = $encoding.GetString($Bytes)
+    $text = $encoding.GetString($Bytes, $skip, $Bytes.Length - $skip)
     # Every piece of DER, the whole file or one PEM block, must be a certificate or a PKCS#7 chain,
     # so a .pfx is refused wherever it sits, before it is parsed.
     $importDer = {
@@ -360,8 +362,8 @@ function Invoke-CaChainBuild {
 # belongs in, why it must not be trusted ($null when it may be), and whether it is outside its
 # validity period at $Now, a UTC time. A certificate is a root when the chain built for it is that
 # certificate alone and its signature verifies under its own key; it goes into Root, and any other
-# CA into CertificateAuthority (the intermediate store). The help's "Where each CA goes" says what
-# each store means. Every other certificate must chain to one of the file's roots, and only the
+# CA into CertificateAuthority (the intermediate store). docs/DEPLOY-SERVER-DB.md section 5.2 says
+# what each store means. Every other certificate must chain to one of the file's roots, and only the
 # file's roots anchor that chain, so a root the machine already trusts cannot take the place of the
 # file's own, as an older root of the same name would. A file with no root gets no anchored build:
 # an empty CustomTrustStore is never passed, and each certificate's chain, which then ends at no
@@ -469,32 +471,34 @@ $refusals = [System.Collections.Generic.List[object]]::new()
 $entries = @(foreach ($cert in $bundle) {
     $check = $checks[$cert.Thumbprint]
     $target = $stores[$check.Store]
+    $why = Get-CaRefusal -Certificate $cert
+    if (-not $why) { $why = $check.Refusal }
     Write-Host ""
     Write-Host "  Subject    : $(ConvertTo-PrintableText $cert.Subject)"
     Write-Host "  Issuer     : $(ConvertTo-PrintableText $cert.Issuer)"
     Write-Host "  Thumbprint : $($cert.Thumbprint)"
     # 'u' writes a 'Z' suffix whatever the DateTime's kind, so the time must be UTC.
     Write-Host "  Not after  : $($cert.NotAfter.ToUniversalTime().ToString('u'))"
-    Write-Host "  Store      : $($target.Label)"
+    # A refused certificate is offered for no store, so none is named for it.
+    Write-Host "  Store      : $(if ($why) { 'none (refused)' } else { $target.Label })"
     if ($check.Outside) {
         Write-Warning "$($cert.Thumbprint) is outside its validity period; a chain through it will not validate."
     }
-    $why = Get-CaRefusal -Certificate $cert
-    if (-not $why) { $why = $check.Refusal }
     if ($why) { $refusals.Add([pscustomobject]@{ Thumbprint = $cert.Thumbprint; Why = $why }) }
     @{ Certificate = $cert; Target = $target }
 })
 if ($refusals.Count -gt 0) {
     # Printed one per line for the operator. pwsh 7's default error view rewraps a message at the
-    # console width, which can split a thumbprint from its reason. The error repeats each pair on
-    # one line, for a caller that catches it or keeps only the error stream.
+    # console width, which can split a thumbprint from its reason. The error repeats each pair in
+    # the same "thumbprint: reason" form, joined by '; ', for a caller that catches it or keeps
+    # only the error stream; the error view may still rewrap it.
     Write-Host ""
     Write-Host "Refused:"
     foreach ($refusal in $refusals) { Write-Host "  $($refusal.Thumbprint): $($refusal.Why)" }
     throw ("Nothing was imported. Every certificate in the file must be a CA that may sign " +
         "certificates, carries no private key, and chains to a self-signed root in the file " +
         "that is within its validity period. Refused: " +
-        (($refusals | ForEach-Object { "$($_.Thumbprint) ($($_.Why))" }) -join '; ') + ".")
+        (($refusals | ForEach-Object { "$($_.Thumbprint): $($_.Why)" }) -join '; ') + ".")
 }
 if (-not ($entries | Where-Object { $_.Target -eq $stores['Root'] })) {
     # Defensive: not expected to fire.
@@ -536,7 +540,7 @@ if ($approved.Count -gt 0) {
     } else {
         Write-Warning ("No root was imported. Over SChannel and ODBC a DB server cert validates only if " +
             "its root is already in $StoreLocation; the engine's Python TLS treats LocalMachine\CA " +
-            "differently (see this script's help, 'Where each CA goes').")
+            "differently (see docs/DEPLOY-SERVER-DB.md section 5.2, 'Where each CA goes').")
     }
     Write-Host ""
     Write-Host "Rotation: when the CA is replaced, import the NEW CA first (this leaves both trusted),"
