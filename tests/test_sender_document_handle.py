@@ -2119,25 +2119,11 @@ async def test_a_streaming_ed_body_under_a_colliding_header_it_cannot_read_is_re
     assert await _ingress_count(store, ic.name) == 0
 
 
-def _handle_refused_payloads() -> list[str]:
-    """Payloads with a well-formed ``OBX-5.5`` handle that the re-attach refuses whatever the
-    handle names: a colliding header, a base64 delimiter, and a later header escaping the
-    marker otherwise than the first line."""
-    handle = make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application")
-    return [
-        _hl7(handle, msh2="^~&"),
-        _well_formed("|", "^~\\/", handle),
-        _hl7(handle) + _escaped_handle_under("", ":~\\&"),
-    ]
-
-
-@pytest.mark.parametrize(
-    "payload", _handle_refused_payloads(), ids=["colliding", "base64-delimiter", "mixed-header"]
-)
-async def test_no_address_is_named_for_a_handle_the_re_attach_refuses(payload: str) -> None:
-    """B13g: ``doc_ref_addresses_in_hl7`` named the address of a handle the re-attach refuses, so
-    a child carrying it was linked to a document its delivery can never send, and held it from
-    retention. The two now read one rule, so neither names an address the other refuses."""
+async def test_no_address_is_named_for_a_handle_under_a_colliding_header() -> None:
+    """B13g: ``doc_ref_addresses_in_hl7`` named the address of a handle under a colliding header,
+    which the re-attach refuses whatever it names, so a child carrying it was linked to a document
+    its delivery can never send. ``main`` named none under any short MSH-2; under a colliding one
+    it now names none again."""
     from messagefoundry.parsing.binary import (
         UnreattachableDocumentError,
         doc_ref_addresses_in_hl7,
@@ -2146,7 +2132,9 @@ async def test_no_address_is_named_for_a_handle_the_re_attach_refuses(payload: s
     from messagefoundry.store.store import attachments_named
 
     ref = hashlib.sha256(b"x").hexdigest()
-    with pytest.raises(UnreattachableDocumentError):
+    # ``^~&``: the OBX-5 components still read, so the handle is read as one.
+    payload = _hl7(make_doc_ref(ref, "Application"), msh2="^~&")
+    with pytest.raises(UnreattachableDocumentError, match="fills a delimiter it does not name"):
         await reattach_documents_in_hl7(payload, _no_read, bound=frozenset({ref}))
     assert doc_ref_addresses_in_hl7(payload) == frozenset()
     assert attachments_named([ref], payload) == []

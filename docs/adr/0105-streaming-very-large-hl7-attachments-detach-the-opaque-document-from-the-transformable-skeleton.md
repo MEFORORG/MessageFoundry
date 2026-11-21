@@ -345,8 +345,9 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   (`NonVerbatimDocumentError`), the same way. A body whose `MSH-2` is shorter than four
   characters is read, detached and re-attached under the delimiters the parser filled for it
   (BACKLOG #5972), unless a default filled in is already another of its delimiters, as in
-  `MSH|^~&|`: `Message` refuses every write to such a body, so the detach refuses its document
-  the same way (`CollidingDelimitersError`, a `NonVerbatimDocumentError`); a body with no `MSH` never reaches the detach, since `Peek.parse` refuses it
+  `MSH|^~&|`: `Message` refuses every write to such a body, so the detach refuses it wherever
+  an `OBX` has `OBX-2` `ED`, whether or not a document reads there, since under `MSH|~|` no
+  `OBX-5` component reads as written (`CollidingDelimitersError`, a `NonVerbatimDocumentError`); a body with no `MSH` never reaches the detach, since `Peek.parse` refuses it
   first. The re-attach refuses a stored value holding a
   delimiter the payload's `MSH-1` or `MSH-2` names after its read and before the splice, so a Handler that
   moved `MSH-1` or `MSH-2` after the detach dead-letters the row rather than send an altered document; a

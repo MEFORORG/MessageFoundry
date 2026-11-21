@@ -80,6 +80,7 @@ from messagefoundry.parsing.binary import (
     EscapedDocumentError,
     InboundDocRefError,
     NonVerbatimDocumentError,
+    _holds_ed_claim,
     _obx_is_ed,
     extract_obx_document,
     is_doc_ref,
@@ -678,6 +679,11 @@ def _strip_and_scan_hl7(text: str) -> None:
     else:
         if colliding and detached:
             raise AssertionError("iter_obx_documents yielded a document under colliding delimiters")
+        if colliding and _holds_ed_claim(message):
+            # An ED claim it could not read must be refused, never ACKed undetached (B13b).
+            raise AssertionError(
+                "iter_obx_documents accepted an ED claim under colliding delimiters"
+            )
     for occurrence in range(1, message.count_segments("OBX") + 1):
         try:
             extract_obx_document(message, occurrence=occurrence)
