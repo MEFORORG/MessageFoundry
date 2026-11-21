@@ -68,6 +68,7 @@ import {
   buildPasteRequest,
   buildToolbarInsertRequest,
   drainEdits,
+  errorText,
   escapeHtml,
   mergeLiveValues,
   parseRewriteResult,
@@ -84,6 +85,8 @@ import {
   traceRowValues,
   withPickedPath,
   type AddMenuItem,
+  QueuedEditRebaser,
+  type AppliedRewrite,
   type EditMessage,
   type HandlerViewModel,
   type LensParseResult,
@@ -307,6 +310,11 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     let sawAlive = false;
     // One edit at a time + the webview↔document update-loop guard (ADR 0076 §5).
     const guard = new EditLoopGuard();
+    // The typed rewrites applied since the webview was last projected, so an edit on one of their rows
+    // is sent with the row's current source rather than refused as stale (BACKLOG #5943). render()
+    // tells it which buffer each new webview was projected from.
+    const rebaser = new QueuedEditRebaser();
+    let projectionId = 0;
 
     // The ONE debounced re-projection channel (ADR 0076 §5 "sync on save"). Both a save and a refresh
     // the guard deferred (BACKLOG #1759) go through it, so an owed refresh coalesces with a real save
@@ -433,6 +441,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       const scriptUri = panel.webview.asWebviewUri(
         vscode.Uri.joinPath(this.extensionUri, "media", "stepsWebview.js"),
       );
+      // Each projection gets a new id, which the page echoes in every edit it posts (#5943).
+      const projection = ++projectionId;
       panel.webview.html = pageHtml(
         panel.webview,
         handlers,
@@ -440,7 +450,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         this.version,
         scriptUri,
         this.opSchema,
+        projection,
       );
+      // The new rows carry `source`, which decides whether the recorded rewrites still apply (#5943).
+      rebaser.project(projection, source);
       // Arm the handshake: if the freshly-loaded script doesn't ping within 3s, it failed to initialize.
       sawAlive = false;
       setTimeout(() => {
@@ -460,13 +473,16 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // so the engine compares the row as it was PROJECTED against the live buffer's row at that line range
     // and REFUSES a stale coordinate (F7). We must NOT recompute expect_src from the same live buffer we
     // send as stdin — that compares the buffer against itself and the guard always passes (the defect).
-    const applyOne = async (msg: EditMessage): Promise<void> => {
+    // Returns what it wrote only when the write landed, so drainEdits can carry a queued edit on the same
+    // row over it (BACKLOG #5943); a refusal, a no-op or a disposed panel returns nothing.
+    const applyOne = async (msg: EditMessage): Promise<AppliedRewrite | undefined> => {
       const spec = buildEditRequest(msg);
+      const before = document.getText();
       // At the SAME contract the rows were projected with — the engine re-locates the row through that
       // grammar, so sending v2 coordinates into a v1 partition would miss it (or hit a different row).
       const res = await lensRewriteStdin(
         spec,
-        document.getText(),
+        before,
         workspaceDir(),
       );
       if (disposed) {
@@ -491,7 +507,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         document.positionAt(document.getText().length),
       );
       edit.replace(document.uri, fullRange, outcome.source);
-      await vscode.workspace.applyEdit(edit);
+      if (!(await vscode.workspace.applyEdit(edit))) {
+        return undefined;
+      }
+      return { before, after: outcome.source };
     };
 
     // One edit at a time. A change that races an in-flight rewrite is NOT dropped — it is queued and
@@ -506,11 +525,13 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         applyOne,
         (err) => {
           void vscode.window.showErrorMessage(
-            `MessageFoundry: could not apply the edit — ${err instanceof Error ? err.message : String(err)}`,
+            `MessageFoundry: could not apply the edit — ${errorText(err)}`,
           );
           void render(); // revert the optimistic webview change to the true projection
         },
         scheduleRerender, // a save the guard suppressed mid-drain is deferred, not dropped (#1759)
+        // Lets an edit on a row rewritten since the last projection carry its expectSrc over (#5943).
+        { rebaser, readSource: () => document.getText(), log: (text) => console.warn(text) },
       );
 
     // Apply a STRUCTURAL op (insert/delete/move). Unlike a param edit these change the file's line count,
@@ -1075,6 +1096,7 @@ function pageHtml(
   version: string,
   scriptUri: vscode.Uri,
   schema: OpSchema | undefined,
+  projection: number,
 ): string {
   const n = nonce();
   const body = renderHandlersHtml(handlers, schema);
@@ -1109,6 +1131,7 @@ function pageHtml(
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src ${webview.cspSource} 'nonce-${n}';" />
+  <meta name="mf-projection" content="${projection}" />
   <style>
     body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 0 12px 16px; }
     .bar { padding: 10px 0; position: sticky; top: 0; z-index: 1; background: var(--vscode-editor-background);

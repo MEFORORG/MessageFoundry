@@ -48,6 +48,13 @@ class ConfigConvergenceRunner:
     with the shared version it converges on, so its audit row can name it; vault BACKLOG #3109). The
     runner never imports the engine — it takes these as plain callbacks so the dependency direction
     stays one-way (pipeline only).
+
+    ``refusals`` names the exceptions a reload raises by design rather than as a fault, at least the
+    runner's lease-lost refusal (BACKLOG #5906). Through a run of such passes on one shared
+    version, the first logs its "converging" line and one refusal line at INFO, with no traceback,
+    and the rest log both at DEBUG. The pass that ends the run logs at INFO: a convergence, or the
+    version that failed beside the fault's own traceback. Each is retried next interval like any
+    failure; the applied version does not advance.
     """
 
     def __init__(
@@ -58,12 +65,18 @@ class ConfigConvergenceRunner:
         set_applied_version: Callable[[int], None],
         reload: Callable[[int], Awaitable[None]],
         interval_seconds: float,
+        refusals: tuple[type[Exception], ...] = (),
     ) -> None:
         self._coordinator = coordinator
         self._applied_version = applied_version
         self._set_applied_version = set_applied_version
         self._reload = reload
         self._interval_seconds = interval_seconds
+        self._refusals = refusals
+        # The shared version a run of designed refusals is on, so it logs at INFO once, not per
+        # pass; and the version the current pass is converging on.
+        self._refused_version: int | None = None
+        self._attempting: int | None = None
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
 
@@ -96,13 +109,36 @@ class ConfigConvergenceRunner:
         # One isolated pass per interval; an error in a pass (e.g. a bad local config) is logged and the
         # loop continues — a convergence hiccup must never take the node down. Cooperatively cancellable.
         while not self._stop.is_set():
-            try:
-                await self.converge_once()
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                log.exception("cluster: config convergence pass failed; will retry next interval")
+            await self._pass_once()
             await self._sleep(self._interval_seconds)
+
+    async def _pass_once(self) -> None:
+        """One isolated pass of :meth:`_run`: a fault is logged with its traceback, a designed
+        refusal (``refusals``) once per run of them without one."""
+        try:
+            await self.converge_once()
+        except asyncio.CancelledError:
+            raise
+        except self._refusals as exc:
+            if self._refused_version != self._attempting:
+                self._refused_version = self._attempting
+                # The type name, not the text: a reload refusal's text tells an operator what to do
+                # about a manual reload, and this background pass is retried by itself.
+                log.info(
+                    "cluster: config convergence on shared version %s refused on this node by "
+                    "design (%s); it retries each interval, and clears once the cause does",
+                    self._attempting,
+                    type(exc).__name__,
+                )
+            else:
+                log.debug("cluster: config convergence refused again (%s)", type(exc).__name__)
+            return
+        except Exception:
+            if self._refused_version is not None:
+                # The converging line went out at DEBUG; say which version failed.
+                log.info("cluster: shared config version %s failed to converge", self._attempting)
+            log.exception("cluster: config convergence pass failed; will retry next interval")
+        self._refused_version = None
 
     async def _sleep(self, delay: float) -> None:
         """Sleep up to ``delay``, waking immediately on stop (so shutdown isn't held by the interval)."""
@@ -123,7 +159,11 @@ class ConfigConvergenceRunner:
         shared = self._coordinator.config_version_cached()
         if shared <= self._applied_version():
             return False
-        log.info(
+        # Quiet through a run of designed refusals of this version, which _pass_once reports once.
+        quiet = self._refused_version == shared
+        self._attempting = shared
+        log.log(
+            logging.DEBUG if quiet else logging.INFO,
             "cluster: shared config version %d is ahead of this node's applied %d; converging",
             shared,
             self._applied_version(),
@@ -135,4 +175,6 @@ class ConfigConvergenceRunner:
         # Only advance the applied version after a clean reload, so a failed convergence retries next
         # tick rather than silently skipping the version it couldn't apply.
         self._set_applied_version(shared)
+        if quiet:
+            log.info("cluster: converged on shared config version %d after refused passes", shared)
         return True

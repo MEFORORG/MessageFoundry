@@ -51,7 +51,7 @@ from messagefoundry.config.tls_policy import (
     hop_name_prefix,
 )
 from messagefoundry.controlchars import has_lone_surrogate
-from messagefoundry.transports.base import float_setting
+from messagefoundry.transports.base import float_setting, positive_seconds
 from messagefoundry.transports.rest import (
     HttpAuthError,
     ProxyConfig,
@@ -405,7 +405,8 @@ def oauth2_cc_provider_from_settings(
             knob="oauth2_expiry_skew_seconds",
             transport="OAuth2",
         ),
-        timeout_seconds=float_setting(
+        # BACKLOG #5959: above zero, as REST's; positive_seconds says why.
+        timeout_seconds=positive_seconds(
             s.get("oauth2_timeout_seconds", _DEFAULT_TOKEN_TIMEOUT),
             knob="oauth2_timeout_seconds",
             transport="OAuth2",
