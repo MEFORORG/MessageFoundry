@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import math
 import operator
+import re
 from collections.abc import Callable
 from decimal import Decimal
 from fractions import Fraction
@@ -63,7 +64,11 @@ from messagefoundry.transports.direct import DirectDestination
 from messagefoundry.transports.email import EmailDestination
 from messagefoundry.transports.fhir import FhirDestination, FhirLookupExecutor
 from messagefoundry.transports.file import FileSource
-from messagefoundry.transports.http_auth import oauth2_cc_provider_from_settings
+from messagefoundry.transports.http_auth import (
+    HttpAuthError,
+    OAuth2ClientCredentialsProvider,
+    oauth2_cc_provider_from_settings,
+)
 from messagefoundry.transports.http_listener import DEFAULT_MAX_HEADER_BYTES, HttpSource
 from messagefoundry.transports.mllp import MLLPDestination, MLLPSource
 from messagefoundry.transports.remotefile import RemoteFileSource
@@ -753,8 +758,9 @@ _FLOAT_OFF_BY_ZERO = [
     ),
 ]
 
-#: Timeouts read by ``float_setting`` alone, where zero is not "off": (builder, key, attribute).
-#: Each was a bare ``float()`` before #3432.
+#: Timeouts read by ``float_setting``, where zero is not "off": (builder, key, attribute). Each was
+#: a bare ``float()`` before #3432. Some are read through ``positive_seconds`` now, which refuses a
+#: zero or a negative too (BACKLOG #5796, #5959; the tests after ``_POSITIVE_TIMEOUTS`` pin that).
 _TIMEOUTS = [
     pytest.param(_MLLP_OUT, "timeout_seconds", "timeout", id="mllp-out-timeout"),
     pytest.param(_MLLP_OUT, "connect_timeout", "connect_timeout", id="mllp-out-connect"),
@@ -898,6 +904,72 @@ def test_an_http_reply_timeout_must_be_above_zero() -> None:
         for unset in (None, ""):
             assert getattr(_HTTP_IN({key: unset}), key) == 30.0
         assert getattr(_HTTP_IN({}), key) == 30.0
+
+
+def _smart(over: dict[str, Any]) -> Any:
+    return token_provider_from_settings(
+        {
+            "smart_token_url": "https://auth.example.com/token",
+            "smart_client_id": "c",
+            "smart_private_key": "unused",
+            **over,
+        }
+    )
+
+
+#: BACKLOG #5959: the REST family's other request timeouts, (builder, key, transport label). REST's
+#: own is pinned in tests/test_rest_transport.py (BACKLOG #5796).
+_POSITIVE_TIMEOUTS = [
+    pytest.param(_soap, "timeout_seconds", "SOAP destination", id="soap"),
+    pytest.param(
+        _url_dest(FhirDestination, ConnectorType.FHIR, "https://fhir.example.com/r4"),
+        "timeout_seconds",
+        "FHIR destination",
+        id="fhir",
+    ),
+    pytest.param(
+        _url_dest(DicomWebDestination, ConnectorType.DICOMWEB, "https://pacs.example.com/studies"),
+        "timeout_seconds",
+        "DICOMweb destination",
+        id="dicomweb",
+    ),
+    pytest.param(_fhir_lookup, "timeout_seconds", "FhirLookup 'epic'", id="fhir-lookup"),
+    pytest.param(_smart, "smart_timeout_seconds", "SMART", id="smart-token"),
+    pytest.param(_oauth2, "oauth2_timeout_seconds", "OAuth2", id="oauth2-token"),
+]
+
+
+@pytest.mark.parametrize(("build", "key", "transport"), _POSITIVE_TIMEOUTS)
+@pytest.mark.parametrize("bad", [0, 0.0, "0", "-0", -1, -0.5, "-2"])
+def test_a_request_timeout_that_is_not_positive_is_refused_at_build(
+    build: Build, key: str, transport: str, bad: object
+) -> None:
+    """BACKLOG #5959: ``float_setting`` passes zero and negatives through, and urllib reads a zero
+    timeout as a non-blocking socket and refuses a negative one, so each built a connection that
+    failed every request. Each is refused when the connection is built, naming the key and
+    withholding the value. The positive control for each but the SMART hop, which loads its key
+    material after the timeout, is ``test_a_float_setting_accepts_a_number_or_its_text`` above,
+    which builds each with 2.5."""
+    message = (
+        rf"^{re.escape(transport)} {key} must be a number of seconds above zero \(value withheld"
+    )
+    with pytest.raises(ValueError, match=message):
+        build({key: bad})
+
+
+@pytest.mark.parametrize("bad", [0, -1.5])
+def test_a_token_hop_built_directly_refuses_a_timeout_that_is_not_positive(bad: float) -> None:
+    """BACKLOG #5959: the token hop checks the timeout itself, so a provider built without a
+    settings reader is held to the rule too. Control: a positive timeout builds."""
+    kwargs: dict[str, Any] = {
+        "token_url": "https://auth.example.com/token",
+        "client_id": "c",
+        "client_secret": "s",
+    }
+    match = r"^OAuth2 token endpoint timeout_seconds must be a number of seconds above zero"
+    with pytest.raises(HttpAuthError, match=match):
+        OAuth2ClientCredentialsProvider(**kwargs, timeout_seconds=bad)
+    assert OAuth2ClientCredentialsProvider(**kwargs, timeout_seconds=0.5).timeout_seconds == 0.5
 
 
 _RANGE_REFUSALS = [
