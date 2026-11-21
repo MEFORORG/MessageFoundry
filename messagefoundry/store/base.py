@@ -5493,12 +5493,12 @@ def _salvage_late_borrow(pool: Any, backend: str, borrow: asyncio.Future[Any]) -
     task.add_done_callback(_LATE_RELEASES.discard)
 
 
-#: Strong references to in-flight releases nobody awaits: :func:`_salvage_late_borrow`'s (see the
-#: comment there) and the stuck warm-up releases :func:`_drain_and_release` abandons.
-_LATE_RELEASES: set[asyncio.Future[None]] = set()
+#: Strong references to in-flight work nobody awaits: :func:`_salvage_late_borrow`'s releases (see
+#: the comment there), and the stuck warm-up borrows and releases :func:`_drain_and_release` abandons.
+_LATE_RELEASES: set[asyncio.Future[Any]] = set()
 
 
-def _discard_late_release(release: asyncio.Future[None]) -> None:
+def _discard_late_release(release: asyncio.Future[Any]) -> None:
     """Drop an abandoned release's strong reference once it ends, retrieving its outcome so the loop
     never logs "exception was never retrieved" for it. :func:`_release_one` already absorbs an
     ordinary release error, so what is left here is at most the cancellation."""
@@ -5580,9 +5580,10 @@ async def warm_pool_connections(pool: Any, *, target: int, timeout: float, backe
     discard the connection there, because a pending cancel is thrown in instead of the resolved value.
     So the cancel path defers the borrow's own cancel with ``call_soon``, so any step the borrow already
     has scheduled runs first and finishes the hand-over, and hands the borrow to the cleanup. The
-    cleanup waits for those borrows within the same bound as the releases, releases what they handed
-    over, and attaches :func:`_salvage_late_borrow` to any still pending at the bound. A cancel that
-    does reach a still-pending borrow lands at one of the driver's own suspension points, and what that
+    cleanup waits for those borrows under the same deadline as the releases, releases what they handed
+    over, and attaches :func:`_salvage_late_borrow` to any still pending at the deadline. That covers
+    a hand-over in the cancel's own loop turn; a borrow whose hand-over has not resolved when the
+    deferred cancel runs takes that cancel at one of the driver's own suspension points, and what that
     does is the driver's: this rests on ``pool.acquire()`` marking the connection in-use atomically
     with returning it, as ``asyncpg>=0.29`` and ``aioodbc>=0.5`` do.
 
@@ -5664,23 +5665,40 @@ async def _drain_and_release(
     # the caller's ``cleanup`` task always resolves normally (a TimeoutError escaping a *shielded* future
     # would otherwise be logged at ERROR by the loop).
     await asyncio.gather(*tasks, return_exceptions=True)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _CLEANUP_TIMEOUT_SECONDS
+    # The held releases start at once; the borrows the acquire tasks gave up on (see "Acquire-side
+    # leak-freedom") are waited for alongside them under the same deadline, and what they handed over
+    # is released too. A borrow still pending at the deadline is parked, strongly held, for the salvage.
+    releases = [asyncio.ensure_future(_release_one(pool, conn, backend)) for conn in held]
     if abandoned:
-        # The borrows the acquire tasks gave up on (see "Acquire-side leak-freedom"): keep what they
-        # handed over for the release below, and leave any still pending at the bound to the salvage.
         landed, late = await asyncio.wait(abandoned, timeout=_CLEANUP_TIMEOUT_SECONDS)
         for borrow in landed:
-            if not borrow.cancelled() and borrow.exception() is None:
-                held.append(borrow.result())
+            if borrow.cancelled():
+                continue
+            if (exc := borrow.exception()) is not None:
+                log.debug("%s: an abandoned warm-up borrow failed: %s", backend, type(exc).__name__)
+                continue
+            held.append(borrow.result())
+            releases.append(asyncio.ensure_future(_release_one(pool, borrow.result(), backend)))
+        if late:
+            log.warning(
+                "%s: %d warm-up borrow(s) still pending after %gs; leaving them to the salvage",
+                backend,
+                len(late),
+                _CLEANUP_TIMEOUT_SECONDS,
+            )
         for borrow in late:
+            _LATE_RELEASES.add(borrow)
+            borrow.add_done_callback(_discard_late_release)
             borrow.add_done_callback(partial(_salvage_late_borrow, pool, backend))
-    if not held:
+    if not releases:
         return
     # ``asyncio.wait`` rather than ``wait_for``, and no await on the cancelled releases afterwards
     # (BACKLOG #5687): both of those wait for a cancelled release to FINISH, so a driver release that
     # ignored the cancel would hang right through the bound. An abandoned release is cancelled and
     # parked in ``_LATE_RELEASES``, whose done-callback retrieves its outcome whenever it ends.
-    releases = [asyncio.ensure_future(_release_one(pool, conn, backend)) for conn in held]
-    _done, stuck = await asyncio.wait(releases, timeout=_CLEANUP_TIMEOUT_SECONDS)
+    _done, stuck = await asyncio.wait(releases, timeout=max(deadline - loop.time(), 0.0))
     if stuck:
         log.warning(
             "%s: pool warm-up release did not finish within %gs; abandoning the stuck release(s) "
