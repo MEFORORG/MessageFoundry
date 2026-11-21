@@ -8312,7 +8312,7 @@ are covered:
 
 | Hop | When its CA is checked | What a refusal does |
 |---|---|---|
-| The `serve` syslog forwarder | Before the forwarder is built | Builds no forwarder and logs that forwarding is off. The audited check then refuses the start before any listener binds. It writes its rows when it can read the file |
+| The `serve` syslog forwarder | Before the forwarder is built | Builds no forwarder and logs that forwarding is off. The audited check then refuses the start before any listener binds. It writes its rows when it can read the file. A start refused before the API lifespan writes no audit row for it. For at least this CA, such a start logs a WARNING with the refusal's reason; at least the exits `messagefoundry/auth/trust_anchors.py` module item 10 lists may log nothing |
 | The `supervise` syslog forwarder | Before the forwarder is built | Refuses the start on stderr before any engine shard spawns, with no audit row: that process has no audited check |
 | The `serve` alert notifier, when it sends email | Before the notifier is built, for the email CA or the internal CA it falls back to | Builds no email transport, and no alert is suppressed for it (module item 10 says how). The audited check then refuses the start. It writes its rows when it can read the file |
 | The offline recovery commands' security notices | Before the SMTP hop is built | Drops the notice with a WARNING. The recovery goes on |
