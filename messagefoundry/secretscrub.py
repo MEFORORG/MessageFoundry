@@ -1389,7 +1389,8 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # wrongly. The rule sits on the user's alternative only, so an empty user's match never takes it,
 # and the declined camelCase lines above, each with an empty user, read as before. The cost: a host
 # with no "." or ":" before a later "@", as in ``smtp://ops:pw@mail;alerts@corp``, is hidden with
-# the password. What it leaves, at least: a group holding ";" and ".", ":" or "=", and every group
+# the password, and the output then names what follows that "@", here ``corp``, as the host, the
+# wrong-host shape the declined reading had for a host with a port. What it leaves, at least: a group holding ";" and ".", ":" or "=", and every group
 # after it, prints, as it did before.
 # Without the user the pattern reads ``ws://:8765?accessToken=Tail@Tok`` as a password-only DSN, and
 # a review measured the token's tail print where the old pattern, matching nothing, left the query
@@ -2334,7 +2335,8 @@ def _run(
 # newly read value could take a later label that hid something, and that something printed (the
 # comment on :data:`_CAMEL_START` gives the measurement). So on a line where they can read anything,
 # :func:`scrub_credentials` runs :func:`_run` twice, once with the shipped patterns and once with
-# :func:`_pre_camel` of each, which is exactly the pattern without them, and keeps a character of the
+# :func:`_pre_camel` of each, which is the pattern without them and, for the widened DSN pattern,
+# also without its tail after a user's placeholder (BACKLOG #5386), and keeps a character of the
 # first output only where the second kept it too. Before those two runs :func:`_union` probes the
 # second reading with a search per pattern, stopping at the first match (BACKLOG #5386); a line
 # where none matches takes the shipped run alone. So a union line costs that probe and two runs, or
@@ -2406,8 +2408,8 @@ _PRE_CAMEL: dict[int, tuple[re.Pattern[str], re.Pattern[str]]] = {}
 
 
 def _pre_camel(pattern: re.Pattern[str]) -> re.Pattern[str]:
-    """``pattern`` without the camelCase reading: each of :data:`_CAMEL_FRAGMENTS` swapped back.
-    Derived from the live pattern, not held beside it, so a test that patches a pattern patches both
+    """``pattern`` without the camelCase reading: each of :data:`_CAMEL_FRAGMENTS` swapped back,
+    and :data:`_DSN_TAIL` left out (the comment in the body says why). Derived from the live pattern, not held beside it, so a test that patches a pattern patches both
     readings, and a pattern change cannot leave this one behind. Compiled once per pattern."""
     found = _PRE_CAMEL.get(id(pattern))
     if found is not None and found[0] is pattern:
