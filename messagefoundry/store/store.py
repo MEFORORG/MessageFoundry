@@ -2043,7 +2043,9 @@ def cancels_at_entry() -> int:
     return current.cancelling() if current is not None else 0
 
 
-def _force_failed_open_release(force_release: Callable[[], object] | None) -> None:
+def _force_failed_open_release(
+    force_release: Callable[[], object] | None, *, after: str = "a failed store open"
+) -> None:
     """Call a backend's synchronous release, logging a failure by class (vault BACKLOG #3054).
     None is a caller with nothing it can release without waiting."""
     if force_release is None:
@@ -2052,7 +2054,8 @@ def _force_failed_open_release(force_release: Callable[[], object] | None) -> No
         force_release()
     except Exception as failure:  # noqa: BLE001 — never mask the open's error
         log.warning(
-            "forcing the release after a failed store open also failed (%s)",
+            "forcing the release after %s also failed (%s)",
+            after,
             type(failure).__name__,
         )
 
@@ -2094,7 +2097,9 @@ def _log_abandoned_end(what: str, task: asyncio.Future[tuple[bool, BaseException
     )
 
 
-def _hold_abandoned_open_cleanup(task: asyncio.Future[Any]) -> None:
+def _hold_abandoned_open_cleanup(
+    task: asyncio.Future[Any], what: str = "a failed store open's cleanup"
+) -> None:
     """Keep a strong reference to a cleanup this open stopped waiting for until it finishes, so
     the loop does not drop it pending (BACKLOG #5720). At most
     :data:`ABANDONED_OPEN_CLEANUPS_MAX` per loop; past that one is not held, and that is logged."""
@@ -2111,8 +2116,9 @@ def _hold_abandoned_open_cleanup(task: asyncio.Future[Any]) -> None:
             return
     if len(held) >= ABANDONED_OPEN_CLEANUPS_MAX:
         log.warning(
-            "a failed store open's unfinished cleanup is not held: %d such cleanups are held "
-            "already, so only its own pending awaits keep it",
+            "%s, unfinished, is not held: %d such cleanups are held already, so only its own "
+            "pending awaits keep it",
+            what,
             len(held),
         )
         return
@@ -2146,13 +2152,15 @@ async def cleanup_failed_open(
     too, then is re-raised. ``force_release`` None is a caller with nothing to release without
     waiting: past the bound this only stops waiting, and what the cleanup holds stays open until
     it finishes. ``what`` names the cleanup in the WARNING lines."""
+    # What the forced-release WARNING names: the open, or the caller's own cleanup.
+    after = "a failed store open" if what == "a failed store open's cleanup" else what
     if isinstance(exc, GeneratorExit):
-        _force_failed_open_release(force_release)
+        _force_failed_open_release(force_release, after=after)
         if force_release is None:
             # Nothing to force, so schedule the ordinary release: that needs no await here.
             closing = asyncio.ensure_future(_run_to_completion(release, report=False))
             closing.add_done_callback(functools.partial(_log_abandoned_end, what))
-            _hold_abandoned_open_cleanup(closing)
+            _hold_abandoned_open_cleanup(closing, what)
         return
 
     # Not reported there: an end it cuts short is reported below, with what follows it.
@@ -2172,7 +2180,7 @@ async def cleanup_failed_open(
         remaining = None if deadline is None else deadline - loop.time()
         if remaining is not None and remaining <= 0:
             # Checked before each wait, so a cancel repeated on every pass cannot keep it away.
-            _force_failed_open_release(force_release)
+            _force_failed_open_release(force_release, after=after)
             log.warning(
                 "%s did not finish within %s s of %s; %s",
                 what,
@@ -2183,7 +2191,7 @@ async def cleanup_failed_open(
                 else "it was left to finish on its own",
             )
             task.add_done_callback(functools.partial(_log_abandoned_end, what))
-            _hold_abandoned_open_cleanup(task)
+            _hold_abandoned_open_cleanup(task, what)
             break
         try:
             if remaining is None:
@@ -2196,10 +2204,10 @@ async def cleanup_failed_open(
             # This coroutine is being closed and cannot await again: release what it can now.
             # A cleanup task already done ended with its body's own GeneratorExit, which
             # _run_to_completion lets through; that one was not stopped waiting for.
-            _force_failed_open_release(force_release)
+            _force_failed_open_release(force_release, after=after)
             if not task.done():
                 task.add_done_callback(functools.partial(_log_abandoned_end, what))
-                _hold_abandoned_open_cleanup(task)
+                _hold_abandoned_open_cleanup(task, what)
             raise
         except asyncio.CancelledError:
             # Ours unless only the cleanup task was cancelled: a cancel of this task landing in
@@ -2216,7 +2224,7 @@ async def cleanup_failed_open(
     if task.done() and (task.cancelled() or task.result()[1] is not None):
         # The cleanup ended cancelled or failed, so what it should have closed may be open,
         # the read pool included: drop it without waiting (BACKLOG #5720).
-        _force_failed_open_release(force_release)
+        _force_failed_open_release(force_release, after=after)
         ended = None if task.cancelled() else task.result()[1]
         log.warning(
             "%s ended %s before it finished; %s",

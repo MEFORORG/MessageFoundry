@@ -491,3 +491,21 @@ async def test_a_cancel_during_an_acloses_graceful_close_is_raised(
     with pytest.raises(asyncio.CancelledError):
         await task
     assert terminated == ["terminated"]
+
+
+async def test_a_system_exit_during_an_acloses_graceful_close_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: a ``SystemExit`` raised by the graceful close under ``aclose()`` propagates,
+    as it did on main, rather than being logged and replaced by the ``GeneratorExit``."""
+    pool = _FakePool()
+
+    async def exiting_close() -> None:
+        raise SystemExit(3)
+
+    pool.close = exiting_close  # type: ignore[method-assign]
+    _install_fake_asyncpg(monkeypatch, pool)
+    cm = PostgresStore._one_connection_store(_settings(), posture=None)
+    await cm.__aenter__()
+    with pytest.raises(SystemExit):
+        await cm.gen.aclose()

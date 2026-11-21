@@ -478,3 +478,23 @@ async def test_an_aclose_whose_graceful_close_fails_forces_the_release(
     await cm.gen.aclose()
     assert pool.closed == 2
     assert executor.shutdown_calls == [False, False]  # the close's own, then the forced one
+
+
+async def test_a_keyboard_interrupt_during_an_acloses_graceful_close_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: a ``KeyboardInterrupt`` raised by the graceful close under ``aclose()``
+    propagates, as it did on main."""
+
+    class _InterruptedPool(_FakePool):
+        async def wait_closed(self) -> None:
+            raise KeyboardInterrupt
+
+    pool = _InterruptedPool()
+    _install_fake_aioodbc(monkeypatch, pool)
+    _fake_executor(monkeypatch)
+    monkeypatch.setattr(sqlserver_module, "check_pinned_certificate", lambda *a, **k: None)
+    cm = SqlServerStore._one_connection_store(_settings(), posture=None)
+    await cm.__aenter__()
+    with pytest.raises(KeyboardInterrupt):
+        await cm.gen.aclose()

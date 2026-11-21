@@ -590,7 +590,7 @@ async def test_a_full_memory_is_logged_once_and_again_after_it_drains(
         rig.drop(f"a{n}.hl7", _PDF)
 
     def full_logs() -> int:
-        text = "memory of files that cannot be moved is full"
+        text = "memory of rejects that cannot be moved is full"
         return sum(text in r.message for r in caplog.records)
 
     def overflow_reads() -> int:
@@ -804,7 +804,7 @@ async def test_a_full_memory_hovering_at_its_cap_is_not_logged_again(
         rig.drop(f"a{n}.hl7", _PDF)
 
     def full_logs() -> int:
-        text = "memory of files that cannot be moved is full"
+        text = "memory of rejects that cannot be moved is full"
         return sum(text in r.message for r in caplog.records)
 
     await rig.scan()
@@ -1182,122 +1182,6 @@ async def test_a_reject_under_leave_costs_no_tracking_stat(
     assert calls == []
 
 
-def _fail_processed(rig: _Rig, monkeypatch: pytest.MonkeyPatch) -> list[bool]:
-    """Make the move into ``.processed`` fail with EACCES while the returned flag's first item is
-    True; set it False to let the move work."""
-    failing = [True]
-    real_open_dest = file_mod._open_dest
-
-    def open_dest(dest_dir: Path, *args: Any) -> Any:
-        if dest_dir.name == ".processed" and failing[0]:
-            raise PermissionError(errno.EACCES, "denied")
-        return real_open_dest(dest_dir, *args)
-
-    monkeypatch.setattr(file_mod, "_open_dest", open_dest)
-    return failing
-
-
-def _fail_delete(monkeypatch: pytest.MonkeyPatch) -> list[bool]:
-    """Make a delete of a processed file fail with EACCES while the flag's first item is True."""
-    failing = [True]
-    real_remove = file_mod._remove_pinned
-
-    def remove(pin: Any) -> None:
-        if failing[0]:
-            raise PermissionError(errno.EACCES, "denied")
-        real_remove(pin)
-
-    monkeypatch.setattr(file_mod, "_remove_pinned", remove)
-    return failing
-
-
-@pytest.mark.parametrize("after_read", ["move", "delete"])
-async def test_a_processed_file_that_cannot_be_disposed_of_is_not_handed_off_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, after_read: str
-) -> None:
-    """Step 10 of BACKLOG #5717: a handed-off file whose move to ``.processed`` or delete failed was
-    read, handed off and charged again on later scans. It is now remembered: skipped unread, and
-    once its retry falls due read again and, its bytes unchanged, disposed of with no second
-    hand-off.
-
-    Mutation: forget an undisposed file in ``_dispose``. Red: handed off again on the next scans."""
-    rig = _Rig(tmp_path, monkeypatch, cap=10, after_read=after_read, fail_errno=None)
-    failing = (
-        _fail_processed(rig, monkeypatch) if after_read == "move" else _fail_delete(monkeypatch)
-    )
-    path = rig.drop("a.hl7", _HL7)
-    await rig.scan()  # settles
-    assert await rig.scan() == ["a.hl7"]
-    assert rig.handed_off == [_HL7]
-    assert path.exists()
-    for _ in range(4):
-        assert await rig.scan() == [], "a remembered processed file is not read again"
-    assert rig.handed_off == [_HL7]
-
-    _age_stuck(rig)
-    await rig.scan()  # the retry settles
-    assert await rig.scan() == ["a.hl7"], "a due retry reads the file to compare its bytes"
-    assert rig.handed_off == [_HL7], "and does not hand it off again"
-    assert path.exists() and len(rig.source._stuck) == 1
-
-    failing[0] = False
-    _age_stuck(rig)
-    await rig.scan()
-    await rig.scan()
-    assert not path.exists(), "once the move or delete works, the file is disposed of"
-    assert rig.handed_off == [_HL7]
-    assert rig.source._stuck == {}
-    if after_read == "move":
-        assert (rig.inbox / ".processed" / "a.hl7").read_bytes() == _HL7
-
-
-async def test_an_undisposed_file_whose_bytes_changed_is_handed_off_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The retry compares the bytes, not only the mark: a rewrite in place that keeps the size, the
-    mtime and the file identity is still a new message, so it is handed off.
-
-    Mutation: dispose of a due retry without comparing its digest. Red: the new bytes are moved
-    to ``.processed`` and never handed off, an accept-and-drop."""
-    rig = _Rig(tmp_path, monkeypatch, cap=10, fail_errno=None)
-    failing = _fail_processed(rig, monkeypatch)
-    path = rig.drop("a.hl7", _HL7)
-    await rig.scan()
-    await rig.scan()
-    assert rig.handed_off == [_HL7]
-    old = path.stat()
-    other = _HL7.replace(b"CTL5717", b"CTL5718")
-    assert len(other) == len(_HL7)
-    with path.open("r+b") as fh:  # in place, so the file identity stays
-        fh.write(other)
-    os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns))
-    assert rig.source._stuck[str(path)][0].mark == file_mod._file_mark(path)
-
-    failing[0] = False
-    _age_stuck(rig)
-    await rig.scan()
-    await rig.scan()
-    assert rig.handed_off == [_HL7, other]
-    assert (rig.inbox / ".processed" / "a.hl7").read_bytes() == other
-    assert rig.source._stuck == {}
-
-
-async def test_a_changed_undisposed_file_is_handed_off_again(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A file rewritten after its move failed has a new mark, so it is forgotten and handed off."""
-    rig = _Rig(tmp_path, monkeypatch, cap=10, fail_errno=None)
-    _fail_processed(rig, monkeypatch)
-    path = rig.drop("a.hl7", _HL7)
-    await rig.scan()
-    await rig.scan()
-    other = _HL7 + b"OBX|1\r"
-    path.write_bytes(other)
-    await rig.scan()  # settles
-    await rig.scan()
-    assert rig.handed_off == [_HL7, other]
-
-
 async def test_a_remembered_reject_costs_no_stat_hop_of_its_own(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1325,97 +1209,3 @@ async def test_a_remembered_reject_costs_no_stat_hop_of_its_own(
     path.write_bytes(_PDF + b" and more")
     await rig.scan()
     assert calls == [path], "a changed reject is stat'd and examined afresh"
-
-
-async def test_an_undisposed_file_whose_stat_times_out_is_still_remembered(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A delete that fails while the share drops: the stat after it fails too, for a reason that
-    is no evidence the file has gone, so the read's own mark stands in and the file is not handed
-    off again. Under ``delete`` only: under ``move`` the archive stamp has changed the mtime.
-
-    Mutation: return None from ``_undisposed`` on any stat failure. Red: nothing is remembered."""
-    rig = _Rig(tmp_path, monkeypatch, cap=10, after_read="delete", fail_errno=None)
-    failing = _fail_delete(monkeypatch)
-    path = rig.drop("a.hl7", _HL7)
-    real_mark = file_mod._file_mark
-    timing_out = [False]
-
-    def mark(p: Path) -> Any:
-        if timing_out[0]:
-            raise OSError(errno.ETIMEDOUT, "timed out")
-        return real_mark(p)
-
-    real_remove = file_mod._remove_pinned
-
-    def remove(pin: Any) -> None:
-        try:
-            real_remove(pin)
-        finally:
-            timing_out[0] = True  # the share drops right after the failed delete
-
-    monkeypatch.setattr(file_mod, "_file_mark", mark)
-    monkeypatch.setattr(file_mod, "_remove_pinned", remove)
-    await rig.scan()
-    await rig.scan()
-    assert rig.handed_off == [_HL7]
-    assert str(path) in rig.source._stuck
-    timing_out[0] = False  # the share is back; the delete still fails
-    for _ in range(4):
-        await rig.scan()
-    assert rig.handed_off == [_HL7], "not handed off again once the share is back"
-    failing[0] = False
-    _age_stuck(rig)
-    await rig.scan()
-    await rig.scan()
-    assert not path.exists()
-    assert rig.handed_off == [_HL7]
-
-
-async def test_a_retried_disposal_is_logged(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A processed file moved on a later retry, with no second hand-off, says so in the log, so it
-    is never moved silently."""
-    rig = _Rig(tmp_path, monkeypatch, cap=10, fail_errno=None)
-    failing = _fail_processed(rig, monkeypatch)
-    rig.drop("a.hl7", _HL7)
-    await rig.scan()
-    await rig.scan()
-    failing[0] = False
-    _age_stuck(rig)
-    with caplog.at_level(logging.INFO, logger=file_mod.__name__):
-        await rig.scan()
-        await rig.scan()
-    assert rig.handed_off == [_HL7]
-    assert "handed off earlier, is moved or deleted now, without another hand-off" in caplog.text
-
-
-async def test_with_no_file_id_an_identical_resend_is_handed_off(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """On a volume that reports no file ID (FAT, exFAT, some NAS: a zero ``st_ino`` stands in), a
-    file whose delete failed is not remembered, so a byte-identical resend under the same name and
-    mtime is handed off rather than deleted unhanded (the count-and-log invariant).
-
-    Mutation: drop the ``not mark[3]`` check in ``_undisposed``. Red: the resend is deleted with
-    no hand-off."""
-    real_file_id = file_mod._file_id
-    monkeypatch.setattr(file_mod, "_file_id", lambda st: (real_file_id(st)[0], 0))
-    rig = _Rig(tmp_path, monkeypatch, cap=10, after_read="delete", fail_errno=None)
-    failing = _fail_delete(monkeypatch)
-    path = rig.drop("a.hl7", _HL7)
-    await rig.scan()
-    await rig.scan()
-    assert rig.handed_off == [_HL7]
-    assert rig.source._stuck == {}, "with no file ID nothing is remembered"
-
-    old = path.stat()
-    path.unlink()  # the partner removes it and sends the same bytes again, mtime kept
-    path.write_bytes(_HL7)
-    os.utime(path, ns=(old.st_atime_ns, old.st_mtime_ns))
-    failing[0] = False
-    await rig.scan()
-    await rig.scan()
-    assert rig.handed_off == [_HL7, _HL7], "the resend is handed off"
-    assert not path.exists()

@@ -2380,8 +2380,9 @@ class PostgresStore:
         cancel cannot cut it short and a close failure is logged by class rather than replacing
         the error (BACKLOG #5720). On a clean exit a close failure is raised, as before. Under an
         ``aclose()``, a ``GeneratorExit``, the graceful close runs first, as before, since an
-        async generator may await there; only if it fails or is interrupted does the forced
-        release run."""
+        async generator may await there; only if it fails or a cancel interrupts it does the
+        forced release run. A ``SystemExit`` or ``KeyboardInterrupt`` raised there propagates, as
+        it did before."""
         cancels_before = cancels_at_entry()
         pool = await cls._create_pool(settings, posture=posture, max_size=1)
         store: PostgresStore | None = None
@@ -2408,7 +2409,7 @@ class PostgresStore:
                             type(forced).__name__,
                         )
                     raise
-                except BaseException as cleanup:  # noqa: BLE001 — fall back, keep the exit
+                except Exception as cleanup:  # noqa: BLE001 — fall back, keep the exit
                     log.warning(
                         "closing a one-connection store at its close failed (%s); it is released "
                         "without waiting",
