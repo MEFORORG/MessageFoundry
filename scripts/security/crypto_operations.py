@@ -623,18 +623,32 @@ def _returned_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
     parameter counts only when that test admits the name as a string literal (``name == "seal"``,
     ``name in ("seal", ...)``); a test it cannot read admits none, so ``if name == "legacy":
     return seal`` exports nothing, as before the hook was followed. A ``return`` under no such
-    ``if`` counts only when no other test in the hook reads the parameter, so an early
-    ``if name != "legacy": raise`` exports nothing either."""
+    ``if`` counts only when no test anywhere in the hook reads the parameter, directly or through
+    a name assigned from it (``key = name.lower()``), so an early ``if name != "legacy": raise``
+    exports nothing either. A hook with no named first parameter (``def __getattr__(*a)``)
+    exports nothing."""
     param = (fn.args.posonlyargs + fn.args.args)[:1]
-    pname = param[0].arg if param else None
-    guarded = pname is not None and any(
-        (
-            isinstance(n, (ast.If, ast.While, ast.IfExp, ast.Assert))
-            and _reads_name(n.test, pname)
-            and not _admitted(n.test, pname)
-        )
-        or (isinstance(n, ast.Match) and _reads_name(n.subject, pname))
-        for n in _own_nodes(fn)
+    if not param:
+        return set()
+    pname = param[0].arg
+    nodes = _own_nodes(fn)
+    readers = {pname}
+    for n in nodes:  # names assigned from the parameter, one level of indirection at least
+        if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign, ast.NamedExpr)):
+            value = n.value
+            if value is not None and any(_reads_name(value, r) for r in tuple(readers)):
+                targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+                readers.update(
+                    t.id for tgt in targets for t in ast.walk(tgt) if isinstance(t, ast.Name)
+                )
+
+    def reads(test: ast.expr) -> bool:
+        return any(_reads_name(test, r) for r in readers)
+
+    guarded = any(
+        (isinstance(n, (ast.If, ast.While, ast.IfExp, ast.Assert)) and reads(n.test))
+        or (isinstance(n, ast.Match) and reads(n.subject))
+        for n in nodes
     )
     out: set[str] = set()
     stack: list[tuple[ast.AST, frozenset[str] | None]] = [(n, None) for n in fn.body]
@@ -648,7 +662,7 @@ def _returned_names(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
             ):
                 out.add(node.value.id)
             continue
-        if isinstance(node, ast.If) and pname is not None and _reads_name(node.test, pname):
+        if isinstance(node, ast.If) and reads(node.test):
             admitted = _admitted(node.test, pname)
             inner = admitted if allowed is None else admitted & allowed
             stack.extend((n, inner) for n in node.body)

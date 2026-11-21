@@ -2047,6 +2047,10 @@ def test_a_pep562_getattr_import_is_a_module_export_for_the_scope_aware_reading(
         "    if name in ('legacy', 'old'):\n        return seal\n    raise AttributeError(name)\n",
         "    if name in __all__:\n        return seal\n    raise AttributeError(name)\n",
         "    if name != 'legacy':\n        raise AttributeError(name)\n    return seal\n",
+        "    if name == 'legacy':\n        pass\n    else:\n        raise AttributeError(name)\n"
+        "    return seal\n",
+        "    key = name.lower()\n    if key != 'legacy':\n        raise AttributeError(name)\n"
+        "    return seal\n",
     )
     for body in guarded:
         served = dict(sources)
@@ -2058,6 +2062,17 @@ def test_a_pep562_getattr_import_is_a_module_export_for_the_scope_aware_reading(
         assert gate.judge_operations(modules, found)["messagefoundry/caller.py"] == frozenset(
             {"hash:via messagefoundry.sec.impl" + gate.OUT_OF_SCOPE}
         ), body
+    # A hook with no named parameter cannot be read, so it exports nothing, as on origin/main.
+    star = dict(sources)
+    star["messagefoundry/sec/__init__.py"] = (
+        "def __getattr__(*a):\n    from messagefoundry.sec.impl import seal\n"
+        "    if a[0] != 'legacy':\n        raise AttributeError(a[0])\n    return seal\n"
+    )
+    modules = ops.parse_sources(star)
+    found = ops.aggregate(ops.discover_operations_in_modules(modules))
+    assert gate.judge_operations(modules, found)["messagefoundry/caller.py"] == frozenset(
+        {"hash:via messagefoundry.sec.impl" + gate.OUT_OF_SCOPE}
+    )
     admits = dict(sources)
     admits["messagefoundry/sec/__init__.py"] = (
         "def __getattr__(name):\n    from messagefoundry.sec.impl import seal\n"
