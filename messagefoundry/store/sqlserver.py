@@ -1543,13 +1543,20 @@ class _SyncHandoffPool:
     def acquire(self, timeout: float | None = None) -> Iterator[Any]:
         conn = self._free.get(timeout=timeout)
         if conn is None:  # a slot discarded by an earlier fault — reconnect lazily on demand
-            conn = self._factory()
+            try:
+                conn = self._factory()
+            except BaseException:
+                # BACKLOG #5663: the slot goes back as a placeholder, or a failed reconnect would
+                # shrink the pool by one for every acquire that met the fault.
+                self._free.put(None)
+                raise
         broken = False
         try:
             yield conn
-        except Exception:
+        except BaseException:
             # A raised handoff may have left the connection mid-transaction or dead. Mark it broken so
             # the finally discards it instead of returning a possibly-poisoned connection to the pool.
+            # BaseException, so a cancellation or interrupt discards it too (BACKLOG #5663).
             broken = True
             raise
         finally:
@@ -1558,15 +1565,18 @@ class _SyncHandoffPool:
                     conn.close()
                 except Exception:  # noqa: BLE001 - best-effort discard
                     log.debug("sync handoff connection close on discard failed", exc_info=True)
+                fresh: Any = None
                 try:
-                    self._free.put(self._factory())  # refill the slot with a fresh connection
+                    fresh = self._factory()  # refill the slot with a fresh connection
                 except Exception:  # noqa: BLE001 - reconnect may itself fail (server down)
-                    # Keep the slot count stable with a None placeholder; the next acquire retries the
-                    # factory. Never re-circulate the poisoned connection or silently shrink the pool.
                     log.debug(
                         "sync handoff reconnect failed; slot will lazily reconnect", exc_info=True
                     )
-                    self._free.put(None)
+                finally:
+                    # Keep the slot count stable, with a None placeholder when the reconnect failed;
+                    # the next acquire retries the factory. Never re-circulate the poisoned
+                    # connection or silently shrink the pool.
+                    self._free.put(fresh)
             else:
                 self._free.put(conn)
 
