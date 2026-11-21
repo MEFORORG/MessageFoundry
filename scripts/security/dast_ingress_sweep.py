@@ -33,11 +33,11 @@ the ingress path must do, and each judgement is a DETECTOR with a positive contr
   sentinel (:func:`run_sentinel`; HL7 in PID-5 or an NTE, X12 in the subscriber's NM1-03), and a
   record whose rendered text contains it is a finding. ``tests/test_dast_ingress_sweep.py`` holds
   every catalogue case and mutation seed to :func:`carries_sentinel`; the liveness probes carry it
-  too. NOT covered, at least: the header-only and framing-only cases, the trickle of
-  ``slowloris-in-frame`` (the listener closes it long before the sentinel's bytes arrive), a frame
-  that a split case such as ``end-byte-mid-body`` cuts off before the sentinel, and a mutation that
-  cuts the sentinel out (measured: about 45 percent of mutations). A log of any of those bodies
-  would be missed.
+  too, and so does every mutated payload: :func:`mutation_cases` puts the sentinel back after an edit
+  that cut it out. NOT covered, at least: the header-only and framing-only cases, the trickle of
+  ``slowloris-in-frame`` (the listener closes it long before the sentinel's bytes arrive), and a
+  frame that a split case such as ``end-byte-mid-body``, or a framing byte a mutation inserts, cuts
+  off before the sentinel. A log of any of those bodies would be missed.
   This is a CALL-SITE check: the receipt also says whether the shipped redaction filters would have
   removed the hit, but a hit is a finding either way, because section 9 binds the call site.
 
@@ -343,7 +343,7 @@ def mutate(rng: random.Random, seed: bytes, limit: int) -> bytes:
 def mutation_seeds(sentinel: str) -> tuple[tuple[bytes, ...], bytes]:
     """The HL7 seeds and the X12 interchange the mutator edits, every one carrying the sentinel so
     the log_body detector can recognise a mutated body on either plane (vault BACKLOG #5581). A
-    mutation may still cut the sentinel out; the seed it starts from never lacks it."""
+    mutation may still cut the sentinel out; :func:`mutation_cases` puts it back."""
     hl7_seeds = (
         *(_hl7_with_sentinel(s, sentinel) for s in _HL7_SEEDS),
         _b(hl7("MUTATE", sentinel)),
@@ -351,22 +351,54 @@ def mutation_seeds(sentinel: str) -> tuple[tuple[bytes, ...], bytes]:
     return hl7_seeds, x12_interchange(sentinel)
 
 
+def _keep_sentinel(
+    body: bytes, segment: bytes, terminators: tuple[bytes, ...], limit: int
+) -> bytes:
+    """``segment`` (which carries the sentinel) appended to the first bytes of ``body``, cut so the
+    result fits ``limit`` whenever ``limit`` holds the segment at all; a smaller ``limit`` gets the
+    segment alone. ``terminators[0]`` goes between them when the cut does not already end on one of
+    ``terminators``, so the segment never runs on into the last field of the one before it. The
+    caller decides when to call it: :func:`mutation_cases` does only for a body without the marker.
+
+    A mutation that cuts or flips a byte of the sentinel would leave a body the log_body detector
+    cannot recognise (vault BACKLOG #5581: measured on 13 of the policy's 24 mutations at seed 318
+    before this). Putting it back after the edit keeps the mutator's edits, so the bytes before the
+    segment are the mutated ones, cut only to fit ``limit``, and the random stream is untouched.
+    """
+    cut = body[: max(0, limit - len(segment) - len(terminators[0]))]
+    lead = b"" if not cut or cut.endswith(terminators) else terminators[0]
+    return cut + lead + segment
+
+
 def mutation_cases(seed: int, count: int, cap: int, sentinel: str) -> list[Case]:
     """``count`` seeded mutations of :func:`mutation_seeds`. X12 mutations edit only what lies
     between the fixed-width ISA and the closing IEA: an edit inside the ISA moves the terminator and
     a lost IEA never closes the interchange, and either way the X12 ingress path would go
-    unreached."""
+    unreached. Every mutated payload carries the sentinel's bytes: a body the edit cut it out of
+    gets it back as a trailing segment (:func:`_keep_sentinel`). A framing byte the edit inserts can
+    still split an MLLP payload into frames, and a frame before the sentinel does not carry it."""
     rng = random.Random(seed)  # nosec B311 (reproducible fuzz cases, seeded)
     limit = cap // 2
     hl7_seeds, x12 = mutation_seeds(sentinel)
     iea_at = x12.rindex(b"IEA")  # the closing IEA segment, which frames the interchange
+    marker = _b(sentinel)
+    elem, term = x12[3:4], x12[_ISA_LEN - 1 : _ISA_LEN]  # the ISA declares both separators
+    x12_segment = elem.join((b"NM1", b"IL", b"1", marker)) + term
+    hl7_segment = _b(f"NTE|1||{sentinel}\r")
     cases = []
     for index in range(count):
         if index % 4 == 3:
             body = mutate(rng, x12[_ISA_LEN:iea_at], limit - len(x12))
+            if marker not in body:
+                body = _keep_sentinel(body, x12_segment, (term,), limit - len(x12))
             plane, payload = "x12", x12[:_ISA_LEN] + body + x12[iea_at:]
         else:
-            plane, payload = "mllp", frame(mutate(rng, rng.choice(hl7_seeds), limit))
+            body = mutate(rng, rng.choice(hl7_seeds), limit)
+            if marker not in body:
+                # A seed segment ends on CR or LF (_hl7_with_sentinel's rule), so neither gets a
+                # second terminator, which would add a blank segment the mutator never chose.
+                body = _keep_sentinel(body, hl7_segment, (b"\r", b"\n"), limit)
+            plane, payload = "mllp", frame(body)
         cases.append(Case(f"mutation-{index}", plane, payload, origin=f"mutation:{seed}:{index}"))
     return cases
 
