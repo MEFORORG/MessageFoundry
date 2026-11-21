@@ -5345,6 +5345,7 @@ def _serve(args: argparse.Namespace) -> int:
         from messagefoundry.auth.trust_anchors import TrustAnchorError
         from messagefoundry.controlchars import scrub_control_chars
 
+        _anchor_refused: TrustAnchorError | None = None
         try:
             ctx = build_api_ssl_context(_api_tls, enforcing=enforcing)
         except KeyWrapRefused as exc:
@@ -5375,14 +5376,21 @@ def _serve(args: argparse.Namespace) -> int:
                 _tls_refusal,
                 exc_info=exc,
             )
-            if isinstance(exc, TrustAnchorError):
-                # Printed and logged first, so a slow store does not delay the refusal. It comes
-                # before uvicorn runs the lifespan, so the lifespan's audited preflight would never
-                # write the anchor's auth.trust_anchor row; run it, binding nothing (BACKLOG #5391
-                # added item 2).
-                _audit_refused_api_client_ca(
-                    app, settings, enforcing=enforcing, queue=_prestore_anchor_refusals
-                )
+            if not isinstance(exc, TrustAnchorError):
+                return 2
+            _anchor_refused = exc
+        if _anchor_refused is not None:
+            # Printed and logged first, so a slow store does not delay the refusal, and run outside
+            # the except block, so nothing the startup raises is chained to it. The refusal comes
+            # before uvicorn runs the lifespan, so the lifespan's audited preflight would never write
+            # the anchor's auth.trust_anchor row; run it, binding nothing (BACKLOG #5391 added item 2).
+            _audit_refused_api_client_ca(
+                app,
+                settings,
+                _anchor_refused,
+                enforcing=enforcing,
+                queue=_prestore_anchor_refusals,
+            )
             return 2
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx
         # Vault BACKLOG #3302: the loop runs every API handshake, so a failed one left no record.
@@ -5421,22 +5429,30 @@ def _serve(args: argparse.Namespace) -> int:
 
 
 def _audit_refused_api_client_ca(
-    app: Any, settings: ServiceSettings, *, enforcing: bool, queue: list[TrustAnchorError]
+    app: Any,
+    settings: ServiceSettings,
+    refused_at_build: TrustAnchorError,
+    *,
+    enforcing: bool,
+    queue: list[TrustAnchorError],
 ) -> None:
     """Run ``app``'s lifespan startup to write the row of a refused ``[api].tls_client_ca_file``.
 
     ``serve`` builds the API context before uvicorn runs the lifespan. A refused client CA
     therefore stopped the start before the store opened, and the lifespan's audited preflight never
-    wrote its ``auth.trust_anchor`` row. This checks the CA again, without logging, and does
-    nothing unless the CA is refused: the API context also checks ``[api].tls_client_crl_file``,
-    which is deliberately kept out of the audited preflight, so no row could come of a CRL refusal.
+    wrote its ``auth.trust_anchor`` row. The API context also checks
+    ``[api].tls_client_crl_file``, which is deliberately kept out of the audited preflight, so no
+    row could come of a CRL refusal. This does nothing when that CRL is refused and the CA's own
+    pin, ACL and path check passes, both re-checked without logging. Every other refusal is taken
+    as the CA's, a content refusal of its bytes included, since those checks do not see one.
 
-    A refused CA goes into ``queue``, the app's ``prestore_anchor_refusals``, as
+    A copy of the refusal goes into ``queue``, the app's ``prestore_anchor_refusals``, as
     ``_start_logging`` queues a refused collector CA (BACKLOG #3470), and the lifespan startup runs
     with no server, so no listener binds. The lifespan opens the store, writes what it writes
     before its anchor check (at least any generated API pair replaced, ADR 0172 decision 6), and
     then raises: its audited preflight refuses an anchor and writes the row, or, if that passes,
-    it raises the queued refusal marked ``unaudited``. That contract is pinned in
+    it raises the queued copy marked ``unaudited``. The copy keeps ``refused_at_build``, the
+    caller's logged exception, unchanged. That contract is pinned in
     ``tests/test_trust_anchors.py`` for the collector CA; were it broken, the startup would go on
     to start the engine.
 
@@ -5448,6 +5464,7 @@ def _audit_refused_api_client_ca(
         TrustAnchorError,
         anchor_refusal,
         api_client_anchor_spec,
+        api_client_crl_spec,
     )
     from messagefoundry.controlchars import scrub_log_argument
     from messagefoundry.last_resort import run_guarded
@@ -5456,10 +5473,19 @@ def _audit_refused_api_client_ca(
     spec = api_client_anchor_spec(settings.api)
     if spec is None:
         return
-    refusal = anchor_refusal(spec, enforcing=enforcing, warn=lambda _message: None)
-    if refusal is None:
+
+    def _quiet(_message: str) -> None:
+        return None
+
+    crl = api_client_crl_spec(settings.api)
+    if (
+        crl is not None
+        and Path(crl.path).is_file()
+        and anchor_refusal(crl, enforcing=enforcing, warn=_quiet) is not None
+        and anchor_refusal(spec, enforcing=enforcing, warn=_quiet) is None
+    ):
         return
-    queue.append(refusal)
+    queue.append(TrustAnchorError(*refused_at_build.args, setting=refused_at_build.setting))
 
     async def _startup() -> None:
         async with app.router.lifespan_context(app):
@@ -5480,6 +5506,7 @@ def _audit_refused_api_client_ca(
             "%s: the startup that writes it stopped first (%s)",
             missing,
             scrub_log_argument(safe_exc(exc)),
+            exc_info=exc,
         )
         return
     # Not reached while the lifespan holds its contract: a queued refusal always raises.

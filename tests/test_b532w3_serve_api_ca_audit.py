@@ -35,6 +35,7 @@ def _serve_with_client_ca(
     monkeypatch: pytest.MonkeyPatch,
     *,
     pin: str | None,
+    extra_api: str = "",
 ) -> tuple[int, Path]:
     """Run ``serve`` in ``tmp_path`` with a client CA pinned to ``pin``, or to its own bytes when
     ``pin`` is None. uvicorn is stubbed, so nothing binds; the managed app and the API context are
@@ -55,7 +56,8 @@ def _serve_with_client_ca(
         f"tls_cert_file = {json.dumps(str(cert))}\n"
         f"tls_key_file = {json.dumps(str(key))}\n"
         f"tls_client_ca_file = {json.dumps(str(ca))}\n"
-        f'tls_client_ca_pin = "{pin}"\n',
+        f'tls_client_ca_pin = "{pin}"\n'
+        f"{extra_api}",
         encoding="utf-8",
     )
     # The host's temp directory decides the path and ACL verdicts, not the test (BACKLOG #1142).
@@ -142,18 +144,47 @@ def test_a_context_that_builds_opens_no_store_for_the_audit(
     assert not db.exists()
 
 
-def test_a_refusal_that_is_not_the_client_cas_opens_no_store(
+def test_a_refused_crl_beside_a_sound_ca_opens_no_store(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """The context also refuses ``[api].tls_client_crl_file``, which the audited preflight leaves
-    out, so no row could come of it. With the CA itself sound, the refusal runs no startup."""
+    out, so no row could come of it. With that CRL refused and the CA sound, no startup runs."""
     from messagefoundry.api import tls as api_tls
+
+    crl = tmp_path / "client.crl"
+    crl.write_bytes(b"planted")
 
     def refuse(*_a: object, **_k: object) -> object:
         raise ta.TrustAnchorError("planted CRL refusal")
+
+    real_refusal = ta.anchor_refusal
+
+    def crl_refused(spec: ta.AnchorSpec, **kw: Any) -> ta.TrustAnchorError | None:
+        if spec.label == "api_client_crl":
+            return ta.TrustAnchorError("planted CRL refusal")
+        return real_refusal(spec, **kw)
+
+    monkeypatch.setattr(api_tls, "build_api_ssl_context", refuse)
+    monkeypatch.setattr(ta, "anchor_refusal", crl_refused)
+    crl_line = f"tls_client_crl_file = {json.dumps(str(crl))}\n"
+    rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_api=crl_line)
+    assert rc == 2
+    assert "error: the API TLS context was not built:" in capsys.readouterr().err
+    assert not db.exists()
+
+
+def test_a_ca_refused_for_its_content_writes_its_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A CA refused for what its bytes hold passes the pin, ACL and path checks, and is still the
+    CA's refusal: the audited preflight writes its row. Round 2 review finding 1."""
+    from messagefoundry.api import tls as api_tls
+
+    def refuse(*_a: object, **_k: object) -> object:
+        raise ta.TrustAnchorError("planted content refusal")
 
     monkeypatch.setattr(api_tls, "build_api_ssl_context", refuse)
     rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None)
     assert rc == 2
     assert "error: the API TLS context was not built:" in capsys.readouterr().err
-    assert not db.exists()
+    assert db.is_file(), "the CA's refusal ran no audited startup"
