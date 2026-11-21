@@ -258,7 +258,7 @@ def test_a_link_that_cannot_be_resolved_refuses_the_load(
     monkeypatch.setattr(Path, "resolve", refusing)
     with pytest.raises(OSError, match="could not be resolved"):
         config_source_trust_paths(cfg)
-    with pytest.raises(WiringError, match="cfg.py"):
+    with pytest.raises(WiringError, match="could not be resolved"):
         load_config(cfg)
 
 
@@ -276,11 +276,51 @@ def test_a_dangling_module_link_refuses_the_load(
     fake_windows_readers(lambda _path: False)
     with pytest.raises(OSError, match="leads to nothing"):
         config_source_trust_paths(cfg)
-    with pytest.raises(WiringError, match="cfg.py"):
+    with pytest.raises(WiringError, match="leads to nothing"):
         load_config(cfg)
     # Control: once the target exists, the same link loads.
     (tmp_path / "gone.py").write_text(
         "from messagefoundry import outbound, File\noutbound('o', File(directory='./out'))\n",
         encoding="utf-8",
     )
+    assert "o" in load_config(cfg).outbound
+
+
+@pytest.mark.parametrize("member", ["connections.toml", "codesets", "codesets/a.csv"])
+def test_a_dangling_data_link_refuses_the_load(
+    member: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_windows_readers: FakeReaders,
+) -> None:
+    # As for a module link: a writer of the folder it points into could create the missing name
+    # before the read, so it is listed and refused rather than left off the list.
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "cfg.py").write_text(
+        "from messagefoundry import outbound, File\noutbound('o', File(directory='./out'))\n",
+        encoding="utf-8",
+    )
+    link = cfg / member
+    link.parent.mkdir(exist_ok=True)
+    target = tmp_path / "shared" / Path(member).name
+    try:
+        link.symlink_to(target, target_is_directory=member == "codesets")
+    except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    fake_windows_readers(lambda _path: False)
+    with pytest.raises(OSError, match="leads to nothing"):
+        config_source_trust_paths(cfg)
+    # The refusal's text is cut to a length, so a long temporary path can hide the name.
+    with pytest.raises(WiringError, match="leads to nothing"):
+        load_config(cfg)
+    # Control: once the target exists, the same link loads.
+    target.parent.mkdir(exist_ok=True)
+    if member == "codesets":
+        target.mkdir()
+    elif member == "connections.toml":
+        target.write_text("", encoding="utf-8")
+    else:
+        target.write_text("code,display\n", encoding="utf-8")
     assert "o" in load_config(cfg).outbound

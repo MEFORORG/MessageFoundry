@@ -855,10 +855,10 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     For each of them that is a symbolic link or a junction, the
     config directory included, it also checks what Python's path resolution says the link leads
     to and, for a file, the folder holding that file, on both platforms, and it refuses the load
-    where a module or `__pycache__` link leads to nothing it can read at check time or cannot be
-    resolved (vault BACKLOG #2596). A link at `connections.toml`, `codesets` or a code-set table
-    that leads to nothing is left off the list instead, so the folder it points into is not
-    checked, and for a linked folder the folder holding its target is not checked either. That
+    where a link it lists, a module, `__pycache__` entry, `connections.toml`, `codesets` or
+    code-set table link among them, leads to nothing it can read at check time or cannot be
+    resolved (vault BACKLOG #2596). For a linked folder the folder holding its target is not
+    checked. That
     resolution is not checked against what the load's open then reaches. It does not check the
     links in between, for a link to a link, a folder outside the config directory that holds a
     link, from which a writer could re-point it, or on Windows a reparse point other than a

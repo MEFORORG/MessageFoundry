@@ -9821,8 +9821,9 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
     **Not on the list:** the value file and the settings file, which sit outside the config
     directory and are checked at ``serve`` start (:func:`assert_trusted_start_paths`), and the
     folders above ``directory``, except where a link's target or the folder holding it lies
-    there. A link at ``connections.toml``, ``codesets`` or a code-set table that leads to nothing
-    is left off the list, so its target folder is not read."""
+    there. A link at ``connections.toml``, ``codesets`` or a code-set table is listed even when it
+    leads to nothing, so that :func:`_with_link_targets` refuses it, as it refuses a dangling module
+    link: a writer of the folder it points into could create the missing name before the read."""
     # Lazy: connections_file imports this module (no circular import at load time).
     from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
 
@@ -9832,7 +9833,8 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
         paths.append(cache)
         paths.extend(sorted(cache.iterdir()))
     connections = directory / CONNECTIONS_FILE_NAME
-    if connections.exists():
+    # A dangling link is listed too, so the link check refuses it rather than leaving it unread.
+    if connections.exists() or _is_link(connections):
         paths.append(connections)
     codesets = directory / CODESETS_DIR_NAME
     if codesets.is_dir():
@@ -9840,9 +9842,19 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
         # The loader's own rule (code_sets.is_code_set_name), so a table spelled .CSV is vetted on
         # POSIX too.
         paths.extend(
-            p for p in sorted(codesets.iterdir()) if p.is_file() and is_code_set_name(p.name)
+            p
+            for p in sorted(codesets.iterdir())
+            if (p.is_file() or _is_link(p)) and is_code_set_name(p.name)
         )
+    elif _is_link(codesets):
+        paths.append(codesets)
     return _with_link_targets(paths)
+
+
+def _is_link(path: Path) -> bool:
+    """Whether ``path`` is a symbolic link or, on Windows, a junction, whether or not it leads
+    anywhere."""
+    return path.is_symlink() or path.is_junction()
 
 
 def _with_link_targets(paths: list[Path]) -> list[Path]:
@@ -9869,7 +9881,7 @@ def _with_link_targets(paths: list[Path]) -> list[Path]:
     out: list[Path] = []
     for path in paths:
         out.append(path)
-        if not (path.is_symlink() or path.is_junction()):
+        if not _is_link(path):
             continue
         unresolved = ""
         target: Path | None = None
