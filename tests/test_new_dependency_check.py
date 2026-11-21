@@ -608,6 +608,11 @@ def test_main_passes_when_a_transient_timeout_clears(monkeypatch: pytest.MonkeyP
         for path in _gate.default_pyprojects(_ROOT)
         for name in declared_distributions(path.read_text(encoding="utf-8"))
     }
+    # Any name a uv.toml beside them declares is vetted too, so it must not fail once either.
+    for path in _gate.default_pyprojects(_ROOT):
+        uv_toml = path.parent / "uv.toml"
+        if uv_toml.is_file():
+            seen |= set(_gate.scan_uv_toml(uv_toml.read_text(encoding="utf-8"))[0])
     seen.discard("fastapi")
     monkeypatch.setattr(mod, "_fetch_once", functools.partial(_fail_once_then_good, seen=seen))
 
@@ -1535,17 +1540,57 @@ def test_main_exits_2_naming_the_sibling_file_it_cannot_parse(
     assert f"could not read {tmp_path / broken}" in capsys.readouterr().err
 
 
+def test_a_broken_uv_toml_still_names_the_pyprojects_refusals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi @ https://evil.example/x.whl"]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "uv.toml").write_text("not = [valid\n", encoding="utf-8")
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project)]) == 2
+    assert "direct reference" in capsys.readouterr().err
+
+
+def test_a_uv_toml_reached_by_two_spellings_is_swept_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
+    )
+    (tmp_path / "uv.toml").write_text("extra-index-url = ['https://e.invalid/s']\n", "utf-8")
+    other = tmp_path / "sub" / ".." / "pyproject.toml"
+    (tmp_path / "sub").mkdir()
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project), "--pyproject", str(other)]) == 1
+    assert "1 finding(s)" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize(
     "payload",
     [
         {"info": "x", "releases": {}},
         {"info": [], "releases": {}},
+        {"info": {"name": 5}, "releases": {}},
+        {"info": {"name": {}}, "releases": {}},
         {"info": {"name": "fastapi"}, "releases": []},
         {"info": {"name": "fastapi"}, "releases": {"1.0": "x"}},
         {"info": {"name": "fastapi"}, "releases": {"1.0": ["x"]}},
         {"info": {"name": "fastapi"}, "releases": {"1.0": [{"upload_time_iso_8601": 5}]}},
     ],
-    ids=["info", "empty-info-list", "releases", "file-list", "file", "upload-time"],
+    ids=[
+        "info",
+        "empty-info-list",
+        "name-number",
+        "name-object",
+        "releases",
+        "file-list",
+        "file",
+        "upload-time",
+    ],
 )
 def test_a_reply_of_the_wrong_shape_exits_2_not_a_traceback(
     tmp_path: Path,

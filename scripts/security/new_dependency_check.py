@@ -109,8 +109,8 @@ least: the default sweep found no ``packaging/*/pyproject.toml``; a pyproject, o
 or ``uv.toml`` beside it, could not be read or parsed; the default sweep's root runtime tables yielded no name; a PyPI request
 failed (a transient failure once the retries are spent, any other failure, such as a certificate
 error, a 4xx other than 404 or 429, or a proxy refusal, at once) or got an unreadable reply, which
-includes a JSON object of a shape ``vet`` does not expect (an ``info``, ``releases``, file list,
-file or upload time of the wrong JSON type); and zero distributions were examined with nothing
+includes a JSON object of a shape ``vet`` does not expect (an ``info``, canonical name,
+``releases``, file list, file or upload time of the wrong JSON type); and zero distributions were examined with nothing
 refused. argparse also exits 2 on a bad command line, by raising SystemExit rather than through
 ``main``'s return. 1: a refusal or a failed check, when none of the exit-2 cases above occurred:
 beside one of them the run exits 2, and a refusal or failed check found before it is not always
@@ -647,7 +647,12 @@ def vet(
             info = {}
         if not isinstance(info, dict):
             raise UnreadableReply(f"PyPI's 'info' for {name!r} is a JSON {type(info).__name__}")
-        canonical = str(info.get("name") or "")
+        raw_canonical = info.get("name")
+        if raw_canonical is not None and not isinstance(raw_canonical, str):
+            raise UnreadableReply(
+                f"PyPI's canonical name for {name!r} is a JSON {type(raw_canonical).__name__}"
+            )
+        canonical = raw_canonical or ""
         if canonical and normalize(canonical) != normalize(name):
             findings.append(
                 Finding(
@@ -924,6 +929,7 @@ def main(argv: list[str] | None = None) -> int:
         # A uv.toml beside each swept pyproject; the root one is what `uv lock` reads.
         uv_toml = path.parent / "uv.toml"
         reading = path
+        swept: list[tuple[Path, tuple[dict[str, str], list[Finding]]]] = []
         try:
             text = path.read_text(encoding="utf-8")
             reading = hatch_toml
@@ -931,17 +937,18 @@ def main(argv: list[str] | None = None) -> int:
             if hatch_text is not None:
                 tomllib.loads(hatch_text)  # parsed here too, so a syntax error names this file
             reading = path
-            swept = [(path, scan(text, source=str(path), hatch_toml_text=hatch_text))]
+            swept.append((path, scan(text, source=str(path), hatch_toml_text=hatch_text)))
             if not args.pyproject and index == 0:
                 root_runtime = _runtime_names(text)
             reading = uv_toml
-            if uv_toml.is_file() and uv_toml not in seen_uv_toml:
-                seen_uv_toml.add(uv_toml)
+            if uv_toml.is_file() and uv_toml.resolve() not in seen_uv_toml:
+                seen_uv_toml.add(uv_toml.resolve())
                 uv_text = uv_toml.read_text(encoding="utf-8")
                 swept.append((uv_toml, scan_uv_toml(uv_text, source=str(uv_toml))))
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-            # The refusals from the files already read are named too, so one run reports both.
-            for finding in unnameable:
+            # The refusals from the files already read are named too, so one run reports both,
+            # including the pyproject read just before a uv.toml beside it failed.
+            for finding in [*unnameable, *(f for _, (_, found) in swept for f in found)]:
                 _print_finding(finding)
             print(
                 _annotation(
