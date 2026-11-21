@@ -592,8 +592,8 @@ async def test_a_truncated_or_misdelimited_upload_answers_400(
     engine: Engine, tmp_path: Path
 ) -> None:
     """BACKLOG #5787: through the route, an upload cut before its close marker, one cut short whose
-    file holds close-marker text mid-line, and one with a file line that starts with the boundary
-    are each a 400, and nothing is stored. The whole body, as a positive control, is stored."""
+    file holds close-marker text mid-line, one with a file line that starts with the boundary, and
+    one whose HL7 segment is a whole delimiter line are each a 400, and nothing is stored. The whole body, as a positive control, is stored."""
     pytest.importorskip("psutil")
     from messagefoundry.api import create_app
 
@@ -608,6 +608,7 @@ async def test_a_truncated_or_misdelimited_upload_answers_400(
             (whole[: -len(b"--\r\n") - 1], "no closing boundary delimiter"),
             (head + b"MSH|a--B--b\r\nPID|1", "no closing boundary delimiter"),
             (head + b"MSH|a\r\n--B--note\r\nPID|1\r\n--B--\r\n", "not a delimiter line"),
+            (head + b"MSH|a\r--B\rPID|1\r\n--B--\r\n", "no header block"),
         ):
             r = await c.post("/uploads", content=body, headers=h)
             assert r.status_code == 400, r.text
