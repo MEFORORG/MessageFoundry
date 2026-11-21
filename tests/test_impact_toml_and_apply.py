@@ -119,10 +119,21 @@ def test_a_toml_inbound_rename_leaves_an_outbound_of_the_same_name(tmp_path: Pat
     toml = REQ + "\n" + OUTBOUNDS.replace("OB_RESULT", "IB_REQ")
     config_dir = _toml_config(tmp_path, toml, LOGIC.replace('Send("OB_RESULT"', 'Send("IB_REQ"'))
     plan = plan_rename(load_config(config_dir), config_dir, "inbound", "IB_REQ", "IB_ORDERS")
+    assert plan.unresolved == ()
     apply_rename(plan)
     registry = load_config(config_dir)
     assert "IB_ORDERS" in registry.inbound
     assert set(registry.outbound) == {"OB_PARTNER", "IB_REQ"}
+
+
+def test_a_toml_rename_beside_a_nan_value_still_applies(tmp_path: Path) -> None:
+    """A nan never equals itself, so it must not make the re-parse proof refuse a rename."""
+    toml = REQ + "[inbound.metadata]\nratio = nan\n\n" + OUTBOUNDS
+    config_dir = _toml_config(tmp_path, toml)
+    plan = plan_rename(load_config(config_dir), config_dir, "router", "route_req", "route_orders")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert load_config(config_dir).inbound["IB_REQ"].router == "route_orders"
 
 
 # --- step 2: a TOML router rename rewrites only an inbound's router binding --------------------
@@ -368,3 +379,35 @@ def test_reapplying_a_plan_with_two_edits_on_one_line_is_a_no_op(tmp_path: Path)
     after = (config_dir / "b.py").read_bytes()
     assert apply_rename(plan) == []
     assert (config_dir / "b.py").read_bytes() == after
+
+
+def test_a_write_that_fails_restores_the_files_already_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_dir = _config(tmp_path, SPLIT)
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
+    before = {name: (config_dir / name).read_bytes() for name in SPLIT}
+    real_write = Path.write_bytes
+    writes: list[str] = []
+
+    def second_write_fails(self: Path, data: bytes) -> int:
+        writes.append(self.name)
+        if len(writes) == 2:
+            raise PermissionError("held open")
+        return real_write(self, data)
+
+    monkeypatch.setattr(Path, "write_bytes", second_write_fails)
+    with pytest.raises(WiringError, match="already written were restored"):
+        apply_rename(plan)
+    monkeypatch.undo()
+    assert {name: (config_dir / name).read_bytes() for name in SPLIT} == before
+
+
+def test_a_reply_from_env_default_naming_the_outbound_is_reported(tmp_path: Path) -> None:
+    """An env() default is no keyword literal the plan rewrites, so it is reported, not passed."""
+    body = PY_REPLY.replace(
+        'reply_from="OB_PARTNER"', 'reply_from=env("REPLY_OB", default="OB_PARTNER")'
+    ).replace("import Http,", "import Http, env,")
+    config_dir = _config(tmp_path, {"conn.py": body})
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_PARTNER", "OB_UPSTREAM")
+    assert plan.unresolved == (Reference("inbound", "IB_HTTP", "outbound", "OB_PARTNER"),)

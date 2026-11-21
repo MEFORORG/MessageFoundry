@@ -18,7 +18,8 @@ Two authoring surfaces are covered:
   renamed connection, are edited as **text** (no TOML round-trip, so hand-authored formatting/comments
   survive byte-for-byte outside the one edited value). Only the value at that key path in a
   connection entry is touched, and the edited text must parse to the original with exactly those
-  values changed, or the referrer is reported unresolved (BACKLOG #5980).
+  values changed. When it does not, a referrer is reported unresolved, and the renamed
+  connection's own ``name`` makes the plan refuse, as an unlocated definition does (BACKLOG #5980).
 
 The rewrite is **site-scoped**: only literals at a referrer's sites (its own body, a handler's ``accepts=``
 predicate, a module-level statement binding a name it reads, and, for a table rename, the accessor call
@@ -43,7 +44,6 @@ from __future__ import annotations
 
 import ast
 import codecs
-import copy
 import io
 import logging
 import os
@@ -70,6 +70,7 @@ from messagefoundry.config.reachability import (
 )
 from messagefoundry.config.wiring import (
     CASE_TWIN_TABLES,
+    EnvRef,
     Registry,
     WiringError,
     case_twins,
@@ -410,25 +411,35 @@ def apply_rename(plan: RenamePlan) -> list[LiteralEdit]:
     Any other state -- a span carrying neither literal, or a file only partly renamed -- means the
     file changed after the plan was made, and writing the rest would leave a half-renamed config
     while reporting success. That raises :class:`WiringError` before any file is written (BACKLOG
-    #5980)."""
+    #5980), as does a file that cannot be read or decoded. A write that fails restores the files
+    already written from the bytes read, then raises :class:`WiringError` too, naming any file it
+    could not restore."""
     by_file: dict[str, list[LiteralEdit]] = {}
     for edit in plan.edits:
         by_file.setdefault(edit.file, []).append(edit)
 
-    rewritten: dict[str, list[str]] = {}
+    rewritten: dict[str, tuple[bytes, list[str]]] = {}
     applied: list[LiteralEdit] = []
     stale: list[LiteralEdit] = []
     for file, file_edits in by_file.items():
+        try:
+            raw = Path(file).read_bytes()
+            text = raw.decode("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise WiringError(
+                f"cannot apply the rename of {plan.target_kind} {plan.old!r}: {file} could not "
+                f"be read ({type(exc).__name__}). Nothing was written"
+            ) from exc
         # Split on \n, \r\n and \r only: the plan numbered lines by tokenizing a universal-newline read,
         # which breaks on exactly those, so an edit's line is the line it names here too.
-        lines = source_lines(Path(file).read_bytes().decode("utf-8"))
+        lines = source_lines(text)
         missing = [e for e in file_edits if _span_text(lines, e) != e.old_literal]
         if not missing:
             # Bottom-to-top, right-to-left: a multi-line edit changes the line count below it, so
             # applying in descending (start_line, start_col) keeps every later edit's indices valid.
             for edit in sorted(file_edits, key=lambda e: (e.start_line, e.start_col), reverse=True):
                 _apply_one(lines, edit)
-            rewritten[file] = lines
+            rewritten[file] = (raw, lines)
             applied.extend(file_edits)
         elif len(missing) < len(file_edits) or not _already_renamed(lines, file_edits):
             stale.extend(missing)
@@ -439,9 +450,32 @@ def apply_rename(plan: RenamePlan) -> list[LiteralEdit]:
             f"longer match the file, which changed after the plan was made ({where}). Nothing was "
             "written; plan the rename again"
         )
-    for file, lines in rewritten.items():
-        Path(file).write_bytes("".join(lines).encode("utf-8"))
+    written: list[tuple[str, bytes]] = []
+    for file, (raw, lines) in rewritten.items():
+        try:
+            Path(file).write_bytes("".join(lines).encode("utf-8"))
+        except OSError as exc:
+            # The failed file may be partly written, so it is restored with the ones before it.
+            unrestored = _restore([*written, (file, raw)])
+            left = f"; these could not be restored: {', '.join(unrestored)}" if unrestored else ""
+            raise WiringError(
+                f"cannot apply the rename of {plan.target_kind} {plan.old!r}: writing {file} "
+                f"failed ({type(exc).__name__}), so the files already written were restored{left}"
+            ) from exc
+        written.append((file, raw))
     return applied
+
+
+def _restore(files: list[tuple[str, bytes]]) -> list[str]:
+    """Write each file's original bytes back, returning the files that could not be."""
+    failed: list[str] = []
+    for file, raw in files:
+        try:
+            Path(file).write_bytes(raw)
+        except OSError as exc:
+            _log.warning("rename could not restore %s: %s", file, type(exc).__name__)
+            failed.append(file)
+    return failed
 
 
 def delete_impact(index: ReferenceIndex, target_kind: str, name: str) -> list[Reference]:
@@ -664,7 +698,15 @@ def _referrer_sites(
             toml_targets.setdefault((conn.source_file, "inbound", ("router",)), []).append(ref)
             return None
         return [], False
-    return None
+    # A referrer kind this function does not read: reported unresolved, never dropped.
+    return [], False
+
+
+#: The connection settings that name another connection: (referrer kind, setting, target kind).
+_SETTING_REFERENCES = (
+    ("outbound", "reingress_to", "inbound"),
+    ("inbound", "reply_from", "outbound"),
+)
 
 
 def _all_referrers(
@@ -673,18 +715,20 @@ def _all_referrers(
     """Every referrer of ``(target_kind, old)``, each with the connection setting it names the
     target in, or ``None`` for a referrer read from its code or its router binding.
 
-    The index carries an outbound's ``reingress_to`` as an ``outbound -> inbound`` edge, and has no
-    edge for an inbound's ``reply_from`` (an ``Http`` inbound naming the outbound whose reply it
-    returns), so that one is read from the registry here (BACKLOG #5966); should the graph gain
-    that edge, the registry's reading replaces the index's rather than adding a second."""
-    out: dict[Reference, str | None] = {
-        ref: "reingress_to" if ref.referrer_kind == "outbound" else None
-        for ref in index.referrers(target_kind, old)
-    }
-    if target_kind == "outbound":
-        for name, conn in sorted(registry.inbound.items()):
-            if conn.spec.settings.get("reply_from") == old:
-                out[Reference("inbound", name, "outbound", old)] = "reply_from"
+    The settings are read from the registry, not inferred from the index's edges: the index carries
+    an outbound's literal ``reingress_to`` as an ``outbound -> inbound`` edge, but has no edge for an
+    inbound's ``reply_from`` (an ``Http`` inbound naming the outbound whose reply it returns), nor
+    for either written as an ``env()`` reference whose default names the target (BACKLOG #5966). The
+    registry's reading replaces an index edge for the same referrer rather than adding a second."""
+    out: dict[Reference, str | None] = dict.fromkeys(index.referrers(target_kind, old))
+    for kind, setting, setting_target in _SETTING_REFERENCES:
+        if setting_target != target_kind:
+            continue
+        table = registry.inbound if kind == "inbound" else registry.outbound
+        for name in sorted(table):
+            value = table[name].spec.settings.get(setting)
+            if value == old or (isinstance(value, EnvRef) and value.default == old):
+                out[Reference(kind, name, target_kind, old)] = setting
     return list(out.items())
 
 
@@ -1908,7 +1952,8 @@ def _toml_edits(
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         _log.debug("rename could not read %s: %s", toml_path, type(exc).__name__)
         return None
-    expected = copy.deepcopy(before)
+    # ``before`` becomes the expected result: the original with exactly those values changed.
+    expected = before
     entries = expected.get(table)
     held = 0
     for entry in entries if isinstance(entries, list) else ():
@@ -1926,9 +1971,14 @@ def _toml_edits(
     lines = source_lines(text)
     for lineno, raw_line in enumerate(lines, start=1):
         line = raw_line.rstrip("\r\n")
-        if line.lstrip().startswith("["):
-            m = _TOML_HEADER.match(line)
-            header = _toml_key_path(m.group("path")) if m is not None else None
+        header_match = _TOML_HEADER.match(line)
+        if header_match is not None:
+            header = _toml_key_path(header_match.group("path"))
+            continue
+        if line.lstrip().startswith("[") and line.rstrip().endswith("]"):
+            # A header this pattern does not read (a quoted key part): no table is known until the
+            # next one. A line that only starts with "[", a nested array's element, is a value.
+            header = None
             continue
         m = _TOML_STRING_KEY.match(line)
         if m is None or m.group("value") != old or header is None:
@@ -1953,7 +2003,8 @@ def _toml_edits(
         after = tomllib.loads("".join(lines))
     except tomllib.TOMLDecodeError:
         return None
-    return edits if after == expected else None
+    # By repr, so a nan, which never equals itself, still compares equal to the nan it was.
+    return edits if repr(after) == repr(expected) else None
 
 
 def _toml_key_path(key: str) -> tuple[str, ...]:

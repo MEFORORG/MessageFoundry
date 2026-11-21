@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import ntpath
 import os
 from collections.abc import Callable
@@ -46,6 +47,8 @@ from messagefoundry.config.code_sets import (
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.controlchars import has_control_char
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
+
+_log = logging.getLogger(__name__)
 
 #: Extensions the loader recognises (the writer only ever *writes* ``.csv``; both are read).
 _SUPPORTED_EXTS = (".csv", ".toml")
@@ -234,12 +237,19 @@ def rename_code_set(
 
         try:
             rewritten = len(impact.apply_rename(plan))
-        except (WiringError, OSError, UnicodeDecodeError):
-            # A referent file changed after the plan, or could not be read. apply_rename checks
-            # and reads every file before it writes one, so it wrote nothing, and moving the table
-            # back leaves the config as it was rather than half renamed.
-            with atomic_edit.refused_as(dest, WiringError, f"rename it back to {src.name}"):
-                replace_generated(dest, src)
+        except WiringError as exc:
+            # apply_rename left every referent file as it was (it writes none on a stale or
+            # unreadable file, and restores the ones written when a write fails), so moving the
+            # table back leaves the config as it was rather than half renamed.
+            try:
+                with atomic_edit.refused_as(dest, WiringError, f"rename it back to {src.name}"):
+                    replace_generated(dest, src)
+            except WiringError as back:
+                raise WiringError(
+                    f"{exc} The code set was then left as {dest.name}, because moving it back "
+                    f"failed ({back}), while its references still name {old!r}: rename "
+                    f"{dest.name} back to {src.name} by hand"
+                ) from exc
             raise
         if rewritten:
             result["referents_rewritten"] = rewritten
@@ -662,12 +672,13 @@ def _plan_code_set_referents(config_dir: str | Path, old: str, new: str) -> Any:
 
     try:
         registry = _load_referent_registry_or_raise(config_dir)
-        return impact.plan_rename(registry, config_dir, "code_set", old, new)
     except _REGISTRY_LOAD_ERRORS as exc:
         raise WiringError(
             f"cannot rename code set {old!r} to {new!r}: its references could not be checked "
             f"({exc}). Nothing was changed; fix the config so it loads, then rename again"
         ) from exc
+    # A refusal of the planner's own carries its own reason, and nothing has moved yet.
+    return impact.plan_rename(registry, config_dir, "code_set", old, new)
 
 
 def _code_set_referrers(config_dir: str | Path, name: str) -> list[dict[str, str]]:
@@ -696,7 +707,10 @@ def _load_referent_registry(config_dir: str | Path) -> Any:
     rewrite its referents, and refuses without it (:func:`_plan_code_set_referents`)."""
     try:
         return _load_referent_registry_or_raise(config_dir)
-    except _REGISTRY_LOAD_ERRORS:
+    except _REGISTRY_LOAD_ERRORS as exc:
+        _log.warning(
+            "code set referrer check skipped: the config does not load (%s)", type(exc).__name__
+        )
         return None
 
 
