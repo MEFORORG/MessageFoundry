@@ -1891,3 +1891,221 @@ async def test_a_forced_stop_has_its_outcome_read(caplog) -> None:
     await asyncio.sleep(0)
     assert "stopping a connection after a failed store open failed (OSError)" in caplog.text
     assert "secret" not in caplog.text
+
+
+async def test_a_cancelled_open_whose_close_wedges_forces_the_real_connections_closed(
+    tmp_path, monkeypatch, caplog
+) -> None:
+    """BACKLOG #5720, open items 6 and 22: the SQLite forced release, run against the real writer
+    and read-pool connections while the failed open's cleanup is still running. The open fails
+    after its read pool opened, its close never returns, and a cancel lands: within the bound the
+    open ends, and every connection's worker thread exits, though nothing closed them in order.
+
+    Mutation: make ``_force_release`` a no-op in ``MessageStore.open``. Red: workers stay."""
+    from messagefoundry.store import store as store_module
+
+    monkeypatch.setattr(store_module, "FAILED_OPEN_CANCEL_BOUND_S", 0.05)
+    watched: set[threading.Thread] = set()
+    opened = _watch_aiosqlite_connects(monkeypatch, watched)
+    closing = asyncio.Event()
+    unwedge = asyncio.Event()
+    real_pool = MessageStore._open_read_pool
+
+    async def pool_then_boom(self: MessageStore, path: str) -> None:
+        await real_pool(self, path)
+        raise RuntimeError("after the read pool")
+
+    async def wedged_close(self: MessageStore) -> None:
+        closing.set()
+        await unwedge.wait()
+
+    monkeypatch.setattr(MessageStore, "_open_read_pool", pool_then_boom)
+    monkeypatch.setattr(MessageStore, "close", wedged_close)
+    task = asyncio.create_task(MessageStore.open(tmp_path / "forced.db"))
+    try:
+        await asyncio.wait_for(closing.wait(), 10)
+        task.cancel()
+        done, _pending = await asyncio.wait({task}, timeout=3)
+        assert task in done, "a cancelled open still waited on a wedged close"
+        left = await _workers_left(watched)
+    finally:
+        unwedge.set()
+        await asyncio.sleep(0.05)
+        for conn in opened:  # a red run leaves them open; close them so exit does not hang
+            if conn._connection is not None:
+                await conn.close()
+    with pytest.raises(asyncio.CancelledError):
+        task.result()
+    assert len(opened) >= 2, "the writer and the read pool should both have connected"
+    assert left == [], f"the forced release left live aiosqlite worker(s): {', '.join(left)}"
+    assert "did not finish within 0.05 s of a cancel" in caplog.text
+
+
+async def test_run_to_completion_lets_a_generator_exit_through() -> None:
+    """BACKLOG #5720, open item 21: ``except BaseException: pass`` took a ``GeneratorExit`` thrown
+    into the wait for the body's failure and awaited again, which a closing coroutine cannot do.
+    Red before the fix: closing the coroutine raises ``RuntimeError``."""
+    from messagefoundry.store.store import _run_to_completion
+
+    unwedge = asyncio.Event()
+
+    async def body() -> None:
+        await unwedge.wait()
+
+    coro = _run_to_completion(body)
+    coro.send(None)  # parked in its wait for the body
+    try:
+        coro.close()  # raises RuntimeError("coroutine ignored GeneratorExit") before the fix
+    finally:
+        unwedge.set()
+        await asyncio.sleep(0)
+
+
+async def test_a_generator_exit_in_the_cleanup_wait_still_forces_the_release() -> None:
+    """BACKLOG #5720, open item 21: a ``GeneratorExit`` thrown while ``cleanup_failed_open`` waits
+    for the cleanup skipped the forced release. Red before the fix: nothing is forced."""
+    from messagefoundry.store.store import cleanup_failed_open
+
+    forced: list[str] = []
+    unwedge = asyncio.Event()
+
+    async def wedged_release() -> None:
+        await unwedge.wait()
+
+    coro = cleanup_failed_open(
+        RuntimeError("open boom"),
+        wedged_release,
+        lambda: forced.append("forced"),
+        cancels_before=0,
+    )
+    coro.send(None)  # parked in its unbounded wait: no cancel, an ordinary failure
+    try:
+        coro.close()
+    finally:
+        unwedge.set()
+        await asyncio.sleep(0)
+    assert forced == ["forced"]
+
+
+async def test_a_cleanup_that_ends_cancelled_is_logged_as_released(caplog) -> None:
+    """BACKLOG #5720, open item 5: a cleanup that ended cancelled was logged at ERROR as one whose
+    work "may not have been released", though the forced release then ran. The line now says the
+    release ran. Red before the fix: the ERROR line."""
+    from messagefoundry.store.store import cleanup_failed_open
+
+    async def cancelled_release() -> None:
+        raise asyncio.CancelledError
+
+    await cleanup_failed_open(
+        RuntimeError("open boom"), cancelled_release, lambda: None, cancels_before=0
+    )
+    assert "may not have been released" not in caplog.text
+    assert (
+        "a failed store open's cleanup ended cancelled before it finished; what it had not "
+        "closed was released without waiting for it" in caplog.text
+    )
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+
+
+async def test_a_cancel_landing_with_the_cleanups_own_cancel_is_raised() -> None:
+    """BACKLOG #5720, open item 16, pinning 8233177b16: the cleanup task and the open's own task
+    cancelled in the same turn, as a loop's cancel-all does. The open's cancel must be raised, not
+    dropped for the ordinary failure. Red at the code before 8233177b16: nothing is raised."""
+    from messagefoundry.store import store as store_module
+
+    forced: list[str] = []
+
+    async def release() -> None:
+        await asyncio.sleep(10)
+
+    outer = asyncio.create_task(
+        store_module.cleanup_failed_open(
+            RuntimeError("open boom"), release, lambda: forced.append("forced"), cancels_before=0
+        )
+    )
+    await asyncio.sleep(0)  # the outer task made its cleanup task, which has not run a step yet
+    cleanups = [
+        t
+        for t in asyncio.all_tasks()
+        if getattr(t.get_coro(), "__name__", "") == "_run_to_completion"
+    ]
+    assert len(cleanups) == 1
+    cleanups[0].cancel()
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await outer
+    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert forced == ["forced"]
+
+
+async def test_abandoned_cleanups_are_held_up_to_a_cap(monkeypatch, caplog) -> None:
+    """BACKLOG #5720, open item 19: the abandoned cleanups a loop holds are capped, so repeated
+    failing opens whose cleanups never finish cannot grow the set without end."""
+    from messagefoundry.store import store as store_module
+
+    monkeypatch.setattr(store_module, "ABANDONED_OPEN_CLEANUPS_MAX", 2)
+    loop = asyncio.get_running_loop()
+    monkeypatch.delattr(loop, store_module._ABANDONED_OPEN_CLEANUPS_ATTR, raising=False)
+    gate = asyncio.Event()
+    tasks = [asyncio.ensure_future(gate.wait()) for _ in range(3)]
+    try:
+        for task in tasks:
+            store_module._hold_abandoned_open_cleanup(task)
+        held = getattr(loop, store_module._ABANDONED_OPEN_CLEANUPS_ATTR)
+        assert len(held) == 2
+        assert "2 such cleanups are held already" in caplog.text
+    finally:
+        gate.set()
+        await asyncio.gather(*tasks)
+    assert len(held) == 0
+
+
+async def test_close_logs_a_failing_step_by_class_only(tmp_path, monkeypatch, caplog) -> None:
+    """BACKLOG #5720, open item 4: ``close()`` logged a failing step with its traceback at
+    WARNING, which the failed open's cleanup runs too, and a message may carry a path or a value.
+    Red before the fix: the WARNING carries the traceback."""
+    store = await MessageStore.open(tmp_path / "close.db")
+    real_close = store._read_conns[0].close
+
+    async def failing_close() -> None:
+        await real_close()
+        raise OSError("read close failed on C:/secret/path")
+
+    monkeypatch.setattr(store._read_conns[0], "close", failing_close)
+    await store.close()
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert any(r.getMessage() == "error closing read-pool connection (OSError)" for r in warnings)
+    assert not any(r.exc_info for r in warnings)
+    assert "secret" not in "".join(r.getMessage() for r in warnings)
+
+
+async def test_a_cancel_during_the_keyless_refusals_close_still_closes_the_store() -> None:
+    """BACKLOG #5720, open items 9 and 20: ``open_store``'s keyless-chain refusal closed the store
+    unshielded, so a cancel landing in that close cut it short, the leak class one layer above the
+    backends. The close now finishes and the cancel is raised, chained to the refusal. Red before
+    the fix: the close never finishes."""
+    from messagefoundry.store.base import KeylessAuditChainRefused, _refuse_to_start_a_keyless_chain
+
+    closing = asyncio.Event()
+    finished: list[str] = []
+
+    class _Store:
+        path = "keyless.db"
+
+        async def audit_anchor(self) -> tuple[int, None]:
+            return 0, None
+
+        async def close(self) -> None:
+            closing.set()
+            await asyncio.sleep(0.2)
+            finished.append("closed")
+
+    task = asyncio.create_task(
+        _refuse_to_start_a_keyless_chain(_Store(), "a test", key_named=False)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(closing.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+    assert finished == ["closed"]
+    assert isinstance(raised.value.__cause__, KeylessAuditChainRefused)

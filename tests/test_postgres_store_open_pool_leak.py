@@ -234,9 +234,12 @@ async def test_a_failed_keyed_open_forfeits_the_block_it_reserved(
 async def test_an_open_that_fails_at_or_before_the_salt_bind_settles_nothing(
     monkeypatch: pytest.MonkeyPatch, step: str
 ) -> None:
-    """BACKLOG #5720, the guard on the settlement: until the bind holds, the cipher may count for
-    another store or for none, so a settle here would write a foreign reserve into this store or
-    switch on the bound of a cipher a retried open then could not bind."""
+    """BACKLOG #5720: an open that fails at or before its salt bind has taken no reserve, since
+    the reserve comes after the bind, and its cleanup settles nothing. The server cleanup never
+    settles (``test_a_failed_keyed_open_forfeits_the_block_it_reserved``), so what this pins
+    beyond that one is the ORDER, open item 15.
+
+    Mutation: take the reserve before ``bind_store_salt``. Red: ``settles`` is ``[False]``."""
     pool = _FakePool()
     _install_fake_asyncpg(monkeypatch, pool)
     settles: list[bool] = []
@@ -363,3 +366,66 @@ async def test_a_pool_without_terminate_keeps_the_opens_error(
     assert "forcing the release after a failed store open also failed (AttributeError)" in (
         caplog.text
     )
+
+
+async def test_a_constructor_that_raises_closes_the_pool(monkeypatch: pytest.MonkeyPatch) -> None:
+    """BACKLOG #5720, open item 9: the store was built outside the cleanup's ``try``, so a
+    constructor that raised left the pool open. Red before the fix: ``pool.closed`` is 0."""
+    pool = _FakePool()
+    _install_fake_asyncpg(monkeypatch, pool)
+
+    def _boom(self: PostgresStore, *_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("constructor boom")
+
+    monkeypatch.setattr(PostgresStore, "__init__", _boom)
+    with pytest.raises(RuntimeError, match="constructor boom"):
+        await PostgresStore.open(_settings())
+    assert pool.closed == 1
+
+
+async def test_a_cancel_during_a_one_connection_stores_close_still_closes_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720, open item 9: ``_one_connection_store`` closed the store in an unshielded
+    ``finally``, so a cancel landing in that close cut it short. Red before the fix: the pool
+    close never finishes."""
+    closing = asyncio.Event()
+    finished: list[str] = []
+    pool = _FakePool()
+
+    async def slow_close() -> None:
+        closing.set()
+        await asyncio.sleep(0.2)
+        finished.append("closed")
+
+    pool.close = slow_close  # type: ignore[method-assign]
+    _install_fake_asyncpg(monkeypatch, pool)
+
+    async def body() -> None:
+        async with PostgresStore._one_connection_store(_settings(), posture=None):
+            raise RuntimeError("probe boom")
+
+    task = asyncio.create_task(body())
+    await asyncio.wait_for(closing.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
+    assert finished == ["closed"]
+    assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+async def test_a_one_connection_store_close_failure_does_not_replace_the_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5720: on an error the close's own failure is logged by class, and the error that
+    ended the block is the one raised."""
+    pool = _FakePool(close_fails=True)
+    _install_fake_asyncpg(monkeypatch, pool)
+    with pytest.raises(RuntimeError, match="probe boom"):
+        async with PostgresStore._one_connection_store(_settings(), posture=None):
+            raise RuntimeError("probe boom")
+    assert (
+        "closing a one-connection store after an error also failed (ConnectionResetError)"
+        in caplog.text
+    )
+    assert "pool close wedged" not in caplog.text

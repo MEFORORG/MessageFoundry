@@ -2237,16 +2237,17 @@ class PostgresStore:
         (BACKLOG #1780). The defaults keep this primitive building, as the tests that call it expect."""
         cancels_before = cancels_at_entry()  # BACKLOG #5720: only this open's cancels
         pool = await cls._create_pool(settings, posture=posture, max_size=settings.pool_size)
-        store = cls(
-            pool,
-            settings,
-            cipher=cipher,
-            audit_mac_key=audit_mac_key,
-            audit_mac_fn=audit_mac_fn,
-            message_events=message_events,
-        )
-        store._read_only = read_only
         try:
+            # Inside the try, so a constructor that raises does not leak the pool (BACKLOG #5720).
+            store = cls(
+                pool,
+                settings,
+                cipher=cipher,
+                audit_mac_key=audit_mac_key,
+                audit_mac_fn=audit_mac_fn,
+                message_events=message_events,
+            )
+            store._read_only = read_only
             await store._ensure_schema(create=create, read_only=read_only)
             if not read_only:
                 await check_open_store_pin(store)  # vault BACKLOG #3411: before any write
@@ -2373,13 +2374,38 @@ class PostgresStore:
         cls, settings: StoreSettings, *, posture: HopPosture | None
     ) -> AsyncIterator[PostgresStore]:
         """A one-connection store with the identity cipher, closed on exit: what
-        :meth:`provision_schema` and :meth:`probe_privileges` run on instead of :meth:`open`."""
+        :meth:`provision_schema` and :meth:`probe_privileges` run on instead of :meth:`open`.
+
+        On an error, a cancel included, the close runs through :func:`cleanup_failed_open`, so a
+        cancel cannot cut it short and a close failure is logged by class rather than replacing
+        the error (BACKLOG #5720). On a clean exit a close failure is raised, as before."""
+        cancels_before = cancels_at_entry()
         pool = await cls._create_pool(settings, posture=posture, max_size=1)
-        store = cls(pool, settings)
+        store: PostgresStore | None = None
         try:
+            store = cls(pool, settings)
             yield store
-        finally:
-            await store.close()
+        except BaseException as exc:
+            built = store
+
+            async def _release() -> None:
+                try:
+                    await (built.close() if built is not None else pool.close())
+                except Exception as cleanup:  # noqa: BLE001 — never mask the error
+                    log.warning(
+                        "closing a one-connection store after an error also failed (%s)",
+                        type(cleanup).__name__,
+                    )
+
+            await cleanup_failed_open(
+                exc,
+                _release,
+                lambda: pool.terminate(),
+                cancels_before=cancels_before,
+                what="a one-connection store's cleanup",
+            )
+            raise
+        await store.close()
 
     @classmethod
     async def schema_meta_anywhere(

@@ -300,8 +300,12 @@ async def test_a_failed_keyed_open_forfeits_the_block_it_reserved(
 async def test_an_open_that_fails_at_or_before_the_salt_bind_settles_nothing(
     monkeypatch: pytest.MonkeyPatch, step: str
 ) -> None:
-    """BACKLOG #5720, the guard on the settlement: the cipher is not this store's until the bind
-    holds, so the cleanup settles nothing before then."""
+    """BACKLOG #5720: an open that fails at or before its salt bind has taken no reserve, since
+    the reserve comes after the bind, and its cleanup settles nothing. The server cleanup never
+    settles (``test_a_failed_keyed_open_forfeits_the_block_it_reserved``), so what this pins
+    beyond that one is the ORDER, open item 15.
+
+    Mutation: take the reserve before ``bind_store_salt``. Red: ``settles`` is ``[False]``."""
     pool = _FakePool()
     _install_fake_aioodbc(monkeypatch, pool)
     executor = _fake_executor(monkeypatch)
@@ -346,6 +350,98 @@ async def test_a_cancel_during_the_cleanup_still_releases_everything(
         await task
 
     assert pool.closed == 1
+    assert pool.wait_closed_called == 1
+    assert executor.shutdown_calls == [False]
+    assert isinstance(raised.value.__cause__, RuntimeError)
+
+
+async def test_a_constructor_that_raises_releases_the_pool_and_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720, open item 9: the store was built outside the cleanup's ``try``, so a
+    constructor that raised left the pool open and the executor's threads running. Red before the
+    fix: nothing closed."""
+    pool = _FakePool()
+    _install_fake_aioodbc(monkeypatch, pool)
+    executor = _fake_executor(monkeypatch)
+
+    def _boom(self: SqlServerStore, *_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("constructor boom")
+
+    monkeypatch.setattr(SqlServerStore, "__init__", _boom)
+    with pytest.raises(RuntimeError, match="constructor boom"):
+        await SqlServerStore.open(_settings())
+    assert pool.closed == 1
+    assert executor.shutdown_calls == [False]
+
+
+async def test_a_cancelled_open_with_a_wedged_wait_closed_ends_and_forces_the_release(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5720, open item 6: the open-level test of the SQL Server forced release. A
+    cancelled open whose ``wait_closed()`` never returns ends within the bound, and the forced
+    release closes the pool and shuts the executor down without waiting.
+
+    Mutation: make ``_force_release`` a no-op in ``SqlServerStore.open``. Red: the second
+    ``close()`` and ``shutdown()`` never happen."""
+    monkeypatch.setattr("messagefoundry.store.store.FAILED_OPEN_CANCEL_BOUND_S", 0.05)
+    unwedge = asyncio.Event()
+
+    class _WedgedPool(_FakePool):
+        async def wait_closed(self) -> None:
+            self.wait_closed_called += 1
+            await unwedge.wait()
+
+    pool = _WedgedPool()
+    _install_fake_aioodbc(monkeypatch, pool)
+    executor = _fake_executor(monkeypatch)
+
+    async def _cancelled(self: SqlServerStore, **_kwargs: object) -> bool:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(SqlServerStore, "_ensure_schema", _cancelled)
+    task = asyncio.create_task(SqlServerStore.open(_settings()))
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=3)
+        assert task in done, "a cancelled open still waited on a wedged wait_closed"
+        assert pool.closed == 2, "the cleanup's close, then the forced release's"
+        assert executor.shutdown_calls == [False]
+    finally:
+        unwedge.set()
+        await asyncio.sleep(0)
+    with pytest.raises(asyncio.CancelledError):
+        task.result()
+    assert "did not finish within 0.05 s of a cancel" in caplog.text
+
+
+async def test_a_cancel_during_a_one_connection_stores_close_still_releases_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720, open item 9: ``_one_connection_store`` closed the store in an unshielded
+    ``finally``, so a cancel landing in that close cut it short and left the executor's threads.
+    Red before the fix: no shutdown call."""
+    closing = asyncio.Event()
+
+    class _SlowPool(_FakePool):
+        async def wait_closed(self) -> None:
+            closing.set()
+            await asyncio.sleep(0.2)
+            await super().wait_closed()
+
+    pool = _SlowPool()
+    _install_fake_aioodbc(monkeypatch, pool)
+    executor = _fake_executor(monkeypatch)
+    monkeypatch.setattr(sqlserver_module, "check_pinned_certificate", lambda *a, **k: None)
+
+    async def body() -> None:
+        async with SqlServerStore._one_connection_store(_settings(), posture=None):
+            raise RuntimeError("probe boom")
+
+    task = asyncio.create_task(body())
+    await asyncio.wait_for(closing.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError) as raised:
+        await task
     assert pool.wait_closed_called == 1
     assert executor.shutdown_calls == [False]
     assert isinstance(raised.value.__cause__, RuntimeError)
