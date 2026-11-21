@@ -219,8 +219,18 @@ export function normalize(g: Graph): NormalGraph {
   }
   const outboundReceives = new Map<string, string[]>();
   const inboundReceives = new Map<string, string[]>();
+  // The reingress_to back-edge, both directions. A payload from a CLI older than the outbound
+  // `edges` field carries none, so it renders no such reference rather than a guessed one.
+  const reingressTo = new Map<string, string[]>();
+  const reingressedFrom = new Map<string, string[]>();
   for (const o of g.outbound) {
     outboundReceives.set(o.name, o.receives_from ?? []);
+    for (const e of o.edges ?? []) {
+      if (e.target_kind === "inbound") {
+        addSorted(reingressTo, o.name, e.target);
+        addSorted(reingressedFrom, e.target, o.name);
+      }
+    }
   }
   for (const c of g.inbound) {
     inboundReceives.set(c.name, c.receives_from ?? []);
@@ -231,18 +241,6 @@ export function normalize(g: Graph): NormalGraph {
       const bucket = e.target_kind === "outbound" ? outboundReceives : e.target_kind === "inbound" ? inboundReceives : undefined;
       if (bucket) {
         addSorted(bucket, e.target, h.name);
-      }
-    }
-  }
-  // The reingress_to back-edge, both directions. A payload from a CLI older than the outbound
-  // `edges` field carries none, so it renders no such reference rather than a guessed one.
-  const reingressTo = new Map<string, string[]>();
-  const reingressedFrom = new Map<string, string[]>();
-  for (const o of g.outbound) {
-    for (const e of o.edges ?? []) {
-      if (e.target_kind === "inbound") {
-        addSorted(reingressTo, o.name, e.target);
-        addSorted(reingressedFrom, e.target, o.name);
       }
     }
   }

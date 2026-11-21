@@ -848,10 +848,17 @@ _COL_GAP = 210
 _MARGIN = 12
 _HEAD_Y = 24
 _TOP = 40
+#: Column index per node kind, the left-to-right order a back-edge is judged against.
+_COLUMN_OF: dict[str, int] = {kind: ci for ci, (kind, _label) in enumerate(_GRAPH_COLUMNS)}
 #: A back-edge (into the same or an earlier column) runs in its own horizontal lane under the rows.
 _LANE_GAP = 14
-#: How far a back-edge's vertical runs sit outside the node boxes, in the column gutters.
-_GUTTER = 8
+#: A back-edge's vertical runs sit in the column gutters, _GUTTER plus _GUTTER_STEP per lane outside
+#: the node boxes, so two back-edges never share one; after _GUTTER_LANES lanes the offsets repeat.
+_GUTTER = 6
+_GUTTER_STEP = 5
+_GUTTER_LANES = 8
+#: A back-edge leaves and enters a node this far below its middle, where no forward line attaches.
+_BACK_DY = 8
 
 
 def _short(name: str, limit: int = 20) -> str:
@@ -869,7 +876,8 @@ def _flow_graph(graph: GraphResponse) -> Markup:
     Loopback inbound, which closes a response cycle, or a handler's pass-through ``Send``. The columns
     are fixed by kind, so a cycle cannot reorder them; a back-edge is routed as a path out of the
     source's right side, along its own lane under the rows and into the target's left side, rather
-    than drawn as a forward line across the whole graph."""
+    than drawn as a forward line across the whole graph. The left margin widens to hold the target
+    side's gutter runs."""
     if not graph.nodes:
         return el("p", "No connections in the graph.", class_="muted")
     columns: dict[str, list[str]] = {kind: [] for kind, _label in _GRAPH_COLUMNS}
@@ -881,46 +889,49 @@ def _flow_graph(graph: GraphResponse) -> Markup:
     for names in columns.values():
         names.sort()
 
+    drawn = [
+        (edge, _COLUMN_OF[edge.target_kind] <= _COLUMN_OF[edge.source_kind])
+        for edge in graph.edges
+        if (edge.source_kind, edge.source) in status_by
+        and (edge.target_kind, edge.target) in status_by
+    ]
+    n_back = sum(1 for _edge, is_back in drawn if is_back)
+    left = _MARGIN + _GUTTER_STEP * min(n_back, _GUTTER_LANES)
+
     pos: dict[tuple[str, str], tuple[int, int]] = {}
     for ci, (kind, _label) in enumerate(_GRAPH_COLUMNS):
-        x = _MARGIN + ci * _COL_GAP
+        x = left + ci * _COL_GAP
         for ri, name in enumerate(columns[kind]):
             pos[(kind, name)] = (x, _TOP + ri * _ROW_GAP)
 
-    col_of = {kind: ci for ci, (kind, _label) in enumerate(_GRAPH_COLUMNS)}
-    drawn = [
-        (
-            edge,
-            pos[(edge.source_kind, edge.source)],
-            pos[(edge.target_kind, edge.target)],
-            col_of[edge.target_kind] <= col_of[edge.source_kind],
-        )
-        for edge in graph.edges
-        if (edge.source_kind, edge.source) in pos and (edge.target_kind, edge.target) in pos
-    ]
-    n_back = sum(1 for *_, is_back in drawn if is_back)
-
     max_rows = max((len(names) for names in columns.values()), default=1)
-    width = _MARGIN + (len(_GRAPH_COLUMNS) - 1) * _COL_GAP + _NODE_W + _MARGIN
+    width = left + (len(_GRAPH_COLUMNS) - 1) * _COL_GAP + _NODE_W + _MARGIN
     rows_bottom = _TOP + max(1, max_rows) * _ROW_GAP
     height = rows_bottom + n_back * _LANE_GAP + _MARGIN
 
     parts: list[object] = []
     for ci, (_kind, label) in enumerate(_GRAPH_COLUMNS):
-        parts.append(el("text", label, x=_MARGIN + ci * _COL_GAP, y=_HEAD_Y, class_="gcolhead"))
+        parts.append(el("text", label, x=left + ci * _COL_GAP, y=_HEAD_Y, class_="gcolhead"))
     # Edges first (drawn behind the node boxes). A target the static extractor couldn't resolve simply
     # has no edge here (its source is flagged dynamic separately) — never a fabricated line.
     lane = 0
-    for edge, s, t, is_back in drawn:
+    for edge, is_back in drawn:
+        s = pos[(edge.source_kind, edge.source)]
+        t = pos[(edge.target_kind, edge.target)]
         sy, ty = s[1] + _NODE_H // 2, t[1] + _NODE_H // 2
         if is_back:
             lane_y = rows_bottom + lane * _LANE_GAP
+            off = _GUTTER + _GUTTER_STEP * (lane % _GUTTER_LANES)
             lane += 1
             d = (
-                f"M {s[0] + _NODE_W} {sy} H {s[0] + _NODE_W + _GUTTER} V {lane_y} "
-                f"H {t[0] - _GUTTER} V {ty} H {t[0]}"
+                f"M {s[0] + _NODE_W} {sy + _BACK_DY} H {s[0] + _NODE_W + off} V {lane_y} "
+                f"H {t[0] - off} V {ty + _BACK_DY} H {t[0]}"
             )
-            parts.append(el("path", d=d, class_=f"gedge gedge-{edge.provenance} gedge-back"))
+            # fill="none" on the element, not only in app.css: a cached stylesheet without the
+            # .gedge-back rule would otherwise fill the closed path black over the graph.
+            parts.append(
+                el("path", d=d, fill="none", class_=f"gedge gedge-{edge.provenance} gedge-back")
+            )
             continue
         parts.append(
             el(

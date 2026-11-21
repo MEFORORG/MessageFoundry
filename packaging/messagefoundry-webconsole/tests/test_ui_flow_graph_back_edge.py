@@ -50,8 +50,10 @@ _BACK = GraphEdge(
 )
 
 
-def _rects(svg: str) -> list[str]:
-    return re.findall(r"<rect [^>]*>", svg)
+def _rect_rows(svg: str) -> list[tuple[str, str]]:
+    """Each node box's row (y) and the label it holds, in drawing order. The x is left out: the left
+    margin widens to hold a back-edge's gutter run, shifting every column by the same amount."""
+    return re.findall(r'<rect x="\d+" y="(\d+)"[^>]*>.*?class="gnodelabel">([^<]*)<', svg)
 
 
 def _lines(svg: str) -> list[tuple[int, int]]:
@@ -63,20 +65,23 @@ def test_reingress_back_edge_is_a_routed_path_not_a_backward_line() -> None:
     # Every straight line runs left to right; the back-edge is not one of them.
     assert len(_lines(svg)) == len(_FORWARD)
     assert all(x1 < x2 for x1, x2 in _lines(svg))
-    paths = re.findall(r'<path d="([^"]+)" class="([^"]+)"', svg)
+    paths = re.findall(r'<path d="([^"]+)" fill="none" class="([^"]+)"', svg)
     assert len(paths) == 1
     d, cls = paths[0]
     assert cls == "gedge gedge-declared gedge-back"
     # It leaves the outbound's right side and ends on the loopback inbound's left side, by its lane
-    # under the rows: OB_PARTNER sits in column 3 (x=642), IB_LOOP in column 0 row 0 (x=12, y=40).
-    assert d.startswith("M 792 55 ")
-    assert d.endswith(" V 55 H 12")
+    # under the rows, 8px below each node's middle where no forward line attaches. One back-edge
+    # widens the left margin from 12 to 17: OB_PARTNER sits in column 3 (x=647), IB_LOOP in column 0
+    # row 0 (x=17, y=40, middle 55).
+    assert d.startswith("M 797 63 ")
+    assert d.endswith(" V 63 H 17")
 
 
 def test_the_cycle_leaves_the_column_layout_untouched() -> None:
     without = str(_flow_graph(GraphResponse(nodes=_NODES, edges=_FORWARD)))
     with_back = str(_flow_graph(GraphResponse(nodes=_NODES, edges=[*_FORWARD, _BACK])))
-    assert _rects(with_back) == _rects(without)
+    assert _rect_rows(with_back) == _rect_rows(without)
+    assert len(_rect_rows(without)) == len(_NODES)
 
 
 def test_each_back_edge_gets_its_own_lane() -> None:
@@ -88,9 +93,13 @@ def test_each_back_edge_gets_its_own_lane() -> None:
         provenance="literal",
     )
     svg = str(_flow_graph(GraphResponse(nodes=_NODES, edges=[*_FORWARD, _BACK, second])))
-    lanes = [int(m) for m in re.findall(r'<path d="M \d+ \d+ H \d+ V (\d+) ', svg)]
+    runs = re.findall(r'<path d="M \d+ \d+ H (\d+) V (\d+) H (\d+) ', svg)
+    lanes = [int(lane) for _src_x, lane, _dst_x in runs]
     assert len(lanes) == 2
     assert len(set(lanes)) == 2
+    # Each back-edge has its own vertical run on both sides, so no two can be read as crossed.
+    assert len({src_x for src_x, _lane, _dst_x in runs}) == 2
+    assert len({dst_x for _src_x, _lane, dst_x in runs}) == 2
     # The SVG grows to hold both lanes below the rows.
     match = re.search(r'<svg [^>]*height="(\d+)"', svg)
     assert match is not None

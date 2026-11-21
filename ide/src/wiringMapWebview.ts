@@ -22,7 +22,7 @@ export function wiringMapScript(token: string): string {
     // Vertical layout: the four pipeline stages stack as top→bottom bands (inbound at the top,
     // outbound at the bottom); nodes within a band spread horizontally by their model row. HSTEP is
     // the horizontal step between sibling nodes in a band; BANDSTEP the vertical step between bands.
-    const NODEW = 200, NODEH = 36, HSTEP = 232, BANDSTEP = 84, TOP = 26, LEFT = 12;
+    const NODEW = 200, NODEH = 36, HSTEP = 232, BANDSTEP = 84, TOP = 26, LEFT = 12, GUTTER = 28;
     let state = null;      // last posted { map, focus, names }
     let selected = null;   // { kind, name } of the selected node
 
@@ -81,7 +81,8 @@ export function wiringMapScript(token: string): string {
       const byId = new Map();
       for (const col of map.columns) for (const nd of col) byId.set(nd.kind + ':' + nd.name, nd);
       const perBand = Math.max(1, ...map.columns.map((c) => c.length));
-      const width = LEFT * 2 + (perBand - 1) * HSTEP + NODEW;
+      // GUTTER past the last node leaves room for a back-edge's vertical run beside it.
+      const width = LEFT * 2 + (perBand - 1) * HSTEP + NODEW + GUTTER;
       const height = bandTop(KINDS.length - 1) + NODEH + 14;
       const svg = el('svg', { width, height, viewBox: '0 0 ' + width + ' ' + height });
 
@@ -92,22 +93,34 @@ export function wiringMapScript(token: string): string {
       });
 
       // Edges first (under the nodes). The pipeline flows top→bottom: a forward edge leaves the
-      // source's bottom edge and enters the target's top; a back-edge (the legal handler→inbound
-      // pass-through, or an outbound's reingress_to into its Loopback inbound) runs the other way
-      // (leaves the top, lands on the target's bottom).
+      // source's bottom edge and enters the target's top. A back-edge (the legal handler→inbound
+      // pass-through, or an outbound's reingress_to into its Loopback inbound) is routed around the
+      // nodes instead: out of the source's right side, up the gutter beside it, along the gap under
+      // the target's band, down the target's own gutter and into its right side. A straight curve
+      // would run behind the nodes of the bands it crosses and read as an edge between them. Each
+      // back-edge takes its own gutter offset, so two never share a vertical run.
       const edgeEls = [];
+      let back = 0;
       for (const e of map.edges) {
         const from = byId.get(e.fromKind + ':' + e.from);
         const to = byId.get(e.toKind + ':' + e.to);
         if (!from || !to) continue;
         const a = nodeXY(from), b = nodeXY(to);
-        const forward = KINDS.indexOf(to.kind) > KINDS.indexOf(from.kind);
-        const x1 = a.x + NODEW / 2, x2 = b.x + NODEW / 2;
-        const y1 = forward ? a.y + NODEH : a.y;
-        const y2 = forward ? b.y : b.y + NODEH;
-        const dy = Math.max(28, Math.abs(y2 - y1) / 2) * (forward ? 1 : -1);
+        let d;
+        if (KINDS.indexOf(to.kind) > KINDS.indexOf(from.kind)) {
+          const x1 = a.x + NODEW / 2, x2 = b.x + NODEW / 2;
+          const y1 = a.y + NODEH, y2 = b.y;
+          const dy = Math.max(28, (y2 - y1) / 2);
+          d = 'M ' + x1 + ' ' + y1 + ' C ' + x1 + ' ' + (y1 + dy) + ', ' + x2 + ' ' + (y2 - dy) + ', ' + x2 + ' ' + y2;
+        } else {
+          const off = 8 + 5 * (back++ % 4);
+          const gs = a.x + NODEW + off, gt = b.x + NODEW + off, gap = b.y + NODEH + off;
+          d = 'M ' + (a.x + NODEW) + ' ' + (a.y + NODEH / 2) + ' H ' + gs + ' V ' + gap + ' H ' + gt +
+            ' V ' + (b.y + NODEH / 2) + ' H ' + (b.x + NODEW);
+        }
         const path = el('path', {
-          d: 'M ' + x1 + ' ' + y1 + ' C ' + x1 + ' ' + (y1 + dy) + ', ' + x2 + ' ' + (y2 - dy) + ', ' + x2 + ' ' + y2,
+          d,
+          fill: 'none',
           class: 'edge p-' + e.provenance,
         }, svg);
         const t = el('title', {}, path);

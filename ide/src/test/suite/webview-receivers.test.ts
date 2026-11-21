@@ -1567,3 +1567,39 @@ suite("webview receivers discard a malformed payload and render a well-formed on
     }
   }
 });
+
+suite("Wiring Map webview routes a back-edge around the bands (BACKLOG #5966)", () => {
+  teardown(closeWindows);
+
+  // IB_LOOP, route_loop, to_partner and OB_PARTNER all land in row 0, so a straight curve from the
+  // outbound back to the loopback inbound would run behind route_loop and to_partner.
+  const LOOP: Graph = {
+    version: 2,
+    inbound: [{ name: "IB_LOOP", type: "loopback", router: "route_loop" }],
+    outbound: [
+      { name: "OB_PARTNER", type: "mllp", edges: [{ target: "IB_LOOP", target_kind: "inbound", provenance: "declared" }] },
+    ],
+    routers: [{ name: "route_loop", edges: [{ target: "to_partner", target_kind: "handler", provenance: "literal" }] }],
+    handlers: [{ name: "to_partner", edges: [{ target: "OB_PARTNER", target_kind: "outbound", provenance: "literal" }] }],
+  };
+
+  test("the reingress_to back-edge runs in the gutter beside the nodes, not through them", () => {
+    const p = wiringMap.load();
+    p.deliver(wiringMapPayload(LOOP, null));
+    const paths = [...p.window.document.querySelectorAll("path")].map((e: DomNode) => ({
+      title: String(e.querySelector("title")?.textContent ?? ""),
+      d: String(e.getAttribute("d")),
+    }));
+    const back = paths.find((x) => x.title.startsWith("outbound OB_PARTNER"));
+    assert.ok(back, `no back-edge among ${JSON.stringify(paths)}`);
+    const m = /^M (\d+) \d+ H (\d+) V \d+ H (\d+) V \d+ H (\d+)$/.exec(back.d);
+    assert.ok(m, back.d);
+    // It leaves the node's right side (x=212), and every vertical run is right of it, in the gutter.
+    assert.strictEqual(m[1], "212");
+    assert.strictEqual(m[4], "212");
+    assert.ok(Number(m[2]) > 212 && Number(m[3]) > 212, back.d);
+    // A forward edge is still the plain curve.
+    const forward = paths.find((x) => x.title.startsWith("handler to_partner"));
+    assert.ok(forward && forward.d.includes(" C "), JSON.stringify(forward));
+  });
+});
