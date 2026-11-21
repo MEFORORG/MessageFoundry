@@ -516,8 +516,9 @@ _RESET_LANE_CHUNK = 500
 _DIRTY_CLOSE_TIMEOUT = 5.0
 
 # BACKLOG #5720: how long the one-connection store's error path waits for its pool to finish
-# closing after the store's own close failed. Past it the pool is left closing, its free
-# connections not yet closed, so a pool that never finishes cannot hang that path.
+# closing when the store's own close failed before its pool step. Past it the pool is left
+# closing. Its own value, not FAILED_OPEN_CANCEL_BOUND_S: it bounds one fallback wait, cancel or
+# not, where that bounds a whole cleanup once a cancel lands.
 _ONE_CONNECTION_POOL_CLOSE_BOUND_S = 5.0
 
 # BACKLOG #3023: how many `[store].acquire_timeout`s a session write that follows a committed auth
@@ -5745,24 +5746,28 @@ class SqlServerStore:
                     )
                     log.debug("the one-connection store's close failure", exc_info=cleanup)
                     # A close that raised before its own pool step leaves the pool and the
-                    # executor open, so release both here (BACKLOG #5720).
+                    # executor open, so release both here (BACKLOG #5720). A close that reached
+                    # that step shut the executor down in its own finally, and closes nothing more
+                    # here. The wait is bounded, so this fallback cannot hang the error path.
+                    if built is None or built._pool_executor is None:
+                        return
+                    bound = asyncio.timeout(_ONE_CONNECTION_POOL_CLOSE_BOUND_S)
                     try:
                         pool.close()
-                        await asyncio.wait_for(
-                            pool.wait_closed(), _ONE_CONNECTION_POOL_CLOSE_BOUND_S
-                        )
-                    except TimeoutError:
-                        log.warning(
-                            "the pool did not finish closing within %s s; it is left closing, "
-                            "its free connections not yet closed",
-                            _ONE_CONNECTION_POOL_CLOSE_BOUND_S,
-                        )
+                        async with bound:
+                            await pool.wait_closed()
                     except Exception as released:  # noqa: BLE001 — keep the error
-                        log.warning(
-                            "closing the pool after that also failed (%s)",
-                            type(released).__name__,
-                        )
-                        log.debug("the pool's close failure", exc_info=released)
+                        if bound.expired():
+                            log.warning(
+                                "the pool did not finish closing within %s s; it is left closing",
+                                _ONE_CONNECTION_POOL_CLOSE_BOUND_S,
+                            )
+                        else:
+                            log.warning(
+                                "closing the pool after that also failed (%s)",
+                                type(released).__name__,
+                            )
+                            log.debug("the pool's close failure", exc_info=released)
                     finally:
                         executor.shutdown(wait=False)
 

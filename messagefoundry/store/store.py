@@ -2167,7 +2167,11 @@ async def cleanup_failed_open(
                 closing = asyncio.ensure_future(pending)
             except RuntimeError:
                 pending.close()
-                log.warning("%s could not run: no event loop can run it", what)
+                log.warning(
+                    "%s could not run: no event loop can run it, so what it would have closed "
+                    "may still be open",
+                    what,
+                )
                 return
             closing.add_done_callback(functools.partial(_log_abandoned_end, what))
             _hold_abandoned_open_cleanup(closing, what)

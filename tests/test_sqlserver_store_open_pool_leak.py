@@ -561,11 +561,12 @@ async def test_a_close_failure_never_replaces_a_cancel_on_the_error_path(
 async def test_a_failed_close_then_a_wedged_wait_closed_is_bounded(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #5720: after the store's own close fails on the error path, the pool is closed
-    again and waited on for at most the failed-open bound, so a pool that never finishes closing
-    cannot hang that path, and the executor is still shut down.
+    """BACKLOG #5720: after the store's own close fails before its pool step on the error path,
+    the pool is closed again and waited on for at most ``_ONE_CONNECTION_POOL_CLOSE_BOUND_S``, so
+    a pool that never finishes closing cannot hang that fallback, and the executor is still shut
+    down.
 
-    Mutation: drop the ``wait_for`` around that ``wait_closed()``. Red: the body never ends."""
+    Mutation: drop the timeout around that ``wait_closed()``. Red: the body never ends."""
     monkeypatch.setattr(sqlserver_module, "_ONE_CONNECTION_POOL_CLOSE_BOUND_S", 0.05)
     unwedge = asyncio.Event()
 
@@ -594,3 +595,24 @@ async def test_a_failed_close_then_a_wedged_wait_closed_is_bounded(
         task.result()
     assert executor.shutdown_calls == [False]
     assert "the pool did not finish closing within 0.05 s; it is left closing" in caplog.text
+
+
+async def test_a_close_that_failed_in_its_pool_step_is_not_retried(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5720: a close that failed inside its own pool step already shut the executor down
+    in its own finally, so the error path closes nothing more, and the block's error is raised.
+
+    Mutation: drop the ``_pool_executor is None`` check. Red: a second ``close()``."""
+    pool = _FakePool(wait_closed_hangs=True)
+    _install_fake_aioodbc(monkeypatch, pool)
+    executor = _fake_executor(monkeypatch)
+    monkeypatch.setattr(sqlserver_module, "check_pinned_certificate", lambda *a, **k: None)
+    with caplog.at_level(logging.WARNING), pytest.raises(ValueError, match="probe boom"):
+        async with SqlServerStore._one_connection_store(_settings(), posture=None):
+            raise ValueError("probe boom")
+    assert pool.closed == 1
+    assert pool.wait_closed_called == 1
+    assert executor.shutdown_calls == [False]
+    assert "after an error also failed (ConnectionResetError)" in caplog.text
+    assert "closing the pool after that also failed" not in caplog.text

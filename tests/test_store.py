@@ -2187,11 +2187,13 @@ async def test_an_abandoned_cleanup_that_later_fails_is_logged_at_error(
             asyncio.CancelledError(), wedged_release, lambda: None, cancels_before=0
         )
     )
-    await asyncio.wait({task}, timeout=3)
-    assert task.done()
-    fail.set()
-    for _ in range(10):
-        await asyncio.sleep(0)
+    try:
+        await asyncio.wait({task}, timeout=3)
+        assert task.done()
+    finally:
+        fail.set()
+        for _ in range(10):
+            await asyncio.sleep(0)
     assert [
         r.getMessage()
         for r in caplog.records
