@@ -24,7 +24,9 @@
     this needs.
 
     What this script checks. This paragraph states the chain and root checks, and the paragraph
-    that starts "The file is read once" states the rest; together they are the full statement.
+    that starts "The file is read once" states at least the other refusals. The file is also
+    refused when, at least, it is empty, holds a PEM block that is not well formed, holds base64
+    that does not decode, or holds no certificate.
     docs/DEPLOY-SERVER-DB.md points here; at least docs/INPUT-SURFACES.md and
     docs/DANGEROUS-FUNCTIONALITY.md still name some of its refusals, with "at least", and this text
     governs where they differ. A

@@ -1705,7 +1705,8 @@ the exception type alone, for an HTTP answer (a 423 for a record that fails its 
 503) or a refusal the checked read is declared to raise (`account_read_errors()`, at least a
 refused store call and a record that cannot be decrypted), less `AUDIT_WRITE_DEFECTS`. A bug
 whose type is in that refusal set, such as a `ValueError`, is logged the same way. Any other
-exception is an ERROR with its traceback. A failure is reported
+exception is an ERROR naming its type alone. No such line carries the exception's message or
+traceback. A failure is reported
 per account and rate-limited, in each engine process: only the first refusal of an account in
 each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
 the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal

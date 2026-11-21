@@ -67,6 +67,7 @@ from .._auth import (
     session_token,
 )
 from .._service import _service
+from ..pages._common import _seg
 from ..pages.admin import (
     CONFIRM_MANUAL_SCOPE_FIELD,
     CONFIRM_MANUAL_SCOPE_VALUE,
@@ -278,20 +279,18 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         of a read made only to label it may replace the page that hands it over. As
         :func:`~messagefoundry.audit_write.write_audit_soft` says of its ``defects``, a raise here
         would report an operation that already ran as a failure. An ``HTTPException`` logs a
-        WARNING naming the account and the status, and one of ``account_read_errors()`` outside
-        ``AUDIT_WRITE_DEFECTS`` a WARNING naming its type alone, since a refusal's text can carry
-        the record's values. Anything else, a defect included, logs an ERROR with its traceback,
-        so the bug can be found. None of these lines is rate-limited."""
+        WARNING naming the account and the status, one of ``account_read_errors()`` outside
+        ``AUDIT_WRITE_DEFECTS`` a WARNING naming its type, and anything else, a defect included,
+        an ERROR naming its type. No line carries the exception's message or traceback, since
+        either can hold the record's values (docs/PHI.md). None of these lines is rate-limited."""
 
-        def fallback(level: int, reason: str, *, trace: bool = False) -> str:
-            # Called inside each handler, so exc_info=True reads the exception being handled.
+        def fallback(level: int, reason: str) -> str:
             _log.log(
                 level,
                 "the name of account %s for a page after a landed action was not shown: its "
                 "checked read %s; the page names the account by id",
                 scrub_log_argument(user_id),
                 reason,
-                exc_info=trace,
             )
             return user_id
 
@@ -305,7 +304,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             reason = f"failed ({type(exc).__name__})"
             if isinstance(exc, account_read_errors()) and not isinstance(exc, AUDIT_WRITE_DEFECTS):
                 return fallback(logging.WARNING, reason)
-            return fallback(logging.ERROR, reason, trace=True)
+            return fallback(logging.ERROR, reason)
         return str(user.username)
 
     async def _user_detail(
@@ -1050,7 +1049,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if exc.status_code != status.HTTP_423_LOCKED:
                 raise
         else:
-            return RedirectResponse(f"/ui/users/{user_id}", status_code=303)
+            # Encoded as the list's link to this page is, so the path spelling is not put back raw.
+            return RedirectResponse(f"/ui/users/{_seg(user_id)}", status_code=303)
         return HTMLResponse(
             pages.user_delete_confirm_page(user_id, is_self=user_id == identity.user_id)
         )

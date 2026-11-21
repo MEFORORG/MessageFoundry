@@ -312,7 +312,11 @@ async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checke
 
 @pytest.mark.parametrize(
     "defect",
-    [TypeError("stand-in: a defect"), NotImplementedError("stand-in: a listed defect")],
+    [
+        # Each message carries record text, as a decode bug's message can.
+        TypeError(f"stand-in: a defect reading {_PLANTED}"),
+        NotImplementedError(f"stand-in: a listed defect reading {_PLANTED}"),
+    ],
     ids=["outside-the-refusals", "listed-defect"],
 )
 async def test_a_defect_in_the_post_action_name_read_still_shows_the_credential(
@@ -324,7 +328,8 @@ async def test_a_defect_in_the_post_action_name_read_still_shows_the_credential(
     """The reset has landed by the time its page reads the name, and its one-time credential is
     shown nowhere else. So an error outside the refusal set, and a listed defect inside it
     (``AUDIT_WRITE_DEFECTS``; NotImplementedError is a RuntimeError), still render the page with
-    the id, and log an ERROR with the traceback. On the code before this test they raised, and the
+    the id, and log an ERROR naming the exception's type, with no traceback and none of its
+    message, which here carries record text. On the code before this test they raised, and the
     credential was lost. The control for a refusal is the test above."""
     engine, _path = keyed
     service, _alerts, _intact, victim = await _setup(engine)
@@ -341,13 +346,17 @@ async def test_a_defect_in_the_post_action_name_read_still_shows_the_credential(
     assert r.status_code == 200
     assert "Temporary password issued" in r.text and "<code>" in r.text
     assert f"Convey this to {victim} " in r.text
-    assert any(
-        rec.levelname == "ERROR"
-        and victim in rec.getMessage()
-        and rec.exc_info is not None
-        and rec.exc_info[1] is defect
+    errors = [
+        rec
         for rec in caplog.records
-    )
+        if rec.levelname == "ERROR" and "names the account by id" in rec.getMessage()
+    ]
+    assert len(errors) == 1, caplog.text
+    assert victim in errors[0].getMessage()
+    assert type(defect).__name__ in errors[0].getMessage()
+    assert not errors[0].exc_info
+    # No log line from the request holds the record text the exception carried.
+    assert _PLANTED not in caplog.text
 
 
 async def test_the_summary_takes_its_roles_from_a_checked_record_only(
