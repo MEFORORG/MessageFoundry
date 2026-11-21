@@ -16,9 +16,10 @@ import inspect
 import textwrap
 from datetime import time
 from pathlib import Path
+from typing import Annotated
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from messagefoundry.config import models
 from messagefoundry.config.bool_numbers import NumbersRefuseBool
@@ -91,31 +92,58 @@ def test_a_policy_model_refuses_a_bool_on_a_number(
             model.model_validate(payload)
 
 
+#: Numbers, alone and in a list, that a numeric field validates: a value inside the usual bounds,
+#: such as ``ge=2`` or a weekday ordinal, as well as 1. No dict probe: the free-form ``settings``
+#: dicts would take one as a number, and no model here has a dict-of-numbers field.
+_NUMBER_PROBES: tuple[object, ...] = (1, 5, [1], [5])
+
+
+def _holds_a_number(got: object) -> bool:
+    if isinstance(got, bool):
+        return False
+    if isinstance(got, int | float):
+        return True
+    if isinstance(got, dict):
+        return any(_holds_a_number(item) for item in got.values())
+    if isinstance(got, list | tuple | set | frozenset):
+        return any(_holds_a_number(item) for item in got)
+    return False
+
+
 def _numeric_models() -> list[type[BaseModel]]:
-    """Every model in ``config.models`` with a field that validates ``1`` as a number."""
+    """Every model in ``config.models`` with a field that validates at least one of
+    :data:`_NUMBER_PROBES` to a value holding a number."""
     found = []
     for _, model in inspect.getmembers(models, inspect.isclass):
         if not issubclass(model, BaseModel) or model.__module__ != models.__name__:
             continue
-        for name in model.model_fields:
-            try:
-                got = model.__pydantic_validator__.validate_assignment(
-                    model.model_construct(), name, 1
-                )
-            except ValidationError:
-                continue
-            value = getattr(got, name, None)
-            if isinstance(value, int | float) and not isinstance(value, bool):
-                found.append(model)
-                break
+        if any(
+            _assigns_a_number(model, name, probe)
+            for name in model.model_fields
+            for probe in _NUMBER_PROBES
+        ):
+            found.append(model)
     return found
+
+
+def _assigns_a_number(model: type[BaseModel], name: str, probe: object) -> bool:
+    """Whether the field's own type and bounds, with no model validator, read ``probe`` as a
+    value holding a number."""
+    field = model.model_fields[name]
+    adapter: TypeAdapter[object] = TypeAdapter(Annotated[field.annotation, field])  # type: ignore[arg-type]
+    try:
+        got = adapter.validate_python(probe)
+    except ValidationError:
+        return False
+    return _holds_a_number(got)
 
 
 def test_every_model_with_a_number_shares_the_guard() -> None:
     """A model added to ``config.models`` with a numeric field, as a plain ``BaseModel``, fails
-    here. The positive control is that the walk finds the models this file probes."""
+    here. The positive control is that the walk finds the models this file probes, a set field
+    and a bounded one among them."""
     numeric = _numeric_models()
-    assert {RetryPolicy, BatchConfig, Destination} <= set(numeric)
+    assert {RetryPolicy, BatchConfig, Destination, ActiveWindow} <= set(numeric)
     assert [m.__name__ for m in numeric if not issubclass(m, NumbersRefuseBool)] == []
 
 
@@ -144,19 +172,31 @@ def _load(sub_table: str) -> Registry:
 
 
 @pytest.mark.parametrize(
-    "sub_table",
+    ("sub_table", "key"),
     [
-        "[outbound.retry]\nmax_attempts = false\n",
-        "[outbound.buildup]\nmax_depth = true\n",
-        "[outbound.stall]\nmax_oldest_seconds = true\n",
-        "[outbound.batch]\nmax_count = 10\nmax_wait_ms = true\n",
-        '[outbound.schedule]\n[[outbound.schedule.windows]]\ndays = [true]\nstart = "08:00"\n'
-        'end = "17:00"\n',
+        ("[outbound.retry]\nmax_attempts = false\n", "max_attempts"),
+        ("[outbound.buildup]\nmax_depth = true\n", "max_depth"),
+        ("[outbound.stall]\nmax_oldest_seconds = true\n", "max_oldest_seconds"),
+        ("[outbound.batch]\nmax_count = 10\nmax_wait_ms = true\n", "max_wait_ms"),
+        (
+            '[outbound.schedule]\n[[outbound.schedule.windows]]\ndays = [true]\nstart = "08:00"\n'
+            'end = "17:00"\n',
+            "days",
+        ),
     ],
 )
-def test_a_bool_in_connections_toml_names_the_bool(sub_table: str) -> None:
-    with pytest.raises(WiringError, match=_REFUSAL):
+def test_a_bool_in_connections_toml_names_the_key_and_the_bool(sub_table: str, key: str) -> None:
+    with pytest.raises(WiringError, match=f"{key} {_REFUSAL}"):
         _load(sub_table)
+
+
+def test_a_self_referencing_destination_setting_still_loads() -> None:
+    """The guard stops at a value validation handed back unchanged, so a free-form ``settings``
+    value that refers to itself does not send the walk into a loop."""
+    looped: dict[str, object] = {"a": 1}
+    looped["self"] = looped
+    built = Destination(name="OB", type=ConnectorType.MLLP, settings={"opts": looped})
+    assert built.settings["opts"] is looped
 
 
 def test_numbers_and_bool_fields_still_load() -> None:

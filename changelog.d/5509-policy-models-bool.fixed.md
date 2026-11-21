@@ -6,5 +6,6 @@
   `SaturationThreshold`, `ActiveWindow`, `BatchConfig`, `Validation` and `Destination`, built in
   code or from `connections.toml`; a boolean in a schedule window's `days` is now refused rather
   than read as a weekday. The buildup and stall thresholds already refused a boolean, and the
-  strict `connections.toml` tables a wrong-typed value; their refusal now names the boolean.
+  strict `connections.toml` tables a wrong-typed value; their refusal now names the field, and on
+  the retry and batch tables says it was a boolean.
   (`BACKLOG #5509`)

@@ -20,11 +20,11 @@ from pydantic import (
     field_validator,
 )
 
-#: pydantic error types that can stand in for a bool on a number. A number's own bound raises one
-#: where lax mode read the bool as a number first; strict mode, as the ``connections.toml`` policy
-#: tables validate, raises the type error instead. Either way the bool refusal names it instead
-#: (BACKLOG #5509).
-_NUMBER_BOUND_ERRORS: Final = frozenset(
+#: pydantic error types that can stand in for a bool on a number: a number's own bound, which lax
+#: mode raises once it has read the bool as a number, and the number's type error, which strict
+#: mode raises, as the ``connections.toml`` policy tables validate. The bool refusal names either
+#: one instead (BACKLOG #5509).
+_BOOL_AS_NUMBER_ERRORS: Final = frozenset(
     {
         "greater_than",
         "greater_than_equal",
@@ -71,6 +71,11 @@ def _bool_read_as_number(given: Any, got: Any, where: str) -> str | None:
     wrote."""
     if isinstance(given, bool):
         return where if isinstance(got, int | float) and not isinstance(got, bool) else None
+    # Validation that handed back the very object, as an ``Any`` value is, coerced nothing inside
+    # it, and a nested guarded model checked its own fields. Stopping there also ends the walk on
+    # a self-referencing value.
+    if got is given or isinstance(got, NumbersRefuseBool):
+        return None
     if isinstance(given, Mapping):
         if isinstance(got, BaseModel):
             fields = type(got).model_fields
@@ -119,13 +124,13 @@ class NumbersRefuseBool(BaseModel):
         try:
             validated = handler(value)
         except ValidationError as exc:
-            # A bool read as 0 can then fail the number's own bound (``gt=0``), and that message
-            # would hide the coercion: name the bool instead.
+            # A bool read as 0 can then fail the number's own bound (``gt=0``), and strict mode
+            # refuses it as a wrong type; either message would hide the bool: name it instead.
             found = next(
                 (
                     path
                     for err in exc.errors(include_url=False)
-                    if err["type"] in _NUMBER_BOUND_ERRORS
+                    if err["type"] in _BOOL_AS_NUMBER_ERRORS
                     and (path := _bool_at(value, err["loc"], where))
                 ),
                 None,
