@@ -6,8 +6,9 @@ The parity target is the k8s manifests' block *what an enforcing start needs* (B
 #5935), pinned by ``tests/test_k8s_enforce_start_inputs.py``. ``[security].enforcement`` defaults
 to ``enforce`` and nothing in ``docker/compose.yaml`` lowers it, so the default ``engine`` and the
 two ``ha`` engines are refused until at least an alert channel, verified-TLS log forwarding to an
-allowlisted collector with a writable spool, bounded retention, and, on the Postgres hop, a store
-CRL are set. Before this item the compose file named none of them.
+allowlisted collector, bounded retention, and, on the Postgres hop, a store CRL are set. Before
+this item the compose file named none of them. The parity target's docstring says why
+the writable spool mount is pinned apart from those gates.
 
 As in the manifests, the inputs only a site can supply ship as COMMENTED entries, because a
 placeholder would pass these gates and start an engine whose notices and logs go nowhere. So two
@@ -25,6 +26,7 @@ import re
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -35,7 +37,11 @@ from messagefoundry.pipeline.alert_sinks import (
     configured_alert_transport_names,
 )
 from messagefoundry.transports.egress import syslog_forward_refusal
-from tests.test_compose_revocation_attestation import _all_services, _serving_engines
+from tests.test_compose_revocation_attestation import (
+    _all_services,
+    _compose_doc,
+    _serving_engines,
+)
 from tests.test_k8s_enforce_start_inputs import (
     _BLOCK,
     _FILLED,
@@ -191,20 +197,40 @@ def _writable_sources(service: str) -> set[str]:
     return out
 
 
+_HA_ENGINES = ("engine-ha", "engine-standby")
+
+
+def _dropped_anchor_mounts(doc: dict[str, Any]) -> dict[str, list[Any]]:
+    """Per ha engine, the x-ha-engine mounts its own ``volumes`` no longer carries."""
+    anchor = doc["x-ha-engine"].get("volumes") or []
+    assert anchor, "positive control: x-ha-engine declares mounts"
+    out: dict[str, list[Any]] = {}
+    for name in _HA_ENGINES:
+        mounts = doc["services"][name].get("volumes") or []
+        out[name] = [m for m in anchor if m not in mounts]
+    return out
+
+
 def test_the_ha_engines_keep_every_anchor_mount() -> None:
     # Each serving ha engine replaces x-ha-engine's volumes to add its spool, so it must still
-    # carry every mount the anchor declares (schema-provision inherits them unchanged).
-    anchor = _all_services()["schema-provision"].get("volumes") or []
-    assert anchor, "positive control: x-ha-engine declares mounts"
-    for name in ("engine-ha", "engine-standby"):
-        mounts = _all_services()[name].get("volumes") or []
-        assert all(m in mounts for m in anchor), f"{name} dropped an anchor mount"
+    # carry every mount the anchor declares.
+    dropped = _dropped_anchor_mounts(_compose_doc())
+    assert not any(dropped.values()), f"an ha engine dropped an anchor mount: {dropped}"
+
+
+@pytest.mark.parametrize("name", _HA_ENGINES)
+def test_the_anchor_mount_check_sees_a_dropped_mount(name: str) -> None:
+    """Negative control: the check above fails once an engine's copy of an anchor mount is gone."""
+    doc = copy.deepcopy(_compose_doc())
+    removed = doc["x-ha-engine"]["volumes"][0]
+    doc["services"][name]["volumes"].remove(removed)
+    assert _dropped_anchor_mounts(doc)[name] == [removed]
 
 
 def test_the_ha_engines_share_no_writable_volume() -> None:
     # The spool locks its directory, so two engines writing one volume, at the spool path or
     # anywhere above it, would leave the second without a spool.
-    ha, standby = (_writable_sources(n) for n in ("engine-ha", "engine-standby"))
+    ha, standby = (_writable_sources(n) for n in _HA_ENGINES)
     assert ha and standby, "positive control: each ha engine mounts a writable volume"
     assert not ha & standby, f"the ha engines share a writable volume: {sorted(ha & standby)}"
 

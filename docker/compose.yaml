@@ -162,8 +162,8 @@ services:
       MEFOR_SECURITY_REQUIRE_MFA: "true"        # the default; covers directory accounts too. Off + exposed = refused under enforce
       MEFOR_STORE_REQUIRE_ENCRYPTION: "true"  # keeps the default keyless refusal past the audited opt-out (docs/PHI.md section 3)
       # --- what an enforcing start needs (BACKLOG #5400) ---
-      # As shipped, serve REFUSES to start until each line below is uncommented with your own
-      # value; x-ha-engine-env above says why they ship commented and what each group is for.
+      # As shipped, serve REFUSES to start. It needs at least each line below uncommented with your
+      # own value; x-ha-engine-env above says why they ship commented and what each group is for.
       # MEFOR_ALERTS_EMAIL_SMTP_HOST: "REPLACE-smtp.example.org"
       # MEFOR_ALERTS_SMTP_ALLOWED_HOSTS: "REPLACE-smtp.example.org"
       # MEFOR_ALERTS_EMAIL_FROM: "REPLACE-mefor@example.org"
@@ -287,7 +287,7 @@ services:
       - "disable-remote-debug"
       - "-B"
       - "-c"
-      - "import sys; from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV as V, tls_revocation_attested as ok; sys.exit(0 if ok() else 'error: refusing to start the engines: ' + V + ' does not read as true, so serve would refuse in-process TLS off loopback and restart forever (docs/SECURITY.md, API revocation gate). Set it to 1 only if your PKI enforces revocation for the certificates the engines serve and accept.')"
+      - "import sys; from messagefoundry.config.tls_policy import TLS_REVOCATION_ATTESTED_ENV as V, tls_revocation_attested as ok; sys.exit(0 if ok() else 'error: refusing to start any engine: ' + V + ' does not read as true, so serve would refuse in-process TLS off loopback and restart forever (docs/SECURITY.md, API revocation gate). Set it to 1 only if your PKI enforces revocation for the certificates the engine serves and accepts.')"
     environment:
       MEFOR_TLS_REVOCATION_ATTESTED: *revocation-attested
     network_mode: none
@@ -391,6 +391,9 @@ services:
       <<: *ha-engine-env
     # The anchor's volumes plus this engine's own log-spool volume (x-ha-engine-env says why). A
     # service's volumes replace the anchor's, so the first two alias its entries.
+    # `docker compose up --scale engine-standby=2` is UNSUPPORTED: every replica would mount this
+    # one named volume, so all but one would run without a spool. Add a third engine as its own
+    # service with its own spool volume instead.
     volumes:
       - *ha-config-mount
       - *ha-tls-mount

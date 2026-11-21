@@ -211,6 +211,12 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
   `messagefoundry gen-key`): `serve` refuses a keyless store by default. The manifests also set
   `MEFOR_STORE_REQUIRE_ENCRYPTION=true`, which keeps that refusal in force past the audited opt-out
   and encrypts nothing itself; [PHI.md](../docs/PHI.md#3-encryption-at-rest) §3 states the rule.
+- **Log spool (possibly PHI at rest):** the compose `ha` engines' `mefor-spool-ha` and
+  `mefor-spool-standby` volumes, the `log-spool` emptyDir in `k8s/ha-postgres.yaml`, and the
+  `log-spool` directory the other engines keep on the store volume hold the off-box forwarder's
+  unsent log records. Give them the store's volume encryption and
+  access control; [PHI.md §2](../docs/PHI.md#2-where-phi-lives--data-at-rest-inventory), *Off-box
+  forwarder spool*, is the inventory row.
 - **Secrets** (`MEFOR_STORE_ENCRYPTION_KEY`, `MEFOR_API_TLS_KEY_PASSWORD`, `MEFOR_STORE_PASSWORD`, …):
   the engine reads these from **env vars**. On k8s inject via `secretKeyRef` (clean). On Docker use
   `env_file` (gitignored) — note plain env is visible in `docker inspect`; prefer a secrets manager for

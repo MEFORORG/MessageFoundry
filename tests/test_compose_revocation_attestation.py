@@ -35,10 +35,15 @@ _REQUIRED = re.compile(r"^\$\{" + TLS_REVOCATION_ATTESTED_ENV + r":\?[^}]+\}$")
 
 
 @functools.cache
+def _compose_doc() -> dict[str, Any]:
+    """The whole compose file, merge keys resolved. Shared: deep-copy it before mutating."""
+    return dict(yaml.safe_load(_COMPOSE.read_text(encoding="utf-8")))
+
+
+@functools.cache
 def _all_services() -> dict[str, dict[str, Any]]:
     """Every compose service, merge keys resolved."""
-    doc = yaml.safe_load(_COMPOSE.read_text(encoding="utf-8"))
-    return dict(doc.get("services") or {})
+    return dict(_compose_doc().get("services") or {})
 
 
 def _serving_engines() -> dict[str, dict[str, Any]]:
