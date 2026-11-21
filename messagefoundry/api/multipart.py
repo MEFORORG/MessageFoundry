@@ -69,14 +69,14 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-# The Content-Disposition tokenizer (:func:`_disposition_params`). Each ``search`` of
-# ``_DISP_ITEM`` reads one item and consumes all it scans, with possessive quantifiers and
-# alternatives told apart by their first character, so a line is read in one linear pass: this is
-# the **ReDoS guard** (CodeQL py/polynomial-redos). The header block is attacker-supplied, and the
-# regex this replaced, ``(\w+)="..."`` unanchored, restarted at every offset of a word run and was
-# quadratic on one until a lookbehind guard was added. Running the parse in a worker thread
-# (BACKLOG #5522) does not make a quadratic scan safe, for the reason ``parse_upload_off_loop``'s
-# docstring states. The cost is pinned by the scan-budget tests in ``tests/test_multipart.py``.
+# The Content-Disposition tokenizer (:func:`_disposition_params`): one ``search`` of
+# ``_DISP_ITEM`` per item. This is the **ReDoS guard** (CodeQL py/polynomial-redos). The header block
+# is attacker-supplied, and the regex this replaced, ``(\w+)="([^"]*)"``, restarted at every offset
+# of a word run and was quadratic on one until a lookbehind guard was added. The scan is linear: the
+# only step that moves it back is a quoted value's literal reading, and a value's opening quote
+# follows ``=`` or a space, so it cannot be escaped, which bounds the rescan to about 2x. Running the
+# parse in a worker thread (BACKLOG #5522) does not make a quadratic scan safe, for the reason
+# ``parse_upload_off_loop``'s docstring states. ADR 0034's 2026-11-21 amendment records the cost.
 #:
 #: One item: either a quoted-string where a key belongs, or a key (the run up to a space, separator,
 #: ``=`` or quote, or nothing right before an ``=``) then, optionally, spaces, ``=``, spaces and a
@@ -101,15 +101,11 @@ _DISPOSITION_HEADER = "content-disposition:"
 #: client sends. Without it the block is bounded only by the request body cap — ``[store]
 #: .max_upload_bytes``, 25 MiB by default and up to 512 MiB — because that cap is applied to a part's
 #: *content*, only after its header has already been parsed. The scan is linear (see the guard above),
-#: but it ran synchronously on the asyncio event loop that also drives every listener and worker, and
-#: linear is not free at that size: a single request would block the engine for ~0.35 s at 25 MiB and
-#: ~7 s at the ceiling (the worker thread since BACKLOG #5522 does not help a single scan; see
-#: ``parse_upload_off_loop``). Bounding the header bounds the cost and, incidentally, gives the
-#: ReDoS analysis a length-bounded source instead of an attacker-sized one. The tokenizer that
-#: replaced the regex (BACKLOG #5787) loops in Python once per item: measured 2026-11-21 on a dev
-#: box, the slowest shape the scan-budget tests time (``=""`` repeated) took ~4 ms for a
-#: 12,000-character line, and a body of 16 parts with header blocks of that shape near this cap
-#: ~76 ms (~22 ms for ``a=b`` items), against ~5 ms for the regex.
+#: but linear is not free at that size, and the worker thread since BACKLOG #5522 does not spare the
+#: event loop a scan (see ``parse_upload_off_loop``). Bounding the header bounds the cost and,
+#: incidentally, gives the ReDoS analysis a length-bounded source instead of an attacker-sized one.
+#: What a header at this cap costs, and what an uncapped one would, is recorded once, in ADR 0034's
+#: 2026-11-21 amendment (BACKLOG #5787).
 _MAX_PART_HEADER_BYTES = 16 * 1024
 
 #: Cap on the number of parts in one body. The upload route keeps one file part and reads no other
@@ -353,8 +349,8 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             # skipping it would store the file cut short there. A 400, not a 413: the size is not
             # what the client has to change, and the other likely cause is headers ended with bare
             # LFs. Over the field cap it is raised at once; otherwise the first such part's refusal
-            # waits for the walk's end, so an unclosed body, often one cut inside a header block, is
-            # refused for that cause.
+            # waits for the walk's end, so an unclosed body, often one cut inside a header block, gets
+            # the missing close marker refusal unless another check refuses it first.
             size = end - start - (2 if body.endswith(b"\r\n", start, end) else 0)
             headerless = MultipartError(
                 f"multipart part of {size} bytes has no header block ended by a blank CRLF line; "

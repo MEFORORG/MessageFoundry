@@ -126,22 +126,20 @@ def _legacy_disposition(line: str) -> tuple[str | None, str | None]:
 
 #: Length of the hostile word run the cost arms measure. 12,000 word characters and no further ``="``
 #: is 73 percent of ``_MAX_PART_HEADER_BYTES``, so the arms measure close to the largest header the
-#: parser will actually admit rather than an arbitrary size. Measured 2026-09-03 on a dev box:
-#: ``parse_single_file_upload`` handles this body in ~0.16 ms with the guarded regex then shipped and
-#: ~0.7 s with the unguarded one -- a separation of about 3,900x, which is the room the budget below
-#: spends. Measured 2026-11-21 on a dev box with the tokenizer that replaced the regex (BACKLOG
-#: #5787): ~0.04 ms, and ~0.43 s with the unguarded regex in its place. So the production arm's
-#: margin below is now wider than the ~290x stated there, and the control arm's about 9x, not 13x.
+#: parser will actually admit rather than an arbitrary size. What this body costs, with the
+#: shipped tokenizer and with the unguarded regex in its place, is recorded once, in ADR 0034's
+#: 2026-11-21 amendment (BACKLOG #5787).
 _HOSTILE_HEADER_CHARS = 12_000
 
-#: The one line both cost arms are measured against, sitting between the two costs recorded above. The
-#: margins run in OPPOSITE directions across it, which is why a single number does the work of two.
+#: The one line the cost arms are measured against, sitting between the costs ADR 0034's 2026-11-21
+#: amendment records. The margins run in OPPOSITE directions across it, which is why a single number
+#: does the work of two; that amendment gives each margin.
 #:
-#: **Above the line (the production arm) a stall turns a pass into a failure, so the margin is huge:**
-#: ~290x, and the estimate is best-of-5, so a runner would have to stall for 50 ms five separate times
-#: inside a 0.16 ms window to fake a red.
+#: **Above the line (the production arms) a stall turns a pass into a failure, so the margin must be
+#: wide,** and each estimate is best-of-5, so one stall cannot fake a red. The branch arm's margin is
+#: the narrowest of them, so a steady slowdown (a loaded or traced runner) reaches it first.
 #:
-#: **Below the line (the control arm) a stall can only help, so the margin stays tight:** ~13x, and one
+#: **Below the line (the control arm) a stall can only help, so the margin stays tight,** and one
 #: sample is enough there because noise cannot deflate it.
 #:
 #: **Deliberately one number rather than a ceiling plus a lower floor.** A floor beneath the ceiling
@@ -261,7 +259,7 @@ def test_the_tokenizer_yields_these_pairs(value: str, pairs: list[tuple[str, str
 
 def _hostile_upload() -> tuple[str, bytes]:
     """A well-formed single-file upload whose Content-Disposition carries a long word run and no
-    further ``="``. That is the shape an unguarded ``(\\w+)="…"`` walks quadratically: the scan
+    further ``="``. That is the shape an unguarded ``(\\w+)="([^"]*)"`` walks quadratically: the scan
     restarts at every offset inside the run and each restart walks the rest of it.
 
     The size invariant lives here rather than in one arm, because it is a property of the fixture and
@@ -320,9 +318,10 @@ def test_a_hostile_disposition_header_stays_inside_the_scan_budget() -> None:
     the quotient one way, up. Re-run 15 times on an IDLE box on 2026-09-03 it ranged **3.73 to 6.80**,
     already 85 percent of the way to its own bound with nothing else competing for the core.
 
-    The separation between linear and quadratic on this input is ~3,900x, not 4x, so an absolute
-    budget carries ~290x of headroom where the ratio carried 1.9x. It also times the shipping entry
-    point rather than a detached regex, so the cost claim is about the parse an upload really runs.
+    The separation between linear and quadratic on this input is thousands of times, not 4x, so an
+    absolute budget carries far more headroom than the ratio's 1.9x; ADR 0034's 2026-11-21 amendment
+    records the figures. It also times the shipping entry point rather than a detached regex, so the
+    cost claim is about the parse an upload really runs.
     """
     seconds = _parse_seconds(5)
     assert seconds < _SCAN_BUDGET_SECONDS, (
@@ -337,8 +336,9 @@ def test_a_hostile_disposition_header_stays_inside_the_scan_budget() -> None:
 def test_every_tokenizer_branch_stays_inside_the_scan_budget(unit: str) -> None:
     """The word run above is the regex's worst case, not the tokenizer's, so each tokenizer branch
     (stray and unclosed quotes, escapes, ``=`` with spaces, separators, bare items, tokens) is timed
-    too, on a line of that unit repeated near ``_MAX_PART_HEADER_BYTES``. Measured 2026-11-21 on a
-    dev box, the slowest, ``=""``, took ~4 ms, so the budget has about 12x of room."""
+    too, on a line of that unit repeated near ``_MAX_PART_HEADER_BYTES``. ADR 0034's 2026-11-21
+    amendment records what each costs. This arm has no positive control: nothing here shows the
+    budget would catch a super-linear tokenizer on these shapes, and no test times a whole body."""
     value = unit * (_HOSTILE_HEADER_CHARS // len(unit))
     best = float("inf")
     for _ in range(5):
