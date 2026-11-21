@@ -1979,6 +1979,7 @@ async def _run_to_completion(
     *,
     what: str = "a revoke's seal report",
     lost: str = "its remaining audit rows and pages were not sent",
+    report: bool = True,
 ) -> tuple[bool, BaseException | None]:
     """Run ``body`` as a task awaited through :func:`asyncio.shield`, awaited again after each
     cancel, so a cancel cannot cut it short. Returns whether a cancel landed meanwhile, and the
@@ -1987,7 +1988,15 @@ async def _run_to_completion(
     row value (CLAUDE.md section 9). A body that ends cancelled is logged too, and returned as a
     ``CancelledError`` (decision d20261110T063908944-857965, item 5). ``what`` names the body and
     ``lost`` what its unfinished end leaves undone in those lines; the defaults are the revoke's,
-    so its callers pass neither (BACKLOG #5720)."""
+    so its callers pass neither (BACKLOG #5720). ``report`` False logs neither line, for a caller
+    that says itself what follows such an end.
+
+    A ``GeneratorExit`` thrown into the wait is re-raised, not taken for the body's failure: a
+    coroutine being closed cannot await again, and trying would replace the exit with a
+    ``RuntimeError`` (BACKLOG #5720). A body that itself ends with one is not returned either: on
+    CPython 3.14.7 such a ``GeneratorExit`` propagates out of this coroutine even when caught
+    here, measured with a handler that swallows it and with the earlier
+    ``except BaseException: pass``."""
     task = asyncio.ensure_future(body())
     cancelled = False
     while not task.done():
@@ -1998,13 +2007,16 @@ async def _run_to_completion(
             # ends is still raised; the body's own cancel is read below instead.
             if not task.cancelled():
                 cancelled = True
+        except GeneratorExit:
+            raise
         except BaseException:  # noqa: BLE001 -- the body's own failure, read from the task below
             pass
     if task.cancelled():
-        log.error("%s was cancelled before it finished; %s", what, lost)
+        if report:
+            log.error("%s was cancelled before it finished; %s", what, lost)
         return cancelled, asyncio.CancelledError()
     failure = task.exception()
-    if failure is not None:
+    if failure is not None and report:
         log.error("%s failed (%s); %s", what, type(failure).__name__, lost)
         log.debug("%s failure", what, exc_info=failure)
     return cancelled, failure
@@ -2019,6 +2031,10 @@ FAILED_OPEN_CANCEL_BOUND_S = 5.0
 # not the module, so the strong reference goes with a closed loop rather than outliving it.
 _ABANDONED_OPEN_CLEANUPS_ATTR = "_mefor_abandoned_open_cleanups"
 
+#: How many abandoned cleanups one loop holds at once (BACKLOG #5720). Past it a further one is not
+#: held, so failing opens whose cleanups never finish cannot grow the set without end.
+ABANDONED_OPEN_CLEANUPS_MAX = 64
+
 
 def cancels_at_entry() -> int:
     """The current task's ``cancelling()`` count, read when a store open starts, so
@@ -2028,13 +2044,19 @@ def cancels_at_entry() -> int:
     return current.cancelling() if current is not None else 0
 
 
-def _force_failed_open_release(force_release: Callable[[], object]) -> None:
-    """Call a backend's synchronous release, logging a failure by class (vault BACKLOG #3054)."""
+def _force_failed_open_release(
+    force_release: Callable[[], object] | None, *, after: str = "a failed store open"
+) -> None:
+    """Call a backend's synchronous release, logging a failure by class (vault BACKLOG #3054).
+    None is a caller with nothing it can release without waiting."""
+    if force_release is None:
+        return
     try:
         force_release()
     except Exception as failure:  # noqa: BLE001 — never mask the open's error
         log.warning(
-            "forcing the release after a failed store open also failed (%s)",
+            "forcing the release after %s also failed (%s)",
+            after,
             type(failure).__name__,
         )
 
@@ -2058,9 +2080,32 @@ def _stop_unawaited(conn: aiosqlite.Connection) -> None:
         future.add_done_callback(_read_stop_outcome)
 
 
-def _hold_abandoned_open_cleanup(task: asyncio.Future[Any]) -> None:
+def _log_abandoned_end(what: str, task: asyncio.Future[tuple[bool, BaseException | None]]) -> None:
+    """Log how a cleanup this open stopped waiting for ended, when it ended badly, since nothing
+    else reports it then (BACKLOG #5720)."""
+    if task.cancelled():
+        ended: BaseException | None = asyncio.CancelledError()
+    else:
+        ended = task.exception() or task.result()[1]
+    if ended is None:
+        return
+    if isinstance(ended, asyncio.CancelledError):
+        log.warning("%s, which an open stopped waiting for, later ended cancelled", what)
+        return
+    log.error(
+        "%s, which an open stopped waiting for, later failed (%s)", what, type(ended).__name__
+    )
+    log.debug("%s failure", what, exc_info=ended)
+
+
+def _hold_abandoned_open_cleanup(
+    task: asyncio.Future[Any], what: str = "a failed store open's cleanup"
+) -> None:
     """Keep a strong reference to a cleanup this open stopped waiting for until it finishes, so
-    the loop does not drop it pending (BACKLOG #5720)."""
+    the loop does not drop it pending (BACKLOG #5720). At most
+    :data:`ABANDONED_OPEN_CLEANUPS_MAX` per loop; past that one is not held, and that is logged."""
+    if task.done():
+        return
     loop = task.get_loop()
     held: set[asyncio.Future[Any]] | None = getattr(loop, _ABANDONED_OPEN_CLEANUPS_ATTR, None)
     if held is None:
@@ -2070,6 +2115,14 @@ def _hold_abandoned_open_cleanup(task: asyncio.Future[Any]) -> None:
         except AttributeError:
             # A loop class that takes no attribute: the references the cleanup's own awaits hold.
             return
+    if len(held) >= ABANDONED_OPEN_CLEANUPS_MAX:
+        log.warning(
+            "%s, unfinished, is not held: %d such cleanups are held already, so only its own "
+            "pending awaits keep it",
+            what,
+            len(held),
+        )
+        return
     held.add(task)
     task.add_done_callback(held.discard)
 
@@ -2077,9 +2130,10 @@ def _hold_abandoned_open_cleanup(task: asyncio.Future[Any]) -> None:
 async def cleanup_failed_open(
     exc: BaseException,
     release: Callable[[], Awaitable[None]],
-    force_release: Callable[[], object],
+    force_release: Callable[[], object] | None,
     *,
     cancels_before: int,
+    what: str = "a failed store open's cleanup",
 ) -> None:
     """Run a failed store open's ``release`` through :func:`_run_to_completion`, so a cancel
     cannot cut it short and leak what the open built (BACKLOG #5720). ``release`` logs its own
@@ -2095,18 +2149,38 @@ async def cleanup_failed_open(
     the bound, ``force_release`` drops what the open built without waiting, and this stops
     waiting for the cleanup. ``force_release`` is synchronous for the same reason it is the only
     thing a ``GeneratorExit`` runs: a coroutine being closed cannot await, and awaiting would
-    replace the exit with a ``RuntimeError``."""
+    replace the exit with a ``RuntimeError``. A ``GeneratorExit`` thrown into the wait runs it
+    too, then is re-raised. ``force_release`` None is a caller with nothing to release without
+    waiting: past the bound this only stops waiting, and what the cleanup holds stays open until
+    it finishes. ``what`` names the cleanup in its log lines. A cleanup that ends cancelled,
+    waited for or not, is logged at WARNING. A failure the release raises to it is logged at
+    ERROR: here when the cleanup was waited for, and by :func:`_log_abandoned_end` when it was
+    not (BACKLOG #5720)."""
+    # What the forced-release WARNING names: the open, or the caller's own cleanup.
+    after = "a failed store open" if what == "a failed store open's cleanup" else what
     if isinstance(exc, GeneratorExit):
-        _force_failed_open_release(force_release)
+        _force_failed_open_release(force_release, after=after)
+        if force_release is None:
+            # Nothing to force, so schedule the ordinary release: that needs no await here. With
+            # no current loop, or a closed one, it cannot be scheduled, and that is logged rather
+            # than raised over the exit.
+            pending = _run_to_completion(release, report=False)
+            try:
+                closing = asyncio.ensure_future(pending)
+            except RuntimeError:
+                pending.close()
+                log.warning(
+                    "%s could not run: no event loop can run it, so what it would have closed "
+                    "may still be open",
+                    what,
+                )
+                return
+            closing.add_done_callback(functools.partial(_log_abandoned_end, what))
+            _hold_abandoned_open_cleanup(closing, what)
         return
 
-    task = asyncio.ensure_future(
-        _run_to_completion(
-            release,
-            what="a failed store open's cleanup",
-            lost="what the open built may not have been released",
-        )
-    )
+    # Not reported there: an end it cuts short is reported below, with what follows it.
+    task = asyncio.ensure_future(_run_to_completion(release, report=False))
     loop = asyncio.get_running_loop()
     current = asyncio.current_task()
     # A cancel this open received, under its own exception or another, has landed already.
@@ -2122,14 +2196,18 @@ async def cleanup_failed_open(
         remaining = None if deadline is None else deadline - loop.time()
         if remaining is not None and remaining <= 0:
             # Checked before each wait, so a cancel repeated on every pass cannot keep it away.
-            _force_failed_open_release(force_release)
+            _force_failed_open_release(force_release, after=after)
             log.warning(
-                "a failed store open's cleanup did not finish within %s s of %s; what the open"
-                " built was released without waiting for it",
+                "%s did not finish within %s s of %s; %s",
+                what,
                 FAILED_OPEN_CANCEL_BOUND_S,
                 trigger,
+                "what the open built was released without waiting for it"
+                if force_release is not None
+                else "it was left to finish on its own",
             )
-            _hold_abandoned_open_cleanup(task)
+            task.add_done_callback(functools.partial(_log_abandoned_end, what))
+            _hold_abandoned_open_cleanup(task, what)
             break
         try:
             if remaining is None:
@@ -2138,6 +2216,15 @@ async def cleanup_failed_open(
                 await asyncio.wait_for(asyncio.shield(task), remaining)
         except TimeoutError:
             continue  # the next pass finds the deadline passed, or the cleanup done
+        except GeneratorExit:
+            # This coroutine is being closed and cannot await again: release what it can now.
+            # A cleanup task already done ended with its body's own GeneratorExit, which
+            # _run_to_completion lets through; that one was not stopped waiting for.
+            _force_failed_open_release(force_release, after=after)
+            if not task.done():
+                task.add_done_callback(functools.partial(_log_abandoned_end, what))
+                _hold_abandoned_open_cleanup(task, what)
+            raise
         except asyncio.CancelledError:
             # Ours unless only the cleanup task was cancelled: a cancel of this task landing in
             # the same turn counts too, so it is never dropped (BACKLOG #5720).
@@ -2153,7 +2240,18 @@ async def cleanup_failed_open(
     if task.done() and (task.cancelled() or task.result()[1] is not None):
         # The cleanup ended cancelled or failed, so what it should have closed may be open,
         # the read pool included: drop it without waiting (BACKLOG #5720).
-        _force_failed_open_release(force_release)
+        _force_failed_open_release(force_release, after=after)
+        ended = None if task.cancelled() else task.result()[1]
+        left = (
+            "what it had not closed was released without waiting for it"
+            if force_release is not None
+            else "what it had not closed may still be open"
+        )
+        if ended is None or isinstance(ended, asyncio.CancelledError):
+            log.warning("%s ended cancelled before it finished; %s", what, left)
+        else:
+            log.error("%s failed (%s); %s", what, type(ended).__name__, left)
+            log.debug("%s failure", what, exc_info=ended)
     if cancelled and isinstance(exc, Exception):
         raise asyncio.CancelledError from exc
 
@@ -8639,6 +8737,13 @@ def _qmark_cutoff_case(
 _CONNECTION_WORKER_EXIT_TIMEOUT: Final[float] = 5.0
 
 
+def _log_close_failure(what: str, exc: BaseException) -> None:
+    """A close step's failure at WARNING by class only, its traceback at DEBUG: a driver's or a
+    defect's message may carry a path or a row value (CLAUDE.md section 9, BACKLOG #5720)."""
+    log.warning("%s (%s)", what, type(exc).__name__)
+    log.debug("%s", what, exc_info=exc)
+
+
 async def _await_connection_worker_exit(
     conn: aiosqlite.Connection, *, timeout: float = _CONNECTION_WORKER_EXIT_TIMEOUT
 ) -> None:
@@ -13633,24 +13738,24 @@ class MessageStore:
             # A read-only handle reserved nothing and cannot write the settlement (BACKLOG #1780).
             if not self._cipher_foreign and not self._read_only:
                 await self.checkpoint_cipher_invocations(settle=True)
-        except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
-            log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
+            _log_close_failure("could not settle the AES-GCM invocation bound at close", exc)
         # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members and
         # resolves their futures before the write connection is closed — otherwise an in-flight handoff
         # would hang forever on a future no committer will ever complete.
         if self._group_commit is not None:
             try:
                 await self._group_commit.aclose()
-            except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
-                log.warning("error closing group-commit committer", exc_info=True)
+            except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
+                _log_close_failure("error closing group-commit committer", exc)
         # Close every pooled read connection (tracked in _read_conns regardless of pool checkout
         # state), then the writer. Best-effort: one failing close must not strand the rest.
         for conn in self._read_conns:
             try:
                 await conn.close()
                 await _await_connection_worker_exit(conn)
-            except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
-                log.warning("error closing read-pool connection", exc_info=True)
+            except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
+                _log_close_failure("error closing read-pool connection", exc)
         self._read_conns = []
         self._read_pool = None
         await self._db.close()
