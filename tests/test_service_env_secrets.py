@@ -238,9 +238,14 @@ def test_no_identifier_in_the_module_reads_as_a_secret_to_codeql() -> None:
 
 
 def test_a_name_set_to_nothing_is_not_listed() -> None:
-    posture = _service(["MEFOR_STORE_ENCRYPTION_KEY=", "MEFOR_STORE_PASSWORD=   ", "=orphan"])
+    posture = _service(["MEFOR_STORE_ENCRYPTION_KEY=", "MEFOR_STORE_PASSWORD=   ", "Path=C:\\x"])
     assert posture.listed == ()
     assert service_env_refusal(posture) is None
+    # An equals-led item may be the password itself, split from its name, so it is read as its
+    # value and refuses, Windows' own nameless entries among them (vault BACKLOG #5394).
+    for item in ("=orphan", "=C:=C:\\x"):
+        orphan = _service(["MEFOR_STORE_PASSWORD=   ", item])
+        assert orphan.listed == ("MEFOR_STORE_PASSWORD",), item
 
 
 def test_a_service_that_cannot_be_found_is_named_and_not_refused() -> None:
