@@ -48,7 +48,7 @@ from concurrent.futures import Executor, ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from pathlib import Path
-from stat import FILE_ATTRIBUTE_REPARSE_POINT, S_ISLNK, S_ISREG
+from stat import FILE_ATTRIBUTE_REPARSE_POINT, S_ISDIR, S_ISLNK, S_ISREG
 from typing import Any, BinaryIO, Literal, NamedTuple, Protocol, TypeGuard
 
 from messagefoundry.config.atomic_edit import _REFUSED, LOCK_FILE_NAME, edit_lock, lock_path_for
@@ -348,9 +348,14 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
     ``lstat``, and opens whatever it names.** Only then is it refused: the name is checked again
     after the open, and must still be no link and name the file that was opened
     (``os.path.samestat``), so this function returns no handle to, and nothing is read from, the
-    link's target. A regular file put in its place, as an atomic replace does, is read. Raises
-    :class:`_NotPlainError` for a refusal, and any other ``OSError`` the filesystem gives,
-    ``FileNotFoundError`` and ``PermissionError`` included."""
+    link's target. A regular file put in its place, as an atomic replace does, is read.
+
+    An open the filesystem refuses is a :class:`_NotPlainError` too when a fresh ``lstat`` shows
+    the name is now a link or not a regular file (BACKLOG #5388 added item 3), as at least a
+    dangling link Windows followed, which answers ``FileNotFoundError``, a Windows folder, which
+    answers ``PermissionError``, and a socket are. Raises :class:`_NotPlainError` for a refusal,
+    and any other ``OSError`` the filesystem gives, ``FileNotFoundError`` and ``PermissionError``
+    included."""
     before = path.lstat()
     if _names_a_link(before) or not S_ISREG(before.st_mode):
         raise _NotPlainError(f"{path.name} is not a plain file")
@@ -362,7 +367,10 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
         # there a FileNotFoundError for a dangling link it followed. The name is what decides,
         # so every caller sees one refusal (BACKLOG #5388 added item 3).
         if _unplain_now(path, exc):
-            raise _NotPlainError(f"{path.name} changed after it was checked") from None
+            # The open's own error is named, so the log says what was met.
+            raise _NotPlainError(
+                f"{path.name} changed after it was checked: {codec_safe_str(exc)}"
+            ) from None
         raise
     try:
         # Before the fdopen, which answers a directory swapped in after the lstat with its own
@@ -489,6 +497,15 @@ def _unplain_now(name: object, cause: OSError) -> bool | None:
         )
         return None
     return _names_a_link(info) or not S_ISREG(info.st_mode)
+
+
+def _lstat_is_dir(path: Path) -> bool:
+    """Whether ``path`` itself, not a link's target, is a directory. ``False`` when it cannot be
+    checked; the caller then raises the error that led here, so the fault is not lost."""
+    try:
+        return S_ISDIR(path.lstat().st_mode)
+    except OSError:
+        return False
 
 
 def _unpadded(text: str) -> str:
@@ -2931,14 +2948,13 @@ class UploadStore:
                     blob_path.unlink(missing_ok=True)
                 except OSError as exc:
                     # A directory swapped in for the body after the check above (BACKLOG #5388
-                    # added item 3). The sidecar is kept, so the upload stays listed.
-                    if _refused_read(exc) != "damaged":
+                    # added item 3), which every platform refuses to unlink, though by different
+                    # errors. Decided by what the name is, so any other unlink failure, such as a
+                    # read-only volume, is raised as it is. The sidecar is kept, so the upload
+                    # stays listed.
+                    if not _lstat_is_dir(blob_path):
                         raise
-                    body_defect: str | None = codec_safe_str(exc)
-                else:
-                    body_defect = None
-                if body_defect is not None:
-                    raise _damaged(file_id, "body", body_defect)
+                    raise _damaged(file_id, "body", codec_safe_str(exc)) from None
                 meta_path.unlink(missing_ok=True)
             return meta
 
