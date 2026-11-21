@@ -1150,11 +1150,13 @@ the move back. The new certificate names what a first-run mint for the current b
 client on this box dials that bind through `localhost`, `127.0.0.1` or `::1`, a replacement, a
 renewal included, also keeps each of those three the old certificate named, and always `127.0.0.1`,
 which the CLI, the IDE and the harness dial by default. A replacement for a missing name is audited
-with reason `bind_changed`, and a renewal, including one of a pair that also lacks a name, with
-reason `renewal`; a shard makes neither, and the new certificate must be imported the same way
-(BACKLOG #5973). At least a shard, a bind the certificate builder refuses (a WARNING names it), and
-a file or lock failure (a WARNING, and the next start tries again) keep serving the old certificate,
-which lacks a name the current bind needs.
+with reason `bind_changed`, unless the pair is also due for renewal, which is audited with reason
+`renewal`. An engine shard makes neither. The audit row may be missing if its write fails, which
+logs an ERROR, or if the start fails before the store opens; the WARNING line is logged either way.
+Import the certificate from either replacement as after a renewal (BACKLOG #5973). At least a shard,
+a bind the certificate builder refuses (a WARNING names it), and a file or lock failure (a WARNING,
+and the next start tries again) keep serving the old certificate, which lacks a name the current
+bind needs.
 See
 [INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console". (The former PySide6 desktop
 console was retired — BACKLOG #103.)

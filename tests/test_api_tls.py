@@ -4545,6 +4545,19 @@ def test_a_pre_5790_pair_for_the_default_bind_is_re_minted_and_names_all_three(
     assert tuple(_san_entries(cert)) == _LOOPBACK_SANS
 
 
+def test_a_pair_both_due_and_missing_a_name_is_audited_as_a_renewal(tmp_path: Path) -> None:
+    """A pre-#5790 pair naming 127.0.0.1 alone, inside its last third, lacks ``::1`` and
+    ``localhost`` and is due, so it is replaced once, with reason ``renewal``, and the new pair
+    names all three (BACKLOG #5790).
+
+    Mutation: test missing names before expiry in ``_replacement_due``. Red: ``bind_changed``."""
+    cert, _ = _plant_generated_pair(tmp_path, lived_days=300, left_days=65, legacy=True)
+    events: list[GeneratedPairReplaced] = []
+    ensure_api_tls_material(ApiSettings(), state_dir=tmp_path, replacements=events)
+    assert [e.reason for e in events] == ["renewal"]
+    assert tuple(_san_entries(cert)) == _LOOPBACK_SANS
+
+
 def test_an_engine_shaped_pair_with_no_san_is_re_minted(tmp_path: Path) -> None:
     """A certificate with no SubjectAlternativeName verifies against no URL at all."""
     cert, key = _plant_generated_pair(tmp_path, lived_days=1, left_days=300, sans=False)
