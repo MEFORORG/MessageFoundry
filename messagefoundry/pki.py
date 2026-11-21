@@ -1856,7 +1856,7 @@ def san_names(pem: bytes, name: str) -> bool:
     ``name`` is classified as :func:`make_self_signed` classifies it (:func:`_general_names`), so a
     certificate that function minted for ``name`` always answers ``True``. An IP is compared by
     address without an IPv6 zone, which a SAN cannot carry; a DNS name without regard to case or a
-    trailing dot (docs/SERVICE.md says what that leaves). ``False`` when the certificate has no
+    trailing dot. ``False`` when the certificate has no
     readable SAN; ``True`` when ``name`` cannot be classified at all, so a caller deciding whether
     to replace the certificate never replaces it over a name the mint would refuse too. Raises
     ``ValueError`` when ``pem`` is not a parseable certificate. Reads only the public certificate.

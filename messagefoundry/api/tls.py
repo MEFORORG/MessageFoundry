@@ -288,8 +288,7 @@ def _names_missing(host: str, pem: bytes) -> list[str]:
     lacks, matched by :func:`messagefoundry.pki.san_names`: the subject and
     :func:`_generated_sans`, except that a WILDCARD bind requires only its family's loopback, the
     address a client dials, since no client dials ``0.0.0.0`` or ``::``. Raises ``ValueError`` when
-    ``pem`` is not a parseable certificate. docs/SERVICE.md states how the match treats a
-    trailing dot."""
+    ``pem`` is not a parseable certificate."""
     from messagefoundry import pki
 
     subject = [] if wildcard_loopback(host) is not None else [unbracketed(host)]

@@ -1140,25 +1140,24 @@ renewal, import the new `api-generated-cert.pem` into the browser trust store ag
 any copy of it you pass to `--cacert`.** A sharded service (`supervise`) renews once, before it
 starts its shards, and a shard it restarts never renews, so every shard serves the same certificate.
 The same replacement runs at startup, whatever the expiry, when the reused certificate lacks a
-name its current bind requires, matched without regard to case or an IPv6 zone. Matching also
-ignores a trailing dot, as on origin/main, so at least a move between `name` and `name.` reuses
-the pair, and a client that treats the dotted name as distinct (Python's `ssl` module does) then
-fails to verify the other spelling. A wildcard `--host` requires only the loopback of its
-family, which a client on this box dials (`127.0.0.1` for `0.0.0.0`, `::1` for `::`). Any other
-bind requires its host without IPv6 brackets (`[::1]` is the address `::1`), and a loopback
-bind, any spelling of `127.0.0.1`, `::1` or `localhost`, also the other two of those three
-(BACKLOG #5790). For example, a certificate from a first-run mint for `0.0.0.0` is replaced
-after a move to `127.0.0.1`, because it lacks `::1` and `localhost`. A certificate minted for a
-loopback bind is not replaced by a move to a wildcard, nor by a later move from that wildcard
-back to `127.0.0.1`, `::1` or `localhost`. The new certificate names what a first-run mint for the current bind would. When a client on this box
-dials that bind through `localhost`, `127.0.0.1` or `::1`, a replacement, a renewal included,
-also keeps each of those three the old certificate named, and always `127.0.0.1`, which the CLI,
-the IDE and the harness dial by default. Its audit row's reason is `bind_changed`, a shard never
-makes it, and the new certificate must be imported the same way (BACKLOG #5973). At least a
-shard, a bind the certificate builder refuses (a WARNING names it), and a file or lock failure
-(a WARNING, and the next start tries again) keep serving the old certificate, which lacks a name
-the bind requires. A replacement keeps no other name the old certificate carried, as before
-BACKLOG #5790, so a name added by hand to a pair at the generated path is dropped.
+name its current bind requires, matched without regard to case or an IPv6 zone. A wildcard
+`--host` requires only the loopback of its family, which a client on this box dials (`127.0.0.1`
+for `0.0.0.0`, `::1` for `::`). Any other bind requires its host without IPv6 brackets (`[::1]` is
+the address `::1`). A loopback bind also requires the other two of `127.0.0.1`, `::1` and
+`localhost` (BACKLOG #5790). At least these spellings count as loopback: `127.0.0.1`, `::1`,
+`localhost`, `LOCALHOST`, `localhost.`, `[::1]`, `0:0:0:0:0:0:0:1` and `::1%1`. For example, a
+certificate from a first-run mint for `0.0.0.0` is replaced after a move to `127.0.0.1`, because
+it lacks `::1` and `localhost`. A certificate minted for a loopback bind is not replaced by a move
+to a wildcard, nor by a later move from that wildcard back to `127.0.0.1`, `::1` or `localhost`.
+The new certificate names what a first-run mint for the current bind would. When a client on
+this box dials that bind through `localhost`, `127.0.0.1` or `::1`, a replacement, a renewal
+included, also keeps each of those three the old certificate named, and always `127.0.0.1`, which
+the CLI, the IDE and the harness dial by default. Its audit row's reason is `bind_changed`, a shard
+never makes it, and the new certificate must be imported the same way (BACKLOG #5973). At least a
+shard, a bind the certificate builder refuses (a WARNING names it), and a file or lock failure (a
+WARNING, and the next start tries again) keep serving the old certificate, which lacks a name the
+bind requires. A replacement keeps no other name the old certificate carried, as before BACKLOG
+#5790, so a name added by hand to a pair at the generated path is dropped.
 See
 [INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console". (The former PySide6 desktop
 console was retired — BACKLOG #103.)
