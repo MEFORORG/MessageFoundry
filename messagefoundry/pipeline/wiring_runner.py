@@ -259,7 +259,11 @@ from messagefoundry.store import (
     Stage,
     StreamingAttachmentsUnsupported,
 )
-from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
+from messagefoundry.store.base import (
+    ATTACHMENT_CONTENT_TYPE_MAX,
+    AuditStore,
+    pool_over_provisioned_warning,
+)
 from messagefoundry.store.cell_tag import CellTagError, CellTagSink, dead_letter_on_cell_tag
 from messagefoundry.store.crypto import (
     MARKER_PREFIX,
@@ -1208,16 +1212,11 @@ class _StreamBudgetExceeded(Exception):
         self.alone = alone
 
 
-#: The widest ``content_type`` every backend's ``attachment`` column holds, in UTF-16 code units:
-#: SQL Server's ``NVARCHAR(256)`` (SQLite and PostgreSQL use unbounded ``TEXT``). OBX-5.2 is
-#: sender-controlled, so a longer label would fail the write with error 2628 on every resend.
-_ATTACHMENT_CONTENT_TYPE_MAX = 256
-
-
 def _label_fits_every_backend(label: str) -> bool:
     """Whether every backend's ``attachment.content_type`` takes ``label`` (BACKLOG #1619): no NUL,
     which PostgreSQL ``TEXT`` refuses (an HL7 ``\\X00\\`` escape decodes to one), and no wider than
-    :data:`_ATTACHMENT_CONTENT_TYPE_MAX`. A label failing either would fail the write on every
+    :data:`~messagefoundry.store.base.ATTACHMENT_CONTENT_TYPE_MAX`, SQL Server's column width, past
+    which the write fails with error 2628. A label failing either would fail the write on every
     resend. The length test comes first, so a long sender-controlled label is never copied to be
     measured.
 
@@ -1225,9 +1224,9 @@ def _label_fits_every_backend(label: str) -> bool:
     does, and the same character then stays in the skeleton, whose ingress write fails on it
     whatever the label is. Downgrading it would only store an unreferenced attachment first, so
     ``put_attachment``'s own encode fault propagates instead, writing nothing."""
-    if len(label) > _ATTACHMENT_CONTENT_TYPE_MAX or "\x00" in label:
+    if len(label) > ATTACHMENT_CONTENT_TYPE_MAX or "\x00" in label:
         return False
-    return utf16_units(label) <= _ATTACHMENT_CONTENT_TYPE_MAX
+    return utf16_units(label) <= ATTACHMENT_CONTENT_TYPE_MAX
 
 
 #: The refusals ``_detach_documents`` raises for a body it will not detach. Both listeners catch
@@ -10378,9 +10377,11 @@ class RegistryRunner:
                 # payload as its claimed inert type. Non-sniffable labels are kept as declared.
                 # A label some backend's column cannot hold is downgraded the same way (BACKLOG #1619),
                 # tested first so an over-long label is never copied by the MIME check.
+                # The magic-byte head is read in a thread too: its work grows with any whitespace
+                # before the prefix, which the sender controls (BACKLOG #1619).
                 safe_ct = content_type
                 if not _label_fits_every_backend(content_type) or not attachment_mime_agrees(
-                    content_type, b64_head(verbatim_b64)
+                    content_type, await asyncio.to_thread(b64_head, verbatim_b64)
                 ):
                     safe_ct = _DEFAULT_ATTACHMENT_MIME
                 ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)

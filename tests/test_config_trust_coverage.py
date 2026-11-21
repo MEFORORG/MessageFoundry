@@ -141,3 +141,186 @@ def test_posix_refuses_a_group_writable_member(
     with pytest.raises(WiringError, match="group/world-writable path") as excinfo:
         load_config(tmp_path)
     assert str(tmp_path / relative) in str(excinfo.value)
+
+
+# --- a module that is a link (vault BACKLOG #2596 added item 2) ------------------------------------
+
+
+def _link_module_into(cfg: Path, shared: Path) -> Path:
+    """``cfg/cfg.py`` as a symbolic link to ``shared/cfg.py``; skips where links cannot be made."""
+    cfg.mkdir()
+    shared.mkdir()
+    target = shared / "cfg.py"
+    target.write_text(
+        "from messagefoundry import outbound, File\noutbound('o', File(directory='./out'))\n",
+        encoding="utf-8",
+    )
+    try:
+        (cfg / "cfg.py").symlink_to(target)
+    except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    return target
+
+
+def test_a_linked_module_lists_its_target_and_the_target_folder(tmp_path: Path) -> None:
+    cfg, shared = tmp_path / "cfg", tmp_path / "shared"
+    target = _link_module_into(cfg, shared)
+    listed = config_source_trust_paths(cfg)
+    assert listed[:2] == [cfg, cfg / "cfg.py"]
+    assert target.resolve() in listed
+    assert target.resolve().parent in listed
+    assert len(listed) == len(set(listed))
+
+
+def test_windows_refuses_a_module_linked_into_a_writable_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_windows_readers: FakeReaders
+) -> None:
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    cfg, shared = tmp_path / "cfg", tmp_path / "shared"
+    target = _link_module_into(cfg, shared)
+    writable = target.resolve().parent
+    fake_windows_readers(lambda path: path == writable)
+    with pytest.raises(WiringError, match="writable-by-others path") as excinfo:
+        load_config(cfg)
+    assert str(writable) in str(excinfo.value)
+
+
+def test_windows_loads_a_linked_module_when_every_path_is_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_windows_readers: FakeReaders
+) -> None:
+    """Control for the test above: the link alone does not refuse."""
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    cfg, shared = tmp_path / "cfg", tmp_path / "shared"
+    target = _link_module_into(cfg, shared)
+    seen = fake_windows_readers(lambda _path: False)
+    assert "o" in load_config(cfg).outbound
+    assert target.resolve() in seen
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits")
+def test_posix_refuses_a_module_linked_into_a_group_writable_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    cfg, shared = tmp_path / "cfg", tmp_path / "shared"
+    target = _link_module_into(cfg, shared)
+    shared.chmod(0o775)
+    with pytest.raises(WiringError, match="group/world-writable path") as excinfo:
+        load_config(cfg)
+    assert str(target.resolve().parent) in str(excinfo.value)
+
+
+def test_a_linked_config_directory_lists_the_real_directory(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    (real / "cfg.py").write_text("", encoding="utf-8")
+    link = tmp_path / "cfg"
+    try:
+        link.symlink_to(real, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    listed = config_source_trust_paths(link)
+    assert listed[0] == link
+    assert real.resolve() in listed
+    # A folder's own parent is not added, as the folders above the config directory are not.
+    assert real.resolve().parent not in listed
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="NTFS junctions")
+def test_a_junction_member_lists_the_real_folder(tmp_path: Path) -> None:
+    import _winapi
+
+    cfg, shared = tmp_path / "cfg", tmp_path / "shared"
+    cfg.mkdir()
+    shared.mkdir()
+    (cfg / "cfg.py").write_text("", encoding="utf-8")
+    (shared / "a.csv").write_text("code,display\n", encoding="utf-8")
+    vars(_winapi)["CreateJunction"](str(shared), str(cfg / "codesets"))  # not in linux stubs
+    listed = config_source_trust_paths(cfg)
+    assert cfg / "codesets" in listed
+    assert shared.resolve() in listed
+
+
+def test_a_link_that_cannot_be_resolved_refuses_the_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_windows_readers: FakeReaders
+) -> None:
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    cfg, shared = tmp_path / "cfg", tmp_path / "shared"
+    _link_module_into(cfg, shared)
+    fake_windows_readers(lambda _path: False)
+    real = Path.resolve
+
+    def refusing(self: Path, strict: bool = False) -> Path:
+        if self.name == "cfg.py" and self.parent.name == "cfg":
+            raise ValueError("embedded null byte")
+        return real(self, strict)
+
+    monkeypatch.setattr(Path, "resolve", refusing)
+    with pytest.raises(OSError, match="could not be resolved"):
+        config_source_trust_paths(cfg)
+    with pytest.raises(WiringError, match="could not be resolved"):
+        load_config(cfg)
+
+
+def test_a_dangling_module_link_refuses_the_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_windows_readers: FakeReaders
+) -> None:
+    # A writer of the folder it points into could create the missing file before the read.
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    try:
+        (cfg / "cfg.py").symlink_to(tmp_path / "gone.py")
+    except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    fake_windows_readers(lambda _path: False)
+    with pytest.raises(OSError, match="leads to nothing"):
+        config_source_trust_paths(cfg)
+    with pytest.raises(WiringError, match="leads to nothing"):
+        load_config(cfg)
+    # Control: once the target exists, the same link loads.
+    (tmp_path / "gone.py").write_text(
+        "from messagefoundry import outbound, File\noutbound('o', File(directory='./out'))\n",
+        encoding="utf-8",
+    )
+    assert "o" in load_config(cfg).outbound
+
+
+@pytest.mark.parametrize("member", ["connections.toml", "codesets", "codesets/a.csv"])
+def test_a_dangling_data_link_refuses_the_load(
+    member: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_windows_readers: FakeReaders,
+) -> None:
+    # As for a module link: a writer of the folder it points into could create the missing name
+    # before the read, so it is listed and refused rather than left off the list.
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    (cfg / "cfg.py").write_text(
+        "from messagefoundry import outbound, File\noutbound('o', File(directory='./out'))\n",
+        encoding="utf-8",
+    )
+    link = cfg / member
+    link.parent.mkdir(exist_ok=True)
+    target = tmp_path / "shared" / Path(member).name
+    try:
+        link.symlink_to(target, target_is_directory=member == "codesets")
+    except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    fake_windows_readers(lambda _path: False)
+    with pytest.raises(OSError, match="leads to nothing"):
+        config_source_trust_paths(cfg)
+    # The refusal's text is cut to a length, so a long temporary path can hide the name.
+    with pytest.raises(WiringError, match="leads to nothing"):
+        load_config(cfg)
+    # Control: once the target exists, the same link loads.
+    target.parent.mkdir(exist_ok=True)
+    if member == "codesets":
+        target.mkdir()
+    elif member == "connections.toml":
+        target.write_text("", encoding="utf-8")
+    else:
+        target.write_text("code,display\n", encoding="utf-8")
+    assert "o" in load_config(cfg).outbound
