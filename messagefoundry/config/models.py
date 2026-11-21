@@ -30,6 +30,7 @@ from pydantic import (
     model_validator,
 )
 
+from messagefoundry.config.bool_numbers import NumbersRefuseBool
 from messagefoundry.config.input_hiding import _InputHidingModel
 from messagefoundry.config.tls_policy import TrustAnchorPolicy
 
@@ -478,7 +479,7 @@ class Source(_InputHidingModel):
         return self
 
 
-class RetryPolicy(BaseModel):
+class RetryPolicy(NumbersRefuseBool):
     """Outbound delivery retry/backoff. ``max_attempts`` is the number of delivery attempts before a
     failure dead-letters.
 
@@ -533,13 +534,6 @@ class RetryPolicy(BaseModel):
             return self.max_backoff_seconds
 
 
-def _refuse_bool_threshold(value: object) -> object:
-    """Refuse a boolean alert threshold, which pydantic would otherwise read as 1 (BACKLOG #5778)."""
-    if isinstance(value, bool):
-        raise ValueError("an alert threshold must be a number or None, not a boolean")
-    return value
-
-
 def infinite_age_is_off(value: float | None) -> float | None:
     """An infinite alert age, which can never be crossed, is the TOML spelling of off, TOML having no
     null: read it as ``None`` so the runner skips the store read an off dimension needs no read for,
@@ -550,7 +544,7 @@ def infinite_age_is_off(value: float | None) -> float | None:
     return value
 
 
-class BuildupThreshold(BaseModel):
+class BuildupThreshold(NumbersRefuseBool):
     """When to raise a ``queue_buildup`` alert for a lane whose backlog is not draining. An outbound
     lane is the classic case: a head retrying its way toward :attr:`RetryPolicy.max_attempts`. The cap
     eventually unblocks the lane, but hours later and only by dead-lettering, so the alert is what an
@@ -571,18 +565,13 @@ class BuildupThreshold(BaseModel):
     max_depth: int | None = Field(default=None, ge=1)
     max_oldest_seconds: float | None = Field(default=300.0, gt=0)
 
-    @field_validator("max_depth", "max_oldest_seconds", mode="before")
-    @classmethod
-    def _refuse_bool(cls, value: object) -> object:
-        return _refuse_bool_threshold(value)
-
     @field_validator("max_oldest_seconds", mode="after")
     @classmethod
     def _inf_is_off(cls, value: float | None) -> float | None:
         return infinite_age_is_off(value)
 
 
-class StallThreshold(BaseModel):
+class StallThreshold(NumbersRefuseBool):
     """When to raise a ``message_stall`` alert for an outbound lane (Corepoint "Max Message Stall"):
     the lane's **oldest undelivered message** has been waiting too long. Modeled on
     :class:`BuildupThreshold` but a single age dimension — it reuses the same oldest-pending age
@@ -598,11 +587,6 @@ class StallThreshold(BaseModel):
     :class:`BuildupThreshold` gives (BACKLOG #5778). An infinite age loads as ``None``, off."""
 
     max_oldest_seconds: float | None = Field(default=None, gt=0)
-
-    @field_validator("max_oldest_seconds", mode="before")
-    @classmethod
-    def _refuse_bool(cls, value: object) -> object:
-        return _refuse_bool_threshold(value)
 
     @field_validator("max_oldest_seconds", mode="after")
     @classmethod
@@ -620,7 +604,7 @@ SATURATION_MIN_GROWTH_DEFAULT = 5
 SATURATION_MIN_GROWTH_MAX = 1_000_000
 
 
-class SaturationThreshold(BaseModel):
+class SaturationThreshold(NumbersRefuseBool):
     """When to raise a ``saturation`` alert for a lane (BACKLOG #93, ADR 0014 amendment): the lane is
     *becoming* overloaded — its pending backlog is **rising sustained** across the sampling window.
 
@@ -638,9 +622,8 @@ class SaturationThreshold(BaseModel):
     the ``[delivery]`` global default > built-in (off).
 
     ``min_growth`` is the rise, in messages, the alert needs before it fires (BACKLOG #5768,
-    :data:`SATURATION_MIN_GROWTH_DEFAULT`). The ``[delivery]`` key refuses a boolean, as every
-    numeric settings key does (BACKLOG #5509); this model takes what that key passes, or a
-    code-first int."""
+    :data:`SATURATION_MIN_GROWTH_DEFAULT`). A boolean on either field is refused rather than read as
+    1 or 0, here as on every numeric settings key (BACKLOG #5509)."""
 
     sustain_samples: int | None = Field(default=None, ge=2)
     min_growth: int = Field(
@@ -648,7 +631,7 @@ class SaturationThreshold(BaseModel):
     )
 
 
-class ActiveWindow(BaseModel):
+class ActiveWindow(NumbersRefuseBool):
     """One **active window** in a per-connection schedule (BACKLOG #147, ADR 0095).
 
     The window is a recurring time-of-day span on a set of weekdays, evaluated in its own IANA
@@ -761,7 +744,7 @@ class Schedule(BaseModel):
         return (not inside) if self.invert else inside
 
 
-class BatchConfig(BaseModel):
+class BatchConfig(NumbersRefuseBool):
     """Opt-in per-outbound HL7 **batch aggregation** (BACKLOG #134 / ADR 0082): coalesce up to
     ``max_count`` consecutive outbound messages on this lane into ONE ``BHS``…``BTS`` envelope on a
     single send.
@@ -1048,7 +1031,7 @@ class Destination(_InputHidingModel):
         return self
 
 
-class Validation(BaseModel):
+class Validation(NumbersRefuseBool):
     """Parse/validate behaviour. Tolerant by default — non-conformant messages
     still route; ``strict`` runs full hl7apy structural validation and NACKs on failure.
 
