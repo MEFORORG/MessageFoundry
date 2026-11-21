@@ -4778,8 +4778,8 @@ unconditional dedicated rows (`message_view`, `message_search`) regardless, and 
 `GET /messages/{id}/raw` (`message_body_view`, whose detail names the `surface` that asked), as do
 `GET /messages/{id}/responses` (`response.read`) and `GET /search/layered` (`preset.layered_search`).
 `GET /search/layered` also tries to write its `preset.layered_search` row when it refuses a
-stored preset while loading it, naming the preset id, the status and the refusal cause, an error
-class name or `malformed` (BACKLOG #5523). The write is best effort: a failed write does not change
+stored preset while loading it, naming at least the number of presets layered, the preset id, the
+status and the refusal cause, an error class name or `malformed` (BACKLOG #5523). The write is best effort: a failed write does not change
 the answer, and it is logged at ERROR. A refusal of the composed layers writes no such row. A
 refusal row has `refused` in its detail, which tells it from a search that ran. A NULL, empty or
 non-text criteria cell is refused by the store itself, which logs a WARNING and writes the

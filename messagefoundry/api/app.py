@@ -10028,6 +10028,10 @@ def create_app(
                     ),
                     client=client_ip(request),
                 )
+            except AUDIT_WRITE_DEFECTS as exc:
+                # Inside the refusal set below, so caught first: they still mean a defect, and
+                # the record says so (BACKLOG #5523). Not re-raised, as the next arm says.
+                failed = f"defect {type(exc).__name__}"
             except audit_write_errors() as exc:
                 # The store-refusal set the other fail-soft audit writes catch. Defects
                 # (AUDIT_WRITE_DEFECTS) are not re-raised: a raise would replace the refusal owed
@@ -10088,8 +10092,13 @@ def create_app(
                 # BACKLOG #5523, as #3734 split the upload routes: the key service gave no verdict,
                 # so a later try may succeed. Its text goes to the log only, as in uploads, and as
                 # a str: the exception's traceback would reach this frame's decrypted `criterias`.
-                _log.warning("layered search answered 503 on preset %s: %s", preset_id, str(exc))
+                # Once per preset per interval, as the other arms log: an outage fails every
+                # recall (BACKLOG #5523).
                 cause = type(exc).__name__
+                if _first_layered_refusal(preset_id, cause):
+                    _log.warning(
+                        "layered search answered 503 on preset %s: %s", preset_id, str(exc)
+                    )
                 refusal = HTTPException(
                     503,
                     f"the store's key service could not open preset {preset_id}. Try again shortly",
@@ -10125,7 +10134,12 @@ def create_app(
             # content needle. json's RecursionError is this 400 too, not a 500. The old TypeError
             # arm is gone: get_search_preset returns the criteria through the cipher as a
             # non-blank str, and refuses a NULL, blank or non-text cell itself (BACKLOG #5523).
-            criteria, refused = json_loads_or_refusal(row["criteria"])
+            # A store that broke that contract, a test double say, gets this 400, not a TypeError's
+            # 500 (BACKLOG #5523).
+            stored = row["criteria"]
+            criteria, refused = (
+                json_loads_or_refusal(stored) if isinstance(stored, str) else (None, "not text")
+            )
             if refused is not None or not isinstance(criteria, dict):
                 # BACKLOG #5523: the store writes criteria as a JSON object, so this was written
                 # outside it. Logged, once per preset per interval, and audited each time.
@@ -10174,15 +10188,18 @@ def create_app(
         )
         # BACKLOG #5523: coalesced into summary_access after the route's own row, as
         # /messages/search does, so a layered recall is no way round the harvest signal (review
-        # M-5). Counted post-redaction; note() writes nothing when both counts are zero.
-        await request.app.state.summary_auditor.note(
-            engine.store,
-            identity.username,
-            meta["channel_id"],
-            count_exposed(messages),
-            time.time(),
-            masked=count_masked(messages),
-        )
+        # M-5). Counted post-redaction; note() writes nothing when both counts are zero, and is
+        # skipped then, as the other call sites skip it.
+        exposed, masked = count_exposed(messages), count_masked(messages)
+        if exposed or masked:
+            await request.app.state.summary_auditor.note(
+                engine.store,
+                identity.username,
+                meta["channel_id"],
+                exposed,
+                time.time(),
+                masked=masked,
+            )
         return MessageSearchResults(
             messages=messages,
             scanned=result.scanned,

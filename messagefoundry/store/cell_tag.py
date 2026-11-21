@@ -94,6 +94,7 @@ __all__ = [
     "refused_for_key",
     "report_cell_tag_failure",
     "report_cell_tag_failures",
+    "require_preset_criteria",
     "row_tag_aad",
     "row_tag_columns",
     "withhold_message_cells",
@@ -443,7 +444,7 @@ def open_preset_criteria(
         _alert(cipher, refused)
         raise refused
     # open_tagged_cell refuses a non-text cell, and returns None only for a None cell, refused above.
-    return cast(
+    opened = cast(
         str,
         open_tagged_cell(
             cipher,
@@ -454,6 +455,20 @@ def open_preset_criteria(
             row_id=preset_id,
         ),
     )
+    if opened == "":
+        # A marked cell that opens to "": sealed outside the store, which never writes it.
+        refused = BlankCellError("search_presets", "criteria", preset_id, None)
+        _alert(cipher, refused)
+        raise refused
+    return opened
+
+
+def require_preset_criteria(criteria: object) -> None:
+    """Refuse, with ``ValueError``, criteria that are not non-blank text, before a preset write
+    seals them: a read refuses such a cell as drift (:func:`open_preset_criteria`), so no writer
+    stores one (BACKLOG #5523)."""
+    if not isinstance(criteria, str) or criteria == "":
+        raise ValueError("a search preset's criteria must be non-blank text")
 
 
 def withhold_message_cells(

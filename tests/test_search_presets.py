@@ -247,3 +247,41 @@ async def test_a_refused_open_leaves_the_v032_preset_table_untouched(tmp_path: P
         conn.close()
     assert "owner" in cols and "owner_user_id" not in cols
     assert owners == ["alice", "bob", "carol", "carol", "ghost", "system"]
+
+
+@pytest.mark.parametrize("criteria", ["", None, b"{}"], ids=["empty", "null", "bytes"])
+async def test_a_preset_write_refuses_criteria_a_read_would_refuse(
+    store: MessageStore, criteria: object
+) -> None:
+    """BACKLOG #5523: a read refuses a blank or non-text criteria cell as drift, so the write path
+    refuses one too rather than sealing a preset no recall can open. Control: real criteria save."""
+    with pytest.raises(ValueError, match="non-blank text"):
+        await store.upsert_search_preset(
+            preset_id="pb",
+            owner_user_id="op",
+            name="n",
+            criteria=criteria,  # type: ignore[arg-type]
+        )
+    assert await store.list_search_presets("op") == []
+    await store.upsert_search_preset(preset_id="pb", owner_user_id="op", name="n", criteria=CRIT)
+    assert await store.get_search_preset(preset_id="pb", owner_user_id="op") is not None
+
+
+async def test_a_marked_cell_that_opens_to_blank_is_drift(store: MessageStore) -> None:
+    """BACKLOG #5523: a marked cell that verifies under its own row's tag but holds "" was sealed
+    outside the store, which never writes blank criteria. It is a ``BlankCellError``, audited as
+    drift, not criteria a route reads as malformed JSON with no integrity row."""
+    from messagefoundry.store.cell_tag import (
+        PRESET_TAG_FAILED_ACTION,
+        BlankCellError,
+        preset_criteria_aad,
+    )
+
+    await store.upsert_search_preset(preset_id="pe", owner_user_id="op", name="n", criteria=CRIT)
+    sealed = store._cipher.encrypt("", aad=preset_criteria_aad(preset_id="pe", owner_user_id="op"))
+    assert sealed.startswith("mfenc:")  # control: a marked cell, which the cipher opens
+    await store._db.execute("UPDATE search_presets SET criteria=? WHERE id='pe'", (sealed,))
+    await store._db.commit()
+    with pytest.raises(BlankCellError):
+        await store.get_search_preset(preset_id="pe", owner_user_id="op")
+    assert len(await store.list_audit(action=PRESET_TAG_FAILED_ACTION)) == 1
