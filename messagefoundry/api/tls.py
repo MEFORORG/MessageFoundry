@@ -47,7 +47,6 @@ from messagefoundry.config.tls_policy import (
 )
 from messagefoundry.file_lock import lock_exclusive as _try_lock
 from messagefoundry.file_lock import unlock as _unlock
-from messagefoundry.hostlist import HostKey, canonical_host
 from messagefoundry.keywrap import load_checked_cert_chain
 from messagefoundry.redaction import log_timestamp
 from messagefoundry.restricted_file import replace_generated, unlink_generated
@@ -240,47 +239,32 @@ _MINT_LOCK_POLL_S = 0.05
 _GENERATED_LIFETIME_DAYS = 365
 
 
-#: The loopback names a generated certificate carries for a loopback or wildcard bind (BACKLOG
-#: #5790), so a client on this box verifies it at whichever of them it dials where the engine
-#: listens there. Never the machine's own host name: the certificate goes to every peer in the
-#: handshake, before any sign-in, so it names only the bind host and, for those binds, these
-#: fixed names, which say nothing about the machine (decision d20261119T191457909-25c3aa).
+#: The loopback names a generated certificate carries for a loopback bind (BACKLOG #5790), so a
+#: client on this box verifies it at whichever of them it dials where the engine listens there.
+#: Never the machine's own host name: the certificate goes to every peer in the handshake, before
+#: any sign-in, so it names only the bind host and, for a loopback or wildcard bind, names from
+#: this tuple, which say nothing about the machine (decision d20261119T191457909-25c3aa).
 _GENERATED_LOOPBACK_SANS = ("127.0.0.1", "::1", "localhost")
 
 
-def _same_name_key(name: str) -> HostKey:
-    """One key per name, for de-duplication: :func:`messagefoundry.hostlist.canonical_host` (an IP
-    literal as its address, any other name lowercased), or the name as written where that reads
-    none, as for ``[::1]``, which ``make_self_signed`` writes as a DNS name and not as ``::1``."""
-    return canonical_host(name) or name
+def _generated_sans(api: ApiSettings) -> list[str]:
+    """The names a generated certificate carries beside ``api.host``, its subject.
 
-
-def _generated_sans(host: str) -> list[str]:
-    """The names a generated certificate carries beside ``host``, its subject.
-
-    A WILDCARD bind (``0.0.0.0``, ``::``) is not an address any client can dial, so a certificate
-    naming it alone verifies against no URL at all. The loopback of the same family
-    (:func:`messagefoundry.api_tls_source.wildcard_loopback`), the address the tray and any other
-    client on this box reach a wildcard bind through, comes right after ``host`` (BACKLOG #5973).
-    A loopback or wildcard bind then carries :data:`_GENERATED_LOOPBACK_SANS` (BACKLOG #5790); a
-    loopback bind is one whose host is one of those names, in any spelling. Any other bind, such as
-    a specific off-loopback address, listens on no loopback, so it carries its own name alone and
-    the placeholder vouches for no loopback name on a machine that imports it. A name that is
-    ``host``, or an earlier name, in another spelling is left out. A wildcard bind is off loopback,
-    so ``serve`` refuses it without an operator certificate unless the operator accepts the
-    placeholder; this list adds no name a remote client would dial.
+    - A loopback bind, by :attr:`ApiSettings.is_loopback` (the definition ``serve``'s exposed-bind
+      gate reads), carries :data:`_GENERATED_LOOPBACK_SANS` (BACKLOG #5790). ``make_self_signed``
+      drops the one that repeats the host.
+    - A WILDCARD bind (``0.0.0.0``, ``::``) is not an address any client can dial, so a
+      certificate naming it alone verifies against no URL at all. It carries the loopback of its
+      own family (:func:`messagefoundry.api_tls_source.wildcard_loopback`), the address the tray
+      and any other client on this box reach it through (BACKLOG #5973), and no other name.
+    - Any other host carries no extra name, so the placeholder vouches for no loopback name on a
+      machine that imports it. That includes a host ``is_loopback`` does not list, such as
+      ``127.0.0.2``, ``LOCALHOST`` or ``[::1]``, even where it listens on a loopback address.
     """
-    loopback = wildcard_loopback(host)
-    seen = {_same_name_key(host)}
-    if loopback is None and not seen & {_same_name_key(n) for n in _GENERATED_LOOPBACK_SANS}:
-        return []
-    sans: list[str] = []
-    for name in (*([] if loopback is None else [loopback]), *_GENERATED_LOOPBACK_SANS):
-        key = _same_name_key(name)
-        if key not in seen:
-            seen.add(key)
-            sans.append(name)
-    return sans
+    if api.is_loopback:
+        return list(_GENERATED_LOOPBACK_SANS)
+    loopback = wildcard_loopback(api.host)
+    return [] if loopback is None else [loopback]
 
 
 #: Renew the generated pair at startup once less than this share of its OWN validity period is
@@ -930,7 +914,7 @@ def _renew_generated_pair(
 
     staged_cert, staged_key = _staged_pair(cert_path, key_path)
     cert_pem, key_pem = pki.make_self_signed(
-        api.host, _generated_sans(api.host), _GENERATED_LIFETIME_DAYS
+        api.host, _generated_sans(api), _GENERATED_LIFETIME_DAYS
     )
     new = pki.read_self_signed_facts(cert_pem)
     try:
@@ -986,7 +970,7 @@ def _mint_generated_pair(api: ApiSettings, cert_path: Path, key_path: Path) -> S
     from messagefoundry.__main__ import _write_private_key
 
     cert_pem, key_pem = pki.make_self_signed(
-        api.host, _generated_sans(api.host), _GENERATED_LIFETIME_DAYS
+        api.host, _generated_sans(api), _GENERATED_LIFETIME_DAYS
     )
     _write_private_key(key_path, key_pem)
     paired = False

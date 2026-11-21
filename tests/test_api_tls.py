@@ -4273,7 +4273,7 @@ def _san_entries(cert: str | Path) -> list[tuple[str, str]]:
     return [(kinds.get(type(n), type(n).__name__), str(n.value)) for n in san]
 
 
-#: The three loopback names every generated certificate carries whatever the bind (BACKLOG #5790):
+#: The three loopback names a generated certificate carries for a loopback bind (BACKLOG #5790):
 #: the two loopback IP literals as iPAddress entries, which is what hostname verification of an
 #: IP-literal URL matches, and ``localhost`` as a DNSName.
 _LOOPBACK_SANS = (("ip", "127.0.0.1"), ("ip", "::1"), ("dns", "localhost"))
@@ -4285,36 +4285,35 @@ _LOOPBACK_SANS = (("ip", "127.0.0.1"), ("ip", "::1"), ("dns", "localhost"))
         ("127.0.0.1", _LOOPBACK_SANS),
         ("::1", (("ip", "::1"), ("ip", "127.0.0.1"), ("dns", "localhost"))),
         ("localhost", (("dns", "localhost"), ("ip", "127.0.0.1"), ("ip", "::1"))),
-        # A specific off-loopback bind listens on no loopback, so it names no loopback name.
+        # A specific off-loopback bind gets its own name alone.
         ("10.0.0.9", (("ip", "10.0.0.9"),)),
         ("engine.example.test", (("dns", "engine.example.test"),)),
-        # A wildcard is dialled on its own family's loopback (BACKLOG #5973), which stays named
-        # right after the bind host, then the other loopback names (BACKLOG #5790).
-        ("0.0.0.0", (("ip", "0.0.0.0"), *_LOOPBACK_SANS)),
-        ("::", (("ip", "::"), ("ip", "::1"), ("ip", "127.0.0.1"), ("dns", "localhost"))),
-        # Another spelling of a loopback name is the bind host's entry, not a second one.
-        ("0:0:0:0:0:0:0:1", (("ip", "::1"), ("ip", "127.0.0.1"), ("dns", "localhost"))),
-        ("LOCALHOST", (("dns", "LOCALHOST"), ("ip", "127.0.0.1"), ("ip", "::1"))),
-        # A bracketed host is written as a DNS name and is not a loopback host, so it gets none.
+        # A wildcard gets its own family's loopback, the address it is dialled on (BACKLOG #5973),
+        # and nothing more: what origin/main gave it.
+        ("0.0.0.0", (("ip", "0.0.0.0"), ("ip", "127.0.0.1"))),
+        ("::", (("ip", "::"), ("ip", "::1"))),
+        # A spelling ApiSettings.is_loopback does not list is not a loopback bind here either.
+        ("0:0:0:0:0:0:0:1", (("ip", "::1"),)),
+        ("LOCALHOST", (("dns", "LOCALHOST"),)),
+        ("127.0.0.2", (("ip", "127.0.0.2"),)),
         ("[::1]", (("dns", "[::1]"),)),
     ],
 )
-def test_the_minted_certificate_names_the_bind_host_and_every_loopback(
+def test_the_minted_certificate_names_the_loopback_names_for_a_loopback_bind_only(
     host: str, names: tuple[tuple[str, str], ...], tmp_path: Path
 ) -> None:
     """Exact equality, so no other name, the machine host name included, is ever added (decision
     d20261119T191457909-25c3aa).
 
     Mutation: mint with the SAN origin/main had before BACKLOG #5790, the bind host plus a wildcard
-    bind's own loopback. Red: every loopback and wildcard row, since each lacks at least
-    ``localhost`` or a loopback literal. Mutation: add the loopback names for every bind. Red: the
-    three off-loopback rows."""
+    bind's own loopback. Red: the three loopback rows. Mutation: add the loopback names for every
+    bind. Red: every other row."""
     cert, _ = ensure_api_tls_material(ApiSettings(host=host), state_dir=tmp_path)
     assert tuple(_san_entries(cert)) == names
 
 
 @pytest.mark.parametrize("dialled", ["localhost", "127.0.0.1", "::1"])
-def test_a_pair_minted_for_a_loopback_bind_verifies_at_every_loopback_name(
+def test_a_pair_minted_for_a_127_bind_verifies_at_each_loopback_name(
     dialled: str, tmp_path: Path
 ) -> None:
     """A real hostname-checked handshake against the minted pair, trusting only that certificate
