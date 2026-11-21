@@ -194,7 +194,7 @@ async def test_a_connection_that_does_not_keep_autocommit_is_refused_and_set_aga
 
 
 class _RaisingRaw(_RawConnection):
-    """A driver whose autocommit setter raises, as a dead link does (SQLSTATE 08S01)."""
+    """A driver whose autocommit setter raises with no connection failure (SQLSTATE HY000)."""
 
     @property
     def autocommit(self) -> bool:
@@ -202,15 +202,14 @@ class _RaisingRaw(_RawConnection):
 
     @autocommit.setter
     def autocommit(self, value: bool) -> None:
-        raise ConnectionError("08S01")
+        raise ConnectionError("HY000")
 
 
 async def test_a_setter_that_raises_returns_the_connection_unconfirmed(driver: _Driver) -> None:
     """The driver's own error reaches the borrower, and the connection goes back open and
-    unconfirmed, so its next borrow sets it again before any statement runs. It is not closed: a
-    close is a worker-thread call a cancellation could abandon, and aioodbc wakes no waiter for a
-    closed connection (PR 2593 covering review, round 2). A dead link stays in the pool: a known
-    cost, written down in the report."""
+    unconfirmed, so its next borrow sets it again before any statement runs. A set that fails
+    with a connection failure (class 08) discards the connection instead (BACKLOG #5748; pinned
+    in tests/test_w2_611_database_remainder.py)."""
     pool = await _make_pool("DSN=x", 2, autocommit=True, login_timeout=5)
     inner = driver.pools[0]
     inner.conn = _Connection(_RaisingRaw())
