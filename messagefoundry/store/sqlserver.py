@@ -241,7 +241,6 @@ from messagefoundry.store.store import (
     AD_SCOPE_MAP,
     ANY_CLAIM_OWNER,
     AUDIT_KEY_EPOCH_ACTION,
-    FAILED_OPEN_CANCEL_BOUND_S,
     GLOBAL_SESSION_EPOCH_SQL,
     LOGIN_ADDRESS_RESET_MARKER,
     NOT_DEPLOYED_EVENT,
@@ -515,6 +514,11 @@ _RESET_LANE_CHUNK = 500
 # handed to that statement's own call and not waited for at all. A close can still queue behind a
 # call the cancellation did not cancel, such as a shielded one, and this bound caps that wait.
 _DIRTY_CLOSE_TIMEOUT = 5.0
+
+# BACKLOG #5720: how long the one-connection store's error path waits for its pool to finish
+# closing after the store's own close failed. Past it the pool is left closing, its free
+# connections not yet closed, so a pool that never finishes cannot hang that path.
+_ONE_CONNECTION_POOL_CLOSE_BOUND_S = 5.0
 
 # BACKLOG #3023: how many `[store].acquire_timeout`s a session write that follows a committed auth
 # change may wait for a pooled connection (SqlServerStore._acquire_after_commit). Longer than an
@@ -5739,17 +5743,26 @@ class SqlServerStore:
                         "closing a one-connection store after an error also failed (%s)",
                         type(cleanup).__name__,
                     )
+                    log.debug("the one-connection store's close failure", exc_info=cleanup)
                     # A close that raised before its own pool step leaves the pool and the
-                    # executor open, so release both here (BACKLOG #5720). The wait is bounded,
-                    # since a pool whose close just failed may never finish closing.
+                    # executor open, so release both here (BACKLOG #5720).
                     try:
                         pool.close()
-                        await asyncio.wait_for(pool.wait_closed(), FAILED_OPEN_CANCEL_BOUND_S)
+                        await asyncio.wait_for(
+                            pool.wait_closed(), _ONE_CONNECTION_POOL_CLOSE_BOUND_S
+                        )
+                    except TimeoutError:
+                        log.warning(
+                            "the pool did not finish closing within %s s; it is left closing, "
+                            "its free connections not yet closed",
+                            _ONE_CONNECTION_POOL_CLOSE_BOUND_S,
+                        )
                     except Exception as released:  # noqa: BLE001 — keep the error
                         log.warning(
                             "closing the pool after that also failed (%s)",
                             type(released).__name__,
                         )
+                        log.debug("the pool's close failure", exc_info=released)
                     finally:
                         executor.shutdown(wait=False)
 

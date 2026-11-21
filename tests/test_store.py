@@ -2154,7 +2154,11 @@ async def test_a_cleanup_that_fails_is_still_logged_at_error(caplog) -> None:
     await cleanup_failed_open(
         RuntimeError("open boom"), failing_release, lambda: None, cancels_before=0
     )
-    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    errors = [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "ERROR" and r.name == "messagefoundry.store.store"
+    ]
     assert errors == [
         "a failed store open's cleanup failed (OSError); what it had not closed was released "
         "without waiting for it"
@@ -2188,33 +2192,42 @@ async def test_an_abandoned_cleanup_that_later_fails_is_logged_at_error(
     fail.set()
     for _ in range(10):
         await asyncio.sleep(0)
-    assert [r.getMessage() for r in caplog.records if r.levelname == "ERROR"] == [
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "ERROR" and r.name == "messagefoundry.store.store"
+    ] == [
         "a failed store open's cleanup, which an open stopped waiting for, later failed (OSError)"
     ]
 
 
-def test_a_generator_exit_with_no_running_loop_schedules_nothing(caplog) -> None:
+def test_a_generator_exit_with_no_event_loop_schedules_nothing(caplog) -> None:
     """BACKLOG #5720: with no forced release, a ``GeneratorExit`` schedules the ordinary release
-    on the running loop. A coroutine closed after its loop stopped has none, and
-    ``ensure_future`` would raise ``RuntimeError`` over the exit; it is logged instead.
+    on the current loop. A coroutine closed where there is none, here a thread with no loop, cannot
+    schedule it, and ``ensure_future`` would raise ``RuntimeError`` over the exit; it is logged
+    instead.
 
-    Mutation: drop the running-loop check. Red: ``RuntimeError`` out of ``coro.send``."""
+    Mutation: drop the ``except RuntimeError`` around ``ensure_future``. Red: ``RuntimeError``."""
+    import threading
+
     from messagefoundry.store.store import cleanup_failed_open
 
     ran: list[str] = []
+    outcome: list[BaseException] = []
 
     async def release() -> None:
         ran.append("release")
 
-    # The loop a stopped run leaves behind: set as current, closed, so scheduling on it raises.
-    stopped = asyncio.new_event_loop()
-    stopped.close()
-    asyncio.set_event_loop(stopped)
-    try:
+    def drive() -> None:
         coro = cleanup_failed_open(GeneratorExit(), release, None, cancels_before=0)
-        with pytest.raises(StopIteration):
+        try:
             coro.send(None)
-    finally:
-        asyncio.set_event_loop(None)
+        except BaseException as exc:  # noqa: BLE001 -- recorded for the assertion below
+            outcome.append(exc)
+
+    worker = threading.Thread(target=drive)
+    worker.start()
+    worker.join(10)
+    assert len(outcome) == 1 and isinstance(outcome[0], StopIteration), outcome
     assert ran == []
-    assert "a failed store open's cleanup could not run: no event loop is running" in caplog.text
+    assert "a failed store open's cleanup could not run: no event loop can run it" in caplog.text

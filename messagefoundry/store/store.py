@@ -2091,7 +2091,6 @@ def _log_abandoned_end(what: str, task: asyncio.Future[tuple[bool, BaseException
     if isinstance(ended, asyncio.CancelledError):
         log.warning("%s, which an open stopped waiting for, later ended cancelled", what)
         return
-    # A failure stays at ERROR, as _run_to_completion logged it before (BACKLOG #5720).
     log.error(
         "%s, which an open stopped waiting for, later failed (%s)", what, type(ended).__name__
     )
@@ -2152,21 +2151,24 @@ async def cleanup_failed_open(
     replace the exit with a ``RuntimeError``. A ``GeneratorExit`` thrown into the wait runs it
     too, then is re-raised. ``force_release`` None is a caller with nothing to release without
     waiting: past the bound this only stops waiting, and what the cleanup holds stays open until
-    it finishes. ``what`` names the cleanup in its log lines."""
+    it finishes. ``what`` names the cleanup in its log lines. A cleanup that ends cancelled,
+    waited for or not, is logged at WARNING; one that fails stays at ERROR, as
+    :func:`_run_to_completion` logs it (BACKLOG #5720)."""
     # What the forced-release WARNING names: the open, or the caller's own cleanup.
     after = "a failed store open" if what == "a failed store open's cleanup" else what
     if isinstance(exc, GeneratorExit):
         _force_failed_open_release(force_release, after=after)
         if force_release is None:
-            # Nothing to force, so schedule the ordinary release: that needs no await here. A
-            # coroutine closed with no loop running, after the loop stopped, can schedule
-            # nothing, so that is logged instead of raising over the exit.
+            # Nothing to force, so schedule the ordinary release: that needs no await here. With
+            # no current loop, or a closed one, it cannot be scheduled, and that is logged rather
+            # than raised over the exit.
+            pending = _run_to_completion(release, report=False)
             try:
-                asyncio.get_running_loop()
+                closing = asyncio.ensure_future(pending)
             except RuntimeError:
-                log.warning("%s could not run: no event loop is running", what)
+                pending.close()
+                log.warning("%s could not run: no event loop can run it", what)
                 return
-            closing = asyncio.ensure_future(_run_to_completion(release, report=False))
             closing.add_done_callback(functools.partial(_log_abandoned_end, what))
             _hold_abandoned_open_cleanup(closing, what)
         return
@@ -2242,7 +2244,6 @@ async def cleanup_failed_open(
         if ended is None or isinstance(ended, asyncio.CancelledError):
             log.warning("%s ended cancelled before it finished; %s", what, left)
         else:
-            # A failure stays at ERROR, as _run_to_completion logged it before (BACKLOG #5720).
             log.error("%s failed (%s); %s", what, type(ended).__name__, left)
             log.debug("%s failure", what, exc_info=ended)
     if cancelled and isinstance(exc, Exception):
