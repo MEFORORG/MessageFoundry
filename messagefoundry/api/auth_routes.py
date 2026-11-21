@@ -77,6 +77,8 @@ from messagefoundry.api.auth_models import (
     UserPermissions,
     UserSummary,
     UserUpdateRequest,
+    changed_name_refusal,
+    custom_role_name_refusal,
 )
 from messagefoundry.api.paging import ts_pinned_page
 from messagefoundry.api.security import (
@@ -349,6 +351,26 @@ async def _refuse_if_self(
         defects=(),
     )
     raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
+
+
+def _refuse_custom_role_name(display_name: str, *, stored: str | None) -> None:
+    """422 for a custom role name :func:`custom_role_name_refusal` refuses (BACKLOG #5785). Checked
+    here rather than on the request model because an update compares it with ``stored``."""
+    refusal = custom_role_name_refusal(display_name, stored)
+    if refusal is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"display_name {refusal}")
+
+
+async def _check_custom_role_name(service: AuthService, role_id: str, display_name: str) -> None:
+    """:func:`_refuse_custom_role_name` for a save of the custom role ``role_id``, exempting its
+    stored name (BACKLOG #5785). A name the rule takes on its own needs no stored name, so it reads
+    nothing and the save goes on exactly as before the rule. An unknown id is not checked here, so
+    it stays the service's 404."""
+    if custom_role_name_refusal(display_name) is None:
+        return
+    stored = await service.custom_role_stored_name(role_id)
+    if stored is not None:
+        _refuse_custom_role_name(display_name, stored=stored)
 
 
 def _seal_outage_503() -> HTTPException:
@@ -1338,6 +1360,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> CustomRoleInfo:
+        _refuse_custom_role_name(body.display_name, stored=None)
         try:
             role = await service.create_custom_role(
                 display_name=body.display_name,
@@ -1385,6 +1408,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         """The edit past :func:`update_custom_role`'s step-up. The console's route takes the same
         proof in its own gate, so the seam hands it this. ``ended`` is the set the gate read, which
         the revoke ends (BACKLOG #5505)."""
+        # BACKLOG #5785: the stored name is exempt, so a role stored under a name the rule refuses
+        # can still have its permissions edited.
+        await _check_custom_role_name(service, role_id, body.display_name)
         try:
             role = await service.update_custom_role(
                 role_id,
@@ -1627,8 +1653,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # BACKLOG #5520: the checked record, so a row whose record fails its seal answers 423, as
         # GET /users shows it, rather than the store's refused write. Its profile fields fill an
         # omitted PATCH field below, so an unchecked value is never written back.
-        # The read follows the gate above, so wherever the gate spends a single-use grant, this 423
-        # and the 404 cost it; docs/SECURITY.md states when that is. Checking first would need the
+        # The read follows the gate above, so wherever the gate spends a single-use grant, every
+        # refusal from here on costs it: at least this 423, the 404, the 503 with Retry-After for
+        # a Vault transit Outage, and the 422 below for a changed display name the name rule
+        # refuses (BACKLOG #5784); docs/SECURITY.md states when that is. Checking first would need the
         # proof moved into this route, and the console calls this function after its own gate, so
         # that move would need the console path reworked too; admin_user_update is not a refundable
         # action (_REFUNDABLE_ACTIONS, ADR 0197).
@@ -1650,6 +1678,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # display_name/email keep their current value (the store sets them unconditionally, so a
         # partial PATCH would otherwise NULL them); an explicit null still clears (review M-20).
         supplied = body.model_fields_set
+        # BACKLOG #5784: a changed display name takes the name rule; the stored one, re-sent while
+        # another field is edited, is exempt (``changed_name_refusal``).
+        if "display_name" in supplied:
+            refusal = changed_name_refusal(body.display_name, current.display_name)
+            if refusal is not None:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_CONTENT, f"display_name {refusal}"
+                )
         # BACKLOG #1139, ADR 0182 Amendment A (the rule is on AuthService.update_user): notify_email
         # is NOT filled from the stored row when omitted, and an explicit null is refused, because a
         # client sending it asked for a clear the address does not allow.
