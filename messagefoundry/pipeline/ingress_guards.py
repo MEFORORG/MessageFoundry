@@ -77,6 +77,7 @@ from messagefoundry.parsing.binary import (
     BinaryCarriageError,
     is_marked,
     marker_under_base64_delimiters,
+    marker_under_colliding_delimiters,
 )
 from messagefoundry.parsing.binary import decode as decode_carriage
 from messagefoundry.parsing.message import Message
@@ -93,6 +94,7 @@ from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.framing import declared_encoding
 
 __all__ = [
+    "COLLIDING_DOC_REF_MARKER_REFUSED_REASON",
     "DOC_REF_MARKER_REFUSED_REASON",
     "FRAME_BYTE_REJECTED_REASON",
     "INGRESS_MAX_BYTES",
@@ -146,14 +148,29 @@ DOC_REF_MARKER_REFUSED_REASON = (
     "character"
 )
 
+#: The stored reason for an HL7 body refused because it holds the document handle marker under a
+#: header whose filled default collides with another of its delimiters (BACKLOG #5972). It names
+#: no byte of the body.
+COLLIDING_DOC_REF_MARKER_REFUSED_REASON = (
+    "document handle refused: the body holds the handle marker, and its header fills a delimiter "
+    "it does not name with one it already uses"
+)
+
 
 def doc_ref_marker_refusal(peek: Peek, text: str) -> str | None:
-    """The reason to refuse a parsed HL7 body before the ACK, or ``None`` to go on: one that holds
-    the document handle marker under a delimiter in the base64 alphabet, which delivery would
-    refuse on every outbound (:func:`~messagefoundry.parsing.binary.marker_under_base64_delimiters`,
-    BACKLOG #5099). Pure, so both listeners and the dry-run run the one check."""
-    if marker_under_base64_delimiters(Message(peek.message), text):
+    """The reason to refuse a parsed HL7 body before the ACK, or ``None`` to go on: at least one
+    that holds the document handle marker under a delimiter in the base64 alphabet, which delivery
+    would refuse on every outbound
+    (:func:`~messagefoundry.parsing.binary.marker_under_base64_delimiters`, BACKLOG #5099), and
+    one that holds it under a header whose filled default collides, where a handle in ``OBX-5.5``
+    may not read as one
+    (:func:`~messagefoundry.parsing.binary.marker_under_colliding_delimiters`, BACKLOG #5972).
+    Pure, so both listeners, the loopback re-ingress and the dry-run run the one check."""
+    message = Message(peek.message)
+    if marker_under_base64_delimiters(message, text):
         return DOC_REF_MARKER_REFUSED_REASON
+    if marker_under_colliding_delimiters(message, text):
+        return COLLIDING_DOC_REF_MARKER_REFUSED_REASON
     return None
 
 

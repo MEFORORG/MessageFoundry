@@ -10269,7 +10269,8 @@ class RegistryRunner:
                 ),
             )
         if marker_refused is not None:
-            # Delivery refuses any handle marker under these delimiters, so the body would be
+            # Under base64 delimiters delivery refuses any handle marker, and under a colliding
+            # header a handle in OBX-5.5 may not read as one (BACKLOG #5972), so the body could be
             # accepted and then dead-letter on every outbound; refused here instead, at any size
             # (BACKLOG #5099). The same body fails the same way every time.
             return await self._refuse(
@@ -10662,9 +10663,10 @@ class RegistryRunner:
             return ack
 
         if marker_refused is not None:
-            # Delivery refuses any handle marker under these delimiters, so an AA here would be
-            # followed by a dead-letter on every outbound; refused here instead, at any size, and
-            # AR since the same body fails the same way every time (BACKLOG #5099).
+            # Under base64 delimiters delivery refuses any handle marker, and under a colliding
+            # header a handle in OBX-5.5 may not read as one (BACKLOG #5972), so an AA here could
+            # be followed by a dead-letter on every outbound; refused here instead, at any size,
+            # and AR since the same body fails the same way every time (BACKLOG #5099).
             mid = await self._record_refused(ic, raw, text, error=marker_refused, peek=peek)
             ack = (
                 build_ack(
@@ -12123,7 +12125,8 @@ class RegistryRunner:
             # reads as, so there it is refused wherever it sits. On any other outbound, one with
             # hl7_raw_separators included (_rewrites_delimiters says what that one changes), only a
             # would-be head is refused: a member behind it is joined into the envelope as queued,
-            # and nothing writes it in its own delimiters.
+            # and nothing writes it in its own delimiters, though hl7_raw_separators then re-emits
+            # its structural escapes as raw delimiters.
             # Each verdict reads a few characters of the member's first line, so it runs here
             # rather than in a thread.
             collides = [batch_member_collides(m) for m in members]

@@ -348,10 +348,12 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   `MSH|^~&|`: `Message` refuses every write to such a body, so the detach refuses it wherever
   an `OBX` has `OBX-2` `ED`, whether or not a document reads there, since under `MSH|~|` no
   `OBX-5` component reads as written (`CollidingDelimitersError`, a `NonVerbatimDocumentError`).
-  Before that, and whatever the `OBX` segments claim, it refuses such a body that holds the
-  handle marker, raw or as a header's delimiters escape it, anywhere (`InboundDocRefError`),
-  since a handle in an `OBX-5.5` the header hides is not read as one. A body with no `MSH` never
-  reaches the detach, since `Peek.parse` refuses it first. The re-attach refuses a stored value holding a
+  A body under such a header that holds the handle marker anywhere, raw or as a header's
+  delimiters escape it, is refused at any size by both listeners
+  (`marker_under_colliding_delimiters`, through `ingress_guards.doc_ref_marker_refusal`, which
+  the dry-run and the loopback re-ingress run too), and by the detach before it judges the claim
+  (`InboundDocRefError`), since a handle in an `OBX-5.5` the header hides is not read as one. A
+  body with no `MSH` never reaches the detach, since `Peek.parse` refuses it first. The re-attach refuses a stored value holding a
   delimiter the payload's `MSH-1` or `MSH-2` names after its read and before the splice, so a Handler that
   moved `MSH-1` or `MSH-2` after the detach dead-letters the row rather than send an altered document; a
   stored control character is an engine fault for the internal-error policy, as a CR or LF is.

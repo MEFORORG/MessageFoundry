@@ -117,6 +117,7 @@ __all__ = [
     "is_doc_ref",
     "may_hold_doc_ref",
     "marker_under_base64_delimiters",
+    "marker_under_colliding_delimiters",
     "make_doc_ref",
     "parse_doc_ref",
     "iter_obx_documents",
@@ -199,7 +200,9 @@ class CollidingDelimitersError(NonVerbatimDocumentError, CollidingDelimitersRefu
     scan finds no document, and the claim is refused rather than ACKed and carried undetached.
     A body under such a header that holds the handle marker, raw or as its headers' delimiters
     escape it, is refused first, as :class:`InboundDocRefError`, so a received handle in an
-    ``OBX-5.5`` is refused as one whether or not that ``OBX-5.5`` reads."""
+    ``OBX-5.5``, raw or so escaped, is refused as one whether or not that ``OBX-5.5`` reads. One
+    hidden behind a hex escape is not looked for in the text, so under an ED claim it meets this
+    refusal instead."""
 
 
 class Base64DelimiterError(InboundDocRefError):
@@ -483,6 +486,24 @@ def marker_under_base64_delimiters(message: Message, text: str) -> bool:
     return _delimits_with_base64(separators) and _holds_marker(text, separators)
 
 
+def marker_under_colliding_delimiters(message: Message, text: str) -> bool:
+    """Whether a received HL7 body's first line fills a delimiter it does not name with one it
+    already uses (``Message._delimiters_collide``, as ``MSH|~|`` does) and the body holds the
+    handle marker, raw or as its first line's or a later header's delimiters escape it
+    (:func:`_body_holds_marker`, BACKLOG #5972). Both listeners refuse such a body before the
+    ACK, whatever its size. ``Message`` refuses every write to it, so no document of it is ever
+    detached, and under some such headers no ``OBX-5.5`` reads, so a sender's handle there is not
+    read as one: the re-attach then refuses a copy naming a content address on every outbound,
+    after the ACK. The marker is refused wherever it sits, a bare one included: where the header
+    hides the ``OBX-5`` components, no read tells whether it sits where a handle would.
+
+    ``message`` is ``text`` parsed. For a header that does not collide the cost is the header
+    read alone; otherwise up to two substring scans of ``text``, plus one per later header naming
+    other delimiters. A marker hidden behind a hex escape is not looked for, as in
+    :func:`marker_under_base64_delimiters`."""
+    return message._delimiters_collide() and _body_holds_marker(message, text)
+
+
 def may_hold_doc_ref(text: str) -> bool:
     """Whether a delivery payload may carry a live document handle the re-attach must resolve
     (BACKLOG #5099). The delivery path's cheap gate ahead of a parse.
@@ -666,14 +687,15 @@ def iter_obx_documents(
     document in it. So an ED value the detach would not lift out under a readable header is
     refused too, at least one not Base64, empty, a tombstone or under ``min_b64_len``, as every
     OBX under a short MSH-2 was before. Under such a header it raises :class:`InboundDocRefError`
-    first, whatever the OBX segments claim, when ``received`` holds the handle marker, raw or as
-    its first line's or a later header's delimiters escape it: under ``MSH|~|`` no ``OBX-5.5``
-    reads, so a sender's handle there is not read as one, and delivery would refuse a copy naming
-    a content address after the ACK. Both verdicts come before any ``OBX-5`` value is read, so a
-    body refused for its header has no value read, marker-scanned or splice-scanned. A handle
-    hidden behind a hex escape, which the engine never writes, is not looked for in the text:
-    under such a header it meets the per-OBX read below where no OBX claims a document, and
-    where one does the claim refuses the body.
+    first, whatever the OBX segments claim, when ``received`` holds the handle marker
+    (:func:`marker_under_colliding_delimiters`, the rule both listeners refuse by at any size):
+    under ``MSH|~|`` no ``OBX-5.5`` reads, so a sender's handle there is not read as one. Both
+    verdicts come before any ``OBX-5`` value is read: a body refused for its header has its
+    received text scanned for the marker, up to two substring scans plus one per later header
+    naming other delimiters, and no value read or splice-scanned. A handle hidden behind a hex
+    escape, which the engine never writes, is not looked for in the text, so under such a header
+    it is refused as a received handle only where no OBX claims a document and its ``OBX-5.5``
+    reads; where an OBX claims one, the claim refuses the body.
 
     Each document's value is held one at a time, as the caller's in-flight budget assumes: each
     check reads a value inside :func:`_scan_obx`, whose frame ends before the next read, and the
@@ -682,11 +704,11 @@ def iter_obx_documents(
     copy of its field that the read splits, dropped when the read returns. Holding every value
     until the scan ends would make the peak the sum of the documents."""
     if message._delimiters_collide():
-        # Judged before any OBX-5 value is read, so a body refused here is never value- or
+        # Judged before any OBX-5 value is read, so a body refused here has no value read or
         # splice-scanned: no document of it can be detached, since Message refuses every write
         # to it. The marker comes first, so a received handle is refused as one wherever it
         # sits, in an OBX-5.5 such a header hides included, where the per-OBX read finds none.
-        if _received_holds_marker(message, received) or _later_header_markers(message, received):
+        if _body_holds_marker(message, received):
             raise InboundDocRefError(
                 "the body holds the document handle marker under a header that fills a delimiter "
                 "it does not name with one it already uses, where an OBX-5.5 handle may not read "
@@ -731,11 +753,7 @@ def iter_obx_documents(
             "escape when it set the value back, so the partner would not get it verbatim; "
             "refusing the detach"
         )
-    if documents and (
-        value_holds_marker
-        or _received_holds_marker(message, received)
-        or _later_header_markers(message, received)
-    ):
+    if documents and (value_holds_marker or _body_holds_marker(message, received)):
         raise InboundDocRefError(
             "the body holds the document handle marker outside an OBX-5.5 start, and a document "
             "would be detached from it; refusing a body delivery would refuse after the ACK"
@@ -795,6 +813,16 @@ def _received_holds_marker(message: Message, received: str) -> bool:
     delimiters: where a detach would leave it for delivery's after-the-splice guard to find
     (BACKLOG #5099). Reads the text the caller already holds, and copies no document."""
     return _holds_marker(received, message._encoding_chars())
+
+
+def _body_holds_marker(message: Message, received: str) -> bool:
+    """Whether ``received`` holds the handle marker raw, as the message's first line escapes it
+    (:func:`_received_holds_marker`), or as a later header naming other delimiters escapes it
+    (:func:`_later_header_markers`): the one marker test the detach and the colliding-header
+    listener refusal share (BACKLOG #5099, #5972)."""
+    return _received_holds_marker(message, received) or bool(
+        _later_header_markers(message, received)
+    )
 
 
 def chunk_b64(b64: str, chunk_len: int = DETACH_CHUNK_BYTES) -> Iterator[str]:

@@ -2207,8 +2207,9 @@ def test_the_detach_scan_refuses_the_marker_under_a_colliding_header_with_no_ed_
     body: str,
 ) -> None:
     """F1: the header hides OBX-5.5, so the per-OBX read found no handle, and with no ED claim
-    nothing was refused: the body was ACKed AA, and delivery refused it on every outbound. The
-    marker in the received text, raw or as the header's delimiters escape it, is refused now."""
+    nothing was refused, so a streaming body was ACKed AA; where the marker named a content
+    address, delivery then refused it on every outbound. The marker in the received text, raw or
+    as the header's delimiters escape it, is refused now, a bare one included."""
     from messagefoundry.parsing.binary import _holds_ed_claim
 
     message = Message.parse(body)
@@ -2228,52 +2229,51 @@ def test_a_colliding_header_with_no_ed_claim_and_no_marker_is_still_read() -> No
     assert list(iter_obx_documents(message, received=_TILDE_HEADER_NO_MARKER)) == []
 
 
-async def test_a_streaming_body_hiding_a_handle_under_a_colliding_header_is_refused(
-    store: MessageStore,
+#: Both kinds of inbound: one over whose threshold the body is detached, and one that never
+#: detaches, so the refusal is shown to come from the listener's own check at any size.
+_LISTENER_KINDS = pytest.mark.parametrize(
+    "streaming", [True, False], ids=["streaming", "not-streaming"]
+)
+
+
+@_LISTENER_KINDS
+async def test_a_hidden_handle_under_a_colliding_header_is_refused_at_both_listeners(
+    store: MessageStore, streaming: bool
 ) -> None:
-    """F1 on the MLLP listener: such a body was ACKed AA and queued, then dead-lettered at
-    delivery. It is refused before the ACK, with an ERROR row, nothing stored and nothing queued."""
-    ic = _streaming_ic()
+    """F1 at both listeners: such a body was ACKed AA and queued, then dead-lettered at
+    delivery. It is refused before the ACK at any size, with an AR on MLLP and a permanent
+    refusal on HTTP, an ERROR row each, nothing stored and nothing queued."""
+    from messagefoundry.pipeline.ingress_guards import COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+    from messagefoundry.transports.receipt import RefusalKind
+
+    ic = _streaming_ic() if streaming else _plain_ic()
     body = _TILDE_HEADER_HANDLE
-    assert len(body) >= (ic.stream_threshold_bytes or 0)
+    assert (ic.stream_threshold_bytes is not None) is streaming
+    assert len(body) >= (_streaming_ic().stream_threshold_bytes or 0)
     runner = _runner(store, ic)
 
     ack = await runner._handle_inbound(ic, body.encode("utf-8"))
+    receipt = await runner._handle_inbound_http(ic, body.encode("utf-8"))
 
     assert _ack_code(ack) == "AR"
-    assert ack is not None and "document handle marker in the body" in ack
-    rows = await _rows(store, ic.name)
-    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
-    assert "handle marker" in str(rows[0]["error"])
-    assert await _attachment_count(store) == 0
-    assert await _ingress_count(store, ic.name) == 0
-
-
-async def test_the_http_listener_refuses_a_hidden_handle_under_a_colliding_header_too(
-    store: MessageStore,
-) -> None:
-    """F1 on the receipt listener: a permanent refusal, with an ERROR row and nothing queued."""
-    from messagefoundry.transports.receipt import RefusalKind
-
-    ic = _streaming_ic()
-    runner = _runner(store, ic)
-
-    receipt = await runner._handle_inbound_http(ic, _TILDE_HEADER_HANDLE.encode("utf-8"))
-
+    assert ack is not None and "handle marker refused by its delimiters" in ack
     assert receipt.refusal is RefusalKind.PERMANENT
-    assert [r["status"] for r in await _rows(store, ic.name)] == [MessageStatus.ERROR.value]
+    rows = await _rows(store, ic.name)
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value] * 2
+    assert all(COLLIDING_DOC_REF_MARKER_REFUSED_REASON in str(r["error"]) for r in rows)
     assert await _attachment_count(store) == 0
     assert await _ingress_count(store, ic.name) == 0
 
 
-async def test_a_streaming_colliding_body_with_no_claim_and_no_marker_is_acked_at_both_listeners(
-    store: MessageStore,
+@_LISTENER_KINDS
+async def test_a_colliding_body_with_no_claim_and_no_marker_is_acked_at_both_listeners(
+    store: MessageStore, streaming: bool
 ) -> None:
     """The listener control for F1: such a body is accepted and queued at both listeners, with
     nothing detached."""
-    ic = _streaming_ic()
+    ic = _streaming_ic() if streaming else _plain_ic()
     body = _TILDE_HEADER_NO_MARKER.encode("utf-8")
-    assert len(body) >= (ic.stream_threshold_bytes or 0)
+    assert len(body) >= (_streaming_ic().stream_threshold_bytes or 0)
     runner = _runner(store, ic)
 
     ack = await runner._handle_inbound(ic, body)
@@ -2285,13 +2285,46 @@ async def test_a_streaming_colliding_body_with_no_claim_and_no_marker_is_acked_a
     assert await _attachment_count(store) == 0
 
 
+@pytest.mark.parametrize(
+    ("body", "refused"),
+    [(_TILDE_HEADER_HANDLE, True), (_TILDE_HEADER_NO_MARKER, False)],
+    ids=["hidden-handle", "no-marker"],
+)
+def test_the_dry_run_and_the_re_ingress_refuse_a_hidden_handle_as_the_listeners_do(
+    body: str, refused: bool
+) -> None:
+    """F1: the listeners' check is the shared one, so ``messagefoundry check`` and a loopback
+    re-ingress refuse the same body with the same reason, and accept the control."""
+    from messagefoundry.pipeline.ingress_guards import COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+    from messagefoundry.pipeline.wiring_runner import _peek_for_loopback
+
+    reg = Registry()
+    reg.add_inbound(_plain_ic())
+    reg.add_router("r", lambda m: [])
+
+    result = dry_run(reg, body.encode("utf-8"))
+    refusal = _peek_for_loopback(_plain_ic(), body)[3]
+
+    if refused:
+        assert result.disposition is MessageStatus.ERROR
+        assert result.error == COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+        assert refusal == COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+    else:
+        assert result.disposition is not MessageStatus.ERROR
+        assert refusal is None
+
+
 def test_a_readable_received_handle_under_a_colliding_header_is_refused_as_one() -> None:
-    """Under ``MSH|^~&|`` OBX-5.5 still reads, and a handle there with an ED claim is refused as
-    a received handle, not for the header, as it was before the header was judged first."""
+    """Under ``MSH|^~&|`` OBX-5.5 still reads, and a raw handle there under an ED claim is
+    refused by the detach as a received handle, an InboundDocRefError, not for the header,
+    although the header is now judged before the per-OBX read."""
+    from messagefoundry.parsing.binary import CollidingDelimitersError
+
     body = _hl7(_HIDDEN_HANDLE, msh2="^~&")
     assert Message.parse(body).field("OBX-5.5") == _HIDDEN_HANDLE
-    with pytest.raises(InboundDocRefError):
+    with pytest.raises(InboundDocRefError, match="handle marker") as caught:
         list(iter_obx_documents(Message.parse(body), received=body))
+    assert not isinstance(caught.value, CollidingDelimitersError)
 
 
 def test_a_body_refused_for_its_header_is_not_value_scanned(
