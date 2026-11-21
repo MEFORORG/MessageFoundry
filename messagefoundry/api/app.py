@@ -533,6 +533,7 @@ from messagefoundry.serviceenv import (
 from messagefoundry.startupcode import StartupPosture, startup_posture
 from messagefoundry.store import Row, open_store, sqlite_settings
 from messagefoundry.store.base import (
+    ATTACHMENT_CONTENT_TYPE_MAX,
     ResendError,
     Store,
     audit_write_errors,
@@ -3853,10 +3854,6 @@ def _export_ndjson_line(row: Row) -> bytes:
 #: shape screen ONLY — it admits ``image/svg+xml``/``text/html``/``application/hta``; the allow-list
 #: below is what makes the served type inert (ASVS 1.3.4).
 _SAFE_MIME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+-]*$")
-#: Length bound on the served ``Content-Type``. The token grammar above is unbounded and the stored
-#: label has no column check, so an arbitrarily long attacker string would otherwise be echoed into a
-#: response header; no registered media type comes close to this.
-_MAX_ATTACHMENT_MIME_LEN = 255
 _DEFAULT_ATTACHMENT_MIME = "application/octet-stream"
 
 #: The **inert** media types an attachment download may DECLARE, each mapped to the extension its download
@@ -4004,7 +4001,12 @@ def _safe_attachment_content_type(content_type: str | None) -> str:
     nosniff + the sandbox CSP), never a sanitizing rewrite of the stored document. An SVG's SERVED
     copy is sanitized in the download route as well, beside this downgrade (see the comment there)."""
     ct = (content_type or "").strip()
-    if len(ct) > _MAX_ATTACHMENT_MIME_LEN or not _SAFE_MIME_RE.match(ct):
+    # The length bound is the store's column width (BACKLOG #1619), so the served type and the stored
+    # one share one limit. SQLite and PostgreSQL store a label of any length, and the bound keeps the
+    # shape screen and the lookup from working over an arbitrarily long attacker string; no type on
+    # the allow-list comes close to it. The screen admits ASCII only, where a character is one UTF-16
+    # unit.
+    if len(ct) > ATTACHMENT_CONTENT_TYPE_MAX or not _SAFE_MIME_RE.match(ct):
         return _DEFAULT_ATTACHMENT_MIME
     # The shape screen has already excluded parameters (``; charset=…``) and inner whitespace, so the
     # case-fold is the only normalization an exact lookup still needs.

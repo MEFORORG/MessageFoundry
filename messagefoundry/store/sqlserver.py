@@ -91,6 +91,7 @@ from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import (
+    ATTACHMENT_CONTENT_TYPE_MAX,
     CONNECTION_FLAG_LOCK_TIMEOUT_SECONDS,
     PROVISION_SCHEMA_COMMAND,
     UPLOAD_RESERVATION_STALE_AFTER,
@@ -2299,8 +2300,8 @@ _SCHEMA: list[str] = [
     # which DISTINCT attachments a message holds (Phase 3a linkage) so retention decrefs exactly those on
     # purge. Logical refs — no FK (mirrors queue.body_ref → shared_body.hash), so a future incremental
     # writer can insert chunks then finalize the header, and the startup sweep reclaims header-less orphans.
-    """IF OBJECT_ID('attachment','U') IS NULL CREATE TABLE attachment (
-        id NVARCHAR(64) NOT NULL PRIMARY KEY, content_type NVARCHAR(256) NOT NULL,
+    f"""IF OBJECT_ID('attachment','U') IS NULL CREATE TABLE attachment (
+        id NVARCHAR(64) NOT NULL PRIMARY KEY, content_type NVARCHAR({ATTACHMENT_CONTENT_TYPE_MAX}) NOT NULL,
         total_bytes BIGINT NOT NULL, refcount INT NOT NULL, created_at FLOAT NOT NULL)""",
     """IF OBJECT_ID('attachment_chunk','U') IS NULL CREATE TABLE attachment_chunk (
         attachment_id NVARCHAR(64) NOT NULL, seq INT NOT NULL, ciphertext NVARCHAR(MAX) NOT NULL,
