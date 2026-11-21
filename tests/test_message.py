@@ -333,6 +333,9 @@ _COLLIDING = (
     "MSH^^A^B^C^D^20260101^^ADT^A01^M1^P^2.5\rPID^1^^111^^DOE\r",
     "MSH|~|A|B\rPID|1||111\r",
     "MSH|^~&|A|B\rPID|1||111\r",
+    # A short MSH-2 that repeats a character itself: "~" is the repetition separator and the
+    # escape (round-3 review finding 1).
+    "MSH|^~~|A|B\rPID|1||111\r",
 )
 
 
@@ -376,13 +379,23 @@ def test_a_short_msh_2_may_be_completed_to_the_characters_the_parser_filled() ->
     assert again.repetitions("PID-3.1") == ["111", "222"]
 
 
+def test_a_refused_group_rebuild_changes_nothing() -> None:
+    """A rebuild cleared the group before its first append raised, so on a message that refuses
+    every write the order lost its observations (BACKLOG #5972)."""
+    m = Message.parse("MSH|^~&|A|B\rOBR|1\rOBX|1|TX|||keep\r")
+    before = m.encode()
+    with pytest.raises(ValueError, match="a default filled in for one"):
+        m.groups()[0].rebuild(["OBX|2|TX|||new"])
+    assert m.encode() == before
+
+
 def test_a_refused_group_delete_changes_nothing() -> None:
     """R2-4 of the round-2 review: a ``groups("BHS")`` group of a BHS-led message opens with the
     leading header, which the positional delete refuses, but ``delete`` removed every later row
     before it reached that one and raised. Every row is now checked first (BACKLOG #5972)."""
     m = Message.parse("BHS|^~\\&|A\rMSH|^~\\&|A|B\rPID|1\rOBX|1\r")
     before = m.encode()
-    with pytest.raises(ValueError, match="out of range"):
+    with pytest.raises(ValueError, match="refusing to delete the BHS header that leads"):
         m.groups("BHS")[0].delete()
     assert m.encode() == before
     # The control: a group that does not hold the header still deletes.

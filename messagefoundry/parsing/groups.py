@@ -223,6 +223,10 @@ class SegmentGroup:
         :meth:`append_segment` per line, but expressed as one intent so a reviewer sees a rebuild,
         not a clear-that-happens-to-be-followed-by-adds. Each line goes through
         :meth:`Message.add_segment` (own-separator split, re-parse), never string slicing."""
+        if lines:
+            # A message refusing every write would otherwise lose the body before the first
+            # append raised (BACKLOG #5972).
+            self._m._write_encoding_chars()
         self.clear()
         for line in lines:
             self.append_segment(line)

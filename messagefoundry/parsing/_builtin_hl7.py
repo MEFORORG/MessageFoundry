@@ -219,27 +219,21 @@ def header_line_head(segment: Segment) -> str:
 
 
 def filled_default_collides(line: str) -> bool:
-    """Whether :func:`_extract_separators` fills a separator ``line`` does not declare with a
-    default that is already one of its other separators, as ``MSH^^...`` (``^`` is the field
-    separator, and the default component separator) or ``MSH|~|...`` (``~`` is the declared
-    component separator, and the default repetition separator) do. Every line is split on the
-    first line's separators, so two structures would share one character and a write joining one
-    would read back as the other (BACKLOG #5972). The parse accepts such a header, as ``Peek``
-    reads it, so a read sees what the sender sent; ``Message``'s writes refuse it. A header that
-    declares all four is never judged here: it filled nothing, and what it repeats is its own
-    (strict validation refuses that)."""
-    sep0 = line[3]
-    end = line.find(sep0, 4, _SEPARATOR_HEAD)
-    declared = len(line[3 : end if end != -1 else _SEPARATOR_HEAD])
-    if declared >= 5:
+    """Whether ``line`` names fewer than four encoding characters and the five separators
+    :func:`_extract_separators` reads from it, its defaults filling the rest, are not five distinct
+    characters. A default may be one already declared, as in ``MSH^^...`` (``^`` is the field
+    separator and the default component one) or ``MSH|~|...`` (``~`` the declared component
+    separator and the default repetition one), or the short header may repeat one itself, as
+    ``MSH|^~~|...`` does. Every line is split on the first line's separators, so two structures
+    would share one character and a write joining one would read back as the other (BACKLOG
+    #5972). The parse accepts such a header, as ``Peek`` reads it, so a read sees what the sender
+    sent; ``Message``'s writes refuse it, as every write to a short header was refused before.
+    A header that declares all four is not judged here: it filled nothing, and what it repeats
+    is its own (strict validation refuses that)."""
+    end = line.find(line[3], 4, _SEPARATOR_HEAD)
+    if len(line[4 : end if end != -1 else _SEPARATOR_HEAD]) >= 4:
         return False
-    seps = _extract_separators(line)
-    # seps is (field, component, repetition, subcomponent, escape); the line declares them in
-    # the order field, component, repetition, escape, subcomponent.
-    in_line_order = (seps[0], seps[1], seps[2], seps[4], seps[3])
-    return any(
-        in_line_order[i] in in_line_order[:i] + in_line_order[i + 1 :] for i in range(declared, 5)
-    )
+    return len(set(_extract_separators(line))) < 5
 
 
 def parse(norm: str) -> ParsedMessage:

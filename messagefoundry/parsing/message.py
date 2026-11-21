@@ -319,7 +319,12 @@ class Message:
         2, a whole-field value that keeps the four encoding characters and adds, drops or changes
         only the one v2.7 truncation character after them; and, on the leading header's short
         field 2, the four characters the parser filled it with, which declares them. To send under other delimiters, re-encode the whole message, as
-        a per-outbound ``encoding_characters`` does."""
+        a per-outbound ``encoding_characters`` does.
+
+        Every write to a message whose first line names fewer than four encoding characters while
+        its five separators, the parser's defaults filled in, are not distinct (``MSH|~|``,
+        ``MSH|^~~|``) raises ``ValueError``, since two structures there share one character; such a
+        message reads as the sender sent it (BACKLOG #5972)."""
         self._write(path, value, occurrence, repetition, as_data=False)
 
     def _write(
@@ -544,6 +549,10 @@ class Message:
         would delete it. A caller deleting several positions checks every one first, so a refusal
         leaves the message unchanged."""
         segments = self._m["segments"]
+        if position == 0:
+            return ValueError(
+                f"refusing to delete the {segments[0]['id']} header that leads the message"
+            )
         if position < 1 or position >= len(segments):
             return ValueError(
                 f"position {position} out of range (1..{len(segments) - 1}); position 1 is after MSH"
@@ -783,11 +792,13 @@ class Message:
 
     def _write_encoding_chars(self) -> tuple[str, str, str, str, str]:
         """:meth:`_encoding_chars` for a write, which refuses a message whose first line names too
-        few encoding characters and has a default filled in for one that is already another of its
-        separators, as ``MSH|~|`` or ``MSH^^`` (BACKLOG #5972). Two structures there share one
+        few encoding characters while its five separators, defaults filled in, are not distinct,
+        as ``MSH|~|``, ``MSH^^`` or ``MSH|^~~|`` (BACKLOG #5972). Two structures there share one
         character, so a value joined on one would read back as the other. A read of such a message
-        is not refused: it reads what the sender sent, as ``Peek`` does, and a message that is only
-        read, routed or acknowledged never comes here."""
+        is not refused: it reads what the sender sent, as ``Peek`` does, so a message that is only
+        read, routed or acknowledged is accepted. A batching outbound's ``encode_batch`` comes
+        here too, since its BHS writes the head's delimiters, so such a head is refused at frame
+        time."""
         if self._delimiters_collide():
             raise ValueError(
                 "the message header names too few encoding characters, and a default filled in "

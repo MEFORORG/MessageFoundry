@@ -380,8 +380,9 @@ _DOC_REF_MARKER_CHARS = frozenset(DOC_REF_MARKER)
 
 #: A header line after the first. A Handler can wrap an MSH-led payload in an FHS or BHS
 #: envelope of other delimiters, or nest a BHS in an FHS, and any of those headers' own may then
-#: have escaped the handle.
-_LATER_HEADER = re.compile(r"[\r\n](?:MSH|BHS|FHS)")
+#: have escaped the handle. Looked for with ``str.find``, which runs at about the speed of the
+#: marker's own substring test, where one regex scan of a large payload cost some twenty times it.
+_LATER_HEADER_STARTS = tuple(brk + seg_id for brk in ("\r", "\n") for seg_id in HEADER_IDS)
 
 #: A segment break, where the parser's read of a header line ends.
 _LINE_END = re.compile(r"[\r\n]")
@@ -474,10 +475,13 @@ def may_hold_doc_ref(text: str) -> bool:
         return False
     if _header_names_marker_char(text, lead):
         return True
-    return any(
-        _header_names_marker_char(text, later.start() + 1)
-        for later in _LATER_HEADER.finditer(text, lead)
-    )
+    for start in _LATER_HEADER_STARTS:
+        at = text.find(start, lead)
+        while at != -1:
+            if _header_names_marker_char(text, at + 1):
+                return True
+            at = text.find(start, at + 1)
+    return False
 
 
 def _header_names_marker_char(text: str, start: int) -> bool:
@@ -613,6 +617,9 @@ def iter_obx_documents(
     document's own value holds a character the splice would escape under the body's own
     delimiters: a document is detached only if splicing it back under them reproduces it exactly.
     A Handler that moves ``MSH-1`` or ``MSH-2`` afterwards is caught by the re-attach instead.
+    It raises :class:`CollidingDelimitersError`, a :class:`NonVerbatimDocumentError`, when a
+    document would be detached and the body's short MSH-2 leaves its separators not distinct,
+    since ``Message`` refuses every write to such a body (BACKLOG #5972).
 
     Each document's value is held one at a time, as the caller's in-flight budget assumes: each
     check reads a value inside :func:`_scan_obx`, whose frame ends before the next read, and the
@@ -828,7 +835,8 @@ def strip_documents_in_hl7(
 
 def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int, int]:
     """Parse ``raw`` as HL7, strip its OBX-5 ED embeds, and re-encode. Returns the original unchanged on
-    a parse failure, or when nothing was stripped (so the caller skips the write)."""
+    a parse failure, on a header ``Message`` refuses every write to (a short MSH-2 whose separators
+    repeat, BACKLOG #5972), or when nothing was stripped (so the caller skips the write)."""
     # Local import keeps the one-way dependency (message.py imports binary.py, never the reverse) — the
     # cycle is broken by importing inside the function, not at module top.
     from messagefoundry.parsing.message import Message
@@ -837,6 +845,8 @@ def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int,
         message = Message.parse(raw)
     except Exception:
         # A malformed body that merely looked like HL7 — never crash a retention pass on it.
+        return raw, 0, 0
+    if message._delimiters_collide():
         return raw, 0, 0
     stripped, reclaimed = strip_documents_in_hl7(message, pruned_at=pruned_at, min_bytes=min_bytes)
     if stripped == 0:
@@ -870,14 +880,15 @@ def _copy_names_address(text: str, marker: str) -> bool:
     return False
 
 
-def _later_header_escapes_marker(message: Message, text: str) -> bool:
-    """Whether a header line after the first names delimiters, in its own fields 1 and 2, under
-    which the handle marker is escaped differently, and ``text`` holds it so escaped. The
-    message reads every line under the first line's delimiters (BACKLOG #5972), so a handle a
-    Handler wrote under an inner MSH's own, then wrapped in an envelope of others, would not be
+def _later_header_markers(message: Message, text: str) -> set[str]:
+    """The handle marker as a header line after the first escapes it under its own fields 1 and
+    2, for each such header whose form differs from the first line's and is held in ``text``.
+    The message reads every line under the first line's delimiters (BACKLOG #5972), so a handle
+    a Handler wrote under an inner MSH's own, then wrapped in an envelope of others, would not be
     read as one and would reach the wire unresolved. Reads the parsed fields only, never a
     slice of the raw text."""
     escaped_here = escape_leaf(DOC_REF_MARKER, message._m["seps"])
+    found: set[str] = set()
     # One pass over the parsed segments: a header line is split eagerly, so its fields 1 and 2
     # are read in place, with no per-header occurrence scan.
     for segment in message._m["segments"][1:]:
@@ -885,8 +896,8 @@ def _later_header_escapes_marker(message: Message, text: str) -> bool:
             continue
         escaped = escape_leaf(DOC_REF_MARKER, _extract_separators(header_line_head(segment)))
         if escaped not in (DOC_REF_MARKER, escaped_here) and escaped in text:
-            return True
-    return False
+            found.add(escaped)
+    return found
 
 
 def doc_ref_addresses_in_hl7(text: str) -> frozenset[str]:
@@ -1002,7 +1013,10 @@ async def reattach_documents_in_hl7(
         if found and message._delimiters_collide():
             # Message refuses every write to such a payload, the splice included (BACKLOG #5972).
             raise UnreattachableDocumentError(_COLLIDING_HANDLE)
-        if _later_header_escapes_marker(message, text):
+        # Judged as a copy is below: a bare marker under an inner header's delimiters, in a
+        # message that holds nothing and names no content address, is carried as text.
+        later = _later_header_markers(message, text)
+        if later and (found or bound or any(_copy_names_address(text, m) for m in later)):
             raise UnreattachableDocumentError(_MIXED_HEADER_HANDLE)
         markers = _marker_forms(separators)
         # Under the same delimiters a copied content address is escaped too, so the address after

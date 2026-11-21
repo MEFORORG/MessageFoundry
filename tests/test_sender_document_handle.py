@@ -869,6 +869,32 @@ async def test_a_handle_escaped_under_any_later_header_opens_the_gate(payload: s
         await reattach_documents_in_hl7(payload, _no_read, bound=frozenset())
 
 
+async def test_a_bare_marker_under_a_later_header_is_judged_as_a_copy() -> None:
+    """A bare marker under an inner header's delimiters, in a message that holds no document and
+    names no content address, is carried as text, as the same bare marker under the first line's
+    is; one naming an address is refused (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+
+    inner = Message.parse("MSH|:~\\&|APP|FAC\rNTE|1\r")
+    inner.set("NTE-3.1", DOC_REF_MARKER)
+    bare = _hl7(_b64(10)) + inner.encode()
+    assert DOC_REF_MARKER not in bare
+    assert await reattach_documents_in_hl7(bare, _no_read, bound=frozenset()) == bare
+    inner.set("NTE-3.1", make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application"))
+    addressed = _hl7(_b64(10)) + inner.encode()
+    with pytest.raises(UnreattachableDocumentError, match="a header after the first"):
+        await reattach_documents_in_hl7(addressed, _no_read, bound=frozenset())
+
+
+def test_the_retention_strip_leaves_a_body_it_cannot_write() -> None:
+    """A stored body whose short MSH-2 leaves its separators not distinct cannot be written, so the
+    strip returns it unchanged, as its contract says, rather than raise (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import strip_documents
+
+    body = _hl7(_b64(2000), msh2="^~&")
+    assert strip_documents(body, pruned_at=0.0) == (body, 0, 0)
+
+
 def test_the_gate_reads_a_header_line_only_to_its_end() -> None:
     """F13 of the round-1 review: a header's separator read stopped at eight characters, not at
     the end of the line, so a short header took a separator from the next line, as the parser
