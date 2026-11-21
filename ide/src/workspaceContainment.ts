@@ -91,6 +91,16 @@ export function committedRelativePath(ws: string, value: string): string | undef
   return rel === "" ? "." : rel.split(path.sep).join("/");
 }
 
+/** `name` without its trailing spaces, in linear time. A `/ +$/` replace backtracks quadratically on
+ *  a long run of spaces followed by another character, and a path setting is workspace-supplied. */
+function dropTrailingSpaces(name: string): string {
+  let end = name.length;
+  while (end > 0 && name.charCodeAt(end - 1) === 0x20) {
+    end--;
+  }
+  return name.slice(0, end);
+}
+
 /** Whether, on Windows (`win32`), any folder or file name in `rel` meets `bad`. Either separator
  *  splits `rel`, since Windows takes both. Spelling only, with no I/O. */
 function someWin32Name(rel: string, win32: boolean, bad: (name: string) => boolean): boolean {
@@ -158,7 +168,7 @@ const RESERVED_DEVICE_NAMES: ReadonlySet<string> = new Set([
  */
 export function hasReservedDeviceName(rel: string, win32: boolean = path.sep === "\\"): boolean {
   return someWin32Name(rel, win32, (part) =>
-    RESERVED_DEVICE_NAMES.has(part.split(".")[0].replace(/ +$/, "").toUpperCase()),
+    RESERVED_DEVICE_NAMES.has(dropTrailingSpaces(part.split(".")[0]).toUpperCase()),
   );
 }
 

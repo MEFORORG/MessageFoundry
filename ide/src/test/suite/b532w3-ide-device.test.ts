@@ -10,7 +10,12 @@ import * as os from "os";
 import * as path from "path";
 
 import { securityConfigTarget, type LinkFs } from "../../securityEditorModel";
-import { escapesByLink, linkEscapeRefusal, resolveInsideWorkspace } from "../../workspaceContainment";
+import {
+  escapesByLink,
+  hasReservedDeviceName,
+  linkEscapeRefusal,
+  resolveInsideWorkspace,
+} from "../../workspaceContainment";
 
 /** Runs `fn` with the synchronous file-system reads workspaceContainment makes replaced by spies that
  *  record the call and throw, and returns what was recorded. */
@@ -166,5 +171,18 @@ suite("b532w3: a reserved device name is refused on Windows (BACKLOG #5404 item 
     const text = linkEscapeRefusal("configDir");
     assert.ok(text.includes("is a Windows device name such as nul or com1"), text);
     assert.ok(text.includes("rename the folder or file"), text);
+  });
+
+  test("a name with a long run of spaces inside is read in linear time", () => {
+    // A `/ +$/` strip backtracks quadratically here: about 4.9 s for 80,000 spaces (measured in
+    // review). The setting is workspace-supplied and the check runs on the extension host thread.
+    const name = `a${" ".repeat(80000)}b`;
+    const start = process.hrtime.bigint();
+    assert.strictEqual(hasReservedDeviceName(name, true), false);
+    const ms = Number(process.hrtime.bigint() - start) / 1e6;
+    assert.ok(ms < 250, `took ${ms} ms`);
+    // The trailing-space reading itself is kept: a device stem with spaces before its dot counts.
+    assert.strictEqual(hasReservedDeviceName("con   .toml", true), true);
+    assert.strictEqual(hasReservedDeviceName(`nul${" ".repeat(80000)}`, true), true);
   });
 });
