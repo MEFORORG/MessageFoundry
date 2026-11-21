@@ -506,6 +506,7 @@ def require_ui(
     mfa_refusal: Callable[[Request], HTTPException] | None = None,
     pending_refusal: PendingRefusal | None = None,
     new_address_check: bool = True,
+    step_up_new_address: Callable[[Request], str | None] | None = None,
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Authenticate a /ui request from the session cookie and assert ``permissions``.
 
@@ -518,8 +519,12 @@ def require_ui(
     decides. A re-auth from the new address re-anchors the session. The check runs once, before
     both budgets. A must-change session is not asked: ``/ui/reauth`` sends it back to its
     confinement page, so a refusal would loop. The step-up factories pass
-    ``new_address_check=False``: they ask the same question themselves, with the continuation their
-    route needs, and asking here first would send the operator to ``/ui`` instead.
+    ``new_address_check=False`` and ``step_up_new_address`` instead: the same question, asked on
+    every request their route serves, GET included, and continuing to what that callable returns
+    (``None`` meaning this request's own path). It is asked at the same place, so their refusal
+    also comes before both budgets (BACKLOG #5646). Asked in the factory after this base had
+    returned, a refused write had already spent the actor's admin-write budget, so a replayed cookie
+    from a new address could throttle the real operator's writes.
 
     ``mfa_refusal`` changes only WHERE the ASVS 6.3.3 gate sends a pending session, never WHETHER it
     refuses or records the refusal. The step-up factories pass it so a pending session lands on
@@ -672,7 +677,11 @@ def require_ui(
         # refused request spends nothing. Not for a must-change session: /ui/reauth sends it back to
         # its confinement page, so a refusal would loop. Such a session reaches this point only on
         # the password page, whose JSON twin /me/password is neither paced nor asked.
-        if new_address_check and not identity.must_change_password and (phi or write):
+        if step_up_new_address is not None:
+            # A step-up factory's own question (BACKLOG #5646): on every request, with no
+            # must-change skip, as each factory asked it before it moved here.
+            await _refuse_from_new_address(auth, request, next_path=step_up_new_address(request))
+        elif new_address_check and not identity.must_change_password and (phi or write):
             await _refuse_from_new_address(
                 auth,
                 request,
@@ -1602,6 +1611,19 @@ async def _refuse_from_new_address(
         raise _reauth_redirect(request, next_path)
 
 
+def _step_up_continuation(
+    reauth_next: Callable[[Request], str] | None,
+) -> Callable[[Request], str | None]:
+    """The ``step_up_new_address`` a step-up factory hands :func:`require_ui`: the continuation its
+    own refusals carry, ``None`` meaning the request's own path, as :func:`_reauth_redirect` reads
+    it."""
+
+    def continuation(request: Request) -> str | None:
+        return reauth_next(request) if reauth_next is not None else None
+
+    return continuation
+
+
 def _reauth_refusal(
     reauth_next: Callable[[Request], str] | None,
 ) -> Callable[[Request], HTTPException]:
@@ -1687,10 +1709,13 @@ def require_ui_step_up(
         phi=phi,
         mfa_refusal=_reauth_refusal(reauth_next),
         new_address_check=False,
+        # The new-client-IP refusal, asked in the base so it comes before both budgets (#5646).
+        step_up_new_address=_step_up_continuation(reauth_next),
     )
 
     async def dependency(request: Request) -> Identity:
-        identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
+        # cookie auth + MFA gate + permission (+ must-change gate) + the new-client-IP refusal
+        identity = await base(request)
         auth = get_auth(request)
         if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
@@ -1700,9 +1725,8 @@ def require_ui_step_up(
         # loses its second-factor check if the base is changed; the audited refusal is the one above.
         if not await auth.mfa_satisfied(token):
             raise _reauth_redirect(request, nxt)
-        # Contextual risk + password step-up window: a new client IP or a stale window forces re-auth.
-        new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
-        if new_ip or not await auth.has_recent_step_up(token):
+        # Password step-up window: a stale window forces re-auth.
+        if not await auth.has_recent_step_up(token):
             raise _reauth_redirect(request, nxt)
         return identity
 
@@ -1725,16 +1749,21 @@ def require_ui_reauth_only(
     """
     # allow_mfa_pending: a genuine exemption, not a re-route. These gate the ENROLLMENT path, and
     # an un-enrolled user can never satisfy a gate standing in front of the route that enrolls them.
-    base = require_ui(*permissions, allow_mfa_pending=True, new_address_check=False)
+    base = require_ui(
+        *permissions,
+        allow_mfa_pending=True,
+        new_address_check=False,
+        step_up_new_address=_step_up_continuation(reauth_next),
+    )
 
     async def dependency(request: Request) -> Identity:
-        identity = await base(request)  # cookie auth + permission (+ must-change gate)
+        # cookie auth + permission (+ must-change gate) + the new-client-IP refusal
+        identity = await base(request)
         auth = get_auth(request)
         if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
-        new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
-        if new_ip or not await auth.has_recent_step_up(token):
+        if not await auth.has_recent_step_up(token):
             raise _reauth_redirect(
                 request, reauth_next(request) if reauth_next is not None else None
             )
@@ -1806,10 +1835,13 @@ def require_ui_step_up_action(
         phi=phi,
         mfa_refusal=_reauth_refusal(reauth_next),
         new_address_check=False,
+        # new_ip first, in the base: before both budgets (#5646) and before the proof is spent.
+        step_up_new_address=_step_up_continuation(reauth_next),
     )
 
     async def dependency(request: Request) -> Identity:
-        identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
+        # cookie auth + MFA gate + permission (+ must-change gate) + the new-client-IP refusal
+        identity = await base(request)
         auth = get_auth(request)
         if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
@@ -1817,9 +1849,6 @@ def require_ui_step_up_action(
         nxt = reauth_next(request) if reauth_next is not None else None
         # Unreachable while the base gate stands; kept for the reason require_ui_step_up gives.
         if not await auth.mfa_satisfied(token):
-            raise _reauth_redirect(request, nxt)
-        new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
-        if new_ip:
             raise _reauth_redirect(request, nxt)
         if await _ui_action_step_up_ok(auth, token, action, spend=spend):
             return identity
@@ -1867,10 +1896,13 @@ def require_ui_step_up_when_own_sessions_end(
         *permissions,
         mfa_refusal=_reauth_refusal(reauth_next),
         new_address_check=False,
+        # new_ip first, in the base: before both budgets (#5646) and before the proof is spent.
+        step_up_new_address=_step_up_continuation(reauth_next),
     )
 
     async def dependency(request: Request) -> Identity:
-        identity = await base(request)  # cookie auth + MFA gate + permission (+ must-change gate)
+        # cookie auth + MFA gate + permission (+ must-change gate) + the new-client-IP refusal
+        identity = await base(request)
         auth = get_auth(request)
         if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
@@ -1878,8 +1910,6 @@ def require_ui_step_up_when_own_sessions_end(
         nxt = reauth_next(request) if reauth_next is not None else None
         # Unreachable while the base gate stands; kept for the reason require_ui_step_up gives.
         if not await auth.mfa_satisfied(token):
-            raise _reauth_redirect(request, nxt)
-        if await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path):
             raise _reauth_redirect(request, nxt)
         named = await ended(request, auth)
         request.scope[_GATE_ENDED_SESSIONS] = named
@@ -2138,7 +2168,7 @@ def require_ui_reauth_only_action(
         if not await auth.factor_binding_is_blocked(token, action):
             return None
         # The JSON twin's rule: a refused request still records the new-IP signal. Only on this
-        # branch, because a request let through records it once, below.
+        # branch, because a request let through records it once, later in the base.
         await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
         return _reauth_redirect(request, reauth_next(request) if reauth_next is not None else None)
 
@@ -2151,28 +2181,26 @@ def require_ui_reauth_only_action(
         allow_mfa_pending=True,
         pending_refusal=refuse_pending,
         new_address_check=False,
+        # new_ip first, in the base: before the admin-write charge (#5646) and the proof's spend.
+        step_up_new_address=_step_up_continuation(reauth_next),
     )
 
     async def dependency(request: Request) -> Identity:
-        # cookie auth + permission (+ must-change gate) + the pending refusal above
+        # cookie auth + permission (+ must-change gate) + the pending refusal above + the
+        # new-client-IP refusal
         identity = await base(request)
         auth = get_auth(request)
         if auth is None:  # pragma: no cover - base already handled this
             raise _login_redirect()
         token = session_token(request)
-        new_ip = await auth.flag_new_client_ip(token, client_ip(request), path=request.url.path)
         nxt = reauth_next(request) if reauth_next is not None else None
         # _ui_action_step_up_ok repeats the factor-binding check, so the refusal still holds if the
         # base ever loses its pending_refusal (refuse_pending above).
         if (
-            new_ip
-            or (
-                before_spend is not None
-                and auth.action_step_up_required
-                and await before_spend(request)
-            )
-            or not await _ui_action_step_up_ok(auth, token, action)
-        ):
+            before_spend is not None
+            and auth.action_step_up_required
+            and await before_spend(request)
+        ) or not await _ui_action_step_up_ok(auth, token, action):
             raise _reauth_redirect(request, nxt)
         return identity
 

@@ -18,6 +18,7 @@ from messagefoundry.auth import Identity, Permission
 
 from .. import pages
 from .._auth import (
+    _new_address_continuation,
     assert_same_origin,
     register_ui_action,
     require_ui,
@@ -46,14 +47,23 @@ register_ui_action(
 )
 # The layered run (ADR 0136) is likewise a step-up-gated GET that composes + decrypts; register it as
 # an UNLOCK form too. Its query carries only preset IDS (never the PHI needle — that's server-composed
-# from the encrypted column), so the deliberate-drop posture is preserved.
+# from the encrypted column), so the deliberate-drop posture is preserved. The pattern is
+# query-tolerant and a refusal carries the query (:func:`_layered_continuation`, BACKLOG #5646): the
+# run's whole input is ``?presets=``, so a continuation without it landed on the run's 400.
+_SEARCH = "/ui/messages/search"
 register_ui_action(
-    r"^/ui/messages/search/layered$",
+    r"^/ui/messages/search/layered(\?[^#]*)?$",
     Permission.MESSAGES_READ,
     auto_retry=False,
     unlock=True,
     label="Run a layered message search",
 )
+
+
+def _layered_continuation(request: Request) -> str:
+    """The layered run with the presets the refused GET named, or the search form when that query
+    would not survive the re-auth: the rule ``_new_address_continuation`` gives a refused GET."""
+    return _new_address_continuation(request, landing=_SEARCH)
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
@@ -285,7 +295,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_save_preset(
         request: Request,
         engine: Any = Depends(deps.get_engine),
-        identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_READ)),
+        # reauth_next: body-carrying, so a refusal continues to the search form, a registered unlock
+        # page. Without it the continuation was this POST path, which /ui/reauth refuses (#5646).
+        identity: Identity = Depends(
+            require_ui_step_up(Permission.MESSAGES_READ, reauth_next=lambda _r: _SEARCH)
+        ),
     ) -> Response:
         # Same-origin; step-up (persists a possibly-PHI criteria). Body-carrying, so it re-opens via the
         # search page's unlock form on a stale step-up rather than being auto-retried.
@@ -356,7 +370,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # No gate-level phi= here, as on ui_message_search (BACKLOG #1025): the composed run already
         # charges once inside core.layered_search, so a gate-level phi= would double-charge that path.
         # The no-preset 400 re-render is the only unpaced path, charged explicitly in its branch below.
-        identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_READ)),
+        identity: Identity = Depends(
+            require_ui_step_up(Permission.MESSAGES_READ, reauth_next=_layered_continuation)
+        ),
         presets: list[str] | None = Query(None),
     ) -> HTMLResponse:
         preset_list = await _presets(engine, identity, request)

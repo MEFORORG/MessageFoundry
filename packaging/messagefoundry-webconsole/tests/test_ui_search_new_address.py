@@ -3,8 +3,9 @@
 """BACKLOG #5646 -- every /ui message-search route refuses a session presented from a new address.
 
 Four search routes gate with ``require_ui_step_up``, which builds its ``require_ui`` base with
-``new_address_check=False`` and asks the question itself, through ``flag_new_client_ip``. The preset
-delete gates with plain ``require_ui``, which asks it for a write. Nothing drove a search route from
+``new_address_check=False`` and hands it ``step_up_new_address``, so the base asks the question on
+every request, through ``flag_new_client_ip``. The preset delete gates with plain ``require_ui``,
+which asks it for a write. Nothing drove a search route from
 a second address, so a change that dropped either call would have stayed green.
 
 **Each route has a REFUSE and an ALLOW arm built the same way.** One session, signed in at
@@ -19,6 +20,12 @@ Mutants, run by hand when this landed: replacing the ``flag_new_client_ip`` call
 ``require_ui_step_up`` with ``False`` failed the four step-up routes' cases; making
 ``_refuse_from_new_address`` return without asking failed the delete case.
 
+**A refused request spends nothing** (BACKLOG #5646). Each REFUSE arm also requires that neither
+the admin-write nor the PHI-read budget was asked for while it ran. The step-up gate used to ask
+the address question after its ``require_ui`` base had returned, so a refused write had already
+spent the actor's admin-write budget. The ALLOW arm of each write is the control that the count
+moves at all.
+
 All data here is synthetic.
 """
 
@@ -27,6 +34,7 @@ from __future__ import annotations
 import json
 from collections.abc import Awaitable, Callable
 from typing import NamedTuple
+from urllib.parse import quote
 
 import httpx
 import pytest
@@ -88,13 +96,14 @@ class Case(NamedTuple):
 CASES = (
     Case("form", SEARCH, "GET", _search_form, 200, SEARCH),
     Case("run", SEARCH + "/run", "POST", _search_run, 200, SEARCH),
-    # The save passes no reauth_next, so its refusal continues to its own POST path, which
-    # /ui/reauth does not accept. That is an open finding, pinned as it stands: a fix changes this
-    # value, and should.
-    Case("save_preset", PRESETS, "POST", _save, 303, PRESETS),
+    # A body-carrying write, so its refusal continues to the search form, a registered unlock page
+    # (BACKLOG #5646). It used to continue to its own POST path, which /ui/reauth refuses.
+    Case("save_preset", PRESETS, "POST", _save, 303, SEARCH),
     # A plain require_ui write lands on /ui after the re-auth: its body cannot be carried through.
     Case("delete_preset", DELETE, "POST", _delete, 303, "/ui"),
-    Case("layered", SEARCH + "/layered", "GET", _layered, 200, SEARCH + "/layered"),
+    # The presets ride the continuation (BACKLOG #5646): without them the run answers 400. The
+    # placeholder is the REFUSE arm's preset id.
+    Case("layered", SEARCH + "/layered", "GET", _layered, 200, SEARCH + "/layered?presets={pid}"),
 )
 
 
@@ -118,6 +127,21 @@ async def test_a_search_route_refuses_a_session_from_a_new_address(
     user = await service.store.get_user_by_username("op")
     assert user is not None
     await _seed(engine)
+
+    # Every budget charge a gate or handler asks for, recorded by a spy over this instance.
+    charges: list[str] = []
+    admin_write, phi_read = service.allow_admin_write, service.allow_phi_read
+
+    def spy_admin_write(actor: str) -> bool:
+        charges.append("admin_write")
+        return admin_write(actor)
+
+    def spy_phi_read(actor: str) -> bool:
+        charges.append("phi_read")
+        return phi_read(actor)
+
+    service.allow_admin_write = spy_admin_write  # type: ignore[method-assign]
+    service.allow_phi_read = spy_phi_read  # type: ignore[method-assign]
 
     async def preset_ids() -> set[str]:
         # Read from the store, not a gated page, so a refused or throttled read cannot pass for
@@ -148,6 +172,7 @@ async def test_a_search_route_refuses_a_session_from_a_new_address(
         before = set(by_name.values())
 
         # ALLOW: the handler ran. The search pages render the form; the writes land back on it.
+        charges.clear()
         ok = await case.send(home, allow_pid)
         assert ok.request.method == case.method
         assert ok.status_code == case.allowed, (ok.status_code, ok.headers.get("location"))
@@ -157,14 +182,21 @@ async def test_a_search_route_refuses_a_session_from_a_new_address(
             assert "Saved presets" in ok.text
         assert await _new_address_paths(engine) == []
         after_allow = await preset_ids()
+        # The control for the spend check below: an admitted write does charge the write budget.
+        if case.method == "POST":
+            assert "admin_write" in charges, charges
 
+    charges.clear()
     async with browser(ELSEWHERE) as away:
         away.cookies.set("mf_session", token)
         refused = await case.send(away, refuse_pid)
     assert refused.request.method == case.method
     location = refused.headers.get("location", "")
     assert refused.status_code == 303, (refused.status_code, location)
-    assert location == f"/ui/reauth?next={case.next_path}", location
+    expected = quote(case.next_path.format(pid=refuse_pid), safe="/")
+    assert location == f"/ui/reauth?next={expected}", location
+    # A refused request spends nothing (BACKLOG #5646): no budget was asked for.
+    assert charges == [], charges
     # The refusal was the address check, recorded for this route's request path.
     assert await _new_address_paths(engine) == [case.path.replace("{preset_id}", refuse_pid)]
     # The refused request changed nothing: no preset saved, none deleted.

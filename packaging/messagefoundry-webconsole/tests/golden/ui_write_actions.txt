@@ -26,7 +26,7 @@
 ^/ui/messages/[^/?#]+/replay$	-	step_up=1,auto_retry=1,unlock=0	Replay a message
 ^/ui/messages/[^/?#]+/resend-confirm(\?[^#]*)?$	message_resend	step_up=1,auto_retry=0,unlock=1	Open the message resend confirmation
 ^/ui/messages/search$	-	step_up=1,auto_retry=0,unlock=1	Search message content
-^/ui/messages/search/layered$	-	step_up=1,auto_retry=0,unlock=1	Run a layered message search
+^/ui/messages/search/layered(\?[^#]*)?$	-	step_up=1,auto_retry=0,unlock=1	Run a layered message search
 ^/ui/roles/[^/?#]+/edit$	save_ends_own_sessions	step_up=1,auto_retry=0,unlock=1	Edit a role
 ^/ui/roles/custom/[^/?#]+/delete$	save_ends_own_sessions	step_up=1,auto_retry=1,unlock=0	Delete a custom role
 ^/ui/roles/new$	-	step_up=1,auto_retry=0,unlock=1	Open the create-role form
