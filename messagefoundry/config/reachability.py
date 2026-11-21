@@ -41,9 +41,10 @@ from typing import cast
 
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.graph import DATA_FLOW_RELATIONS
-from messagefoundry.config.wiring import _CONFIG_MODULE_PREFIX, Registry
+from messagefoundry.config.wiring import _CONFIG_MODULE_PREFIX, EnvRef, Registry
 
 __all__ = [
+    "SETTING_REFERENCES",
     "Reference",
     "ReferenceIndex",
     "SourceCache",
@@ -57,6 +58,13 @@ __all__ = [
 ]
 
 _log = logging.getLogger(__name__)
+
+#: The connection settings that name another connection: (referrer kind, setting, target kind).
+#: Each referrer's edge carries the setting as its relation.
+SETTING_REFERENCES: tuple[tuple[str, str, str], ...] = (
+    ("outbound", "reingress_to", "inbound"),
+    ("inbound", "reply_from", "outbound"),
+)
 
 #: The run-time call each table kind is read through, keyed by the simple name the call resolves to
 #: (``code_set(...)`` and ``mod.code_set(...)`` alike). Its first positional argument is the table name.
@@ -478,6 +486,22 @@ def build_reference_index(registry: Registry, sources: SourceCache | None = None
     # Helpers shared by many referrers are read once: targets are cached per reached object.
     targets_of: dict[int, list[tuple[str, str]]] = {}
     seen: set[Reference] = set(edges)
+    # A setting the wiring graph has no edge for still names its target: one written as an env()
+    # whose default names it, and a reingress_to naming an inbound that is no Loopback (dangling in
+    # the graph). Delete impact and rename must see both (BACKLOG #5966).
+    settings_of = {
+        "inbound": {n: c.spec.settings for n, c in registry.inbound.items()},
+        "outbound": {n: c.spec.settings for n, c in registry.outbound.items()},
+    }
+    for kind, setting, target_kind in SETTING_REFERENCES:
+        for name, settings in sorted(settings_of[kind].items()):
+            value = settings.get(setting)
+            named = value.default if isinstance(value, EnvRef) else value
+            if isinstance(named, str) and named in settings_of[target_kind]:
+                edge = Reference(kind, name, target_kind, named, setting)
+                if edge not in seen:
+                    seen.add(edge)
+                    edges.append(edge)
     for kind, name, fn in roots:
         for reached in _reached(fn):
             if id(reached) not in targets_of:

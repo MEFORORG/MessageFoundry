@@ -98,7 +98,7 @@ export function wiringMapScript(token: string): string {
       // nodes instead: out of the source's right side, up the gutter beside it, along the gap under
       // the target's band, down the target's own gutter and into its right side. A straight curve
       // would run behind the nodes of the bands it crosses and read as an edge between them. Each
-      // back-edge takes its own gutter offset, so two never share a vertical run.
+      // back-edge takes the next of four gutter offsets, so up to four never share a vertical run.
       const edgeEls = [];
       let back = 0;
       for (const e of map.edges) {

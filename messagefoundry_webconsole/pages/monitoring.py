@@ -896,7 +896,9 @@ def _flow_graph(graph: GraphResponse) -> Markup:
         and (edge.target_kind, edge.target) in status_by
     ]
     n_back = sum(1 for _edge, is_back in drawn if is_back)
-    left = _MARGIN + _GUTTER_STEP * min(n_back, _GUTTER_LANES)
+    # A back-edge's runs sit outside both end columns, so both margins widen by the same gutter.
+    gutter = _GUTTER_STEP * min(n_back, _GUTTER_LANES)
+    left = _MARGIN + gutter
 
     pos: dict[tuple[str, str], tuple[int, int]] = {}
     for ci, (kind, _label) in enumerate(_GRAPH_COLUMNS):
@@ -905,7 +907,7 @@ def _flow_graph(graph: GraphResponse) -> Markup:
             pos[(kind, name)] = (x, _TOP + ri * _ROW_GAP)
 
     max_rows = max((len(names) for names in columns.values()), default=1)
-    width = left + (len(_GRAPH_COLUMNS) - 1) * _COL_GAP + _NODE_W + _MARGIN
+    width = left + (len(_GRAPH_COLUMNS) - 1) * _COL_GAP + _NODE_W + _MARGIN + gutter
     rows_bottom = _TOP + max(1, max_rows) * _ROW_GAP
     height = rows_bottom + n_back * _LANE_GAP + _MARGIN
 

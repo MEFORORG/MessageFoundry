@@ -175,6 +175,21 @@ def test_delete_impact_names_the_reply_from_referrer(
     assert [(r["referrer"], r["relation"]) for r in out["referrers"]] == [("IB_REQ", "reply_from")]
 
 
+def test_delete_impact_names_a_reply_from_written_as_an_env_default(tmp_path: Path) -> None:
+    # The wiring graph reads only a literal setting, so the index adds this referrer itself; delete
+    # impact and rename both read the index.
+    body = PY_CONNECTIONS.replace(
+        'reply_from="OB_PARTNER"', 'reply_from=env("REPLY_OB", default="OB_OTHER")'
+    ).replace("import Http,", "import Http, env,")
+    config_dir = _config(tmp_path, "connections.py", body)
+    referrers = delete_impact(
+        build_reference_index(load_config(config_dir)), "outbound", "OB_OTHER"
+    )
+    assert [(r.referrer_kind, r.referrer, r.relation) for r in referrers] == [
+        ("inbound", "IB_REQ", "reply_from")
+    ]
+
+
 async def test_the_data_flow_graph_route_leaves_out_a_reply_from(tmp_path: Path) -> None:
     # The web console draws GET /graph/edges as data flow; a reply_from drawn there would be a
     # forward line against the reply's own flow.

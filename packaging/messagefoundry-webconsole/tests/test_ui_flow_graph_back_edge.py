@@ -104,3 +104,26 @@ def test_each_back_edge_gets_its_own_lane() -> None:
     match = re.search(r'<svg [^>]*height="(\d+)"', svg)
     assert match is not None
     assert int(match.group(1)) > max(lanes)
+
+
+def test_every_back_edge_run_stays_inside_the_svg() -> None:
+    # Three outbounds, each re-entering its own Loopback inbound: the source-side runs sit right of
+    # the outbound column, so the right margin must widen with the gutter as the left one does.
+    nodes = [GraphNode(name=f"IB_L{i}", kind="inbound", status="running") for i in range(3)]
+    nodes += [GraphNode(name=f"OB_{i}", kind="outbound", status="running") for i in range(3)]
+    back = [
+        GraphEdge(
+            source=f"OB_{i}",
+            source_kind="outbound",
+            target=f"IB_L{i}",
+            target_kind="inbound",
+            provenance="declared",
+        )
+        for i in range(3)
+    ]
+    svg = str(_flow_graph(GraphResponse(nodes=nodes, edges=back)))
+    match = re.search(r'<svg [^>]*width="(\d+)"', svg)
+    assert match is not None
+    runs = [int(x) for x in re.findall(r'<path d="M \d+ \d+ H (\d+) ', svg)]
+    assert len(runs) == 3
+    assert max(runs) < int(match.group(1))

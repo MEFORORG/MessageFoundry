@@ -59,6 +59,7 @@ from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
 from messagefoundry.config.reachability import (
     _TABLE_ACCESSORS,
+    SETTING_REFERENCES,
     Reference,
     ReferenceIndex,
     SourceCache,
@@ -70,7 +71,6 @@ from messagefoundry.config.reachability import (
 )
 from messagefoundry.config.wiring import (
     CASE_TWIN_TABLES,
-    EnvRef,
     Registry,
     WiringError,
     case_twins,
@@ -305,7 +305,7 @@ def plan_rename(
     # A connection naming another in its settings (an outbound's reingress_to, an inbound's
     # reply_from) is a referrer too (BACKLOG #5966).
     referrers: list[tuple[Reference, list[_Site], bool]] = []
-    for ref, setting in _all_referrers(registry, index, target_kind, old):
+    for ref, setting in _all_referrers(index, target_kind, old):
         found = (
             _referrer_sites(registry, ref, old, target_kind, sources, toml_targets)
             if setting is None
@@ -767,41 +767,23 @@ def _referrer_sites(
     return [], False
 
 
-#: The connection settings that name another connection: (referrer kind, setting, target kind).
-_SETTING_REFERENCES = (
-    ("outbound", "reingress_to", "inbound"),
-    ("inbound", "reply_from", "outbound"),
-)
-#: Those settings' names, which are also the relation an index edge carries for each.
-_SETTING_NAMES = frozenset(setting for _kind, setting, _target in _SETTING_REFERENCES)
+#: The settings' names, which are also the relation the index tags each such edge with.
+_SETTING_NAMES = frozenset(setting for _kind, setting, _target in SETTING_REFERENCES)
 
 
 def _all_referrers(
-    registry: Registry, index: ReferenceIndex, target_kind: str, old: str
+    index: ReferenceIndex, target_kind: str, old: str
 ) -> list[tuple[Reference, str | None]]:
     """Every referrer of ``(target_kind, old)``, each with the connection setting it names the
     target in, or ``None`` for a referrer read from its code or its router binding.
 
-    An index edge names its setting by its relation: the index carries an outbound's literal
-    ``reingress_to`` as an ``outbound -> inbound`` edge and an ``Http`` inbound's literal
-    ``reply_from`` as an ``inbound -> outbound`` one, each tagged with that setting, so neither is
-    read as a router binding (BACKLOG #5966). The registry is read as well, for what the index has
-    no edge for: a setting written as an ``env()`` reference whose default names the target, and a
-    ``reingress_to`` naming an inbound that is no Loopback, which the graph reports as dangling. A
-    referrer the index already holds keeps its edge's reading, rather than gaining a second."""
-    out: dict[Reference, str | None] = {
-        ref: ref.relation if ref.relation in _SETTING_NAMES else None
+    The index tags a connection naming another in a setting (an outbound's ``reingress_to``, an
+    ``Http`` inbound's ``reply_from``, either an ``env()`` whose default names the target) with
+    that setting as its relation, so it is never read as a router binding (BACKLOG #5966)."""
+    return [
+        (ref, ref.relation if ref.relation in _SETTING_NAMES else None)
         for ref in index.referrers(target_kind, old)
-    }
-    for kind, setting, setting_target in _SETTING_REFERENCES:
-        if setting_target != target_kind:
-            continue
-        table = registry.inbound if kind == "inbound" else registry.outbound
-        for name in sorted(table):
-            value = table[name].spec.settings.get(setting)
-            if value == old or (isinstance(value, EnvRef) and value.default == old):
-                out.setdefault(Reference(kind, name, target_kind, old, setting), setting)
-    return list(out.items())
+    ]
 
 
 def _setting_sites(
