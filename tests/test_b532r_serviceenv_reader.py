@@ -80,19 +80,14 @@ def test_a_retired_keys_list_on_the_line_below_an_empty_name_refuses(key: str) -
 
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)
 def test_an_empty_store_key_item_above_an_ordinary_item_does_not_refuse(key: str) -> None:
-    """The control: an empty key is harmless when the next item's first line sets an ordinary
-    variable, even to nothing, under a name that could not be key material, or is empty-named
-    like Windows' own ``=C:`` entries."""
+    """The control: an empty key is harmless when the next item's first line sets a variable
+    Windows itself sets, spelled as Windows spells it, or the secrets directory. Any other item,
+    Windows' own nameless entries such as ``=C:`` among them, may be the key itself, so it
+    refuses: ``tests/test_b532w3_serviceenv_split_shapes.py`` pins those."""
     followers = (
-        "MEFOR_AI_ENVIRONMENT=prod",
         "ProgramFiles(x86)=C:\\x",
-        "=C:=C:\\x",
-        "HTTP_PROXY=",  # an ordinary variable set to nothing still ends the value above
-        "NO_PROXY=",
-        "HTTP_PROXY= ",  # a value of blanks alone, with no equals sign, ends it too
-        "NO_PROXY=\t",
-        "MEFOR_SECRETS_DIRECTORY=",
-        "A" * 42 + "_B=1",  # a base64 run one short of a key's, so this is a name
+        "Path=C:\\x",
+        "MEFOR_SECRETS_DIRECTORY=C:\\s",
     )
     for follower in followers:
         posture = _read([f"{key}=", follower])
@@ -389,18 +384,31 @@ def test_the_next_item_is_read_as_the_same_lines_below_the_key_in_one_string(
     assert split.unplain_value_names == one_string.unplain_value_names, follower
 
 
-@pytest.mark.parametrize("item", ["=C:=C:\\x", "MEFOR_SECRETS_DIRECTORY=", "HTTP_PROXY="])
-def test_the_first_line_shapes_the_readings_differ_on(item: str) -> None:
-    """Below the key in one string each line belongs to the key's value, so it refuses; as the
-    next item each ends the value above, since NSSM reads the item as its own variable and its
-    name could not be key material."""
+@pytest.mark.parametrize(
+    ("item", "refuses"),
+    [
+        ("Path=C:\\x", False),
+        ("=C:=C:\\x", True),
+        ("MEFOR_SECRETS_DIRECTORY=", True),
+        ("HTTP_PROXY=", True),
+    ],
+)
+def test_the_first_line_shapes_the_readings_once_differed_on_now_agree(
+    item: str, refuses: bool
+) -> None:
+    """Below an empty key, a later line of one string and the next item are read under one rule
+    (vault BACKLOG #5394). ``Path=C:\\x`` ends the key's value both ways; Windows' own ``=C:``
+    entry, an empty directory entry or an empty ``HTTP_PROXY`` is not positively a variable of
+    its own, so both readings take it into the key's value and refuse, as origin/main 9421dcbf27
+    did for the later line of one string."""
     key = KEY_CLASS_NAMES[0]
-    assert _read([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\n{item}"]).listed_keys == (key,)
-    assert _read([f"{key}=", item]).listed_keys == ()
+    expected = (key,) if refuses else ()
+    assert _read([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\n{item}"]).listed_keys == expected
+    assert _read([f"{key}=", item]).listed_keys == expected
 
 
 def test_an_item_that_sets_the_secrets_directory_is_not_taken_into_the_value_above() -> None:
-    posture_items = ["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=\nC:\\s"]
+    posture_items = ["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=C:\\s"]
     posture = _read(posture_items)
     assert posture.listed == ("MEFOR_SECRETS_DIRECTORY",)
     # A secret of its own makes the refusal speak; the remedy then reads the directory as set.
@@ -411,6 +419,28 @@ def test_an_item_that_sets_the_secrets_directory_is_not_taken_into_the_value_abo
     assert "The service's lists set no" not in refusal
     control = service_env_refusal(_read(["MEFOR_STORE_PASSWORD=", secret]))
     assert control is not None and "The service's lists set no" in control
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        ["MEFOR_STORE_PASSWORD=", "MEFOR_SECRETS_DIRECTORY=\nC:\\s"],
+        ["MEFOR_STORE_PASSWORD=", "=", "MEFOR_SECRETS_DIRECTORY=\nC:\\s"],
+        ["MEFOR_STORE_PASSWORD", "=", "MEFOR_SECRETS_DIRECTORY=\nC:\\s"],
+    ],
+)
+def test_a_directory_item_set_to_nothing_on_its_first_line_is_taken_into_an_empty_secret(
+    items: list[str],
+) -> None:
+    """With its path on a later line, the directory item's first line sets it to nothing, which
+    is not positively a variable of its own, so the empty password above takes it and refuses
+    (vault BACKLOG #5394). The remedy then says the directory string was read into it, past any
+    item of equals signs alone between them, and does not say the lists set no directory."""
+    posture = _read([*items, "MEFOR_VALUE_A=1"])
+    assert "MEFOR_STORE_PASSWORD" in posture.listed
+    assert posture.value_runs_on and posture.directory_joined
+    refusal = service_env_refusal(posture)
+    assert refusal is not None and "The service's lists set no" not in refusal
 
 
 #: A base64url secret with two ``=`` of padding and both ``-`` and ``_`` in it.
@@ -468,10 +498,27 @@ def test_a_key_shaped_item_with_an_ordinary_later_line_continues_the_empty_key()
 
 
 @pytest.mark.parametrize("value", ["x", ""])
-def test_no_runs_on_step_when_the_variable_that_ran_on_is_not_refused(value: str) -> None:
-    """The path-form OIDC key runs on into a path, which is not a secret, so only the
-    ``MEFOR_VALUE_A`` above it refuses, and its value did not run on, empty or not."""
+def test_an_empty_pem_key_that_runs_on_into_a_path_refuses_with_the_run_on_step(
+    value: str,
+) -> None:
+    """An OIDC key empty on its own line takes the next item as its value. That key was once
+    exempted as a path by the text it ran on into, which let a password split below it escape
+    (round-2 finding 1); the exemption now judges only the key's own line, so the key refuses
+    and the remedy says to remove the item it ran on into. The ``MEFOR_VALUE_A`` above it did
+    not run on, empty or not."""
     entries = [f"MEFOR_VALUE_A={value}\nMEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=", "C:\\k.pem"]
+    posture = _read(entries)
+    assert posture.listed == ("MEFOR_VALUE_A", "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY")
+    assert posture.value_runs_on
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert _RUNS_ON in refusal
+
+
+def test_no_runs_on_step_when_only_a_variable_that_did_not_run_on_is_refused() -> None:
+    """The control the test above once was: a path on the OIDC key's own line does not run on,
+    so only the empty ``MEFOR_VALUE_A`` refuses, and there is no run-on step."""
+    entries = ["MEFOR_VALUE_A=\nMEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\k.pem", "Path=C:\\x"]
     posture = _read(entries)
     assert posture.listed == ("MEFOR_VALUE_A",)
     assert not posture.value_runs_on

@@ -165,19 +165,49 @@ def _ref_searched_code(inner: str) -> str:
     return _ref_code_text(old_faultcode, inner, soap._FAULTCODE_END_RE)
 
 
+#: Text up to the first tag outside markup: each terminated markup whole, else any character but a
+#: tag's ``<`` (BACKLOG #5912, closing step 21).
+_REF_UNTIL_A_TAG_RE = re.compile(rf"(?:(?>{_REF_MARKUP})|[^<]|<[!?])*", re.DOTALL)
+
+
+#: A terminated comment or processing instruction (dropped), else a terminated CDATA section or
+#: one character (kept, group 1).
+_REF_STRIP_RE = re.compile(r"(?><!--.*?-->|<\?.*?\?>)|(<!\[CDATA\[.*?\]\]>|.)", re.DOTALL)
+#: Terminated markup whole, else an opener with no terminator (group 1), else one character.
+_REF_UNTERMINATED_RE = re.compile(rf"(?>{_REF_MARKUP})|(<!--|<!\[CDATA\[|<\?)|.", re.DOTALL)
+_REF_CLASS_RE = re.compile(r"client|sender|server|receiver", re.IGNORECASE)
+
+
+def _ref_child_code_text(m: re.Match[str] | None, inner: str, own_close: re.Pattern[str]) -> str:
+    """The old capture, except that a non-empty capture naming no class and opening markup it
+    does not terminate is read on to the first tag outside markup, when that tag is the element's
+    own close tag, comments and processing instructions dropped, unless that leaves nothing
+    (BACKLOG #5912, closing step 21)."""
+    text = _ref_code_text(m, inner, own_close)
+    if m is None or not text or _REF_CLASS_RE.search(text):
+        return text
+    if not any(t.group(1) for t in _REF_UNTERMINATED_RE.finditer(text)):
+        return text
+    whole = _REF_UNTIL_A_TAG_RE.match(inner, m.start(1))
+    if whole is None or not own_close.match(inner, whole.end()):
+        return text
+    kept = "".join(t.group(1) or "" for t in _REF_STRIP_RE.finditer(whole.group()))
+    return kept or text
+
+
 def _ref_first_child_code(inner: str) -> str:
     lead = _REF_BEFORE_THE_CHILD_RE.match(inner)
     child = inner[lead.end() :] if lead is not None else ""
     faultcode = _OLD_FAULTCODE_RE.match(child)
     if faultcode is not None:
-        return _ref_code_text(faultcode, child, soap._FAULTCODE_END_RE)
+        return _ref_child_code_text(faultcode, child, soap._FAULTCODE_END_RE)
     code = _REF_CODE_RE.match(child)
     if code is None or code.group(1).endswith("/>"):
         return ""
     in_code = code.group(2)
     lead = _REF_BEFORE_THE_CHILD_RE.match(in_code)
     child = in_code[lead.end() :] if lead is not None else ""
-    return _ref_code_text(_OLD_CODEVALUE_RE.match(child), child, soap._CODEVALUE_END_RE)
+    return _ref_child_code_text(_OLD_CODEVALUE_RE.match(child), child, soap._CODEVALUE_END_RE)
 
 
 # --- what the extraction reads ------------------------------------------------------------------
@@ -490,7 +520,8 @@ def test_a_commented_fault_close_ends_the_fallback_range() -> None:
     """The PR 2936 hold of 2026-11-14 (head 8c5a940a17): the shape the #5912 changelog and
     CONNECTIONS.md name. The first child is a faultstring, so the fallback reads the code, and its
     range ends at the commented Fault close tag, as main's did: no code, a permanent fault.
-    Control: without the comment the same reply reads the Server code and retries."""
+    Control: with the comment's close tag replaced by text, the same reply reads the Server code
+    and retries."""
     body = (
         "<soap:Fault><faultstring>busy</faultstring><!-- </soap:Fault> -->"
         "<faultcode>soap:Server</faultcode></soap:Fault>"
@@ -503,10 +534,11 @@ def test_a_commented_fault_close_ends_the_fallback_range() -> None:
         "<soap:Fault><faultstring>busy</faultstring><!-- </soap:Fault> -->"
         "<faultcode>soap:Server</faultcode>"
     )
-    assert _fault_code(literal) == ""
+    assert _fault_code(literal) == "" == _ref_fault_code(literal)
     assert _outcome(_classify_soap(200, literal)) == "soap-fault"
-    plain = body.replace("<!-- </soap:Fault> -->", "")
-    assert _fault_code(plain) == "soap:Server"
+    # Only the close tag goes; the comment stays, so the close tag is what ended the range.
+    plain = body.replace("<!-- </soap:Fault> -->", "<!-- note -->")
+    assert _fault_code(plain) == "soap:Server" == _ref_fault_code(plain)
     assert _outcome(_classify_soap(200, plain)) == "transient"
 
 
@@ -519,11 +551,180 @@ def test_with_no_body_a_fault_only_in_markup_is_still_read() -> None:
     body = "<Envelope><!-- <Fault><faultcode>soap:Server</faultcode></Fault> --></Envelope>"
     assert soap._BODY_RE.search(body) is None
     assert soap._search_outside_markup(soap._FAULT_OUTSIDE_MARKUP_RE, body, 0, len(body)) is None
-    assert _fault_code(body) == "soap:Server" == _ref_fault_code(body)
+    assert _fault_code(body) == "soap:Server" == _ref_fault_code(body) == _pr2790_fault_code(body)
     assert _outcome(_classify_soap(200, body)) == "transient"
     assert _outcome(_classify_soap(500, body)) == "transient"
     no_fault = "<Envelope><!-- note --></Envelope>"
     assert _classify_soap(200, no_fault) is None
+
+
+#: BACKLOG #5912, closing step 21: a first-child code element whose first ``</`` is its own close
+#: tag inside markup. The merged PR 2936 head read the text up to that tag, ``<!-- `` say, and
+#: dead-lettered each; the PR 2790 reading retried each through the commented code element ahead.
+#: Each: (body, code, outcome).
+_OWN_CLOSE_IN_MARKUP = {
+    "soap11-commented-own-close-first": (
+        "<soap:Fault><!-- <Value>soap:Server</Value> --><faultcode><!-- </faultcode> -->"
+        "soap:Server</faultcode></soap:Fault>",
+        "soap:Server",
+        "transient",
+    ),
+    "soap12-commented-own-close-first": (
+        "<env:Fault><!-- <env:Value>env:Receiver</env:Value> --><env:Code><env:Value>"
+        "<!-- </env:Value> -->env:Receiver</env:Value></env:Code></env:Fault>",
+        "env:Receiver",
+        "transient",
+    ),
+    "soap11-cdata-own-close-first": (
+        "<Fault><!-- <Value>Server</Value> --><faultcode><![CDATA[</faultcode>]]>"
+        "soap:Server</faultcode></Fault>",
+        "<![CDATA[</faultcode>]]>soap:Server",
+        "transient",
+    ),
+    # A Sender code ahead of the markup is kept, so a Value ahead that the PR 2790 reading took
+    # does not make the fault retry (the round-1 review of this change).
+    "soap11-client-then-commented-own-close": (
+        "<Fault><!-- <Value>Server</Value> --><faultcode>soap:Client<!-- </faultcode> -->"
+        "</faultcode></Fault>",
+        "soap:Client<!-- ",
+        "soap-sender",
+    ),
+    "soap12-sender-then-commented-own-close": (
+        "<env:Fault><!-- <env:Value>env:Receiver</env:Value> --><env:Code><env:Value>env:Sender"
+        "<!-- </env:Value> --></env:Value></env:Code></env:Fault>",
+        "env:Sender<!-- ",
+        "soap-sender",
+    ),
+    # A commented faultcode ahead does not decide it either.
+    "soap11-commented-faultcode-then-client": (
+        "<Fault><!-- <faultcode>soap:Server</faultcode> --><faultcode><!-- </faultcode> -->"
+        "soap:Client</faultcode></Fault>",
+        "soap:Client",
+        "soap-sender",
+    ),
+    # Text inside the markup is left out, so it does not decide the class (round-2 review).
+    "soap11-commented-own-close-holding-a-class-word": (
+        "<Fault><faultcode><!-- </faultcode> server -->soap:MustUnderstand</faultcode></Fault>",
+        "soap:MustUnderstand",
+        "soap-fault",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    ("body", "code", "outcome"),
+    list(_OWN_CLOSE_IN_MARKUP.values()),
+    ids=list(_OWN_CLOSE_IN_MARKUP),
+)
+def test_a_code_element_whose_own_close_is_in_markup_is_read_to_its_real_close(
+    body: str, code: str, outcome: str
+) -> None:
+    """Engine PR 2936 hold repair 4, open item 2: the first-child read took the text up to the
+    ``</`` inside the markup, ``<!-- `` say, as the code, and dead-lettered a Server fault the
+    PR 2790 reading retried. The element is now read to its own close tag outside the markup.
+    Control: with the re-read patched out, each reads the text up to the markup, as the merged
+    head read it, so each Server shape is a permanent unrecognized fault there; the re-read text
+    starts with that text, and no shape here retries a code that was a Sender one there."""
+    if outcome != "soap-fault":
+        assert soap._RECEIVER_RE.search(_pr2790_fault_code(body)), "the PR 2790 reading retried it"
+    assert _fault_code(body) == code == _ref_fault_code(body)
+    assert _outcome(_classify_soap(200, body)) == outcome
+    assert _outcome(_classify_soap(500, body)) == outcome
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(soap, "_child_code_text", soap._code_text)
+        merged_code = _fault_code(body)
+        merged = _outcome(_classify_soap(200, body))
+    assert merged_code
+    assert merged == ("soap-sender" if soap._SENDER_RE.search(merged_code) else "soap-fault")
+    # A reading that named a class is kept; only an unrecognized one is read again.
+    assert merged_code == code or merged == "soap-fault"
+    assert outcome == "soap-sender" or merged == "soap-fault"
+
+
+def test_a_code_element_whose_own_close_is_in_markup_with_no_real_close_keeps_its_text() -> None:
+    """Control: with no own close tag outside the markup, the text up to the ``</`` stands, as on
+    the merged head, and so does a first ``</`` in markup that is not the element's own, which
+    still yields no code and takes the fallback."""
+    unclosed = "<Fault><faultcode><!-- </faultcode> -->soap:Server</x></Fault>"
+    assert _fault_code(unclosed) == "<!-- " == _ref_fault_code(unclosed)
+    assert _outcome(_classify_soap(200, unclosed)) == "soap-fault"
+    foreign = "<Fault><!-- <Value>Server</Value> --><faultcode>soap:Client<!-- </x> --></faultcode>"
+    assert _fault_code(foreign) == "Server" == _ref_fault_code(foreign)
+    # A reading that names a class is never read again, so a word past the markup cannot flip it.
+    named = "<Fault><faultcode>soap:Server<!-- </faultcode> -->Client</faultcode></Fault>"
+    assert _fault_code(named) == "soap:Server<!-- " == _ref_fault_code(named)
+    assert _outcome(_classify_soap(200, named)) == "transient"
+
+
+def _main_outcome(body: str) -> str:
+    """The outcome with the re-read patched out: origin/main's first-child read."""
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(soap, "_child_code_text", soap._code_text)
+        return _outcome(_classify_soap(200, body))
+
+
+#: Code texts that hold markup but are not the step 21 shape, so each reads as origin/main reads
+#: it: terminated markup only, a CDATA section holding the code, and terminated markup ahead of
+#: the code.
+_NOT_THE_STEP_21_SHAPE = {
+    "markup-only-faultcode": (
+        "<Fault><!-- <Value>Server</Value> --><faultcode><!-- c --></faultcode></Fault>"
+    ),
+    "markup-only-value": (
+        "<env:Fault><!-- <env:Value>env:Receiver</env:Value> --><env:Code><env:Value><!-- x -->"
+        "</env:Value></env:Code></env:Fault>"
+    ),
+    "cdata-held-code": (
+        "<Fault><!-- <Value>Server</Value> --><faultcode><![CDATA[soap:Foo]]></faultcode></Fault>"
+    ),
+    "cdata-held-receiver": "<Fault><faultcode><![CDATA[soap:Server]]></faultcode></Fault>",
+    "comment-then-code": "<Fault><faultcode><!-- c -->soap:Foo</faultcode></Fault>",
+    "pi-then-code": "<Fault><faultcode><?p?>soap:Foo</faultcode></Fault>",
+}
+
+
+@pytest.mark.parametrize(
+    "body", list(_NOT_THE_STEP_21_SHAPE.values()), ids=list(_NOT_THE_STEP_21_SHAPE)
+)
+def test_a_code_text_that_is_not_the_step_21_shape_reads_as_on_main(body: str) -> None:
+    """Round-3 review of this change: a re-read that fired on any code text holding a ``<``
+    dropped markup-only and CDATA-held codes and sent them to the fallback, which retried each
+    of these with a commented Value ahead. Each now reads exactly as origin/main reads it."""
+    assert _fault_code(body) == _ref_fault_code(body)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(soap, "_child_code_text", soap._code_text)
+        main_code = _fault_code(body)
+    assert _fault_code(body) == main_code
+    assert _outcome(_classify_soap(200, body)) == _main_outcome(body)
+    assert _outcome(_classify_soap(500, body)) == _main_outcome(body)
+
+
+@pytest.mark.parametrize("opener", ["<?", "<!--", "<![CDATA["])
+def test_a_code_element_full_of_unterminated_openers_reads_in_bounded_time(opener: str) -> None:
+    """Round-3 review of this change: the re-read's markup pass searched again for every
+    unterminated opener, so 40,000 ``<?`` took about 0.6 s, against about 0.03 s for origin/main's
+    read. It now remembers the miss. Bounded against origin/main's read of the same reply, the
+    best of three each, since the absolute time depends on the runner (CDATA openers took about
+    0.05 s on main here); the linear check in _PATHOLOGICAL_REPLIES pins the curve."""
+    import time
+
+    body = "<Fault><faultcode>" + opener * 40_000 + "</faultcode></Fault>"
+    assert _outcome(_classify_soap(200, body)) == _main_outcome(body)
+
+    def best(read: Callable[[str], object]) -> float:
+        times = []
+        for _ in range(3):
+            started = time.perf_counter()
+            read(body)
+            times.append(time.perf_counter() - started)
+        return min(times)
+
+    ours = best(_classify_2xx)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(soap, "_child_code_text", soap._code_text)
+        main = best(_classify_2xx)
+    # About 2.5x here, from the re-read's two extra linear passes; the quadratic pass was 20x.
+    assert ours < 6 * main + 0.02, f"{ours:.3f} s against main's {main:.3f} s"
 
 
 #: BACKLOG #5912: where the first child holds the code, a Value outside the Code, here inside markup
@@ -847,6 +1048,7 @@ _FRAGMENTS = (
     "<", ">", "</", "/>", " ", "\n", "faultcode", "FaultCode", "Value", "VALUE", "Fault",
     "soap:", "SOAP-ENV:", "a.b:", ":", "x", "Client", "Receiver", '"', "'", "=", "<!--", "-->",
     "<![CDATA[", "]]>", "faultcodes", "Values", "Body", "<x:Body>", "Code", "<Code>", "</Code>",
+    "<!-- </faultcode> -->", "<?p </Value>?>",
 )  # fmt: skip
 #: What goes before the Body: the fragments, and Fault-named elements the Body anchor must skip,
 #: two of them holding a code so the anchor changes what is read.
@@ -984,6 +1186,13 @@ _PATHOLOGICAL_REPLIES: dict[str, Callable[[int], str]] = {
     ),
     "commented-close-tags-in-a-code": lambda k: (
         "<Fault><Code>" + "<!-- </Code></Fault> -->" * (k // 24)
+    ),
+    # The re-read's passes (closing step 21) over a code element full of unterminated openers.
+    "unterminated-pis-in-a-faultcode": lambda k: (
+        "<Fault><faultcode>" + "<?" * (k // 2) + "</faultcode>"
+    ),
+    "unterminated-cdata-in-a-value": lambda k: (
+        "<Fault><Code><Value>" + "<![CDATA[" * (k // 9) + "</Value>"
     ),
     # The fallback when no Fault follows the Body: the search after it, then the one before it.
     "lt-runs-around-a-trailing-body": lambda k: (

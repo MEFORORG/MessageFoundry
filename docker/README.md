@@ -137,19 +137,28 @@ against one case that matters, described under
 
 - **Docker single host:** [`compose.yaml`](compose.yaml) — Topology A (in-process TLS). Copy
   `secrets.env.example` → `secrets.env`, drop a cert/key under `./tls`, point `./config` at your repo,
-  and read topology A below for the revocation attestation `docker compose` requires.
+  and read topology A below for the revocation attestation `docker compose` requires. Like the
+  Kubernetes manifests, the `engine` and both `ha` engines carry a block *what an enforcing start
+  needs* of commented entries (the alert channel, verified-TLS log forwarding and the retention
+  bounds, and for the `ha` engines the store CRL); as shipped `serve --env prod` refuses to start,
+  so uncomment each with your value and put the trust files it names under `./config/pki/`. Each
+  `ha` engine also mounts its own named log-spool volume, live as shipped.
 - **Kubernetes (single-node):** [`k8s/statefulset.yaml`](k8s/statefulset.yaml) + [`k8s/secret.example.yaml`](k8s/secret.example.yaml)
-  — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set all three `image:` fields (`tls-dir`, `copy-tls` and `engine`) to your config-baked image.
+  — in-process TLS, a PVC for the SQLite store, secrets via `secretKeyRef`. Set every `image:` field (at least `revocation-attestation-check`, `tls-dir`, `copy-tls` and
+  `engine`) to your config-baked image.
   An enforcing start needs more than the bind, and the manifest's block *what an enforcing start
   needs* names at least the alert channel, verified-TLS log forwarding and the retention bounds as
   commented entries. As shipped the engine refuses to start; uncomment each entry with your value. Bake the syslog CA and CRL it names under `/config/pki/`, and
   add the Secret's `tls-revocation-attested` key, without which the pod does not start: the kubelet
-  refuses the engine container with `CreateContainerConfigError`. The HA manifest below,
+  refuses the pod with `CreateContainerConfigError`, at the first container that reads it. The HA manifest below,
   `k8s/ha-postgres.yaml`, requires the same key. Set it only
   if your PKI enforces revocation ([SECURITY.md, API revocation gate](../docs/SECURITY.md#api-revocation-gate)),
   and to a value that reads as true (`1`, `true`, `yes` or `on`). A value such as `0` passes the
-  kubelet, and the engine then exits 2 and the pod crash-loops: neither Kubernetes manifest checks
-  the value before the engine starts.
+  kubelet, and each manifest's `revocation-attestation-check` initContainer then exits 1 naming the
+  gate: the pod stays in `Init:CrashLoopBackOff` and the engine never starts, rather than the engine
+  itself crash-looping. Every value in `k8s/secret.example.yaml` ships commented out, so applying it
+  unedited creates a Secret the kubelet refuses the pod over, not one whose placeholders crash-loop
+  the engine.
 - **Kubernetes (multi-node active-passive HA):** [`k8s/ha-postgres.yaml`](k8s/ha-postgres.yaml) — a
   Postgres-backed `replicas: 3` Deployment with `[cluster].enabled`, a PodDisruptionBudget, and
   lease-TTL-aware grace (ADR 0047). Read [`docs/CLOUD-DEPLOYMENT.md`](../docs/CLOUD-DEPLOYMENT.md)
@@ -202,6 +211,13 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
   `messagefoundry gen-key`): `serve` refuses a keyless store by default. The manifests also set
   `MEFOR_STORE_REQUIRE_ENCRYPTION=true`, which keeps that refusal in force past the audited opt-out
   and encrypts nothing itself; [PHI.md](../docs/PHI.md#3-encryption-at-rest) §3 states the rule.
+- **Log spool (possibly PHI at rest):** the compose `ha` engines' `mefor-spool-ha` and
+  `mefor-spool-standby` volumes, the `log-spool` emptyDir in `k8s/ha-postgres.yaml`, and the
+  `log-spool` directory the other engines keep on the store volume hold the off-box forwarder's
+  unsent log records. `MEFOR_STORE_ENCRYPTION_KEY` does not cover them, so put them on an
+  encrypted volume or node disk that only the engine's account can read;
+  [PHI.md §2](../docs/PHI.md#2-where-phi-lives--data-at-rest-inventory), *Off-box forwarder
+  spool*, is the inventory row.
 - **Secrets** (`MEFOR_STORE_ENCRYPTION_KEY`, `MEFOR_API_TLS_KEY_PASSWORD`, `MEFOR_STORE_PASSWORD`, …):
   the engine reads these from **env vars**. On k8s inject via `secretKeyRef` (clean). On Docker use
   `env_file` (gitignored) — note plain env is visible in `docker inspect`; prefer a secrets manager for

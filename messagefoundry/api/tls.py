@@ -158,6 +158,9 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
             if Path(crl.path).is_file():
                 refusal = anchor_refusal(crl, enforcing=enforcing)
                 if refusal is not None:
+                    # Tagged, so `serve` can tell this refusal from the client CA's: the CRL is
+                    # kept out of the audited preflight, so no audit row comes of it (BACKLOG #5391).
+                    refusal.setting = crl.setting
                     raise refusal
             # And the whole chain is checked, so a revoked intermediate refuses its clients too,
             # and a loaded client CA with no CRL of its own in the file refuses the build.

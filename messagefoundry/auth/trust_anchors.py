@@ -147,7 +147,15 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
       At least these run first: the API TLS pair is minted or renewed, the store is created and
       migrated, and the startup attestation runs and may alert. Their log records reach stdout
       and the log file but no collector. No listener binds, since uvicorn binds after the
-      lifespan.
+      lifespan. A start refused for another reason before uvicorn runs the lifespan, such as at
+      the API TLS context build, runs no attestation and no lifespan, though the API TLS pair may
+      already be minted or renewed. Such a start writes **no** audit row for either anchor: it
+      opens no store (BACKLOG #5391). ``serve``'s exit hook logs a WARNING with the refusal's
+      reason for at least the collector CA and a client CA the build refused as an anchor refusal
+      or as an ``OSError`` naming that file. Other refusals may log nothing, at least a client CA
+      path that is a directory, pipe or device, a path the OS rejects, and the CRL's other build
+      refusals. So may at least these exits: an interrupt, an exit uvicorn takes before the
+      lifespan starts, and an exit inside the lifespan before this preflight runs.
     * ``supervise`` checks the same CA before it builds its own forwarder, and refuses on stderr
       before any engine shard spawns. Its process has no audited preflight, so no row is written.
     * The API lifespan checks the CA of :func:`smtp_hop_anchor_spec` before it builds an alert
@@ -376,10 +384,12 @@ class TrustAnchorError(Exception):
 
     ``setting`` names what was refused the way :attr:`AnchorSpec.setting` does, such as
     ``inbound connection 'IB_X' tls_ca_file``, with no path: the pin's setting where the pin did
-    not parse. The audited check sets it (:func:`_preflight_one`), and so does a reload's lane
-    check (:func:`connection_anchor_failure`). ``None`` where the raiser did not know it. A caller
-    that may not show the refusal's own text, such as a DR activation's abort, shows this instead
-    (vault BACKLOG #3498).
+    not parse. At least these set it: the audited check (:func:`_preflight_one`), a reload's lane
+    check (:func:`connection_anchor_failure`), and the API context build for its
+    ``[api].tls_client_crl_file`` refusal, which has no audit row behind it (BACKLOG #5391). So
+    a set ``setting`` does not mean a row was written. ``None`` where the raiser did not know it.
+    A caller that may not show the refusal's own text, such as a DR activation's abort, shows this
+    instead (vault BACKLOG #3498).
 
     ``fixed_text`` is True for a message built from fixed words, a connection's name and a
     setting key, never from a refusal's own text, such as a lane's status line. A caller may then

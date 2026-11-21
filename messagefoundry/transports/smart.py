@@ -60,7 +60,12 @@ from messagefoundry.config.tls_policy import (
     hop_name_prefix,
 )
 from messagefoundry.redaction import json_loads_or_refusal
-from messagefoundry.transports.base import DeliveryError, NegativeAckError, float_setting
+from messagefoundry.transports.base import (
+    DeliveryError,
+    NegativeAckError,
+    float_setting,
+    positive_seconds,
+)
 from messagefoundry.transports.bounded_read import (
     MAX_TOKEN_RESPONSE_BYTES,
     EgressReplyError,
@@ -397,7 +402,19 @@ class _TokenEndpointProvider(abc.ABC):
         set up for Digest or if it verifies with no revocation check, and set up the empty cache."""
         self.token_url = token_url
         self.expiry_skew_seconds = max(0.0, expiry_skew_seconds)
-        self.timeout_seconds = timeout_seconds
+        # BACKLOG #5959: checked here too, so a provider built directly, not through a settings
+        # reader, is held to the same rule; positive_seconds says why. Raised as the provider's own
+        # error, as its other configuration refusals are, outside the except block so it carries no
+        # context (positive_seconds withholds the value either way).
+        refusal: str | None = None
+        try:
+            self.timeout_seconds = positive_seconds(
+                timeout_seconds, knob="timeout_seconds", transport=f"{self._LABEL} token endpoint"
+            )
+        except ValueError as exc:
+            refusal = str(exc)
+        if refusal is not None:
+            raise self._ERROR(refusal)
         # ADR 0126: route the token-endpoint POST through the connection's forward proxy — resolved
         # for the TOKEN host (its own bypass decision, #128). None / bypassed → the shared opener and
         # no Proxy-Authorization (byte-identical). None with an ECH sidecar too: the POST goes to the
@@ -781,7 +798,8 @@ def token_provider_from_settings(
             knob="smart_expiry_skew_seconds",
             transport="SMART",
         ),
-        timeout_seconds=float_setting(
+        # BACKLOG #5959: above zero, as REST's; positive_seconds says why.
+        timeout_seconds=positive_seconds(
             s.get("smart_timeout_seconds", _DEFAULT_TOKEN_TIMEOUT),
             knob="smart_timeout_seconds",
             transport="SMART",

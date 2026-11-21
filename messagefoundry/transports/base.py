@@ -275,7 +275,11 @@ def positive_seconds(value: Any, *, knob: str, transport: str) -> float:
     """:func:`float_setting`, then refuse a value that is not above zero, withholding it.
 
     For a number of seconds with no "off", where zero or a negative would make every wait end at
-    once: at least ``poll_seconds``, the HTTP reply timeouts and the Timer's ``interval_seconds``."""
+    once: at least ``poll_seconds``, the HTTP reply timeouts and the Timer's ``interval_seconds``.
+    It also reads the HTTP request timeouts of at least the REST, SOAP, FHIR and DICOMweb
+    destinations, ``fhir_lookup`` and the SMART and OAuth2 token hops (BACKLOG #5796, #5959),
+    because urllib reads a zero timeout as a non-blocking socket and refuses a negative one, so
+    either would build a connection that then failed every request."""
     seconds = float_setting(value, knob=knob, transport=transport)
     if seconds <= 0:
         raise ValueError(

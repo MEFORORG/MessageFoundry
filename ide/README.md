@@ -200,8 +200,11 @@ and uses your user value or the default instead, until you trust the workspace (
   `-P -X disable-remote-debug` as serve does, so the working directory is not put on the import
   path: a config module can import its `_`-prefixed siblings, but not a top-level workspace package
   that the interpreter cannot otherwise import. The Test Bench's Debug launch goes through debugpy
-  and passes it the same options; an older debugpy that ignores `-P` when it runs a module may still
-  put the working directory on the import path.
+  and passes it the same options. It runs a small program in the extension's storage folder, not
+  the module. debugpy before 1.8.22 ignores `-P` when it runs a module, and puts the working
+  directory on the import path. `-P` does not remove a PYTHONPATH entry. At least one set in the
+  environment, or in the env file the Python Debugger loads, still applies to the Debug launch. That
+  file is a workspace `.env` by default, or the file `python.envFile` names.
 - `messagefoundry.configDir` (default `samples/config`) — config modules directory. This,
   `serviceConfig` and `messageSetsDir` are relative to the workspace folder. A value set in workspace
   settings whose spelling names a path outside the first workspace folder is not used, nor is a user
@@ -220,7 +223,9 @@ and uses your user value or the default instead, until you trust the workspace (
   - its real path cannot be read;
   - on Windows, a folder or file name on it ends in a dot or a space;
   - on Windows, a folder or file name on it holds a colon, which Windows opens as a stream on
-    another entry.
+    another entry;
+  - on Windows, a folder or file name on it is a device name such as `nul`, `con` or `com1`,
+    with or without an extension. Windows can open such a name as the device.
 
   The fix is a plain folder or file inside the workspace folder. Commands other than New Route and
   the commit hook also take a link's target as an absolute path in user settings, once any
@@ -229,7 +234,7 @@ and uses your user value or the default instead, until you trust the workspace (
   workspace folder. The check reads the named path only, so a link below it is still followed, such
   as a linked folder under `configDir`. The security editor does not run this check. It makes its
   own: it collapses a `..` rather than refusing it, and it refuses a link anywhere on the named
-  path below the workspace folder. On Windows it also refuses a name that ends in a dot or a space or holds a colon.
+  path below the workspace folder. On Windows it also refuses a name that ends in a dot or a space, holds a colon, or is a device name.
   The New Route wizard makes its own link check as well.
 - `messagefoundry.serviceConfig` (default `messagefoundry.toml`) — the service-settings TOML the engine
   loads; the Alert Wizard and the security editor read/write their sections of it. The security

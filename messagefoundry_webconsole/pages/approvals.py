@@ -193,8 +193,9 @@ _REFUSALS: dict[int, tuple[str, str]] = {
     503: (
         "Dual control is not available now",
         "The engine could not do this now, and nothing ran. Its message below says why: at least no "
-        "approval workflow bound to this engine, a store it could not read, or a store that could "
-        "not record this release or rejection. Reload the page to see the request's state, and try "
+        "approval workflow bound to this engine, a store it could not read, a store that could "
+        "not record this release or rejection, or a cluster node that no longer leads, where the "
+        "release belongs on the leader. Reload the page to see the request's state, and try "
         "again once the cause is fixed.",
     ),
 }

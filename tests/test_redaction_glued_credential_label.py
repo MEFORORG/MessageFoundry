@@ -724,3 +724,79 @@ def test_every_route_of_the_sweep_answers_the_rule_off_redactor_masked() -> None
             fixed += any(value in before[path] and value not in out for value in _SWEEP_PLANTED)
     assert not broken, broken[:10]
     assert fixed > 2000, fixed
+
+
+#: ``(text, its synthetic glued value)``: a credential label and an unquoted MRN glued to a run.
+_BEFORE_A_NOTE = (
+    ("x^y^token= Kplm7abc", "Kplm7abc"),
+    ("a|b|secret: qwerty12", "qwerty12"),
+    ("a|b|mrn: zqxdoe", "zqxdoe"),
+    # Code review: a short last word, which a value judged as glued to the note's line break kept.
+    ("a|b|mrn: qw", "qw"),
+    ("x^y^secret: k7", "k7"),
+    ("a|b|PatientID: Li", "Li"),
+)
+
+
+#: Values :func:`redaction.clamp_untrusted`'s name walk drops before redaction runs, so a route
+#: through the clamp would not show whether the arm masks them.
+_CLAMP_DROPS = frozenset({"Li", "ZqMS"})
+
+
+@pytest.mark.parametrize(("text", "value"), _BEFORE_A_NOTE)
+def test_a_glued_value_ending_at_a_clamp_notes_line_break_is_found_and_masked(
+    text: str, value: str
+) -> None:
+    """A defect found in the #5925 review: the unquoted PHI arm and the credential arm found the
+    value's end on the text with the clamp's note on. The note is joined by a line break, and
+    :data:`redaction._GLUED_BARE_VALUE` needs a space or the text's end after the value, so the
+    value right before the note was not found and printed whole, with the label gone into the run.
+    These values, letters or a credential not opening with a digit, are masked now. A digit-bearing
+    PHI value there still prints, as on main (a residual the changelog names).
+
+    The log-chain route is asserted only where the clamp keeps the value: its name walk drops a
+    trailing capitalized word such as ``Li`` before any redaction runs, so for that value the
+    route would pass with or without the fix, and the premise is asserted instead."""
+    clamped = f"{text}\n{redaction._clamp_marker(70_000)}"
+    assert value not in redact(text)  # the premise: unclamped, the arm masks it
+    assert value not in redact(clamped)
+    routed = text + " " + "q" * 70_000
+    if value in _CLAMP_DROPS:
+        assert value not in redaction.clamp_untrusted(routed)
+    else:
+        assert value in redaction.clamp_untrusted(routed)  # the premise: the clamp kept it
+        assert value not in _through_the_chain(routed)
+
+
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ("a|b|password: 4455  ", "4455"),
+        ("x^y^token= kplm7b ", "kplm7b"),
+        ("a|b|mrn: Zqx4 ", "Zqx4"),
+        ("a|b|pwd: ZqMS ", "ZqMS"),
+    ],
+)
+def test_a_value_with_whitespace_before_a_clamp_note_keeps_the_earlier_mask(
+    text: str, value: str
+) -> None:
+    """Regression pin from code review: judging every value on the note-free text read a value
+    followed by whitespace and then the note as ending the text, so the end-of-text refusals kept
+    values origin/main masked. Only a value that ends right at the note's line break is judged
+    that way now."""
+    clamped = f"{text}\n{redaction._clamp_marker(70_000)}"
+    assert value not in redact(clamped)
+    routed = text + " " + "q" * 70_000
+    if value in _CLAMP_DROPS:  # the clamp's name walk drops it, so only the premise is asserted
+        assert value not in redaction.clamp_untrusted(routed)
+    else:
+        assert value in redaction.clamp_untrusted(routed)  # the premise: the clamp kept it
+        assert value not in redact(redaction.clamp_untrusted(routed))
+
+
+def test_a_value_before_a_space_joined_note_keeps_the_earlier_answer() -> None:
+    """The end is found on the note-free text, but the value is still judged on the text with the
+    note, so a value before a space-joined note is not read as ending the text: its end-of-text
+    refusals stay off, and it is masked as the earlier answer masked it."""
+    text = f"a|b|mrn: ZqMS {redaction._clamp_marker(70_000)}"
+    assert redact(text).startswith(f"{redaction._REDACTED} XxXX ")
