@@ -254,7 +254,11 @@ def test_a_refused_crl_is_reported_by_its_own_setting(
     crl_line = _crl_refused(tmp_path, monkeypatch)
     rc, _db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_api=crl_line)
     assert rc == 2
-    assert grab.starting("no audit row records the refused [api].tls_client_crl_file: ")
+    crl = grab.starting("no audit row records the refused [api].tls_client_crl_file: ")
+    assert len(crl) == 1, grab.seen
+    # No start writes a CRL row, so the line must not say the lifespan's preflight writes one.
+    assert "never checks this setting" in crl[0], crl
+    assert "whose audited preflight writes that row" not in crl[0], crl
     assert grab.starting(_CLIENT_CA_LINE) == []
 
 
@@ -432,3 +436,33 @@ def test_serve_without_its_hook_fails_loudly() -> None:
     decorator cannot silently turn the report off."""
     with pytest.raises(RuntimeError, match="pre-lifespan anchor audit hook"):
         cli._pre_lifespan_anchor_audit()
+
+
+def test_the_report_survives_an_error_log_level(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grab: _Grab
+) -> None:
+    """``[logging].level = "ERROR"`` must not drop the report: it goes through
+    ``_write_start_audit``, which skips the level, as the start's other AUDIT lines do. Red
+    before, when the report was a plain ``log.warning``."""
+    extra = _collector_ca_refused(tmp_path, monkeypatch).replace(
+        "[logging]\n", '[logging]\nlevel = "ERROR"\n'
+    )
+    monkeypatch.setattr(cli, "_emit_anchor_diagnostics", lambda **_k: (2, None))
+    rc, _db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_toml=extra)
+    assert rc == 2
+    assert len(grab.starting(_COLLECTOR_CA_LINE)) == 1, grab.seen
+
+
+def test_the_report_carries_the_collector_cas_reason(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grab: _Grab
+) -> None:
+    """When ``configure_logging`` refuses after the collector CA was deferred, nothing else
+    prints the CA's reason, so the report carries it. Red before, when the report named the
+    setting only."""
+    extra = _collector_ca_refused(tmp_path, monkeypatch).replace(
+        "[egress]\n", f"file = {json.dumps(str(tmp_path))}\n[egress]\n"
+    )
+    rc, _db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_toml=extra)
+    assert rc == 2
+    lines = grab.starting(_COLLECTOR_CA_LINE)
+    assert len(lines) == 1 and "planted early refusal" in lines[0], grab.seen

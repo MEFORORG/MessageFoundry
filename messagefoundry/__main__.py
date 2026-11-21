@@ -2944,7 +2944,7 @@ class _PreLifespanAnchorAudit:
         armed, self.armed = self.armed, False
         if armed and (self.forward_ca_refusals or self.api_ca_refusal is not None):
             _report_anchors_refused_before_the_lifespan(
-                forward_ca_refused=bool(self.forward_ca_refusals),
+                forward_ca_refusals=self.forward_ca_refusals,
                 api_ca_refusal=self.api_ca_refusal,
             )
 
@@ -5506,38 +5506,49 @@ def _serve(args: argparse.Namespace) -> int:
 
 
 def _report_anchors_refused_before_the_lifespan(
-    *, forward_ca_refused: bool, api_ca_refusal: TrustAnchorError | None
+    *,
+    forward_ca_refusals: Sequence[TrustAnchorError],
+    api_ca_refusal: TrustAnchorError | None,
 ) -> None:
     """Log, for each trust anchor a ``serve`` start refused before uvicorn ran its lifespan, that no
-    ``auth.trust_anchor`` row records its refusal (BACKLOG #5391 added item 2). ``serve``'s exit
-    hook calls this on every way out between ``_start_logging`` and ``uvicorn.run``.
+    ``auth.trust_anchor`` row records its refusal, and why it was refused (BACKLOG #5391 added
+    item 2). ``serve``'s exit hook calls this on a way out between ``_start_logging`` and
+    ``uvicorn.run``: a return or an ``Exception``, and not an interrupt or other
+    ``BaseException`` (:class:`_PreLifespanAnchorAudit` names the exits it does not cover).
 
-    **No row is written, and no store is opened** (Manager decision on round-32e2013d's finding 1:
-    a refused start writes nothing but the anchor rows themselves). The row is the lifespan's
-    audited preflight's to write, and writing it here would take a writable store open. Every such
-    open writes more than the row, and no read-only check can rule that out. At least these at-open
-    writes are why: the schema ensure, which creates a SQLite file and migrates an older schema;
-    the WAL journal mode; the open-store hook; the salt bind; the AES-GCM invocation reserve, which
-    a keyed open writes every time; the sealing of legacy plaintext on unsealed surfaces; the
-    keyed-surface markers; the audit chain's genesis row; the store file's ACL rewrite; and a
-    ``key_provider = "host"`` custody handoff's conversion and deletion.
+    **No row is written, and no store is opened** (Manager decision, BACKLOG #5391: a refused
+    start writes nothing to the store). The row is the lifespan's audited preflight's to write,
+    and writing it here would take a writable store open, which writes more than the row:
+    :func:`~messagefoundry.store.open_store` says what an open does. At least the AES-GCM
+    invocation reserve is written by every keyed writable open.
 
-    The anchors it names: ``[logging].forward_tls_ca_file`` when ``forward_ca_refused``, and the
-    setting ``api_ca_refusal`` names, ``[api].tls_client_ca_file`` where it names none. Each
-    refusal's own reason was printed and logged when it was made."""
-    log = logging.getLogger(__name__)
-    refused: list[str] = []
-    if forward_ca_refused:
-        refused.append("[logging].forward_tls_ca_file")
+    The anchors it names: ``[logging].forward_tls_ca_file`` for each refusal in
+    ``forward_ca_refusals``, and the setting ``api_ca_refusal`` names, ``[api].tls_client_ca_file``
+    where it names none. ``[api].tls_client_crl_file`` is said to have no row on any start, since
+    the audited preflight never checks it. Each line carries the refusal's own reason, because
+    ``serve`` prints none for a collector CA when ``_start_logging`` then refuses at
+    ``configure_logging``. The lines go through :func:`_write_start_audit`, so ``[logging].level``
+    does not filter them out."""
+    from messagefoundry.controlchars import scrub_log_argument
+    from messagefoundry.redaction import safe_exc
+
+    refused: list[tuple[str, TrustAnchorError]] = [
+        ("[logging].forward_tls_ca_file", refusal) for refusal in forward_ca_refusals
+    ]
     if api_ca_refusal is not None:
-        refused.append(api_ca_refusal.setting or "[api].tls_client_ca_file")
-    for setting in refused:
-        log.warning(
-            "no audit row records the refused %s: the start was refused before the API lifespan, "
-            "whose audited preflight writes that row, and a refused start opens no store to write "
-            "it (BACKLOG #5391)",
-            setting,
-        )
+        refused.append((api_ca_refusal.setting or "[api].tls_client_ca_file", api_ca_refusal))
+    lines: list[str] = []
+    for setting, refusal in refused:
+        reason = scrub_log_argument(safe_exc(refusal))
+        if setting == "[api].tls_client_crl_file":
+            why = "the audited preflight never checks this setting, so no start writes its row"
+        else:
+            why = (
+                "the start was refused before the API lifespan, whose audited preflight writes "
+                "that row, and a refused start opens no store to write it"
+            )
+        lines.append(f"no audit row records the refused {setting}: {why} (BACKLOG #5391): {reason}")
+    _write_start_audit(lines)
 
 
 def _floor_or_refusal[T](refusing_to: str, build: Callable[[], T]) -> T | None:
