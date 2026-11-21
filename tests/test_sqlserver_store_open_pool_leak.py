@@ -562,7 +562,8 @@ async def test_a_failed_close_then_a_wedged_wait_closed_is_bounded(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """BACKLOG #5720: after the store's own close fails before its pool step on the error path,
-    the pool is closed again and waited on for at most ``_ONE_CONNECTION_POOL_CLOSE_BOUND_S``, so
+    the pool is closed, its first close, and waited on for at most
+    ``_ONE_CONNECTION_POOL_CLOSE_BOUND_S``, so
     a pool that never finishes closing cannot hang that fallback, and the executor is still shut
     down.
 
@@ -593,6 +594,7 @@ async def test_a_failed_close_then_a_wedged_wait_closed_is_bounded(
         unwedge.set()
     with pytest.raises(ValueError, match="probe boom"):
         task.result()
+    assert pool.closed == 1
     assert executor.shutdown_calls == [False]
     assert "the pool did not finish closing within 0.05 s; it is left closing" in caplog.text
 

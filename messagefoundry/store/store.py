@@ -2152,8 +2152,8 @@ async def cleanup_failed_open(
     too, then is re-raised. ``force_release`` None is a caller with nothing to release without
     waiting: past the bound this only stops waiting, and what the cleanup holds stays open until
     it finishes. ``what`` names the cleanup in its log lines. A cleanup that ends cancelled,
-    waited for or not, is logged at WARNING; one that fails stays at ERROR, as
-    :func:`_run_to_completion` logs it (BACKLOG #5720)."""
+    waited for or not, is logged at WARNING; one that fails is logged at ERROR, by
+    this function, since it runs the release with ``report`` False (BACKLOG #5720)."""
     # What the forced-release WARNING names: the open, or the caller's own cleanup.
     after = "a failed store open" if what == "a failed store open's cleanup" else what
     if isinstance(exc, GeneratorExit):
