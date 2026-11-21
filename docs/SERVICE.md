@@ -1141,17 +1141,22 @@ any copy of it you pass to `--cacert`.** A sharded service (`supervise`) renews 
 starts its shards, and a shard it restarts never renews, so every shard serves the same certificate.
 The same replacement runs at startup, whatever the expiry, when the certificate does not name the
 address a client on this box dials for the current bind: the family's loopback for a wildcard
-`--host` (`127.0.0.1` for `0.0.0.0`, `::1` for `::`), else the host without IPv6 brackets
-(`[::1]` is the address `::1`), matched without regard to case or an IPv6 zone. A move from
-`127.0.0.1` to `::` replaces it; a move from `127.0.0.1` to `0.0.0.0` does not. The new
-certificate names what a first-run mint for the current bind would. When a client on this box
-dials that bind through `localhost`, `127.0.0.1` or `::1`, a replacement, a renewal included,
-also keeps each of those three the old certificate named, and always `127.0.0.1`, which the CLI,
-the IDE and the harness dial by default. Its audit row's reason is `bind_changed`, a shard never
-makes it, and the new certificate must be imported the same way (BACKLOG #5973). At least a
-shard, a bind the certificate builder refuses (a WARNING names it), and a file or lock failure
-(a WARNING, and the next start tries again) keep serving the old certificate, which does not name
-the bind.
+`--host` (`127.0.0.1` for `0.0.0.0`, `::1` for `::`), else the host without IPv6 brackets (`[::1]`
+is the address `::1`), matched without regard to case or an IPv6 zone. For a bind the engine treats
+as loopback (`127.0.0.1`, `::1`, `localhost`), whose certificate names all three, it also runs when
+the certificate lacks any of them (BACKLOG #5790). A move from `0.0.0.0` to `::` replaces a pair a
+first run minted for `0.0.0.0`; a move from `127.0.0.1` to `0.0.0.0` or `::` does not, and nor does
+the move back. The new certificate names what a first-run mint for the current bind would. When a
+client on this box dials that bind through `localhost`, `127.0.0.1` or `::1`, a replacement, a
+renewal included, also keeps each of those three the old certificate named, and always `127.0.0.1`,
+which the CLI, the IDE and the harness dial by default. A replacement for a missing name is audited
+with reason `bind_changed`, unless the pair is also due for renewal, which is audited with reason
+`renewal`. An engine shard makes neither. The audit row may be missing, at least if its write fails,
+which logs an ERROR, or if the start fails after the replacement and before the row is written,
+which leaves the WARNING line as the only record (ADR 0172 decision 6). Import the certificate from
+either replacement as after a renewal (BACKLOG #5973). At least an engine shard, a bind the
+certificate builder refuses (a WARNING names it), and a file or lock failure (a WARNING, and the
+next start tries again) keep serving the old certificate, which lacks a name the current bind needs.
 See
 [INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console". (The former PySide6 desktop
 console was retired — BACKLOG #103.)
