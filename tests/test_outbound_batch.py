@@ -663,14 +663,21 @@ async def test_a_colliding_head_is_dead_lettered_alone_and_the_rest_batch(
     assert "cannot be batched" in error and "MSGX" not in error and "ADT" not in error
 
 
+@pytest.mark.parametrize("raw_separators", [False, True], ids=["plain", "raw-separators"])
 async def test_a_verbatim_outbound_carries_a_colliding_member_that_does_not_head(
-    store: Any,
+    store: Any, raw_separators: bool
 ) -> None:
     # A verbatim outbound sends each member's own bytes, so a colliding member behind the head is
     # delivered as origin/main delivers it; only the would-be heads are refused (BACKLOG #5972).
+    # hl7_raw_separators re-joins the envelope on the delimiters it split it on, so it keeps the
+    # member's bytes and counts as verbatim (PR 3135 finding f394ede3-2).
     mids = await _enqueue_bodies(store, [_COLLIDING, _COLLIDING, _msg(3), _COLLIDING, _msg(5)])
-    rec = await _run_one_batch(store, simulate=False)
+    dest = MllpRecorder(DEST, hl7_raw_separators=True) if raw_separators else None
+    rec = await _run_one_batch(store, simulate=False, dest=dest)
     (envelope,) = rec.sent
+    if dest is not None:
+        # The send's own rewrite keeps the colliding member's bytes on the wire.
+        assert _COLLIDING in dest._rewrite_for_wire(envelope)
     assert envelope.split("\r")[0].split("|")[10] == "MSG3"  # BHS-11, the first kept member
     assert _COLLIDING in envelope and envelope.endswith("BTS|3\r")
     assert await _states(store, mids) == [
@@ -682,17 +689,15 @@ async def test_a_verbatim_outbound_carries_a_colliding_member_that_does_not_head
     ]
 
 
-@pytest.mark.parametrize("rewrite", ["raw-separators", "encoding-characters"])
 async def test_a_rewriting_outbound_refuses_a_colliding_member_wherever_it_sits(
-    store: Any, rewrite: str
+    store: Any,
 ) -> None:
     # A send that rewrites the envelope's delimiters would rewrite a later colliding member under
     # the BHS's, so MSH-9 "ADT~A01" would read as two repetitions on the wire. There every
     # colliding member is refused alone, wherever it sits (BACKLOG #5972).
     mids = await _enqueue_bodies(store, [_COLLIDING, _COLLIDING, _msg(3), _COLLIDING, _msg(5)])
-    dest = MllpRecorder(DEST, hl7_raw_separators=rewrite == "raw-separators")
-    if rewrite == "encoding-characters":
-        dest.encoding_characters = parse_encoding_characters("|^~\\&")
+    dest = MllpRecorder(DEST)
+    dest.encoding_characters = parse_encoding_characters("|^~\\&")
     rec = await _run_one_batch(store, simulate=False, dest=dest)
     (envelope,) = rec.sent
     assert envelope.split("\r")[0].split("|")[10] == "MSG3"  # BHS-11, the first kept member

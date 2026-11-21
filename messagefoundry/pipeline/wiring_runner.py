@@ -14797,11 +14797,12 @@ async def _read_from_store[T](what: str, read: Callable[[], Awaitable[T]]) -> T:
 
 def _rewrites_delimiters(connector: object) -> bool:
     """Whether ``connector`` rewrites a payload's delimiters before it sends it: an MLLP outbound
-    with ``encoding_characters`` or ``hl7_raw_separators`` set (BACKLOG #5972). Read off the
-    instance, so a connector with neither, or a test double, sends its payload's own bytes."""
-    return getattr(connector, "encoding_characters", None) is not None or bool(
-        getattr(connector, "hl7_raw_separators", False)
-    )
+    with ``encoding_characters`` set (BACKLOG #5972). Read off the instance, so a connector without
+    it, or a test double, sends its payload's own bytes. ``hl7_raw_separators`` is not one: it
+    re-joins the envelope on the delimiters it was split on, so a member's delimiters reach the
+    wire as they were written, and a colliding member behind the head is delivered, as it was
+    before the refusal existed."""
+    return getattr(connector, "encoding_characters", None) is not None
 
 
 def _frames(connector: object) -> bool:
