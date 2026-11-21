@@ -494,8 +494,10 @@ def marker_under_colliding_delimiters(message: Message, text: str) -> bool:
     ACK, whatever its size. ``Message`` refuses every write to it, so no document of it is ever
     detached, and under some such headers no ``OBX-5.5`` reads, so a sender's handle there is not
     read as one: the re-attach then refuses a copy naming a content address on every outbound,
-    after the ACK. The marker is refused wherever it sits, a bare one included: where the header
-    hides the ``OBX-5`` components, no read tells whether it sits where a handle would.
+    after the ACK. The rule judges the text, not where in it the marker sits, so it refuses a bare
+    marker too, under every such header, those whose ``OBX-5`` components still read included,
+    although delivery carries a bare marker that names no content address: where a header hides
+    the components, no read tells whether a marker sits where a handle would.
 
     ``message`` is ``text`` parsed. For a header that does not collide the cost is the header
     read alone; otherwise up to two substring scans of ``text``, plus one per later header naming
@@ -660,9 +662,10 @@ def iter_obx_documents(
     Raises :class:`EscapedDocumentError` when any ED Base64 ``OBX-5.5`` holds the escape character,
     whose value would be decoded rather than verbatim (vault BACKLOG #2809), and
     :class:`InboundDocRefError` when any ``OBX-5.5``, ED or not, already holds a live handle: only
-    this detach writes one, so a received one is the sender's (BACKLOG #5099). Every OBX is checked
-    before the first document is yielded, so a caller that stores each one as it goes has stored
-    none of them when the refusal comes.
+    this detach writes one, so a received one is the sender's (BACKLOG #5099). Under a header whose
+    filled default collides, the header's verdicts below come first instead, so such a handle is
+    refused by one of them where they apply. Every refusal comes before the first document is
+    yielded, so a caller that stores each one as it goes has stored none of them when it comes.
 
     It raises :class:`InboundDocRefError` too when a document would be detached and the body holds
     the handle marker anywhere else: in a document's value past its start, or anywhere in

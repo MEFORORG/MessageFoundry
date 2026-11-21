@@ -736,6 +736,19 @@ def test_the_binary_carriage_target_refuses_a_detach_that_accepts_a_colliding_ed
         TARGETS_BY_NAME["binary_carriage"].run(COLLIDING_HEADER_SEED)
 
 
+def test_the_binary_carriage_target_refuses_a_detach_that_accepts_a_colliding_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The negative control for the colliding-header marker refusal: a detach that accepts a body
+    holding the handle marker under such a header, with no ED claim, fails the target, and the
+    real scan refuses it (BACKLOG #5972)."""
+    body = b"MSH|~|A|B|C|D|20260101||ORU~R01|X1|P|2.5\rNTE|1||see mfdoc:v1:ref:x\r"
+    TARGETS_BY_NAME["binary_carriage"].run(body)  # control: the real scan refuses it, runs clean
+    monkeypatch.setattr(fuzz_targets, "iter_obx_documents", lambda *_a, **_k: iter(()))
+    with pytest.raises(AssertionError, match="accepted a handle marker under colliding"):
+        TARGETS_BY_NAME["binary_carriage"].run(body)
+
+
 def test_the_binary_carriage_target_refuses_a_detach_collision_refusal_of_a_readable_header(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

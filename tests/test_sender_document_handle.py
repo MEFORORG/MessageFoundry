@@ -2199,7 +2199,31 @@ _HIDDEN_MARKER_BODIES = {
         "MSH^^APP^FAC^RCV^RCVF^20260101120000^^MDM~T02^MSGID001^P^2.5\r"
         f"OBX^1^TX^PDF^^x~Application~PDF~Base64~{_HIDDEN_HANDLE}\r"
     ),
+    # Escaped only by a later header's ``:``, so the first line's forms miss it.
+    "later-header": (
+        "MSH|~|APP|FAC|RCV|RCVF|20260101120000||MDM~T02|MSGID001|P|2.5\r"
+        "BHS|:~\\&|A\rNTE|1||mfdoc\\S\\v1\\S\\ref\\S\\"
+        f"{hashlib.sha256(b'x').hexdigest()}\\S\\Application\r"
+    ),
 }
+
+
+@pytest.mark.parametrize("body", _HIDDEN_MARKER_BODIES.values(), ids=_HIDDEN_MARKER_BODIES.keys())
+def test_the_listener_check_refuses_the_marker_under_a_colliding_header(body: str) -> None:
+    """F1: the check both listeners, the dry-run and the re-ingress run refuses each shape, the
+    marker escaped only by a later header included; the control body is not refused."""
+    from messagefoundry.parsing.binary import _received_holds_marker
+    from messagefoundry.parsing.peek import Peek
+    from messagefoundry.pipeline.ingress_guards import (
+        COLLIDING_DOC_REF_MARKER_REFUSED_REASON,
+        doc_ref_marker_refusal,
+    )
+
+    if "BHS|" in body:
+        assert not _received_holds_marker(Message.parse(body), body)  # a later header's form only
+    assert doc_ref_marker_refusal(Peek.parse(body), body) == COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+    control = _TILDE_HEADER_NO_MARKER
+    assert doc_ref_marker_refusal(Peek.parse(control), control) is None
 
 
 @pytest.mark.parametrize("body", _HIDDEN_MARKER_BODIES.values(), ids=_HIDDEN_MARKER_BODIES.keys())
@@ -2237,8 +2261,9 @@ _LISTENER_KINDS = pytest.mark.parametrize(
 
 
 @_LISTENER_KINDS
+@pytest.mark.parametrize("padded", [True, False], ids=["over-threshold", "under-threshold"])
 async def test_a_hidden_handle_under_a_colliding_header_is_refused_at_both_listeners(
-    store: MessageStore, streaming: bool
+    store: MessageStore, streaming: bool, padded: bool
 ) -> None:
     """F1 at both listeners: such a body was ACKed AA and queued, then dead-lettered at
     delivery. It is refused before the ACK at any size, with an AR on MLLP and a permanent
@@ -2248,8 +2273,10 @@ async def test_a_hidden_handle_under_a_colliding_header_is_refused_at_both_liste
 
     ic = _streaming_ic() if streaming else _plain_ic()
     body = _TILDE_HEADER_HANDLE
+    if not padded:
+        body = body[: body.index("NTE|")]
     assert (ic.stream_threshold_bytes is not None) is streaming
-    assert len(body) >= (_streaming_ic().stream_threshold_bytes or 0)
+    assert (len(body) >= (_streaming_ic().stream_threshold_bytes or 0)) is padded
     runner = _runner(store, ic)
 
     ack = await runner._handle_inbound(ic, body.encode("utf-8"))
@@ -2310,7 +2337,8 @@ def test_the_dry_run_and_the_re_ingress_refuse_a_hidden_handle_as_the_listeners_
         assert result.error == COLLIDING_DOC_REF_MARKER_REFUSED_REASON
         assert refusal == COLLIDING_DOC_REF_MARKER_REFUSED_REASON
     else:
-        assert result.disposition is not MessageStatus.ERROR
+        # The router returns no handler, so the accepted control is unrouted.
+        assert result.disposition is MessageStatus.UNROUTED
         assert refusal is None
 
 

@@ -85,6 +85,7 @@ from messagefoundry.parsing.binary import (
     extract_obx_document,
     is_doc_ref,
     iter_obx_documents,
+    marker_under_colliding_delimiters,
     parse_doc_ref,
     strip_documents,
 )
@@ -637,8 +638,10 @@ def _binary_carriage(data: bytes) -> None:
       document and, for an ED OBX under a short MSH-2 whose filled default is already another of
       its delimiters, ``CollidingDelimitersRefused`` (BACKLOG #5972), which is not a
       ``BinaryCarriageError`` and is accepted only on such a header. The detach scan's refusal of
-      such a header, ``CollidingDelimitersError``, is a ``NonVerbatimDocumentError``, and must
-      come for every such header with an OBX whose ``OBX-2`` is ``ED``, read or not. A body the
+      such a header, ``CollidingDelimitersError``, is a ``NonVerbatimDocumentError``. Under such a
+      header the scan must refuse a body holding the handle marker
+      (``marker_under_colliding_delimiters``), with ``InboundDocRefError``, and otherwise every
+      body with an OBX whose ``OBX-2`` is ``ED``, read or not. A body the
       parser accepts always has readable delimiters, so any other ``ValueError`` out of either is
       a defect, not a refusal.
 
@@ -683,6 +686,11 @@ def _strip_and_scan_hl7(text: str) -> None:
         if colliding and (detached or _holds_ed_claim(message)):
             raise AssertionError(
                 "iter_obx_documents accepted an ED claim under colliding delimiters"
+            )
+        # Nor may such a header accept a body holding the marker, which both listeners refuse.
+        if colliding and marker_under_colliding_delimiters(message, text):
+            raise AssertionError(
+                "iter_obx_documents accepted a handle marker under colliding delimiters"
             )
     for occurrence in range(1, message.count_segments("OBX") + 1):
         try:
