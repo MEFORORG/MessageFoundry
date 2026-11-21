@@ -461,13 +461,20 @@ those settings, and its Handlers still run with no active environment.
   commands, and not to refuse `--env` without `--project-root`. Given `--env`, `validate`, `graph`
   and `dryrun` now run the service settings load `serve` runs, with `--env` as the
   `[ai].environment` override and `--project-root` as the `[environments].base_dir` override that
-  `serve` applies. That one load names the value file for both the missing-file check (AC-3) and
-  the read. For `validate` and `dryrun` the check fires wherever that load names a project root,
-  a `base_dir` from the settings file or the environment included, as `serve`'s does. `graph`
-  keeps the check it ran before: under an explicit `--project-root` only, ahead of the settings
-  load and without it, so it exits 2 in the cases it did before, a settings file that does not
-  load included, and can name a different folder than its read. They read the file with `serve`'s
-  own reader, so overrides such as `MEFOR_VALUE_*` apply. Settings that do not load are reported
+  `serve` applies. That load names the value file the three read. For `validate` and `dryrun` it
+  also names the file the missing-file check (AC-3) looks for, and the check fires wherever that
+  load names a project root, a `base_dir` from the settings file or the environment included, as
+  `serve`'s does. Where their settings do not load, they run the settings-free check `graph` runs
+  instead, so a missing value file under `--project-root` still exits 2 ahead of the settings
+  failure, as it did before. `graph` always runs that settings-free check, ahead of the settings
+  load: it fires under an explicit `--project-root` only, and takes the value folder from
+  `MEFOR_ENVIRONMENTS_DIR`, else from `[environments].dir` in the `--service-config` file or
+  `<root>/messagefoundry.toml`, else `environments`. So `graph` exits 2 in every case it did
+  before, a settings file that does not load included, and it can look in a different folder than
+  its read. For example, with no `<root>/messagefoundry.toml` and a `./messagefoundry.toml` naming
+  `dir = "envs"`, `graph` exits 2 over a missing `<root>/environments/<env>.toml`, as it did before
+  this note, while `validate` reads `<root>/envs/<env>.toml` and can pass. They read the file with
+  `serve`'s own reader, so overrides such as `MEFOR_VALUE_*` apply. Settings that do not load are reported
   as `serve`'s settings load renders them, naming the settings file where one exists; a value file
   that cannot be read is reported naming that file. They resolve every `env()` reference of each
   deployed connection and lookup, and report one that does not resolve by its key, never its

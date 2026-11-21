@@ -736,33 +736,84 @@ def test_offline_env_fails_loud_under_a_settings_base_dir(
     assert rc == 0 and json.loads(captured.out)["env_problems"] == [], captured
 
 
-@pytest.mark.parametrize("settings", ["typo", "bad_port"])
-def test_graph_keeps_its_missing_value_file_refusal_when_settings_do_not_load(
+@pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
+@pytest.mark.parametrize("settings", ["typo", "bad_port", "bad_toml", "deep", "not_utf8"])
+def test_offline_env_keeps_its_missing_value_file_refusal_when_settings_do_not_load(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    command: str,
     settings: str,
 ) -> None:
-    # Before --env read values, graph under --project-root exited 2 on an env()-referencing graph
-    # with no value file, whatever the settings file held. A settings load that fails must not
-    # turn that into a listed problem and exit 0.
+    # Before --env read values, each of the three under --project-root exited 2 on an
+    # env()-referencing graph with no value file when the settings file was missing, did not
+    # validate or did not parse. A settings load that fails must not turn that into exit 1, or
+    # into a listed problem and exit 0 for graph. A deeply nested or non-UTF-8 settings file
+    # ended all three on an uncaught exception (exit 1); it now gets the same exit 2.
     root = tmp_path / "R"
     cfg = _config_dir(root, body=_ENV_GRAPH)
     _empty_cwd(tmp_path, monkeypatch)
-    argv = ["graph", "--project-root", str(root), "--config", str(cfg), "--env", "prod", "--json"]
+    argv = ["--project-root", str(root), "--config", str(cfg), "--env", "prod"]
+    settings_file = root / "messagefoundry.toml"
     if settings == "typo":
         argv += ["--service-config", str(root / "typo.toml")]
+    elif settings == "bad_port":
+        settings_file.write_text('[api]\nport = "not-a-port"\n', encoding="utf-8")
+    elif settings == "bad_toml":
+        settings_file.write_text("[[[\n", encoding="utf-8")
+    elif settings == "deep":
+        settings_file.write_text("a = " + "[" * 3000 + "]" * 3000 + "\n", encoding="utf-8")
     else:
-        (root / "messagefoundry.toml").write_text('[api]\nport = "not-a-port"\n', encoding="utf-8")
-    rc = main(argv)
+        settings_file.write_bytes(b'[environments]\ndir = "\xff\xfe"\n')
+    rc = main(_offline_argv(command, tmp_path, *argv))
     captured = capsys.readouterr()
     assert rc == 2, captured
     assert str(root / "environments" / "prod.toml") in captured.err, captured
-    # Control: with the value file present graph prints the graph and lists the settings failure.
+    assert "Traceback" not in captured.err
+    # Control: with the value file present, the settings failure is what each reports: validate
+    # and dryrun fail on it, graph prints the graph and lists it.
     _values_file(root, "prod", f'peer_host = "{_SECRET_HOST}"\n')
-    rc = main(argv)
+    rc = main(_offline_argv(command, tmp_path, *argv))
     captured = capsys.readouterr()
-    assert rc == 0, captured
-    problems = json.loads(captured.out)["env_problems"]
-    assert any("could not load the service settings" in p for p in problems), problems
+    assert _SECRET_HOST not in captured.out + captured.err
+    if command == "graph":
+        assert rc == 0, captured
+        problems = json.loads(captured.out)["env_problems"]
+        assert any("could not load the service settings" in p for p in problems), problems
+    else:
+        assert rc == 1, captured
+
+
+@pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
+@pytest.mark.parametrize("settings", ["deep", "not_utf8"])
+def test_offline_env_reports_an_unparseable_root_settings_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+    settings: str,
+) -> None:
+    # With the value file present, a deeply nested or non-UTF-8 <root>/messagefoundry.toml is a
+    # settings failure each command reports in its own shape: validate and dryrun fail on it,
+    # graph lists it under env_problems. It ended all three on an uncaught exception before.
+    root = tmp_path / "R"
+    cfg = _config_dir(root, body=_ENV_GRAPH)
+    _values_file(root, "prod", f'peer_host = "{_SECRET_HOST}"\n')
+    _empty_cwd(tmp_path, monkeypatch)
+    settings_file = root / "messagefoundry.toml"
+    if settings == "deep":
+        settings_file.write_text("a = " + "[" * 3000 + "]" * 3000 + "\n", encoding="utf-8")
+    else:
+        settings_file.write_bytes(b'[environments]\ndir = "\xff\xfe"\n')
+    argv = ["--project-root", str(root), "--config", str(cfg), "--env", "prod"]
+    rc = main(_offline_argv(command, tmp_path, *argv))
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    if command == "graph":
+        assert rc == 0, captured
+        problems = json.loads(captured.out)["env_problems"]
+        assert any("could not load the service settings" in p for p in problems), problems
+    else:
+        assert rc == 1, captured
+        assert "could not load the service settings" in captured.out + captured.err, captured
     assert _SECRET_HOST not in captured.out + captured.err

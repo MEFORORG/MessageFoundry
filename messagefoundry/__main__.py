@@ -1490,9 +1490,9 @@ def _resolve_offline_anchor(
 
     ``env_file_check=False`` leaves that check out, for ``validate`` and ``dryrun``:
     :func:`_offline_env_values` runs it from the settings it loads, so the check and the value read
-    name one file (vault BACKLOG #5554). ``check`` and ``graph`` keep it here, so ``graph`` exits 2
-    in exactly the cases it did before ``--env`` read values, a settings file that does not load
-    included.
+    name one file, and falls back to this settings-free check when those settings do not load (vault
+    BACKLOG #5554). ``check`` and ``graph`` keep it here, so ``graph`` exits 2 in every case it did
+    before ``--env`` read values, a settings file that does not load included.
     """
     from messagefoundry.config.anchor import anchor_under_root, resolve_project_root
 
@@ -1553,11 +1553,14 @@ def _offline_env_values(
     ``--env``, or an exit code, already reported, for the AC-3 missing-value-file refusal (vault
     BACKLOG #5554, ADR 0050 §3).
 
-    One settings load locates the value file for both the AC-3 check and the read. It is the load
-    serve runs, with ``--env`` as the ``[ai].environment`` override and ``--project-root`` as the
-    ``[environments].base_dir`` override serve applies. ``service_config`` is the file
-    :func:`_resolve_offline_anchor` chose. The AC-3 check fires wherever that load names a project
-    root, as serve's does, including a ``base_dir`` from the file or the environment.
+    Where the settings load, one load locates the value file for both the AC-3 check and the read.
+    It is the load serve runs, with ``--env`` as the ``[ai].environment`` override and
+    ``--project-root`` as the ``[environments].base_dir`` override serve applies. ``service_config``
+    is the file :func:`_resolve_offline_anchor` chose. The AC-3 check fires wherever that load names
+    a project root, as serve's does, including a ``base_dir`` from the file or the environment.
+    Where the settings do not load, the settings-free AC-3 check of :func:`_resolve_offline_anchor`
+    runs instead, under an explicit ``--project-root`` only, before the failure is raised, so its
+    exit 2 comes first as it did before ``--env`` read values.
     ``value_file_check=False`` (``graph``) runs no AC-3 check here, because ``graph`` keeps the
     pre-check in :func:`_resolve_offline_anchor` that it ran before ``--env`` read values. The values
     are read by :func:`_read_environment_values`, serve's own reader, so overrides such as
@@ -1580,6 +1583,16 @@ def _offline_env_values(
     # Rendered, never stringified: see _load_service_settings.
     settings, detail = _load_service_settings(service_config, cli=cli)
     if settings is None:
+        # Settings that do not load name no value dir, so under an explicit --project-root the
+        # settings-free pre-check runs first: a graph with env() and no value file still exits 2,
+        # as it did before --env read values, rather than 1 for the settings.
+        explicit_root = resolve_project_root(args.project_root, cwd=Path.cwd())
+        if value_file_check and explicit_root is not None:
+            rc = _check_env_file_present(
+                config_dir, explicit_root, args.env, _env_dir_name(service_config)
+            )
+            if rc is not None:
+                return rc
         settings_file = settings_file_path(service_config)
         # Name the file only where there is one: with none, the failure is the environment's or
         # the command line's, and a named file would send the operator to the wrong place.
@@ -1635,10 +1648,10 @@ def _env_dir_name(service_config: str | None) -> str:
 
     Read from the resolved ``service_config`` TOML (a tiny, settings-free tomllib read) so the offline
     AC-3 check honors a CUSTOM ``dir = "envs"`` instead of false-positive-failing on the hardcoded
-    literal. Best-effort: no/unreadable/malformed file -> the default. Only ``check``'s AC-3
-    pre-check in :func:`_resolve_offline_anchor` reads it, ahead of the settings load its settings
-    legs run; ``validate``/``graph``/``dryrun`` take the dir from their own settings load in
-    :func:`_offline_env_values` (vault BACKLOG #5554).
+    literal. Best-effort: no/unreadable/malformed file -> the default. The settings-free AC-3
+    pre-check reads it: ``check``'s and ``graph``'s in :func:`_resolve_offline_anchor`, and
+    ``validate``'s and ``dryrun``'s in :func:`_offline_env_values` only when their settings do not
+    load; otherwise those two take the dir from that settings load (vault BACKLOG #5554).
 
     ``MEFOR_ENVIRONMENTS_DIR`` beats the file, as it does in ``serve``'s ``load_settings`` (vault
     BACKLOG #2355). The file read is ``service_config`` alone: under ``--project-root`` with no root
@@ -1653,7 +1666,10 @@ def _env_dir_name(service_config: str | None) -> str:
     try:
         with Path(service_config).open("rb") as fh:
             data = tomllib.load(fh)
-    except (tomllib.TOMLDecodeError, OSError):
+    except (ValueError, RecursionError, OSError):
+        # ValueError covers tomllib.TOMLDecodeError and a file that is not UTF-8 (a
+        # UnicodeDecodeError); RecursionError a deeply nested document. The settings load that
+        # follows reports each of them.
         return "environments"
     env_section = data.get("environments")
     if isinstance(env_section, dict):
@@ -6156,8 +6172,7 @@ def _graph(args: argparse.Namespace) -> int:
     except WiringError as exc:
         env_read_problems.append(str(exc))
         env = None
-    if isinstance(env, int):  # not returned with value_file_check=False; kept for the type
-        return env
+    assert not isinstance(env, int)  # value_file_check=False returns no exit code
     env_values = env
     try:
         # allow_empty: `graph` REPORTS a graph, it does not gate one (BACKLOG #1648), and its edges
