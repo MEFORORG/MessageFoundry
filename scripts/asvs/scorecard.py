@@ -2503,9 +2503,27 @@ _Scope = dict[str, list[_DefNode]]
 
 
 def _is_type_checking(test: ast.expr) -> bool:
-    """``if TYPE_CHECKING:`` or ``if typing.TYPE_CHECKING:``, whose body never runs."""
+    """``TYPE_CHECKING`` or ``typing.TYPE_CHECKING``, false at runtime."""
     return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
         isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+    )
+
+
+def _is_not_type_checking(test: ast.expr) -> bool:
+    """``not TYPE_CHECKING``, true at runtime."""
+    return (
+        isinstance(test, ast.UnaryOp)
+        and isinstance(test.op, ast.Not)
+        and _is_type_checking(test.operand)
+    )
+
+
+def _is_accessor(node: ast.stmt) -> bool:
+    """A ``@x.setter``, ``@x.getter`` or ``@x.deleter`` def: it adds an accessor to the property
+    ``x`` already names, so it does not replace that property's shape."""
+    return isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+        isinstance(d, ast.Attribute) and d.attr in ("setter", "getter", "deleter")
+        for d in node.decorator_list
     )
 
 
@@ -2516,7 +2534,8 @@ def _branches(node: ast.stmt) -> list[list[ast.stmt]] | None:
     if isinstance(node, ast.If):
         return [node.body, node.orelse]
     if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
-        return [node.body + node.orelse, node.orelse]
+        # A ``break`` skips the ``else``, so the body alone is an alternative too.
+        return [node.body + node.orelse, node.body, node.orelse]
     if isinstance(node, (ast.Try, ast.TryStar)):
         return [node.body + node.orelse, *(h.body for h in node.handlers)]
     if isinstance(node, ast.Match):
@@ -2532,16 +2551,21 @@ def _run_block(body: list[ast.stmt], scope: _Scope) -> _Scope:
     A compound statement's alternatives (``if``/``else``, ``try``/``except``, ``match`` cases, a
     loop that may not run) each give one, and an alternative that does not bind the name leaves the
     earlier definition possible. An ``if TYPE_CHECKING:`` body never runs, so only its ``else``
-    counts. A ``with`` body always runs. A ``try``'s ``finally`` runs after its alternatives.
+    counts, and the reverse for ``if not TYPE_CHECKING:``. A property accessor def does not replace
+    the property (:func:`_is_accessor`). A ``with`` body always runs. A ``try``'s ``finally`` runs after its alternatives.
     """
     out = dict(scope)
     for node in body:
+        if _is_accessor(node):
+            continue
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             out[node.name] = [node]
         elif isinstance(node, ast.If) and _is_type_checking(node.test):
             out = _run_block(node.orelse, out)
-        elif isinstance(node, (ast.With, ast.AsyncWith)):
-            out = _run_block(node.body, out)
+        elif (isinstance(node, ast.If) and _is_not_type_checking(node.test)) or isinstance(
+            node, (ast.With, ast.AsyncWith)
+        ):
+            out = _run_block(node.body, out)  # a body that always runs
         elif (branches := _branches(node)) is not None:
             results = [_run_block(b, out) for b in branches]
             merged: _Scope = {}
@@ -2605,7 +2629,8 @@ def _is_generator(fn: _FunctionNode) -> bool:
 #: Decorators that change what a call site gets back, by the last part of their dotted name: a
 #: property for a method, a context manager for a value, a wrapper that hashes its arguments, a
 #: generated constructor. At least these; a decorator not named here is free to come or go, because
-#: dropping one can BE the reintroduction (a permission check written as a decorator).
+#: dropping one can BE the reintroduction (a permission check written as a decorator). A dotted
+#: spelling counts only under :data:`_SHAPE_DECORATOR_MODULES`, so ``@acl.define`` is not attrs'.
 _SHAPE_DECORATORS: Final = frozenset(
     {
         "property",
@@ -2633,17 +2658,25 @@ _SHAPE_DECORATORS: Final = frozenset(
         "attrs",
     }
 )
+#: The modules a dotted shape decorator may come from, as in ``@functools.cache``. A ``@x.setter``
+#: and its siblings take any prefix: it is the property's own name.
+_SHAPE_DECORATOR_MODULES: Final = frozenset(
+    {"functools", "dataclasses", "contextlib", "typing", "attr", "attrs", "pytest", "builtins"}
+)
 
 
 def _decorators(node: _DefNode) -> tuple[str, ...]:
     """The decorators in :data:`_SHAPE_DECORATORS`, by the last part of their name, in order.
-    Arguments are left out for the reason default VALUES are, and so is the module prefix, so
-    ``@functools.cache`` and ``@cache`` are one decorator.
+    Arguments are left out for the reason default VALUES are, and so is a module prefix from
+    :data:`_SHAPE_DECORATOR_MODULES`, so ``@functools.cache`` and ``@cache`` are one decorator.
     """
     out = []
     for d in node.decorator_list:
-        name = ast.unparse(d.func if isinstance(d, ast.Call) else d).rsplit(".", 1)[-1]
-        if name in _SHAPE_DECORATORS:
+        head, _, name = ast.unparse(d.func if isinstance(d, ast.Call) else d).rpartition(".")
+        accessor = name in ("setter", "getter", "deleter")
+        if name in _SHAPE_DECORATORS and (
+            not head or accessor or head.rsplit(".", 1)[-1] in _SHAPE_DECORATOR_MODULES
+        ):
             out.append(name)
     return tuple(out)
 
@@ -2663,7 +2696,7 @@ _SIGNATURE_FIELDS: Final = (
 )
 
 
-def _signature(fn: _FunctionNode) -> tuple[object, ...]:
+def _signature(fn: _FunctionNode, *, method: bool = False) -> tuple[object, ...]:
     """The call-compatible shape of a signature: what a CALL SITE can observe, one value per
     :data:`_SIGNATURE_FIELDS` entry.
 
@@ -2680,14 +2713,24 @@ def _signature(fn: _FunctionNode) -> tuple[object, ...]:
     with every parameter intact (BACKLOG #5590). Being a GENERATOR is part of it for the same
     reason: a caller of a function that now yields gets a generator object in place of its value.
     So are the decorators that change what the name is bound to (:func:`_decorators`).
+
+    For a ``method`` other than a ``staticmethod``, the first parameter is bound, never passed by
+    a caller, so its name is not part of the shape (``self`` and ``this`` are one shape).
     """
     args = fn.args
+    posonly = [p.arg for p in args.posonlyargs]
+    positional = [p.arg for p in args.args]
+    if method and "staticmethod" not in _decorators(fn):
+        if posonly:
+            posonly[0] = "<bound>"
+        elif positional:
+            positional[0] = "<bound>"
     return (
         isinstance(fn, ast.AsyncFunctionDef),
         _is_generator(fn),
         _decorators(fn),
-        tuple(p.arg for p in args.posonlyargs),
-        tuple(p.arg for p in args.args),
+        tuple(posonly),
+        tuple(positional),
         tuple(p.arg for p in args.kwonlyargs),
         args.vararg.arg if args.vararg else None,
         args.kwarg.arg if args.kwarg else None,
@@ -2702,7 +2745,9 @@ def _describe(shape: tuple[object, ...]) -> str:
     )
 
 
-def _scope_mismatch(mut: _Scope, src: _Scope, prefix: str = "") -> str | None:
+def _scope_mismatch(
+    mut: _Scope, src: _Scope, prefix: str = "", *, in_class: bool = False
+) -> str | None:
     """The first definition in `mut` that shadows one in `src` with a different call shape, as a
     clause for the refusal; ``None`` if every shadowing definition matches.
 
@@ -2727,10 +2772,12 @@ def _scope_mismatch(mut: _Scope, src: _Scope, prefix: str = "") -> str | None:
                     return problems[0]
             elif not sfuncs:
                 return f"redefines {qual}() as a function where the target defines a class"
-            elif _signature(m) not in (shapes := [_signature(s) for s in sfuncs]):
+            elif (sig := _signature(m, method=in_class)) not in (
+                shapes := [_signature(s, method=in_class) for s in sfuncs]
+            ):
                 return (
                     f"redefines {qual}() with a different signature than the target declares "
-                    f"({_describe(_signature(m))} vs {_describe(shapes[0])})"
+                    f"({_describe(sig)} vs {_describe(shapes[-1])})"
                 )
     return None
 
@@ -2760,7 +2807,7 @@ def _class_mismatch(m: ast.ClassDef, s: ast.ClassDef, qual: str) -> str | None:
             f"redefines class {qual} with different decorators than the target declares "
             f"({_decorators(m)} vs {_decorators(s)})"
         )
-    return _scope_mismatch(_scope_defs(m.body), _scope_defs(s.body), f"{qual}.")
+    return _scope_mismatch(_scope_defs(m.body), _scope_defs(s.body), f"{qual}.", in_class=True)
 
 
 def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings) -> bool:

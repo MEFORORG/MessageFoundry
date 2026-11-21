@@ -2597,8 +2597,8 @@ def test_signature_tells_a_decorator_swap() -> None:
 def test_screen_does_not_match_a_mutation_against_an_overload_stub(tmp_path: Path) -> None:
     """``@overload`` stubs are never the live binding. A mutation copied from a stub's narrower
     signature breaks every call the implementation takes, so it must not pass by matching the stub.
-    origin/main compared only the last definition, the implementation, and refused it; this holds
-    that while every definition is a candidate shape."""
+    The implementation is the last definition, the one the name is left bound to, so the stubs
+    are not compared, as on origin/main."""
     target = (
         "@overload\ndef get(key: str): ...\n@overload\ndef get(key: str, default: int): ...\n"
         "def get(key, default=None):\n    return default\n"
@@ -2628,6 +2628,30 @@ def test_screen_compares_only_the_definition_a_name_is_left_bound_to(tmp_path: P
     assert _screen("def f(x, y): ...", alternatives, tmp_path) == []
     guarded = "def f(a): ...\nif FAST:\n    def f(a, b): ...\n"
     assert _screen("def f(a): ...", guarded, tmp_path) == []  # an if with no else may not run
+
+
+def test_screen_accepts_call_compatible_shapes_origin_main_accepted(tmp_path: Path) -> None:
+    """Shapes no call site can tell apart, each accepted on origin/main, which compared no class
+    member and walked no compound statement: a getter override of a property that also has a
+    setter, a method whose bound first parameter is renamed, a definition a loop's ``break``
+    leaves bound, and a dropped decorator that only shares a last name with a shape decorator. The
+    first cut of this fix refused them, and it let a mutation match the never-live stub under
+    ``if not TYPE_CHECKING:``'s ``else``, which is now refused."""
+    prop = "class C:\n    @property\n    def x(self): ...\n    @x.setter\n    def x(self, v): ...\n"
+    assert (
+        _screen("class C(C):\n    @property\n    def x(self):\n        return 2\n", prop, tmp_path)
+        == []
+    )
+    method = "class C:\n    def m(self, a): ...\n"
+    assert _screen("class C(C):\n    def m(this, a): ...\n", method, tmp_path) == []
+    loop = "for _ in r:\n    def f(a): ...\n    break\nelse:\n    def f(a, b): ...\n"
+    assert _screen("def f(a): ...", loop, tmp_path) == []
+    not_tc = "if not TYPE_CHECKING:\n    def f(x, y=None): ...\nelse:\n    def f(x): ...\n"
+    assert any("different signature" in p for p in _screen("def f(x): ...", not_tc, tmp_path))
+    assert _screen("@acl.define('admin')\ndef f(a): ...\n", "def f(a): ...\n", tmp_path) == []
+    assert _screen("def f(a): ...\n", "@acl.define('admin')\ndef f(a): ...\n", tmp_path) == []
+    # Control: attrs' own spelling still counts.
+    assert _screen("class P: ...\n", "@attrs.define\nclass P: ...\n", tmp_path)
 
 
 def test_screen_accepts_a_concrete_override_of_an_abstract_method(tmp_path: Path) -> None:
