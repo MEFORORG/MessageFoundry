@@ -161,6 +161,7 @@ from messagefoundry.parsing.binary import (
     CollidingDelimitersError,
     DocRefError,
     EscapedDocumentError,
+    HeaderFormsLimitError,
     InboundDocRefError,
     NonVerbatimDocumentError,
     UnreattachableDocumentError,
@@ -10315,7 +10316,9 @@ class RegistryRunner:
         attachment_refs: list[str] = []
         if streaming_over:
             try:
-                skeleton, attachment_refs = await self._detach_documents(ic, text)
+                skeleton, attachment_refs = await self._detach_documents(
+                    ic, text, marker_checked=True
+                )
             except _DETACH_REFUSALS as exc:
                 return await self._refuse(
                     ic,
@@ -10378,7 +10381,9 @@ class RegistryRunner:
         The rule lives in ``ingress_guards`` so the operator resend reads it the same way (#1911)."""
         return streaming_over_threshold(ic, text)
 
-    async def _detach_documents(self, ic: InboundConnection, text: str) -> tuple[str, list[str]]:
+    async def _detach_documents(
+        self, ic: InboundConnection, text: str, *, marker_checked: bool = False
+    ) -> tuple[str, list[str]]:
         """Detach every oversized OBX-5 ED base64 document from an over-threshold HL7 body into the
         store's content-addressed attachment substrate and return ``(skeleton_text, attachment_refs)``
         (#149, ADR 0105 Phase 1a, Approach B — VERBATIM).
@@ -10407,7 +10412,13 @@ class RegistryRunner:
         ``OBX-2`` is ``ED``, whether or not a document reads there (BACKLOG #5972) — each, as one of
         :data:`_DETACH_REFUSALS`, is turned
         into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
-        Phase-C); the budget bounds how many such buffers can be concurrent."""
+        Phase-C); the budget bounds how many such buffers can be concurrent.
+
+        ``marker_checked`` is ``True`` only from a listener that ran
+        :func:`~messagefoundry.pipeline.ingress_guards.doc_ref_marker_refusal` on ``text`` and went
+        on because it refused nothing, as both do: the detach then does not repeat that check's
+        colliding-header marker test (BACKLOG #5972). Any other caller leaves it out and gets the
+        test."""
         size = len(text)
         budget = self._stream_inflight_budget
         if budget and self._stream_inflight_bytes + size > budget:
@@ -10436,7 +10447,7 @@ class RegistryRunner:
             message = await asyncio.to_thread(Message.parse, text)
             # The received text rides along so a body holding the handle marker anywhere is refused
             # here, before the ACK, rather than dead-lettered after the splice (BACKLOG #5099).
-            documents = iter_obx_documents(message, received=text)
+            documents = iter_obx_documents(message, received=text, marker_checked=marker_checked)
 
             def _next_document() -> tuple[int, str, str] | None:
                 return next(documents, None)
@@ -10772,7 +10783,9 @@ class RegistryRunner:
         attachment_refs: list[str] = []
         if streaming_over:
             try:
-                skeleton, attachment_refs = await self._detach_documents(ic, text)
+                skeleton, attachment_refs = await self._detach_documents(
+                    ic, text, marker_checked=True
+                )
             except _DETACH_REFUSALS as exc:
                 detach_err = f"streaming detach failed: {safe_exc(exc)}"
                 mid = await self._record_refused(ic, raw, text, error=detach_err, peek=peek)
@@ -10793,6 +10806,10 @@ class RegistryRunner:
                 elif isinstance(exc, Base64DelimiterError):
                     # Checked before its base class: the body's delimiters, not a marker.
                     nak_text = "document under base64 delimiters"
+                elif isinstance(exc, HeaderFormsLimitError):
+                    # Checked before its base class: the headers' delimiter sets, judged without
+                    # a scan per marker form (BACKLOG #5972).
+                    nak_text = "too many header delimiter sets"
                 elif isinstance(exc, InboundDocRefError):
                     # At least these shapes: a handle in OBX-5.5, the marker elsewhere in a body
                     # with a document to detach, or the marker anywhere under a header whose

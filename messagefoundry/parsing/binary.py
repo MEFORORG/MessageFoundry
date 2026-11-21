@@ -118,6 +118,8 @@ __all__ = [
     "may_hold_doc_ref",
     "marker_under_base64_delimiters",
     "marker_under_colliding_delimiters",
+    "later_header_forms_over_limit",
+    "HeaderFormsLimitError",
     "make_doc_ref",
     "parse_doc_ref",
     "iter_obx_documents",
@@ -171,6 +173,15 @@ class InboundDocRefError(ValueError):
     body whose header leaves two delimiters one character, where an ``OBX-5.5`` handle may not
     read as one (BACKLOG #5972). The text names at most the OBX occurrence, never a byte of the
     body."""
+
+
+class HeaderFormsLimitError(InboundDocRefError):
+    """A received body's later headers name more than :data:`_LATER_HEADER_FORMS_LIMIT` distinct
+    forms of the handle marker, so the detach does not look for each in the text and refuses the
+    body as if it held one (BACKLOG #5972). Each form costs a substring scan of the whole body, so
+    looking for every one would make the check quadratic in the body. A subclass of
+    :class:`InboundDocRefError`, so both listeners refuse it the same way. The text names no byte
+    of the body."""
 
 
 class NonVerbatimDocumentError(ValueError):
@@ -426,6 +437,22 @@ _MIXED_HEADER_HANDLE = (
     "handle marker as they escape it, so the re-attach cannot read that handle"
 )
 
+#: The most distinct forms of the handle marker, as the later headers of one body escape it, that
+#: the checks before the ACK look for in its text (BACKLOG #5972): the listeners' shared check
+#: under a colliding header and the ingress detach. Each form costs a substring scan of the whole
+#: body, the listeners' on the event loop, so a body whose headers give more is judged to hold
+#: the marker without those scans (fail closed), and the check stays linear in the body. A form
+#: differs from the first line's only where a later header names other delimiters that escape a
+#: character of the marker, so an ordinary batch gives none.
+_LATER_HEADER_FORMS_LIMIT = 16
+
+#: The detach's refusal of a body whose later headers give more marker forms than it looks for.
+_TOO_MANY_HEADER_FORMS = (
+    "the later headers name delimiters that escape the document handle marker in more than "
+    f"{_LATER_HEADER_FORMS_LIMIT} distinct ways, too many to look for each in the body; refusing "
+    "the body as if it held the marker"
+)
+
 #: The re-attach's refusal of a handle in a payload whose header fills a delimiter it does not
 #: name with one it already uses: no write to it can be read back (BACKLOG #5972).
 _COLLIDING_HANDLE = (
@@ -500,10 +527,22 @@ def marker_under_colliding_delimiters(message: Message, text: str) -> bool:
     the components, no read tells whether a marker sits where a handle would.
 
     ``message`` is ``text`` parsed. For a header that does not collide the cost is the header
-    read alone; otherwise up to two substring scans of ``text``, plus one per later header naming
-    other delimiters. A marker hidden behind a hex escape is not looked for, as in
+    read alone; otherwise up to two substring scans of ``text``, plus one per distinct marker form
+    a later header naming other delimiters gives, at most :data:`_LATER_HEADER_FORMS_LIMIT` of
+    them. A body whose later headers give more is judged to hold the marker without those scans
+    (fail closed, :func:`later_header_forms_over_limit`), so the check stays linear in the body. A
+    marker hidden behind a hex escape is not looked for, as in
     :func:`marker_under_base64_delimiters`."""
     return message._delimiters_collide() and _body_holds_marker(message, text)
+
+
+def later_header_forms_over_limit(message: Message) -> bool:
+    """Whether ``message``'s later headers give more than :data:`_LATER_HEADER_FORMS_LIMIT`
+    distinct forms of the handle marker other than its first line's, the case in which
+    :func:`marker_under_colliding_delimiters` and the ingress detach judge a body to hold the
+    marker without looking for each form (BACKLOG #5972). Reads the parsed header fields only, and
+    stops at the first form past the limit."""
+    return _bounded_later_header_forms(message) is None
 
 
 def may_hold_doc_ref(text: str) -> bool:
@@ -644,7 +683,7 @@ def _is_base64_ed(message: Message, occurrence: int) -> bool:
 
 
 def iter_obx_documents(
-    message: Message, *, received: str, min_b64_len: int = 0
+    message: Message, *, received: str, min_b64_len: int = 0, marker_checked: bool = False
 ) -> Iterator[tuple[int, str, str]]:
     """Yield ``(occurrence, verbatim_base64, content_type)`` for every OBX-5 ED **Base64** document in
     ``message`` whose base64 length is at least ``min_b64_len`` (#149, ADR 0105 Phase 1a).
@@ -658,6 +697,11 @@ def iter_obx_documents(
 
     ``received`` is the text ``message`` was parsed from, and is required: the marker check below
     reads it, so a caller cannot skip that check by leaving it out (BACKLOG #5099).
+    ``marker_checked`` is ``True`` only from a caller that ran
+    :func:`marker_under_colliding_delimiters` on this ``message`` and ``received`` and went on
+    because it was false, as both listeners do through their shared check: under a colliding
+    header the detach then skips that same test rather than scan the body for it again (BACKLOG
+    #5972). It skips nothing under any other header. A caller that leaves it out gets the test.
 
     Raises :class:`EscapedDocumentError` when any ED Base64 ``OBX-5.5`` holds the escape character,
     whose value would be decoded rather than verbatim (vault BACKLOG #2809), and
@@ -694,8 +738,11 @@ def iter_obx_documents(
     (:func:`marker_under_colliding_delimiters`, the rule both listeners refuse by at any size):
     under ``MSH|~|`` no ``OBX-5.5`` reads, so a sender's handle there is not read as one. Both
     verdicts come before any ``OBX-5`` value is read: a body refused for its header has its
-    received text scanned for the marker, up to two substring scans plus one per later header
-    naming other delimiters, and no value read or splice-scanned. A handle hidden behind a hex
+    received text scanned for the marker, up to two substring scans plus one per distinct form a
+    later header naming other delimiters gives, at most :data:`_LATER_HEADER_FORMS_LIMIT` of
+    them, and no value read or splice-scanned. A body whose later headers give more is refused
+    without those scans, as :class:`HeaderFormsLimitError`, under any header the marker test
+    runs under. A handle hidden behind a hex
     escape, which the engine never writes, is not looked for in the text, so under such a header
     it is refused as a received handle only where no OBX claims a document and its ``OBX-5.5``
     reads; where an OBX claims one, the claim refuses the body.
@@ -711,7 +758,9 @@ def iter_obx_documents(
         # splice-scanned: no document of it can be detached, since Message refuses every write
         # to it. The marker comes first, so a received handle is refused as one wherever it
         # sits, in an OBX-5.5 such a header hides included, where the per-OBX read finds none.
-        if _body_holds_marker(message, received):
+        if not marker_checked and _body_holds_marker(message, received):
+            if later_header_forms_over_limit(message):
+                raise HeaderFormsLimitError(_TOO_MANY_HEADER_FORMS)
             raise InboundDocRefError(
                 "the body holds the document handle marker under a header that fills a delimiter "
                 "it does not name with one it already uses, where an OBX-5.5 handle may not read "
@@ -757,6 +806,8 @@ def iter_obx_documents(
             "refusing the detach"
         )
     if documents and (value_holds_marker or _body_holds_marker(message, received)):
+        if not value_holds_marker and later_header_forms_over_limit(message):
+            raise HeaderFormsLimitError(_TOO_MANY_HEADER_FORMS)
         raise InboundDocRefError(
             "the body holds the document handle marker outside an OBX-5.5 start, and a document "
             "would be detached from it; refusing a body delivery would refuse after the ACK"
@@ -820,12 +871,17 @@ def _received_holds_marker(message: Message, received: str) -> bool:
 
 def _body_holds_marker(message: Message, received: str) -> bool:
     """Whether ``received`` holds the handle marker raw, as the message's first line escapes it
-    (:func:`_received_holds_marker`), or as a later header naming other delimiters escapes it
-    (:func:`_later_header_markers`): the one marker test the detach and the colliding-header
-    listener refusal share (BACKLOG #5099, #5972)."""
-    return _received_holds_marker(message, received) or bool(
-        _later_header_markers(message, received)
-    )
+    (:func:`_received_holds_marker`), or as a later header naming other delimiters escapes it:
+    the one marker test the detach and the colliding-header listener refusal share (BACKLOG
+    #5099, #5972). The later headers' forms are each looked for once, as
+    :func:`_later_header_markers` looks, while they number at most
+    :data:`_LATER_HEADER_FORMS_LIMIT`; past it the body is judged to hold the marker without
+    those scans (fail closed), so the test costs at most that many scans plus two, linear in the
+    body however many headers it has."""
+    if _received_holds_marker(message, received):
+        return True
+    forms = _bounded_later_header_forms(message)
+    return forms is None or any(form in received for form in forms)
 
 
 def chunk_b64(b64: str, chunk_len: int = DETACH_CHUNK_BYTES) -> Iterator[str]:
@@ -997,16 +1053,11 @@ def _copy_names_address(text: str, marker: str) -> bool:
     return False
 
 
-def _later_header_markers(message: Message, text: str) -> set[str]:
-    """The handle marker as a header line after the first escapes it under its own fields 1 and
-    2, for each such header whose form differs from the first line's and is held in ``text``.
-    The message reads every line under the first line's delimiters (BACKLOG #5972), so a handle
-    a Handler wrote under an inner MSH's own, then wrapped in an envelope of others, would not be
-    read as one and would reach the wire unresolved. Reads the parsed fields only, never a
-    slice of the raw text."""
-    found: set[str] = set()
-    # Each distinct form is scanned for once, so a batch of many headers naming the same
-    # delimiters costs one scan of the text, not one per header.
+def _later_header_forms(message: Message) -> Iterator[str]:
+    """Each distinct form of the handle marker, as a header line after the first escapes it under
+    its own fields 1 and 2, that differs from the raw marker and from the first line's form, in
+    the order the headers give them. Reads the parsed fields only, never a slice of the raw text,
+    and scans no text: the caller decides which forms to look for."""
     checked = {DOC_REF_MARKER, escape_leaf(DOC_REF_MARKER, message._m["seps"])}
     segments = message._m["segments"]
     # One pass over the parsed segments: a header line is split eagerly, so its fields 1 and 2
@@ -1019,9 +1070,31 @@ def _later_header_markers(message: Message, text: str) -> set[str]:
         if escaped in checked:
             continue
         checked.add(escaped)
-        if escaped in text:
-            found.add(escaped)
-    return found
+        yield escaped
+
+
+def _bounded_later_header_forms(message: Message) -> list[str] | None:
+    """:func:`_later_header_forms` while they number at most :data:`_LATER_HEADER_FORMS_LIMIT`,
+    or ``None`` once one more is given, read no further (BACKLOG #5972)."""
+    forms: list[str] = []
+    for form in _later_header_forms(message):
+        if len(forms) == _LATER_HEADER_FORMS_LIMIT:
+            return None
+        forms.append(form)
+    return forms
+
+
+def _later_header_markers(message: Message, text: str) -> set[str]:
+    """The handle marker as a header line after the first escapes it under its own fields 1 and
+    2, for each such header whose form differs from the first line's and is held in ``text``.
+    The message reads every line under the first line's delimiters (BACKLOG #5972), so a handle
+    a Handler wrote under an inner MSH's own, then wrapped in an envelope of others, would not be
+    read as one and would reach the wire unresolved. Each distinct form is scanned for once, so
+    a batch of many headers naming the same delimiters costs one scan of the text, not one per
+    header; every distinct form is looked for, with no limit, so this costs one scan per form.
+    The delivery re-attach, which runs in a thread, is its only caller; the checks before the
+    ACK use :func:`_body_holds_marker`, which bounds the forms."""
+    return {form for form in _later_header_forms(message) if form in text}
 
 
 def doc_ref_addresses_in_hl7(text: str) -> frozenset[str]:
