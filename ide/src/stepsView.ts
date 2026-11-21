@@ -310,8 +310,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // One edit at a time + the webview↔document update-loop guard (ADR 0076 §5).
     const guard = new EditLoopGuard();
     // The typed rewrites applied since the webview was last projected, so an edit on one of their rows
-    // is sent with the row's current source rather than refused as stale (BACKLOG #5943). Reset when
-    // render() replaces the webview, whose new rows carry the current source.
+    // is sent with the row's current source rather than refused as stale (BACKLOG #5943). render()
+    // tells it which buffer each new webview was projected from.
     const rebaser = new QueuedEditRebaser();
 
     // The ONE debounced re-projection channel (ADR 0076 §5 "sync on save"). Both a save and a refresh
@@ -447,11 +447,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         scriptUri,
         this.opSchema,
       );
-      // The new rows carry `source`. Keep the recorded rewrites when a typed one landed after that
-      // snapshot, since the new rows still carry the row text it replaced (BACKLOG #5943).
-      if (document.getText() === source) {
-        rebaser.reset();
-      }
+      // The new rows carry `source`, which decides whether the recorded rewrites still apply (#5943).
+      rebaser.project(source);
       // Arm the handshake: if the freshly-loaded script doesn't ping within 3s, it failed to initialize.
       sawAlive = false;
       setTimeout(() => {

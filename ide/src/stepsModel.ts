@@ -2975,28 +2975,37 @@ export async function drainEdits(
   }
   // An edit's expectSrc is carried over the rewrites already applied to its row only when `rebase` is
   // given, since the rebase must compare the live buffer (BACKLOG #5943). A throw while reading the
-  // buffer latches the rebase off and sends the edit as posted, so the drain still never throws.
+  // buffer or recording a write latches the rebase off and the edit goes as posted, so the drain still
+  // never throws; the engine's stale guard then decides, as it does with no rebase.
   const carry = (msg: EditMessage): EditMessage => {
     if (rebase === undefined) {
       return msg;
     }
     try {
-      return rebase.rebaser.rebase(msg, rebase.readSource());
+      return rebase.rebaser.rebase(msg, rebase.readSource);
     } catch {
       rebase.rebaser.latch();
       return msg;
     }
   };
+  const record = (msg: EditMessage, wrote: AppliedRewrite | void): void => {
+    try {
+      rebase?.rebaser.record(msg, wrote);
+    } catch {
+      rebase?.rebaser.latch();
+    }
+  };
   try {
     let current: EditMessage | undefined = carry(first);
     while (current) {
+      let wrote: AppliedRewrite | void = undefined;
       try {
-        const wrote = await apply(current);
-        rebase?.rebaser.record(current, wrote);
+        wrote = await apply(current);
       } catch (err) {
         rebase?.rebaser.latch(); // the buffer's state is unknown after an unexpected rejection
         onError?.(err, current);
       }
+      record(current, wrote);
       const next = guard.takePending();
       current = next === undefined ? undefined : carry(next);
     }
@@ -3052,35 +3061,61 @@ export function rowAfterRewrite(msg: EditMessage, write: AppliedRewrite): string
  * replaced with the row's current text only when all of these hold, so the stale guard still refuses
  * every row text these rewrites did not themselves write:
  *
- *  - every recorded write since the last {@link reset} rewrote its own row in place
- *    ({@link rowAfterRewrite}); the first that did not, or an unexpected rejection, latches rebasing off
- *    until the next reset. A recorded write whose input buffer is not the previous one's output starts
- *    a new chain, since a change between them may have moved lines;
- *  - the edit names the same handler and line range as a recorded row, and its `expectSrc` is one of
- *    that row's earlier texts since the reset;
+ *  - the recorded writes form one chain: each rewrote its own row in place ({@link rowAfterRewrite})
+ *    and read the previous one's output. A write that did not rewrite in place, an unexpected
+ *    rejection, or a throw ends the chain ({@link latch}); a write whose input is not the previous
+ *    output starts a new one, since a change between them may have moved lines. Every buffer in one
+ *    chain therefore has the same lines at the same numbers outside the rewritten rows;
+ *  - the webview on screen was projected from a buffer in the chain ({@link project}), so the edit's
+ *    line numbers name the same rows as in the live buffer;
+ *  - the edit names the same handler and line range as a recorded row, its `expectSrc` is one of that
+ *    row's earlier texts in the chain, and the live row reads the row's current text;
  *  - the live buffer, read just before the edit is sent, is exactly the last recorded write's output.
  *    Any change these writes did not make (a split view, an undo, a structural op, a pick, another panel)
  *    leaves the edit unrebased.
  *
- * The provider owns one for the panel and resets it whenever it replaces the webview, whose new rows
- * carry the current source. Only the typed-edit drain records writes. The field picker's drain
- * (`applyPickedEdit`) does not, so a pick's write breaks the live-buffer condition: a typed template
- * edit posted behind a pick carries the parts as shown before the pick, and rebasing it would write the
- * old path back over the picked one.
+ * The provider owns one for the panel and calls {@link project} whenever it replaces the webview. Only
+ * the typed-edit drain records writes. The field picker's drain (`applyPickedEdit`) does not, so a
+ * pick's write breaks the live-buffer condition: a typed template edit posted behind a pick carries the
+ * parts as shown before the pick, and rebasing it would write the old path back over the picked one.
+ *
+ * Edits do not say which projection they came from, so one posted by a webview that was replaced while
+ * the edit was in transit is judged against the new projection.
  */
 export class QueuedEditRebaser {
-  private latched = false;
+  private projected: string | undefined;
   private lastAfter: string | undefined;
+  // Every buffer in the current chain: each recorded write's input and output.
+  private readonly chain = new Set<string>();
   // Per row: the texts recorded writes replaced, and the row's current text.
   private readonly rows = new Map<string, { superseded: Set<string>; current: string }>();
 
+  // The same separator EditLoopGuard.queue keys by, without the param name: one entry per row.
   private static key(msg: EditMessage): string {
-    return `${msg.handler} ${msg.lineStart} ${msg.lineEnd}`;
+    return `${msg.handler}\u0000${msg.lineStart}\u0000${msg.lineEnd}`;
+  }
+
+  /** The webview now shows rows projected from `source`. Outside the chain, the chain ends. */
+  project(source: string): void {
+    this.projected = source;
+    if (!this.chain.has(source)) {
+      this.latch();
+      return;
+    }
+    // Drop the buffers recorded before this one, so the chain holds only the writes since the webview
+    // last caught up. A later projection of a dropped buffer (an undo, an out-of-order render) then ends
+    // the chain, which only turns rebasing off.
+    for (const buffer of this.chain) {
+      if (buffer === source) {
+        break;
+      }
+      this.chain.delete(buffer);
+    }
   }
 
   /** Record what applying `msg` wrote (`undefined` when nothing was written). */
   record(msg: EditMessage, write: AppliedRewrite | void): void {
-    if (this.latched || write === undefined) {
+    if (write === undefined) {
       return;
     }
     const expectSrc = msg.expectSrc;
@@ -3091,11 +3126,11 @@ export class QueuedEditRebaser {
       this.latch();
       return;
     }
-    if (this.lastAfter !== undefined && write.before !== this.lastAfter) {
-      // A change these writes did not make came between them and may have moved lines, so the rows
-      // recorded before it no longer name the same lines. Start a new chain from this write.
-      this.rows.clear();
+    if (write.before !== this.lastAfter) {
+      this.latch(); // a change these writes did not make came first: start a new chain
     }
+    this.chain.add(write.before);
+    this.chain.add(write.after);
     const key = QueuedEditRebaser.key(msg);
     const entry = this.rows.get(key) ?? { superseded: new Set<string>(), current: row };
     entry.superseded.add(expectSrc);
@@ -3104,30 +3139,30 @@ export class QueuedEditRebaser {
     this.lastAfter = write.after;
   }
 
-  /** Turn rebasing off until the next {@link reset}. */
+  /** End the chain: nothing recorded so far rebases an edit. */
   latch(): void {
-    this.latched = true;
-    this.rows.clear();
-    this.lastAfter = undefined;
-  }
-
-  /** Forget every recorded write and lift a latch: the webview now carries the current source. */
-  reset(): void {
-    this.latched = false;
+    this.chain.clear();
     this.rows.clear();
     this.lastAfter = undefined;
   }
 
   /** `msg` with its `expectSrc` rebased onto its row's current text, or `msg` unchanged. */
-  rebase(msg: EditMessage, liveSource: string): EditMessage {
-    if (this.latched || msg.expectSrc === undefined || liveSource !== this.lastAfter) {
-      return msg;
-    }
+  rebase(msg: EditMessage, readSource: () => string): EditMessage {
     const entry = this.rows.get(QueuedEditRebaser.key(msg));
-    if (entry === undefined || entry.current === msg.expectSrc || !entry.superseded.has(msg.expectSrc)) {
+    if (
+      entry === undefined ||
+      msg.expectSrc === undefined ||
+      entry.current === msg.expectSrc ||
+      !entry.superseded.has(msg.expectSrc) ||
+      this.projected === undefined ||
+      !this.chain.has(this.projected)
+    ) {
       return msg;
     }
-    // Implied by the chain rule in record(); checked so a gap in that rule cannot move an edit to another row.
+    const liveSource = readSource();
+    if (liveSource !== this.lastAfter) {
+      return msg;
+    }
     const live = physicalLines(liveSource).slice(msg.lineStart - 1, msg.lineEnd).join("\n");
     if (live !== entry.current) {
       return msg;

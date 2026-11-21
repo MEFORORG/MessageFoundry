@@ -36,6 +36,7 @@ class FakeEditor {
 
   constructor(text: string) {
     this.text = text;
+    this.rebaser.project(text); // the webview's first render
   }
 
   /** Hold the next apply open until {@link release} is called. */
@@ -216,44 +217,73 @@ suite("Steps edit -- rowAfterRewrite and QueuedEditRebaser (BACKLOG #5943)", () 
     assert.strictEqual(rowAfterRewrite(noExpect, { before, after }), undefined);
   });
 
-  test("an edit on a different row, or with an unseen expectSrc, is not rebased", () => {
+  const fresh = (): QueuedEditRebaser => {
     const r = new QueuedEditRebaser();
+    r.project(before);
+    return r;
+  };
+
+  test("an edit on a different row, or with an unseen expectSrc, is not rebased", () => {
+    const r = fresh();
     r.record(edit("A"), { before, after });
     const otherRow: EditMessage = { ...edit("B"), lineStart: 4, lineEnd: 4, expectSrc: "    return msg" };
-    assert.strictEqual(r.rebase(otherRow, after), otherRow);
+    assert.strictEqual(r.rebase(otherRow, () => after), otherRow);
     const unseen = edit("B", "value", "    something else");
-    assert.strictEqual(r.rebase(unseen, after), unseen);
-    assert.strictEqual(r.rebase(edit("B"), after).expectSrc, afterRow);
+    assert.strictEqual(r.rebase(unseen, () => after), unseen);
+    assert.strictEqual(r.rebase(edit("B"), () => after).expectSrc, afterRow);
   });
 
-  test("a write recorded with no expectSrc latches rebasing off until reset", () => {
-    const r = new QueuedEditRebaser();
+  test("a write recorded with no expectSrc ends the chain", () => {
+    const r = fresh();
     r.record(edit("A"), { before, after });
     r.record({ ...edit("X"), lineStart: 4, lineEnd: 4, expectSrc: undefined }, { before: after, after });
     const queued = edit("B");
-    assert.strictEqual(r.rebase(queued, after), queued);
-    r.reset();
-    r.record(edit("A"), { before, after });
-    assert.strictEqual(r.rebase(queued, after).expectSrc, afterRow, "reset lifts the latch");
+    assert.strictEqual(r.rebase(queued, () => after), queued);
   });
 
   test("a recorded write whose input is not the previous output starts a new chain", () => {
-    const r = new QueuedEditRebaser();
+    const r = fresh();
     r.record(edit("A"), { before, after });
     // Something outside the recorded writes changed the buffer, then a write on another row landed.
     const gap = `${after}\n# typed`;
     const gapAfter = gap.replace("    return msg", "    return None");
     r.record({ ...edit("Y"), lineStart: 4, lineEnd: 4, expectSrc: "    return msg" }, { before: gap, after: gapAfter });
     const queued = edit("B");
-    assert.strictEqual(r.rebase(queued, gapAfter), queued, "the row recorded before the gap is forgotten");
+    assert.strictEqual(r.rebase(queued, () => gapAfter), queued, "the row recorded before the gap is forgotten");
   });
 
-  test("reset forgets every recorded write", () => {
-    const r = new QueuedEditRebaser();
+  test("a projection of a buffer in the chain keeps it; one outside the chain ends it", () => {
+    const r = fresh();
     r.record(edit("A"), { before, after });
-    r.reset();
+    r.project(after); // a re-projection mid-drain, of the buffer A wrote
+    assert.strictEqual(r.rebase(edit("B"), () => after).expectSrc, afterRow, "kept across an in-chain projection");
+    // A structural op moved lines; its re-projection shows a layout the chain never had.
+    r.project(`# moved\n${after}`);
     const queued = edit("B");
-    assert.strictEqual(r.rebase(queued, after), queued);
+    assert.strictEqual(r.rebase(queued, () => after), queued, "an undo back to `after` does not revive the chain");
+  });
+
+  test("a projection prunes the chain to the buffers since it, and an older one then ends the chain", () => {
+    const r = fresh();
+    r.record(edit("A"), { before, after });
+    r.project(after);
+    r.project(before); // an out-of-order render of the pre-A buffer
+    const queued = edit("B");
+    assert.strictEqual(r.rebase(queued, () => after), queued);
+  });
+
+  test("the live buffer is read only when a recorded row could rebase the edit", () => {
+    const r = fresh();
+    let reads = 0;
+    const read = (): string => {
+      reads++;
+      return after;
+    };
+    r.rebase(edit("B"), read);
+    assert.strictEqual(reads, 0, "nothing recorded: no buffer copy");
+    r.record(edit("A"), { before, after });
+    r.rebase(edit("B"), read);
+    assert.strictEqual(reads, 1);
   });
 });
 
@@ -272,8 +302,11 @@ suite("Steps edit -- the provider wires the rebase (BACKLOG #5943)", () => {
     assert.ok(landed >= 0 && ret > landed, "the write is returned only after applyEdit reports it landed");
   });
 
-  test("the typed drain gets the panel's rebaser and render() resets it on a current projection", () => {
+  test("the typed drain gets the panel's rebaser and render() reports each projection's buffer", () => {
     assert.ok(src.includes("{ rebaser, readSource: () => document.getText() }"));
-    assert.ok(/if \(document\.getText\(\) === source\) \{\s*rebaser\.reset\(\);/.test(src));
+    const html = src.indexOf("panel.webview.html = pageHtml(");
+    const project = src.indexOf("rebaser.project(source);");
+    assert.ok(html >= 0 && project > html, "the projection is reported once the webview carries it");
   });
 });
+
