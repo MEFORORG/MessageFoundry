@@ -8637,13 +8637,15 @@ class SqlServerStore:
     async def delete_search_preset(self, *, preset_id: str, owner_user_id: str) -> bool:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                # Counted from OUTPUT, which a session-wide SET NOCOUNT ON cannot hide (BACKLOG
+                # #5672, as #2283).
                 await cur.execute(
-                    "DELETE FROM search_presets WHERE id=? AND owner_user_id=?",
+                    "DELETE FROM search_presets OUTPUT deleted.id WHERE id=? AND owner_user_id=?",
                     (preset_id, owner_user_id),
                 )
-                deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+                deleted = bool(await cur.fetchall())
                 await self._commit(conn)
-                return deleted > 0
+                return deleted
             except Exception:
                 await conn.rollback()
                 raise
