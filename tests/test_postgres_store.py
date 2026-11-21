@@ -6145,27 +6145,52 @@ async def test_ingress_handoff_dead_letters_a_token_it_can_never_hand_off(
             await s.close()
 
 
+async def _role_isolation_default(conn: Any) -> str | None:
+    """This role's own default_transaction_isolation in this database, or ``None``."""
+    configs = await conn.fetchval(
+        "SELECT setconfig FROM pg_db_role_setting"
+        " WHERE setrole = (SELECT oid FROM pg_roles WHERE rolname = current_user)"
+        " AND setdatabase = (SELECT oid FROM pg_database WHERE datname = current_database())"
+    )
+    for entry in configs or []:
+        name, _, value = entry.partition("=")
+        if name == "default_transaction_isolation":
+            return str(value)
+    return None
+
+
+async def _set_role_isolation_default(conn: Any, value: str | None) -> None:
+    """Set, or with ``None`` reset, this role's default in this database only."""
+    # A DO block, since ALTER ROLE takes no bind parameters and the database is named by value.
+    # format() quotes both the name (%I) and the value (%L); the value is a fixed level, never input.
+    if value is None:
+        stmt = (
+            "format('ALTER ROLE CURRENT_USER IN DATABASE %I RESET default_transaction_isolation',"
+        )
+        stmt += " current_database())"
+    else:
+        assert value in ("read uncommitted", "read committed", "repeatable read", "serializable")
+        stmt = "format('ALTER ROLE CURRENT_USER IN DATABASE %I SET default_transaction_isolation"
+        stmt += f" = %L', current_database(), '{value}')"
+    await conn.execute(f"DO $do$ BEGIN EXECUTE {stmt}; END $do$")
+
+
 async def test_pool_isolation_pin_outranks_a_role_default(store) -> None:
     """BACKLOG #5674: the finalizer's read after its advisory lock sees a sibling's commit only under
-    READ COMMITTED. With the role's default set to REPEATABLE READ, a freshly opened pool still runs
-    a transaction that names no isolation under READ COMMITTED, and the pool's reset on release
-    restores the pin a session changed. CONTROL: the role setting is in place, and the session's
-    value comes from the client, so the pin is what won."""
+    READ COMMITTED. With the role's default in this database set to REPEATABLE READ, a freshly
+    opened pool still runs a transaction that names no isolation under READ COMMITTED, and the
+    pool's reset on release restores the pin on the very connection a session changed. CONTROL: the
+    role setting is in place, and the session's value comes from the client, so the pin is what
+    won. The role's prior setting is restored afterwards."""
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.postgres import PostgresStore
 
     async with store._pool.acquire() as conn:
-        await conn.execute(
-            "ALTER ROLE CURRENT_USER SET default_transaction_isolation = 'repeatable read'"
-        )
+        prior = await _role_isolation_default(conn)
+        await _set_role_isolation_default(conn, "repeatable read")
     try:
         async with store._pool.acquire() as conn:
-            configs = await conn.fetchval(
-                "SELECT setconfig FROM pg_db_role_setting"
-                " WHERE setrole = (SELECT oid FROM pg_roles WHERE rolname = current_user)"
-                " AND setdatabase = 0"
-            )
-        assert "default_transaction_isolation=repeatable read" in (configs or [])
+            assert await _role_isolation_default(conn) == "repeatable read"
 
         pinned = await PostgresStore.open(load_settings(environ=os.environ).store)
         try:
@@ -6177,13 +6202,22 @@ async def test_pool_isolation_pin_outranks_a_role_default(store) -> None:
                 async with conn.transaction():
                     assert await conn.fetchval("SHOW transaction_isolation") == "read committed"
                 await conn.execute("SET SESSION default_transaction_isolation = 'repeatable read'")
-            async with pinned._pool.acquire() as conn, conn.transaction():
-                assert await conn.fetchval("SHOW transaction_isolation") == "read committed"
+                changed = await conn.fetchval("SELECT pg_backend_pid()")
+            # Cycle the pool until the changed connection comes back; each must read the pin.
+            seen = False
+            for _ in range(pinned._pool.get_max_size() + 1):
+                async with pinned._pool.acquire() as conn:
+                    async with conn.transaction():
+                        assert await conn.fetchval("SHOW transaction_isolation") == "read committed"
+                    if await conn.fetchval("SELECT pg_backend_pid()") == changed:
+                        seen = True
+                        break
+            assert seen, "the connection the session changed never came back from the pool"
         finally:
             await pinned.close()
     finally:
         async with store._pool.acquire() as conn:
-            await conn.execute("ALTER ROLE CURRENT_USER RESET default_transaction_isolation")
+            await _set_role_isolation_default(conn, prior)
 
 
 @pytest.mark.parametrize("case", KEYLESS_BLANK_CASES, ids=lambda c: c.__name__)

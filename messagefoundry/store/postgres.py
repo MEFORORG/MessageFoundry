@@ -2309,6 +2309,21 @@ class PostgresStore:
         return store
 
     @staticmethod
+    async def _check_default_isolation(conn: Any) -> None:
+        """Refuse a writing open unless a pooled transaction that names no isolation runs under READ
+        COMMITTED (BACKLOG #5674). The pool asks for it as a startup parameter, and a connection
+        pooler in front of the server can drop that parameter, which leaves the server, database or
+        role default in force, so the open reads what took effect."""
+        level = await conn.fetchval("SHOW default_transaction_isolation")
+        if level != "read committed":
+            raise RuntimeError(
+                "Postgres store: default_transaction_isolation is "
+                f"{safe_text(str(level))!r}, not 'read committed'. The pool sets it at connect, so"
+                " something between the engine and the server dropped it: let the connection"
+                " pooler pass the parameter, or set the server default to read committed."
+            )
+
+    @staticmethod
     async def _create_pool(
         settings: StoreSettings, *, posture: HopPosture | None, max_size: int
     ) -> Any:
@@ -2326,7 +2341,9 @@ class PostgresStore:
             # change what a transaction that names no isolation sees. `_maybe_finalize_message`
             # reads its message's queue rows after taking the finalize advisory lock, and only
             # under READ COMMITTED does that read see a sibling's commit. A startup parameter
-            # outranks those defaults, and the pool's RESET ALL on release restores it.
+            # outranks those defaults, and the pool's RESET ALL on release restores it. A pooler in
+            # front of the server may refuse the parameter or drop it, and
+            # `_check_default_isolation` refuses a writing open where it did not take effect.
             "default_transaction_isolation": "read committed",
         }
         if settings.db_schema:
@@ -2487,6 +2504,8 @@ class PostgresStore:
             and self._settings.resolved_schema_management() is SchemaManagement.EXTERNAL
         )
         async with self._timed_acquire() as conn:
+            if not provisioning and not read_only:
+                await self._check_default_isolation(conn)
             if external and not read_only:
                 # BEFORE the marker read: that read needs SELECT on schema_meta, and without it the
                 # operator would get a raw permission error naming one table instead of the full list.

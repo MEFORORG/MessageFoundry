@@ -3092,6 +3092,7 @@ def _postgres_batch_store(monkeypatch: pytest.MonkeyPatch, fail: Exception) -> A
     monkeypatch.setattr(PostgresStore, "_timed_acquire", _acquire)
     monkeypatch.setattr(PostgresStore, "_schema_marker_current", staticmethod(_false))
     monkeypatch.setattr(PostgresStore, "_advisory_lock", _nothing)
+    monkeypatch.setattr(PostgresStore, "_check_default_isolation", staticmethod(_nothing))
     monkeypatch.setattr(PostgresStore, "_migrate_lease_columns", _nothing)
     monkeypatch.setattr(PostgresStore, "_verify_live_schema", _fail)
     store = object.__new__(PostgresStore)
