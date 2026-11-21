@@ -63,6 +63,8 @@ def test_the_check_is_the_first_init_container_and_runs_composes_program(name: s
     ours = _program_argv([str(a) for a in inits[0]["command"]])
     theirs = _program_argv([str(a) for a in _compose_check()["entrypoint"]])
     assert ours == theirs, f"{name}: the check's program differs from compose.yaml's"
+    # Review round 1: without it the refusal reaches only the container log, not the pod status.
+    assert inits[0].get("terminationMessagePolicy") == "FallbackToLogsOnError", name
 
 
 @pytest.mark.parametrize("name", _MANIFESTS)

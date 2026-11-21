@@ -369,8 +369,9 @@ and the engine's at-rest encryption does not cover them ([`PHI.md`](PHI.md) §2,
    `store-encryption-key`, `store-password`, `tls-revocation-attested`, and the API TLS cert/key (and
    optional `api-tls-key-password`). Both manifests, `ha-postgres.yaml` and `statefulset.yaml`, read
    `MEFOR_TLS_REVOCATION_ATTESTED` from the `tls-revocation-attested` key, with no default and not
-   optional, so without it the kubelet refuses each engine container with
-   `CreateContainerConfigError`. The attestation is yours
+   optional, so without it the kubelet refuses each manifest's containers, its
+   `revocation-attestation-check` init container first, with `CreateContainerConfigError`. The
+   attestation is yours
    ([SECURITY.md, API revocation gate](SECURITY.md#api-revocation-gate)): set the key only if your PKI
    enforces revocation for the certificates the engine serves and accepts, and to a value that reads
    as true to the engine (`1`, `true`, `yes` or `on`, in any case). A value that does not, such as

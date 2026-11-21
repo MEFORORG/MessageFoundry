@@ -13,7 +13,7 @@
   the kubelet but the engine container never starts: the pod crash-loops in
   `Init:CrashLoopBackOff`, naming the gate. Each manifest now has four `image:` fields to set.
   `docker/k8s/secret.example.yaml` ships every value commented out, so applied unedited it holds no
-  key and the kubelet refuses the containers instead of an engine starting on a placeholder. See
+  key and the pod starts no engine, instead of an engine starting on a placeholder. See
   docs/CLOUD-DEPLOYMENT.md, section 7. (BACKLOG #5400)
 - **`install-service.ps1` now counts a "Log on as a service" holder written as an account name.**
   It compared the exported `SeServiceLogonRight` holders with the account's SID only, so a row that

@@ -144,7 +144,7 @@ against one case that matters, described under
   needs* names at least the alert channel, verified-TLS log forwarding and the retention bounds as
   commented entries. As shipped the engine refuses to start; uncomment each entry with your value. Bake the syslog CA and CRL it names under `/config/pki/`, and
   add the Secret's `tls-revocation-attested` key, without which the pod does not start: the kubelet
-  refuses the engine container with `CreateContainerConfigError`. The HA manifest below,
+  refuses the pod's containers, the `revocation-attestation-check` init container first, with `CreateContainerConfigError`. The HA manifest below,
   `k8s/ha-postgres.yaml`, requires the same key. Set it only
   if your PKI enforces revocation ([SECURITY.md, API revocation gate](../docs/SECURITY.md#api-revocation-gate)),
   and to a value that reads as true (`1`, `true`, `yes` or `on`). A value such as `0` passes the
