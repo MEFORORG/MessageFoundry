@@ -637,7 +637,13 @@ def _log_dir_settings(tmp_path: Path, log_dir: Path) -> object:
     from messagefoundry.config.settings import load_settings
 
     toml = tmp_path / "messagefoundry.toml"
-    toml.write_text(f'[logging]\nlog_dir = "{log_dir.as_posix()}"\n', encoding="utf-8")
+    # The store is pinned under tmp_path, so the status snapshot never opens one in the working
+    # directory.
+    store = (tmp_path / "absent.db").as_posix()
+    toml.write_text(
+        f'[logging]\nlog_dir = "{log_dir.as_posix()}"\n[store]\npath = "{store}"\n',
+        encoding="utf-8",
+    )
     return load_settings(config_path=toml)
 
 
@@ -871,3 +877,264 @@ def test_read_log_file_refuses_a_directory_swapped_in(tmp_path: Path) -> None:
     expected: type[OSError] = OSError if os.name == "nt" else bundle_mod._LogFileRefused
     with pytest.raises(expected):
         bundle_mod._read_log_file(log, listed)
+
+
+# --- BACKLOG #5385: the log read is bounded, so a large log cannot exhaust memory and lose the zip --
+
+
+def test_log_tail_reads_only_a_bounded_tail_of_a_large_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole file used to be read into memory, so a large enough log raised ``MemoryError``,
+    which nothing catches, and no zip was written. Only the last ``_LOG_TAIL_MAX_BYTES`` bytes are
+    read now; the line the bound cuts into is dropped."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 64)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    lines = [f"line-{n:04d} synthetic" for n in range(200)]
+    (log_dir / "engine.log").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    tail = _tail_member(tmp_path, log_dir)
+    assert tail is not None
+    got = tail.split("\n")
+    assert len(tail.encode("utf-8")) <= 64, tail
+    # Whole lines only, and the newest ones, in order.
+    assert got == lines[-len(got) :], got
+    assert got[-1] == "line-0199 synthetic"
+
+
+def test_log_tail_bound_on_a_line_start_drops_no_whole_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bound that falls exactly on a line start keeps that line: only a cut line is dropped."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_bytes(b"aaaa\r\nbbbb\r\ncccc\r\n")
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 12)
+    assert _tail_member(tmp_path, log_dir) == "bbbb\ncccc"
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 11)
+    assert _tail_member(tmp_path, log_dir) == "cccc"
+
+
+def test_read_log_file_never_asks_for_more_than_the_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The read itself is bounded, not only the text kept: a read of the whole file is what ran
+    out of memory."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)
+    log = tmp_path / "engine.log"
+    log.write_bytes(b"x" * 10 + b"\n" + b"y" * 1000 + b"\nlast\n")
+    listed = os.lstat(log)
+    sizes: list[int] = []
+    opened: list[int] = []
+    real_open, real_read = os.open, os.read
+
+    def recording_open(path: Any, *args: Any, **kwargs: Any) -> int:
+        fd = real_open(path, *args, **kwargs)
+        if Path(path) == log:
+            opened.append(fd)
+        return fd
+
+    def recording_read(fd: int, n: int) -> bytes:
+        # Only a descriptor opened on the log, so another thread's read is not counted.
+        if fd in opened:
+            sizes.append(n)
+        return real_read(fd, n)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "read", recording_read)
+    assert bundle_mod._read_log_file(log, listed) == "last\n"
+    assert sizes and all(n <= 33 for n in sizes), sizes
+
+
+def test_read_log_file_one_byte_over_the_bound_drops_the_cut_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file one byte longer than the bound starts its read at byte 0, and its first line is
+    still cut by the bound, so it is still dropped."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 11)
+    log = tmp_path / "engine.log"
+    log.write_bytes(b"abcdefgh\nxy\n")
+    assert bundle_mod._read_log_file(log, os.lstat(log)) == "xy\n"
+
+
+@pytest.mark.parametrize("body", [b"short\n" + b"z" * 100, b"short\n" + b"z" * 100 + b"\n"])
+def test_log_tail_a_last_line_longer_than_the_bound_reports_a_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: bytes
+) -> None:
+    """No whole line in the bytes read would leave an empty tail that reads as an empty log, so
+    the read reports a code instead."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_bytes(body)
+    assert _tail_member(tmp_path, log_dir) == "MF-BUNDLE-LOG-003 _LogLineTooLong"
+
+
+def test_read_log_file_a_cut_window_of_only_empty_lines_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tail of blank lines renders as an empty member, which reads as an empty log; the
+    newest line with content was cut by the bound, so the read refuses (BACKLOG #5385)."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)
+    log = tmp_path / "engine.log"
+    log.write_bytes(b"x" * 40 + b"\n" * 21)
+    with pytest.raises(bundle_mod._LogLineTooLong):
+        bundle_mod._read_log_file(log, os.lstat(log))
+
+
+def _shrink_on_lseek(
+    monkeypatch: pytest.MonkeyPatch, log: Path, *, times: int, refill: bytes | None = None
+) -> list[int]:
+    """Truncate ``log`` in place on each of the first ``times`` seeks made on a descriptor
+    ``os.open`` returned for ``log``, which falls after the read's fstat and before its read.
+    With ``refill``, the file is rewritten with it, in place, before each such open. Another
+    descriptor's seek, on this thread or another, runs unchanged. Returns the descriptors
+    seen, one entry per seek."""
+    real_open, real_lseek = os.open, os.lseek
+    opened: list[int] = []
+    seeks: list[int] = []
+
+    def recording_open(path: Any, *args: Any, **kwargs: Any) -> int:
+        ours = Path(path) == log
+        if ours and refill is not None:
+            log.write_bytes(refill)
+        fd = real_open(path, *args, **kwargs)
+        if ours:
+            opened.append(fd)
+        return fd
+
+    def truncating_lseek(fd: int, pos: int, how: int) -> int:
+        if fd in opened:
+            seeks.append(fd)
+            if len(seeks) <= times:
+                log.write_bytes(b"")  # truncated in place after the fstat, before the read
+        return real_lseek(fd, pos, how)
+
+    monkeypatch.setattr(os, "open", recording_open)
+    monkeypatch.setattr(os, "lseek", truncating_lseek)
+    return seeks
+
+
+def test_log_tail_a_file_truncated_while_it_is_read_is_read_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A copytruncate rotation between the fstat and the read leaves the read short; the tail is
+    listed and read again rather than reported as a long line."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    log = log_dir / "engine.log"
+    log.write_bytes(b"old line\n" * 10)
+    seeks = _shrink_on_lseek(monkeypatch, log, times=1)
+    assert _tail_member(tmp_path, log_dir) == ""
+    assert len(seeks) == 2, seeks
+
+
+def test_log_tail_a_file_that_shrinks_twice_reports_a_shrink_not_a_swap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file shorter than its fstat on both reads is reported by its own name, not as
+    ``_LogFileRefused``, whose diagnostic says the file was replaced: it was truncated in place
+    (BACKLOG #5385)."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    log = log_dir / "engine.log"
+    log.write_bytes(b"old line\n" * 10)
+    seeks = _shrink_on_lseek(monkeypatch, log, times=2, refill=b"old line\n" * 10)
+    assert _tail_member(tmp_path, log_dir) == "MF-BUNDLE-LOG-002 _LogFileShrank"
+    assert len(seeks) == 2, seeks
+
+
+@pytest.mark.parametrize("ending", [b"\n\n", b"\r\n\r\n", b"\r\r"])
+def test_log_tail_a_long_last_line_then_a_blank_line_reports_a_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ending: bytes
+) -> None:
+    """A line longer than the bound followed by one blank line leaves only that blank line in
+    the bytes kept; an empty tail with no code would read as an empty log, so the code is
+    reported (BACKLOG #5385)."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_bytes(b"y" * 40 + ending)
+    assert _tail_member(tmp_path, log_dir) == "MF-BUNDLE-LOG-003 _LogLineTooLong"
+
+
+def test_log_tail_a_short_line_then_more_blank_lines_than_the_bound_reports_a_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The line with content need not be long: blank lines past the bound put it out of reach
+    as well, and the code, not an empty tail, is what reports that."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_bytes(b"short\n" + b"\n" * 40)
+    assert _tail_member(tmp_path, log_dir) == "MF-BUNDLE-LOG-003 _LogLineTooLong"
+
+
+def test_log_tail_a_long_line_then_a_line_with_content_keeps_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Negative control for the test above: a blank line followed by a line with content is a
+    tail, so it is kept rather than refused."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_bytes(b"y" * 40 + b"\n\nx\n")
+    assert _tail_member(tmp_path, log_dir) == "\nx"
+
+
+def test_a_long_line_has_its_own_code() -> None:
+    """``MF-BUNDLE-LOG-002`` says the file could not be read; a long line was read, so it is
+    listed under ``MF-BUNDLE-LOG-003`` and not under 002 (BACKLOG #5385)."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    doc = " ".join((bundle_mod._diagnostic.__doc__ or "").split())
+
+    def entry(code: str) -> str:
+        return doc.split(f"``{code}``", 1)[1].split("* ``", 1)[0]
+
+    assert "_LogLineTooLong" in entry("MF-BUNDLE-LOG-003")
+    # A short line put out of reach by blank lines raises it too, so 003 must not say the
+    # line is longer than the bound.
+    assert "starts before it" in entry("MF-BUNDLE-LOG-003")
+    assert "_LogLineTooLong" not in entry("MF-BUNDLE-LOG-002")
+    assert "_LogFileShrank" in entry("MF-BUNDLE-LOG-002")
+
+
+def test_the_help_and_phi_md_state_the_read_bound(capsys: pytest.CaptureFixture[str]) -> None:
+    """The byte bound is restated in the operator help and the PHI record; both follow the
+    constant."""
+    from messagefoundry.__main__ import _build_parser
+    from messagefoundry.support import bundle as bundle_mod
+
+    mib = f"{bundle_mod._LOG_TAIL_MAX_BYTES // (1024 * 1024)} MiB"
+    parser, _ = _build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["support-bundle", "--help"])
+    assert mib in " ".join(capsys.readouterr().out.split())
+    phi = (Path(__file__).resolve().parents[1] / "docs" / "PHI.md").read_text(encoding="utf-8")
+    row = next(line for line in phi.splitlines() if line.startswith("| **14. "))
+    assert mib in row

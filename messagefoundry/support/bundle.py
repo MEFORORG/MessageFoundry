@@ -1,20 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Assemble the offline support bundle zip (#49).
+"""Assemble the support bundle zip (#49).
 
-:func:`build_bundle` writes a single ``.zip`` from purely **local** inputs — it touches no network and
-starts no server. Contents (each a small text/JSON member):
+:func:`build_bundle` writes a single ``.zip``; it starts no server. Contents (each a small text/JSON
+member):
 
 * ``version.txt`` / ``manifest.json`` — the engine :data:`messagefoundry.__version__` + generation
   timestamp + a content listing.
-* ``config-summary.json`` — a **secret-free** summary of the wired graph: registry COUNTS only
+* ``config-summary.json`` — a summary of the wired graph that holds no secret: registry COUNTS only
   (inbound/outbound/router/handler counts + the connection NAMES + transport TYPE), never a settings
   value, host, path, credential, or any ``env()``-resolved data.
 * ``status.json`` — a ``/status`` snapshot built from the REAL status models
-  (:class:`~messagefoundry.api.models.SystemStatus` / ``EngineInfo`` / ``DbInfo``), populated offline
-  from the store. PHI-free (counts + sizes only).
-* ``app-log.txt`` — a **redacted** tail of the configured app log (see
-  :mod:`messagefoundry.support.redact`); omitted when no ``[logging].log_dir`` is configured.
+  (:class:`~messagefoundry.api.models.SystemStatus` / ``EngineInfo`` / ``DbInfo``), populated
+  from the store. Metadata-only, the term the manifest's ``phi_contract`` uses;
+  :func:`status_snapshot` says what it holds.
+* ``app-log.txt`` — when written, a **redacted** app-log tail or an ``MF-BUNDLE-LOG-*`` code in its place (see
+  :mod:`messagefoundry.support.redact` and :func:`_log_tail`).
 
 HARD RULE (do not break): no member this module builds reads a message body from the store, and only
 the app-log tail can carry a secret or a body into the archive. The config summary loads the config but
@@ -40,6 +41,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import re
 import stat
 import time
 import zipfile
@@ -73,9 +75,16 @@ def _diagnostic(code: str, exc: BaseException) -> str:
       no store exists at the configured path, and the bundle did not create one (BACKLOG #1780).
     * ``MF-BUNDLE-LOG-001`` -- the configured ``[logging].log_dir`` could not be listed, or a log
       file in it could not be stat'd.
-    * ``MF-BUNDLE-LOG-002`` -- the newest app-log file could not be read. With ``_LogFileRefused``
-      it was, twice, no longer the plain regular file the listing saw when it was opened
-      (BACKLOG #5383).
+    * ``MF-BUNDLE-LOG-002`` -- the newest app-log file could not be read. The type is the
+      second attempt's, after a first that also failed as the file changing under the read.
+      With ``_LogFileRefused`` the file was, on that attempt, no longer the plain regular file
+      the listing saw when it was opened (BACKLOG #5383). With ``_LogFileShrank`` it was, on
+      that attempt, shorter when read than when it was opened: truncated in place, as a
+      copytruncate rotation does (BACKLOG #5385).
+    * ``MF-BUNDLE-LOG-003`` -- the newest app-log file was read, but the bytes the read takes from
+      its end, less the line the bound cuts into, hold nothing but line breaks: the newest line with
+      content is cut by the bound or starts before it (``_LogLineTooLong``, BACKLOG #5385). The
+      line need not be long; enough blank lines after it put it out of reach too.
 
     A type name is a class defined in this project or the standard library, so it is bounded input; an
     exception's ``str()`` is not, and the bundle is a file an operator hands outside the environment."""
@@ -91,7 +100,8 @@ class BundleResult:
 
 
 def config_summary(config_dir: str | Path) -> dict[str, Any]:
-    """A **secret-free** summary of the wired graph: COUNTS + connection names + transport types only.
+    """A summary of the wired graph that holds no secret, the manifest ``phi_contract``'s term:
+    COUNTS + connection names + transport types only.
 
     Deliberately omits every settings value (hosts, ports, paths, credentials, ``env()`` data) — only
     the shape of the graph is carried, so the summary can never leak a connection string or secret. A
@@ -135,12 +145,13 @@ def config_summary(config_dir: str | Path) -> dict[str, Any]:
 
 
 def status_snapshot(settings: ServiceSettings | None) -> dict[str, Any]:
-    """A ``/status`` snapshot built from the REAL status models, populated offline from the store.
+    """A ``/status`` snapshot built from the REAL status models, populated from the store.
 
     The engine isn't running under the CLI, so ``EngineInfo`` carries the version with a zero uptime /
     no live channel counts; ``DbInfo`` is read from the store the settings point at (when reachable).
-    PHI-free — the status models are metadata/counts/sizes only. Returns an ``error`` member instead of
-    raising if the store can't be opened (e.g. the DB is missing or in use), so the bundle still builds."""
+    Metadata-only, the manifest ``phi_contract``'s term. ``db`` is null when ``settings`` is None
+    or the store cannot be opened or read; in the second case a ``db_error`` member holds a code instead of
+    raising (e.g. the DB is missing or in use), so the bundle still builds."""
     import os
 
     from messagefoundry.api.models import EngineInfo, SystemStatus
@@ -222,11 +233,37 @@ _IO_REPARSE_TAG_NAME_SURROGATE = 0x20000000
 #: replaced the file between listing and opening, which reads as a swap to the identity check.
 _LOG_READ_ATTEMPTS = 2
 
+#: The most bytes from the end of the app-log file the tail is taken from; the read takes one
+#: byte more, to find where a line starts. The whole file used to be read, so a
+#: large enough log raised ``MemoryError`` and no zip was written (BACKLOG #5385).
+_LOG_TAIL_MAX_BYTES = 4 * 1024 * 1024
 
-class _LogFileRefused(OSError):
+
+#: A byte that is not a line break; a cut read with none left would render as an empty tail.
+_LOG_CONTENT_BYTE = re.compile(rb"[^\r\n]")
+
+
+class _LogFileChanged(OSError):
+    """The newest app-log file changed under the read, as a rotation does, so :func:`_log_tail`
+    lists and reads again once before it reports the subclass by its bounded name."""
+
+
+class _LogFileRefused(_LogFileChanged):
     """The newest app-log file was not, once opened, the plain regular file the listing saw: a
     different file or a special file swapped in at its name (BACKLOG #5383). A type of this
     module, so :func:`_diagnostic` reports it by its bounded name."""
+
+
+class _LogFileShrank(_LogFileChanged):
+    """The newest app-log file held fewer bytes when read than ``fstat`` reported after the open:
+    the same file, truncated in place, as a copytruncate rotation does (BACKLOG #5385). Not a
+    :class:`_LogFileRefused`, whose diagnostic says another file was swapped in."""
+
+
+class _LogLineTooLong(ValueError):
+    """The bytes the read takes from the end of the app-log file, less the line the bound cuts
+    into, hold nothing but line breaks, so the tail would show nothing although the file is not
+    empty (BACKLOG #5385). Not an :class:`OSError`: the read worked."""
 
 
 def _is_plain_file(st: os.stat_result) -> bool:
@@ -262,9 +299,10 @@ def _log_candidates(directory: Path) -> list[tuple[Path, os.stat_result]]:
 
 
 def _read_log_file(path: Path, listed: os.stat_result) -> str:
-    """The text of ``path``, checked after the open to be the same plain regular file that was
-    listed (BACKLOG #5383): ``fstat`` on the new descriptor must report a regular file with the
-    device and file id the listing saw. The descriptor is closed on every path out.
+    """The text of at most the last ``_LOG_TAIL_MAX_BYTES`` bytes of ``path``, less the line the
+    bound cuts into, checked after the open to be the same plain regular file that was listed
+    (BACKLOG #5383): ``fstat`` on the new descriptor must report a regular file with the device
+    and file id the listing saw. The descriptor is closed on every path out.
 
     On POSIX, ``O_NOFOLLOW`` makes the open fail with ``ELOOP`` when a symbolic link has been put
     at the name, so the open never reaches another file through one. ``O_NONBLOCK`` makes the open
@@ -278,7 +316,8 @@ def _read_log_file(path: Path, listed: os.stat_result) -> str:
     opening that target happens: connecting to a named pipe the link points at, for one. What the
     check after the open prevents is only the read: a target with another id is refused, and
     none of its content enters the bundle. Raises :class:`OSError`, the identity refusal as
-    :class:`_LogFileRefused`."""
+    :class:`_LogFileRefused` and a file that shrank while it was read as :class:`_LogFileShrank`;
+    and :class:`_LogLineTooLong` for a cut read that keeps nothing but line breaks."""
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     nonblocking = getattr(os, "O_NONBLOCK", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0) | nonblocking
@@ -292,26 +331,51 @@ def _read_log_file(path: Path, listed: os.stat_result) -> str:
             raise _LogFileRefused("the app-log file changed between listing and opening")
         if nonblocking:
             os.set_blocking(fd, True)
-        handle = os.fdopen(fd, "rb")
-    except BaseException:
+        # One byte before the bound is read too, so the line the bound cuts into can be told
+        # from one it starts exactly at: that byte is a line break only in the second case.
+        truncated = opened.st_size > _LOG_TAIL_MAX_BYTES
+        start = max(0, opened.st_size - _LOG_TAIL_MAX_BYTES - 1)
+        os.lseek(fd, start, os.SEEK_SET)
+        want = opened.st_size - start
+        chunks: list[bytes] = []
+        while want > 0:
+            chunk = os.read(fd, want)
+            if not chunk:
+                # Shorter than the fstat said: truncated in place, as a copytruncate rotation
+                # does, so the caller lists and reads again.
+                raise _LogFileShrank("the app-log file shrank while it was read")
+            chunks.append(chunk)
+            want -= len(chunk)
+    finally:
         os.close(fd)
-        raise
-    with handle:
-        data = handle.read()
+    data = b"".join(chunks)
+    if truncated:
+        # Drop through the first line break: what precedes it is the cut line, or nothing when
+        # the bound starts exactly after it. A CRLF counts as one break.
+        lf = data.find(b"\n")
+        cr = data.find(b"\r", 0, lf if lf >= 0 else len(data))
+        cut = (cr if cr >= 0 else lf) + 1
+        if cut and data[cut - 1 : cut + 1] == b"\r\n":
+            cut += 1
+        data = data[cut:] if cut else b""
+        # Only line breaks left would render as an empty tail, which reads as an empty log.
+        if _LOG_CONTENT_BYTE.search(data) is None:
+            raise _LogLineTooLong("no app-log line with content fits in the read bound")
     # Read tolerant of a legacy codepage; the redaction pass runs on the decoded text.
     return data.decode("utf-8", errors="replace")
 
 
 def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
-    """A redacted tail of the newest app-log file under ``log_dir`` (one level). ``None`` when no log
-    dir is configured, it holds no readable log file, or ``lines`` is not positive (BACKLOG #5384: a
-    slice by zero or a negative count would carry the whole file, or most of it). **Never** raises —
-    a log read problem is logged into the tail text, not propagated.
+    """A redacted tail of an app-log file under ``log_dir``. ``None`` at least when no log dir is
+    configured or ``lines`` is not positive (BACKLOG #5384: a slice by zero or a negative count
+    would carry the whole file, or most of it). An :class:`OSError` from the listing or the read,
+    and the read's :class:`_LogLineTooLong`, are not propagated.
 
     Only a plain regular file with one name is read: a link, a hard link or a special file with a
     log suffix is passed over (BACKLOG #5383), see :func:`_log_candidates` and
-    :func:`_read_log_file`. A file replaced between listing and opening, as a rotation does, is
-    listed and opened again once before the refusal is reported.
+    :func:`_read_log_file`. A file replaced between listing and opening, or truncated in place
+    while it is read, as a rotation does, is listed and opened again once before the failure is
+    reported.
 
     EVERY returned string leaves through ``redact_log_text``, and that is what makes the manifest's
     ``phi_contract`` claim about this member true. The two failure branches used to ``return`` ahead of
@@ -334,10 +398,12 @@ def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
         newest, listed = max(files, key=lambda item: item[1].st_mtime)
         try:
             text = _read_log_file(newest, listed)
+        except _LogLineTooLong as exc:
+            return redact_log_text(_diagnostic("MF-BUNDLE-LOG-003", exc))
         except OSError as exc:
             # A refusal, a file gone, or (POSIX) a link put at its name: each is what a rotation or
             # a swap between listing and opening leaves, so list again once before reporting it.
-            changed = isinstance(exc, (_LogFileRefused, FileNotFoundError)) or exc.errno == ELOOP
+            changed = isinstance(exc, (_LogFileChanged, FileNotFoundError)) or exc.errno == ELOOP
             if changed and attempt + 1 < _LOG_READ_ATTEMPTS:
                 continue
             return redact_log_text(_diagnostic("MF-BUNDLE-LOG-002", exc))
@@ -354,12 +420,12 @@ def build_bundle(
     log_tail_lines: int = DEFAULT_LOG_TAIL_LINES,
     now: float | None = None,
 ) -> BundleResult:
-    """Write the support-bundle zip to ``out_path`` from local inputs only (no network, no server).
+    """Write the support-bundle zip to ``out_path``; it starts no server.
 
-    ``config_dir`` (optional) drives the secret-free config summary; ``settings`` (optional) drives the
-    status snapshot + the redacted log tail. Each member is best-effort — a failure in one section is
-    recorded in that member, never aborting the bundle — because support is most wanted when something
-    is already broken.
+    ``config_dir`` (optional) drives the config summary, which holds no secret; ``settings``
+    (optional) drives the status snapshot + the redacted log tail. Each member is best-effort — a
+    failure in one section is recorded in that member, never aborting the bundle — because support
+    is most wanted when something is already broken.
 
     Returns a :class:`BundleResult` (the path + member names). The caller is responsible for picking a
     PHI-safe destination. This function never copies ``.env`` / ``*.db`` content into the bundle, but
@@ -392,7 +458,8 @@ def build_bundle(
         # An explicit, auditable statement of what is and isn't in the bundle (the PHI contract). It
         # is machine-readable and a reviewer may rely on it, so it claims no more than every member
         # meets. The CLI help repeats its log-tail residual (BACKLOG #1475, #5385), and
-        # tests/test_support_bundle.py holds the two to the same terms, so change both together.
+        # tests/test_support_bundle.py and tests/test_b532w3_redaction_bundle_members.py hold
+        # the two to the same terms, so change both together.
         "phi_contract": (
             "no member reads a message body from the store; config summary is counts/names only and "
             "holds no secret; status is the metadata-only status models; the app-log tail is a "
