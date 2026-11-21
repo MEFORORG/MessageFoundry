@@ -15,7 +15,8 @@ its own and is not the control: it proves the output stays USEFUL. The leg that 
 ``load_settings`` to raise a ``ValidationError`` from a plain model that DOES carry the secret -- the
 shape a section added later outside ``_InputHidingModel`` would raise -- and asserts its control
 first: the planted secret is in ``str(exc)``. Each arm must then render it through
-``settings_error_detail`` and print the field and message without the value.
+``settings_error_detail`` and print the field and message without the value, except the
+``_FIELD_ONLY_ARMS``, which print the field and the error type in place of a validator's message.
 
 ``_ARMS`` holds at least the operator commands vault BACKLOG #2760 moved onto the renderer and
 the ones that already used it, except ``serve`` and ``supervise``, which start the engine. A new
@@ -184,7 +185,25 @@ _ARMS: list[tuple[str, Callable[[Path, Path], list[str]]]] = [
         "alert-remove",
         lambda cfg, tmp: ["alert", "remove", "--service-config", str(cfg), "--index", "0"],
     ),
+    # validate, graph and dryrun load the settings only under --env (vault BACKLOG #5554).
+    ("validate-env", lambda cfg, tmp: _offline_env_arm("validate", cfg, tmp)),
+    ("graph-env", lambda cfg, tmp: _offline_env_arm("graph", cfg, tmp)),
+    ("dryrun-env", lambda cfg, tmp: _offline_env_arm("dryrun", cfg, tmp)),
 ]
+
+
+def _offline_env_arm(command: str, cfg: Path, tmp: Path) -> list[str]:
+    argv = [command, "--config", str(tmp), "--service-config", str(cfg), "--env", "prod", "--json"]
+    if command == "dryrun":
+        msg = tmp / "adt.hl7"
+        msg.write_text("MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5.1\r", encoding="utf-8")
+        argv += ["--messages", str(msg)]
+    return argv
+
+
+#: The arms that print a field's error type in place of a validator's message, because the message
+#: can quote the refused value: `__main__._settings_failure_fields` (vault BACKLOG #5554).
+_FIELD_ONLY_ARMS = {"validate-env", "graph-env", "dryrun-env"}
 
 #: The file each arm starts from. ``alert remove`` needs a rule to remove before it reloads.
 _STARTING_FILE = {"alert-remove": '[[alerts.rules]]\nevent_type = "connection_stopped"\n'}
@@ -193,8 +212,9 @@ _STARTING_FILE = {"alert-remove": '[[alerts.rules]]\nevent_type = "connection_st
 _EDIT_ARMS = {"security-set", "alert-add", "alert-remove"}
 
 #: The arms a load failure does not fail. ``support-bundle`` reports it as a warning, and
-#: ``security show`` as a partial report with its reason.
-_EXIT_0_ARMS = {"support-bundle", "security-show"}
+#: ``security show`` as a partial report with its reason. ``graph`` lists it under
+#: ``env_problems`` beside the graph.
+_EXIT_0_ARMS = {"support-bundle", "security-show", "graph-env"}
 
 #: How ``settings_error_detail`` names the failing section. Pydantic's own text puts the location on
 #: a line of its own, and a bare ``store`` would also match a temporary path.
@@ -215,6 +235,11 @@ def _run(
     code = main(argv_for(cfg, work))
     captured = capsys.readouterr()
     return code, captured.out + captured.err, cfg, body
+
+
+def _field_only(arm: str, out: str) -> bool:
+    """A field-only arm names the field and the error type, never the validator's message."""
+    return arm in _FIELD_ONLY_ARMS and f"{_FIELD}value_error" in out and _MESSAGE not in out
 
 
 def _patch_leaky_load(monkeypatch: pytest.MonkeyPatch) -> list[int]:
@@ -249,7 +274,7 @@ def test_an_arm_renders_a_load_failure_without_its_input(
     assert calls, f"{arm} never reached load_settings, so this case proves nothing"
     assert _CANARY not in out, f"{arm} printed the input of a settings load failure: {out!r}"
     # Useful, not just quiet: the section and the reason are still named.
-    assert _FIELD in out and _MESSAGE in out, out
+    assert _FIELD in out and (_MESSAGE in out or _field_only(arm, out)), out
     assert (code == 0) is (arm in _EXIT_0_ARMS), (arm, code)
     if arm in _EDIT_ARMS:
         # The post-write check refused, and the edit was rolled back. `security set` reports its
@@ -274,7 +299,7 @@ def test_a_real_store_failure_names_the_field_and_never_the_env_secret(
     code, out, cfg, _ = _run(arm, tmp_path, capsys, body)
 
     assert _CANARY not in out, f"{arm} printed an env-supplied secret: {out!r}"
-    assert _FIELD in out and "server, database, username" in out, out
+    assert _FIELD in out and ("server, database, username" in out or _field_only(arm, out)), out
     assert "input_value" not in out and "errors.pydantic.dev" not in out, out
     if arm not in _EXIT_0_ARMS:
         assert code != 0

@@ -819,8 +819,29 @@ def test_offline_env_reports_an_unparseable_root_settings_file(
     assert _SECRET_HOST not in captured.out + captured.err
 
 
+#: A password no settings failure may print. Unique, so a match is this value and nothing else.
+_URL_PASSWORD = "ZqUrlPw5554x"
+
+
+def _settings_failure_output(
+    command: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    settings_body: str,
+) -> tuple[int, str]:
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    cwd = tmp_path / "cwd"
+    _values_file(cwd, "prod", f'peer_host = "{_SECRET_HOST}"\n')
+    (cwd / "messagefoundry.toml").write_text(settings_body, encoding="utf-8")
+    monkeypatch.chdir(cwd)
+    rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), "--env", "prod"))
+    captured = capsys.readouterr()
+    return rc, captured.out + captured.err
+
+
 @pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
-def test_offline_env_scrubs_url_userinfo_from_a_settings_error(
+def test_offline_env_never_prints_a_refused_trusted_proxy_url(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -828,16 +849,77 @@ def test_offline_env_scrubs_url_userinfo_from_a_settings_error(
 ) -> None:
     # The [api].trusted_proxies refusal quotes the entry it refused. Under --env these three
     # commands print a settings failure where origin/main printed none, to stdout, which CI logs
-    # keep, so a password in a URL's userinfo must not reach it.
+    # keep, so the field and the error type print and the message, which holds the URL, does not.
+    body = f'[api]\ntrusted_proxies = ["https://u:{_URL_PASSWORD}@host/"]\n'
+    rc, out = _settings_failure_output(command, tmp_path, monkeypatch, capsys, body)
+    assert _URL_PASSWORD not in out, out
+    assert "host/" not in out, out
+    assert "api.trusted_proxies: value_error (its message is not shown" in out, out
+    assert rc == (0 if command == "graph" else 1), out
+
+
+@pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
+def test_offline_env_does_not_read_a_failing_secret_field_as_a_set_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    # A credential scrub read "auth.ad_bind_password: Input should be..." as a label and its value,
+    # and printed "auth.ad_bind_password=<redacted> should be...", which reads as a set secret.
+    body = "[auth]\nad_bind_password = 5\n"
+    rc, out = _settings_failure_output(command, tmp_path, monkeypatch, capsys, body)
+    assert "auth.ad_bind_password: Input should be a valid string" in out, out
+    assert "redacted" not in out, out
+    assert rc == (0 if command == "graph" else 1), out
+
+
+@pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
+def test_offline_env_names_a_settings_path_holding_a_credential_label_as_it_is(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    # A --service-config naming a directory fails at the open with an OSError naming the path. A
+    # credential scrub rewrote a path holding "api_key=" into one that does not exist.
     cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
     cwd = tmp_path / "cwd"
     _values_file(cwd, "prod", f'peer_host = "{_SECRET_HOST}"\n')
-    (cwd / "messagefoundry.toml").write_text(
-        '[api]\ntrusted_proxies = ["https://u:secret@host/"]\n', encoding="utf-8"
-    )
+    named = tmp_path / "api_key=ZqPath5554" / "settings.toml"
+    named.mkdir(parents=True)
     monkeypatch.chdir(cwd)
-    rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), "--env", "prod"))
+    argv = ["--config", str(cfg), "--service-config", str(named), "--env", "prod"]
+    rc = main(_offline_argv(command, tmp_path, *argv))
     captured = capsys.readouterr()
-    assert "secret" not in captured.out + captured.err, captured
-    assert "trusted_proxies" in captured.out + captured.err, captured
-    assert rc == (0 if command == "graph" else 1), captured
+    out = captured.out + captured.err
+    assert str(named) in out or json.dumps(str(named))[1:-1] in out, out
+    assert "redacted" not in out, out
+    assert rc == (0 if command == "graph" else 1), out
+
+
+def test_the_settings_failure_rendering_keeps_a_missing_field_missing() -> None:
+    # "store.password: Field required" became "store.password=<redacted> required" through a
+    # credential scrub. The field-path rendering prints pydantic's own message as written.
+    from pydantic import ValidationError
+
+    from messagefoundry.__main__ import _settings_failure_fields
+
+    exc = ValidationError.from_exception_data(
+        "ServiceSettings",
+        [
+            {"type": "missing", "loc": ("store", "password"), "input": {}},
+            {
+                "type": "value_error",
+                "loc": ("api", "trusted_proxies"),
+                "input": f"https://u:{_URL_PASSWORD}@host/",
+                "ctx": {"error": ValueError(f"entry 'https://u:{_URL_PASSWORD}@host/' refused")},
+            },
+        ],
+    )
+    assert _URL_PASSWORD in str(exc)  # the control: the raw text carries it
+    shown = _settings_failure_fields(exc)
+    assert shown.startswith("store.password: Field required; api.trusted_proxies: value_error"), (
+        shown
+    )
+    assert _URL_PASSWORD not in shown and "redacted" not in shown, shown

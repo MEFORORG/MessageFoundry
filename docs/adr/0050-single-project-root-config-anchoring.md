@@ -474,14 +474,14 @@ those settings, and its Handlers still run with no active environment.
   its read. For example, with no `<root>/messagefoundry.toml` and a `./messagefoundry.toml` naming
   `dir = "envs"`, `graph` exits 2 over a missing `<root>/environments/<env>.toml`, as it did before
   this note, while `validate` reads `<root>/envs/<env>.toml` and can pass. They read the file with
-  `serve`'s own reader, so overrides such as `MEFOR_VALUE_*` apply. Settings that do not load are reported
-  as `serve`'s settings load renders them, with credential values such as a password in a URL
-  scrubbed out, because CI logs keep these commands' output, naming the settings file where one
-  exists; a value file that cannot be read is reported naming that file. They resolve every
-  `env()` reference of each deployed connection and lookup, and report one that does not resolve
-  by its key, never its value. `validate` lists each of these failures with its other problems and
-  `dryrun` stops on it, so both exit 1 on settings that do not load where they exited 0 before
-  this note, for example an unparseable settings file with the value file present. `graph` lists it under `env_problems` beside the graph and exits as it would without it,
+  `serve`'s own reader, so overrides such as `MEFOR_VALUE_*` apply. Where the settings do not
+  load, they report the failure naming the settings file where one exists, and they report a value
+  file that cannot be read naming that file. They resolve every `env()` reference of each deployed
+  connection and lookup, and report one that does not resolve by its key, never its value.
+  `validate` lists each of these failures with its other problems and `dryrun` stops on it, so
+  both exit 1 on settings that do not load where they exited 0 before this note, for example an
+  unparseable settings file with the value file present. `graph` lists it under `env_problems`
+  beside the graph and exits as it would without it,
   because it reports a graph and does not gate one (BACKLOG #1648); that is a Manager decision.
   A reference set is left out, as `serve` and
   `check` leave an unresolved one to its sync. Without `--env` nothing changes. Where they still
@@ -492,6 +492,11 @@ those settings, and its Handlers still run with no active environment.
   - No connector is built, so a refusal only the build check makes, such as an egress or hop
     refusal, is still `check --env`'s, as is the posture check.
   - `dryrun`'s Handlers still run with no active environment.
+  - Settings that fail to validate are printed by their failing field paths. Where `serve` prints a
+    validator's message as written, these three print its error type in its place, because CI logs
+    keep their output and the message can quote the refused value, at least the
+    `[api].trusted_proxies` refusal quoting a URL with its password. At least a mapping key in a
+    field path and a path the operator named still print.
 
 **What "matches `serve`" covers.** The settings checks read the environment name `serve --env`
 reads. Value-file location is shared too: the offline `<env>.toml` check under `--project-root` now
