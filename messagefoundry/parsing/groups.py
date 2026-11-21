@@ -193,21 +193,26 @@ class SegmentGroup:
         primitive, never string slicing."""
         start, end = self._span()
         # Everything after the boundary row, removed back-to-front so earlier positions don't shift.
-        removed = 0
-        for row in range(end - 1, start, -1):
-            self._m._delete_segment_at(row)
-            removed += 1
-        return removed
+        return self._delete_rows(range(end - 1, start, -1))
 
     def delete(self) -> int:
         """Remove the **entire** group, boundary included, returning the count removed — drop a whole
         order. After this the view is stale; calling another method raises :class:`LookupError`."""
         start, end = self._span()
-        removed = 0
-        for row in range(end - 1, start - 1, -1):
+        return self._delete_rows(range(end - 1, start - 1, -1))
+
+    def _delete_rows(self, rows: range) -> int:
+        """Delete ``rows``, back-to-front, through the parent's positional delete, and return how
+        many. The span keeps every row but the lowest in range, so that one is checked first: a
+        refused one, such as the leading header a ``groups("BHS")`` group opens with, leaves the
+        message unchanged (BACKLOG #5972)."""
+        if rows:
+            refusal = self._m._positional_delete_refusal(rows[-1])
+            if refusal is not None:
+                raise refusal
+        for row in rows:
             self._m._delete_segment_at(row)
-            removed += 1
-        return removed
+        return len(rows)
 
     def rebuild(self, lines: list[str]) -> None:
         """Replace the group's **body** (non-boundary segments) with ``lines``, in order — the
@@ -218,11 +223,20 @@ class SegmentGroup:
         :meth:`append_segment` per line, but expressed as one intent so a reviewer sees a rebuild,
         not a clear-that-happens-to-be-followed-by-adds. Each line goes through
         :meth:`Message.add_segment` (own-separator split, re-parse), never string slicing."""
+        if lines:
+            # A message refusing every write would otherwise lose the body before the first
+            # append raised (BACKLOG #5972).
+            self._m._write_encoding_chars()
         self.clear()
         for line in lines:
             self.append_segment(line)
 
     # --- internals -----------------------------------------------------------
+
+    def _delimiters_collide(self) -> bool:
+        """The parent's :meth:`Message._delimiters_collide`, so an OBX helper an untyped Handler
+        passes a group to refuses what it refuses for the message (BACKLOG #5972)."""
+        return self._m._delimiters_collide()
 
     def _resolve(self, path: str, occurrence: int) -> tuple[str, int | None]:
         """``path``'s segment id and the message-wide occurrence of its ``occurrence``-th segment

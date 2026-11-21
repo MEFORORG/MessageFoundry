@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import csv
 import io
+import logging
 import ntpath
 import os
 from collections.abc import Callable
@@ -45,7 +46,10 @@ from messagefoundry.config.code_sets import (
 )
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.controlchars import has_control_char
+from messagefoundry.secretscrub import scrub_credentials
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
+
+_log = logging.getLogger(__name__)
 
 #: Extensions the loader recognises (the writer only ever *writes* ``.csv``; both are read).
 _SUPPORTED_EXTS = (".csv", ".toml")
@@ -178,8 +182,8 @@ def rename_code_set(
 
     **Both** ``old`` and ``new`` are checked with the same name-safety rules as ``upsert``; the rename
     is rejected if **any** supported file already exists for ``new`` (a stem collision). Raises
-    :class:`WiringError` if ``old``/``new`` is missing or unsafe, the source is absent, or the stem
-    collides."""
+    :class:`WiringError` on at least a missing or unsafe ``old``/``new``, an absent source, a stem
+    collision, and a reference rewrite the rename cannot make (see ``docs/CODESETS.md``)."""
     # Here, not at module top, so importing the config layer does not import the auth package.
     from messagefoundry.restricted_file import replace_generated
 
@@ -211,11 +215,11 @@ def rename_code_set(
         # modules that call code_set("old"). PLAN the referent rewrite BEFORE moving the file — the
         # plan is built from the loaded graph while "old" still resolves (the loader would otherwise
         # fail on a code_set("old") capture whose table just vanished). impact.py owns the
-        # tokenize-safe rewriter, so it is never duplicated here. Best-effort + additive: the file
-        # rename is the core operation, so a config that doesn't load leaves the result
-        # byte-identical to the pre-#152 shape.
+        # tokenize-safe rewriter, so it is never duplicated here. A config that does not load has
+        # referents nobody can find, so the rename refuses rather than move the file under them
+        # (BACKLOG #5980).
         plan = _plan_code_set_referents(config_dir, old, new)
-        if plan is not None and plan.unresolved:
+        if plan.unresolved:
             # A referrer the planner could not rewrite would still read the old name once the file
             # moved, so the table would vanish under it. Refuse before anything moves (BACKLOG #5980).
             named = ", ".join(f"{r.referrer_kind} {r.referrer!r}" for r in plan.unresolved)
@@ -223,19 +227,64 @@ def rename_code_set(
                 f"cannot rename code set {old!r} to {new!r}: {len(plan.unresolved)} reference(s) "
                 f"cannot be rewritten and would still read the old name: {named}. Nothing was "
                 "changed; rewrite those references by hand, or run `messagefoundry-toolkit impact "
-                "--kind code_set --rename-to` to see the plan"
+                f"--config <dir> code_set {old} --rename-to {new}` to see the plan"
             )
+        from messagefoundry.config import impact
+
+        # Checked against the files before the table moves: a referent file that changed since
+        # the plan refuses here, with nothing moved (BACKLOG #5980).
+        prepared = impact.prepare_rename(plan)
         with atomic_edit.refused_as(src, WiringError, f"rename it to {dest.name}"):
             replace_generated(src, dest)
         result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
         # The referent rewrite stays under the lock: a second rename planned between the move
         # and the rewrite would read literals naming a table that is already gone.
-        if plan is not None:
-            from messagefoundry.config import impact
-
-            rewritten = len(impact.apply_rename(plan))
-            if rewritten:
-                result["referents_rewritten"] = rewritten
+        try:
+            rewritten = len(impact.write_rename(prepared))
+        except impact.RenameWriteError as exc:
+            # A write failed and the files written were restored, so the table moves back to the
+            # name they read. A file the error names could not be restored and still reads the new
+            # name; the message says so.
+            try:
+                with atomic_edit.refused_as(dest, WiringError, f"rename it back to {src.name}"):
+                    replace_generated(dest, src)
+            except (WiringError, OSError) as back:
+                raise WiringError(
+                    f"{exc}. The code set was then left as {dest.name}, because moving it back "
+                    f"failed ({back}), while its references still name {old!r}: rename "
+                    f"{dest.name} back to {src.name} by hand"
+                ) from exc
+            raise WiringError(f"{exc}. The code set was moved back to {src.name}") from exc
+        except BaseException:
+            # An interrupt (Ctrl-C, SystemExit) or an unexpected error. write_rename restores only
+            # what was cut off inside a write, so an interrupt after a write returned, or while
+            # its locks were released, can leave references naming the new table. Read the files:
+            # the table goes back only when none is left rewritten, so table and references agree.
+            left = impact.rewritten_files(prepared)
+            if left:
+                _log.error(
+                    "code set rename interrupted: %s left naming %r, so the code set stays as %s; "
+                    "these still name %r: %s",
+                    ", ".join(left),
+                    new,
+                    dest.name,
+                    old,
+                    ", ".join(f for f, _raw, _new in prepared.files if f not in left) or "none",
+                )
+                raise
+            try:
+                replace_generated(dest, src)
+            except OSError as back:
+                _log.error(
+                    "code set rename interrupted: moving %s back to %s failed (%s); rename it "
+                    "back by hand",
+                    dest.name,
+                    src.name,
+                    type(back).__name__,
+                )
+            raise
+        if rewritten:
+            result["referents_rewritten"] = rewritten
     return result
 
 
@@ -644,18 +693,26 @@ def _write_validated(path: Path, new_text: str, validate: Validate) -> None:
 
 def _plan_code_set_referents(config_dir: str | Path, old: str, new: str) -> Any:
     """The :class:`~messagefoundry.config.impact.RenamePlan` rewriting a code set's ``code_set("old")``
-    referents to ``new``, or ``None`` when the graph can't be loaded / ``old`` isn't referenced. Built
-    while ``old`` still resolves (call BEFORE moving the file). The tokenize-safe rewriter lives in
-    :mod:`messagefoundry.config.impact` and is never duplicated here."""
-    registry = _load_referent_registry(config_dir)
-    if registry is None:
-        return None
+    referents to ``new``. Built while ``old`` still resolves (call BEFORE moving the file). The
+    tokenize-safe rewriter lives in :mod:`messagefoundry.config.impact` and is never duplicated here.
+
+    Raises :class:`WiringError` when no plan can be built: a config that does not load, or a plan
+    the planner refuses. The referents are then unknown, and moving the file would leave every
+    ``code_set("old")`` reading a table that is gone while the rename reported success (BACKLOG
+    #5980)."""
     from messagefoundry.config import impact
 
     try:
-        return impact.plan_rename(registry, config_dir, "code_set", old, new)
-    except WiringError:
-        return None
+        registry = _load_referent_registry_or_raise(config_dir)
+    except _REGISTRY_LOAD_ERRORS as exc:
+        # Scrubbed as validate_config scrubs it: a load error can echo a setting's value.
+        reason = scrub_credentials(str(exc))
+        raise WiringError(
+            f"cannot rename code set {old!r} to {new!r}: its references could not be checked "
+            f"({reason}). Nothing was changed; fix the config so it loads, then rename again"
+        ) from exc
+    # A refusal of the planner's own carries its own reason, and nothing has moved yet.
+    return impact.plan_rename(registry, config_dir, "code_set", old, new)
 
 
 def _code_set_referrers(config_dir: str | Path, name: str) -> list[dict[str, str]]:
@@ -674,12 +731,28 @@ def _code_set_referrers(config_dir: str | Path, name: str) -> list[dict[str, str
     ]
 
 
+#: What load_config raises for a config that does not load.
+_REGISTRY_LOAD_ERRORS = (WiringError, OSError, ValueError)
+
+
 def _load_referent_registry(config_dir: str | Path) -> Any:
-    """Load the config graph for the referent pre-flight, or ``None`` if it can't be loaded.
+    """Load the config graph for the delete pre-flight, or ``None`` if it can't be loaded: a broken
+    graph never fails a ``remove``, whose referrers are advisory. A ``rename`` needs the graph to
+    rewrite its referents, and refuses without it (:func:`_plan_code_set_referents`)."""
+    try:
+        return _load_referent_registry_or_raise(config_dir)
+    except _REGISTRY_LOAD_ERRORS as exc:
+        _log.warning(
+            "code set referrer check skipped: the config does not load (%s)", type(exc).__name__
+        )
+        return None
+
+
+def _load_referent_registry_or_raise(config_dir: str | Path) -> Any:
+    """Load the config graph for a referent pre-flight.
 
     The code-set edit itself is standalone data (validated by re-loading the one file); the referent
-    pre-flight additionally needs the wired graph. Loading executes config modules, so a broken /
-    absent graph must never fail the core code-set operation — swallow and skip.
+    pre-flight additionally needs the wired graph.
 
     ``allow_empty``: this is an AUTHORING surface, like ``connection upsert/remove`` (BACKLOG #1648).
     Swallowing the empty-graph refusal here would be SILENT and wrong, not merely conservative — a
@@ -690,7 +763,4 @@ def _load_referent_registry(config_dir: str | Path) -> Any:
     connection-less arm lost the rewrite."""
     from messagefoundry.config.wiring import load_config
 
-    try:
-        return load_config(config_dir, allow_empty=True)
-    except (WiringError, FileNotFoundError, OSError, ValueError):
-        return None
+    return load_config(config_dir, allow_empty=True)

@@ -598,9 +598,6 @@ def _py_files(*roots: Path) -> list[Path]:
 #: property the docstring's honesty clause actually claims.
 _UNSCANNABLE_RE_PATTERNS = {
     # composed at runtime (each value is `ast.unparse` of the argument, i.e. its source text):
-    "messagefoundry/config/impact.py": (
-        r"""'^(?P<pre>\\s*' + re.escape(key) + '\\s*=\\s*)(?P<lit>(?P<q>[\\"\'])' + re.escape(old) + '(?P=q))'""",
-    ),
     "messagefoundry/logging_setup.py": (
         r"""'(?i)\\b(' + '|'.join(_CREDENTIAL_QUERY_KEYS) + ')=' + _QUERY_VALUE""",
     ),

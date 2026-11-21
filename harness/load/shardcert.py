@@ -30,6 +30,7 @@ import asyncio
 import contextlib
 import enum
 import logging
+import math
 import socket
 import sys
 import time
@@ -136,6 +137,24 @@ def _derive_driver_done_timeout(
     if override is not None:
         return override
     return hold_seconds + drain_timeout + _DRIVER_DONE_MARGIN
+
+
+class DriveShapeError(ValueError):
+    """An offered rate or hold that is not a finite number above 0 (:func:`require_drive_shape`). Its own
+    class so a CLI can report this setup error without also swallowing every other ValueError."""
+
+
+def require_drive_shape(aggregate_rate: float, hold_seconds: float) -> None:
+    """Refuse an offered rate or hold that is not a finite positive number (BACKLOG #5977, S27-64).
+
+    The CLI parses both with ``type=float``, which accepts ``nan``, ``inf``, ``0`` and negatives. An
+    infinite rate removes the pacing, so the drive floods the engine box at whatever rate the sockets
+    take; an infinite or NaN hold makes every timeout derived from it unbounded or NaN; a zero or
+    negative one drives nothing and then reads the empty run as a verdict. Checked at entry, before any
+    coord wait or child spawn, so a bad value is a setup error rather than a stall or a fake rung."""
+    for name, value in (("aggregate_rate", aggregate_rate), ("hold_seconds", hold_seconds)):
+        if not (math.isfinite(value) and value > 0):
+            raise DriveShapeError(f"{name} must be a finite number above 0, got {value!r}")
 
 
 #: B6: slack added on top of the SUM of the coordinator's own step timeouts, to absorb coord-file polling
@@ -3866,6 +3885,7 @@ async def run_shardcert_driver(
 
     The drain poll is https with the remote rig session unless ``allow_insecure``; ``cacert`` is the
     engine box's certificate PEM (see :func:`_remote_engine_poller`)."""
+    require_drive_shape(aggregate_rate, hold_seconds)
     ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     inbound_base = int(ready["inbound_base"])
@@ -4330,6 +4350,7 @@ async def run_shardcert_driver_worker(
     It NEVER binds a sink (the external sink tier owns delivery) and NEVER spawns an engine — the whole
     point is CPU isolation and horizontal sender scale. **Fail loud** if the band slice is empty / the
     worker count exceeds the bands (see :func:`_band_slice`)."""
+    require_drive_shape(aggregate_rate, hold_seconds)
     ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     inbound_base = int(ready["inbound_base"])
@@ -4452,13 +4473,81 @@ async def _spawn_proc(argv: list[str]) -> Any:
     )
 
 
+class ShardCertChildExited(CoordTimeout):
+    """A spawned child exited before posting the coord message the coordinator was waiting on
+    (BACKLOG #5977, S27-65). A :class:`CoordTimeout` on purpose: the message will now never arrive, and
+    every caller already treats that as a broken rendezvous (the ladder aborts the rung, the CLI exits 2),
+    so a crashed child gets the same handling at once instead of after the whole wait."""
+
+
+#: How long a child's exit may precede its coord message being readable before the wait calls it a
+#: crash. ``FileDropCoord.read`` returns None for a file it cannot read yet (a scanner or a share holding
+#: it open), so one None read after a clean post-and-exit must not abort a healthy rung.
+_CHILD_EXIT_GRACE = 2.0
+
+
 async def _await_indexed(
-    coord: FileDropCoord, base_name: str, count: int, *, timeout: float
+    coord: FileDropCoord,
+    base_name: str,
+    count: int,
+    *,
+    timeout: float,
+    children: Sequence[tuple[str, Any]] = (),
+    interval: float = 0.25,
 ) -> list[dict[str, Any]]:
     """Await the per-child-index messages ``base_name.0 .. base_name.<count-1>`` (each posted by one
-    child), returning their payloads in index order. Sequential awaits are fine — the children post
-    around the same time, so the total wait is bounded by the slowest to appear, not their sum."""
-    return [await coord.await_message(f"{base_name}.{i}", timeout=timeout) for i in range(count)]
+    child), returning their payloads in index order. ONE deadline covers the whole step, so the wait is
+    bounded by ``timeout`` however many children there are, as the B6 sink budget assumes.
+
+    ``children[i]``, where given, is the ``(label, proc)`` that posts message ``i``. Every pending index
+    is checked on each poll, so a child that has exited with its message still absent (after
+    :data:`_CHILD_EXIT_GRACE`) raises :class:`ShardCertChildExited` rather than stalling for ``timeout``,
+    whichever index it holds (BACKLOG #5977, S27-65)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    payloads: dict[int, dict[str, Any]] = {}
+    exited_at: dict[int, float] = {}
+    while True:
+        now = loop.time()
+        for i in range(count):
+            if i in payloads:
+                continue
+            label, proc = children[i] if i < len(children) else ("", None)
+            # The exit code is taken BEFORE the read, so a child that posted and then exited is read
+            # as posted, never as crashed.
+            code = getattr(proc, "returncode", None)
+            payload = coord.read(f"{base_name}.{i}")
+            if payload is not None:
+                payloads[i] = payload
+            elif code is not None and now - exited_at.setdefault(i, now) >= _CHILD_EXIT_GRACE:
+                raise ShardCertChildExited(
+                    f"child {label} exited with code {code} before posting coord message "
+                    f"{f'{base_name}.{i}'!r}"
+                )
+        if len(payloads) == count:
+            return [payloads[i] for i in range(count)]
+        # Written as "not before", so a NaN deadline (a NaN timeout) times out at once, as
+        # FileDropCoord.await_message does, rather than waiting forever.
+        if not now < deadline:
+            missing = next(i for i in range(count) if i not in payloads)
+            raise CoordTimeout(
+                f"coord message {f'{base_name}.{missing}'!r} not received within {timeout}s "
+                f"(dir={coord.directory})"
+            )
+        await asyncio.sleep(interval)
+
+
+#: The longest stretch of one child's output tail the raised error carries. The ladder posts the error
+#: text across the coord channel (RUNG_ABORTED), which refuses a message over its byte cap.
+_CHILD_TAIL_CHARS = 400
+
+
+def _tail_end(tail: str) -> str:
+    """``tail`` (``"[label] ..."`` from :func:`_reap_child`) cut to its label and last characters."""
+    if len(tail) <= _CHILD_TAIL_CHARS:
+        return tail
+    label, _, rest = tail.partition(" ")
+    return f"{label} ...{rest[-_CHILD_TAIL_CHARS:]}"
 
 
 async def _reap_child(label: str, proc: Any, *, grace: float) -> str:
@@ -4910,6 +4999,7 @@ async def run_shardcert_drive(
     closes that window. The advisory poll runs beside the gate: once the gate lands it gets
     :data:`_ADVISORY_DRAIN_GRACE` more, then is asked to stop. Bounded + best-effort — a missing signal degrades to
     the advisory-drain fallback (the poll then runs in full) with a note, never a hang."""
+    require_drive_shape(aggregate_rate, hold_seconds)
     ready = await _await_shards_ready(coord, timeout=shards_ready_timeout)
     ids_list = [str(s) for s in ready["shards"]]
     dests = int(ready["dests"])
@@ -4967,7 +5057,10 @@ async def run_shardcert_drive(
 
     coord_dir = str(coord.directory)
     run_id = coord.run_id
-    procs: list[tuple[str, Any]] = []
+    sink_procs: list[tuple[str, Any]] = []
+    worker_procs: list[tuple[str, Any]] = []
+    coord_failure: CoordTimeout | None = None
+    child_tails: list[str] = []
     notes: list[str] = []
     poller: EnginePoller | None = None
     advisory_drain: asyncio.Task[float | None] | None = None
@@ -5033,8 +5126,10 @@ async def run_shardcert_drive(
                     run_id,
                 ]
             )
-            procs.append((f"sink-{m}", proc))
-        await _await_indexed(coord, SINK_BOUND, sink_count, timeout=child_ready_timeout)
+            sink_procs.append((f"sink-{m}", proc))
+        await _await_indexed(
+            coord, SINK_BOUND, sink_count, timeout=child_ready_timeout, children=sink_procs
+        )
 
         # (2) Spawn the K sender-worker children over CONTIGUOUS band slices; await each DRIVER_ARMED.<j>.
         for j in range(driver_count):
@@ -5057,8 +5152,10 @@ async def run_shardcert_drive(
                     run_id,
                 ]
             )
-            procs.append((f"worker-{j}", proc))
-        await _await_indexed(coord, DRIVER_ARMED, driver_count, timeout=child_ready_timeout)
+            worker_procs.append((f"worker-{j}", proc))
+        await _await_indexed(
+            coord, DRIVER_ARMED, driver_count, timeout=child_ready_timeout, children=worker_procs
+        )
 
         # (3) Release: DRIVE_START keeps the ENGINE half's handshake unchanged (its kill anchor; no kill
         #     here); DRIVE_GO releases the armed sender-workers into their hold in lockstep.
@@ -5074,7 +5171,7 @@ async def run_shardcert_drive(
             hold_seconds, drain_timeout, driver_done_timeout
         )
         driver_dones = await _await_indexed(
-            coord, DRIVER_DONE, driver_count, timeout=driver_done_wait
+            coord, DRIVER_DONE, driver_count, timeout=driver_done_wait, children=worker_procs
         )
         # The poller was opened, and signed in, at step (0); without it the advisory terms stay unread.
         # Without the gate the poll is the barrier, awaited here in full. With the gate armed it is
@@ -5156,7 +5253,14 @@ async def run_shardcert_drive(
 
         # (5) Signal drained → every sink records its final tally and posts SINK_DONE.<m>.
         coord.post(DRIVE_COMPLETE, {"t": time.time()})
-        sink_dones = await _await_indexed(coord, SINK_DONE, sink_count, timeout=sink_done_timeout)
+        sink_dones = await _await_indexed(
+            coord, SINK_DONE, sink_count, timeout=sink_done_timeout, children=sink_procs
+        )
+    except CoordTimeout as exc:
+        # Held until the children are reaped below, so the raised error can carry their output tails:
+        # a crashed child's traceback is otherwise only a local note, lost when this unwinds
+        # (BACKLOG #5977, S27-65).
+        coord_failure = exc
     finally:
         if advisory_drain is not None and not advisory_drain.done():
             # An early failure (or a cancel) leaves the poll running: stop it and let it finish before
@@ -5171,12 +5275,22 @@ async def run_shardcert_drive(
         # Reap CONCURRENTLY so an early failure (e.g. a coord timeout while M+K children are still
         # live, some blocked on DRIVE_COMPLETE) tears the whole tier down in ~one reap_grace, not
         # (M+K)*reap_grace — no lingering child processes on the load-gen box between ladder steps.
+        procs = sink_procs + worker_procs
         if procs:
-            notes.extend(
-                await asyncio.gather(
-                    *(_reap_child(label, proc, grace=reap_grace) for label, proc in procs)
-                )
+            child_tails = await asyncio.gather(
+                *(_reap_child(label, proc, grace=reap_grace) for label, proc in procs)
             )
+            notes.extend(child_tails)
+    if coord_failure is not None:
+        # The LAST characters of each tail: the exception line is at its end. The label stays in front.
+        tails = "; ".join(escape_for_terminal(_tail_end(t), single_line=True) for t in child_tails)
+        # Rebuilt as its own class (every CoordTimeout here takes one message), so a caller that tells
+        # the subclasses apart, as the ladder does for EngineSetupFailed, still can.
+        enriched = type(coord_failure)(f"{coord_failure}; child output: {tails or '(none)'}")
+        # What crosses the box boundary (the ladder's RUNG_ABORTED detail) is the rendezvous message
+        # alone: the coord channel carries metadata only, and a child's output is not that.
+        enriched.coord_detail = str(coord_failure)  # type: ignore[attr-defined]
+        raise enriched from coord_failure
 
     # (6) Aggregate the children's coord DONE files (the authority) + the engine's REMOTE drain gauge.
     a = sum(int(d["acked"]) for d in driver_dones)

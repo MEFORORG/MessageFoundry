@@ -1553,7 +1553,11 @@ def _run_shardcert_driver(argv: list[str]) -> int:
     from pathlib import Path
 
     from harness.load.coord import CoordTimeout, FileDropCoord
-    from harness.load.shardcert import RemoteEngineSignInError, run_shardcert_driver
+    from harness.load.shardcert import (
+        DriveShapeError,
+        RemoteEngineSignInError,
+        run_shardcert_driver,
+    )
     from messagefoundry.apiclient import ApiError
 
     coord = _coord_from_args(args)
@@ -1581,6 +1585,11 @@ def _run_shardcert_driver(argv: list[str]) -> int:
             f"shardcert-driver: {_exc_text(exc)}\n{_INSECURE_HINT}",
             file=sys.stderr,
         )
+        return 2
+    except (
+        DriveShapeError
+    ) as exc:  # a rate or hold that is not a finite number above 0 — setup error
+        print(f"shardcert-driver: {exc}", file=sys.stderr)
         return 2
     except CoordTimeout as exc:
         print(f"shardcert-driver: {exc}", file=sys.stderr)
@@ -2127,8 +2136,9 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
         type=float,
         default=300.0,
         help="soak hold in seconds (default 300s = 5 min; OMITTING THIS STILL RUNS A 300s SOAK — it is "
-        "not 'off'). To DISABLE the soak use --no-soak; --soak-hold-seconds 0 is NOT a skip (it runs a "
-        "degenerate 0s soak). The soak also self-skips when no climb rung sustained (nothing to soak).",
+        "not 'off'). To DISABLE the soak use --no-soak; --soak-hold-seconds 0 is NOT a skip (it is "
+        "refused, with any value that is not a finite number above 0). The soak also self-skips when no "
+        "climb rung sustained (nothing to soak).",
     )
     parser.add_argument(
         "--soak-drain-timeout",

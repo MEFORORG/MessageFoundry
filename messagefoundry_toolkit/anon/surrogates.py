@@ -750,7 +750,9 @@ def read_message_seps(text: str) -> tuple[Seps, str] | None:
     """The ``(component/repetition/escape/subcomponent, field)`` separators of an HL7 message, read
     from its own MSH-1/MSH-2 (never hardcoded). Returns ``None`` when there is no MSH carrying the
     **full four** encoding characters — a degenerate/absent MSH-2 — so BOTH adapters fail closed
-    identically (the engine's ``Message`` itself raises when MSH-2 has fewer than four chars).
+    identically. The engine's ``Message`` no longer raises there: it reads a short MSH-2 under the
+    defaults the parser fills, and a BHS- or FHS-led message under that header's delimiters
+    (BACKLOG #5972), so this stricter read can differ from the engine's on such a capture.
     Also ``None`` when that header repeats one of the four (:func:`repeats_encoding_characters`):
     it cannot say which structure a character marks, so the surrogate rewriters and the leak check
     would split fields at the wrong places. The anonymizer refuses such a message, and the

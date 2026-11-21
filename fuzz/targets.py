@@ -75,11 +75,12 @@ from messagefoundry.parsing import HL7PeekError, Peek, TreeNode, parse_tree
 from messagefoundry.parsing.binary import MARKER as CARRIAGE_MARKER
 from messagefoundry.parsing.binary import (
     BinaryCarriageError,
+    CollidingDelimitersRefused,
     DocRefError,
     EscapedDocumentError,
     InboundDocRefError,
     NonVerbatimDocumentError,
-    UnreadableDelimitersError,
+    _obx_is_ed,
     extract_obx_document,
     is_doc_ref,
     iter_obx_documents,
@@ -253,15 +254,21 @@ class KnownFinding:
 #: were fixed under BACKLOG #2873, and their entries and the carve-out in :func:`_binary_carriage`
 #: came out with them. Both were a bare ``ValueError`` ('cannot determine HL7 separators') out of
 #: ``extract_obx_document``, on an MSH-led body whose MSH-2 carries fewer than four encoding
-#: characters and on an FHS- or BHS-led body with no MSH; it now refuses both as
-#: ``UnreadableDelimitersError``, which is not a ``BinaryCarriageError``. What each body still
-#: meets at the listener is in ``fuzz/README.md``,
-#: *Known findings*. Both reproducers stay on as ``binary_carriage`` seeds, and
+#: characters and on an FHS- or BHS-led body with no MSH. BACKLOG #5972 then made
+#: ``Message._encoding_chars`` read the delimiters the parser recorded, so both bodies now read
+#: under them and neither is refused. What each body meets at the listener is in
+#: ``fuzz/README.md``, *Known findings*. Both reproducers stay on as ``binary_carriage`` seeds, and
 #: ``tests/test_fuzz_targets.py`` drives them, so the fix cannot quietly regress.
 SHORT_MSH2_REPRODUCER = (
     b"MSH|^~|A|B|C|D|20260101||ORU^R01|X1|P|2.5\rOBX|1|ED|X||^Application^pdf^Base64^JVBERi0=\r"
 )
 BATCH_HEADER_REPRODUCER = b"FHS|^~\\&|A|B\rOBX|1|ED|X||^Application^pdf^Base64^JVBERi0=\r"
+
+#: An ED document under ``MSH|^~&|``: ``&`` is declared the escape character and filled in as the
+#: subcomponent separator, so the header's filled default collides while its OBX-5 components
+#: still read. The extract refuses it as ``CollidingDelimitersRefused``, the target's expected
+#: rejection on such a header (BACKLOG #5972), so it is a seed rather than a finding.
+COLLIDING_HEADER_SEED = SHORT_MSH2_REPRODUCER.replace(b"MSH|^~|", b"MSH|^~&|", 1)
 
 KNOWN_FINDINGS: tuple[KnownFinding, ...] = ()
 
@@ -616,18 +623,22 @@ def _binary_carriage(data: bytes) -> None:
 
     * ``decode`` of a carriage string built from them -- ``BinaryCarriageError`` is its refusal;
     * ``parse_doc_ref`` when the text claims to be a handle -- ``DocRefError`` is its refusal;
-    * ``strip_documents``, bare and as a carriage value, with **no** exception allowed at all. The
-      retention pass in each store backend calls it on every stored body with no ``try``, so a raise
-      here would abort the whole pass, not just skip one row. Its docstring promises that a body it
-      does not strip comes back unchanged;
+    * ``strip_documents``, bare and as a carriage value, with **no** exception allowed at all. Its
+      docstring promises that a body it does not strip comes back unchanged. The retention pass
+      (``transform_strip_batch``) catches a raise and skips the row, logging only the error's
+      type, so a raise there would leave that row's document past its window with no stated
+      cause;
     * after ``Message.parse`` (``HL7PeekError`` is its refusal), ``iter_obx_documents`` -- the ingress
       document-detach scan, whose refusals are ``EscapedDocumentError``, for a handle a sender
       wrote into ``OBX-5.5`` ``InboundDocRefError``, for a value the splice would not set back
-      verbatim ``NonVerbatimDocumentError``, and for a body with an OBX and no MSH, or an MSH-2
-      shorter than four characters, ``UnreadableDelimitersError`` (BACKLOG #5099) -- and
-      ``extract_obx_document`` on every OBX, whose refusals are ``BinaryCarriageError`` for an OBX
-      that is not a Base64 ED document and, for a body whose delimiters cannot be read,
-      ``UnreadableDelimitersError`` (BACKLOG #2873), which is not a ``BinaryCarriageError``.
+      verbatim ``NonVerbatimDocumentError`` (BACKLOG #5099) -- and ``extract_obx_document`` on
+      every OBX, whose refusals are ``BinaryCarriageError`` for an OBX that is not a Base64 ED
+      document and, for an ED OBX under a short MSH-2 whose filled default is already another of
+      its delimiters, ``CollidingDelimitersRefused`` (BACKLOG #5972), which is not a
+      ``BinaryCarriageError`` and is accepted only on such a header. The detach scan's refusal of
+      such a header, ``CollidingDelimitersError``, is a ``NonVerbatimDocumentError``. A body the
+      parser accepts always has readable delimiters, so any other ``ValueError`` out of either is
+      a defect, not a refusal.
 
     There is no carve-out.
     """
@@ -637,10 +648,13 @@ def _binary_carriage(data: bytes) -> None:
     if is_doc_ref(text):
         with contextlib.suppress(DocRefError):
             parse_doc_ref(text)
-    # The retention pass calls strip_documents bare, so no raise is allowed; it returns a body
-    # whose separators cannot be read unchanged (BACKLOG #5099).
+    # strip_documents' contract is that a body it does not strip comes back unchanged, so no
+    # raise is allowed (the retention pass would only skip the row and log its error type). The
+    # pass passes on_unwritable, which opens a branch of its own (BACKLOG #5972), so the body is
+    # stripped both with it and with the default every other caller gets.
     strip_documents(CARRIAGE_MARKER + text, pruned_at=0.0)
     strip_documents(text, pruned_at=0.0)
+    strip_documents(text, pruned_at=0.0, on_unwritable=_ignore)
     _strip_and_scan_hl7(text)
 
 
@@ -650,33 +664,44 @@ def _strip_and_scan_hl7(text: str) -> None:
         message = Message.parse(text)
     except HL7PeekError:
         return
+    # The header-collision refusals are the header's, so each must come from a header whose
+    # filled default collides, and such a header must not yield a document read under it (BACKLOG
+    # #5972). The oracle is the engine's own verdict, so it catches a guard that over-refuses or
+    # under-refuses, but not a regression in that verdict itself.
+    colliding = message._delimiters_collide()
     try:
-        list(iter_obx_documents(message, received=text))
-    except UnreadableDelimitersError:
-        _require_unreadable(message, "iter_obx_documents")
+        detached = list(iter_obx_documents(message, received=text))
+    except CollidingDelimitersRefused:  # the detach's CollidingDelimitersError is one
+        _require_colliding(colliding, "iter_obx_documents")
     except (EscapedDocumentError, InboundDocRefError, NonVerbatimDocumentError):
         pass
+    else:
+        if colliding and detached:
+            raise AssertionError("iter_obx_documents yielded a document under colliding delimiters")
     for occurrence in range(1, message.count_segments("OBX") + 1):
-        # UnreadableDelimitersError first, so the check still runs were it ever made a subclass.
         try:
             extract_obx_document(message, occurrence=occurrence)
-        except UnreadableDelimitersError:
-            _require_unreadable(message, "extract_obx_document")
-            break  # the header is the cause, so every later OBX is refused the same way
+        except CollidingDelimitersRefused:
+            _require_colliding(colliding, "extract_obx_document")
+            continue
         except BinaryCarriageError:
-            pass
+            # An OBX that is not ED is refused so in any message; an ED one under a colliding
+            # header must meet the header's refusal instead, never this skippable one.
+            if not (colliding and _obx_is_ed(message, occurrence)):
+                continue
+        if colliding:
+            raise AssertionError("extract_obx_document read a document under colliding delimiters")
 
 
-def _require_unreadable(message: Message, refuser: str) -> None:
-    """An ``UnreadableDelimitersError`` is the header's refusal, so the header must be one the
-    engine cannot read; a refusal of a readable body is a defect, not a refusal (BACKLOG #2873).
-    The oracle is ``Message._encoding_chars``, the engine's own read, so it catches a guard that
-    over-refuses but not a regression in that read itself."""
-    try:
-        message._encoding_chars()
-    except ValueError:
-        return
-    raise AssertionError(f"{refuser} refused readable delimiters as unreadable")
+def _ignore() -> None:
+    """An ``on_unwritable`` that records nothing: the target needs the branch run, not the call."""
+
+
+def _require_colliding(colliding: bool, refuser: str) -> None:
+    """A header-collision refusal of a header whose delimiters do not collide is a defect, not a
+    refusal (BACKLOG #5972)."""
+    if not colliding:
+        raise AssertionError(f"{refuser} refused a header whose delimiters do not collide")
 
 
 @dataclass(frozen=True)
@@ -751,13 +776,15 @@ _COMPRESSION_SEEDS = (
 
 #: Binary-carriage seeds: an HL7 message with one OBX-5 ED Base64 document (a PDF header, synthetic),
 #: a bare base64 value, a live document handle with a 64-hex content address, and the two retired
-#: findings' reproducers (:data:`SHORT_MSH2_REPRODUCER`, :data:`BATCH_HEADER_REPRODUCER`).
+#: findings' reproducers (:data:`SHORT_MSH2_REPRODUCER`, :data:`BATCH_HEADER_REPRODUCER`), and a
+#: colliding header's document (:data:`COLLIDING_HEADER_SEED`).
 _BINARY_SEEDS = (
     _MINIMAL_HL7 + b"OBX|1|ED|DOC^Document||^Application^pdf^Base64^JVBERi0xLjQKJQ==\r",
     b"JVBERi0xLjQKJQ==",
     b"mfdoc:v1:ref:" + b"0" * 64 + b":application/pdf",
     SHORT_MSH2_REPRODUCER,
     BATCH_HEADER_REPRODUCER,
+    COLLIDING_HEADER_SEED,
 )
 
 

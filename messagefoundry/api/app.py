@@ -10322,7 +10322,9 @@ def create_app(
         for name in reg.handlers:
             nodes[("handler", name)] = GraphNode(name=name, kind="handler", status=None)
 
-        edges = list(graph.edges)
+        # The data-flow graph: a reply_from names an outbound but sends it nothing, so drawing it
+        # would put a forward line against the reply's own flow (BACKLOG #5966).
+        edges = [e for e in graph.edges if e.carries_data]
 
         # Per-channel RBAC (#76 review — SECURITY): a channel-scoped caller must NOT see shared-outbound
         # topology or its live status — an outbound spans channels, so its running/failed/filtered state

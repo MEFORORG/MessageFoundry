@@ -95,6 +95,7 @@ from harness.load.shardcert import (
     ShardCertEngineReport,
     fidelity_note,
     inbound_band_count,
+    require_drive_shape,
     run_shardcert_drive,
     run_shardcert_engine,
     rung_fidelity,
@@ -3739,7 +3740,7 @@ async def run_drive_ladder(
     allow_insecure: bool = False,
     cacert: str | None = None,
     # NB: the DEFAULT is a real 300s soak — the "off" switch is ``do_soak=False`` (CLI ``--no-soak``), NOT a
-    # dropped/zero ``soak_hold_seconds`` (0 arms a degenerate 0s soak, it does not skip).
+    # dropped/zero ``soak_hold_seconds`` (0 does not skip: run_drive_ladder refuses it, BACKLOG #5977).
     soak_hold_seconds: float = 300.0,
     soak_drain_timeout: float = 300.0,
     soak_rate_override: float | None = None,
@@ -3757,6 +3758,15 @@ async def run_drive_ladder(
     engine's SHARDS_READY (via :attr:`ShardCertDriveReport`), so the shape has ONE source of truth across the
     box boundary. A shape flag on both CLIs would be a two-place constant that drifts invisibly — and the
     drift would surface as a fabricated ceiling, not an error."""
+    # Every rate and hold the drive will be handed, refused HERE rather than at the rung that reaches
+    # run_shardcert_drive: a soak value that only fails after the climb would discard a finished climb's
+    # report and leave the engine half waiting on its armed soak (BACKLOG #5977, S27-64).
+    for rate in rates:
+        require_drive_shape(rate, hold_seconds)
+    if do_soak:
+        require_drive_shape(
+            soak_rate_override if soak_rate_override is not None else 1.0, soak_hold_seconds
+        )
     climb = plan_climb_rungs(rates, hold_seconds=hold_seconds, drain_timeout=drain_timeout)
     # Clear cross-rung signals so a re-run under the same base run_id doesn't read a stale STOP/SOAK.
     base_coord.clear_messages(LADDER_STOP, LADDER_SOAK)
@@ -3829,7 +3839,10 @@ async def run_drive_ladder(
             # B3: also tell the ENGINE on the RUNG coord that THIS rung aborted, so its in-flight drain —
             # failing only because we reaped its sinks — marks the rung's store-truth INVALID rather than
             # posting a fabricated collapse. LADDER_STOP is polled only BETWEEN rungs; this is per-rung.
-            rung_coord.post(RUNG_ABORTED, {"reason": "drive_aborted", "detail": str(exc)})
+            rung_coord.post(
+                RUNG_ABORTED,
+                {"reason": "drive_aborted", "detail": getattr(exc, "coord_detail", str(exc))},
+            )
             notes.append(
                 f"{rung.run_suffix}: drive aborted ({escape_for_terminal(str(exc), single_line=True)}) — posted LADDER_STOP + RUNG_ABORTED, setup-abort"
             )
@@ -3948,7 +3961,10 @@ async def run_drive_ladder(
             # soak drain failure — from our reaped sinks — marks the soak store-truth INVALID, not a collapse
             # (B3).
             soak_aborted = True
-            soak_coord.post(RUNG_ABORTED, {"reason": "soak_drive_aborted", "detail": str(exc)})
+            soak_coord.post(
+                RUNG_ABORTED,
+                {"reason": "soak_drive_aborted", "detail": getattr(exc, "coord_detail", str(exc))},
+            )
             notes.append(
                 f"soak: drive aborted ({escape_for_terminal(str(exc), single_line=True)}) — soak ABORTED (setup-degraded, not a bench result)"
             )

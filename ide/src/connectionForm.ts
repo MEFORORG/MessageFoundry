@@ -292,6 +292,11 @@ export function buildForm(
  *   a boolean -- so a value the record did not carry AND that equals the schema default is omitted
  *   too (see the guard below). Without that, every save wrote an explicit `encrypt = true` for each
  *   default-true bool, which is exactly the bloat (and the upgrade-unsafety) invariant 2 forbids.
+ *   A box with NO schema default (null/undefined) draws unticked for "never set", so its unset
+ *   position is false: an unticked one the record did not carry is omitted too (BACKLOG #5976),
+ *   unless it is required. The webview's collectSettings applies the rule inline, and judges "the
+ *   record carried it" against the record itself rather than the descriptor's value, so a value a
+ *   transport or direction rebuild carried does not count; this function sees only the descriptor.
  * - number: `Number(text)`; text that is not a number is returned VERBATIM so the engine's validator
  *   rejects what the user actually typed instead of this function silently discarding it.
  * - select: the matching entry from `choices`, preserving its JSON type (a Literal may be an int).
@@ -318,13 +323,17 @@ export function coerce(
   // without this guard every save wrote an explicit `encrypt = true` for each default-true flag,
   // the bloat (and upgrade-unsafety) invariant 2 forbids. Not applied when the record already
   // carried the key: a value the user authored stays explicit even if it equals the default.
+  // A box with no schema default is drawn unticked, so false is its unset position.
+  const unset =
+    descriptor.defaultValue === undefined || descriptor.defaultValue === null
+      ? false
+      : descriptor.defaultValue;
   if (
     descriptor.control === "checkbox" &&
     descriptor.value === undefined &&
     !descriptor.isEnvRef &&
-    descriptor.defaultValue !== undefined &&
-    descriptor.defaultValue !== null &&
-    raw === descriptor.defaultValue
+    !descriptor.required &&
+    raw === unset
   ) {
     return undefined;
   }
