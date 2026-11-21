@@ -101,7 +101,10 @@ OUTAGE_MIN_ROWS = 3
 #: How many failed batch writes in a row the call reads as a store-wide write fault (a full disk, a
 #: read-only store), ending early (BACKLOG #5651). Without it such a fault re-sealed every candidate
 #: on every pass, each seal counting toward the AES-GCM invocation ceiling, and logged one ERROR per
-#: batch. A write that lands resets the count, so fewer failing batches in a row than this, two at
+#: batch. The call ends when it reads a batch past that many failures, so a scan whose last batches
+#: all failed still reached its end and is not reported as ended early. A write that returns has
+#: committed, so it resets the count, even when what it returns is malformed and the batch is passed
+#: over uncounted. So fewer failing batches in a row than this, two at
 #: the head of the keyset say, cannot stop the rows after them. The trade-off is accepted: this many
 #: failing in a row at the head of the keyset stop every pass at the same place while the fault
 #: lasts, as a failed batch read does. That is a long lock on the oldest rows, say, and also a fault
@@ -234,6 +237,7 @@ async def run_strip_pass(
     reported = False
     ended_early = read_failed = write_failed = False
     failed_writes_in_a_row = 0
+    last_write_error: type[BaseException] | None = None
     try:
         while True:
             limit = STRIP_BATCH_ROWS
@@ -250,6 +254,19 @@ async def run_strip_pass(
                 log.debug("document strip batch read failure", exc_info=True)
                 break
             if not rows:
+                break
+            if failed_writes_in_a_row >= WRITE_FAULT_MAX_BATCHES:
+                # A store-wide write fault, which this batch would meet too: end the call rather
+                # than re-seal the rest of the store for nothing. Judged here, once a batch past
+                # the failures is known to exist, so a scan whose last batches all failed is not
+                # reported as ended early (BACKLOG #5651). This batch is read but not transformed.
+                ended_early = True
+                _log_early_end(
+                    f"{failed_writes_in_a_row} batch writes in a row failed",
+                    last_write_error,
+                    documents,
+                    messages,
+                )
                 break
             after = (rows[-1]["received_at"], rows[-1]["id"])
             # Filled as the transform finds them, so a batch whose transform then raises still has
@@ -310,19 +327,11 @@ async def run_strip_pass(
                             type(exc).__name__,
                         )
                         log.debug("document strip batch write failure", exc_info=True)
-                        if failed_writes_in_a_row >= WRITE_FAULT_MAX_BATCHES and len(rows) == limit:
-                            # A store-wide write fault, which every later batch would meet too:
-                            # end the call rather than re-seal the rest of the store for nothing.
-                            # Not on a short batch: that was the last, so the scan reached its end.
-                            ended_early = True
-                            _log_early_end(
-                                f"{failed_writes_in_a_row} batch writes in a row failed",
-                                exc,
-                                documents,
-                                messages,
-                            )
-                            break
+                        last_write_error = type(exc)
                     else:
+                        # The write returned, so its transaction committed: it landed, and resets
+                        # the breaker even when what it returned is malformed below.
+                        failed_writes_in_a_row = 0
                         try:
                             # Totalled first, so a malformed return adds nothing.
                             landed_counts = [(d.documents, d.reclaimed) for d in landed]
@@ -336,9 +345,6 @@ async def run_strip_pass(
                             )
                             log.debug("document strip batch failure", exc_info=True)
                         else:
-                            # Only a write that landed resets the breaker; a malformed return,
-                            # passed over above, neither resets nor counts toward it.
-                            failed_writes_in_a_row = 0
                             for n_docs, n_bytes in landed_counts:
                                 messages += 1
                                 documents += n_docs
@@ -381,12 +387,23 @@ async def run_strip_pass(
     )
 
 
-def _log_early_end(why: str, exc: BaseException | None, documents: int, messages: int) -> None:
+def _log_early_end(
+    why: str,
+    exc: BaseException | type[BaseException] | None,
+    documents: int,
+    messages: int,
+) -> None:
+    # A class is accepted so a caller can name an error it did not keep (its traceback holds the
+    # frames of the batch that raised it, bodies included).
+    if isinstance(exc, type):
+        name = exc.__name__
+    else:
+        name = type(exc).__name__ if exc is not None else "no error raised"
     log.warning(
         "document strip ended early: %s (%s); it had stripped and committed %d documents in %d "
         "messages before it",
         why,
-        type(exc).__name__ if exc is not None else "no error raised",
+        name,
         documents,
         messages,
     )

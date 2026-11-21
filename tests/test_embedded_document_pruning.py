@@ -1538,3 +1538,44 @@ async def test_the_breaker_does_not_trip_on_the_last_batch(monkeypatch: pytest.M
 
     assert writes == [2, 2, 1]
     assert result == StripResult(write_failed=True)
+
+
+async def test_the_breaker_does_not_trip_on_a_full_last_batch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a third failed write on a FULL last batch, at a candidate count that is an exact
+    multiple of the batch size, reports an early end the scan did not have (BACKLOG #5651)."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 2)
+    writes: list[int] = []
+
+    async def read_only(updates: Any) -> list[Any]:
+        writes.append(len(updates))
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    result = await _run_pass(_keyset_fetch(_plain_rows(6)), read_only, _no_report)
+
+    assert writes == [2, 2, 2]
+    assert result == StripResult(write_failed=True)
+
+
+async def test_a_committed_write_with_a_malformed_return_resets_the_breaker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RED when: a write that returned, so committed, but returned something malformed leaves the
+    failure count standing, so fail, fail, malformed, fail ends the call though a write landed in
+    between (BACKLOG #5651)."""
+    monkeypatch.setattr(document_strip, "STRIP_BATCH_ROWS", 1)
+    outcomes = ["fail", "fail", "malformed", "fail", "ok", "ok"]
+    writes: list[str] = []
+
+    async def mixed(updates: Any) -> Any:
+        outcome = outcomes[len(writes)]
+        writes.append(outcome)
+        if outcome == "fail":
+            raise sqlite3.OperationalError("lock timeout on this row")
+        return None if outcome == "malformed" else list(updates)
+
+    result = await _run_pass(_keyset_fetch(_plain_rows(6)), mixed, _no_report)
+
+    assert writes == outcomes
+    assert (result.ended_early, result.write_failed, result.messages_stripped) == (False, True, 2)

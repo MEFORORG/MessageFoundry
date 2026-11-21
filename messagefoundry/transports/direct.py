@@ -342,19 +342,22 @@ def _same_name_and_key(a: x509.Certificate, b: x509.Certificate) -> bool:
 #: (BACKLOG #5631). A partner's CA stamps notBefore from its own clock, so a certificate issued
 #: moments ago would otherwise read as not yet valid on a host whose clock is a little behind. Only
 #: notBefore takes it: an allowance on notAfter would extend trust in a certificate past its expiry.
-#: The signing cert takes it too, for the same reason. Its partner verifies it on the partner's own
-#: clock, so a partner whose clock lags the CA's as this host's does can still refuse a signature
-#: made in those minutes. Without it, a host a little behind the CA stops the lane on a freshly
-#: renewed signing cert, and the lane stays stopped until an operator starts it again.
+#: The signing cert takes none (Manager decision, batch 224, the stricter reading): its partner
+#: verifies it on the partner's own clock, so an allowance here could let out a signature the
+#: partner then refuses. The cost is that a host a little behind the CA stops the lane on a freshly
+#: renewed signing cert until notBefore passes and an operator starts the lane again.
 _NOT_BEFORE_SKEW = datetime.timedelta(minutes=5)
 
 
 def _window_problem(
-    cert: x509.Certificate, setting: str, now: datetime.datetime
+    cert: x509.Certificate,
+    setting: str,
+    now: datetime.datetime,
+    skew: datetime.timedelta = _NOT_BEFORE_SKEW,
 ) -> _WindowProblem | None:
-    """Why ``cert`` is outside its validity window at ``now``, or None. A notBefore up to
-    :data:`_NOT_BEFORE_SKEW` ahead of ``now`` is allowed."""
-    if now + _NOT_BEFORE_SKEW < cert.not_valid_before_utc:
+    """Why ``cert`` is outside its validity window at ``now``, or None. A notBefore up to ``skew``
+    ahead of ``now`` is allowed."""
+    if now + skew < cert.not_valid_before_utc:
         return _WindowProblem(setting, expired=False)
     if now > cert.not_valid_after_utc:
         return _WindowProblem(setting, expired=True)
@@ -393,7 +396,7 @@ def _validity_refusal(
         for p in (
             _window_problem(recipient, "recipient_cert", now),
             anchor_problem,
-            _window_problem(signer, "signing_cert", now),
+            _window_problem(signer, "signing_cert", now, skew=datetime.timedelta(0)),
         )
         if p
     ]
@@ -466,13 +469,20 @@ def _anchor_ca_problem(anchor: x509.Certificate) -> str | None:
     """Why the issuing ``anchor`` may not issue certificates, or None. A self-signed recipient
     pinned as its own anchor never reaches this: it issues nothing else.
 
-    An X.509 version 1 anchor that carries no extensions passes (BACKLOG #5631). RFC 5280 defines
-    extensions for version 3 only, so such a root has no way to assert basicConstraints, and RFC
-    5280 takes a trust anchor as an input to path validation rather than a certificate whose
-    extensions are checked (its section 6.1.1). A version 1 cert that carries extensions anyway,
-    which ``cryptography`` parses, is checked as a version 3 one is, so one asserting CA=false is
-    still refused."""
-    if anchor.version == x509.Version.v1 and _carries_no_extensions(anchor):
+    A self-issued (subject equal to issuer) X.509 version 1 root that carries no extensions passes
+    (BACKLOG #5631). RFC 5280 defines extensions for version 3 only, so such a root has no way to
+    assert basicConstraints, and RFC 5280 takes a trust anchor as an input to path validation
+    rather than a certificate whose extensions are checked (its section 6.1.1). Any other version
+    1 cert is checked as a version 3 one is: one some other party issued, an end-entity cert say,
+    or one that carries extensions anyway, which ``cryptography`` parses, so one asserting CA=false
+    is still refused. ``pki._strict_ca_faults`` reads a bare version 1 cert the same way and, for
+    its own strict verification, reports such a CA as a fault; Direct's one-level issuance check
+    accepts the root."""
+    if (
+        anchor.version == x509.Version.v1
+        and anchor.subject == anchor.issuer
+        and _carries_no_extensions(anchor)
+    ):
         return None
     constraints = _extension(anchor, x509.BasicConstraints, "trust_anchor")
     if constraints is None or not constraints.ca:

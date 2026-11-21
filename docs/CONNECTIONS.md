@@ -3304,10 +3304,10 @@ multi-level path building is deferred. On top of issuance, construction refuses 
 
 - a `recipient_cert` whose every issuing `trust_anchor` is **not a CA** (no `basicConstraints` asserting
   `CA=true`, or a `keyUsage` that does not assert `keyCertSign`) or has extensions that cannot be read.
-  An X.509 **version 1** anchor that carries no extensions is exempt: RFC 5280 defines extensions for
-  version 3 only, so such a root has no way to assert `basicConstraints`, and RFC 5280 takes a trust
-  anchor as an input to path validation. A version 1 cert that carries extensions anyway is checked as
-  a version 3 one is. An
+  A self-issued X.509 **version 1** root (subject equal to issuer) that carries no extensions is exempt:
+  RFC 5280 defines extensions for version 3 only, so such a root has no way to assert `basicConstraints`,
+  and RFC 5280 takes a trust anchor as an input to path validation. Any other version 1 cert, one another
+  party issued or one that carries extensions anyway, is checked as a version 3 one is. An
   issuing anchor that fails this is skipped, and the recipient is accepted when another issuing anchor in
   the file passes. A **pinned** correspondent is exempt: an anchor with the same subject and the same public
   key as the `recipient_cert` (the same cert, or an older copy of a renewed one), because it issues nothing
@@ -3333,11 +3333,12 @@ a `subjectAltName` value, any of which can identify a patient's provider.
 anything is built or dialled, when the `recipient_cert` or the `signing_cert` is outside its window, or when
 every issuing `trust_anchor` is. A partner's verifier refuses a signature made under an out-of-window
 `signing_cert`, after the relay has accepted the message. A bundle may hold an older copy of a CA beside its
-renewal under the same name and key, and any one of them inside its window will do. A `notBefore` up to five
-minutes ahead of this host's clock still counts as valid, so a certificate a CA issued moments ago is not
-refused for a small clock difference. That holds for the `signing_cert` too, though its partner verifies it on
-the partner's own clock: a partner as far behind the CA can still refuse a signature made in those minutes.
-No allowance is given past `notAfter`.
+renewal under the same name and key, and any one of them inside its window will do. For the `recipient_cert`
+and the anchors, a `notBefore` up to five minutes ahead of this host's clock still counts as valid, so a
+certificate a CA issued moments ago is not refused for a small clock difference. The `signing_cert` gets no
+such allowance, because its partner verifies it on the partner's own clock: a freshly renewed signing cert on
+a host a little behind the CA stops the lane until `notBefore` passes and the lane is started again. No
+allowance is given past `notAfter`.
 
 Either bound is a permanent `NegativeAckError` marked as a configuration fault, with code
 `direct-cert-validity:<setting>:expired` or `direct-cert-validity:<setting>:not-yet-valid`, `<setting>` being

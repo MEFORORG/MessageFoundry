@@ -230,19 +230,62 @@ async def test_every_search_route_is_covered(engine: Engine) -> None:
     assert mounted == covered, mounted ^ covered
 
 
+_ID = "0123456789abcdef" * 2  # the shape of a preset id: 32 lower-case hex digits
+
+
+def _layered_query(n: int, preset: str = _ID) -> str:
+    return SEARCH + "/layered?" + "&".join([f"presets={preset}"] * n)
+
+
 @pytest.mark.parametrize(
     ("target", "admitted"),
     [
         (SEARCH + "/layered", True),
-        (SEARCH + "/layered?presets=a", True),
-        (SEARCH + "/layered?presets=a&presets=b", True),
-        (SEARCH + "/layered?presets=a&other=1", False),
+        (_layered_query(1), True),
+        (_layered_query(8), True),
+        (_layered_query(9), False),
+        (_layered_query(1, "not-an-id"), False),
+        (_layered_query(1) + "&other=1", False),
         (SEARCH + "/layered?other=1", False),
     ],
+    ids=["bare", "one", "eight", "nine", "not-an-id", "extra-parameter", "other-only"],
 )
-def test_the_layered_continuation_admits_only_presets(target: str, admitted: bool) -> None:
-    """The layered unlock pattern takes the run's ``presets`` query and nothing else (BACKLOG
-    #5646), so a continuation carrying any other parameter is not one /ui/reauth will follow."""
+def test_the_layered_continuation_admits_only_bounded_presets(target: str, admitted: bool) -> None:
+    """The layered unlock pattern takes one to eight preset ids under ``presets`` and nothing else
+    (BACKLOG #5646), so a continuation carrying more, or any other parameter, is not one
+    /ui/reauth will follow."""
     from messagefoundry_webconsole._auth import is_unlock_action
 
     assert is_unlock_action(target) is admitted
+
+
+def test_the_route_bound_matches_the_json_routes_cap() -> None:
+    # The console's direct call skips the JSON route's own checks, so its copy of the cap must
+    # not drift from them.
+    from messagefoundry.api import app as api_app
+    from messagefoundry.api.validation import LAYERED_PRESET_IDS_PATTERN
+    from messagefoundry_webconsole.routes import search
+
+    assert search._MAX_LAYERS == api_app._MAX_PRESET_LAYERS
+    assert rf"^{search._PRESET_ID}(,{search._PRESET_ID})*$" == LAYERED_PRESET_IDS_PATTERN
+
+
+@pytest.mark.parametrize(
+    ("presets", "expected"),
+    [([_ID] * 9, "at most 8"), (["not-an-id"], "at most 8")],
+    ids=["nine", "not-an-id"],
+)
+async def test_the_layered_route_refuses_what_its_pattern_would_not_admit(
+    engine: Engine, presets: list[str], expected: str
+) -> None:
+    """RED when: the layered route runs a selection its unlock pattern refuses (BACKLOG #5646);
+    the console's direct call skips the JSON route's ``Query`` pattern, so the route bounds it."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    app = create_app(engine, auth=service, serve_ui=True, webauthn_rp_from_request=True)
+    transport = httpx.ASGITransport(app=app, client=(SIGN_IN, 51000))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        assert (await _cookie_login(c, "op")).status_code == 303
+        r = await c.get(SEARCH + "/layered", params={"presets": presets})
+    assert r.status_code == 400, r.text
+    assert expected in r.text and "not-an-id" not in r.text

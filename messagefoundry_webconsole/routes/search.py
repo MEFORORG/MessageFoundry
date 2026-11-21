@@ -6,6 +6,7 @@ plus saved / layered filter presets (BACKLOG #151, ADR 0136)."""
 from __future__ import annotations
 
 import contextlib
+import re
 from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
@@ -48,14 +49,19 @@ register_ui_action(
 # The layered run (ADR 0136) is likewise a step-up-gated GET that composes + decrypts; register it as
 # an UNLOCK form too. Its query carries only preset IDS (never the PHI needle — that's server-composed
 # from the encrypted column), so the deliberate-drop posture is preserved. The pattern admits a
-# query of ``presets`` parameters and nothing else, and a refusal carries that query
-# (:func:`_layered_continuation`, BACKLOG #5646): the run's whole input is ``?presets=``, so a
-# continuation without it landed on the run's 400. Any other parameter fails the pattern, so its
-# continuation is the search form. The handler still caps the layers and reads only the caller's
-# own presets.
+# query of one to _MAX_LAYERS ``presets`` parameters, each a preset id, and nothing else, and a
+# refusal carries that query (:func:`_layered_continuation`, BACKLOG #5646): the run's whole input is
+# ``?presets=``, so a continuation without it landed on the run's 400. Any other query fails the
+# pattern, so its continuation is the search form. The route applies the same bound to what it is
+# sent (:func:`_layered_ids`), so the pattern admits nothing the route would run.
 _SEARCH = "/ui/messages/search"
+#: The most presets one layered run composes: the JSON route's own cap (``_MAX_PRESET_LAYERS`` in
+#: ``messagefoundry/api/app.py``), which a direct call skips with the rest of its ``Query`` checks.
+_MAX_LAYERS = 8
+#: One preset id, as ``LAYERED_PRESET_IDS_PATTERN`` spells each comma-separated item.
+_PRESET_ID = r"[0-9a-f]{32}"
 register_ui_action(
-    r"^/ui/messages/search/layered(\?presets=[^&#]*(&presets=[^&#]*)*)?$",
+    rf"^/ui/messages/search/layered(\?presets={_PRESET_ID}(&presets={_PRESET_ID}){{0,{_MAX_LAYERS - 1}}})?$",
     Permission.MESSAGES_READ,
     auto_retry=False,
     unlock=True,
@@ -67,6 +73,17 @@ def _layered_continuation(request: Request) -> str:
     """The layered run with the presets the refused GET named, or the search form when that query
     would not survive the re-auth: the rule ``_new_address_continuation`` gives a refused GET."""
     return _new_address_continuation(request, landing=_SEARCH)
+
+
+def _layered_ids(presets: list[str] | None) -> str | None:
+    """The comma-joined preset ids a layered run was sent, or None when they break the route's
+    bound: more than :data:`_MAX_LAYERS`, or an item that is not a preset id (BACKLOG #5646). The
+    JSON handler's own ``Query`` pattern does not run on the console's direct call. Blank items
+    are dropped first, as the form's empty checkboxes send none."""
+    ids = [p for p in (presets or []) if p]
+    if len(ids) > _MAX_LAYERS or not all(re.fullmatch(_PRESET_ID, p) for p in ids):
+        return None
+    return ",".join(ids)
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
@@ -379,17 +396,21 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         presets: list[str] | None = Query(None),
     ) -> HTMLResponse:
         preset_list = await _presets(engine, identity, request)
-        ids = ",".join(p for p in (presets or []) if p)
+        ids = _layered_ids(presets)
         if not ids:
-            # BACKLOG #1025, as on ui_message_search: this no-preset 400 re-render returns before
+            # BACKLOG #1025, as on ui_message_search: this 400 re-render returns before
             # core.layered_search (which charges the budget in its own body), so charge here — only on
             # this short-circuit branch — to bring it under the per-actor read budget without
-            # double-charging the composed-run path.
+            # double-charging the composed-run path. No preset, or a selection that breaks the
+            # route's bound (BACKLOG #5646); the message names the bound, never a value sent.
             enforce_phi_read_pacing(request, identity)
+            error = (
+                "select at least one preset to layer"
+                if ids == ""
+                else f"select at most {_MAX_LAYERS} of your saved presets to layer"
+            )
             return HTMLResponse(
-                pages.message_search(
-                    None, error="select at least one preset to layer", presets=preset_list
-                ),
+                pages.message_search(None, error=error, presets=preset_list),
                 status_code=400,
             )
         try:

@@ -2666,27 +2666,41 @@ def test_a_version_1_cert_carrying_ca_false_is_still_refused_as_an_anchor(
     assert "not a CA certificate" in _refusal(pki, **files)
 
 
-@pytest.mark.parametrize(
-    "ahead, refused",
-    [(datetime.timedelta(minutes=2), False), (datetime.timedelta(minutes=10), True)],
-    ids=["inside-the-allowance", "past-the-allowance"],
-)
-async def test_a_signing_cert_takes_the_same_not_before_allowance(
-    monkeypatch: pytest.MonkeyPatch,
-    pki: dict[str, Any],
-    tmp_path: Path,
-    ahead: datetime.timedelta,
-    refused: bool,
+async def test_a_signing_cert_gets_no_not_before_allowance(
+    monkeypatch: pytest.MonkeyPatch, pki: dict[str, Any], tmp_path: Path
 ) -> None:
-    # A freshly renewed signer on a host a little behind the CA must not stop the lane.
+    # The partner judges the signer on its own clock, so a signer two minutes early is refused
+    # even though a recipient two minutes early is not (Manager decision, batch 224).
     _install_fake(monkeypatch)
-    overrides = _signer(pki, tmp_path, "signer_early", valid_from=ahead)
+    overrides = _signer(pki, tmp_path, "signer_early", valid_from=datetime.timedelta(minutes=2))
     d = DirectDestination(_dest(pki, **overrides))
-    if refused:
-        with pytest.raises(NegativeAckError) as caught:
-            await d.send(_SYNTHETIC_HL7)
-        assert caught.value.code == "direct-cert-validity:signing_cert:not-yet-valid"
-        assert _FakeSMTP.instances == []
-    else:
+    with pytest.raises(NegativeAckError) as caught:
         await d.send(_SYNTHETIC_HL7)
-        assert len(_FakeSMTP.instances) == 1
+    assert caught.value.code == "direct-cert-validity:signing_cert:not-yet-valid"
+    assert _FakeSMTP.instances == []
+
+
+def test_a_version_1_cert_another_party_issued_is_refused_as_an_anchor(
+    pki: dict[str, Any], tmp_path: Path
+) -> None:
+    """RED when: the version 1 exemption reaches a v1 cert that is not self-issued, such as an
+    end-entity cert a CA issued, so a recipient its key signs is trusted (BACKLOG #5631)."""
+    ca_key, ca = pki["ca_key"], pki["ca_cert"]
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    now = datetime.datetime.now(datetime.UTC)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Correspondent B")]))
+        .issuer_name(ca.subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+    )
+    builder._version = x509.Version.v1
+    v1_leaf = builder.sign(ca_key, hashes.SHA256())
+    assert v1_leaf.version == x509.Version.v1 and len(v1_leaf.extensions) == 0
+    assert v1_leaf.subject != v1_leaf.issuer
+    _, recipient = _mint_leaf("recipient@hisp.example", key, v1_leaf)
+    files = _files(tmp_path, "v1_leaf", recipient_cert=recipient, trust_anchor=v1_leaf)
+    assert "not a CA certificate" in _refusal(pki, **files)

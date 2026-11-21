@@ -1141,10 +1141,13 @@ def is_unlock_action(next_path: str | None) -> bool:
     A PATTERN ENDING ``(\\?[^#]*)?`` IS QUERY-TOLERANT and the promise above is correspondingly
     weaker for it: an arbitrary same-site query on that one path reaches the re-auth. Such a lane has
     to be, because its action's parameters ride the query and ``_reauth_redirect`` puts the whole
-    continuation into ``next``. Every other pattern forbids ``?`` by construction via ``[^/?#]+``.
-    The path prefix is still anchored, the ``..`` rejection above still applies first, and each such
-    route's own ``Query`` bounds reject anything the pattern admits — so the widening is bounded to a
-    query string on the pages that opted in.
+    continuation into ``next``. One pattern admits a NAMED query and nothing else: the layered
+    search's, ``?presets=`` followed by one to eight preset ids (``routes/search.py``, BACKLOG
+    #5646), which its route bounds the same way in its handler. Every other pattern forbids ``?``
+    by construction via ``[^/?#]+``. The path prefix is still anchored, the ``..`` rejection above
+    still applies first, and each such route's own bounds, its ``Query`` declarations or its
+    handler's checks, reject anything the pattern admits — so the widening is bounded to a query
+    string on the pages that opted in.
 
     DELIBERATELY NOT A COUNT. This paragraph read "ONE REGISTERED PATTERN", then "TWO", each time
     edited by hand in three files at once; the shape is what a reader needs, and a number in prose is
