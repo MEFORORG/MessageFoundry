@@ -2362,9 +2362,12 @@ control and non-ASCII character. The relay's own process log writes the same det
 files, at file level only; [TEE-RELAY.md, Purge](TEE-RELAY.md#purge) states what the scrub
 does and does not reach, and where `VACUUM`'s temp copy may go. On POSIX the `-wal` and `-shm`
 files take the DB file's mode. That mode is `0600` only when the store's `0600` pre-create of a
-new DB, or its best-effort `chmod` on open, succeeds; neither reports a failure. On
-Windows nothing restricts the three files to the owner yet (BACKLOG #5637, open half), so place
-every tee DB on a protected volume.
+new DB, or its best-effort `chmod` on open, succeeds; a failed `chmod` is logged as a warning,
+and a failed pre-create is not reported. On Windows each open gives the DB, `-wal` and `-shm` a
+protected access list granting full control to the opening account alone, logged when it fails.
+A `-wal` or `-shm` that SQLite deletes and re-creates takes its folder's list again until the next
+open, and the DB is then usable only by the account that opened it last. Place every tee DB on a
+protected volume regardless.
 
 The **opt-in ADR 0087 sandbox worker** (`[sandbox].mode = "subprocess"`, default `"off"`) is **not** an
 exclusion, and this paragraph is the single statement of how its output reaches stream 1 — the code

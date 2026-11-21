@@ -608,6 +608,11 @@ def test_main_passes_when_a_transient_timeout_clears(monkeypatch: pytest.MonkeyP
         for path in _gate.default_pyprojects(_ROOT)
         for name in declared_distributions(path.read_text(encoding="utf-8"))
     }
+    # Any name a uv.toml beside them declares is vetted too, so it must not fail once either.
+    for path in _gate.default_pyprojects(_ROOT):
+        uv_toml = path.parent / "uv.toml"
+        if uv_toml.is_file():
+            seen |= set(_gate.scan_uv_toml(uv_toml.read_text(encoding="utf-8"))[0])
     seen.discard("fastapi")
     monkeypatch.setattr(mod, "_fetch_once", functools.partial(_fail_once_then_good, seen=seen))
 
@@ -1141,8 +1146,8 @@ def test_the_real_tree_default_sweep_reads_every_packaging_pyproject() -> None:
         "hatch-custom-hook",
         "hatch-target-custom-hook",
         "hatch-custom-target",
-        "uv-allow-insecure-host",
         "uv-pip-allow-insecure-host",
+        "uv-allow-insecure-host",
         "dynamic-not-a-list",
         "dependency-metadata-not-an-array",
     ],
@@ -1419,3 +1424,202 @@ def test_documented_blind_spot_npm_manifests_are_not_read(
     asked = _stub_registry(monkeypatch, absent=frozenset({"invented-npm-helper"}))
     assert main([]) == 0
     assert asked == ["fastapi"]
+
+
+# --- [tool.uv.pip] tables, a uv.toml, and a reply of the wrong shape --------------------------
+
+
+def test_the_uv_pip_build_tables_are_swept() -> None:
+    """uv reads extra-build-dependencies and dependency-metadata under [tool.uv.pip] too."""
+    declared, findings = _gate.scan(
+        """
+        [tool.uv.pip.extra-build-dependencies]
+        some-sdist = ["pipextrabuild>=1", { requirement = "pipmatched", match-runtime = true }]
+
+        [[tool.uv.pip.dependency-metadata]]
+        name = "something"
+        requires-dist = ["pipmetadep>=1"]
+        """
+    )
+    assert findings == []
+    assert set(declared) == {"pipextrabuild", "pipmatched", "pipmetadep"}
+
+
+@pytest.mark.parametrize(
+    "toml_text",
+    [
+        "[tool.uv.pip]\ndependency-metadata = 'x'\n",
+        "[tool.uv.pip]\nextra-build-dependencies = 'x'\n",
+        "[tool.uv.pip.extra-build-dependencies]\nsome-sdist = [1]\n",
+    ],
+    ids=["pip-metadata-not-a-list", "pip-extra-build-not-a-table", "pip-extra-build-entry"],
+)
+def test_a_malformed_uv_pip_build_table_is_a_finding(toml_text: str) -> None:
+    declared, findings = _gate.scan(toml_text)
+    assert len(findings) == 1, findings
+    assert declared == {}
+
+
+def test_a_uv_toml_is_swept_as_uv_settings() -> None:
+    """A uv.toml holds [tool.uv]'s keys at its top level and [tool.uv.pip]'s under [pip]."""
+    declared, findings = _gate.scan_uv_toml(
+        """
+        dev-dependencies = ["uvtomldev>=1"]
+        override-dependencies = ["uvtomloverride==1"]
+        extra-index-url = ["https://example.invalid/simple"]
+        allow-insecure-host = ["example.invalid"]
+
+        [pip]
+        index-url = "https://example.invalid/simple"
+
+        [extra-build-dependencies]
+        some-sdist = ["uvtomlbuild>=1"]
+
+        [[pip.dependency-metadata]]
+        name = "x"
+        requires-dist = ["uvtomlmeta>=1"]
+        """,
+        source="uv.toml",
+    )
+    assert set(declared) == {"uvtomldev", "uvtomloverride", "uvtomlbuild", "uvtomlmeta"}
+    assert sorted(f.distribution for f in findings) == [
+        "uv.toml [pip].index-url",
+        "uv.toml allow-insecure-host",
+        "uv.toml extra-index-url",
+    ]
+
+
+def test_main_sweeps_a_root_uv_toml_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A name declared only in the root uv.toml reaches `uv lock`, so the gate must vet it."""
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
+    )
+    (tmp_path / "uv.toml").write_text(
+        'override-dependencies = ["invented-override>=1"]\n', encoding="utf-8"
+    )
+    sub = tmp_path / "packaging" / "messagefoundry-thing"
+    sub.mkdir(parents=True)
+    (sub / "pyproject.toml").write_text(
+        '[project]\nname = "messagefoundry-thing"\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(_gate, "_ROOT", tmp_path)
+    asked = _stub_registry(monkeypatch, absent=frozenset({"invented-override"}))
+
+    assert main([]) == 1
+    assert sorted(asked) == ["fastapi", "invented-override"]
+    assert f"in {tmp_path / 'uv.toml'}" in capsys.readouterr().err, "the finding names the uv.toml"
+
+
+def test_main_refuses_an_index_in_a_uv_toml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
+    )
+    (tmp_path / "uv.toml").write_text(
+        "[[index]]\nname = 'x'\nurl = 'https://example.invalid/simple'\n", encoding="utf-8"
+    )
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project)]) == 1
+
+
+@pytest.mark.parametrize("broken", ["uv.toml", "hatch.toml"])
+def test_main_exits_2_naming_the_sibling_file_it_cannot_parse(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], broken: str
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
+    )
+    (tmp_path / broken).write_text("not = [valid\n", encoding="utf-8")
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project)]) == 2
+    assert f"could not read {tmp_path / broken}" in capsys.readouterr().err
+
+
+def test_a_broken_uv_toml_still_names_the_pyprojects_refusals(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi @ https://evil.example/x.whl"]\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "uv.toml").write_text("not = [valid\n", encoding="utf-8")
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project)]) == 2
+    assert "direct reference" in capsys.readouterr().err
+
+
+def test_a_uv_toml_reached_by_two_spellings_is_swept_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
+    )
+    (tmp_path / "uv.toml").write_text("extra-index-url = ['https://e.invalid/s']\n", "utf-8")
+    other = tmp_path / "sub" / ".." / "pyproject.toml"
+    (tmp_path / "sub").mkdir()
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project), "--pyproject", str(other)]) == 1
+    assert "1 finding(s)" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"info": "x", "releases": {}},
+        {"info": [], "releases": {}},
+        {"info": {"name": 5}, "releases": {}},
+        {"info": {"name": {}}, "releases": {}},
+        {"info": {"name": "fastapi"}, "releases": []},
+        {"info": {"name": "fastapi"}, "releases": {"1.0": "x"}},
+        {"info": {"name": "fastapi"}, "releases": {"1.0": ["x"]}},
+        {"info": {"name": "fastapi"}, "releases": {"1.0": [{"upload_time_iso_8601": 5}]}},
+    ],
+    ids=[
+        "info",
+        "empty-info-list",
+        "name-number",
+        "name-object",
+        "releases",
+        "file-list",
+        "file",
+        "upload-time",
+    ],
+)
+def test_a_reply_of_the_wrong_shape_exits_2_not_a_traceback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    payload: dict,
+) -> None:
+    """A JSON object vet does not expect is "could not see" (2), never a traceback's exit 1."""
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(_gate, "_http_fetch", lambda _name, **_kw: payload)
+    assert main(["--pyproject", str(project)]) == 2
+    assert "unreadable reply from PyPI" in capsys.readouterr().err
+
+
+def test_the_exit_1_summary_counts_findings_not_only_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A refusal is not a dependency name, so the summary must not call every finding one."""
+    project = tmp_path / "pyproject.toml"
+    project.write_text(
+        '[project]\nname = "x"\ndependencies = ["fastapi>=0.100"]\n'
+        "[tool.uv]\nextra-index-url = ['https://example.invalid/simple']\n",
+        encoding="utf-8",
+    )
+    _stub_registry(monkeypatch)
+    assert main(["--pyproject", str(project)]) == 1
+    err = capsys.readouterr().err
+    assert "dependency name(s)" not in err
+    assert "1 finding(s)" in err
