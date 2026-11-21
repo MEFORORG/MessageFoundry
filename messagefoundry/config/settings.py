@@ -11760,7 +11760,9 @@ def settings_error_detail(exc: Exception) -> str:
     ``__main__._load_service_settings``, including the post-write ``validate`` callback of
     ``security set`` and ``alert add``/``remove``, whose reload is the whole file plus the
     environment layer and not the JSON the operator typed. ``tests/test_cli_settings_error_render.py``
-    holds at least the arms it lists to this; a new arm belongs there. Some arms print ``str(exc)``
+    holds at least the arms it lists to this, except the ``validate``, ``graph`` and ``dryrun``
+    ``--env`` arms, which render through ``__main__._settings_failure_fields`` instead; a new arm
+    belongs there. Some arms print ``str(exc)``
     on purpose, at least the operator-input prechecks (``invalid [security] value``, ``invalid alert
     rule``) and ``security show``'s read of the file's own ``[security]`` table: none of those
     reads the environment.

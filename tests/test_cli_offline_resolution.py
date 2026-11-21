@@ -927,6 +927,21 @@ def test_the_settings_failure_rendering_keeps_a_missing_field_missing() -> None:
     assert _URL_PASSWORD not in shown and "redacted" not in shown, shown
 
 
+def test_the_settings_failure_rendering_of_other_failures(tmp_path: Path) -> None:
+    # A loader refusal prints its type alone; a TOML parse error, its own line and column text.
+    import tomllib
+
+    from messagefoundry.__main__ import _settings_failure_fields
+
+    shown = _settings_failure_fields(ValueError(f"refused https://u:{_URL_PASSWORD}@host/"))
+    assert shown == "ValueError (its message is not shown, because it can quote a value)", shown
+    with pytest.raises(tomllib.TOMLDecodeError) as caught:
+        tomllib.loads("[environments\n")
+    assert _settings_failure_fields(caught.value) == f"TOMLDecodeError: {caught.value}"
+    assert "RecursionError" in _settings_failure_fields(RecursionError(_URL_PASSWORD))
+    assert _URL_PASSWORD not in _settings_failure_fields(RecursionError(_URL_PASSWORD))
+
+
 def test_the_settings_failure_rendering_hides_a_custom_error_type_message() -> None:
     # A PydanticCustomError keeps its own type and message, which can quote anything, so a type
     # that is not one of pydantic's built-ins prints its type alone: the list fails closed.

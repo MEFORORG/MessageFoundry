@@ -23,7 +23,8 @@ the ones that already used it, except ``serve`` and ``supervise``, which start t
 CLI arm that loads the whole settings file belongs in it.
 
 The URL refusal cases (vault BACKLOG #2850) go at the models instead of through an arm. Every arm
-prints a validator's message as written, so a message that quotes nothing is what they rest on.
+but the ``_FIELD_ONLY_ARMS`` prints a validator's message as written, so a message that quotes
+nothing is what they rest on.
 """
 
 from __future__ import annotations

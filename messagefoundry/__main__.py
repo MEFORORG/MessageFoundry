@@ -1543,9 +1543,20 @@ def _resolve_offline_anchor(
 
 
 #: Pydantic error types whose message can quote the refused input, at least: a validator's own text
-#: (``value_error``, ``assertion_error``), a discriminator tag and an attribute error.
+#: (``value_error``, ``assertion_error``), a discriminator tag, an attribute name, and an ``{error}``
+#: taken from another exception's text.
 _INPUT_QUOTING_ERROR_TYPES = frozenset(
-    {"value_error", "assertion_error", "union_tag_invalid", "get_attribute_error"}
+    {
+        "value_error",
+        "assertion_error",
+        "union_tag_invalid",
+        "get_attribute_error",
+        "no_such_attribute",
+        "iteration_error",
+        "mapping_type",
+        "datetime_object_invalid",
+        "json_invalid",
+    }
 )
 
 
@@ -1565,10 +1576,12 @@ def _settings_failure_fields(exc: Exception) -> str:
     quote a refused value is not rendered at all.
 
     A pydantic error prints its field path and, for a built-in pydantic error type outside
-    :data:`_INPUT_QUOTING_ERROR_TYPES`, pydantic's own message. Any other type, a custom
-    ``PydanticCustomError`` type included, prints its type in place of the message. At most
-    ``_ERROR_DETAIL_ROWS`` errors are shown. An ``OSError`` prints its type, the OS's reason and the
-    path it names; a TOML parse error its own text, a line and a column with at most a key or one
+    :data:`_INPUT_QUOTING_ERROR_TYPES`, pydantic's own message. Any other type, a
+    ``PydanticCustomError`` type name of a validator's own included, prints its type in place of
+    the message. At most ``_ERROR_DETAIL_ROWS`` errors are shown. An ``OSError`` that names a file
+    prints its type, the OS's reason and that path, and one that names none prints its own text,
+    which at least the loader's ``service config not found`` refusal uses; a TOML parse error its
+    own text, a line and a column with at most a key or one
     character; a ``UnicodeDecodeError`` its reason and byte offset; a ``RecursionError`` a fixed
     line; and anything else, the loader's own refusals included, its exception type alone. Those
     refusals, such as an unrecognized key, are written to name a key and not its value, so this
@@ -1576,8 +1589,10 @@ def _settings_failure_fields(exc: Exception) -> str:
     text, every message as written.
 
     What this still prints, at least: a mapping key that is part of a field path, a path the
-    operator named, a key ``tomllib`` quotes, and a character of the input that some pydantic parse
-    messages quote."""
+    operator named, a key ``tomllib`` quotes, a character of the input that some pydantic parse
+    messages quote, the text of an ``OSError`` that names no file, and the message of a custom
+    error a validator raises under a built-in type's name, since the type is a string its author
+    picks."""
     from typing import get_args
 
     from pydantic import ValidationError
@@ -2199,7 +2214,10 @@ def _load_service_settings_or_error(
     except (FileNotFoundError, ValueError, ValidationError, OSError, RecursionError) as exc:
         # RecursionError: a deeply nested TOML document recurses past the limit in tomllib, as
         # _read_environment_values measures for a value file (vault BACKLOG #5554).
-        return None, exc
+        # Drop the traceback and the chain: load_settings' frames hold the input mapping, env
+        # secrets included, and the caller raises its own error while this one is still live.
+        exc.__cause__ = exc.__context__ = None
+        return None, exc.with_traceback(None)
 
 
 def _post_write_settings_check(
