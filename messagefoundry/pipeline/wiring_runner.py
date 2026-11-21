@@ -12906,7 +12906,8 @@ class RegistryRunner:
             # re-pended it at the head of this FIFO lane forever. Dead-letter it at once, as a claim
             # does an unopenable payload; the token keeps its reference for a replay. The handoff
             # below is not wrapped: its encrypt's invocation ceiling is a deliberate hard stop, so
-            # any CipherError the handoff raises still takes the fault arm.
+            # any CipherError the handoff raises still takes the fault arm. The Postgres handoff
+            # contains its own decrypt failures that are verdicts on a cell (BACKLOG #5689).
             log.warning(
                 "response worker %r: reply body of %s does not decrypt (%s); dead-lettering",
                 name,
