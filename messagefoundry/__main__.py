@@ -1614,6 +1614,11 @@ def _offline_env_values(
                 if args.project_root is not None
                 else "the [environments].base_dir project root"
             ),
+            remedy=(
+                "--project-root"
+                if args.project_root is not None
+                else "[environments].base_dir, set in the settings file or the environment,"
+            ),
         )
         if rc is not None:
             return rc
@@ -1622,8 +1627,8 @@ def _offline_env_values(
     env_file = values_file_path(base_dir, dir_name, args.env)
     if not env_file.is_file():
         print(
-            f"note: no value file at {env_file} for --env {args.env!r}; env() values come only "
-            "from overrides such as MEFOR_VALUE_* variables",
+            f"note: no value file at {env_file} for --env {args.env!r}; an env() reference "
+            "resolves only from an override such as a MEFOR_VALUE_* variable, or its default",
             file=sys.stderr,
         )
     return values
@@ -1687,11 +1692,12 @@ def _check_env_file_present(
     env_dir: str,
     *,
     anchor: str = "the explicit --project-root",
+    remedy: str = "--project-root",
 ) -> int | None:
     """Hard-fail (return exit 2) if the graph references ``env()`` but ``<root>/<env_dir>/<env>.toml``
     is absent; otherwise ``None``. ``env_dir`` is ``[environments].dir`` (default ``environments``),
     read from the resolved service config so a custom value-dir name is honored, not false-failed.
-    ``anchor`` names where ``root`` came from, in the message."""
+    ``anchor`` names where ``root`` came from, and ``remedy`` what to drop, in the message."""
     from messagefoundry.config.anchor import graph_references_env
     from messagefoundry.config.wiring import WiringError, load_config
 
@@ -1713,8 +1719,8 @@ def _check_env_file_present(
     if not env_file.is_file():
         print(
             f"error: the graph references env() but no value file was found at {env_file} under "
-            f"{anchor} {str(root)!r} for --env {env_name!r}. Create that file (or drop the project "
-            "root to use the working directory).",
+            f"{anchor} {str(root)!r} for --env {env_name!r}. Create that file (or drop "
+            f"{remedy} to use the working directory).",
             file=sys.stderr,
         )
         return 2
