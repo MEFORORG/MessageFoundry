@@ -3018,6 +3018,23 @@ class UploadStore:
 
         return await asyncio.to_thread(_scan)
 
+    async def storage_reachable(self) -> bool:
+        """Whether the uploads root itself can be reached now, so an outage met on one upload is
+        that upload's own fault, such as a stale NFS handle, not the storage's (BACKLOG #5388 added
+        item 3). The route reads it to answer a caller who may not see the upload as it answers an
+        absent id (ASVS 8.2.2). ``False`` only when the root's ``lstat`` fails as unreachable
+        (:func:`~messagefoundry.path_reach.is_unreachable`); a root that is missing is reachable
+        storage holding nothing."""
+
+        def _check() -> bool:
+            try:
+                os.lstat(self._root)
+            except OSError as exc:
+                return not is_unreachable(exc)
+            return True
+
+        return await asyncio.to_thread(_check)
+
     async def get_meta(self, file_id: str) -> UploadedFileMeta:
         """Return one file's metadata (path-traversal-guarded). Raises :class:`UploadNotFoundError`,
         and :class:`UploadUnreadableError` for a sidecar the cipher refuses, that is damaged

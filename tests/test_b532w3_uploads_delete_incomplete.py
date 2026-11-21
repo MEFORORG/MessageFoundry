@@ -599,7 +599,11 @@ async def test_an_owner_meets_the_storage_503_not_a_404_when_the_share_is_down(
                 raise _unreachable_share(Path(target))
             return os.open(target, flags, *args)
 
-        monkeypatch.setattr(uploads, "os", _OsWith(_dropped))
+        # The whole share is down, so the uploads root cannot be reached either (r6: an outage on
+        # one upload alone keeps the 404 for a caller who may not see it).
+        dropped = _OsLstatRaises(root, _unreachable_share)
+        dropped._open = _dropped
+        monkeypatch.setattr(uploads, "os", dropped)
         for r in (
             await c.get(f"/uploads/{fid}/messages", headers=h),
             await c.delete(f"/uploads/{fid}", headers=h),
@@ -679,3 +683,80 @@ def test_in_use_reads_only_an_int_winerror() -> None:
     text = PermissionError(errno.EACCES, "x")
     text.winerror = "32"  # type: ignore[attr-defined,misc,unused-ignore]
     assert uploads._in_use(text) is False
+
+
+# --- r6: ASVS 8.2.2, the same answer for another user's upload and an absent id -------------------
+
+
+def _estale(path: Path) -> OSError:
+    """A stale NFS handle on one file, as an open of it may meet while the share is up."""
+    code = getattr(errno, "ESTALE", 116)
+    return OSError(code, "Stale file handle", str(path))
+
+
+@pytest.mark.parametrize("outage", ["estale", "share-down"])
+async def test_a_caller_who_may_not_see_an_upload_cannot_tell_it_from_an_absent_id(
+    engine: Engine,  # noqa: F811 - the imported fixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outage: str,
+) -> None:
+    # r5 finding 8. On 9bb9df57bb5 a stale handle on another user's existing upload answered 503
+    # while an absent id answered 404, so the answer told which ids exist. Now both answer alike:
+    # 404 while the uploads root is reachable, 503 while it is not.
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    await _add_user(service, Role.OPERATOR, name="other")
+    root = tmp_path / "uploads"
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    absent = "0" * 32
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        ho = await _login(c, "other")
+        fid = (
+            await c.post("/uploads", files={"file": ("x.hl7", ADT, "text/plain")}, headers=h)
+        ).json()["file_id"]
+        if outage == "estale":
+            sidecar = root / f"{fid}.meta"
+
+            def _stale(target: Any, flags: int, *args: Any) -> int:
+                if Path(target) == sidecar:
+                    raise _estale(Path(target))
+                return os.open(target, flags, *args)
+
+            monkeypatch.setattr(uploads, "os", _OsWith(_stale))
+        else:
+
+            def _under_root(path: Any) -> bool:
+                if not isinstance(path, str | os.PathLike):
+                    return False
+                return root in (Path(path), *Path(path).parents)
+
+            def _down_open(target: Any, flags: int, *args: Any) -> int:
+                if _under_root(target):
+                    raise _unreachable_share(Path(target))
+                return os.open(target, flags, *args)
+
+            down = _OsLstatRaises(root, _unreachable_share)
+            down._open = _down_open
+            monkeypatch.setattr(uploads, "os", down)
+            real_lstat = Path.lstat
+
+            def _lstat(self: Path) -> os.stat_result:
+                if _under_root(self):
+                    raise _unreachable_share(self)
+                return real_lstat(self)
+
+            monkeypatch.setattr(Path, "lstat", _lstat)
+        for verb in ("get", "delete"):
+            path = "/uploads/{}/messages" if verb == "get" else "/uploads/{}"
+            existing = await getattr(c, verb)(path.format(fid), headers=ho)
+            missing = await getattr(c, verb)(path.format(absent), headers=ho)
+            assert (existing.status_code, existing.json()) == (
+                missing.status_code,
+                missing.json(),
+            ), (verb, existing.text, missing.text)
+            assert existing.status_code == (404 if outage == "estale" else 503)

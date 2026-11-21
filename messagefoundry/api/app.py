@@ -9322,8 +9322,10 @@ def create_app(
             # BACKLOG #3734: an outage, not the 423. Only its text is kept past this clause.
             override_answer = partial(_upload_unavailable, _outage_of(exc), op)
             # BACKLOG #5388 added item 3: storage that could not be reached answers every caller
-            # 503. It reveals no upload's existence, since an absent id meets the same outage, and
-            # a 404 would tell an owner their file is gone.
+            # 503, since an absent id meets the same outage and a 404 would tell an owner their
+            # file is gone. Only while the uploads root itself cannot be reached: an outage on one
+            # upload alone, such as a stale NFS handle, is one an absent id never meets, so for a
+            # caller who may not see the upload it keeps the 404 below (ASVS 8.2.2).
             everyone = isinstance(exc, UploadStorageUnreachableError)
         except UploadUnreadableError as exc:
             override_answer = partial(_UploadSidecarRefused, _upload_refusal_kind(exc))
@@ -9333,7 +9335,9 @@ def create_app(
             # can act on it; neither a refused sidecar nor an outage is an existence oracle for
             # anyone else. Both raises sit after the handler ends, so neither chain carries the
             # cipher's error.
-            if everyone or identity.has(Permission.FILES_ACCESS_ANY):
+            if identity.has(Permission.FILES_ACCESS_ANY):
+                raise override_answer()
+            if everyone and not await us.storage_reachable():
                 raise override_answer()
             raise HTTPException(404, "no such uploaded file")
         if not _may_access_upload(identity, meta):
