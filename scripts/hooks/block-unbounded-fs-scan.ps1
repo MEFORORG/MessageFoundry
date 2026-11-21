@@ -101,7 +101,17 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
 # commit-message form. Arithmetic, `$((...))`, is blanked for the same reason: `1 << n` would read
 # as a heredoc opener. A substitution inside it still runs, so that is left visible, and so is the
 # `#` of a comment, whose body is blanked.
-function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
+#
+# -Refined READS THREE FORMS AS BASH DOES (BACKLOG #5607), each of which the reading without it
+# misreads into blanking a walk inside a double-quoted substitution, where the plain toggle blanks
+# it too. A `$((` whose second `(` closes with something other than `))` is a subshell inside a
+# substitution, not arithmetic (`"$((find /proc) )"`). A `<<` glued to a word opens a heredoc
+# (`"$(cat<<'EOF'"`). And every heredoc opened on one line has a body, read in order to its own
+# terminator (`cat <<A <<B`), where the reading without it keeps only the last delimiter. The
+# switch is a third view, not a replacement: reading a glued `<<` as an opener also misreads one
+# in arithmetic it does not enter, such as `(( a<<b ))` and `$[a<<b]`, and the reading without
+# it denies those, so the call site scans both.
+function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
     if ($Text.IndexOf('"') -lt 0 -and $Text.IndexOf("'") -lt 0) { return $Text }
     if ($Plain) {
         $sb = [System.Text.StringBuilder]::new($Text.Length)
@@ -130,17 +140,21 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
     # the depth of unquoted `${...}`, inside which it never does.
     $wordStart = $true
     $braceDepth = 0
-    # The delimiter of a heredoc opened on this line, then of the body being blanked.
-    $pending = $null
-    $bodyTerm = $null
+    # The delimiters of the heredocs opened on this line, in order, then of the bodies being blanked:
+    # with -Refined, `cat <<A <<B` reads A's body to its terminator, then B's.
+    $pending = [System.Collections.Generic.List[string]]::new()
+    $bodyTerms = [System.Collections.Generic.List[string]]::new()
+    # The index of the `)` matching each `(`, built on the first `$((`, so telling arithmetic from a
+    # subshell in a substitution stays linear however many there are.
+    $parenMatch = $null
     $n = 0
     while ($n -lt $Text.Length) {
-        if ($null -ne $bodyTerm) {
+        if ($bodyTerms.Count -gt 0) {
             # At the start of a body line: blank it whole, or keep the terminator line as it is.
             $end = $Text.IndexOf("`n", $n)
             if ($end -lt 0) { $end = $Text.Length }
             $line = $Text.Substring($n, $end - $n)
-            if ($line.Trim() -ceq $bodyTerm) { [void]$sb.Append($line); $bodyTerm = $null }
+            if ($line.Trim() -ceq $bodyTerms[0]) { [void]$sb.Append($line); $bodyTerms.RemoveAt(0) }
             else { [void]$sb.Append(' ' * $line.Length) }
             if ($end -lt $Text.Length) { [void]$sb.Append("`n") }
             $n = $end + 1
@@ -167,6 +181,26 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
         }
         if ($ch -ceq '$' -and $next -ceq '(' -and $n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '(' -and
             $kind -cne 'sq' -and $kind -cne 'ansi') {
+            # Bash reads `$((` as arithmetic only when the `)` matching its second `(` is followed
+            # by `)`. Otherwise, as in `$((find /proc) )`, it is a subshell inside a substitution,
+            # which falls through here to be read as `$(` and then `(`. An unmatched one is read
+            # as a substitution too, which leaves it visible.
+            $isArith = $true
+            if ($Refined) {
+                if ($null -eq $parenMatch) {
+                    $parenMatch = [int[]]::new($Text.Length)
+                    $open = [System.Collections.Generic.Stack[int]]::new()
+                    for ($k = 0; $k -lt $Text.Length; $k++) {
+                        $parenMatch[$k] = -1
+                        if ($Text[$k] -ceq '(') { $open.Push($k) }
+                        elseif ($Text[$k] -ceq ')' -and $open.Count -gt 0) { $parenMatch[$open.Pop()] = $k }
+                    }
+                }
+                $close = $parenMatch[$n + 2]
+                $isArith = $close -ge 0 -and $close + 1 -lt $Text.Length -and $Text[$close + 1] -ceq ')'
+            }
+        } else { $isArith = $false }
+        if ($isArith) {
             $kinds.Add('arith'); $depths.Add(0); [void]$sb.Append('$(('); $prevDollar = $false
             $n += 3; continue
         }
@@ -198,17 +232,22 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain) {
         }
         # Unquoted: top, sub or bt. A newline ends the line a heredoc was opened on, so its body
         # starts here. A heredoc opener is read as Hide-HeredocBodies reads it: after a space or at
-        # the start, not `<<<`, and a delimiter that starts with a letter or underscore.
-        if ($ch -ceq "`n" -and $null -ne $pending) {
-            [void]$sb.Append($ch); $bodyTerm = $pending; $pending = $null; $prevDollar = $false; $wordStart = $true
+        # the start, not `<<<`, and a delimiter that starts with a letter or underscore. With
+        # -Refined a `<<` glued to a word opens one too (`cat<<EOF`), which is wider than
+        # Hide-HeredocBodies, so every terminator line it waits for is kept visible here; and each
+        # opener on a line queues its delimiter, where without it the last one replaces the rest.
+        if ($ch -ceq "`n" -and $pending.Count -gt 0) {
+            [void]$sb.Append($ch); $bodyTerms.AddRange($pending); $pending.Clear(); $prevDollar = $false; $wordStart = $true
             $n++; continue
         }
-        if ($ch -ceq '<' -and $next -ceq '<' -and ($n -eq 0 -or [char]::IsWhiteSpace($Text[$n - 1])) -and
+        if ($ch -ceq '<' -and $next -ceq '<' -and
+            ($n -eq 0 -or [char]::IsWhiteSpace($Text[$n - 1]) -or ($Refined -and $Text[$n - 1] -cne '<')) -and
             -not ($n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '<')) {
             $d = [regex]::Match($Text.Substring($n + 2), '^-?[ \t]*(?:''([^''\n]+)''|"([^"\n]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))')
             if ($d.Success) {
-                $pending = @($d.Groups[1].Value, $d.Groups[2].Value, $d.Groups[3].Value) |
-                    Where-Object { $_ } | Select-Object -First 1
+                if (-not $Refined) { $pending.Clear() }
+                $pending.Add((@($d.Groups[1].Value, $d.Groups[2].Value, $d.Groups[3].Value) |
+                    Where-Object { $_ } | Select-Object -First 1))
             }
             [void]$sb.Append('<<'); $prevDollar = $false; $wordStart = $false
             $n += 2; continue
@@ -611,13 +650,18 @@ try {
     # "$(...)". So a bash command is scanned under BOTH views and denied if either denies: the bash
     # reading can only add denies to the toggle's, never remove one. The floor does NOT make the bash
     # reading right. Where the toggle blanks the same walk -- inside one double-quoted span, say --
-    # a misreading still allows it; at least `$((cmd) )`, `cat<<`, and two heredocs on a line remain.
+    # a misreading still allows it. The -Refined reading is a third view under the same rule, for
+    # the `$((cmd) )`, `cat<<` and two-heredoc forms inside such a span; see Hide-QuotedSpans. At
+    # least these still blank a walk in a double-quoted span under all three views: a `$((cmd) )`
+    # nested in arithmetic, and a `case` pattern's `)` inside "$(...)", which closes it early.
     # The price is the toggle's own false denies, such as `'It'\''s; find /proc'`, which main had.
-    # Most commands mask the same under both, and then one scan is enough.
+    # Most commands mask the same under every view, and then one scan is enough.
     $scans = @(Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd -Plain))
     if ($tool -cne 'PowerShell') {
         $bashScan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd)
         if ($bashScan -cne $scans[0]) { $scans += $bashScan }
+        $refinedScan = Hide-HeredocBodies $cmd (Hide-QuotedSpans $cmd -Refined)
+        if ($scans -cnotcontains $refinedScan) { $scans += $refinedScan }
     }
     # The PowerShell tool's reading, beside the toggle under the same rule (BACKLOG #5451). Without
     # a backtick, `#`, `@` or `${` it masks exactly as the toggle does, so it is skipped. THE TOGGLE
