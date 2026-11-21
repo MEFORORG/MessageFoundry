@@ -548,17 +548,22 @@ def _read_string(
     later: list[tuple[int, str, list[str]]] = []
     starts_seen = False  # whether any later line starts a variable, kept or ordinary
     parts = first_parts  # the value the current line belongs to
+    # The whole-string reading, below: the name is everything before the first equals sign.
+    whole_written, whole_equals, whole_value = entry.partition("=")
+    whole_written = whole_written.strip()
+    whole_kept = bool(whole_equals) and _refused_name(whole_written.upper())
     for number, line in enumerate(rest_lines, skip + 2):
         start = _line_start(line, below_empty_class=empty_class)
         if (
             start is None
-            and (first_sets or starts_seen)
             and not empty_class
+            and (first_sets or starts_seen or not whole_kept)
             and _blank_class(line, "")
         ):
-            # A secret-class name alone below another variable starts a variable of its own. Not
-            # below an empty secret-class value, which takes it, nor below a first line that
-            # starts none, where the whole-string reading names the variable instead.
+            # A secret-class name alone below another variable, or below lines that start none,
+            # starts a variable of its own. Not below an empty secret-class value, which takes
+            # it, nor inside a name the whole-string reading keeps, such as ``MEFOR_VALUE_A<LF>``
+            # on the first line, which names the variable instead.
             start = "kept"
         if start is None:
             parts.append(line)
@@ -587,10 +592,8 @@ def _read_string(
     # not in its string refuses under that reading. A name that still holds a line break is
     # counted only when no later line sets a name :func:`_names` keeps, since both readings then
     # describe the same variable.
-    whole_written, whole_equals, whole_value = entry.partition("=")
-    whole_written = whole_written.strip()
     broken = _LINE_BREAK.search(whole_written) is not None
-    if whole_equals and _refused_name(whole_written.upper()):
+    if whole_kept:
         # A broken name is kept under its first line, as the line reading names it.
         name = _LINE_BREAK.split(whole_written, 1)[0].rstrip() if broken else whole_written
         same_string = [
@@ -608,7 +611,12 @@ def _read_string(
     read.extend(later_variables)
     if later and parts is later[-1][2]:
         ending = later_variables[-1]
-    if ending is None or not _refused_name(ending.written.upper()) or ending.value.strip():
+    # Equals signs alone leave it empty (``_still_blank``), as ``NAME<LF>=`` writes it.
+    if (
+        ending is None
+        or not _refused_name(ending.written.upper())
+        or not _still_blank(ending.value)
+    ):
         ending = None
     return read, ending
 
@@ -676,11 +684,12 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
     it holds an equals sign, or is a secret-class name alone: blank lines above it are skipped,
     as the whole-string reading's strip of the name skips them, so a secrets directory set below
     a blank first line is still read as set. A later line is one when it sets a name the refusal
-    is about, so a store key on a later line still refuses. A later line that sets an ordinary variable (:func:`_is_ordinary_line`)
-    ends the value above it under the line reading, and is not kept, except below an empty
-    secret-class value, where :func:`_ends_blank_class` decides instead: under the
-    whole-string reading it sets nothing, so the secrets directory's name is never taken as set
-    by a later line. Any other line, such as one of key material, belongs to the value above it,
+    is about, or is a secret-class name alone below another variable, so a store key on a later
+    line still refuses. A later line that sets an ordinary variable (:func:`_is_ordinary_line`)
+    ends the value above it under the line reading, and is not kept: under the whole-string
+    reading it sets nothing, so the secrets directory's name is never taken as set by a later
+    line. Below an empty secret-class value :func:`_ends_blank_class` decides instead whether a
+    later line ends it. Any other line, such as one of key material, belongs to the value above it,
     so a key whose value starts on the next line is not empty.
 
     Each string is also read whole: the name before its first equals sign, stripped, and
@@ -753,8 +762,17 @@ def _variables(entries: Sequence[tuple[str, str]]) -> list[_Variable]:
             ran_on = key in ran and bool(variable.value.strip())
             # Its value takes the next string's first line, which may set the directory, past any
             # string of equals signs alone, which keeps the value running on (_still_blank).
-            taken = next((s for s in strings[index + 1 :] if not _still_blank(s)), "")
-            holds = ran_on and _sets_directory_first(taken)
+            holds = False
+            if ran_on:
+                taken = next(
+                    (
+                        strings[i]
+                        for i in range(index + 1, len(strings))
+                        if not _still_blank(strings[i])
+                    ),
+                    "",
+                )
+                holds = _sets_directory_first(taken)
             read.append(
                 replace(variable, line=line_on_string, runs_on=ran_on, holds_directory=holds)
             )

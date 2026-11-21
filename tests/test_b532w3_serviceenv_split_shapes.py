@@ -222,11 +222,11 @@ def test_a_line_that_may_be_the_secret_refuses_as_an_item_and_on_a_later_line(
 
 @pytest.mark.parametrize("line", ["TZ=UTC", "HTTP_PROXY=x", "MEFOR_AI_ENVIRONMENT=prod"])
 def test_an_ordinary_line_below_a_non_secret_value_still_ends_it(line: str) -> None:
-    """The control for the fail-closed rows above: below a value that is set, the plain line rule
-    still ends it, so a later empty secret-class name stays unlisted."""
-    posture = _read([f"Path=x\n{line}"])
-    assert posture.listed == (), line
-    assert service_env_refusal(posture) is None
+    """The control for the fail-closed rows above: below an empty value that is not a secret,
+    here the secrets directory's, the plain line rule still ends it, so the directory reads as
+    unset. Read under the fail-closed rule, the line would set the directory instead."""
+    posture = _read([f"MEFOR_SECRETS_DIRECTORY=\n{line}", "MEFOR_VALUE_A=1"])
+    assert posture.listed == ("MEFOR_VALUE_A",), line
 
 
 @pytest.mark.parametrize(
@@ -238,6 +238,8 @@ def test_an_ordinary_line_below_a_non_secret_value_still_ends_it(line: str) -> N
         ["MEFOR_AUTH_AD_BIND_PASSWORD ", "Winter=2026!"],
         ["MEFOR_AUTH_AD_BIND_PASSWORD\nWinter=2026!"],
         ["Path=x\nMEFOR_AUTH_AD_BIND_PASSWORD\n=Winter2026"],
+        ["junk\nMEFOR_AUTH_AD_BIND_PASSWORD\n=Winter2026"],
+        ["MEFOR_AUTH_AD_BIND_PASSWORD\n=", "Winter2026"],
         ["Path=x\nMEFOR_AUTH_AD_BIND_PASSWORD", "=Winter2026"],
         ["MEFOR_AUTH_AD_BIND_PASSWORD=\n=\nWinter=2026!"],
         ["Path=x", "MEFOR_AUTH_AD_BIND_PASSWORD", "=Winter2026"],
