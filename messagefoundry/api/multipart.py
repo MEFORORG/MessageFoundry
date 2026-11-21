@@ -15,9 +15,11 @@ What it refuses, at least: more than ``_MAX_PARTS`` parts, a part header block o
 more than one. BACKLOG #5787 adds, at least: a body with no closing delimiter line; a line before
 the close marker that starts with ``--<boundary>`` but is not a delimiter line; boundary text in the
 preamble, which would otherwise drop the first part; a line starting with ``--<boundary>`` after the
-close marker; a part with no header block; and a part whose ``Content-Disposition`` does not
-mention a ``name`` or ``filename`` at all. The last two are refused at any size, in a closed body;
-an unclosed one gets the missing close marker refusal instead.
+close marker; a part with no header block; and a part whose ``Content-Disposition`` has no
+``name`` or ``filename`` parameter, read or not. The last two are refused at any size in a closed
+body. In an unclosed body, one over ``_MAX_FIELD_BYTES`` gets the field cap's refusal (a 400 for no
+header block, a 413 for a header block with no name), and a smaller one lets the body reach the
+missing close marker refusal.
 
 **What a delimiter line is** (BACKLOG #5787). ``--<boundary>`` counts only at the start of the body
 or right after a CR or an LF, so boundary text in the middle of a line is part content. After it come
@@ -90,8 +92,8 @@ _MAX_PART_HEADER_BYTES = 16 * 1024
 #: with a peak near 150 MiB, about six times the body. The walk stops at the first part over the cap.
 _MAX_PARTS = 16
 
-#: Cap on one non-file part's bytes, named or not (a part not refused for mentioning no name at
-#: all). ``max_file_bytes`` bounds only file parts, so a
+#: Cap on one non-file part's bytes, named or not (in a closed body, one with no name or filename
+#: parameter is refused before this cap). ``max_file_bytes`` bounds only file parts, so a
 #: text field was bounded by the body cap alone and was decoded into a ``str`` of up to the whole
 #: body. The upload route keeps no text field, so this only has to admit a short form value.
 _MAX_FIELD_BYTES = 16 * 1024
@@ -111,8 +113,10 @@ class MultipartError(ValueError):
 
 class MultipartTooLargeError(MultipartError):
     """A file part exceeds the caller's byte cap, or a non-file part with a header block exceeds
-    ``_MAX_FIELD_BYTES`` (HTTP 413). A part with no header block, or whose Content-Disposition does
-    not mention a name, raises the base :class:`MultipartError` instead (HTTP 400)."""
+    ``_MAX_FIELD_BYTES`` (HTTP 413). A part with no header block raises the base
+    :class:`MultipartError` instead (HTTP 400), and so, in a closed body, does a part whose
+    Content-Disposition has no ``name`` or ``filename`` parameter. In an unclosed body such a part over
+    ``_MAX_FIELD_BYTES`` gets this 413."""
 
 
 @dataclass(frozen=True)
@@ -148,20 +152,20 @@ def parse_boundary(content_type: str | None) -> bytes | None:
     return None
 
 
-def _mentions_a_name(head: bytes) -> bool:
-    """Whether a Content-Disposition line of the header block mentions ``name`` at all, read or not
-    (``filename`` contains it)."""
-    return any(
-        line.lower().startswith("content-disposition:") and "name" in line.lower()
-        for line in head.decode("latin-1", "replace").split("\r\n")
-    )
+#: A Content-Disposition parameter's name, whatever its value's form (quoted or not), so a ``name``
+#: parameter the value pattern above cannot read still counts as one. The same ``(?<!\w)`` guard as
+#: ``_DISPOSITION_PARAM`` keeps the scan linear; the padding match is possessive.
+_DISPOSITION_KEY = re.compile(r"(?<!\w)(\w+)[ \t]*+=")
 
 
-def _disposition(head: bytes) -> tuple[str | None, str | None]:
-    """Parse a part's header block for its Content-Disposition ``name`` + ``filename`` (or ``None``)."""
+def _disposition(head: bytes) -> tuple[str | None, str | None, bool]:
+    """Parse a part's header block for its Content-Disposition ``name`` + ``filename`` (or ``None``),
+    and whether it has a ``name`` or ``filename`` parameter at all, read or not. A parameter is one by
+    its exact key: ``x-unnamed=`` and the extended ``filename*=`` are not."""
     text = head.decode("latin-1", "replace")
     name: str | None = None
     filename: str | None = None
+    named = False
     for line in text.split("\r\n"):
         if line.lower().startswith("content-disposition:"):
             for match in _DISPOSITION_PARAM.finditer(line):
@@ -170,7 +174,11 @@ def _disposition(head: bytes) -> tuple[str | None, str | None]:
                     name = value
                 elif key == "filename":
                     filename = value
-    return name, filename
+            named = named or any(
+                key.group(1).lower() in ("name", "filename")
+                for key in _DISPOSITION_KEY.finditer(line)
+            )
+    return name, filename, named
 
 
 #: The hint a refusal gives when the likeliest cause is a file sent as a plain field (no
@@ -213,7 +221,7 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     alive at once. Here the only copy of a part's content is the one the caller takes of a value it
     keeps. Two passes: the first counts parts, bounds each header block and finds each part with no
     header block, all before any header is parsed; the second parses each header, which says
-    whether the part is a file, refuses one that mentions no name, and applies the file and field
+    whether the part is a file, refuses one with no name or filename parameter (closed body only), and applies the file and field
     caps to the part's length.
 
     Raises what :func:`parse_multipart_form` documents."""
@@ -304,13 +312,13 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     parts: list[_Part] = []
     for head_start, head_end, content_start, content_end in spans:
         head = body[head_start:head_end]
-        name, filename = _disposition(head)
+        name, filename, named = _disposition(head)
         size = content_end - content_start
-        if closed and name is None and filename is None and not _mentions_a_name(head):
+        if closed and not named:
             # BACKLOG #5787: refused at any size, not skipped. A file split at a whole delimiter
             # line, whose rest holds a blank CRLF line, leaves this shape, and skipping it would
-            # store the file cut short. A header that mentions a name the parser cannot read (an
-            # unquoted ``name=x``) is left to the field cap, as before, rather than called nameless.
+            # store the file cut short. A ``name`` parameter the parser cannot read (an unquoted
+            # ``name=x``) is left to the field cap, as before, rather than called nameless.
             raise MultipartError(
                 "multipart part has neither a name nor a filename in its Content-Disposition; "
                 "a file line that is a whole boundary delimiter line can leave one"
@@ -415,7 +423,7 @@ def parse_multipart_form(
     Raises :class:`MultipartError` if the Content-Type is not multipart, the body is malformed, it
     has no closing delimiter line, it holds more than ``_MAX_PARTS`` parts, it has boundary text in
     its preamble or a boundary line after its close marker, a part has no header block or a
-    Content-Disposition that mentions no name, or a line starts with the delimiter but is not a
+    Content-Disposition with no name or filename parameter, or a line starts with the delimiter but is not a
     delimiter line (all HTTP 400 at the route), and :class:`MultipartTooLargeError` if a file part
     exceeds ``max_file_bytes`` or a non-file part with a header block exceeds ``_MAX_FIELD_BYTES``
     (HTTP 413 at the route).
@@ -423,9 +431,9 @@ def parse_multipart_form(
     The order, where a body has more than one fault: first the walk's refusals (preamble boundary
     text, the part count, an oversized header block, a part with no header block over the field
     cap, a misdelimited line, a boundary line after the close marker), in body order; then, in a
-    closed body, a smaller part with no header block; then, part by part, a part that mentions no
-    name (closed body only) and the size caps; then, last, a body with no delimiter line or no close
-    marker. So an unclosed body with an oversized part gets the 413, and an unclosed body cut inside
+    closed body, a smaller part with no header block; then, part by part, a part with no name or
+    filename parameter (closed body only) and the size caps; then, last, a body with no delimiter
+    line or no close marker. So an unclosed body with an oversized part gets the 413, and an unclosed body cut inside
     a header block gets the missing close marker refusal. The module docstring says what a delimiter
     line is and what the parser still trusts of a part's content.
 
