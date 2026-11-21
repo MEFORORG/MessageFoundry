@@ -354,10 +354,8 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     does not end either element (:func:`_search_outside_markup`); the fallback below does not step
     over markup.
 
-    Where the code element's first ``</`` is its own close tag inside a comment, a CDATA section
-    or a processing instruction, and the text before it names no class, the element is read to
-    its own close tag outside that markup when that is the next tag, that markup left out
-    (:func:`_child_code_text`).
+    One shape is read again: :func:`_child_code_text` says exactly when (BACKLOG #5912, closing
+    step 21).
 
     Where the first-child read yields no code, because the first child is neither element, it
     cannot hold a code, or a ``<!`` the read does not step over (a DOCTYPE, a lowercase
@@ -415,45 +413,58 @@ def _first_child_code(body: str, start: int, end: int) -> str:
 
 
 def _child_code_text(m: re.Match[str], end_re: re.Pattern[str], body: str, end: int) -> str:
-    """The first-child read's text for the code element ``m``: :func:`_code_text`'s, except where
-    that text names no class and ends at a ``</`` inside a comment, a CDATA section or a
-    processing instruction.
+    """The first-child read's text for the code element ``m``: :func:`_code_text`'s, except in
+    the one shape below (BACKLOG #5912, closing step 21).
 
-    BACKLOG #5912 (closing step 21): ``<faultcode><!-- </faultcode> -->soap:Server</faultcode>``
-    gave :func:`_code_text` the text ``<!-- ``, read as an unrecognized, permanent fault, where
-    the code before #5912 retried such a reply through a ``Value`` ahead of it. Where the
-    :func:`_code_text` text matches neither ``_SENDER_RE`` nor ``_RECEIVER_RE`` and holds a ``<``,
-    the element is read instead to the first tag outside such markup, when that tag is its own
-    close tag, with that markup left out (``soap:Server`` here). Otherwise the :func:`_code_text`
-    text stands, so a Sender or Receiver reading is never changed, and the class can change only
-    from an unrecognized fault to a Sender or Receiver one. Each read is one scan forward, so the
-    read stays linear in the reply."""
+    ``<faultcode><!-- </faultcode> -->soap:Server</faultcode>`` gave :func:`_code_text` the text
+    ``<!-- ``, read as an unrecognized, permanent fault, where the code before #5912 retried such
+    a reply through a ``Value`` ahead of it. The element is read again only where all of these
+    hold: the :func:`_code_text` text is not empty, so its first ``</`` is the element's own close
+    tag; that text matches neither ``_SENDER_RE`` nor ``_RECEIVER_RE``; and it opens a comment, a
+    CDATA section or a processing instruction it does not terminate, so that close tag lies
+    inside the markup. It is then read to the first tag outside such markup, when that tag is its
+    own close tag, with each terminated comment and processing instruction left out and CDATA
+    sections kept whole (``soap:Server`` here). Where that read finds no such tag, or leaves
+    nothing, the :func:`_code_text` text stands. So a Sender or Receiver reading is never changed,
+    and the class can change only from an unrecognized fault to a Sender or Receiver one. Each
+    pass is one scan forward (:func:`_scan_markup`, :func:`_search_outside_markup`), so the read
+    stays linear in the reply."""
     text = _code_text(m, end_re, body, end)
-    if "<" not in text or _SENDER_RE.search(text) or _RECEIVER_RE.search(text):
+    if not text or _SENDER_RE.search(text) or _RECEIVER_RE.search(text):
+        return text
+    if not _scan_markup(text)[1]:
         return text
     gt = _start_tag_gt(body, m.end(), end)
     tag = _search_outside_markup(_TAG_OPEN_OUTSIDE_MARKUP_RE, body, gt + 1, end)
     if tag is None or not end_re.match(body, tag.start(), end):
         return text
-    return _without_markup(body[gt + 1 : tag.start()])
+    return _scan_markup(body[gt + 1 : tag.start()])[0] or text
 
 
-def _without_markup(text: str) -> str:
-    """``text`` with each terminated comment, CDATA section and processing instruction left out.
-    An opener with no terminator is kept as text, as :func:`_search_outside_markup` reads it."""
+def _scan_markup(text: str) -> tuple[str, bool]:
+    """``text`` with each terminated comment and processing instruction left out, CDATA sections
+    kept whole, and whether ``text`` opens such markup, a CDATA section included, that it does
+    not terminate. An opener with no terminator is kept as text, as :func:`_search_outside_markup`
+    reads it; once one has none, no later opener of its kind can have one, so it is not searched
+    for again and the scan stays linear in ``text``."""
     kept: list[str] = []
+    unterminated: set[str] = set()
     pos = scan = 0
     while (lt := text.find("<", scan)) >= 0:
         scan = lt + 1
         for opener, closer in _NON_ELEMENT_MARKUP:
             if text.startswith(opener, lt):
-                close = text.find(closer, lt + len(opener))
-                if close >= 0:
-                    kept.append(text[pos:lt])
-                    pos = scan = close + len(closer)
+                close = -1 if opener in unterminated else text.find(closer, lt + len(opener))
+                if close < 0:
+                    unterminated.add(opener)
+                else:
+                    scan = close + len(closer)
+                    if opener != "<![CDATA[":
+                        kept.append(text[pos:lt])
+                        pos = scan
                 break
     kept.append(text[pos:])
-    return "".join(kept)
+    return "".join(kept), bool(unterminated)
 
 
 def _searched_code(body: str, start: int, end: int) -> str:

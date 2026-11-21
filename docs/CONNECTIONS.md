@@ -3003,12 +3003,14 @@ Sender/Receiver class is read first from the Fault's first child element: SOAP 1
 processing instruction before either child is stepped over, with at least these exceptions, each of
 which leaves that read with no code: such markup that has no terminator; a `<!` that opens anything
 else, such as a DOCTYPE or a lowercase `<![cdata[`; and a first `</` inside such markup within the
-`faultcode` or `Value` itself that is not that element's own close tag. Where that first `</` is
-the element's own close tag and the text before it names no class, the element is read on to its
-own close tag outside the markup when that is the next tag outside it, with that markup left out,
-so `<faultcode><!-- </faultcode> -->soap:Server</faultcode>` reads `soap:Server`; otherwise the code
-text ends at that `</`, and a comment before it within the code text is read with the code, as
-the earlier search read it. Where that read
+`faultcode` or `Value` itself that is not that element's own close tag. Otherwise the code text
+runs to that first `</`, any markup in it included. One shape is read again (BACKLOG #5912): where
+that first `</` is the element's own close tag inside a comment, CDATA section or processing
+instruction the text opens and does not terminate, and the text names no Sender, Client, Receiver
+or Server class, the element is read on to the first tag outside such markup, if that is its own
+close tag, with terminated comments and processing instructions left out and CDATA kept, and
+that reading is used unless it is empty. So
+`<faultcode><!-- </faultcode> -->soap:Server</faultcode>` reads `soap:Server` and retries. Where that read
 yields no code, for
 those shapes, for a first child that is neither element (a SOAP 1.1 `faultstring` before the
 `faultcode`, a SOAP 1.2 `Reason` before the `Code`), or for a code element that holds no code, the
