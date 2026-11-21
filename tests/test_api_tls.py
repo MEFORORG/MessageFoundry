@@ -4437,6 +4437,11 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
         ("127.0.0.1", "[::1]", True),
         # Hostname matching ignores case, and a SAN cannot carry an IPv6 zone.
         ("myhost", "MYHOST", True),
+        # OPEN EDGE, pinned as current behaviour: san_names ignores a trailing dot, so these reuse
+        # though hostname verification of the new spelling fails (see _names_missing).
+        ("myhost", "myhost.", True),
+        ("myhost.", "myhost", True),
+        ("localhost", "localhost.", True),
         ("fe80::1%12", "fe80::1%12", True),
         # A bracketed host is minted and checked without its brackets, as the address.
         ("[::1]", "[::1]", True),

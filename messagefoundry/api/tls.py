@@ -291,8 +291,9 @@ def _names_missing(host: str, pem: bytes) -> list[str]:
     ``pem`` is not a parseable certificate.
 
     OPEN EDGE: ``san_names`` ignores a trailing dot and hostname verification does not, so a pair
-    minted for ``localhost`` is reused after a move to ``localhost.``, or the reverse, though a
-    client dialling the new spelling fails verification."""
+    minted off loopback for ``myhost`` is reused after a move to ``myhost.``, or the reverse, and
+    likewise ``localhost`` to ``localhost.``, though a client dialling the new spelling fails
+    verification."""
     from messagefoundry import pki
 
     subject = [] if wildcard_loopback(host) is not None else [unbracketed(host)]
