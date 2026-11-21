@@ -572,8 +572,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     # The old wording read "a SECRET-FREE / PHI-free support zip". The config summary holds no
     # secret and the status snapshot is metadata-only, the phi_contract's own terms, but the log
     # tail meets neither, because its redaction is best-effort: a single-token identifier
-    # survives it (messagefoundry/redaction.py states that residual), and an operator username is exactly that shape while this engine's own settings classifier calls a
-    # username a credential. A blanket claim resting on a member that does not meet it is the
+    # survives it (messagefoundry/redaction.py states that residual), and an operator username
+    # is exactly that shape while this engine's own settings classifier calls a username a
+    # credential. A blanket claim resting on a member that does not meet it is the
     # false-premise shape CLAUDE.md section 11 forbids, so the claim was repaired rather than the
     # control -- see BACKLOG #1475 and the exclusion table in
     # tests/test_log_redaction_secret_domain.py for why the username class stays out. The help
@@ -13901,16 +13902,18 @@ def _verify(args: argparse.Namespace) -> int:
 
 
 def _support_bundle(args: argparse.Namespace) -> int:
-    """Write a support zip (#49): engine version + a config summary (registry COUNTS/names only — never
-    settings values or secrets) + a ``/status`` snapshot built from the real status models + a REDACTED
-    app-log tail. **The blanket "secret-free / PHI-free" this docstring used to open with covered the
-    first two members and not the tail**, whose redaction is best-effort with a single-token residual
-    that includes an operator username (BACKLOG #1475; the argparse help above carries the reasoning,
-    and ``docs/PHI.md`` stream 14 is the record). Offline: touches no network, starts no server. The
-    status
-    snapshot + log tail come from the service settings (the configured store + ``[logging].log_dir``);
-    the config summary comes from ``--config``. A missing service config or store is tolerated — the
-    bundle is still produced (support is most wanted when something is already broken)."""
+    """Write a support zip (#49): ``version.txt``, ``manifest.json`` (with the ``phi_contract``), a
+    config summary (registry COUNTS/names only, holding no secret), a metadata-only ``/status``
+    snapshot built from the real status models, and a REDACTED app-log tail. **The blanket
+    "secret-free / PHI-free" this docstring used to open with was not the phi_contract's claim
+    about any member**: the contract calls the config summary one that holds no secret and the
+    status snapshot metadata-only, and the tail meets neither, since its redaction is best-effort
+    with a single-token residual that includes an operator username (BACKLOG #1475; the argparse
+    help above carries the reasoning, and ``docs/PHI.md`` stream 14 is the record). Offline:
+    touches no network, starts no server. The status snapshot + log tail come from the service
+    settings (the configured store + ``[logging].log_dir``); the config summary comes from
+    ``--config``. A missing service config or store is tolerated — the bundle is still produced
+    (support is most wanted when something is already broken)."""
     from pydantic import ValidationError
 
     from messagefoundry.config.anchor import anchor_settings_store_path
