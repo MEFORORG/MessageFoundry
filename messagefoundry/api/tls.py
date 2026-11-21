@@ -239,17 +239,27 @@ _MINT_LOCK_POLL_S = 0.05
 _GENERATED_LIFETIME_DAYS = 365
 
 
+#: The loopback names every generated certificate carries, whatever the bind (BACKLOG #5790): a
+#: client on this box may dial either loopback literal or ``localhost``. Never the machine's own
+#: host name: the certificate goes to every peer in the handshake, before any sign-in, so it names
+#: nothing the bind did not already spell (decision d20261119T191457909-25c3aa).
+_GENERATED_LOOPBACK_SANS = ("127.0.0.1", "::1", "localhost")
+
+
 def _generated_sans(host: str) -> list[str]:
-    """The names a generated certificate carries beside ``host``, its subject (BACKLOG #5973).
+    """The names a generated certificate carries beside ``host``, its subject.
 
     A WILDCARD bind (``0.0.0.0``, ``::``) is not an address any client can dial, so a certificate
-    naming it alone verifies against no URL at all. It also names the loopback of the same family
+    naming it alone verifies against no URL at all. The loopback of the same family
     (:func:`messagefoundry.api_tls_source.wildcard_loopback`), the address the tray and any other
-    client on this box reach a wildcard bind through. Every other bind needs nothing extra: a
-    client dials that host as written.
+    client on this box reach a wildcard bind through, comes first (BACKLOG #5973). Every bind then
+    carries :data:`_GENERATED_LOOPBACK_SANS` (BACKLOG #5790); ``make_self_signed`` drops the
+    duplicates. A wildcard bind is off loopback, so ``serve`` refuses it without an operator
+    certificate unless the operator accepts the placeholder; this list does not make it reachable
+    by any name a remote client would dial.
     """
     loopback = wildcard_loopback(host)
-    return [] if loopback is None else [loopback]
+    return [*([] if loopback is None else [loopback]), *_GENERATED_LOOPBACK_SANS]
 
 
 #: Renew the generated pair at startup once less than this share of its OWN validity period is
