@@ -347,6 +347,7 @@ from messagefoundry.config.ai_policy import (
     AiMode,
     resolve_effective_policy,
 )
+from messagefoundry.config.anchor import explicit_root_value_file_guard
 from messagefoundry.config.fingerprint import (
     ConfigDirMissing,
     DigestCoverage,
@@ -12604,6 +12605,23 @@ async def _initial_credential_expiry_reminder(auth: AuthService, sink: AlertSink
         await asyncio.sleep(interval)
 
 
+def _chain_registry_guards(
+    *guards: Callable[[Registry], None] | None,
+) -> Callable[[Registry], None] | None:
+    """One registry guard that runs each given guard in order; ``None`` entries are skipped, a lone
+    survivor is returned as it is, and none gives ``None``. The engine takes a single guard, and
+    the first refusal wins (BACKLOG #5775)."""
+    live = [guard for guard in guards if guard is not None]
+    if len(live) <= 1:
+        return live[0] if live else None
+
+    def chained(registry: Registry) -> None:
+        for guard in live:
+            guard(registry)
+
+    return chained
+
+
 def _chain_registry_preflights(
     *preflights: Callable[[Registry, Mapping[str, Any]], Awaitable[None]] | None,
 ) -> Callable[[Registry, Mapping[str, Any]], Awaitable[None]]:
@@ -12746,7 +12764,11 @@ def create_managed_app(
     so it is refused beside an enabled ``cluster_settings``, and ``serve`` passes it only on a
     single node. ``static_credential_settings`` is
     the resolved service configuration ``GET /security/posture`` reads the static-credential
-    inventory's settings half from; ``None`` makes that route say it could not read it. The Vault
+    inventory's settings half from; ``None`` makes that route say it could not read it. Its
+    ``[environments].base_dir``, with an ``env_values_provider`` that is a
+    ``SnapshotEnvValuesProvider`` naming a value file, also turns on the ADR 0050 AC-3 value-file
+    guard, run before ``registry_guard`` (BACKLOG #5775,
+    :func:`~messagefoundry.config.anchor.explicit_root_value_file_guard`). The Vault
     privilege preflight (ADR 0216) names the Vault tokens to probe from it too, so with ``None`` no
     Vault token is probed.
     ``prestore_anchor_refusals`` holds trust-anchor refusals a caller made before the store opened
@@ -13136,7 +13158,14 @@ def create_managed_app(
                 coordinator=coordinator,
                 cluster_settings=cluster_settings,
                 registry_filter=registry_filter,
-                registry_guard=registry_guard,
+                # BACKLOG #5775: the ADR 0050 AC-3 value-file check, so a reload that turns on a
+                # connection whose env() a start did not count is refused as that start would have
+                # been. First, so a guard that reads env() values never judges the ones a missing
+                # value file leaves. None, no check, without an explicit root.
+                registry_guard=_chain_registry_guards(
+                    explicit_root_value_file_guard(static_credential_settings, env_values_provider),
+                    registry_guard,
+                ),
                 # BACKLOG #1188: the settings the engine is not otherwise handed, read only for the
                 # directories they name (key files, CA files, spool dirs), which the `.processed`
                 # archive sweep must never reach.
