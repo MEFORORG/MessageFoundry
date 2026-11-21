@@ -5216,8 +5216,8 @@ async def _close_quietly(store: Store, exc: BaseException, cancels_before: int) 
     """Close ``store`` on an error path without letting a close failure replace the real error,
     ``exc``. The close runs through :func:`~messagefoundry.store.store.cleanup_failed_open`, so a
     cancel cannot cut it short (BACKLOG #5720); that raises a cancel that landed meanwhile when
-    ``exc`` is an ``Exception``. A store has no synchronous release, so past the cancel's bound the
-    close is left to finish on its own."""
+    ``exc`` is an ``Exception``. The ``Store`` protocol names no synchronous release, so past the
+    cancel's bound the close is left to finish on its own, and that is logged."""
     from messagefoundry.store.store import cleanup_failed_open
 
     await cleanup_failed_open(

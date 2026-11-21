@@ -5864,8 +5864,13 @@ class SqlServerStore:
         try:
             if not self._read_only:  # #1780: a read-only handle reserved nothing to settle
                 await self.checkpoint_cipher_invocations(settle=True)
-        except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
-            log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
+            # By class at WARNING, the traceback at DEBUG only: a driver's message may carry a
+            # path or a value, and a failed open's cleanup runs this close too (BACKLOG #5720).
+            log.warning(
+                "could not settle the AES-GCM invocation bound at close (%s)", type(exc).__name__
+            )
+            log.debug("the settle's failure at close", exc_info=exc)
         # Tear down any synchronous fused-handoff pools first (best-effort; a no-op when none were
         # opened, so it never affects the async path). ADR 0071 B5.
         self.close_sync_handoff_pool()

@@ -1992,7 +1992,10 @@ async def _run_to_completion(
 
     A ``GeneratorExit`` thrown into the wait is re-raised, not taken for the body's failure: a
     coroutine being closed cannot await again, and trying would replace the exit with a
-    ``RuntimeError`` (BACKLOG #5720)."""
+    ``RuntimeError`` (BACKLOG #5720). A body that itself ends with one is not returned either: on
+    CPython 3.14.7 such a ``GeneratorExit`` propagates out of this coroutine even when caught
+    here, measured with a handler that swallows it and with the earlier
+    ``except BaseException: pass``."""
     task = asyncio.ensure_future(body())
     cancelled = False
     while not task.done():
@@ -2071,6 +2074,24 @@ def _stop_unawaited(conn: aiosqlite.Connection) -> None:
     future = conn.stop()
     if future is not None:
         future.add_done_callback(_read_stop_outcome)
+
+
+def _log_abandoned_end(what: str, task: asyncio.Future[tuple[bool, BaseException | None]]) -> None:
+    """Log how a cleanup this open stopped waiting for ended, when it ended badly, since nothing
+    else reports it then (BACKLOG #5720)."""
+    if task.cancelled():
+        ended: BaseException | None = asyncio.CancelledError()
+    else:
+        ended = task.exception() or task.result()[1]
+    if ended is None:
+        return
+    log.warning(
+        "%s, which an open stopped waiting for, later ended %s",
+        what,
+        "cancelled"
+        if isinstance(ended, asyncio.CancelledError)
+        else f"with {type(ended).__name__}",
+    )
 
 
 def _hold_abandoned_open_cleanup(task: asyncio.Future[Any]) -> None:
@@ -2156,6 +2177,7 @@ async def cleanup_failed_open(
                 if force_release is not None
                 else "it was left to finish on its own",
             )
+            task.add_done_callback(functools.partial(_log_abandoned_end, what))
             _hold_abandoned_open_cleanup(task)
             break
         try:
@@ -2167,7 +2189,9 @@ async def cleanup_failed_open(
             continue  # the next pass finds the deadline passed, or the cleanup done
         except GeneratorExit:
             # This coroutine is being closed and cannot await again: release what it can now.
+            # The cleanup task never raises (it returns its body's end), so this was thrown in.
             _force_failed_open_release(force_release)
+            task.add_done_callback(functools.partial(_log_abandoned_end, what))
             _hold_abandoned_open_cleanup(task)
             raise
         except asyncio.CancelledError:

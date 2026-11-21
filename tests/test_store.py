@@ -2109,3 +2109,32 @@ async def test_a_cancel_during_the_keyless_refusals_close_still_closes_the_store
         await task
     assert finished == ["closed"]
     assert isinstance(raised.value.__cause__, KeylessAuditChainRefused)
+
+
+async def test_an_abandoned_cleanup_that_later_ends_badly_is_logged(monkeypatch, caplog) -> None:
+    """BACKLOG #5720: a cleanup an open stopped waiting for is reported if it later ends cancelled,
+    since nothing else is waiting on it then."""
+    from messagefoundry.store import store as store_module
+
+    monkeypatch.setattr(store_module, "FAILED_OPEN_CANCEL_BOUND_S", 0.05)
+    started = asyncio.Event()
+
+    async def wedged_release() -> None:
+        started.set()
+        await asyncio.sleep(10)
+
+    task = asyncio.create_task(
+        store_module.cleanup_failed_open(
+            asyncio.CancelledError(), wedged_release, lambda: None, cancels_before=0
+        )
+    )
+    await asyncio.wait({task}, timeout=3)
+    assert task.done()
+    bodies = [
+        t for t in asyncio.all_tasks() if getattr(t.get_coro(), "__name__", "") == "wedged_release"
+    ]
+    assert len(bodies) == 1
+    bodies[0].cancel()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert "which an open stopped waiting for, later ended cancelled" in caplog.text
