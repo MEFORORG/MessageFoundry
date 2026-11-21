@@ -1232,8 +1232,8 @@ export interface EditMessage {
   // echoed back from the webview's `data-expect-src` and carried to `lens rewrite` as `expect_src` (F7).
   // Optional so a hand-built message (tests / an older payload) may omit it — then no stale check is sent.
   expectSrc?: string;
-  // The id of the projection the edit was made on, echoed from the page's `data-projection`. Only the
-  // rebaser reads it (BACKLOG #5943); an edit without it is never rebased. Not sent to the engine.
+  // The id of the projection the edit was made on, echoed from the page's `<meta name="mf-projection">`.
+  // Only the rebaser reads it (BACKLOG #5943); an edit without it is never rebased. Not sent to the engine.
   projection?: number;
 }
 
@@ -2986,7 +2986,12 @@ export async function drainEdits(
   // drain still never throws; the engine's stale guard then decides, as it does with no rebase.
   const failed = (stage: string, err: unknown): void => {
     rebase?.rebaser.latch();
-    rebase?.log?.(`Steps edit rebase ${stage} failed: ${err instanceof Error ? err.message : String(err)}`);
+    try {
+      rebase?.log?.(`Steps edit rebase ${stage} failed: ${err instanceof Error ? err.message : String(err)}`);
+    } catch {
+      // A throwing logger, or an error String() cannot convert, must not escape the drain; the rebase is
+      // already latched off, which is all a failure needs.
+    }
   };
   const carry = (msg: EditMessage): EditMessage => {
     if (rebase === undefined) {
@@ -3083,15 +3088,19 @@ export function rowAfterRewrite(msg: EditMessage, write: AppliedRewrite): string
  *
  *  - its projection id is one the rebaser still keeps, and that projection's buffer is in the chain;
  *  - its `expectSrc` is that buffer's text at the edit's line range;
- *  - the live buffer, read just before the edit is sent, is exactly the chain's last output. Any change
- *    the recorded writes did not make (a split view, an undo, a structural op, a pick, another panel)
- *    leaves the edit unrebased.
+ *  - the live buffer, read just before the edit is sent, is exactly the chain's last output. A change
+ *    made between recorded writes (an undo, a structural op, a pick, another panel, split-view typing)
+ *    leaves the edit unrebased. Split-view typing made while a rewrite is in flight is not covered:
+ *    applyOne overwrites it with the rewrite's output, as on main, and the write is recorded as clean.
  *
  * The provider owns one for the panel and calls {@link project} each time it replaces the webview. A
- * projection whose buffer is in the chain keeps the chain; the rebaser then keeps only that projection
- * and the one before it, and drops the chain buffers recorded before the older of the two. A projection
- * outside the chain ends it and keeps only itself. An edit from a projection no longer kept is sent as
- * posted.
+ * projection whose buffer is not in the chain ends the chain and keeps only itself. Otherwise the
+ * rebaser keeps the new projection, and the previous one when its buffer is in the chain. It then
+ * deletes the chain buffers that come before the older kept projection's buffer. Chain buffers are
+ * ordered by last use, not by projection. So when a write reuses an older buffer (a value retyped back)
+ * or renders finish out of order, this can delete the new projection's own buffer. Edits from that
+ * projection are then sent as posted, and the engine refuses them as stale, as on main. An edit from a
+ * projection no longer kept is sent as posted.
  *
  * Only the typed-edit drain records writes. The field picker's drain (`applyPickedEdit`) does not, so a
  * pick's write breaks the live-buffer condition: a typed template edit posted behind a pick carries the

@@ -331,6 +331,50 @@ suite("Steps edit -- rowAfterRewrite and QueuedEditRebaser (BACKLOG #5943)", () 
     assert.strictEqual(logged.length, 1);
     assert.ok(logged[0].includes("document closed"));
   });
+
+  test("a throwing logger, or an error String() cannot convert, does not escape drainEdits", async () => {
+    const cases: { thrown: unknown; log: (t: string) => void }[] = [
+      {
+        thrown: new Error("document closed"),
+        log: (): void => {
+          throw new Error("logger down");
+        },
+      },
+      { thrown: Object.create(null) as unknown, log: (): void => undefined }, // String() of it throws
+    ];
+    for (const { thrown, log } of cases) {
+      const r = fresh();
+      r.record(edit("A"), { before, after });
+      const guard = new EditLoopGuard();
+      const sent: EditMessage[] = [];
+      guard.beginEdit();
+      guard.queue(edit("C", "other")); // queued behind B, so a throw would strand it
+      guard.endEdit();
+      const rebase = {
+        rebaser: r,
+        readSource: (): string => {
+          throw thrown;
+        },
+        log,
+      };
+      await drainEdits(
+        guard,
+        edit("B"),
+        async (m) => {
+          sent.push(m);
+        },
+        undefined,
+        undefined,
+        rebase,
+      );
+      assert.deepStrictEqual(
+        sent.map((m) => m.value),
+        ["B", "C"],
+        "the drain did not throw and the queued edit was still sent",
+      );
+      assert.strictEqual(guard.isEditing, false);
+    }
+  });
 });
 
 suite("Steps edit -- the provider wires the rebase (BACKLOG #5943)", () => {
