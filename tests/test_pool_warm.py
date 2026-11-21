@@ -27,6 +27,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.pipeline.engine import Engine
+from messagefoundry.store import base as base_module
 from messagefoundry.store.base import warm_pool_connections, warm_pool_target
 from messagefoundry.store.store import MessageStore
 
@@ -266,17 +267,25 @@ async def _settle() -> None:
         await asyncio.sleep(0)
 
 
-async def test_warm_cancelled_in_the_turn_the_acquire_resolves_strands_nothing() -> None:
+@pytest.mark.parametrize("cancel_first", [False, True], ids=["hand-over-first", "cancel-first"])
+async def test_warm_cancelled_in_the_turn_the_acquire_resolves_strands_nothing(
+    cancel_first: bool,
+) -> None:
+    # Both orders within one turn. Cancel-first is the one that pins the DEFERRED borrow cancel: an
+    # immediate borrow.cancel() there would find the hand-off resolved and throw the cancel in.
     pool = _HandOffPool()
     task = asyncio.create_task(warm_pool_connections(pool, target=1, timeout=5.0, backend="stub"))
     await _settle()
     assert len(pool.handoffs) == 1  # the borrow is parked on the hand-off
 
-    pool.hand_over()  # the pool resolves the borrow ...
-    task.cancel()  # ... and the cancel lands in the same loop turn
+    if cancel_first:
+        task.cancel()
+        pool.hand_over()
+    else:
+        pool.hand_over()
+        task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    await _settle()  # let a salvage release run
     assert pool.checked_out == [], "a connection the pool handed over was stranded"
 
 
@@ -298,17 +307,22 @@ async def test_warm_release_that_ignores_cancellation_cannot_hang_the_cleanup(
                     continue  # a driver that ignores the cancel
 
     pool = _DeafReleasePool()
+    parked_before = set(base_module._LATE_RELEASES)
     task = asyncio.create_task(warm_pool_connections(pool, target=2, timeout=5.0, backend="stub"))
     try:
         done, _pending = await asyncio.wait({task}, timeout=2.0)
         assert task in done, "the warm-up cleanup hung on a release that ignored its cancel"
         assert task.result() == 2
+        # Both stuck releases are held strongly while they run, so none is collected mid-flight ...
+        assert len(base_module._LATE_RELEASES - parked_before) == 2
     finally:
         unstick.set()  # let the abandoned releases end so the loop closes clean
         await _settle()
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+    # ... and dropped once they end.
+    assert base_module._LATE_RELEASES - parked_before == set()
 
 
 # --- warm_pool_target: headroom sizing --------------------------------------
