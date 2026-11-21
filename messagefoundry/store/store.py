@@ -2079,9 +2079,12 @@ def _stop_unawaited(conn: aiosqlite.Connection) -> None:
         future.add_done_callback(_read_stop_outcome)
 
 
-def _log_abandoned_end(what: str, task: asyncio.Future[tuple[bool, BaseException | None]]) -> None:
+def _log_abandoned_end(
+    what: str, forced: bool, task: asyncio.Future[tuple[bool, BaseException | None]]
+) -> None:
     """Log how a cleanup this open stopped waiting for ended, when it ended badly, since nothing
-    else reports it then (BACKLOG #5720)."""
+    else reports it then (BACKLOG #5720). ``forced`` is whether a forced release ran; the level
+    follows :func:`cleanup_failed_open`'s rule."""
     if task.cancelled():
         ended: BaseException | None = asyncio.CancelledError()
     else:
@@ -2089,7 +2092,14 @@ def _log_abandoned_end(what: str, task: asyncio.Future[tuple[bool, BaseException
     if ended is None:
         return
     if isinstance(ended, asyncio.CancelledError):
-        log.warning("%s, which an open stopped waiting for, later ended cancelled", what)
+        if forced:
+            log.warning("%s, which an open stopped waiting for, later ended cancelled", what)
+        else:
+            log.error(
+                "%s, which an open stopped waiting for, later ended cancelled; what it had not "
+                "closed may not have been released",
+                what,
+            )
         return
     log.error(
         "%s, which an open stopped waiting for, later failed (%s)", what, type(ended).__name__
@@ -2152,8 +2162,10 @@ async def cleanup_failed_open(
     too, then is re-raised. ``force_release`` None is a caller with nothing to release without
     waiting: past the bound this only stops waiting, and what the cleanup holds stays open until
     it finishes. ``what`` names the cleanup in its log lines. A cleanup that ends cancelled,
-    waited for or not, is logged at WARNING; one that fails stays at ERROR, as
-    :func:`_run_to_completion` logs it (BACKLOG #5720)."""
+    waited for or not, is logged at WARNING only where a forced release ran; with
+    ``force_release`` None it stays at ERROR, as possibly not released, as on main. One that fails
+    stays at ERROR, as :func:`_run_to_completion` logs it. A ``GeneratorExit`` release that cannot
+    be scheduled is logged at ERROR too (BACKLOG #5720)."""
     # What the forced-release WARNING names: the open, or the caller's own cleanup.
     after = "a failed store open" if what == "a failed store open's cleanup" else what
     if isinstance(exc, GeneratorExit):
@@ -2167,13 +2179,13 @@ async def cleanup_failed_open(
                 closing = asyncio.ensure_future(pending)
             except RuntimeError:
                 pending.close()
-                log.warning(
+                log.error(
                     "%s could not run: no event loop can run it, so what it would have closed "
-                    "may still be open",
+                    "may not have been released",
                     what,
                 )
                 return
-            closing.add_done_callback(functools.partial(_log_abandoned_end, what))
+            closing.add_done_callback(functools.partial(_log_abandoned_end, what, False))
             _hold_abandoned_open_cleanup(closing, what)
         return
 
@@ -2204,7 +2216,9 @@ async def cleanup_failed_open(
                 if force_release is not None
                 else "it was left to finish on its own",
             )
-            task.add_done_callback(functools.partial(_log_abandoned_end, what))
+            task.add_done_callback(
+                functools.partial(_log_abandoned_end, what, force_release is not None)
+            )
             _hold_abandoned_open_cleanup(task, what)
             break
         try:
@@ -2220,7 +2234,9 @@ async def cleanup_failed_open(
             # _run_to_completion lets through; that one was not stopped waiting for.
             _force_failed_open_release(force_release, after=after)
             if not task.done():
-                task.add_done_callback(functools.partial(_log_abandoned_end, what))
+                task.add_done_callback(
+                    functools.partial(_log_abandoned_end, what, force_release is not None)
+                )
                 _hold_abandoned_open_cleanup(task, what)
             raise
         except asyncio.CancelledError:
@@ -2243,10 +2259,13 @@ async def cleanup_failed_open(
         left = (
             "what it had not closed was released without waiting for it"
             if force_release is not None
-            else "what it had not closed may still be open"
+            else "what it had not closed may not have been released"
         )
         if ended is None or isinstance(ended, asyncio.CancelledError):
-            log.warning("%s ended cancelled before it finished; %s", what, left)
+            if force_release is not None:
+                log.warning("%s ended cancelled before it finished; %s", what, left)
+            else:
+                log.error("%s ended cancelled before it finished; %s", what, left)
         else:
             log.error("%s failed (%s); %s", what, type(ended).__name__, left)
             log.debug("%s failure", what, exc_info=ended)

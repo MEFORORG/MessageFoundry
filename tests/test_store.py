@@ -2232,4 +2232,72 @@ def test_a_generator_exit_with_no_event_loop_schedules_nothing(caplog) -> None:
     worker.join(10)
     assert len(outcome) == 1 and isinstance(outcome[0], StopIteration), outcome
     assert ran == []
-    assert "a failed store open's cleanup could not run: no event loop can run it" in caplog.text
+    assert [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == "ERROR" and r.name == "messagefoundry.store.store"
+    ] == [
+        "a failed store open's cleanup could not run: no event loop can run it, so what it would "
+        "have closed may not have been released"
+    ]
+
+
+def _store_records(caplog, level: str) -> list[str]:
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelname == level and r.name == "messagefoundry.store.store"
+    ]
+
+
+async def test_a_cancelled_cleanup_with_nothing_forced_stays_at_error(caplog) -> None:
+    """BACKLOG #5720: a cleanup that ends cancelled with no forced release to run, as on
+    ``open_store``'s keyless-chain refusal, is logged at ERROR as possibly not released, as on
+    main; only where a forced release ran is it WARNING.
+
+    Mutation: log the cancelled branch at WARNING whatever ``force_release`` is. Red: no ERROR."""
+    from messagefoundry.store.store import cleanup_failed_open
+
+    async def cancelled_release() -> None:
+        raise asyncio.CancelledError
+
+    await cleanup_failed_open(RuntimeError("open boom"), cancelled_release, None, cancels_before=0)
+    assert _store_records(caplog, "ERROR") == [
+        "a failed store open's cleanup ended cancelled before it finished; what it had not closed "
+        "may not have been released"
+    ]
+    assert not _store_records(caplog, "WARNING")
+
+
+async def test_an_abandoned_cancelled_cleanup_with_nothing_forced_stays_at_error(
+    monkeypatch, caplog
+) -> None:
+    """BACKLOG #5720: a cleanup an open stopped waiting for, with no forced release, that later
+    ends cancelled is logged at ERROR, as on main.
+
+    Mutation: pass ``forced`` True on the abandoning path. Red: WARNING in place of ERROR."""
+    from messagefoundry.store import store as store_module
+
+    monkeypatch.setattr(store_module, "FAILED_OPEN_CANCEL_BOUND_S", 0.05)
+
+    async def wedged_release() -> None:
+        await asyncio.sleep(10)
+
+    task = asyncio.create_task(
+        store_module.cleanup_failed_open(
+            asyncio.CancelledError(), wedged_release, None, cancels_before=0
+        )
+    )
+    await asyncio.wait({task}, timeout=3)
+    assert task.done()
+    bodies = [
+        t for t in asyncio.all_tasks() if getattr(t.get_coro(), "__name__", "") == "wedged_release"
+    ]
+    assert len(bodies) == 1
+    bodies[0].cancel()
+    for _ in range(5):
+        await asyncio.sleep(0)
+    assert (
+        "a failed store open's cleanup, which an open stopped waiting for, later ended cancelled;"
+        " what it had not closed may not have been released"
+    ) in _store_records(caplog, "ERROR")
