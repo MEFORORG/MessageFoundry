@@ -352,12 +352,15 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   delimiters escape it, is refused at any size by both listeners
   (`marker_under_colliding_delimiters`, through `ingress_guards.doc_ref_marker_refusal`, which
   the dry-run and the loopback re-ingress run too), and by the detach before it judges the claim
-  (`InboundDocRefError`), since a handle in an `OBX-5.5` the header hides is not read as one. The
-  marker is looked for in at most four distinct forms that later headers' delimiters give. A body
-  whose later headers give more, and whose first line's forms are not found, is refused without
-  those scans, so the check stays linear in the body: by both listeners under such a header
-  (`COLLIDING_HEADER_FORMS_REFUSED_REASON`), and by the detach under any header where it would
-  detach a document (`HeaderFormsLimitError`, an `InboundDocRefError`). A
+  (`InboundDocRefError`), since a handle in an `OBX-5.5` the header hides is not read as one.
+  Each such check looks for the marker in as many distinct forms as later headers' delimiters
+  give, up to a limit that falls with the body's size to a floor
+  (`binary._later_header_forms_limit`). A body whose later headers give more, and whose first
+  line's forms are not found, is refused without those scans, so the check stays linear in the
+  body: at least by both listeners, the dry-run and the loopback re-ingress under such a
+  header (`COLLIDING_HEADER_FORMS_REFUSED_REASON`), and by the streaming detach, under such a
+  header before it reads any `OBX` and under any other where it would detach a document
+  (`HeaderFormsLimitError`, an `InboundDocRefError`). A
   body with no `MSH` never reaches the detach, since `Peek.parse` refuses it first. The re-attach refuses a stored value holding a
   delimiter the payload's `MSH-1` or `MSH-2` names after its read and before the splice, so a Handler that
   moved `MSH-1` or `MSH-2` after the detach dead-letters the row rather than send an altered document; a

@@ -162,8 +162,9 @@ COLLIDING_DOC_REF_MARKER_REFUSED_REASON = (
 #: found, so it is refused without a scan per form (BACKLOG #5972). It names no byte of the
 #: body.
 COLLIDING_HEADER_FORMS_REFUSED_REASON = (
-    "document handle refused: its header fills a delimiter it does not name with one it already "
-    "uses, and its later headers escape the handle marker in too many ways to look for each"
+    "document handle check refused the body: its header fills a delimiter it does not name with "
+    "one it already uses, and its later headers escape the handle marker in too many ways to look "
+    "for each"
 )
 
 

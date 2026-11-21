@@ -10676,7 +10676,7 @@ class RegistryRunner:
                     code="AR",
                     # Judged without a scan per form, so no marker is named (BACKLOG #5972).
                     text=(
-                        "too many header delimiter sets"
+                        "too many header delimiter sets to check"
                         if marker_refused == COLLIDING_HEADER_FORMS_REFUSED_REASON
                         else "handle marker refused by its delimiters"
                     ),
@@ -10803,7 +10803,7 @@ class RegistryRunner:
                 elif isinstance(exc, HeaderFormsLimitError):
                     # Checked before its base class: the headers' delimiter sets, judged without
                     # a scan per marker form (BACKLOG #5972).
-                    nak_text = "too many header delimiter sets"
+                    nak_text = "too many header delimiter sets to check"
                 elif isinstance(exc, InboundDocRefError):
                     # At least these shapes: a handle in OBX-5.5, the marker elsewhere in a body
                     # with a document to detach, or the marker anywhere under a header whose

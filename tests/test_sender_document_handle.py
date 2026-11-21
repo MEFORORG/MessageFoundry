@@ -2441,9 +2441,10 @@ _TILDE_HEAD = "MSH|~|APP|FAC|RCV|RCVF|20260101120000||MDM~T02|MSGID001|P|2.5\r"
 def test_the_listener_check_scans_a_body_of_many_headers_a_bounded_number_of_times() -> None:
     """R1: the check looked for each distinct form a later header gave with its own scan of the
     whole body, on the event loop, so a 4 MB ``MSH|~|`` body of about 10,000 such headers took
-    5.7 s; 9,990 is as many as the segment cap admits beside the rest. It now makes at most the limit's scans plus two, and refuses such a body, as it could not
-    look for every form, with a reason that says so."""
-    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT
+    5.7 s; 9,990 is as many as the segment cap admits beside the rest. It now makes at most the
+    limit's scans plus two for a body of that size, and refuses such a body, as it could not look
+    for every form, with a reason that says so."""
+    from messagefoundry.parsing.binary import _later_header_forms_limit
     from messagefoundry.parsing.peek import Peek
     from messagefoundry.pipeline.ingress_guards import (
         COLLIDING_HEADER_FORMS_REFUSED_REASON,
@@ -2456,14 +2457,24 @@ def test_the_listener_check_scans_a_body_of_many_headers_a_bounded_number_of_tim
     assert doc_ref_marker_refusal(Peek.parse(body), counted) == (
         COLLIDING_HEADER_FORMS_REFUSED_REASON
     )
-    assert counted.scans <= _LATER_HEADER_FORMS_LIMIT + 2
+    # The floor shows the instrument saw the first line's scan, so the bound is not vacuous.
+    assert 1 <= counted.scans <= _later_header_forms_limit(len(body)) + 2
 
 
-def test_the_listener_check_looks_for_every_form_up_to_the_limit() -> None:
+@pytest.fixture
+def _floor_limit(monkeypatch: pytest.MonkeyPatch) -> int:
+    """Spend no scan budget, so the limit is its floor for a body of any size and a small test
+    body can sit on either side of it."""
+    from messagefoundry.parsing import binary
+
+    monkeypatch.setattr(binary, "_MARKER_SCAN_BUDGET_CHARS", 0)
+    return binary._LATER_HEADER_FORMS_LIMIT
+
+
+def test_the_listener_check_looks_for_every_form_up_to_the_limit(_floor_limit: int) -> None:
     """R1: up to the limit every form is still looked for, so the verdict is the exact one; one
     form past it, the body is refused without the scans, and a marker the first line's forms find
     is still named as held, not as the limit."""
-    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT
     from messagefoundry.parsing.peek import Peek
     from messagefoundry.pipeline.ingress_guards import (
         COLLIDING_DOC_REF_MARKER_REFUSED_REASON,
@@ -2471,7 +2482,7 @@ def test_the_listener_check_looks_for_every_form_up_to_the_limit() -> None:
         doc_ref_marker_refusal,
     )
 
-    limit = _LATER_HEADER_FORMS_LIMIT
+    limit = _floor_limit
     at_limit = _TILDE_HEAD + _headers(limit)
     held = at_limit + f"NTE|1||{_form(limit - 1)}x\r"
     over = _TILDE_HEAD + _headers(limit + 1)
@@ -2487,14 +2498,34 @@ def test_the_listener_check_looks_for_every_form_up_to_the_limit() -> None:
         assert counted.scans == scans
 
 
-def test_the_detach_refuses_a_body_of_too_many_header_forms_and_reads_one_at_the_limit() -> None:
+def test_a_small_body_has_every_header_form_looked_for() -> None:
+    """R1: the limit falls with the body's size, so a small body past the floor is still judged
+    exactly: with no marker it is accepted, and with the marker in its last header's form it is
+    refused as held."""
+    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT
+    from messagefoundry.parsing.peek import Peek
+    from messagefoundry.pipeline.ingress_guards import (
+        COLLIDING_DOC_REF_MARKER_REFUSED_REASON,
+        doc_ref_marker_refusal,
+    )
+
+    count = _LATER_HEADER_FORMS_LIMIT * 4
+    clean = _TILDE_HEAD + _headers(count)
+    held = clean + f"NTE|1||{_form(count - 1)}x\r"
+    assert doc_ref_marker_refusal(Peek.parse(clean), clean) is None
+    assert doc_ref_marker_refusal(Peek.parse(held), held) == COLLIDING_DOC_REF_MARKER_REFUSED_REASON
+
+
+def test_the_detach_refuses_a_body_of_too_many_header_forms_and_reads_one_at_the_limit(
+    _floor_limit: int,
+) -> None:
     """R1 at the detach, under ordinary delimiters where it alone looks: a body with a document
     and more forms than the limit is refused as :class:`HeaderFormsLimitError`, and at the limit
     its document is yielded. Under a colliding header the same refusal comes before the claim's,
     and a marker the first line's forms find is refused as held."""
-    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT, HeaderFormsLimitError
+    from messagefoundry.parsing.binary import HeaderFormsLimitError
 
-    limit = _LATER_HEADER_FORMS_LIMIT
+    limit = _floor_limit
     document = _hl7(_b64(10))
     at_limit = document + _headers(limit)
     assert [
@@ -2504,7 +2535,7 @@ def test_the_detach_refuses_a_body_of_too_many_header_forms_and_reads_one_at_the
         counted = _counting(body)
         with pytest.raises(HeaderFormsLimitError, match="distinct ways"):
             list(iter_obx_documents(Message.parse(body), received=counted))
-        assert counted.scans <= limit + 2
+        assert 1 <= counted.scans <= limit + 2
     for body in (
         document + _headers(limit + 1) + f"NTE|1||{DOC_REF_MARKER}x\r",
         _TILDE_HEADER_DOCUMENT + _headers(limit + 1) + f"NTE|1||{DOC_REF_MARKER}x\r",
@@ -2523,14 +2554,12 @@ def test_the_detach_refuses_a_body_of_too_many_header_forms_and_reads_one_at_the
     ids=["streaming-detach", "colliding-listener-check"],
 )
 async def test_the_mllp_listener_names_a_body_of_too_many_header_forms(
-    store: MessageStore, body: str
+    store: MessageStore, body: str, _floor_limit: int
 ) -> None:
     """R1: a body refused for more header forms than the limit, by the detach under ordinary
     delimiters or by the listeners' check under a colliding header, gets an AR that names the
     headers, not a marker, an ERROR row, and nothing stored or queued."""
-    from messagefoundry.parsing.binary import _LATER_HEADER_FORMS_LIMIT
-
-    assert _LATER_HEADER_FORMS_LIMIT < 5
+    assert _floor_limit < 5
     ic = _streaming_ic()
     assert len(body) >= (ic.stream_threshold_bytes or 0)
     runner = _runner(store, ic)
@@ -2538,7 +2567,7 @@ async def test_the_mllp_listener_names_a_body_of_too_many_header_forms(
     ack = await runner._handle_inbound(ic, body.encode("utf-8"))
 
     assert _ack_code(ack) == "AR"
-    assert ack is not None and "too many header delimiter sets" in ack
+    assert ack is not None and "too many header delimiter sets to check" in ack
     assert [r["status"] for r in await _rows(store, ic.name)] == [MessageStatus.ERROR.value]
     assert await _attachment_count(store) == 0
     assert await _ingress_count(store, ic.name) == 0
