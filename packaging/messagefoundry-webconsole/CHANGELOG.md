@@ -76,6 +76,17 @@ this line.**
 
 ### Security
 
+- **The user pages read an account through the engine's seal-checked read.** The detail page, the
+  federated identity screen and its unlink confirmation, the channel-scope save and the
+  notification-address form read the account through `AdminHandlers.checked_user` rather than the
+  store row, so a record that fails its integrity seal answers 423, or offers no suggestion on the
+  notification-address form, with nothing of the row shown, and the failure goes to the engine's
+  rate-limited seal-failure report. The users list names
+  such an account by its id and, for a `users:manage` holder only, offers its delete through a new
+  confirmation page, `GET /ui/users/{user_id}/delete-confirm`. A page shown after a password
+  reset, a factor reset or an enrolment code was issued names the account by its id when its name
+  read fails in any way, so the one-time credential is still shown. The supported engine seam
+  moved with it: `admin.checked_user` is part of it. (`BACKLOG #5559`)
 - **The cookie WebSocket gate refuses a blank or repeated `Origin`.** `authorize_ui_ws` read
   only the first `Origin` header. It now reads every copy and refuses a blank `Origin`, or more
   than one, as the engine's header path does; an absent header still leaves the handshake to the

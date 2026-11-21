@@ -710,8 +710,8 @@ def _J(authority: str, reach: str) -> Ui:
 _AS = "AuthService"
 _E = "get_engine"
 
-#: Every ``/ui`` operation of ``create_app(serve_ui=True, oidc_enabled=True)``: 129 with OIDC off,
-#: as ADR 0215 measured, and the 4 OIDC legs. A write's authority is its write routes, and a read
+#: Every ``/ui`` operation of ``create_app(serve_ui=True, oidc_enabled=True)``: 130 with OIDC off,
+#: which :func:`test_the_ui_route_counts_are_the_measured_ones` derives, and the 4 OIDC legs. A write's authority is its write routes, and a read
 #: only where the write's own gate names a permission that read decides and no write route does:
 #: under ADR 0215 section 2 a write makes one sub-request and redirects, and the page it re-renders
 #: on an error today is read on the following GET. :func:`_write_authority_problems` checks it.
@@ -791,6 +791,8 @@ _UI_ROUTES: dict[str, Ui] = {
     ),
     "GET /ui/roles": _J("GET /roles", f"{_AS} admin.list_roles"),
     "GET /ui/roles/new": Ui("check", "ADD GET /auth/check/users:manage", ""),
+    # BACKLOG #5559: the delete confirmation for a row that fails its seal reads nothing.
+    "GET /ui/users/{user_id}/delete-confirm": Ui("check", "ADD GET /auth/check/users:manage", ""),
     "GET /ui/roles/{role_id}/edit": _J(
         "GET /roles/custom;ADD GET /auth/check/users:manage", f"{_AS} admin.list_custom_roles"
     ),
@@ -1563,13 +1565,13 @@ def test_every_ui_route_is_classified_by_the_json_route_carrying_its_authority(
 
 
 def test_the_ui_route_counts_are_the_measured_ones() -> None:
-    """129 ``/ui`` operations with OIDC off: the 127 ADR 0215 measured and ADR 0207's two
-    enrolment-code writes, and 4 OIDC legs."""
+    """130 ``/ui`` operations with OIDC off: the 127 ADR 0215 measured, ADR 0207's two
+    enrolment-code writes and BACKLOG #5559's delete confirmation, and 4 OIDC legs."""
     default = set(_ui_routes(create_app(serve_ui=True)))
-    assert len(default) == 129
+    assert len(default) == 130
     assert set(_UI_ROUTES) == default | _OIDC_ONLY
     counts = Counter(u.kind for u in _UI_ROUTES.values())
-    assert counts == {"json": 109, "public": 15, "confinement": 3, "ceremony": 3, "check": 3}, (
+    assert counts == {"json": 109, "public": 15, "confinement": 3, "ceremony": 3, "check": 4}, (
         counts
     )
 

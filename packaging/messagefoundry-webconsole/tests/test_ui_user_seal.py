@@ -162,11 +162,17 @@ async def test_a_failing_account_is_listed_with_its_delete_and_the_delete_remove
         await cookie_login(c, "root")
         listed = await c.get("/ui/users")
         assert listed.status_code == 200
-        assert f'action="/ui/users/{victim}/delete"' in listed.text
+        # The list leads to a confirmation and holds no form that deletes.
+        assert f'href="/ui/users/{victim}/delete-confirm"' in listed.text
+        assert f'action="/ui/users/{victim}/delete"' not in listed.text
         assert _PLANTED not in listed.text
         # Control: an intact account is linked and offers no delete on the list.
         assert f'href="/ui/users/{intact}"' in listed.text
-        assert f'action="/ui/users/{intact}/delete"' not in listed.text
+        assert f"/ui/users/{intact}/delete" not in listed.text
+        confirm = await c.get(f"/ui/users/{victim}/delete-confirm")
+        assert confirm.status_code == 200
+        assert f'action="/ui/users/{victim}/delete"' in confirm.text and victim in confirm.text
+        assert _PLANTED not in confirm.text and "victim" not in confirm.text
         r = await c.post(f"/ui/users/{victim}/delete", headers=SAME_ORIGIN)
     assert r.status_code == 303 and r.headers["location"] == "/ui/users"
     assert await engine.store.get_user(victim) is None
@@ -284,13 +290,17 @@ async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checke
     assert r.status_code == 200
     assert "Temporary password issued" in r.text and "<code>" in r.text
     assert f"Convey this to {victim} " in r.text and "Convey this to victim " not in r.text
-    # The fallback is logged with the account's id.
-    assert any(
-        rec.levelname == "WARNING"
+    # The fallback is logged with the account's id. A store failure keeps its traceback.
+    fallback = [
+        rec
+        for rec in caplog.records
+        if rec.levelname == "WARNING"
         and victim in rec.getMessage()
         and "names the account by id" in rec.getMessage()
-        for rec in caplog.records
-    )
+    ]
+    assert fallback
+    if type(failure) is RuntimeError:  # UserSealRefused is one too, and answers 423
+        assert all(rec.exc_info is not None for rec in fallback)
 
 
 @pytest.mark.parametrize(
@@ -298,12 +308,17 @@ async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checke
     [TypeError("stand-in: a defect"), NotImplementedError("stand-in: a listed defect")],
     ids=["outside-the-refusals", "listed-defect"],
 )
-async def test_a_defect_in_the_post_action_name_read_raises(
-    keyed: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch, defect: Exception
+async def test_a_defect_in_the_post_action_name_read_still_shows_the_credential(
+    keyed: tuple[Engine, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    defect: Exception,
 ) -> None:
-    """The fallback to the id takes only a refusal. An error outside the refusal set, and a listed
-    defect inside it (``AUDIT_WRITE_DEFECTS``; NotImplementedError is a RuntimeError), raise rather
-    than render the id. The control for the fallback is the test above."""
+    """The reset has landed by the time its page reads the name, and its one-time credential is
+    shown nowhere else. So an error outside the refusal set, and a listed defect inside it
+    (``AUDIT_WRITE_DEFECTS``; NotImplementedError is a RuntimeError), still render the page with
+    the id, and log an ERROR with the traceback. On the code before this test they raised, and the
+    credential was lost. The control for a refusal is the test above."""
     engine, _path = keyed
     service, _alerts, _intact, victim = await _setup(engine)
 
@@ -315,8 +330,17 @@ async def test_a_defect_in_the_post_action_name_read_raises(
         monkeypatch.setattr(service, "checked_user", failing)
         path = f"/ui/users/{victim}/reset-password"
         await mint_bound_proof(c, path)
-        with pytest.raises(type(defect), match="stand-in"):
-            await c.post(path, headers=SAME_ORIGIN)
+        r = await c.post(path, headers=SAME_ORIGIN)
+    assert r.status_code == 200
+    assert "Temporary password issued" in r.text and "<code>" in r.text
+    assert f"Convey this to {victim} " in r.text
+    assert any(
+        rec.levelname == "ERROR"
+        and victim in rec.getMessage()
+        and rec.exc_info is not None
+        and rec.exc_info[1] is defect
+        for rec in caplog.records
+    )
 
 
 async def test_the_summary_takes_its_roles_from_a_checked_record_only(
@@ -341,3 +365,62 @@ async def test_the_summary_takes_its_roles_from_a_checked_record_only(
     assert _console_user_summary(raw, [Role.VIEWER.value], show_scope=True).roles == [
         Role.VIEWER.value
     ]
+
+
+async def test_a_users_read_only_reader_is_offered_no_delete_of_a_failing_account(
+    keyed: tuple[Engine, Path],
+) -> None:
+    """The delete route needs ``users:manage``, so the list offers a reader holding ``users:read``
+    alone no delete of a failing row, and the confirmation refuses that reader too. The control is
+    the administrator's list of the same account."""
+    engine, path = keyed
+    service, _alerts, _intact, victim = await _setup(engine)
+    role = await service.create_custom_role(
+        display_name="User reader", description=None, permissions=["users:read"], actor="test"
+    )
+    await provision(service, "reader", [role.id])
+    _tamper(path, victim)
+    async with _client(engine, service) as c:
+        await cookie_login(c, "reader")
+        listed = await c.get("/ui/users")
+        confirm = await c.get(f"/ui/users/{victim}/delete-confirm")
+    assert listed.status_code == 200 and victim in listed.text
+    assert "integrity check failed" in listed.text
+    assert f"/ui/users/{victim}/delete" not in listed.text
+    assert confirm.status_code == 403
+    async with _client(engine, service) as c:
+        await cookie_login(c, "root")
+        boss = await c.get("/ui/users")
+    assert f'href="/ui/users/{victim}/delete-confirm"' in boss.text  # control
+
+
+@pytest.mark.parametrize(
+    "form",
+    [
+        {"scope_mode": "bogus"},
+        {"scope_mode": "list", "channels": ""},
+        {"scope_mode": "list", "channels": "*"},
+    ],
+    ids=["unknown-mode", "empty-list", "all-channels-token"],
+)
+async def test_a_refused_scope_save_reads_the_account_once(
+    keyed: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch, form: dict[str, str]
+) -> None:
+    """A channel-scope post refused for its form re-renders the detail page from the record the
+    save already read through the checked read, rather than reading the account a second time.
+    The control is the refusal's own page, which names the account."""
+    engine, _path = keyed
+    service, _alerts, intact, _victim = await _setup(engine)
+    reads: list[str] = []
+    real = service.checked_user
+
+    async def counting(user_id: str) -> object:
+        reads.append(user_id)
+        return await real(user_id)
+
+    async with _client(engine, service) as c:
+        await cookie_login(c, "root")
+        monkeypatch.setattr(service, "checked_user", counting)
+        r = await c.post(f"/ui/users/{intact}/channel-scope", data=form, headers=SAME_ORIGIN)
+    assert r.status_code == 400 and "User: intact" in r.text
+    assert reads.count(intact) == 1, reads
