@@ -178,6 +178,9 @@ _HEADS = [
     "MSH|~\nPID|1\n",  # a colliding head with LF line endings
     "  \nMSH|^~&|A\r",  # a colliding head after whitespace
     "BHS|~|A\rMSH|^~\\&|A\r",  # a colliding envelope-led head
+    "MSH|~ \n",  # a trailing space the parser's strip removes, after an LF
+    "MSH|~ \nPID|1\n",  # the same space kept, as more follows it
+    "MSH|^~\\ \t \n\n",  # whitespace past the eight characters the read takes
 ]
 
 

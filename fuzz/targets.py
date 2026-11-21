@@ -80,6 +80,7 @@ from messagefoundry.parsing.binary import (
     EscapedDocumentError,
     InboundDocRefError,
     NonVerbatimDocumentError,
+    _obx_is_ed,
     extract_obx_document,
     is_doc_ref,
     iter_obx_documents,
@@ -646,9 +647,11 @@ def _binary_carriage(data: bytes) -> None:
     if is_doc_ref(text):
         with contextlib.suppress(DocRefError):
             parse_doc_ref(text)
-    # The retention pass calls strip_documents bare, so no raise is allowed. It passes
-    # on_unwritable, which opens a branch of its own (BACKLOG #5972), so this call does too.
+    # The retention pass calls strip_documents with no try, so no raise is allowed. It passes
+    # on_unwritable, which opens a branch of its own (BACKLOG #5972), so the body is stripped
+    # both with it and with the default every other caller gets.
     strip_documents(CARRIAGE_MARKER + text, pruned_at=0.0)
+    strip_documents(text, pruned_at=0.0)
     strip_documents(text, pruned_at=0.0, on_unwritable=_ignore)
     _strip_and_scan_hl7(text)
 
@@ -665,11 +668,14 @@ def _strip_and_scan_hl7(text: str) -> None:
     # under-refuses, but not a regression in that verdict itself.
     colliding = message._delimiters_collide()
     try:
-        list(iter_obx_documents(message, received=text))
+        detached = list(iter_obx_documents(message, received=text))
     except CollidingDelimitersRefused:  # the detach's CollidingDelimitersError is one
         _require_colliding(colliding, "iter_obx_documents")
     except (EscapedDocumentError, InboundDocRefError, NonVerbatimDocumentError):
         pass
+    else:
+        if colliding and detached:
+            raise AssertionError("iter_obx_documents yielded a document under colliding delimiters")
     for occurrence in range(1, message.count_segments("OBX") + 1):
         try:
             extract_obx_document(message, occurrence=occurrence)
@@ -679,8 +685,7 @@ def _strip_and_scan_hl7(text: str) -> None:
         except BinaryCarriageError:
             # An OBX that is not ED is refused so in any message; an ED one under a colliding
             # header must meet the header's refusal instead, never this skippable one.
-            ed = (message.field("OBX-2", occurrence=occurrence) or "").upper() == "ED"
-            if not (colliding and ed):
+            if not (colliding and _obx_is_ed(message, occurrence)):
                 continue
         if colliding:
             raise AssertionError("extract_obx_document read a document under colliding delimiters")

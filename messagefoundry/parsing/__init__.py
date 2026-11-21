@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from messagefoundry.parsing.binary import (
     BinaryCarriageError,
+    CollidingDelimitersRefused,
     embed_obx_document,
     extract_obx_document,
 )
@@ -121,6 +122,7 @@ __all__ = [
     # RawMessage.from_bytes/.raw_bytes) + OBX-5 ED embed/extract; full surface under
     # messagefoundry.parsing.binary.
     "BinaryCarriageError",
+    "CollidingDelimitersRefused",
     "embed_obx_document",
     "extract_obx_document",
     # Compression codec (ADR 0123) — pure gzip/zlib-deflate/zip, bytes in → bytes out. Deterministic

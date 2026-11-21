@@ -392,7 +392,8 @@ def transform_strip_batch(
     text. A row whose strip raises, or whose encrypt the key service gives no verdict on, is
     logged with the message id and the error's type only, and skipped. Any other
     :class:`CipherError` from ``encrypt`` is store-wide and is raised. A row whose HL7 header
-    cannot be written is returned for :func:`log_unwritable_skips`. A body holding no embedded document needs no write.
+    cannot be written and that holds an OBX whose ``OBX-2`` is ``ED`` is returned for
+    :func:`log_unwritable_skips`; one with no such OBX holds no document to report. A body holding no embedded document needs no write.
 
     ``refused_into``, when given, is the list the refused cells are appended to as they are found,
     and is returned as ``refused``, so a caller still holds them when a later row raises."""

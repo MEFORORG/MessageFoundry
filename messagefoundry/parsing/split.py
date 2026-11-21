@@ -31,10 +31,12 @@ import re
 from dataclasses import dataclass
 
 from messagefoundry.parsing._builtin_hl7 import (
+    _SEPARATOR_HEAD,
     HEADER_IDS,
     CollidingDelimitersRefused,
     _extract_separators,
     _first_line_head,
+    _whitespace_end,
     filled_default_collides,
 )
 from messagefoundry.parsing.message import COLLIDING_DELIMITERS_WRITE, Message
@@ -442,10 +444,11 @@ def batch_member_collides(member: Message | str) -> bool:
     under the BHS's. The delivery stage asks this of every member and refuses each such one alone
     rather than let one refuse the whole batch.
 
-    Read from the first line's opening characters alone, as :func:`_head_separators` reads them,
-    so a large hydrated member is not copied. ``member`` need not be normalized: the read stops at
-    the first ``\\r`` or ``\\n``, where :func:`~messagefoundry.parsing.peek.normalize` would end the
-    line. On a message the parse accepts it is the parse's own verdict,
+    Read from the first line's opening characters alone, as
+    :func:`~messagefoundry.parsing._builtin_hl7._first_line_head` reads them after
+    :func:`~messagefoundry.parsing.peek.normalize`, so a large hydrated member is neither copied
+    nor scanned: the read stops at the first ``\\r`` or ``\\n`` within those characters, and only
+    a head that ends in whitespace looks past them, as the parser's strip does. On a message the parse accepts it is the parse's own verdict,
     :meth:`Message._delimiters_collide`. It judges the first line only, so it is also ``True``
     for a colliding first line whose message a parse refuses for something later, such as its
     escape budget or a later header line too short to read; the delivery stage then refuses that
@@ -454,7 +457,13 @@ def batch_member_collides(member: Message | str) -> bool:
     did."""
     if isinstance(member, Message):
         return member._delimiters_collide()
-    line = _first_line_head(member).split("\n", 1)[0]
+    end = len(member)
+    start = _whitespace_end(member, 0, end)
+    line = member[start : start + _SEPARATOR_HEAD].split("\r", 1)[0].split("\n", 1)[0]
+    # The parse strips the text's trailing whitespace, which shortens the first line only when
+    # everything after it is whitespace, so only a line ending in whitespace needs the scan.
+    if line[-1:].isspace() and _whitespace_end(member, start + len(line), end) == end:
+        line = line.rstrip()
     return (
         line[:3] in HEADER_IDS and len(line) >= _SEPARATORS_WIDTH and filled_default_collides(line)
     )

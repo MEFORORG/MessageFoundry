@@ -354,8 +354,8 @@ the log line reads (BACKLOG #3043)."""
 #: document (vault BACKLOG #2809): :meth:`RegistryRunner._hydrate_payload` raises it.
 _REATTACH_CODE = "reattach"
 
-#: The :class:`NegativeAckError` code of a batch member whose short MSH-2 fills a delimiter with
-#: one it already uses, so it cannot be written in its own delimiters, as the head's BHS or as a
+#: The :class:`NegativeAckError` code of a batch member whose first line, an MSH, BHS or FHS, names
+#: too few encoding characters and fills a delimiter with one it already uses, so it cannot be written in its own delimiters, as the head's BHS or as a
 #: send's delimiter rewrite would (BACKLOG #5972): :func:`_colliding_member_refusal` raises it.
 _COLLIDING_MEMBER_CODE = "colliding-delimiters"
 
@@ -364,7 +364,8 @@ def _colliding_member_refusal() -> NegativeAckError:
     """The permanent refusal of a batch member whose header cannot be written (BACKLOG #5972). Its
     text names the header's shape only, never a byte of the member."""
     return NegativeAckError(
-        "its short MSH-2 fills a delimiter with one it already uses, so it cannot be batched",
+        "its first line names too few encoding characters and fills a delimiter with one it "
+        "already uses, so it cannot be batched",
         code=_COLLIDING_MEMBER_CODE,
         permanent=True,
     )
@@ -12040,9 +12041,9 @@ class RegistryRunner:
             # rewrites the envelope's delimiters would rewrite the member under the BHS's and
             # change what it reads as. Each such member is refused alone wherever it sits, so its
             # disposition does not depend on which member the window put first, and the rest
-            # batch. Judged in a thread: a member may be large, and its first line ends where
-            # its first CR or LF is.
-            collides = await asyncio.to_thread(lambda: [batch_member_collides(m) for m in members])
+            # batch. Each verdict reads a few characters of the member's first line, so it runs
+            # here rather than in a thread.
+            collides = [batch_member_collides(m) for m in members]
             colliding = [
                 self._refuse_alone_or_raise(it.id, _colliding_member_refusal())
                 for it, hit in zip(kept, collides, strict=True)
