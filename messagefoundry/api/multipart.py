@@ -26,13 +26,15 @@ with one: a close marker right after a file's last segment CR, and a CR run afte
 still parse. A body cut inside its close marker, ending ``--<boundary>-``, is refused as unclosed.
 A close-marker line with text after its padding (``--<boundary>--epilogue``) is refused, not taken as
 the close, because the same line inside a file would otherwise end the file there. A file line
-that is a plain delimiter line splits the file, and the rest has no header block, so it is refused.
+that is a plain delimiter line splits the file. Where the rest has no blank CRLF line, it has no
+header block, so it is refused; where it has one, see the next paragraph.
 
 **What it still trusts.** A part's content must not hold a whole delimiter line. Because a bare CR is
 a line break, every HL7 segment start is a line start, so a file whose segment is a close-marker
 line (``--<boundary>--``, padding allowed) still ends there, and a body cut short after such a
 segment is taken as complete. At least that, and a split whose rest has a blank CRLF line in it,
-which then reads as a part with a header block.
+which then reads as a part with a header block: with no name it is dropped, up to
+``_MAX_FIELD_BYTES``, and the file is stored short.
 A real client picks a boundary its content never holds (RFC 2046), so this is the same invariant
 every multipart parser rests on, narrowed from any boundary text to a whole line of it.
 
@@ -194,7 +196,7 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     The body is walked with ``find`` rather than ``split``: a split copies each segment, and the old
     walk then sliced, partitioned and trimmed it again, about four copies of every admitted part, all
     alive at once. Here the only copy of a part's content is the one the caller takes of a value it
-    keeps. Two passes: the first counts parts, bounds each header block and bounds each part with no
+    keeps. Two passes: the first counts parts, bounds each header block and refuses each part with no
     header block, all before any header is parsed; the second parses each header, which says
     whether the part is a file, and applies the file and field caps to the part's length.
 

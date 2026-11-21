@@ -411,7 +411,7 @@ def test_the_walk_stops_at_the_first_part_over_the_cap() -> None:
     assert 0 < body.finds <= 3 * (multipart._MAX_PARTS + 2), body.finds
 
 
-def test_a_part_with_no_header_block_is_bounded_too() -> None:
+def test_a_part_with_no_header_block_is_refused_at_any_size() -> None:
     """A part with no blank line after its headers is refused with a 400 at any size (#5787). It was
     skipped up to ``_MAX_FIELD_BYTES``, which let a file cut by a whole delimiter line be stored
     short."""
