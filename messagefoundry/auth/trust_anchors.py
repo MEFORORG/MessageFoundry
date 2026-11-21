@@ -154,8 +154,8 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
       collector CA, and on ``[api].tls_client_ca_file`` where that build refused it (BACKLOG
       #5391). A row is written there when the file can be read, this preflight refuses it, and the
       store opens and takes it. At least these write no row: an interrupt, an exit uvicorn takes
-      before the lifespan starts, and a refusal for low disk or an unconfirmed clock, which
-      opens no store.
+      before the lifespan starts, an exit inside the lifespan before this preflight runs, and a
+      refusal for low disk or an unconfirmed clock, which opens no store.
     * ``supervise`` checks the same CA before it builds its own forwarder, and refuses on stderr
       before any engine shard spawns. Its process has no audited preflight, so no row is written.
     * The API lifespan checks the CA of :func:`smtp_hop_anchor_spec` before it builds an alert

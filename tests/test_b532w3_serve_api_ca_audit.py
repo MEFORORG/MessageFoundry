@@ -620,3 +620,15 @@ def test_serve_without_its_hook_fails_loudly() -> None:
     decorator cannot silently turn the audit off."""
     with pytest.raises(RuntimeError, match="pre-lifespan anchor audit hook"):
         cli._pre_lifespan_anchor_audit()
+
+
+def test_a_start_that_reaches_uvicorn_leaves_the_rows_to_the_lifespan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The negative control for ``disarm``: a refused collector CA on a start that reaches uvicorn
+    (stubbed, so no lifespan runs) is the lifespan's to audit, so the exit hook opens no store.
+    Red with the ``disarm`` call removed, when the hook audited after uvicorn returned."""
+    extra = _collector_ca_refused(tmp_path, monkeypatch)
+    rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_toml=extra)
+    assert rc == 0
+    assert not db.exists()

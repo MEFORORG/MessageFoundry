@@ -2917,10 +2917,13 @@ class _PreLifespanAnchorAudit:
     context build refuses. ``serve`` arms this just before ``_start_logging`` and disarms it just
     before ``uvicorn.run``. Any way out in between, a return or an ``Exception``, is an exit the
     lifespan never ran for, so :func:`_audits_anchors_refused_before_the_lifespan` writes those
-    rows then. An interrupt runs no audit, and nor does an exit a gate marks with :meth:`forgo`.
+    rows then.
 
-    The window from ``disarm`` to the lifespan's start, uvicorn's own config load, is not
-    covered: an exit there writes no row."""
+    At least these write no row for an anchor refused before the store: an interrupt, any other
+    ``BaseException`` that is not an ``Exception`` (a ``SystemExit`` included), an exit a gate
+    marks with :meth:`forgo`, an exit uvicorn takes before the lifespan starts, and an exit inside
+    the lifespan before its preflight runs, such as a refused secret provider, a store that does
+    not open, or an attestation that fails closed."""
 
     def __init__(self) -> None:
         self.settings: ServiceSettings | None = None
@@ -2952,8 +2955,9 @@ class _PreLifespanAnchorAudit:
 
     def forgo(self, why: str) -> None:
         """Mark this exit as one that must not write to the store, such as the low-disk floor's
-        or a fail-closed clock check's. ``run`` then logs that no row records each refused
-        anchor, and opens no store."""
+        or a fail-closed clock check's. ``run`` then opens no store, and logs one WARNING that no
+        row records the refused anchors, naming the reason and not each anchor. Only the gates
+        that call this are marked."""
         self.forgone = why
 
     def run(self) -> None:
@@ -2996,8 +3000,9 @@ def _audits_anchors_refused_before_the_lifespan(
 ) -> Callable[[argparse.Namespace], int]:
     """``serve``'s one exit hook over the span :class:`_PreLifespanAnchorAudit` names. The audit
     runs once the body has returned, so every refusal is printed before the store opens, and
-    before an ``Exception`` propagates. It never replaces that exception, except with a
-    ``MemoryError`` of its own."""
+    before an ``Exception`` propagates. The audit logs its own ``Exception``s rather than raise
+    them, so it does not replace the body's. A ``MemoryError`` or an interrupt during the audit
+    does replace it. On a server store the exit waits on the store's connect."""
 
     @functools.wraps(serve)
     def hooked(args: argparse.Namespace) -> int:
@@ -5551,8 +5556,11 @@ def _audit_anchors_refused_before_the_store(
 
     ``serve``'s exit hook (:func:`_audits_anchors_refused_before_the_lifespan`) calls this on every
     way out between ``_start_logging`` and ``uvicorn.run``. It opens the store directly, at the hop
-    posture the lifespan's own open passes, so it is never stricter or looser than ``serve``: at
-    ``enforce`` it refuses what the lifespan's open refuses. It runs the audited preflight
+    posture the lifespan's own open passes, so its hop checks are never stricter or looser than
+    ``serve``'s: at ``enforce`` it refuses what the lifespan's open refuses. Unlike that open it
+    passes no ``refusal_hook`` and no ``message_events``, so a store-cipher refusal found at open
+    is logged and raises no alert. Like it, it opens with ``create=True``, so it may create and
+    migrate the store, as the start would have. It runs the audited preflight
     (:func:`run_anchor_preflight`) on each anchor refused before the store, and closes the store.
     It runs no lifespan, so none of the lifespan's other startup work (at least the secret
     provider, the notifier, the attestation and the engine) runs for a start already refused.
