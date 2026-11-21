@@ -97,19 +97,41 @@ def test_no_file_part_rejected() -> None:
         )
 
 
-# --- ReDoS guard on the Content-Disposition parameter regex (CodeQL py/polynomial-redos) ---------
+# --- ReDoS guard on the Content-Disposition tokenizer (CodeQL py/polynomial-redos) ---------------
 
-#: The pre-guard pattern. Kept here so the equivalence test proves the ``(?<!\w)`` guard is a pure
-#: performance change; if the production regex ever drifts, this test is what catches the semantic gap.
-#: It is also the live positive control for the cost arms below: swapped into the shipping parse path,
-#: it shows that the budget those arms assert against is a line a quadratic scan cannot get under.
+#: The unguarded form of the regex origin/main read Content-Disposition with (origin/main carried a
+#: ``(?<!\w)`` lookbehind in front, which changed no match). It serves twice below: as the reader
+#: the tokenizer is compared against, and as the live positive control for the cost arms, where,
+#: swapped into the shipping parse path, it shows the budget they assert against is a line a
+#: quadratic scan cannot get under.
 _LEGACY_DISPOSITION_PARAM = re.compile(r'(\w+)="([^"]*)"')
+
+
+def _legacy_params(value: str) -> list[tuple[str, str | None]]:
+    """origin/main's reading of a Content-Disposition value, in the tokenizer's pair shape."""
+    return [(m.group(1).lower(), m.group(2)) for m in _LEGACY_DISPOSITION_PARAM.finditer(value)]
+
+
+def _legacy_disposition(line: str) -> tuple[str | None, str | None]:
+    """origin/main's ``_disposition`` on one Content-Disposition line: last value read wins."""
+    name: str | None = None
+    filename: str | None = None
+    for key, value in _legacy_params(line):
+        if key == "name":
+            name = value
+        elif key == "filename":
+            filename = value
+    return name, filename
+
 
 #: Length of the hostile word run the cost arms measure. 12,000 word characters and no further ``="``
 #: is 73 percent of ``_MAX_PART_HEADER_BYTES``, so the arms measure close to the largest header the
 #: parser will actually admit rather than an arbitrary size. Measured 2026-09-03 on a dev box:
-#: ``parse_single_file_upload`` handles this body in ~0.16 ms with the shipped pattern and ~0.7 s with
-#: the unguarded one -- a separation of about 3,900x, which is the room the budget below spends.
+#: ``parse_single_file_upload`` handles this body in ~0.16 ms with the guarded regex then shipped and
+#: ~0.7 s with the unguarded one -- a separation of about 3,900x, which is the room the budget below
+#: spends. Measured 2026-11-21 on a dev box with the tokenizer that replaced the regex (BACKLOG
+#: #5787): ~0.04 ms, and ~0.43 s with the unguarded regex in its place. So the production arm's
+#: margin below is now wider than the ~290x stated there, and the control arm's about 9x, not 13x.
 _HOSTILE_HEADER_CHARS = 12_000
 
 #: The one line both cost arms are measured against, sitting between the two costs recorded above. The
@@ -137,21 +159,90 @@ _SCAN_BUDGET_SECONDS = 0.05
         'Content-Disposition:form-data;name="a";filename="b.txt"',
         'Content-Disposition: form-data; filename="a;b=c.txt"; name="f"',
         'Content-Disposition: form-data; name=""',
-        'Content-Disposition: form-data; foo*name="x"',
         'Content-Disposition: form-data; name="x" name="y"',
         'Content-Disposition: form-data; 9name="d"; _n="e"',
         'Content-Disposition: form-data; name = "spaced"',
-        'name="a"filename="b"',
+        'Content-Disposition: name="a"filename="b"',
         "Content-Disposition: form-data",
+        'Content-Disposition: filename="a.hl7"',
+        'Content-Disposition: form-data, name="file", filename="a.hl7"',
+        'Content-Disposition: form-data name="n" filename="f"',
+        'Content-Disposition: form-data; NAME="Up"; FileName="F.hl7"',
+        'Content-Disposition: form-data; x="a name=b"',
+        'Content-Disposition: form-data; x="abc; name="file"',
+        "Content-Disposition: form-data; name=x; filename*=utf-8''a",
+        'Content-Disposition: form-data; name=upload; filename="a.hl7"',
+        'Content-Disposition: form-data; name="abc',
+        'Content-Disposition: form-data; filename="C:/logs/a.hl7"; name="f"',
     ],
 )
-def test_disposition_param_regex_matches_legacy_semantics(line: str) -> None:
-    """The ``(?<!\\w)`` ReDoS guard must not change which parameters are extracted.
+def test_the_tokenizer_reads_what_origin_main_read(line: str) -> None:
+    """On a line with no backslash and no key that merely ends in ``name`` or ``filename``, the
+    tokenizer reads the same ``name`` and ``filename`` origin/main's regex read (BACKLOG #5787). The
+    lines where the two differ on purpose are the next test's."""
+    assert multipart._disposition(line.encode("latin-1"))[:2] == _legacy_disposition(line)
 
-    Read through the module rather than a from-import, so this file has exactly ONE way to name the
-    pattern and it is the one the arms below substitute. A second, permanently-real binding would sit
-    right beside three tests that replace it, and nothing would say which is which."""
-    assert multipart._DISPOSITION_PARAM.findall(line) == _LEGACY_DISPOSITION_PARAM.findall(line)
+
+@pytest.mark.parametrize(
+    ("line", "legacy", "now"),
+    [
+        # A key is the whole run before its ``=``: ``foo*name`` and ``x-filename`` are not keys
+        # origin/main's word-run regex read as ``name`` and ``filename``.
+        ('Content-Disposition: form-data; foo*name="x"', ("x", None), (None, None, False)),
+        (
+            'Content-Disposition: form-data; name="note"; x-filename="a.hl7"',
+            ("note", "a.hl7"),
+            ("note", None, True),
+        ),
+        # A backslash escapes the next character in a quoted-string; origin/main ended the value at
+        # the escaped quote and kept both backslashes of ``\\``.
+        (
+            'Content-Disposition: form-data; name="file"; filename="a\\"b.hl7"',
+            ("file", "a\\"),
+            ("file", 'a"b.hl7', True),
+        ),
+        (
+            'Content-Disposition: form-data; name="file"; filename="a\\\\b.hl7"',
+            ("file", "a\\\\b.hl7"),
+            ("file", "a\\b.hl7", True),
+        ),
+        ('Content-Disposition: form-data; x="a\\" name="b"', ("b", None), (None, None, False)),
+    ],
+    ids=["foo-star-name", "x-filename", "escaped-quote", "escaped-backslash", "name-in-escaped"],
+)
+def test_where_the_tokenizer_reads_otherwise_than_origin_main(
+    line: str, legacy: tuple[str | None, str | None], now: tuple[str | None, str | None, bool]
+) -> None:
+    """The intended differences from origin/main's reading, each pinned on both sides."""
+    assert _legacy_disposition(line) == legacy
+    assert multipart._disposition(line.encode("latin-1")) == now
+
+
+@pytest.mark.parametrize(
+    ("value", "pairs"),
+    [
+        ('filename="a.hl7"', [("filename", "a.hl7")]),
+        ('form-data, name="file", filename="a.hl7"', [("name", "file"), ("filename", "a.hl7")]),
+        (
+            'form-data; x="a\\"b"; name="file"; filename="a.hl7"',
+            [("x", 'a"b'), ("name", "file"), ("filename", "a.hl7")],
+        ),
+        ('x="a name=b"', [("x", "a name=b")]),
+        ("x-name=y", [("x-name", None)]),
+        ("name=x", [("name", None)]),
+        ('name = "spaced"', [("name", None)]),
+        ('name="abc', [("name", None)]),
+        ('"stray" name="a"', [("name", "a")]),
+        ("form-data; filename*=utf-8''a.hl7", [("filename*", None)]),
+        ('form-data; filename="C:\\logs\\a.hl7"', [("filename", "C:\\logs\\a.hl7")]),
+        ("form-data", []),
+        ("", []),
+    ],
+)
+def test_the_tokenizer_yields_these_pairs(value: str, pairs: list[tuple[str, str | None]]) -> None:
+    """The tokenizer's pairs: a value only from a quoted-string right after ``key=``, ``None`` for
+    any other value form, and no pair for the disposition type."""
+    assert multipart._disposition_params(value) == pairs
 
 
 def _hostile_upload() -> tuple[str, bytes]:
@@ -225,18 +316,36 @@ def test_a_hostile_disposition_header_stays_inside_the_scan_budget() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "unit",
+    ['"', 'a="\\', " =", ";", "a ", "a   ", "\\x", "a  =  ", "=", "a=b "],
+)
+def test_every_tokenizer_branch_stays_inside_the_scan_budget(unit: str) -> None:
+    """The word run above is the regex's worst case, not the tokenizer's, so each tokenizer branch
+    (stray and unclosed quotes, escapes, ``=`` with spaces, separators, bare items, tokens) is timed
+    too, on a line of that unit repeated near ``_MAX_PART_HEADER_BYTES``. Measured 2026-11-21 on a
+    dev box, the slowest took ~3 ms, so the budget has about 15x of room."""
+    value = unit * (_HOSTILE_HEADER_CHARS // len(unit))
+    best = float("inf")
+    for _ in range(5):
+        start = time.perf_counter()
+        multipart._disposition_params(value)
+        best = min(best, time.perf_counter() - start)
+    assert best < _SCAN_BUDGET_SECONDS, f"{unit!r} * n cost {best:.4f}s"
+
+
 def test_the_unguarded_pattern_blows_that_same_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Live positive control: the SAME body and the SAME budget, with the ``(?<!\\w)`` guard removed
-    from the shipping parse path.
+    """Live positive control: the SAME body and the SAME budget, with origin/main's regex, unguarded,
+    in place of the tokenizer on the shipping parse path.
 
     Without it the arm above is unfalsifiable. A budget nothing on this input could ever exceed would
     pass while measuring nothing, and so would an input that had quietly stopped being hostile — which
     the old ratio arm had no way to notice either, since it never ran a pattern it expected to be slow.
-    This one does: it patches the module global ``_disposition`` reads, so the whole shipping path runs
-    unguarded rather than a regex held off to one side.
+    This one does: it patches the module global ``_disposition`` calls, so the whole shipping path runs
+    the quadratic scan rather than a regex held off to one side.
 
     One rep, deliberately. The assertion is that the scan is SLOW, so noise moves it the safe way."""
-    monkeypatch.setattr(multipart, "_DISPOSITION_PARAM", _LEGACY_DISPOSITION_PARAM)
+    monkeypatch.setattr(multipart, "_disposition_params", _legacy_params)
     seconds = _parse_seconds(1)
     assert seconds > _SCAN_BUDGET_SECONDS, (
         f"the unguarded pattern parsed the hostile header in {seconds:.4f}s, inside the "
@@ -246,18 +355,13 @@ def test_the_unguarded_pattern_blows_that_same_budget(monkeypatch: pytest.Monkey
 
 
 class _ScanSentinel:
-    """Stands in for the disposition pattern and fails loudly on ANY use of it.
-
-    It trips from ``__getattr__`` rather than by implementing ``finditer``, because a stand-in pinned
-    to one method name degrades into an ``AttributeError`` the day the scan is rewritten to call
-    something else — and this file already calls ``findall`` on that same object. An
-    ``AttributeError`` would still red, but it would name the wrong problem."""
+    """Stands in for the Content-Disposition tokenizer and fails loudly when the scan calls it."""
 
     def __init__(self, reason: str) -> None:
         self.reason = reason
 
-    def __getattr__(self, name: str) -> object:
-        raise AssertionError(f"{self.reason} (the scan asked the pattern for {name!r})")
+    def __call__(self, value: str) -> list[tuple[str, str | None]]:
+        raise AssertionError(f"{self.reason} (the scan called the tokenizer)")
 
 
 def test_oversized_part_header_is_refused_not_parsed(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -269,7 +373,7 @@ def test_oversized_part_header_is_refused_not_parsed(monkeypatch: pytest.MonkeyP
     a Content-Type is a couple hundred bytes.
 
     **"Before" is the whole claim, so it is asserted rather than described.** A sentinel stands in for
-    the pattern and raises if the scan reaches it, so the refusal has to arrive with the header
+    the tokenizer and raises if the scan reaches it, so the refusal has to arrive with the header
     unscanned. Checking only that ``MultipartError`` is raised passes identically with the cap moved
     below the scan — and that reordering is exactly the regression that hands the header scan a
     body-sized input again, which is the reason the cap exists.
@@ -277,7 +381,7 @@ def test_oversized_part_header_is_refused_not_parsed(monkeypatch: pytest.MonkeyP
     sentinel = _ScanSentinel(
         "the size cap should have refused this header before anything scanned it"
     )
-    monkeypatch.setattr(multipart, "_DISPOSITION_PARAM", sentinel)
+    monkeypatch.setattr(multipart, "_disposition_params", sentinel)
     fat = b"X" * (_MAX_PART_HEADER_BYTES + 1)
     part = (
         b'Content-Disposition: form-data; name="file"; filename="a.hl7"\r\nX-Pad: '
@@ -295,9 +399,9 @@ def test_the_scan_sentinel_fires_when_a_header_is_scanned(monkeypatch: pytest.Mo
     arm above passes for the wrong reason — a sentinel that could never fire proves nothing about
     ordering. An ordinary under-cap header reaches ``_disposition`` normally, so the same substitution
     must raise there."""
-    monkeypatch.setattr(multipart, "_DISPOSITION_PARAM", _ScanSentinel("reached"))
+    monkeypatch.setattr(multipart, "_disposition_params", _ScanSentinel("reached"))
     part = b'Content-Disposition: form-data; name="file"; filename="a.hl7"\r\n\r\nMSH|body'
-    with pytest.raises(AssertionError, match="asked the pattern for"):
+    with pytest.raises(AssertionError, match="the scan called the tokenizer"):
         parse_single_file_upload(
             f"multipart/form-data; boundary={_B}", _body([part]), max_file_bytes=1024
         )
@@ -1210,8 +1314,19 @@ def test_the_close_marker_prefix_line_residual_as_it_stands() -> None:
         b"Content-Disposition: form-data; filename*=utf-8''a",
         b'Content-Disposition: form-data; x="a name=b"',
         b"Content-Disposition: form-data; x-name=y",
+        b'Content-Disposition: form-data; foo*name="x"',
+        b'Content-Disposition: form-data; x="a\\" name="b"',
+        b'Content-Disposition: form-data; x="abc; name="file"',
     ],
-    ids=["x-unnamed", "extended-filename", "name-inside-a-quoted-value", "x-name-key"],
+    ids=[
+        "x-unnamed",
+        "extended-filename",
+        "name-inside-a-quoted-value",
+        "x-name-key",
+        "foo-star-name-key",
+        "name-after-an-escaped-quote",
+        "name-inside-a-later-quote",
+    ],
 )
 def test_a_name_substring_is_not_a_name_parameter(disposition: bytes) -> None:
     """A Content-Disposition holding ``name`` only inside another key is not a part with a name.
@@ -1235,3 +1350,60 @@ def test_a_real_name_or_filename_parameter_counts_as_named(disposition: bytes) -
     body = b"--B\r\n" + _FP + b"MSH|x\r\n--B\r\n" + disposition + b"\r\n\r\nv\r\n--B--\r\n"
     form = parse_multipart_form(_CT_B, body, max_file_bytes=1024)
     assert form.files[0].data == b"MSH|x"
+
+
+#: The Content-Disposition shapes BACKLOG #5787 measured against origin/main, each in a closed body
+#: after a real file part (``MSH|x``), and the outcome of :func:`parse_multipart_form` now: the
+#: files as ``(name, filename, data)`` and the fields, or the refusal's text. Each row's comment
+#: says what origin/main gave, where it differs.
+_DISPOSITION_OUTCOMES: list[tuple[str, object]] = [
+    (
+        'filename="a.hl7"',
+        ([("file", "a.hl7", b"MSH|x"), ("file", "a.hl7", b"v")], {}),
+    ),
+    (
+        'form-data, name="file", filename="a.hl7"',
+        ([("file", "a.hl7", b"MSH|x"), ("file", "a.hl7", b"v")], {}),
+    ),
+    (
+        'form-data; x="a\\"b"; name="file"; filename="a.hl7"',
+        ([("file", "a.hl7", b"MSH|x"), ("file", "a.hl7", b"v")], {}),
+    ),
+    ('form-data; x="a\\"b"; name="note"', ([("file", "a.hl7", b"MSH|x")], {"note": "v"})),
+    # origin/main: the part kept, dropped as a field with no name. Now nameless, so refused.
+    ('x="a name=b"', "neither a name nor a filename"),
+    ("x-name=y", "neither a name nor a filename"),
+    # A name whose value is not read: named, dropped as origin/main dropped it.
+    ("name=x", ([("file", "a.hl7", b"MSH|x")], {})),
+    # origin/main read ``x-filename`` as ``filename``: a second file part named ``note``.
+    ('name="note"; x-filename="a.hl7"', ([("file", "a.hl7", b"MSH|x")], {"note": "v"})),
+]
+
+
+@pytest.mark.parametrize(("disposition", "outcome"), _DISPOSITION_OUTCOMES)
+def test_each_measured_disposition_shape_parses_as_recorded(
+    disposition: str, outcome: object
+) -> None:
+    """BACKLOG #5787: the shapes the one tokenizer was measured on, through the whole parse."""
+    body = (
+        b"--B\r\n"
+        + _FP
+        + b"MSH|x\r\n--B\r\nContent-Disposition: "
+        + disposition.encode()
+        + b"\r\n\r\nv\r\n--B--\r\n"
+    )
+    if isinstance(outcome, str):
+        with pytest.raises(MultipartError, match=outcome):
+            parse_multipart_form(_CT_B, body, max_file_bytes=1024)
+        return
+    form = parse_multipart_form(_CT_B, body, max_file_bytes=1024)
+    assert ([(f.name, f.filename, f.data) for f in form.files], form.fields) == outcome
+
+
+def test_an_x_filename_beside_the_file_no_longer_makes_a_second_file() -> None:
+    """origin/main read ``x-filename`` as ``filename``, so a text field carrying one beside the
+    upload's file made a second file part, and the single-file parse refused the upload. Now it is
+    a field, and the upload's one file is returned."""
+    field = b'Content-Disposition: form-data; name="note"; x-filename="a.hl7"\r\n\r\nv'
+    file = parse_single_file_upload(_CT_WK, _body([_FILE_PART, field]), max_file_bytes=1024)
+    assert (file.name, file.filename, file.data) == ("file", "a.hl7", b"MSH|body")

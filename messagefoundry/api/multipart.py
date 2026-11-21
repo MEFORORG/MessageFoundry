@@ -15,11 +15,23 @@ What it refuses, at least: more than ``_MAX_PARTS`` parts, a part header block o
 more than one. BACKLOG #5787 adds, at least: a body with no closing delimiter line; a line before
 the close marker that starts with ``--<boundary>`` but is not a delimiter line; boundary text in the
 preamble, which would otherwise drop the first part; a line starting with ``--<boundary>`` after the
-close marker; a part with no header block; and a part whose ``Content-Disposition`` has no
-``name`` or ``filename`` parameter, read or not. The last two are refused at any size in a closed
-body. In an unclosed body, one over ``_MAX_FIELD_BYTES`` gets the field cap's refusal (a 400 for no
-header block, a 413 for a header block with no name), and a smaller one lets the body reach the
-missing close marker refusal.
+close marker; and a part with no header block, or with no ``name`` or ``filename`` parameter, under
+the rule in the next paragraph.
+
+**Headerless and nameless parts** (BACKLOG #5787). This is the one statement of the rule; the
+docstrings and comments below point here. A part is nameless when no Content-Disposition parameter
+of its header block has the key ``name`` or ``filename``, whatever its value's form
+(:func:`_disposition_params` says what a parameter is). In a body that closes, a part with no header
+block and a nameless part are each refused with a 400, at any size. In a body that does not close, a
+part with no header block over ``_MAX_FIELD_BYTES`` is refused with that 400 at once, a nameless part
+over ``_MAX_FIELD_BYTES`` gets the field cap's 413, and a smaller one of either is not refused for
+itself, so the body gets the missing close marker refusal unless another check refuses it first.
+
+**How a Content-Disposition is read** (BACKLOG #5787). One quote-aware tokenizer,
+:func:`_disposition_params`, reads each Content-Disposition line into ``(key, value)`` pairs, and a
+part's ``name``, ``filename`` and whether it is nameless all come from those pairs. A value is read
+only from a quoted-string written right after ``key=``, as the parser before this one read it; a
+``name`` or ``filename`` parameter in any other form names the part but gives no value.
 
 **What a delimiter line is** (BACKLOG #5787). ``--<boundary>`` counts only at the start of the body
 or right after a CR or an LF, so boundary text in the middle of a line is part content. After it come
@@ -31,7 +43,7 @@ A close-marker line with text after its padding (``--<boundary>--epilogue``) is 
 the close, because the same line inside a file would otherwise end the file there. A file line
 that is a plain delimiter line splits the file. Where the rest has no blank CRLF line, it has no
 header block, and is refused; where it has one, the rest reads as a part with a header block,
-refused unless its header happens to name a part (next paragraph).
+refused unless its header happens to name a part (next paragraph), under the rule above.
 
 **What it still trusts.** A part's content must not hold a whole delimiter line. Because a bare CR is
 a line break, every HL7 segment start is a line start, so a file whose segment is a close-marker
@@ -41,7 +53,7 @@ boundary, which a body with the real close marker later always does. A file line
 with the close marker (``--<boundary>--note``) is refused in a whole body, but a body cut right
 after its ``--<boundary>--``, or inside padding after it, leaves a valid close and is taken as
 complete. At least those remain, and a split whose rest happens to read as a named part (its own
-``Content-Disposition`` with a ``name``).
+``Content-Disposition`` with a ``name`` or ``filename`` parameter).
 A real client picks a boundary its content never holds (RFC 2046), so this is the same invariant
 every multipart parser rests on, narrowed from any boundary text to a whole line of it.
 
@@ -58,20 +70,25 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-# The leading ``(?<!\w)`` is a **ReDoS guard**, not a semantic filter (CodeQL py/polynomial-redos).
-# Without it, ``(\w+)="…"`` is quadratic on a hostile Content-Disposition line: the scan restarts at
-# every offset inside a word run, and at each one ``\w+`` walks the rest of the run before failing —
-# O(n^2) on a header of n word characters. That header block is attacker-supplied and bounded only by
-# ``[store].max_upload_bytes`` (25 MiB default), and a single scan would wedge the whole engine for
-# days. Running the parse in a worker thread (BACKLOG #5522) does not change that, for the reason
-# ``parse_upload_off_loop``'s docstring states. The lookbehind is O(1) and fails every offset
-# *inside* a run immediately, leaving one ``\w+`` walk per run — O(n) overall.
-#
-# It removes no match: ``=`` is not a word character, so ``\w+`` starting anywhere inside a run can
-# only ever succeed at that run's end — i.e. an interior offset matches iff the run's first offset
-# does, and the leftmost scan always reaches the first offset earlier. Equivalence is pinned by
-# ``tests/test_multipart.py::test_disposition_param_regex_matches_legacy_semantics``.
-_DISPOSITION_PARAM = re.compile(r'(?<!\w)(\w+)="([^"]*)"')
+# The Content-Disposition tokenizer's pieces. Each is applied with ``match`` at one offset and
+# consumes what it scans, so a line is read in one linear pass: this is the **ReDoS guard**
+# (CodeQL py/polynomial-redos). The header block is attacker-supplied, and the regex it replaced,
+# ``(\w+)="…"`` unanchored, restarted at every offset of a word run and was quadratic on one until a
+# lookbehind guard was added. Running the parse in a worker thread (BACKLOG #5522) does not make a
+# quadratic scan safe, for the reason ``parse_upload_off_loop``'s docstring states. The cost is
+# pinned by ``tests/test_multipart.py::test_a_hostile_disposition_header_stays_inside_the_scan_budget``.
+#: A key: every character up to whitespace, a separator, ``=`` or ``"``.
+_DISP_KEY = re.compile(r'[^ \t;,="]*+')
+#: An unquoted (token) value: every character up to whitespace, a separator or ``"``.
+_DISP_TOKEN = re.compile(r'[^ \t;,"]*+')
+#: A quoted-string from its opening quote: its text, then its closing quote, empty if the line ends
+#: first. A backslash takes the next character with it, so ``\"`` does not close the string.
+_DISP_QUOTED = re.compile(r'"((?:[^"\\]|\\[\s\S])*+)("?+)')
+#: The escapes a quoted value's text is decoded for. A backslash before any other character is kept,
+#: so a Windows path such as ``C:\logs\a.hl7`` reads as written.
+_DISP_ESCAPE = re.compile(r'\\([\\"])')
+_DISP_SPACE = re.compile(r"[ \t]*+")
+_DISPOSITION_HEADER = "content-disposition:"
 
 #: Cap on one part's header block. RFC 2388 part headers are ``Content-Disposition`` plus at most a
 #: ``Content-Type``/``Content-Transfer-Encoding``, so 16 KiB is orders of magnitude more than any real
@@ -92,8 +109,8 @@ _MAX_PART_HEADER_BYTES = 16 * 1024
 #: with a peak near 150 MiB, about six times the body. The walk stops at the first part over the cap.
 _MAX_PARTS = 16
 
-#: Cap on one non-file part's bytes, named or not (in a closed body, one with no name or filename
-#: parameter is refused before this cap). ``max_file_bytes`` bounds only file parts, so a
+#: Cap on one non-file part's bytes, named or not (the module docstring's rule on nameless parts
+#: says when one is refused before this cap). ``max_file_bytes`` bounds only file parts, so a
 #: text field was bounded by the body cap alone and was decoded into a ``str`` of up to the whole
 #: body. The upload route keeps no text field, so this only has to admit a short form value.
 _MAX_FIELD_BYTES = 16 * 1024
@@ -113,10 +130,9 @@ class MultipartError(ValueError):
 
 class MultipartTooLargeError(MultipartError):
     """A file part exceeds the caller's byte cap, or a non-file part with a header block exceeds
-    ``_MAX_FIELD_BYTES`` (HTTP 413). A part with no header block raises the base
-    :class:`MultipartError` instead (HTTP 400), and so, in a closed body, does a part whose
-    Content-Disposition has no ``name`` or ``filename`` parameter. In an unclosed body such a part over
-    ``_MAX_FIELD_BYTES`` gets this 413."""
+    ``_MAX_FIELD_BYTES`` (HTTP 413). A part with no header block, or a nameless one, may get the
+    base :class:`MultipartError` (HTTP 400) instead; the module docstring's rule on headerless and
+    nameless parts says when."""
 
 
 @dataclass(frozen=True)
@@ -152,42 +168,87 @@ def parse_boundary(content_type: str | None) -> bytes | None:
     return None
 
 
-def _disposition_keys(line: str) -> list[str]:
-    """The parameter keys of one Content-Disposition line, lowercased, whatever each value's form
-    (quoted or not), so a ``name`` parameter ``_DISPOSITION_PARAM`` cannot read still counts as one.
+def _quoted(value: str, pos: int) -> tuple[str | None, int]:
+    """The quoted-string that opens at ``value[pos]``: its decoded text, or ``None`` if the line
+    ends before its closing quote, and the offset just past it (the end of the line if unclosed)."""
+    match = _DISP_QUOTED.match(value, pos)
+    assert match is not None  # value[pos] is a quote, and the rest of the pattern matches empty
+    if not match.group(2):
+        return None, len(value)
+    return _DISP_ESCAPE.sub(r"\1", match.group(1)), match.end()
 
-    Text inside double quotes is a value and is dropped first, so ``x="a name=b"`` has the one key
-    ``x``. Then the line splits on ``;`` and each piece's key is the text before its first ``=``,
-    stripped; the piece before the first ``;`` is the disposition type, not a parameter. All of it is
-    ``str`` methods, linear in the line. A backslash-escaped quote is not honoured: it ends the
-    quoted value early, so at worst text after it is read as a key."""
-    unquoted = '""'.join(line.split('"')[::2])
-    keys: list[str] = []
-    for piece in unquoted.split(";")[1:]:
-        key, eq, _ = piece.partition("=")
-        if eq:
-            keys.append(key.strip().lower())
-    return keys
+
+def _disposition_params(value: str) -> list[tuple[str, str | None]]:
+    """The parameters of one Content-Disposition value (the text after ``Content-Disposition:``),
+    in order, as ``(key, value)`` pairs with the key lowercased (BACKLOG #5787).
+
+    The value is read left to right as RFC 6266 and RFC 7578 write it, tolerantly. Spaces, tabs,
+    ``;`` and ``,`` separate items. An item is a key, then, if an ``=`` follows it (spaces allowed
+    around the ``=``), a value: a quoted-string, in which a backslash escapes the next character, or
+    else a token, which runs to the next space, separator or quote. A key with no ``=`` after it is
+    the disposition type, or stray text, and is not a parameter; so ``form-data`` is not, and a first
+    item such as ``filename="a.hl7"`` is. A quoted-string where a key belongs is skipped. A key is
+    the whole run before its ``=``, so ``x-name``, ``foo*name`` and the extended ``filename*`` are
+    their own keys, and text inside a quoted value is never a key.
+
+    The pair's value is the quoted-string's text, with ``\\"`` and ``\\\\`` decoded and any other
+    backslash kept, when the quoted-string is written right after ``key=`` with no space and is
+    closed. Otherwise it is ``None``: a token, a value with spaces around its ``=`` and an unclosed
+    quoted-string give the key but no value, as the regex this replaced read none of them."""
+    pairs: list[tuple[str, str | None]] = []
+    pos, end = 0, len(value)
+    while pos < end:
+        char = value[pos]
+        if char in " \t;,":
+            pos += 1
+            continue
+        if char == '"':
+            pos = _quoted(value, pos)[1]
+            continue
+        key_end = _match_end(_DISP_KEY, value, pos)
+        eq = _match_end(_DISP_SPACE, value, key_end)
+        if eq == end or value[eq] != "=":
+            pos = key_end  # past at least ``char``, which is neither ``=`` nor a space
+            continue
+        key = value[pos:key_end].lower()
+        start = _match_end(_DISP_SPACE, value, eq + 1)
+        text: str | None = None
+        if start < end and value[start] == '"':
+            quoted, pos = _quoted(value, start)
+            if eq == key_end and start == eq + 1:
+                text = quoted
+        else:
+            pos = _match_end(_DISP_TOKEN, value, start)
+        pairs.append((key, text))
+    return pairs
+
+
+def _match_end(pattern: re.Pattern[str], value: str, pos: int) -> int:
+    """Where ``pattern``, which matches the empty string, stops when matched at ``pos``."""
+    match = pattern.match(value, pos)
+    assert match is not None  # every pattern passed here matches the empty string
+    return match.end()
 
 
 def _disposition(head: bytes) -> tuple[str | None, str | None, bool]:
-    """Parse a part's header block for its Content-Disposition ``name`` + ``filename`` (or ``None``),
-    and whether it has a ``name`` or ``filename`` parameter at all, read or not. A parameter is one by
-    its exact key, outside any quoted value (:func:`_disposition_keys`): ``x-name=``,
-    ``x="a name=b"`` and the extended ``filename*=`` are not."""
+    """A part's Content-Disposition ``name`` and ``filename`` (each ``None`` if no value was read),
+    and whether the part is named, all from :func:`_disposition_params`' pairs: named means a
+    parameter keyed exactly ``name`` or ``filename``, whatever its value's form (the module
+    docstring's rule on nameless parts). Where a key repeats, the last value read wins."""
     text = head.decode("latin-1", "replace")
     name: str | None = None
     filename: str | None = None
     named = False
     for line in text.split("\r\n"):
-        if line.lower().startswith("content-disposition:"):
-            for match in _DISPOSITION_PARAM.finditer(line):
-                key, value = match.group(1).lower(), match.group(2)
-                if key == "name":
+        if line[: len(_DISPOSITION_HEADER)].lower() == _DISPOSITION_HEADER:
+            for key, value in _disposition_params(line[len(_DISPOSITION_HEADER) :]):
+                if key not in ("name", "filename"):
+                    continue
+                named = True
+                if value is not None and key == "name":
                     name = value
-                elif key == "filename":
+                elif value is not None:
                     filename = value
-            named = named or any(key in ("name", "filename") for key in _disposition_keys(line))
     return name, filename, named
 
 
@@ -231,8 +292,8 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
     alive at once. Here the only copy of a part's content is the one the caller takes of a value it
     keeps. Two passes: the first counts parts, bounds each header block and finds each part with no
     header block, all before any header is parsed; the second parses each header, which says
-    whether the part is a file, refuses one with no name or filename parameter (closed body only), and applies the file and field
-    caps to the part's length.
+    whether the part is a file or nameless, and applies the nameless rule (module docstring) and the
+    file and field caps to the part's length.
 
     Raises what :func:`parse_multipart_form` documents."""
     boundary = parse_boundary(content_type)
@@ -288,13 +349,14 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             raise MultipartError(f"multipart body has more parts than the limit of {_MAX_PARTS}")
         sep = body.find(b"\r\n\r\n", start, end)
         if sep == -1:
-            # Refused at any size in a closed body, not skipped (BACKLOG #5787). No real client sends
-            # a part without a header block, and one is what is left when a file line, such as an
-            # HL7 segment after a bare CR, is a whole delimiter line: skipping it would store the
-            # file cut short there. A 400, not a 413: the size is not what the client has to change,
-            # and the other likely cause is headers ended with bare LFs. Over the field cap it is
-            # refused at once, which bounds the walk; under it the refusal waits for the walk's end,
-            # so an unclosed body, often one cut inside a header block, is refused for that cause.
+            # Refused, not skipped, as the module docstring's rule on headerless parts says (BACKLOG
+            # #5787). No real client sends a part without a header block, and one is what is left
+            # when a file line, such as an HL7 segment after a bare CR, is a whole delimiter line:
+            # skipping it would store the file cut short there. A 400, not a 413: the size is not
+            # what the client has to change, and the other likely cause is headers ended with bare
+            # LFs. Raising at once over the field cap bounds the walk; under it the refusal waits
+            # for the walk's end, so an unclosed body, often one cut inside a header block, is
+            # refused for that cause.
             size = end - start - (2 if body.endswith(b"\r\n", start, end) else 0)
             headerless = MultipartError(
                 f"multipart part of {size} bytes has no header block ended by a blank CRLF line; "
@@ -325,10 +387,11 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
         name, filename, named = _disposition(head)
         size = content_end - content_start
         if closed and not named:
-            # BACKLOG #5787: refused at any size, not skipped. A file split at a whole delimiter
-            # line, whose rest holds a blank CRLF line, leaves this shape, and skipping it would
-            # store the file cut short. A ``name`` parameter the parser cannot read (an unquoted
-            # ``name=x``) is left to the field cap, as before, rather than called nameless.
+            # BACKLOG #5787, under the module docstring's rule on nameless parts: refused, not
+            # skipped. A file split at a whole delimiter line, whose rest holds a blank CRLF line,
+            # leaves this shape, and skipping it would store the file cut short. A ``name`` whose
+            # value is not read (an unquoted ``name=x``) still names the part, so that part is
+            # left to the field cap, as before.
             raise MultipartError(
                 "multipart part has neither a name nor a filename in its Content-Disposition; "
                 "a file line that is a whole boundary delimiter line can leave one"
@@ -432,20 +495,21 @@ def parse_multipart_form(
 
     Raises :class:`MultipartError` if the Content-Type is not multipart, the body is malformed, it
     has no closing delimiter line, it holds more than ``_MAX_PARTS`` parts, it has boundary text in
-    its preamble or a boundary line after its close marker, a part has no header block or a
-    Content-Disposition with no name or filename parameter, or a line starts with the delimiter but is not a
-    delimiter line (all HTTP 400 at the route), and :class:`MultipartTooLargeError` if a file part
-    exceeds ``max_file_bytes`` or a non-file part with a header block exceeds ``_MAX_FIELD_BYTES``
-    (HTTP 413 at the route).
+    its preamble or a boundary line after its close marker, or a line starts with the delimiter but
+    is not a delimiter line (all HTTP 400 at the route), and :class:`MultipartTooLargeError` if a
+    file part exceeds ``max_file_bytes`` or a non-file part with a header block exceeds
+    ``_MAX_FIELD_BYTES`` (HTTP 413 at the route). A part with no header block, or a nameless one,
+    is refused as the module docstring's rule on them says, with a 400 or the field cap's 413.
 
     The order, where a body has more than one fault: first the walk's refusals (preamble boundary
     text, the part count, an oversized header block, a part with no header block over the field
     cap, a misdelimited line, a boundary line after the close marker), in body order; then, in a
-    closed body, a smaller part with no header block; then, part by part, a part with no name or
-    filename parameter (closed body only) and the size caps; then, last, a body with no delimiter
-    line or no close marker. So an unclosed body with an oversized part gets the 413, and an unclosed body cut inside
-    a header block gets the missing close marker refusal. The module docstring says what a delimiter
-    line is and what the parser still trusts of a part's content.
+    closed body, a smaller part with no header block; then, part by part, a nameless part (closed
+    body only) and the size caps; then, last, a body with no delimiter line or no close marker. So
+    an unclosed body with a file or field part over its cap gets the 413, and an unclosed body cut
+    inside a header block gets the missing close marker refusal. The module docstring says what a
+    delimiter line is, how a Content-Disposition is read, and what the parser still trusts of a
+    part's content.
 
     The function is synchronous and walks the whole body. The upload route keeps one file and no
     field, so it calls :func:`parse_upload_off_loop`, which runs :func:`parse_single_file_upload`
@@ -489,7 +553,7 @@ async def parse_upload_off_loop(
 
     **What leaves the loop, and what does not.** This is the one statement of that limit; the
     comments that rely on it point here. The per-part Python work runs on the worker thread. At least
-    each ``find`` over the body, each regex scan of a header block, and the copy of the file part is
+    each ``find`` over the body, each regex match in a header block, and the copy of the file part is
     still one C call that holds the GIL while it runs, so the event loop can still lose the time of the
     longest such call.
 
