@@ -2798,9 +2798,11 @@ reason is written only for an anchor that passed them. An anchor they refuse is 
 `trust_anchor` when its audit row then fails, and so is an anchor file that cannot be read.
 Such a refusal may then have no `auth.trust_anchor` row behind it, so the engine log is the record
 of it. An inline reload answers **503** for `store_unavailable`; a released one answers 422, as
-every refused release does. The engine log carries the store's error. A cluster node that lost
-its lease while its graph still runs refuses a reload before it changes any lane, as `lease_lost`
-(BACKLOG #5906): an inline reload answers **503**, a released one 422.
+every refused release does. The engine log carries the store's error. A reload on a cluster node
+that has lost its lease, while its graph still runs, is refused as `lease_lost` (BACKLOG #5906).
+An inline reload answers **503**; a released one answers 422. The lease is read twice, on entry
+and before the reload stops any listener. Each read is point in time: a lease lost after the
+second read is not refused, and `Engine._stop_graph` takes that graph down.
 
 **The same store fault would not read as a refused anchor on an operator start or on a connection
 test (vault BACKLOG #3746).** A start or restart whose CA check the store stopped would answer

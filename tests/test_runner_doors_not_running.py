@@ -8,7 +8,7 @@ it, outside the engine lifecycle, and ``stop_outbound`` recorded a pause the nex
 
 A node that lost its lease before ``_stop_graph`` ran still has a running graph, so its start and
 restart doors also ask the coordinator for leadership (BACKLOG #5906, #8214 item 16). So do a
-reload, the calendar resume a reload runs, and the single-row send right before it sends.
+reload and the single-row send right before it sends.
 """
 
 from __future__ import annotations
@@ -454,7 +454,7 @@ async def test_a_leader_resend_refusal_still_says_start_it(
         await runner.stop()
 
 
-# --- BACKLOG #5906 closing steps 1 and 2: the send, the reload and the reload's resume -----------
+# --- BACKLOG #5906 closing steps 1 and 2: the single-row send and the reload ----------------------
 
 
 async def _claimed_row(
@@ -499,22 +499,51 @@ async def test_a_single_row_is_not_sent_when_the_lease_goes_before_its_send(
     stops, as at the path's first lease read."""
     coordinator = _LeaseCoordinator()
     runner, recorder, message_id, item = await _claimed_row(store, coordinator)
-    _demote_during_hydration(runner, coordinator)
-    outcome, retry_until = await runner._process_delivery_item(_OUT, item)
-    assert recorder.sent == []
-    assert (outcome, retry_until) == (_ItemOutcome.STOPPED, None)
-    (row,) = await store.outbox_for(message_id)
-    assert row["status"] == "pending" and row["attempts"] == 0 and not row["last_error"]
+    try:
+        _demote_during_hydration(runner, coordinator)
+        outcome, retry_until = await runner._process_delivery_item(_OUT, item)
+        assert recorder.sent == []
+        assert (outcome, retry_until) == (_ItemOutcome.STOPPED, None)
+        (row,) = await store.outbox_for(message_id)
+        assert row["status"] == "pending" and row["attempts"] == 0 and not row["last_error"]
+    finally:
+        await runner.stop()
+
+
+async def test_a_single_row_is_not_sent_when_a_pause_lands_before_its_send(
+    store: MessageStore,
+) -> None:
+    """The same gate as the batch's (#5706): a pause that lands during the reads is not sent
+    through. The leader hands the row back unsent and uncharged."""
+    coordinator = _LeaseCoordinator()
+    runner, recorder, message_id, item = await _claimed_row(store, coordinator)
+    hydrate = runner._hydrate_payload
+
+    async def pausing(payload: str, message_id: str) -> str:
+        runner._outbound_paused.add(_OUT)
+        return await hydrate(payload, message_id)
+
+    runner._hydrate_payload = pausing  # type: ignore[method-assign]
+    try:
+        outcome, _ = await runner._process_delivery_item(_OUT, item)
+        assert recorder.sent == [] and outcome is _ItemOutcome.PROCESSED
+        (row,) = await store.outbox_for(message_id)
+        assert row["status"] == "pending" and row["attempts"] == 0 and not row["last_error"]
+    finally:
+        await runner.stop()
 
 
 async def test_a_single_row_is_sent_while_the_lease_holds(store: MessageStore) -> None:
     """The negative control: the same path, with the lease kept, sends and completes the row."""
     coordinator = _LeaseCoordinator()
     runner, recorder, message_id, item = await _claimed_row(store, coordinator)
-    outcome, _ = await runner._process_delivery_item(_OUT, item)
-    assert outcome is _ItemOutcome.PROCESSED and len(recorder.sent) == 1
-    (row,) = await store.outbox_for(message_id)
-    assert row["status"] == "done"
+    try:
+        outcome, _ = await runner._process_delivery_item(_OUT, item)
+        assert outcome is _ItemOutcome.PROCESSED and len(recorder.sent) == 1
+        (row,) = await store.outbox_for(message_id)
+        assert row["status"] == "done"
+    finally:
+        await runner.stop()
 
 
 def _with_second_inbound(tmp_path: Path) -> Registry:
@@ -566,22 +595,25 @@ async def test_a_leader_reload_binds_the_inbound_it_adds(
         await runner.stop()
 
 
-async def test_a_reload_resumes_no_calendar_park_on_a_node_that_lost_its_lease(
+async def test_a_lease_lost_during_the_reload_prepare_is_refused_before_the_quiesce(
     store: MessageStore, tmp_path: Path
 ) -> None:
-    """Closing step 2, the resume half: the lease can go during the reload's awaits, after its own
-    read. The calendar's park stays, for a later reload to retry."""
+    """Closing step 2: the entry read passes, and the lease goes during the connector builds, the
+    last await before step 1. The second read refuses there, so no listener is unbound or bound."""
     runner, coordinator = await _lease_lost_runner(store, tmp_path, "pooled")
-    try:
-        coordinator.leader = True
-        await runner.stop_outbound(_OUT)
-        runner._schedule_parked.add(_OUT)
+    coordinator.leader = True
+    prepare = runner._prepare_outbound_reconcile
+
+    async def demoting(*args: Any, **kwargs: Any) -> None:
         coordinator.leader = False
-        await runner._resume_unscheduled_outbound(_OUT)
-        assert _OUT in runner._outbound_paused and _OUT in runner._schedule_parked
-        coordinator.leader = True  # the control: a leader resumes the same park
-        await runner._resume_unscheduled_outbound(_OUT)
-        assert _OUT not in runner._outbound_paused
+        await prepare(*args, **kwargs)
+
+    runner._prepare_outbound_reconcile = demoting  # type: ignore[method-assign]
+    try:
+        before = runner._sources[_IN]
+        with pytest.raises(RunnerLeaseLostError):
+            await runner.reload(_with_second_inbound(tmp_path))
+        assert runner._sources == {_IN: before}
     finally:
         await runner.stop()
 
