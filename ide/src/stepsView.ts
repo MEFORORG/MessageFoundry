@@ -68,6 +68,7 @@ import {
   buildPasteRequest,
   buildToolbarInsertRequest,
   drainEdits,
+  errorText,
   escapeHtml,
   mergeLiveValues,
   parseRewriteResult,
@@ -524,7 +525,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         applyOne,
         (err) => {
           void vscode.window.showErrorMessage(
-            `MessageFoundry: could not apply the edit — ${err instanceof Error ? err.message : String(err)}`,
+            `MessageFoundry: could not apply the edit — ${errorText(err)}`,
           );
           void render(); // revert the optimistic webview change to the true projection
         },
