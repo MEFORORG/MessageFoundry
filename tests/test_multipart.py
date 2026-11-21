@@ -181,6 +181,9 @@ _SCAN_BUDGET_SECONDS = 0.05
         'Content-Disposition: form-data; x="a\\" name="b"',
         'Content-Disposition: form-data; name="file"; filename="C:\\logs\\a.hl7"',
         'Content-Disposition: form-data; x=ab"c; name="file"; filename="a.hl7"',
+        'Content-Disposition: form-data; name="up\\"; filename=" report.hl7"',
+        'Content-Disposition: form-data; filename="log\\"; name=" f"',
+        'Content-Disposition: form-data; name="file"; filename="a\\\\b.hl7"',
     ],
 )
 def test_the_tokenizer_reads_what_origin_main_read(line: str) -> None:
@@ -201,23 +204,23 @@ def test_the_tokenizer_reads_what_origin_main_read(line: str) -> None:
             ("note", "a.hl7"),
             ("note", None, True),
         ),
-        # A backslash escapes the next character in a quoted-string; origin/main ended the value at
-        # the escaped quote and kept both backslashes of ``\\``.
+        # Where reading to the first quote cannot end the value, the backslash escapes are read;
+        # origin/main ended the value at the escaped quote.
         (
             'Content-Disposition: form-data; name="file"; filename="a\\"b.hl7"',
             ("file", "a\\"),
             ("file", 'a"b.hl7', True),
         ),
         (
-            'Content-Disposition: form-data; name="file"; filename="a\\\\b.hl7"',
-            ("file", "a\\\\b.hl7"),
-            ("file", "a\\b.hl7", True),
+            'Content-Disposition: form-data; name="file"; filename="say \\"hi\\".hl7"',
+            ("file", "say \\"),
+            ("file", 'say "hi".hl7', True),
         ),
         # A double quote where a key belongs opens a quoted-string, which can hide the parameters
         # after it; origin/main's regex read through it.
         ('Content-Disposition: form-data; "abc; name="file"', ("file", None), (None, None, False)),
     ],
-    ids=["foo-star-name", "x-filename", "escaped-quote", "escaped-backslash", "stray-quote"],
+    ids=["foo-star-name", "x-filename", "escaped-quote", "escaped-quotes", "stray-quote"],
 )
 def test_where_the_tokenizer_reads_otherwise_than_origin_main(
     line: str, legacy: tuple[str | None, str | None], now: tuple[str | None, str | None, bool]
@@ -931,7 +934,8 @@ def _HEADERLESS(size: int) -> tuple[Any, ...]:  # noqa: N802 - reads as a record
         "refused",
         "MultipartError",
         f"multipart part of {size} bytes has no header block ended by a blank CRLF line; "
-        "a file line that is a whole boundary delimiter line leaves one",
+        "headers ended with bare LFs, or a file line that is a whole boundary delimiter line, "
+        "leave one",
     )
 
 
@@ -976,7 +980,9 @@ _MOVED_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "close-then-epilogue": (
         "refused",
         "MultipartError",
-        "multipart body has a line that starts with the boundary delimiter but is not a delimiter line; the body may use another boundary than its Content-Type names",
+        "multipart body has a line that starts with the boundary delimiter but is not a delimiter "
+        "line; the body may use another boundary than its Content-Type names, or a part may hold "
+        "a line that starts with the boundary",
     ),
 }
 

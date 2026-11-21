@@ -29,9 +29,8 @@ itself, so the body gets the missing close marker refusal unless another check r
 
 **How a Content-Disposition is read** (BACKLOG #5787). One quote-aware tokenizer,
 :func:`_disposition_params`, reads each Content-Disposition line into ``(key, value)`` pairs, and a
-part's ``name``, ``filename`` and whether it is nameless all come from those pairs. A value is read
-only from a quoted-string written right after ``key=``, as the parser before this one read it; a
-``name`` or ``filename`` parameter in any other form names the part but gives no value.
+part's ``name``, ``filename`` and whether it is nameless all come from those pairs. What a
+parameter is, and when its value is read, is that function's docstring.
 
 **What a delimiter line is** (BACKLOG #5787). ``--<boundary>`` counts only at the start of the body
 or right after a CR or an LF, so boundary text in the middle of a line is part content. After it come
@@ -83,7 +82,8 @@ from dataclasses import dataclass, field
 #: ``=`` or quote, or nothing right before an ``=``) then, optionally, spaces, ``=``, spaces and a
 #: value: a quoted-string (groups 4 to 6: its opening quote, its text, its closing quote, empty if the
 #: line ends first) or a token (the run up to a space or separator). A backslash in a quoted-string
-#: takes the next character with it, so ``\"`` does not close the string.
+#: takes the next character with it, so ``\"`` does not close the string: this is the escaped
+#: reading, and :func:`_disposition_params` says when the other is used.
 _DISP_ITEM = re.compile(
     r'"(?:[^"\\]|\\[\s\S])*+"?+'
     r'|([^ \t;,="]++|(?==))'
@@ -183,26 +183,26 @@ def _disposition_params(value: str) -> list[tuple[str, str | None]]:
 
     The value is read left to right as RFC 6266 and RFC 7578 write it, tolerantly. Spaces, tabs,
     ``;`` and ``,`` separate items. An item is a key, then, if an ``=`` follows it (spaces allowed
-    around the ``=``), a value: a quoted-string, in which a backslash escapes the next character, or
-    else a token, which runs to the next space or separator. A key with no ``=`` after it is the
+    around the ``=``), a value: a quoted-string, read as the next paragraph says, or else a token,
+    which runs to the next space or separator. A key with no ``=`` after it is the
     disposition type, or stray text, and is not a parameter; so ``form-data`` is not, and a first
     item such as ``filename="a.hl7"`` is. A quoted-string where a key belongs is skipped. A key is
     the whole run before its ``=``, so ``x-name``, ``foo*name`` and the extended ``filename*`` are
     their own keys, and text inside a quoted value is never a key.
 
-    **A browser does not escape a backslash** (the HTML form encoding percent-encodes only ``"``,
-    CR and LF), so a value that ends in one, ``name="a\"; filename="b.hl7"``, reads under the
-    escapes as one value running to the next quote, while a client that does escape, such as curl or
-    httpx, writes ``x="a\"b"``. The escaped reading wins where its closing quote is followed by the
-    end of the line, a space or a separator. Where it is not, or the string does not close, and the
-    value holds a backslash, the value is read as the regex this replaced read it, to the first
-    ``"`` with backslashes kept, if that quote is so followed.
+    **Two readings of a quoted value.** Most clients never backslash-escape one: a browser, httpx
+    and curl by default percent-encode a ``"`` (as ``%22``), and a browser leaves a backslash as it
+    is, so ``name="a\"; filename="b.hl7"`` is a name that ends in a backslash. Some, such as curl
+    with ``--form-escape``, write ``x="a\"b"``. So a quoted value is read first as the regex this
+    replaced read it, to the first ``"`` with every backslash kept, where that quote is followed by
+    the end of the line, a space or a separator. Otherwise it is read with the escapes, ``\"`` and
+    ``\\`` decoded and any other backslash kept, where that reading closes; and otherwise to the
+    first ``"`` again, if there is one.
 
-    The pair's value is the quoted-string's text, with ``\"`` and ``\\`` decoded under the escaped
-    reading and any other backslash kept, when the quoted-string is written right after ``key=``
-    with no space and closes. Otherwise it is ``None``: a token, a value with spaces around its
-    ``=`` and an unclosed quoted-string give the key but no value, as the regex this replaced read
-    none of them."""
+    The pair's value is the text so read, when the quoted-string is written right after ``key=``
+    with no space. Otherwise it is ``None``: a token, a value with spaces around its ``=`` and an
+    unclosed quoted-string with no later ``"`` give the key but no value, as the regex this
+    replaced read none of them."""
     pairs: list[tuple[str, str | None]] = []
     pos, end = 0, len(value)
     while (item := _DISP_ITEM.search(value, pos)) is not None:
@@ -212,18 +212,15 @@ def _disposition_params(value: str) -> list[tuple[str, str | None]]:
             continue  # a quoted-string where a key belongs, or a key with no "="
         text: str | None = None
         if quote is not None:
-            raw = item.group(5)
-            if item.group(6) and (pos == end or value[pos] in _DISP_AFTER_VALUE):
-                text = _DISP_ESCAPE.sub(r"\1", raw)
-            elif "\\" in raw:
-                opened = item.start(5)
-                closed = value.find('"', opened)
-                if closed != -1 and (closed + 1 == end or value[closed + 1] in _DISP_AFTER_VALUE):
-                    text, pos = value[opened:closed], closed + 1
-                elif item.group(6):
-                    text = _DISP_ESCAPE.sub(r"\1", raw)
+            raw, opened = item.group(5), item.start(5)
+            # Without a backslash the two readings are one, and the escaped match already holds it.
+            literal = value.find('"', opened) if "\\" in raw else -1
+            if literal != -1 and (literal + 1 == end or value[literal + 1] in _DISP_AFTER_VALUE):
+                text, pos = value[opened:literal], literal + 1
             elif item.group(6):
-                text = raw
+                text = _DISP_ESCAPE.sub(r"\1", raw)
+            elif literal != -1:
+                text, pos = value[opened:literal], literal + 1
             if before or after:
                 text = None
         pairs.append((key.lower(), text))
@@ -358,14 +355,14 @@ def _locate_parts(content_type: str | None, body: bytes, *, max_file_bytes: int)
             # part's refusal waits for the walk's end, so an unclosed body, often one cut inside a
             # header block, is refused for that cause.
             size = end - start - (2 if body.endswith(b"\r\n", start, end) else 0)
-            if size > _MAX_FIELD_BYTES or pending is None:
-                headerless = MultipartError(
-                    f"multipart part of {size} bytes has no header block ended by a blank CRLF "
-                    "line; a file line that is a whole boundary delimiter line leaves one"
-                )
-                if size > _MAX_FIELD_BYTES:
-                    raise headerless
-                pending = headerless
+            headerless = MultipartError(
+                f"multipart part of {size} bytes has no header block ended by a blank CRLF line; "
+                "headers ended with bare LFs, or a file line that is a whole boundary delimiter "
+                "line, leave one"
+            )
+            if size > _MAX_FIELD_BYTES:
+                raise headerless
+            pending = pending or headerless
         else:
             if sep - start > _MAX_PART_HEADER_BYTES:
                 # Refuse rather than skip: a header this size is never a real client, and skipping
@@ -484,7 +481,8 @@ class _DelimiterLines:
         if after < len(body) and body[after] not in b"\r\n":
             raise MultipartError(
                 "multipart body has a line that starts with the boundary delimiter but is not a "
-                "delimiter line; the body may use another boundary than its Content-Type names"
+                "delimiter line; the body may use another boundary than its Content-Type names, "
+                "or a part may hold a line that starts with the boundary"
             )
         return after, match.group(1) is not None
 
