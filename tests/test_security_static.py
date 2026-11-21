@@ -718,7 +718,7 @@ _UNSCANNABLE_RE_PATTERNS = {
         "'\\\\b(' + re.escape(_ENV_PREFIX) + '[A-Z0-9_]+)\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_NO_SPACE + f'(?![^{_PLAIN_TERMINATORS}])' + '[\\'\\\\\"]?|' + _GUARDED_BRACED_VALUE + f'(?![^{_PLAIN_TERMINATORS}])' + '|(?=' + _GUARDED_QUOTED_VALUE + ')[\\'\\\\\"][^\\\\s\\'\\\\\"]++[\\'\\\\\"]|' + _GUARDED_QUOTED_VALUE + '|' + _PLAIN_VALUE + '[\\'\\\\\"]?)'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _alternation(_CREDENTIAL_WORDS) + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _ODBC_BRACED + '|' + _KV_QUOTED_VALUE + '|' + _ODBC_BRACED_OVERRUN + '|' + _PLAIN_KV_VALUE + ')'",
         "'(?i)(' + _LABEL_OR_CAMEL_START + _LABEL_PREFIX + '(?:' + _KEY_LABEL_ALTERNATION + '))\\\\b[\\'\\\\\"]?\\\\s*[:=]\\\\s*(?:' + _GUARDED_BRACED_VALUE + f'(?![^{_KEY_TERMINATORS}])|' + _GUARDED_QUOTED_VALUE + '|' + _CAMEL_PLAIN_KEY_VALUE + ')'",
-        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*+(?:(@)[a-z0-9.\\\\-]++)?):(?(2)' + _DSN_EMPTY_USER_SEGMENT + '|(?:(?<=//:)' + _DSN_EMPTY_USER_SEGMENT + '|(?<!//:)(?P<lead>@*+)' + _DSN_USER_FIRST_SEGMENT + '))(?:' + _DSN_RUN_STOP + '[^\\\\s/;?#&,()|^~{}<>\\\\[\\\\]%\\\\x27\\\\x22])*@'",
+        "'(?i)(?<![a-z0-9+.\\\\-])([a-z0-9+.\\\\-]+://[^\\\\s:/@]*+(?:(@)[a-z0-9.\\\\-]++)?):(?(2)(?![0-9]++(?![a-z0-9_]))' + _DSN_EMPTY_USER_SEGMENT + '|(?:(?<=//:)' + _DSN_EMPTY_USER_SEGMENT + '|(?<!//:)(?P<lead>@*+)' + _DSN_USER_FIRST_SEGMENT + '))(?:' + _DSN_RUN_STOP + '[^\\\\s/;?#&,()|^~{}<>\\\\[\\\\]%\\\\x27\\\\x22])*@'",
         "_camel_start('\\\\b[\\'\\\\\"]?\\\\s*+[:=]')",
         "source",
     ),

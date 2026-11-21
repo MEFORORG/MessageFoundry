@@ -1291,7 +1291,8 @@ def test_the_dsn_scan_still_reaches_every_scheme_shape_that_matters() -> None:
         ),
         # An empty user's password that starts with "=" or "@": the first segment had to take a
         # character, so these printed whole (code review, round 2). With a user, the same shape is
-        # hidden too since BACKLOG #5386's wave 3; the test after the residual test below pins it.
+        # hidden too since BACKLOG #5386's wave 3, pinned by the ``lead_at`` assertion in
+        # test_an_empty_user_dsn_hides_an_equals_sign_and_states_its_residual.
         ("store dsn redis://:=Lead_Eq-75@db.invalid", ("Lead_Eq-75",), "redis://:"),
         ("store dsn redis://:@Lead_At-76@db.invalid", ("Lead_At-76",), "redis://:"),
         # Both at once, two "@" signs in the password.

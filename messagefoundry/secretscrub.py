@@ -1449,12 +1449,14 @@ _DSN_EMPTY_USER_SEGMENT = (
 # (group ``lead``, written back by :func:`_dsn_password_repl`). A user holding an "@" takes the
 # empty user's segment (group 2 decides), which stops at ";", ",", "=" and the rest, so
 # ``postgres://svc@db:5432;sslpassword=Tail@Sec`` and ``http://user@host:8080,admin@corp``, where
-# the "@" ends a user and a port follows, still match nothing. The lead keeps its "@" signs before
+# the "@" ends a user and a port follows, still match nothing; and a segment that opens with a run of
+# digits no word character follows is a port, not a password, so ``user@host:8080!admin@corp``
+# matches nothing either (code review). A password after ``user@host:`` that opens that way prints. The lead keeps its "@" signs before
 # the placeholder, so ``svc:@<placeholder>@`` is no ``user:password@`` the URL arm of
 # :data:`messagefoundry.redaction._CREDENTIAL_AHEAD` reads, as ``svc:@Pw@`` was not.
 _WIDE_DSN_PASSWORD = re.compile(
     r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+(?:(@)[a-z0-9.\-]++)?):"
-    r"(?(2)"
+    r"(?(2)(?![0-9]++(?![a-z0-9_]))"
     + _DSN_EMPTY_USER_SEGMENT
     + r"|(?:(?<=//:)"
     + _DSN_EMPTY_USER_SEGMENT
@@ -1470,15 +1472,21 @@ def _dsn_password_repl(m: re.Match[str], placeholder: str) -> str:
     """The replacement for a match of :data:`_DSN_PASSWORD` or :data:`_WIDE_DSN_PASSWORD`: group 1,
     then ":", the widened match's leading "@" signs, the placeholder and the "@".
 
-    THE NARROW MATCH CAN HOLD A CONNECTION-STRING MEMBER (BACKLOG #5386, the JDBC no-user tail).
-    With no user before the host, ``jdbc:sqlserver://db:1433;user=svc;sslpassword=P@ss_Sec9;``
-    reads the host as the user and ``1433;...;sslpassword=P`` as the password, so the member's key
-    was hidden with it and ``ss_Sec9`` printed. Where the match holds a member key, as
+    A JDBC DSN WITH NO USER BEFORE ITS HOST (BACKLOG #5386, the JDBC no-user tail).
+    ``jdbc:sqlserver://db:1433;user=svc;sslpassword=P@ss_Sec9;`` reads the host as the user and
+    ``1433;...;sslpassword=P`` as the password, so the member's key was hidden with it and
+    ``ss_Sec9`` printed. Only on that shape -- ``jdbc:`` before the scheme, and a password that opens
+    with a port of one to five digits and a ";" -- and only where the match holds a member key, as
     :data:`_CONNECTION_STRING_MEMBER` opens one, whose value runs past the match's "@", the
-    placeholder stops before that key's ";" and the rest of the match is written back with its
-    value's words masked (:func:`_mask_member_value`), so the member pass, which runs later on both
-    surfaces, reads the key and masks the whole value. Nothing the match held prints: the key, its
-    "=" and the value's punctuation do, as the member pass prints them.
+    replacement is ``<group 1>:<placeholder><;key=><placeholder>@``. So the member pass, which runs
+    later on both surfaces, reads the key and masks the tail after the "@". What prints that the
+    narrow replacement hid is the key itself, its ";" and "=", never a character of its value.
+    The cost, at least: a ``jdbc:`` DSN WITH a user whose password opens with digits, a ";" and a
+    member key prints that key. The shape is held this narrow because a write-back on every match
+    printed parts of real ``user:password`` values a code review measured.
+
+    The key and the leading "@" signs are text of the line that :class:`_Trace` reads as fixed
+    replacement text (the comment above :data:`_BRACED` says so).
 
     LINEAR in the match. Each member is read only up to the match's end, which the value reaches
     exactly when it reaches past it in the whole text, since the match holds no line break and ends
@@ -1488,14 +1496,20 @@ def _dsn_password_repl(m: re.Match[str], placeholder: str) -> str:
     lead = (m.group("lead") or "") if "lead" in m.re.groupindex else ""
     head = f"{m.group(1)}:{lead}{placeholder}"
     text, end = m.string, m.end()
-    at = text.find(";", m.end(1) + 1, end)
+    port = _JDBC_PORT.match(text, m.end(1) + 1, end)
+    if port is None or not text.endswith("jdbc:", 0, m.start()):
+        return f"{head}@"
+    at = port.end() - 1
     while at != -1:
         member = _CONNECTION_STRING_MEMBER.match(text, at, end)
         if member is not None and member.end(2) == end:
-            value = member.start(2)
-            return f"{head}{text[at:value]}{_mask_member_value(text, value, end - 1)}@"
+            return f"{head}{text[at : member.start(2)]}{placeholder}@"
         at = text.find(";", at + 1 if member is None else member.end(), end)
     return f"{head}@"
+
+
+#: The port a JDBC DSN with no user puts where :data:`_DSN_PASSWORD` reads a password, then its ";".
+_JDBC_PORT = re.compile(r"[0-9]{1,5};")
 
 
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG
@@ -1603,8 +1617,11 @@ _MEMBER_EXTRA_WORDS = ("token",)
 #
 # THE VALUE RUNS TO THE NEXT ";", QUOTE OR LINE BREAK, OR THE END OF THE TEXT, over spaces, ",",
 # "&", "=" and "://" alike, and over a quote glued between two word characters, so
-# ``;sslpassword=P'Kv9_Sec;`` is masked whole (BACKLOG #5386 wave 3; a quote ending it there printed
-# ``Kv9_Sec``). Spaces and then one quote may open it. Stopping at a later quote costs
+# ``;sslpassword=P'Kv9_Sec;`` is masked whole (BACKLOG #5386 wave 3; a quote ending the value there
+# printed ``Kv9_Sec``). A key ``_CREDENTIAL_KV`` reads first, such as ``;PWD=``, is a residual: that
+# pass ends its value at the quote and writes its placeholder, and this pass, reading a quote after
+# the placeholder, stops there, so ``;PWD=P'Kv9_Sec;`` prints ``Kv9_Sec``. Taking a quote after a
+# placeholder was tried and changed what the member differential's whole-value control reads. Spaces and then one quote may open it. Stopping at a later quote costs
 # nothing the builder sends, since a plain password and every ``odbc_params`` value refuse quotes,
 # and it keeps the rest of a quoted echo (``'...;PWD=a b' refused``) readable. A braced value is
 # taken by ``_ODBC_BRACED`` with its body kept to one line, and then on to the same stops, so
@@ -2368,6 +2385,10 @@ def _run(
 # written back masked one character for one: the braced tail, or a member's value. A replacement of
 # any other shape raises :class:`_Untraceable`, and the line takes the pre-camelCase reading alone,
 # which is what ``origin/main`` printed before BACKLOG #5545, plus the widened DSN pass (:func:`_run`).
+# ONE EXCEPTION, which the trace cannot see: :func:`_dsn_password_repl` writes back, as "fixed"
+# text, a password's leading "@" signs and, on a JDBC DSN with no user, a member's ``;key=`` (BACKLOG
+# #5386). Neither is a value: the trace reads them as text a replacement wrote, which both readings
+# write the same way, since the DSN patterns hold no camelCase fragment.
 
 #: The group :func:`_keep_label` and ``_AUTH_SCHEME``'s replacement write back masked at their end.
 _BRACED = "braced_tail"
