@@ -1131,7 +1131,7 @@ def test_an_unparseable_origin_matches_nothing_on_public_host_and_proxied_postur
     """Each of these makes ``urlsplit`` raise ValueError, with more than one message. On the
     public-origin and Host-fallback postures ``_origin_matches`` answers False for them rather
     than raising, and the control shows each still matches its own origin. The proxied-loopback
-    posture answers False for every Origin, so its rows check only that nothing raises."""
+    rows check only that nothing raises."""
     from messagefoundry_webconsole._auth import _origin_matches
 
     postures = {
