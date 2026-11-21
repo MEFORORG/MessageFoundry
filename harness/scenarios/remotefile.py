@@ -90,7 +90,9 @@ def verify_written(
 ) -> ScenarioResult:
     """Every file written for a sent control id equals what was sent, byte for byte, and was
     published directly inside the outbox. Any entry :func:`sink_faults` names (a link, an unread
-    entry, an incomplete scan, a file read from outside) fails the check whatever it carries."""
+    entry, an incomplete scan, a file read that could not be shown to be inside the sink
+    directory) fails the check whatever it carries. Not caught: a folder moved out of the outbox
+    after the walk entered it and replaced by another at its old name."""
     faults = sink_faults(records)
     if faults:
         return ScenarioResult(scenario, False, f"{prior}; {faults}")
@@ -100,7 +102,9 @@ def verify_written(
         if record.meta.get("refused"):
             # Unread, so its bytes were never compared: a problem whatever it was, including a
             # record sink_faults does not take for a file sink's.
-            problems.append(f"an entry in the outbox was not read ({where!r})")
+            problems.append(
+                f"an entry in the outbox was not read ({where!r}): {record.meta['refused']}"
+            )
             continue
         cid = control_id_of(record.payload)
         if cid is None or cid not in sent:

@@ -309,11 +309,13 @@ def record_where(record: sinks.Record) -> str:
 def sink_faults(records: Iterable[sinks.Record]) -> str:
     """A failure note naming the records a sink took as a link (``meta["symlink"]``), the other
     entries the file sink recorded unread (a FIFO or device, a refused name, an over-cap file), its
-    scan-wide refusals (a replaced directory, a bounded scan), and any file it read and recorded as
-    not inside its directory (``meta["inside"]`` false), or "" when there are none. An unread
-    entry carries no control id, a scan that did not cover the directory may have missed a link,
-    and a file read from outside the directory may carry any control id: each would otherwise be
-    invisible to a check that counts control ids. Names are quoted with ``repr``, since a File
+    scan-wide refusals (a replaced directory, a bounded scan), and a file read that could not be
+    shown to be inside the sink directory (``meta["inside"]`` not true: an escape, or a resolve
+    that failed), or "" when there are none. An unread entry carries no control id, a scan that
+    did not cover the directory may have missed a link, and a file that could not be shown to be
+    inside may carry any control id: each would otherwise be invisible to a check that counts
+    control ids. Not caught: a folder moved out of the directory after the walk entered it and
+    replaced by another at its old name, since ``inside`` is judged by the path afterwards. Names are quoted with ``repr``, since a File
     outbound can render one from HL7 fields."""
     links: list[str] = []
     unread: list[str] = []
