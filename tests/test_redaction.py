@@ -3177,16 +3177,19 @@ def test_the_credential_pattern_is_held_to_its_sources() -> None:
     )
     run_head = "(?:" + secretscrub._DSN_RUN_STOP + r"[^\s/"
     run = secretscrub._DSN_RUN
-    assert run.startswith(run_head) and run.endswith("])*@"), run
+    assert run.startswith(run_head) and run.endswith("])*"), run
     group_char = secretscrub._DSN_GROUP_CHAR
     assert group_char.startswith(run_head) and group_char.endswith("])"), group_char
     tail_char = secretscrub._DSN_TAIL_CHAR
     tail_head = "(?:;|" + secretscrub._DSN_RUN_STOP + r"[^\s/"
     assert tail_char.startswith(tail_head) and tail_char.endswith("])"), tail_char
     tail = wide.split(r"(?<!//:)" + first, 1)[1]
-    assert tail == (
-        run + r"(?(dsn_placeholder)(?:" + group_char + "*+@|" + tail_char + "++@)*+))"
-    ), tail
+    expected_tail = (
+        r"(?(dsn_placeholder)(?:@" + group_char + "*+(?=@)|@" + tail_char + "++(?=@))*+)"
+    )
+    shipped_tail = secretscrub._DSN_TAIL
+    assert shipped_tail == expected_tail, shipped_tail
+    assert tail == run + secretscrub._DSN_TAIL + ")@", tail
 
 
 def test_an_empty_user_dsn_does_not_switch_the_encoded_run_off() -> None:

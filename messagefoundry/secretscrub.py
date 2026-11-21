@@ -1380,7 +1380,10 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # holding no ";", or a group holding ";" and only characters outside the run's stops and ".", ":",
 # "=" and "@", where a ";" may lead, end or repeat. All such groups are taken at once, and the
 # text after the last is a group of neither kind, which is also the only text the run could start
-# on in a second redaction, so a second redaction leaves the output as the first left it. A group
+# on in a second run, so a second run of this pattern over its own output takes nothing more. That
+# says nothing of a whole redaction, whose other passes can still change a line a second time, as
+# they do on ``origin/main``; on a camelCase-labelled DSN the union keeps the tail as ``origin/main``
+# read it (:func:`_pre_camel` says why). A group
 # holding a ";" and a ".", a ":" or a ``key=`` member is not taken, so
 # ``smtp://ops:pw@mail.local:587;alerts@corp`` keeps its host, which the declined ";" reading named
 # wrongly. The rule sits on the user's alternative only, so an empty user's match never takes it,
@@ -1413,8 +1416,8 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # would try every split of a run that reaches no "@", which is quadratic; possessive, it gives
 # nothing back, so the run after it is the only walk and backs off to its last "@". Written flat,
 # not as a repeated "@"-led group, so no quantifier nests under another, except in the tail after
-# a user's placeholder: there each repeat is a possessive run that refuses "@", then an "@", so the
-# repeats tile the text and none can split another. The static ReDoS gate in
+# a user's placeholder: there each repeat is an "@", then a possessive run that refuses "@", ending
+# where the next "@" is, so the repeats tile the text and none can split another. The static ReDoS gate in
 # ``tests/test_security_static.py`` DOES NOT SCAN this pattern: it splices ``_DSN_RUN_STOP`` below,
 # so that gate lists it among the patterns it cannot resolve, and the shape is held by inspection,
 # stated there. The growth is held by a stopwatch, against a backtracking control, in
@@ -1461,7 +1464,9 @@ _DSN_USER_FIRST_SEGMENT = (
 #: What the run after the first segment stops at, one class body, shared with the tail's class so
 #: the two stop sets cannot drift apart.
 _DSN_RUN_STOPS = r"\s/;?#&,()|^~{}<>\[\]%\x27\x22"
-_DSN_RUN = r"(?:" + _DSN_RUN_STOP + r"[^" + _DSN_RUN_STOPS + r"])*@"
+#: The run, less the "@" it ends at: the pattern takes that "@" once, last, after the tail, so
+#: :func:`_pre_camel` can leave the tail (:data:`_DSN_TAIL`) out and keep a whole pattern.
+_DSN_RUN = r"(?:" + _DSN_RUN_STOP + r"[^" + _DSN_RUN_STOPS + r"])*"
 # One character of a tail group after a user's placeholder (BACKLOG #5386, the
 # ``svc:Kv9x@Zq7;w@db`` shape): a ";", or a character of the run's class but ".", ":", "=" or "@",
 # so a group holding a host's dot, a port or a ``key=`` member is not taken. The comment above says
@@ -1469,6 +1474,12 @@ _DSN_RUN = r"(?:" + _DSN_RUN_STOP + r"[^" + _DSN_RUN_STOPS + r"])*@"
 _DSN_TAIL_CHAR = r"(?:;|" + _DSN_RUN_STOP + r"[^" + _DSN_RUN_STOPS + r".:=@])"
 # One character of a tail group with no ";": the run's own class, less "@".
 _DSN_GROUP_CHAR = r"(?:" + _DSN_RUN_STOP + r"[^" + _DSN_RUN_STOPS + r"@])"
+#: The tail after a user's placeholder: each group opens with the "@" before it and ends before
+#: the next. :func:`_pre_camel` leaves it out of the reading before, so on a camelCase-labelled DSN
+#: the union keeps the line as ``origin/main`` wrote it (BACKLOG #5386; the comment above says why).
+_DSN_TAIL = (
+    r"(?(dsn_placeholder)(?:@" + _DSN_GROUP_CHAR + r"*+(?=@)|@" + _DSN_TAIL_CHAR + r"++(?=@))*+)"
+)
 _WIDE_DSN_PASSWORD = re.compile(
     r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):"
     r"(?:(?<=//:)(?:" + _DSN_RUN_STOP + r"(?:[^\s/@?#&=;,()|^~{}<>\[%\x27\x22]|%(?!7c|7e|5e|26|"
@@ -1477,11 +1488,8 @@ _WIDE_DSN_PASSWORD = re.compile(
     + r"|(?<!//:)"
     + _DSN_USER_FIRST_SEGMENT
     + _DSN_RUN
-    + r"(?(dsn_placeholder)(?:"
-    + _DSN_GROUP_CHAR
-    + r"*+@|"
-    + _DSN_TAIL_CHAR
-    + r"++@)*+))"
+    + _DSN_TAIL
+    + r")@"
 )
 
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG
@@ -2283,8 +2291,11 @@ def _run(
     :func:`scrub_credentials`'s own run, on a line it sends to no union, takes it too. So the pass
     also runs where the union returns its reading before whole: on a line where the shipped
     reading would hide a member key's ";", and on an untraceable one.
-    The widened pattern holds no camelCase fragment, so :func:`_pre_camel` leaves it as it is and
-    both readings apply the same pattern. Its run does not cross a camelCase label only the shipped
+    The widened pattern holds no camelCase fragment, and :func:`_pre_camel` changes it in one place
+    only: it leaves out the tail after a user's placeholder (:data:`_DSN_TAIL`), so the reading
+    before reads the tail as ``origin/main`` did. So a line the union returns its reading before
+    for, whole, on either branch above, does not take the tail, and prints it as ``origin/main``
+    did. Its run does not cross a camelCase label only the shipped
     reading reads, because every segment of the widened match stops at a label word
     (``_DSN_RUN_STOP``): on ``redis://:pw@h?accessToken=Tail@Sec`` and
     ``redis://:pw@h;userPassword=Tail@Sec`` the reading before, widened or not, differs only in
@@ -2404,6 +2415,14 @@ def _pre_camel(pattern: re.Pattern[str]) -> re.Pattern[str]:
     source = pattern.pattern
     for fragment, before in _CAMEL_FRAGMENTS:
         source = source.replace(fragment, before)
+    # Not a camelCase fragment: the widened DSN pass's tail after a user's placeholder (BACKLOG
+    # #5386). In the reading before, it hid the ``Zq7;w`` of ``dbPassword=postgres://svc:Kv9x@Zq7;w
+    # @db``, where the shipped reading's label pass had already taken the DSN and left ``;w@db``,
+    # so the union joined the two into ``<placeholder>@db``, which a second redaction's label pass
+    # read on to the host. Left out here, the union writes ``<placeholder>;w@db``, as
+    # ``origin/main`` did, which a second redaction leaves as it is. On a line the shipped reading
+    # reads the tail on, the union still hides it, since it hides what either reading hid.
+    source = source.replace(_DSN_TAIL, "")
     if len(_PRE_CAMEL) >= 64:  # only patched test patterns get here
         _PRE_CAMEL.clear()
     compiled = re.compile(source, pattern.flags)

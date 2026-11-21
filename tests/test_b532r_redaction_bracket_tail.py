@@ -11,6 +11,7 @@ on ``secretscrub._WIDE_DSN_PASSWORD`` says how, and what each rule still leaves.
 
 from __future__ import annotations
 
+import random
 import re
 from collections.abc import Callable
 
@@ -69,6 +70,88 @@ def test_a_second_redaction_leaves_the_tail_rules_output_as_it_is(line: str) -> 
     assert scrub_credentials(once) == once, once
     chain = scrub_log_text(line)
     assert redact_log_line(chain) == chain.replace(CREDENTIAL_PLACEHOLDER, REDACTION_PLACEHOLDER)
+
+
+def test_a_camelcase_labelled_dsn_keeps_its_host_and_reads_as_origin_main() -> None:
+    """Review round 3: the union joined the label pass's reading and the tail's into
+    ``dbPassword=<redacted>db``, losing the host's "@", and a second pass hid the host too. The
+    reading before now leaves the tail out, so the line is written as ``origin/main`` wrote it,
+    host kept, and a second pass leaves it as it is. Its ``;w`` prints, as on ``origin/main``."""
+    line = "dbPassword=postgres://svc:Kv9x@Zq7;w@db failed"
+    expected = f"dbPassword={CREDENTIAL_PLACEHOLDER};w@db failed"
+    assert scrub_credentials(line) == expected
+    assert scrub_credentials(expected) == expected
+    chain = scrub_log_text(line)
+    assert chain == expected and scrub_log_text(chain) == chain
+    bundle = redact_log_line(chain)
+    assert bundle == expected.replace(CREDENTIAL_PLACEHOLDER, REDACTION_PLACEHOLDER)
+    assert redact_log_line(bundle) == bundle
+
+
+def test_known_residual_a_labelled_dsn_tail_prints() -> None:
+    """Pinned as printed, as on ``origin/main``: a credential label before the DSN takes the DSN
+    up to the ";" in its own pass, so the tail rule never sees it. A red means the reading changed."""
+    for line in (
+        "password: postgres://svc:Kv9x@Zq7;w@db failed",
+        "dbPassword=postgres://svc:Kv9x@Zq7;w@db failed",
+    ):
+        assert ";w@db failed" in scrub_credentials(line), line
+
+
+_CORPUS_PIECES = ("Kv9", "a", "Zq7", ";", ";", "@", "@", ".", ":", "=", "w", "x.y", "587", "[9]")
+_CORPUS_SCHEMES = ("postgres://svc:", "smtp://ops:", "redis://:")
+_CORPUS_LABELS = ("", "dbPassword=", "password: ", "accessToken=", "userPwd=", "x ")
+_CORPUS_ENDS = (" failed", "; userPwd=x", ",userPwd='a;PWD=b'", "")
+
+
+def _corpus() -> list[str]:
+    rng = random.Random(5386)
+    lines = []
+    for _ in range(1500):
+        body = "".join(rng.choice(_CORPUS_PIECES) for _ in range(rng.randint(2, 10)))
+        host = rng.choice(("db", "h.invalid", "mail.local:587"))
+        lines.append(
+            rng.choice(_CORPUS_LABELS)
+            + rng.choice(_CORPUS_SCHEMES)
+            + body
+            + "@"
+            + host
+            + rng.choice(_CORPUS_ENDS)
+        )
+    return lines
+
+
+def _stable(line: str) -> tuple[bool, bool]:
+    once = scrub_credentials(line)
+    chain = scrub_log_text(line)
+    bundle = redact_log_line(chain)
+    return scrub_credentials(once) == once, redact_log_line(bundle) == bundle
+
+
+def test_the_tail_makes_no_line_of_the_corpus_unstable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Over a seeded corpus, every line a second scrub, or a second bundle read of a chain line,
+    leaves unchanged with the tail left out of the widened pattern, it leaves unchanged with the
+    tail too. The control drops the tail on both callers."""
+    import messagefoundry.support.redact as redact_mod
+
+    lines = _corpus()
+    shipped = [_stable(line) for line in lines]
+    shipped_out = [scrub_credentials(line) for line in lines]
+    control = re.compile(
+        scrub_mod._WIDE_DSN_PASSWORD.pattern.replace(scrub_mod._DSN_TAIL, ""),
+        scrub_mod._WIDE_DSN_PASSWORD.flags,
+    )
+    monkeypatch.setattr(scrub_mod, "_WIDE_DSN_PASSWORD", control)
+    monkeypatch.setattr(redact_mod, "_WIDE_DSN_PASSWORD", control)
+    without = [_stable(line) for line in lines]
+    worse = [
+        line
+        for line, a, b in zip(lines, shipped, without, strict=True)
+        if (b[0] and not a[0]) or (b[1] and not a[1])
+    ]
+    assert not worse, worse[:5]
+    # Positive control: the tail changes the output of some lines of the corpus.
+    assert any(scrub_credentials(line) != out for line, out in zip(lines, shipped_out, strict=True))
 
 
 @pytest.mark.parametrize("call", _ENTRY_POINTS, ids=_IDS)

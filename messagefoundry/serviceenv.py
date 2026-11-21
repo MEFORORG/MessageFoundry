@@ -388,8 +388,9 @@ def _holds_key_run(text: str) -> bool:
 
 def _is_key_value(text: str) -> bool:
     """Whether ``text``, stripped and with one pair of surrounding quotes taken off, is one secret
-    or a comma-separated list of them, as a retired-keys list is (:func:`_is_one_key_text`; vault
-    BACKLOG #5394 added items 6 and 12)."""
+    or a comma-separated list of them with no empty entry (:func:`_is_one_key_text`; vault
+    BACKLOG #5394 added items 6 and 12). A retired-keys list the engine would load with an empty
+    entry, from a trailing or doubled comma, is not read as one, a known gap."""
     value = text.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
         value = value[1:-1]
