@@ -565,7 +565,7 @@ def test_a_file_it_cannot_restrict_is_logged(
     def refuse(_path: object, *_args: object) -> None:
         raise PermissionError("denied")
 
-    monkeypatch.setattr(tee_store, "_owner_only_dacl", lambda _path: "error 5")
+    monkeypatch.setattr(tee_store, "_owner_only_dacl", lambda _paths: "error 5")
     monkeypatch.setattr(os, "chmod", refuse)
     with caplog.at_level(logging.WARNING, logger="tee.store"):
         tee_store._secure_file(str(target))  # noqa: SLF001 - the helper under test

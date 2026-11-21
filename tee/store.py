@@ -262,10 +262,12 @@ def _precreate_secure(path: str) -> None:
         pass
 
 
-def _owner_only_dacl(path: str) -> str | None:
-    """Give ``path`` a protected DACL holding one entry, full control for this process's own user.
+def _owner_only_dacl(paths: list[str]) -> str | dict[str, str]:
+    """Give each of ``paths`` a protected DACL holding one entry, full control for this process's
+    own user.
 
-    Windows only. Returns None once the DACL is set, or why it could not be. The user is the SID in
+    Windows only. Returns why no file could be restricted, as a string, or else each path that
+    could not be, with the reason; an empty dict means every one was. The user is the SID in
     this process's own token, never a name or an environment variable, which another party could
     have set. Protected means no entry is inherited from the folder. Native calls rather than
     ``icacls``: the tee imports nothing from ``messagefoundry``, whose ``_secure_file`` pins that
@@ -355,18 +357,25 @@ def _owner_only_dacl(path: str) -> str | None:
             descriptor, ctypes.byref(present), ctypes.byref(dacl), ctypes.byref(defaulted)
         ):
             return f"the owner-only DACL could not be read back (error {ctypes.get_last_error()})"
-        error = advapi32.SetNamedSecurityInfoW(
-            path,
-            se_file_object,
-            dacl_information | protected_dacl_information,
-            None,
-            None,
-            dacl,
-            None,
-        )
+        # A NULL DACL set on a file grants everyone full control, so never pass one on.
+        if not present.value or not dacl.value:
+            return "the owner-only DACL came back empty"
+        failures: dict[str, str] = {}
+        for path in paths:
+            error = advapi32.SetNamedSecurityInfoW(
+                path,
+                se_file_object,
+                dacl_information | protected_dacl_information,
+                None,
+                None,
+                dacl,
+                None,
+            )
+            if error != 0:
+                failures[path] = f"SetNamedSecurityInfoW failed (error {error})"
     finally:
         kernel32.LocalFree(ctypes.cast(descriptor, wintypes.HLOCAL))
-    return None if error == 0 else f"SetNamedSecurityInfoW failed (error {error})"
+    return failures
 
 
 def _secure_file(path: str) -> None:
@@ -379,24 +388,26 @@ def _secure_file(path: str) -> None:
     On Windows each file gets a protected DACL granting full control to this process's own user and
     nobody else (``_owner_only_dacl``); chmod there sets only the read-only bit. A sibling that
     SQLite deletes and later re-creates, on the last connection's close or a journal-mode switch,
-    takes its folder's access list again until a later open restricts it.
+    takes its folder's access list again until a later open restricts it. Each open restricts the
+    files to the account opening them, so a DB is usable only by the account that opened it last:
+    run the relay and the tee commands that read its DB under one account.
 
     On POSIX each file is chmod 0600. A sibling SQLite re-creates later takes the main file's mode
     whatever the umask (the unix VFS copies it), so it is 0600 whenever the main file is.
     test_wal_siblings_recreated_after_open_inherit_owner_only_mode pins the inheritance."""
-    for sibling in (path, path + "-wal", path + "-shm"):
-        if not os.path.exists(sibling):
-            continue
-        if os.name == "nt":
-            reason = _owner_only_dacl(sibling)
-            if reason is not None:
-                _log.warning(
-                    "could not restrict %s to its owner (%s); it keeps its folder's access list, "
-                    "so keep the tee DB on a protected volume",
-                    sibling,
-                    reason,
-                )
-            continue
+    present = [s for s in (path, path + "-wal", path + "-shm") if os.path.exists(s)]
+    if os.name == "nt":
+        result = _owner_only_dacl(present)
+        failures = dict.fromkeys(present, result) if isinstance(result, str) else result
+        for sibling, reason in failures.items():
+            _log.warning(
+                "could not restrict %s to its owner (%s); it keeps its folder's access list, "
+                "so keep the tee DB on a protected volume",
+                sibling,
+                reason,
+            )
+        return
+    for sibling in present:
         try:
             os.chmod(sibling, 0o600)
         except OSError as exc:
@@ -436,7 +447,8 @@ class RelayStore:
         await db.executescript(_SCHEMA)
         await db.commit()
         if path != ":memory:":
-            _secure_file(path)
+            # Off the loop: native ACL calls can block on a network volume.
+            await asyncio.to_thread(_secure_file, path)
         return cls(db, path)
 
     async def record_leg(
