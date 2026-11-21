@@ -447,6 +447,33 @@ def test_an_interrupted_codeset_rename_moves_the_table_back(
     load_config(config_dir)
 
 
+def test_a_codeset_rename_interrupted_after_a_write_keeps_table_and_references_together(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Ctrl-C after the reference write returned, as the locks are released: nothing restores
+    the reference, so moving the table back would leave it named by a reference that reads the
+    new name. The table stays under the new name and the log names the file left rewritten."""
+    mod = CODESET_MOD.replace("r_cs_misspelled", "r_cs")
+    config_dir = _config(tmp_path, {"mod.py": mod, "codesets/diets.csv": "code,value\nA,Apple\n"})
+    real_locks = impact._rename_locks
+
+    @contextlib.contextmanager
+    def interrupted_on_release(files: Any) -> Iterator[None]:
+        with real_locks(files):
+            yield
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(impact, "_rename_locks", interrupted_on_release)
+    with caplog.at_level("ERROR"), pytest.raises(KeyboardInterrupt):
+        codeset_edit.rename_code_set(config_dir, "diets", "meals", validate=_validate)
+    monkeypatch.undo()
+    assert sorted(p.name for p in (config_dir / "codesets").iterdir()) == ["meals.csv"]
+    text = (config_dir / "mod.py").read_text(encoding="utf-8")
+    assert 'code_set("meals")' in text and 'code_set("diets")' not in text
+    load_config(config_dir)
+    assert "mod.py" in caplog.text and "stays as meals.csv" in caplog.text
+
+
 def test_reapplying_a_plan_with_two_edits_on_one_line_is_a_no_op(tmp_path: Path) -> None:
     """The already-renamed check maps each span through the edits before it: a second edit on the
     same line sits where the first one's change in length moved it."""

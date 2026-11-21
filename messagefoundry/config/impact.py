@@ -534,7 +534,7 @@ def write_rename(prepared: PreparedRename) -> list[LiteralEdit]:
     the bytes read, then raises :class:`RenameWriteError` naming any file it could not restore."""
     plan = prepared.plan
     with _rename_locks(file for file, _raw, _new in prepared.files):
-        changed = [file for file, raw, _new in prepared.files if not _still_reads(file, raw)]
+        changed = rewritten_files(prepared)
         if changed:
             raise RenameWriteError(
                 f"cannot apply the rename of {plan.target_kind} {plan.old!r}: "
@@ -566,6 +566,14 @@ def write_rename(prepared: PreparedRename) -> list[LiteralEdit]:
                 raise
             written.append((file, raw))
     return list(prepared.applied)
+
+
+def rewritten_files(prepared: PreparedRename) -> list[str]:
+    """The files of ``prepared`` that no longer hold the bytes :func:`prepare_rename` read, read
+    from disk now. A caller that must undo its own step after :func:`write_rename` raised, at any
+    point, reads here which references are left rewritten rather than trusting the write's own
+    bookkeeping, which an interrupt can cut short. A file that cannot be read counts as rewritten."""
+    return [file for file, raw, _new in prepared.files if not _still_reads(file, raw)]
 
 
 def _still_reads(file: str, raw: bytes) -> bool:

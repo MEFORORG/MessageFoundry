@@ -256,9 +256,22 @@ def rename_code_set(
                 ) from exc
             raise WiringError(f"{exc}. The code set was moved back to {src.name}") from exc
         except BaseException:
-            # An interrupt (Ctrl-C, SystemExit) or an unexpected error: write_rename has restored
-            # the references to the old name, so the table goes back to it too before the
-            # exception propagates, leaving the config as it was.
+            # An interrupt (Ctrl-C, SystemExit) or an unexpected error. write_rename restores only
+            # what was cut off inside a write, so an interrupt after a write returned, or while
+            # its locks were released, can leave references naming the new table. Read the files:
+            # the table goes back only when none is left rewritten, so table and references agree.
+            left = impact.rewritten_files(prepared)
+            if left:
+                _log.error(
+                    "code set rename interrupted: %s left naming %r, so the code set stays as %s; "
+                    "these still name %r: %s",
+                    ", ".join(left),
+                    new,
+                    dest.name,
+                    old,
+                    ", ".join(f for f, _raw, _new in prepared.files if f not in left) or "none",
+                )
+                raise
             try:
                 replace_generated(dest, src)
             except OSError as back:
