@@ -84,13 +84,31 @@ _BLANK_GLYPHS: Final = frozenset({0x2800, 0x16FE4, 0x1D159})
 BLANK_USERNAME_REFUSAL: Final = "a username is required and must not be blank"
 
 
-def _unprintable(ch: str) -> bool:
+#: Unicode's Prepended_Concatenation_Mark characters (PropList.txt): format characters (Cf) that
+#: draw a visible glyph, such as the Arabic number sign U+0600 and end of ayah U+06DD.
+_VISIBLE_FORMAT: Final = frozenset(
+    {0x0600, 0x0601, 0x0602, 0x0603, 0x0604, 0x0605, 0x06DD, 0x070F, 0x0890, 0x0891, 0x08E2}
+    | {0x110BD, 0x110CD}
+)
+
+
+def renders_as_nothing(ch: str) -> bool:
+    """Whether ``ch`` is one of the characters this module treats as drawing no glyph: a format
+    character (category Cf) other than :data:`_VISIBLE_FORMAT`, a default-ignorable code point
+    (:data:`_DEFAULT_IGNORABLE`) or a blank glyph (:data:`_BLANK_GLYPHS`). Not every character a
+    font draws blank. The account and role name rule in ``api.auth_models`` sets these aside
+    before it asks whether a name is blank or folds to a built-in role's name (BACKLOG #5784,
+    #5785)."""
     point = ord(ch)
     return (
-        unicodedata.category(ch) in CONTROL_CATEGORIES
+        (unicodedata.category(ch) == "Cf" and point not in _VISIBLE_FORMAT)
         or point in _BLANK_GLYPHS
         or any(low <= point <= high for low, high in _DEFAULT_IGNORABLE)
     )
+
+
+def _unprintable(ch: str) -> bool:
+    return unicodedata.category(ch) in CONTROL_CATEGORIES or renders_as_nothing(ch)
 
 
 def username_refusal(username: str) -> str | None:
