@@ -50,9 +50,10 @@ class ConfigConvergenceRunner:
     stays one-way (pipeline only).
 
     ``refusals`` names the exceptions a reload raises by design rather than as a fault, at least the
-    runner's lease-lost refusal (BACKLOG #5906). A pass that meets one is logged at INFO with no
-    traceback, once until a pass ends without one, and is retried next interval like any failure;
-    the applied version does not advance.
+    runner's lease-lost refusal (BACKLOG #5906). Through a run of passes that meet one, the first
+    logs its "converging" line and one refusal line at INFO, with no traceback, and the rest log
+    both at DEBUG. Each is retried next interval like any failure; the applied version does not
+    advance.
     """
 
     def __init__(
@@ -117,11 +118,15 @@ class ConfigConvergenceRunner:
         except self._refusals as exc:
             if not self._refusal_logged:
                 self._refusal_logged = True
+                # The type name, not the text: a reload refusal's text tells an operator what to do
+                # about a manual reload, and this background pass needs nothing.
                 log.info(
-                    "cluster: config convergence refused on this node (%s); will retry next "
-                    "interval",
-                    exc,
+                    "cluster: config convergence refused on this node by design (%s); it retries "
+                    "each interval and needs no operator action",
+                    type(exc).__name__,
                 )
+            else:
+                log.debug("cluster: config convergence refused again (%s)", type(exc).__name__)
             return
         except Exception:
             log.exception("cluster: config convergence pass failed; will retry next interval")
@@ -146,7 +151,9 @@ class ConfigConvergenceRunner:
         shared = self._coordinator.config_version_cached()
         if shared <= self._applied_version():
             return False
-        log.info(
+        # Quiet through a run of designed refusals, which _pass_once reports once.
+        log.log(
+            logging.DEBUG if self._refusal_logged else logging.INFO,
             "cluster: shared config version %d is ahead of this node's applied %d; converging",
             shared,
             self._applied_version(),

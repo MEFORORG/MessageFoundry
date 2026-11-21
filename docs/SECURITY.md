@@ -2699,7 +2699,10 @@ with a note saying why. A release refused for unreadable parameters writes an
 `approval.params_unreadable` row against the approver, which carries no parameters, and one refused
 as `params_no_requester` or `params_no_fingerprint` writes an `approval.params_no_requester` or
 `approval.params_no_fingerprint` row against the approver. A
-release refused on the requester's standing writes `approval.stale_requester`, above. A refusal for
+release refused on the requester's standing writes `approval.stale_requester`, above. One an
+operation refuses on this node's state before the claim, at least a config reload on a cluster
+node that lost its lease (BACKLOG #5906), writes `approval.node_refused` against the approver and
+leaves the request unclaimed. A refusal for
 a request with no requester id, or for an operation no longer registered, still writes no row.
 
 **A listing that shows `requester_not_authorized` writes one audit row (vault BACKLOG #3747).** Each
@@ -2803,10 +2806,12 @@ cluster node whose coordinator no longer reads it as leader, while its graph sti
 refused as `lease_lost` (BACKLOG #5906). "The lease" here is the coordinator's cached
 `is_leader()` flag, not a read of the lease row, so it can lag that row. On such a node an inline
 reload answers **503**. A request that dual control gates files its hold as usual, since the hold
-reads no lease. A release approved on that node is refused with **409** before the gate claims
-it, so the request stays pending and can be approved on the leader; the refusal writes the same
-`lease_lost` row. If the flag goes false only after that check, the reload itself refuses, and
-the approval is then marked failed and answers 422, as every refused release does. A release on
+reads no lease. A release approved on that node is refused with **503** before the gate claims
+it, so the request is not spent and can be approved on the leader; the refusal writes an
+`approval.node_refused` row against the approver. If the flag goes false after that check and
+before the runner's second read, below, the reload itself refuses, and the approval is then
+marked failed and answers 422, as every refused release does. If it goes false after that second
+read, the release is not refused and runs on this node, as an inline reload would. A release on
 the leader, or on this node once its graph has stopped, is not refused for the lease. A dry run
 there is not refused for the lease: it swaps nothing and never asks for it. The runner reads the
 flag twice: once it holds the reload lock, which is after `Engine.reload_detail` has loaded the
@@ -2815,8 +2820,10 @@ in time, so what they guarantee is at least this: a reload is refused when the f
 at either read, and a flag that goes false after the second read is not refused. That reload then
 binds listeners and resumes lanes on the node, and `Engine._stop_graph` takes them down only once
 the reload ends, since it waits on the same lock. A cluster convergence pass on such a node is
-refused the same way, logged once at INFO, and retried; a DR activation's reload is refused too,
-and its `dr_activation_aborted` row names the lease.
+refused the same way, before it loads the config, and retried each interval; the first pass of
+such a run logs at INFO with no traceback, the rest at DEBUG. A DR activation's reload is refused
+too, and its `dr_activation_aborted` row names the lease. That refusal comes at the activation's
+profile step, after its store recovery, its seed marker and any takeover hook have run.
 
 **The same store fault would not read as a refused anchor on an operator start or on a connection
 test (vault BACKLOG #3746).** A start or restart whose CA check the store stopped would answer

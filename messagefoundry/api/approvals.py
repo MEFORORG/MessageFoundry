@@ -128,9 +128,10 @@ ScopeCheck = Callable[[Identity, Mapping[str, Any]], bool]
 
 #: A refusal an operation's executor would make that THIS node's state, not the request, decides
 #: (BACKLOG #5906: a reload on a cluster node that lost its lease). :meth:`ApprovalGate.approve`
-#: awaits it before the claim, so a raised :class:`ApprovalError` leaves the request pending for a
-#: release elsewhere or later, where past the claim the executor's own raise is compensated to
-#: ``failed``. Point in time: a state that changes after it returns is the executor's to refuse.
+#: awaits it before the claim, so a raised :class:`ApprovalError` leaves the request as it was,
+#: where past the claim the executor's own raise is compensated to ``failed``. The gate writes an
+#: ``approval.node_refused`` row against the approver for it. Point in time: a state that changes
+#: after it returns is the executor's to meet.
 BeforeClaim = Callable[[Mapping[str, Any]], Awaitable[None]]
 
 #: What an operator records for an ``interrupted`` release, mapped to the terminal status it writes
@@ -512,7 +513,8 @@ class _Operation:
     #: every config when there is no usable one (:func:`held_fingerprint`; vault BACKLOG #3192), so
     #: :meth:`ApprovalGate._release_blocked` predicts that refusal before the claim too.
     requires_fingerprint: bool = False
-    #: Awaited just before the claim, after every other refusal (:data:`BeforeClaim`).
+    #: Awaited before the approver read and the claim, after the refusals that read the request
+    #: alone (:data:`BeforeClaim`).
     before_claim: BeforeClaim | None = None
 
 
@@ -1515,7 +1517,8 @@ class ApprovalGate:
         one younger than ``[approvals].min_dwell_seconds`` (409, ``approval.too_early``), and one
         whose operation dual control no longer gates (409, ``approval.no_longer_gated``;
         :meth:`_refuse_ungated`), and one its operation's ``before_claim`` refuses on this node's
-        state (:data:`BeforeClaim`), with the status that hook raises.
+        state (:data:`BeforeClaim`), with the status that hook raises and an
+        ``approval.node_refused`` row.
 
         **The refusal compares user ids, never usernames (BACKLOG #1540).** The stored ``requester``
         and the live ``approver`` are two snapshots of a directory-writable name, taken up to
@@ -1690,7 +1693,28 @@ class ApprovalGate:
         # before the claim, so a raise leaves the request pending for a release on another node or
         # later.
         if op.before_claim is not None:
-            await op.before_claim(params)
+            try:
+                await op.before_claim(params)
+            except ApprovalError as refused:
+                # Against the approver, as the other refusals here are; soft for the same reason.
+                # The detail is the engine's own fixed text, never the params.
+                await self._record_audit_soft(
+                    approval_id,
+                    "approval.node_refused",
+                    actor=approver,
+                    detail=json.dumps(
+                        {
+                            "approval_id": approval_id,
+                            "operation": operation,
+                            "requester": row.requester,
+                            "status": refused.status,
+                            "refusal": refused.detail,
+                        }
+                    ),
+                    client=client,  # ADR 0150: the approver's address, matching this row's actor
+                    context="the release was refused on this node",
+                )
+                raise
         # BACKLOG #315 (b): READ the approver's account now, before the transition, so no store read
         # sits between the transition and the executor. The flag is written in the `finally` below.
         changed = await self._approver_changes(approver_user_id, row.requested_at)

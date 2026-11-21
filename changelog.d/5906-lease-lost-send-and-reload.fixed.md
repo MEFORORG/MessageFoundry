@@ -9,8 +9,10 @@
   listener. It is refused with no lane changed when either read is false; a flag that goes false
   after the second read is not refused. On such a node an ungated `POST /config/reload` answers
   503 and writes a `config_reload_failed` row with reason `lease_lost`. A gated one files its
-  hold, which reads no lease. Approving that hold on such a node answers 409 before the request is
-  claimed, so it stays pending and can be approved on the leader; a flag that goes false only after
-  that check is refused by the reload itself, and that approval is then marked failed. A cluster convergence pass there
-  is logged once at INFO with no traceback and retried, and a DR activation's abort row names the
-  lease. A dry run there is not refused for the lease. (`BACKLOG #5906`)
+  hold, which reads no lease. Approving that hold on such a node answers 503 before the request is
+  claimed, writes `approval.node_refused` against the approver, and leaves the request to be
+  approved on the leader. A flag that goes false after that check and before the runner's second
+  read is refused by the reload itself, and that approval is then marked failed; after the second
+  read the release runs. A cluster convergence pass there is refused before it loads the config,
+  logged once at INFO with no traceback, and retried. A DR activation's abort row names the lease.
+  A dry run there is not refused for the lease. (`BACKLOG #5906`)

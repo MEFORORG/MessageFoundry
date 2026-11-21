@@ -77,7 +77,11 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
 from messagefoundry.pipeline.crl_reload import CrlReloadRunner
-from messagefoundry.pipeline.dr import DrCoordinator, warn_unset_pass_environment
+from messagefoundry.pipeline.dr import (
+    DrCoordinator,
+    DrProfileNotLeading,
+    warn_unset_pass_environment,
+)
 from messagefoundry.pipeline.dr_backup import BackupRunner
 from messagefoundry.pipeline.gcm_invocations import GcmInvocationRunner
 from messagefoundry.pipeline.intake_bound import IntakeBoundMonitor
@@ -1274,7 +1278,7 @@ class Engine:
                 # The reload's build check and executor build still load each lookup CA file,
                 # with no bound, as a lane's build loads its own.
                 close_failures = await rr.reload(fhir_lookup_anchors=lookups)
-        except BaseException:
+        except BaseException as exc:
             # A refused reload (BACKLOG #2034: a settings trust anchor, say) applied no DR profile,
             # so the latch and the runner's threshold go back too. Left set, the next operator
             # reload would park the feeds below the threshold on a box the DR coordinator reports
@@ -1306,6 +1310,10 @@ class Engine:
                         "DR activation failed, and closing the outbound sessions it had opened "
                         "failed too; POST /config/reload closes them"
                     )
+            if isinstance(exc, RunnerLeaseLostError):
+                # BACKLOG #5906: the DR coordinator's own type, so its abort row can name the
+                # lease without importing the runner.
+                raise DrProfileNotLeading(str(exc)) from exc
             raise
         # Only now may a backup pass run: the latch flipped before the reload, which can still
         # fail and roll it back (vault BACKLOG #5712).
@@ -2937,6 +2945,12 @@ class Engine:
         shared row; read after the reload, a refresh could have moved the cache to a later bump."""
         initiator_digest = self._initiator_digest(version)
         try:
+            rr = self._registry_runner
+            if rr is not None and rr.lease_lost:
+                # BACKLOG #5906: the runner would refuse this reload once it holds its lock. Refused
+                # here, before the load runs the config modules and the preflights read the
+                # anchors, since the convergence runner retries it every interval.
+                raise RunnerLeaseLostError.for_reload()
             outcome = await self.reload_detail(propagate=False)
         except Exception as exc:
             hook = self.convergence_reload_failed

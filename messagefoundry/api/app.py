@@ -2104,31 +2104,17 @@ def _build_approval_gate(
         # BACKLOG #3157 item 4, which says when the row can still be lost).
         return await outliving.run(_apply(), "released config reload")
 
-    async def _config_reload_before_claim(p: Mapping[str, Any]) -> None:
-        # BACKLOG #5906: a node whose coordinator no longer reads it as leader, while its graph
-        # still runs, refuses the reload (RegistryRunner.reload). Asked here, before the gate's
-        # claim, so the request stays pending and can be released on the leader. Past the claim
-        # the same refusal is compensated to 'failed' and that approval is spent. A point in time
-        # read of the coordinator's cached flag: a flag that goes false after it, during the
-        # approver read, the claim or the executor's config load, is still refused by the reload
-        # itself, and then the approval is marked failed.
+    async def _config_reload_before_claim(_p: Mapping[str, Any]) -> None:
+        # BACKLOG #5906: a node that RegistryRunner.lease_lost reads as lease-lost refuses the
+        # reload. Asked here, before the gate's claim, so the request is not spent and can be
+        # released on the leader; the gate writes approval.node_refused against the approver.
+        # Past the claim the same refusal is compensated to 'failed' and that approval is spent.
+        # A point in time read: a flag that goes false after it and before the runner's second
+        # read is refused by the reload itself, and the approval is then marked failed; one that
+        # goes false after that second read is not refused (RegistryRunner.reload).
         rr = engine.registry_runner
-        if rr is None or not rr.lease_lost:
-            return
-        actor = named_requester(p)
-        if (
-            actor is not None
-        ):  # the gate refused a hold naming none before this (requires_requester)
-            # The row the inline route writes for the same refusal, reason lease_lost; its status
-            # and answer are the inline route's, so this route answers its own below.
-            await _audit_refused_reload(
-                engine,
-                RunnerLeaseLostError.for_reload(),
-                actor=actor,
-                requested=p.get("config_dir"),
-                dry_run=False,
-            )
-        raise ApprovalError(409, _LEASE_LOST_RELEASE_DETAIL)
+        if rr is not None and rr.lease_lost:
+            raise ApprovalError(503, _LEASE_LOST_RELEASE_DETAIL)
 
     def _replay_params_in_scope(identity: Identity, p: Mapping[str, Any]) -> bool:
         channel_id = p.get("channel_id")
@@ -2903,10 +2889,10 @@ _LEASE_LOST_RELOAD_DETAIL: Final = (
 )
 
 #: The approve route's answer to a release on such a node, refused before the gate claims the
-#: request, so it stays pending (BACKLOG #5906).
+#: request, so the request is not spent (BACKLOG #5906).
 _LEASE_LOST_RELEASE_DETAIL: Final = (
-    "this node no longer holds the cluster lease, so it releases no config reload; the request "
-    "is still pending, so approve it on the leader"
+    "this node no longer holds the cluster lease, so it releases no config reload and did not "
+    "claim the request; approve it on the leader"
 )
 
 #: The answer to a reload whose config directory the engine could not resolve or list: at the
@@ -3009,7 +2995,8 @@ async def _audit_refused_reload(
     written: a row already in it is not written again, and a row that lands is added. That reload
     retries every interval, and this keeps it to one row of each kind per version. Its refusal is
     then logged at DEBUG, not WARNING: the convergence runner already logs each failure at ERROR,
-    and a WARNING per retry would repeat it every interval.
+    except a refusal it is told is designed, such as ``lease_lost``, which it logs once at INFO per
+    run of refused passes (BACKLOG #5906), and a WARNING per retry would repeat it every interval.
 
     **The row's write never raises.** A refusal changed nothing, so its answer stands whether or
     not the row lands, and a store fault here would otherwise turn it into a raw 500 (vault BACKLOG

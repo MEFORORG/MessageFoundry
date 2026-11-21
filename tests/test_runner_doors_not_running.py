@@ -743,16 +743,13 @@ async def test_a_release_on_a_lease_lost_node_is_refused_before_the_claim(
 ) -> None:
     """Regression 1 of the hold: the reload's own refusal comes after the gate's claim, so the
     approval was compensated to 'failed' and could not be released on the leader. The registered
-    hook refuses first with 409 and writes the lease_lost row, so the request stays pending."""
+    hook refuses first with 503, so the gate never claims the request."""
     engine: Any = SimpleNamespace(store=store, registry_runner=SimpleNamespace(lease_lost=True))
     hook = _release_gate(engine)._ops["config_reload"].before_claim
     assert hook is not None
     with pytest.raises(ApprovalError) as ei:
         await hook({"requester": "maker", "config_dir": None})
-    assert ei.value.status == 409 and "pending" in ei.value.detail
-    (row,) = await store.list_audit(action="config_reload_failed")
-    assert json.loads(row["detail"])["reason"] == "lease_lost"
-    assert row["actor"] == "maker"
+    assert ei.value.status == 503 and "leader" in ei.value.detail and "claim" in ei.value.detail
 
 
 @pytest.mark.parametrize("runner", [None, SimpleNamespace(lease_lost=False)])
@@ -764,14 +761,14 @@ async def test_a_release_on_a_leading_or_graphless_node_passes_the_hook(
     hook = _release_gate(engine)._ops["config_reload"].before_claim
     assert hook is not None
     await hook({"requester": "maker", "config_dir": None})
-    assert await store.list_audit(action="config_reload_failed") == []
 
 
 async def test_the_gate_leaves_a_request_its_before_claim_refuses_pending(
     store: MessageStore,
 ) -> None:
     """The gate's half: a raise from ``before_claim`` comes before the claim, so the executor does
-    not run and the row is still pending; once the hook passes, the same request releases."""
+    not run, the row is still pending, and an ``approval.node_refused`` row names the approver;
+    once the hook passes, the same request releases."""
     settings = ApprovalsSettings(
         enabled=True, operations=["dead_letter_replay"], min_dwell_seconds=0.0
     )
@@ -808,6 +805,12 @@ async def test_the_gate_leaves_a_request_its_before_claim_refuses_pending(
     assert ei.value.status == 409 and runs == []
     row = await store.get_pending_approval("a1")
     assert row is not None and str(row["status"]) == "pending"
+    assert await store.list_audit(action="approval.release_attempted") == []
+    (refused,) = await store.list_audit(action="approval.node_refused")
+    assert refused["actor"] == "checker"
+    detail = json.loads(refused["detail"])
+    assert detail["approval_id"] == "a1" and detail["status"] == 409
+    assert detail["refusal"] == "not on this node" and detail["requester"] == "maker"
     refuse[0] = False
     await gate.approve("a1", approver="checker", approver_user_id="checker-id")
     assert runs == ["ran"]
@@ -825,8 +828,9 @@ async def test_a_convergence_pass_refused_for_the_lease_logs_once_without_a_trac
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Regression 3 of the hold: every pass on a lease-lost node logged an ERROR traceback for a
-    designed refusal. It now logs one INFO line per run of refused passes, and the version is not
-    marked applied, so the pass is retried. A real fault still logs its traceback."""
+    designed refusal. Through a run of refused passes only the first logs at INFO (its converging
+    line and one refusal line, which does not repeat the manual-reload advice), and the version
+    is not marked applied, so the pass is retried. A real fault still logs its traceback."""
     applied: list[int] = []
     error: list[Exception] = [RunnerLeaseLostError.for_reload()]
 
@@ -845,9 +849,13 @@ async def test_a_convergence_pass_refused_for_the_lease_logs_once_without_a_trac
     with caplog.at_level(logging.DEBUG, logger=name):
         for _ in range(3):
             await runner._pass_once()
-    refused = [r for r in caplog.records if r.name == name and "refused" in r.getMessage()]
-    assert len(refused) == 1 and refused[0].levelno == logging.INFO and refused[0].exc_info is None
-    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+    info = [r for r in caplog.records if r.name == name and r.levelno >= logging.INFO]
+    assert [("converging" in r.getMessage(), r.levelno) for r in info] == [
+        (True, logging.INFO),
+        (False, logging.INFO),
+    ]
+    assert info[1].exc_info is None and "refused" in info[1].getMessage()
+    assert "leader" not in info[1].getMessage()
     assert applied == []
     caplog.clear()
     error[0] = ValueError("a bad local config")
@@ -855,3 +863,31 @@ async def test_a_convergence_pass_refused_for_the_lease_logs_once_without_a_trac
         await runner._pass_once()
     (fault,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert fault.exc_info is not None
+
+
+async def test_a_convergence_reload_on_a_lease_lost_node_loads_no_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pass is refused before ``reload_detail`` runs the config modules and the preflights,
+    since it is retried every interval; the failure hook still sees it, so its row is written."""
+    engine = await Engine.create(
+        tmp_path / "converge.db", egress_settings=EgressSettings(deny_by_default=False)
+    )
+    try:
+        seen: list[type[BaseException]] = []
+
+        async def no_load(**_kwargs: Any) -> None:
+            raise AssertionError("reload_detail ran on a lease-lost node")
+
+        async def failed(exc: Exception, _version: int, _reported: set[str]) -> None:
+            seen.append(type(exc))
+
+        monkeypatch.setattr(engine, "reload_detail", no_load)
+        monkeypatch.setattr(engine, "_registry_runner", SimpleNamespace(lease_lost=True))
+        engine.convergence_reload_failed = failed
+        with pytest.raises(RunnerLeaseLostError):
+            await engine._converge_reload(2)
+        assert seen == [RunnerLeaseLostError]
+    finally:
+        monkeypatch.undo()
+        await engine.stop()

@@ -70,12 +70,11 @@ from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.dr_backup import VerifyResult, join_before_checks, run_restore_verify
 from messagefoundry.pipeline.path_confine import confine, lexical_roots
-from messagefoundry.pipeline.wiring_runner import RunnerLeaseLostError
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import Store
 from messagefoundry.store.store import OwnedLanes
 
-__all__ = ["DrCoordinator", "DrActivationError", "DrResult"]
+__all__ = ["DrCoordinator", "DrActivationError", "DrProfileNotLeading", "DrResult"]
 
 log = logging.getLogger(__name__)
 
@@ -141,6 +140,13 @@ _REQUEST_ARCHIVE_REFUSED = (
 _OLD_SEED_FLAG = (
     "; add --allow-old-archive for a seed taken more than 7 days ago or one that does not say when"
 )
+
+
+class DrProfileNotLeading(RuntimeError):
+    """The ``activate_profile`` callback's reload was refused because this cluster node's
+    coordinator no longer reads it as leader, before the reload changed any lane (BACKLOG #5906).
+    The engine raises it from the runner's own refusal, so this module does not import the
+    runner."""
 
 
 class DrActivationError(RuntimeError):
@@ -510,7 +516,7 @@ class DrCoordinator:
                 log.warning("DR activation refused by a trust anchor: %s", exc, exc_info=exc)
             # A preflight that refused or timed out bound nothing, so its reason must not say a
             # bind failed (vault BACKLOG #3094).
-            if isinstance(exc, RunnerLeaseLostError):
+            if isinstance(exc, DrProfileNotLeading):
                 # BACKLOG #5906: the runner refused the profile's reload before it changed any
                 # lane, because this node's coordinator no longer reads it as leader. Nothing
                 # failed to bind, and an operator reload here would be refused the same way.

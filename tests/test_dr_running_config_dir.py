@@ -39,11 +39,11 @@ from messagefoundry.config.models import Priority
 from messagefoundry.config.settings import DrSettings, EgressSettings
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.pipeline import Engine
-from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.wiring_runner import DrParkedError
 from tests.test_dr_activation import _seed
 from tests.test_dr_outlive_deadline import _admin_client, _rows
+from tests.test_runner_doors_not_running import _LeaseCoordinator
 
 # A name that cannot be encoded as UTF-8: a lone surrogate. NTFS stores it as UTF-16, and on a
 # POSIX file system Python writes it as the raw byte 0x80. Under environments/ it is fingerprinted
@@ -1136,16 +1136,6 @@ async def test_a_step_4_preflight_that_does_not_answer_aborts_within_the_takeove
     assert row["kind"] == "profile"
 
 
-class _NotLeading(NullCoordinator):
-    """A cluster node whose coordinator no longer reads it as leader (BACKLOG #5906)."""
-
-    def __init__(self) -> None:
-        super().__init__("dr-node")
-
-    def is_leader(self) -> bool:
-        return False
-
-
 async def test_an_activation_on_a_lease_lost_node_names_the_lease_in_its_abort(box: _Box) -> None:
     """Regression 2 of the hold on engine PR 3136: the runner refuses the profile's reload on such
     a node, and the abort row said the engine could not bind the feeds and handed on the reload
@@ -1157,7 +1147,9 @@ async def test_an_activation_on_a_lease_lost_node_names_the_lease_in_its_abort(b
     await engine.reload_detail(box.tiered)
     rr = engine.registry_runner
     assert rr is not None and rr.running
-    rr._coordinator = _NotLeading()
+    not_leading = _LeaseCoordinator()
+    not_leading.leader = False
+    rr._coordinator = not_leading
     assert rr.lease_lost
     with pytest.raises(DrActivationError) as caught:
         await coord.activate(actor="alice")
