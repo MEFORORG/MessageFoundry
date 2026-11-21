@@ -27,7 +27,6 @@ import argparse
 import importlib.util
 import json
 import math
-import re
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -35,16 +34,6 @@ from types import ModuleType
 from typing import Any
 
 _HERE = Path(__file__).resolve().parent
-
-#: The ``prs_merged`` detail's per-repo key -> the series name the dashboard plots.
-REPO_SERIES = (
-    ("MEFORORG/MessageFoundry", "Engine"),
-    ("MEFORORG/MessageFoundry-vault", "Vault"),
-    ("MEFORORG/korus", "Korus"),
-)
-
-_SHA = re.compile(r"\b[0-9a-f]{7,40}\b")
-_ENGINE_REF = re.compile(r"\bengine=(\S+)")
 
 
 def _collector() -> ModuleType:
@@ -59,6 +48,13 @@ def _collector() -> ModuleType:
     sys.modules[name] = mod
     spec.loader.exec_module(mod)
     return mod
+
+
+def repo_series() -> tuple[tuple[str, str], ...]:
+    """The ``prs_merged`` per-repo key -> the series name the dashboard plots, keyed by the
+    collector's own repo names so a rename cannot leave a series quietly empty."""
+    cm = _collector()
+    return ((cm.ENGINE_REPO, "Engine"), (cm.VAULT_REPO, "Vault"), (cm.KORUS_REPO, "Korus"))
 
 
 def _dict(value: Any) -> dict[str, Any]:
@@ -85,11 +81,12 @@ class Snapshot:
             m for m in data.get("metrics") or [] if isinstance(m, dict) and "id" in m
         ]
         self.by_id = {str(m["id"]): m for m in self.metrics}
+        self.last_full_week = self._last_full_week()
 
     def detail(self, mid: str) -> dict[str, Any]:
         return _dict(self.by_id.get(mid, {}).get("detail"))
 
-    def last_full_week(self) -> str | None:
+    def _last_full_week(self) -> str | None:
         """The week the collector valued its weekly metrics at; the window's second-last week when
         no metric recorded one."""
         for mid in ("prs_merged", "ci_main"):
@@ -100,24 +97,16 @@ class Snapshot:
 
 
 def asvs_refs(detail: dict[str, Any]) -> tuple[str, str]:
-    """``(scorecard sha, engine ref)`` as recorded, each ``"unknown"`` when it is not."""
-    sha = detail.get("scorecard_sha")
-    if not isinstance(sha, str) or not sha:
-        found = _SHA.search(str(detail.get("scorecard_ref") or ""))
-        sha = found.group(0) if found else "unknown"
-    engine = detail.get("engine_ref")
-    if not isinstance(engine, str) or not engine:
-        engine = "unknown"
-        for line in detail.get("provenance") or []:
-            hit = _ENGINE_REF.search(str(line))
-            if hit:
-                engine = hit.group(1)
-                break
-    return sha[:12], engine
+    """``(scorecard sha, engine ref)`` as the collector recorded them, ``"unknown"`` when not."""
+    sha, engine = detail.get("scorecard_sha"), detail.get("engine_ref")
+    return (
+        sha[:12] if isinstance(sha, str) and sha else "unknown",
+        engine if isinstance(engine, str) and engine else "unknown",
+    )
 
 
 def notes(snap: Snapshot) -> dict[str, str]:
-    week = snap.last_full_week() or "unknown"
+    week = snap.last_full_week or "unknown"
     sha, engine = asvs_refs(snap.detail("asvs"))
     return {
         "backlog_burn": "Counts ledger rows, not items.",
@@ -226,7 +215,7 @@ def metric_rows(snap: Snapshot) -> list[dict[str, Any]]:
 
 
 def series_rows(snap: Snapshot) -> list[dict[str, Any]]:
-    last_full = snap.last_full_week()
+    last_full = snap.last_full_week
     rows: list[dict[str, Any]] = []
 
     def add(name: str, points: Any) -> None:
@@ -248,7 +237,7 @@ def series_rows(snap: Snapshot) -> list[dict[str, Any]]:
     add("Filed", burn.get("filed_series"))
     add("Closed", burn.get("closed_series"))
     per_repo = _dict(snap.detail("prs_merged").get("per_repo"))
-    for repo, name in REPO_SERIES:
+    for repo, name in repo_series():
         add(name, per_repo.get(repo))
     add("CI pass %", snap.by_id.get("ci_main", {}).get("series"))
     return rows

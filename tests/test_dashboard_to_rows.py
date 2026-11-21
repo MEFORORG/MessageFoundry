@@ -155,12 +155,6 @@ def test_asvs_note_tolerates_missing_refs() -> None:
     snap = _snapshot()
     snap["metrics"][3]["detail"] = {"scorecard_ref": "", "provenance": ["# no ref here"]}
     assert "origin/main unknown; engine tool ref unknown." in _rows(snap)["asvs"]["note"]
-    # The older detail shape: refs read from scorecard_ref and the provenance line.
-    snap["metrics"][3]["detail"] = {
-        "scorecard_ref": "vault origin/main 0123456789abcdef (archived)",
-        "provenance": ["# asvs-status scorecard=NO-GIT engine=feedface0000"],
-    }
-    assert "0123456789ab; engine tool ref feedface0000." in _rows(snap)["asvs"]["note"]
 
 
 def test_series_rows() -> None:

@@ -602,7 +602,6 @@ def c_backlog_burn(ctx: Context, m: Metric) -> None:
         "rows_total": c.rows,
         "undated": dict(c.undated),
         "series_is": "closed minus filed, per week",
-        "clipped_at": ctx.through.isoformat(),
         "after_through": dict(c.weeks.get(AFTER_THROUGH, {})),
     }
 
@@ -675,7 +674,12 @@ def c_flow_health(ctx: Context, m: Metric) -> None:
     now = dt.datetime.now(dt.UTC)
     ages = [(now - _parse_stamp(r["createdAt"])).total_seconds() / 86400 for r in rows]
     oldest = round(max(ages), 1) if ages else None
-    detail: dict[str, Any] = {"open_prs": len(rows), "oldest_open_days": oldest}
+    detail: dict[str, Any] = {
+        "open_prs": len(rows),
+        "oldest_open_days": oldest,
+        "median_open_to_merge_hours": None,
+        "merged_prs_measured": None,
+    }
 
     # The merged-PR read feeds only the time-to-merge fields, so its failure nulls those alone.
     try:
@@ -687,8 +691,6 @@ def c_flow_health(ctx: Context, m: Metric) -> None:
         detail["median_open_to_merge_hours"] = round(statistics.median(hours), 1) if hours else None
         detail["merged_prs_measured"] = len(hours)
     except (CollectError, ValueError, TypeError) as exc:
-        detail["median_open_to_merge_hours"] = None
-        detail["merged_prs_measured"] = None
         add_partial(detail, f"merged PRs: {type(exc).__name__}: {exc}")
 
     stalled: int | None = None
@@ -751,18 +753,20 @@ def c_ci_main(ctx: Context, m: Metric) -> None:
     # The ci-red label is today's state. A past --through window is not judged by it: the count
     # is left unread, so it can never pass for a historical one.
     current = ctx.through >= ctx.today
-    red: list[dict[str, Any]] | None = None
+    red: int | None = None
     if current:
-        red = gh_list(
-            ctx,
-            ["pr", "list", "-R", ENGINE_REPO, "--state", "open", "--label", "ci-red"]
-            + ["--json", "number"],
+        red = len(
+            gh_list(
+                ctx,
+                ["pr", "list", "-R", ENGINE_REPO, "--state", "open", "--label", "ci-red"]
+                + ["--json", "number"],
+            )
         )
     labels = ctx.labels
     series = ci_pass_series(runs, labels)
     week = last_full_week(ctx.through, labels, ctx.today)
     m.value = series_value(series, week)
-    m.status = status_ci(m.value, len(red) if red is not None else 0)
+    m.status = status_ci(m.value, red or 0)
     m.series = series
     m.detail = {
         "workflow_file": "ci.yml (the workflow named CI), push events on main only",
@@ -770,7 +774,7 @@ def c_ci_main(ctx: Context, m: Metric) -> None:
         "runs_read": len(runs),
         "counted": "success passes; failure, timed_out, startup_failure, action_required fail; "
         "cancelled, skipped and in-progress runs are not counted",
-        "open_ci_red_prs": len(red) if red is not None else None,
+        "open_ci_red_prs": red,
         "open_ci_red_prs_as_of": "run time"
         if current
         else "not read: --through is in the past and the label count is current state only",
@@ -881,7 +885,7 @@ def c_dependency_vulns(ctx: Context, m: Metric) -> None:
         "state_as_of": "run time; --through does not apply",
     }
     if kpis["error"]:
-        m.detail["partial_error"] = f"vuln-metrics KPIs: {kpis['error']}"
+        add_partial(m.detail, f"vuln-metrics KPIs: {kpis['error']}")
 
 
 def _vuln_kpis(ctx: Context) -> dict[str, Any]:
