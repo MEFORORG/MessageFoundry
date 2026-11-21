@@ -275,6 +275,8 @@ async def test_a_record_waits_while_this_node_is_not_the_leader(
     assert d._states[LANE].phase is stage_dispatcher._LanePhase.STOPPED
     down.clear()
     lease.held = False
+    # The episode parks for this backoff; long enough that its timer cannot fire before the read.
+    monkeypatch.setattr(stage_dispatcher, "_LANE_ERROR_BACKOFF_SECONDS", 30.0)
     assert d.resume_lane(LANE) is True
     assert d._assemble_chunk(d._claimers[0]) == []
     await asyncio.wait_for(d._lane_tasks[LANE], timeout=5.0)

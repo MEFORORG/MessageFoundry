@@ -272,9 +272,13 @@ class _Stranded:
     lane's next chunk assembly re-pends them first (:meth:`StageDispatcher._repend_stranded`).
 
     ``head`` is the T17 head and the date its re-pend was sent with; ``tail`` the rows to release.
-    ``fence`` is the lease they were claimed under. An end on a moved lease (``SUPERSEDED``) is
-    never recorded, and a record is dropped unwritten once its lease moves, because another node
-    may hold those rows. A stop clears every record with the rest of the lane state."""
+    ``fence`` is the lease they were claimed under. A hold that ended on a moved lease
+    (``SUPERSEDED``) makes no record. A tail the fence skipped beside a recorded head is recorded,
+    whatever the lease, so the write fence is the episode's own check: a record's writes are sent
+    only while this node leads under ``fence`` (:class:`RependFence` names the window that leaves),
+    kept unwritten while it does not lead, and dropped
+    unwritten once it leads under another lease, because another node may hold those rows. A
+    stop clears every record with the rest of the lane state."""
 
     head: tuple[str, float] | None
     tail: tuple[str, ...]
@@ -338,7 +342,8 @@ class _LaneState:
     claimer_deaths: int = 0
     # BACKLOG #5704: while the lane is STOPPED, whether the STOP that set it left claimed rows whose
     # re-pend did not land, so they are still in flight. _to_stopped writes it on every STOP, and
-    # _run_lane's RETRY branch also writes it before _apply_retry, which passes it to a T17 STOP;
+    # _run_lane's RETRY branch and _repend_stranded's bound also write it before _apply_retry,
+    # which passes it to a T17 STOP;
     # so on a lane that is not STOPPED it can hold a stale value. Read by _apply_retry, for that
     # T17 STOP, and by StageDispatcher.stopped_holding_rows, which checks the phase.
     unlanded: bool = False
@@ -903,7 +908,10 @@ class StageDispatcher:
                 # A dead claimer's rows that its replacement had not yet released are INFLIGHT too, so
                 # the contract is not met. They are NOT released here: this path runs because the
                 # lease may be lost, and an unfenced release could re-pend a row a successor holds.
-                return not any(claimer.orphan_ids for claimer in self._claimers)
+                # A lane's stranded record (BACKLOG #5744) is rows in flight too.
+                return not any(claimer.orphan_ids for claimer in self._claimers) and not any(
+                    st.stranded is not None for st in self._states.values()
+                )
             remaining = deadline - loop.time()
             if remaining <= 0:
                 self._reap(watched)
@@ -1236,7 +1244,9 @@ class StageDispatcher:
     def _assemble_chunk(self, claimer: _Claimer) -> list[str]:
         """Pop READY lanes into a claim chunk, reserving one processing slot per lane as it is added
         (T8). Skips stale ready entries (a lane already advanced past READY). Slots reserved here are
-        released for any lane the claim does not turn into PROCESSING (§4.3 exact-reservation)."""
+        released for any lane the claim does not turn into PROCESSING (§4.3 exact-reservation).
+        A lane with a stranded record (BACKLOG #5744) is not returned: it takes a slot and starts
+        a :meth:`_repend_stranded` episode in place of a claim."""
         budget = min(self._slots_free, self._claim_lane_chunk)
         lanes: list[str] = []
         # S_lane (ARM 1): ONE clock read for the whole chunk, hoisted out of the loop. The whole
@@ -1710,8 +1720,19 @@ class StageDispatcher:
         ended = HoldResult.LANDED
         due: float | None = None  # the date a landed head was re-pended with
         # Not the leader, nothing is sent (the lane parks below); leading, the fence decides.
-        leading = fence.is_leader()
-        if leading and fence.superseded():
+        try:
+            leading = fence.is_leader()
+            moved = leading and fence.superseded()
+        except Exception:  # noqa: BLE001 — a lease read fault must not wedge the held lane
+            log.warning(
+                "StageDispatcher %s lane %s: reading leadership for its stranded rows failed; "
+                "sending nothing and asking again after a backoff",
+                self._stage.value,
+                lane,
+                exc_info=True,
+            )
+            leading = moved = False
+        if moved:
             ended = HoldResult.SUPERSEDED
         elif leading:
             if left.head is not None:
@@ -1777,8 +1798,8 @@ class StageDispatcher:
             self._park(lane, st, self._clock() + _LANE_ERROR_BACKOFF_SECONDS)
         elif due is not None and due > self._clock():
             self._park(lane, st, due)  # the head is not due yet, as _run_lane parks a T17 head
-        else:
-            self._to_ready(lane, woken=st.ready_woken)
+        else:  # a wake during the episode makes it wake-sourced, as T14 does
+            self._to_ready(lane, woken=st.dirty_woken if st.dirty else st.ready_woken)
 
     def _apply_retry(self, lane: str, st: _LaneState, outcome: _LaneOutcome) -> None:
         """Apply a RETRY outcome under the ADR 0070 infra-fault bound (fix B). A T17 zero-progress
