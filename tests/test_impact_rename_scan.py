@@ -553,27 +553,92 @@ def test_a_table_a_handler_reads_out_of_a_module_dict_reports_the_referrer(tmp_p
     assert plan.unresolved == (Reference("handler", "h_p", "code_set", "diets"),)
 
 
-def test_a_loopback_a_handler_sends_to_through_a_helper_is_rewritten(tmp_path: Path) -> None:
-    """Step 8 for an inbound: a Loopback inbound a handler reaches only through a helper's table."""
-    body = (
-        "from messagefoundry import MLLP, Loopback, Send, handler, inbound, outbound, router\n\n"
+def _sends_through_a_helper(spec: str, extra: str = "") -> str:
+    """A config whose handler ``h_a`` sends to ``IB_OLD`` only through a helper's module table,
+    with ``IB_OLD`` declared as ``spec``."""
+    return (
+        "from messagefoundry import MLLP, Loopback, PassThrough, Send, handler, inbound, outbound, "
+        "router\n\n"
         'TARGETS = {"ADT": "IB_OLD"}\n\n\n'
         "def _route(k):\n"
         "    return TARGETS[k]\n\n\n"
         'inbound("IB_A", MLLP(port=2932), router="r_a")\n'
-        'inbound("IB_OLD", Loopback(), router="r_b")\n'
+        f'inbound("IB_OLD", {spec}, router="r_b")\n'
+        f"{extra}"
         'outbound("OB_B", MLLP(host="127.0.0.1", port=6931))\n\n\n'
         '@router("r_a")\ndef r_a(msg):\n    return ["h_a"]\n\n\n'
         '@router("r_b")\ndef r_b(msg):\n    return ["h_b"]\n\n\n'
         '@handler("h_a")\ndef h_a(msg):\n    return Send(_route("ADT"), msg)\n\n\n'
         '@handler("h_b")\ndef h_b(msg):\n    return Send("OB_B", msg)\n'
     )
-    config_dir = _write(tmp_path, {"mod.py": body})
+
+
+def test_a_pass_through_a_handler_sends_to_through_a_helper_is_rewritten(tmp_path: Path) -> None:
+    """Step 8 for an inbound: a pass-through inbound a handler reaches only through a helper's
+    table."""
+    config_dir = _write(tmp_path, {"mod.py": _sends_through_a_helper("PassThrough()")})
     plan = plan_rename(load_config(config_dir), config_dir, "inbound", "IB_OLD", "IB_NEW")
     assert plan.unresolved == ()
     apply_rename(plan)
     assert 'TARGETS = {"ADT": "IB_NEW"}' in _text(config_dir)
     load_config(config_dir)
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        "Loopback()",
+        # An MLLP inbound beside an outbound of the same name: the Send goes to the outbound.
+        "MLLP(port=2933)",
+    ],
+    ids=["loopback", "same_named_outbound"],
+)
+def test_a_send_literal_naming_an_inbound_that_is_no_send_target_is_left(
+    tmp_path: Path, spec: str
+) -> None:
+    """Only a pass-through inbound is a Send target; a Send naming any other inbound's name goes
+    to an outbound of that name, so renaming the inbound must not rewrite it."""
+    extra = 'outbound("IB_OLD", MLLP(host="127.0.0.1", port=6932))\n' if "MLLP" in spec else ""
+    config_dir = _write(tmp_path, {"mod.py": _sends_through_a_helper(spec, extra)})
+    plan = plan_rename(load_config(config_dir), config_dir, "inbound", "IB_OLD", "IB_NEW")
+    apply_rename(plan)
+    assert 'TARGETS = {"ADT": "IB_OLD"}' in _text(config_dir)
+
+
+def test_an_outbound_shadowed_by_a_pass_through_of_its_name_leaves_the_send(
+    tmp_path: Path,
+) -> None:
+    """The mirror: a Send names the pass-through inbound when one shares the name, so renaming the
+    outbound of that name must not rewrite it."""
+    extra = 'outbound("IB_OLD", MLLP(host="127.0.0.1", port=6932))\n'
+    config_dir = _write(tmp_path, {"mod.py": _sends_through_a_helper("PassThrough()", extra)})
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "IB_OLD", "IB_NEW")
+    apply_rename(plan)
+    assert 'TARGETS = {"ADT": "IB_OLD"}' in _text(config_dir)
+
+
+def test_a_router_that_filters_with_a_bare_return_keeps_a_label_dict_rename_resolved(
+    tmp_path: Path,
+) -> None:
+    """A router's ``return None`` reads no value, so it is no unfollowed role read: a label dict
+    holding the handler's name beside it is not a referent, and the rename completes."""
+    body = (
+        "from messagefoundry import MLLP, Send, handler, inbound, outbound, router\n\n"
+        'LABELS = {"h_old": "ADT handler"}\n\n'
+        'inbound("IB_A", MLLP(port=2934), router="r_a")\n'
+        'inbound("IB_B", MLLP(port=2935), router="r_b")\n'
+        'outbound("OB_B", MLLP(host="127.0.0.1", port=6933))\n\n\n'
+        '@router("r_a")\ndef r_a(msg):\n    return ["h_old"]\n\n\n'
+        '@router("r_b")\ndef r_b(msg):\n'
+        "    if msg is None:\n        return None\n"
+        "    note = LABELS.get(str(msg))\n"
+        '    return ["h_b"]\n\n\n'
+        '@handler("h_old")\ndef h_old(msg):\n    return Send("OB_B", msg)\n\n\n'
+        '@handler("h_b")\ndef h_b(msg):\n    return Send("OB_B", msg)\n'
+    )
+    config_dir = _write(tmp_path, {"mod.py": body})
+    plan = plan_rename(load_config(config_dir), config_dir, "handler", "h_old", "h_new")
+    assert plan.unresolved == ()
 
 
 def test_a_read_at_a_role_reads_coordinates_in_another_file_reports_the_referrer(

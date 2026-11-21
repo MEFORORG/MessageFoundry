@@ -128,6 +128,9 @@ def test_a_toml_inbound_rename_leaves_an_outbound_of_the_same_name(tmp_path: Pat
     registry = load_config(config_dir)
     assert "IB_ORDERS" in registry.inbound
     assert set(registry.outbound) == {"OB_PARTNER", "IB_REQ"}
+    # The handler's Send goes to the outbound, so it keeps naming it.
+    logic = (config_dir / "logic.py").read_text(encoding="utf-8")
+    assert 'Send("IB_REQ"' in logic and "IB_ORDERS" not in logic
 
 
 def test_a_toml_rename_beside_a_nan_value_still_applies(tmp_path: Path) -> None:

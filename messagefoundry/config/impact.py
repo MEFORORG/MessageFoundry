@@ -1016,6 +1016,12 @@ def _scanned_referrers(
     success (BACKLOG #5980); taken in, each is rewritten or reported unresolved like any other.
     Each comes with its sites, so the plan does not scan it twice."""
     out: list[tuple[Reference, tuple[list[_Site], bool]]] = []
+    # A Send names a pass-through inbound when one has the name, else an outbound (the runtime
+    # resolves it that way), so a handler's Send literal is a referent of only one of the two. A
+    # Loopback or any other inbound is no Send target at all.
+    is_pt = old in registry.passthrough_inbounds()
+    if (target_kind == "inbound" and not is_pt) or (target_kind == "outbound" and is_pt):
+        return out
     for kind in _SCANNED_REFERRER_KINDS.get(target_kind, ()):
         known = {ref.referrer for ref in indexed if ref.referrer_kind == kind}
         table = _table(registry, kind)
@@ -1042,7 +1048,7 @@ def _scanned_referrers(
 
 
 #: The code kinds that may name a target of each kind without an index edge: a handler sends to
-#: an outbound or a Loopback inbound, a router returns a handler, and either reads a table.
+#: an outbound or a pass-through inbound, a router returns a handler, and either reads a table.
 _SCANNED_REFERRER_KINDS: dict[str, tuple[str, ...]] = {
     "outbound": ("handler",),
     "inbound": ("handler",),
@@ -1576,8 +1582,15 @@ def _scan_function(
 def _carries_nothing(
     root: ast.expr, values: Mapping[str, list[ast.expr]], params: frozenset[str], role: _Role
 ) -> bool:
-    """Whether a role expression carries no value the scan can follow: no constant, name,
-    attribute or helper return (``p[1]`` over ``.items()`` pairs, an f-string)."""
+    """Whether a role expression reads a value the scan cannot follow: it carries no constant,
+    name, attribute or helper return (``p[1]`` over ``.items()`` pairs, an f-string). A literal
+    that names nothing (a router's filtering ``return None`` or ``return []``) reads nothing, so
+    it is followed."""
+    if not any(
+        isinstance(n, (ast.Name, ast.Attribute, ast.Call, ast.Subscript, ast.JoinedStr))
+        for n in ast.walk(root)
+    ):
+        return False
     probe = _role_flow(params, role)
     _carried(root, values, set(), probe)
     return probe.is_empty()
