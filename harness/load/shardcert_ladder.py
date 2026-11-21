@@ -3757,6 +3757,12 @@ async def run_drive_ladder(
     engine's SHARDS_READY (via :attr:`ShardCertDriveReport`), so the shape has ONE source of truth across the
     box boundary. A shape flag on both CLIs would be a two-place constant that drifts invisibly — and the
     drift would surface as a fabricated ceiling, not an error."""
+    # Before any rung consumes SHARDS_READY: refused mid-rung, it would end the ladder with no
+    # LADDER_STOP posted.
+    if cacert is not None and not cacert.strip():
+        raise ValueError(
+            "cacert names no certificate: an empty value would fall back to the default trust"
+        )
     climb = plan_climb_rungs(rates, hold_seconds=hold_seconds, drain_timeout=drain_timeout)
     # Clear cross-rung signals so a re-run under the same base run_id doesn't read a stale STOP/SOAK.
     base_coord.clear_messages(LADDER_STOP, LADDER_SOAK)
@@ -3786,6 +3792,9 @@ async def run_drive_ladder(
     climb_aborted = False
     soak_aborted = False
     engine_setup_failed = False
+    # Once the engine box refuses the rig's sign-in, later rungs and the soak do not try again: each
+    # retry of a refused credential counts toward locking the rig Administrator out.
+    sign_in_refused = False
     for rung in climb:
         rung_coord = base_coord.for_run(f"{base_coord.run_id}.{rung.run_suffix}")
         try:
@@ -3803,6 +3812,7 @@ async def run_drive_ladder(
                 shards_ready_timeout=shards_ready_timeout,
                 await_engine_drained=True,
                 engine_drained_timeout=engine_drained_timeout,
+                sign_in=not sign_in_refused,
             )
         except EngineSetupFailed as exc:
             # BACKLOG #5576: the ENGINE half's setup failed (a failed store reset) and it has exited. Not a
@@ -3836,6 +3846,7 @@ async def run_drive_ladder(
             climb_aborted = True
             stopped = True
             break
+        sign_in_refused = sign_in_refused or drive.sign_in_refused
         shards = drive.shards
         dests, handlers, delivering = drive.dests, drive.handlers, drive.delivering
         routing = drive.routing
@@ -3924,6 +3935,7 @@ async def run_drive_ladder(
                 shards_ready_timeout=shards_ready_timeout,
                 await_engine_drained=True,
                 engine_drained_timeout=engine_drained_timeout,
+                sign_in=not sign_in_refused,
             )
             if not shards:
                 # A soak-only run (every climb rung aborted before reporting) still has to name the shape it

@@ -160,14 +160,35 @@ def destinations_for_seq(seq: int, *, routing: str, dests: int, fanout: int) -> 
     :meth:`ShardCertShape.destination_indices` for why the mix is load-bearing.
 
     One function, so the two-box driver's per-message copy check expects exactly the destinations the
-    served router picks."""
+    served router picks.
+
+    Raises ``ValueError`` on what :func:`fanout_refusal` refuses for a partitioned routing or an
+    unknown one, rather than divide by zero or guess: :func:`load_shape` never builds such a shape, but
+    the two-box driver reads these values off the engine box's post."""
     if routing == BROADCAST:
         return list(range(fanout))
+    if routing not in _ROUTINGS or not 0 <= fanout <= dests:
+        raise ValueError(fanout_refusal(routing, dests=dests, fanout=fanout))
     pool = list(range(dests))
     for i in range(fanout):
         j = i + (_mix64((seq + i * _FANOUT_STRIDE) & _M64) % (dests - i))
         pool[i], pool[j] = pool[j], pool[i]
     return pool[:fanout]
+
+
+def fanout_refusal(routing: str, *, dests: int, fanout: int) -> str | None:
+    """Why :func:`destinations_for_seq` cannot answer for this routing and fan-out, or ``None``.
+
+    Refused: an unknown routing, a negative fan-out, and a partitioned fan-out above the destination
+    count, which :func:`load_shape` never serves (a pick out of ``dests - i`` destinations would divide
+    by zero). A broadcast fan-out needs no destination count: its picks are ``0 .. fanout-1``."""
+    if routing not in _ROUTINGS:
+        return f"unknown routing {routing!r}"
+    if fanout < 0:
+        return f"negative fan-out {fanout}"
+    if routing != BROADCAST and fanout > dests:
+        return f"fan-out {fanout} above the {dests} destinations"
+    return None
 
 
 def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
@@ -544,7 +565,12 @@ def fifo_lane_destination(label: str) -> int | None:
     """The destination index a :func:`fifo_lane` label names (its last ``_`` field), or ``None`` for
     a label it did not write, such as an empty MSH-6 under the ``cheap`` transform."""
     _, sep, tail = label.rpartition("_")
-    return int(tail) if sep and tail.isdigit() else None
+    # At most 9 ASCII digits: str.isdigit accepts digits such as superscript two, which int() refuses,
+    # and int() refuses a run past its digit limit, so a hostile MSH-6 label at the sink would raise at
+    # report time and end the run with no report. fifo_lane writes two digits.
+    if not sep or len(tail) > 9 or not (tail.isascii() and tail.isdigit()):
+        return None
+    return int(tail)
 
 
 def apply_transform(
