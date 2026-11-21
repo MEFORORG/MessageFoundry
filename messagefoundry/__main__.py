@@ -1574,6 +1574,7 @@ def _offline_env_values(
     from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
     from messagefoundry.config.settings import settings_file_path
     from messagefoundry.config.wiring import WiringError
+    from messagefoundry.secretscrub import scrub_credentials
 
     if args.env is None:
         return None
@@ -1597,7 +1598,10 @@ def _offline_env_values(
         # Name the file only where there is one: with none, the failure is the environment's or
         # the command line's, and a named file would send the operator to the wrong place.
         source = f" ({settings_file})" if settings_file.exists() else ""
-        raise WiringError(f"could not load the service settings{source}: {detail or 'no detail'}")
+        # These three commands print the detail where CI logs keep it, and a validator
+        # message can quote a URL's userinfo, so credential values are scrubbed from it.
+        shown = scrub_credentials(detail) if detail else "no detail"
+        raise WiringError(f"could not load the service settings{source}: {shown}")
     cwd = Path.cwd()
     base_dir = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
     dir_name = settings.environments.dir

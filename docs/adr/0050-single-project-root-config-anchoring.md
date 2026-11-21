@@ -475,11 +475,13 @@ those settings, and its Handlers still run with no active environment.
   `dir = "envs"`, `graph` exits 2 over a missing `<root>/environments/<env>.toml`, as it did before
   this note, while `validate` reads `<root>/envs/<env>.toml` and can pass. They read the file with
   `serve`'s own reader, so overrides such as `MEFOR_VALUE_*` apply. Settings that do not load are reported
-  as `serve`'s settings load renders them, naming the settings file where one exists; a value file
-  that cannot be read is reported naming that file. They resolve every `env()` reference of each
-  deployed connection and lookup, and report one that does not resolve by its key, never its
-  value. `validate` lists each of these failures with its other problems and `dryrun` stops on
-  it. `graph` lists it under `env_problems` beside the graph and exits as it would without it,
+  as `serve`'s settings load renders them, with credential values such as a password in a URL
+  scrubbed out, because CI logs keep these commands' output, naming the settings file where one
+  exists; a value file that cannot be read is reported naming that file. They resolve every
+  `env()` reference of each deployed connection and lookup, and report one that does not resolve
+  by its key, never its value. `validate` lists each of these failures with its other problems and
+  `dryrun` stops on it, so both exit 1 on settings that do not load where they exited 0 before
+  this note, for example an unparseable settings file with the value file present. `graph` lists it under `env_problems` beside the graph and exits as it would without it,
   because it reports a graph and does not gate one (BACKLOG #1648); that is a Manager decision.
   A reference set is left out, as `serve` and
   `check` leave an unresolved one to its sync. Without `--env` nothing changes. Where they still

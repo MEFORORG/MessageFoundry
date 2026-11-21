@@ -817,3 +817,27 @@ def test_offline_env_reports_an_unparseable_root_settings_file(
         assert rc == 1, captured
         assert "could not load the service settings" in captured.out + captured.err, captured
     assert _SECRET_HOST not in captured.out + captured.err
+
+
+@pytest.mark.parametrize("command", ["validate", "graph", "dryrun"])
+def test_offline_env_scrubs_url_userinfo_from_a_settings_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str,
+) -> None:
+    # The [api].trusted_proxies refusal quotes the entry it refused. Under --env these three
+    # commands print a settings failure where origin/main printed none, to stdout, which CI logs
+    # keep, so a password in a URL's userinfo must not reach it.
+    cfg = _config_dir(tmp_path, body=_ENV_GRAPH)
+    cwd = tmp_path / "cwd"
+    _values_file(cwd, "prod", f'peer_host = "{_SECRET_HOST}"\n')
+    (cwd / "messagefoundry.toml").write_text(
+        '[api]\ntrusted_proxies = ["https://u:secret@host/"]\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(cwd)
+    rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), "--env", "prod"))
+    captured = capsys.readouterr()
+    assert "secret" not in captured.out + captured.err, captured
+    assert "trusted_proxies" in captured.out + captured.err, captured
+    assert rc == (0 if command == "graph" else 1), captured
