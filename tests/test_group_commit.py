@@ -28,6 +28,7 @@ listener→worker path is unaffected because the API is byte-identical with the 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,7 @@ from messagefoundry.store.store import (
     OutboxStatus,
     Stage,
     _GroupCommitter,
+    _Member,
 )
 
 RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
@@ -684,6 +686,116 @@ async def test_committer_submit_after_close_raises(tmp_path: Path) -> None:
     await s.close()
     with pytest.raises(RuntimeError, match="closed"):
         await gc.submit(lambda: _ret(1))
+
+
+async def test_committer_cancelled_while_parked_rejects_pending_and_closes(tmp_path: Path) -> None:
+    """BACKLOG #5664: a committer cancelled outside aclose(), here parked in its coalescing window
+    with members enrolled, must reject every pending member and mark itself closed, or each caller
+    (the ACK gate among them) parks on its future forever."""
+    s = await MessageStore.open(
+        tmp_path / "parked.db", group_commit_window_ms=60_000.0, group_commit_max_batch=64
+    )
+    try:
+        gc = s._group_commit
+        assert gc is not None and gc._task is not None
+        members = [asyncio.create_task(gc.submit(functools.partial(_ret, n))) for n in range(3)]
+        for _ in range(50):
+            await asyncio.sleep(0)
+        assert len(gc._pending) == 3  # enrolled, the committer waiting out its window
+
+        gc._task.cancel()
+        await asyncio.gather(gc._task, return_exceptions=True)
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(*members, return_exceptions=True), timeout=5.0
+        )
+        assert all(isinstance(o, RuntimeError) for o in outcomes), outcomes
+        assert gc._closed
+        with pytest.raises(RuntimeError, match="closed"):
+            await gc.submit(lambda: _ret(1))
+    finally:
+        await s.close()
+
+
+async def test_close_after_a_cancelled_committer_survives_a_caught_cancel(tmp_path: Path) -> None:
+    """The store's close must finish when the committer was cancelled earlier, even from a caller
+    that had already caught a cancel of its own (as Engine.stop does before closing the store)."""
+    s = await MessageStore.open(tmp_path / "late.db", group_commit_window_ms=GC_WINDOW_MS)
+    gc = s._group_commit
+    assert gc is not None and gc._task is not None
+    gc._task.cancel()
+    await asyncio.gather(gc._task, return_exceptions=True)
+
+    async def _stopper() -> None:
+        # Caught, not uncancelled: cancelling() stays at 1.
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.Event().wait()
+        await s.close()
+
+    stopper = asyncio.create_task(_stopper())
+    await asyncio.sleep(0)
+    stopper.cancel()
+    try:
+        await asyncio.wait_for(stopper, timeout=10.0)  # close raised nothing
+        assert s._read_conns == []
+    finally:
+        if s._read_conns:
+            await s.close()  # the regression case: release the handles so the run can exit
+
+
+async def test_committer_cancelled_before_its_first_step_still_rejects(tmp_path: Path) -> None:
+    """A committer task cancelled before it ever ran never enters its body, so the rejection must
+    not depend on code inside it."""
+    s = await MessageStore.open(tmp_path / "unstarted.db", group_commit_window_ms=GC_WINDOW_MS)
+    try:
+        gc = s._group_commit
+        assert gc is not None and gc._task is not None
+        await gc.aclose()
+        gc.start()  # a fresh task, not yet stepped
+        assert gc._task is not None
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[Any] = loop.create_future()
+        gc._pending.append(_Member(run=functools.partial(_ret, 1), future=fut))
+        gc._task.cancel()  # before its first step
+        await asyncio.gather(gc._task, return_exceptions=True)
+        with pytest.raises(RuntimeError, match="stopped"):
+            await asyncio.wait_for(fut, timeout=5.0)
+        assert gc._closed
+    finally:
+        await s.close()
+
+
+async def test_committer_cancelled_mid_flush_rejects_members_beyond_the_batch(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5664: _flush rejects only the batch it claimed on a cancel, so the members beyond
+    max_batch must be rejected by the committer's exit, not left pending."""
+    s = await MessageStore.open(
+        tmp_path / "midflush.db", group_commit_window_ms=GC_WINDOW_MS, group_commit_max_batch=1
+    )
+    try:
+        gc = s._group_commit
+        assert gc is not None and gc._task is not None
+        entered = asyncio.Event()
+
+        async def _park() -> int:
+            entered.set()
+            await asyncio.Event().wait()
+            return 0
+
+        first = asyncio.create_task(gc.submit(_park))
+        rest = [asyncio.create_task(gc.submit(functools.partial(_ret, n))) for n in range(2)]
+        await asyncio.wait_for(entered.wait(), timeout=5.0)
+        assert len(gc._pending) == 2  # beyond the claimed batch of one
+
+        gc._task.cancel()
+        await asyncio.gather(gc._task, return_exceptions=True)
+        outcomes = await asyncio.wait_for(
+            asyncio.gather(first, *rest, return_exceptions=True), timeout=5.0
+        )
+        assert all(isinstance(o, RuntimeError) for o in outcomes), outcomes
+        assert gc._closed
+    finally:
+        await s.close()
 
 
 # --- regression: no member is stranded beyond one max_batch chunk (adversarial finding #1/#3) ----

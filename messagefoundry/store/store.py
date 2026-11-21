@@ -598,7 +598,8 @@ class _GroupCommitter:
     (a coordinated form of the crash-re-run the INFLIGHT-guarded idempotent handoffs already tolerate).
     Resolving the futures on the cancellation path matters as much as the rollback does: a member's
     caller parks on its future (the ACK gate among them), so a batch abandoned without rejection would
-    park every one of them forever.
+    park every one of them forever. For the same reason the committer, however it exits, marks itself
+    closed and rejects every member still pending beyond that batch (BACKLOG #5664).
 
     Enabled only when ``window_ms > 0``; otherwise the store never constructs one and each grouped
     method commits inline (byte-identical to the pre-feature path)."""
@@ -625,15 +626,51 @@ class _GroupCommitter:
         self._task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
-        if self._task is None:
+        if self._task is None or self._task.done():
+            # A committer that stopped marked itself closed (see _on_stopped); a new task reopens it.
+            self._closed = False
             self._task = asyncio.create_task(self._run(), name="store-group-committer")
+            self._task.add_done_callback(self._on_stopped)
+
+    def _on_stopped(self, task: asyncio.Task[None]) -> None:
+        """However the committer task ends -- a cancel while parked on ``_wake``, a cancel before its
+        first step, or a BaseException out of :meth:`_flush`, which rejects only the batch it claimed --
+        no later :meth:`submit` may enrol, and every member still pending is rejected, or its caller
+        (the ACK gate among them) parks forever (BACKLOG #5664). A done-callback rather than a
+        ``finally`` in :meth:`_run`, because a task cancelled before its first step never enters its
+        body. On the clean :meth:`aclose` exit ``_pending`` is already empty."""
+        if task is not self._task:
+            return  # a stale task; a newer one owns the committer now
+        self._closed = True
+        stranded, self._pending = self._pending, []
+        if task.cancelled() or task.exception() is not None:
+            log.warning(
+                "store group committer stopped outside close; rejecting %d pending member(s)",
+                len(stranded),
+            )
+        for member in stranded:
+            if not member.future.done():
+                member.future.set_exception(RuntimeError("group committer stopped"))
 
     async def aclose(self) -> None:
         """Stop the committer, flushing any enrolled members first so nothing is stranded."""
         self._closed = True
         self._wake.set()
         if self._task is not None:
-            await self._task
+            task = self._task
+            current = asyncio.current_task()
+            baseline = current.cancelling() if current is not None else 0
+            try:
+                await task
+            except asyncio.CancelledError:
+                # A committer cancelled earlier has already rejected its members (_on_stopped); that
+                # stale cancel must not abort the store's close. A cancel of OUR task during the
+                # await still propagates; the baseline keeps a caller that already caught an
+                # earlier cancel of its own from reading as cancelled now.
+                if not task.cancelled() or (
+                    current is not None and current.cancelling() > baseline
+                ):
+                    raise
             self._task = None
 
     async def submit(
@@ -11789,11 +11826,13 @@ class MessageStore:
 
     async def get_secret_rotation_meta(self) -> dict[str, SecretRotationMetaRow]:
         """Every persisted secret-rotation watch record, keyed by ``secret_key`` (non-secret dates +
-        keyed-MAC fingerprints)."""
-        cur = await self._db.execute(
-            "SELECT secret_key, fingerprint, tracked_since, last_rotated FROM secret_rotation_meta"
-        )
-        rows = await cur.fetchall()
+        keyed-MAC fingerprints). Read through :meth:`_read`, like every other reader here, rather than
+        on the writer connection outside its lock (BACKLOG #5665)."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT secret_key, fingerprint, tracked_since, last_rotated FROM secret_rotation_meta"
+            )
+            rows = await cur.fetchall()
         return {
             r["secret_key"]: SecretRotationMetaRow(
                 secret_key=r["secret_key"],

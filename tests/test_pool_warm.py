@@ -27,6 +27,7 @@ from messagefoundry.config.settings import (
     StoreSettings,
 )
 from messagefoundry.pipeline.engine import Engine
+from messagefoundry.store import base as base_module
 from messagefoundry.store.base import warm_pool_connections, warm_pool_target
 from messagefoundry.store.store import MessageStore
 
@@ -234,6 +235,94 @@ async def test_warm_absorbs_a_release_error_and_releases_the_rest() -> None:
     assert (
         pool.release_attempts == 3
     )  # the loop attempted release for all 3 (did not stop at the raise)
+
+
+class _HandOffPool:
+    """A pool whose ``acquire()`` hands its connection over through a plain future, marking it in-use
+    at the instant it resolves (``checked_out`` is the ground truth for a stranded connection). The
+    test resolves the hand-off and cancels the warm-up in the SAME loop turn, which is the race
+    BACKLOG #5686 names: a task awaiting the future directly has the pending cancel thrown in instead
+    of the resolved connection, so nobody holds it and nobody returns it."""
+
+    def __init__(self) -> None:
+        self.handoffs: list[asyncio.Future[str]] = []
+        self.checked_out: list[str] = []
+
+    def acquire(self) -> asyncio.Future[str]:
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        self.handoffs.append(fut)
+        return fut
+
+    def hand_over(self) -> None:
+        conn = f"conn-{len(self.checked_out) + 1}"
+        self.checked_out.append(conn)  # in-use atomically with the hand-off
+        self.handoffs[0].set_result(conn)
+
+    async def release(self, conn: str) -> None:
+        self.checked_out.remove(conn)
+
+
+async def _settle() -> None:
+    for _ in range(50):
+        await asyncio.sleep(0)
+
+
+@pytest.mark.parametrize("cancel_first", [False, True], ids=["hand-over-first", "cancel-first"])
+async def test_warm_cancelled_in_the_turn_the_acquire_resolves_strands_nothing(
+    cancel_first: bool,
+) -> None:
+    # Both orders within one turn. Cancel-first is the one that pins the DEFERRED borrow cancel: an
+    # immediate borrow.cancel() there would find the hand-off resolved and throw the cancel in.
+    pool = _HandOffPool()
+    task = asyncio.create_task(warm_pool_connections(pool, target=1, timeout=5.0, backend="stub"))
+    await _settle()
+    assert len(pool.handoffs) == 1  # the borrow is parked on the hand-off
+
+    if cancel_first:
+        task.cancel()
+        pool.hand_over()
+    else:
+        pool.hand_over()
+        task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert pool.checked_out == [], "a connection the pool handed over was stranded"
+
+
+async def test_warm_release_that_ignores_cancellation_cannot_hang_the_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # BACKLOG #5687: past _CLEANUP_TIMEOUT_SECONDS the stuck releases are cancelled, and a release
+    # that swallows the cancel must not hold the warm-up open anyway.
+    monkeypatch.setattr("messagefoundry.store.base._CLEANUP_TIMEOUT_SECONDS", 0.05)
+    unstick = asyncio.Event()
+
+    class _DeafReleasePool(StubPool):
+        async def release(self, conn: str) -> None:
+            self.release_attempts += 1
+            while not unstick.is_set():
+                try:
+                    await unstick.wait()
+                except asyncio.CancelledError:
+                    continue  # a driver that ignores the cancel
+
+    pool = _DeafReleasePool()
+    parked_before = set(base_module._LATE_RELEASES)
+    task = asyncio.create_task(warm_pool_connections(pool, target=2, timeout=5.0, backend="stub"))
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=2.0)
+        assert task in done, "the warm-up cleanup hung on a release that ignored its cancel"
+        assert task.result() == 2
+        # Both stuck releases are held strongly while they run, so none is collected mid-flight ...
+        assert len(base_module._LATE_RELEASES - parked_before) == 2
+    finally:
+        unstick.set()  # let the abandoned releases end so the loop closes clean
+        await _settle()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    # ... and dropped once they end.
+    assert base_module._LATE_RELEASES - parked_before == set()
 
 
 # --- warm_pool_target: headroom sizing --------------------------------------
