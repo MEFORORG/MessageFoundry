@@ -65,6 +65,7 @@ from messagefoundry.transports.email import EmailDestination
 from messagefoundry.transports.fhir import FhirDestination, FhirLookupExecutor
 from messagefoundry.transports.file import FileSource
 from messagefoundry.transports.http_auth import (
+    HttpAuthError,
     OAuth2ClientCredentialsProvider,
     oauth2_cc_provider_from_settings,
 )
@@ -966,7 +967,7 @@ def test_a_token_hop_built_directly_refuses_a_timeout_that_is_not_positive(bad: 
         "client_secret": "s",
     }
     match = r"^OAuth2 token endpoint timeout_seconds must be a number of seconds above zero"
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(HttpAuthError, match=match):
         OAuth2ClientCredentialsProvider(**kwargs, timeout_seconds=bad)
     assert OAuth2ClientCredentialsProvider(**kwargs, timeout_seconds=0.5).timeout_seconds == 0.5
 

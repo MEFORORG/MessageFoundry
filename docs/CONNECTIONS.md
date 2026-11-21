@@ -3004,10 +3004,11 @@ processing instruction before either child is stepped over, with at least these 
 which leaves that read with no code: such markup that has no terminator; a `<!` that opens anything
 else, such as a DOCTYPE or a lowercase `<![cdata[`; and a first `</` inside such markup within the
 `faultcode` or `Value` itself that is not that element's own close tag. Where that first `</` is
-the element's own close tag, the element is read on to its own close tag outside the markup when
-that is the next tag outside it, so `<faultcode><!-- </faultcode> -->soap:Server</faultcode>` reads
-`<!-- </faultcode> -->soap:Server`; otherwise the code text ends at that `</`. Text inside markup
-within the code element is read with the code, as the earlier search read it. Where that read
+the element's own close tag and the text before it names no class, the element is read on to its
+own close tag outside the markup when that is the next tag outside it, with that markup left out,
+so `<faultcode><!-- </faultcode> -->soap:Server</faultcode>` reads `soap:Server`; otherwise the code
+text ends at that `</`, and a comment before it within the code text is read with the code, as
+the earlier search read it. Where that read
 yields no code, for
 those shapes, for a first child that is neither element (a SOAP 1.1 `faultstring` before the
 `faultcode`, a SOAP 1.2 `Reason` before the `Code`), or for a code element that holds no code, the
@@ -3978,7 +3979,7 @@ again: see *A 2xx reply over the byte bound* under [REST](#rest--rest). Each of 
 also a permanent refusal, in both capture modes (BACKLOG #5914): a non-empty 2xx body that is not
 parseable JSON, repeats a key at any depth, is nested too deep, or is not a dataset object or a
 non-empty array of them, or carries a FailedSOPSequence that is not an object, has a `Value` that is
-not an array, carries any key but `vr` and `Value`, or holds an item while its `vr` is not `SQ` or
+not an array, carries any key but `vr` and `Value`, or holds an item while its `vr` is absent or not `SQ` or
 an item is not a dataset object, with no well-formed one holding an item in another dataset (code
 `unparseable-reply`, since such a sequence proves no rejection; `failed-sop` is kept for a
 well-formed FailedSOPSequence with an item); and a
@@ -3986,11 +3987,12 @@ well-formed FailedSOPSequence with an item); and a
 element has `vr` `UI`, carries no key but `vr` and `Value`, and has a `Value` of exactly one string
 in the UID grammar once trailing NUL or space padding is dropped (dot-separated ASCII digits, at
 most 64 characters), an empty 202 included (code
-`unconfirmed-202`). A ReferencedSOPSequence that is malformed in the ways a FailedSOPSequence can
-be names no instance. **Not every 2xx that fails to confirm the store is refused.** A 200 is not
+`unconfirmed-202`). A ReferencedSOPSequence that is not an object, has a `Value` that
+is not an array, or carries any key but `vr` and `Value` names no instance; its own `vr` is not
+checked. **Not every 2xx that fails to confirm the store is refused.** A 200 is not
 required to carry a ReferencedSOPSequence, so a 200 dataset that confirms nothing and is not
 refused above, `{}` included, is delivered; and an empty 2xx other than a 202 (empty, or JSON
-whitespace after a leading BOM) is delivered, `no_reply` when capturing. **PHI:** the response can
+whitespace after any leading BOMs) is delivered, `no_reply` when capturing. **PHI:** the response can
 name patient/study identifiers, so it is never logged — only the HTTP status and a redacted URL are.
 
 ```python

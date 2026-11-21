@@ -709,8 +709,9 @@ async def test_dicomweb_a_malformed_failed_sop_sequence_fails_closed(
         '{"vr": "SQ", "Value": [{}, null]}',
         '{"vr": "UI", "Value": ["1.2.3"]}',
         '{"vr": "UI", "Value": [{}]}',
+        '{"Value": [{}]}',
     ],
-    ids=["null-item", "text-item", "number-item", "mixed-items", "ui-text", "ui-dataset"],
+    ids=["null-item", "text-item", "number-item", "mixed-items", "ui-text", "ui-dataset", "no-vr"],
 )
 async def test_dicomweb_a_failed_sop_sequence_of_non_datasets_proves_no_rejection(
     element: str,
