@@ -80,9 +80,9 @@ def _diagnostic(code: str, exc: BaseException) -> str:
       (BACKLOG #5383). With ``_LogFileShrank`` it was, twice, shorter when read than when it was
       opened: truncated in place, as a copytruncate rotation does (BACKLOG #5385).
     * ``MF-BUNDLE-LOG-003`` -- the newest app-log file was read, but the bytes the read takes from
-      its end hold no line with anything in it but a line break: the newest line with content is
-      longer than the bound, and only blank lines, or none, follow it (``_LogLineTooLong``,
-      BACKLOG #5385).
+      its end, less the line the bound cuts into, hold nothing but line breaks: the newest line with
+      content is cut by the bound or starts before it (``_LogLineTooLong``, BACKLOG #5385). The
+      line need not be long; enough blank lines after it put it out of reach too.
 
     A type name is a class defined in this project or the standard library, so it is bounded input; an
     exception's ``str()`` is not, and the bundle is a file an operator hands outside the environment."""
@@ -259,9 +259,9 @@ class _LogFileShrank(_LogFileChanged):
 
 
 class _LogLineTooLong(ValueError):
-    """The bytes the read takes from the end of the app-log file hold no line with anything in
-    it but a line break, so the tail would show nothing although the file is not empty (BACKLOG
-    #5385). Not an :class:`OSError`: the read worked."""
+    """The bytes the read takes from the end of the app-log file, less the line the bound cuts
+    into, hold nothing but line breaks, so the tail would show nothing although the file is not
+    empty (BACKLOG #5385). Not an :class:`OSError`: the read worked."""
 
 
 def _is_plain_file(st: os.stat_result) -> bool:
@@ -315,8 +315,7 @@ def _read_log_file(path: Path, listed: os.stat_result) -> str:
     check after the open prevents is only the read: a target with another id is refused, and
     none of its content enters the bundle. Raises :class:`OSError`, the identity refusal as
     :class:`_LogFileRefused` and a file that shrank while it was read as :class:`_LogFileShrank`;
-    and :class:`_LogLineTooLong` for a cut read that keeps no line with anything in it but a line
-    break."""
+    and :class:`_LogLineTooLong` for a cut read that keeps nothing but line breaks."""
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     nonblocking = getattr(os, "O_NONBLOCK", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0) | nonblocking

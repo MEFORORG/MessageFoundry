@@ -1077,6 +1077,20 @@ def test_log_tail_a_long_last_line_then_a_blank_line_reports_a_code(
     assert _tail_member(tmp_path, log_dir) == "MF-BUNDLE-LOG-003 _LogLineTooLong"
 
 
+def test_log_tail_a_short_line_then_more_blank_lines_than_the_bound_reports_a_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The line with content need not be long: blank lines past the bound put it out of reach
+    as well, and the code, not an empty tail, is what reports that."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_bytes(b"short\n" + b"\n" * 40)
+    assert _tail_member(tmp_path, log_dir) == "MF-BUNDLE-LOG-003 _LogLineTooLong"
+
+
 def test_log_tail_a_long_line_then_a_line_with_content_keeps_it(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1102,6 +1116,9 @@ def test_a_long_line_has_its_own_code() -> None:
         return doc.split(f"``{code}``", 1)[1].split("* ``", 1)[0]
 
     assert "_LogLineTooLong" in entry("MF-BUNDLE-LOG-003")
+    # A short line put out of reach by blank lines raises it too, so 003 must not say the
+    # line is longer than the bound.
+    assert "starts before it" in entry("MF-BUNDLE-LOG-003")
     assert "_LogLineTooLong" not in entry("MF-BUNDLE-LOG-002")
     assert "_LogFileShrank" in entry("MF-BUNDLE-LOG-002")
 
