@@ -20,6 +20,7 @@ from pydantic import AfterValidator, BaseModel, Field
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
     MAX_MAP_ENTRIES,
+    SIGN_IN_NAME_PATTERN,
     ChannelScopeEntry,
     PermissionId,
     RoleId,
@@ -410,10 +411,14 @@ class DirectoryUserCreateRequest(RequestModel):
     cannot point the holder's notices away from the directory's (ASVS 6.3.7).
     """
 
-    # vault BACKLOG #5342, BACKLOG #5784: refused, 422, by :func:`name_refusal` before the
-    # directory is asked. The NUL case is pinned by tests/test_auth_federated_identity_routes.py::
-    # test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory.
-    username: PrintableName
+    # vault BACKLOG #5342, BACKLOG #5784: a refused name answers 422 before the directory is
+    # asked. The constraints declared on the Field below, which the published schema carries,
+    # run before :func:`name_refusal`.
+    username: Annotated[
+        str,
+        Field(min_length=1, max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN),
+        AfterValidator(_printable_name),
+    ]
     notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 
 

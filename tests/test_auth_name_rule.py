@@ -71,8 +71,15 @@ _ACCEPTED = ["Bob", "Jane Doe", " edge ", "Zo\u00eb", "\u0645\u06cc\u200c\u0631\
 @pytest.mark.parametrize("name", _REFUSED)
 def test_the_rule_refuses(name: str) -> None:
     assert name_refusal(name) is not None
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as refused:
         DirectoryUserCreateRequest(username=name)
+    if name == "":
+        expected = "string_too_short"
+    elif "\x00" in name:
+        expected = "string_pattern_mismatch"
+    else:
+        expected = "value_error"
+    assert [e["type"] for e in refused.value.errors()] == [expected]
     with pytest.raises(ValidationError):
         UserCreateRequest(username="newuser", display_name=name, email="n@example.org")
 
@@ -502,3 +509,17 @@ def test_the_literal_pattern_agrees_with_the_shared_one() -> None:
     from messagefoundry.api.validation import PRINTABLE_TEXT_PATTERN
 
     assert auth_models._PRINTABLE_NAME.pattern == PRINTABLE_TEXT_PATTERN
+
+
+def test_the_directory_username_schema_is_the_one_origin_main_published() -> None:
+    """The field's published schema, as ``DirectoryUserCreateRequest`` declares it."""
+    schema = DirectoryUserCreateRequest.model_json_schema()["properties"]["username"]
+    assert schema == {
+        "maxLength": 256,
+        "minLength": 1,
+        "pattern": "^[^\\x00]*$",
+        "title": "Username",
+        "type": "string",
+    }
+    with pytest.raises(ValidationError):
+        DirectoryUserCreateRequest(username="a\tb")  # control: the runtime rule still refuses
