@@ -36,8 +36,8 @@ _WRONG_PIN = "00" * 32
 # Built from parts, so the secret scanner does not read a fake label as a key.
 _KEY_LABEL = b"PRIVATE " + b"KEY"
 _KEY_BLOCK = b"-----BEGIN " + _KEY_LABEL + b"-----\nQUFBQQ==\n-----END " + _KEY_LABEL + b"-----\n"
-_CLIENT_CA_LINE = "no audit row records the refused [api].tls_client_ca_file: "
-_COLLECTOR_CA_LINE = "no audit row records the refused [logging].forward_tls_ca_file: "
+_CLIENT_CA_LINE = "no audit row records the refused [api].tls_client_ca_file (BACKLOG"
+_COLLECTOR_CA_LINE = "no audit row records the refused [logging].forward_tls_ca_file (BACKLOG"
 
 
 def _provision(db: Path, key: str | None) -> None:
@@ -254,11 +254,10 @@ def test_a_refused_crl_is_reported_by_its_own_setting(
     crl_line = _crl_refused(tmp_path, monkeypatch)
     rc, _db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_api=crl_line)
     assert rc == 2
-    crl = grab.starting("no audit row records the refused [api].tls_client_crl_file: ")
+    crl = grab.starting("no audit row records the refused [api].tls_client_crl_file (BACKLOG")
     assert len(crl) == 1, grab.seen
-    # No start writes a CRL row, so the line must not say the lifespan's preflight writes one.
-    assert "never checks this setting" in crl[0], crl
-    assert "whose audited preflight writes that row" not in crl[0], crl
+    # No start writes a CRL row, so the line must not say any preflight writes one.
+    assert "writes that row" not in crl[0], crl
     assert grab.starting(_CLIENT_CA_LINE) == []
 
 
@@ -466,3 +465,40 @@ def test_the_report_carries_the_collector_cas_reason(
     assert rc == 2
     lines = grab.starting(_COLLECTOR_CA_LINE)
     assert len(lines) == 1 and "planted early refusal" in lines[0], grab.seen
+
+
+def test_a_client_ca_the_build_cannot_read_is_reported(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grab: _Grab
+) -> None:
+    """``verified_anchor_cadata`` passes the client CA file's own read failure through as a bare
+    ``OSError``, which the build's catch also turns into exit 2. It is the client CA's refusal, so
+    it is reported too. Planted at the read, naming the CA's file. Red before, when only a
+    ``TrustAnchorError`` was reported."""
+    real = ta.evaluate_anchor
+
+    def unreadable(spec: ta.AnchorSpec) -> ta.AnchorVerdict:
+        if spec.label == "api_client":
+            raise PermissionError(13, "planted unreadable CA", spec.path)
+        return real(spec)
+
+    monkeypatch.setattr(ta, "evaluate_anchor", unreadable)
+    rc, _db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None)
+    assert rc == 2
+    lines = grab.starting(_CLIENT_CA_LINE)
+    assert len(lines) == 1 and "PermissionError" in lines[0], grab.seen
+
+
+def test_an_unrelated_oserror_is_not_reported_as_the_client_ca(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grab: _Grab
+) -> None:
+    """The control: an ``OSError`` from the build that names another file, here the API key, is
+    not the client CA's refusal, and is not reported as one."""
+    from messagefoundry.api import tls as api_tls
+
+    def refuse(*_a: object, **_k: object) -> object:
+        raise FileNotFoundError(2, "planted", str(tmp_path / "api-key.pem"))
+
+    monkeypatch.setattr(api_tls, "build_api_ssl_context", refuse)
+    rc, _db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None)
+    assert rc == 2
+    assert grab.starting(_CLIENT_CA_LINE) == [], grab.seen

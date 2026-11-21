@@ -151,9 +151,11 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
       the API TLS context build, runs no attestation and no lifespan, though the API TLS pair may
       already be minted or renewed. It writes **no** row for the collector CA, nor for
       ``[api].tls_client_ca_file`` where that build refused it: a refused start opens no store,
-      since every writable open writes more than the row. ``serve``'s exit hook logs a WARNING
-      for each such anchor that no row records it (BACKLOG #5391). At least an interrupt, an exit
-      uvicorn takes before the lifespan starts, and an exit inside the lifespan before this
+      since every writable open writes more than the row. On at least a return or an
+      ``Exception`` before uvicorn runs, ``serve``'s exit hook logs a WARNING with the refusal's
+      reason, for the collector CA and for the client CA where the build refused it, as an anchor
+      refusal or as an ``OSError`` reading that file (BACKLOG #5391). At least an interrupt, an
+      exit uvicorn takes before the lifespan starts, and an exit inside the lifespan before this
       preflight runs log no such WARNING and write no row.
     * ``supervise`` checks the same CA before it builds its own forwarder, and refuses on stderr
       before any engine shard spawns. Its process has no audited preflight, so no row is written.
