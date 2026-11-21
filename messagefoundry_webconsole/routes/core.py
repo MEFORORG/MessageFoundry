@@ -2468,7 +2468,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return Response(status_code=204)
         try:
             doc = json.loads(raw.decode("utf-8", "replace"))
-        except ValueError:
+        # A body nested too deep for json's decoder raises RecursionError, not ValueError, and is
+        # just as malformed (vault BACKLOG #5341).
+        except (ValueError, RecursionError):
             _log.warning("CSP violation report from %s: %s", client, "malformed-json")
             return Response(status_code=204)
         bodies = _csp_report_bodies(doc)

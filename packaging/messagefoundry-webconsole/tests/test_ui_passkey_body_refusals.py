@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""Web console tests for too-deep passkey bodies and NUL sign-in names (vault BACKLOG #5341,
-#5342). All data here is synthetic.
+"""Web console tests for too-deep passkey bodies and CSP reports, and NUL sign-in names (vault
+BACKLOG #5341, #5342). All data here is synthetic.
 """
 
 from __future__ import annotations
@@ -104,6 +104,42 @@ def test_a_body_nested_too_deep_is_a_refusal_not_a_500(tmp_path: Path, route: st
 
     r = _on_a_small_stack(_post)
     assert (r.status_code, r.json()) == (400, refusal)
+
+
+def test_a_csp_report_nested_too_deep_is_malformed_not_a_500(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The public CSP report sink answers a too-deep body as it answers any other malformed
+    report: 204, logged as ``malformed-json`` (vault BACKLOG #5341)."""
+
+    async def _parse() -> object:
+        return json.loads(_TOO_DEEP)
+
+    # As above: on the stack the route runs on, json refuses this body with RecursionError.
+    with pytest.raises(RecursionError):
+        _on_a_small_stack(_parse)
+
+    async def _post() -> httpx.Response:
+        engine = await Engine.create(
+            tmp_path / "webui.db",
+            poll_interval=0.02,
+            egress_settings=EgressSettings(deny_by_default=False),
+        )
+        try:
+            service = await _service(engine)
+            async with _client(engine, service) as c:
+                return await c.post(
+                    "/ui/csp-report",
+                    content=_TOO_DEEP,
+                    headers={**SAME_ORIGIN, "Content-Type": "application/csp-report"},
+                )
+        finally:
+            await engine.stop()
+
+    with caplog.at_level("WARNING", logger="messagefoundry_webconsole"):
+        r = _on_a_small_stack(_post)
+    assert r.status_code == 204
+    assert any("malformed-json" in rec.getMessage() for rec in caplog.records)
 
 
 def _spy_login(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> list[str]:
