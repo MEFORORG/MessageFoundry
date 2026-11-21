@@ -203,6 +203,11 @@ ALERT_SUSPEND_MINUTES_MAX = 43200
 #: Printable text: no C0 control, no DEL, no C1 control. One or more characters.
 PRINTABLE_TEXT_PATTERN = r"^[^\x00-\x1f\x7f-\x9f]+$"
 
+#: Any text without a NUL, empty included (vault BACKLOG #5342). The directory user name's
+#: published schema keeps it; the account name rule (``api.auth_models.name_refusal``) refuses
+#: more at run time (BACKLOG #5784).
+SIGN_IN_NAME_PATTERN = r"^[^\x00]*$"
+
 #: A member of one of the engine's own closed vocabularies -- ``MessageStatus``, ``OutboxStatus``,
 #: the connection-event kinds. Every member of all three is letters and underscores only. The
 #: vocabulary itself stays the store's to define; this is the shape a member can have.
