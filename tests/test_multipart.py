@@ -332,13 +332,13 @@ def test_a_hostile_disposition_header_stays_inside_the_scan_budget() -> None:
 
 @pytest.mark.parametrize(
     "unit",
-    ['"', 'a="\\', 'a="\\" ', " =", ";", "a ", "a   ", "\\x", "a  =  ", "=", "a=b "],
+    ['"', 'a="\\', 'a="\\" ', " =", ";", "a ", "a   ", "\\x", "a  =  ", "=", "a=b ", '=""'],
 )
 def test_every_tokenizer_branch_stays_inside_the_scan_budget(unit: str) -> None:
     """The word run above is the regex's worst case, not the tokenizer's, so each tokenizer branch
     (stray and unclosed quotes, escapes, ``=`` with spaces, separators, bare items, tokens) is timed
     too, on a line of that unit repeated near ``_MAX_PART_HEADER_BYTES``. Measured 2026-11-21 on a
-    dev box, the slowest took ~3 ms, so the budget has about 15x of room."""
+    dev box, the slowest, ``=""``, took ~4 ms, so the budget has about 12x of room."""
     value = unit * (_HOSTILE_HEADER_CHARS // len(unit))
     best = float("inf")
     for _ in range(5):
