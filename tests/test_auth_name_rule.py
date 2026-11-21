@@ -54,6 +54,12 @@ _REFUSED = [
     "trail\n",
     "del\x7f",
     "c1\x85",
+    chr(0x200B),  # a zero-width space alone draws nothing
+    chr(0x3164) + chr(0x2800),  # a Hangul filler and a Braille blank
+    "a" + chr(0x2028) + "b",  # a line separator
+    "x" + chr(0x2029),  # a paragraph separator
+    chr(0x202E) + "rotartsinimdA",  # a right-to-left override
+    "a" + chr(0x2066) + "b",  # an isolate
 ]
 _ACCEPTED = ["Bob", "Jane Doe", " edge ", "Zo\u00eb", "\u0645\u06cc\u200c\u0631\u0627"]
 
@@ -89,6 +95,28 @@ def test_an_edit_that_resends_the_stored_name_is_exempt() -> None:
 
 
 @pytest.mark.parametrize(
+    ("stored", "posted"),
+    [
+        ("\tBad\tName", "Bad\tName"),  # the console strips the edges
+        ("a\nb\tc", "ab\tc"),  # a browser drops LF and CR from a text input's value
+        ("a\r\nb\x01", "ab\x01"),
+        ("jd\x00o\x01e", "jd" + chr(0xFFFD) + "o\x01e"),  # and reads an attribute NUL as U+FFFD
+    ],
+)
+def test_the_stored_name_as_a_console_form_posts_it_is_exempt(stored: str, posted: str) -> None:
+    assert name_refusal(posted) is not None  # the exemption is what lets it through
+    assert changed_name_refusal(posted, stored) is None
+    assert custom_role_name_refusal(posted, stored) is None
+
+
+def test_the_exemption_cannot_add_a_control_character_to_a_clean_name() -> None:
+    """Only the stored-to-posted direction matches, so a clean stored name gains nothing."""
+    assert changed_name_refusal("Bob\n", "Bob") is not None
+    assert changed_name_refusal(" Bob\t", "Bob") is not None
+    assert custom_role_name_refusal("Readers\n", "Readers") is not None
+
+
+@pytest.mark.parametrize(
     "name",
     [
         "Administrator",
@@ -99,6 +127,12 @@ def test_an_edit_that_resends_the_stored_name_is_exempt() -> None:
         "\uff21dministrator",  # a fullwidth A, which NFKC folds
         "viewer",
         "Coding",
+        "Administrator" + chr(0xFE0F),  # a variation selector
+        "Admini" + chr(0x034F) + "strator",  # a combining grapheme joiner
+        "Administrator" + chr(0x3164),  # a Hangul filler
+        chr(0x115F) + "Administrator",
+        "Administrator" + chr(0x2800),  # a Braille blank
+        chr(0x202E) + "rotartsinimdA",  # refused as a bidi override, not by the fold
     ],
 )
 def test_a_custom_role_may_not_take_a_built_in_role_name(name: str) -> None:
@@ -257,16 +291,19 @@ async def test_custom_role_routes_refuse_a_bad_or_built_in_name(engine: Engine) 
         assert "display_name" in refused.json()["detail"]
     assert made.status_code == 201, made.text
     role_url = f"/roles/custom/{made.json()['id']}"
-    renamed, kept = await _calls(
+    unknown_url = "/roles/custom/custom:" + "0" * 32
+    renamed, kept, unknown = await _calls(
         engine,
         service,
         [
             ("PUT", role_url, {"display_name": "Operator", "permissions": perms}),
             ("PUT", role_url, {"display_name": "Readers", "permissions": perms}),
+            ("PUT", unknown_url, {"display_name": "Auditor", "permissions": perms}),
         ],
     )
     assert renamed.status_code == 422, renamed.text
     assert kept.status_code == 200, kept.text
+    assert unknown.status_code == 404, unknown.text  # the service's answer, not the name rule's
     assert [r.display_name for r in await service.list_custom_roles()] == ["Readers"]
 
 

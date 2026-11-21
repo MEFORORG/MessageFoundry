@@ -84,13 +84,21 @@ _BLANK_GLYPHS: Final = frozenset({0x2800, 0x16FE4, 0x1D159})
 BLANK_USERNAME_REFUSAL: Final = "a username is required and must not be blank"
 
 
-def _unprintable(ch: str) -> bool:
+def renders_as_nothing(ch: str) -> bool:
+    """Whether ``ch`` draws no glyph: a format character (category Cf), a default-ignorable code
+    point (:data:`_DEFAULT_IGNORABLE`) or a blank glyph (:data:`_BLANK_GLYPHS`). The account and
+    role name rule in ``api.auth_models`` sets these aside before it asks whether a name is blank
+    or folds to a built-in role's name (BACKLOG #5784, #5785)."""
     point = ord(ch)
     return (
-        unicodedata.category(ch) in CONTROL_CATEGORIES
+        unicodedata.category(ch) == "Cf"
         or point in _BLANK_GLYPHS
         or any(low <= point <= high for low, high in _DEFAULT_IGNORABLE)
     )
+
+
+def _unprintable(ch: str) -> bool:
+    return unicodedata.category(ch) in CONTROL_CATEGORIES or renders_as_nothing(ch)
 
 
 def username_refusal(username: str) -> str | None:

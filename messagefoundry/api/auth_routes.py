@@ -1397,11 +1397,11 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         proof in its own gate, so the seam hands it this. ``ended`` is the set the gate read, which
         the revoke ends (BACKLOG #5505)."""
         # BACKLOG #5785: the stored name is exempt, so a role stored under a name the rule refuses
-        # can still have its permissions edited. An unknown id finds none and is the service's 404.
-        stored = next(
-            (r.display_name for r in await service.list_custom_roles() if r.id == role_id), None
-        )
-        _refuse_custom_role_name(body.display_name, stored=stored)
+        # can still have its permissions edited. An unknown id finds none, is not checked here, and
+        # is the service's 404.
+        stored = [r.display_name for r in await service.list_custom_roles() if r.id == role_id]
+        if stored:
+            _refuse_custom_role_name(body.display_name, stored=stored[0])
         try:
             role = await service.update_custom_role(
                 role_id,

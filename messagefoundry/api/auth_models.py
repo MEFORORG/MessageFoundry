@@ -28,7 +28,7 @@ from messagefoundry.api.validation import (
 from messagefoundry.auth.permissions import ROLE_METADATA, Role
 from messagefoundry.auth.tokens import ENROLMENT_CODE_MAX
 from messagefoundry.auth.totp import MAX_DIGITS as TOTP_DIGITS
-from messagefoundry.auth.usernames import username_refusal
+from messagefoundry.auth.usernames import renders_as_nothing, username_refusal
 from messagefoundry.password_bounds import PASSWORD_MAX as _PASSWORD_MAX
 
 # Upper bounds on free-text request fields (API-INPUT): reject absurd inputs before they reach the
@@ -278,28 +278,54 @@ class ChannelScope(RequestModel):
     expected_source: Literal["ad", "manual"] | None = Field(default=None, exclude=True)
 
 
+#: The explicit bidirectional embeddings, overrides and isolates, which reorder how a name and the
+#: text beside it display, so ``U+202E`` followed by a reversed spelling renders as another name.
+_BIDI_REORDERING = frozenset(range(0x202A, 0x202F)) | frozenset(range(0x2066, 0x206A))
+
+
 def name_refusal(name: str) -> str | None:
     """Why ``name`` may not be stored as an account or role name an administrator sends, or
-    ``None`` when it may (BACKLOG #5784, #5785). Refused: a blank name or one of white space
-    alone, and a name holding a C0 control (NUL included), DEL or a C1 control, the characters
-    :data:`~messagefoundry.api.validation.PRINTABLE_TEXT_PATTERN` excludes. Nothing else is
-    refused here: a format character such as a zero-width joiner, which some scripts need inside
-    a word, passes, and so does white space at an edge. The reason is fixed text that never echoes
-    the value."""
-    if not name.strip():
+    ``None`` when it may (BACKLOG #5784, #5785). Refused, at least:
+
+    * a blank name: nothing left once white space and the characters that draw nothing
+      (``auth.usernames.renders_as_nothing``, such as a zero-width space or a Hangul filler) are
+      set aside;
+    * a C0 control (NUL included), DEL or a C1 control, the characters
+      :data:`~messagefoundry.api.validation.PRINTABLE_TEXT_PATTERN` excludes, a line or paragraph
+      separator (U+2028, U+2029), or a bidirectional embedding, override or isolate.
+
+    A format character inside a visible name, such as the zero-width non-joiner some scripts need
+    inside a word, passes, and so does white space at an edge. The reason is fixed text that never
+    echoes the value."""
+    if not "".join(c for c in name if not renders_as_nothing(c)).strip():
         return "must not be blank"
-    if re.fullmatch(PRINTABLE_TEXT_PATTERN, name) is None:
-        return "must not contain a control character"
+    if re.fullmatch(PRINTABLE_TEXT_PATTERN, name) is None or any(
+        unicodedata.category(c) in ("Zl", "Zp") or ord(c) in _BIDI_REORDERING for c in name
+    ):
+        return "must not contain a control, line separator or bidirectional override character"
     return None
 
 
+def _as_a_form_posts_it(stored: str) -> str:
+    """``stored`` as a console form posts it back: a browser drops CR and LF from a text input's
+    value and reads a NUL in an attribute as U+FFFD, and the console's route strips the edges."""
+    return stored.replace("\r", "").replace("\n", "").replace("\x00", "�").strip()
+
+
+def _resends_stored(name: str, stored: str | None) -> bool:
+    """Whether ``name`` is the stored name re-sent: equal to it, or to what a console form posts
+    for it (:func:`_as_a_form_posts_it`). Only that direction matches, so a client cannot add a
+    control character to a clean stored name under the exemption."""
+    return stored is not None and name in (stored, _as_a_form_posts_it(stored))
+
+
 def changed_name_refusal(name: str | None, stored: str | None) -> str | None:
-    """:func:`name_refusal` for a name an edit sends, with one exemption: a value equal to the one
-    already stored passes, so a client re-sending a stored name another writer put there, such as
+    """:func:`name_refusal` for a name an edit sends, with one exemption: the stored name re-sent
+    (:func:`_resends_stored`) passes, so a client re-sending a name another writer stored, such as
     a directory sync or a save made before this rule, is not refused while it edits another field.
     A different value takes the rule, so a repair to a clean name is accepted. ``None`` (a clear,
     where the field allows one) passes too."""
-    if name is None or name == stored:
+    if name is None or _resends_stored(name, stored):
         return None
     return name_refusal(name)
 
@@ -609,10 +635,11 @@ class RoleInfo(BaseModel):
 
 
 def _fold_role_name(name: str) -> str:
-    """A role name as the built-in name check compares it: format characters (Unicode category
-    Cf, such as a zero-width space or a soft hyphen) dropped, then NFKC, case folding, and each run
-    of white space as one space with none at the edges."""
-    visible = "".join(c for c in name if unicodedata.category(c) != "Cf")
+    """A role name as the built-in name check compares it: the characters that draw nothing
+    (``auth.usernames.renders_as_nothing``, such as a zero-width space, a variation selector or a
+    Hangul filler) dropped, then NFKC, case folding, and each run of white space as one space with
+    none at the edges."""
+    visible = "".join(c for c in name if not renders_as_nothing(c))
     return " ".join(unicodedata.normalize("NFKC", visible).casefold().split())
 
 
@@ -629,9 +656,10 @@ def custom_role_name_refusal(name: str, stored: str | None = None) -> str | None
     ``ADMINISTRATOR`` or ``Administrator`` with a zero-width space inside, is refused, so a custom
     role cannot be listed under a built-in role's name. It does not fold letters across scripts: a
     name that only looks alike, such as one spelled with a Cyrillic or small-capital letter,
-    passes. A save that re-sends the stored name is exempt from both checks, so a role stored
-    under a name the rule now refuses can still have its permissions edited."""
-    if name == stored:
+    passes. A save that re-sends the stored name (:func:`_resends_stored`) is exempt from both
+    checks, so a role stored under a name the rule now refuses can still have its permissions
+    edited."""
+    if _resends_stored(name, stored):
         return None
     refusal = name_refusal(name)
     if refusal is not None:
