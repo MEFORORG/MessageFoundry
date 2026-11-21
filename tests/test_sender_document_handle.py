@@ -2104,7 +2104,8 @@ async def test_a_streaming_ed_body_under_a_colliding_header_it_cannot_read_is_re
     store: MessageStore,
 ) -> None:
     """B13b: such a body was ACKed AA and stored with its document undetached. It is refused
-    before the ACK with an ERROR row, nothing stored and nothing queued, as ``main`` refused it."""
+    before the ACK with an ERROR row, nothing stored and nothing queued, as origin/main refused
+    every OBX under a short MSH-2."""
     ic = _streaming_ic()
     body = _TILDE_HEADER_DOCUMENT
     assert len(body) >= (ic.stream_threshold_bytes or 0)
@@ -2139,8 +2140,8 @@ async def test_the_http_listener_refuses_a_streaming_ed_body_under_a_colliding_h
 async def test_no_address_is_named_for_a_handle_under_a_colliding_header() -> None:
     """B13g: ``doc_ref_addresses_in_hl7`` named the address of a handle under a colliding header,
     which the re-attach refuses whatever it names, so a child carrying it was linked to a document
-    its delivery can never send. ``main`` named none under any short MSH-2; under a colliding one
-    it now names none again."""
+    its delivery can never send. origin/main named none under any short MSH-2; under a colliding
+    one it now names none again."""
     from messagefoundry.parsing.binary import (
         UnreattachableDocumentError,
         doc_ref_addresses_in_hl7,
@@ -2167,3 +2168,175 @@ def test_an_address_is_still_named_for_a_handle_the_re_attach_resolves() -> None
     payload = _hl7(make_doc_ref(ref, "Application"))
     assert doc_ref_addresses_in_hl7(payload) == frozenset({ref})
     assert attachments_named([ref], payload) == [ref]
+
+
+# --- PR 3135 review round-103403be: a handle under a colliding header (BACKLOG #5972) ----------
+
+_HIDDEN_HANDLE = make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application")
+
+#: A body with no ED claim whose OBX carries a sender's handle where its OBX-5.5 would be, under
+#: ``MSH|~|``, which hides every OBX-5 component; an NTE pads it past the streaming threshold.
+_TILDE_HEADER_HANDLE = (
+    "MSH|~|APP|FAC|RCV|RCVF|20260101120000||MDM~T02|MSGID001|P|2.5\r"
+    f"OBX|1|TX|PDF||^Application^PDF^Base64^{_HIDDEN_HANDLE}||||||F\r"
+    f"NTE|1||{'Q' * 600}\r"
+)
+
+#: The control: the same body with no marker anywhere in it.
+_TILDE_HEADER_NO_MARKER = _TILDE_HEADER_HANDLE.replace(_HIDDEN_HANDLE, "plain text", 1)
+
+_HIDDEN_MARKER_BODIES = {
+    "handle": _TILDE_HEADER_HANDLE,
+    "bare-marker": _TILDE_HEADER_HANDLE.replace(_HIDDEN_HANDLE, f"see {DOC_REF_MARKER}x", 1),
+    # ``:`` is the field separator, so the marker is escaped; ``~`` is declared the component
+    # separator and filled in as the repetition one.
+    "escaped": (
+        "MSH:~:APP:FAC:RCV:RCVF:20260101120000::MDM~T02:MSGID001:P:2.5\r"
+        "OBX:1:TX:PDF::^Application^PDF^Base64^mfdoc\\F\\v1\\F\\ref\\F\\"
+        f"{hashlib.sha256(b'x').hexdigest()}\\F\\Application\r"
+    ),
+    "field-separator-collision": (
+        "MSH^^APP^FAC^RCV^RCVF^20260101120000^^MDM~T02^MSGID001^P^2.5\r"
+        f"OBX^1^TX^PDF^^x~Application~PDF~Base64~{_HIDDEN_HANDLE}\r"
+    ),
+}
+
+
+@pytest.mark.parametrize("body", _HIDDEN_MARKER_BODIES.values(), ids=_HIDDEN_MARKER_BODIES.keys())
+def test_the_detach_scan_refuses_the_marker_under_a_colliding_header_with_no_ed_claim(
+    body: str,
+) -> None:
+    """F1: the header hides OBX-5.5, so the per-OBX read found no handle, and with no ED claim
+    nothing was refused: the body was ACKed AA, and delivery refused it on every outbound. The
+    marker in the received text, raw or as the header's delimiters escape it, is refused now."""
+    from messagefoundry.parsing.binary import _holds_ed_claim
+
+    message = Message.parse(body)
+    assert message._delimiters_collide()
+    assert message.field("OBX-5.5") is None  # the header hides it
+    assert not _holds_ed_claim(message)
+    with pytest.raises(InboundDocRefError, match="handle marker"):
+        list(iter_obx_documents(message, received=body))
+
+
+def test_a_colliding_header_with_no_ed_claim_and_no_marker_is_still_read() -> None:
+    """The control for F1: the read half of BACKLOG #5972 stands, so such a body yields nothing
+    and is not refused."""
+    message = Message.parse(_TILDE_HEADER_NO_MARKER)
+    assert message._delimiters_collide()
+    assert DOC_REF_MARKER not in _TILDE_HEADER_NO_MARKER and "plain text" in _TILDE_HEADER_NO_MARKER
+    assert list(iter_obx_documents(message, received=_TILDE_HEADER_NO_MARKER)) == []
+
+
+async def test_a_streaming_body_hiding_a_handle_under_a_colliding_header_is_refused(
+    store: MessageStore,
+) -> None:
+    """F1 on the MLLP listener: such a body was ACKed AA and queued, then dead-lettered at
+    delivery. It is refused before the ACK, with an ERROR row, nothing stored and nothing queued."""
+    ic = _streaming_ic()
+    body = _TILDE_HEADER_HANDLE
+    assert len(body) >= (ic.stream_threshold_bytes or 0)
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, body.encode("utf-8"))
+
+    assert _ack_code(ack) == "AR"
+    assert ack is not None and "document handle marker in the body" in ack
+    rows = await _rows(store, ic.name)
+    assert [r["status"] for r in rows] == [MessageStatus.ERROR.value]
+    assert "handle marker" in str(rows[0]["error"])
+    assert await _attachment_count(store) == 0
+    assert await _ingress_count(store, ic.name) == 0
+
+
+async def test_the_http_listener_refuses_a_hidden_handle_under_a_colliding_header_too(
+    store: MessageStore,
+) -> None:
+    """F1 on the receipt listener: a permanent refusal, with an ERROR row and nothing queued."""
+    from messagefoundry.transports.receipt import RefusalKind
+
+    ic = _streaming_ic()
+    runner = _runner(store, ic)
+
+    receipt = await runner._handle_inbound_http(ic, _TILDE_HEADER_HANDLE.encode("utf-8"))
+
+    assert receipt.refusal is RefusalKind.PERMANENT
+    assert [r["status"] for r in await _rows(store, ic.name)] == [MessageStatus.ERROR.value]
+    assert await _attachment_count(store) == 0
+    assert await _ingress_count(store, ic.name) == 0
+
+
+async def test_a_streaming_colliding_body_with_no_claim_and_no_marker_is_acked_at_both_listeners(
+    store: MessageStore,
+) -> None:
+    """The listener control for F1: such a body is accepted and queued at both listeners, with
+    nothing detached."""
+    ic = _streaming_ic()
+    body = _TILDE_HEADER_NO_MARKER.encode("utf-8")
+    assert len(body) >= (ic.stream_threshold_bytes or 0)
+    runner = _runner(store, ic)
+
+    ack = await runner._handle_inbound(ic, body)
+    receipt = await runner._handle_inbound_http(ic, body)
+
+    assert _ack_code(ack) == "AA"
+    assert receipt.refusal is None
+    assert await _ingress_count(store, ic.name) == 2
+    assert await _attachment_count(store) == 0
+
+
+def test_a_readable_received_handle_under_a_colliding_header_is_refused_as_one() -> None:
+    """Under ``MSH|^~&|`` OBX-5.5 still reads, and a handle there with an ED claim is refused as
+    a received handle, not for the header, as it was before the header was judged first."""
+    body = _hl7(_HIDDEN_HANDLE, msh2="^~&")
+    assert Message.parse(body).field("OBX-5.5") == _HIDDEN_HANDLE
+    with pytest.raises(InboundDocRefError):
+        list(iter_obx_documents(Message.parse(body), received=body))
+
+
+def test_a_body_refused_for_its_header_is_not_value_scanned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """F4: the header's verdicts come before the per-OBX read, so a large ED body refused for its
+    header is never read value by value first."""
+    from messagefoundry.parsing import binary
+    from messagefoundry.parsing.binary import CollidingDelimitersError
+
+    def _no_scan(*_args: object) -> tuple[bool, bool, bool, bool]:
+        raise AssertionError("an OBX-5 value was scanned for a body refused for its header")
+
+    monkeypatch.setattr(binary, "_scan_obx", _no_scan)
+    for body, refusal in (
+        (_TILDE_HEADER_DOCUMENT, CollidingDelimitersError),
+        (_COLLIDING_MSH2_DOCUMENT, CollidingDelimitersError),
+        (_TILDE_HEADER_HANDLE, InboundDocRefError),
+    ):
+        with pytest.raises(refusal):
+            list(iter_obx_documents(Message.parse(body), received=body))
+    # The control: a body under ordinary delimiters is scanned, so the patch is reached.
+    plain = _hl7(_b64(10))
+    with pytest.raises(AssertionError, match="was scanned"):
+        list(iter_obx_documents(Message.parse(plain), received=plain))
+
+
+@pytest.mark.parametrize(
+    "obx5",
+    ["^Application^PDF^Base64^", "^Application^PDF^A^SGVsbG8="],
+    ids=["empty-value", "not-base64"],
+)
+def test_an_ed_claim_the_detach_would_not_lift_out_is_refused_under_a_colliding_header(
+    obx5: str,
+) -> None:
+    """F9: under ``MSH|^~&|`` an ED OBX whose value is empty, or not encoded Base64, is refused
+    for its header, as the claim alone is judged; under ``MSH|^~\\&|`` the same OBX is read and
+    yields nothing."""
+    from messagefoundry.parsing.binary import CollidingDelimitersError
+
+    tail = (
+        f"|APP|FAC|RCV|RCVF|20260101120000||MDM^T02|MSGID001|P|2.5\rOBX|1|ED|PDF||{obx5}||||||F\r"
+    )
+    colliding = "MSH|^~&" + tail
+    with pytest.raises(CollidingDelimitersError):
+        list(iter_obx_documents(Message.parse(colliding), received=colliding))
+    ordinary = "MSH|^~\\&" + tail
+    assert list(iter_obx_documents(Message.parse(ordinary), received=ordinary)) == []

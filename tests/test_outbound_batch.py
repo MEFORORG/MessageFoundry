@@ -667,11 +667,12 @@ async def test_a_colliding_head_is_dead_lettered_alone_and_the_rest_batch(
 async def test_a_verbatim_outbound_carries_a_colliding_member_that_does_not_head(
     store: Any, raw_separators: bool
 ) -> None:
-    # A verbatim outbound sends each member's own bytes, so a colliding member behind the head is
-    # delivered as origin/main delivers it; only the would-be heads are refused (BACKLOG #5972).
-    # hl7_raw_separators re-joins the envelope on the delimiters it split it on, so it keeps the
-    # bytes of a member that holds no structural escape, and a colliding member behind the head is
-    # carried as main carries it (PR 3135 finding f394ede3-2).
+    # The plain outbound sends each member's own bytes, so a colliding member behind the head is
+    # delivered with no write in its own delimiters; only the would-be heads are refused (BACKLOG
+    # #5972). hl7_raw_separators is not byte-for-byte: it re-joins the envelope on the delimiters
+    # it split it on and emits structural escapes as raw delimiters, so it keeps the bytes of a
+    # member that holds no structural escape, as this colliding one holds none, and delivers a
+    # colliding member behind the head too (PR 3135 finding f394ede3-2).
     mids = await _enqueue_bodies(store, [_COLLIDING, _COLLIDING, _msg(3), _COLLIDING, _msg(5)])
     dest = MllpRecorder(DEST, hl7_raw_separators=True) if raw_separators else None
     rec = await _run_one_batch(store, simulate=False, dest=dest)

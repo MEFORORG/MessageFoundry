@@ -10792,8 +10792,9 @@ class RegistryRunner:
                     # Checked before its base class: the body's delimiters, not a marker.
                     nak_text = "document under base64 delimiters"
                 elif isinstance(exc, InboundDocRefError):
-                    # Either shape: a handle in OBX-5.5, or the marker elsewhere in a body
-                    # with a document to detach.
+                    # At least these shapes: a handle in OBX-5.5, the marker elsewhere in a body
+                    # with a document to detach, or the marker anywhere under a header whose
+                    # filled default collides (BACKLOG #5972).
                     nak_text = "document handle marker in the body"
                 else:
                     nak_text = "streaming detach failed"
@@ -12121,7 +12122,8 @@ class RegistryRunner:
             # rewrites delimiters would rewrite the member under the BHS's and change what it
             # reads as, so there it is refused wherever it sits. On any other outbound, one with
             # hl7_raw_separators included (_rewrites_delimiters says what that one changes), only a
-            # would-be head is refused, as main carried the rest.
+            # would-be head is refused: a member behind it is joined into the envelope as queued,
+            # and nothing writes it in its own delimiters.
             # Each verdict reads a few characters of the member's first line, so it runs here
             # rather than in a thread.
             collides = [batch_member_collides(m) for m in members]
@@ -14879,9 +14881,9 @@ def _rewrites_delimiters(connector: object) -> bool:
     with ``encoding_characters`` set (BACKLOG #5972). Read off the instance, so a connector without
     it, or a test double, sends its payload's own bytes. ``hl7_raw_separators`` is not one: it
     re-joins the envelope on the delimiters it was split on, so a colliding member behind the head
-    is delivered, as ``main`` delivers it. It does emit a member's structural escapes as the
-    head's raw delimiters, so such a member's data can change on the wire; that holds for any
-    member whose delimiters differ from the head's, and is not judged here."""
+    is delivered with no write in its own delimiters. It does emit a member's structural escapes
+    as the head's raw delimiters, so such a member's data can change on the wire; that holds for
+    any member whose delimiters differ from the head's, and is not judged here."""
     return getattr(connector, "encoding_characters", None) is not None
 
 

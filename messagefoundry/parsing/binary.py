@@ -165,8 +165,11 @@ class InboundDocRefError(ValueError):
     """A received body's ``OBX-5.5`` already holds a live ``mfdoc:v1:ref:`` document handle
     (BACKLOG #5099). Only the engine's own detach writes a handle, after the body is received, so
     one that arrives with the body is the sender's text. The ingress detach refuses the message
-    rather than treat the value as already detached. The text names the OBX occurrence only, never
-    a byte of the value."""
+    rather than treat the value as already detached. The detach raises it too for the handle
+    marker elsewhere in a body it would detach a document from, and for the marker anywhere in a
+    body whose header leaves two delimiters one character, where an ``OBX-5.5`` handle may not
+    read as one (BACKLOG #5972). The text names at most the OBX occurrence, never a byte of the
+    body."""
 
 
 class NonVerbatimDocumentError(ValueError):
@@ -194,7 +197,9 @@ class CollidingDelimitersError(NonVerbatimDocumentError, CollidingDelimitersRefu
     Raised once for a body under such a header when any of its OBX segments has ``OBX-2``
     ``ED``, whether or not its OBX-5 components still read: under ``MSH|~|`` none does, so the
     scan finds no document, and the claim is refused rather than ACKed and carried undetached.
-    A received handle in an ``OBX-5.5`` is refused first, as :class:`InboundDocRefError`."""
+    A body under such a header that holds the handle marker, raw or as its headers' delimiters
+    escape it, is refused first, as :class:`InboundDocRefError`, so a received handle in an
+    ``OBX-5.5`` is refused as one whether or not that ``OBX-5.5`` reads."""
 
 
 class Base64DelimiterError(InboundDocRefError):
@@ -660,7 +665,15 @@ def iter_obx_documents(
     component reads as written, so the scan finds none and the body would be ACKed with its
     document in it. So an ED value the detach would not lift out under a readable header is
     refused too, at least one not Base64, empty, a tombstone or under ``min_b64_len``, as every
-    OBX under a short MSH-2 was before.
+    OBX under a short MSH-2 was before. Under such a header it raises :class:`InboundDocRefError`
+    first, whatever the OBX segments claim, when ``received`` holds the handle marker, raw or as
+    its first line's or a later header's delimiters escape it: under ``MSH|~|`` no ``OBX-5.5``
+    reads, so a sender's handle there is not read as one, and delivery would refuse a copy naming
+    a content address after the ACK. Both verdicts come before any ``OBX-5`` value is read, so a
+    body refused for its header has no value read, marker-scanned or splice-scanned. A handle
+    hidden behind a hex escape, which the engine never writes, is not looked for in the text:
+    under such a header it meets the per-OBX read below where no OBX claims a document, and
+    where one does the claim refuses the body.
 
     Each document's value is held one at a time, as the caller's in-flight budget assumes: each
     check reads a value inside :func:`_scan_obx`, whose frame ends before the next read, and the
@@ -668,6 +681,24 @@ def iter_obx_documents(
     the marker and splice checks scan it in place. What each read holds beside the value is the
     copy of its field that the read splits, dropped when the read returns. Holding every value
     until the scan ends would make the peak the sum of the documents."""
+    if message._delimiters_collide():
+        # Judged before any OBX-5 value is read, so a body refused here is never value- or
+        # splice-scanned: no document of it can be detached, since Message refuses every write
+        # to it. The marker comes first, so a received handle is refused as one wherever it
+        # sits, in an OBX-5.5 such a header hides included, where the per-OBX read finds none.
+        if _received_holds_marker(message, received) or _later_header_markers(message, received):
+            raise InboundDocRefError(
+                "the body holds the document handle marker under a header that fills a delimiter "
+                "it does not name with one it already uses, where an OBX-5.5 handle may not read "
+                "as one and no document can be detached; refusing the body"
+            )
+        # A detachable document is an ED claim, so the claim alone is judged.
+        if _holds_ed_claim(message):
+            raise CollidingDelimitersError(
+                "an OBX claims a document under a header that fills a delimiter it does not name "
+                "with one it already uses, so the message cannot be written and no document of it "
+                "could be detached and set back; refusing the detach"
+            )
     obx_count = message.count_segments("OBX")
     occurrences: list[int] = []
     documents: list[int] = []
@@ -682,13 +713,6 @@ def iter_obx_documents(
             value_holds_marker = value_holds_marker or holds_marker
             if alters and altered is None:
                 altered = occ
-    # A detachable document is an ED claim, so the claim alone is judged.
-    if message._delimiters_collide() and _holds_ed_claim(message):
-        raise CollidingDelimitersError(
-            "an OBX claims a document under a header that fills a delimiter it does not name with "
-            "one it already uses, so the message cannot be written and no document of it could be "
-            "detached and set back; refusing the detach"
-        )
     if documents and _delimits_with_base64(message._encoding_chars()):
         raise Base64DelimiterError(
             "a delimiter of the body is a base64 character, so a detached document could not be "
