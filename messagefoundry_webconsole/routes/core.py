@@ -55,6 +55,7 @@ from messagefoundry.auth.webauthn import CHALLENGE_TTL_SECONDS
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.parsing import HL7PeekError, parse_tree
 from messagefoundry.parsing.tree import ParseTreeTooLargeError
+from messagefoundry.redaction import json_loads_or_refusal
 
 from .. import pages
 from .._auth import (
@@ -2466,11 +2467,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if not raw:
             _log.warning("CSP violation report from %s: %s", client, "empty")
             return Response(status_code=204)
-        try:
-            doc = json.loads(raw.decode("utf-8", "replace"))
-        # A body nested too deep for json's decoder raises RecursionError, not ValueError, and is
-        # just as malformed (vault BACKLOG #5341).
-        except (ValueError, RecursionError):
+        # The helper also refuses a body nested too deep to decode (vault BACKLOG #5341).
+        doc, refused = json_loads_or_refusal(raw.decode("utf-8", "replace"))
+        if refused:
             _log.warning("CSP violation report from %s: %s", client, "malformed-json")
             return Response(status_code=204)
         bodies = _csp_report_bodies(doc)
