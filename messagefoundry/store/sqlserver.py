@@ -8649,20 +8649,14 @@ class SqlServerStore:
         return row
 
     async def delete_search_preset(self, *, preset_id: str, owner_user_id: str) -> bool:
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                # Counted from OUTPUT, which a session-wide SET NOCOUNT ON cannot hide (BACKLOG
-                # #5672, as #2283).
-                await cur.execute(
-                    "DELETE FROM search_presets OUTPUT deleted.id WHERE id=? AND owner_user_id=?",
-                    (preset_id, owner_user_id),
-                )
-                deleted = bool(await cur.fetchall())
-                await self._commit(conn)
-                return deleted
-            except Exception:
-                await conn.rollback()
-                raise
+        # Counted from OUTPUT, which a session-wide SET NOCOUNT ON cannot hide (BACKLOG #5672, as
+        # #2283). _execute_output drains the rowset before its commit.
+        return bool(
+            await self._execute_output(
+                "DELETE FROM search_presets OUTPUT deleted.id WHERE id=? AND owner_user_id=?",
+                (preset_id, owner_user_id),
+            )
+        )
 
     async def list_connection_events(
         self,
@@ -8764,53 +8758,56 @@ class SqlServerStore:
             else None
         )
         key = hashlib.sha256(f"{event_type}\x00{connection}".encode()).hexdigest()
-        async with self._acquire() as conn, self._cursor(conn) as cur:
+        async with self._acquire() as conn:
             try:
-                # The SELECT opens the transaction the applock needs, as in put_attachment.
-                await cur.execute(
-                    "SELECT TOP (1) id FROM alert_instance WHERE event_type=? AND connection=?",
-                    (event_type, connection),
-                )
-                await cur.fetchall()
-                await self._applock(cur, f"mefor:alert_instance:{key}")
-                await cur.execute(
-                    "UPDATE alert_instance"
-                    " SET last_seen=?, [count]=[count]+1, severity=?, reason=?,"
-                    " escalation_tier=CASE WHEN escalation_tier < ? THEN ? ELSE escalation_tier END,"
-                    " raised_by=?"
-                    " OUTPUT inserted.id"
-                    " WHERE event_type=? AND connection=? AND status<>'resolved'",
-                    (
-                        now,
-                        severity,
-                        reason_enc,
-                        escalation_tier,
-                        escalation_tier,
-                        raised_by,
-                        event_type,
-                        connection,
-                    ),
-                )
-                if not await cur.fetchall():
+                async with self._cursor(conn) as cur:
+                    # The SELECT opens the transaction the applock needs, as in put_attachment.
                     await cur.execute(
-                        "INSERT INTO alert_instance"
-                        " (event_type, connection, severity, status, first_seen, last_seen,"
-                        " [count], reason, escalation_tier, raised_by)"
-                        " VALUES (?,?,?,'open',?,?,1,?,?,?)",
+                        "SELECT TOP (1) id FROM alert_instance WHERE event_type=? AND connection=?",
+                        (event_type, connection),
+                    )
+                    await cur.fetchall()
+                    await self._applock(cur, f"mefor:alert_instance:{key}")
+                    await cur.execute(
+                        "UPDATE alert_instance"
+                        " SET last_seen=?, [count]=[count]+1, severity=?, reason=?,"
+                        " escalation_tier=CASE WHEN escalation_tier < ? THEN ? ELSE escalation_tier"
+                        " END, raised_by=?"
+                        " OUTPUT inserted.id"
+                        " WHERE event_type=? AND connection=? AND status<>'resolved'",
                         (
-                            event_type,
-                            connection,
+                            now,
                             severity,
-                            now,
-                            now,
                             reason_enc,
                             escalation_tier,
+                            escalation_tier,
                             raised_by,
+                            event_type,
+                            connection,
                         ),
                     )
-                await self._commit(conn)
+                    if not await cur.fetchall():
+                        await cur.execute(
+                            "INSERT INTO alert_instance"
+                            " (event_type, connection, severity, status, first_seen, last_seen,"
+                            " [count], reason, escalation_tier, raised_by)"
+                            " VALUES (?,?,?,'open',?,?,1,?,?,?)",
+                            (
+                                event_type,
+                                connection,
+                                severity,
+                                now,
+                                now,
+                                reason_enc,
+                                escalation_tier,
+                                raised_by,
+                            ),
+                        )
+                    await self._commit(conn)
             except Exception:
-                await conn.rollback()
+                # As in _execute_output: a failed rollback discards rather than recycles the
+                # connection, so no open transaction keeps this key's applock (BACKLOG #1940).
+                await self._rollback_or_discard(conn)
                 raise
 
     async def list_active_alert_instances(
@@ -12612,18 +12609,11 @@ class SqlServerStore:
     async def attachment_incref(self, ref: str) -> None:
         """Add one live reference to an attachment (store-once refcount). Raises :class:`KeyError` if the
         attachment does not exist — an incref must name a real stored document."""
-        async with self._acquire() as conn, self._cursor(conn) as cur:
-            try:
-                # Read from OUTPUT, which a session-wide SET NOCOUNT ON cannot hide: there
-                # cur.rowcount is -1, which is truthy (BACKLOG #5675, as #2283).
-                await cur.execute(_SQL_INCREF_ATTACHMENT, (1, ref))
-                if await cur.fetchone() is None:
-                    await conn.rollback()
-                    raise KeyError(f"attachment {ref!r} not found")
-                await self._commit(conn)
-            except Exception:
-                await conn.rollback()
-                raise
+        # Read from OUTPUT, which a session-wide SET NOCOUNT ON cannot hide: there cur.rowcount is
+        # -1, which is truthy (BACKLOG #5675, as #2283). A missing ref matches nothing, so the
+        # commit _execute_output runs commits no change.
+        if not await self._execute_output(_SQL_INCREF_ATTACHMENT, (1, ref)):
+            raise KeyError(f"attachment {ref!r} not found")
 
     async def _decref_attachment(self, cur: Any, ref: str, count: int = 1) -> None:
         """Drop ``count`` references to an attachment and **GC the attachment + all its chunks at

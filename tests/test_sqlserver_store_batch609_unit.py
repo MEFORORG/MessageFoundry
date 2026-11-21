@@ -268,6 +268,7 @@ class _NocountCursor:
     statement's rowset comes from ``rowsets`` in order; a statement past the end returns none."""
 
     rowcount = -1
+    description = [("id",)]  # _execute_output names the OUTPUT columns from it
 
     def __init__(self, rowsets: list[list[tuple[Any, ...]]]) -> None:
         self._rowsets = list(rowsets)
@@ -330,12 +331,12 @@ async def test_delete_search_preset_reads_output() -> None:
 
 
 async def test_attachment_incref_of_a_missing_ref_raises_under_nocount() -> None:
-    """Red before #5675: ``rowcount`` of -1 is truthy, so a missing ref committed silently."""
+    """Red before #5675: ``rowcount`` of -1 is truthy, so a missing ref returned as if counted.
+    Through ``_execute_output`` the zero-match UPDATE still commits, and commits no change."""
     cur = _NocountCursor([[]])
-    store, commits = _store(cur)
+    store, _ = _store(cur)
     with pytest.raises(KeyError):
         await store.attachment_incref("f" * 64)
-    assert commits == []
     hit = _NocountCursor([[("a" * 64,)]])
     store, commits = _store(hit)
     await store.attachment_incref("a" * 64)
@@ -366,6 +367,32 @@ async def test_upsert_alert_instance_inserts_a_first_fire_under_nocount() -> Non
         event_type="connection_error", connection="OB_X", severity="warning", now=2.0
     )
     assert len(repeat.executed) == 3, "a matched UPDATE inserts nothing"
+
+
+async def test_a_failed_alert_upsert_rolls_back_through_rollback_or_discard() -> None:
+    """A failed upsert holds this key's applock in its open transaction, so its rollback goes
+    through ``_rollback_or_discard``, which discards a connection whose rollback fails rather than
+    recycle the lock to the next borrower (BACKLOG #1940)."""
+
+    class _FailingInsert(_NocountCursor):
+        async def execute(self, sql: str, params: Any = None) -> None:
+            await super().execute(sql, params)
+            if sql.startswith("INSERT INTO alert_instance"):
+                raise RuntimeError("deadlock victim")
+
+    cur = _FailingInsert([[], [(0,)], []])
+    store, commits = _store(cur)
+    discards: list[Any] = []
+
+    async def _rollback_or_discard(conn: Any, *, within: float | None = None) -> None:
+        discards.append(conn)
+
+    store._rollback_or_discard = _rollback_or_discard  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="deadlock victim"):
+        await store.upsert_alert_instance(
+            event_type="connection_error", connection="OB_X", severity="warning", now=1.0
+        )
+    assert len(discards) == 1 and commits == []
 
 
 async def test_the_options_reread_failure_logs_no_driver_text(
