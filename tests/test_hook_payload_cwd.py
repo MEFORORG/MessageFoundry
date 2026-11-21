@@ -1026,6 +1026,41 @@ def test_a_desktop_session_whose_project_is_a_linked_worktree_keeps_the_cwd_reco
     assert recs[0]["worktreeSource"] == UNPINNED_SOURCE, recs
 
 
+def test_a_cli_session_launched_in_the_primary_keeps_the_cwd_record(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """The launch worktree must be a LINKED worktree: a plain CLI launched in the primary is the
+    desktop-app shape, so a sibling cwd keeps the #5954 record there, labelled unpinned."""
+    repo, _, sibling, _ = seat_clones
+    _record_stop(repo, _stop("s1", sibling), project_dir=repo, entrypoint="cli")
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], sibling), recs
+    assert recs[0]["worktreeSource"] == UNPINNED_SOURCE, recs
+
+
+def test_a_cli_cwd_rule_4_refused_is_recorded_at_the_launch_worktree_labelled(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """A hook started outside the launch worktree, with the cwd still in it: rule 4 refuses the
+    cwd, so the record says the launch worktree chose it."""
+    repo, wt, _, _ = seat_clones
+    _record_stop(repo, _stop("s1", wt), project_dir=wt, entrypoint="cli")
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+    assert recs[0]["worktreeSource"] == LAUNCHED_SOURCE, recs
+
+
+def test_a_cli_launch_directory_that_is_gone_is_not_walked_up_from(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """A CLAUDE_PROJECT_DIR that no longer exists names no launch worktree, even inside one."""
+    repo, wt, sibling, _ = seat_clones
+    _record_stop(wt, _stop("s1", sibling), project_dir=wt / "removed", entrypoint="cli")
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], sibling), recs
+    assert recs[0]["worktreeSource"] == UNPINNED_SOURCE, recs
+
+
 def test_a_cli_session_still_in_its_launch_worktree_carries_no_launch_label(
     seat_clones: tuple[Path, Path, Path, Path],
 ) -> None:

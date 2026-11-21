@@ -78,7 +78,9 @@ try {
     $launchRoot = $null
     $launchCommon = $null
     if (-not $session.Pinned -and [string]$env:CLAUDE_CODE_ENTRYPOINT -eq 'cli' -and $env:CLAUDE_PROJECT_DIR) {
-        $lr = Get-CcxWorktreeRoot ([string]$env:CLAUDE_PROJECT_DIR)
+        # It must exist: Get-CcxWorktreeRoot walks up from a missing path, so a removed launch
+        # worktree nested in another linked worktree would name that one.
+        $lr = if (Test-Path -LiteralPath ([string]$env:CLAUDE_PROJECT_DIR) -PathType Container) { Get-CcxWorktreeRoot ([string]$env:CLAUDE_PROJECT_DIR) } else { $null }
         # `.git` is a FILE only in a linked worktree.
         if ($lr -and (Test-Path -LiteralPath (Join-Path $lr '.git') -PathType Leaf)) {
             $launchRoot = $lr
@@ -105,7 +107,8 @@ try {
         # checkout, and input that cannot be read are still refused below.
         # DECIDED, NOT ACCIDENTAL (BACKLOG #5961, after #5954). A desktop-app session has no other
         # source of truth for its worktree: /clear mints a new session id and no pin, and its
-        # CLAUDE_PROJECT_DIR names the primary, so the cwd is all there is.
+        # CLAUDE_PROJECT_DIR names the project the app opened, which the entrypoint check above
+        # keeps out, so the cwd is all there is.
         # -Unpinned labels the record so (seat.ps1's -Unpinned says what the label does), except for
         # the start checkout itself, which rule 4 takes. tests/test_hook_payload_cwd.py pins both.
         $p = Get-CcxHookPayloadCwd -Payload $session.Payload

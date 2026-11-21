@@ -141,8 +141,9 @@ param(
     [Parameter(ParameterSetName = 'Record')][switch]$Unpinned,
     # -Record only: scripts/hooks/seat-record.ps1's verdict that the -Worktree it passes is the LINKED
     # WORKTREE A PLAIN CLI SESSION WAS LAUNCHED IN (CLAUDE_PROJECT_DIR), recorded for an unpinned
-    # session whose cwd has left it for another worktree of this repository (BACKLOG #5961). The record's
-    # worktreeSource says so. Wins over -Unpinned, which the hook never passes with it.
+    # session whose cwd has left it for another worktree of this repository, or whose cwd rule 4
+    # refused (BACKLOG #5961). The record's worktreeSource says so. Wins over -Unpinned, which the
+    # hook never passes with it.
     [Parameter(ParameterSetName = 'Record')][switch]$Launched,
     # Precedence for the record's session key, highest first: this parameter, then the hook's stdin
     # payload session_id, then $env:CLAUDE_CODE_SESSION_ID, then the literal 'nosid'. See
