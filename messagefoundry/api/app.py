@@ -4919,8 +4919,8 @@ def create_app(
     # [service] service-status reporting (L6a): default-off; the managed lifespan sets the live value,
     # here it backs the direct-construction (test) path.
     app.state.service_settings = service_settings
-    # Configured [logging].log_dir for the GET /status app-log metering (#50). None = stdout-only (no
-    # metering). The managed-app lifespan sets the live value; here it backs the direct-construction path.
+    # Configured [logging].log_dir for the GET /status app-log metering (#50) and GET /logs/tail.
+    # None = stdout-only (no metering). The managed-app lifespan sets the live value; here it backs the direct-construction path.
     app.state.log_dir = log_dir
     # BACKLOG #171 (ADR 0130): the startup [logging].level baseline GET /logging/level reports next to the
     # (possibly runtime-overridden, ephemeral) effective level. None when unknown (embedding/test path).
@@ -10964,7 +10964,8 @@ def create_app(
         offset: int = Query(0, ge=0),
     ) -> LogTailPage:
         """A paginated, **redacted** page of the newest application-log file's tail (#171, ADR 0130) — the
-        in-console viewer over the same redacted tail the support bundle produces. ``offset`` counts lines
+        in-console viewer. It picks and reads its file on its own terms, not the support bundle's
+        (docs/DANGEROUS-FUNCTIONALITY.md section 7 has both rows). ``offset`` counts lines
         back from the END (``offset=0`` = the most recent ``limit`` lines).
 
         This is a genuine **new PHI read surface**: the app log is best-effort-redacted (a residual
@@ -13719,7 +13720,7 @@ def create_managed_app(
             # EmailTransport with the SAME anchors as the live notifier. None on the embedded/test path.
             app.state.tls_settings = tls_settings
             app.state.service_settings = service_settings  # back GET /service/status (L6a)
-            app.state.log_dir = log_dir  # back GET /status app-log metering (#50)
+            app.state.log_dir = log_dir  # back GET /status app-log metering (#50) + GET /logs/tail
             app.state.approval_gate = _build_approval_gate(
                 engine,
                 approvals_settings or ApprovalsSettings(),
