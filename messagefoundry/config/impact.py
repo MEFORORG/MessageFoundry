@@ -13,9 +13,13 @@ Two authoring surfaces are covered:
   router. These are rewritten with :mod:`tokenize`, so a match is a *plain* ``str`` literal whose
   decoded value is exactly the old name — never a substring, an identifier, a comment, an f-string, a
   bytes literal, or a fragment of an implicit adjacent-string concatenation.
-* ``connections.toml`` — a data-authored inbound's ``router = "r"`` binding (and a connection's own
-  ``name`` definition) is edited as **text** (no TOML round-trip, so hand-authored formatting/comments
-  survive byte-for-byte outside the one edited value).
+* ``connections.toml`` — a data-authored inbound's ``router = "r"`` binding, a connection's own
+  ``name`` definition, and an outbound's ``reingress_to`` or an inbound's ``reply_from`` naming the
+  renamed connection, are edited as **text** (no TOML round-trip, so hand-authored formatting/comments
+  survive byte-for-byte outside the one edited value). Only the value at that key path in a
+  connection entry is touched, and the edited text must parse to the original with exactly those
+  values changed. When it does not, a referrer is reported unresolved, and the renamed
+  connection's own ``name`` makes the plan refuse, as an unlocated definition does (BACKLOG #5980).
 
 The rewrite is **site-scoped**: only literals at a referrer's sites (its own body, a handler's ``accepts=``
 predicate, a module-level statement binding a name it reads, and, for a table rename, the accessor call
@@ -33,27 +37,32 @@ reported unresolved, since it still reads the old name.
 ``plan_rename`` is a pure computation (it reads files but writes nothing); ``apply_rename`` performs the
 writes, preserving each file's exact bytes outside the replaced spans (newline style and the original
 quote delimiter of every literal are kept). A dry-run followed by ``--apply`` on an unchanged tree
-produces identical edits, and re-applying a plan is idempotent (a span already carrying the new literal
-is skipped)."""
+produces identical edits. Re-applying a plan to a file it wholly renamed already is a no-op; a file
+holding only some of its edits, or otherwise changed since the plan read it, is refused with
+nothing written (BACKLOG #5980)."""
 
 from __future__ import annotations
 
 import ast
 import codecs
+import contextlib
 import io
 import logging
 import os
 import re
 import tokenize
+import tomllib
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import FunctionType
 
+from messagefoundry.config import atomic_edit
 from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
 from messagefoundry.config.reachability import (
     _TABLE_ACCESSORS,
+    SETTING_REFERENCES,
     Reference,
     ReferenceIndex,
     SourceCache,
@@ -71,17 +80,21 @@ from messagefoundry.config.wiring import (
     config_py_files,
 )
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
-from messagefoundry.controlchars import has_control_char
+from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.redaction import safe_exc
 
 _log = logging.getLogger(__name__)
 
 __all__ = [
     "LiteralEdit",
+    "PreparedRename",
     "RenamePlan",
+    "RenameWriteError",
     "apply_rename",
     "delete_impact",
     "plan_rename",
+    "prepare_rename",
+    "write_rename",
 ]
 
 #: The object kinds a rename/delete can target (the registry tables reachability indexes).
@@ -142,8 +155,8 @@ class LiteralEdit:
 
     Positions are ``tokenize``/text coordinates — ``start_line``/``end_line`` are 1-based, the columns
     0-based, ``end_col`` exclusive. ``old_literal`` is the exact source text being replaced (including
-    its quotes), so :func:`apply_rename` can assert the span before writing and no-op if it already
-    carries ``new_literal`` (idempotency)."""
+    its quotes), so :func:`apply_rename` can assert the span before writing; a file whose every span
+    already carries ``new_literal`` is left alone."""
 
     file: str
     start_line: int
@@ -187,6 +200,9 @@ class RenamePlan:
     new: str
     edits: tuple[LiteralEdit, ...] = ()
     unresolved: tuple[Reference, ...] = ()
+    #: (file, its bytes) for each edited file, as read when the plan was made, so applying it to a
+    #: file that changed since is refused (BACKLOG #5980). Config modules are small.
+    sources: tuple[tuple[str, bytes], ...] = field(default=(), repr=False)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -259,8 +275,9 @@ def plan_rename(
     # A definition that exists but that this plan cannot read: outside the config dir, with no
     # source, or not found by the declaration scan. Its name would stay old, so the plan refuses.
     unlocated: list[str] = []
-    # (toml-path, key) pairs whose value == old must be rewritten (router binding / name definition).
-    toml_targets: set[tuple[str, str]] = set()
+    # connections.toml values equal to old that must be rewritten (the name definition, a router
+    # binding, a reingress_to / reply_from setting), each with the referrers it carries.
+    toml_targets: dict[_TomlTarget, list[Reference]] = {}
 
     def add_def_span(
         file: str | None, span: _Span | None, positions: Mapping[_Pos, frozenset[_Pos]]
@@ -283,14 +300,28 @@ def plan_rename(
     _add_definition_span(
         registry, config_dir, target_kind, old, sources, add_def_span, toml_targets
     )
-    toml_defs = {path for path, key in toml_targets if key == "name"}
+    toml_defs = {path for path, _table, keys in toml_targets if keys == ("name",)}
 
     # Every referent edge: rewrite the literal at each site the referrer reads it from (or its toml
     # binding). Keep each py referrer's sites, so a referrer we could not rewrite is surfaced, not
     # dropped -- including one whose source, or one of whose captured values, could not be located.
+    # A connection naming another in its settings (an outbound's reingress_to, an inbound's
+    # reply_from) is a referrer too (BACKLOG #5966).
     referrers: list[tuple[Reference, list[_Site], bool]] = []
-    for ref in index.referrers(target_kind, old):
-        found = _referrer_sites(registry, ref, old, target_kind, sources, toml_targets)
+    all_refs = _all_referrers(index, target_kind, old)
+    scanned = _scanned_referrers(registry, [ref for ref, _ in all_refs], target_kind, old, sources)
+    for ref, found in [
+        *(
+            (
+                ref,
+                _referrer_sites(registry, ref, old, target_kind, sources, toml_targets)
+                if setting is None
+                else _setting_sites(registry, ref, setting, old, sources, toml_targets),
+            )
+            for ref, setting in all_refs
+        ),
+        *scanned,
+    ]:
         if found is None:
             continue
         sites, complete = found
@@ -314,13 +345,15 @@ def plan_rename(
     # the listing failed, so no binding literal is rewritten.
     listed: list[tuple[str, ...] | None] = []
     files = set(def_spans) | {site.file for site in ref_sites}
-    bom_files = frozenset(file for file in files if _has_bom(file))
+    bom_files = frozenset(
+        file for file in files if (sources.raw(file) or b"")[:3] == codecs.BOM_UTF8
+    )
     for file in sorted(files):
         file_def = def_spans.get(file, [])
         file_sites = [site for site in ref_sites if site.file == file]
         spans = file_def + [site.span for site in file_sites]
         kinds = sources.occurrences(file, old)
-        for edit in _py_literal_edits(file, old, new, spans):
+        for edit in _py_literal_edits(sources, file, old, new, spans):
             pos = _source_position(edit, bom_files)
             is_def = pos in def_positions.get(file, ())
             if not is_def and not any(
@@ -348,11 +381,16 @@ def plan_rename(
                 listed.append(_config_modules(config_dir))
             if _binding_read_only_by_referents(sources, listed[0], file, pos, declaring, covering):
                 edits.append(edit)
-    for toml_path, key in toml_targets:
-        toml_edits = _toml_value_edits(toml_path, key, old, new)
-        if key == "name" and not toml_edits:
+    # A connections.toml referrer whose value could not be rewritten exactly is unresolved.
+    toml_unresolved: list[Reference] = []
+    for toml_path, table, keys in sorted(toml_targets):
+        toml_refs = toml_targets[(toml_path, table, keys)]
+        toml_edits = _toml_edits(sources, toml_path, table, keys, old, new)
+        if keys == ("name",) and not toml_edits:
             unlocated.append(toml_path)
-        edits.extend(toml_edits)
+        elif toml_edits is None or (toml_refs and not toml_edits):
+            toml_unresolved.extend(toml_refs)
+        edits.extend(toml_edits or ())
 
     # Deterministic, de-duplicated (a literal reachable from two overlapping spans appears once).
     unique = {(e.file, e.start_line, e.start_col): e for e in edits}
@@ -373,36 +411,236 @@ def plan_rename(
             "could not be located, or other code reads it too, so the rename would leave the "
             "definition under its old name or change what that code reads; rename it by hand"
         )
-    unresolved = _unresolved_referrers(referrers, edited, old, sources, shared_kind)
+    unresolved = tuple(
+        dict.fromkeys(
+            (*_unresolved_referrers(referrers, edited, old, sources, shared_kind), *toml_unresolved)
+        )
+    )
     return RenamePlan(
-        target_kind=target_kind, old=old, new=new, edits=tuple(ordered), unresolved=unresolved
+        target_kind=target_kind,
+        old=old,
+        new=new,
+        edits=tuple(ordered),
+        unresolved=unresolved,
+        sources=_file_bytes(sources, {e.file for e in ordered}),
     )
 
 
+def _file_bytes(sources: SourceCache, files: Iterable[str]) -> tuple[tuple[str, bytes], ...]:
+    """Each edited file's bytes as the plan read them, the ones its edits were computed from. A
+    file with none gets no entry, and :func:`prepare_rename` refuses it."""
+    out: list[tuple[str, bytes]] = []
+    for file in sorted(files):
+        raw = sources.raw(file)
+        if raw is not None:
+            out.append((file, raw))
+    return tuple(out)
+
+
 def apply_rename(plan: RenamePlan) -> list[LiteralEdit]:
-    """Write ``plan``'s edits to disk and return the edits actually applied.
+    """Write ``plan``'s edits to disk and return the edits actually applied:
+    :func:`prepare_rename`, then :func:`write_rename`."""
+    return write_rename(prepare_rename(plan))
+
+
+@dataclass(frozen=True)
+class PreparedRename:
+    """A plan checked against the files on disk, with each file's original and new bytes."""
+
+    plan: RenamePlan
+    files: tuple[tuple[str, bytes, bytes], ...]
+    applied: tuple[LiteralEdit, ...]
+
+
+class RenameWriteError(WiringError):
+    """A write failed partway; ``unrestored`` names the files left holding the new name."""
+
+    def __init__(self, message: str, unrestored: list[str]) -> None:
+        super().__init__(message)
+        self.unrestored = unrestored
+
+    def __reduce__(self) -> tuple[type[RenameWriteError], tuple[str, list[str]]]:
+        # Exception pickles as cls(*args), and args holds only the message.
+        return (type(self), (str(self), self.unrestored))
+
+
+def prepare_rename(plan: RenamePlan) -> PreparedRename:
+    """Check ``plan`` against the files on disk and build each file's new bytes, writing nothing.
 
     Each file is rewritten byte-for-byte outside the replaced spans (newline style preserved). Edits
-    are applied bottom-to-top / right-to-left so earlier offsets stay valid, and a span that no longer
-    carries ``old_literal`` (already renamed) is skipped, so re-applying a plan is a safe no-op."""
-    applied: list[LiteralEdit] = []
+    are applied bottom-to-top / right-to-left so earlier offsets stay valid. A file whose every span
+    already carries the new literal where the edits would have put it (a re-applied plan) is left
+    alone, so re-applying is a no-op.
+
+    A file whose bytes differ from the ones the plan read, and that is not wholly renamed already,
+    changed after the plan was made: writing the edits would rewrite whatever now sits at their
+    spans, or leave a half-renamed config while reporting success. That raises
+    :class:`WiringError`, as does a file that cannot be read, decoded or encoded (BACKLOG #5980)."""
     by_file: dict[str, list[LiteralEdit]] = {}
     for edit in plan.edits:
         by_file.setdefault(edit.file, []).append(edit)
+    planned = dict(plan.sources)
 
+    files: list[tuple[str, bytes, bytes]] = []
+    applied: list[LiteralEdit] = []
+    stale: list[LiteralEdit] = []
     for file, file_edits in by_file.items():
-        raw = Path(file).read_bytes()
-        text = raw.decode("utf-8")
-        # Split on \n, \r\n and \r only: the plan numbered lines by tokenizing a universal-newline read,
-        # which breaks on exactly those, so an edit's line is the line it names here too.
-        lines = source_lines(text)
-        # Bottom-to-top, right-to-left: a multi-line edit changes the line count below it, so applying
-        # in descending (start_line, start_col) keeps every not-yet-applied edit's indices valid.
-        for edit in sorted(file_edits, key=lambda e: (e.start_line, e.start_col), reverse=True):
-            if _apply_one(lines, edit):
-                applied.append(edit)
-        Path(file).write_bytes("".join(lines).encode("utf-8"))
-    return applied
+        try:
+            raw = Path(file).read_bytes()
+            # Split on \n, \r\n and \r only: the plan numbered lines by tokenizing a universal-newline
+            # read, which breaks on exactly those, so an edit's line is the line it names here too.
+            lines = source_lines(raw.decode("utf-8"))
+        except (OSError, UnicodeDecodeError) as exc:
+            raise WiringError(
+                f"cannot apply the rename of {plan.target_kind} {plan.old!r}: {file} could not "
+                f"be read ({type(exc).__name__}). Nothing was written"
+            ) from exc
+        unchanged = planned.get(file) == raw
+        missing = [e for e in file_edits if _span_text(lines, e) != e.old_literal]
+        if unchanged and not missing:
+            for edit in sorted(file_edits, key=lambda e: (e.start_line, e.start_col), reverse=True):
+                _apply_one(lines, edit)
+            try:
+                new_bytes = "".join(lines).encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise WiringError(
+                    f"cannot apply the rename of {plan.target_kind} {plan.old!r}: the new name "
+                    "cannot be written as UTF-8. Nothing was written"
+                ) from exc
+            files.append((file, raw, new_bytes))
+            applied.extend(file_edits)
+        elif len(missing) < len(file_edits) or not _already_renamed(lines, file_edits):
+            stale.extend(missing or file_edits)
+    if stale:
+        where = ", ".join(sorted({f"{e.file}:{e.start_line}" for e in stale}))
+        raise WiringError(
+            f"cannot apply the rename of {plan.target_kind} {plan.old!r}: the file changed after "
+            f"the plan was made ({where}). Nothing was written; plan the rename again"
+        )
+    return PreparedRename(plan=plan, files=tuple(files), applied=tuple(applied))
+
+
+def write_rename(prepared: PreparedRename) -> list[LiteralEdit]:
+    """Write a :func:`prepare_rename` result and return the edits applied.
+
+    The writes run under the config editors' cross-process edit lock
+    (:func:`~messagefoundry.config.atomic_edit.edit_lock`) of every directory holding an edited
+    file, and each file is read again under it: one whose bytes are no longer those
+    :func:`prepare_rename` read was changed by another edit in between, and writing would drop that
+    edit, so that raises :class:`RenameWriteError` with nothing written (BACKLOG #5980). Blocking,
+    like the lock: call it off the event loop.
+
+    A write that fails restores every file already written, and the failing one if it changed, from
+    the bytes read, then raises :class:`RenameWriteError` naming any file it could not restore."""
+    plan = prepared.plan
+    with _rename_locks(file for file, _raw, _new in prepared.files):
+        changed = rewritten_files(prepared)
+        if changed:
+            raise RenameWriteError(
+                f"cannot apply the rename of {plan.target_kind} {plan.old!r}: "
+                f"{', '.join(changed)} changed or could not be read after the plan was checked. "
+                "Nothing was written; plan the rename again",
+                [],
+            )
+        written: list[tuple[str, bytes]] = []
+        for file, raw, new_bytes in prepared.files:
+            try:
+                _replace(file, new_bytes)
+            except (OSError, WiringError) as exc:
+                unrestored = _restore([*written, (file, raw)])
+                left = (
+                    f"; these still hold the new name: {', '.join(unrestored)}"
+                    if unrestored
+                    else ""
+                )
+                raise RenameWriteError(
+                    f"cannot apply the rename of {plan.target_kind} {plan.old!r}: writing {file} "
+                    f"failed ({type(exc).__name__}), so the files already written were "
+                    f"restored{left}",
+                    unrestored,
+                ) from exc
+            except BaseException:
+                # An interrupt between two files (Ctrl-C, SystemExit) must not leave the rename
+                # half applied: the files already written go back before it propagates.
+                _restore([*written, (file, raw)])
+                raise
+            written.append((file, raw))
+    return list(prepared.applied)
+
+
+def rewritten_files(prepared: PreparedRename) -> list[str]:
+    """The files of ``prepared`` that no longer hold the bytes :func:`prepare_rename` read, read
+    from disk now. A caller that must undo its own step after :func:`write_rename` raised, at any
+    point, reads here which references are left rewritten rather than trusting the write's own
+    bookkeeping, which an interrupt can cut short. A file that cannot be read counts as rewritten."""
+    return [file for file, raw, _new in prepared.files if not _still_reads(file, raw)]
+
+
+def _still_reads(file: str, raw: bytes) -> bool:
+    """Whether ``file`` still holds ``raw``; one that cannot be read does not."""
+    try:
+        return Path(file).read_bytes() == raw
+    except OSError as exc:
+        _log.debug("rename could not re-read %s under the lock: %s", file, type(exc).__name__)
+        return False
+
+
+@contextlib.contextmanager
+def _rename_locks(files: Iterable[str]) -> Iterator[None]:
+    """Hold the edit lock of each directory holding one of ``files``, taken in one sorted order so
+    two renames cannot each hold one lock and wait on the other's. A lock that stays held past its
+    timeout, or a directory that refuses the lock file, raises :class:`RenameWriteError` with
+    nothing written, so a caller that moved a code set first moves it back."""
+    # Keyed as edit_lock keys its own lock file, so two files of one directory take one lock.
+    by_dir: dict[str, Path] = {}
+    with contextlib.ExitStack() as stack:
+        try:
+            for file in files:
+                path = Path(file)
+                lock = atomic_edit.lock_path_for(path).resolve()
+                by_dir.setdefault(os.path.normcase(str(lock)), path)
+            for key in sorted(by_dir):
+                stack.enter_context(
+                    atomic_edit.edit_lock(
+                        by_dir[key], busy_error=WiringError, refused_error=WiringError
+                    )
+                )
+        except (WiringError, OSError) as exc:
+            raise RenameWriteError(
+                f"cannot take the config edit lock for the rename ({exc}). Nothing was written",
+                [],
+            ) from exc
+        yield
+
+
+def _replace(file: str, data: bytes) -> None:
+    """Replace ``file`` with ``data`` through the config editors' atomic write: a candidate beside
+    it, flushed to disk, renamed over it. A write that fails or is interrupted part way leaves the
+    live file whole, never truncated (BACKLOG #5980). The plan's bytes were checked when it was
+    prepared, so the candidate needs no further validation."""
+    atomic_edit.replace_validated(Path(file), data, _accept_candidate, refused_error=WiringError)
+
+
+def _accept_candidate(_candidate: Path) -> None:
+    """:func:`_replace`'s validation: :func:`prepare_rename` has already checked the bytes."""
+
+
+def _restore(files: list[tuple[str, bytes]]) -> list[str]:
+    """Write each file's original bytes back where they changed, returning the files that could
+    not be. A file whose write failed before it changed anything is left alone."""
+    failed: list[str] = []
+    for file, raw in files:
+        try:
+            if Path(file).read_bytes() == raw:
+                continue
+        except OSError as exc:
+            _log.debug("rename could not re-read %s: %s", file, type(exc).__name__)
+        try:
+            _replace(file, raw)
+        except (OSError, WiringError) as exc:
+            _log.warning("rename could not restore %s: %s", file, type(exc).__name__)
+            failed.append(file)
+    return failed
 
 
 def delete_impact(index: ReferenceIndex, target_kind: str, name: str) -> list[Reference]:
@@ -421,7 +659,7 @@ def _add_definition_span(
     old: str,
     sources: SourceCache,
     add_py_span: Callable[[str | None, _Span | None, Mapping[_Pos, frozenset[_Pos]]], None],
-    toml_targets: set[tuple[str, str]],
+    toml_targets: dict[_TomlTarget, list[Reference]],
 ) -> None:
     """Scope the object's own definition (``@router("old")`` / ``outbound("old", …)`` /
     ``DatabaseLookup("old", …)`` / a TOML ``name = "old"``), with the position of its name argument,
@@ -452,7 +690,7 @@ def _add_definition_span(
                 _call_line_positions(sources, conn.source_file, conn.source_line, old, target_kind),
             )
         elif conn.source_file and _is_connections_toml(conn.source_file):
-            toml_targets.add((conn.source_file, "name"))
+            toml_targets.setdefault((conn.source_file, target_kind, ("name",)), [])
         else:
             # Declared somewhere this plan cannot read, so its name cannot be rewritten.
             add_py_span(None, None, {})
@@ -483,13 +721,20 @@ class _Site:
     handler name and the like, so an equal literal in another role is left alone and, being still
     counted, reports its referrer unresolved. ``ignored`` holds the literals at the site that are not
     a referent at all and so are neither rewritten nor counted: the referrer's own registering
-    ``@handler("name")`` argument, when the referrer is named like the target."""
+    ``@handler("name")`` argument, when the referrer is named like the target. ``reads`` holds the
+    ids of the function's name reads a role takes or that do not depend on the value, so a module
+    binding read anywhere else in the body is not rewritten. ``returned`` holds the referent
+    positions a helper (``helper``, its name) hands back as its return value: rewriting one changes
+    every caller's value, so each call must be one a role reads."""
 
     file: str
     span: _Span
     allowed: frozenset[tuple[int, int]] | None
     rewritable: frozenset[tuple[int, int]] | None = None
     ignored: frozenset[tuple[int, int]] = frozenset()
+    reads: frozenset[_Key] = frozenset()
+    returned: frozenset[tuple[int, int]] = frozenset()
+    helper: str | None = None
 
     def rewrites(
         self,
@@ -529,11 +774,16 @@ def _referrer_sites(
     old: str,
     target_kind: str,
     sources: SourceCache,
-    toml_targets: set[tuple[str, str]],
+    toml_targets: dict[_TomlTarget, list[Reference]],
+    held: list[bool] | None = None,
+    opaque: list[bool] | None = None,
 ) -> tuple[list[_Site], bool] | None:
     """The ``.py`` sites one referent edge reads ``old`` from, and whether every value the referrer
     captures holding ``old`` was located; ``None`` for a ``connections.toml`` router binding
-    (recorded in ``toml_targets`` instead).
+    (recorded in ``toml_targets`` instead). ``held``, when given, gets ``True`` appended when a
+    module container a role reads holds ``old``, located or not, or a value passed where it is
+    never rewritten may hold it; ``opaque`` gets ``True`` when a role reads a value the scan cannot
+    follow.
 
     A router/handler's sites are its own body and, for a handler, its ``accepts=`` predicate's; for a
     table rename, the config-authored helpers either reaches; and each module-level statement that
@@ -580,31 +830,129 @@ def _referrer_sites(
                     complete = complete and depth > 0
                 else:
                     funcs.append((depth, func, file, span))
+        # The scan knows a helper by its bare name (``_a.pick()`` and ``_b.pick()`` are both
+        # ``pick``), so two reached functions sharing one cannot be told apart: one's return or
+        # parameter would be taken for the other's. Such a referrer is unresolved (BACKLOG #5980).
+        # Code objects compare by content, so two helpers with one body are told apart by place.
+        by_name: dict[str, set[tuple[str, int]]] = {}
+        for func in reached:
+            if func.__name__ != "<lambda>":
+                code = func.__code__
+                by_name.setdefault(func.__name__, set()).add(
+                    (code.co_filename, code.co_firstlineno)
+                )
         scans = _scan_referrer(sources, funcs, old, ref.referrer_kind, table_kind)
+        # Only a shared name the scan resolves through matters: one whose return a role reads,
+        # or one with role parameters. Two unrelated formatters of one name do not.
+        used = {name for scan in scans for name in scan.calls | scan.iter_calls} | {
+            func.__name__
+            for (_depth, func, *_rest), scan in zip(funcs, scans, strict=True)
+            if scan.slots or scan.passes or scan.iter_slots or scan.iter_passes or scan.taints
+        }
+        complete = complete and not any(
+            len(codes) > 1 and name in used for name, codes in by_name.items()
+        )
         role_globals = {name for scan in scans for name in scan.globals}
         role_attrs = {name for scan in scans for name in scan.attrs}
+        iter_globals = {name for scan in scans for name in scan.iter_globals}
+        iter_attrs = {name for scan in scans for name in scan.iter_attrs}
         for (depth, func, file, span), scan in zip(funcs, scans, strict=True):
             rewritable = set(scan.positions)
-            # A non-table rename rewrites a default only for a parameter that reaches a referent
-            # role; a table rename rewrites every default equal to the old name.
-            role_params = (
-                None if table_kind is not None else {name for _i, name in scan.slots | scan.passes}
+            # A default is rewritten only for a parameter that reaches a referent role, or, for a
+            # table rename, when it is itself the accessor's argument (``cs=code_set("diets")``);
+            # one read any other way (``if t == "x"``) is left and counted (BACKLOG #5980).
+            by_value = {name for _i, name in scan.slots | scan.passes}
+            by_element = frozenset(name for _i, name in scan.iter_slots | scan.iter_passes)
+            defaults = _default_positions(sources, func, file, span, old)
+            rewritable |= _default_positions(sources, func, file, span, old, by_value, by_element)
+            # A pass-through parameter's default reaches only the return value, which every
+            # caller of the helper reads, so it is held to the returned literals' rule.
+            pass_defaults = _default_positions(
+                sources,
+                func,
+                file,
+                span,
+                old,
+                {name for _i, name in scan.passes},
+                frozenset(name for _i, name in scan.iter_passes),
             )
-            rewritable |= _default_positions(sources, func, file, span, old, role_params)
+            accessor = (
+                _accessor_positions(sources, file, span, old, table_kind)
+                if table_kind is not None
+                else set()
+            )
+            rewritable |= defaults & accessor
+            # A helper's return value is read by its callers, each of which must be in a role.
+            returned = frozenset(scan.returned | pass_defaults) if depth > 0 else frozenset()
+            helper = func.__name__ if depth > 0 else None
             if table_kind is None or depth == 0:
                 # ``ignored`` holds bare positions in the decorator's own file; a helper elsewhere
                 # at the same (line, col) is a referent and must stay counted.
                 own = ignored if file == own_file else frozenset()
-                sites.append(_Site(file, span, None, frozenset(rewritable), own))
+                allowed: frozenset[_Pos] | None = None
+                role = rewritable
             else:
-                allowed = _accessor_positions(sources, file, span, old, table_kind) | rewritable
-                sites.append(_Site(file, span, frozenset(allowed)))
+                # A helper the referrer reaches counts its accessor calls, its role values and
+                # its defaults: a default left because its parameter is read in no role reports
+                # the referrer rather than leaving the helper reading the old table.
+                own = frozenset()
+                role = accessor | rewritable
+                kinds = sources.occurrences(file, old)
+                allowed = frozenset(
+                    role | {pos for pos in defaults if kinds.get(pos) in (None, table_kind)}
+                )
+            sites.append(
+                _Site(file, span, allowed, frozenset(role), own, scan.reads, returned, helper)
+            )
+        # A local that carries a rewritten literal into another read leaves the referrer unresolved.
+        complete = complete and not any(scan.unsafe or scan.unfollowed for scan in scans)
+        # An argument for a role parameter that is also read elsewhere is never rewritten, so one
+        # that may hold the old name leaves the referrer unresolved (BACKLOG #5980).
+        taint_globals = {name for scan in scans for name in scan.taint_globals}
+        taint_attrs = {name for scan in scans for name in scan.taint_attrs}
+        tainted = (
+            any(scan.tainted for scan in scans)
+            or bool(taint_globals or taint_attrs)
+            and any(
+                _holds_either(captured.value, old)
+                for func in reached
+                for captured in captured_values(func, func.__module__)
+                if captured.source != "default"
+                and captured.name
+                in (taint_attrs if captured.source == "attribute" else taint_globals)
+            )
+        )
+        complete = complete and not tainted
+        # A module table a role takes the elements of a value of: an inner dict holding the name
+        # would have its values rewritten and its keys, the elements, missed.
+        nested = {name for scan in scans for name in scan.nested}
+        nested_attrs = {name for scan in scans for name in scan.nested_attrs}
+        inner_held = bool(nested or nested_attrs) and any(
+            isinstance(captured.value, dict)
+            and any(
+                isinstance(inner, dict) and _holds_either(inner, old)
+                for inner in captured.value.values()
+            )
+            for func in reached
+            for captured in captured_values(func, func.__module__)
+            if captured.source != "default"
+            and captured.name in (nested_attrs if captured.source == "attribute" else nested)
+        )
+        complete = complete and not inner_held
+        if held is not None and inner_held:
+            held.append(True)
+        if held is not None and tainted:
+            held.append(True)
+        if opaque is not None and any(scan.opaque for scan in scans):
+            opaque.append(True)
         for func in reached:
-            bound_sites, located = _module_binding_sites(
-                func, old, table_kind, sources, role_globals, role_attrs
+            bound_sites, located, role_held = _module_binding_sites(
+                func, old, table_kind, sources, role_globals, role_attrs, iter_globals, iter_attrs
             )
             sites.extend(bound_sites)
             complete = complete and located
+            if role_held and held is not None:
+                held.append(True)
         return sites, complete
     if ref.referrer_kind == "inbound":
         conn = registry.inbound.get(ref.referrer)
@@ -618,14 +966,155 @@ def _referrer_sites(
             # the inbound's own name or a sibling argument equal to the router's is another value
             # (BACKLOG #5980). A router= the statement does not spell leaves the site empty, which
             # reports the inbound unresolved.
-            binding = _router_binding_positions(sources, conn.source_file, span, old)
+            binding = _keyword_value_positions(
+                sources, conn.source_file, span, old, "router", "inbound"
+            )
             return [_Site(conn.source_file, span, binding)], True
         if conn.source_file and _is_connections_toml(conn.source_file):
             # The referent edge is the router binding; rewrite only the `router = "..."` value.
-            toml_targets.add((conn.source_file, "router"))
+            toml_targets.setdefault((conn.source_file, "inbound", ("router",)), []).append(ref)
             return None
         return [], False
-    return None
+    # A referrer kind this function does not read: reported unresolved, never dropped.
+    return [], False
+
+
+#: The settings' names, which are also the relation the index tags each such edge with.
+_SETTING_NAMES = frozenset(setting for _kind, setting, _target in SETTING_REFERENCES)
+
+
+def _all_referrers(
+    index: ReferenceIndex, target_kind: str, old: str
+) -> list[tuple[Reference, str | None]]:
+    """Every referrer of ``(target_kind, old)``, each with the connection setting it names the
+    target in, or ``None`` for a referrer read from its code or its router binding.
+
+    The index tags a connection naming another in a setting (an outbound's ``reingress_to``, an
+    ``Http`` inbound's ``reply_from``, either an ``env()`` whose default names the target) with
+    that setting as its relation, so it is never read as a router binding (BACKLOG #5966)."""
+    return [
+        (ref, ref.relation if ref.relation in _SETTING_NAMES else None)
+        for ref in index.referrers(target_kind, old)
+    ]
+
+
+def _setting_sites(
+    registry: Registry,
+    ref: Reference,
+    setting: str,
+    old: str,
+    sources: SourceCache,
+    toml_targets: dict[_TomlTarget, list[Reference]],
+) -> tuple[list[_Site], bool] | None:
+    """The site a connection names ``old`` at in its ``setting`` (``reingress_to`` / ``reply_from``):
+    the ``setting=`` value in its declaring statement, or ``None`` for a ``connections.toml`` entry,
+    recorded in ``toml_targets`` instead. A setting the statement does not spell as a literal leaves
+    the site empty, which reports the referrer unresolved (BACKLOG #5966)."""
+    table = registry.inbound if ref.referrer_kind == "inbound" else registry.outbound
+    conn = table.get(ref.referrer)
+    if conn is None:
+        return [], False
+    if conn.source_line is not None and conn.source_file:
+        span = _statement_span(conn.source_file, conn.source_line)
+        if span is None:
+            return [], False
+        binding = _keyword_value_positions(
+            sources, conn.source_file, span, old, setting, ref.referrer_kind, in_spec=True
+        )
+        return [_Site(conn.source_file, span, binding)], True
+    if conn.source_file and _is_connections_toml(conn.source_file):
+        if not isinstance(conn.spec.settings.get(setting), str):
+            # An env() table whose default names the target holds no literal to rewrite; left to
+            # the file-wide toml check, a sibling entry's literal edit would hide it (BACKLOG #5966).
+            return [], False
+        key = (conn.source_file, ref.referrer_kind, ("settings", setting))
+        toml_targets.setdefault(key, []).append(ref)
+        return None
+    return [], False
+
+
+def _scanned_referrers(
+    registry: Registry,
+    indexed: list[Reference],
+    target_kind: str,
+    old: str,
+    sources: SourceCache,
+) -> list[tuple[Reference, tuple[list[_Site], bool]]]:
+    """The handlers (for an outbound or inbound), routers (for a handler) or both (for a table) the
+    reverse index has no edge from, whose role scan still finds ``old`` in a referent role: a name a helper returns
+    (``Send(_route("ADT"), msg)``), one read out of a module table, and other forms the wiring
+    graph does not follow. Left out, their literal would keep the old name while the plan reported
+    success (BACKLOG #5980); taken in, each is rewritten or reported unresolved like any other.
+    Each comes with its sites, so the plan does not scan it twice."""
+    out: list[tuple[Reference, tuple[list[_Site], bool]]] = []
+    # A Send names a pass-through inbound when one has the name, else an outbound (the runtime
+    # resolves it that way), so a handler's Send literal is a referent of only one of the two. A
+    # Loopback or any other inbound is no Send target at all.
+    is_pt = old in registry.passthrough_inbounds()
+    if (target_kind == "inbound" and not is_pt) or (target_kind == "outbound" and is_pt):
+        return out
+    for kind in _SCANNED_REFERRER_KINDS.get(target_kind, ()):
+        known = {ref.referrer for ref in indexed if ref.referrer_kind == kind}
+        table = _table(registry, kind)
+        for name in sorted(set(table) - known):
+            roots = [table[name]]
+            if kind == "handler" and name in registry.handler_accepts:
+                roots.append(registry.handler_accepts[name])
+            if not any(_may_read(root, old, sources) for root in roots):
+                continue
+            ref = Reference(kind, name, target_kind, old)
+            held: list[bool] = []
+            opaque: list[bool] = []
+            # A router or handler never takes the connections.toml branch, so no toml target is lost.
+            found = _referrer_sites(registry, ref, old, target_kind, sources, {}, held, opaque)
+            if found is not None and (held or any(site.rewritable for site in found[0])):
+                out.append((ref, found))
+            elif opaque and any(_captures(root, old) for root in roots):
+                # It holds a container with the name and a role reads a value in a form the scan
+                # does not follow (enumerate, a tuple index): reported, never left on the old name.
+                # A container no role could be reading it through (a label dict beside a literal
+                # Send) is not a referent, so it is left.
+                out.append((ref, ([], False)))
+    return out
+
+
+#: The code kinds that may name a target of each kind without an index edge: a handler sends to
+#: an outbound or a pass-through inbound, a router returns a handler, and either reads a table.
+_SCANNED_REFERRER_KINDS: dict[str, tuple[str, ...]] = {
+    "outbound": ("handler",),
+    "inbound": ("handler",),
+    "handler": ("router",),
+    **dict.fromkeys(_TABLE_KINDS, ("router", "handler")),
+}
+
+
+def _captures(fn: object, old: str) -> bool:
+    """Whether a function ``fn`` reaches captures a value holding ``old``, as a value or an
+    element."""
+    return any(
+        _holds_either(captured.value, old)
+        for func in reached_functions(fn)
+        for captured in captured_values(func, func.__module__)
+    )
+
+
+def _may_read(fn: object, old: str, sources: SourceCache) -> bool:
+    """Whether ``fn`` could read ``old`` at all: one of the functions it reaches spells it inside
+    its own lines, or captures a value holding it. A cheap gate before the full role scan, which
+    would otherwise run on every handler of a large config. A function whose source cannot be
+    located is scanned."""
+    for func in reached_functions(fn):
+        file, span = _fn_span(func)
+        if file is None or span is None:
+            return True
+        if any(
+            span.start <= line <= span.end for line, _col in sources.occurrences(file, old)
+        ) or any(
+            _holds_either(captured.value, old)
+            for captured in captured_values(func, func.__module__)
+        ):
+            return True
+    return False
 
 
 def _accessor_positions(
@@ -646,10 +1135,14 @@ def _default_positions(
     span: _Span,
     old: str,
     params: set[str] | None = None,
+    elements: frozenset[str] = frozenset(),
 ) -> set[tuple[int, int]]:
     """The positions of ``old`` written as a default argument in ``func``'s own signature
     (``def _lookup(code, table="diets")``), which the function reads as a captured value; with
-    ``params``, only the defaults of those parameters."""
+    ``params`` (read for their value) and ``elements`` (iterated), only the defaults of those
+    parameters, and only the parts of each a role reads:
+    its value, or for a parameter in ``elements``, which the function iterates, its elements (a
+    dict default's keys, BACKLOG #5980)."""
     parsed = sources.parse(file)
     if parsed is None:
         return set()
@@ -675,13 +1168,17 @@ def _default_positions(
                 if d is not None
             ),
         ]
-        defaults = [d for a, d in pairs if params is None or a.arg in params]
-        out |= {
-            sources.position(file, c)
-            for d in defaults
-            for c in ast.walk(d)
-            if isinstance(c, ast.Constant) and c.value == old
-        }
+        if params is None:
+            consts = [c for _a, d in pairs for c in ast.walk(d) if isinstance(c, ast.Constant)]
+        else:
+            flow = _Flow()
+            for a, d in pairs:
+                if a.arg in elements:
+                    _carried_elements(d, {}, set(), flow)
+                if a.arg in params:
+                    _carried(d, {}, set(), flow)
+            consts = flow.consts
+        out |= {sources.position(file, c) for c in consts if c.value == old}
     return out
 
 
@@ -708,6 +1205,22 @@ _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda
 #: A ``(line, char col)`` source position, as :meth:`SourceCache.position` gives it.
 _Pos = tuple[int, int]
 
+#: A node's span, ``(line, col, end line, end col)`` in the AST's own offsets: a read is matched by
+#: where it sits, never by ``id()``, since the readers of a binding are found in a parse of the
+#: plan's resolved path, which need not be the parse the role scan read (a path differing in case,
+#: or through a link).
+_Key = tuple[int, int, int, int]
+
+
+def _key(node: ast.AST) -> _Key:
+    """``node``'s :data:`_Key`; a synthetic node the scan builds has none and reads as ``(0,)*4``."""
+    return (
+        getattr(node, "lineno", 0),
+        getattr(node, "col_offset", 0),
+        getattr(node, "end_lineno", 0) or 0,
+        getattr(node, "end_col_offset", 0) or 0,
+    )
+
 
 @dataclass
 class _Flow:
@@ -720,10 +1233,50 @@ class _Flow:
     # A pass-through helper's parameters that reach only its return value: a call to it carries
     # those arguments only where the call itself is carried into a role.
     passes: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
+    # The pass-through parameters a helper iterates, so a call's argument there carries elements.
+    iter_passes: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
     consts: list[ast.Constant] = field(default_factory=list)
+    # Names read for their value, and names read for their elements (iterated): a dict's elements
+    # are its keys, its value is read through its values (BACKLOG #5980).
     unbound: set[str] = field(default_factory=set)
+    iterated: set[str] = field(default_factory=set)
     attrs: set[str] = field(default_factory=set)
+    iter_attrs: set[str] = field(default_factory=set)
     calls: set[str] = field(default_factory=set)
+    # The helpers whose return value a role iterates.
+    iter_calls: set[str] = field(default_factory=set)
+    # The keys of the name and attribute nodes the flow read.
+    read: set[_Key] = field(default_factory=set)
+    # A role takes the elements of a value read out of a table (``for d in ROUTES[kind]``). The
+    # table's values are carried, which is right for a list or a name; for an inner dict its keys
+    # are the elements and its values are not, so such a table is checked by name (``nested``,
+    # ``nested_attrs``), and one the scan cannot name or see (``unfollowed``) leaves its referrer
+    # unresolved (BACKLOG #5980).
+    nested: set[str] = field(default_factory=set)
+    nested_attrs: set[str] = field(default_factory=set)
+    unfollowed: bool = False
+
+    def is_empty(self) -> bool:
+        """Whether the flow carried no value: no constant, name, attribute or helper return."""
+        return not any(
+            (
+                self.consts,
+                self.unbound,
+                self.iterated,
+                self.attrs,
+                self.iter_attrs,
+                self.calls,
+                self.iter_calls,
+            )
+        )
+
+
+def _role_flow(params: frozenset[str], role: _Role) -> _Flow:
+    """A fresh :class:`_Flow` over ``params`` that follows ``role``'s module names and
+    pass-through helpers."""
+    return _Flow(
+        params=params, modules=role.names.modules, passes=role.passes, iter_passes=role.iter_passes
+    )
 
 
 @dataclass
@@ -739,6 +1292,36 @@ class _Scan:
     calls: set[str]
     slots: set[tuple[int, str]]
     passes: set[tuple[int, str]] = field(default_factory=set)
+    iter_calls: set[str] = field(default_factory=set)
+    # The same, for what a role reads through its elements (a loop, a comprehension, list(...)).
+    iter_globals: set[str] = field(default_factory=set)
+    iter_attrs: set[str] = field(default_factory=set)
+    iter_slots: set[tuple[int, str]] = field(default_factory=set)
+    iter_passes: set[tuple[int, str]] = field(default_factory=set)
+    # The ids of the reads in the body that a role takes, or that do not depend on the value; and
+    # whether a local carries a rewritten literal into some other read.
+    reads: frozenset[_Key] = frozenset()
+    unsafe: bool = False
+    # The referent positions this function hands back as its return value.
+    returned: set[tuple[int, int]] = field(default_factory=set)
+    # A parameter whose value reaches a role but is also read elsewhere (a log line, a comparison)
+    # gives no role slot, so a caller's argument there is not rewritten. A literal argument in the
+    # caller's own lines is still counted; one reached through a module name, a module attribute
+    # or a helper's return is not, so these record what such an argument reads: whether it carries
+    # the old name or a helper's return (``tainted``), and the module names and attributes it
+    # reads, whose bound values the caller checks (BACKLOG #5980).
+    taints: set[tuple[int, str]] = field(default_factory=set)
+    tainted: bool = False
+    taint_globals: set[str] = field(default_factory=set)
+    taint_attrs: set[str] = field(default_factory=set)
+    # A role takes the elements of a value read out of a table (:attr:`_Flow.unfollowed`), and the
+    # module names and attributes read that way.
+    unfollowed: bool = False
+    nested: set[str] = field(default_factory=set)
+    nested_attrs: set[str] = field(default_factory=set)
+    # A role read the scan cannot follow to any value: a name bound in a form it does not track
+    # (``for _i, d in enumerate(DESTS)``), or an expression that carries nothing (``p[1]``).
+    opaque: bool = False
 
 
 @dataclass(frozen=True)
@@ -791,38 +1374,64 @@ def _scan_referrer(
     argument for a table rename, the return value of a helper whose result one of those reads, and
     an argument passed to a helper parameter that reaches one. Helpers feed each other, so the scan
     runs until neither the helpers read for their return value nor their role parameters grow."""
+    # What does not change between passes is read once: a function's locals, its module's
+    # names, and its reads that do not depend on the value.
     prepared = [
-        (depth, func, file, span, node, _local_values(node) if node is not None else {}, names)
+        (
+            depth,
+            func,
+            file,
+            span,
+            node,
+            _local_values(node) if node is not None else {},
+            names,
+            _value_agnostic_reads(_body(node)) if node is not None else set(),
+        )
         for depth, func, file, span in funcs
         for node in (_function_node(sources, file, span, func),)
         for names in (_module_names(sources, file),)
     ]
     send = table_kind is None and referrer_kind == "handler"
     returns: set[str] = set()
-    slots: dict[str, set[tuple[int, str]]] = {}
-    passes: dict[str, set[tuple[int, str]]] = {}
+    iter_returns: set[str] = set()
+    # helper name -> its role parameters: read for their value, then read for their elements; and
+    # its pass-through parameters, the same two ways.
+    maps: dict[str, dict[str, set[tuple[int, str]]]] = {
+        key: {} for key in ("slots", "iter_slots", "passes", "iter_passes", "taints")
+    }
     while True:
         scans: list[_Scan] = []
-        for depth, func, file, span, node, values, names in prepared:
+        for depth, func, file, span, node, values, names, agnostic in prepared:
+            # The engine iterates a router's return, so a dict it returns names its keys; a
+            # helper whose return a role iterates is read the same way.
             if depth == 0:
-                give_back = referrer_kind == "router" and table_kind is None
+                give_back = False
+                iterate = referrer_kind == "router" and table_kind is None
             else:
                 give_back = func.__name__ in returns
-            role = _Role(send, give_back, table_kind, slots, names, passes)
-            scans.append(_scan_function(sources, file, span, node, values, old, role))
+                iterate = func.__name__ in iter_returns
+            role = _Role(
+                send,
+                give_back,
+                table_kind,
+                names=names,
+                iterate_returns=iterate,
+                **maps,
+            )
+            scans.append(_scan_function(sources, file, span, node, values, old, role, agnostic))
         new_returns = returns | {name for scan in scans for name in scan.calls}
-        new_slots = {name: set(found) for name, found in slots.items()}
-        new_passes = {name: set(found) for name, found in passes.items()}
+        new_iter_returns = iter_returns | {name for scan in scans for name in scan.iter_calls}
+        new_maps = {key: {name: set(found) for name, found in m.items()} for key, m in maps.items()}
         for (depth, func, *_rest), scan in zip(prepared, scans, strict=True):
-            if scan.slots:
-                new_slots.setdefault(func.__name__, set()).update(scan.slots)
-            # The referrer's own return is no helper's, so it gives no call a pass-through.
-            if scan.passes and depth > 0:
-                new_passes.setdefault(func.__name__, set()).update(scan.passes)
-        # All three only grow and are bounded by the helpers' names and parameters, so this ends.
-        if new_returns == returns and new_slots == slots and new_passes == passes:
+            for key, target in new_maps.items():
+                # The referrer's own return is no helper's, so it gives no call a pass-through.
+                params: set[tuple[int, str]] = getattr(scan, key)
+                if params and (depth > 0 or key in ("slots", "iter_slots")):
+                    target.setdefault(func.__name__, set()).update(params)
+        # All of them only grow and are bounded by the helpers' names and parameters, so this ends.
+        if new_returns == returns and new_iter_returns == iter_returns and new_maps == maps:
             return scans
-        returns, slots, passes = new_returns, new_slots, new_passes
+        returns, iter_returns, maps = new_returns, new_iter_returns, new_maps
 
 
 @dataclass(frozen=True)
@@ -832,9 +1441,14 @@ class _Role:
     send: bool
     give_back: bool
     accessor: str | None
-    slots: Mapping[str, set[tuple[int, str]]]
     names: _Names
+    slots: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
     passes: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
+    iter_slots: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
+    iter_passes: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
+    # The parameters whose value reaches a role but is also read elsewhere (``_Scan.taints``).
+    taints: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
+    iterate_returns: bool = False
 
 
 def _function_node(
@@ -872,8 +1486,10 @@ def _scan_function(
     values: Mapping[str, list[ast.expr]],
     old: str,
     role: _Role,
+    agnostic: set[_Key],
 ) -> _Scan:
-    """The referent literals in ``node``'s body, per :func:`_scan_referrer`'s roles. A call in a
+    """The referent literals in ``node``'s body, per :func:`_scan_referrer`'s roles.
+    ``agnostic`` holds :func:`_value_agnostic_reads` of the body. A call in a
     nested function or lambda counts (``key=lambda k: code_set("t").get(k)``); a nested function's
     return value does not, since it is not this function's."""
     if node is None:
@@ -885,10 +1501,10 @@ def _scan_function(
     # Two flows: what reaches a role inside this function (``sink``), and what reaches only its
     # return value (``back``). A parameter in ``sink`` makes every call's argument a referent; one
     # only in ``back`` does so only for a call that is itself carried into a role (BACKLOG #5980).
-    sink = _Flow(params=params, modules=role.names.modules, passes=role.passes)
-    back = _Flow(params=params, modules=role.names.modules, passes=role.passes)
+    sink = _role_flow(params, role)
+    back = _role_flow(params, role)
     returned: list[ast.expr] = []
-    if role.give_back:
+    if role.give_back or role.iterate_returns:
         if isinstance(node, ast.Lambda):
             returned.append(node.body)
         returned.extend(
@@ -896,26 +1512,94 @@ def _scan_function(
             for child in _own_nodes(node)
             if isinstance(child, (ast.Return, ast.Yield, ast.YieldFrom)) and child.value is not None
         )
-    body: list[ast.AST] = [node.body] if isinstance(node, ast.Lambda) else list(node.body)
+    taint = _role_flow(params, role)
+    body = _body(node)
+    roots: list[ast.expr] = []
     for stmt in body:
         for child in ast.walk(stmt):
             if isinstance(child, ast.Call):
                 for root in _call_roots(child, role):
+                    roots.append(root)
                     _carried(root, values, set(), sink)
+                if not role.taints:
+                    continue
+                helper = _helper_name(child.func, role.names.modules) or ""
+                for arg in _slot_arguments(child, role.taints.get(helper, ())):
+                    _carried(arg, values, set(), taint)
+                    _carried_elements(arg, values, set(), taint)
     for root in returned:
-        _carried(root, values, set(), back)
-    positions = {
-        pos
-        for const in (*sink.consts, *back.consts)
-        if const.value == old
-        and span.start <= (pos := sources.position(file, const))[0] <= span.end
+        roots.append(root)
+        if role.iterate_returns:
+            _carried_elements(root, values, set(), back)
+        if role.give_back:
+            _carried(root, values, set(), back)
+    stored = {
+        child.id
+        for child in _own_nodes(node)
+        if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store)
     }
+    role_reads = sink.unbound | sink.iterated | back.unbound | back.iterated
+    opaque = bool((role_reads & stored) - set(values) - params) or any(
+        _carries_nothing(root, values, params, role) for root in roots
+    )
+
+    def in_span(consts: list[ast.Constant]) -> set[_Pos]:
+        return {
+            pos
+            for const in consts
+            if const.value == old
+            and span.start <= (pos := sources.position(file, const))[0] <= span.end
+        }
+
+    returned_positions = in_span(back.consts)
+    positions = in_span(sink.consts) | returned_positions
+    # A name a role reads may also be read elsewhere -- in a comparison, a log line, a lookup.
+    # Rewriting its value changes that read too, so such a name gives no role (BACKLOG #5980).
+    reads = sink.read | back.read | agnostic
+    loose = {
+        child.id
+        for stmt in body
+        for child in ast.walk(stmt)
+        if isinstance(child, ast.Name)
+        and isinstance(child.ctx, ast.Load)
+        and _key(child) not in reads
+    }
+    # A local carrying a rewritten literal into a loose read: the referrer is unresolved. A
+    # parameter read loosely is no role slot, so a caller's argument for it stays counted.
+    unsafe = False
+    role_names = sink.unbound | sink.iterated | back.unbound | back.iterated
+    role_attrs = sink.attrs | sink.iter_attrs | back.attrs | back.iter_attrs
+    role_calls = sink.calls | back.calls
+    for name in loose & set(values):
+        probe = _Flow(params=params, modules=role.names.modules)
+        ref = ast.Name(id=name, ctx=ast.Load())
+        _carried(ref, values, set(), probe)
+        _carried_elements(ref, values, set(), probe)
+        # Its value is rewritten through a literal it carries, or through what it copies: a
+        # parameter, a module name or a helper's return that a role here reads as well.
+        unsafe = (
+            unsafe
+            or any(c.value == old and sources.position(file, c) in positions for c in probe.consts)
+            or bool(
+                (probe.unbound | probe.iterated) & role_names
+                or (probe.attrs | probe.iter_attrs) & role_attrs
+                or probe.calls & role_calls
+            )
+        )
 
     def slots_of(unbound: set[str]) -> set[tuple[int, str]]:
+        unbound = unbound - loose
         found = {(positional.index(p), p) for p in unbound if p in positional}
         return found | {(-1, p) for p in unbound if p in keyword_only}
 
     own_slots = slots_of(sink.unbound)
+    own_iter_slots = slots_of(sink.iterated)
+    # A parameter a role reads and something else reads too, or one a caller's tainted argument
+    # is handed on through: its callers' arguments there are checked, never rewritten.
+    taint_params = (role_reads & loose & params) | ((taint.unbound | taint.iterated) & params)
+    taints = {(positional.index(p), p) for p in taint_params if p in positional} | {
+        (-1, p) for p in taint_params if p in keyword_only
+    }
     return _Scan(
         positions,
         (sink.unbound | back.unbound) - params,
@@ -923,7 +1607,103 @@ def _scan_function(
         sink.calls | back.calls,
         own_slots,
         slots_of(back.unbound) - own_slots,
+        iter_calls=sink.iter_calls | back.iter_calls,
+        iter_globals=(sink.iterated | back.iterated) - params,
+        iter_attrs=sink.iter_attrs | back.iter_attrs,
+        iter_slots=own_iter_slots,
+        iter_passes=slots_of(back.iterated) - own_iter_slots,
+        reads=frozenset(reads),
+        unsafe=unsafe,
+        returned=returned_positions,
+        taints=taints,
+        tainted=any(c.value == old for c in taint.consts) or bool(taint.calls | taint.iter_calls),
+        taint_globals=(taint.unbound | taint.iterated) - params,
+        taint_attrs=taint.attrs | taint.iter_attrs,
+        opaque=opaque or sink.unfollowed or back.unfollowed,
+        unfollowed=sink.unfollowed or back.unfollowed,
+        nested=(sink.nested | back.nested) - params,
+        nested_attrs=sink.nested_attrs | back.nested_attrs,
     )
+
+
+def _carries_nothing(
+    root: ast.expr, values: Mapping[str, list[ast.expr]], params: frozenset[str], role: _Role
+) -> bool:
+    """Whether a role expression reads a value the scan cannot follow: it carries no constant,
+    name, attribute or helper return (``p[1]`` over ``.items()`` pairs, an f-string). A literal
+    that names nothing (a router's filtering ``return None`` or ``return []``) reads nothing, so
+    it is followed."""
+    if not any(
+        isinstance(n, (ast.Name, ast.Attribute, ast.Call, ast.Subscript, ast.JoinedStr))
+        for n in ast.walk(root)
+    ):
+        return False
+    probe = _role_flow(params, role)
+    _carried(root, values, set(), probe)
+    return probe.is_empty()
+
+
+def _body(node: _FunctionNode) -> list[ast.AST]:
+    """The statements (or, for a lambda, the expression) a function's body evaluates."""
+    return [node.body] if isinstance(node, ast.Lambda) else list(node.body)
+
+
+def _value_agnostic_reads(body: Iterable[ast.AST]) -> set[_Key]:
+    """The keys of the name and attribute reads in ``body`` whose result does not depend on which
+    string the name holds: a truth test (``if names:``, ``not names``, a comprehension's ``if``),
+    ``isinstance()``/``bool()``, an ``is None`` check, and the receiver of a list or set collector
+    (``names.append("h")``). ``len()`` is not one: a string's length is the name's."""
+    out: set[_Key] = set()
+    parents: dict[int, ast.AST] = {}
+    for stmt in body:
+        for holder in ast.walk(stmt):
+            for child in ast.iter_child_nodes(holder):
+                parents[id(child)] = holder
+
+    def tested(node: ast.AST) -> bool:
+        parent = parents.get(id(node))
+        if isinstance(parent, (ast.If, ast.While, ast.IfExp, ast.Assert)):
+            return parent.test is node
+        if isinstance(parent, ast.comprehension):
+            return node in parent.ifs
+        if isinstance(parent, ast.UnaryOp) and isinstance(parent.op, ast.Not):
+            return True
+        if isinstance(parent, ast.BoolOp):
+            return tested(parent)
+        return False
+
+    for stmt in body:
+        for node in ast.walk(stmt):
+            if not isinstance(node, (ast.Name, ast.Attribute)) or not isinstance(
+                node.ctx, ast.Load
+            ):
+                continue
+            parent = parents.get(id(node))
+            if (
+                tested(node)
+                or (
+                    isinstance(parent, ast.Call)
+                    and isinstance(parent.func, ast.Name)
+                    and parent.func.id in ("isinstance", "bool")
+                    and node in parent.args
+                )
+                or (
+                    isinstance(parent, ast.Compare)
+                    and all(isinstance(op, (ast.Is, ast.IsNot)) for op in parent.ops)
+                    and all(
+                        isinstance(c, ast.Constant) and c.value is None
+                        for c in (parent.left, *parent.comparators)
+                        if c is not node
+                    )
+                )
+                or (
+                    isinstance(parent, ast.Attribute)
+                    and parent.attr in _COLLECTOR_METHODS
+                    and isinstance(parents.get(id(parent)), ast.Call)
+                )
+            ):
+                out.add(_key(node))
+    return out
 
 
 def _call_roots(call: ast.Call, role: _Role) -> list[ast.expr]:
@@ -943,9 +1723,17 @@ def _call_roots(call: ast.Call, role: _Role) -> list[ast.expr]:
         and (table := _first_or_keyword(call, _ACCESSOR_NAME_PARAMS[accessor])) is not None
     ):
         out.append(table)
-    helper = _helper_name(call.func, role.names.modules)
-    out.extend(_slot_arguments(call, role.slots.get(helper or "", ())))
+    helper = _helper_name(call.func, role.names.modules) or ""
+    out.extend(_slot_arguments(call, role.slots.get(helper, ())))
+    # A parameter the helper iterates takes the argument's elements (a dict's keys).
+    out.extend(_elements(arg) for arg in _slot_arguments(call, role.iter_slots.get(helper, ())))
     return out
+
+
+def _elements(expr: ast.expr) -> ast.Starred:
+    """A marker for "the elements of ``expr``", as ``*expr`` reads them: :func:`_carried` takes a
+    starred value through :func:`_carried_elements`."""
+    return ast.Starred(value=expr, ctx=ast.Load())
 
 
 def _first_or_keyword(call: ast.Call, keyword: str) -> ast.expr | None:
@@ -1012,6 +1800,25 @@ def _bind(
         for elt in value.elts:
             _bind(target, elt, values, element=False)
         return
+    if (
+        element
+        and isinstance(target, (ast.Tuple, ast.List))
+        and len(target.elts) == 2
+        and isinstance(value, ast.Call)
+        and isinstance(value.func, ast.Attribute)
+        and value.func.attr == "items"
+        and not value.args
+    ):
+        # for k, v in d.items(): k takes d's keys and v its values.
+        for sub_target, view in zip(target.elts, ("keys", "values"), strict=True):
+            method = ast.Attribute(value=value.func.value, attr=view, ctx=ast.Load())
+            _bind(sub_target, ast.Call(func=method, args=[], keywords=[]), values, element=True)
+        return
+    if element and isinstance(target, ast.Name):
+        # Taken in turn from any other iterable, the name holds its elements: a dict's keys, never
+        # its values (BACKLOG #5980).
+        values.setdefault(target.id, []).append(_elements(value))
+        return
     if isinstance(target, ast.Name):
         values.setdefault(target.id, []).append(value)
         return
@@ -1042,7 +1849,9 @@ def _carried(
             _carried(elt, values, seen, flow)
     elif isinstance(expr, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
         _carried(expr.elt, values, seen, flow)
-    elif isinstance(expr, (ast.DictComp, ast.Starred)):
+    elif isinstance(expr, ast.Starred):
+        _carried_elements(expr.value, values, seen, flow)
+    elif isinstance(expr, ast.DictComp):
         _carried(expr.value, values, seen, flow)
     elif isinstance(expr, ast.IfExp):
         _carried(expr.body, values, seen, flow)
@@ -1064,6 +1873,7 @@ def _carried(
     elif isinstance(expr, ast.Call):
         _carried_call(expr, values, seen, flow)
     elif isinstance(expr, ast.Name):
+        flow.read.add(_key(expr))
         if expr.id not in values or expr.id in flow.params:
             # A parameter (even one reassigned locally) or a module global; the caller sorts which.
             flow.unbound.add(expr.id)
@@ -1072,6 +1882,7 @@ def _carried(
             for value in values[expr.id]:
                 _carried(value, values, seen, flow)
     elif isinstance(expr, ast.Attribute):
+        flow.read.add(_key(expr))
         flow.attrs.add(expr.attr)
 
 
@@ -1082,16 +1893,114 @@ def _carried_call(
     container through; any other call's return value is recorded as a helper's to scan."""
     called = _call_name(call.func)
     if called in _COPY_CALLS and isinstance(call.func, ast.Name) and call.args:
-        _carried(call.args[0], values, seen, flow)
+        # list(d) and sorted(d) build from d's elements, which for a dict are its keys.
+        _carried_elements(call.args[0], values, seen, flow)
     elif isinstance(call.func, ast.Attribute) and called in ("get", "copy"):
         _carried(call.func.value, values, seen, flow)
         if called == "get" and len(call.args) > 1:
             _carried(call.args[1], values, seen, flow)
     elif (helper := _helper_name(call.func, flow.modules)) is not None:
         flow.calls.add(helper)
+        # The helper's name is read here for its return value, which is in a role.
+        flow.read.add(_key(call.func))
         # This call's value is in a role, so a pass-through helper's argument is too.
         for root in _slot_arguments(call, flow.passes.get(helper, ())):
             _carried(root, values, seen, flow)
+        for root in _slot_arguments(call, flow.iter_passes.get(helper, ())):
+            _carried_elements(root, values, seen, flow)
+
+
+def _carried_elements(
+    expr: ast.expr, values: Mapping[str, list[ast.expr]], seen: set[str], flow: _Flow
+) -> None:
+    """Add to ``flow`` what ``expr``'s elements are made of, as a loop, a comprehension, ``*expr``
+    or ``list(expr)`` reads them: a dict's keys (never its values), the keys of ``d.keys()``, the
+    values of ``d.values()``; a name read this way is recorded as iterated, so its module binding
+    is read the same way (BACKLOG #5980). ``d.items()`` yields pairs, which carry no name."""
+    if isinstance(expr, ast.Dict):
+        for key, value in zip(expr.keys, expr.values, strict=True):
+            if key is None:
+                # {**other} takes other's keys.
+                _carried_elements(value, values, seen, flow)
+            else:
+                _carried(key, values, seen, flow)
+    elif isinstance(expr, ast.DictComp):
+        _carried(expr.key, values, seen, flow)
+    elif isinstance(expr, ast.IfExp):
+        _carried_elements(expr.body, values, seen, flow)
+        _carried_elements(expr.orelse, values, seen, flow)
+    elif isinstance(expr, ast.BoolOp):
+        for value in expr.values:
+            _carried_elements(value, values, seen, flow)
+    elif isinstance(expr, ast.Name):
+        flow.read.add(_key(expr))
+        if expr.id not in values or expr.id in flow.params:
+            flow.iterated.add(expr.id)
+        # Seen apart from a read for its value, which follows the name separately.
+        if expr.id in values and f"*{expr.id}" not in seen:
+            seen.add(f"*{expr.id}")
+            for value in values[expr.id]:
+                _carried_elements(value, values, seen, flow)
+    elif isinstance(expr, ast.Attribute):
+        flow.read.add(_key(expr))
+        flow.iter_attrs.add(expr.attr)
+    elif isinstance(expr, ast.Call) and (
+        (helper := _helper_name(expr.func, flow.modules)) is not None
+        and not (_call_name(expr.func) in _COPY_CALLS and isinstance(expr.func, ast.Name))
+    ):
+        # Before the dict methods, so ``_routes.all()`` is a helper call, not a method.
+        # A helper's return taken for its elements: the helper is scanned for its returned
+        # elements, and a pass-through argument is iterated with it.
+        flow.iter_calls.add(helper)
+        flow.read.add(_key(expr.func))
+        for root in _slot_arguments(
+            expr, [*flow.passes.get(helper, ()), *flow.iter_passes.get(helper, ())]
+        ):
+            _carried_elements(root, values, seen, flow)
+    elif isinstance(expr, ast.Subscript) or (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "get"
+        and expr.args
+    ):
+        # The elements of a value read out of a table: carried as the table's values, and the
+        # table checked for an inner dict, whose keys would be the elements.
+        _carried(expr, values, seen, flow)
+        base: ast.expr = expr
+        if isinstance(expr, ast.Subscript):
+            base = expr.value
+        elif isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
+            base = expr.func.value
+        # What the table is: module names and attributes are checked by their bound value; a
+        # parameter, a helper's return or a local dict holding a dict is not seen, so unfollowed.
+        probe = _Flow(params=flow.params, modules=flow.modules)
+        _carried(base, values, set(), probe)
+        flow.nested |= probe.unbound - flow.params
+        flow.nested_attrs |= probe.attrs
+        local_inner = any(
+            isinstance(node, (ast.Dict, ast.DictComp)) and node is not base
+            for node in ast.walk(base)
+        ) or any(
+            isinstance(node, (ast.Dict, ast.DictComp)) and node is not value
+            for name in probe.unbound | {n.id for n in ast.walk(base) if isinstance(n, ast.Name)}
+            for value in values.get(name, ())
+            for node in ast.walk(value)
+        )
+        flow.unfollowed = flow.unfollowed or bool(
+            probe.unbound & flow.params or probe.calls or local_inner or probe.is_empty()
+        )
+    elif isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute) and not expr.args:
+        if expr.func.attr in ("keys", "copy"):
+            # A dict's keys, or a copy of a container, iterate as the container does.
+            _carried_elements(expr.func.value, values, seen, flow)
+        elif expr.func.attr == "values":
+            _carried(expr.func.value, values, seen, flow)
+        elif expr.func.attr != "items":
+            _carried(expr, values, seen, flow)
+    else:
+        # A list, a tuple, a set, a comprehension or anything else: its value's parts are its
+        # elements.
+        _carried(expr, values, seen, flow)
 
 
 def _slot_arguments(call: ast.Call, slots: Iterable[tuple[int, str]]) -> list[ast.expr]:
@@ -1105,18 +2014,49 @@ def _slot_arguments(call: ast.Call, slots: Iterable[tuple[int, str]]) -> list[as
     return out
 
 
-def _router_binding_positions(
-    sources: SourceCache, file: str, span: _Span, old: str
+def _keyword_value_positions(
+    sources: SourceCache,
+    file: str,
+    span: _Span,
+    old: str,
+    keyword: str,
+    factory: str,
+    *,
+    in_spec: bool = False,
 ) -> frozenset[tuple[int, int]]:
-    """The ``router=`` values equal to ``old`` in an inbound's declaring statement at ``span``."""
+    """The ``<keyword>=`` values equal to ``old`` in a connection's declaring statement at ``span``:
+    a keyword of the ``factory(...)`` call itself (``inbound``/``outbound``, spelled as
+    :func:`_factory_spellings` finds it), an inbound's ``router=``; or, with ``in_spec``, a keyword
+    of a call inside that call's ``spec`` argument (an inbound's ``Http(reply_from=...)``, an
+    outbound's ``MLLP(reingress_to=...)``, a wrapper around either). The same keyword on any other
+    call in the statement (``_transport(router="r")`` as a sibling argument) is another call's
+    argument, not the binding, so it is left (BACKLOG #5980, #5966). A spec built outside the statement leaves no
+    position, which reports the referrer unresolved."""
     parsed = sources.parse(file)
     if parsed is None:
         return frozenset()
+    spelled = _factory_spellings(parsed[0], {factory})
     flow = _Flow()
     for node in ast.walk(parsed[0]):
-        if isinstance(node, ast.Call) and span.start <= node.lineno <= span.end:
-            for kw in node.keywords:
-                if kw.arg == "router":
+        if not (
+            isinstance(node, ast.Call)
+            and span.start <= node.lineno <= span.end
+            and _call_name(node.func) in spelled
+        ):
+            continue
+        owners = (
+            [
+                call
+                for arg in _slot_arguments(node, [(1, "spec")])
+                for call in ast.walk(arg)
+                if isinstance(call, ast.Call)
+            ]
+            if in_spec
+            else [node]
+        )
+        for owner in owners:
+            for kw in owner.keywords:
+                if kw.arg == keyword:
                     _carried(kw.value, {}, set(), flow)
     return frozenset(sources.position(file, c) for c in flow.consts if c.value == old)
 
@@ -1310,7 +2250,9 @@ def _module_binding_sites(
     sources: SourceCache,
     role_names: set[str],
     role_attrs: set[str],
-) -> tuple[list[_Site], bool]:
+    iter_names: set[str],
+    iter_attrs: set[str],
+) -> tuple[list[_Site], bool, bool]:
     """The module-level statements that bind a name ``func`` reads and hold ``old`` -- a global in
     ``func``'s own module, or an attribute of a config module it reads (``_consts.TARGET``) in that
     module -- and whether every such captured value whose value is ``old`` (or a code set named
@@ -1322,10 +2264,14 @@ def _module_binding_sites(
 
     For a non-table rename only a binding of a name the referrer reads in a referent role is
     rewritten, and only in its bound value: a bare global (``role_names``) in ``func``'s own module,
-    a module attribute (``role_attrs``) in another, as :func:`_scan_referrer` found them.
-    ``SKIP = "h"`` read only in a comparison is left, and counted (BACKLOG #5980)."""
+    a module attribute (``role_attrs``) in another, as :func:`_scan_referrer` found them; a name
+    the referrer iterates (``iter_names``, ``iter_attrs``) gives its bound value's elements.
+    ``SKIP = "h"`` read only in a comparison is left, and counted (BACKLOG #5980). A container a
+    role reads that holds ``old`` (``ALL = [DEST, "OB_A"]``) must be located the same way, and the
+    third value says whether there is one."""
     names_by_file: dict[str, set[str]] = {}
     required: set[tuple[str | None, str]] = set()
+    role_held = False
     for captured in captured_values(func, func.__module__):
         if captured.source == "default":
             continue
@@ -1334,8 +2280,22 @@ def _module_binding_sites(
         if file is not None and captured.source != "closure":
             names_by_file.setdefault(file, set()).add(captured.name)
         value = captured.value
-        if (isinstance(value, str) and value == old) or (
-            isinstance(value, CodeSet) and value.name == old and table_kind == "code_set"
+        # A container is required only when a role reads it: a label table beside a role
+        # (``LABELS = {"diets": ...}``) is not the referent.
+        attribute = captured.source == "attribute"
+        by_value = captured.name in (role_attrs if attribute else role_names)
+        by_element = captured.name in (iter_attrs if attribute else iter_names)
+        # A role reads the name the way it reads the container: an iterated dict for its keys,
+        # a subscripted one for its values.
+        role_holds = (by_value and _holds(value, old)) or (
+            by_element and _holds(value, old, elements=True)
+        )
+        contained = not isinstance(value, str) and role_holds
+        role_held = role_held or role_holds
+        if (
+            (isinstance(value, str) and value == old)
+            or contained
+            or (isinstance(value, CodeSet) and value.name == old and table_kind == "code_set")
         ):
             required.add((file if captured.source != "closure" else None, captured.name))
     sites: list[_Site] = []
@@ -1349,9 +2309,13 @@ def _module_binding_sites(
                 found = any(span.start <= p[0] <= span.end for p in sources.occurrences(file, old))
                 # The bound value is the referent, not a dict key or a comparison beside it.
                 flow = _Flow()
-                read = role_names if file == func.__code__.co_filename else role_attrs
+                own = file == func.__code__.co_filename
+                read = role_names if own else role_attrs
+                iterated = iter_names if own else iter_attrs
                 if stmt.value is not None and stmt_names & read:
                     _carried(stmt.value, {}, set(), flow)
+                if stmt.value is not None and stmt_names & iterated:
+                    _carried_elements(stmt.value, {}, set(), flow)
                 rewritable = frozenset(
                     sources.position(file, c) for c in flow.consts if c.value == old
                 )
@@ -1369,7 +2333,40 @@ def _module_binding_sites(
             sites.append(
                 _Site(file, span, frozenset(allowed) if allowed is not None else None, rewritable)
             )
-    return sites, required <= bound
+    return sites, required <= bound, role_held
+
+
+def _holds(value: object, old: str, depth: int = 0, *, elements: bool = False) -> bool:
+    """Whether ``value`` is ``old`` or a container holding it, a few levels down: a list, tuple or
+    set's elements, a dict's values, or with ``elements`` (a container read by iterating it) a
+    dict's keys and not its values. A container global the referrer reads, built from another
+    name (``ALL = [DEST, "OB_A"]``), holds the old name with no literal at its own binding, so its
+    binding must be located like a string's or the referrer is unresolved (BACKLOG #5980)."""
+    if isinstance(value, str):
+        return value == old
+    if depth >= 4:
+        return False
+    if isinstance(value, dict):
+        return any(
+            _holds(v, old, depth + 1) for v in (value.keys() if elements else value.values())
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_holds(v, old, depth + 1) for v in value)
+    return False
+
+
+def _holds_either(value: object, old: str, depth: int = 0) -> bool:
+    """Whether ``value`` holds ``old`` read any way, a few levels down: as a value, an element, or
+    a dict key at any level (``ROUTES = {"adt": {"OB_X": 1}}``)."""
+    if isinstance(value, str):
+        return value == old
+    if depth >= 4:
+        return False
+    if isinstance(value, dict):
+        return any(_holds_either(v, old, depth + 1) for v in (*value.keys(), *value.values()))
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_holds_either(v, old, depth + 1) for v in value)
+    return False
 
 
 def _binding_read_only_by_referents(
@@ -1389,7 +2386,9 @@ def _binding_read_only_by_referents(
     as a referent. Any other read -- a second declaration (``inbound(NAME, router=NAME)``), another
     object's decorator (``@handler(NAME)``), module-level code, a function no referrer covers, a
     config module that imports it -- would change with it, so the literal is not rewritten: the
-    definition then counts as not located, and a referrer as unresolved (BACKLOG #5980)."""
+    definition then counts as not located, and a referrer as unresolved (BACKLOG #5980). A literal
+    a helper returns is read by every call of the helper, so it is held to the same rule, and so
+    is a read in a covered body that no role takes (:attr:`_Site.reads`)."""
     names: set[str] = set()
     for stmt, stmt_names in _module_bindings(sources, file, None):
         if stmt.value is not None and any(
@@ -1397,6 +2396,12 @@ def _binding_read_only_by_referents(
             for node in ast.walk(stmt.value)
         ):
             names |= stmt_names
+    # A helper's returned literal is read by every call of the helper, the same way.
+    names |= {
+        site.helper
+        for site in covering
+        if site.helper is not None and site.file == file and pos in site.returned
+    }
     if not names:
         return True
     if len(declaring) > 1 or modules is None:
@@ -1405,6 +2410,10 @@ def _binding_read_only_by_referents(
         if reader_file == file and sources.position(file, node) in declaring:
             continue
         if not _in_covered_body(sources, reader_file, node, covering):
+            return False
+        # In a covered body, only a read a role takes, or one that does not depend on the value:
+        # ``if msg.x == TARGET`` beside ``Send(TARGET, msg)`` would change with it (BACKLOG #5980).
+        if not any(site.file == reader_file and _key(node) in site.reads for site in covering):
             return False
     return True
 
@@ -1663,17 +2672,6 @@ def _unresolved_referrers(
 # --- python literal rewriting (tokenize) -------------------------------------
 
 
-def _has_bom(file: str) -> bool:
-    """Whether ``file`` starts with a UTF-8 byte-order mark."""
-    try:
-        with open(file, "rb") as fh:
-            return fh.read(3) == codecs.BOM_UTF8
-    except OSError as exc:
-        # The tokenizer cannot read it either, so it yields no edit for the shift to apply to.
-        _log.debug("rename could not read %s for a byte-order mark: %s", file, type(exc).__name__)
-        return False
-
-
 def _source_position(edit: LiteralEdit, bom_files: frozenset[str]) -> tuple[int, int]:
     """``edit``'s position as the AST positions count it. An edit is tokenized from a plain UTF-8
     read, which keeps a byte-order mark as the first character of line 1, while ``SourceCache``
@@ -1683,15 +2681,21 @@ def _source_position(edit: LiteralEdit, bom_files: frozenset[str]) -> tuple[int,
     return edit.start_line, edit.start_col
 
 
-def _py_literal_edits(file: str, old: str, new: str, spans: list[_Span]) -> list[LiteralEdit]:
+def _py_literal_edits(
+    sources: SourceCache, file: str, old: str, new: str, spans: list[_Span]
+) -> list[LiteralEdit]:
     """Every plain-``str`` literal whose decoded value == ``old`` inside one of ``spans`` in ``file``.
 
     tokenize is the authority: an f-string (its own token kinds), a bytes literal, or a fragment of an
     implicit adjacent-string concatenation is never matched — only a lone plain ``str`` whose value is
     exactly ``old``."""
     try:
-        text = Path(file).read_text(encoding="utf-8")
-    except OSError:
+        # Through the cache, so the plan's snapshot holds the bytes these edits were computed from.
+        text = sources.text(file)
+    except UnicodeDecodeError as exc:
+        _log.debug("rename could not decode %s: %s", file, type(exc).__name__)
+        return []
+    if text is None:
         return []
     try:
         toks = list(tokenize.generate_tokens(io.StringIO(text).readline))
@@ -1781,37 +2785,84 @@ def _in_any_span(line: int, spans: list[_Span]) -> bool:
 # --- connections.toml text rewriting -----------------------------------------
 
 
-def _toml_value_edits(toml_path: str, key: str, old: str, new: str) -> list[LiteralEdit]:
-    """Rewrite a ``connections.toml`` ``<key> = "old"`` assignment as text (no TOML round-trip).
+#: A ``connections.toml`` value a rename rewrites: the file, the connection table (``inbound`` /
+#: ``outbound``) and the key path inside an entry (``("name",)``, ``("settings", "reply_from")``).
+_TomlTarget = tuple[str, str, tuple[str, ...]]
 
-    Matches only a line whose value is exactly ``old`` between matching quotes (no escapes), so a
-    substring or a differently-keyed value is never touched. The quote style is preserved."""
+#: A table header line: ``[[inbound]]``, ``[outbound.settings]``. A quoted key part is not matched,
+#: so the lines under it are attributed to no table and are never rewritten. The path is one flat
+#: character class, split and checked by :func:`_toml_key_path`: a ``part(.part)*`` group would be
+#: a nested quantifier, which the ReDoS gate refuses (tests/test_security_static.py).
+_TOML_HEADER = re.compile(r"^\s*\[\[?(?P<path>[A-Za-z0-9_.\s-]+)\]\]?\s*(?:#.*)?$")
+
+#: A bare or dotted key assigned a one-line string with no escape: ``router = "r"``. The key, its
+#: leading space included, is checked by :func:`_toml_key_path` as the header's path is.
+_TOML_STRING_KEY = re.compile(
+    r"^(?P<pre>(?P<key>[A-Za-z0-9_.\s-]+)=\s*)"
+    r"(?P<lit>(?P<q>[\"'])(?P<value>[^\"'\\\r\n]*)(?P=q))\s*(?:#.*)?$"
+)
+
+
+def _toml_edits(
+    sources: SourceCache, toml_path: str, table: str, keys: tuple[str, ...], old: str, new: str
+) -> list[LiteralEdit] | None:
+    """Rewrite, as text (no TOML round-trip), every ``<table>`` entry's value at ``keys`` equal to
+    ``old`` in ``toml_path``: ``[]`` when no entry holds it, ``None`` when the edits cannot be proved.
+
+    A candidate is a string assignment of ``old`` whose key path, under the table header above it,
+    is exactly ``(table, *keys)``, so a ``name`` under ``[inbound.metadata]``, or an outbound named
+    like the inbound being renamed, is not one. The candidates are then applied in memory and the
+    file parsed again: the result must equal the original with exactly those values changed. A value
+    spelled another way (an inline table, a quoted key, an escape) fails that check, so its referrer
+    is reported rather than left reading the old name (BACKLOG #5980). The quote style and every
+    other byte survive."""
     try:
-        text = Path(toml_path).read_text(encoding="utf-8")
-    except OSError:
+        # Decoded as apply_rename decodes it, so line numbers agree, from the cached bytes the
+        # plan's snapshot holds.
+        raw = sources.raw(toml_path)
+        if raw is None:
+            return None
+        text = raw.decode("utf-8")
+        before = tomllib.loads(text)
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        _log.debug("rename could not read %s: %s", toml_path, type(exc).__name__)
+        return None
+    # ``before`` becomes the expected result: the original with exactly those values changed.
+    expected = before
+    entries = expected.get(table)
+    held = 0
+    for entry in entries if isinstance(entries, list) else ():
+        parent: object = entry
+        for key in keys[:-1]:
+            parent = parent.get(key) if isinstance(parent, dict) else None
+        if isinstance(parent, dict) and parent.get(keys[-1]) == old:
+            parent[keys[-1]] = new
+            held += 1
+    if not held:
         return []
-    pattern = re.compile(
-        r"^(?P<pre>\s*"
-        + re.escape(key)
-        + r"\s*=\s*)(?P<lit>(?P<q>[\"'])"
-        + re.escape(old)
-        + r"(?P=q))"
-    )
+    wanted = (table, *keys)
+    header: tuple[str, ...] | None = ()
     edits: list[LiteralEdit] = []
-    # Number lines exactly as apply_rename splits them: a TOML string may hold U+2028 or U+0085, and a
-    # split on those would shift every later edit's line.
-    for lineno, line in enumerate(source_lines(text), start=1):
-        line = line.rstrip("\r\n")
-        m = pattern.match(line)
-        if m is None:
+    lines = source_lines(text)
+    for lineno, raw_line in enumerate(lines, start=1):
+        line = raw_line.rstrip("\r\n")
+        header_match = _TOML_HEADER.match(line)
+        if header_match is not None:
+            # A path with an empty or spaced part is no header this reads: no table is known.
+            header = _toml_key_path(header_match.group("path"))
             continue
-        # Guard against a trailing non-comment token that would make this not a bare scalar assignment.
-        rest = line[m.end("lit") :].lstrip()
-        if rest and not rest.startswith("#"):
+        if line.lstrip().startswith("[") and line.rstrip().endswith("]"):
+            # A header this pattern does not read (a quoted key part): no table is known until the
+            # next one. A line that only starts with "[", a nested array's element, is a value.
+            header = None
             continue
-        lit = m.group("lit")
-        quote = m.group("q")
-        col = len(m.group("pre"))
+        m = _TOML_STRING_KEY.match(line)
+        if m is None or m.group("value") != old or header is None:
+            continue
+        key_path = _toml_key_path(m.group("key"))
+        if key_path is None or (*header, *key_path) != wanted:
+            continue
+        lit, quote, col = m.group("lit"), m.group("q"), len(m.group("pre"))
         edits.append(
             LiteralEdit(
                 file=toml_path,
@@ -1823,40 +2874,78 @@ def _toml_value_edits(toml_path: str, key: str, old: str, new: str) -> list[Lite
                 new_literal=f"{quote}{new}{quote}",
             )
         )
-    return edits
+    for edit in edits:
+        _apply_one(lines, edit)
+    try:
+        after = tomllib.loads("".join(lines))
+    except tomllib.TOMLDecodeError as exc:
+        _log.info("rename refused its edits to %s: they do not parse (%s)", toml_path, exc)
+        return None
+    # By repr, so a nan, which never equals itself, still compares equal to the nan it was.
+    return edits if repr(after) == repr(expected) else None
+
+
+#: The characters of a bare TOML key part.
+_TOML_BARE_KEY_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+
+
+def _toml_key_path(key: str) -> tuple[str, ...] | None:
+    """A bare dotted TOML key's parts (``settings . reply_from`` -> ``("settings", "reply_from")``),
+    or ``None`` when a part is empty or holds a character a bare key cannot (a space inside it)."""
+    parts = tuple(part.strip() for part in key.split("."))
+    if all(part and _TOML_BARE_KEY_CHARS.issuperset(part) for part in parts):
+        return parts
+    return None
 
 
 # --- apply -------------------------------------------------------------------
 
 
-def _apply_one(lines: list[str], edit: LiteralEdit) -> bool:
-    """Apply one edit in place, returning whether it was applied (``False`` = span already renamed)."""
-    if edit.start_line == edit.end_line:
-        idx = edit.start_line - 1
-        if idx >= len(lines):
-            return False
-        line = lines[idx]
-        current = line[edit.start_col : edit.end_col]
-        if current == edit.old_literal:
-            lines[idx] = line[: edit.start_col] + edit.new_literal + line[edit.end_col :]
-            return True
-        # Idempotent no-op: the span already carries the new literal (a re-applied plan).
-        if line[edit.start_col : edit.start_col + len(edit.new_literal)] == edit.new_literal:
-            return False
-        return False
-    # Multi-line (triple-quoted) literal: reconstruct the region across the affected lines.
-    lo, hi = edit.start_line - 1, edit.end_line - 1
-    if hi >= len(lines):
-        return False
-    region_lines = lines[lo : hi + 1]
+def _region(lines: list[str], edit: LiteralEdit) -> tuple[str, int]:
+    """The text of ``edit``'s lines joined, and the offset in it where the edit's span ends."""
+    region_lines = lines[edit.start_line - 1 : edit.end_line]
     region = "".join(region_lines)
-    inner_start = edit.start_col
-    inner_end = len(region) - (len(region_lines[-1]) - edit.end_col)
-    if region[inner_start:inner_end] != edit.old_literal:
-        return False
-    new_region = region[:inner_start] + edit.new_literal + region[inner_end:]
-    # Re-split as apply_rename split the file, so an earlier edit on line ``lo`` still indexes its line.
-    lines[lo : hi + 1] = source_lines(new_region)
+    return region, len(region) - (len(region_lines[-1]) - edit.end_col)
+
+
+def _apply_one(lines: list[str], edit: LiteralEdit) -> None:
+    """Replace ``edit``'s span, which carries its old literal, in place."""
+    region, end = _region(lines, edit)
+    new_region = region[: edit.start_col] + edit.new_literal + region[end:]
+    # Re-split as apply_rename split the file, so an earlier edit on its first line still indexes it.
+    lines[edit.start_line - 1 : edit.end_line] = source_lines(new_region)
+
+
+def _span_text(lines: list[str], edit: LiteralEdit) -> str | None:
+    """The text ``edit`` spans in ``lines``, or ``None`` past the end, with its line ends as
+    ``\\n``: the plan read the literal with universal newlines, so a literal continued over a CRLF
+    line end still matches it."""
+    if edit.end_line > len(lines):
+        return None
+    region, end = _region(lines, edit)
+    return region[edit.start_col : end].replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _already_renamed(lines: list[str], edits: list[LiteralEdit]) -> bool:
+    """Whether every edit's new literal sits where applying the edits would have put it.
+
+    A new literal is one line (a name holds no line break), so an edit moves the text after it on
+    its last line by the literal's change in length, and every later line up by the lines it spanned."""
+    line_shift = 0
+    prev: tuple[int, int, int, int] | None = None  # the last edit's old end, and where it now ends
+    for edit in sorted(edits, key=lambda e: (e.start_line, e.start_col)):
+        if prev is not None and edit.start_line == prev[0]:
+            at = (prev[2], prev[3] + edit.start_col - prev[1])
+        else:
+            at = (edit.start_line + line_shift, edit.start_col)
+        line, col = at
+        if (
+            line > len(lines)
+            or lines[line - 1][col : col + len(edit.new_literal)] != edit.new_literal
+        ):
+            return False
+        line_shift += edit.start_line - edit.end_line
+        prev = (edit.end_line, edit.end_col, at[0], at[1] + len(edit.new_literal))
     return True
 
 
@@ -1873,6 +2962,9 @@ def _validate_new_name(config_dir: Path, target_kind: str, new: str) -> None:
     # refuse anything that could corrupt the rewrite.
     if has_control_char(new):
         raise WiringError(f"the new name {new!r} must not contain control characters")
+    if has_lone_surrogate(new):
+        # Not encodable as UTF-8, so no file could be written with it.
+        raise WiringError(f"the new name {new!r} must not contain a lone surrogate")
     if any(ch in new for ch in ("'", '"', "\\")):
         raise WiringError(f"the new name {new!r} must not contain a quote or backslash")
     # A renamed connection must still load (BACKLOG #1107): refuse here, before any file is rewritten.

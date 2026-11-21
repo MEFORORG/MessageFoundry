@@ -70,7 +70,7 @@ loader's own wording inline.
 | `messagefoundry codeset list --config DIR` | Summarize every set under `codesets/` (`.csv` **and** `.toml`), sorted by name. |
 | `messagefoundry codeset show --config DIR --name N` | The grid for set `N` (headers + rows); `format:"toml"` ⇒ read-only. |
 | `messagefoundry codeset upsert --config DIR [--data JSON]` | Validate → write an owner-only candidate of `codesets/N.csv` → **load the candidate as the final check** → replace the live file with it; a bad save never touches the live file. DETAIL JSON comes from `--data` or stdin. |
-| `messagefoundry codeset rename --config DIR --name N --to M` | Name-safety on **both** `N` and `M` (a bare stem, no separator, `..`, drive or extension) → atomic `os.replace` of `codesets/N.<ext>` → `codesets/M.<ext>`; rejects a stem collision. |
+| `messagefoundry codeset rename --config DIR --name N --to M` | Name-safety on **both** `N` and `M` (a bare stem, no separator, `..`, drive or extension), then an atomic `os.replace` of `codesets/N.<ext>` to `codesets/M.<ext>`, and every `code_set("N")` reference rewritten to `M`. Refuses, with nothing moved, at least on a stem collision, a config that does not load (its references cannot be found), a reference it cannot rewrite, and a referencing file that changed after the plan. A reference write that fails comes after the table moved: the references written are restored and the table is moved back to its old name. If that move back fails, the table is left under its new name while its references read the old one, and the error says so. On an interrupt such as Ctrl-C after the table moved, the table is moved back only when no reference file is left rewritten. Otherwise it stays under its new name and the log names, at `ERROR`, the files left rewritten and the files that still read the old name; when only some were rewritten, the config does not load until those are fixed by hand. |
 | `messagefoundry codeset remove --config DIR --name N` | Delete `codesets/N.csv` (else `.toml`). |
 
 Add `--json` to any command for machine-readable output.
@@ -128,17 +128,20 @@ Editing a `codesets/` file changes nothing live; the running graph adopts the ch
 **existing audited `POST /config/reload`** (the IDE promote), exactly like a connection or handler
 change.
 
-**Renaming or removing a code set can break a handler reference.** A code set is referenced by **name**
-from a Handler (`code_set("epic_diets")`), and that reference is resolved at the loader/runner — not by
-`messagefoundry codeset`. So after a rename/remove, a `code_set("old_name")` call raises at run time
-(that message's `ERROR` disposition). A plain `validate` only confirms each *file* parses, so it
-**won't** catch a now-dangling reference.
+**Removing a code set can break a handler reference.** A code set is referenced by **name** from a
+Handler (`code_set("epic_diets")`), and that reference is resolved at the loader/runner. So after a
+remove, a `code_set("old_name")` call raises at run time (that message's `ERROR` disposition). The
+remove warns of the referrers it finds but deletes the table anyway. A plain `validate` only confirms
+each *file* parses, so it **won't** catch a now-dangling reference.
+
+**A rename rewrites the references it can find** (`impact`'s rename plan, BACKLOG #5980) and refuses,
+with nothing moved, when it finds one it cannot rewrite. It still cannot see a name computed at call
+time (`code_set(prefix + "_diets")`) or one reached through code the plan does not read.
 
 > **After a rename or remove, run `messagefoundry check` before promoting.** Its dry-run actually
 > executes the transforms, so it triggers the lookup and surfaces a broken `code_set(...)` reference at
-> the gate rather than at the first message in production. The editor deliberately does **not** scan
-> handler source for references (that would couple a data tool to code parsing and still miss a
-> call-time-computed name) — the `messagefoundry check` dry-run is the safety net.
+> the gate rather than at the first message in production. For a remove, and for a reference a
+> rename's plan cannot see, the `messagefoundry check` dry-run is the safety net.
 
 ## Out of scope
 
