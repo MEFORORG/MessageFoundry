@@ -423,10 +423,10 @@ def test_the_detach_and_the_download_route_share_the_store_bound() -> None:
     # One width, owned by the store (BACKLOG #1619): the API once kept its own 255 beside it.
     from messagefoundry.api import app as api_app
 
-    assert wiring_runner.ATTACHMENT_CONTENT_TYPE_MAX is ATTACHMENT_CONTENT_TYPE_MAX
-    assert api_app.ATTACHMENT_CONTENT_TYPE_MAX is ATTACHMENT_CONTENT_TYPE_MAX
+    # Each module reads the store's own name, not a copy of the number.
+    assert vars(wiring_runner)["ATTACHMENT_CONTENT_TYPE_MAX"] is ATTACHMENT_CONTENT_TYPE_MAX
+    assert vars(api_app)["ATTACHMENT_CONTENT_TYPE_MAX"] is ATTACHMENT_CONTENT_TYPE_MAX
     widest = "application/" + "x" * (ATTACHMENT_CONTENT_TYPE_MAX - len("application/"))
-    # Both pass the length bound, so the generic type below comes from the allow-list, not the bound.
     assert wiring_runner._label_fits_every_backend(widest)
     assert not wiring_runner._label_fits_every_backend(widest + "x")
 
@@ -440,7 +440,7 @@ async def test_the_magic_byte_head_is_read_off_the_event_loop(
 
     loop_thread = threading.get_ident()
     seen: list[int] = []
-    real = wiring_runner.b64_head
+    real = vars(wiring_runner)["b64_head"]
 
     def recording(b64: str, max_bytes: int = 32) -> bytes:
         seen.append(threading.get_ident())
