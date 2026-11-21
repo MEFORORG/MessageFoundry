@@ -97,7 +97,7 @@ from messagefoundry.config.tls_policy import (
     narrow_to_approved_suites,
 )
 from messagefoundry.connection_events import check_connection_event_kind
-from messagefoundry.redaction import safe_text
+from messagefoundry.redaction import json_loads_or_refusal, safe_text
 from messagefoundry.store import server_schema_verify
 from messagefoundry.store.audit_exclusion import AuditExclusion
 from messagefoundry.store.audit_tee import emit_audit_tee
@@ -6330,7 +6330,13 @@ class PostgresStore:
     ) -> bool:
         """Postgres twin of :meth:`MessageStore.ingress_handoff` (ADR 0013 Increment 2) — the same
         single-transaction guarded-DELETE handoff under one ``conn.transaction()``. A no-op (work-row
-        already consumed) rolls the transaction back via the internal sentinel and returns ``False``."""
+        already consumed) rolls the transaction back via the internal sentinel and returns ``False``.
+
+        A token that can never be handed off is dead-lettered and consumed, returning ``True``: a
+        corrupt reference, a missing or erased reply, an origin metadata cell that fails its tag, a
+        depth past the cap, and (BACKLOG #5689) a reply or origin metadata cell that does not
+        decrypt, or origin metadata that does not parse. A decrypt failure from a key service that
+        gave no verdict propagates instead, as any other error does."""
 
         class _Noop(Exception):
             pass
@@ -6433,9 +6439,27 @@ class PostgresStore:
                             "re-ingress reply erased",
                             erased=True,
                         )
+
                     # BACKLOG #5689: a reply or an origin cell that will never open or parse
-                    # dead-letters the token, so the loopback lane moves. A key service that gave no
-                    # verdict says nothing about the cell, so it propagates and the token is retried.
+                    # dead-letters the token, keeping its reference for a replay, so the loopback
+                    # lane moves. A key service that gave no verdict says nothing about the cell, so
+                    # its error propagates and the token is retried.
+                    async def _dead_unopenable(exc: CipherError, what: str, label: str) -> bool:
+                        if is_transient_open_failure(exc):
+                            raise exc
+                        log.warning(
+                            "ingress_handoff: %s of work-row %s does not decrypt (%s);"
+                            " dead-lettering",
+                            what,
+                            response_row_id,
+                            type(exc).__name__,
+                        )
+                        return await _consume_dead(
+                            label,
+                            f"re-ingress {what} does not decrypt ({type(exc).__name__})",
+                            f"re-ingress {what} undecryptable",
+                        )
+
                     try:
                         body = (
                             self._dec(
@@ -6445,12 +6469,8 @@ class PostgresStore:
                             or ""
                         )
                     except CipherError as exc:
-                        if is_transient_open_failure(exc):
-                            raise
-                        return await _consume_dead(
-                            "ingress_handoff(reply-unopenable)",
-                            "re-ingress reply does not decrypt",
-                            "re-ingress reply undecryptable",
+                        return await _dead_unopenable(
+                            exc, "reply", "ingress_handoff(reply-unopenable)"
                         )
                     mrow = await conn.fetchrow(
                         "SELECT channel_id, metadata FROM messages WHERE id=$1", origin_id
@@ -6478,25 +6498,31 @@ class PostgresStore:
                             "re-ingress origin failed its integrity check",
                         )
                     except CipherError as exc:
-                        if is_transient_open_failure(exc):
-                            raise
-                        return await _consume_dead(
-                            "ingress_handoff(origin-unopenable)",
-                            "re-ingress origin metadata does not decrypt",
-                            "re-ingress origin metadata undecryptable",
+                        return await _dead_unopenable(
+                            exc, "origin metadata", "ingress_handoff(origin-unopenable)"
                         )
+                    refusal: str | None = None
+                    if meta_json:
+                        loaded, refusal = json_loads_or_refusal(meta_json)
+                        if isinstance(loaded, dict):
+                            origin_meta = loaded
                     try:
-                        if meta_json:
-                            loaded = json.loads(meta_json)
-                            if isinstance(loaded, dict):
-                                origin_meta = loaded
                         child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
-                    except (ValueError, TypeError, OverflowError, RecursionError):
-                        # Corrupt JSON, or a depth that is not an integer (a string, a list, an
-                        # infinity): the lineage is unreadable, so the child's depth is unknowable.
+                    except (ValueError, TypeError, OverflowError) as exc:
+                        refusal = type(exc).__name__
+                    if refusal is not None:
+                        # Metadata that is not JSON, or a depth int() cannot read (a list, an
+                        # infinity, a word): the lineage is unreadable, so the child's depth is
+                        # unknowable. The hint is content-free, never the cell's text.
+                        log.warning(
+                            "ingress_handoff: origin metadata of work-row %s is unparseable (%s);"
+                            " dead-lettering",
+                            response_row_id,
+                            refusal,
+                        )
                         return await _consume_dead(
                             "ingress_handoff(origin-metadata)",
-                            "re-ingress origin metadata is unparseable",
+                            f"re-ingress origin metadata is unparseable ({refusal})",
                             "re-ingress origin metadata unparseable",
                         )
                     root = origin_meta.get("correlation_root_id") or origin_id

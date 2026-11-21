@@ -6113,6 +6113,7 @@ async def test_ingress_handoff_dead_letters_a_token_it_can_never_hand_off(
         good = await contract.captured(s, control="HP-GOOD", now=2.0)
         # The handoff's own body read; the worker's earlier read is BACKLOG #4995's contract.
         await (spoil or contract.spoil_with_a_foreign_key)(fetch, raw, bad, good)
+        before = await contract.token_of(fetch, bad)
         for _ in range(2):
             item = await s.claim_next_fifo(LOOP, now=3.0, stage=Stage.RESPONSE.value)
             assert item is not None
@@ -6130,7 +6131,10 @@ async def test_ingress_handoff_dead_letters_a_token_it_can_never_hand_off(
             )
         assert await s.claim_next_fifo(LOOP, now=5.0, stage=Stage.RESPONSE.value) is None
 
-        assert (await contract.token_of(fetch, bad))["status"] == OutboxStatus.DEAD.value
+        after = await contract.token_of(fetch, bad)
+        # Dead with its reference kept, so a replay can retry it once the cause is fixed.
+        assert after["status"] == OutboxStatus.DEAD.value
+        assert after["payload"] == before["payload"] and after["payload"] != ""
         # Read raw: a keyed get_message would refuse the spoiled metadata cell itself.
         [origin] = await fetch("SELECT status FROM messages WHERE id=?", (bad,))
         assert origin["status"] == MessageStatus.ERROR.value
