@@ -31,7 +31,7 @@ from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
-from messagefoundry.transports.mllp import MLLPDestination
+from messagefoundry.transports.mllp import MLLPDestination, parse_encoding_characters
 from tests._claim_lock_helpers import claim_past_empty_yield
 from tests._mllp_recorder import MllpRecorder, run_one_batch
 
@@ -663,15 +663,37 @@ async def test_a_colliding_head_is_dead_lettered_alone_and_the_rest_batch(
     assert "cannot be batched" in error and "MSGX" not in error and "ADT" not in error
 
 
-@pytest.mark.parametrize("rewrite", [False, True], ids=["verbatim", "raw-separators"])
-async def test_a_colliding_member_is_refused_wherever_it_sits(store: Any, rewrite: bool) -> None:
-    # Round-3 review: refused only as the head, a later colliding member was carried, and a send
-    # that rewrites the envelope's delimiters rewrote it under the BHS's, so MSH-9 "ADT~A01" read
-    # as two repetitions on the wire. Its disposition also hung on which member the window put
-    # first. Every colliding member is refused alone now, wherever it sits.
-    field = {"hl7_raw_separators": True} if rewrite else {}
+async def test_a_verbatim_outbound_carries_a_colliding_member_that_does_not_head(
+    store: Any,
+) -> None:
+    # A verbatim outbound sends each member's own bytes, so a colliding member behind the head is
+    # delivered as origin/main delivers it; only the would-be heads are refused (BACKLOG #5972).
     mids = await _enqueue_bodies(store, [_COLLIDING, _COLLIDING, _msg(3), _COLLIDING, _msg(5)])
-    rec = await _run_one_batch(store, simulate=False, **field)
+    rec = await _run_one_batch(store, simulate=False)
+    (envelope,) = rec.sent
+    assert envelope.split("\r")[0].split("|")[10] == "MSG3"  # BHS-11, the first kept member
+    assert _COLLIDING in envelope and envelope.endswith("BTS|3\r")
+    assert await _states(store, mids) == [
+        DEAD_LETTERED,
+        DEAD_LETTERED,
+        DELIVERED,
+        DELIVERED,
+        DELIVERED,
+    ]
+
+
+@pytest.mark.parametrize("rewrite", ["raw-separators", "encoding-characters"])
+async def test_a_rewriting_outbound_refuses_a_colliding_member_wherever_it_sits(
+    store: Any, rewrite: str
+) -> None:
+    # A send that rewrites the envelope's delimiters would rewrite a later colliding member under
+    # the BHS's, so MSH-9 "ADT~A01" would read as two repetitions on the wire. There every
+    # colliding member is refused alone, wherever it sits (BACKLOG #5972).
+    mids = await _enqueue_bodies(store, [_COLLIDING, _COLLIDING, _msg(3), _COLLIDING, _msg(5)])
+    dest = MllpRecorder(DEST, hl7_raw_separators=rewrite == "raw-separators")
+    if rewrite == "encoding-characters":
+        dest.encoding_characters = parse_encoding_characters("|^~\\&")
+    rec = await _run_one_batch(store, simulate=False, dest=dest)
     (envelope,) = rec.sent
     assert envelope.split("\r")[0].split("|")[10] == "MSG3"  # BHS-11, the first kept member
     assert [m.split("|")[9] for m in split_batch(envelope)] == ["MSG3", "MSG5"]

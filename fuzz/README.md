@@ -27,8 +27,10 @@ a message. Their refusals are named on each target in `fuzz/targets.py`; two are
   ONE request, as the listener reads one per connection, with small header, stream and body caps so
   each cap branch is reachable. It does not run the header-mode authentication the listener runs
   between head and body.
-* `binary_carriage` allows **no** exception at all out of `strip_documents`: the store backends'
-  retention pass calls it with no `try`, so a raise there aborts the whole pass.
+* `binary_carriage` allows **no** exception at all out of `strip_documents`: its contract is
+  that a body it does not strip comes back unchanged. The retention pass
+  (`transform_strip_batch`) catches a raise and skips the row, logging only the error's type, so
+  a raise leaves that row's document past its window with no stated cause.
 
 Three of the new targets also assert a property the decoder's own docstring states, and raise
 `AssertionError` when it fails, which libFuzzer records like any other escape:

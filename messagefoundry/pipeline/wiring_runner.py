@@ -11825,8 +11825,10 @@ class RegistryRunner:
         carry, that holds more than one message (ADR 0209), or that itself breaks the re-attach of
         its detached document (vault BACKLOG #2809), is taken out before the envelope is built and
         dead-lettered alone, and "all N" above means the rest. So is a member whose short MSH-2
-        fills a delimiter with one it already uses, wherever it sits, since neither the head's
-        BHS nor a send's delimiter rewrite can write it (BACKLOG #5972). The envelope's head is then the
+        fills a delimiter with one it already uses, since neither the head's BHS nor a send's
+        delimiter rewrite can write it (BACKLOG #5972): wherever it sits on an outbound that
+        rewrites delimiters, and only where it would head the envelope on one that sends each
+        member's own bytes. The envelope's head is then the
         first member that survived.
 
         **Invariants.** Every member is INFLIGHT throughout the window, so a crash recovers the whole set in
@@ -12037,13 +12039,17 @@ class RegistryRunner:
                 kept, members = hydrated_items, list[Message | str](hydrated)
             # A member whose short MSH-2 fills a delimiter with one it already uses cannot be
             # written in its own delimiters (BACKLOG #5972). As the head, the BHS would be such a
-            # write, and encode_batch refuses the whole batch for it; later, a send that
-            # rewrites the envelope's delimiters would rewrite the member under the BHS's and
-            # change what it reads as. Each such member is refused alone wherever it sits, so its
-            # disposition does not depend on which member the window put first, and the rest
-            # batch. Each verdict reads a few characters of the member's first line, so it runs
-            # here rather than in a thread.
+            # write, and encode_batch refuses the whole batch for it, so each would-be head is
+            # refused alone and the next member heads. Later in the envelope, an outbound that
+            # rewrites delimiters would rewrite the member under the BHS's and change what it
+            # reads as, so there it is refused wherever it sits; a verbatim outbound sends the
+            # member's own bytes, as it always has, so there only a would-be head is refused.
+            # Each verdict reads a few characters of the member's first line, so it runs here
+            # rather than in a thread.
             collides = [batch_member_collides(m) for m in members]
+            if not _rewrites_delimiters(connector):
+                heads = next((i for i, hit in enumerate(collides) if not hit), len(collides))
+                collides = [hit and i < heads for i, hit in enumerate(collides)]
             colliding = [
                 self._refuse_alone_or_raise(it.id, _colliding_member_refusal())
                 for it, hit in zip(kept, collides, strict=True)
@@ -14786,6 +14792,15 @@ async def _read_from_store[T](what: str, read: Callable[[], Awaitable[T]]) -> T:
     except Exception as exc:
         fault = _StoreReadFault(f"store {what} failed: {safe_exc(exc)}")
     raise fault
+
+
+def _rewrites_delimiters(connector: object) -> bool:
+    """Whether ``connector`` rewrites a payload's delimiters before it sends it: an MLLP outbound
+    with ``encoding_characters`` or ``hl7_raw_separators`` set (BACKLOG #5972). Read off the
+    instance, so a connector with neither, or a test double, sends its payload's own bytes."""
+    return getattr(connector, "encoding_characters", None) is not None or bool(
+        getattr(connector, "hl7_raw_separators", False)
+    )
 
 
 def _frames(connector: object) -> bool:

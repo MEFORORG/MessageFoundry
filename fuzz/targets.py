@@ -623,10 +623,11 @@ def _binary_carriage(data: bytes) -> None:
 
     * ``decode`` of a carriage string built from them -- ``BinaryCarriageError`` is its refusal;
     * ``parse_doc_ref`` when the text claims to be a handle -- ``DocRefError`` is its refusal;
-    * ``strip_documents``, bare and as a carriage value, with **no** exception allowed at all. The
-      retention pass in each store backend calls it on every stored body with no ``try``, so a raise
-      here would abort the whole pass, not just skip one row. Its docstring promises that a body it
-      does not strip comes back unchanged;
+    * ``strip_documents``, bare and as a carriage value, with **no** exception allowed at all. Its
+      docstring promises that a body it does not strip comes back unchanged. The retention pass
+      (``transform_strip_batch``) catches a raise and skips the row, logging only the error's
+      type, so a raise there would leave that row's document past its window with no stated
+      cause;
     * after ``Message.parse`` (``HL7PeekError`` is its refusal), ``iter_obx_documents`` -- the ingress
       document-detach scan, whose refusals are ``EscapedDocumentError``, for a handle a sender
       wrote into ``OBX-5.5`` ``InboundDocRefError``, for a value the splice would not set back
@@ -647,9 +648,10 @@ def _binary_carriage(data: bytes) -> None:
     if is_doc_ref(text):
         with contextlib.suppress(DocRefError):
             parse_doc_ref(text)
-    # The retention pass calls strip_documents with no try, so no raise is allowed. It passes
-    # on_unwritable, which opens a branch of its own (BACKLOG #5972), so the body is stripped
-    # both with it and with the default every other caller gets.
+    # strip_documents' contract is that a body it does not strip comes back unchanged, so no
+    # raise is allowed (the retention pass would only skip the row and log its error type). The
+    # pass passes on_unwritable, which opens a branch of its own (BACKLOG #5972), so the body is
+    # stripped both with it and with the default every other caller gets.
     strip_documents(CARRIAGE_MARKER + text, pruned_at=0.0)
     strip_documents(text, pruned_at=0.0)
     strip_documents(text, pruned_at=0.0, on_unwritable=_ignore)
