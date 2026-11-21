@@ -1108,8 +1108,8 @@ def _options_error(exc: BaseException) -> str:
     """How the database-options check renders an error into its refusals and logs (BACKLOG #5666):
     its text through ``redact_log_line``, since ODBC text can echo connection parameters. The
     redacted text keeps a driver's diagnosis, such as an untrusted certificate or a query timeout,
-    readable. Where redaction changes nothing the text is the error's own, so the CLI's
-    ``_engine_refusal_text`` still finds and replaces it."""
+    readable. The CLI's ``_engine_refusal_text`` matches this rendering as well as the error's own
+    text, so it still prints its SQLSTATE form in place of either."""
     return redact_log_line(str(exc))
 
 
