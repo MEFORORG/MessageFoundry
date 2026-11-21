@@ -186,8 +186,8 @@ def test_a_refused_client_ca_is_reported_and_the_store_is_untouched(
     )
     assert rc == 2
     assert "error: the API TLS context was not built:" in capsys.readouterr().err
-    assert len(grab.starting(_CLIENT_CA_LINE)) == 1, grab.seen
     assert _store_files(db) == before
+    assert len(grab.starting(_CLIENT_CA_LINE)) == 1, grab.seen
 
 
 def test_a_keyless_store_is_not_sealed_by_a_refused_keyed_start(
@@ -202,8 +202,8 @@ def test_a_keyless_store_is_not_sealed_by_a_refused_keyed_start(
     before = _store_files(db)
     rc, _db = _serve_with_client_ca(tmp_path, monkeypatch, pin=_WRONG_PIN, provision=False)
     assert rc == 2
-    assert grab.starting(_CLIENT_CA_LINE), grab.seen
     assert _store_files(db) == before
+    assert grab.starting(_CLIENT_CA_LINE), grab.seen
 
 
 def test_an_absent_store_stays_absent(
