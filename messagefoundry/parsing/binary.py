@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import logging
 import re
 import time
 from collections.abc import Awaitable, Callable, Collection, Iterable, Iterator
@@ -44,6 +45,8 @@ from messagefoundry.parsing._builtin_hl7 import (
     escape_leaf_alters,
     header_line_head,
 )
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     # Type-only import: keep parsing.message out of this module's *runtime* imports so the dependency
@@ -308,7 +311,17 @@ def extract_obx_document(message: Message, *, occurrence: int = 1) -> bytes:
     §7). Reads the ``Encoding`` component (``OBX-5.4``), requires it to be ``"Base64"``
     (case-insensitive), then decodes the data component (``OBX-5.5``). Raises
     :class:`BinaryCarriageError` if ``OBX-2`` is not ``ED``, the encoding is not ``Base64``, or the
-    data is corrupt — so a Handler can dead-letter rather than mis-decode."""
+    data is corrupt — so a Handler can dead-letter rather than mis-decode.
+
+    Raises a plain ``ValueError``, not a :class:`BinaryCarriageError`, on a message whose short
+    MSH-2 leaves its separators not distinct (BACKLOG #5972): under ``MSH|~|`` no OBX-5
+    component reads where it was written, so a Handler that skips a ``BinaryCarriageError``
+    would drop every document of it with no trace, where this error escapes to ``ERROR``."""
+    if message._delimiters_collide():
+        raise ValueError(
+            "the message header leaves two of its delimiters one character, so its OBX-5 "
+            "components cannot be read as written; refusing rather than report no document"
+        )
     obx2 = message.field("OBX-2", occurrence=occurrence)
     if (obx2 or "").upper() != "ED":
         raise BinaryCarriageError(f"OBX-2 is {obx2!r}, not 'ED' — not an embedded document")
@@ -378,11 +391,12 @@ def is_doc_ref(value: str) -> bool:
 #: raw text (BACKLOG #5099).
 _DOC_REF_MARKER_CHARS = frozenset(DOC_REF_MARKER)
 
-#: A header line after the first. A Handler can wrap an MSH-led payload in an FHS or BHS
-#: envelope of other delimiters, or nest a BHS in an FHS, and any of those headers' own may then
-#: have escaped the handle. Looked for with ``str.find``, which runs at about the speed of the
-#: marker's own substring test, where one regex scan of a large payload cost some twenty times it.
-_LATER_HEADER_STARTS = tuple(brk + seg_id for brk in ("\r", "\n") for seg_id in HEADER_IDS)
+#: The characters a header line after the first follows. A Handler can wrap an MSH-led payload
+#: in an FHS or BHS envelope of other delimiters, or nest a BHS in an FHS, and any of those
+#: headers' own may then have escaped the handle. The gate finds each header id with
+#: ``str.find``, one scan per id, and checks the character before it: one regex scan of a large
+#: payload cost some twenty times the marker's own substring test.
+_SEGMENT_BREAKS = frozenset("\r\n")
 
 #: A segment break, where the parser's read of a header line ends.
 _LINE_END = re.compile(r"[\r\n]")
@@ -464,7 +478,8 @@ def may_hold_doc_ref(text: str) -> bool:
     test alone let the handle reach the wire unresolved. ``Message.set`` escapes by the delimiters
     the parser read from that first line (BACKLOG #5972), but a payload may wrap a message, or a
     batch, written under its own header's delimiters, so every later MSH, BHS or FHS line is
-    checked as well; the re-attach refuses a marker escaped by one of them. A handle hidden by
+    checked as well; the re-attach judges a marker escaped by one of them as a copy, refusing it
+    where the payload holds a handle or a document or the marker names a content address. A handle hidden by
     any other escape cannot be the engine's, which escapes only the delimiters, so it is the
     sender's text and resolves nothing unless the gate opens for another reason, where the
     re-attach parses it and resolves it only to an attachment the message holds. False otherwise."""
@@ -475,12 +490,12 @@ def may_hold_doc_ref(text: str) -> bool:
         return False
     if _header_names_marker_char(text, lead):
         return True
-    for start in _LATER_HEADER_STARTS:
-        at = text.find(start, lead)
+    for seg_id in HEADER_IDS:
+        at = text.find(seg_id, lead + 1)
         while at != -1:
-            if _header_names_marker_char(text, at + 1):
+            if text[at - 1] in _SEGMENT_BREAKS and _header_names_marker_char(text, at):
                 return True
-            at = text.find(start, at + 1)
+            at = text.find(seg_id, at + 1)
     return False
 
 
@@ -665,7 +680,11 @@ def iter_obx_documents(
             "escape when it set the value back, so the partner would not get it verbatim; "
             "refusing the detach"
         )
-    if documents and (value_holds_marker or _received_holds_marker(message, received)):
+    if documents and (
+        value_holds_marker
+        or _received_holds_marker(message, received)
+        or _later_header_markers(message, received)
+    ):
         raise InboundDocRefError(
             "the body holds the document handle marker outside an OBX-5.5 start, and a document "
             "would be detached from it; refusing a body delivery would refuse after the ACK"
@@ -846,9 +865,21 @@ def _strip_obx_ed(raw: str, pruned_at: float, min_bytes: int) -> tuple[str, int,
     except Exception:
         # A malformed body that merely looked like HL7 — never crash a retention pass on it.
         return raw, 0, 0
-    if message._delimiters_collide():
+    try:
+        stripped, reclaimed = strip_documents_in_hl7(
+            message, pruned_at=pruned_at, min_bytes=min_bytes
+        )
+    except ValueError:
+        if not message._delimiters_collide():
+            raise
+        # The first write refused the body before changing it (BACKLOG #5972). Reported, not
+        # silent: the document it holds now outlives its strip window. The text names the shape
+        # only, never a byte of the body.
+        log.warning(
+            "document strip skipped a body whose short MSH-2 leaves its delimiters not "
+            "distinct, so it cannot be written; its embedded document stays (BACKLOG #5972)"
+        )
         return raw, 0, 0
-    stripped, reclaimed = strip_documents_in_hl7(message, pruned_at=pruned_at, min_bytes=min_bytes)
     if stripped == 0:
         return raw, 0, 0
     return message.encode(), stripped, reclaimed
@@ -887,15 +918,22 @@ def _later_header_markers(message: Message, text: str) -> set[str]:
     a Handler wrote under an inner MSH's own, then wrapped in an envelope of others, would not be
     read as one and would reach the wire unresolved. Reads the parsed fields only, never a
     slice of the raw text."""
-    escaped_here = escape_leaf(DOC_REF_MARKER, message._m["seps"])
     found: set[str] = set()
+    # Each distinct form is scanned for once, so a batch of many headers naming the same
+    # delimiters costs one scan of the text, not one per header.
+    checked = {DOC_REF_MARKER, escape_leaf(DOC_REF_MARKER, message._m["seps"])}
+    segments = message._m["segments"]
     # One pass over the parsed segments: a header line is split eagerly, so its fields 1 and 2
     # are read in place, with no per-header occurrence scan.
-    for segment in message._m["segments"][1:]:
+    for index in range(1, len(segments)):
+        segment = segments[index]
         if segment["id"] not in HEADER_IDS:
             continue
         escaped = escape_leaf(DOC_REF_MARKER, _extract_separators(header_line_head(segment)))
-        if escaped not in (DOC_REF_MARKER, escaped_here) and escaped in text:
+        if escaped in checked:
+            continue
+        checked.add(escaped)
+        if escaped in text:
             found.add(escaped)
     return found
 

@@ -800,20 +800,19 @@ class Message:
         here too, since its BHS writes the head's delimiters, so such a head is refused at frame
         time."""
         if self._delimiters_collide():
-            raise ValueError(
-                "the message header names too few encoding characters, and a default filled in "
-                "for one is already another of its delimiters, so a write could not be read back "
-                "as written; the message can be read but not written"
-            )
+            raise ValueError(COLLIDING_DELIMITERS_WRITE)
         return self._encoding_chars()
 
     def _delimiters_collide(self) -> bool:
         """Whether the first line fills a delimiter it does not declare with a default that is
         already another of its delimiters (:func:`~messagefoundry.parsing._builtin_hl7.filled_default_collides`),
         read from the header's parsed fields 1 and 2, never from a slice of the raw text."""
-        return _builtin_hl7.filled_default_collides(
-            _builtin_hl7.header_line_head(self._m["segments"][0])
-        )
+        # The same verdict as filled_default_collides on the first line, from what the parse
+        # stored: field 2 shorter than four characters, and the five recorded separators not
+        # distinct. No delimiter write can change either.
+        first = self._m["segments"][0]["fields"]
+        short = len(first) < 3 or len(_builtin_hl7._field_text(first[2])) < 4
+        return short and len(set(self._m["seps"])) < 5
 
     @staticmethod
     def _escape_leaf(
@@ -827,6 +826,15 @@ class Message:
         that ``unescape()`` then mis-decoded, silently corrupting them (review M-13). The one
         implementation is :func:`~messagefoundry.parsing._builtin_hl7.escape_leaf`."""
         return _builtin_hl7.escape_leaf(value, (field_sep, comp_sep, rep_sep, sub_sep, esc))
+
+
+#: The refusal of a write to a message whose short MSH-2 leaves its separators not distinct
+#: (BACKLOG #5972), shared with ``split.encode_batch``'s header-only read.
+COLLIDING_DELIMITERS_WRITE = (
+    "the message header names too few encoding characters, and a default filled in for one is "
+    "already another of its delimiters, so a write could not be read back as written; the "
+    "message can be read but not written"
+)
 
 
 def emit_raw_separators(payload: str) -> str:

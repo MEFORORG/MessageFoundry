@@ -2892,7 +2892,10 @@ that line.
 - A line ahead of the header that the check does not refuse: a line with fields, or a bare id
   the header's version defines. The tee emits the line, and its leak-check walks it against the
   header's version. The engine's parser refuses at least a message that leads with a `PID` line.
-  A leading `BHS` or `FHS` line with its separator is emitted by both.
+  A leading `BHS` or `FHS` line with its separator is emitted by both when it names the same
+  delimiters as the MSH. When it names others, the engine refuses the message, because its
+  `Message` reads every line under the first line's delimiters (BACKLOG #5972), and the tee
+  emits it.
 - Whitespace after the last field of the last line. The engine's parser trims it before a rule
   reads the value, and the tee does not. So a date in that field is filled by the engine and
   emptied by the tee.

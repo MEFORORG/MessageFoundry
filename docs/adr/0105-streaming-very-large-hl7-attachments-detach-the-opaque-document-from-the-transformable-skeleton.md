@@ -262,7 +262,10 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   these are refused permanently: the payload does not parse as HL7; it holds a handle and its
   short `MSH-2` fills a delimiter with one it already uses, so no write to it can be read back
   (BACKLOG #5972); or a header line after the first names delimiters under which it holds the
-  marker escaped. Each of these raises `UnreattachableDocumentError`, which `_hydrate_payload`
+  marker escaped, and it holds a handle or a document, or that marker names a content address
+  (a bare one in a payload that holds nothing is carried as text, as under the first line's
+  delimiters). The ingress detach refuses a body with a document to detach and such a marker,
+  so delivery does not meet one it accepted. Each of these raises `UnreattachableDocumentError`, which `_hydrate_payload`
   turns into a
   permanent `NegativeAckError` (code `reattach`), so that row dead-letters alone, under either
   `internal_error` policy. On a batched outbound that member is dead-lettered alone and the rest of the

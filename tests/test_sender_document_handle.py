@@ -886,6 +886,34 @@ async def test_a_bare_marker_under_a_later_header_is_judged_as_a_copy() -> None:
         await reattach_documents_in_hl7(addressed, _no_read, bound=frozenset())
 
 
+def test_the_detach_refuses_a_marker_escaped_under_a_later_header() -> None:
+    """Delivery refuses a handle marker escaped under a later header's delimiters once the message
+    holds a document, so the detach refuses that body before the ACK rather than store the
+    document and dead-letter the row on every outbound (BACKLOG #5972)."""
+    inner = Message.parse("BHS|:~\\&|A\rNTE|1\r")
+    inner.set("NTE-3.1", DOC_REF_MARKER)
+    body = _hl7(_b64(2000)) + inner.encode()
+    assert DOC_REF_MARKER not in body
+    with pytest.raises(InboundDocRefError):
+        next(iter_obx_documents(Message.parse(body), received=body))
+    # The control: the same body with no inner marker is detached.
+    plain = _hl7(_b64(2000)) + "BHS|:~\\&|A\rNTE|1\r"
+    assert [occ for occ, _v, _t in iter_obx_documents(Message.parse(plain), received=plain)] == [1]
+
+
+def test_an_obx_document_under_a_colliding_short_msh2_is_not_reported_absent() -> None:
+    """Under ``MSH|~|`` no OBX-5 component reads where it was written, so the extract raised a
+    BinaryCarriageError a Handler may skip, and every document was dropped with no trace. It now
+    raises a plain ValueError, which escapes such a skip (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import BinaryCarriageError, extract_obx_document
+
+    message = Message.parse(_hl7(_b64(10), msh2="~"))
+    with pytest.raises(ValueError, match="cannot be read as written") as caught:
+        extract_obx_document(message)
+    assert not isinstance(caught.value, BinaryCarriageError)
+    assert extract_obx_document(Message.parse(_hl7(_b64(10)))) == b"P" * 10
+
+
 def test_the_retention_strip_leaves_a_body_it_cannot_write() -> None:
     """A stored body whose short MSH-2 leaves its separators not distinct cannot be written, so the
     strip returns it unchanged, as its contract says, rather than raise (BACKLOG #5972)."""

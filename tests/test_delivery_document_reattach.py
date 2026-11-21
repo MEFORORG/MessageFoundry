@@ -376,10 +376,11 @@ async def _store_doc_with_a_cr(store: MessageStore, line_end: str = "\r") -> str
 
 
 def _with_a_bad_msh2(hl7: str) -> str:
-    """``hl7`` with a short MSH-2 whose filled default is already its component separator. The
-    parse accepts it, and the re-attach refuses a handle under it, since no write to it can be
-    read back (BACKLOG #5972): a payload-caused re-attach failure."""
-    return hl7.replace("|^~\\&|", "|~|", 1)
+    """``hl7`` with a short MSH-2 whose declared escape, ``&``, is also the subcomponent separator
+    the parser fills. The parse accepts it and its OBX-5.5 handle still reads, and the re-attach
+    refuses that handle, since no write to it can be read back (BACKLOG #5972): a payload-caused
+    re-attach failure."""
+    return hl7.replace("|^~\\&|", "|^~&|", 1)
 
 
 def _without_an_msh(hl7: str) -> str:

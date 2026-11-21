@@ -233,6 +233,11 @@ class SegmentGroup:
 
     # --- internals -----------------------------------------------------------
 
+    def _delimiters_collide(self) -> bool:
+        """The parent's :meth:`Message._delimiters_collide`, so an OBX helper an untyped Handler
+        passes a group to refuses what it refuses for the message (BACKLOG #5972)."""
+        return self._m._delimiters_collide()
+
     def _resolve(self, path: str, occurrence: int) -> tuple[str, int | None]:
         """``path``'s segment id and the message-wide occurrence of its ``occurrence``-th segment
         in this group (None if the group holds fewer), the translation :meth:`field` and

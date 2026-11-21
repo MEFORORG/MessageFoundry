@@ -35,7 +35,7 @@ from messagefoundry.parsing._builtin_hl7 import (
     _first_line_head,
     filled_default_collides,
 )
-from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.message import COLLIDING_DELIMITERS_WRITE, Message
 from messagefoundry.parsing.peek import enforce_expansion_budget, normalize, starts_with_msh
 from messagefoundry.parsing.sniff import _LEADING_WS_STR
 
@@ -447,8 +447,8 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
     (:func:`~messagefoundry.parsing._builtin_hl7._first_line_head`) and separator read (BACKLOG
     #5919): a full parse of a large hydrated head to read eight characters copied the whole head
     at least twice. A short MSH-2 is filled with the parser's defaults, as the parse fills it;
-    one whose filled default is already another separator goes to the parse, and the write
-    read refuses it with ``ValueError``, as it refuses any write to such a message. Every other head, such as an ``FHS``/``BHS``-led one, one led by a byte
+    one whose filled default is already another separator is refused with the ``ValueError``
+    every write to such a message raises. Every other head, such as an ``FHS``/``BHS``-led one, one led by a byte
     order mark or a non-HL7 one, is parsed, so it frames or raises exactly as a parse does.
 
     A head read from its MSH line is still checked against the parser's own escape expansion
@@ -461,9 +461,12 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
     line = _first_line_head(norm)
     # The parse's _encoding_chars returns exactly what _extract_separators reads from this line,
     # a short MSH-2 filled with the same defaults (BACKLOG #5972), so any MSH line the parse would
-    # read takes the fast read; one whose filled default collides goes to the write's refusal.
-    if not line.startswith(_MSH) or len(line) < _SEPARATORS_WIDTH or filled_default_collides(line):
+    # read takes the fast read; one whose filled default collides takes the write's refusal.
+    if not line.startswith(_MSH) or len(line) < _SEPARATORS_WIDTH:
         return Message.parse(norm)._write_encoding_chars()
+    if filled_default_collides(line):
+        # The parse would only reach the same write refusal, at the cost of parsing the head.
+        raise ValueError(COLLIDING_DELIMITERS_WRITE)
     # A parse checks the budget before it reads anything, so a head it refuses for its escapes is
     # refused here too, with the same error. The parse above checks it for itself.
     enforce_expansion_budget(norm)
