@@ -12,12 +12,15 @@ import * as path from "node:path";
  * module: a debugpy older than 1.8.22, which includes the 1.8.21 the Python Debugger extension
  * bundles at the time of writing, inserts the working directory, the workspace, into `sys.path`
  * when it runs a module, whatever `-P` says. For a program it adds at most the program's own
- * folder. That folder holds only what {@link writeDebugProgram} puts there: one program per program
+ * folder. That folder holds what {@link writeDebugProgram} puts there: one program per program
  * text, each named `mefor_testbench_debug_<checksum>.py`, so extension versions with different
  * texts share a file only if their checksums collide (see textChecksum). It also holds `.tmp-`
  * folders, one per write, which a failed removal or a killed extension host can leave behind and
- * no import statement can name. Nothing is ever pruned there.
- * Nothing the launch imports has any of those names. The program runs the installed
+ * no import statement can name. Nothing is ever pruned there, and nothing checks what else is
+ * there. It also holds whatever another process running as the same OS user puts there, such as a
+ * stdlib-named module, which then shadows that module on every Debug launch. Such a process is
+ * outside the trust boundary, which is the OS account (docs/SESSION-MAIL.md). None of the names
+ * writeDebugProgram writes is one the launch imports. The program runs the installed
  * package through `runpy`, so no debugpy build puts the working directory on the import path. The
  * source is written at launch rather than shipped, because the extension package holds no Python
  * (the crypto inventory's ide/ arm reads only TypeScript).

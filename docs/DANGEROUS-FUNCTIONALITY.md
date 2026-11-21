@@ -1080,7 +1080,11 @@ a command line: the engine's `serve`, and `provision-admin`. The other two type 
 
 **Debug sessions.** The test bench's debug action starts a Python debug session. It runs
 `messagefoundry dryrun` with `--show-phi` on one sample message, in a VS Code terminal. The config
-folder it passes comes from the `messagefoundry.configDir` setting.
+folder it passes comes from the `messagefoundry.configDir` setting. To run it, the extension writes
+a small Python program into its own global storage folder, under `testbench-debug`, and has the
+debugger run that program. debugpy 1.8.21 and older put that folder at `sys.path[0]`, so a module
+placed there is imported ahead of the standard library. The folder is not pruned, and nothing
+checks its contents. `ide/src/testBenchDebugProgram.ts` says what it holds (BACKLOG #5409).
 
 **Links.** `openExternal` hands a URL to the operating system, which opens it with whatever program
 is registered for its scheme. The extension opens web console pages and the Git download page this
