@@ -5146,8 +5146,16 @@ class DatabaseSource(SourceConnector):
         skipped: list[str] = []
         budget_spent = False
         ceiling = self._poll_max_rows
+        discard = False
         try:
-            cur = await conn.cursor()
+            try:
+                cur = await conn.cursor()
+            except Exception as exc:
+                refused = _cursor_refused(exc, pool)  # BACKLOG #5749, as send() reads it
+                if refused is None:
+                    raise
+                discard = True
+                raise refused from exc
             await cur.execute(self._poll_sql)
             columns = [d[0] for d in cur.description]
             if self._body_column is not None and self._body_column not in columns:
@@ -5222,7 +5230,7 @@ class DatabaseSource(SourceConnector):
                     ceiling,
                 )
         finally:
-            await _close_and_release(pool, conn, cur)
+            await _close_and_release(pool, conn, cur, discard=discard)
         return _PolledBatch(rows, skipped, budget_spent)
 
     def _body(self, record: dict[str, Any]) -> bytes:
@@ -5287,11 +5295,19 @@ class DatabaseSource(SourceConnector):
         pool = await self._get_pool()
         conn = await _acquire(pool, self._acquire_timeout)
         cur: Any = None
+        discard = False
         try:
-            cur = await conn.cursor()
+            try:
+                cur = await conn.cursor()
+            except Exception as exc:
+                refused = _cursor_refused(exc, pool)  # BACKLOG #5749, as send() reads it
+                if refused is None:
+                    raise
+                discard = True
+                raise refused from exc
             await cur.execute(self._mark_sql, params)
         finally:
-            await _close_and_release(pool, conn, cur)
+            await _close_and_release(pool, conn, cur, discard=discard)
 
     async def test_connection(self) -> None:
         await _probe_db(self._get_pool, timeout=self._acquire_timeout)
@@ -5793,8 +5809,17 @@ class DatabaseLookupExecutor:
         except Exception as exc:
             raise DbLookupError(_lookup_connect_failure(connection, exc)) from exc
         cur: Any = None
+        discard = False
         try:
-            cur = await conn.cursor()
+            try:
+                cur = await conn.cursor()
+            except Exception as exc:
+                refused = _cursor_refused(exc, pool)  # BACKLOG #5749, as send() reads it
+                if refused is None:
+                    raise
+                discard = True
+                # A failure to borrow a usable connection, mapped as the acquire's is above.
+                raise DbLookupError(f"db_lookup on {connection!r}: {refused}") from exc
             await cur.execute(sql, bound)
             columns = [d[0] for d in cur.description] if cur.description else []
             limit = self._max_rows[connection]
@@ -5820,7 +5845,7 @@ class DatabaseLookupExecutor:
                 f"db_lookup query on {connection!r} failed" + (f" [{state}]" if state else "")
             ) from exc
         finally:
-            await _close_and_release(pool, conn, cur)
+            await _close_and_release(pool, conn, cur, discard=discard)
         return [dict(zip(columns, row)) for row in rows]  # noqa: B905
 
     async def aclose(self) -> None:

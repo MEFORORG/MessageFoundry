@@ -341,6 +341,7 @@ async def _load_database_source(
         _bound_statements,
         _close_and_release,
         _close_pool_bounded,
+        _cursor_refused,
         _login_timeout,
         _make_pool,
         _sqlstate,
@@ -419,6 +420,7 @@ async def _load_database_source(
         if timeout_refused:
             raise ReferenceStatementTimeoutRefused(refused_text)
         timed_out = False
+        discard = False
         cur: Any = None
         try:
             try:
@@ -427,7 +429,13 @@ async def _load_database_source(
                 # A driver that takes the connection timeout but refuses it on a cursor refuses
                 # every cursor (docs/CONNECTIONS.md, the statement_timeout facts).
                 if not statement_timeout or _sqlstate(exc) not in _CURSOR_TIMEOUT_REFUSALS:
-                    raise
+                    # Any other driver refusal is the connection's failure, classified as a
+                    # DATABASE connector's is, and the handle is not lent again (BACKLOG #5749).
+                    refused = _cursor_refused(exc, pool)
+                    if refused is None:
+                        raise
+                    discard = True
+                    raise refused from exc
                 timeout_refused = True  # raised below, outside the handler
             if cur is not None:
                 try:
@@ -445,7 +453,7 @@ async def _load_database_source(
             # at a bound, so once a stop cancels this sync, a statement with no time limit does not
             # hold that stop. An uncancelled statement's calls are bounded by statement_timeout
             # except in the cases the comment at the _bound_statements call above lists.
-            await _close_and_release(pool, conn, cur)
+            await _close_and_release(pool, conn, cur, discard=discard)
     finally:
         await _close_pool_bounded(pool, "DATABASE reference source")
     if timeout_refused:
