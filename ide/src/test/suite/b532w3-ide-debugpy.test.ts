@@ -96,6 +96,9 @@ suite("b532w3: debugpy adds no working directory to the Test Bench Debug launch 
     const caught = /try \{\s*program = await writeDebugProgram\(this\.context\.globalStorageUri\);\s*\} catch \(e\) \{([\s\S]*?)\n\s*\}\n/.exec(fn);
     assert.ok(caught, fn);
     assert.ok(/\breturn;\s*$/.test(caught[1]), caught[1]);
+    // The notice shows an fs error's code, not its message, which names the home folder's path.
+    assert.ok(!caught[1].includes("String(e)"), caught[1]);
+    assert.ok(caught[1].includes("(e as { code?: unknown })?.code"), caught[1]);
     assert.ok(fn.indexOf(caught[0]) < fn.indexOf("startDebugging"), fn);
     assert.ok(fn.includes("cwd: folder.uri.fsPath"), fn);
     assert.ok(INTERPRETER_OPTIONS.includes("-P"));

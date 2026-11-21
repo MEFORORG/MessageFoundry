@@ -545,7 +545,11 @@ export class TestBench {
     try {
       program = await writeDebugProgram(this.context.globalStorageUri);
     } catch (e) {
-      void vscode.window.showErrorMessage(`MessageFoundry: Debug did not start: ${String(e)}`);
+      // An fs error's code only, as newRoute.ts shows: its message names the global storage path,
+      // which holds the account's home folder. writeDebugProgram's own refusal carries no path.
+      const code = (e as { code?: unknown })?.code;
+      const why = typeof code === "string" ? code.replace(/[^A-Za-z0-9_]/g, "") : e instanceof Error ? e.message : "unknown error";
+      void vscode.window.showErrorMessage(`MessageFoundry: Debug did not start: ${why}`);
       return;
     }
     await vscode.debug.startDebugging(folder, {
