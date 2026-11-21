@@ -1673,8 +1673,9 @@ def _env_dir_name(service_config: str | None) -> str:
             data = tomllib.load(fh)
     except (ValueError, RecursionError, OSError):
         # ValueError covers tomllib.TOMLDecodeError and a file that is not UTF-8 (a
-        # UnicodeDecodeError); RecursionError a deeply nested document. The settings load that
-        # follows reports each of them.
+        # UnicodeDecodeError); RecursionError a deeply nested document. Each is left to the full
+        # settings load: validate's, graph's and dryrun's report it, while check's settings legs
+        # still raise the RecursionError.
         return "environments"
     env_section = data.get("environments")
     if isinstance(env_section, dict):
