@@ -165,11 +165,22 @@ class _OptionsCursor:
 
 
 class _OptionsConn:
-    def __init__(self, row: tuple[int, int], timeouts: dict[str, int], alters_fail: bool) -> None:
+    def __init__(
+        self,
+        row: tuple[int, int],
+        timeouts: dict[str, int],
+        alters_fail: bool,
+        second_cursor_fails: bool = False,
+    ) -> None:
         self._conn = _Raw()
         self._args = (row, timeouts, alters_fail)
+        self._second_cursor_fails = second_cursor_fails
+        self._cursors = 0
 
     async def cursor(self) -> _OptionsCursor:
+        self._cursors += 1
+        if self._second_cursor_fails and self._cursors > 1:
+            raise RuntimeError(_DRIVER_TEXT)  # the session died after the state read
         return _OptionsCursor(self._conn, *self._args)
 
     async def close(self) -> None:
@@ -182,7 +193,11 @@ def _install(
     connect_fails: bool = False,
     reread_fails: bool = False,
     alters_fail: bool = True,
+    alter_cursor_fails: bool = False,
+    later_row: tuple[int, int] = (0, 0),
 ) -> dict[str, int]:
+    """``alter_cursor_fails`` makes the first connection's second cursor open raise: the cursor
+    the ALTERs get. ``later_row`` is what every connection after the first reads."""
     timeouts: dict[str, int] = {}
     connects = 0
 
@@ -191,7 +206,9 @@ def _install(
         connects += 1
         if connect_fails or (reread_fails and connects > 1):
             raise RuntimeError(_DRIVER_TEXT)
-        return _OptionsConn((0, 0), timeouts, alters_fail)
+        if connects > 1:
+            return _OptionsConn(later_row, timeouts, alters_fail)
+        return _OptionsConn((0, 0), timeouts, alters_fail, alter_cursor_fails)
 
     module = types.ModuleType("aioodbc")
     module.connect = _connect  # type: ignore[attr-defined]
@@ -411,3 +428,20 @@ async def test_the_options_reread_failure_logs_no_driver_text(
     rereads = [r for r in caplog.records if "RCSI re-read" in r.getMessage()]
     assert rereads, "the control: the re-read failed and logged"
     assert all(r.exc_info is None and _SECRET not in r.getMessage() for r in rereads)
+
+
+async def test_a_failed_alter_cursor_open_reaches_the_alters_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ALTERs' cursor opens after the state read. A failure there, such as a session a peer's
+    ROLLBACK IMMEDIATE killed, gets main's outcome for a failed ALTER: the peer re-read, then the
+    refusal with its remedy and the driver text redacted. Red before the open moved into the
+    ALTER's try: the raw driver error escaped the open."""
+    _install(monkeypatch, alters_fail=False, alter_cursor_fails=True)
+    with pytest.raises(RuntimeError, match="READ_COMMITTED_SNAPSHOT is OFF") as info:
+        await SqlServerStore._ensure_database_options(_settings())
+    assert "a DBA must run once" in str(info.value)
+    assert _SECRET not in str(info.value)
+    # The control: a peer that turned RCSI on lets the open go on, as on main.
+    _install(monkeypatch, alters_fail=False, alter_cursor_fails=True, later_row=(1, 1))
+    await SqlServerStore._ensure_database_options(_settings())

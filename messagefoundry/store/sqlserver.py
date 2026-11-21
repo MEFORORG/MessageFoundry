@@ -4979,23 +4979,35 @@ class SqlServerStore:
                 log.warning("%s", message)
                 return
             off = _options_off(row)
-            if off and fail_closed and settings.command_timeout:
-                # The ALTERs run with no statement limit, as on a provision-schema run, so they get
-                # a cursor opened after the limit is lifted (see the comment at the state read).
-                # `cur` is cleared before the close, so a cancellation landing in it does not hand
-                # the same cursor to the gate a second time.
-                old, cur = cur, None
-                try:
-                    await old.close()
-                except Exception as exc:  # noqa: BLE001 - the ALTER below meets a dead session
-                    # A peer's ROLLBACK IMMEDIATE may have killed the session; the ALTER then
-                    # fails inside its own handler, which re-reads the state.
-                    log.debug("options state-read cursor close failed: %s", _options_error(exc))
-                _bound_one_shot(conn, 0)
-                cur = await conn.cursor()
+            swap = bool(off) and fail_closed and bool(settings.command_timeout)
+
+            async def alter(sql: str) -> None:
+                """Run one ALTER inside its caller's try, so a failure to open its cursor reaches
+                the same handler as the ALTER's own failure: the peer re-read and the remedy."""
+                nonlocal cur, swap
+                if swap or cur is None:
+                    # The ALTERs run with no statement limit, as on a provision-schema run, so
+                    # they get a cursor opened after the limit is lifted (see the comment at the
+                    # state read). `cur` is cleared before the close, so a cancellation landing in
+                    # it does not hand the same cursor to the gate a second time.
+                    swap = False
+                    old, cur = cur, None
+                    if old is not None:
+                        try:
+                            await old.close()
+                        except Exception as exc:  # noqa: BLE001 - the ALTER meets a dead session
+                            # A peer's ROLLBACK IMMEDIATE may have killed the session; the cursor
+                            # open or the ALTER then fails in the caller's handler.
+                            log.debug(
+                                "options state-read cursor close failed: %s", _options_error(exc)
+                            )
+                    _bound_one_shot(conn, 0)
+                    cur = await conn.cursor()
+                await cur.execute(sql)
+
             if "READ_COMMITTED_SNAPSHOT" in off:
                 try:
-                    await cur.execute(
+                    await alter(
                         "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE"
                     )
                     log.info("enabled READ_COMMITTED_SNAPSHOT on database %r", db)
@@ -5029,7 +5041,7 @@ class SqlServerStore:
             if "ALLOW_SNAPSHOT_ISOLATION" in off:
                 try:
                     # ALLOW_SNAPSHOT_ISOLATION is an online change (no exclusivity required).
-                    await cur.execute("ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON")
+                    await alter("ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON")
                 except Exception as exc:  # noqa: BLE001 - non-fatal
                     log.warning(
                         "could not enable ALLOW_SNAPSHOT_ISOLATION on %r (%s); a DBA should run once: %s",
@@ -6501,8 +6513,9 @@ class SqlServerStore:
     async def _execute_output(
         self, sql: str, params: tuple[Any, ...] = (), *, empty_is_read: bool = False
     ) -> list[dict[str, Any]]:
-        """Run one write that carries an ``OUTPUT`` clause, commit it as a durable write, and return
-        the rows it output (BACKLOG #2283).
+        """Run one write that carries an ``OUTPUT`` clause, commit it, and return the rows it output
+        (BACKLOG #2283). The commit counts as a durable write, except that ``empty_is_read`` makes
+        one that output no row an uncounted read commit.
 
         For a write whose caller needs to know what it changed. The rowset holds whatever
         ``cursor.rowcount`` would, and a session-wide ``SET NOCOUNT ON`` cannot hide it, while the
