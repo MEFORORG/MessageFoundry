@@ -1081,7 +1081,7 @@ holds claimed rows whose return to the queue never landed. Under the pooled clai
 restart leaves STOPPED a lane that still holds claimed rows whose return to the queue never landed;
 under per_lane the restart respawns such a worker, and it can claim past rows left in flight.
 Any later notify_work broadcast re-arms such a lane, at least a reload, a replay, a resend, an
-inject or a dead-letter replay, and it then claims past the unlanded rows; until one arrives it
+inject or a dead-letter replay, and it can then claim past the unlanded rows; until one arrives it
 stays STOPPED. At least a service restart returns them to the queue first, because the engine does that as it starts, so restart the service
 to recover it.
 **Fix the disk first — the restart is refused while the log is still unwritable.** The engine
