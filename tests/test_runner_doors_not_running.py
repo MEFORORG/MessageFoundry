@@ -49,6 +49,7 @@ from messagefoundry.pipeline.wiring_runner import (
     _ItemOutcome,
 )
 from messagefoundry.store import MessageStore
+from messagefoundry.transports.base import NegativeAckError
 from tests._pending_approval_store_contract import _REQUESTER_ID, _resolve, _StandingStore
 from tests.test_reload_retired_connector_send import _Recorder as _SendRecorder
 from tests.test_shard_lane_ownership import _unsharded_registry
@@ -685,7 +686,7 @@ async def test_a_shadow_row_is_not_marked_done_when_the_lease_goes_during_its_fr
     _demote_during_hydration(runner, coordinator)
     try:
         outcome, retry_until = await runner._process_delivery_item(_OUT, item)
-        assert len(framing.checked) == 1 and framing.sent == []  # the frame check did run
+        assert framing.checked == [] and framing.sent == []  # gated before the frame check
         assert (outcome, retry_until) == (_ItemOutcome.STOPPED, None)
         (row,) = await store.outbox_for(message_id)
         assert row["status"] == "pending" and row["attempts"] == 0 and not row["last_error"]
@@ -705,6 +706,34 @@ async def test_a_shadow_row_completes_while_the_lease_holds(store: MessageStore)
         assert outcome is _ItemOutcome.PROCESSED and len(framing.checked) == 1
         (row,) = await store.outbox_for(message_id)
         assert row["status"] == "done"
+    finally:
+        await runner.stop()
+
+
+class _RefusingFrame(_FramingRecorder):
+    """A framing outbound whose frame check refuses every payload, permanently."""
+
+    def check_frame(self, payload: str, *, rewrite: bool = True) -> None:
+        super().check_frame(payload, rewrite=rewrite)
+        raise NegativeAckError("re-encode refused", code="reencode", permanent=True)
+
+
+async def test_a_shadow_frame_refusal_does_not_dead_letter_on_a_node_that_lost_its_lease(
+    store: MessageStore,
+) -> None:
+    """The gate comes between the hydrate and the frame check, so a node that lost its lease
+    during the hydrate does not dead-letter the row a successor may own; it releases it."""
+    coordinator = _LeaseCoordinator()
+    runner, _, message_id, item = await _claimed_row(store, coordinator)
+    refusing = _RefusingFrame()
+    runner._destinations[_OUT] = refusing
+    runner._simulate[_OUT] = True
+    _demote_during_hydration(runner, coordinator)
+    try:
+        outcome, _ = await runner._process_delivery_item(_OUT, item)
+        assert refusing.checked == [] and outcome is _ItemOutcome.STOPPED
+        (row,) = await store.outbox_for(message_id)
+        assert row["status"] == "pending" and row["attempts"] == 0 and not row["last_error"]
     finally:
         await runner.stop()
 
@@ -863,6 +892,42 @@ async def test_a_convergence_pass_refused_for_the_lease_logs_once_without_a_trac
         await runner._pass_once()
     (fault,) = [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert fault.exc_info is not None
+    # The fault ended the run: its version is named at INFO, though its converging line was quiet.
+    assert any(
+        r.levelno == logging.INFO and "failed to converge" in r.getMessage() for r in caplog.records
+    )
+
+
+async def test_the_pass_that_ends_a_run_of_refusals_logs_its_convergence_at_info(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """After refused passes the converging line is quiet, so a pass that does converge says so at
+    INFO, and the next refusal run logs at INFO again."""
+    applied: list[int] = []
+    refuse = [True]
+
+    async def reload(_version: int) -> None:
+        if refuse[0]:
+            raise RunnerLeaseLostError.for_reload()
+
+    runner = ConfigConvergenceRunner(
+        _VersionCoordinator(),
+        applied_version=lambda: 1,
+        set_applied_version=applied.append,
+        reload=reload,
+        interval_seconds=1.0,
+        refusals=(RunnerLeaseLostError,),
+    )
+    name = "messagefoundry.pipeline.config_convergence"
+    with caplog.at_level(logging.DEBUG, logger=name):
+        await runner._pass_once()
+        await runner._pass_once()
+        caplog.clear()
+        refuse[0] = False
+        await runner._pass_once()
+    assert applied == [2]
+    info = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert info == ["cluster: converged on shared config version 2 after refused passes"]
 
 
 async def test_a_convergence_reload_on_a_lease_lost_node_loads_no_config(

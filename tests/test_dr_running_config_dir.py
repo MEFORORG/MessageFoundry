@@ -1136,11 +1136,14 @@ async def test_a_step_4_preflight_that_does_not_answer_aborts_within_the_takeove
     assert row["kind"] == "profile"
 
 
-async def test_an_activation_on_a_lease_lost_node_names_the_lease_in_its_abort(box: _Box) -> None:
+async def test_an_activation_on_a_lease_lost_node_names_the_lease_in_its_abort(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Regression 2 of the hold on engine PR 3136: the runner refuses the profile's reload on such
     a node, and the abort row said the engine could not bind the feeds and handed on the reload
     refusal's own instruction. It now names the lease, says nothing bound, and the box stays
-    passive."""
+    passive. Reached only by an embedder that skips the settings check refusing [dr] with
+    [cluster], so the coordinator is swapped in by hand, and put back before teardown."""
     engine = box.engine
     coord = engine.dr_coordinator
     assert coord is not None
@@ -1149,10 +1152,11 @@ async def test_an_activation_on_a_lease_lost_node_names_the_lease_in_its_abort(b
     assert rr is not None and rr.running
     not_leading = _LeaseCoordinator()
     not_leading.leader = False
-    rr._coordinator = not_leading
+    monkeypatch.setattr(rr, "_coordinator", not_leading)
     assert rr.lease_lost
     with pytest.raises(DrActivationError) as caught:
         await coord.activate(actor="alice")
+    monkeypatch.undo()
     assert caught.value.kind == "profile"
     text = str(caught.value)
     assert "no longer holds the cluster lease" in text and "stays passive" in text

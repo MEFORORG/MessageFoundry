@@ -513,8 +513,8 @@ class _Operation:
     #: every config when there is no usable one (:func:`held_fingerprint`; vault BACKLOG #3192), so
     #: :meth:`ApprovalGate._release_blocked` predicts that refusal before the claim too.
     requires_fingerprint: bool = False
-    #: Awaited before the approver read and the claim, after the refusals that read the request
-    #: alone (:data:`BeforeClaim`).
+    #: Awaited after the requester's standing check and before the approver read and the claim
+    #: (:data:`BeforeClaim`).
     before_claim: BeforeClaim | None = None
 
 
@@ -899,7 +899,8 @@ class ApprovalGate:
         non-empty string, so the gate refuses such a request before it claims it and the queue
         marks it ``params_no_requester``. ``requires_fingerprint`` declares the same of
         :func:`held_fingerprint`, marked ``params_no_fingerprint``. ``before_claim`` is a node-state
-        refusal approve() asks just before its claim (:data:`BeforeClaim`); the queue does not
+        refusal approve() asks before its approver read and its claim (:data:`BeforeClaim`), with
+        at least that store read between it and the claim; the queue does not
         predict it."""
         self._ops[key] = _Operation(
             key=key,

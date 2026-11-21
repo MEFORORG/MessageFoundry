@@ -2109,9 +2109,9 @@ def _build_approval_gate(
         # reload. Asked here, before the gate's claim, so the request is not spent and can be
         # released on the leader; the gate writes approval.node_refused against the approver.
         # Past the claim the same refusal is compensated to 'failed' and that approval is spent.
-        # A point in time read: a flag that goes false after it and before the runner's second
-        # read is refused by the reload itself, and the approval is then marked failed; one that
-        # goes false after that second read is not refused (RegistryRunner.reload).
+        # A point in time read: leadership lost after it and before the runner's second read is
+        # refused by the reload itself, and the approval is then marked failed; leadership lost
+        # after that second read is not refused (RegistryRunner.reload).
         rr = engine.registry_runner
         if rr is not None and rr.lease_lost:
             raise ApprovalError(503, _LEASE_LOST_RELEASE_DETAIL)
@@ -2994,9 +2994,9 @@ async def _audit_refused_reload(
     BACKLOG #3109). ``reported``, when passed, holds :func:`_failure_row_key` of each row already
     written: a row already in it is not written again, and a row that lands is added. That reload
     retries every interval, and this keeps it to one row of each kind per version. Its refusal is
-    then logged at DEBUG, not WARNING: the convergence runner already logs each failure at ERROR,
-    except a refusal it is told is designed, such as ``lease_lost``, which it logs once at INFO per
-    run of refused passes (BACKLOG #5906), and a WARNING per retry would repeat it every interval.
+    then logged at DEBUG, not WARNING, since a WARNING per retry would repeat every interval: the
+    convergence runner already logs each failure at ERROR, except a refusal it is told is designed,
+    such as ``lease_lost``, which it logs at INFO once per run of refused passes (BACKLOG #5906).
 
     **The row's write never raises.** A refusal changed nothing, so its answer stands whether or
     not the row lands, and a store fault here would otherwise turn it into a raw 500 (vault BACKLOG

@@ -9614,12 +9614,12 @@ class RegistryRunner:
         does not.
 
         On a running graph that :attr:`lease_lost` reads as lease-lost, it raises
-        :class:`RunnerLeaseLostError` with no lane changed (BACKLOG #5906). The flag is read
-        twice: once this method holds the reload
-        lock, which is after ``Engine.reload_detail`` has loaded the config and run its
-        preflights, and again just before step 1. Each read is point in time: a flag that goes
-        false after the second read is not refused, and steps 1 to 3a then run on this node until
-        ``Engine._stop_graph``, which waits on the same lock, takes them down.
+        :class:`RunnerLeaseLostError` with no lane changed (BACKLOG #5906). The coordinator's
+        ``is_leader()`` is read twice: once this method holds the reload lock, which is after
+        ``Engine.reload_detail`` has loaded the config and run its preflights, and again just
+        before step 1. Each read is point in time: leadership lost after the second read is not
+        refused, and steps 1 to 3a then run on this node until ``Engine._stop_graph``, which waits
+        on the same lock, takes them down.
         """
         async with self._reload_lock:
             # BACKLOG #5906: refused at once too, so a lease-lost node does not hold the lock its
@@ -11581,9 +11581,13 @@ class RegistryRunner:
                 # live (vault #2756).
                 if _frames(connector):
                     try:
-                        connector.check_frame(
-                            await self._hydrate_payload(item.payload, item.message_id)
-                        )
+                        framed = await self._hydrate_payload(item.payload, item.message_id)
+                        # BACKLOG #5906: the hydrate is an await, so the same gate as the live
+                        # send's below, before the frame check can dead-letter the row or the row
+                        # is marked done. Inside the try only so a hydrate fault keeps its arm.
+                        if not self._may_send(name):
+                            raise _SendGated
+                        connector.check_frame(framed)
                     except NegativeAckError:
                         raise
                     except DeliveryError as exc:
@@ -11592,8 +11596,8 @@ class RegistryRunner:
                             name,
                             type(exc).__name__,
                         )
-                    # BACKLOG #5906: the frame check's hydrate is an await too, so the same gate as
-                    # the live send's below, before the row is marked done.
+                    # The same gate again, for a hydrate fault the arm above logged: its await ran
+                    # too, and the row is marked done below.
                     if not self._may_send(name):
                         raise _SendGated
                 response = None

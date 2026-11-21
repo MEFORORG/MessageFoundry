@@ -13,6 +13,8 @@
   claimed, writes `approval.node_refused` against the approver, and leaves the request to be
   approved on the leader. A flag that goes false after that check and before the runner's second
   read is refused by the reload itself, and that approval is then marked failed; after the second
-  read the release runs. A cluster convergence pass there is refused before it loads the config,
-  logged once at INFO with no traceback, and retried. A DR activation's abort row names the lease.
-  A dry run there is not refused for the lease. (`BACKLOG #5906`)
+  read the release runs. A cluster convergence pass there is refused before it loads the config
+  and retried; through a run of such passes only the first logs at INFO, with no traceback. A DR
+  activation's abort row names the lease, a case only an embedder that skips the settings check
+  refusing `[dr]` with `[cluster]` reaches. A dry run there is not refused for the lease.
+  (`BACKLOG #5906`)
