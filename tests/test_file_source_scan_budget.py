@@ -1325,3 +1325,56 @@ async def test_a_remembered_reject_costs_no_stat_hop_of_its_own(
     path.write_bytes(_PDF + b" and more")
     await rig.scan()
     assert calls == [path], "a changed reject is stat'd and examined afresh"
+
+
+async def test_an_undisposed_file_whose_stat_times_out_is_still_remembered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A move to ``.processed`` that fails while the share drops: the stat after it fails too, for
+    a reason that is no evidence the file has gone, so the read's own mark stands in and the file
+    is not handed off again.
+
+    Mutation: return None from ``_undisposed`` on any stat failure. Red: nothing is remembered."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10, fail_errno=None)
+    _fail_processed(rig, monkeypatch)
+    path = rig.drop("a.hl7", _HL7)
+    real_mark = file_mod._file_mark
+    timing_out = [False]
+
+    def mark(p: Path) -> Any:
+        if timing_out[0]:
+            raise OSError(errno.ETIMEDOUT, "timed out")
+        return real_mark(p)
+
+    real_archive_to = FileSource._archive_to
+
+    def archive_to(self: FileSource, *args: Any, **kwargs: Any) -> Any:
+        done = real_archive_to(self, *args, **kwargs)
+        timing_out[0] = True  # the share drops right after the failed move
+        return done
+
+    monkeypatch.setattr(file_mod, "_file_mark", mark)
+    monkeypatch.setattr(FileSource, "_archive_to", archive_to)
+    await rig.scan()
+    await rig.scan()
+    assert rig.handed_off == [_HL7]
+    assert str(path) in rig.source._stuck
+
+
+async def test_a_retried_disposal_is_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A processed file moved on a later retry, with no second hand-off, says so in the log, so it
+    is never moved silently."""
+    rig = _Rig(tmp_path, monkeypatch, cap=10, fail_errno=None)
+    failing = _fail_processed(rig, monkeypatch)
+    rig.drop("a.hl7", _HL7)
+    await rig.scan()
+    await rig.scan()
+    failing[0] = False
+    _age_stuck(rig)
+    with caplog.at_level(logging.INFO, logger=file_mod.__name__):
+        await rig.scan()
+        await rig.scan()
+    assert rig.handed_off == [_HL7]
+    assert "handed off earlier, is moved or deleted now, without another hand-off" in caplog.text
