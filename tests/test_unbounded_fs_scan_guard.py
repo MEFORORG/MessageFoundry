@@ -740,10 +740,11 @@ def test_a_walk_the_plain_toggle_denied_is_still_denied(command: str) -> None:
     assert_denied(run_guard(bash(command)))
 
 
-# THE SAME THREE MISREADINGS INSIDE A DOUBLE-QUOTED SPAN, where the plain toggle blanks the walk
-# too, so the floor above cannot catch them. Each row was allowed before the -Refined reading of
-# Hide-QuotedSpans (BACKLOG #5607): `$((cmd) )` read as arithmetic, a glued `cat<<` read as no
-# opener, and a line with two heredoc openers waiting for a terminator the masker had blanked.
+# THE MISREADINGS -Refined CORRECTS, INSIDE A DOUBLE-QUOTED SPAN, where the plain toggle blanks the
+# walk too, so the floor above cannot catch them. Each row was allowed before the -Refined reading
+# of Hide-QuotedSpans (BACKLOG #5607): `$((cmd) )` read as arithmetic, also with a quoted or escaped
+# paren in the subshell; a glued `cat<<` read as no opener; a line with two heredoc openers waiting
+# for a terminator the masker had blanked; and a spaced shift in `(( ))` or `$[ ]` read as a heredoc.
 REFINED_READING_DENY = [
     pytest.param('echo "$((find /proc) )"', id="subshell-substitution-inside-double-quotes"),
     pytest.param('echo "$(echo $((find /proc) ))"', id="subshell-substitution-in-a-substitution"),
@@ -763,6 +764,16 @@ REFINED_READING_DENY = [
         'echo "$(cat <<A <<B\nx\'\nA\ny\nB\n) $(find /proc)"',
         id="two-heredocs-with-an-apostrophe-inside-double-quotes",
     ),
+    pytest.param(
+        "echo \"$(echo $((grep -r 'foo(' /proc) ))\"", id="quoted-paren-in-a-subshell-substitution"
+    ),
+    pytest.param(
+        r'echo "$((echo \(; find /proc) ))"', id="escaped-paren-in-a-subshell-substitution"
+    ),
+    pytest.param('echo "$( (( a << b ))\nfind /proc)"', id="spaced-shift-in-an-arithmetic-command"),
+    pytest.param(
+        'echo "$(echo $[ a << b ]\nfind /proc)"', id="spaced-shift-in-old-style-arithmetic"
+    ),
 ]
 
 
@@ -771,9 +782,9 @@ def test_a_walk_the_refined_reading_finds_inside_double_quotes_is_denied(command
     assert_denied(run_guard(bash(command)))
 
 
-# THE -Refined READING IS A THIRD VIEW, NOT A REPLACEMENT. It reads a glued `<<` in arithmetic it
-# does not enter as a heredoc opener, and blanks the walk on the next line as a body; the reading
-# without it denies each row. Replacing that reading with the refined one would allow both.
+# THE -Refined READING IS A THIRD VIEW, NOT A REPLACEMENT. Each row was denied before it, because
+# the reading without it opens no heredoc at a glued `<<`. The refined reading opens one there, and
+# denies these only because it blanks the arithmetic around the shift, so they pin that reading.
 REFINED_FLOOR_DENY = [
     pytest.param('echo "$( (( a<<b ))\nfind /proc)"', id="glued-shift-in-an-arithmetic-command"),
     pytest.param('echo "$(echo $[a<<b]\nfind /proc)"', id="glued-shift-in-old-style-arithmetic"),
@@ -785,11 +796,13 @@ def test_a_walk_only_the_reading_without_refined_sees_is_still_denied(command: s
     assert_denied(run_guard(bash(command)))
 
 
-def test_a_glued_heredoc_commit_message_naming_a_walk_is_still_allowed() -> None:
-    """The control for the glued opener: its body is data, so a walk it names is not run."""
-    assert_allowed(
-        run_guard(bash("git commit -m \"$(cat<<'EOF'\nsay find /proc is blocked, don't\nEOF\n)\""))
-    )
+def test_arithmetic_that_reads_like_a_walk_is_still_allowed() -> None:
+    """The control for Test-ArithmeticClose: `$(( find / 2 ))` divides a variable by two.
+
+    It closes with `))`, so it is arithmetic and runs nothing. Read as a subshell instead, its
+    `find /` would sit in program position and be denied.
+    """
+    assert_allowed(run_guard(bash('echo "$(( find / 2 ))"')))
 
 
 # ============================================ the corpora must not quietly shrink
@@ -821,7 +834,7 @@ EXPECTED_ROW_COUNTS = {
     "POWERSHELL_QUOTE_DENY": 2,
     "TOGGLE_FLOOR_DENY": 5,
     "COMMENT_BOUNDARY_DENY": 6,
-    "REFINED_READING_DENY": 6,
+    "REFINED_READING_DENY": 10,
     "REFINED_FLOOR_DENY": 2,
 }
 
