@@ -43,6 +43,7 @@ from messagefoundry.pipeline.dr import DrActivationError
 from messagefoundry.pipeline.wiring_runner import DrParkedError
 from tests.test_dr_activation import _seed
 from tests.test_dr_outlive_deadline import _admin_client, _rows
+from tests.test_runner_doors_not_running import _LeaseCoordinator
 
 # A name that cannot be encoded as UTF-8: a lone surrogate. NTFS stores it as UTF-16, and on a
 # POSIX file system Python writes it as the raw byte 0x80. Under environments/ it is fingerprinted
@@ -1133,6 +1134,37 @@ async def test_a_step_4_preflight_that_does_not_answer_aborts_within_the_takeove
     assert not rr.inbound_running(_CRIT) and not rr.inbound_running(_NORM)
     (row,) = await _rows(engine.store, "dr_activation_aborted")
     assert row["kind"] == "profile"
+
+
+async def test_an_activation_on_a_lease_lost_node_names_the_lease_in_its_abort(
+    box: _Box, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression 2 of the hold on engine PR 3136: the runner refuses the profile's reload on such
+    a node, and the abort row said the engine could not bind the feeds and handed on the reload
+    refusal's own instruction. It now names the lease, says nothing bound, and the box stays
+    passive. Reached only by an embedder that skips the settings check refusing [dr] with
+    [cluster], so the coordinator is swapped in by hand, and put back before teardown."""
+    engine = box.engine
+    coord = engine.dr_coordinator
+    assert coord is not None
+    await engine.reload_detail(box.tiered)
+    rr = engine.registry_runner
+    assert rr is not None and rr.running
+    not_leading = _LeaseCoordinator()
+    not_leading.leader = False
+    monkeypatch.setattr(rr, "_coordinator", not_leading)
+    assert rr.lease_lost
+    with pytest.raises(DrActivationError) as caught:
+        await coord.activate(actor="alice")
+    monkeypatch.undo()
+    assert caught.value.kind == "profile"
+    text = str(caught.value)
+    assert "no longer holds the cluster lease" in text and "stays passive" in text
+    assert "could not bind" not in text and "reload on the leader" not in text
+    assert coord.active is False and engine.dr_active is False
+    assert not rr.inbound_running(_CRIT) and not rr.inbound_running(_NORM)
+    (row,) = await _rows(engine.store, "dr_activation_aborted")
+    assert row["kind"] == "profile" and "cluster lease" in str(row["reason"])
 
 
 async def test_an_unexpected_error_before_the_hook_is_an_audited_abort(

@@ -2105,6 +2105,18 @@ def _build_approval_gate(
         # BACKLOG #3157 item 4, which says when the row can still be lost).
         return await outliving.run(_apply(), "released config reload")
 
+    async def _config_reload_before_claim(_p: Mapping[str, Any]) -> None:
+        # BACKLOG #5906: a node that RegistryRunner.lease_lost reads as lease-lost refuses the
+        # reload. Asked here, before the gate's claim, so the request is not spent and can be
+        # released on the leader; the gate writes approval.node_refused against the approver.
+        # Past the claim the same refusal is compensated to 'failed' and that approval is spent.
+        # A point in time read: leadership lost after it and before the runner's second read is
+        # refused by the reload itself, and the approval is then marked failed; leadership lost
+        # after that second read is not refused (RegistryRunner.reload).
+        rr = engine.registry_runner
+        if rr is not None and rr.lease_lost:
+            raise ApprovalError(503, _LEASE_LOST_RELEASE_DETAIL)
+
     def _replay_params_in_scope(identity: Identity, p: Mapping[str, Any]) -> bool:
         channel_id = p.get("channel_id")
         return _replay_in_scope(identity, channel_id if isinstance(channel_id, str) else None)
@@ -2132,6 +2144,7 @@ def _build_approval_gate(
         in_scope=lambda identity, _p: _cross_channel_in_scope(identity),
         requires_requester=True,
         requires_fingerprint=True,
+        before_claim=_config_reload_before_claim,
     )
     return gate
 
@@ -2876,6 +2889,13 @@ _LEASE_LOST_RELOAD_DETAIL: Final = (
     "leader instead"
 )
 
+#: The approve route's answer to a release on such a node, refused before the gate claims the
+#: request, so the request is not spent (BACKLOG #5906).
+_LEASE_LOST_RELEASE_DETAIL: Final = (
+    "this node no longer holds the cluster lease, so it releases no config reload and did not "
+    "claim the request; approve it on the leader"
+)
+
 #: The answer to a reload whose config directory the engine could not resolve or list: at the
 #: target check, or in the load after it (vault BACKLOG #5248).
 _UNREADABLE_DETAIL: Final = "the engine could not read the config directory; see the engine log"
@@ -2975,8 +2995,9 @@ async def _audit_refused_reload(
     BACKLOG #3109). ``reported``, when passed, holds :func:`_failure_row_key` of each row already
     written: a row already in it is not written again, and a row that lands is added. That reload
     retries every interval, and this keeps it to one row of each kind per version. Its refusal is
-    then logged at DEBUG, not WARNING: the convergence runner already logs each failure at ERROR,
-    and a WARNING per retry would repeat it every interval.
+    then logged at DEBUG, not WARNING, since a WARNING per retry would repeat every interval: the
+    convergence runner already logs each failure at ERROR, except a refusal it is told is designed,
+    such as ``lease_lost``, which it logs at INFO once per run of refused passes (BACKLOG #5906).
 
     **The row's write never raises.** A refusal changed nothing, so its answer stands whether or
     not the row lands, and a store fault here would otherwise turn it into a raw 500 (vault BACKLOG
