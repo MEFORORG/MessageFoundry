@@ -489,6 +489,31 @@ def test_a_write_interrupted_part_way_leaves_each_file_whole(
     assert {name: (config_dir / name).read_bytes() for name in SPLIT} == before
 
 
+def test_an_interrupt_between_two_files_restores_the_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl-C after one file is written and before the next must not leave the rename half
+    applied: the written file is restored before the interrupt propagates."""
+    config_dir = _config(tmp_path, SPLIT)
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
+    before = {name: (config_dir / name).read_bytes() for name in SPLIT}
+    real_replace = atomic_edit.replace_validated
+    writes: list[str] = []
+
+    def second_write_interrupted(path: Path, data: bytes, *args: Any, **kwargs: Any) -> None:
+        writes.append(path.name)
+        if len(writes) == 2:
+            raise KeyboardInterrupt
+        real_replace(path, data, *args, **kwargs)
+
+    monkeypatch.setattr(atomic_edit, "replace_validated", second_write_interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        apply_rename(plan)
+    monkeypatch.undo()
+    assert len(writes) >= 2
+    assert {name: (config_dir / name).read_bytes() for name in SPLIT} == before
+
+
 def test_write_rename_holds_the_config_edit_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

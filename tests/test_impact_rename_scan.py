@@ -617,6 +617,23 @@ def test_an_outbound_shadowed_by_a_pass_through_of_its_name_leaves_the_send(
     assert 'TARGETS = {"ADT": "IB_OLD"}' in _text(config_dir)
 
 
+def test_a_literal_send_to_a_pass_through_shadowing_an_outbound_is_left(tmp_path: Path) -> None:
+    """The index's own edge follows the runtime: a literal ``Send("X")`` with a pass-through and
+    an outbound both named X reaches the pass-through, so renaming the outbound leaves it."""
+    body = (
+        "from messagefoundry import MLLP, PassThrough, Send, handler, inbound, outbound, router\n\n"
+        'inbound("IB_A", MLLP(port=2936), router="r_a")\n'
+        'inbound("X", PassThrough(), router="r_a")\n'
+        'outbound("X", MLLP(host="127.0.0.1", port=6934))\n\n\n'
+        '@router("r_a")\ndef r_a(msg):\n    return ["h_a"]\n\n\n'
+        '@handler("h_a")\ndef h_a(msg):\n    return Send("X", msg)\n'
+    )
+    config_dir = _write(tmp_path, {"mod.py": body})
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "X", "X2")
+    apply_rename(plan)
+    assert 'return Send("X", msg)' in _text(config_dir)
+
+
 def test_a_router_that_filters_with_a_bare_return_keeps_a_label_dict_rename_resolved(
     tmp_path: Path,
 ) -> None:

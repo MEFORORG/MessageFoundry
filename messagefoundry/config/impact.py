@@ -559,6 +559,11 @@ def write_rename(prepared: PreparedRename) -> list[LiteralEdit]:
                     f"restored{left}",
                     unrestored,
                 ) from exc
+            except BaseException:
+                # An interrupt between two files (Ctrl-C, SystemExit) must not leave the rename
+                # half applied: the files already written go back before it propagates.
+                _restore([*written, (file, raw)])
+                raise
             written.append((file, raw))
     return list(prepared.applied)
 

@@ -1213,16 +1213,18 @@ def build_wiring_graph(registry: Registry) -> WiringGraph:
             literal, saw_dynamic, extra = ast_result
             if saw_dynamic:
                 dynamic.add(("handler", hname))
+        # A Send naming both a pass-through inbound and an outbound reaches the pass-through, as the
+        # runtime resolves it (pipeline/dryrun.py), so that is its only edge.
         for name in sorted(literal):
-            if name in outbound_names:
-                edges.append(WiringEdge("handler", hname, "outbound", name, "literal", "sends"))
-            elif name in pt_names:
+            if name in pt_names:
                 edges.append(WiringEdge("handler", hname, "inbound", name, "literal", "sends"))
+            elif name in outbound_names:
+                edges.append(WiringEdge("handler", hname, "outbound", name, "literal", "sends"))
             else:
                 dangling.append(DanglingRef("handler", hname, name, "outbound/pass-through"))
         code = _code_of(hfn)
         consts = _string_consts(code) if code is not None else set()
-        for name in sorted(((consts | extra) & outbound_names) - literal):
+        for name in sorted(((consts | extra) & outbound_names) - literal - pt_names):
             edges.append(WiringEdge("handler", hname, "outbound", name, "heuristic", "sends"))
         for name in sorted(((consts | extra) & pt_names) - literal):
             edges.append(WiringEdge("handler", hname, "inbound", name, "heuristic", "sends"))
