@@ -5559,8 +5559,12 @@ def _audit_anchors_refused_before_the_store(
     posture the lifespan's own open passes, so its hop checks are never stricter or looser than
     ``serve``'s: at ``enforce`` it refuses what the lifespan's open refuses. Unlike that open it
     passes no ``refusal_hook`` and no ``message_events``, so a store-cipher refusal found at open
-    is logged and raises no alert. Like it, it opens with ``create=True``, so it may create and
-    migrate the store, as the start would have. It runs the audited preflight
+    is logged and raises no alert. **It never creates or migrates the store** (Manager decision
+    on round-d89a2d24's finding 1): it opens without ``create``, and only a store that exists and
+    whose schema is current. A SQLite store's schema is compared read-only first. A server store
+    under ``[store].schema_management = auto``, whose open could upgrade it, is not opened at all;
+    under ``external`` its open runs no DDL and refuses a marker that is not current. In each of
+    those cases no row is written, and a WARNING says why. It runs the audited preflight
     (:func:`run_anchor_preflight`) on each anchor refused before the store, and closes the store.
     It runs no lifespan, so none of the lifespan's other startup work (at least the secret
     provider, the notifier, the attestation and the engine) runs for a start already refused.
@@ -5596,7 +5600,12 @@ def _audit_anchors_refused_before_the_store(
         log_forward_anchor_spec,
         run_anchor_preflight,
     )
-    from messagefoundry.config.settings import hop_posture_from_ai, keyless_opt_out_refusal
+    from messagefoundry.config.settings import (
+        SchemaManagement,
+        StoreBackend,
+        hop_posture_from_ai,
+        keyless_opt_out_refusal,
+    )
     from messagefoundry.controlchars import scrub_log_argument
     from messagefoundry.last_resort import run_guarded
     from messagefoundry.redaction import safe_exc
@@ -5617,10 +5626,30 @@ def _audit_anchors_refused_before_the_store(
     # which is None at warn and so refuses hops serve accepts.
     posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
 
+    def _unaudited(why: str) -> None:
+        log.warning("no audit row records the refused trust anchors: %s", why)
+
     async def _audit() -> None:
+        if settings.store.backend == StoreBackend.SQLITE:
+            from messagefoundry.store.store import MessageStore
+
+            if not Path(settings.store.path).is_file():
+                _unaudited("the store does not exist, and a refused start does not create it")
+                return
+            if await MessageStore.schema_differences_at(settings.store.path):
+                _unaudited(
+                    "the store's schema is not current, and a refused start does not migrate it"
+                )
+                return
+        elif settings.store.resolved_schema_management() is SchemaManagement.AUTO:
+            _unaudited(
+                "the store's [store].schema_management is auto, so opening it could migrate it, "
+                "and a refused start does not"
+            )
+            return
         store = await open_store(
             settings.store,
-            create=True,
+            create=False,  # never create or migrate a store for a refused start
             posture=posture,
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
         )

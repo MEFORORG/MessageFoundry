@@ -149,13 +149,14 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
       and the log file but no collector. No listener binds, since uvicorn binds after the
       lifespan. A start refused for another reason before uvicorn runs the lifespan, such as at
       the API TLS context build, runs no attestation and no lifespan, though the API TLS pair may
-      already be minted or renewed. ``serve``'s exit hook then opens the store itself, creating
-      and migrating it, at the posture the lifespan's open passes, and runs this preflight on the
-      collector CA, and on ``[api].tls_client_ca_file`` where that build refused it (BACKLOG
-      #5391). A row is written there when the file can be read, this preflight refuses it, and the
-      store opens and takes it. At least these write no row: an interrupt, an exit uvicorn takes
-      before the lifespan starts, an exit inside the lifespan before this preflight runs, and a
-      refusal for low disk or an unconfirmed clock, which opens no store.
+      already be minted or renewed. ``serve``'s exit hook then opens the store itself, at the
+      posture the lifespan's open passes, and runs this preflight on the collector CA, and on
+      ``[api].tls_client_ca_file`` where that build refused it (BACKLOG #5391). It never creates or
+      migrates the store. A row is written there when the file can be read, this preflight
+      refuses it, and the store exists, has a current schema, opens and takes it. At least these
+      write no row: a store that does not exist or whose schema is not current, an interrupt, an
+      exit uvicorn takes before the lifespan starts, an exit inside the lifespan before this
+      preflight runs, and a refusal for low disk or an unconfirmed clock, which opens no store.
     * ``supervise`` checks the same CA before it builds its own forwarder, and refuses on stderr
       before any engine shard spawns. Its process has no audited preflight, so no row is written.
     * The API lifespan checks the CA of :func:`smtp_hop_anchor_spec` before it builds an alert

@@ -12105,6 +12105,17 @@ class MessageStore:
                 "; ".join(problems),
             )
 
+    @classmethod
+    async def schema_differences_at(cls, path: str | Path) -> list[str]:
+        """Every way the existing SQLite store at ``path`` falls short of this build's schema, read
+        through a ``mode=ro`` connection, so nothing is created, migrated or written. A caller
+        that must not migrate a store asks this before its writable open (BACKLOG #5391)."""
+        db = await aiosqlite.connect(_sqlite_readonly_uri(str(Path(path).resolve())), uri=True)
+        try:
+            return await live_schema_differences(db, schema=_SCHEMA, migrate=cls._migrate)
+        finally:
+            await db.close()
+
     async def _load_read_only(self) -> None:
         """The at-open loads of a read-only handle (BACKLOG #1780): the audit chain's state only.
 

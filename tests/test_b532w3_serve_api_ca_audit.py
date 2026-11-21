@@ -25,6 +25,7 @@ from messagefoundry.__main__ import main
 from messagefoundry.auth import trust_anchors as ta
 from messagefoundry.auth.anchor_path import PathVerdict
 from messagefoundry.pki import make_self_signed
+from messagefoundry.store import open_store as _real_open_store
 from messagefoundry.store.crypto import generate_key
 from messagefoundry.store.store import MessageStore
 
@@ -46,12 +47,18 @@ def _serve_with_client_ca(
     extra_api: str = "",
     enforcement: str = "warn",
     uvicorn_run: Callable[..., None] | None = None,
+    provision: bool = True,
+    store_key: str | None = None,
 ) -> tuple[int, Path]:
     """Run ``serve`` in ``tmp_path`` with a client CA pinned to ``pin``, or to its own bytes when
     ``pin`` is None. The CA holds ``ca_bytes``, or a real self-signed certificate. uvicorn is
-    stubbed by ``uvicorn_run``, or by a no-op, so nothing binds."""
+    stubbed by ``uvicorn_run``, or by a no-op, so nothing binds. With ``provision`` the store
+    exists first, at the current schema, since the audit neither creates nor migrates one."""
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    store_key = store_key or generate_key()
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", store_key)
+    if provision:
+        _provision(tmp_path / "messagefoundry.db", store_key)
     ca = tmp_path / "client-ca.pem"
     ca.write_bytes(
         ca_bytes if ca_bytes is not None else make_self_signed("client-ca.example", [], 30)[0]
@@ -79,6 +86,18 @@ def _serve_with_client_ca(
     monkeypatch.setattr("uvicorn.run", uvicorn_run or (lambda *a, **k: None))
     rc = main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"])
     return rc, tmp_path / "messagefoundry.db"
+
+
+def _provision(db: Path, key: str) -> None:
+    """Create the store at ``db`` with this build's schema, keyed with ``key``, as a prior start
+    would have. The real ``open_store``, so a test that plants a failing one does not stop it."""
+    from messagefoundry.config.settings import StoreSettings
+
+    async def make() -> None:
+        store = await _real_open_store(StoreSettings(path=str(db), encryption_key=key), create=True)
+        await store.close()
+
+    asyncio.run(make())
 
 
 def _anchor_events(db: Path, label: str) -> list[str]:
@@ -285,10 +304,11 @@ def test_a_context_that_builds_opens_no_store_for_the_audit(
     monkeypatch.setattr(
         cli, "_audit_anchors_refused_before_the_store", lambda *a, **k: calls.append(True)
     )
-    rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None)
+    # A refused collector CA, so a hook that was not disarmed would call the audit: red then.
+    extra = _collector_ca_refused(tmp_path, monkeypatch)
+    rc, _db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_toml=extra)
     assert rc == 0
     assert calls == []
-    assert not db.exists()
 
 
 def test_a_refused_crl_opens_no_store(
@@ -301,7 +321,7 @@ def test_a_refused_crl_opens_no_store(
     rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_api=crl_line)
     assert rc == 2
     assert "error: the API TLS context was not built:" in capsys.readouterr().err
-    assert not db.exists()
+    assert _anchor_events(db, "api_client") == []
 
 
 def test_the_build_tags_a_crl_refusal_with_its_setting(
@@ -409,6 +429,7 @@ def test_the_audit_opens_the_store_at_the_lifespans_posture(
         ),
         security=SecuritySettings(enforcement=SecurityEnforcement(enforcement)),
     )
+    _provision(db, settings.store.encryption_key or "")
     seen = _store_posture_spy(monkeypatch)
     cli._audit_anchors_refused_before_the_store(
         settings,
@@ -499,7 +520,7 @@ def test_an_interrupt_runs_no_audit(tmp_path: Path, monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(cli, "_emit_anchor_diagnostics", interrupt)
     with pytest.raises(KeyboardInterrupt):
         _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_toml=extra)
-    assert not (tmp_path / "messagefoundry.db").exists()
+    assert _anchor_events(tmp_path / "messagefoundry.db", "logging_forward_ca") == []
 
 
 def test_a_memory_fault_on_one_anchor_does_not_stop_the_next(
@@ -564,7 +585,7 @@ def test_a_low_disk_refusal_writes_nothing_to_the_store(
     extra = _collector_ca_refused(tmp_path, monkeypatch) + "[retention]\nmin_free_disk_mb = 100\n"
     rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_toml=extra)
     assert rc == 2
-    assert not db.exists()
+    assert _anchor_events(db, "logging_forward_ca") == []
     head = "no audit row records the refused trust anchors: the start was refused because the store"
     assert [m for m in grab.seen if m.startswith(head)], grab.seen
 
@@ -592,6 +613,7 @@ def test_the_audit_writes_a_replaced_pairs_row(
             forward_tls_ca_file=str(collector_ca),
         ),
     )
+    _provision(db, settings.store.encryption_key or "")
     event = GeneratedPairReplaced(
         reason="renewal",
         cert_file=str(tmp_path / "api-cert.pem"),
@@ -631,4 +653,40 @@ def test_a_start_that_reaches_uvicorn_leaves_the_rows_to_the_lifespan(
     extra = _collector_ca_refused(tmp_path, monkeypatch)
     rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=None, extra_toml=extra)
     assert rc == 0
+    assert _anchor_events(db, "logging_forward_ca") == []
+
+
+def test_an_absent_store_stays_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grab: _Grab
+) -> None:
+    """Manager decision on finding 1: a refused start never creates a store. With none, the audit
+    writes no row and says why. Red before, when the audit opened with ``create=True``."""
+    rc, db = _serve_with_client_ca(tmp_path, monkeypatch, pin=_WRONG_PIN, provision=False)
+    assert rc == 2
     assert not db.exists()
+    head = "no audit row records the refused trust anchors: the store does not exist"
+    assert [m for m in grab.seen if m.startswith(head)], grab.seen
+
+
+def test_an_old_schema_store_is_left_unmigrated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, grab: _Grab
+) -> None:
+    """A refused start never migrates a store. One index is dropped from a current store, so its
+    schema is short of this build's, and the file is byte-for-byte what it was after the refused
+    start. Red before, when the writable open rebuilt the index and wrote the row."""
+    import sqlite3
+
+    key = generate_key()
+    db = tmp_path / "messagefoundry.db"
+    _provision(db, key)
+    with sqlite3.connect(db) as conn:
+        conn.execute("DROP INDEX ix_messages_received")
+    conn.close()
+    before = db.read_bytes()
+    rc, _db = _serve_with_client_ca(
+        tmp_path, monkeypatch, pin=_WRONG_PIN, provision=False, store_key=key
+    )
+    assert rc == 2
+    assert db.read_bytes() == before
+    head = "no audit row records the refused trust anchors: the store's schema is not current"
+    assert [m for m in grab.seen if m.startswith(head)], grab.seen
