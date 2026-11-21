@@ -162,7 +162,8 @@ early, at startup, and audits every replacement.** This amends decisions 5 and 6
 nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
 
 1. **Decision 5 now reads: mint once, reuse while fresh, renew early.** A start that finds a pair
-   with at least a third of its own lifetime left reuses it and writes nothing. A start that finds
+   with at least a third of its own lifetime left reuses it and writes nothing, unless its
+   certificate does not name the bind (BACKLOG #5973, item 6). A start that finds
    less than a third left, or an expired pair, renews it: a new key and a new certificate under the
    same two file names. For the 365-day pair a third is about 122 days. The threshold is a share of
    the certificate's own validity period, so it does not hang on the 365 constant.
@@ -189,12 +190,18 @@ nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
    A file-system or lock failure (an `OSError`) that leaves an old pair which still loads and has
    not expired keeps that pair, and the next start tries again. That includes a failed first move,
    a state directory the engine can read but not write, and a lock it could not take. An expired or
-   unloadable pair has nothing to fall back on, so the start fails, as does any other error. A
-   crash between the two moves leaves a new certificate beside the old key. That pair does not load, so the next start discards it, mints a fresh one, and
+   unloadable pair has nothing to fall back on, so the start fails, as does any other error except
+   a `[api].host` the certificate builder refuses on a `bind_changed` re-mint, which keeps the old
+   pair with a WARNING (BACKLOG #5973). A copy of the old certificate is staged with the new pair,
+   so an `OSError` on the key's move puts the old certificate back beside the old key, logged at
+   ERROR, and the fallback above then applies (BACKLOG #5973). A crash between the two moves, or a
+   failed move back, leaves a new certificate beside the old key. That pair does not load, so the next start discards it, mints a fresh one, and
    reports it as an unusable pair. That row's old fingerprint is the half-installed certificate,
    not the one clients trusted, whose fingerprint only the earlier WARNING line carries.
 6. **Decision 6, realised: every re-mint of an existing pair is audited.** A renewal, a replaced
-   unusable pair, and a replaced half-pair each write one `api.tls_generated_pair_replaced` row to
+   unusable pair, a replaced half-pair, and (BACKLOG #5973) a re-mint at startup of a pair whose
+   certificate does not name the address a client dials for the current bind, reason
+   `bind_changed`, each write one `api.tls_generated_pair_replaced` row to
    the store's existing hash-chained audit log. The row carries the reason, the certificate path,
    and the old and new SHA-256 fingerprints and expiry dates. It never carries key material. The
    replacement happens before the store is open, so `serve` hands the event to the app, and the
