@@ -520,6 +520,8 @@ _SERVE_DIAL = "(security_settings or SecuritySettings()).enforcement"
 #: reads the dial off the instance's own ``[security]`` settings, never a constant.
 _DERIVATIONS = sorted(
     [
+        # BACKLOG #5391: serve's pre-lifespan anchor audit opens at the lifespan's own posture.
+        ("__main__.py", "_audit_anchors_refused_before_the_store", "settings.security.enforcement"),
         ("__main__.py", "_check_privileges", "settings.security.enforcement"),
         ("__main__.py", "_cipher_audit", "settings.security.enforcement"),
         ("__main__.py", "_connection.validate", "settings.security.enforcement"),

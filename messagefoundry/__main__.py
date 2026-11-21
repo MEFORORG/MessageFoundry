@@ -5569,14 +5569,15 @@ def _audit_anchors_refused_before_the_store(
             specs.append(ca)
     if not specs:
         return
+    # The lifespan's own posture (BACKLOG #5391, Manager decision Q1), not _command_hop_posture's,
+    # which is None at warn and so refuses hops serve accepts.
+    posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
 
     async def _audit() -> None:
         store = await open_store(
             settings.store,
             create=True,
-            # The lifespan's own posture (BACKLOG #5391, Manager decision Q1), not
-            # _command_hop_posture's, which is None at warn and so refuses hops serve accepts.
-            posture=hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement),
+            posture=posture,
             keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
         )
         memory_fault: MemoryError | None = None
