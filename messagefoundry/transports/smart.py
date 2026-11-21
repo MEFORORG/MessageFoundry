@@ -402,7 +402,11 @@ class _TokenEndpointProvider(abc.ABC):
         set up for Digest or if it verifies with no revocation check, and set up the empty cache."""
         self.token_url = token_url
         self.expiry_skew_seconds = max(0.0, expiry_skew_seconds)
-        self.timeout_seconds = timeout_seconds
+        # BACKLOG #5959: checked here too, so a provider built directly, not through a settings
+        # reader, is held to the same rule; positive_seconds says why.
+        self.timeout_seconds = positive_seconds(
+            timeout_seconds, knob="timeout_seconds", transport=f"{self._LABEL} token endpoint"
+        )
         # ADR 0126: route the token-endpoint POST through the connection's forward proxy — resolved
         # for the TOKEN host (its own bypass decision, #128). None / bypassed → the shared opener and
         # no Proxy-Authorization (byte-identical). None with an ECH sidecar too: the POST goes to the
@@ -786,9 +790,7 @@ def token_provider_from_settings(
             knob="smart_expiry_skew_seconds",
             transport="SMART",
         ),
-        # BACKLOG #5959: positive, as REST's (BACKLOG #5796), because urllib reads a zero timeout as a
-        # non-blocking socket and refuses a negative one, so either would build and then fail every
-        # token request.
+        # BACKLOG #5959: above zero, as REST's; positive_seconds says why.
         timeout_seconds=positive_seconds(
             s.get("smart_timeout_seconds", _DEFAULT_TOKEN_TIMEOUT),
             knob="smart_timeout_seconds",

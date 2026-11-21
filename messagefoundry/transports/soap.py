@@ -195,6 +195,8 @@ _MARKUP_CLOSER = dict(_NON_ELEMENT_MARKUP)
 _FAULT_OUTSIDE_MARKUP_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|(?i:<\s*(?:[\w.\-]+:)?Fault[\s/>])")
 _FAULT_END_OUTSIDE_MARKUP_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|(?i:</\s*(?:[\w.\-]+:)?Fault\s*>)")
 _CODE_END_OUTSIDE_MARKUP_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|(?i:</\s*(?:[\w.\-]+:)?Code\s*>)")
+# _TAG_OPEN_RE among those openers: the first tag outside that markup (_child_code_text).
+_TAG_OPEN_OUTSIDE_MARKUP_RE = re.compile(r"<!--|<!\[CDATA\[|<\?|<(?![!?])")
 # A <…:Header> element (any/no namespace prefix) smuggled into a <Body> fragment (purity-leak lint).
 _HEADER_EL_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Header[\s/>]", re.IGNORECASE)
 
@@ -352,10 +354,13 @@ def _fault_code(body: str, fault: re.Match[str] | None = None) -> str:
     does not end either element (:func:`_search_outside_markup`); the fallback below does not step
     over markup.
 
+    Where the code element's first ``</`` is its own close tag inside a comment, a CDATA section
+    or a processing instruction, the element is read to its own close tag outside that markup
+    when that is the next tag (:func:`_child_code_text`).
+
     Where the first-child read yields no code, because the first child is neither element, it
-    cannot hold a code, its text ends inside a comment, CDATA section or processing instruction it
-    opens (:func:`_outside_markup_text`), or a ``<!`` the read does not step over (a DOCTYPE, a
-    lowercase ``<![cdata[``, an unterminated comment) stops it, the code falls back to the earlier search
+    cannot hold a code, or a ``<!`` the read does not step over (a DOCTYPE, a lowercase
+    ``<![cdata[``, an unterminated comment) stops it, the code falls back to the earlier search
     (:func:`_searched_code`), by that search's rule for its range: from the Fault start tag
     :func:`_find_fault` took to the first plain Fault close tag, or the reply's end, markup not
     stepped over. So, where :func:`_find_fault` takes the Fault start tag the code before #5912
@@ -396,7 +401,7 @@ def _first_child_code(body: str, start: int, end: int) -> str:
         return ""
     faultcode = _FAULTCODE_RE.match(body, child, end)
     if faultcode is not None:
-        return _outside_markup_text(_code_text(faultcode, _FAULTCODE_END_RE, body, end))
+        return _child_code_text(faultcode, _FAULTCODE_END_RE, body, end)
     code = _CODE_RE.match(body, child, end)
     code_gt = -1 if code is None else _start_tag_gt(body, code.end(), end)
     if code_gt < 0:
@@ -405,30 +410,30 @@ def _first_child_code(body: str, start: int, end: int) -> str:
     stop = end if code_end is None else code_end.start()
     child = _first_child(body, code_gt + 1, stop)
     value = None if child < 0 else _CODEVALUE_RE.match(body, child, stop)
-    if value is None:
-        return ""
-    return _outside_markup_text(_code_text(value, _CODEVALUE_END_RE, body, stop))
+    return "" if value is None else _child_code_text(value, _CODEVALUE_END_RE, body, stop)
 
 
-def _outside_markup_text(text: str) -> str:
-    """``text``, or ``""`` when it ends inside a comment, a CDATA section or a processing
-    instruction it opens, so the ``</`` that ended it lies inside that markup.
+def _child_code_text(m: re.Match[str], end_re: re.Pattern[str], body: str, end: int) -> str:
+    """The first-child read's text for the code element ``m``: :func:`_code_text`'s, except where
+    that text ends at a ``</`` inside a comment, a CDATA section or a processing instruction.
 
-    BACKLOG #5912: such a capture, ``<!-- `` from ``<faultcode><!-- </faultcode> -->soap:Server``
-    say, is not the element's code, so the first-child read yields none and :func:`_fault_code`
-    falls back to :func:`_searched_code`, as the code before #5912 read it. Markup terminated
-    inside ``text`` is kept, as before. One scan forward, so linear in ``text``."""
-    pos = 0
-    while (lt := text.find("<", pos)) >= 0:
-        pos = lt + 1
-        for opener, closer in _NON_ELEMENT_MARKUP:
-            if text.startswith(opener, lt):
-                close = text.find(closer, lt + len(opener))
-                if close < 0:
-                    return ""
-                pos = close + len(closer)
-                break
-    return text
+    BACKLOG #5912 (closing step 21): ``<faultcode><!-- </faultcode> -->soap:Server</faultcode>``
+    gave :func:`_code_text` the text ``<!-- ``, read as an unrecognized, permanent fault, where
+    the code before #5912 retried such a reply through a ``Value`` ahead of it. There the element
+    is read instead to the first tag outside such markup, when that tag is its own close tag
+    (``<!-- </faultcode> -->soap:Server``). Otherwise the :func:`_code_text` text stands. That
+    text is then a prefix of the new one, so a Sender or Client code it held is kept, and the
+    class can change only from an unrecognized fault to a Sender or Receiver one. Markup inside
+    the text is kept and searched, as before. Only text holding a ``<`` is read twice, and each
+    read is one scan forward, so the read stays linear in the reply."""
+    text = _code_text(m, end_re, body, end)
+    if "<" not in text:
+        return text
+    gt = _start_tag_gt(body, m.end(), end)
+    tag = _search_outside_markup(_TAG_OPEN_OUTSIDE_MARKUP_RE, body, gt + 1, end)
+    if tag is None or not end_re.match(body, tag.start(), end):
+        return text
+    return body[gt + 1 : tag.start()]
 
 
 def _searched_code(body: str, start: int, end: int) -> str:
@@ -657,9 +662,7 @@ class SoapDestination(DestinationConnector):
         self.url = url
         # BACKLOG #2060: names this hop in a bounded-read refusal, which never carries the URL.
         self._hop = hop_identity("SOAP", config.name)
-        # BACKLOG #5959: positive, as REST's (BACKLOG #5796), because urllib reads a zero timeout as a
-        # non-blocking socket and refuses a negative one, so either would build and then fail every
-        # send.
+        # BACKLOG #5959: above zero, as REST's; positive_seconds says why.
         self.timeout: float = positive_seconds(
             s.get("timeout_seconds", 30.0), knob="timeout_seconds", transport="SOAP destination"
         )

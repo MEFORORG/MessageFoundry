@@ -64,7 +64,10 @@ from messagefoundry.transports.direct import DirectDestination
 from messagefoundry.transports.email import EmailDestination
 from messagefoundry.transports.fhir import FhirDestination, FhirLookupExecutor
 from messagefoundry.transports.file import FileSource
-from messagefoundry.transports.http_auth import oauth2_cc_provider_from_settings
+from messagefoundry.transports.http_auth import (
+    OAuth2ClientCredentialsProvider,
+    oauth2_cc_provider_from_settings,
+)
 from messagefoundry.transports.http_listener import DEFAULT_MAX_HEADER_BYTES, HttpSource
 from messagefoundry.transports.mllp import MLLPDestination, MLLPSource
 from messagefoundry.transports.remotefile import RemoteFileSource
@@ -754,8 +757,9 @@ _FLOAT_OFF_BY_ZERO = [
     ),
 ]
 
-#: Timeouts read by ``float_setting`` alone, where zero is not "off": (builder, key, attribute).
-#: Each was a bare ``float()`` before #3432.
+#: Timeouts read by ``float_setting``, where zero is not "off": (builder, key, attribute). Each was
+#: a bare ``float()`` before #3432. Some are read through ``positive_seconds`` now, which refuses a
+#: zero or a negative too (BACKLOG #5796, #5959; the tests after ``_POSITIVE_TIMEOUTS`` pin that).
 _TIMEOUTS = [
     pytest.param(_MLLP_OUT, "timeout_seconds", "timeout", id="mllp-out-timeout"),
     pytest.param(_MLLP_OUT, "connect_timeout", "connect_timeout", id="mllp-out-connect"),
@@ -950,6 +954,21 @@ def test_a_request_timeout_that_is_not_positive_is_refused_at_build(
     )
     with pytest.raises(ValueError, match=message):
         build({key: bad})
+
+
+@pytest.mark.parametrize("bad", [0, -1.5])
+def test_a_token_hop_built_directly_refuses_a_timeout_that_is_not_positive(bad: float) -> None:
+    """BACKLOG #5959: the token hop checks the timeout itself, so a provider built without a
+    settings reader is held to the rule too. Control: a positive timeout builds."""
+    kwargs: dict[str, Any] = {
+        "token_url": "https://auth.example.com/token",
+        "client_id": "c",
+        "client_secret": "s",
+    }
+    match = r"^OAuth2 token endpoint timeout_seconds must be a number of seconds above zero"
+    with pytest.raises(ValueError, match=match):
+        OAuth2ClientCredentialsProvider(**kwargs, timeout_seconds=bad)
+    assert OAuth2ClientCredentialsProvider(**kwargs, timeout_seconds=0.5).timeout_seconds == 0.5
 
 
 _RANGE_REFUSALS = [

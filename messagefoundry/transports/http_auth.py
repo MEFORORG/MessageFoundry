@@ -405,9 +405,7 @@ def oauth2_cc_provider_from_settings(
             knob="oauth2_expiry_skew_seconds",
             transport="OAuth2",
         ),
-        # BACKLOG #5959: positive, as REST's (BACKLOG #5796), because urllib reads a zero timeout as a
-        # non-blocking socket and refuses a negative one, so either would build and then fail every
-        # token request.
+        # BACKLOG #5959: above zero, as REST's; positive_seconds says why.
         timeout_seconds=positive_seconds(
             s.get("oauth2_timeout_seconds", _DEFAULT_TOKEN_TIMEOUT),
             knob="oauth2_timeout_seconds",

@@ -700,6 +700,50 @@ async def test_dicomweb_a_malformed_failed_sop_sequence_fails_closed(
     assert exc.value.permanent
 
 
+@pytest.mark.parametrize(
+    "element",
+    [
+        '{"vr": "SQ", "Value": [null]}',
+        '{"vr": "SQ", "Value": ["garbage"]}',
+        '{"vr": "SQ", "Value": [1]}',
+        '{"vr": "SQ", "Value": [{}, null]}',
+        '{"vr": "UI", "Value": ["1.2.3"]}',
+        '{"vr": "UI", "Value": [{}]}',
+    ],
+    ids=["null-item", "text-item", "number-item", "mixed-items", "ui-text", "ui-dataset"],
+)
+async def test_dicomweb_a_failed_sop_sequence_of_non_datasets_proves_no_rejection(
+    element: str,
+) -> None:
+    # BACKLOG #5914: such a sequence proves no rejection, so it is refused as unparseable, with the
+    # replay advice, not as failed-sop.
+    dest = _dest()
+    dest._opener = _FakeOpener(body=f'{{"00081198": {element}}}'.encode(), status=200)  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
+    assert exc.value.code == "unparseable-reply"
+    assert exc.value.permanent
+    assert "before a replay" in str(exc.value)
+
+
+async def test_dicomweb_a_proven_rejection_wins_over_a_malformed_sequence_elsewhere() -> None:
+    # BACKLOG #5914: each dataset is judged alone, in either order.
+    proven = json.loads(STORED_FAILED)
+    for datasets in ([proven, {"00081198": "garbage"}], [{"00081198": "garbage"}, proven]):
+        dest = _dest()
+        dest._opener = _FakeOpener(body=json.dumps(datasets).encode(), status=200)  # type: ignore[assignment]
+        with pytest.raises(NegativeAckError) as exc:
+            await dest.send(PAYLOAD)
+        assert exc.value.code == "failed-sop"
+
+
+async def test_dicomweb_an_empty_failed_sop_sequence_of_another_vr_is_not_a_refusal() -> None:
+    # Control: with no item there is nothing to judge, so the vr alone refuses nothing, as before.
+    dest = _dest()
+    dest._opener = _FakeOpener(body=b'{"00081198": {"vr": "UI"}}', status=200)  # type: ignore[assignment]
+    assert await dest.send(PAYLOAD) is None
+
+
 async def test_dicomweb_an_empty_failed_sop_sequence_is_not_a_refusal() -> None:
     # PS3.18 F.2.5: an element with no Value, or an empty one, is an empty sequence.
     for element in ('{"vr": "SQ"}', '{"vr": "SQ", "Value": []}'):
