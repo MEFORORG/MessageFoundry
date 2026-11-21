@@ -1198,7 +1198,7 @@ async def test_coordinator_signs_in_over_https_and_a_refusal_needs_a_barrier(
     assert report.sign_in_refused
 
 
-@pytest.mark.parametrize("case", ["unreachable", "skipped"])
+@pytest.mark.parametrize("case", ["unreachable", "rate-limited", "skipped"])
 async def test_gated_drive_flags_only_a_refused_sign_in_and_can_skip_it(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
 ) -> None:
@@ -1210,7 +1210,7 @@ async def test_gated_drive_flags_only_a_refused_sign_in_and_can_skip_it(
     Red: the unreachable case reads refused, or the skipped case builds a poller."""
     import types
 
-    from harness.load.rigadmin import RigUnreachable
+    from harness.load.rigadmin import RigSignInRateLimited, RigUnreachable
 
     _install_coordinator_fakes(
         monkeypatch,
@@ -1235,6 +1235,8 @@ async def test_gated_drive_flags_only_a_refused_sign_in_and_can_skip_it(
             built.append(urls)
 
         async def open(self) -> None:
+            if case == "rate-limited":
+                raise RigSignInRateLimited("HTTP 429 on every attempt")
             raise RigUnreachable("the engine did not answer")
 
         async def close(self) -> None:
@@ -1271,7 +1273,8 @@ async def test_gated_drive_flags_only_a_refused_sign_in_and_can_skip_it(
         sign_in=case != "skipped",
     )
     assert any("advisory /stats poller not opened" in n for n in report.notes), report.notes
-    if case == "unreachable":
+    if case != "skipped":
+        # Neither an engine that did not answer nor a transient 429 is a refused credential.
         assert len(built) == 1
         assert not report.sign_in_refused
     else:

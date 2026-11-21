@@ -76,7 +76,12 @@ from harness.load.failover_track import FailoverTracker
 from harness.load.ids import SHARDCERT_IDS
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix, load_profile_text
-from harness.load.rigadmin import REMOTE_RIG_SESSION, RIG_SESSION, RigSignInRefused
+from harness.load.rigadmin import (
+    REMOTE_RIG_SESSION,
+    RIG_SESSION,
+    RigSignInRateLimited,
+    RigSignInRefused,
+)
 from harness.load.sender import PersistentConnection
 from harness.load.sink import CorrelationSink
 from harness.load.tlsmat import harness_ssl_context
@@ -927,6 +932,9 @@ def _copies_missing(tracker: FailoverTracker, *, routing: str, dests: int, deliv
     picks for each seq (:func:`destinations_for_seq`), read from each copy's lane label. O(A x D) under
     broadcast and O(A x dests) under the partitioned modes, so an async caller runs it off the loop."""
     fanout = max(delivering, 0)
+    # Unmeasured, never a guess: the walk would raise on a routing or fan-out the router never serves.
+    if fanout < 1 or fanout_refusal(routing, dests=dests, fanout=fanout) is not None:
+        return -1
     if routing == BROADCAST:
         every = frozenset(destinations_for_seq(0, routing=BROADCAST, dests=dests, fanout=fanout))
         return tracker.acked_copies_missing(lambda _seq: every, fifo_lane_destination)
@@ -5041,7 +5049,10 @@ async def run_shardcert_drive(
                     raise
                 # Only a refusal, never an engine that did not answer: a retry of a refused
                 # credential is what counts toward a lockout.
-                sign_in_refused = isinstance(exc.__cause__, RigSignInRefused)
+                # A 429 (RigSignInRateLimited) is transient, so it does not stop a later rung's try.
+                sign_in_refused = isinstance(exc.__cause__, RigSignInRefused) and not isinstance(
+                    exc.__cause__, RigSignInRateLimited
+                )
                 notes.append(
                     "advisory /stats poller not opened, so drained/engine_done/engine_dead are unread: "
                     + escape_for_terminal(str(exc), single_line=True)

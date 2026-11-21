@@ -3757,6 +3757,12 @@ async def run_drive_ladder(
     engine's SHARDS_READY (via :attr:`ShardCertDriveReport`), so the shape has ONE source of truth across the
     box boundary. A shape flag on both CLIs would be a two-place constant that drifts invisibly — and the
     drift would surface as a fabricated ceiling, not an error."""
+    # Before any rung consumes SHARDS_READY: refused mid-rung, it would end the ladder with no
+    # LADDER_STOP posted.
+    if cacert is not None and not cacert.strip():
+        raise ValueError(
+            "cacert names no certificate: an empty value would fall back to the default trust"
+        )
     climb = plan_climb_rungs(rates, hold_seconds=hold_seconds, drain_timeout=drain_timeout)
     # Clear cross-rung signals so a re-run under the same base run_id doesn't read a stale STOP/SOAK.
     base_coord.clear_messages(LADDER_STOP, LADDER_SOAK)

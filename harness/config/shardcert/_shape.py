@@ -565,9 +565,12 @@ def fifo_lane_destination(label: str) -> int | None:
     """The destination index a :func:`fifo_lane` label names (its last ``_`` field), or ``None`` for
     a label it did not write, such as an empty MSH-6 under the ``cheap`` transform."""
     _, sep, tail = label.rpartition("_")
-    # ASCII digits only: str.isdigit accepts digits such as superscript two, which int() refuses, so a
-    # hostile MSH-6 label at the sink would raise at report time and end the run with no report.
-    return int(tail) if sep and tail.isascii() and tail.isdigit() else None
+    # At most 9 ASCII digits: str.isdigit accepts digits such as superscript two, which int() refuses,
+    # and int() refuses a run past its digit limit, so a hostile MSH-6 label at the sink would raise at
+    # report time and end the run with no report. fifo_lane writes two digits.
+    if not sep or len(tail) > 9 or not (tail.isascii() and tail.isdigit()):
+        return None
+    return int(tail)
 
 
 def apply_transform(

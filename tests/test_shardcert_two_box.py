@@ -638,7 +638,7 @@ def test_tracker_partitioned_copy_at_the_wrong_destination_is_missing() -> None:
     assert _tracker(acked, wrong).acked_copies_missing(expected, fifo_lane_destination) == 20
 
 
-@pytest.mark.parametrize("label", ["a_²", "a_0٣", "a_１"])
+@pytest.mark.parametrize("label", ["a_²", "a_0٣", "a_１", "a_" + "1" * 5000])
 def test_fifo_lane_destination_names_no_destination_for_non_ascii_digits(label: str) -> None:
     """BACKLOG #5640: ``str.isdigit`` accepts superscript two (``int`` then raises at report time,
     ending the run with no report) and other scripts' digits (which ``int`` reads as a destination
@@ -665,6 +665,9 @@ def test_destinations_for_seq_refuses_a_fanout_the_router_never_serves(
     Fisher-Yates, and an unknown routing was answered as partitioned. Both are refused, by name.
 
     Mutation: drop the guard. Red: ZeroDivisionError, or a list for the unknown routing."""
+    # The copy walk over an ACKed message reads it as unmeasured rather than raise.
+    walk = _tracker([7], {"a_00": [7]})
+    assert sc._copies_missing(walk, routing=routing, dests=dests, delivering=fanout) == -1
     assert reason in (fanout_refusal(routing, dests=dests, fanout=fanout) or "")
     with pytest.raises(ValueError, match=reason):
         destinations_for_seq(7, routing=routing, dests=dests, fanout=fanout)
@@ -1241,6 +1244,24 @@ def test_remote_poller_refuses_insecure_with_a_cacert() -> None:
     """A certificate means nothing on a plaintext hop; asking for both is a mistake, said loud."""
     with pytest.raises(ValueError, match="--cacert"):
         sc._remote_engine_poller("10.0.0.5", [9001], allow_insecure=True, cacert="x.pem")
+
+
+async def test_drive_ladder_refuses_an_empty_cacert_before_any_rung(tmp_path: Path) -> None:
+    """Refused mid-rung, after SHARDS_READY was read, it ended the ladder with no LADDER_STOP."""
+    import harness.load.shardcert_ladder as ladder
+
+    with pytest.raises(ValueError, match="names no certificate"):
+        await ladder.run_drive_ladder(
+            engine_host="10.0.0.5",
+            rates=[10.0],
+            hold_seconds=0.05,
+            drain_timeout=1.0,
+            driver_count=1,
+            sink_count=1,
+            sink_host="127.0.0.1",
+            base_coord=FileDropCoord(tmp_path, run_id="emptyca"),
+            cacert="",
+        )
 
 
 def test_remote_poller_refuses_an_empty_cacert() -> None:
