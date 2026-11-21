@@ -1625,10 +1625,11 @@ async def _refuse_from_new_address(
 def _step_up_continuation(
     reauth_next: Callable[[Request], str] | None,
 ) -> Callable[[Request], str | None]:
-    """The continuation every refusal of a step-up factory carries to ``/ui/reauth``: the
-    ``step_up_new_address`` and :func:`_reauth_refusal` it hands :func:`require_ui`, and its own
-    stale-window and missing-proof refusals. ``None`` means the request's own path, as
-    :func:`_reauth_redirect` reads it."""
+    """The continuation a step-up factory's refusals carry to ``/ui/reauth``. At least these use
+    it: the ``step_up_new_address`` and :func:`_reauth_refusal` the factory hands
+    :func:`require_ui`, and the factory's own stale-window and missing-proof refusals.
+    ``spend_ui_action_step_up`` does not: a route calls it with its own ``reauth_next``. ``None``
+    means the request's own path, as :func:`_reauth_redirect` reads it."""
 
     def continuation(request: Request) -> str | None:
         return reauth_next(request) if reauth_next is not None else None
