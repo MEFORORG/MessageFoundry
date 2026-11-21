@@ -1677,8 +1677,9 @@ _XML_PHI_END = re.compile(
     r"</(?:[A-Za-z_][\w.-]*+:)?(family|given|name|birthDate|address|identifier|telecom)\s*+>"
 )
 
-#: A vocabulary end tag followed by a space, outside any walked element: the only kind whose rest
-#: :func:`_end_tag_rest` can mask, since every maskable rest opens with a space.
+#: A vocabulary end tag followed by a space, outside any walked element or at the end of a field
+#: run's token (:func:`_glued_end_tag_rest`): the only kind whose rest :func:`_end_tag_rest` can mask
+#: there, since every maskable rest opens with a space.
 _XML_PHI_END_OPEN = re.compile(
     r"</(?:[A-Za-z_][\w.-]*+:)?(?:family|given|name|birthDate|address|identifier|telecom)(?= )"
 )
@@ -1759,23 +1760,29 @@ def _end_tag_rest(text: str, start: int, stop: int, mask: bool) -> str:
 
     **Which words may be masked depends on what follows them** (:func:`_rest_words` holds the rules
     both share). Where only whitespace follows the line, :func:`_maskable_rest` decides with its
-    rules for an answer's end, and :func:`_ends_in_camel_head` can refuse the last word too. Where
+    rules for an answer's end, and also with its rules for a value glued to what follows where that
+    whitespace opens with anything but a space, such as a line break (``</family Li`` then a line
+    break keeps ``Li``); :func:`_ends_in_camel_head` can refuse the last word too. Where
     the tag's ``>``, a ``<`` or a line break follows, a last word ending in a whole boundary-free
     word is refused too, and a surname such as ``Johnson`` is masked there.
 
-    Where the rules refuse, the rest stays as it stood, and that is the residual, at least these: a
-    rest holding punctuation, a tab or a non-ASCII letter; one holding a word some pass reads
-    literally or the start of one, a credential word inside a longer word, or a date (``</family
-    Bearer x>``, ``</family userPwd>``); one longer than :data:`_GLUED_VALUE_MAX`; any word after a
-    line break inside the tag; every rest in a text that holds the backstop's opener when the XML
+    Only the rest's first line, up to the tag's ``>``, a ``<`` or a line break, is tested and masked.
+    Where the rules refuse it, that line stays as it stood, and that is the residual, at least these:
+    a first line holding punctuation, a tab or a non-ASCII letter; one holding a word some pass reads
+    literally or the start of one (``</family Bearer x>``), a credential word inside a longer word
+    (``</family userPwd>``), or a date (``</family Zqxdoe 19800505>``); one longer than
+    :data:`_GLUED_VALUE_MAX`; any word after a line break inside the tag, whatever the first line
+    held; every rest in a text that holds the backstop's opener when the XML
     pass reads it; every rest of an end tag outside a walked element that names no vocabulary
-    element (``<family>Smith</family></b Zqxdoe>``, :func:`_mask_stray_end_tags`); every rest whose
-    end tag an HL7 field run took before this pass ran, in at least these shapes: a run before the
-    element (``a|b|<family>Smith</family Zqxdoe>``), one in its own content (``<given>A^B^C</given
-    Zqxdoe>``), and one before a stray end tag (``a|b|</family Zqxdoe>``); and, where the rest ends
-    the text, every refusal :func:`_maskable_rest` makes there, a last word with a digit or
-    ending in ``m``, ``b``, ``f`` or ``n`` among them, and every last word
-    :func:`_ends_in_camel_head` refuses (``</family zqxP``)."""
+    element (``<family>Smith</family></b Zqxdoe>``, :func:`_mask_stray_end_tags`); a rest whose end
+    tag's name an HL7 field run took before this pass ran, which that run masks instead
+    (:func:`_glued_end_tag_rest`) only where these rules allow and the next run's token would not
+    open inside the mask, so it keeps at least what these rules refuse, while a run that took the
+    name of an end tag outside the vocabulary leaves its rest as it stood, even inside a vocabulary
+    element (``<name>a|b|<b>c</b Zqxdoe></name>``); and, where the rest ends the text, every
+    refusal :func:`_maskable_rest` makes there, a last word with a digit or ending in ``m``, ``b``,
+    ``f`` or ``n`` among them, and every last word :func:`_ends_in_camel_head` refuses (``</family
+    zqxP``)."""
     if not mask or not text.startswith(" ", start):
         return text[start:stop]
     line = _END_TAG_LINE.match(text, start, stop)
@@ -1951,11 +1958,8 @@ def _mask_stray_end_tags(text: str, lo: int, hi: int, mask: bool) -> str:
 def _redact_structured(text: str, *, widened: bool, masks: bool = True) -> str:
     """The structured-shape passes, run on everything but this module's own trailing notes
     (:data:`_TRAILING_NOTES`); ``masks`` is :func:`_redact_xml_elements`'s."""
-    body, tail = text, ""
-    if text.endswith("unscanned]"):  # a cheap test before a search of the whole text
-        note = _TRAILING_NOTES.search(text)
-        if note is not None:
-            body, tail = text[: note.start()], note.group()
+    body = _without_trailing_note(text)
+    tail = text[len(body) :]
     body = _redact_json_fields(body, widened=widened)
     body = _redact_dicom_tags(body, widened=widened)
     body = _redact_dicom_labels(body, widened=widened)
@@ -2310,7 +2314,8 @@ _UNBOUNDED_HEADS = tuple(
 #: The credential label words a camelCase start opens on, which the credential filters read inside
 #: a longer word (``userPwd=``, ``clientSecret=``), lower-cased: the glued-label words and the
 #: compound key words. That module imports this one, so they are spelled here; a test holds this set
-#: to its ``_CAMEL_WORDS``. Read by :func:`_end_tag_rest` only.
+#: to its ``_CAMEL_WORDS``. Read for end-tag rests only, by :func:`_rest_words` with ``camel`` and
+#: by :func:`_ends_in_camel_head`.
 _CAMEL_LABEL_WORDS = (
     *_GLUED_CREDENTIAL_WORDS,
     "sharedaccesskey",
@@ -2334,26 +2339,83 @@ _CREDENTIAL_UNBOUNDED_HEADS = (*_UNBOUNDED_HEADS, "mfb6", "mfb64")
 _TRAILING_SPACE = re.compile(r"\s*+\Z")
 
 
-def _glued_value(text: str, run: re.Match[str], field_run: re.Pattern[str]) -> str | None:
+def _glued_value(
+    text: str, body: str, run: re.Match[str], field_run: re.Pattern[str]
+) -> str | None:
     """The rest of a PHI or credential value that the field run ``run`` cut through, when it is safe
     to mask: the text after the token, up to the value's terminator. ``None`` leaves the plain
-    scrub.
+    scrub. ``body`` is ``text`` as the XML pass reads it (:func:`_without_trailing_note`).
 
-    The PHI arms answer first, exactly as they did before BACKLOG #2968. Only where they decline
-    does a credential label at the token's end mask the next word, so the credential arm adds a
-    mask to an answer and never takes one away."""
+    The PHI arms answer first, exactly as they did before BACKLOG #2968. Where they decline, a token
+    that ends on a vocabulary end tag's name masks that tag's rest (:func:`_glued_end_tag_rest`,
+    BACKLOG #5925); it reads only such a token, which no credential label ends. Only where both
+    decline does a credential label at the token's end mask the next word, so the credential arm
+    adds a mask to an answer and never takes one away."""
     token, end = run.group(), run.end()
     stop = _glued_phi_value_end(text, token, end)
     if stop is not None:
         rest = _maskable_rest(text, end, stop, field_run, credential=False)
         if rest is not None:
             return rest
+    rest = _glued_end_tag_rest(text, body, token, end, field_run)
+    if rest is not None:
+        return rest
     if not _ends_in_credential_label(token):
         return None
     bare = _GLUED_BARE_VALUE.match(text, end)
     return (
         None if bare is None else _maskable_rest(text, end, bare.end(), field_run, credential=True)
     )
+
+
+def _glued_end_tag_rest(
+    text: str, body: str, token: str, end: int, field_run: re.Pattern[str]
+) -> str | None:
+    """The rest of a vocabulary end tag a field run cut through, when its ``token`` ends on
+    the tag's name (``a|b|<family>Smith</family`` before `` Zqxdoe>``), masked only where both of
+    these allow it: :func:`_end_tag_rest`'s rules, read on ``body``, the text as the XML pass reads
+    it (:func:`_without_trailing_note`), which that pass applies to the same rest when no run took
+    the tag; and the one field-run rule that applies here: a last word glued to what follows must
+    not open the next run's token, which would start inside the mask (BACKLOG #5925 item 1). The
+    flat passes run before the XML pass, so without this the run took the tag's name and the rest
+    it left was read by neither. ``None`` keeps the rest as it stood.
+
+    **The rest ends inside ``body``.** A bound note joined by a space is on the tag's line, so a rest
+    read on ``text`` ran into the note, and was judged as followed by it rather than as ending the
+    text. ``body`` is found once per :func:`_scrub_field_runs` call, never once per token, which
+    made the cost grow with the square of the text's tokens.
+
+    Only a vocabulary end tag is read, as :func:`_mask_stray_end_tags` reads one outside a walked
+    element. This arm tracks no open elements, so the rest of any other end tag a run took stays as
+    it stood, even inside a vocabulary element (``<name>a|b|<b>c</b Zqxdoe></name>``)."""
+    lt = token.rfind("<")
+    if lt == -1 or end >= len(body):
+        return None
+    tag = _XML_PHI_END_OPEN.match(body, end - len(token) + lt)
+    if tag is None or tag.end() != end:
+        return None
+    line = _END_TAG_LINE.match(body, end, min(len(body), end + _GLUED_VALUE_MAX + 1))
+    assert line is not None  # the pattern matches the empty string
+    stop = line.end()
+    rest = body[end:stop]
+    # _end_tag_rest returns the line masked, or unchanged where its rules refuse.
+    if _end_tag_rest(body, end, stop, True) == rest:
+        return None
+    words = _GLUED_WORD.findall(rest)
+    if not words:  # _end_tag_rest masks only a rest with a word; a stand-in for it may not
+        return None
+    if not rest.endswith(" ") and field_run.match(text, stop - len(words[-1])) is not None:
+        return None
+    return rest
+
+
+def _without_trailing_note(text: str) -> str:
+    """``text`` without this module's trailing bound note and its joiner (:data:`_TRAILING_NOTES`),
+    as :func:`_redact_structured` hands it to the XML pass."""
+    if not text.endswith("unscanned]"):  # a cheap test before a search of the whole text
+        return text
+    note = _TRAILING_NOTES.search(text)
+    return text if note is None else text[: note.start()]
 
 
 def _ends_in_credential_label(token: str) -> bool:
@@ -2430,13 +2492,19 @@ def _scrub_field_runs(text: str, field_run: re.Pattern[str] | None = None) -> st
         return field_run.sub(_REDACTED, text)
     out: list[str] = []
     pos = 0
+    #: Found once per call, never per token: :func:`_glued_end_tag_rest` says why.
+    body: str | None = None
     for run in field_run.finditer(text):
         out.append(text[pos : run.start()])
         out.append(_REDACTED)
         pos = run.end()
         # Every value it masks opens with a space, and its token holds a hint, so most runs skip it.
         candidate = text.startswith(" ", pos) and _GLUED_HINT.search(text, run.start(), pos)
-        rest = _glued_value(text, run, field_run) if candidate else None
+        rest = None
+        if candidate:
+            if body is None:
+                body = _without_trailing_note(text)
+            rest = _glued_value(text, body, run, field_run)
         if rest is not None:
             out.append(rest.translate(_SHAPE))
             pos += len(rest)
