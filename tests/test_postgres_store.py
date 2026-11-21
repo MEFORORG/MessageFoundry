@@ -6038,6 +6038,47 @@ async def test_undecryptable_reply_contract(store, spoil) -> None:
         await sealed.close()
 
 
+async def test_pool_isolation_pin_outranks_a_role_default(store) -> None:
+    """BACKLOG #5674: the finalizer's read after its advisory lock sees a sibling's commit only under
+    READ COMMITTED. With the role's default set to REPEATABLE READ, a freshly opened pool still runs
+    a transaction that names no isolation under READ COMMITTED, and the pool's reset on release
+    restores the pin a session changed. CONTROL: the role setting is in place, and the session's
+    value comes from the client, so the pin is what won."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            "ALTER ROLE CURRENT_USER SET default_transaction_isolation = 'repeatable read'"
+        )
+    try:
+        async with store._pool.acquire() as conn:
+            configs = await conn.fetchval(
+                "SELECT setconfig FROM pg_db_role_setting"
+                " WHERE setrole = (SELECT oid FROM pg_roles WHERE rolname = current_user)"
+                " AND setdatabase = 0"
+            )
+        assert "default_transaction_isolation=repeatable read" in (configs or [])
+
+        pinned = await PostgresStore.open(load_settings(environ=os.environ).store)
+        try:
+            async with pinned._pool.acquire() as conn:
+                source = await conn.fetchval(
+                    "SELECT source FROM pg_settings WHERE name = 'default_transaction_isolation'"
+                )
+                assert source == "client"
+                async with conn.transaction():
+                    assert await conn.fetchval("SHOW transaction_isolation") == "read committed"
+                await conn.execute("SET SESSION default_transaction_isolation = 'repeatable read'")
+            async with pinned._pool.acquire() as conn, conn.transaction():
+                assert await conn.fetchval("SHOW transaction_isolation") == "read committed"
+        finally:
+            await pinned.close()
+    finally:
+        async with store._pool.acquire() as conn:
+            await conn.execute("ALTER ROLE CURRENT_USER RESET default_transaction_isolation")
+
+
 @pytest.mark.parametrize("case", KEYLESS_BLANK_CASES, ids=lambda c: c.__name__)
 async def test_keyless_blank_contract(store, case) -> None:
     """BACKLOG #3495: the first keyed open seals a live empty row, the same contract the SQLite suite

@@ -286,6 +286,20 @@ async def test_pool_connect_hook_builds_a_fresh_verifying_context_per_connection
         assert ctx.get_ciphers() == opened_with.get_ciphers()
 
 
+@pytest.mark.parametrize("schema", [None, "mefor_app"])
+async def test_pool_pins_read_committed_as_the_default_isolation(
+    monkeypatch: pytest.MonkeyPatch, schema: str | None
+) -> None:
+    """BACKLOG #5674: the finalizer reads after its advisory lock and sees a sibling's commit only
+    under READ COMMITTED, so the pool pins it as a startup parameter rather than trusting the
+    server's default. The live suite's role-default test shows the pin outranks a role setting."""
+    fake = await _pool_with_fake_asyncpg(monkeypatch, _pg(db_schema=schema))
+    server_settings = fake.pool_kwargs["server_settings"]
+    assert isinstance(server_settings, dict)
+    assert server_settings["default_transaction_isolation"] == "read committed"
+    assert server_settings.get("search_path") == schema
+
+
 async def test_pool_connect_hook_names_a_slow_build_without_posing_as_pool_exhaustion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

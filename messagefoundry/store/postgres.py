@@ -2320,7 +2320,15 @@ class PostgresStore:
                 "Postgres backend requires the 'postgres' extra: "
                 "pip install 'messagefoundry[postgres]'"
             ) from exc
-        server_settings = {"application_name": settings.application_name}
+        server_settings = {
+            "application_name": settings.application_name,
+            # BACKLOG #5674: pinned, so a server, database or role default of REPEATABLE READ cannot
+            # change what a transaction that names no isolation sees. `_maybe_finalize_message`
+            # reads its message's queue rows after taking the finalize advisory lock, and only
+            # under READ COMMITTED does that read see a sibling's commit. A startup parameter
+            # outranks those defaults, and the pool's RESET ALL on release restores it.
+            "default_transaction_isolation": "read committed",
+        }
         if settings.db_schema:
             # Resolve unqualified table names against the configured schema (it must already exist).
             server_settings["search_path"] = settings.db_schema
