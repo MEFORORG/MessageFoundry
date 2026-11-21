@@ -370,3 +370,75 @@ async def test_the_cursor_close_and_autocommit_set_run_on_the_pools_executor(
     await _source()._mark(dict(_RECORD))
     assert len(threads) == 2, (threads, rig.log)
     assert all(name.startswith("mefor-database") for name in threads), threads
+
+
+# --- the coordinator's repair of 976dca70 --------------------------------------------------------
+
+
+class _LoginRefusedCursor(_BusyCursorRefused):
+    state = "28000"
+
+
+async def test_a_send_discards_on_every_cursor_refusal_a_login_refusal_included(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """send() discards on every cursor refusal, as origin/main does; only the sites this branch
+    newly classifies keep a connection on a static refusal. Red at 976dca70, which kept it."""
+    _aioodbc_serving(
+        monkeypatch, rig, pool_type=_WakingPool, raw_type=_LoginRefusedCursor, blocks=never
+    )
+    with pytest.raises(NegativeAckError) as caught:
+        await _destination().send('{"a": 1}')
+    assert caught.value.credential_fault, caught.value
+    assert _discarded(rig), rig.log
+
+
+class _AcquireSpendsBudget(_WakingPool):
+    """A pool whose acquire returns once the borrow's whole acquire_timeout has passed, read by
+    the loop's clock, which ``bump`` moves forward."""
+
+    bump: Any = None
+
+    async def acquire(self) -> Any:
+        conn = await super().acquire()
+        type(self).bump()
+        return conn
+
+
+class _SlowTimeoutWrite(RawConn):
+    """A ``timeout`` write that takes a short real time on its worker thread."""
+
+    @property
+    def timeout(self) -> int:
+        return getattr(self, "_timeout", 0)
+
+    @timeout.setter
+    def timeout(self, value: int) -> None:
+        if value:
+            threading.Event().wait(0.05)
+            self.note("timeout:set")
+        self._timeout = value
+
+
+async def test_a_borrow_whose_acquire_spent_the_budget_still_waits_for_the_write(
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+) -> None:
+    """Red at 976dca70: the write got a zero budget and the borrow failed, where origin/main,
+    whose write had no bound, succeeded."""
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    offset = [0.0]
+    monkeypatch.setattr(loop, "time", lambda: real_time() + offset[0])
+    dest = _destination()
+    dest._acquire_timeout = 1.0  # well inside WAIT, which the moved clock also reads
+
+    def _spend() -> None:
+        offset[0] += dest._acquire_timeout
+
+    monkeypatch.setattr(_AcquireSpendsBudget, "bump", staticmethod(_spend))
+    _aioodbc_serving(
+        monkeypatch, rig, pool_type=_AcquireSpendsBudget, raw_type=_SlowTimeoutWrite, blocks=never
+    )
+    await asyncio.wait_for(dest.send('{"a": 1}'), WAIT)
+    assert "timeout:set" in rig.log and "execute:start" in rig.log, rig.log
+    assert rig.pools[0].free == [rig.conn]

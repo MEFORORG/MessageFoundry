@@ -155,8 +155,7 @@ async def test_a_send_that_loses_its_link_discards_the_connection(
 async def test_a_refused_cursor_discards_the_connection(
     monkeypatch: pytest.MonkeyPatch, rig: _Rig, raw_type: type[RawConn]
 ) -> None:
-    """A handle that cannot make a cursor is not lent again, whatever its SQLSTATE class, unless
-    the refusal is a static configuration or credential fault (``_cursor_refusal_discards``)."""
+    """A handle that cannot make a cursor is not lent again, whatever its SQLSTATE class."""
     _aioodbc_serving(monkeypatch, rig, pool_type=_WakingPool, raw_type=raw_type, blocks=never)
     with pytest.raises(DeliveryError):
         await _destination().send('{"a": 1}')

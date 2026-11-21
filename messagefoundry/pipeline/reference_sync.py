@@ -417,8 +417,9 @@ async def _load_database_source(
         # made, and before the try below: on a refusal it gives the connection back itself.
         timeout_refused = False
         try:
-            # What is left of the borrow's one bound (BACKLOG #1052), never a second full one.
-            await _apply_statement_timeout(pool, conn, timeout=max(0.0, deadline - loop.time()))
+            # What is left of the borrow's bound (BACKLOG #1052), never a second full one; once it
+            # is spent the write waits unbounded, as before it had a bound.
+            await _apply_statement_timeout(pool, conn, timeout=deadline - loop.time())
         except NegativeAckError:
             timeout_refused = True  # raised below, outside the handler, so no chain is carried
         if timeout_refused:
