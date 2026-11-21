@@ -53,6 +53,8 @@ try {
         Write-Output "[seat] scripts/hooks/_hookinput.ps1 is missing beside this hook, so it cannot tell which worktree this session is in; nothing was recorded."
         exit 0
     }
+    # Read before Enter-CcxHookSession can move the hook into the session's directory.
+    $startDir = (Get-Location).ProviderPath
     . $hookInput
     # Read stdin ONCE and pass it on. The payload carries session_id, and without it seat.ps1 keys the
     # record on the literal string 'nosid' -- correct, but it collapses every unidentified session in
@@ -67,25 +69,58 @@ try {
     # leaves a trace beyond this turn's notice. Named explicitly either way, so seat.ps1 never falls
     # back to the payload's cwd as its hint.
     $recordArgs = $null
+    # THE LINKED WORKTREE THE SESSION WAS LAUNCHED IN, for an UNPINNED session only (BACKLOG #5961).
+    # A plain CLI session's CLAUDE_PROJECT_DIR is the directory it was launched in, and a `cd` or a
+    # /clear does not move it, so after a /clear in a sibling it still names the session's own
+    # worktree where the cwd no longer does. Under the desktop app it names the PRIMARY (the header
+    # of _hookinput.ps1 says so), which is no linked worktree, so that case is left as it was. With
+    # no CLAUDE_PROJECT_DIR the hook's own start directory stands in. A pin still wins: rule 3.
+    $launchRoot = $null
+    $launchCommon = $null
+    if (-not $session.Pinned) {
+        $launchDir = if ($env:CLAUDE_PROJECT_DIR) { [string]$env:CLAUDE_PROJECT_DIR } else { $startDir }
+        $lr = Get-CcxWorktreeRoot $launchDir
+        # `.git` is a FILE only in a linked worktree.
+        if ($lr -and (Test-Path -LiteralPath (Join-Path $lr '.git') -PathType Leaf)) {
+            $launchRoot = $lr
+            $launchCommon = Get-CcxGitCommonDir $lr
+        }
+    }
+    # -Worktree with the launch worktree, when $Root is a worktree of the launch worktree's own
+    # repository; -Launched only when the session's cwd has left it. $null where none applies.
+    $launchArgs = {
+        param([string] $Root)
+        if (-not $launchCommon -or -not $Root) { return $null }
+        $common = Get-CcxGitCommonDir $Root
+        if (-not $common -or -not (Test-CcxSamePath $common $launchCommon)) { return $null }
+        $a = @('-Worktree', $launchRoot)
+        if (-not (Test-CcxSamePath $Root $launchRoot)) { $a += '-Launched' }
+        return , $a
+    }
     if ($session.Reason) {
         # AN UNPINNED SESSION WHOSE cwd IS A WORKTREE OF THIS SAME REPOSITORY keeps the record it always
         # had, at that worktree. That is every desktop-app worktree session after a /clear, which never
         # pins (rule 5), and refusing it would leave such a session unrecorded with a notice at every
-        # turn end. Only a pin can tell its own worktree from a sibling it moved into, so this case is
-        # no better than before and no worse. Another repository, no checkout, and input that cannot
-        # be read are still refused below.
-        # DECIDED, NOT ACCIDENTAL (BACKLOG #5961, after #5954). Such a session has no other source of
-        # truth for its worktree: /clear mints a new session id and no pin, so the cwd is all there is.
+        # turn end. Under the desktop app only a pin can tell its own worktree from a sibling it moved
+        # into, so this case is no better than before and no worse. A session launched in a linked
+        # worktree is recorded there instead (the launch worktree above). Another repository, no
+        # checkout, and input that cannot be read are still refused below.
+        # DECIDED, NOT ACCIDENTAL (BACKLOG #5961, after #5954). A desktop-app session has no other
+        # source of truth for its worktree: /clear mints a new session id and no pin, and its
+        # CLAUDE_PROJECT_DIR names the primary, so the cwd is all there is.
         # -Unpinned labels the record so (seat.ps1's -Unpinned says what the label does), except for
         # the start checkout itself, which rule 4 takes. tests/test_hook_payload_cwd.py pins both.
         $p = Get-CcxHookPayloadCwd -Payload $session.Payload
-        $startRoot = Get-CcxWorktreeRoot (Get-Location).ProviderPath
+        $startRoot = Get-CcxWorktreeRoot $startDir
         $startCommon = if ($startRoot) { Get-CcxGitCommonDir $startRoot } else { $null }
         $cwdRoot = if ($p.Cwd) { Get-CcxWorktreeRoot $p.Cwd } else { $null }
         $cwdCommon = if ($cwdRoot) { Get-CcxGitCommonDir $cwdRoot } else { $null }
         if (-not $session.Pinned -and $startCommon -and $cwdCommon -and (Test-CcxSamePath $cwdCommon $startCommon)) {
-            $recordArgs = @('-Worktree', [string]$cwdRoot)
-            if (-not (Test-CcxSamePath ([string]$cwdRoot) ([string]$startRoot))) { $recordArgs += '-Unpinned' }
+            $recordArgs = & $launchArgs ([string]$cwdRoot)
+            if (-not $recordArgs) {
+                $recordArgs = @('-Worktree', [string]$cwdRoot)
+                if (-not (Test-CcxSamePath ([string]$cwdRoot) ([string]$startRoot))) { $recordArgs += '-Unpinned' }
+            }
         }
         else {
             # The only worktree left to record is the one this hook started in, the PRIMARY under the
@@ -100,7 +135,10 @@ try {
     }
     if (-not $recordArgs) {
         $worktree = if ($session.Dir) { [string]$session.Dir } else { (Get-Location).ProviderPath }
-        $recordArgs = @('-Worktree', $worktree)
+        # A hook whose working directory followed the session's `cd` takes that cwd under rule 4, so
+        # the launch worktree is checked here too.
+        $recordArgs = & $launchArgs (Get-CcxWorktreeRoot $worktree)
+        if (-not $recordArgs) { $recordArgs = @('-Worktree', $worktree) }
     }
 
     # The pwsh on PATH, as before, resolved to its full path first: a launch error must not be

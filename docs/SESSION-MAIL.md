@@ -241,7 +241,10 @@ worktree you moved into in at least these ways: a peer that addresses that path,
 there by a `seat.ps1 -Declare` or `-Close` you ran from it, a record written before the change, and
 a session with no pin, for example after a /clear under the desktop app, whose `cwd` is a worktree
 of this repository. Only a pin can tell its own worktree from a sibling. So that record lands at
-the `cwd`, and its `worktreeSource` says no session pin vouches for it (BACKLOG #5961). Nothing
+the `cwd`, and its `worktreeSource` says no session pin vouches for it (BACKLOG #5961). A plain
+CLI session launched in a linked worktree is the exception: its `CLAUDE_PROJECT_DIR` still names
+that worktree after a `cd` and a /clear, so the record lands there, labelled as the launch
+worktree. Under the desktop app `CLAUDE_PROJECT_DIR` names the primary, so it cannot help. Nothing
 that addresses mail reads that label yet. The drain does not read that box. With no pin, rule 4 of
 `_hookinput.ps1` refuses a `cwd` outside the checkout the hook started in. The drain then reads no
 box and says so. While the session stays unpinned, its drain reads none of the mail sent by that

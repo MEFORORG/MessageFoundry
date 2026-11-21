@@ -139,6 +139,11 @@ param(
     # The hook's comment there says why it records that cwd (BACKLOG #5954, #5961). The record's
     # worktreeSource says so; no reader consults that label yet.
     [Parameter(ParameterSetName = 'Record')][switch]$Unpinned,
+    # -Record only: scripts/hooks/seat-record.ps1's verdict that the -Worktree it passes is the LINKED
+    # WORKTREE THE SESSION WAS LAUNCHED IN (CLAUDE_PROJECT_DIR), recorded for an unpinned session whose
+    # cwd has moved to another worktree of this repository (BACKLOG #5961). The record's
+    # worktreeSource says so. Wins over -Unpinned, which the hook never passes with it.
+    [Parameter(ParameterSetName = 'Record')][switch]$Launched,
     # Precedence for the record's session key, highest first: this parameter, then the hook's stdin
     # payload session_id, then $env:CLAUDE_CODE_SESSION_ID, then the literal 'nosid'. See
     # Get-SessionKey -- the env rung is what keeps a CLI -Declare on the same record as the hooks.
@@ -1060,7 +1065,11 @@ try {
                 # failed, which rule 2 wants on record once the registry resolves below.
                 $hookFault = "the hook input could not be checked, recorded at -Worktree as passed: $($hookIn.Reason)"
             }
-            if ($Unpinned) {
+            if ($Launched) {
+                # The hook's verdict, as for -Unpinned below.
+                $script:WorktreeSource = 'session launch worktree, unpinned: CLAUDE_PROJECT_DIR (scripts/hooks/seat-record.ps1)'
+            }
+            elseif ($Unpinned) {
                 # The hook's verdict, passed rather than re-derived; see -Unpinned. Checked first, so a
                 # fault in this script's own second read cannot drop it.
                 $script:WorktreeSource = 'hook cwd, unpinned: no session pin vouches for it (scripts/hooks/seat-record.ps1)'

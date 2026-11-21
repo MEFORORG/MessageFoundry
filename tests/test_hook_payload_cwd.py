@@ -69,10 +69,13 @@ def _primary_with(tmp_path: Path, worktree_leaf: str) -> tuple[Path, Path]:
     return repo, wt
 
 
-def _run(script: Path, cwd: Path, stdin: bytes) -> subprocess.CompletedProcess[bytes]:
+def _run(
+    script: Path, cwd: Path, stdin: bytes, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[bytes]:
     proc = subprocess.run(
         ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)],
         cwd=str(cwd),
+        env=env,
         input=stdin,
         capture_output=True,
         timeout=TIMEOUT,
@@ -874,12 +877,17 @@ def _seat_records(start: Path) -> list[dict[str, Any]]:
     return [json.loads(p.read_text(encoding="utf-8")) for p in sorted(seats.rglob("*.json"))]
 
 
-def _record_stop(repo: Path, payload: dict[str, Any]) -> None:
-    """Run the Stop hook in the primary, as the app runs it.
+def _record_stop(repo: Path, payload: dict[str, Any], *, project_dir: Path | None = None) -> None:
+    """Run the Stop hook in ``repo``, by default the primary, as the app runs it.
+
+    ``CLAUDE_PROJECT_DIR`` is ``project_dir``, or ``repo``: the app sets it to the primary, and a
+    plain CLI to the directory it was launched in. Set either way, so the value of the session
+    running the tests never reaches the hook.
 
     tests/conftest.py drops MEFOR_COORD_ROOT for the whole run, so no record can reach the real
     shared root: each fixture clone's own ``.git/mefor-coord`` is its registry."""
-    _run(SEAT_RECORD, repo, _raw(payload))
+    env = {**os.environ, "CLAUDE_PROJECT_DIR": str(project_dir or repo)}
+    _run(SEAT_RECORD, repo, _raw(payload), env)
 
 
 @pytest.fixture
@@ -971,6 +979,63 @@ def test_an_unpinned_seat_recorder_still_records_the_checkout_it_started_in(
     assert len(recs) == 1 and _same_dir(recs[0]["worktree"], repo), recs
     # The label's control: the start checkout is the one cwd rule 4 takes, so nothing says unpinned.
     assert recs[0]["worktreeSource"] == "git rev-parse --show-toplevel", recs
+
+
+LAUNCHED_SOURCE = (
+    "session launch worktree, unpinned: CLAUDE_PROJECT_DIR (scripts/hooks/seat-record.ps1)"
+)
+
+
+@pytest.mark.parametrize("hook_runs_in", ["launch worktree", "sibling"])
+def test_a_cli_session_launched_in_a_linked_worktree_is_recorded_there_after_a_clear_in_a_sibling(
+    seat_clones: tuple[Path, Path, Path, Path], hook_runs_in: str
+) -> None:
+    """BACKLOG #5961 remainder. A plain CLI session launched in linked worktree W moves to sibling S
+    and runs /clear, which mints a new session id and never pins. Its CLAUDE_PROJECT_DIR still names
+    W, so the record goes to W, labelled. Both places the hook may run from are covered: W, and S
+    for a hook whose working directory followed the cd. Before the fix both recorded S."""
+    repo, wt, sibling, _ = seat_clones
+    start = wt if hook_runs_in == "launch worktree" else sibling
+    _record_stop(start, _stop("s1", sibling), project_dir=wt)
+    recs = _seat_records(repo)
+    assert not any(_same_dir(r["worktree"], sibling) for r in recs), recs
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+    assert recs[0]["worktreeSource"] == LAUNCHED_SOURCE, recs
+
+
+def test_a_cli_session_still_in_its_launch_worktree_carries_no_launch_label(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """The control for the arm above: a cwd in the launch worktree itself is recorded there, as
+    before, and nothing says the cwd left it."""
+    repo, wt, _, _ = seat_clones
+    _record_stop(wt, _stop("s1", wt), project_dir=wt)
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+    assert recs[0]["worktreeSource"] == "git rev-parse --show-toplevel", recs
+
+
+def test_a_pin_still_wins_over_the_launch_worktree(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """Rule 3: a pinned session answers for its pin whatever CLAUDE_PROJECT_DIR names."""
+    repo, wt, sibling, _ = seat_clones
+    seed_pin(repo, wt, "s1")
+    _record_stop(sibling, _stop("s1", sibling), project_dir=sibling)
+    recs = _seat_records(repo)
+    assert len(recs) == 1 and _same_dir(recs[0]["worktree"], wt), recs
+    assert recs[0]["worktreeSource"].startswith("session pin"), recs
+
+
+def test_a_cli_session_in_another_repository_is_still_refused(
+    seat_clones: tuple[Path, Path, Path, Path],
+) -> None:
+    """The launch worktree is used only for a cwd in its own repository, so this stays a refusal."""
+    repo, wt, _, other = seat_clones
+    _record_stop(wt, _stop("s1", other), project_dir=wt)
+    assert _seat_records(repo) == [] and _seat_records(other) == []
+    lines = (_seats_dir(repo) / ".writer-refusals.txt").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1, lines
 
 
 def test_a_hook_refusal_leaves_a_refusal_line(seat_clones: tuple[Path, Path, Path, Path]) -> None:
