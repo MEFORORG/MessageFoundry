@@ -1533,13 +1533,17 @@ worker can. *What this boundary does NOT cover*, below, holds for both modes.
 | **Processes** | Per inbound **that receives traffic**: one child process (a full interpreter with its own re-loaded copy of your config dir), two parent daemon threads (frame reader + stderr relay), three parent pipe fds, and on Windows a job-object handle. Nothing is spawned for an idle inbound — the child starts lazily on first dispatch. |
 | **Environment variables** | The worker starts with a short allowlist, not the engine's environment: what the platform and the interpreter need to start (such as `PATH`, the temp and profile directories, `TZ` and the locale), the interpreter's own variables by name (such as `PYTHONPATH`, `PYTHONUTF8` and `PYTHONHASHSEED`, which an isolated worker then ignores, as the engine does), and the names you list in `pass_environment`. No `MEFOR_*` variable crosses. `messagefoundry/childenv.py` holds the full list. The worker runs your config modules again under that environment, from the bytes the engine read and checked. **Config code that reads any other variable from `os.environ` finds it unset in the worker and set at `mode="off"`**, at the top of a module as much as inside a Router or Handler. If the read has no default, the worker fails to start. If it has a default, the worker can build a different graph. **The engine compares the two graphs when a worker starts, and refuses a worker whose graph differs**: the inbound, router, handler and outbound names, each inbound's router, which handlers have an `accepts=` predicate, and a digest of the bytes of every `*.py` in the config directory, `_` helpers included, as each load read them. Under the default `[delivery] internal_error = "continue"`, each message on that inbound then dead-letters with an error that names what differs and on which side; under `"stop"` the refusal halts the stage that asked for the worker, routing or transform, with a `connection_stopped` alert, and the other stage can halt the same way at its next dispatch on that inbound. Each stop raises the `connection_stopped` alert; the [`[alerts]`](#alerts) table states its cooldown, re-alert and fallback rules. Name the variable in `pass_environment` and restart. **A function that keeps its name and branches on a variable the worker lacks is not caught**: the names match, and so do the bytes. So list every variable your config reads. `current_environment()` names the active environment in both modes, and a value that differs by environment belongs in a connection spec (`env()`), a code set or a reference set. |
 
-**Edit a config file only as part of a reload.** A worker loads your config directory again
-whenever it starts: on the first message an inbound receives, and after a worker is recycled by a
-wall-time or memory overrun or a crash. The engine keeps serving the graph it loaded. So once a
-`*.py` in the config directory changes on disk, the next worker that starts reads different bytes,
-and the engine refuses it, though every name may still match. Before that comparison of bytes, a
-worker ran an edited Router or Handler body nobody had reloaded. What you see while it lasts
-(vault BACKLOG #2724):
+**Edit a config file only as part of a reload.** A worker never reads your config directory. It
+runs the config bytes the engine loaded, which the engine sends it whenever it starts: on the first
+message an inbound receives, and after a worker is recycled by a wall-time or memory overrun or a
+crash (vault BACKLOG #2596). So an edit on disk changes nothing the engine or its workers run until
+a reload, and until then `GET /config/provenance` reports `drift` as true, because the files on
+disk no longer match the ones the engine loaded. Before that, a worker loaded the directory again
+whenever it started, so an edit made the next worker read different bytes; before the engine
+compared those bytes, such a worker ran an edited Router or Handler body nobody had reloaded (vault
+BACKLOG #2724). The engine still compares each starting worker's graph with its own, a digest of
+the module bytes included, as a backstop. What you see when a worker is refused because it ran
+other module bytes than the engine loaded:
 
 1. The message in hand fails with an error that contains `sandbox worker for inbound '<name>'
    refused` and then `config module content` with the two digests. It fails at the stage that
@@ -1548,9 +1552,10 @@ worker ran an edited Router or Handler body nobody had reloaded. What you see wh
    whole refusal once, in a `WARNING` line that begins `inbound '<name>': sandbox worker`.
 2. The engine raises a `sandbox_worker_refused` alert for the inbound, under either
    `internal_error` setting. Its `connection` is the inbound's name, and its text names the cause
-   and says to reload the config. It carries fixed words only, never the message or the refusal.
-   An edit that stops the worker's load from finishing, such as one that no longer imports, is a
-   bootstrap failure rather than this refusal: its messages fail the same way, with no alert.
+   and says to reload the config. It carries fixed words only, never the message or the refusal. A
+   worker whose load does not finish, such as one whose config raises on a variable the worker is
+   not given, is a bootstrap failure rather than this refusal: its messages fail the same way,
+   with no alert.
 3. Under the default `[delivery].internal_error = "continue"` the message is dead-lettered with
    status `ERROR`, the error is its last error, and the log has a `WARNING` naming the inbound and
    the error type. Under `"stop"` the inbound's routing or transform halts, the head message
@@ -1558,15 +1563,12 @@ worker ran an edited Router or Handler body nobody had reloaded. What you see wh
    `connection_stopped` alert fires as well.
 4. Every later message on that inbound is refused the same way, without starting another worker,
    until a reload changes the graph the engine serves. Those refusals raise no further alert and
-   log no further `WARNING` line of their own. Other inbounds are refused too, as soon as their
-   own workers start, and each raises its own alert. A reload that does not clear the cause
+   log no further `WARNING` line of their own. Each other inbound's worker is compared when it
+   starts, and each one refused raises its own alert. A reload that does not clear the cause
    raises the alert again. Nothing resolves it on its own, so resolve it in the alert list once
    the reload is done.
-5. `GET /config/provenance` reports `drift` as true, because the files on disk no longer match the
-   ones the engine loaded.
 
-Reload the config. Putting the file back is not enough for an inbound already refused: the
-engine keeps that refusal until a reload changes the graph it serves. Other files in the config directory, such as
+Reload the config: the engine keeps that refusal until a reload changes the graph it serves. Other files in the config directory, such as
 `connections.toml` and the code-set tables, are not part of the digest: the worker uses the
 engine's code sets, and `connections.toml` changes the names, which are compared anyway.
 

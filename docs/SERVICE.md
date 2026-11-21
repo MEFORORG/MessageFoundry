@@ -851,10 +851,12 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     file, or from one owned by any uid other than root or the engine's effective uid. When the engine
     runs as root, only a root owner is trusted. A root-owned config that is not group/world-writable
     is the safest layout, because the engine's own account cannot rewrite it, provided the engine
-    can still read every file. The loader checks the same paths as on Windows, following links, so
-    the layout also depends on at least these, which it does not check: every directory above the
-    config directory is writable only by root; a file that is a link points into such a directory;
-    and the file system reports real owners and modes (a network mount may synthesize them).
+    can still read every file. The loader checks the same paths as on Windows, following links, and
+    for a file that is a link it also checks the folder holding each link the open passes through
+    and the folder the link leads to (vault BACKLOG #2596). So the layout also depends on at least
+    these, which it does not check: every directory above the config directory, and above each
+    folder a link leads to, is writable only by root; and the file system reports real owners and
+    modes (a network mount may synthesize them).
     - **Why the loader does not walk the directories above it (vault BACKLOG #3106).** The trust
       anchor check, `anchor_path.posix_path_verdict`, does walk them: it reads every directory from
       `/` down to the file, follows each link and reads its target's directories too, and reads the
@@ -873,15 +875,18 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       take this walk either, but it does walk the links an open of each file passes through, as
       it models the open, and vets the folders holding them, as the value-file paragraph in
       [SECURITY.md](SECURITY.md#dual-control-approval-for-high-value-actions-wp-l3-04-asvs-235)
-      states. The config load's trust list still vets each module by its own path, not the links
-      it passes through, so the two checks answer a linked file differently.
+      states. The config load's trust list takes the same walk for each member of the config
+      directory that is itself a link, and vets what it names and the folder the link leads to
+      (vault BACKLOG #2596). A member that is not a link is still vetted by its own path, so a folder
+      link above the config directory is still not vetted, as the directories above it are not.
     - **The exposure that leaves is a known limit, not a safe layout.** An account that can write
       any directory above the config directory can rename that directory and put a link or another
       directory in its place. A substitute put there after the check runs unchecked, and one put
       there before it passes when it is a link to any directory owned by root or by the engine's
       own account that is not group- or world-writable, such as the engine's data directory.
-      Nothing here detects either. An account that can write the directory a link points into can
-      replace the file the check passed. Before you deploy, run `namei -l <config dir>` to list
+      Nothing here detects either. An account that can write a directory above the one a link
+      points into can rename that directory and put another in its place, after the check or,
+      with the same limit as above, before it. Before you deploy, run `namei -l <config dir>` to list
       every directory on the path. It does not look inside the directory, so also run `ls -lR` on
       the config directory, which lists at least its `codesets` and `environments` folders, and
       run `namei -l` on every file there that is a link. Each directory those commands list must be owned by root, or by the engine's own

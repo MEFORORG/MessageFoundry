@@ -141,3 +141,70 @@ def test_posix_refuses_a_group_writable_member(
     with pytest.raises(WiringError, match="group/world-writable path") as excinfo:
         load_config(tmp_path)
     assert str(tmp_path / relative) in str(excinfo.value)
+
+
+# --- a module that is a link (vault BACKLOG #2596 added item 2) ------------------------------------
+
+
+def _link_module_into(cfg: Path, shared: Path) -> Path:
+    """``cfg/cfg.py`` as a symbolic link to ``shared/cfg.py``; skips where links cannot be made."""
+    cfg.mkdir()
+    shared.mkdir()
+    target = shared / "cfg.py"
+    target.write_text(
+        "from messagefoundry import outbound, File\noutbound('o', File(directory='./out'))\n",
+        encoding="utf-8",
+    )
+    try:
+        (cfg / "cfg.py").symlink_to(target)
+    except (OSError, NotImplementedError) as exc:  # Windows without the symlink privilege
+        pytest.skip(f"cannot create a symlink here: {exc}")
+    return target
+
+
+def test_a_linked_module_lists_its_target_and_the_target_folder(tmp_path: Path) -> None:
+    cfg, shared = tmp_path / "cfg", tmp_path / "shared"
+    target = _link_module_into(cfg, shared)
+    listed = config_source_trust_paths(cfg)
+    assert listed[:2] == [cfg, cfg / "cfg.py"]
+    assert target.resolve() in listed
+    assert target.resolve().parent in listed
+    assert len(listed) == len(set(listed))
+
+
+def test_windows_refuses_a_module_linked_into_a_writable_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_windows_readers: FakeReaders
+) -> None:
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    cfg, shared = tmp_path / "cfg", tmp_path / "shared"
+    target = _link_module_into(cfg, shared)
+    writable = target.resolve().parent
+    fake_windows_readers(lambda path: path == writable)
+    with pytest.raises(WiringError, match="writable-by-others path") as excinfo:
+        load_config(cfg)
+    assert str(writable) in str(excinfo.value)
+
+
+def test_windows_loads_a_linked_module_when_every_path_is_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fake_windows_readers: FakeReaders
+) -> None:
+    """Control for the test above: the link alone does not refuse."""
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    cfg, shared = tmp_path / "cfg", tmp_path / "shared"
+    target = _link_module_into(cfg, shared)
+    seen = fake_windows_readers(lambda _path: False)
+    assert "o" in load_config(cfg).outbound
+    assert target.resolve() in seen
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits")
+def test_posix_refuses_a_module_linked_into_a_group_writable_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(INSECURE_CONFIG_SOURCE_ESCAPE_ENV, raising=False)
+    cfg, shared = tmp_path / "cfg", tmp_path / "shared"
+    target = _link_module_into(cfg, shared)
+    shared.chmod(0o775)
+    with pytest.raises(WiringError, match="group/world-writable path") as excinfo:
+        load_config(cfg)
+    assert str(target.resolve().parent) in str(excinfo.value)

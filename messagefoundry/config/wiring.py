@@ -9806,8 +9806,10 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
 
     The directory and each ``*.py`` (:func:`config_py_files`), and, when they exist, the
     ``__pycache__`` folder and each entry in it, ``connections.toml``, and the ``codesets`` folder
-    with each table the loader reads from it. Both config-source trust checks walk this list (vault
-    BACKLOG #2626 step 3, #2596 step 4).
+    with each table the loader reads from it. Each of those that is a symbolic link is followed by
+    the real folder holding each link a walk of it follows, the object it leads to and that
+    object's folder (:func:`_with_link_targets`). Both config-source trust checks
+    walk this list (vault BACKLOG #2626 step 3, #2596 step 4).
 
     **The cache folder is on the list although no load reads it.** The loader compiles each module
     from the bytes of its snapshot (:func:`load_config`), so a ``.pyc`` there never runs in place of
@@ -9838,7 +9840,32 @@ def config_source_trust_paths(directory: Path) -> list[Path]:
         paths.extend(
             p for p in sorted(codesets.iterdir()) if p.is_file() and is_code_set_name(p.name)
         )
-    return paths
+    return _with_link_targets(paths)
+
+
+def _with_link_targets(paths: list[Path]) -> list[Path]:
+    """``paths`` with, after each member past the directory that is a symbolic link, what
+    :func:`_link_chain` names for it and the folder holding the object it leads to (vault BACKLOG
+    #2596).
+
+    A load reads a link's target, so vetting the link alone let a config module that is a link into
+    a writable folder pass: whoever can write that folder can swap the code the load runs, and on
+    Windows the link object's own access list was read rather than the target's. The walk is the
+    one the ``serve`` start check runs for its files, so the real folder holding each link it
+    follows is vetted too, and a layout it cannot walk raises ``OSError``, which refuses the load.
+    A member that is not itself a link adds nothing, though a folder link above the config
+    directory then goes unvetted, as the folders above it do. A path already listed is not
+    repeated."""
+    out: list[Path] = []
+    for index, path in enumerate(paths):
+        out.append(path)
+        if index == 0 or not path.is_symlink():
+            continue
+        chain, end = _link_chain(path)
+        out += chain
+        if end is not None:
+            out.append(end.parent)
+    return list(dict.fromkeys(out))
 
 
 def _config_module_name(path: Path) -> str:
