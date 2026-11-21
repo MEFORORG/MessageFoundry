@@ -738,17 +738,34 @@ _BEFORE_A_NOTE = (
 )
 
 
+#: Values :func:`redaction.clamp_untrusted`'s name walk drops before redaction runs, so a route
+#: through the clamp would not show whether the arm masks them.
+_CLAMP_DROPS = frozenset({"Li", "ZqMS"})
+
+
 @pytest.mark.parametrize(("text", "value"), _BEFORE_A_NOTE)
-def test_a_glued_value_right_before_a_clamp_note_is_masked(text: str, value: str) -> None:
+def test_a_glued_value_ending_at_a_clamp_notes_line_break_is_found_and_masked(
+    text: str, value: str
+) -> None:
     """A defect found in the #5925 review: the unquoted PHI arm and the credential arm found the
     value's end on the text with the clamp's note on. The note is joined by a line break, and
     :data:`redaction._GLUED_BARE_VALUE` needs a space or the text's end after the value, so the
     value right before the note was not found and printed whole, with the label gone into the run.
-    It is masked now, as it is with no clamp."""
+    These values, letters or a credential not opening with a digit, are masked now. A digit-bearing
+    PHI value there still prints, as on main (a residual the changelog names).
+
+    The log-chain route is asserted only where the clamp keeps the value: its name walk drops a
+    trailing capitalized word such as ``Li`` before any redaction runs, so for that value the
+    route would pass with or without the fix, and the premise is asserted instead."""
     clamped = f"{text}\n{redaction._clamp_marker(70_000)}"
     assert value not in redact(text)  # the premise: unclamped, the arm masks it
     assert value not in redact(clamped)
-    assert value not in _through_the_chain(text + " " + "q" * 70_000)
+    routed = text + " " + "q" * 70_000
+    if value in _CLAMP_DROPS:
+        assert value not in redaction.clamp_untrusted(routed)
+    else:
+        assert value in redaction.clamp_untrusted(routed)  # the premise: the clamp kept it
+        assert value not in _through_the_chain(routed)
 
 
 @pytest.mark.parametrize(
@@ -769,7 +786,12 @@ def test_a_value_with_whitespace_before_a_clamp_note_keeps_the_earlier_mask(
     that way now."""
     clamped = f"{text}\n{redaction._clamp_marker(70_000)}"
     assert value not in redact(clamped)
-    assert value not in redact(redaction.clamp_untrusted(text + " " + "q" * 70_000))
+    routed = text + " " + "q" * 70_000
+    if value in _CLAMP_DROPS:  # the clamp's name walk drops it, so only the premise is asserted
+        assert value not in redaction.clamp_untrusted(routed)
+    else:
+        assert value in redaction.clamp_untrusted(routed)  # the premise: the clamp kept it
+        assert value not in redact(redaction.clamp_untrusted(routed))
 
 
 def test_a_value_before_a_space_joined_note_keeps_the_earlier_answer() -> None:

@@ -1301,8 +1301,9 @@ _JSON_LITERALS = frozenset({"true", "false", "null", "True", "False", "None", "r
 _JSON_BARE_CONTINUATION = re.compile(r"""(?:[ \t]++[^\s{}\[\](),:"']++(?!\())*+""")
 
 #: The bound note :func:`_clamp_marker` writes, joined by a newline (:func:`clamp_untrusted`) or a
-#: space (:func:`safe_text`). The structured passes run on the text BEFORE it, and the field-run
-#: arms find a glued value's end on it (:func:`_glued_value`); the structured passes do so because
+#: space (:func:`safe_text`). The structured passes run on the text BEFORE it, and the unquoted
+#: PHI, credential and end-tag field-run arms find a glued value's end on it (:func:`_glued_value`;
+#: the quoted and XML-label arms read the whole text). The structured passes do so because
 #: an unterminated region runs to the end of the text and would otherwise scrub the note -- and :func:`safe_text` is
 #: re-applied to its own output at the store chokepoint, where that would erase the only sign the text
 #: was cut. Anchored at ``\Z`` so only a note last in the text is spared: a peer that writes the
@@ -2353,8 +2354,10 @@ def _glued_value(
     joined by a line break is still found (:data:`_GLUED_BARE_VALUE` needs a space or the text's
     end after it). A defect found in the #5925 review: with both read on ``text``, such a value
     printed whole behind a clamp. A value that ends exactly where ``body`` ends, with the note's
-    line break right after it, is then judged on ``body``, as the same value would be with no clamp;
-    every other value is judged on ``text``, as before. Judged on ``text`` there, the value read as
+    line break right after it, is then judged on ``body``, as a value that ends the text: its
+    end-of-text refusals apply, so a PHI value holding a digit, or a credential value opening with
+    one, still prints there, as on main (``a|b|mrn: 12345`` cut by a clamp right after it). Every
+    other value is judged on ``text``, as before. Judged on ``text`` there, the value read as
     glued to the line break, and a last word of two characters or fewer was refused (``a|b|mrn:
     qw``). Judged on ``body`` anywhere else, a value followed by whitespace and then the note, or by
     a space-joined note, would read as ending the text, and the end-of-text refusals would keep
@@ -2399,7 +2402,8 @@ def _glued_end_tag_rest(body: str, token: str, end: int, field_run: re.Pattern[s
     left was read by neither. ``None`` keeps the rest as it stood.
 
     **The rules are the walk's, but the text they read is not always the walk's.** This arm reads
-    the rest before the date, SSN, name and structured passes, and the walk reads what they left.
+    the rest before at least the declared-delimiter run, the widened MRN pass and the date, SSN,
+    name and structured passes, and the walk reads what they left.
     So the two can answer differently, at least these ways: a rest a later pass scrubs in part
     (``</family Zq Doe Vandt 4455>``) keeps its digits in the walk and loses them here; and a text
     holding the backstop's opener (:data:`_USERINFO_OPENER`) when the field-run pass reads it keeps
