@@ -1143,7 +1143,7 @@ The same replacement runs at startup, whatever the expiry, when the certificate 
 address a client on this box dials for the current bind: the family's loopback for a wildcard
 `--host` (`127.0.0.1` for `0.0.0.0`, `::1` for `::`), else the host without IPv6 brackets
 (`[::1]` is the address `::1`), matched without regard to case or an IPv6 zone. A move from
-`0.0.0.0` to `::` replaces it; a move from `127.0.0.1` to `0.0.0.0` or to `::` does not, because
+`0.0.0.0` to `::` replaces a certificate minted for `0.0.0.0`; a move from `127.0.0.1` to `0.0.0.0` or to `::` does not, because
 a certificate minted for a `127.0.0.1`, `::1` or `localhost` bind names all three (BACKLOG #5790).
 Only that one dialled address is tested, so a certificate that names it is kept even when it lacks
 names a first-run mint for the current bind would carry, until its renewal: at least a move from

@@ -268,8 +268,9 @@ def _generated_sans(host: str) -> list[str]:
       ``is_loopback`` does not list, such as ``127.0.0.2``, ``LOCALHOST`` or ``[::1]``, even where
       it listens on a loopback address, and such a host may itself be a loopback name.
 
-    A replacement of an existing pair adds the loopback names :func:`_kept_loopback_names` keeps,
-    so a renewal or bind re-mint for ``LOCALHOST`` or ``[::1]`` can name more than the bind host.
+    A renewal or a re-mint for a changed bind adds the loopback names :func:`_kept_loopback_names`
+    keeps, so one for ``LOCALHOST`` or ``[::1]`` can name more than the bind host. The recovery of an
+    unusable or half-written pair adds none.
 
     The names are read only when a pair is minted, at least on first run, at renewal, at the
     recovery of an unusable or half-written pair, and at a re-mint for a bind the reused
@@ -317,8 +318,9 @@ def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
     one the old certificate names, and the default ``[api].host``, which the CLI, the IDE and the
     harness dial by default, less the one the bind itself names. A bind
     :attr:`ApiSettings.is_loopback` lists gets all three from :func:`_generated_sans` anyway, so
-    this matters for a wildcard bind and for a spelling that list lacks: a move from ``10.0.0.9``
-    to ``LOCALHOST`` would otherwise drop the ``127.0.0.1`` those clients verify. A renewal keeps
+    this matters for a wildcard bind and for a spelling that list lacks: a move from ``::`` to
+    ``LOCALHOST`` would otherwise drop the ``::1`` the old certificate named, and leave out the
+    ``127.0.0.1`` those clients verify. A renewal keeps
     them as a bind re-mint does, or the next renewal would drop what the re-mint kept. The set is
     fixed, so repeated moves do not grow it. A bind off loopback keeps nothing. A first-run mint
     has no old certificate, so it keeps nothing.
@@ -331,7 +333,7 @@ def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
     default = ApiSettings.model_fields["host"].default
     return [
         name
-        for name in sorted(_LOOPBACK_HOSTS)
+        for name in _GENERATED_LOOPBACK_SANS
         if _host_key(name) != dialled and (name == default or pki.san_names(old_pem, name))
     ]
 
@@ -937,8 +939,8 @@ def _replacement_due(host: str, cert_path: Path) -> _Due | None:
     dials for ``host`` (:func:`messagefoundry.api_tls_source.dialled_host`, matched by
     :func:`messagefoundry.pki.san_names`), so a bind moved after the mint, for example to ``::``
     from ``0.0.0.0``, gets a fresh certificate for the new bind at this start rather than at the
-    next renewal (BACKLOG #5973). Only that one name is tested: a pair naming it is reused even
-    when it lacks other names a fresh mint would add (:func:`_generated_sans`). It names the new bind, as a first-run mint for it would, plus
+    next renewal (BACKLOG #5973). Only that one name is tested; :func:`_generated_sans` says what
+    that leaves. It names the new bind, as a first-run mint for it would, plus
     the loopback names :func:`_kept_loopback_names` keeps.
 
     **Only the engine's own shape is ever due**: a certificate at the generated path that is not
@@ -1175,12 +1177,10 @@ def _mint_generated_pair(api: ApiSettings, cert_path: Path, key_path: Path) -> S
             key_path.unlink(missing_ok=True)
     _let_local_users_read_cert(cert_path)
     log.warning(
-        "no [api].tls_cert_file configured — minted a SELF-SIGNED certificate for %s at %s, "
-        "naming %s. It has no chain of trust and is a PLACEHOLDER: browsers will show a trust "
-        "interstitial until it is imported, and it should be replaced with an operator-supplied "
-        "chain.",
+        "no [api].tls_cert_file configured — minted a SELF-SIGNED certificate for %s at %s. It has "
+        "no chain of trust and is a PLACEHOLDER: browsers will show a trust interstitial until it "
+        "is imported, and it should be replaced with an operator-supplied chain.",
         api.host,
         cert_path,
-        ", ".join(dict.fromkeys([unbracketed(api.host), *_generated_sans(api.host)])),
     )
     return pki.read_self_signed_facts(cert_pem)
