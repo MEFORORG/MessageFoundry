@@ -290,8 +290,14 @@ def plan_rename(
     # dropped -- including one whose source, or one of whose captured values, could not be located.
     referrers: list[tuple[Reference, list[_Site], bool]] = []
     indexed = index.referrers(target_kind, old)
-    for ref in [*indexed, *_scanned_referrers(registry, indexed, target_kind, old, sources)]:
-        found = _referrer_sites(registry, ref, old, target_kind, sources, toml_targets)
+    scanned = _scanned_referrers(registry, indexed, target_kind, old, sources)
+    for ref, found in [
+        *(
+            (ref, _referrer_sites(registry, ref, old, target_kind, sources, toml_targets))
+            for ref in indexed
+        ),
+        *scanned,
+    ]:
         if found is None:
             continue
         sites, complete = found
@@ -616,10 +622,13 @@ def _referrer_sites(
                 name for _i, name in scan.slots | scan.passes | scan.iter_slots | scan.iter_passes
             }
             defaults = _default_positions(sources, func, file, span, old)
-            kinds = sources.occurrences(file, old)
             rewritable |= _default_positions(sources, func, file, span, old, role_params)
-            if table_kind is not None:
-                rewritable |= {pos for pos in defaults if kinds.get(pos) == table_kind}
+            accessor = (
+                _accessor_positions(sources, file, span, old, table_kind)
+                if table_kind is not None
+                else set()
+            )
+            rewritable |= defaults & accessor
             # A helper's return value is read by its callers, each of which must be in a role.
             returned = frozenset(scan.returned) if depth > 0 else frozenset()
             helper = func.__name__ if depth > 0 else None
@@ -627,15 +636,21 @@ def _referrer_sites(
                 # ``ignored`` holds bare positions in the decorator's own file; a helper elsewhere
                 # at the same (line, col) is a referent and must stay counted.
                 own = ignored if file == own_file else frozenset()
-                site = _Site(file, span, None, frozenset(rewritable), own, scan.reads)
+                allowed: frozenset[_Pos] | None = None
+                role = rewritable
             else:
                 # A helper the referrer reaches counts its accessor calls, its role values and
                 # its defaults: a default left because its parameter is read in no role reports
                 # the referrer rather than leaving the helper reading the old table.
-                role = _accessor_positions(sources, file, span, old, table_kind) | rewritable
-                counted = role | {pos for pos in defaults if kinds.get(pos) in (None, table_kind)}
-                site = _Site(file, span, frozenset(counted), frozenset(role), reads=scan.reads)
-            sites.append(replace(site, returned=returned, helper=helper))
+                own = frozenset()
+                role = accessor | rewritable
+                kinds = sources.occurrences(file, old)
+                allowed = frozenset(
+                    role | {pos for pos in defaults if kinds.get(pos) in (None, table_kind)}
+                )
+            sites.append(
+                _Site(file, span, allowed, frozenset(role), own, scan.reads, returned, helper)
+            )
         # A local that carries a rewritten literal into another read leaves the referrer unresolved.
         complete = complete and not any(scan.unsafe for scan in scans)
         for func in reached:
@@ -675,27 +690,25 @@ def _scanned_referrers(
     target_kind: str,
     old: str,
     sources: SourceCache,
-) -> list[Reference]:
+) -> list[tuple[Reference, tuple[list[_Site], bool]]]:
     """The handlers (for an outbound) or routers (for a handler) the reverse index has no edge
     from, whose role scan still finds ``old`` in a referent role: a name a helper returns
     (``Send(_route("ADT"), msg)``), one read out of a module table, and other forms the wiring
     graph does not follow. Left out, their literal would keep the old name while the plan reported
-    success (BACKLOG #5980); taken in, each is rewritten or reported unresolved like any other."""
-    table: Mapping[str, object]
-    if target_kind == "outbound":
-        kind, table = "handler", registry.handlers
-    elif target_kind == "handler":
-        kind, table = "router", registry.routers
-    else:
+    success (BACKLOG #5980); taken in, each is rewritten or reported unresolved like any other.
+    Each comes with its sites, so the plan does not scan it twice."""
+    kind = {"outbound": "handler", "handler": "router"}.get(target_kind)
+    if kind is None:
         return []
     known = {ref.referrer for ref in indexed if ref.referrer_kind == kind}
-    out: list[Reference] = []
-    for name in sorted(set(table) - known):
+    out: list[tuple[Reference, tuple[list[_Site], bool]]] = []
+    for name in sorted(set(_table(registry, kind)) - known):
         ref = Reference(kind, name, target_kind, old)
         held: list[bool] = []
+        # A router or handler never takes the connections.toml branch, so no toml target is lost.
         found = _referrer_sites(registry, ref, old, target_kind, sources, set(), held)
         if found is not None and (held or any(site.rewritable for site in found[0])):
-            out.append(ref)
+            out.append((ref, found))
     return out
 
 
@@ -881,8 +894,19 @@ def _scan_referrer(
     argument for a table rename, the return value of a helper whose result one of those reads, and
     an argument passed to a helper parameter that reaches one. Helpers feed each other, so the scan
     runs until neither the helpers read for their return value nor their role parameters grow."""
+    # What does not change between passes is read once: a function's locals, its module's
+    # names, and its reads that do not depend on the value.
     prepared = [
-        (depth, func, file, span, node, _local_values(node) if node is not None else {}, names)
+        (
+            depth,
+            func,
+            file,
+            span,
+            node,
+            _local_values(node) if node is not None else {},
+            names,
+            _value_agnostic_reads(_body(node)) if node is not None else set(),
+        )
         for depth, func, file, span in funcs
         for node in (_function_node(sources, file, span, func),)
         for names in (_module_names(sources, file),)
@@ -891,34 +915,31 @@ def _scan_referrer(
     returns: set[str] = set()
     # helper name -> its role parameters: read for their value, then read for their elements; and
     # its pass-through parameters, the same two ways.
-    maps: tuple[dict[str, set[tuple[int, str]]], ...] = ({}, {}, {}, {})
+    maps: dict[str, dict[str, set[tuple[int, str]]]] = {
+        key: {} for key in ("slots", "iter_slots", "passes", "iter_passes")
+    }
     while True:
         scans: list[_Scan] = []
-        for depth, func, file, span, node, values, names in prepared:
+        for depth, func, file, span, node, values, names, agnostic in prepared:
             router_return = depth == 0 and referrer_kind == "router" and table_kind is None
             give_back = router_return if depth == 0 else func.__name__ in returns
             role = _Role(
                 send,
                 give_back,
                 table_kind,
-                maps[0],
-                names,
-                passes=maps[2],
-                iter_slots=maps[1],
-                iter_passes=maps[3],
+                names=names,
                 # The engine iterates a router's return, so a dict it returns names its keys.
                 iterate_returns=router_return,
+                **maps,
             )
-            scans.append(_scan_function(sources, file, span, node, values, old, role))
+            scans.append(_scan_function(sources, file, span, node, values, old, role, agnostic))
         new_returns = returns | {name for scan in scans for name in scan.calls}
-        new_maps = tuple({name: set(found) for name, found in m.items()} for m in maps)
+        new_maps = {key: {name: set(found) for name, found in m.items()} for key, m in maps.items()}
         for (depth, func, *_rest), scan in zip(prepared, scans, strict=True):
-            # The referrer's own return is no helper's, so it gives no call a pass-through.
-            found = (scan.slots, scan.iter_slots) + (
-                (scan.passes, scan.iter_passes) if depth > 0 else (set(), set())
-            )
-            for target, params in zip(new_maps, found, strict=True):
-                if params:
+            for key, target in new_maps.items():
+                # The referrer's own return is no helper's, so it gives no call a pass-through.
+                params: set[tuple[int, str]] = getattr(scan, key)
+                if params and (depth > 0 or key in ("slots", "iter_slots")):
                     target.setdefault(func.__name__, set()).update(params)
         # All of them only grow and are bounded by the helpers' names and parameters, so this ends.
         if new_returns == returns and new_maps == maps:
@@ -933,8 +954,8 @@ class _Role:
     send: bool
     give_back: bool
     accessor: str | None
-    slots: Mapping[str, set[tuple[int, str]]]
     names: _Names
+    slots: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
     passes: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
     iter_slots: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
     iter_passes: Mapping[str, set[tuple[int, str]]] = field(default_factory=dict)
@@ -976,8 +997,10 @@ def _scan_function(
     values: Mapping[str, list[ast.expr]],
     old: str,
     role: _Role,
+    agnostic: set[int],
 ) -> _Scan:
-    """The referent literals in ``node``'s body, per :func:`_scan_referrer`'s roles. A call in a
+    """The referent literals in ``node``'s body, per :func:`_scan_referrer`'s roles.
+    ``agnostic`` holds :func:`_value_agnostic_reads` of the body. A call in a
     nested function or lambda counts (``key=lambda k: code_set("t").get(k)``); a nested function's
     return value does not, since it is not this function's."""
     if node is None:
@@ -1004,7 +1027,7 @@ def _scan_function(
             for child in _own_nodes(node)
             if isinstance(child, (ast.Return, ast.Yield, ast.YieldFrom)) and child.value is not None
         )
-    body: list[ast.AST] = [node.body] if isinstance(node, ast.Lambda) else list(node.body)
+    body = _body(node)
     for stmt in body:
         for child in ast.walk(stmt):
             if isinstance(child, ast.Call):
@@ -1028,7 +1051,7 @@ def _scan_function(
     positions = in_span(sink.consts) | returned_positions
     # A name a role reads may also be read elsewhere -- in a comparison, a log line, a lookup.
     # Rewriting its value changes that read too, so such a name gives no role (BACKLOG #5980).
-    reads = sink.read | back.read | _value_agnostic_reads(body)
+    reads = sink.read | back.read | agnostic
     loose = {
         child.id
         for stmt in body
@@ -1071,6 +1094,11 @@ def _scan_function(
         unsafe=unsafe,
         returned=returned_positions,
     )
+
+
+def _body(node: _FunctionNode) -> list[ast.AST]:
+    """The statements (or, for a lambda, the expression) a function's body evaluates."""
+    return [node.body] if isinstance(node, ast.Lambda) else list(node.body)
 
 
 def _value_agnostic_reads(body: Iterable[ast.AST]) -> set[int]:
