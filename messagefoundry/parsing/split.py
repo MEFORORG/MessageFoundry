@@ -30,7 +30,11 @@ import itertools
 import re
 from dataclasses import dataclass
 
-from messagefoundry.parsing._builtin_hl7 import _extract_separators, _first_line_head
+from messagefoundry.parsing._builtin_hl7 import (
+    _extract_separators,
+    _first_line_head,
+    filled_default_collides,
+)
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import enforce_expansion_budget, normalize, starts_with_msh
 from messagefoundry.parsing.sniff import _LEADING_WS_STR
@@ -427,8 +431,9 @@ def encode_batch(messages: list[Message | str], *, control_id: str, timestamp: s
     return "".join(pieces)
 
 
-#: The shortest MSH line the parser reads separators from: the id, MSH-1 and one encoding
-#: character. A shorter one is refused by the parse, so it goes there.
+#: The shortest MSH line the parser reads separators from: the id, MSH-1 and one more
+#: character, which may be the field separator again (an empty MSH-2). A shorter one is refused
+#: by the parse, so it goes there.
 _SEPARATORS_WIDTH = len(_MSH) + 1 + 1
 
 
@@ -436,12 +441,13 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
     """The ``(field, component, repetition, escape, subcomponent)`` delimiters of a batch's head
     member, normalized as ``norm``, as :meth:`Message._encoding_chars` reads them after a parse.
 
-    For a head that opens with ``MSH`` after whitespace, with MSH-1 and at least one encoding
+    For a head that opens with ``MSH`` after whitespace, with MSH-1 and at least one more
     character, they are read from that line's first few characters alone, through the parser's own window
     (:func:`~messagefoundry.parsing._builtin_hl7._first_line_head`) and separator read (BACKLOG
     #5919): a full parse of a large hydrated head to read eight characters copied the whole head
-    at least twice. A short MSH-2 is filled with the parser's defaults, as
-    the parse fills it. Every other head, such as an ``FHS``/``BHS``-led one, one led by a byte
+    at least twice. A short MSH-2 is filled with the parser's defaults, as the parse fills it;
+    one whose filled default is already another separator goes to the parse, which refuses
+    it. Every other head, such as an ``FHS``/``BHS``-led one, one led by a byte
     order mark or a non-HL7 one, is parsed, so it frames or raises exactly as a parse does.
 
     A head read from its MSH line is still checked against the parser's own escape expansion
@@ -454,8 +460,8 @@ def _head_separators(norm: str) -> tuple[str, str, str, str, str]:
     line = _first_line_head(norm)
     # The parse's _encoding_chars returns exactly what _extract_separators reads from this line,
     # a short MSH-2 filled with the same defaults (BACKLOG #5972), so any MSH line the parse would
-    # read takes the fast read.
-    if not line.startswith(_MSH) or len(line) < _SEPARATORS_WIDTH:
+    # read takes the fast read; one whose filled default collides goes to the parse's refusal.
+    if not line.startswith(_MSH) or len(line) < _SEPARATORS_WIDTH or filled_default_collides(line):
         return Message.parse(norm)._encoding_chars()
     # A parse checks the budget before it reads anything, so a head it refuses for its escapes is
     # refused here too, with the same error. The parse above checks it for itself.

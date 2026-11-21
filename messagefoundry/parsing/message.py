@@ -315,9 +315,10 @@ class Message:
         delimiters, which the parser read once from the first line and every other line is written
         in. A write to one of them that would change a delimiter raises ``ValueError``, so a write
         there cannot leave a header advertising delimiters its body is not written in (BACKLOG
-        #5972). Accepted there: a value equal to what :meth:`field` reads at that path, and, at field
+        #5972). Accepted there: a value equal to what :meth:`field` reads at that path; at field
         2, a whole-field value that keeps the four encoding characters and adds, drops or changes
-        only the one v2.7 truncation character after them. To send under other delimiters, re-encode the whole message, as
+        only the one v2.7 truncation character after them; and, on the leading header's short
+        field 2, the four characters the parser filled it with, which declares them. To send under other delimiters, re-encode the whole message, as
         a per-outbound ``encoding_characters`` does."""
         self._write(path, value, occurrence, repetition, as_data=False)
 
@@ -502,12 +503,19 @@ class Message:
     def delete_segments(self, segment_id: str) -> int:
         """Remove every segment with ``segment_id`` and return how many were removed.
 
-        Deleting ``MSH`` is refused — the message must keep its header. Common for clearing a
+        Deleting ``MSH`` is refused — the message must keep its header — and so is deleting the
+        ``BHS`` or ``FHS`` that leads the message, whose delimiters every line is read and
+        written in (BACKLOG #5972). Common for clearing a
         repeating block (e.g. ``delete_segments("ODS")``) before rebuilding it with
         :meth:`add_segment`. A fieldless bare line of that id is removed and counted too, though
         :meth:`count_segments` skips it, so a delete leaves no stray bare line behind."""
         if segment_id == "MSH":
             raise ValueError("refusing to delete the MSH segment")
+        if segment_id in _builtin_hl7.HEADER_IDS and self.segments()[:1] == [segment_id]:
+            raise ValueError(
+                f"refusing to delete the {segment_id} header that leads the message, whose "
+                "delimiters every line is read and written in"
+            )
         self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
         removed = 0
         ids = _builtin_hl7.segment_ids(self._m)
@@ -676,6 +684,20 @@ class Message:
             self.field(path, occurrence=occurrence, repetition=repetition) or ""
         ):
             return
+        # A short field 2 on the leading header may be completed to the four characters the
+        # parser filled it with, so the header declares the delimiters every line is read and
+        # written in; nothing moves.
+        if (
+            whole
+            and fld == 2
+            and len(current) < 4
+            and occurrence == 1
+            and self.segments()[:1] == [seg]
+        ):
+            _f, comp_sep, rep_sep, esc, sub_sep = self._encoding_chars()
+            if value == comp_sep + rep_sep + esc + sub_sep and value.startswith(current):
+                self._assign_field(seg, fld, occurrence, value)
+                return
         truncation = whole and fld == 2 and len(current) >= 4
         if truncation and value[:4] == current[:4]:
             tail = value[4:]

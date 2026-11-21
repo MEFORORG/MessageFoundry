@@ -37,6 +37,7 @@ from typing import TYPE_CHECKING
 from messagefoundry.parsing._builtin_hl7 import (
     _HEX_ESCAPED_CONTROLS,
     _SEPARATOR_HEAD,
+    HEADER_IDS,
     _extract_separators,
     _whitespace_end,
     escape_leaf_alters,
@@ -365,6 +366,17 @@ def is_doc_ref(value: str) -> bool:
 #: raw text (BACKLOG #5099).
 _DOC_REF_MARKER_CHARS = frozenset(DOC_REF_MARKER)
 
+#: The first MSH segment after a batch header. A Handler can wrap an MSH-led payload in an
+#: FHS or BHS envelope of other delimiters; the MSH's own then escaped the handle.
+_FIRST_MSH = re.compile(r"[\r\n]MSH")
+
+#: The re-attach's refusal of a payload whose later header names other delimiters than its
+#: first line, and holds the handle marker as those escape it (BACKLOG #5972).
+_MIXED_HEADER_HANDLE = (
+    "a header after the first names other delimiters, and the payload holds the document "
+    "handle marker as they escape it, so the re-attach cannot read that handle"
+)
+
 #: The re-attach's refusal of a handle marker the splice did not resolve (BACKLOG #5099).
 _UNSPLICED_HANDLE = "a document handle marker was left that the re-attach splice did not resolve"
 
@@ -426,16 +438,24 @@ def may_hold_doc_ref(text: str) -> bool:
     or BHS header names a character of the marker in its fields 1 and 2: there an engine handle
     written into ``OBX-5.5`` is escaped, so the raw text never holds the marker, and a substring
     test alone let the handle reach the wire unresolved. ``Message.set`` escapes by the delimiters
-    the parser read from that first line (BACKLOG #5972), so no later MSH is read. A handle hidden by
+    the parser read from that first line (BACKLOG #5972), but a payload led by an FHS or BHS
+    envelope may wrap an MSH-led message written under its own, so for such a payload the first
+    MSH is checked as well; the re-attach refuses a marker escaped by it. A handle hidden by
     any other escape cannot be the engine's, which escapes only the delimiters, so it is the
     sender's text and resolves nothing unless the gate opens for another reason, where the
     re-attach parses it and resolves it only to an attachment the message holds. False otherwise."""
     if DOC_REF_MARKER in text:
         return True
     lead = _whitespace_end(text, 0, len(text))
-    if text[lead : lead + 3] not in ("MSH", "FHS", "BHS"):
+    head = text[lead : lead + 3]
+    if head == "MSH":
+        return _header_names_marker_char(text, lead)
+    if head not in ("FHS", "BHS"):
         return False
-    return _header_names_marker_char(text, lead)
+    if _header_names_marker_char(text, lead):
+        return True
+    first_msh = _FIRST_MSH.search(text, lead)
+    return first_msh is not None and _header_names_marker_char(text, first_msh.start() + 1)
 
 
 def _header_names_marker_char(text: str, start: int) -> bool:
@@ -818,6 +838,35 @@ def _copy_names_address(text: str, marker: str) -> bool:
     return False
 
 
+def _later_header_escapes_marker(
+    message: Message, text: str, separators: tuple[str, str, str, str, str]
+) -> bool:
+    """Whether a header line after the first names delimiters, in its own fields 1 and 2, under
+    which the handle marker is escaped differently, and ``text`` holds it so escaped. The
+    message reads every line under the first line's delimiters (BACKLOG #5972), so a handle a
+    Handler wrote under an inner MSH's own, then wrapped in an envelope of others, would not be
+    read as one and would reach the wire unresolved. Reads the parsed fields only, never a
+    slice of the raw text."""
+    # Local import, as reattach_documents_in_hl7 does: message.py imports this module.
+    from messagefoundry.parsing.message import Message as _Message
+
+    escaped_here = _Message._escape_leaf(DOC_REF_MARKER, *separators)
+    seen: dict[str, int] = {}
+    for index, seg_id in enumerate(message.segments()):
+        seen[seg_id] = seen.get(seg_id, 0) + 1
+        if index == 0 or seg_id not in HEADER_IDS:
+            continue
+        field_sep = message._raw_field(seg_id, 1, seen[seg_id])
+        encoding = message._raw_field(seg_id, 2, seen[seg_id])
+        if len(field_sep) != 1:
+            continue
+        f, c, r, sub, esc = _extract_separators(seg_id + field_sep + encoding + field_sep)
+        escaped = _Message._escape_leaf(DOC_REF_MARKER, f, c, r, esc, sub)
+        if escaped not in (DOC_REF_MARKER, escaped_here) and escaped in text:
+            return True
+    return False
+
+
 def doc_ref_addresses_in_hl7(text: str) -> frozenset[str]:
     """The content addresses named by the well-formed document handles in an HL7 body's
     ``OBX-5.5`` values, read as :func:`reattach_documents_in_hl7` reads them: the places delivery
@@ -895,10 +944,9 @@ async def reattach_documents_in_hl7(
     # at a 64 MiB document and stayed about 0.1 s at 15 MiB: the splice's escape pass over the whole
     # value is one string operation, which holds the GIL in any thread. Only `reader` runs on the
     # loop, where the store read belongs. Only one thread touches `message` at a time.
-    def _handles() -> (
-        tuple[Message, list[tuple[int, str]], tuple[str, ...], tuple[str, str, str, str, str]]
-        | None
-    ):
+    def _handles() -> tuple[
+        Message, list[tuple[int, str]], tuple[str, ...], tuple[str, str, str, str, str]
+    ]:
         refused: str | None = None
         try:
             message = Message.parse(text)
@@ -929,6 +977,8 @@ async def reattach_documents_in_hl7(
         base64_delimited = _delimits_with_base64(separators)
         if found and base64_delimited:
             raise UnreattachableDocumentError(_BASE64_DELIMITED_HANDLE)
+        if _later_header_escapes_marker(message, text, separators):
+            raise UnreattachableDocumentError(_MIXED_HEADER_HANDLE)
         markers = _marker_forms(separators)
         # Under the same delimiters a copied content address is escaped too, so the address after
         # a marker cannot be read: every marker counts as a copy.
@@ -946,10 +996,7 @@ async def reattach_documents_in_hl7(
             raise UnreattachableDocumentError(_UNSPLICED_HANDLE)
         return message, found, markers, separators
 
-    scanned = await asyncio.to_thread(_handles)
-    if scanned is None:
-        return text
-    message, handles, markers, separators = scanned
+    message, handles, markers, separators = await asyncio.to_thread(_handles)
 
     def _splice(occ: int, verbatim: str) -> None:
         # The detach checks a value under the delimiters it arrived with; MSH-1 or MSH-2

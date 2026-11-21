@@ -220,7 +220,8 @@ def parse_or_refuse(text: str) -> _builtin_hl7.ParsedMessage:
     :meth:`Peek.parse` and :meth:`Message.parse <messagefoundry.parsing.message.Message.parse>` share.
 
     ``text`` is normalized, budget-checked and free of blank lines already. A body with no leading
-    ``MSH``/``FHS``/``BHS``, or a header too short to read, is refused with the parser's own fixed
+    ``MSH``/``FHS``/``BHS``, a header too short to read, or a short MSH-2 whose filled default is
+    already another of its separators (BACKLOG #5972), is refused with the parser's own fixed
     text. Any other error is a fault in the parser, not a property of the message (ADR 0054
     amendment). It is refused through the same
     ``HL7PeekError`` the listener NAKs and records as ``ERROR``, so the message is counted and logged,

@@ -792,7 +792,8 @@ def _batch(msh2: str, obx5_5: str) -> str:
 def test_a_batch_escapes_by_its_header_not_by_its_msh() -> None:
     """BACKLOG #5972: every line of a batch is split on the delimiters of its first line, so
     ``Message.set`` escapes by the batch header's, not by an MSH's that names ``:``: the handle is
-    written raw, which the gate's substring test finds."""
+    written raw, which the gate's substring test finds. The gate still opens on a batch whose
+    first MSH names a marker character, since a Handler may have written that MSH under its own."""
     handle = make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application")
     msg = Message.parse(_batch(":~\\&", _b64(10)))
     msg.set("OBX-5.5", handle)
@@ -800,7 +801,7 @@ def test_a_batch_escapes_by_its_header_not_by_its_msh() -> None:
     assert payload.startswith("FHS")
     assert DOC_REF_MARKER in payload
     assert may_hold_doc_ref(payload)
-    assert not may_hold_doc_ref(_batch(":~\\&", _b64(10)))
+    assert may_hold_doc_ref(_batch(":~\\&", _b64(10)))
     assert not may_hold_doc_ref(_batch("^~\\&", _b64(10)))
 
 
@@ -812,6 +813,26 @@ def test_the_gate_opens_when_a_batch_header_escapes_the_marker() -> None:
     payload = msg.encode()
     assert DOC_REF_MARKER not in payload  # the engine's own handle is escaped by the FHS's ":"
     assert may_hold_doc_ref(payload)
+
+
+async def test_an_envelope_around_an_msh_written_under_its_own_delimiters_is_refused() -> None:
+    """A Handler may wrap an encoded MSH-led payload, whose ``:`` escaped the engine's handle, in an
+    FHS envelope of ordinary delimiters. The message then reads under the envelope's, where the
+    escaped handle is no handle, so the gate opens on the inner MSH and the re-attach refuses the
+    payload rather than send the handle unresolved (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+
+    handle = make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application")
+    inner = Message.parse(_hl7(_b64(10), msh2=":~\\&"))
+    inner.set("OBX-5.5", handle)
+    payload = "FHS|^~\\&|APP|FAC\r" + inner.encode()
+    assert DOC_REF_MARKER not in payload
+    assert may_hold_doc_ref(payload)
+    with pytest.raises(UnreattachableDocumentError, match="a header after the first"):
+        await reattach_documents_in_hl7(payload, _no_read, bound=frozenset())
+    # The control: the same envelope around an ordinary MSH is carried as it is.
+    plain = "FHS|^~\\&|APP|FAC\r" + _hl7(_b64(10))
+    assert await reattach_documents_in_hl7(plain, _no_read, bound=frozenset()) == plain
 
 
 async def test_a_hex_escaped_handle_cannot_offset_a_copy_left_live(store: MessageStore) -> None:

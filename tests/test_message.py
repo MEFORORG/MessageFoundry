@@ -9,7 +9,7 @@ from collections.abc import Callable, ItemsView
 
 import pytest
 
-from messagefoundry.parsing import Message, Peek, _builtin_hl7
+from messagefoundry.parsing import HL7PeekError, Message, Peek, _builtin_hl7
 
 ADT = (
     "MSH|^~\\&|SENDAPP|SENDFAC|RECVAPP|RECVFAC|20260101||ADT^A01^ADT_A01|MSG1|P|2.5.1\r"
@@ -324,6 +324,48 @@ def test_an_inner_msh_naming_other_delimiters_does_not_steer_a_write() -> None:
     again = Message.parse(m.encode())
     assert again["PID-3.1"] == "A^B"
     assert again["PID-3.2"] == "Y"
+
+
+def test_a_filled_default_that_is_already_a_separator_is_refused_at_parse() -> None:
+    """A short MSH-2 whose filled default is already another separator would make two structures
+    one character, so a component join would read back as a field or a repetition. The parse
+    refuses it, at the listener's ``Peek.parse`` too (BACKLOG #5972)."""
+    for raw in (
+        "MSH^^A^B^C^D^20260101^^ADT^A01^M1^P^2.5\rPID^1^^111^^DOE\r",
+        "MSH|~|A|B\rPID|1||111\r",
+        "MSH|^~&|A|B\rPID|1||111\r",
+    ):
+        with pytest.raises(HL7PeekError, match="a default filled in for one"):
+            Message.parse(raw)
+        with pytest.raises(HL7PeekError, match="a default filled in for one"):
+            Peek.parse(raw)
+    # The control: a short MSH-2 whose filled defaults are new characters still parses.
+    assert Message.parse(_PARSER_FILLED["short-msh-2"])["PID-3.1"] == "111"
+
+
+def test_a_short_msh_2_may_be_completed_to_the_characters_the_parser_filled() -> None:
+    """The header can be made to declare the delimiters the body is written in; any other
+    completion would move one, and stays refused."""
+    m = Message.parse(_PARSER_FILLED["short-msh-2"])
+    with pytest.raises(ValueError, match="holds the message's delimiters"):
+        m.set("MSH-2", "^~#&")
+    m.set("MSH-2", "^~\\&")
+    again = Message.parse(m.encode())
+    assert again["MSH-2"] == "^~\\&"
+    assert again.repetitions("PID-3.1") == ["111", "222"]
+
+
+@pytest.mark.parametrize("header", ["BHS", "FHS"])
+def test_the_leading_batch_header_cannot_be_deleted(header: str) -> None:
+    """Every line is read and written in the leading header's delimiters, so deleting it would
+    leave the message led by a line that names others (BACKLOG #5972). A later one may go."""
+    m = Message.parse(f"{header}|#~\\&|A\rMSH|^~\\&|A|B\rPID|1||X#Y\r")
+    before = m.encode()
+    with pytest.raises(ValueError, match=f"refusing to delete the {header} header"):
+        m.delete_segments(header)
+    assert m.encode() == before
+    batch = Message.parse("FHS|^~\\&|A\rBHS|^~\\&|A\rMSH|^~\\&|A|B\rPID|1\r")
+    assert batch.delete_segments("BHS") == 1
 
 
 # --- field repetitions (H-9) -------------------------------------------------
