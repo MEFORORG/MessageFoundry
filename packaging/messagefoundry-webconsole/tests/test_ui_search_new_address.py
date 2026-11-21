@@ -260,8 +260,8 @@ def test_the_layered_continuation_admits_only_bounded_presets(target: str, admit
 
 
 def test_the_route_bound_matches_the_json_routes_cap() -> None:
-    # The console's direct call skips the JSON route's own checks, so its copy of the cap must
-    # not drift from them.
+    # The console's copies of the JSON route's bounds (the id pattern its direct call skips, and
+    # the layer cap its unlock pattern carries) must not drift from them.
     from messagefoundry.api import app as api_app
     from messagefoundry.api.validation import LAYERED_PRESET_IDS_PATTERN
     from messagefoundry_webconsole.routes import search
@@ -272,7 +272,7 @@ def test_the_route_bound_matches_the_json_routes_cap() -> None:
 
 @pytest.mark.parametrize(
     ("presets", "expected"),
-    [([_ID] * 9, "at most 8"), (["not-an-id"], "at most 8")],
+    [([_ID] * 9, "at most 8"), (["not-an-id"], "not one of your saved presets")],
     ids=["nine", "not-an-id"],
 )
 async def test_the_layered_route_refuses_what_its_pattern_would_not_admit(

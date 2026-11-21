@@ -53,12 +53,14 @@ register_ui_action(
 # refusal carries that query (:func:`_layered_continuation`, BACKLOG #5646): the run's whole input is
 # ``?presets=``, so a continuation without it landed on the run's 400. Any other query fails the
 # pattern, so its continuation is the search form. The route applies the same bound to what it is
-# sent (:func:`_layered_ids`), so the pattern admits nothing the route would run.
+# sent (:func:`_layered_ids`), so it runs nothing past the bound the pattern admits.
 _SEARCH = "/ui/messages/search"
 #: The most presets one layered run composes: the JSON route's own cap (``_MAX_PRESET_LAYERS`` in
-#: ``messagefoundry/api/app.py``), which a direct call skips with the rest of its ``Query`` checks.
+#: ``messagefoundry/api/app.py``), which its handler body also enforces on a direct call. Copied so
+#: the unlock pattern can carry it.
 _MAX_LAYERS = 8
-#: One preset id, as ``LAYERED_PRESET_IDS_PATTERN`` spells each comma-separated item.
+#: One preset id, as ``LAYERED_PRESET_IDS_PATTERN`` spells each comma-separated item. That pattern
+#: sits in the JSON route's ``Query`` declaration, which the console's direct call skips.
 _PRESET_ID = r"[0-9a-f]{32}"
 register_ui_action(
     rf"^/ui/messages/search/layered(\?presets={_PRESET_ID}(&presets={_PRESET_ID}){{0,{_MAX_LAYERS - 1}}})?$",
@@ -75,15 +77,20 @@ def _layered_continuation(request: Request) -> str:
     return _new_address_continuation(request, landing=_SEARCH)
 
 
-def _layered_ids(presets: list[str] | None) -> str | None:
-    """The comma-joined preset ids a layered run was sent, or None when they break the route's
-    bound: more than :data:`_MAX_LAYERS`, or an item that is not a preset id (BACKLOG #5646). The
-    JSON handler's own ``Query`` pattern does not run on the console's direct call. Blank items
-    are dropped first, as the form's empty checkboxes send none."""
+def _layered_refusal(presets: list[str] | None) -> tuple[str, str | None]:
+    """The comma-joined preset ids a layered run was sent, and why they break the route's bound,
+    or None when they do not (BACKLOG #5646): none at all, more than :data:`_MAX_LAYERS`, or an
+    item that is not a preset id. The JSON handler's own ``Query`` pattern does not run on the
+    console's direct call. Blank items are dropped first, as the form's empty checkboxes send
+    none. The reason names the bound, never a value sent."""
     ids = [p for p in (presets or []) if p]
-    if len(ids) > _MAX_LAYERS or not all(re.fullmatch(_PRESET_ID, p) for p in ids):
-        return None
-    return ",".join(ids)
+    if not ids:
+        return "", "select at least one preset to layer"
+    if len(ids) > _MAX_LAYERS:
+        return "", f"select at most {_MAX_LAYERS} presets to layer"
+    if not all(re.fullmatch(_PRESET_ID, p) for p in ids):
+        return "", "a selected preset is not one of your saved presets"
+    return ",".join(ids), None
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
@@ -396,19 +403,14 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         presets: list[str] | None = Query(None),
     ) -> HTMLResponse:
         preset_list = await _presets(engine, identity, request)
-        ids = _layered_ids(presets)
-        if not ids:
+        ids, error = _layered_refusal(presets)
+        if error is not None:
             # BACKLOG #1025, as on ui_message_search: this 400 re-render returns before
             # core.layered_search (which charges the budget in its own body), so charge here — only on
             # this short-circuit branch — to bring it under the per-actor read budget without
             # double-charging the composed-run path. No preset, or a selection that breaks the
-            # route's bound (BACKLOG #5646); the message names the bound, never a value sent.
+            # route's bound (BACKLOG #5646).
             enforce_phi_read_pacing(request, identity)
-            error = (
-                "select at least one preset to layer"
-                if ids == ""
-                else f"select at most {_MAX_LAYERS} of your saved presets to layer"
-            )
             return HTMLResponse(
                 pages.message_search(None, error=error, presets=preset_list),
                 status_code=400,
