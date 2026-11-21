@@ -313,16 +313,22 @@ def _names_a_link(info: os.stat_result) -> bool:
     )
 
 
-#: The reparse tag of a Windows ``AF_UNIX`` socket (``IO_REPARSE_TAG_AF_UNIX``), which the
-#: ``stat`` module does not name.
-_AF_UNIX_REPARSE_TAG = 0x80000023
+#: The reparse tags of Windows files that ``lstat`` reports as regular by ``st_mode`` but that an
+#: open refuses with ``EINVAL``: at least an ``AF_UNIX`` socket (``IO_REPARSE_TAG_AF_UNIX``), the
+#: FIFO, character and block device files WSL makes (``IO_REPARSE_TAG_LX_FIFO``, ``_LX_CHR``,
+#: ``_LX_BLK``), and an app execution alias (``IO_REPARSE_TAG_APPEXECLINK``). Listed, not inferred
+#: from the reparse attribute, since a cloud-files or dedup placeholder is a reparse point too and
+#: is read as the file it is.
+_UNOPENABLE_REPARSE_TAGS = frozenset({0x80000023, 0x80000024, 0x80000025, 0x80000026, 0x8000001B})
 
 
 def _is_regular(info: os.stat_result) -> bool:
-    """Whether an ``lstat`` result is a regular file. Windows reports an ``AF_UNIX`` socket as one
-    by ``st_mode``, and only its reparse tag tells it apart; an open of it fails with ``EINVAL``,
-    so it is no plain file (BACKLOG #5388 added item 3)."""
-    return S_ISREG(info.st_mode) and getattr(info, "st_reparse_tag", 0) != _AF_UNIX_REPARSE_TAG
+    """Whether an ``lstat`` result is a regular file, and not one of the Windows reparse points
+    ``_UNOPENABLE_REPARSE_TAGS`` names, which only their tag tells apart (BACKLOG #5388 added
+    item 3)."""
+    return (
+        S_ISREG(info.st_mode) and getattr(info, "st_reparse_tag", 0) not in _UNOPENABLE_REPARSE_TAGS
+    )
 
 
 #: How a sidecar or body is opened (BACKLOG #5387 added item 1). ``O_NOFOLLOW`` refuses a final
@@ -515,11 +521,18 @@ def _unplain_now(name: object, cause: OSError) -> bool | None:
 
 
 def _lstat_is_dir(path: Path) -> bool:
-    """Whether ``path`` itself, not a link's target, is a directory. ``False`` when it cannot be
-    checked; the caller then raises the error that led here, so the fault is not lost."""
+    """Whether ``path`` itself, not a link's target, is a directory. ``False`` when it is gone or
+    cannot be checked; a check that fails for any other reason is logged, never swallowed."""
     try:
         return S_ISDIR(path.lstat().st_mode)
-    except OSError:
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        _log.warning(
+            "uploaded-file part %s could not be checked for a directory: %s",
+            path.name,
+            codec_safe_str(exc),
+        )
         return False
 
 
@@ -2959,6 +2972,11 @@ class UploadStore:
             # listing key, so once it is gone the file is invisible even if the blob lingers).
             # Under the pair lock, so a rotate-key re-seal cannot put either back (BACKLOG #3181).
             with _pair_lock(meta_path):
+                # A directory swapped in for the sidecar after its read is refused before the body
+                # goes (BACKLOG #5388 added item 3), since its unlink would fail with the body
+                # already removed and no refusal the route answers.
+                if _lstat_is_dir(meta_path):
+                    raise _damaged(file_id, "sidecar", "it is a directory")
                 body_defect: str | None = None
                 try:
                     blob_path.unlink(missing_ok=True)

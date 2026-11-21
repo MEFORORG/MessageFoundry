@@ -236,6 +236,70 @@ async def test_a_directory_swapped_in_for_the_body_before_the_delete_unlinks_it(
     assert blob.is_dir() and _sidecar(store, meta.file_id).is_file()
 
 
+async def test_a_directory_swapped_in_for_the_sidecar_is_refused_before_the_body_goes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Before the fix the body was unlinked first, then the sidecar's unlink raised a raw OSError:
+    # a 500, with the body already gone.
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    sidecar = _sidecar(store, meta.file_id)
+    real = uploads._pair_lock
+
+    @contextlib.contextmanager
+    def _swap_then_lock(path: Path, **kwargs: Any) -> Iterator[None]:
+        sidecar.unlink()
+        sidecar.mkdir()
+        with real(path, **kwargs):
+            yield
+
+    monkeypatch.setattr(uploads, "_pair_lock", _swap_then_lock)
+    with pytest.raises(UploadDamagedError):
+        await store.delete(meta.file_id)
+    assert sidecar.is_dir() and _blob(store, meta.file_id).is_file()
+
+
+async def test_a_body_unlink_that_fails_on_a_file_is_raised_as_it_is(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Control: only a directory is answered as damage; a read-only volume or a sharing violation
+    # on the body is not a file an operator should delete.
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    blob = _blob(store, meta.file_id)
+    real_unlink = Path.unlink
+
+    def _unlink(self: Path, missing_ok: bool = False) -> None:
+        if self == blob:
+            raise PermissionError(errno.EACCES, "Permission denied", str(self))
+        real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _unlink)
+    with pytest.raises(PermissionError):
+        await store.delete(meta.file_id)
+    assert blob.is_file() and _sidecar(store, meta.file_id).is_file()
+
+
+@pytest.mark.parametrize("read", ["get_meta", "read_bytes"])
+async def test_a_transient_open_error_on_a_regular_part_is_re_raised(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, read: str
+) -> None:
+    # Control: _open_plain converts a refused open only when the name is now not a plain file.
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    part = _blob(store, meta.file_id) if read == "read_bytes" else _sidecar(store, meta.file_id)
+
+    def _eio(path: Any, flags: int, *args: Any) -> int:
+        if Path(path) == part:
+            raise OSError(errno.EIO, "Input/output error", str(path))
+        return os.open(path, flags, *args)
+
+    monkeypatch.setattr(uploads, "os", _OsWith(_eio))
+    with pytest.raises(OSError) as raised:
+        await getattr(store, read)(meta.file_id)
+    assert raised.value.errno == errno.EIO
+
+
 @pytest.mark.skipif(
     sys.platform == "win32" or not hasattr(socket, "AF_UNIX"),
     reason="a socket file needs POSIX AF_UNIX",
@@ -282,6 +346,11 @@ _WINDOWS_SOCKET_STAT = SimpleNamespace(
 def test_a_windows_socket_stat_is_not_a_regular_file() -> None:
     socket_stat: Any = _WINDOWS_SOCKET_STAT
     assert not uploads._is_regular(socket_stat)
+    # An app execution alias, as %LOCALAPPDATA%\Microsoft\WindowsApps holds, is refused the same
+    # way, as are the device and FIFO files WSL makes.
+    for tag in (0x8000001B, 0x80000024, 0x80000025, 0x80000026):
+        alias: Any = SimpleNamespace(st_mode=0o100777, st_file_attributes=0x420, st_reparse_tag=tag)
+        assert not uploads._is_regular(alias)
     # Controls: a plain file, and a reparse point of another kind, such as a cloud placeholder.
     plain: Any = SimpleNamespace(st_mode=0o100666, st_file_attributes=0x20, st_reparse_tag=0)
     cloud: Any = SimpleNamespace(
@@ -338,17 +407,26 @@ def _bind_windows_socket(path: Path) -> Any:
         pytest.skip("Winsock did not start")
     ws2.socket.restype = ctypes.c_size_t
     sock = ws2.socket(1, 1, 0)  # AF_UNIX, SOCK_STREAM
-    if sock == ctypes.c_size_t(-1).value:
-        pytest.skip("Winsock offers no AF_UNIX socket here")
+    opened = sock != ctypes.c_size_t(-1).value
+
+    def _close() -> None:
+        # Every exit after the startup balances it, the skips included.
+        if opened:
+            ws2.closesocket(ctypes.c_size_t(sock))
+        ws2.WSACleanup()
+
     name = os.fsencode(path)
-    if len(name) >= 108:
-        ws2.closesocket(ctypes.c_size_t(sock))
-        pytest.skip("the socket path is longer than sockaddr_un holds")
     addr = struct.pack("H", 1) + name.ljust(108, b"\0")
-    if ws2.bind(ctypes.c_size_t(sock), addr, len(addr)) != 0:
-        ws2.closesocket(ctypes.c_size_t(sock))
-        pytest.skip("Winsock could not bind an AF_UNIX socket here")
-    return lambda: ws2.closesocket(ctypes.c_size_t(sock))
+    if not opened:
+        reason = "Winsock offers no AF_UNIX socket here"
+    elif len(name) >= 108:
+        reason = "the socket path is longer than sockaddr_un holds"
+    elif ws2.bind(ctypes.c_size_t(sock), addr, len(addr)) != 0:
+        reason = "Winsock could not bind an AF_UNIX socket here"
+    else:
+        return _close
+    _close()
+    pytest.skip(reason)
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="a Windows AF_UNIX socket needs Windows")
