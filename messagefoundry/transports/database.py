@@ -3023,7 +3023,8 @@ class AutocommitNotConfirmed(RuntimeError):
 
     The borrow is refused, and the connection goes back to its pool unconfirmed, so no statement runs
     on it until a later borrow has set the mode. A setter that raises a driver error raises that
-    error instead, and its connection goes back unconfirmed the same way. The text names neither
+    error instead, and its connection goes back unconfirmed the same way, unless the error is a
+    connection failure (class 08), which discards it (BACKLOG #5748). The text names neither
     the DSN nor the server."""
 
 
@@ -3164,9 +3165,9 @@ async def _return_to_pool(pool: Any, conn: Any) -> None:
     worker thread can still be using ``conn`` (the rule :func:`_return_when_settled` enforces).
     Never raises: the caller, if any, is already raising its own reason.
 
-    A connection whose autocommit was not confirmed is returned, not closed, unless the set failed
-    with a connection failure, which discards it instead (:func:`_discard_to_pool`, BACKLOG #5748).
-    It is not marked
+    A connection whose autocommit was not confirmed is returned, not closed; a caller whose set
+    failed with a connection failure calls :func:`_discard_to_pool` instead (BACKLOG #5748), since
+    this function never discards. It is not marked
     confirmed, so its next borrow sets autocommit again before any statement runs on it, and refuses
     again if the driver still rejects the set. Closing it would add nothing to that rule, and
     aioodbc's own release of an open connection is what wakes a borrower waiting for a free slot.
@@ -3338,7 +3339,7 @@ def _return_when_settled(
     work: asyncio.Future[Any],
     what: str,
     *,
-    discard_on: Callable[[BaseException], bool] = _connection_lost,
+    discard_on: Callable[[BaseException], bool] | None = None,
 ) -> None:
     """Once ``work`` is done, return ``conn`` to ``pool``, but only if ``work`` ending proves the
     worker thread it waited on has finished with ``conn`` (PR 2593 review).
@@ -3359,7 +3360,9 @@ def _return_when_settled(
 
     **A ``work`` that failed is logged, and one whose failure ``discard_on`` accepts discards the
     connection rather than returning it** (BACKLOG #5748): by default a connection failure, class
-    08, whose handle is presumed dead. No borrower is left to raise either to."""
+    08, whose handle is presumed dead (:func:`_connection_lost`). No borrower is left to raise
+    either to."""
+    discards = _connection_lost if discard_on is None else discard_on
 
     def _done(finished: asyncio.Future[Any]) -> None:
         if finished.cancelled():
@@ -3370,7 +3373,7 @@ def _return_when_settled(
             )
             return
         failure = finished.exception()
-        if failure is not None and discard_on(failure):
+        if failure is not None and discards(failure):
             logger.warning(
                 "DATABASE: %s failed after its borrower left (%s); the connection is discarded "
                 "rather than returned to its pool",
@@ -3649,11 +3652,12 @@ async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float | Non
     and ``0`` on a fresh one. A borrower cancelled during the write leaves at once, and the
     connection goes back only once the write has returned (:func:`_return_when_settled`), or is
     discarded if the write then failed with a transient state. ``timeout`` bounds the wait for the
-    write the same way, as a transient :class:`DeliveryError`; :func:`_acquire` passes its
-    ``acquire_timeout``, so that bound still covers the whole borrow.
+    write the same way, as a transient :class:`DeliveryError`; :func:`_acquire` passes what is
+    left of its ``acquire_timeout``, so that one bound covers the whole borrow.
 
     **A driver that refuses the value fails the borrow closed.** The connection goes back to
-    ``pool`` first, since no call ran on it, and a ``config_fault`` naming the setting is raised,
+    ``pool`` first, since a refused write leaves the handle usable and no statement ran on it, and
+    a ``config_fault`` naming the setting is raised,
     so the lane stops rather than running with a bound the operator believes is set.
 
     **A transient driver state from the setter, class 08 or ``HYT00`` among them, is the
@@ -3677,7 +3681,7 @@ async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float | Non
             # call ran on it, and the exception propagates unchanged, as _cursor_refused's does.
             await _return_to_pool(pool, conn)
             raise
-        await _close_and_release(pool, conn, None, discard=True)
+        await _discard_to_pool(pool, conn)
         raise DeliveryError(
             f"DATABASE connection unusable reading its statement timeout: {_safe_db_error(exc)}"
         ) from exc
@@ -3706,14 +3710,15 @@ async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float | Non
             )
             if isinstance(exc, TimeoutError):
                 raise DeliveryError(
-                    f"DATABASE statement_timeout write timed out after {timeout:g}s"
+                    "DATABASE statement_timeout write did not finish within the borrow's "
+                    "acquire_timeout"
                 ) from None
             raise
     failure = work.exception()  # done here; the thread resolved it, so it is never cancelled
     if failure is None:
         return
     state = _log_sqlstate(failure)
-    if state is not None and _is_transient(state):
+    if state is not None and _is_transient(state):  # _transient_driver_error's test
         await _discard_to_pool(pool, conn)
         raise _classify_db_error(state, str(failure), connecting=True) from failure
     await _return_to_pool(pool, conn)
@@ -3787,6 +3792,8 @@ async def _acquire(pool: Any, timeout: float) -> Any:
     real aioodbc connection the gate cannot wrap is refused and discarded instead, before any call
     runs on it (:func:`_require_gate_or_discard`). It also carries the pool's statement timeout
     (:func:`_apply_statement_timeout`, BACKLOG #5756)."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
     try:
         conn = await asyncio.wait_for(pool.acquire(), timeout)
     except TimeoutError as exc:
@@ -3794,7 +3801,8 @@ async def _acquire(pool: Any, timeout: float) -> Any:
             f"DATABASE pool acquire timed out after {timeout:g}s (pool exhausted or DB unresponsive)"
         ) from exc
     await _require_gate_or_discard(pool, conn)
-    await _apply_statement_timeout(pool, conn, timeout=timeout)
+    # What is left of the one bound, so the write cannot extend the borrow past it.
+    await _apply_statement_timeout(pool, conn, timeout=max(0.0, deadline - loop.time()))
     return conn
 
 

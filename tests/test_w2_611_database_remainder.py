@@ -341,7 +341,7 @@ async def test_acquire_timeout_bounds_a_hung_timeout_write(
     with pytest.raises(DeliveryError) as caught:
         await asyncio.wait_for(dest.send('{"a": 1}'), WAIT)
     assert not isinstance(caught.value, NegativeAckError)
-    assert "statement_timeout write timed out" in str(caught.value)
+    assert "statement_timeout write did not finish" in str(caught.value)
     assert rig.pools[0].free == []
     rig.release.set()
     assert await wait_until(lambda: rig.pools[0].free == [rig.conn]), rig.log

@@ -4813,7 +4813,9 @@ Facts that are easy to get wrong, stated plainly first:
   value set explicitly is never dropped silently. A send then stops its lane; a poll reports the
   failure and polls again next interval; a `db_lookup` raises into its Handler. A transient driver
   state from that write is the connection's failure instead: the borrow fails transiently and
-  the connection is discarded. The transient states are every state the connector retries:
+  the connection is discarded. A write that does not return within the borrow's
+  `acquire_timeout` fails the borrow transiently too, and its connection stays out of the pool
+  until the write returns. The transient states are every state the connector retries:
   SQLSTATE class `08`, class `40`, `HYT00` and `HYT01`. A driver that takes it on the
   connection but refuses the ODBC query timeout on a cursor refuses every cursor; a send and the
   connection test read `HYC00` or `HY092` there as the same configuration fault, while a poll,
