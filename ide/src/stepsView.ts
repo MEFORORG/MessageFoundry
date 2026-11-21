@@ -84,6 +84,7 @@ import {
   traceRowValues,
   withPickedPath,
   type AddMenuItem,
+  type AppliedRewrite,
   type EditMessage,
   type HandlerViewModel,
   type LensParseResult,
@@ -460,13 +461,16 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // so the engine compares the row as it was PROJECTED against the live buffer's row at that line range
     // and REFUSES a stale coordinate (F7). We must NOT recompute expect_src from the same live buffer we
     // send as stdin — that compares the buffer against itself and the guard always passes (the defect).
-    const applyOne = async (msg: EditMessage): Promise<void> => {
+    // Returns what it wrote only when the write landed, so drainEdits can carry a queued edit on the same
+    // row over it (BACKLOG #5943); a refusal, a no-op or a disposed panel returns nothing.
+    const applyOne = async (msg: EditMessage): Promise<AppliedRewrite | undefined> => {
       const spec = buildEditRequest(msg);
+      const before = document.getText();
       // At the SAME contract the rows were projected with — the engine re-locates the row through that
       // grammar, so sending v2 coordinates into a v1 partition would miss it (or hit a different row).
       const res = await lensRewriteStdin(
         spec,
-        document.getText(),
+        before,
         workspaceDir(),
       );
       if (disposed) {
@@ -491,7 +495,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         document.positionAt(document.getText().length),
       );
       edit.replace(document.uri, fullRange, outcome.source);
-      await vscode.workspace.applyEdit(edit);
+      if (!(await vscode.workspace.applyEdit(edit))) {
+        return undefined;
+      }
+      return { before, after: outcome.source };
     };
 
     // One edit at a time. A change that races an in-flight rewrite is NOT dropped — it is queued and
@@ -511,6 +518,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           void render(); // revert the optimistic webview change to the true projection
         },
         scheduleRerender, // a save the guard suppressed mid-drain is deferred, not dropped (#1759)
+        () => document.getText(), // lets a queued edit on a rewritten row carry its expectSrc over (#5943)
       );
 
     // Apply a STRUCTURAL op (insert/delete/move). Unlike a param edit these change the file's line count,

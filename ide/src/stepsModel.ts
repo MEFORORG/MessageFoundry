@@ -2964,26 +2964,138 @@ export class RerenderDebouncer<H = unknown> {
 export async function drainEdits(
   guard: EditLoopGuard,
   first: EditMessage,
-  apply: (msg: EditMessage) => Promise<void>,
+  apply: (msg: EditMessage) => Promise<AppliedRewrite | void>,
   onError?: (err: unknown, msg: EditMessage) => void,
   onRefreshOwed?: () => void,
+  readSource?: () => string,
 ): Promise<void> {
   if (!guard.beginEdit()) {
     guard.queue(first);
     return;
   }
   try {
+    // A queued edit's expectSrc is carried over the rewrites this drain applied to its row only when
+    // `readSource` is given, since the rebase must compare the live buffer (BACKLOG #5943).
+    const rebaser = new QueuedEditRebaser();
     let current: EditMessage | undefined = first;
     while (current) {
       try {
-        await apply(current);
+        rebaser.record(current, await apply(current));
       } catch (err) {
+        rebaser.latch(); // the buffer's state is unknown after an unexpected rejection
         onError?.(err, current);
       }
-      current = guard.takePending();
+      const next = guard.takePending();
+      current = next && readSource ? rebaser.rebase(next, readSource()) : next;
     }
   } finally {
     releaseEdit(guard, onRefreshOwed);
+  }
+}
+
+/**
+ * What one applied param edit wrote (BACKLOG #5943): the buffer sent to `lens rewrite` and the source
+ * written back. `apply` returns it only when the write landed; a refusal, a no-op or a disposed panel
+ * returns nothing.
+ */
+export interface AppliedRewrite {
+  before: string;
+  after: string;
+}
+
+/**
+ * The applied row's text after `write`, or `undefined` when the write did more than rewrite that row in
+ * place: a different line count, any changed line outside the row, or a row that did not read
+ * `msg.expectSrc` before the write. Only an in-place rewrite of one row leaves every other row's
+ * coordinates and source as they were.
+ */
+export function rowAfterRewrite(msg: EditMessage, write: AppliedRewrite): string | undefined {
+  if (msg.expectSrc === undefined) {
+    return undefined;
+  }
+  const before = physicalLines(write.before);
+  const after = physicalLines(write.after);
+  const lo = msg.lineStart - 1;
+  const hi = msg.lineEnd;
+  if (before.length !== after.length || lo < 0 || hi <= lo || hi > before.length) {
+    return undefined;
+  }
+  if (before.slice(lo, hi).join("\n") !== msg.expectSrc) {
+    return undefined;
+  }
+  for (let i = 0; i < before.length; i++) {
+    if ((i < lo || i >= hi) && before[i] !== after[i]) {
+      return undefined;
+    }
+  }
+  return after.slice(lo, hi).join("\n");
+}
+
+/**
+ * Carries a queued edit's `expectSrc` forward over the rewrites a drain already applied to its row
+ * (BACKLOG #5943). An edit typed on a row while an earlier rewrite of that row was in flight was
+ * projected from the source before that rewrite, so sent unchanged the engine's stale guard (F7)
+ * refuses it and the user's edit is reverted. The queued edit's `expectSrc` is replaced with the row's
+ * current text only when all of these hold, so the stale guard still refuses every row text this drain
+ * did not itself write:
+ *
+ *  - every write in this drain so far rewrote its own row in place ({@link rowAfterRewrite}); the first
+ *    write that did not, or an unexpected rejection, latches rebasing off for the rest of the drain;
+ *  - the queued edit names the same handler and line range as a row this drain rewrote, and its
+ *    `expectSrc` is one of that row's earlier texts in this drain;
+ *  - the live buffer, read just before the queued edit is sent, is exactly the last write's output, so a
+ *    split-view change, or a write that did not land, leaves that edit unrebased.
+ *
+ * Only the typed-edit drain uses it. The field picker's drain (`applyPickedEdit`) does not: a typed
+ * template edit queued behind a pick carries the parts as shown before the pick, and rebasing it would
+ * write the old path back over the picked one.
+ */
+export class QueuedEditRebaser {
+  private latched = false;
+  private lastAfter: string | undefined;
+  // Per row: the texts this drain replaced, and the row's current text.
+  private readonly rows = new Map<string, { superseded: Set<string>; current: string }>();
+
+  private static key(msg: EditMessage): string {
+    return `${msg.handler} ${msg.lineStart} ${msg.lineEnd}`;
+  }
+
+  /** Record what applying `msg` wrote (`undefined` when nothing was written). */
+  record(msg: EditMessage, write: AppliedRewrite | void): void {
+    if (this.latched || write === undefined) {
+      return;
+    }
+    const row = rowAfterRewrite(msg, write);
+    // A write sent with no expectSrc is unverified, so it latches like a write that moved other rows.
+    if (row === undefined || msg.expectSrc === undefined) {
+      this.latch();
+      return;
+    }
+    const key = QueuedEditRebaser.key(msg);
+    const entry = this.rows.get(key) ?? { superseded: new Set<string>(), current: row };
+    entry.superseded.add(msg.expectSrc);
+    entry.current = row;
+    this.rows.set(key, entry);
+    this.lastAfter = write.after;
+  }
+
+  /** Turn rebasing off for the rest of the drain. */
+  latch(): void {
+    this.latched = true;
+    this.rows.clear();
+    this.lastAfter = undefined;
+  }
+
+  /** `msg` with its `expectSrc` rebased onto its row's current text, or `msg` unchanged. */
+  rebase(msg: EditMessage, liveSource: string): EditMessage {
+    if (this.latched || msg.expectSrc === undefined || liveSource !== this.lastAfter) {
+      return msg;
+    }
+    const entry = this.rows.get(QueuedEditRebaser.key(msg));
+    if (entry === undefined || entry.current === msg.expectSrc || !entry.superseded.has(msg.expectSrc)) {
+      return msg;
+    }
+    return { ...msg, expectSrc: entry.current };
   }
 }
 
