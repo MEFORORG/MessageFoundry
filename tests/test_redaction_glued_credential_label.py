@@ -751,6 +751,27 @@ def test_a_glued_value_right_before_a_clamp_note_is_masked(text: str, value: str
     assert value not in _through_the_chain(text + " " + "q" * 70_000)
 
 
+@pytest.mark.parametrize(
+    ("text", "value"),
+    [
+        ("a|b|password: 4455  ", "4455"),
+        ("x^y^token= kplm7b ", "kplm7b"),
+        ("a|b|mrn: Zqx4 ", "Zqx4"),
+        ("a|b|pwd: ZqMS ", "ZqMS"),
+    ],
+)
+def test_a_value_with_whitespace_before_a_clamp_note_keeps_the_earlier_mask(
+    text: str, value: str
+) -> None:
+    """Regression pin from code review: judging every value on the note-free text read a value
+    followed by whitespace and then the note as ending the text, so the end-of-text refusals kept
+    values origin/main masked. Only a value that ends right at the note's line break is judged
+    that way now."""
+    clamped = f"{text}\n{redaction._clamp_marker(70_000)}"
+    assert value not in redact(clamped)
+    assert value not in redact(redaction.clamp_untrusted(text + " " + "q" * 70_000))
+
+
 def test_a_value_before_a_space_joined_note_keeps_the_earlier_answer() -> None:
     """The end is found on the note-free text, but the value is still judged on the text with the
     note, so a value before a space-joined note is not read as ending the text: its end-of-text

@@ -1301,8 +1301,9 @@ _JSON_LITERALS = frozenset({"true", "false", "null", "True", "False", "None", "r
 _JSON_BARE_CONTINUATION = re.compile(r"""(?:[ \t]++[^\s{}\[\](),:"']++(?!\())*+""")
 
 #: The bound note :func:`_clamp_marker` writes, joined by a newline (:func:`clamp_untrusted`) or a
-#: space (:func:`safe_text`). The structured passes run on the text BEFORE it, because an unterminated
-#: region runs to the end of the text and would otherwise scrub the note -- and :func:`safe_text` is
+#: space (:func:`safe_text`). The structured passes run on the text BEFORE it, and the field-run
+#: arms find a glued value's end on it (:func:`_glued_value`); the structured passes do so because
+#: an unterminated region runs to the end of the text and would otherwise scrub the note -- and :func:`safe_text` is
 #: re-applied to its own output at the store chokepoint, where that would erase the only sign the text
 #: was cut. Anchored at ``\Z`` so only a note last in the text is spared: a peer that writes the
 #: literal mid-payload ends nothing early, and a trailing one carries no PHI. :func:`safe_text`'s
@@ -2351,22 +2352,26 @@ def _glued_value(
     the credential arm find where their value ends on ``body``, so a value right before a note
     joined by a line break is still found (:data:`_GLUED_BARE_VALUE` needs a space or the text's
     end after it). A defect found in the #5925 review: with both read on ``text``, such a value
-    printed whole behind a clamp. Every PHI and credential value is then judged on ``body`` where
-    the note is joined by a line break, so it is judged as the same value with no clamp is, and on
-    ``text`` otherwise. Judged on ``text`` there, a value before the line break read as glued to it,
-    and a last word of two characters or fewer was refused (``a|b|mrn: qw``). Judged on ``body``
-    before a space-joined note, it would read as ending the text, and keep some values the earlier
-    answer masked (``a|b|mrn: ZqMS`` then a space and the note).
+    printed whole behind a clamp. A value that ends exactly where ``body`` ends, with the note's
+    line break right after it, is then judged on ``body``, as the same value would be with no clamp;
+    every other value is judged on ``text``, as before. Judged on ``text`` there, the value read as
+    glued to the line break, and a last word of two characters or fewer was refused (``a|b|mrn:
+    qw``). Judged on ``body`` anywhere else, a value followed by whitespace and then the note, or by
+    a space-joined note, would read as ending the text, and the end-of-text refusals would keep
+    values the earlier answer masked (``a|b|password: 4455`` then two spaces and a clamp).
 
-    The PHI arms answer first, exactly as they did before BACKLOG #2968. Where they decline, a token
+    The PHI arms answer first, as they did before BACKLOG #2968, apart from the clamp-note rule
+    above. Where they decline, a token
     that ends on a vocabulary end tag's name masks that tag's rest (:func:`_glued_end_tag_rest`,
     BACKLOG #5925); it reads only such a token, which no credential label ends. Only where both
     decline does a credential label at the token's end mask the next word, so the credential arm
     adds a mask to an answer and never takes one away."""
     token, end = run.group(), run.end()
-    judged = body if text.startswith("\n", len(body)) else text
+    # Only a value whose last character ends body sits right before the note's line break.
+    note_follows = len(body) < len(text) and text.startswith("\n", len(body))
     stop = _glued_phi_value_end(text, body, token, end)
     if stop is not None:
+        judged = body if note_follows and stop == len(body) else text
         rest = _maskable_rest(judged, end, stop, field_run, credential=False)
         if rest is not None:
             return rest
@@ -2376,11 +2381,10 @@ def _glued_value(
     if not _ends_in_credential_label(token):
         return None
     bare = _GLUED_BARE_VALUE.match(body, end)
-    return (
-        None
-        if bare is None
-        else _maskable_rest(judged, end, bare.end(), field_run, credential=True)
-    )
+    if bare is None:
+        return None
+    judged = body if note_follows and bare.end() == len(body) else text
+    return _maskable_rest(judged, end, bare.end(), field_run, credential=True)
 
 
 def _glued_end_tag_rest(body: str, token: str, end: int, field_run: re.Pattern[str]) -> str | None:
