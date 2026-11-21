@@ -2800,10 +2800,12 @@ Such a refusal may then have no `auth.trust_anchor` row behind it, so the engine
 of it. An inline reload answers **503** for `store_unavailable`; a released one answers 422, as
 every refused release does. The engine log carries the store's error. An applied reload on a
 cluster node that has lost its lease, while its graph still runs, is refused as `lease_lost`
-(BACKLOG #5906). An inline reload that dual control does not gate answers **503**. A gated one
-files its hold as usual, since the hold reads no lease, and its release is refused with 422. A
-dry run is not refused: it swaps nothing and never asks for the lease. The lease is read twice, on entry
-and before the reload stops any listener. Each read is point in time: a lease lost after the
+(BACKLOG #5906). On such a node an inline reload answers **503**. A request that dual control
+gates files its hold as usual, since the hold reads no lease. A release run on that node while
+it is still in that state is refused with 422; a release on the leader, or on this node once its
+graph has stopped, is not refused for the lease. A dry run there is not refused for the lease: it
+swaps nothing and never asks for it. The lease is read twice, on entry and before the reload
+stops any listener. Each read is point in time: a lease lost after the
 second read is not refused. That reload then binds listeners and resumes lanes on the node, and
 `Engine._stop_graph` takes them down only once the reload ends, since it waits on the same lock.
 
