@@ -1177,8 +1177,13 @@ def test_a_body_cut_in_a_header_block_is_called_truncated(tail: bytes) -> None:
             parse(_CT_B, body, max_file_bytes=1024)
 
 
+_PREFIX_LINE_BODY = b"--B\r\n" + _FP + b"MSH|x\r\n--B--note\r\nPID|1\r\n--B--\r\n"
+_PREFIX_LINE_CUT = _PREFIX_LINE_BODY[: _PREFIX_LINE_BODY.index(b"note")]
+
+
 @pytest.mark.xfail(
     strict=True,
+    raises=pytest.fail.Exception,  # "DID NOT RAISE" from the pytest.raises below
     reason="known residual (BACKLOG #5787): a body cut right after a file line's --B-- prefix "
     "leaves a valid close marker, so it is taken as complete",
 )
@@ -1186,18 +1191,27 @@ def test_a_body_cut_right_after_a_close_marker_prefix_line_is_refused() -> None:
     """The known residual the module docstring states: ``--B--note`` in a file is refused in a whole
     body, but a body cut right after its ``--B--`` leaves a valid close and is taken as complete.
     This asserts the correct outcome, a refusal, and is expected to fail until that is built."""
-    body = b"--B\r\n" + _FP + b"MSH|x\r\n--B--note\r\nPID|1\r\n--B--\r\n"
-    with pytest.raises(MultipartError, match="not a delimiter line"):
-        parse_single_file_upload(_CT_B, body, max_file_bytes=1024)
-    cut = body[: body.index(b"note")]
     with pytest.raises(MultipartError):
-        parse_single_file_upload(_CT_B, cut, max_file_bytes=1024)
+        parse_single_file_upload(_CT_B, _PREFIX_LINE_CUT, max_file_bytes=1024)
+
+
+def test_the_close_marker_prefix_line_residual_as_it_stands() -> None:
+    """Current behaviour, pinned as the residual (not as correct): the whole body is refused, and the
+    body cut right after the ``--B--`` prefix parses to the file cut short, ``MSH|x``."""
+    with pytest.raises(MultipartError, match="not a delimiter line"):
+        parse_single_file_upload(_CT_B, _PREFIX_LINE_BODY, max_file_bytes=1024)
+    assert parse_single_file_upload(_CT_B, _PREFIX_LINE_CUT, max_file_bytes=1024).data == b"MSH|x"
 
 
 @pytest.mark.parametrize(
     "disposition",
-    [b"Content-Disposition: x-unnamed", b"Content-Disposition: form-data; filename*=utf-8''a"],
-    ids=["x-unnamed", "extended-filename"],
+    [
+        b"Content-Disposition: x-unnamed",
+        b"Content-Disposition: form-data; filename*=utf-8''a",
+        b'Content-Disposition: form-data; x="a name=b"',
+        b"Content-Disposition: form-data; x-name=y",
+    ],
+    ids=["x-unnamed", "extended-filename", "name-inside-a-quoted-value", "x-name-key"],
 )
 def test_a_name_substring_is_not_a_name_parameter(disposition: bytes) -> None:
     """A Content-Disposition holding ``name`` only inside another key is not a part with a name.
@@ -1207,3 +1221,17 @@ def test_a_name_substring_is_not_a_name_parameter(disposition: bytes) -> None:
     for parse in (parse_multipart_form, parse_single_file_upload):
         with pytest.raises(MultipartError, match="neither a name nor a filename"):
             parse(_CT_B, body, max_file_bytes=1024)
+
+
+@pytest.mark.parametrize(
+    "disposition",
+    [b"Content-Disposition: form-data; name=x", b'Content-Disposition: form-data; filename="f"'],
+    ids=["unquoted-name", "quoted-filename"],
+)
+def test_a_real_name_or_filename_parameter_counts_as_named(disposition: bytes) -> None:
+    """A real ``name`` or ``filename`` key, quoted or not, names the part, so the nameless refusal
+    does not fire: the unquoted name is skipped as main skipped it, the filename is a file part."""
+    assert multipart._disposition(disposition)[2] is True
+    body = b"--B\r\n" + _FP + b"MSH|x\r\n--B\r\n" + disposition + b"\r\n\r\nv\r\n--B--\r\n"
+    form = parse_multipart_form(_CT_B, body, max_file_bytes=1024)
+    assert form.files[0].data == b"MSH|x"

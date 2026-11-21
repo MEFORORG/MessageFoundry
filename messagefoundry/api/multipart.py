@@ -152,16 +152,29 @@ def parse_boundary(content_type: str | None) -> bytes | None:
     return None
 
 
-#: A Content-Disposition parameter's name, whatever its value's form (quoted or not), so a ``name``
-#: parameter the value pattern above cannot read still counts as one. The same ``(?<!\w)`` guard as
-#: ``_DISPOSITION_PARAM`` keeps the scan linear; the padding match is possessive.
-_DISPOSITION_KEY = re.compile(r"(?<!\w)(\w+)[ \t]*+=")
+def _disposition_keys(line: str) -> list[str]:
+    """The parameter keys of one Content-Disposition line, lowercased, whatever each value's form
+    (quoted or not), so a ``name`` parameter ``_DISPOSITION_PARAM`` cannot read still counts as one.
+
+    Text inside double quotes is a value and is dropped first, so ``x="a name=b"`` has the one key
+    ``x``. Then the line splits on ``;`` and each piece's key is the text before its first ``=``,
+    stripped; the piece before the first ``;`` is the disposition type, not a parameter. All of it is
+    ``str`` methods, linear in the line. A backslash-escaped quote is not honoured: it ends the
+    quoted value early, so at worst text after it is read as a key."""
+    unquoted = '""'.join(line.split('"')[::2])
+    keys: list[str] = []
+    for piece in unquoted.split(";")[1:]:
+        key, eq, _ = piece.partition("=")
+        if eq:
+            keys.append(key.strip().lower())
+    return keys
 
 
 def _disposition(head: bytes) -> tuple[str | None, str | None, bool]:
     """Parse a part's header block for its Content-Disposition ``name`` + ``filename`` (or ``None``),
     and whether it has a ``name`` or ``filename`` parameter at all, read or not. A parameter is one by
-    its exact key: ``x-unnamed=`` and the extended ``filename*=`` are not."""
+    its exact key, outside any quoted value (:func:`_disposition_keys`): ``x-name=``,
+    ``x="a name=b"`` and the extended ``filename*=`` are not."""
     text = head.decode("latin-1", "replace")
     name: str | None = None
     filename: str | None = None
@@ -174,10 +187,7 @@ def _disposition(head: bytes) -> tuple[str | None, str | None, bool]:
                     name = value
                 elif key == "filename":
                     filename = value
-            named = named or any(
-                key.group(1).lower() in ("name", "filename")
-                for key in _DISPOSITION_KEY.finditer(line)
-            )
+            named = named or any(key in ("name", "filename") for key in _disposition_keys(line))
     return name, filename, named
 
 
