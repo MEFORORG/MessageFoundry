@@ -35,35 +35,6 @@ export function cliArgv(module: string, args: readonly string[]): string[] {
   return [...INTERPRETER_OPTIONS, "-m", module, ...args];
 }
 
-/**
- * The program the Test Bench's Debug launch hands debugpy in place of `module: "messagefoundry"`
- * (BACKLOG #5409 item 2): its folder below the extension's global storage, its file name, and its
- * source. `-P` alone does not hold for a module: a debugpy older than 1.8.22, which includes the
- * 1.8.21 the Python Debugger extension bundles at the time of writing, inserts the working
- * directory, the workspace, into `sys.path` when it runs a module, whatever `-P` says. For a
- * program it adds at most the program's own folder, which the extension writes and which holds
- * only this file, and the file runs the installed package through `runpy`. So no debugpy build puts
- * the working directory on the import path. The source is written at launch rather than shipped,
- * because the extension package holds no Python (the crypto inventory's ide/ arm reads only
- * TypeScript).
- *
- * Open limit: `-P` does not remove a PYTHONPATH entry, and the Python Debugger extension loads an
- * env file into the debuggee, the workspace's `.env` by default. At least a PYTHONPATH that env file
- * sets, whichever file `python.envFile` names, or one the window inherits, can still put a workspace
- * folder on the import path for this launch.
- */
-export const TEST_BENCH_DEBUG_PROGRAM = {
-  folder: "testbench-debug",
-  file: "mefor_testbench_debug.py",
-  source: [
-    "# Written by the MessageFoundry extension for the Test Bench Debug launch (BACKLOG #5409 item 2).",
-    "import runpy",
-    "",
-    'runpy.run_module("messagefoundry", run_name="__main__", alter_sys=True)',
-    "",
-  ].join("\n"),
-} as const;
-
 /** The argv for the preflight import check (`python <these>`). */
 export function preflightArgs(): string[] {
   return [...INTERPRETER_OPTIONS, "-c", `import ${PREFLIGHT_IMPORT}`];

@@ -18,10 +18,11 @@ import {
   sweepStaleCaseDirs,
 } from "./collectionCaseFiles";
 import { CollectionStore, CollectionStoreError } from "./collectionStore";
-import { INTERPRETER_OPTIONS, TEST_BENCH_DEBUG_PROGRAM } from "./engineControlModel";
+import { INTERPRETER_OPTIONS } from "./engineControlModel";
 import { hexdump } from "./hexdump";
 import { diffMessages } from "./hl7diff";
 import { buildTraceDetail, type TraceDetail, type TraceEntry } from "./traceView";
+import { writeDebugProgram } from "./testBenchDebugProgram";
 import { testBenchScript } from "./testBenchWebview";
 import { STARTUP_BANNERS, openChannel, postToWebview } from "./webviewMessaging";
 import {
@@ -542,7 +543,7 @@ export class TestBench {
     }
     let program: string;
     try {
-      program = await this.debugProgram();
+      program = await writeDebugProgram(this.context.globalStorageUri);
     } catch (e) {
       void vscode.window.showErrorMessage(`MessageFoundry: Debug did not start: ${String(e)}`);
       return;
@@ -555,8 +556,8 @@ export class TestBench {
       // directory, the workspace, off the import path, so a `messagefoundry.py` or a stdlib-named
       // module in the workspace root does not shadow the installed one through it. The launch names
       // a program the extension writes, not the module, so debugpy adds no working directory on any
-      // build; TEST_BENCH_DEBUG_PROGRAM says why, and what still reaches the import path. `cwd` is
-      // set because for a program debugpy would otherwise start in the program's folder.
+      // build; TEST_BENCH_DEBUG_PROGRAM in testBenchDebugProgram.ts says why, and what still reaches the
+      // import path. `cwd` is set because for a program debugpy would otherwise start in its folder.
       pythonArgs: [...INTERPRETER_OPTIONS],
       program,
       cwd: folder.uri.fsPath,
@@ -565,39 +566,6 @@ export class TestBench {
       justMyCode: false, // step into the config modules (Router/Handler)
       python: pythonPath(),
     });
-  }
-
-  /** Puts TEST_BENCH_DEBUG_PROGRAM in its own folder under the extension's global storage and returns
-   *  its path, which the debuggee's interpreter opens, so the storage must be a local `file:` folder.
-   *  A file that already holds the source is left alone; otherwise the source is written to a
-   *  temporary name and renamed over it with Node's rename, which replaces the target in one step,
-   *  so a launch from another window never runs a half-written file. A temporary file a failed
-   *  rename leaves is removed. */
-  private async debugProgram(): Promise<string> {
-    if (this.context.globalStorageUri.scheme !== "file") {
-      throw new Error("the extension's storage folder is not on this machine's file system");
-    }
-    const dir = path.join(this.context.globalStorageUri.fsPath, TEST_BENCH_DEBUG_PROGRAM.folder);
-    const file = path.join(dir, TEST_BENCH_DEBUG_PROGRAM.file);
-    const source = Buffer.from(TEST_BENCH_DEBUG_PROGRAM.source, "utf8");
-    try {
-      if ((await fs.promises.readFile(file)).equals(source)) {
-        return file;
-      }
-    } catch (e) {
-      if ((e as NodeJS.ErrnoException).code !== "ENOENT") {
-        throw e;
-      }
-    }
-    await fs.promises.mkdir(dir, { recursive: true });
-    const temp = path.join(dir, `${TEST_BENCH_DEBUG_PROGRAM.file}.${process.pid}-${Date.now()}.tmp`);
-    try {
-      await fs.promises.writeFile(temp, source);
-      await fs.promises.rename(temp, file);
-    } finally {
-      await fs.promises.rm(temp, { force: true });
-    }
-    return file;
   }
 
   /**
