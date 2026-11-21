@@ -20,8 +20,9 @@ human remembering". CLAUDE.md section 5 states the rule in prose, and prose is w
 rationalizes past at 2am.
 
 WHAT IT SWEEPS: by default the root ``pyproject.toml`` and every ``packaging/*/pyproject.toml``, each
-with a ``hatch.toml`` beside it merged over ``[tool.hatch]`` the way hatchling merges it. The tables
-read in each file are listed once, in ``declared_distributions``. The PEP 735 groups were added
+with a ``hatch.toml`` beside it merged over ``[tool.hatch]`` the way hatchling merges it, and a
+``uv.toml`` beside it swept as uv settings (``scan_uv_toml``). The tables read in each file are
+listed once, in ``declared_distributions``. The PEP 735 groups were added
 2026-07-29 with the hash-pinned CI toolchain (ADR 0034 section 3): those names are not shipped in the
 wheel, but they are resolved into ``uv.lock`` and installed into the runner that executes the BLOCKING
 security gates, which makes a squatted scanner name a sharper target than a runtime dependency rather
@@ -40,7 +41,8 @@ this one is refused as a precaution); a non-empty source or index key in ``[tool
 ``allow-insecure-host`` in either, which under ``[tool.uv]`` lets uv fetch from that host without
 verifying TLS, so the bytes need not be what pypi.org serves (uv 0.13.1 rejects the key under
 ``[tool.uv.pip]`` as unknown; it is refused there too, so a uv that reads it there cannot open the
-hole); and a ``[tool.uv].workspace``, whose members this gate does not sweep.
+hole); and a ``[tool.uv].workspace``, whose members this gate does not sweep. A swept ``uv.toml``
+is refused on the same keys, at its top level and under its ``[pip]`` table.
 
 EXEMPT FROM THE AGE FLOOR ONLY: this repository's own distributions (``FIRST_PARTY``), by exact PEP
 503 name, wherever declared. Every other check still runs on them; the comment above ``FIRST_PARTY``
@@ -48,10 +50,11 @@ gives the reason. Nothing is skipped outright except a reviewed ``ALLOWLIST`` en
 
 NOT SWEPT, at least: npm manifests (``ide/package.json``, ``ci/npm-tools/package.json``); tools a
 workflow or script installs by command line (a ``pipx install`` or ``uv tool install``); hatch
-environment tables; any requirements file; a ``uv.toml``; a ``setup.py``, whose ``setup_requires``
-runs under a setuptools backend. An invented name supplied by any of these passes this gate. For
-npm, ``npm audit`` answers known advisories, the npm counterpart of pip-audit, and so shares its
-blindness to a freshly registered name. The npm boundary is pinned by a named test in
+environment tables; any requirements file; a ``uv.toml`` anywhere but beside a swept pyproject (in
+a parent directory, or the user-level or system-level one) and uv's ``UV_*`` environment variables;
+a ``setup.py``, whose ``setup_requires`` runs under a setuptools backend. An invented name supplied
+by any of these passes this gate. For npm, ``npm audit`` answers known advisories, the npm
+counterpart of pip-audit, and so shares its blindness to a freshly registered name. The npm boundary is pinned by a named test in
 ``tests/test_new_dependency_check.py``.
 
 WHAT IT CHECKS, per declared distribution:
@@ -102,16 +105,17 @@ When the retries are spent the last error propagates and the run exits 2 exactly
 never turns an unreachable PyPI into a pass.
 
 EXIT CODES. 0: every distribution examined passed and nothing was refused. 2, "could not see", at
-least: the default sweep found no ``packaging/*/pyproject.toml``; a pyproject or its ``hatch.toml``
-could not be read or parsed; the default sweep's root runtime tables yielded no name; a PyPI request
+least: the default sweep found no ``packaging/*/pyproject.toml``; a pyproject, or the ``hatch.toml``
+or ``uv.toml`` beside it, could not be read or parsed; the default sweep's root runtime tables yielded no name; a PyPI request
 failed (a transient failure once the retries are spent, any other failure, such as a certificate
-error, a 4xx other than 404 or 429, or a proxy refusal, at once) or got an unreadable reply; and zero
-distributions were examined with nothing refused. argparse also exits 2 on a bad command line, by
-raising SystemExit rather than through ``main``'s return. 1: a
-refusal or a failed check, when none of the exit-2 cases above occurred: beside one of them the run
-exits 2, and a refusal or failed check found before it is not always printed. An exception ``main``
-does not catch, such as a PyPI reply of a shape ``vet`` does not expect, ends the run with Python's
-traceback exit, also 1; that is a gap in FAIL-CLOSED above, not a vetting result.
+error, a 4xx other than 404 or 429, or a proxy refusal, at once) or got an unreadable reply, which
+includes a JSON object of a shape ``vet`` does not expect (an ``info``, ``releases``, file list,
+file or upload time of the wrong JSON type); and zero distributions were examined with nothing
+refused. argparse also exits 2 on a bad command line, by raising SystemExit rather than through
+``main``'s return. 1: a refusal or a failed check, when none of the exit-2 cases above occurred:
+beside one of them the run exits 2, and a refusal or failed check found before it is not always
+printed. An exception ``main`` does not catch would still end the run with Python's traceback exit,
+also 1; that would be a gap in FAIL-CLOSED above, not a vetting result.
 
 Worst case added time. The whole run gets at most ``_RUN_RETRY_BUDGET`` (6) retries, and none starts
 once the sweep has been running ``_RETRY_WINDOW_S`` (120s). So retries add at most those 120s plus
@@ -226,6 +230,174 @@ _UV_REQUIREMENT_LISTS = (
 _UV_SOURCE_KEYS = ("sources", "index", "index-url", "extra-index-url", "find-links")
 
 
+class _Scan:
+    """What one sweep of one file fills: the names it can vet, and the entries it refuses."""
+
+    def __init__(self, source: str) -> None:
+        self.source = source
+        self.declared: dict[str, str] = {}
+        self.bad: list[Finding] = []
+
+    def refuse(self, where: str, problem: str, detail: str) -> None:
+        self.bad.append(Finding(f"{self.source} {where}", problem, detail))
+
+    def add(self, where: str, spec: str) -> None:
+        name = requirement_name(spec)
+        if name is None:
+            self.refuse(
+                where,
+                "unnameable entry",
+                f"{spec!r} is not a PEP 508 requirement this gate can name, so the distribution it "
+                "brings in would enter unvetted. Declare it by its PyPI name.",
+            )
+        elif "@" in spec.split(";", 1)[0]:
+            # `name @ url`: the name is vettable, the bytes are not -- uv installs whatever the URL
+            # serves. Vetting the PyPI project of that name would pass an attacker's wheel.
+            self.refuse(
+                where,
+                "direct reference",
+                f"{spec!r} installs from a URL or path, not from the PyPI project of that name, so "
+                "vetting the name says nothing about what is installed. Declare it by its PyPI name.",
+            )
+        else:
+            self.declared.setdefault(normalize(name), spec)
+
+    def table(self, container: dict[str, object], key: str, where: str) -> dict[str, object]:
+        value = container.get(key, {})
+        if isinstance(value, dict):
+            return value
+        self.refuse(
+            where,
+            "not a table",
+            f"expected a TOML table here, found a {type(value).__name__}. Whatever it declares "
+            "cannot be vetted; write it in the shape the tool that reads it expects.",
+        )
+        return {}
+
+    def requirements(
+        self,
+        value: object,
+        where: str,
+        *,
+        include_groups: bool = False,
+        requirement_tables: bool = False,
+    ) -> None:
+        if not isinstance(value, list):
+            self.refuse(
+                where,
+                "not a list",
+                f"expected a list of requirement strings, found a {type(value).__name__}. It is "
+                "not read entry by entry, so nothing it names is vetted; make it a list.",
+            )
+            return
+        for index, entry in enumerate(value):
+            if isinstance(entry, str):
+                self.add(f"{where}[{index}]", entry)
+            elif (
+                include_groups
+                and isinstance(entry, dict)
+                and set(entry) == {"include-group"}
+                and isinstance(entry["include-group"], str)
+            ):
+                continue
+            elif (
+                # uv's `{ requirement = "...", match-runtime = true }` form names its distribution.
+                requirement_tables
+                and isinstance(entry, dict)
+                and isinstance(entry.get("requirement"), str)
+            ):
+                self.add(f"{where}[{index}].requirement", entry["requirement"])
+            else:
+                self.refuse(
+                    f"{where}[{index}]",
+                    "unnameable entry",
+                    f"a {type(entry).__name__} where a requirement string belongs names no "
+                    "distribution this gate can vet; declare it as a PEP 508 string.",
+                )
+
+    def uv_settings(self, uv: dict[str, object], base: str, pip_base: str) -> None:
+        """One uv settings table and its ``pip`` sub-table.
+
+        ``base`` labels the table (``[tool.uv]`` in a pyproject, empty for a ``uv.toml``'s top level)
+        and ``pip_base`` its pip table. ``extra-build-dependencies``, ``dependency-metadata``, the
+        source keys and ``allow-insecure-host`` are read in both tables; the requirement lists and
+        ``workspace`` in the top one only.
+        """
+
+        def at(prefix: str, key: str) -> str:
+            return f"{prefix}.{key}" if prefix else key
+
+        for key in _UV_REQUIREMENT_LISTS:
+            self.requirements(uv.get(key, []), at(base, key))
+        uv_pip = self.table(uv, "pip", pip_base)
+        for where, settings in ((base, uv), (pip_base, uv_pip)):
+            extra_where = at(where, "extra-build-dependencies")
+            for package, value in self.table(
+                settings, "extra-build-dependencies", extra_where
+            ).items():
+                self.requirements(value, f"{extra_where}.{package}", requirement_tables=True)
+            metadata_where = at(where, "dependency-metadata")
+            metadata = settings.get("dependency-metadata", [])
+            if not isinstance(metadata, list):
+                self.refuse(
+                    metadata_where,
+                    "not a list",
+                    "dependency-metadata must be an array of tables "
+                    "([[tool.uv.dependency-metadata]]).",
+                )
+                metadata = []
+            for index, entry in enumerate(metadata):
+                place = f"{metadata_where}[{index}]"
+                if isinstance(entry, dict):
+                    self.requirements(entry.get("requires-dist", []), f"{place}.requires-dist")
+                else:
+                    self.refuse(
+                        place, "not a table", "a dependency-metadata entry must be a table."
+                    )
+            # Where uv fetches FROM. The gate vets a name against pypi.org, so a source or an index
+            # that sends the name anywhere else makes that verdict about a different artifact.
+            for key in _UV_SOURCE_KEYS:
+                if settings.get(key):
+                    self.refuse(
+                        at(where, key),
+                        "non-PyPI source",
+                        "this redirects where uv fetches a distribution from, and this gate vets "
+                        "names against pypi.org only, so what it passes is not what would be "
+                        "installed.",
+                    )
+            # uv 0.13.1 reads this under [tool.uv] only and rejects it under [tool.uv.pip]; refusing
+            # it in both costs nothing and holds if a later uv reads it there.
+            if settings.get("allow-insecure-host"):
+                self.refuse(
+                    at(where, "allow-insecure-host"),
+                    "insecure host",
+                    "this lets uv fetch from a host without verifying TLS, so the bytes installed "
+                    "need not be what pypi.org serves for the name this gate vetted. Remove it, and "
+                    "fix the host's certificate chain or trust store instead.",
+                )
+        if uv.get("workspace"):
+            self.refuse(
+                at(base, "workspace"),
+                "uv workspace",
+                "a workspace member's pyproject is resolved into uv.lock, and this gate sweeps only "
+                "the root and packaging/*/pyproject.toml, so a member's dependencies would go "
+                "unvetted.",
+            )
+
+
+def scan_uv_toml(text: str, *, source: str = "uv.toml") -> tuple[dict[str, str], list[Finding]]:
+    """A ``uv.toml``: the settings ``[tool.uv]`` holds, at its top level, with ``[pip]`` below it.
+
+    uv reads a ``uv.toml`` in the project directory in preference to ``[tool.uv]``, so a source, an
+    index or a requirement list there reaches ``uv lock`` without appearing in any pyproject. Every
+    key ``[tool.uv]`` is swept for is swept here too, including any uv rejects in a ``uv.toml``,
+    which can only add findings.
+    """
+    found = _Scan(source)
+    found.uv_settings(tomllib.loads(text), "", "[pip]")
+    return found.declared, found.bad
+
+
 def scan(
     pyproject_text: str, *, source: str = "pyproject.toml", hatch_toml_text: str | None = None
 ) -> tuple[dict[str, str], list[Finding]]:
@@ -241,80 +413,8 @@ def scan(
     is PEP 735's ``{include-group = "<group>"}``: it names another group in this same file, whose
     members are swept in their own right. Each finding names ``source`` and the entry's place in it.
     """
-    declared: dict[str, str] = {}
-    bad: list[Finding] = []
-
-    def refuse(where: str, problem: str, detail: str) -> None:
-        bad.append(Finding(f"{source} {where}", problem, detail))
-
-    def add(where: str, spec: str) -> None:
-        name = requirement_name(spec)
-        if name is None:
-            refuse(
-                where,
-                "unnameable entry",
-                f"{spec!r} is not a PEP 508 requirement this gate can name, so the distribution it "
-                "brings in would enter unvetted. Declare it by its PyPI name.",
-            )
-        elif "@" in spec.split(";", 1)[0]:
-            # `name @ url`: the name is vettable, the bytes are not -- uv installs whatever the URL
-            # serves. Vetting the PyPI project of that name would pass an attacker's wheel.
-            refuse(
-                where,
-                "direct reference",
-                f"{spec!r} installs from a URL or path, not from the PyPI project of that name, so "
-                "vetting the name says nothing about what is installed. Declare it by its PyPI name.",
-            )
-        else:
-            declared.setdefault(normalize(name), spec)
-
-    def table(container: dict[str, object], key: str, where: str) -> dict[str, object]:
-        value = container.get(key, {})
-        if isinstance(value, dict):
-            return value
-        refuse(
-            where,
-            "not a table",
-            f"expected a TOML table here, found a {type(value).__name__}. Whatever it declares "
-            "cannot be vetted; write it in the shape the tool that reads it expects.",
-        )
-        return {}
-
-    def requirements(
-        value: object, where: str, *, include_groups: bool = False, requirement_tables: bool = False
-    ) -> None:
-        if not isinstance(value, list):
-            refuse(
-                where,
-                "not a list",
-                f"expected a list of requirement strings, found a {type(value).__name__}. It is "
-                "not read entry by entry, so nothing it names is vetted; make it a list.",
-            )
-            return
-        for index, entry in enumerate(value):
-            if isinstance(entry, str):
-                add(f"{where}[{index}]", entry)
-            elif (
-                include_groups
-                and isinstance(entry, dict)
-                and set(entry) == {"include-group"}
-                and isinstance(entry["include-group"], str)
-            ):
-                continue
-            elif (
-                # uv's `{ requirement = "...", match-runtime = true }` form names its distribution.
-                requirement_tables
-                and isinstance(entry, dict)
-                and isinstance(entry.get("requirement"), str)
-            ):
-                add(f"{where}[{index}].requirement", entry["requirement"])
-            else:
-                refuse(
-                    f"{where}[{index}]",
-                    "unnameable entry",
-                    f"a {type(entry).__name__} where a requirement string belongs names no "
-                    "distribution this gate can vet; declare it as a PEP 508 string.",
-                )
+    found = _Scan(source)
+    refuse, table, requirements = found.refuse, found.table, found.requirements
 
     data = tomllib.loads(pyproject_text)
     build_system = table(data, "build-system", "[build-system]")
@@ -346,57 +446,7 @@ def scan(
     for group, value in table(data, "dependency-groups", "[dependency-groups]").items():
         requirements(value, f"[dependency-groups].{group}", include_groups=True)
     tool = table(data, "tool", "[tool]")
-    uv = table(tool, "uv", "[tool.uv]")
-    for key in _UV_REQUIREMENT_LISTS:
-        requirements(uv.get(key, []), f"[tool.uv].{key}")
-    extra_build = table(uv, "extra-build-dependencies", "[tool.uv.extra-build-dependencies]")
-    for package, value in extra_build.items():
-        requirements(
-            value, f"[tool.uv.extra-build-dependencies].{package}", requirement_tables=True
-        )
-    metadata = uv.get("dependency-metadata", [])
-    if not isinstance(metadata, list):
-        refuse(
-            "[tool.uv].dependency-metadata",
-            "not a list",
-            "dependency-metadata must be an array of tables ([[tool.uv.dependency-metadata]]).",
-        )
-        metadata = []
-    for index, entry in enumerate(metadata):
-        where = f"[tool.uv].dependency-metadata[{index}]"
-        if isinstance(entry, dict):
-            requirements(entry.get("requires-dist", []), f"{where}.requires-dist")
-        else:
-            refuse(where, "not a table", "a dependency-metadata entry must be a table.")
-    # Where uv fetches FROM. The gate vets a name against pypi.org, so a source or an index that
-    # sends the name anywhere else makes that verdict about a different artifact.
-    uv_pip = table(uv, "pip", "[tool.uv.pip]")
-    for where, settings in (("[tool.uv]", uv), ("[tool.uv.pip]", uv_pip)):
-        for key in _UV_SOURCE_KEYS:
-            if settings.get(key):
-                refuse(
-                    f"{where}.{key}",
-                    "non-PyPI source",
-                    "this redirects where uv fetches a distribution from, and this gate vets names "
-                    "against pypi.org only, so what it passes is not what would be installed.",
-                )
-        # uv 0.13.1 reads this under [tool.uv] only and rejects it under [tool.uv.pip]; refusing it
-        # in both costs nothing and holds if a later uv reads it there.
-        if settings.get("allow-insecure-host"):
-            refuse(
-                f"{where}.allow-insecure-host",
-                "insecure host",
-                "this lets uv fetch from a host without verifying TLS, so the bytes installed need "
-                "not be what pypi.org serves for the name this gate vetted. Remove it, and fix the "
-                "host's certificate chain or trust store instead.",
-            )
-    if uv.get("workspace"):
-        refuse(
-            "[tool.uv].workspace",
-            "uv workspace",
-            "a workspace member's pyproject is resolved into uv.lock, and this gate sweeps only the "
-            "root and packaging/*/pyproject.toml, so a member's dependencies would go unvetted.",
-        )
+    found.uv_settings(table(tool, "uv", "[tool.uv]"), "[tool.uv]", "[tool.uv.pip]")
     hatch = dict(table(tool, "hatch", "[tool.hatch]"))
     if hatch_toml_text is not None:
         hatch.update(tomllib.loads(hatch_toml_text))
@@ -447,7 +497,7 @@ def scan(
                     )
             else:
                 refuse(f"{prefix}.{hook}", "not a table", "a hatch build hook must be a table.")
-    return declared, bad
+    return found.declared, found.bad
 
 
 def declared_distributions(pyproject_text: str) -> dict[str, str]:
@@ -470,8 +520,9 @@ def declared_distributions(pyproject_text: str) -> dict[str, str]:
       the job's token before any of these controls report.
     * the ``[tool.uv]`` requirement lists (``dev-dependencies``, ``constraint-dependencies``,
       ``override-dependencies``, ``build-constraint-dependencies``) and every
-      ``[tool.uv.extra-build-dependencies]`` list, and each ``[tool.uv].dependency-metadata``
-      entry's ``requires-dist``: uv fetches what they name.
+      ``extra-build-dependencies`` list and each ``dependency-metadata`` entry's ``requires-dist``,
+      in both ``[tool.uv]`` and ``[tool.uv.pip]``: uv fetches what they name. A ``uv.toml`` beside
+      the pyproject is swept for the same keys by ``scan_uv_toml``.
     * hatch ``[tool.hatch.build]``, build-target and build-hook ``dependencies``: the backend asks
       PEP 517 isolation to install them in the same release build jobs. Read in hatchling 1.33.0,
       the pinned backend: ``BuilderConfig.dependencies`` in ``hatchling/builders/config.py`` returns
@@ -510,11 +561,22 @@ def _first_release_date(payload: dict) -> datetime | None:
     says nothing about how long the NAME has existed.
     """
     earliest: datetime | None = None
-    for files in (payload.get("releases") or {}).values():
+    releases = payload.get("releases")
+    if releases is None:
+        releases = {}
+    if not isinstance(releases, dict):
+        raise UnreadableReply(f"PyPI's 'releases' is a JSON {type(releases).__name__}")
+    for files in releases.values():
+        if not isinstance(files, list | None):
+            raise UnreadableReply(f"a PyPI release's file list is a JSON {type(files).__name__}")
         for file_info in files or []:
+            if not isinstance(file_info, dict):
+                raise UnreadableReply(f"a PyPI release file is a JSON {type(file_info).__name__}")
             raw = file_info.get("upload_time_iso_8601") or file_info.get("upload_time")
             if not raw:
                 continue
+            if not isinstance(raw, str):
+                raise UnreadableReply(f"a PyPI upload time is a JSON {type(raw).__name__}")
             try:
                 # fromisoformat parses a trailing "Z" natively on 3.11+, so no pre-substitution is
                 # needed; the project floor is 3.14. PyPI serves both `upload_time_iso_8601`
@@ -576,7 +638,15 @@ def vet(
             )
             continue
 
-        info = payload.get("info") or {}
+        # A reply of a shape this does not expect is "could not see", like an undecodable body, and
+        # not a traceback, which would exit 1, the code for a vetting failure.
+        if not isinstance(payload, dict):
+            raise UnreadableReply(f"PyPI's reply for {name!r} is a JSON {type(payload).__name__}")
+        info = payload.get("info")
+        if info is None:
+            info = {}
+        if not isinstance(info, dict):
+            raise UnreadableReply(f"PyPI's 'info' for {name!r} is a JSON {type(info).__name__}")
         canonical = str(info.get("name") or "")
         if canonical and normalize(canonical) != normalize(name):
             findings.append(
@@ -591,7 +661,10 @@ def vet(
             )
             continue
 
-        first = _first_release_date(payload)
+        try:
+            first = _first_release_date(payload)
+        except UnreadableReply as exc:
+            raise UnreadableReply(f"{exc}, in the reply for {name!r}") from None
         if first is None:
             findings.append(
                 Finding(
@@ -842,37 +915,47 @@ def main(argv: list[str] | None = None) -> int:
     declared_in: dict[str, Path] = {}
     unnameable: list[Finding] = []
     root_runtime: set[str] = set()
+    # Two --pyproject files in one directory share its uv.toml; it is swept once, not reported twice.
+    seen_uv_toml: set[Path] = set()
     for index, path in enumerate(files):
         # A file that cannot be read or parsed is "could not see" (2), never "failed vetting" (1),
         # which is what a traceback would exit with.
         hatch_toml = path.parent / "hatch.toml"
+        # A uv.toml beside each swept pyproject; the root one is what `uv lock` reads.
+        uv_toml = path.parent / "uv.toml"
+        reading = path
         try:
             text = path.read_text(encoding="utf-8")
-            names, problems = scan(
-                text,
-                source=str(path),
-                hatch_toml_text=(
-                    hatch_toml.read_text(encoding="utf-8") if hatch_toml.is_file() else None
-                ),
-            )
+            reading = hatch_toml
+            hatch_text = hatch_toml.read_text(encoding="utf-8") if hatch_toml.is_file() else None
+            if hatch_text is not None:
+                tomllib.loads(hatch_text)  # parsed here too, so a syntax error names this file
+            reading = path
+            swept = [(path, scan(text, source=str(path), hatch_toml_text=hatch_text))]
             if not args.pyproject and index == 0:
                 root_runtime = _runtime_names(text)
+            reading = uv_toml
+            if uv_toml.is_file() and uv_toml not in seen_uv_toml:
+                seen_uv_toml.add(uv_toml)
+                uv_text = uv_toml.read_text(encoding="utf-8")
+                swept.append((uv_toml, scan_uv_toml(uv_text, source=str(uv_toml))))
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             # The refusals from the files already read are named too, so one run reports both.
             for finding in unnameable:
                 _print_finding(finding)
             print(
                 _annotation(
-                    f"::error::could not read {path} ({type(exc).__name__}: {exc}). This is a "
+                    f"::error::could not read {reading} ({type(exc).__name__}: {exc}). This is a "
                     "broken gate, not a clean sweep."
                 ),
                 file=sys.stderr,
             )
             return 2
-        for name, spec in names.items():
-            declared.setdefault(name, spec)
-            declared_in.setdefault(name, path)
-        unnameable.extend(problems)
+        for where, (names, problems) in swept:
+            for name, spec in names.items():
+                declared.setdefault(name, spec)
+                declared_in.setdefault(name, where)
+            unnameable.extend(problems)
     # Named before PyPI is asked anything, so an unreachable PyPI cannot hide them.
     for finding in unnameable:
         _print_finding(finding)
@@ -938,9 +1021,9 @@ def main(argv: list[str] | None = None) -> int:
 
     if findings:
         print(
-            f"\n{len(findings)} dependency name(s) failed vetting. Verify the INTENDED distribution "
-            "(real, reputable, exact name) before touching pyproject.toml, then re-lock "
-            "(CLAUDE.md section 5).",
+            f"\n{len(findings)} finding(s): a declared entry refused, or a distribution that failed "
+            "vetting. Verify the INTENDED distribution (real, reputable, exact name) and declare it "
+            "by its PyPI name before touching pyproject.toml, then re-lock (CLAUDE.md section 5).",
             file=sys.stderr,
         )
         return 1
