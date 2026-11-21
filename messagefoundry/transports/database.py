@@ -3433,7 +3433,7 @@ class _AutocommitPool:
     or the task is cancelled. Releasing or closing the connection then would let another call reach
     it, or free handles the running call is using, the crash shape BACKLOG #2049 recorded. So the call
     runs on :func:`_thread_settled`, whose future only the thread resolves, and is shielded: the
-    borrower leaves at once, so ``acquire_timeout`` still bounds the borrow, and the connection goes
+    borrower leaves at once, and the connection goes
     back to the pool only once the call has returned. No task cancel can decide that early, loop
     teardown's included (PR 2593 review). The call also runs through the connection's call gate,
     installed at the borrow (BACKLOG #2394), so no other pyodbc call on that connection, a close
@@ -3781,9 +3781,7 @@ def _retire_executor(pool: Any, closing: asyncio.Future[None]) -> None:
 # within the timeout means the pool is wedged or the DB is unresponsive — fail it transiently rather
 # than block the worker forever (which would let the queue back up unbounded). Override per connection
 # with the ``acquire_timeout`` setting. The statement_timeout write after the acquire is bounded
-# by its own ``acquire_timeout`` (BACKLOG #5756). Neither bounds the borrow as a whole: at least
-# the close of a refused ungated connection (:func:`_require_gate_or_discard`) and the close of a
-# discarded one wait unbounded.
+# by its own ``acquire_timeout`` (BACKLOG #5756). Neither bounds the borrow as a whole.
 _DEFAULT_DB_ACQUIRE_TIMEOUT = 30.0
 
 

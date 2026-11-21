@@ -1228,9 +1228,7 @@ def DatabaseRef(
 
     ``acquire_timeout`` bounds the acquire from this source's throwaway pool, and separately the
     ``statement_timeout`` write that follows it (default 30 s, matching the DATABASE connector and
-    ``[store].acquire_timeout``). On either expiry the set's sync fails, the
-    last-good snapshot stays active and the AlertSink fires — the runner syncs sets sequentially, so
-    the bound is what stops one unresponsive server from stalling every other set's refresh.
+    ``[store].acquire_timeout``).
 
     ``max_rows`` (default :data:`DEFAULT_REFERENCE_MAX_ROWS`) bounds one sync's result. The engine
     reads at most one row past it from the driver, then refuses the sync: the last-good snapshot
