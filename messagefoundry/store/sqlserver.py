@@ -12585,10 +12585,10 @@ class SqlServerStore:
         attachment does not exist — an incref must name a real stored document."""
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
-                await cur.execute(
-                    "UPDATE attachment SET refcount = refcount + 1 WHERE id=?", (ref,)
-                )
-                if not cur.rowcount:
+                # Read from OUTPUT, which a session-wide SET NOCOUNT ON cannot hide: there
+                # cur.rowcount is -1, which is truthy (BACKLOG #5675, as #2283).
+                await cur.execute(_SQL_INCREF_ATTACHMENT, (1, ref))
+                if await cur.fetchone() is None:
                     await conn.rollback()
                     raise KeyError(f"attachment {ref!r} not found")
                 await self._commit(conn)
