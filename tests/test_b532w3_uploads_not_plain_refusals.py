@@ -90,9 +90,11 @@ def _swapping(refused: set[Path], error: Any) -> Any:
 # --- the classification ---------------------------------------------------------------------------
 
 
-def test_a_not_a_file_errno_decides_only_when_the_path_cannot_be_checked(tmp_path: Path) -> None:
+def test_a_not_a_file_errno_decides_only_when_the_error_names_no_path(tmp_path: Path) -> None:
     assert uploads._refused_read(_is_a_directory(None)) == "damaged"
-    assert uploads._refused_read(_no_such_device(tmp_path / "gone.meta")) == "damaged"
+    # A part that is gone by the re-check is not called damaged: its absence is the caller's to
+    # report (r3, finding 3; on 52c0fdef3ca this answered "damaged").
+    assert uploads._refused_read(_no_such_device(tmp_path / "gone.meta")) is None
     # A regular file answered ENXIO for some other reason is not called damaged.
     plain = tmp_path / "x.meta"
     plain.write_bytes(b"synthetic")
@@ -289,26 +291,34 @@ async def test_a_body_unlink_that_fails_on_a_file_is_not_damage(
     assert blob.is_file() and _sidecar(store, meta.file_id).is_file()
 
 
-async def test_a_sidecar_unlink_that_fails_after_the_body_went_returns_the_delete(
+async def test_a_sidecar_unlink_that_fails_after_the_body_went_is_no_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    # Before, the body was gone and the sidecar's failure raised a raw OSError: a 500 with no
-    # audit row for a deleted body. Now the delete is returned, so the route records it.
+    # On 433f9d36ce0 the body was gone and the sidecar's failure raised a raw OSError: a 500 with
+    # no audit row. On 52c0fdef3ca the delete was returned as a success while the upload stayed
+    # listed (r3, finding 9). Now the unlink is tried again, then the delete raises the
+    # incomplete error carrying the metadata, so the route records the row and answers a retry.
     caplog.set_level(logging.WARNING, logger=uploads._log.name)
+    from tests.test_b532w3_uploads_delete_incomplete import _failing_unlink, _sharing_violation
+
+    monkeypatch.setattr(uploads, "_UNLINK_PAUSE", 0.0)
     store = _store(tmp_path / "uploads")
     meta = await _saved(store)
     sidecar = _sidecar(store, meta.file_id)
     real_unlink = Path.unlink
-
-    def _unlink(self: Path, missing_ok: bool = False) -> None:
-        if self == sidecar:
-            raise PermissionError(errno.EACCES, "Permission denied", str(self))
-        real_unlink(self, missing_ok=missing_ok)
-
-    monkeypatch.setattr(Path, "unlink", _unlink)
-    assert await store.delete(meta.file_id) == meta
+    tries = _failing_unlink(monkeypatch, sidecar, _sharing_violation)
+    with pytest.raises(uploads.UploadDeleteIncompleteError) as raised:
+        await store.delete(meta.file_id)
+    assert raised.value.removed == meta
+    assert len(tries) == uploads._UNLINK_ATTEMPTS
     assert not _blob(store, meta.file_id).exists() and sidecar.is_file()
-    assert any("remove the sidecar" in r.getMessage() for r in caplog.records)
+    assert any("delete it again" in r.getMessage() for r in caplog.records)
+    # What is on disk is what the store reports: the upload is still listed, and a retry, once the
+    # sidecar can go, finishes the delete.
+    assert [m.file_id for m in await store.list_files()] == [meta.file_id]
+    monkeypatch.setattr(Path, "unlink", real_unlink)
+    await store.delete(meta.file_id)
+    assert not sidecar.exists() and not await store.list_files()
 
 
 @pytest.mark.parametrize("read", ["get_meta", "read_bytes"])

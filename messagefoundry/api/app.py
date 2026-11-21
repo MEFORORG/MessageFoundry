@@ -577,6 +577,7 @@ from messagefoundry.uploads import (
     UploadAccessError,
     UploadContentError,
     UploadDamagedError,
+    UploadDeleteIncompleteError,
     UploadedFileMeta,
     UploadError,
     UploadNotFoundError,
@@ -9168,6 +9169,19 @@ def create_app(
         "known to be damaged, so do not delete it for this. An operator fixes the cause on the "
         "server, then tries again"
     )
+    # BACKLOG #5388 added item 3: a delete the store could not finish. 409, which no other answer of
+    # the delete route spends, so the web console names it apart from a refusal. Neither text says
+    # the file is damaged or that access was refused: a retry may finish it.
+    _UPLOAD_DELETE_INCOMPLETE_STATUS = 409
+    _UPLOAD_DELETE_IN_USE = (
+        "this uploaded file is in use on the server, so nothing was deleted. Try the delete again "
+        "shortly. If it keeps failing, an administrator checks what holds the file open"
+    )
+    _UPLOAD_PARTLY_DELETED = (
+        "this uploaded file was only partly deleted: its content is gone, but its record could not "
+        "be removed, so it is still listed. Try the delete again to finish it. If it keeps "
+        "failing, an administrator removes the record on the server"
+    )
     _UPLOAD_REFUSED_TEXT: dict[str, str] = {
         "locked": _UPLOAD_UNREADABLE,
         "damaged": _UPLOAD_DAMAGED,
@@ -9793,8 +9807,14 @@ def create_app(
         unlinked), and an ``upload.delete`` audit row.
 
         The check reads the metadata FIRST, because ``UploadStore.delete`` returns the metadata only
-        after it has already unlinked both sidecars — a check bolted onto that call would fire too
-        late. The age-based retention sweep is deliberately owner-blind and unaffected.
+        after it has already unlinked the body and the sidecar — a check bolted onto that call
+        would fire too late. The age-based retention sweep is deliberately owner-blind and
+        unaffected.
+
+        A delete the store could not finish answers 409 with nothing reported deleted (BACKLOG
+        #5388 added item 3): a body another handle held open, with nothing removed, or a sidecar
+        left after the body went, which keeps the upload listed. The latter still writes its
+        ``upload.delete`` row, marked ``sidecar_kept``, and a retry finishes the delete.
 
         An override holder goes on to ``UploadStore.delete`` when the sidecar is refused. That call
         removes the kind it classes as never sealable, and refuses the rest (BACKLOG #2322)."""
@@ -9815,8 +9835,16 @@ def create_app(
 
             async def _unlink_then_row() -> UploadedFileMeta | UploadError:
                 nonlocal detail
+                partial: UploadDeleteIncompleteError | None = None
                 try:
                     removed = await us.delete(file_id, sidecar_refused=refused)
+                except UploadDeleteIncompleteError as exc:
+                    if exc.removed is None:
+                        # Nothing was removed, so no row is owed.
+                        return exc
+                    # The body is gone, so the row is owed for it, though the delete is answered
+                    # as unfinished.
+                    removed, partial = exc.removed, exc
                 except (
                     UploadPathError,
                     UploadNotFoundError,
@@ -9828,11 +9856,14 @@ def create_app(
                     # body unlink that failed, which keeps the sidecar (BACKLOG #5388 added item
                     # 3). Returned, so the route still answers it.
                     return exc
-                detail = json.dumps({"file_id": removed.file_id, "size": removed.size})
+                fields: dict[str, object] = {"file_id": removed.file_id, "size": removed.size}
+                if partial is not None:
+                    fields["sidecar_kept"] = True
+                detail = json.dumps(fields)
                 await engine.store.record_audit(
                     "upload.delete", actor=actor, detail=detail, client=client
                 )
-                return removed
+                return removed if partial is None else partial
 
             def _lost() -> str:
                 if detail is not None:
@@ -9851,14 +9882,20 @@ def create_app(
         # request, so a deadline can no longer land between them and leave a removed file with no
         # row.
         outage: str | None = None
+        unfinished: str | None = None
         try:
             meta = await outliving.run(_delete_and_record(), "upload delete")
         except (UploadPathError, UploadNotFoundError):
             raise HTTPException(404, "no such uploaded file") from None
+        except UploadDeleteIncompleteError as exc:
+            unfinished = _UPLOAD_DELETE_IN_USE if exc.removed is None else _UPLOAD_PARTLY_DELETED
         except UploadUnavailableError as exc:
             outage = str(exc)
         except UploadUnreadableError as exc:
             raise _UploadRefused(_upload_refusal_kind(exc)) from None
+        if unfinished is not None:
+            # After the handler, so the store's error is on no chain.
+            raise HTTPException(_UPLOAD_DELETE_INCOMPLETE_STATUS, unfinished)
         if outage is not None:
             raise _upload_unavailable(outage, "delete")  # after the handler: no chain link
         return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)

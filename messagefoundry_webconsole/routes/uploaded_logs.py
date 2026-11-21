@@ -156,6 +156,7 @@ DELETE_DAMAGED_CODE = "delete_damaged"
 BROWSE_DAMAGED_CODE = "browse_damaged"
 RESEND_ACCESS_CODE = "resend_access_refused"
 DELETE_ACCESS_CODE = "delete_access_refused"
+DELETE_INCOMPLETE_CODE = "delete_incomplete"
 BROWSE_ACCESS_CODE = "browse_access_refused"
 BROWSE_HOP_REFUSED_CODE = "browse_hop_refused"
 BROWSE_THROTTLED_CODE = "browse_throttled"
@@ -257,6 +258,16 @@ BROWSE_ACCESS_NOTICE = f"{_BROWSE_LEAD} {_DENIED_CAUSE} {_TRY_AGAIN}"
 RESEND_ACCESS_NOTICE = f"{_RESEND_LEAD} {_DENIED_CAUSE} {_TRY_AGAIN}"
 DELETE_ACCESS_NOTICE = f"{_DELETE_LEAD} {_DENIED_CAUSE} {_TRY_AGAIN}"
 
+#: 409 on a delete is one the engine could not finish (BACKLOG #5388 added item 3): the file was in
+#: use on the server, with nothing removed, or its content went and its record stayed, so it is
+#: still listed. One text serves both, so it claims neither, and it invites the retry that
+#: finishes either.
+DELETE_INCOMPLETE_NOTICE = (
+    "That delete did not finish. The file was in use on the server, or part of it could not be "
+    "removed, so some of it may already be gone and it may still be listed. Try deleting it "
+    "again. If that keeps failing, an administrator should check the file on the server."
+)
+
 #: Three more engine answers the routes used to let escape as JSON (BACKLOG #1169, PR 1506
 #: follow-up A). Each is this module's own text. The engine's detail for each names config keys and
 #: posture internals, and none of it is reflected here, for the same reason as every notice above.
@@ -310,6 +321,7 @@ _LIST_NOTICES: dict[str, str] = {
     BROWSE_DAMAGED_CODE: BROWSE_DAMAGED_NOTICE,
     RESEND_ACCESS_CODE: RESEND_ACCESS_NOTICE,
     DELETE_ACCESS_CODE: DELETE_ACCESS_NOTICE,
+    DELETE_INCOMPLETE_CODE: DELETE_INCOMPLETE_NOTICE,
     BROWSE_ACCESS_CODE: BROWSE_ACCESS_NOTICE,
     BROWSE_HOP_REFUSED_CODE: BROWSE_HOP_REFUSED_NOTICE,
     BROWSE_THROTTLED_CODE: BROWSE_THROTTLED_NOTICE,
@@ -347,6 +359,7 @@ _DELETE_CODES: dict[int, str] = {
     404: DELETE_FAILED_CODE,
     _LOCKED_STATUS: DELETE_LOCKED_CODE,
     _UNAVAILABLE_STATUS: UPLOADS_UNAVAILABLE_CODE,
+    status.HTTP_409_CONFLICT: DELETE_INCOMPLETE_CODE,
 }
 
 #: The same for a browse the engine refused. 404 is NOT here: an absent file, a traversal id and an
