@@ -974,9 +974,10 @@ function Get-ScanRawIndexMap($Seg) {
 # the $absC test excludes every such window, so `git -C '<p>' --work-tree=<rel> reset --hard` and
 # `git -C '<p>' --git-dir=<rel> config <key>` are allowed there (fail-open, f0e49f45c5c has it too).
 # Also: a chdir ahead of an invocation joined by a bracket (`cd <p> && git -C <o> log $(git reset
-# --hard)`) where the text before the bracket holds no chdir the follower can read on its own, for
-# example two chdirs, or a relative one after an earlier line's (Get-InvocationReading's bracket
-# reading says which it reads); a `-C` re-quoted inside a `bash -c` payload with `'\''` or `'"'"'`,
+# --hard)`) where Get-InvocationReading's bracket reading reads nothing. At least: two chdirs, a
+# relative chdir after an earlier line's, and any closed bracket between the chdir and the open one,
+# since the chdir follower gives up on any bracket in its text (`cd <p>`, then `echo $(date); git -C
+# <o> log $(git reset --hard)`, is allowed from outside); a `-C` re-quoted inside a `bash -c` payload with `'\''` or `'"'"'`,
 # because the payload's extraction stops at the first joint, as it did at f0e49f45c5c; and A GIT BASH
 # DRIVE SPELLING, `/c/<primary>`, which no reading maps to the primary, so `git -C /c/<primary> reset
 # --hard` is allowed (fail-open, f0e49f45c5c has it too). And a `config` disarm whose first `config`
@@ -999,7 +1000,8 @@ function Get-ScanRawIndexMap($Seg) {
 #   * rule 3c's later-disarm filter counts `.git` as a git word (`git config core.hooksPath ; grep
 #     --exclude-dir=.git -c alias.lg f` from the primary);
 #   * a chdir in an earlier line's heredoc, here-string or multi-line `bash -c` body is read as a
-#     real one;
+#     real one, by the prior-lines reading and by the bracket reading alike (a heredoc body holding
+#     `cd <p>`, then `echo hi; git -C <o> log $(git reset --hard)`, from outside under Bash);
 #   * a `config` pathspec after a closed `$( )` reads as a config disarm (`git -C '<p>' log $(git
 #     rev-parse HEAD) -- config <key> x` from outside);
 #   * rule 3c's first window can start at a git word inside a closed `$( )`, or at the git of a
