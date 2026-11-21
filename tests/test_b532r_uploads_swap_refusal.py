@@ -74,7 +74,7 @@ def test_a_failed_folder_check_is_logged_not_swallowed(
         raise ValueError("synthetic")
 
     monkeypatch.setattr(os, "lstat", _fails)
-    with caplog.at_level(logging.WARNING, logger=uploads.__name__):
+    with caplog.at_level(logging.DEBUG, logger=uploads.__name__):
         assert uploads._refused_read(PermissionError(13, "denied", "x.meta")) == "denied"
     assert any("ValueError" in r.getMessage() for r in caplog.records), caplog.records
     assert not any("x.meta" in r.getMessage() for r in caplog.records)

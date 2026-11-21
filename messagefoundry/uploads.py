@@ -444,14 +444,12 @@ def _refused_read(exc: OSError) -> _ReadRefusal | None:
     on Windows a file another program holds open (a sharing violation). That is not damage, so it
     is never answered as a file an operator should delete. A ``PermissionError`` whose path is now
     a folder is ``"damaged"``, since Windows refuses an open of a folder that way. A part swapped
-    for a folder or a socket after the ``lstat`` on POSIX is ``"damaged"`` too: the open of a
-    socket answers ``ENXIO`` on Linux, and a folder's descriptor ``EISDIR``, and no retry makes
-    either a plain file (BACKLOG #5388 added item 3). A system whose open of a socket answers
-    another code, such as ``EOPNOTSUPP``, still gets ``None``: that code is not one only a socket
-    gives. ``None`` for
-    any other ``OSError``, such as too many open files or an I/O error, which may pass on a retry,
-    so the caller re-raises it."""
-    if isinstance(exc, _NotPlainError) or exc.errno in _NOT_PLAIN_ERRNOS:
+    for a folder, a socket or a link after the ``lstat`` on POSIX is ``"damaged"`` too, read by
+    the codes the pair lock reads a planted file by (:func:`_not_a_file_errnos`), such as
+    ``EISDIR`` for a folder's descriptor and ``ENXIO`` for a socket on Linux, since no retry makes
+    either a plain file (BACKLOG #5388 added item 3). ``None`` for any other ``OSError``, such as
+    too many open files or an I/O error, which may pass on a retry, so the caller re-raises it."""
+    if isinstance(exc, _NotPlainError) or exc.errno == errno.ELOOP or exc.errno in _NOT_A_FILE:
         return "damaged"
     if isinstance(exc, PermissionError):
         # Windows answers an open of a folder with a PermissionError too, so a folder swapped in
@@ -459,20 +457,16 @@ def _refused_read(exc: OSError) -> _ReadRefusal | None:
         try:
             folder = exc.filename is not None and S_ISDIR(os.lstat(exc.filename).st_mode)
         except (OSError, TypeError, ValueError) as lstat_exc:
-            # The path cannot be checked again, so it is answered as the refusal it was. Logged,
-            # not swallowed: the class only, since the path names the upload.
-            _log.warning(
+            # The path cannot be checked again, so it is answered as the refusal it was. Logged at
+            # DEBUG, not swallowed: the caller already logs the refusal at WARNING. The class
+            # only, since the path names the upload.
+            _log.debug(
                 "upload part refused, and the check for a folder failed: %s",
                 type(lstat_exc).__name__,
             )
             folder = False
         return "damaged" if folder else "denied"
     return None
-
-
-#: The ``errno`` values an open or ``fdopen`` of a part that is not a plain file answers with
-#: (:func:`_refused_read`): a link the open would not follow, a folder, and a socket.
-_NOT_PLAIN_ERRNOS = frozenset((errno.ELOOP, errno.EISDIR, errno.ENXIO))
 
 
 def _unpadded(text: str) -> str:
