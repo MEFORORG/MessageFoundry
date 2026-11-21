@@ -203,6 +203,7 @@ class FileSink(Sink):
         self.max_file_bytes = DEFAULT_MAX_MESSAGE_BYTES
 
     def start(self) -> None:
+        self._started = False
         self.directory.mkdir(parents=True, exist_ok=True)
         st = self.directory.lstat()
         if _is_link(st) or not stat.S_ISDIR(st.st_mode):

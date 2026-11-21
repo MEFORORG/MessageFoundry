@@ -338,7 +338,11 @@ def test_verify_written_fails_on_an_over_cap_record() -> None:
     over = Record(b"", {"relpath": "big.hl7", "inside": "true", "refused": "9 bytes, over the cap"})
     assert verify_written(scenario, [good], {"X1": _BODY}, "p").ok
     result = verify_written(scenario, [good, over], {"X1": _BODY}, "p")
-    assert not result.ok and "was not read ('big.hl7')" in result.detail
+    assert not result.ok and "was not read ('big.hl7': 9 bytes, over the cap)" in result.detail
+    # A refused record with no ``inside`` is not one sink_faults reads; it still fails here.
+    bare = Record(b"", {"relpath": "big.hl7", "refused": "9 bytes, over the cap"})
+    result = verify_written(scenario, [good, bare], {"X1": _BODY}, "p")
+    assert not result.ok and "an entry in the outbox was not read ('big.hl7')" in result.detail
 
 
 class _Fake(Sink):
@@ -564,7 +568,7 @@ def test_verify_sink_fails_on_a_file_read_from_outside_the_directory() -> None:
     assert _verify_sink(scenario, fake, ["X1"], 0.2, "p").ok
     fake._add(_escaped_record())
     result = _verify_sink(scenario, fake, ["X1"], 0.2, "p")
-    assert not result.ok and "outside the sink directory was read ('sub/x.hl7')" in result.detail
+    assert not result.ok and "inside the sink directory ('sub/x.hl7')" in result.detail
 
 
 def test_the_timer_scenario_fails_on_a_file_read_from_outside_the_directory(
@@ -585,12 +589,14 @@ def test_the_timer_scenario_fails_on_a_file_read_from_outside_the_directory(
     assert scenario.run(ctx).ok
     fake._add(_escaped_record())
     result = scenario.run(ctx)
-    assert not result.ok and "outside the sink directory" in result.detail
+    assert not result.ok and "shown to be inside the sink directory" in result.detail
 
 
 def test_sink_faults_flags_an_over_cap_file_the_sink_left_unread() -> None:
     over = {"relpath": "big.hl7", "inside": "true", "refused": "9 bytes, over the 8-byte cap"}
-    assert "was not read ('big.hl7')" in sink_faults([Record(_BODY), Record(b"", over)])
+    assert "was not read ('big.hl7': 9 bytes, over the 8-byte cap)" in sink_faults(
+        [Record(_BODY), Record(b"", over)]
+    )
     # A record that carries no ``inside`` is not a file sink's: its own refusal is that sink's
     # business, and an unread delivery carries no control id either way.
     assert sink_faults([Record(b"", {"refused": "over the cap"})]) == ""

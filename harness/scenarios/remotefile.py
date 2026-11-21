@@ -97,6 +97,11 @@ def verify_written(
     problems: list[str] = []
     for record in records:
         where = record_where(record)
+        if record.meta.get("refused"):
+            # Unread, so its bytes were never compared: a problem whatever it was, including a
+            # record sink_faults does not take for a file sink's.
+            problems.append(f"an entry in the outbox was not read ({where!r})")
+            continue
         cid = control_id_of(record.payload)
         if cid is None or cid not in sent:
             continue

@@ -332,17 +332,18 @@ def sink_faults(records: Iterable[sinks.Record]) -> str:
         elif "inside" not in r.meta:
             continue  # not a file sink's record: no other check here reads it
         elif refused:
-            other.append(where)  # over the cap, or grew past it while read: bytes never compared
+            other.append(f"{where!r}: {refused}")  # over the cap, or grew past it while read
         elif r.meta["inside"] != "true":
             outside.append(where)
     notes = [f"a link appeared in the sink ({', '.join(map(repr, links))})"] if links else []
     if unread:
         notes.append(f"a non-file entry appeared in the sink ({', '.join(map(repr, unread))})")
     if other:
-        notes.append(f"an entry in the sink was not read ({', '.join(map(repr, other))})")
+        notes.append(f"an entry in the sink was not read ({', '.join(other)})")
     if outside:
         notes.append(
-            f"a file outside the sink directory was read ({', '.join(map(repr, outside))})"
+            "a file was read that could not be shown to be inside the sink directory "
+            f"({', '.join(map(repr, outside))})"
         )
     notes += [f"the file sink's scan was incomplete: {reason}" for reason in incomplete]
     return "; ".join(notes)
