@@ -29,10 +29,12 @@ from messagefoundry.api.auth_models import (
     DirectoryUserCreateRequest,
     UserCreateRequest,
     changed_name_refusal,
+    custom_role_name_refusal,
     name_refusal,
 )
-from messagefoundry.auth import Role
+from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.identity import ALL_CHANNELS
+from messagefoundry.auth.permissions import validate_custom_role_permissions
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
@@ -84,6 +86,42 @@ def test_an_edit_that_resends_the_stored_name_is_exempt() -> None:
     assert changed_name_refusal(None, "a\tb") is None  # a clear
     assert changed_name_refusal("a\tc", "a\tb") is not None  # a changed value takes the rule
     assert changed_name_refusal("ab", "a\tb") is None  # the repair
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Administrator",
+        "administrator",
+        "ADMINISTRATOR",
+        "  Auditor ",
+        "Admin\u200bistrator",  # a zero-width space inside
+        "\uff21dministrator",  # a fullwidth A, which NFKC folds
+        "viewer",
+        "Coding",
+    ],
+)
+def test_a_custom_role_may_not_take_a_built_in_role_name(name: str) -> None:
+    assert custom_role_name_refusal(name) is not None
+
+
+def test_a_cross_script_lookalike_is_not_caught() -> None:
+    """The documented limit: a letter from another script that only looks alike passes."""
+    assert custom_role_name_refusal("\u0410dministrator") is None  # Cyrillic capital A
+
+
+def test_a_custom_role_save_resending_the_stored_name_is_exempt() -> None:
+    assert custom_role_name_refusal("Administrator", "Administrator") is None
+    assert custom_role_name_refusal("x\ty", "x\ty") is None
+    assert custom_role_name_refusal("Administrator", "Other") is not None
+    assert custom_role_name_refusal("Readers", None) is None
+
+
+def test_a_repeated_permission_is_one_grant() -> None:
+    """BACKLOG #5785's duplicate-permission half is not a defect: the service's validator collects
+    the list into a set before anything is stored or audited."""
+    perms = validate_custom_role_permissions(["monitoring:read", "monitoring:read"])
+    assert perms == [Permission.MONITORING_READ]
 
 
 # --- the routes ------------------------------------------------------------------------------------
@@ -199,3 +237,78 @@ async def test_the_directory_create_refuses_a_blank_name(engine: Engine) -> None
     service, _ = await _setup(engine)
     [r] = await _calls(engine, service, [("POST", "/users/directory", {"username": "  "})])
     assert r.status_code == 422, r.text
+
+
+async def test_custom_role_routes_refuse_a_bad_or_built_in_name(engine: Engine) -> None:
+    service, _ = await _setup(engine)
+    perms = ["monitoring:read"]
+    blank, nul, builtin, made = await _calls(
+        engine,
+        service,
+        [
+            ("POST", "/roles/custom", {"display_name": " ", "permissions": perms}),
+            ("POST", "/roles/custom", {"display_name": "R\x00", "permissions": perms}),
+            ("POST", "/roles/custom", {"display_name": "ADMINISTRATOR", "permissions": perms}),
+            ("POST", "/roles/custom", {"display_name": "Readers", "permissions": perms}),
+        ],
+    )
+    for refused in (blank, nul, builtin):
+        assert refused.status_code == 422, refused.text
+        assert "display_name" in refused.json()["detail"]
+    assert made.status_code == 201, made.text
+    role_url = f"/roles/custom/{made.json()['id']}"
+    renamed, kept = await _calls(
+        engine,
+        service,
+        [
+            ("PUT", role_url, {"display_name": "Operator", "permissions": perms}),
+            ("PUT", role_url, {"display_name": "Readers", "permissions": perms}),
+        ],
+    )
+    assert renamed.status_code == 422, renamed.text
+    assert kept.status_code == 200, kept.text
+    assert [r.display_name for r in await service.list_custom_roles()] == ["Readers"]
+
+
+async def test_a_stored_custom_role_name_the_rule_refuses_does_not_block_a_permission_edit(
+    engine: Engine,
+) -> None:
+    """The PR 3110 regression: a role stored under a name the rule refuses, here a built-in label
+    and a control character, can still have its permissions edited under that name, and can be
+    renamed to a clean one."""
+    service, _ = await _setup(engine)
+    perms = ["monitoring:read"]
+    stored: list[str] = []
+    for name in ("Administrator", "Tab\tRole"):
+        role = await service.create_custom_role(
+            display_name=name, description=None, permissions=perms, actor="test"
+        )
+        stored.append(role.id)
+    wider = ["monitoring:read", "messages:read"]
+    edits = await _calls(
+        engine,
+        service,
+        [
+            (
+                "PUT",
+                f"/roles/custom/{stored[0]}",
+                {"display_name": "Administrator", "permissions": wider},
+            ),
+            (
+                "PUT",
+                f"/roles/custom/{stored[1]}",
+                {"display_name": "Tab\tRole", "permissions": wider},
+            ),
+            (
+                "PUT",
+                f"/roles/custom/{stored[1]}",
+                {"display_name": "Tab Role", "permissions": wider},
+            ),
+        ],
+    )
+    for r in edits:
+        assert r.status_code == 200, r.text
+    names = {r.id: (r.display_name, r.permissions) for r in await service.list_custom_roles()}
+    assert names[stored[0]][0] == "Administrator"
+    assert names[stored[1]][0] == "Tab Role"
+    assert Permission.MESSAGES_READ in names[stored[0]][1]

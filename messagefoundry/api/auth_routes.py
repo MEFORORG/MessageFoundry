@@ -78,6 +78,7 @@ from messagefoundry.api.auth_models import (
     UserSummary,
     UserUpdateRequest,
     changed_name_refusal,
+    custom_role_name_refusal,
 )
 from messagefoundry.api.paging import ts_pinned_page
 from messagefoundry.api.security import (
@@ -350,6 +351,14 @@ async def _refuse_if_self(
         defects=(),
     )
     raise HTTPException(status.HTTP_400_BAD_REQUEST, detail)
+
+
+def _refuse_custom_role_name(display_name: str, *, stored: str | None) -> None:
+    """422 for a custom role name :func:`custom_role_name_refusal` refuses (BACKLOG #5785). Checked
+    here rather than on the request model because an update compares it with ``stored``."""
+    refusal = custom_role_name_refusal(display_name, stored)
+    if refusal is not None:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"display_name {refusal}")
 
 
 def _seal_outage_503() -> HTTPException:
@@ -1339,6 +1348,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
     ) -> CustomRoleInfo:
+        _refuse_custom_role_name(body.display_name, stored=None)
         try:
             role = await service.create_custom_role(
                 display_name=body.display_name,
@@ -1386,6 +1396,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         """The edit past :func:`update_custom_role`'s step-up. The console's route takes the same
         proof in its own gate, so the seam hands it this. ``ended`` is the set the gate read, which
         the revoke ends (BACKLOG #5505)."""
+        # BACKLOG #5785: the stored name is exempt, so a role stored under a name the rule refuses
+        # can still have its permissions edited. An unknown id finds none and is the service's 404.
+        stored = next(
+            (r.display_name for r in await service.list_custom_roles() if r.id == role_id), None
+        )
+        _refuse_custom_role_name(body.display_name, stored=stored)
         try:
             role = await service.update_custom_role(
                 role_id,

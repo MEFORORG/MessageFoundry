@@ -12,7 +12,7 @@ page still match the code, and fails if the page drops one. It does not check ev
 page. At least four rules in the table are written, in whole or in part, elsewhere. The
 connection-name pattern is defined in
 [`messagefoundry/connection_names.py`](../messagefoundry/connection_names.py) and imported by that
-module, because the config loader enforces the same rule. The account name rule is
+module, because the config loader enforces the same rule. The account and role name rule is
 `name_refusal` in [`messagefoundry/api/auth_models.py`](../messagefoundry/api/auth_models.py),
 built on this module's printable pattern.
 The HL7 field-path grammar is `parse_path` in
@@ -54,7 +54,7 @@ filesystem path, a log line or a CSV export.
 | Audit action filter | Printable text, no control characters, 1 to 128 characters | `action` on `GET /audit` and `GET /audit/export` |
 | Display label | Printable text, no control characters, 1 to 128 characters | `name` on `POST /search/presets` |
 | Filesystem path | Printable text, no control characters, 1 to 4096 characters | `config_dir` on `POST /config/reload`, and `archive` on `POST /dr/activate` |
-| Account name | Printable text, no control characters, up to 256 characters, and not blank or white space alone. An edit that sends the name already stored is exempt, so `PATCH /users/{user_id}` checks it in the route against the stored name. Pinned by `tests/test_auth_name_rule.py` | `username` on `POST /users/directory`; `display_name` on `POST /users` and `PATCH /users/{user_id}` |
+| Account or role name | Printable text, no control characters, up to 256 characters, and not blank or white space alone. An edit that sends the name already stored is exempt, so `PATCH /users/{user_id}` and `PUT /roles/custom/{role_id}` check it in the route against the stored name. A custom role name may also not fold to a built-in role's id or label; `custom_role_name_refusal` says how it folds. Pinned by `tests/test_auth_name_rule.py` | `username` on `POST /users/directory`; `display_name` on `POST /users`, `PATCH /users/{user_id}`, `POST /roles/custom` and `PUT /roles/custom/{role_id}` |
 | Layered preset ids | Resource ids joined by single commas with no spaces, up to 1024 characters in all | `presets` on `GET /search/layered` |
 
 The email-address row covers `recipient_override` only. The account email fields follow a different

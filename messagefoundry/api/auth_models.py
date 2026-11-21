@@ -12,6 +12,7 @@ the two bases.
 from __future__ import annotations
 
 import re
+import unicodedata
 from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, Field
@@ -24,6 +25,7 @@ from messagefoundry.api.validation import (
     PermissionId,
     RoleId,
 )
+from messagefoundry.auth.permissions import ROLE_METADATA, Role
 from messagefoundry.auth.tokens import ENROLMENT_CODE_MAX
 from messagefoundry.auth.totp import MAX_DIGITS as TOTP_DIGITS
 from messagefoundry.auth.usernames import username_refusal
@@ -606,13 +608,51 @@ class RoleInfo(BaseModel):
     builtin: bool = True
 
 
+def _fold_role_name(name: str) -> str:
+    """A role name as the built-in name check compares it: format characters (Unicode category
+    Cf, such as a zero-width space or a soft hyphen) dropped, then NFKC, case folding, and each run
+    of white space as one space with none at the edges."""
+    visible = "".join(c for c in name if unicodedata.category(c) != "Cf")
+    return " ".join(unicodedata.normalize("NFKC", visible).casefold().split())
+
+
+#: Every built-in role's id and label, folded by :func:`_fold_role_name`.
+_BUILTIN_ROLE_NAMES = frozenset(
+    _fold_role_name(name) for role in Role for name in (role.value, ROLE_METADATA[role][0])
+)
+
+
+def custom_role_name_refusal(name: str, stored: str | None = None) -> str | None:
+    """Why a custom role may not be saved with the name ``name``, or ``None`` when it may (BACKLOG
+    #5785). :func:`changed_name_refusal`'s rule, with its stored-value exemption, plus one more: a
+    name that folds (:func:`_fold_role_name`) to a built-in role's id or label, such as
+    ``ADMINISTRATOR`` or ``Administrator`` with a zero-width space inside, is refused, so a custom
+    role cannot be listed under a built-in role's name. It does not fold letters across scripts: a
+    name that only looks alike, such as one spelled with a Cyrillic or small-capital letter,
+    passes. A save that re-sends the stored name is exempt from both checks, so a role stored
+    under a name the rule now refuses can still have its permissions edited."""
+    if name == stored:
+        return None
+    refusal = name_refusal(name)
+    if refusal is not None:
+        return refusal
+    if _fold_role_name(name) in _BUILTIN_ROLE_NAMES:
+        return "must not be a built-in role's name"
+    return None
+
+
 class CustomRoleRequest(RequestModel):
     """Create/update an admin-defined custom role (ADR 0045): a named SUBSET of the existing Permission
     catalog. The engine validates the subset (recognized perms only, non-empty, no carved-out
-    escalation primitive) and rejects otherwise."""
+    escalation primitive) and rejects otherwise.
+
+    ``display_name`` is checked by the route, not here, because an update compares it with the
+    stored name: :func:`custom_role_name_refusal`, answered with a 422 (BACKLOG #5785)."""
 
     display_name: str = Field(max_length=_NAME_MAX)
     description: str | None = Field(default=None, max_length=_NAME_MAX)
+    #: A repeated permission is one grant: ``validate_custom_role_permissions`` collects the list
+    #: into a set before anything is stored or audited.
     permissions: list[PermissionId] = Field(max_length=64)
 
 
