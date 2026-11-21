@@ -729,6 +729,34 @@ def test_a_file_the_snapshot_does_not_hold_is_refused(tmp_path: Path) -> None:
     assert {name: (config_dir / name).read_bytes() for name in SPLIT} == before
 
 
+def test_an_undecodable_file_is_refused_without_chaining_its_bytes(tmp_path: Path) -> None:
+    """A UnicodeDecodeError keeps the whole file in ``.object``; chained onto the refusal it would
+    ride out with it, so the refusal names the error's type and carries no cause or context."""
+    config_dir = _config(tmp_path, SPLIT)
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
+    (config_dir / "b.py").write_bytes(b"# SECRET-BODY \xff\n")
+    with pytest.raises(WiringError, match=r"could not be read \(UnicodeDecodeError\)") as caught:
+        apply_rename(plan)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+def test_an_unencodable_new_literal_is_refused_without_chaining_the_text(tmp_path: Path) -> None:
+    """A UnicodeEncodeError keeps the whole edited text in ``.object``, so it is not chained."""
+    import dataclasses
+
+    config_dir = _config(tmp_path, SPLIT)
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
+    edits = tuple(dataclasses.replace(e, new_literal='"OB_\ud800"') for e in plan.edits)
+    bad = RenamePlan(plan.target_kind, plan.old, plan.new, edits=edits, sources=plan.sources)
+    before = {name: (config_dir / name).read_bytes() for name in SPLIT}
+    with pytest.raises(WiringError, match="cannot be written as UTF-8") as caught:
+        apply_rename(bad)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+    assert {name: (config_dir / name).read_bytes() for name in SPLIT} == before
+
+
 def test_a_rename_write_error_survives_pickling() -> None:
     import pickle
 

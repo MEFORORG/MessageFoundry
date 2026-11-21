@@ -485,28 +485,38 @@ def prepare_rename(plan: RenamePlan) -> PreparedRename:
     applied: list[LiteralEdit] = []
     stale: list[LiteralEdit] = []
     for file, file_edits in by_file.items():
+        # A UnicodeDecodeError holds the whole file in .object, so only its type name leaves the
+        # handler, and the raise waits until the handler has ended rather than chaining the error.
+        unreadable: str | None = None
         try:
             raw = Path(file).read_bytes()
             # Split on \n, \r\n and \r only: the plan numbered lines by tokenizing a universal-newline
             # read, which breaks on exactly those, so an edit's line is the line it names here too.
             lines = source_lines(raw.decode("utf-8"))
         except (OSError, UnicodeDecodeError) as exc:
+            unreadable = type(exc).__name__
+        if unreadable is not None:
             raise WiringError(
                 f"cannot apply the rename of {plan.target_kind} {plan.old!r}: {file} could not "
-                f"be read ({type(exc).__name__}). Nothing was written"
-            ) from exc
+                f"be read ({unreadable}). Nothing was written"
+            )
         unchanged = planned.get(file) == raw
         missing = [e for e in file_edits if _span_text(lines, e) != e.old_literal]
         if unchanged and not missing:
             for edit in sorted(file_edits, key=lambda e: (e.start_line, e.start_col), reverse=True):
                 _apply_one(lines, edit)
+            # A UnicodeEncodeError holds the whole edited text in .object, so the raise waits until
+            # the handler has ended rather than chaining the error.
+            new_bytes: bytes | None
             try:
                 new_bytes = "".join(lines).encode("utf-8")
-            except UnicodeEncodeError as exc:
+            except UnicodeEncodeError:
+                new_bytes = None
+            if new_bytes is None:
                 raise WiringError(
                     f"cannot apply the rename of {plan.target_kind} {plan.old!r}: the new name "
                     "cannot be written as UTF-8. Nothing was written"
-                ) from exc
+                )
             files.append((file, raw, new_bytes))
             applied.extend(file_edits)
         elif len(missing) < len(file_edits) or not _already_renamed(lines, file_edits):
