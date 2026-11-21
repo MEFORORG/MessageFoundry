@@ -190,9 +190,9 @@ class CollidingDelimitersError(NonVerbatimDocumentError, CollidingDelimitersRefu
     refusal ``Message``'s writes and ``extract_obx_document`` raise for the same header, so one
     ``except`` catches the header's refusal from any of them. The text names no byte of the body.
 
-    Raised only for a document the detach finds, so only under a header whose OBX-5 components
-    still read: under ``MSH|~|`` or ``MSH^^`` none does, so the detach finds no document and
-    does not raise this."""
+    Raised for every OBX whose ``OBX-2`` is ``ED``, whether or not its OBX-5 components still read:
+    under ``MSH|~|`` none does, so a document the detach could not find is still refused, never
+    ACKed and carried undetached."""
 
 
 class Base64DelimiterError(InboundDocRefError):
@@ -643,9 +643,13 @@ def iter_obx_documents(
     document's own value holds a character the splice would escape under the body's own
     delimiters: a document is detached only if splicing it back under them reproduces it exactly.
     A Handler that moves ``MSH-1`` or ``MSH-2`` afterwards is caught by the re-attach instead.
-    It raises :class:`CollidingDelimitersError`, a :class:`NonVerbatimDocumentError`, when a
-    document would be detached and the body's short MSH-2 leaves its separators not distinct,
-    since ``Message`` refuses every write to such a body (BACKLOG #5972).
+    It raises :class:`CollidingDelimitersError`, a :class:`NonVerbatimDocumentError`, when the
+    body's short MSH-2 leaves its separators not distinct and an OBX claims a document, its
+    ``OBX-2`` ``ED``: ``Message`` refuses every write to such a body, so no document of it could
+    be detached and set back (BACKLOG #5972). The claim is what is judged, not a document the
+    scan found, because under some such headers, ``MSH|~|`` among them, no OBX-5 component
+    reads as written, so the scan finds no document and the body would be ACKed with its
+    document left in it, where a refusal of every short MSH-2 turned it away before.
 
     Each document's value is held one at a time, as the caller's in-flight budget assumes: each
     check reads a value inside :func:`_scan_obx`, whose frame ends before the next read, and the
@@ -667,7 +671,11 @@ def iter_obx_documents(
             value_holds_marker = value_holds_marker or holds_marker
             if alters and altered is None:
                 altered = occ
-    if documents and message._delimiters_collide():
+    if message._delimiters_collide() and (
+        documents or any(_obx_is_ed(message, occ) for occ in range(1, obx_count + 1))
+    ):
+        # OBX-2 is a whole field, split on the field separator before any other, so the claim
+        # reads as written under such a header too.
         raise CollidingDelimitersError(
             "the header fills a delimiter it does not name with one it already uses, so the "
             "message cannot be written and a detached document could not be set back; refusing "
@@ -955,12 +963,31 @@ def _later_header_markers(message: Message, text: str) -> set[str]:
     return found
 
 
+def _handle_refusal(message: Message, text: str) -> str | None:
+    """Why the re-attach refuses every document handle ``message`` holds, whatever the handle,
+    before any read, or ``None`` where it does not: a delimiter is a base64 character, the header
+    fills a delimiter with one it already uses (BACKLOG #5972), or a later header escapes the
+    marker other than the first line does. ``text`` is the text ``message`` was parsed from.
+    :func:`reattach_documents_in_hl7` raises the reason, and :func:`doc_ref_addresses_in_hl7`
+    names no address for such a payload, so a child is never linked to a document its delivery
+    would refuse."""
+    if _delimits_with_base64(message._encoding_chars()):
+        return _BASE64_DELIMITED_HANDLE
+    if message._delimiters_collide():
+        # Message refuses every write to such a payload, the splice included.
+        return _COLLIDING_HANDLE
+    if _later_header_markers(message, text):
+        return _MIXED_HEADER_HANDLE
+    return None
+
+
 def doc_ref_addresses_in_hl7(text: str) -> frozenset[str]:
     """The content addresses named by the well-formed document handles in an HL7 body's
     ``OBX-5.5`` values, read as :func:`reattach_documents_in_hl7` reads them: the places delivery
     splices (BACKLOG #5099). A handle anywhere else, or a bare content address, is not one, since
-    delivery never resolves it. Empty for a body that does not parse as HL7: delivery resolves no
-    handle in it."""
+    delivery never resolves it. Empty for a body that does not parse as HL7, and for one whose
+    handles the re-attach refuses whatever they name (:func:`_handle_refusal`): delivery resolves
+    no handle in either, so none is a document the body's message can deliver."""
     # Local import, as reattach_documents_in_hl7 does: message.py imports this module.
     from messagefoundry.parsing.message import Message
     from messagefoundry.parsing.peek import HL7PeekError
@@ -977,6 +1004,8 @@ def doc_ref_addresses_in_hl7(text: str) -> frozenset[str]:
                 found.add(parse_doc_ref(value)[0])
             except DocRefError:
                 continue  # malformed: delivery refuses it, and it names nothing to hold
+    if found and _handle_refusal(message, text) is not None:
+        return frozenset()
     return frozenset(found)
 
 
@@ -1063,16 +1092,18 @@ async def reattach_documents_in_hl7(
         # Under a base64 delimiter the splice below would escape it inside the stored document,
         # so a handle to splice is refused before any read (_delimits_with_base64).
         base64_delimited = _delimits_with_base64(separators)
-        if found and base64_delimited:
-            raise UnreattachableDocumentError(_BASE64_DELIMITED_HANDLE)
-        if found and message._delimiters_collide():
-            # Message refuses every write to such a payload, the splice included (BACKLOG #5972).
-            raise UnreattachableDocumentError(_COLLIDING_HANDLE)
-        # Judged as a copy is below: a bare marker under an inner header's delimiters, in a
-        # message that holds nothing and names no content address, is carried as text.
-        later = _later_header_markers(message, text)
-        if later and (found or bound or any(_copy_names_address(text, m) for m in later)):
-            raise UnreattachableDocumentError(_MIXED_HEADER_HANDLE)
+        if found:
+            # The one rule doc_ref_addresses_in_hl7 reads too, so no child is linked to a
+            # document this refuses (BACKLOG #5972).
+            refusal = _handle_refusal(message, text)
+            if refusal is not None:
+                raise UnreattachableDocumentError(refusal)
+        else:
+            # Judged as a copy is below: a bare marker under an inner header's delimiters, in a
+            # message that holds nothing and names no content address, is carried as text.
+            later = _later_header_markers(message, text)
+            if later and (bound or any(_copy_names_address(text, m) for m in later)):
+                raise UnreattachableDocumentError(_MIXED_HEADER_HANDLE)
         markers = _marker_forms(separators)
         # Under the same delimiters a copied content address is escaped too, so the address after
         # a marker cannot be read: every marker counts as a copy.
