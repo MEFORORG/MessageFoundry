@@ -1533,12 +1533,15 @@ worker can. *What this boundary does NOT cover*, below, holds for both modes.
 | **Processes** | Per inbound **that receives traffic**: one child process (a full interpreter that runs its own copy of the config the engine loaded, from the bytes the engine sends it), two parent daemon threads (frame reader + stderr relay), three parent pipe fds, and on Windows a job-object handle. Nothing is spawned for an idle inbound — the child starts lazily on first dispatch. |
 | **Environment variables** | The worker starts with a short allowlist, not the engine's environment: what the platform and the interpreter need to start (such as `PATH`, the temp and profile directories, `TZ` and the locale), the interpreter's own variables by name (such as `PYTHONPATH`, `PYTHONUTF8` and `PYTHONHASHSEED`, which an isolated worker then ignores, as the engine does), and the names you list in `pass_environment`. No `MEFOR_*` variable crosses. `messagefoundry/childenv.py` holds the full list. The worker runs your config modules again under that environment, from the bytes the engine read and checked. **Config code that reads any other variable from `os.environ` finds it unset in the worker and set at `mode="off"`**, at the top of a module as much as inside a Router or Handler. If the read has no default, the worker fails to start. If it has a default, the worker can build a different graph. **The engine compares the two graphs when a worker starts, and refuses a worker whose graph differs**: the inbound, router, handler and outbound names, each inbound's router, which handlers have an `accepts=` predicate, and a digest of the bytes of every `*.py` in the config directory, `_` helpers included, as each load read them. Under the default `[delivery] internal_error = "continue"`, each message on that inbound then dead-letters with an error that names what differs and on which side; under `"stop"` the refusal halts the stage that asked for the worker, routing or transform, with a `connection_stopped` alert, and the other stage can halt the same way at its next dispatch on that inbound. Each stop raises the `connection_stopped` alert; the [`[alerts]`](#alerts) table states its cooldown, re-alert and fallback rules. Name the variable in `pass_environment` and restart. **A function that keeps its name and branches on a variable the worker lacks is not caught**: the names match, and so do the bytes. So list every variable your config reads. `current_environment()` names the active environment in both modes, and a value that differs by environment belongs in a connection spec (`env()`), a code set or a reference set. |
 
-**Edit a config file only as part of a reload.** A worker never reads your config directory. It
-runs the config bytes the engine loaded, which the engine sends it whenever it starts: on the first
-message an inbound receives, and after a worker is recycled by a wall-time or memory overrun or a
-crash (vault BACKLOG #2596). So an edit on disk changes nothing the engine or its workers run until
-a reload, and until then `GET /config/provenance` reports `drift` as true, because the files on
-disk no longer match the ones the engine loaded. Before that, a worker loaded the directory again
+**Edit a config file only as part of a reload.** A worker does not load your config directory. It
+runs the config module bytes the engine loaded, which the engine sends it whenever it starts: on
+the first message an inbound receives, and after a worker is recycled by a wall-time or memory
+overrun or a crash (vault BACKLOG #2596). So an edit to a `*.py` on disk changes no module code the
+engine or its workers run until a reload. That is not all a worker can read: config code can
+itself open a file, such as one beside it, and a worker that starts after that file changed can
+read the new copy, reload or not. After an edit to a `*.py`, until a reload, `GET /config/provenance`
+reports `drift` as true, because the files on disk no longer match the ones the engine loaded.
+Before vault BACKLOG #2596, a worker loaded the directory again
 whenever it started, so an edit made the next worker read different bytes; before the engine
 compared those bytes, such a worker ran an edited Router or Handler body nobody had reloaded (vault
 BACKLOG #2724). The engine still compares each starting worker's graph with its own, a digest of

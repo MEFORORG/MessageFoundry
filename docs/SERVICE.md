@@ -853,10 +853,13 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
     is the safest layout, because the engine's own account cannot rewrite it, provided the engine
     can still read every file. The loader checks the same paths as on Windows, following links.
     For each of them that is a symbolic link or a junction, the
-    config directory included, it also checks what the link resolves to and, for a file, the
-    folder holding that file, on both platforms (vault BACKLOG #2596). It does not check the links
-    in between, for a link to a link, or a folder outside the config directory that holds a link,
-    from which a writer could re-point it. So the layout also depends on at least these, which it
+    config directory included, it also checks what Python's path resolution says the link leads
+    to and, for a file, the folder holding that file, on both platforms, and it refuses the load
+    where a link leads to nothing at check time or cannot be resolved (vault BACKLOG #2596). That
+    resolution is not checked against what the load's open then reaches. It does not check the
+    links in between, for a link to a link, a folder outside the config directory that holds a
+    link, from which a writer could re-point it, or on Windows a reparse point other than a
+    symbolic link or a junction, which it does not follow. So the layout also depends on at least these, which it
     does not check: every directory above the config directory, and above each folder a link
     leads to, is writable only by root; no link leads through a folder another account can write;
     and the file system reports real owners and modes (a network mount may synthesize them).
@@ -886,9 +889,10 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
       directory in its place. A substitute put there after the check runs unchecked, and one put
       there before it passes when it is a link to any directory owned by root or by the engine's
       own account that is not group- or world-writable, such as the engine's data directory.
-      Nothing here detects either. An account that can write a directory above the one a link
-      points into can rename that directory and put another in its place, after the check or,
-      with the same limit as above, before it. Before you deploy, run `namei -l <config dir>` to list
+      Nothing here detects either. An account that can write the directory a link points into
+      can replace the file the check passed, after the check, and an account that can write a
+      directory above that one, or a folder holding a link in between, can put another in its
+      place, after the check or, with the same limit as above, before it. Before you deploy, run `namei -l <config dir>` to list
       every directory on the path. It does not look inside the directory, so also run `ls -lR` on
       the config directory, which lists at least its `codesets` and `environments` folders, and
       run `namei -l` on every file there that is a link. Each directory those commands list must be owned by root, or by the engine's own

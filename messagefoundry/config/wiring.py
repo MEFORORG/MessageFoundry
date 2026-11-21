@@ -9850,16 +9850,20 @@ def _with_link_targets(paths: list[Path]) -> list[Path]:
 
     A load reads a link's target, so vetting the link alone let a config module that is a link into
     a writable folder pass: whoever can write that folder can swap the code the load runs, and on
-    Windows the link object's own access list was read rather than the target's. The target is the
-    kernel's own answer (:meth:`~pathlib.Path.resolve`). A link that leads nowhere adds nothing,
-    since nothing reads it, and the link itself stays listed, as before. A link whose target cannot
-    be resolved raises ``OSError`` naming it, which refuses the load.
+    Windows the link object's own access list was read rather than the target's. The target is
+    what :meth:`~pathlib.Path.resolve` answers: on POSIX that is Python's own ``realpath`` walk in
+    userspace, and nothing here checks it against the object an open of the path reaches, as the
+    ``serve`` start check does (:func:`_file_and_folder`). A link whose target cannot be resolved,
+    or that leads to nothing at check time, raises ``OSError`` naming it, which refuses the load: a
+    writer of the folder it points into could create the missing name before the read (Manager
+    decision under the owner's standing instruction of 2026-10-22).
 
     **Not vetted**, at least: the links in between, for a link to a link, the folders holding the
-    links outside the config directory, from which a writer could re-point one, and the folders
-    above each target's folder, as the folders above the config directory are not. The ``serve``
-    start check walks the links of its own files further (:func:`_link_chain`). A path already
-    listed is not repeated."""
+    links outside the config directory, from which a writer could re-point one, the folders above
+    each target's folder, as the folders above the config directory are not, and on Windows a
+    name-surrogate reparse point that is neither a symbolic link nor a junction, which is not
+    followed (the start check's :func:`_link_chain` refuses one). The start check walks the links
+    of its own files further. A path already listed is not repeated."""
     out: list[Path] = []
     for path in paths:
         out.append(path)
@@ -9875,7 +9879,7 @@ def _with_link_targets(paths: list[Path]) -> list[Path]:
         if target is None:
             raise OSError(errno.EINVAL, f"a link could not be resolved ({unresolved})", str(path))
         if not target.exists():
-            continue
+            raise OSError(errno.EINVAL, "a link leads to nothing at check time", str(path))
         out.append(target)
         if not target.is_dir():
             out.append(target.parent)
