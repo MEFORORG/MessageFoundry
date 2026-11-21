@@ -4401,6 +4401,21 @@ def test_a_renewal_keeps_the_loopback_names_a_bind_re_mint_kept(
     assert [str(n.value) for n in san] == ["localhost", "127.0.0.1"]
 
 
+def test_a_kept_loopback_name_the_bind_already_names_is_not_repeated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A bind spelled ``0:0:0:0:0:0:0:1`` is the address ``::1``, so a renewal of a certificate
+    naming ``::1`` keeps no second ``::1`` entry."""
+    import messagefoundry.api.tls as tls
+
+    ensure_api_tls_material(ApiSettings(host="::1"), state_dir=tmp_path)
+    monkeypatch.setattr(tls, "_RENEW_REMAINING_FRACTION", 1.01)
+    cert, _ = ensure_api_tls_material(ApiSettings(host="0:0:0:0:0:0:0:1"), state_dir=tmp_path)
+    loaded = x509.load_pem_x509_certificate(Path(cert).read_bytes())
+    san = loaded.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert [str(n.value) for n in san] == ["::1", "127.0.0.1"]
+
+
 def test_an_engine_shaped_pair_with_no_san_is_re_minted(tmp_path: Path) -> None:
     """A certificate with no SubjectAlternativeName verifies against no URL at all."""
     cert, key = _plant_generated_pair(tmp_path, lived_days=1, left_days=300, sans=False)

@@ -190,8 +190,12 @@ nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
    A file-system or lock failure (an `OSError`) that leaves an old pair which still loads and has
    not expired keeps that pair, and the next start tries again. That includes a failed first move,
    a state directory the engine can read but not write, and a lock it could not take. An expired or
-   unloadable pair has nothing to fall back on, so the start fails, as does any other error. A
-   crash between the two moves leaves a new certificate beside the old key. That pair does not load, so the next start discards it, mints a fresh one, and
+   unloadable pair has nothing to fall back on, so the start fails, as does any other error except
+   a `[api].host` the certificate builder refuses on a `bind_changed` re-mint, which keeps the old
+   pair with a WARNING (BACKLOG #5973). A copy of the old certificate is staged with the new pair,
+   so an `OSError` on the key's move puts the old certificate back beside the old key, logged at
+   ERROR, and the fallback above then applies (BACKLOG #5973). A crash between the two moves, or a
+   failed move back, leaves a new certificate beside the old key. That pair does not load, so the next start discards it, mints a fresh one, and
    reports it as an unusable pair. That row's old fingerprint is the half-installed certificate,
    not the one clients trusted, whose fingerprint only the earlier WARNING line carries.
 6. **Decision 6, realised: every re-mint of an existing pair is audited.** A renewal, a replaced

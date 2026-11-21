@@ -272,36 +272,37 @@ def _make_generated(host: str, kept: Sequence[str] = ()) -> tuple[bytes, bytes]:
     )
 
 
-def _dials_loopback(host: str) -> bool:
-    """Whether a client on this box dials a bind on ``host`` through one of ``localhost``,
-    ``127.0.0.1`` and ``::1``, compared as hostname verification compares: an IP by address, so
-    ``0:0:0:0:0:0:0:1`` counts, and a name without regard to case or a trailing dot."""
-    dialled = dialled_host(host)
+def _host_key(name: str) -> object:
+    """``name`` as hostname verification compares it: an IP by address without an IPv6 zone, so
+    ``0:0:0:0:0:0:0:1`` is ``::1``, and a DNS name without regard to case or a trailing dot."""
     try:
-        address = ipaddress.ip_address(dialled.split("%", 1)[0])
+        return ipaddress.ip_address(name.split("%", 1)[0])
     except ValueError:
-        return dialled.rstrip(".").lower() in _LOOPBACK_HOSTS
-    return any(address == ipaddress.ip_address(name) for name in ("127.0.0.1", "::1"))
+        return name.rstrip(".").lower()
 
 
 def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
     """The loopback names a replacement of a loadable pair keeps (BACKLOG #5973).
 
-    Only for a bind a client on this box dials through a loopback (:func:`_dials_loopback`): of
-    ``localhost``, ``127.0.0.1`` and ``::1``, every one the old certificate names, and the default
-    ``[api].host``, which the CLI, the IDE and the harness dial by default. A move from
-    ``127.0.0.1`` to ``localhost`` would otherwise drop the ``127.0.0.1`` those clients verify. A
-    renewal keeps them as a bind re-mint does, or the next renewal would drop what the re-mint
-    kept. The set is fixed, so repeated moves do not grow it. A bind off loopback keeps nothing.
-    A first-run mint has no old certificate, so it names only the bind.
+    Only for a bind a client on this box dials through one of ``localhost``, ``127.0.0.1`` and
+    ``::1``, compared as hostname verification compares (:func:`_host_key`): of those three, every
+    one the old certificate names, and the default ``[api].host``, which the CLI, the IDE and the
+    harness dial by default, less the one the bind itself names. A move from ``127.0.0.1`` to
+    ``localhost`` would otherwise drop the ``127.0.0.1`` those clients verify. A renewal keeps
+    them as a bind re-mint does, or the next renewal would drop what the re-mint kept. The set is
+    fixed, so repeated moves do not grow it. A bind off loopback keeps nothing. A first-run mint
+    has no old certificate, so it names only the bind.
     """
     from messagefoundry import pki
 
-    if not _dials_loopback(host):
+    dialled = _host_key(dialled_host(host))
+    if dialled not in {_host_key(name) for name in _LOOPBACK_HOSTS}:
         return []
     default = ApiSettings.model_fields["host"].default
     return [
-        name for name in sorted(_LOOPBACK_HOSTS) if name == default or pki.san_names(old_pem, name)
+        name
+        for name in sorted(_LOOPBACK_HOSTS)
+        if _host_key(name) != dialled and (name == default or pki.san_names(old_pem, name))
     ]
 
 
@@ -959,7 +960,8 @@ def _discard_staged_leftovers(cert_path: Path, key_path: Path) -> None:
     the next renewal, whose ``O_EXCL`` write would otherwise refuse it on every later start.
     """
     for leftover in _staged_files(cert_path, key_path):
-        if leftover.exists():
+        # A dangling link answers exists() False, and a later write would follow it.
+        if leftover.is_symlink() or leftover.exists():
             log.warning("discarding %s, left by an interrupted certificate renewal", leftover)
             unlink_generated(leftover)
 
@@ -969,10 +971,10 @@ def _remove_quietly(*paths: Path) -> None:
     masks the error that called for it. The next start's locked pass discards what is left."""
     for leftover in paths:
         try:
-            if leftover.exists():
+            if leftover.is_symlink() or leftover.exists():
                 unlink_generated(leftover)
         except OSError as cleanup:
-            log.warning("could not remove %s after a failed renewal: %s", leftover, cleanup)
+            log.warning("could not remove %s after a certificate renewal: %s", leftover, cleanup)
 
 
 def _renew_generated_pair(
@@ -1044,8 +1046,9 @@ def _renew_generated_pair(
     try:
         _replace_generated(staged_key, key_path)
     except OSError as exc:
-        _roll_back_certificate(prior_cert, cert_path, key_path, exc)
-        _remove_quietly(staged_key, prior_cert)
+        # A failed move back keeps both files, the only halves that still match the live ones.
+        if _roll_back_certificate(prior_cert, cert_path, key_path, exc):
+            _remove_quietly(staged_key, prior_cert)
         raise
     _remove_quietly(prior_cert)
     event = _replaced(reason, cert_path, old, new)
@@ -1069,8 +1072,9 @@ def _renew_generated_pair(
     )
 
 
-def _roll_back_certificate(prior_cert: Path, cert_path: Path, key_path: Path, exc: OSError) -> None:
-    """Put the old certificate back after the new key could not replace the old one. Never raises.
+def _roll_back_certificate(prior_cert: Path, cert_path: Path, key_path: Path, exc: OSError) -> bool:
+    """Put the old certificate back after the new key could not replace the old one; ``True`` once
+    it is back. Never raises.
 
     The new certificate is already live, and the old key is still live, so until this runs the two
     do not load as a pair. Moving the staged copy of the old certificate back restores the pair the
@@ -1089,7 +1093,7 @@ def _roll_back_certificate(prior_cert: Path, cert_path: Path, key_path: Path, ex
             cert_path,
             restore,
         )
-        return
+        return False
     log.error(
         "could not replace the generated TLS key at %s (%s); put the previous certificate back at "
         "%s, beside the previous key, so the pair on disk matches again; the next start tries the "
@@ -1098,6 +1102,7 @@ def _roll_back_certificate(prior_cert: Path, cert_path: Path, key_path: Path, ex
         exc,
         cert_path,
     )
+    return True
 
 
 def _replaced(
