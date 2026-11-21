@@ -4298,6 +4298,12 @@ _LOOPBACK_SANS = (("ip", "127.0.0.1"), ("ip", "::1"), ("dns", "localhost"))
         ("LOCALHOST", (("dns", "LOCALHOST"), ("ip", "127.0.0.1"), ("ip", "::1"))),
         # Named by its address without brackets (BACKLOG #5973).
         ("[::1]", (("ip", "::1"), ("ip", "127.0.0.1"), ("dns", "localhost"))),
+        # A trailing dot is a loopback bind, but its entry is not ``localhost``, which hostname
+        # verification will not match to it, so ``localhost`` is named too.
+        (
+            "localhost.",
+            (("dns", "localhost."), ("ip", "127.0.0.1"), ("ip", "::1"), ("dns", "localhost")),
+        ),
         # Another loopback address is not one of the three names.
         ("127.0.0.2", (("ip", "127.0.0.2"),)),
     ],
@@ -4309,8 +4315,8 @@ def test_the_minted_certificate_names_the_loopback_names_for_a_loopback_bind_onl
     d20261119T191457909-25c3aa).
 
     Mutation: mint with the SAN origin/main had before BACKLOG #5790, the bind host plus a wildcard
-    bind's own loopback. Red: the three loopback rows. Mutation: add the loopback names for every
-    bind. Red: every other row."""
+    bind's own loopback. Red: every loopback row, in every spelling. Mutation: add the loopback
+    names for every bind. Red: every other row."""
     cert, _ = ensure_api_tls_material(ApiSettings(host=host), state_dir=tmp_path)
     assert tuple(_san_entries(cert)) == names
 
@@ -4356,30 +4362,28 @@ def test_a_pair_minted_for_a_127_bind_fails_verification_at_a_name_it_lacks(
         # #5790), so a move from a wildcard to a loopback bind re-mints.
         ("0.0.0.0", "127.0.0.1", ["127.0.0.1", "::1", "localhost"]),
         ("::", "::1", ["::1", "127.0.0.1", "localhost"]),
-        # A loopback pair lacks the wildcard subject, and keeps its loopback names.
-        ("127.0.0.1", "0.0.0.0", ["0.0.0.0", "127.0.0.1", "::1", "localhost"]),
-        ("127.0.0.1", "::", ["::", "::1", "127.0.0.1", "localhost"]),
-        ("::1", "[::]", ["::", "::1", "127.0.0.1", "localhost"]),
         # A loopback bind names all three, whatever the old pair named.
         ("10.0.0.9", "localhost", ["localhost", "127.0.0.1", "::1"]),
         ("10.0.0.9", "LOCALHOST", ["LOCALHOST", "127.0.0.1", "::1"]),
         ("10.0.0.9", "0:0:0:0:0:0:0:1", ["::1", "127.0.0.1", "localhost"]),
         # A bracketed IPv6 bind is named by the address, not a DNS name spelled "[::1]".
         ("10.0.0.9", "[::1]", ["::1", "127.0.0.1", "localhost"]),
-        # Off loopback, nothing is kept: the CLI defaults cannot reach this bind anyway.
+        # Off loopback, nothing is kept: the CLI defaults cannot reach this bind anyway. A re-mint
+        # carries only the fixed loopback set, as origin/main's does, so the old names are dropped.
         ("127.0.0.1", "myhost.example", ["myhost.example"]),
     ],
 )
 def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
     first: str, then: str, names: list[str], tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """BACKLOG #5973. A pair minted for one bind, reused after the bind moved, must name what a
-    client dials for the new bind (a wildcard's loopback, else the host), or that client (the
-    tray, pinning the file) fails hostname verification until the renewal months later. The
-    re-mint is a reported, audited replacement.
+    """BACKLOG #5973, #5790. A pair minted for one bind, reused after the bind moved, must carry
+    every name ``_names_missing`` requires for the new bind (the host a client dials, and for a
+    loopback bind the other loopback names), or a client fails hostname verification until the
+    renewal months later. The re-mint is a reported, audited replacement.
 
-    Mutation: drop the bind check in ``_replacement_due``. Red: the second start reuses the first
-    certificate, which lacks the dialled name."""
+    Mutation: drop the bind check in ``_replacement_due``. Red: every row, since the second start
+    reuses the first certificate. Mutation: require only the dialled host. Red: the wildcard to
+    loopback rows, whose old pair names it."""
     old_cert, old_key = ensure_api_tls_material(ApiSettings(host=first), state_dir=tmp_path)
     old_sha = _sha256(Path(old_cert))
     events: list[GeneratedPairReplaced] = []
@@ -4417,9 +4421,13 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
 @pytest.mark.parametrize(
     ("first", "then", "renew"),
     [
-        # The old certificate already names every name a fresh mint for the new bind would. A
-        # pair minted for a loopback bind names all three loopback names (BACKLOG #5790), so a
-        # move to any of them, in any spelling, needs no new name.
+        # The old certificate already names every name the new bind requires. A pair minted for
+        # a loopback bind names all three loopback names (BACKLOG #5790), so a move to any of
+        # them, in any spelling, needs no new name. A wildcard requires only its family's
+        # loopback, never its own 0.0.0.0 or ::, which no client dials.
+        ("127.0.0.1", "0.0.0.0", True),
+        ("127.0.0.1", "::", True),
+        ("::1", "[::]", True),
         ("127.0.0.1", "localhost", True),
         ("::1", "localhost", True),
         ("127.0.0.1", "LOCALHOST", True),
@@ -4450,13 +4458,30 @@ def test_a_bind_move_that_needs_no_new_name_or_is_a_shard_reuses_the_pair(
     assert events == [] and _snapshot(cert, key) == before
 
 
+def test_a_loopback_to_wildcard_and_back_round_trip_reuses_the_pair(tmp_path: Path) -> None:
+    """A wildcard requires only its family's loopback, and a loopback pair names all three
+    loopback names, so 127.0.0.1 -> 0.0.0.0 -> 127.0.0.1 never replaces the first pair, and it
+    names what a 127.0.0.1 client dials throughout.
+
+    Mutation: require a wildcard's own subject. Red: the move to 0.0.0.0 re-mints."""
+    cert, key = ensure_api_tls_material(ApiSettings(host="127.0.0.1"), state_dir=tmp_path)
+    before = _snapshot(Path(cert), Path(key))
+    for host in ("0.0.0.0", "127.0.0.1"):
+        events: list[GeneratedPairReplaced] = []
+        ensure_api_tls_material(ApiSettings(host=host), state_dir=tmp_path, replacements=events)
+        assert events == []
+        assert _snapshot(Path(cert), Path(key)) == before
+    assert tuple(_san_entries(cert)) == _LOOPBACK_SANS
+
+
 def test_a_renewal_keeps_the_loopback_names_a_bind_re_mint_kept(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #5973. A re-mint for a move from ``::1`` to ``::`` keeps ``127.0.0.1``, which the
-    CLI, IDE and harness dial by default, and the ``localhost`` the old pair named. The renewal
-    months later must keep them too, or those clients fail hostname verification then. A loopback
-    bind gets all three names anyway (BACKLOG #5790), so a wildcard is where keeping shows.
+    """BACKLOG #5973. A pair minted for ``::1`` is reused after a move to ``::``, which requires
+    only ``::1``, so it still names ``127.0.0.1``, which the CLI, IDE and harness dial by default,
+    and ``localhost``. The renewal months later must keep them, or those clients fail hostname
+    verification then. A loopback bind gets all three names anyway (BACKLOG #5790), so a wildcard
+    is where keeping shows.
 
     Mutation: keep the names on a bind re-mint only. Red: the renewal names only ``::`` and
     ``::1``."""

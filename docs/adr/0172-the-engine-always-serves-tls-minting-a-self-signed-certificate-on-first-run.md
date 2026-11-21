@@ -163,7 +163,7 @@ nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
 
 1. **Decision 5 now reads: mint once, reuse while fresh, renew early.** A start that finds a pair
    with at least a third of its own lifetime left reuses it and writes nothing, unless its
-   certificate lacks a name a fresh mint for the bind would carry (BACKLOG #5973, item 6;
+   certificate lacks a name the bind requires (BACKLOG #5973, item 6;
    BACKLOG #5790). A start that finds
    less than a third left, or an expired pair, renews it: a new key and a new certificate under the
    same two file names. For the 365-day pair a third is about 122 days. The threshold is a share of
@@ -201,7 +201,7 @@ nothing, and the rest of this ADR stands. BACKLOG #1276 carries the build.
    not the one clients trusted, whose fingerprint only the earlier WARNING line carries.
 6. **Decision 6, realised: every re-mint of an existing pair is audited.** A renewal, a replaced
    unusable pair, a replaced half-pair, and (BACKLOG #5973) a re-mint at startup of a pair whose
-   certificate lacks a name a fresh mint for the current bind would carry (BACKLOG #5790), the
+   certificate lacks a name the current bind requires (BACKLOG #5790), the
    address a client dials among them, reason
    `bind_changed`, each write one `api.tls_generated_pair_replaced` row to
    the store's existing hash-chained audit log. The row carries the reason, the certificate path,

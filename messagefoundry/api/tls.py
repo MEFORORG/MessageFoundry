@@ -247,8 +247,10 @@ _GENERATED_LIFETIME_DAYS = 365
 #: Never the machine's own host name: the certificate goes to every peer in the handshake, before
 #: any sign-in, so it names only the bind host and names from this tuple, which say nothing about
 #: the machine (decision d20261119T191457909-25c3aa).
-#: The same set ``ApiSettings.is_loopback`` reads, so the names added and the membership test
-#: cannot drift apart; sorted, so the order is fixed: ``127.0.0.1``, ``::1``, ``localhost``.
+#: Built from the set ``ApiSettings.is_loopback`` reads, so the two list the same three names;
+#: sorted, so the order is fixed: ``127.0.0.1``, ``::1``, ``localhost``. Which binds count as
+#: loopback here is a different, wider match (:data:`_LOOPBACK_KEYS`) than ``is_loopback``'s
+#: exact spelling.
 _GENERATED_LOOPBACK_SANS = tuple(sorted(_LOOPBACK_HOSTS))
 
 
@@ -261,33 +263,36 @@ def _generated_sans(host: str) -> list[str]:
       certificate naming it alone verifies against no URL at all. It carries the loopback of its
       own family (:func:`messagefoundry.api_tls_source.wildcard_loopback`), the address the tray
       and any other client on this box reach it through (BACKLOG #5973).
-    - A loopback bind carries :data:`_GENERATED_LOOPBACK_SANS` (BACKLOG #5790), less the one its
-      own subject already names. A host is loopback when hostname verification would compare it
-      equal to one of them (:func:`_host_key`), the same match :func:`_kept_loopback_names` uses,
-      so ``LOCALHOST``, ``[::1]`` and ``0:0:0:0:0:0:0:1`` count, and a mint and a renewal for one
-      bind agree.
+    - A loopback bind carries :data:`_GENERATED_LOOPBACK_SANS` (BACKLOG #5790), less a name
+      that is the same SAN entry as its own subject (:func:`_san_key`). A host is loopback when
+      :func:`_host_key` matches it to one of them (:data:`_LOOPBACK_KEYS`, which
+      :func:`_kept_loopback_names` uses too), so ``LOCALHOST``, ``[::1]``, ``0:0:0:0:0:0:0:1`` and
+      ``localhost.`` count, and a mint and a renewal for one loopback bind agree.
     - Any other host carries no extra name, ``127.0.0.2`` included.
 
-    :func:`_replacement_due` re-mints a reused pair that lacks any of these names, and a renewal
-    or bind re-mint adds what :func:`_kept_loopback_names` keeps.
+    :func:`_replacement_due` re-mints a reused pair that lacks a name :func:`_names_missing`
+    requires, and a renewal or bind re-mint adds what :func:`_kept_loopback_names` keeps.
     """
     loopback = wildcard_loopback(host)
     if loopback is not None:
         return [loopback]
-    own = _host_key(unbracketed(host))
-    keys = [_host_key(name) for name in _GENERATED_LOOPBACK_SANS]
-    if own not in keys:
+    subject = unbracketed(host)
+    if _host_key(subject) not in _LOOPBACK_KEYS:
         return []
-    return [name for name, key in zip(_GENERATED_LOOPBACK_SANS, keys, strict=True) if key != own]
+    own = _san_key(subject)
+    return [name for name in _GENERATED_LOOPBACK_SANS if _san_key(name) != own]
 
 
 def _names_missing(host: str, pem: bytes) -> list[str]:
-    """The names a fresh mint for a bind on ``host`` would carry that the certificate in ``pem``
+    """The names a reused certificate for a bind on ``host`` must carry and the one in ``pem``
     lacks, matched by :func:`messagefoundry.pki.san_names`: the subject and
-    :func:`_generated_sans`. Raises ``ValueError`` when ``pem`` is not a parseable certificate."""
+    :func:`_generated_sans`, except that a WILDCARD bind requires only its family's loopback, the
+    address a client dials, since no client dials ``0.0.0.0`` or ``::``. Raises ``ValueError`` when
+    ``pem`` is not a parseable certificate."""
     from messagefoundry import pki
 
-    wanted = [unbracketed(host), *_generated_sans(host)]
+    subject = [] if wildcard_loopback(host) is not None else [unbracketed(host)]
+    wanted = [*subject, *_generated_sans(host)]
     return [name for name in wanted if not pki.san_names(pem, name)]
 
 
@@ -298,14 +303,21 @@ def _make_generated(host: str, kept: Sequence[str] = ()) -> tuple[bytes, bytes]:
     so a ``[::1]`` bind is named by the IP address ``::1`` a client's hostname check compares,
     not by a DNS name spelled ``[::1]`` that matches no URL (BACKLOG #5973). The extra names come
     from :func:`_generated_sans`, read on ``host`` as written. ``kept`` adds names a replacement
-    of an existing pair carries over (:func:`_kept_loopback_names`). Raises ``ValueError`` for a
-    host the certificate builder refuses.
+    of an existing pair carries over (:func:`_renew_generated_pair`). A name that is the same SAN
+    entry as one before it (:func:`_san_key`) is dropped. Raises ``ValueError`` for a host the
+    certificate builder refuses.
     """
     from messagefoundry import pki
 
-    return pki.make_self_signed(
-        unbracketed(host), [*_generated_sans(host), *kept], _GENERATED_LIFETIME_DAYS
-    )
+    subject = unbracketed(host)
+    seen = {_san_key(subject)}
+    extras: list[str] = []
+    for name in [*_generated_sans(host), *kept]:
+        key = _san_key(name)
+        if key not in seen:
+            seen.add(key)
+            extras.append(name)
+    return pki.make_self_signed(subject, extras, _GENERATED_LIFETIME_DAYS)
 
 
 def _host_key(name: str) -> object:
@@ -315,6 +327,23 @@ def _host_key(name: str) -> object:
         return ipaddress.ip_address(name.split("%", 1)[0])
     except ValueError:
         return name.rstrip(".").lower()
+
+
+#: The loopback names as :func:`_host_key` matches them: a bind whose subject has one of these
+#: keys is a loopback bind for the generated certificate (:func:`_generated_sans`,
+#: :func:`_kept_loopback_names`).
+_LOOPBACK_KEYS = frozenset(_host_key(name) for name in _GENERATED_LOOPBACK_SANS)
+
+
+def _san_key(name: str) -> object:
+    """``name`` as the SAN entry ``make_self_signed`` writes for it: an IP literal by address, so
+    ``0:0:0:0:0:0:0:1`` and ``::1`` are one entry, and anything else as a DNS name without regard
+    to case. Unlike :func:`_host_key` it keeps a trailing dot and a zone, because hostname
+    verification does not match ``localhost`` against an entry ``localhost.``."""
+    try:
+        return ipaddress.ip_address(name)
+    except ValueError:
+        return name.lower()
 
 
 def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
@@ -333,7 +362,7 @@ def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
     from messagefoundry import pki
 
     dialled = _host_key(dialled_host(host))
-    if dialled not in {_host_key(name) for name in _LOOPBACK_HOSTS}:
+    if dialled not in _LOOPBACK_KEYS:
         return []
     default = ApiSettings.model_fields["host"].default
     return [
@@ -379,8 +408,7 @@ class GeneratedPairReplaced:
     """
 
     #: ``renewal``: a loadable pair near or past its expiry. ``bind_changed``: a loadable pair whose
-    #: certificate lacks a name a fresh mint for the current ``[api].host`` would carry
-    #: (:func:`_names_missing`), such as the ``::1`` of a bind moved to ``::`` after the mint
+    #: certificate lacks a name the current ``[api].host`` requires (:func:`_names_missing`), such as the ``::1`` of a bind moved to ``::`` after the mint
     #: (BACKLOG #5973, #5790). ``unusable``: a pair that would not load as one. ``half_pair``: one file of the two, left by an interrupted mint or renewal.
     reason: _ReplacedReason
     cert_file: str
@@ -756,8 +784,8 @@ def ensure_api_tls_material(
     with less than a third of its lifetime left, or past it, is RENEWED at startup -- see
     :func:`_renew_generated_pair` -- but only when it is still the engine's own shape (self-signed,
     ``CA=false``). Anything else at the generated path is served as found and never replaced.
-    **A pair of that shape whose certificate lacks a name a fresh mint for the current bind would
-    carry is replaced the same way**, the report's reason ``bind_changed``: for example the
+    **A pair of that shape whose certificate lacks a name the current bind requires
+    (:func:`_names_missing`) is replaced the same way**, the report's reason ``bind_changed``: for example the
     loopback of a wildcard bind (:func:`_replacement_due`, BACKLOG #5973, #5790). Only the engine's own
     generated pair is ever checked; an operator's ``[api].tls_cert_file`` never reaches this
     branch. Nothing renews mid-run: ``CertExpiryRunner`` watches the served certificate, because
@@ -940,8 +968,8 @@ def _replacement_due(host: str, cert_path: Path) -> _Due | None:
     """Why the generated pair should be replaced now, with the old certificate's facts, else ``None``.
 
     ``renewal`` means expired, or less than :data:`_RENEW_REMAINING_FRACTION` of the certificate's
-    own validity period left. ``bind_changed`` means the certificate lacks a name a fresh mint for
-    ``host`` would carry (:func:`_names_missing`), among them the host a client dials for it
+    own validity period left. ``bind_changed`` means the certificate lacks a name ``host`` requires
+    (:func:`_names_missing`), among them the host a client dials for it
     (:func:`messagefoundry.api_tls_source.dialled_host`). So a bind moved after the mint, for
     example to ``::`` from ``0.0.0.0``, or to ``127.0.0.1`` from ``0.0.0.0``, gets a fresh
     certificate for the new bind at this start rather than at the next renewal (BACKLOG #5973,
@@ -1065,7 +1093,7 @@ def _renew_generated_pair(
             "bind %r: a new certificate for that bind was refused (%s). Clients that verify those "
             "names will fail until the bind or [api].tls_cert_file is fixed.",
             cert_path,
-            ", ".join(_names_missing(api.host, old_pem)),
+            ", ".join(repr(name) for name in _names_missing(api.host, old_pem)),
             api.host,
             type(exc).__name__,
         )
