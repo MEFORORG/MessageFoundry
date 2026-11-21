@@ -39,6 +39,7 @@ from .rules import (
 )
 from .surrogates import (
     Seps,
+    SurrogateSeparatorRefused,
     normalized_message,
     obx5_kind,
     preserve_obx5_value,
@@ -46,11 +47,6 @@ from .surrogates import (
     repeats_encoding_characters,
     scrub_message_site_codes,
     surrogate_field_recorded,
-)
-
-# Re-exported: ``tee/__main__.py`` names this refusal from here.
-from .surrogates import (
-    SurrogateSeparatorRefused as SurrogateSeparatorRefused,
 )
 
 

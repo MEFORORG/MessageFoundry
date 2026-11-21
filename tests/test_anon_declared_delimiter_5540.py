@@ -126,12 +126,6 @@ def test_both_adapters_raise_the_same_refusal_naming_the_rule(case: str) -> None
         assert getattr(caught.value, "path", None) == path
 
 
-def test_the_tee_run_line_counts_the_refusal_it_imports() -> None:
-    """``tee/__main__.py`` counts a separator refusal by the class ``tee.anon.hl7`` exports, so
-    that name must be the shared class the surrogates raise."""
-    assert tee_hl7.SurrogateSeparatorRefused is tee_surrogates.SurrogateSeparatorRefused
-
-
 @_EACH_CASE
 def test_the_same_values_under_the_default_encoding_agree_on_both_sides(case: str) -> None:
     """The positive control: under ``^~\\&`` no surrogate holds a delimiter, both adapters emit
@@ -155,6 +149,47 @@ def test_a_custom_encoding_no_surrogate_writes_agrees_on_both_sides() -> None:
     engine_out = engine_anon.anonymize(message, salt=_SALT)
     assert engine_out == tee_anon.anonymize(message, salt=_SALT)
     assert "DOE" not in engine_out and "12345" not in engine_out
+
+
+@_SIDES
+@pytest.mark.parametrize(
+    "fields",
+    [{1: "1", 7: "19800315", 8: _MARK}, {1: "1", 13: "2025550100", 15: _MARK}],
+    ids=["dob", "phone"],
+)
+def test_a_digit_delimiter_refuses_under_every_salt(
+    anon: ModuleType, fields: dict[int, str]
+) -> None:
+    """Under a digit escape character, what a phone or date-of-birth surrogate COULD write is
+    judged, not the digits one salt drew, so the refusal does not depend on the secret salt."""
+    message = _message("^~5&", "PID", fields)
+    for n in range(8):
+        with pytest.raises(anon.AnonError, match="escape character the message declares"):
+            anon.anonymize(message, salt=f"{_SALT}-{n}")
+
+
+@pytest.mark.parametrize("surrogates", [engine_surrogates, tee_surrogates], ids=["engine", "tee"])
+@pytest.mark.parametrize(
+    ("encoding", "year"),
+    [("^~1&", "2010"), ("^~\\0", "2026")],
+    ids=["digit-escape", "digit-subcomponent"],
+)
+def test_a_dates_year_is_the_senders_and_is_not_checked(
+    surrogates: ModuleType, encoding: str, year: str
+) -> None:
+    """A bare year is copied from the sender, so a declared delimiter in it is no reason to
+    refuse; only the fill and offset are written. The control: a month and day the fill writes
+    as ``0101`` hold the same delimiter, and are refused."""
+    component, repetition, escape, subcomponent = tuple(encoding)
+    seps = surrogates.Seps(component, repetition, subcomponent, escape)
+    kept = surrogates.surrogate_field_recorded(
+        "PID-29", SurrogateKind.DATE, year, Keyer(_SALT), seps, None
+    )
+    assert kept == year
+    with pytest.raises(surrogates.SurrogateSeparatorRefused):
+        surrogates.surrogate_field_recorded(
+            "PID-29", SurrogateKind.DATE, f"{year}0315", Keyer(_SALT), seps, None
+        )
 
 
 @pytest.mark.parametrize("field_sep", ["|", "+", "#", "[", " "])

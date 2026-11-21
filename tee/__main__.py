@@ -50,7 +50,6 @@ from pathlib import Path
 
 from tee import __version__, mefor_api, mllp
 from tee.anon import anonymize_checked
-from tee.anon.hl7 import SurrogateSeparatorRefused
 from tee.anon.keying import Keyer
 from tee.anon.leak import (
     MALFORMED_LINE_ADVICE,
@@ -68,7 +67,11 @@ from tee.anon.rules import (
     load_rules,
     retargeted_defaults,
 )
-from tee.anon.surrogates import SiteCodeSeparatorRefused, site_prefixes_loaded
+from tee.anon.surrogates import (
+    SiteCodeSeparatorRefused,
+    SurrogateSeparatorRefused,
+    site_prefixes_loaded,
+)
 from tee.controlchars import scrub_control_chars
 from tee.correlate import CorepointOutput, CorrelateConfig
 from tee.relay import Endpoint, RelayConfig, TeeRelay
