@@ -328,9 +328,8 @@ def test_real_git_allows_a_directory_outside_any_repo(tmp_path: Path) -> None:
     # The negative control for the test above, through real git: a directory in no repository.
     outside = tmp_path / "out"
     outside.mkdir()
-    probe = cm.run_bytes  # real git; skip rather than mis-assert where tmp is itself in a repo
-    try:
-        probe(["git", "-C", str(outside), "rev-parse", "--is-inside-work-tree"])
+    try:  # real git, under the guard's own env; skip where tmp is itself in a repo
+        cm.run_probe(["git", "-C", str(outside), "rev-parse", "--is-inside-work-tree"])
     except cm.CollectError:
         assert cm.refuse_reason(outside / "x.json") is None
     else:
@@ -492,7 +491,9 @@ def test_gh_fails_fast_on_a_non_transient_error(tmp_path: Path) -> None:
     [
         ("gh exited 1: HTTP 502: Bad Gateway", True),
         ("gh exited 1: API rate limit exceeded for user", True),
-        ("gh could not run: TimeoutExpired: timed out after 180 seconds", True),
+        ("gh could not run: TimeoutExpired: timed out after 180 seconds", False),
+        ("gh exited 1: error connecting to api.github.com", True),
+        ("gh exited 1: context deadline exceeded", True),
         ("gh exited 1: read tcp: connection reset by peer", True),
         ("gh exited 1: HTTP 429: Too Many Requests", True),
         ("gh exited 1: HTTP 404: Not Found", False),
@@ -615,6 +616,8 @@ def test_probe_env_drops_git_variables(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_real_git_refuses_this_checkout_despite_a_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
     # A ceiling AT the checkout root stops discovery before it, so without the scrub git answers
     # "not a git repository" for tests/. The control proves the ceiling bites on this machine.
+    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):  # set under a git hook
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(Path(__file__).resolve().parents[1]))
     assert cm.refuse_reason(Path(__file__), cm.run_cmd) is None
     reason = cm.refuse_reason(Path(__file__))
@@ -810,7 +813,7 @@ def test_main_writes_the_snapshot_and_prints_the_ref_pair(
     assert rc == 0
     snap = json.loads(out.read_text(encoding="utf-8"))
     assert [m["id"] for m in snap["metrics"]] == ["asvs", "prs_merged"]
-    assert not (tmp_path / "snap.json.tmp").exists()
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["snap.json"]  # no temp left behind
     printed = capsys.readouterr().out
     want = "asvs: value=50.0 status=warn scorecard=vault-origin-main@abc123 engine=deadbeef1234"
     assert want in printed
@@ -897,3 +900,27 @@ def test_write_json_atomic_is_strict_and_leaves_no_temp(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         cm.write_json_atomic(out, {"a": float("nan")})
     assert [p.name for p in tmp_path.iterdir()] == ["x.json"]
+
+
+def test_dirty_engine_ref_is_partial(tmp_path: Path) -> None:
+    printed = "# asvs-status scorecard=NO-GIT engine=abc123+dirty\ncells 1: 1 pass\n"
+    m = cm.Metric("asvs", "", "", "", "")
+    cm.c_asvs(_asvs_ctx(tmp_path, printed), m)
+    assert "engine=abc123+dirty" in m.detail["partial_error"]
+
+
+def test_archive_uses_literal_pathspecs(tmp_path: Path) -> None:
+    seen: list[list[str]] = []
+
+    def raw(argv: Sequence[str]) -> bytes:
+        seen.append(list(argv))
+        return _tar({})
+
+    ctx = _ctx(tmp_path, _failing)
+    ctx.run_raw = raw
+    cm._archive_into(ctx, "v", "sha", ["docs/BACKLOG[1].md"], tmp_path)
+    assert seen[0][:2] == ["git", "--literal-pathspecs"]
+
+
+def test_a_naive_timestamp_is_utc() -> None:
+    assert cm.parse_stamp("2026-11-10T00:00:00").tzinfo is not None

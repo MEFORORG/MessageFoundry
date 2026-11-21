@@ -102,7 +102,8 @@ GH_BACKOFF_SECONDS = 2.0
 #: attempt, because a retry would only fail again, slower.
 _TRANSIENT = re.compile(
     r"HTTP 5\d\d|HTTP 429|rate limit|timed? ?out|TimeoutExpired|connection (?:reset|refused)"
-    r"|\bEOF\b|dial tcp|TLS handshake|temporarily unavailable|Something went wrong",
+    r"|\bEOF\b|dial tcp|TLS handshake|temporarily unavailable|Something went wrong"
+    r"|error connecting to|context deadline exceeded",
     re.IGNORECASE,
 )
 
@@ -156,10 +157,13 @@ def iso_week(day: dt.date) -> str:
 
 def week_of_timestamp(stamp: str) -> str:
     """The ISO week of an ISO-8601 timestamp, read in UTC (``Z`` or an offset)."""
-    moment = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-    if moment.tzinfo is None:
-        moment = moment.replace(tzinfo=dt.UTC)
-    return iso_week(moment.astimezone(dt.UTC).date())
+    return iso_week(parse_stamp(stamp).astimezone(dt.UTC).date())
+
+
+def parse_stamp(stamp: Any) -> dt.datetime:
+    """An ISO-8601 timestamp (``Z`` or an offset) as an aware datetime; a naive one is UTC."""
+    moment = dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    return moment if moment.tzinfo is not None else moment.replace(tzinfo=dt.UTC)
 
 
 def window(through: dt.date, weeks: int) -> list[str]:
@@ -371,8 +375,13 @@ def fetch_url(url: str) -> bytes:
 
 
 def is_transient(error: CollectError) -> bool:
-    """Whether a failed ``gh`` call is worth another attempt; see :data:`_TRANSIENT`."""
-    return _TRANSIENT.search(str(error)) is not None
+    """Whether a failed ``gh`` call is worth another attempt; see :data:`_TRANSIENT`.
+
+    A call that hit :data:`CMD_TIMEOUT` is not: a hung ``gh`` would hang again, and two more full
+    timeouts would cost minutes for an answer already known.
+    """
+    text = str(error)
+    return "TimeoutExpired" not in text and _TRANSIENT.search(text) is not None
 
 
 def gh_json(ctx: Context, args: Sequence[str]) -> Any:
@@ -479,7 +488,9 @@ def _on_path(directory: Path) -> Iterator[None]:
 
 
 def _archive_into(ctx: Context, vault: str, sha: str, paths: Sequence[str], root: Path) -> None:
-    tar_bytes = ctx.run_raw(["git", "-C", vault, "archive", "--format=tar", sha, "--", *paths])
+    # Literal pathspecs: a listed ledger name holding `*`, `?` or `[` archives that file alone.
+    argv = ["git", "--literal-pathspecs", "-C", vault, "archive", "--format=tar", sha, "--"]
+    tar_bytes = ctx.run_raw([*argv, *paths])
     with tarfile.open(fileobj=io.BytesIO(tar_bytes)) as tar:
         tar.extractall(root, filter="data")
 
@@ -681,10 +692,6 @@ def c_prs_merged(ctx: Context, m: Metric) -> None:
     m.detail = {"value_week": week, "per_repo": per_repo}
 
 
-def _parse_stamp(stamp: Any) -> dt.datetime:
-    return dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
-
-
 def c_flow_health(ctx: Context, m: Metric) -> None:
     rows = gh_list(
         ctx, ["pr", "list", "-R", ENGINE_REPO, "--state", "open", "--json", "number,createdAt"]
@@ -692,7 +699,7 @@ def c_flow_health(ctx: Context, m: Metric) -> None:
     # Open PRs are today's set, so their ages are measured from now, never from --through: a past
     # --through would give a PR opened after it a negative age.
     now = dt.datetime.now(dt.UTC)
-    ages = [(now - _parse_stamp(r["createdAt"])).total_seconds() / 86400 for r in rows]
+    ages = [(now - parse_stamp(r["createdAt"])).total_seconds() / 86400 for r in rows]
     oldest = round(max(ages), 1) if ages else None
     detail: dict[str, Any] = {
         "open_prs": len(rows),
@@ -704,13 +711,13 @@ def c_flow_health(ctx: Context, m: Metric) -> None:
     # The merged-PR read feeds only the time-to-merge fields, so its failure nulls those alone.
     try:
         hours = [
-            (_parse_stamp(r["mergedAt"]) - _parse_stamp(r["createdAt"])).total_seconds() / 3600
+            (parse_stamp(r["mergedAt"]) - parse_stamp(r["createdAt"])).total_seconds() / 3600
             for r in merged_prs(ctx, ENGINE_REPO)
             if r.get("mergedAt") and r.get("createdAt")
         ]
         detail["median_open_to_merge_hours"] = round(statistics.median(hours), 1) if hours else None
         detail["merged_prs_measured"] = len(hours)
-    except (CollectError, ValueError, TypeError) as exc:
+    except (CollectError, ValueError, TypeError, KeyError, AttributeError) as exc:
         add_partial(detail, f"merged PRs: {type(exc).__name__}: {exc}")
 
     stalled: int | None = None
@@ -853,7 +860,8 @@ def c_asvs(ctx: Context, m: Metric) -> None:
     if engine_ref is None:
         # A score is quoted only beside its ref pair; without the engine half it cannot be.
         add_partial(m.detail, "scorecard provenance printed no engine= ref")
-    elif "NO-GIT" in engine_ref or engine_ref.endswith("+status-unknown"):
+    elif "NO-GIT" in engine_ref or engine_ref.endswith(("+status-unknown", "+dirty")):
+        # +dirty is a measurement against uncommitted changes: not reproducible from the ref.
         add_partial(
             m.detail, f"scorecard provenance names no attributable ref: engine={engine_ref}"
         )
@@ -1073,7 +1081,8 @@ SPECS: tuple[Spec, ...] = (
         "CI on main",
         "How often does the engine's CI pass on main?",
         "percent",
-        f"gh run list -R {ENGINE_REPO} --branch main --workflow ci.yml --json conclusion,createdAt; "
+        f"gh run list -R {ENGINE_REPO} --branch main --workflow ci.yml --event push "
+        "--json conclusion,createdAt; "
         "gh pr list --label ci-red",
         c_ci_main,
     ),

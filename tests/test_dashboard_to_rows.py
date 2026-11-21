@@ -219,6 +219,10 @@ def test_main_rejects_an_unreadable_snapshot(
 
 
 def test_real_guard_refuses_this_checkout(tmp_path: Path) -> None:
+    # The refusal is the inside-a-repo answer, not a fail-closed "cannot tell".
+    here = Path(__file__).resolve().parent
+    reason = tr._collector().refuse_dir_reason(tr._nearest_existing(here / "no-such-dir"))
+    assert reason is not None and "rev-parse said 'true'" in reason
     src = tmp_path / "snap.json"
     src.write_text(json.dumps(_snapshot()), encoding="utf-8")
     assert tr.main([str(src), str(Path(__file__).resolve().parent / "no-such-dir")]) == 1
@@ -268,3 +272,23 @@ def test_a_write_failure_exits_1(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     out = tmp_path / "o"
     (out / "series.json").mkdir(parents=True)  # a directory where a file must go
     assert tr.main([str(src), str(out)]) == 1
+
+
+def test_fact_rows_carry_the_reason_for_a_null() -> None:
+    snap = _snapshot()
+    snap["metrics"][4]["detail"]["kpis"] = {"row": {"dep_mttr_days": "n/a: no merged PRs"}}
+    rows = _rows(snap)
+    assert rows["dependency_vulns.dep_mttr_days"]["error"] == "n/a: no merged PRs"
+    assert rows["release_distance.pypi_version"]["error"] == "GET failed"
+    assert rows["backlog_burn.open_total"]["error"] is None
+
+
+def test_unresolved_week_marks_the_newest_partial() -> None:
+    snap = _snapshot()
+    for m in snap["metrics"]:
+        m["detail"].pop("value_week", None)
+    del snap["through"]
+    rows = tr.series_rows(tr.Snapshot(snap))
+    assert all(r["partial"] == (r["week"] == "2026-W47") for r in rows)
+    snap["weeks"] = []
+    assert tr.Snapshot(snap).last_full_week is None  # no IndexError

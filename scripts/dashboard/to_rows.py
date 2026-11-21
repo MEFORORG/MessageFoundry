@@ -99,7 +99,7 @@ class Snapshot:
             through = dt.date.fromisoformat(str(self.data["through"]))
             made = dt.datetime.fromisoformat(str(self.data["generated_at"])).date()
             week = _collector().last_full_week(through, self.weeks, made)
-        except (KeyError, ValueError, _collector().CollectError):
+        except (KeyError, ValueError, IndexError, _collector().CollectError):
             return None
         return str(week)
 
@@ -129,7 +129,10 @@ def _critical_high(d: dict[str, Any]) -> int | None:
     sev = d.get("open_by_severity")
     if not isinstance(sev, dict):
         return None
-    return int(sev.get("critical") or 0) + int(sev.get("high") or 0)
+    try:
+        return int(sev.get("critical") or 0) + int(sev.get("high") or 0)
+    except (TypeError, ValueError):
+        return None
 
 
 def _uploaded_day(d: dict[str, Any]) -> str | None:
@@ -173,7 +176,7 @@ def facts(weeks: int) -> list[Fact]:
         (
             "dependency_vulns",
             "dep_mttr_days",
-            "Mean days to patch",
+            "Median days to merge a security PR",
             lambda d: finite_float(_dict(_dict(d.get("kpis")).get("row")).get("dep_mttr_days")),
         ),
         ("release_distance", "pypi_version", "Latest release", _key("pypi_version")),
@@ -206,25 +209,33 @@ def metric_rows(snap: Snapshot) -> list[dict[str, Any]]:
     for mid, key, label, read in facts(len(snap.weeks)):
         if mid not in snap.by_id:
             continue
+        value = read(snap.detail(mid))
+        # A null fact carries its metric's reason, so a dashboard showing it alone is not mute.
+        reason = None if value is not None else error(snap.by_id[mid])
+        if value is None and key == "dep_mttr_days":
+            raw = _dict(_dict(snap.detail(mid).get("kpis")).get("row")).get(key)
+            reason = reason or (raw if isinstance(raw, str) and raw else None)
         rows.append(
             {
                 "id": f"{mid}.{key}",
                 "label": label,
                 "question": "",
-                "value": read(snap.detail(mid)),
+                "value": value,
                 "unit": "",
                 "status": "",
                 # An ASVS count is quoted only beside its ref pair, on every row that carries one.
                 "note": f"Measured at {asvs_pair(snap)}." if mid == "asvs" else "",
                 "source": snap.by_id[mid].get("source", ""),
-                "error": None,
+                "error": reason,
             }
         )
     return rows
 
 
 def series_rows(snap: Snapshot) -> list[dict[str, Any]]:
-    last_full = snap.last_full_week
+    # Unresolved, the window's newest week is the one that may be in progress: fail closed and
+    # mark it partial rather than plot it as complete.
+    last_full = snap.last_full_week or (snap.weeks[-2] if len(snap.weeks) >= 2 else "")
     rows: list[dict[str, Any]] = []
 
     def add(name: str, points: Any) -> None:
@@ -238,7 +249,7 @@ def series_rows(snap: Snapshot) -> list[dict[str, Any]]:
                     "week": week,
                     "value": p.get("value"),
                     # A week after the last complete one is still in progress.
-                    "partial": last_full is not None and week > last_full,
+                    "partial": week > last_full,
                 }
             )
 
