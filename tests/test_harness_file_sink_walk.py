@@ -26,7 +26,7 @@ from harness.scenarios._core import Scenario, _verify_sink, sink_faults
 from harness.scenarios.internal import TimerScenario
 from harness.scenarios.remotefile import RemoteFileScenario, verify_written
 from harness.sinks import Record, Sink
-from harness.sinks.file import ROOT_CHANGED, WALK_BOUND, FileSink
+from harness.sinks.file import ROOT_CHANGED, UNSAFE_NAME, WALK_BOUND, FileSink
 
 _BODY = b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|X1|P|2.5.1\r"
 _SECRET = b"MSH|^~\\&|S|S|S|S|20260101||ADT^A01|SECRET|P|2.5.1\r"
@@ -601,6 +601,15 @@ def test_sink_faults_quotes_a_link_name() -> None:
     assert "\n" not in note and "'a\\nb.hl7'" in note
 
 
+def test_sink_faults_names_a_refused_name_with_its_folder() -> None:
+    def refused(folder: str) -> Record:
+        meta = {"name": "nul", "folder": folder, "inside": "false", "refused": UNSAFE_NAME}
+        return Record(b"", meta)
+
+    note = sink_faults([refused("."), refused("sub/deeper")])
+    assert "('nul', 'sub/deeper/nul')" in note
+
+
 def test_verify_sink_stops_waiting_on_a_sink_fault() -> None:
     """A link in the sink fails the check whatever else arrives, so the wait ends there rather than
     running out the timeout."""
@@ -651,38 +660,6 @@ def test_a_root_read_fault_at_start_is_raised_with_its_error_not_logged_as_retri
     assert isinstance(raised.value.__cause__, PermissionError)
 
 
-@pytest.mark.parametrize("by_path", [False, True], ids=["native-walk", "by-path-walk"])
-def test_a_fault_that_clears_and_comes_back_is_logged_again(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
-    by_path: bool,
-) -> None:
-    """A fault found on every scan is logged once; one that clears and recurs is logged again,
-    rather than once for the sink's life."""
-    if by_path:
-        monkeypatch.setattr(file_sink, "_DIR_FD", False)
-    (tmp_path / "locked").mkdir()
-    locked = os.stat(tmp_path / "locked")
-    real_scandir = os.scandir
-    denied = [True]
-
-    def scandir(target: Any = ".") -> Any:
-        listed = os.fstat(target) if isinstance(target, int) else os.stat(target)
-        if denied[0] and os.path.samestat(listed, locked):
-            raise PermissionError(13, "denied")
-        return real_scandir(target)
-
-    with FileSink(tmp_path) as sink:
-        monkeypatch.setattr(os, "scandir", scandir)
-        with caplog.at_level(logging.WARNING, logger="harness.sinks.file"):
-            for state in (True, True, False, True):
-                denied[0] = state
-                sink.records()
-    said = [r.getMessage() for r in caplog.records if "cannot list a folder" in r.getMessage()]
-    assert len(said) == 2, said
-
-
 def test_a_root_with_a_file_id_where_start_found_none_is_reported_changed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -720,8 +697,9 @@ def test_a_swap_is_read_again_through_the_held_folder(
     """``a.hl7`` is replaced by another file between its ``lstat`` and its open. The entry is
     ``lstat``-ed again relative to the held folder, never by its full path."""
     target, other = tmp_path / "a.hl7", tmp_path / "b.tmp"
-    real_open, real_lstat = os.open, os.lstat
+    real_open, real_stat, real_lstat = os.open, os.stat, os.lstat
     fired: list[bool] = []
+    again: list[bool] = []
 
     def open_(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
         if _named(path, "a.hl7") and not fired:
@@ -730,6 +708,13 @@ def test_a_swap_is_read_again_through_the_held_folder(
             other.replace(target)
         return real_open(path, flags, *args, **kwargs)
 
+    def stat_(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if _named(path, "a.hl7"):
+            assert kwargs.get("dir_fd") is not None, "the entry was stat-ed by its full path"
+            if fired:
+                again.append(True)
+        return real_stat(path, *args, **kwargs)
+
     def lstat_(path: Any, *args: Any, **kwargs: Any) -> Any:
         assert not _named(path, "a.hl7"), "the entry was lstat-ed again by its full path"
         return real_lstat(path, *args, **kwargs)
@@ -737,11 +722,13 @@ def test_a_swap_is_read_again_through_the_held_folder(
     with FileSink(tmp_path) as sink:
         target.write_bytes(_BODY)
         monkeypatch.setattr(os, "open", open_)
+        monkeypatch.setattr(os, "stat", stat_)
         monkeypatch.setattr(os, "lstat", lstat_)
         assert sink.records() == []  # not the file its lstat saw: retried
         monkeypatch.undo()
         records = sink.records()
     assert fired, "the hook never fired: the swap was not staged"
+    assert again, "the entry was never stat-ed again after the swap: the test proves nothing"
     assert [r.payload for r in records] == [_LATER]
 
 

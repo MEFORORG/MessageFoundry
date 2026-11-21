@@ -9,9 +9,11 @@ identity, file type, size and modification time, and a file that changes while i
 recorded once it settles, not twice. The scan enters only what ``lstat`` reads as a plain
 directory, never a link or a junction, except in the Windows folder-swap race this module names
 as open, and records each file's path relative to it
-(``meta["relpath"]``) and whether its resolved path, symlinks followed, stays inside it
-(``meta["inside"]``). A link that cannot be resolved strictly (a loop, a dangling link, a race) is
-recorded as not inside, never as inside. A file written OUTSIDE the directory is not looked for
+(``meta["relpath"]``) and whether it stays inside it (``meta["inside"]``): for a link, whether its
+resolved path, symlinks followed, does; for a file the walk reached through held folder handles,
+true, since each folder on the way was opened relative to its parent; for a file the by-path walk
+read, whether its folder's resolved path does. A link that cannot be resolved strictly (a loop, a
+dangling link, a race) is recorded as not inside, never as inside. A file written OUTSIDE the directory is not looked for
 here; a scenario that tests for an escape must look where it would land, and a link the sink
 records unread carries no control id, so a scenario must check ``meta["symlink"]`` itself.
 
@@ -46,9 +48,8 @@ directory reads as an escape, not as nothing. A listed name that :func:`_unsafe_
 is never joined onto its folder: it is recorded once, unread, with the :data:`UNSAFE_NAME` reason,
 its folder's relative path (``meta["folder"]``) and no ``path`` or ``relpath``. A folder that cannot
 be listed, an entry that cannot be ``lstat``-ed and a file that cannot be opened are logged at
-WARNING, once per entry and kind of fault while every scan finds it again (one that clears and
-comes back is logged again), and retried on the next scan; an entry gone before its ``lstat`` is
-skipped unlogged. The log names no listed entry, since a File outbound can render a
+WARNING, once per entry and kind of fault for the sink's life, and retried on the next scan; an
+entry gone before its ``lstat`` is skipped unlogged. The log names no listed entry, since a File outbound can render a
 name from HL7 fields: only the kind of fault and the OS error number.
 """
 
@@ -193,11 +194,8 @@ class FileSink(Sink):
         self._seen_unsafe: set[tuple[Path, str]] = set()
         #: Scan-wide refusals (:data:`ROOT_CHANGED`, :data:`WALK_BOUND`) already recorded.
         self._reported: set[str] = set()
-        #: The faults the last scan found, and those this scan has found so far: a fault that
-        #: persists is logged once, not on every poll, and one that clears and comes back is
-        #: logged again.
+        #: What has been logged, so a fault that persists is logged once, not on every poll.
         self._warned: set[tuple[str, Path]] = set()
-        self._warning: set[tuple[str, Path]] = set()
         #: The sink directory's ``(st_dev, st_ino)`` as :meth:`start` found it.
         self._root_id: tuple[int, int] | None = None
         #: Whether :meth:`start` has finished, and whether its first scan is running.
@@ -236,14 +234,11 @@ class FileSink(Sink):
             self._report(WALK_BOUND)  # files past the bound were not taken as already there
 
     def _warn(self, kind: str, where: Path, message: str, *args: object) -> None:
-        """Log ``message`` at WARNING once per ``(kind, where)`` while the fault is found on every
-        scan; ``where`` itself is not logged."""
-        key = (kind, where)
-        if key in self._warning:
+        """Log ``message`` at WARNING once per ``(kind, where)``; ``where`` itself is not logged."""
+        if (kind, where) in self._warned:
             return
-        self._warning.add(key)
-        if key not in self._warned:
-            _log.warning(message, *args)
+        self._warned.add((kind, where))
+        _log.warning(message, *args)
 
     def _matches(self, path: Path) -> bool:
         """Whether ``path`` matches :attr:`pattern`, relative to the directory. Right-anchored, so
@@ -270,8 +265,6 @@ class FileSink(Sink):
         junction included, is a candidate whatever its name and is not entered. A path gone
         before its ``lstat``, or a folder gone before it is listed, is left out: nothing is there
         to record or to ignore."""
-        # A fault the last scan found need not be logged again by this one; any other fault is.
-        self._warned, self._warning = self._warning, set()
         scan = _Scan()
         if _DIR_FD:
             try:
@@ -349,7 +342,7 @@ class FileSink(Sink):
             if self._started:
                 return identity is None
             self._root_id = identity
-        return identity is None or self._root_id is None or identity == self._root_id
+        return identity is None or identity == self._root_id
 
     def _walk(self, held: int | Path, folder: Path, depth: int, visit: _Visit, scan: _Scan) -> bool:
         """List ``folder``, held as a directory handle where the OS has ``dir_fd`` and by its path
@@ -519,9 +512,9 @@ class FileSink(Sink):
     def _inside(self, path: Path, link: bool, root: Path, by_handle: bool) -> bool:
         """Whether ``path`` resolves inside ``root``; False where that cannot be shown. A link is
         resolved strictly, so a loop or a dangling link is not inside. A file the walk reached
-        through held folder handles (``by_handle``) is inside: each folder on the way was opened
-        relative to its parent, never through a link, down from the directory :meth:`start`
-        found. A file the by-path walk read is judged by its folder, which the walk reached
+        through held folder handles (``by_handle``, given only where the root's file id showed it
+        is the directory :meth:`start` found) is inside: each folder on the way was opened
+        relative to its parent, never through a link. A file the by-path walk read is judged by its folder, which the walk reached
         through what ``lstat`` read as plain directories, so a file that vanishes after its read
         is not mistaken for an escape. Where the walk lists by path (Windows), a folder swapped for
         a link and back during the scan defeats this check: the open race in the module
@@ -549,7 +542,10 @@ class FileSink(Sink):
         #: remembered only together with its record, so a scan that ends early loses neither.
         found: list[tuple[Path, _Signature, Record]] = []
 
-        by_handle = _DIR_FD  # read once, as _scan reads it, so each record is judged by its walk
+        # Read once, as _scan reads _DIR_FD, so each record is judged by the walk that found it.
+        # Without the root's file id the handle walk cannot show its root is the directory start()
+        # found (an ancestor may have been swapped for a link), so files are judged by path then.
+        by_handle = _DIR_FD and self._root_id is not None
 
         def visit(path: Path, st: os.stat_result, opener: _Opener, again: _Restat) -> None:
             signature = _signature(st)

@@ -295,11 +295,22 @@ def _verify_sink(
     return ScenarioResult(scenario, got >= wanted, detail)
 
 
+def record_where(record: sinks.Record) -> str:
+    """Where a sink record says its entry is: its ``relpath``; or, for a name the file sink refused
+    before joining it, that name under its ``meta["folder"]``; or its bare name."""
+    meta = record.meta
+    if "relpath" in meta:
+        return meta["relpath"]
+    name = meta.get("name", "?")
+    folder = meta.get("folder")
+    return name if folder in (None, ".") else f"{folder}/{name}"
+
+
 def sink_faults(records: Iterable[sinks.Record]) -> str:
     """A failure note naming the records a sink took as a link (``meta["symlink"]``), the other
     entries the file sink recorded unread (a FIFO or device, a refused name, an over-cap file), its
-    scan-wide refusals (a replaced directory, a bounded scan), and any file it read whose path
-    resolves outside its directory (``meta["inside"]`` false), or "" when there are none. An unread
+    scan-wide refusals (a replaced directory, a bounded scan), and any file it read and recorded as
+    not inside its directory (``meta["inside"]`` false), or "" when there are none. An unread
     entry carries no control id, a scan that did not cover the directory may have missed a link,
     and a file read from outside the directory may carry any control id: each would otherwise be
     invisible to a check that counts control ids. Names are quoted with ``repr``, since a File
@@ -311,7 +322,7 @@ def sink_faults(records: Iterable[sinks.Record]) -> str:
     outside: list[str] = []
     for r in records:
         refused = r.meta.get("refused")
-        where = r.meta.get("relpath", r.meta.get("name", "?"))
+        where = record_where(r)
         if r.meta.get("symlink") == "true":
             links.append(where)
         elif refused in (NOT_REGULAR, file_sink.UNSAFE_NAME):
