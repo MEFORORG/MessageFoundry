@@ -9,7 +9,7 @@ from collections.abc import Callable, ItemsView
 
 import pytest
 
-from messagefoundry.parsing import HL7PeekError, Message, Peek, _builtin_hl7
+from messagefoundry.parsing import Message, Peek, _builtin_hl7
 
 ADT = (
     "MSH|^~\\&|SENDAPP|SENDFAC|RECVAPP|RECVFAC|20260101||ADT^A01^ADT_A01|MSG1|P|2.5.1\r"
@@ -326,33 +326,70 @@ def test_an_inner_msh_naming_other_delimiters_does_not_steer_a_write() -> None:
     assert again["PID-3.2"] == "Y"
 
 
-def test_a_filled_default_that_is_already_a_separator_is_refused_at_parse() -> None:
-    """A short MSH-2 whose filled default is already another separator would make two structures
-    one character, so a component join would read back as a field or a repetition. The parse
-    refuses it, at the listener's ``Peek.parse`` too (BACKLOG #5972)."""
-    for raw in (
-        "MSH^^A^B^C^D^20260101^^ADT^A01^M1^P^2.5\rPID^1^^111^^DOE\r",
-        "MSH|~|A|B\rPID|1||111\r",
-        "MSH|^~&|A|B\rPID|1||111\r",
+#: Short MSH-2s whose filled default is already another of their separators: ``^`` is the field
+#: separator and the default component one; ``~`` is the declared component separator and the
+#: default repetition one; ``&`` is the declared escape and the default subcomponent separator.
+_COLLIDING = (
+    "MSH^^A^B^C^D^20260101^^ADT^A01^M1^P^2.5\rPID^1^^111^^DOE\r",
+    "MSH|~|A|B\rPID|1||111\r",
+    "MSH|^~&|A|B\rPID|1||111\r",
+)
+
+
+@pytest.mark.parametrize("raw", _COLLIDING)
+def test_a_filled_default_that_is_already_a_separator_reads_but_is_not_written(raw: str) -> None:
+    """A short MSH-2 whose filled default is already another separator makes two structures one
+    character, so a value joined on one would read back as the other. The parse accepts it, as
+    ``Peek.parse`` does, so a read, a route and an ACK see what the sender sent; every ``Message``
+    write that would join on those separators refuses it (BACKLOG #5972)."""
+    assert Peek.parse(raw).field("PID-1") == "1"
+    m = Message.parse(raw)
+    assert m.field("PID-1") == "1"
+    assert m.encode() == raw
+    for write in (
+        lambda: m.set("PID-5.2", "JANE"),
+        lambda: m.set_data("PID-5", "JANE"),
+        lambda: m.set("PID-5", "JANE"),
+        lambda: m.set("MSH-2", m.field("MSH-2") or ""),
+        lambda: m.add_repetition("PID-3", "222"),
+        lambda: m.add_segment("NTE|1"),
     ):
-        with pytest.raises(HL7PeekError, match="a default filled in for one"):
-            Message.parse(raw)
-        with pytest.raises(HL7PeekError, match="a default filled in for one"):
-            Peek.parse(raw)
-    # The control: a short MSH-2 whose filled defaults are new characters still parses.
-    assert Message.parse(_PARSER_FILLED["short-msh-2"])["PID-3.1"] == "111"
+        with pytest.raises(ValueError, match="a default filled in for one"):
+            write()
+    assert m.encode() == raw
+    # The control: a short MSH-2 whose filled defaults are new characters is written.
+    plain = Message.parse(_PARSER_FILLED["short-msh-2"])
+    plain.set("PID-5.2", "JOHN")
+    assert Message.parse(plain.encode())["PID-5.2"] == "JOHN"
 
 
 def test_a_short_msh_2_may_be_completed_to_the_characters_the_parser_filled() -> None:
     """The header can be made to declare the delimiters the body is written in; any other
     completion would move one, and stays refused."""
     m = Message.parse(_PARSER_FILLED["short-msh-2"])
-    with pytest.raises(ValueError, match="holds the message's delimiters"):
+    # The refusal names the completion it would have taken (R2-8 of the round-2 review).
+    with pytest.raises(ValueError, match="holds the message's delimiters.*complete it to"):
         m.set("MSH-2", "^~#&")
     m.set("MSH-2", "^~\\&")
     again = Message.parse(m.encode())
     assert again["MSH-2"] == "^~\\&"
     assert again.repetitions("PID-3.1") == ["111", "222"]
+
+
+@pytest.mark.parametrize("edit", ["clear", "delete"])
+def test_a_group_edit_cannot_remove_an_msh_and_a_refusal_changes_nothing(edit: str) -> None:
+    """R2-4 of the round-2 review: in a BHS-led message the MSH sits past position 0, so a
+    ``groups("BHS")`` edit removed it, and ``delete`` removed the later rows before position 0
+    raised. Every row is now checked first, and an MSH is refused as ``delete_segments`` refuses
+    it (BACKLOG #5972)."""
+    m = Message.parse("BHS|^~\\&|A\rMSH|^~\\&|A|B\rPID|1\rOBX|1\r")
+    before = m.encode()
+    with pytest.raises(ValueError, match="refusing to delete the MSH segment"):
+        getattr(m.groups("BHS")[0], edit)()
+    assert m.encode() == before
+    # The control: a group with no MSH in it still clears and deletes.
+    obr = Message.parse("MSH|^~\\&|A|B\rOBR|1\rOBX|1\rOBR|2\rOBX|2\r")
+    assert getattr(obr.groups()[0], edit)() == (1 if edit == "clear" else 2)
 
 
 @pytest.mark.parametrize("header", ["BHS", "FHS"])

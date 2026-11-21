@@ -136,8 +136,10 @@ _Reading = tuple[str, ...]
 
 
 def _parser_reading(head: str) -> _Reading:
+    # The write read: the BHS is a write of the head's delimiters, so a head whose short MSH-2
+    # fills a default it already uses is refused as any write to it is (BACKLOG #5972).
     try:
-        return Message.parse(head)._encoding_chars()
+        return Message.parse(head)._write_encoding_chars()
     except ValueError as exc:  # HL7PeekError is one
         return type(exc).__name__, str(exc)
 
@@ -166,6 +168,8 @@ def _batch_reading(head: str) -> _Reading:
         "MSH\r",
         "MSH|^~\r",
         "MSH|^~|A|B\r",
+        "MSH|~|A|B\r",  # a filled default the head already uses, refused as a write
+        "MSH^^A^B\r",
         "MSH|",
         "not an HL7 message",
         "\N{ZERO WIDTH NO-BREAK SPACE}" + M1,  # a byte order mark, which the parser refuses
@@ -177,6 +181,14 @@ def test_the_head_separators_match_the_parser(head: str) -> None:
     # The contract Message._encoding_chars kept: the separators it reads, or a refusal rather than
     # a guess.
     assert _batch_reading(head) == _parser_reading(head)
+
+
+def test_a_message_head_whose_filled_default_collides_is_refused() -> None:
+    # The BHS writes the head's delimiters, so a parsed head is refused as a str head is.
+    head = Message.parse("MSH|~|A|B\rPID|1\r")
+    with pytest.raises(ValueError, match="a default filled in for one"):
+        encode_batch([head], control_id="1", timestamp=_TS)
+    assert encode_batch([Message.parse(M1)], control_id="1", timestamp=_TS).startswith("BHS|")
 
 
 #: A head whose escapes could expand past the parser's budget (ASVS 1.3.3).

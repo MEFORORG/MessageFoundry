@@ -122,8 +122,10 @@ an hl7apy tree; the two trees stay disjoint, sharing only `normalize()` + MSH se
   (`ValueError` XFORM-2/3 if undeterminable). *(Note 2026-11-20, vault BACKLOG #5972: reads and
   writes now use the delimiters the parser recorded from the first line, MSH, BHS or FHS, with a
   short MSH-2 filled by the defaults, so nothing is undeterminable once the parse accepts the
-  message. The parse now also refuses a short MSH-2 whose filled default is already another of
-  its separators, as `HL7PeekError` at `Peek.parse` and `Message.parse` alike.)*
+  message. The parse still accepts a short MSH-2 whose filled default is already another of its
+  separators, such as `MSH|~|`, so `Peek` and every read see it as the sender sent it; a
+  `Message` write that would join a value on those separators (`set`, `set_data`,
+  `add_repetition`, `add_segment`) raises `ValueError` there instead.)*
 - `SegmentGroup` (from `Message.groups()`): `boundary`, `ordinal` (re-indexes after delete; stale view →
   `LookupError`), `segment_ids`, `__len__`, `count`, `field`, `append_segment`, `clear`, `delete`,
   `rebuild`; `DEFAULT_BOUNDARY='OBR'`; `groups_of` raises `ValueError` on `boundary='MSH'`.

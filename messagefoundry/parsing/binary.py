@@ -39,7 +39,9 @@ from messagefoundry.parsing._builtin_hl7 import (
     _SEPARATOR_HEAD,
     HEADER_IDS,
     _extract_separators,
+    _field_text,
     _whitespace_end,
+    escape_leaf,
     escape_leaf_alters,
 )
 
@@ -100,6 +102,7 @@ __all__ = [
     "EscapedDocumentError",
     "InboundDocRefError",
     "NonVerbatimDocumentError",
+    "CollidingDelimitersError",
     "Base64DelimiterError",
     "UnreattachableDocumentError",
     "encode",
@@ -172,6 +175,15 @@ class NonVerbatimDocumentError(ValueError):
     sender's. Refused at the detach, before anything is stored and before the ACK, as
     :class:`EscapedDocumentError` is. The text names the OBX occurrence only, never a byte of the
     value."""
+
+
+class CollidingDelimitersError(NonVerbatimDocumentError):
+    """A received body has a document to detach, and its header names too few encoding
+    characters while a default filled in for one is already another of its delimiters, as
+    ``MSH|~|`` does (BACKLOG #5972). ``Message`` refuses every write to such a message, so the
+    detach could not set its handle in, nor delivery set the document back. Refused at the detach,
+    before anything is stored and before the ACK. A subclass of :class:`NonVerbatimDocumentError`,
+    so both listeners refuse it the same way. The text names no byte of the body."""
 
 
 class Base64DelimiterError(InboundDocRefError):
@@ -366,15 +378,26 @@ def is_doc_ref(value: str) -> bool:
 #: raw text (BACKLOG #5099).
 _DOC_REF_MARKER_CHARS = frozenset(DOC_REF_MARKER)
 
-#: The first MSH segment after a batch header. A Handler can wrap an MSH-led payload in an
-#: FHS or BHS envelope of other delimiters; the MSH's own then escaped the handle.
-_FIRST_MSH = re.compile(r"[\r\n]MSH")
+#: A header line after the first. A Handler can wrap an MSH-led payload in an FHS or BHS
+#: envelope of other delimiters, or nest a BHS in an FHS, and any of those headers' own may then
+#: have escaped the handle.
+_LATER_HEADER = re.compile(r"[\r\n](?:MSH|BHS|FHS)")
+
+#: A segment break, where the parser's read of a header line ends.
+_LINE_END = re.compile(r"[\r\n]")
 
 #: The re-attach's refusal of a payload whose later header names other delimiters than its
 #: first line, and holds the handle marker as those escape it (BACKLOG #5972).
 _MIXED_HEADER_HANDLE = (
     "a header after the first names other delimiters, and the payload holds the document "
     "handle marker as they escape it, so the re-attach cannot read that handle"
+)
+
+#: The re-attach's refusal of a handle in a payload whose header fills a delimiter it does not
+#: name with one it already uses: no write to it can be read back (BACKLOG #5972).
+_COLLIDING_HANDLE = (
+    "the payload's header fills a delimiter it does not name with one it already uses, so a "
+    "document cannot be set back"
 )
 
 #: The re-attach's refusal of a handle marker the splice did not resolve (BACKLOG #5099).
@@ -438,31 +461,31 @@ def may_hold_doc_ref(text: str) -> bool:
     or BHS header names a character of the marker in its fields 1 and 2: there an engine handle
     written into ``OBX-5.5`` is escaped, so the raw text never holds the marker, and a substring
     test alone let the handle reach the wire unresolved. ``Message.set`` escapes by the delimiters
-    the parser read from that first line (BACKLOG #5972), but a payload led by an FHS or BHS
-    envelope may wrap an MSH-led message written under its own, so for such a payload the first
-    MSH is checked as well; the re-attach refuses a marker escaped by it. A handle hidden by
+    the parser read from that first line (BACKLOG #5972), but a payload may wrap a message, or a
+    batch, written under its own header's delimiters, so every later MSH, BHS or FHS line is
+    checked as well; the re-attach refuses a marker escaped by one of them. A handle hidden by
     any other escape cannot be the engine's, which escapes only the delimiters, so it is the
     sender's text and resolves nothing unless the gate opens for another reason, where the
     re-attach parses it and resolves it only to an attachment the message holds. False otherwise."""
     if DOC_REF_MARKER in text:
         return True
     lead = _whitespace_end(text, 0, len(text))
-    head = text[lead : lead + 3]
-    if head == "MSH":
-        return _header_names_marker_char(text, lead)
-    if head not in ("FHS", "BHS"):
+    if text[lead : lead + 3] not in HEADER_IDS:
         return False
     if _header_names_marker_char(text, lead):
         return True
-    first_msh = _FIRST_MSH.search(text, lead)
-    return first_msh is not None and _header_names_marker_char(text, first_msh.start() + 1)
+    return any(
+        _header_names_marker_char(text, later.start() + 1)
+        for later in _LATER_HEADER.finditer(text, lead)
+    )
 
 
 def _header_names_marker_char(text: str, start: int) -> bool:
     """Whether the MSH, FHS or BHS segment at ``start`` names a character of the marker as a
     separator or the escape character, read as the parser reads them (its defaults fill a short
-    MSH-2, which only opens the gate wider)."""
-    line = text[start : start + _SEPARATOR_HEAD]
+    MSH-2, which only opens the gate wider). The read stops at the end of that line, as the
+    parser's does, so no separator is taken from the next line."""
+    line = _LINE_END.split(text[start : start + _SEPARATOR_HEAD], maxsplit=1)[0]
     if len(line) < 4:
         return False
     return not _DOC_REF_MARKER_CHARS.isdisjoint(_extract_separators(line))
@@ -608,6 +631,12 @@ def iter_obx_documents(
             value_holds_marker = value_holds_marker or holds_marker
             if alters and altered is None:
                 altered = occ
+    if documents and message._delimiters_collide():
+        raise CollidingDelimitersError(
+            "the header fills a delimiter it does not name with one it already uses, so the "
+            "message cannot be written and a detached document could not be set back; refusing "
+            "the detach"
+        )
     if documents and _delimits_with_base64(message._encoding_chars()):
         raise Base64DelimiterError(
             "a delimiter of the body is a base64 character, so a detached document could not be "
@@ -847,21 +876,20 @@ def _later_header_escapes_marker(
     Handler wrote under an inner MSH's own, then wrapped in an envelope of others, would not be
     read as one and would reach the wire unresolved. Reads the parsed fields only, never a
     slice of the raw text."""
-    # Local import, as reattach_documents_in_hl7 does: message.py imports this module.
-    from messagefoundry.parsing.message import Message as _Message
-
-    escaped_here = _Message._escape_leaf(DOC_REF_MARKER, *separators)
-    seen: dict[str, int] = {}
-    for index, seg_id in enumerate(message.segments()):
-        seen[seg_id] = seen.get(seg_id, 0) + 1
-        if index == 0 or seg_id not in HEADER_IDS:
+    field, comp, rep, esc, sub = separators
+    escaped_here = escape_leaf(DOC_REF_MARKER, (field, comp, rep, sub, esc))
+    # One pass over the parsed segments: a header line is split eagerly, so its fields 1 and 2
+    # are read in place, with no per-header occurrence scan.
+    for segment in message._m["segments"][1:]:
+        seg_id = segment["id"]
+        if seg_id not in HEADER_IDS:
             continue
-        field_sep = message._raw_field(seg_id, 1, seen[seg_id])
-        encoding = message._raw_field(seg_id, 2, seen[seg_id])
-        if len(field_sep) != 1:
-            continue
-        f, c, r, sub, esc = _extract_separators(seg_id + field_sep + encoding + field_sep)
-        escaped = _Message._escape_leaf(DOC_REF_MARKER, f, c, r, esc, sub)
+        fields = segment["fields"]
+        encoding = _field_text(fields[2]) if len(fields) > 2 else ""
+        field_sep = _field_text(fields[1])
+        escaped = escape_leaf(
+            DOC_REF_MARKER, _extract_separators(seg_id + field_sep + encoding + field_sep)
+        )
         if escaped not in (DOC_REF_MARKER, escaped_here) and escaped in text:
             return True
     return False
@@ -977,6 +1005,9 @@ async def reattach_documents_in_hl7(
         base64_delimited = _delimits_with_base64(separators)
         if found and base64_delimited:
             raise UnreattachableDocumentError(_BASE64_DELIMITED_HANDLE)
+        if found and message._delimiters_collide():
+            # Message refuses every write to such a payload, the splice included (BACKLOG #5972).
+            raise UnreattachableDocumentError(_COLLIDING_HANDLE)
         if _later_header_escapes_marker(message, text, separators):
             raise UnreattachableDocumentError(_MIXED_HEADER_HANDLE)
         markers = _marker_forms(separators)

@@ -158,6 +158,7 @@ from messagefoundry.parsing import (
 )
 from messagefoundry.parsing.binary import (
     Base64DelimiterError,
+    CollidingDelimitersError,
     DocRefError,
     EscapedDocumentError,
     InboundDocRefError,
@@ -10324,7 +10325,9 @@ class RegistryRunner:
         holds an HL7 escape (vault BACKLOG #2809),
         :class:`~messagefoundry.parsing.binary.InboundDocRefError` for a received handle or marker,
         and :class:`~messagefoundry.parsing.binary.NonVerbatimDocumentError` for a document
-        delivery's splice would not set back verbatim (BACKLOG #5099) — each, as one of
+        delivery's splice would not set back verbatim (BACKLOG #5099), its subclass
+        :class:`~messagefoundry.parsing.binary.CollidingDelimitersError` among them, for a body
+        whose short MSH-2 fills a delimiter with one it already uses (BACKLOG #5972) — each, as one of
         :data:`_DETACH_REFUSALS`, is turned
         into an ``ERROR``/NAK by the caller. The whole body is buffered once (accepted-by-design until the streaming decoder, ADR 0105
         Phase-C); the budget bounds how many such buffers can be concurrent."""
@@ -10703,6 +10706,9 @@ class RegistryRunner:
                 nak_code = _nak_code(_detach_refusal_kind(exc))
                 if isinstance(exc, EscapedDocumentError):
                     nak_text = "escaped document in OBX-5.5"
+                elif isinstance(exc, CollidingDelimitersError):
+                    # Checked before its base class: the header, not a document (BACKLOG #5972).
+                    nak_text = "MSH-2 default collides with a delimiter"
                 elif isinstance(exc, NonVerbatimDocumentError):
                     # A document's own value, which the splice would escape, not a marker.
                     nak_text = "OBX-5.5 document holds a delimiter or control"

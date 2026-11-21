@@ -259,7 +259,11 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   ERROR/retry/dead-letter path and **the connector never receives an un-hydrated handle** (which would
   deliver `mfdoc:v1:ref:…` into the partner's `OBX-5.5` = silent corruption).
 - **Which re-attach failures are permanent (vault BACKLOG #2809, added 2026-11-01).** At least
-  these are refused permanently: the payload does not parse as HL7. Each of these raises `UnreattachableDocumentError`, which `_hydrate_payload` turns into a
+  these are refused permanently: the payload does not parse as HL7; it holds a handle and its
+  short `MSH-2` fills a delimiter with one it already uses, so no write to it can be read back
+  (BACKLOG #5972); or a header line after the first names delimiters under which it holds the
+  marker escaped. Each of these raises `UnreattachableDocumentError`, which `_hydrate_payload`
+  turns into a
   permanent `NegativeAckError` (code `reattach`), so that row dead-letters alone, under either
   `internal_error` policy. On a batched outbound that member is dead-lettered alone and the rest of the
   batch goes out, provided every other member hydrates. A stored
@@ -337,7 +341,9 @@ and (B) a Handler that picks up a PDF, base64-encodes it, and builds a large MDM
   them, such as a non-base64 value holding `&` or a control character under `|^~\&`
   (`NonVerbatimDocumentError`), the same way. A body whose `MSH-2` is shorter than four
   characters is read, detached and re-attached under the delimiters the parser filled for it
-  (BACKLOG #5972); a body with no `MSH` never reaches the detach, since `Peek.parse` refuses it
+  (BACKLOG #5972), unless a default filled in is already another of its delimiters, as in
+  `MSH|^~&|`: `Message` refuses every write to such a body, so the detach refuses its document
+  the same way (`CollidingDelimitersError`, a `NonVerbatimDocumentError`); a body with no `MSH` never reaches the detach, since `Peek.parse` refuses it
   first. The re-attach refuses a stored value holding a
   delimiter the payload's `MSH-1` or `MSH-2` names after its read and before the splice, so a Handler that
   moved `MSH-1` or `MSH-2` after the detach dead-letters the row rather than send an altered document; a

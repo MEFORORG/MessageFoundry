@@ -835,6 +835,51 @@ async def test_an_envelope_around_an_msh_written_under_its_own_delimiters_is_ref
     assert await reattach_documents_in_hl7(plain, _no_read, bound=frozenset()) == plain
 
 
+def _escaped_handle_under(header: str, msh2: str = "^~\\&") -> str:
+    """``header`` and an MSH-led message under ``msh2``, parsed together, with an engine handle
+    set into ``OBX-5.5``: the handle is escaped by the first line's delimiters, which the parse
+    reads every line under. The marker is not in the result's raw text."""
+    msg = Message.parse(header + _hl7(_b64(10), msh2=msh2))
+    msg.set("OBX-5.5", make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application"))
+    encoded = msg.encode()
+    assert DOC_REF_MARKER not in encoded
+    return encoded
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        # A second MSH, past an ordinary first one, that escaped the handle.
+        "FHS|^~\\&|APP|FAC\r" + _hl7(_b64(10)) + _escaped_handle_under("", ":~\\&"),
+        # A BHS naming ":" inside an ordinary FHS, its own MSH ordinary.
+        "FHS|^~\\&|APP|FAC\r" + _escaped_handle_under("BHS|:~\\&|APP|FAC\r"),
+        # The same BHS after an ordinary MSH-led message.
+        _hl7(_b64(10)) + _escaped_handle_under("BHS|:~\\&|APP|FAC\r"),
+    ],
+    ids=["second-msh", "bhs-in-fhs", "bhs-after-msh"],
+)
+async def test_a_handle_escaped_under_any_later_header_opens_the_gate(payload: str) -> None:
+    """R2-3 of the round-2 review: the gate read only the leading header and the first MSH, so a
+    handle escaped under a later header passed it and reached the wire unresolved. Every header
+    line is now read, and the re-attach refuses the payload (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+
+    assert may_hold_doc_ref(payload)
+    with pytest.raises(UnreattachableDocumentError, match="a header after the first"):
+        await reattach_documents_in_hl7(payload, _no_read, bound=frozenset())
+
+
+def test_the_gate_reads_a_header_line_only_to_its_end() -> None:
+    """F13 of the round-1 review: a header's separator read stopped at eight characters, not at
+    the end of the line, so a short header took a separator from the next line, as the parser
+    never does."""
+    # "MSH|^~" then a line break: the parser fills "\\" and "&", neither a marker character; the
+    # next line's ":" is not a separator of this header.
+    assert not may_hold_doc_ref("MSH|^~\r:BC|1\r")
+    # The control: the same character inside the header line opens the gate.
+    assert may_hold_doc_ref("MSH|^:\rABC|1\r")
+
+
 async def test_a_hex_escaped_handle_cannot_offset_a_copy_left_live(store: MessageStore) -> None:
     """The copy guard compared marker counts, so a handle written with hex escapes, which the
     parser reads as a handle but the raw text does not hold as the marker, let one literal copy
@@ -1826,6 +1871,65 @@ async def test_a_streaming_short_msh2_body_is_detached_and_acked(store: MessageS
     assert _ack_code(await runner._handle_inbound(ic, body.encode("utf-8"))) == "AA"
     assert await _attachment_count(store) == 1
     assert await _ingress_count(store, ic.name) == 1
+
+
+async def test_a_short_msh2_document_is_spliced_back_byte_identical(store: MessageStore) -> None:
+    """F14 of the round-1 review: the partner gets the very short-MSH-2 body the sender sent,
+    the header left short, after the detach and the re-attach (BACKLOG #5972)."""
+    body = _hl7(_EVERY_BASE64_CHARACTER, msh2="^~\\")
+    ic = _streaming_ic()
+    runner = _runner(store, ic)
+    assert _ack_code(await runner._handle_inbound(ic, body.encode("utf-8"))) == "AA"
+    cur = await store._db.execute("SELECT raw FROM messages WHERE channel_id=?", (ic.name,))
+    row = await cur.fetchone()
+    assert row is not None
+    skeleton = str(row[0])
+    assert skeleton.startswith("MSH|^~\\|")
+    handle = Message.parse(skeleton).field("OBX-5.5") or ""
+    assert is_doc_ref(handle)
+    col = _Collector()
+    runner._destinations[DEST] = col  # type: ignore[assignment]
+
+    await _deliver_holding(store, runner, skeleton, parse_doc_ref(handle)[0])
+
+    assert col.deliveries == [body]
+
+
+#: A streaming body with a document whose MSH-2, ``^~&``, declares ``&`` as the escape character,
+#: which the parser also fills the subcomponent separator with, so no write to it can be read
+#: back. Its OBX-5 still reads as five components, so the document is found.
+_COLLIDING_MSH2_DOCUMENT = _hl7(_b64(2000), msh2="^~&")
+
+
+async def test_a_document_under_a_colliding_short_msh2_is_refused_before_anything_is_stored(
+    store: MessageStore,
+) -> None:
+    """The detach would have to write its handle into such a body, which ``Message`` refuses, so
+    the body is refused before the ACK with nothing stored, where it would otherwise store the
+    document and then fail on the write (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import CollidingDelimitersError
+
+    message = Message.parse(_COLLIDING_MSH2_DOCUMENT)
+    with pytest.raises(CollidingDelimitersError):
+        next(iter_obx_documents(message, received=_COLLIDING_MSH2_DOCUMENT))
+    ic = _streaming_ic()
+    runner = _runner(store, ic)
+    ack = await runner._handle_inbound(ic, _COLLIDING_MSH2_DOCUMENT.encode("utf-8"))
+    assert _ack_code(ack) == "AR"
+    assert ack is not None and "MSH-2 default collides with a delimiter" in ack
+    assert await _attachment_count(store) == 0
+    assert await _ingress_count(store, ic.name) == 0
+
+
+async def test_a_handle_under_a_colliding_short_msh2_is_refused_by_the_re_attach() -> None:
+    """A payload whose header leaves two delimiters one character cannot take the splice, so the
+    re-attach refuses it permanently rather than fail on the write (BACKLOG #5972)."""
+    from messagefoundry.parsing.binary import UnreattachableDocumentError, reattach_documents_in_hl7
+
+    handle = make_doc_ref(hashlib.sha256(b"x").hexdigest(), "Application")
+    payload = _hl7(handle, msh2="^~&")
+    with pytest.raises(UnreattachableDocumentError, match="fills a delimiter it does not name"):
+        await reattach_documents_in_hl7(payload, _no_read, bound=frozenset())
 
 
 async def test_an_ordinary_base64_document_is_detached_and_spliced_back_byte_identical(

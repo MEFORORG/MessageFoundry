@@ -267,7 +267,8 @@ an MSH-led body whose MSH-2 carries fewer than four encoding characters and on a
 body with no MSH (BACKLOG #2873 and #2874). BACKLOG #2873 first refused both by name in the OBX
 helpers; BACKLOG #5972 then made `Message._encoding_chars` read the delimiters the parser recorded
 from the first line, filling a short MSH-2 as the parser does, so every `Message` read and write
-now agrees with the parse and with `Peek.field`, and neither body is refused. The entries and the
+now agrees with the parse and with `Peek.field`, and neither body is refused. A write, not a
+read, is refused on a short MSH-2 whose filled default is already another of its delimiters. The entries and the
 carve-out in `_binary_carriage` are gone. Both reproducers stay on as `binary_carriage` seeds,
 so a regression to a bare `ValueError` cannot come back quietly.
 

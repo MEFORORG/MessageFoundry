@@ -193,21 +193,25 @@ class SegmentGroup:
         primitive, never string slicing."""
         start, end = self._span()
         # Everything after the boundary row, removed back-to-front so earlier positions don't shift.
-        removed = 0
-        for row in range(end - 1, start, -1):
-            self._m._delete_segment_at(row)
-            removed += 1
-        return removed
+        return self._delete_rows(range(end - 1, start, -1))
 
     def delete(self) -> int:
         """Remove the **entire** group, boundary included, returning the count removed — drop a whole
         order. After this the view is stale; calling another method raises :class:`LookupError`."""
         start, end = self._span()
-        removed = 0
-        for row in range(end - 1, start - 1, -1):
+        return self._delete_rows(range(end - 1, start - 1, -1))
+
+    def _delete_rows(self, rows: range) -> int:
+        """Delete ``rows``, back-to-front, through the parent's positional delete, and return how
+        many. Every row is checked first, so a refused one, such as the message's header or an
+        ``MSH`` inside a ``BHS`` group, leaves the message unchanged (BACKLOG #5972)."""
+        for row in rows:
+            refusal = self._m._positional_delete_refusal(row)
+            if refusal is not None:
+                raise refusal
+        for row in rows:
             self._m._delete_segment_at(row)
-            removed += 1
-        return removed
+        return len(rows)
 
     def rebuild(self, lines: list[str]) -> None:
         """Replace the group's **body** (non-boundary segments) with ``lines``, in order — the

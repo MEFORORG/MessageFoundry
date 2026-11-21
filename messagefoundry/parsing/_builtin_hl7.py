@@ -206,11 +206,6 @@ def _parse_msh(msh_line: str, seps: tuple[str, str, str, str, str]) -> Segment:
 
 _SHORT_HEADER = "message header is too short to read its encoding characters"
 
-_COLLIDING_DEFAULT = (
-    "message header names too few encoding characters, and a default filled in for one is already "
-    "another of its separators"
-)
-
 
 def filled_default_collides(line: str) -> bool:
     """Whether :func:`_extract_separators` fills a separator ``line`` does not declare with a
@@ -218,9 +213,10 @@ def filled_default_collides(line: str) -> bool:
     separator, and the default component separator) or ``MSH|~|...`` (``~`` is the declared
     component separator, and the default repetition separator) do. Every line is split on the
     first line's separators, so two structures would share one character and a write joining one
-    would read back as the other (BACKLOG #5972). A header that declares all four is never
-    judged here: it filled nothing, and what it repeats is its own (strict validation refuses
-    that)."""
+    would read back as the other (BACKLOG #5972). The parse accepts such a header, as ``Peek``
+    reads it, so a read sees what the sender sent; ``Message``'s writes refuse it. A header that
+    declares all four is never judged here: it filled nothing, and what it repeats is its own
+    (strict validation refuses that)."""
     sep0 = line[3]
     end = line.find(sep0, 4, _SEPARATOR_HEAD)
     declared = len(line[3 : end if end != -1 else _SEPARATOR_HEAD])
@@ -256,10 +252,6 @@ def parse(norm: str) -> ParsedMessage:
     # all. That is bad input, not a parser fault, so it is the same contract error (BACKLOG #1601).
     if len(lines[0]) < 5:
         raise HL7ParseError(_SHORT_HEADER)
-    # A filled default that is already another separator would make two structures one
-    # character, so a later write could not be read back as written (BACKLOG #5972).
-    if filled_default_collides(lines[0]):
-        raise HL7ParseError(_COLLIDING_DEFAULT)
     seps = _extract_separators(lines[0])
 
     field_sep = seps[0]
