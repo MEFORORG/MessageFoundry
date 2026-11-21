@@ -11812,11 +11812,13 @@ class MessageStore:
 
     async def get_secret_rotation_meta(self) -> dict[str, SecretRotationMetaRow]:
         """Every persisted secret-rotation watch record, keyed by ``secret_key`` (non-secret dates +
-        keyed-MAC fingerprints)."""
-        cur = await self._db.execute(
-            "SELECT secret_key, fingerprint, tracked_since, last_rotated FROM secret_rotation_meta"
-        )
-        rows = await cur.fetchall()
+        keyed-MAC fingerprints). Read through :meth:`_read`, like every other reader here, rather than
+        on the writer connection outside its lock (BACKLOG #5665)."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT secret_key, fingerprint, tracked_since, last_rotated FROM secret_rotation_meta"
+            )
+            rows = await cur.fetchall()
         return {
             r["secret_key"]: SecretRotationMetaRow(
                 secret_key=r["secret_key"],
