@@ -583,9 +583,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     # Both the command list and `support-bundle --help` print it.
     support_bundle_help = (
         "write a support zip to hand to support (#49). Its members: version.txt (the engine "
-        "version); manifest.json (at least the member list, the engine version, a generation "
+        "version); manifest.json (at least a list of the other members, the engine version, a generation "
         "time and the phi_contract); config-summary.json (counts/names only, holding no "
-        "secret); status.json (the metadata-only status models); and, when written, app-log.txt, "
+        "secret); status.json (from the metadata-only status models); and, when written, app-log.txt, "
         "a REDACTED app-log tail or an MF-BUNDLE-LOG-* code in its place. The tail's "
         "redaction is BEST-EFFORT, and values survive it: at least a single-token identifier such "
         "as an operator username and, on a non-production instance logging at DEBUG, a message "
@@ -613,7 +613,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--log-tail-lines",
         type=_non_negative_int,
         default=None,
-        help="most trailing app-log lines to include (redacted); default 500; 0 omits the app log",
+        help="at most this many trailing app-log lines are included (redacted), from at most the "
+        "last 4 MiB of the file; default 500; 0 omits the app log",
     )
 
     sub.add_parser(
@@ -13898,9 +13899,9 @@ def _verify(args: argparse.Namespace) -> int:
 
 
 def _support_bundle(args: argparse.Namespace) -> int:
-    """Write a support zip (#49) with :func:`messagefoundry.support.build_bundle`. The members and
-    the log-tail residual are stated in the argparse help above and the manifest's
-    ``phi_contract``; ``docs/PHI.md`` stream 14 is the record (BACKLOG #1475, #5385). The status
+    """Write a support zip (#49) with :func:`messagefoundry.support.build_bundle`. The argparse
+    help above names the members, the manifest's ``phi_contract`` states the log-tail residual, and
+    ``docs/PHI.md`` stream 14 is the record (BACKLOG #1475, #5385). The status
     snapshot + log tail come from the service settings, the config summary from ``--config``."""
     from pydantic import ValidationError
 

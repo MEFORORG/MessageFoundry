@@ -76,7 +76,8 @@ def _diagnostic(code: str, exc: BaseException) -> str:
       file in it could not be stat'd.
     * ``MF-BUNDLE-LOG-002`` -- the newest app-log file could not be read. With ``_LogFileRefused``
       it was, twice, no longer the plain regular file the listing saw when it was opened
-      (BACKLOG #5383).
+      (BACKLOG #5383). With ``_LogLineTooLong`` no whole line fit in the bytes the read takes
+      from the end of the file (BACKLOG #5385).
 
     A type name is a class defined in this project or the standard library, so it is bounded input; an
     exception's ``str()`` is not, and the bundle is a file an operator hands outside the environment."""
@@ -142,7 +143,7 @@ def status_snapshot(settings: ServiceSettings | None) -> dict[str, Any]:
     The engine isn't running under the CLI, so ``EngineInfo`` carries the version with a zero uptime /
     no live channel counts; ``DbInfo`` is read from the store the settings point at (when reachable).
     Metadata-only, the manifest ``phi_contract``'s term. ``db`` is null when ``settings`` is None
-    or the store cannot be opened; in the second case a ``db_error`` member holds a code instead of
+    or the store cannot be opened or read; in the second case a ``db_error`` member holds a code instead of
     raising (e.g. the DB is missing or in use), so the bundle still builds."""
     import os
 
@@ -237,6 +238,11 @@ class _LogFileRefused(OSError):
     module, so :func:`_diagnostic` reports it by its bounded name."""
 
 
+class _LogLineTooLong(OSError):
+    """No whole line of the app-log file fit in the bytes the read takes from its end, so the
+    tail would be empty although the file is not (BACKLOG #5385)."""
+
+
 def _is_plain_file(st: os.stat_result) -> bool:
     """A regular file with one name, that is not a symbolic link or junction.
 
@@ -303,6 +309,7 @@ def _read_log_file(path: Path, listed: os.stat_result) -> str:
             os.set_blocking(fd, True)
         # One byte before the bound is read too, so the line the bound cuts into can be told
         # from one it starts exactly at: that byte is a line break only in the second case.
+        truncated = opened.st_size > _LOG_TAIL_MAX_BYTES
         start = max(0, opened.st_size - _LOG_TAIL_MAX_BYTES - 1)
         os.lseek(fd, start, os.SEEK_SET)
         want = opened.st_size - start
@@ -316,11 +323,14 @@ def _read_log_file(path: Path, listed: os.stat_result) -> str:
     finally:
         os.close(fd)
     data = b"".join(chunks)
-    if start:
+    if truncated:
         # Drop through the first line break: what precedes it is the cut line, or nothing when
         # the bound starts exactly after it. A CRLF counts as one break.
-        breaks = [i for i in (data.find(b"\n"), data.find(b"\r")) if i >= 0]
-        cut = min(breaks) + 1 if breaks else len(data)
+        lf = data.find(b"\n")
+        cr = data.find(b"\r", 0, lf if lf >= 0 else len(data))
+        cut = (cr if cr >= 0 else lf) + 1
+        if cut == 0 or not data[cut:].strip(b"\r\n"):
+            raise _LogLineTooLong("no whole app-log line fits in the read bound")
         if data[cut - 1 : cut + 1] == b"\r\n":
             cut += 1
         data = data[cut:]
@@ -332,7 +342,7 @@ def _log_tail(log_dir: str | None, *, lines: int) -> str | None:
     """A redacted tail of an app-log file under ``log_dir``. ``None`` at least when no log dir is
     configured or ``lines`` is not positive (BACKLOG #5384: a slice by zero or a negative count
     would carry the whole file, or most of it). An :class:`OSError` from the listing or the read is
-    reported in the tail text as a code, not propagated.
+    not propagated.
 
     Only a plain regular file with one name is read: a link, a hard link or a special file with a
     log suffix is passed over (BACKLOG #5383), see :func:`_log_candidates` and

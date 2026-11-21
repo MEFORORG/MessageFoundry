@@ -128,7 +128,7 @@ def test_the_help_describes_status_as_the_phi_contract_does(
     help_text = _help_text(capsys).lower()
     assert "status is the metadata-only status models" in contract
     # Anchored on the member, so "metadata-only" elsewhere on the screen does not pass.
-    assert "status.json (the metadata-only status models)" in help_text, help_text
+    assert "status.json (from the metadata-only status models)" in help_text, help_text
     # The contract makes no PHI-free claim about any member, so the help may not either, except
     # in the "not as secret-free or PHI-free" residual sentence it shares with the contract.
     residual = "not as secret-free or phi-free"

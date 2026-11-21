@@ -637,7 +637,13 @@ def _log_dir_settings(tmp_path: Path, log_dir: Path) -> object:
     from messagefoundry.config.settings import load_settings
 
     toml = tmp_path / "messagefoundry.toml"
-    toml.write_text(f'[logging]\nlog_dir = "{log_dir.as_posix()}"\n', encoding="utf-8")
+    # The store is pinned under tmp_path, so the status snapshot never opens one in the working
+    # directory.
+    store = (tmp_path / "absent.db").as_posix()
+    toml.write_text(
+        f'[logging]\nlog_dir = "{log_dir.as_posix()}"\n[store]\npath = "{store}"\n',
+        encoding="utf-8",
+    )
     return load_settings(config_path=toml)
 
 
@@ -934,3 +940,31 @@ def test_read_log_file_never_asks_for_more_than_the_bound(
     monkeypatch.setattr(os, "read", recording_read)
     assert bundle_mod._read_log_file(log, listed) == "last\n"
     assert sizes and all(n <= 33 for n in sizes), sizes
+
+
+def test_read_log_file_one_byte_over_the_bound_drops_the_cut_line(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file one byte longer than the bound starts its read at byte 0, and its first line is
+    still cut by the bound, so it is still dropped."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 11)
+    log = tmp_path / "engine.log"
+    log.write_bytes(b"abcdefgh\nxy\n")
+    assert bundle_mod._read_log_file(log, os.lstat(log)) == "xy\n"
+
+
+@pytest.mark.parametrize("body", [b"short\n" + b"z" * 100, b"short\n" + b"z" * 100 + b"\n"])
+def test_log_tail_a_last_line_longer_than_the_bound_reports_a_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: bytes
+) -> None:
+    """No whole line in the bytes read would leave an empty tail that reads as an empty log, so
+    the read reports a code instead."""
+    from messagefoundry.support import bundle as bundle_mod
+
+    monkeypatch.setattr(bundle_mod, "_LOG_TAIL_MAX_BYTES", 32)
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    (log_dir / "engine.log").write_bytes(body)
+    assert _tail_member(tmp_path, log_dir) == "MF-BUNDLE-LOG-002 _LogLineTooLong"
