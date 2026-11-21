@@ -38,6 +38,7 @@ from messagefoundry.auth.permissions import validate_custom_role_permissions
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
+from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
 
 PW = "a-strong-test-passphrase"
@@ -368,8 +369,9 @@ async def test_a_stored_custom_role_name_the_rule_refuses_does_not_block_a_permi
 async def test_a_role_whose_seal_fails_has_no_exempt_name(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A name written outside the store fails the row's seal, so it is never the exemption's
-    stored name: a re-save under it takes the rule."""
+    """On a store with an integrity key, a name written outside the store fails the row's seal, so
+    it is never the exemption's stored name: a re-save under it takes the rule. The seal failure is
+    stood in for by patching ``_load_role``; the keyless case is the next test."""
     service, _ = await _setup(engine)
     role = await service.create_custom_role(
         display_name="Administrator", description=None, permissions=["monitoring:read"], actor="t"
@@ -384,3 +386,24 @@ async def test_a_role_whose_seal_fails_has_no_exempt_name(
     held, stored = await service.custom_role_stored_name(role.id)
     assert (held, stored) == (True, None)
     assert custom_role_name_refusal("Administrator", stored) is not None
+
+
+async def test_on_a_keyless_store_a_name_written_outside_the_store_is_exempt(
+    engine: Engine,
+) -> None:
+    """Pins the keyless case as it behaves: no seal is checked, so a name written straight into
+    the ``roles`` table is returned as the stored name, and a save re-sending it is exempt."""
+    service, _ = await _setup(engine)
+    assert engine.store.row_sealer() is None  # control: this store has no integrity key
+    role = await service.create_custom_role(
+        display_name="Readers", description=None, permissions=["monitoring:read"], actor="t"
+    )
+    store = engine.store
+    assert isinstance(store, MessageStore)
+    await store._db.execute(
+        "UPDATE roles SET display_name=? WHERE id=?", ("Administrator", role.id)
+    )
+    await store._db.commit()
+    held, stored = await service.custom_role_stored_name(role.id)
+    assert (held, stored) == (True, "Administrator")
+    assert custom_role_name_refusal("Administrator", stored) is None

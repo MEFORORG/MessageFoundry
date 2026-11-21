@@ -1731,7 +1731,10 @@ proof, as the console's `POST /ui/users/{user_id}/update` does after its own gat
 for a changed display name the name rule refuses (BACKLOG #5784), which the route checks against
 the stored name after that read. Where it is
 off, the gate checks the step-up session window instead and spends nothing, so none of these
-answers costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
+answers costs a proof. `PUT /roles/custom/{role_id}`, and the console's
+`POST /ui/roles/custom/{role_id}/update`, check the role name (BACKLOG #5785) after the
+single-use `save_ends_own_sessions` proof, where the save takes one because it would end the
+caller's own sessions, so a 422 for a name the rule refuses costs that proof too. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
 answered the same way, a 423 or listed as failed, but reported under
 `integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
 its own. A Vault transit Outage on any account these reads check answers 503 with `Retry-After`,
