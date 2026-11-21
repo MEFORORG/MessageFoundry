@@ -4815,18 +4815,18 @@ Facts that are easy to get wrong, stated plainly first:
   state from that write is the connection's failure instead: the borrow fails transiently and
   the connection is discarded. The transient states are every state the connector retries:
   SQLSTATE class `08`, class `40`, `HYT00` and `HYT01`. A driver that takes it on the
-  connection but refuses the ODBC query timeout on a cursor refuses every cursor; a send and the
-  connection test read `HYC00` or `HY092` there as the same configuration fault, while a poll,
-  mark or lookup at least reports it as an ordinary failure. Such a connection needs `0`. Both
+  connection but refuses the ODBC query timeout on a cursor refuses every cursor; a send, the
+  connection test, a poll, a mark and a lookup read `HYC00` or `HY092` there as the same
+  configuration fault, naming `statement_timeout`. Such a connection needs `0`. Both
   refusals are readings of pyodbc's documentation and source, not measurements. A `DatabaseRef` reference sync
   takes `statement_timeout` too, 30 s unset, by the SQL Server preset's rule (*A `DatabaseRef`
   statement passes the same gate, and a row ceiling*). The connector also exposes `connect_timeout` (default 15 s, a
   **login** timeout only, passed to the driver as pyodbc's `timeout=` on both dialects), `pool_max`
-  and `acquire_timeout`; there is no `timeout_seconds`. Each DATABASE pool runs aioodbc's driver
-  calls (statements, fetches, commits, rollbacks) on its own thread pool, sized `pool_max + 4`,
-  rather than the event loop's default executor. Not every driver call moved: at least the cursor
-  closes, the discard of a failed connection, the rollback after a cancelled statement and the
-  autocommit set still run on the default executor.
+  and `acquire_timeout`; there is no `timeout_seconds`. Each DATABASE pool runs its driver calls
+  on its own thread pool, sized `pool_max + 4`, rather than the event loop's default executor:
+  aioodbc's (statements, fetches, commits, rollbacks) and, at least, the connector's own
+  `statement_timeout` write, autocommit set, cursor closes, discard of a failed connection and
+  rollback after a cancelled statement.
 - **The store's message-pipeline pool acquire is bounded on both server backends.**
   `[store].acquire_timeout` (default **30 s**, must be > 0) caps one borrow from the SQL Server or
   Postgres store pool, and the throwaway pool a `DatabaseRef` reference sync opens takes its own

@@ -3045,7 +3045,9 @@ _ENGINE_FIXED_TEXT: tuple[type[BaseException], ...] = (
 _ENGINE_TEXT_LIMIT = 400
 
 
-def _thread_settled[T](fn: Callable[[], T], *, gate: CallGate | None = None) -> asyncio.Future[T]:
+def _thread_settled[T](
+    fn: Callable[[], T], *, gate: CallGate | None = None, pool: Any = None
+) -> asyncio.Future[T]:
     """Run ``fn`` on a worker thread and return a future that the THREAD resolves, once ``fn`` has
     returned or raised.
 
@@ -3059,8 +3061,15 @@ def _thread_settled[T](fn: Callable[[], T], *, gate: CallGate | None = None) -> 
     runs beside another pyodbc call on the connection. When a call is running there, as after a
     cancelled ``execute``, ``fn`` is handed to that call, which runs it on its own thread as it
     returns. So no second thread waits for a statement that may have no timeout. Otherwise ``fn``
-    goes to a worker thread through the gate, as before."""
+    goes to a worker thread through the gate, as before.
+
+    **With ``pool``, that worker thread is the pool's own executor** (:func:`_make_pool`, BACKLOG
+    #5756), so a hung close or set holds a thread of that pool, never one of the event loop's
+    default executor. A pool with no tracked executor, and no ``pool``, use the default one. A
+    pool's executor is shut down once a close of the pool has ended, and a call submitted after
+    that raises ``RuntimeError`` here, as one on a shut-down default executor does."""
     loop = asyncio.get_running_loop()
+    executor = None if pool is None else _tracked(_POOL_EXECUTORS, pool)
     settled: asyncio.Future[T] = loop.create_future()
 
     def _resolve(value: T | None, error: BaseException | None) -> None:
@@ -3090,9 +3099,9 @@ def _thread_settled[T](fn: Callable[[], T], *, gate: CallGate | None = None) -> 
             )
 
     if gate is None:
-        loop.run_in_executor(None, _work)
+        loop.run_in_executor(executor, _work)
     elif not gate.run_after_running_call(_work):
-        loop.run_in_executor(None, partial(gate.run, _work))
+        loop.run_in_executor(executor, partial(gate.run, _work))
     return settled
 
 
@@ -3419,11 +3428,13 @@ class _AutocommitPool:
             return conn
         try:
             # No driver call has run on it before this succeeds: _thread_settled raises at once
-            # if the default executor is already shut down, and neither starts a thread then.
+            # if the pool's executor is already shut down, and neither starts a thread then.
             raw = _driver_connection(conn)
             # Through the gate (BACKLOG #2394): the set uses the raw handle, which aioodbc's gated
             # _execute never sees.
-            work = _thread_settled(partial(_set_and_read_autocommit, raw), gate=call_gate(conn))
+            work = _thread_settled(
+                partial(_set_and_read_autocommit, raw), gate=call_gate(conn), pool=self._pool
+            )
         except (AutocommitNotConfirmed, RuntimeError):
             await _return_to_pool(self._pool, conn)
             raise
@@ -3592,11 +3603,13 @@ async def _apply_statement_timeout(pool: Any, conn: Any) -> None:
     """Set ``pool``'s statement timeout on a connection just borrowed from it (BACKLOG #5756).
 
     pyodbc's ``Connection.timeout`` is set on each cursor as it is made, as the ODBC query timeout.
-    aioodbc exposes it read-only, so it is set on the pyodbc connection (``_conn``), on the loop
-    with no call running on a connection just lent, as the SQL Server store sets
-    ``[store].command_timeout``. pyodbc's setter also hands the value to the driver as a
-    connection attribute, so the write is skipped when the connection already holds the value: a
-    connection lent before, and ``0`` on a fresh one.
+    aioodbc exposes it read-only, so it is set on the pyodbc connection (``_conn``). pyodbc's
+    setter also hands the value to the driver as a connection attribute, so the write runs on the
+    pool's own executor, inside the connection's call gate (:func:`_thread_settled`), never on the
+    event loop. The read of the current value is pyodbc's own record of it and stays on the loop.
+    The write is skipped when the connection already holds the value: a connection lent before,
+    and ``0`` on a fresh one. A borrower cancelled during the write leaves at once, and the
+    connection goes back only once the write has returned (:func:`_return_when_settled`).
 
     **A driver that refuses the value fails the borrow closed.** The connection goes back to
     ``pool`` first, since no call ran on it, and a ``config_fault`` naming the setting is raised,
@@ -3634,7 +3647,14 @@ async def _apply_statement_timeout(pool: Any, conn: Any) -> None:
     if current == seconds:
         return
     try:
-        raw.timeout = seconds
+        work = _thread_settled(
+            partial(_set_driver_timeout, raw, seconds), gate=call_gate(conn), pool=pool
+        )
+    except RuntimeError:  # the pool's executor is shut down: no thread started, nothing ran
+        await _return_to_pool(pool, conn)
+        raise
+    try:
+        await asyncio.shield(work)
     except Exception as exc:  # noqa: BLE001 - a driver's own error class too; re-raised classified
         state = _log_sqlstate(exc)
         if state is not None and _is_transient(state):
@@ -3649,6 +3669,17 @@ async def _apply_statement_timeout(pool: Any, conn: Any) -> None:
             permanent=True,
             config_fault=True,
         ) from exc
+    except BaseException:
+        # The borrower left (a cancel) while the thread may still be inside the setter: the
+        # connection goes back only once the thread has resolved ``work``, as a cursor close's does.
+        _return_when_settled(pool, conn, work, "a statement_timeout set")
+        raise
+
+
+def _set_driver_timeout(raw: Any, seconds: int) -> None:
+    """On a worker thread: write ``seconds`` to pyodbc's ``Connection.timeout``, whose setter hands
+    it to the driver (BACKLOG #5756), so a driver slow to take it holds no event-loop time."""
+    raw.timeout = seconds
 
 
 #: Pools already warned that their driver connection has no ``timeout`` (BACKLOG #5756), so the
@@ -3741,7 +3772,9 @@ async def _require_gate_or_discard(pool: Any, conn: Any) -> None:
         raw = drop_handle(conn)  # first, and await-free: the pool never lends it again
         if raw is not None:
             try:
-                asyncio.get_running_loop().run_in_executor(None, _close_refused, raw)
+                asyncio.get_running_loop().run_in_executor(
+                    _tracked(_POOL_EXECUTORS, pool), _close_refused, raw
+                )
             except RuntimeError as exc:  # the executor is shut down; see the docstring
                 logger.debug("DATABASE: refused connection not closed, executor shut down: %s", exc)
         else:
@@ -3885,9 +3918,9 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
         else:
             close = partial(_close_raw_cursor, raw_cur)
         try:
-            work = _thread_settled(close, gate=gate)
+            work = _thread_settled(close, gate=gate, pool=pool)
         except RuntimeError as exc:
-            # The default executor is shut down: no close thread started, so none runs on it.
+            # The executor is shut down: no close thread started, so none runs on it.
             # Not raised: this runs in callers' finally blocks, and must not mask their outcome.
             # A dropped handle is left for pyodbc to close when it is collected.
             logger.debug("DATABASE: cursor close not run, executor shut down: %s", exc)
@@ -3895,7 +3928,9 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
             return
     else:
         work = asyncio.ensure_future(
-            _close_cursor(cur) if dropped is None else _close_cursor_then_drop(cur, dropped, gate)
+            _close_cursor(cur)
+            if dropped is None
+            else _close_cursor_then_drop(cur, dropped, gate, pool)
         )
         # The loop holds a task only weakly; keep this one alive until its done-callback has run.
         _DETACHED_SETTLES.add(work)
@@ -3916,12 +3951,12 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     await _release(pool, conn)
 
 
-async def _close_cursor_then_drop(cur: Any, raw: Any, gate: CallGate | None) -> None:
+async def _close_cursor_then_drop(cur: Any, raw: Any, gate: CallGate | None, pool: Any) -> None:
     """The discard for a cursor with no raw pyodbc cursor: close it through its own ``close()``,
     then close the dropped handle on a worker thread, through the gate. Never raises."""
     await _close_cursor(cur)
     try:
-        closing = _thread_settled(partial(_close_dropped, raw), gate=gate)
+        closing = _thread_settled(partial(_close_dropped, raw), gate=gate, pool=pool)
     except RuntimeError as exc:  # the executor is shut down: pyodbc closes it when collected
         logger.debug("DATABASE: discarded connection not closed, executor shut down: %s", exc)
         return
