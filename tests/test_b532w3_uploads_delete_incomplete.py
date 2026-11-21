@@ -452,8 +452,11 @@ async def test_a_body_unlink_on_a_dropped_share_is_no_success(
     blob = _blob(store, meta.file_id)
     monkeypatch.setattr(uploads, "os", _OsLstatRaises(blob, _unreachable_share))
     _failing_unlink(monkeypatch, blob, lambda p: OSError(errno.EIO, "Input/output error", str(p)))
-    with pytest.raises(uploads.UploadStorageUnreachableError):
+    # r5 item 2: whether the body went is not known, so the error says so and carries the
+    # metadata for the route's row; on ee36e28d9d6 it was the plain unreachable refusal.
+    with pytest.raises(uploads.UploadDeleteUnconfirmedError) as raised:
         await store.delete(meta.file_id)
+    assert raised.value.meta == meta and meta.filename not in repr(raised.value)
     assert blob.is_file() and _sidecar(store, meta.file_id).is_file()
 
 
@@ -549,12 +552,130 @@ async def test_the_route_answers_an_unreachable_storage_503_and_the_console_name
         )
         r = await c.delete(f"/uploads/{fid}", headers=h)
         assert r.status_code == 503, r.text
-        assert "could not be reached" in r.json()["detail"]
+        assert "could not be confirmed" in r.json()["detail"]
+    # r5 item 2: the attempt is recorded with its outcome unknown, never as nothing removed. On
+    # ee36e28d9d6 no row was written.
     rows = [a for a in await engine.store.list_audit() if a["action"] == "upload.delete"]
-    assert not rows
+    assert [json.loads(str(a["detail"]))["body_removed"] for a in rows] == ["unknown"]
+
+
+# --- r5: every caller gets the storage 503, a gone sidecar is not kept, and more network losses ---
+
+
+def test_the_console_names_each_storage_outage() -> None:
     busy = HTTPException(503, "x", headers={"Retry-After": "5"})
     assert ul._refusal_code(busy, ul._DELETE_CODES) == ul.KEY_SERVICE_BUSY_CODE
     busy.storage_unreachable = True  # type: ignore[attr-defined]
+    assert ul._refusal_code(busy, ul._DELETE_CODES) == ul.STORAGE_UNREACHABLE_CODE
+    busy.outcome_unconfirmed = True  # type: ignore[attr-defined]
     code = ul._refusal_code(busy, ul._DELETE_CODES)
-    assert code == ul.STORAGE_UNREACHABLE_CODE
-    assert "could not reach the storage" in ul._LIST_NOTICES[code]
+    assert code == ul.DELETE_UNCONFIRMED_CODE
+    assert "could not be confirmed" in ul._LIST_NOTICES[code]
+
+
+async def test_an_owner_meets_the_storage_503_not_a_404_when_the_share_is_down(
+    engine: Engine,  # noqa: F811 - the imported fixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # r5 item 1. On ee36e28d9d6 _authorized_upload_meta answered 404 to every caller without
+    # FILES_ACCESS_ANY, so an owner was told their file was gone.
+    pytest.importorskip("psutil")
+    from messagefoundry.api import create_app
+
+    service = await _make_user(engine, Role.OPERATOR, name="op")
+    root = tmp_path / "uploads"
+    app = create_app(engine, auth=service, store_settings=_uploads_settings(tmp_path))
+    transport = reproving_transport(PW, app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        h = await _login(c, "op")
+        fid = (
+            await c.post("/uploads", files={"file": ("x.hl7", ADT, "text/plain")}, headers=h)
+        ).json()["file_id"]
+        sidecar = root / f"{fid}.meta"
+
+        def _dropped(target: Any, flags: int, *args: Any) -> int:
+            if Path(target) == sidecar:
+                raise _unreachable_share(Path(target))
+            return os.open(target, flags, *args)
+
+        monkeypatch.setattr(uploads, "os", _OsWith(_dropped))
+        for r in (
+            await c.get(f"/uploads/{fid}/messages", headers=h),
+            await c.delete(f"/uploads/{fid}", headers=h),
+        ):
+            assert r.status_code == 503, r.text
+            assert "could not be reached" in r.json()["detail"]
+    assert not [a for a in await engine.store.list_audit() if a["action"] == "upload.delete"]
+    assert sidecar.is_file()
+
+
+async def test_a_sidecar_gone_inside_the_lock_is_not_recorded_as_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # r5 item 3. On ee36e28d9d6 the removal read sidecar_removed False, which the route wrote as
+    # sidecar_kept: true for a sidecar that was not there.
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    real_lock = uploads._pair_lock
+
+    @contextlib.contextmanager
+    def _sidecar_raced(path: Path, **kwargs: Any) -> Iterator[None]:
+        _sidecar(store, meta.file_id).unlink()
+        with real_lock(path, **kwargs):
+            yield
+
+    monkeypatch.setattr(uploads, "_pair_lock", _sidecar_raced)
+    removal = await store.delete(meta.file_id)
+    assert (removal.body_removed, removal.sidecar_removed) == (True, False)
+    assert removal.sidecar_was_there is False
+
+
+@pytest.mark.parametrize("winerror", [64, 59, 1231])
+async def test_an_open_that_lost_its_share_with_einval_is_unreachable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, winerror: int
+) -> None:
+    # r5 item 4: a share that drops mid-session answers EINVAL with a network winerror. On
+    # ee36e28d9d6 it was re-raised as EINVAL, a 500.
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    part = _blob(store, meta.file_id)
+
+    def _lost(target: Any, flags: int, *args: Any) -> int:
+        if Path(target) == part:
+            exc = OSError(errno.EINVAL, "The specified network name is no longer available")
+            exc.winerror = winerror  # type: ignore[attr-defined,misc,unused-ignore]
+            raise exc
+        return os.open(target, flags, *args)
+
+    monkeypatch.setattr(uploads, "os", _OsWith(_lost))
+    with pytest.raises(uploads.UploadStorageUnreachableError):
+        await store.read_bytes(meta.file_id)
+
+
+def test_path_reach_names_the_network_losses_and_not_eio() -> None:
+    from messagefoundry.path_reach import is_unreachable
+
+    for code in (53, 67, 51, 59, 64, 1222, 1231, 1232):
+        exc = OSError(errno.EINVAL, "x")
+        exc.winerror = code  # type: ignore[attr-defined,misc,unused-ignore]
+        assert is_unreachable(exc), code
+    for name in ("ESTALE", "EHOSTDOWN", "ENETDOWN", "ENETUNREACH"):
+        posix = getattr(errno, name, None)
+        if posix is not None:
+            assert is_unreachable(OSError(posix, name)), name
+    # Controls: EIO is a device fault too, and a winerror that is no int is no answer.
+    assert not is_unreachable(OSError(errno.EIO, "Input/output error"))
+    odd = OSError(errno.EINVAL, "x")
+    odd.winerror = "64"  # type: ignore[attr-defined,misc,unused-ignore]
+    assert not is_unreachable(odd)
+
+
+def test_in_use_reads_only_an_int_winerror() -> None:
+    # r3 item 10. On ee36e28d9d6 an unhashable winerror raised TypeError inside the delete.
+    odd = PermissionError(errno.EACCES, "x")
+    odd.winerror = [32]  # type: ignore[attr-defined,misc,unused-ignore]
+    assert uploads._in_use(odd) is False
+    text = PermissionError(errno.EACCES, "x")
+    text.winerror = "32"  # type: ignore[attr-defined,misc,unused-ignore]
+    assert uploads._in_use(text) is False

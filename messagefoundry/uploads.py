@@ -60,7 +60,7 @@ from messagefoundry.controlchars import (
 from messagefoundry.parsing.peek import HL7PeekError, Peek
 from messagefoundry.parsing.sniff import _looks_like_hl7, _lstrip_bom_ws, nontext_upload_reason
 from messagefoundry.parsing.split import split_batch
-from messagefoundry.path_reach import is_absent
+from messagefoundry.path_reach import is_absent, is_unreachable
 from messagefoundry.redaction import codec_safe_str, json_loads_or_refusal
 from messagefoundry.store.content_search import SearchSpec, row_matches
 from messagefoundry.store.crypto import (
@@ -400,13 +400,13 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
         # least ENXIO or EOPNOTSUPP for a socket (EINVAL on Windows), a PermissionError for a
         # folder on Windows, and there a FileNotFoundError for a dangling link it followed. The
         # name is what decides, so every caller sees one refusal (BACKLOG #5388 added item 3).
-        seen = _recheck(path, exc)
+        # A share that went away is classed first, before any errno, at least the EINVAL a
+        # dropped Windows share answers, so it is a 503 rather than a re-raised error.
+        seen: _Recheck = "unreachable" if is_unreachable(exc) else _recheck(path, exc)
         # A refusal is converted when the name is now not plain, is gone and the open met
         # something other than absence, or cannot be reached; anything else is re-raised.
-        absent = isinstance(exc, FileNotFoundError) and is_absent(exc)
-        if seen != "unplain" and (
-            seen == "unreachable" or (isinstance(exc, FileNotFoundError) and not absent)
-        ):
+        absent = is_absent(exc)
+        if seen != "unplain" and isinstance(exc, FileNotFoundError) and not absent:
             seen = "unreachable"
         if seen not in ("unplain", "unreachable") and not (seen == "gone" and not absent):
             # The caller classes it; it reads this verdict rather than checking, and logging a
@@ -563,7 +563,11 @@ def _recheck(name: object, cause: OSError) -> _Recheck:
         if is_absent(exc):
             return "gone"
         again, verdict = exc, "unreachable"
-    except (OSError, ValueError) as exc:
+    except OSError as exc:
+        again = exc
+        if is_unreachable(exc):
+            verdict = "unreachable"
+    except ValueError as exc:
         again = exc
     else:
         return "unplain" if _names_a_link(info) or not _is_regular(info) else "plain"
@@ -586,13 +590,15 @@ def _refused_unlink(
     an unlink failed. ``"denied"`` for any other ``PermissionError``, and ``None`` for any other
     ``OSError``, which the caller raises as it is. A body that cannot be checked again is a
     directory only by ``EISDIR``; that check's failure is logged, never swallowed."""
-    if isinstance(exc, FileNotFoundError) and not is_absent(exc):
+    if is_unreachable(exc):
         return "unreachable"
     try:
         folder = S_ISDIR(os.lstat(path).st_mode)
     except FileNotFoundError as again:
         return "gone" if is_absent(again) else "unreachable"
     except OSError as again:
+        if is_unreachable(again):
+            return "unreachable"
         _log.warning(
             "uploaded-file body could not be checked again after a refused unlink (%s): %s",
             codec_safe_str(exc),
@@ -612,7 +618,8 @@ _IN_USE_WINERRORS = frozenset({32, 33})
 
 def _in_use(exc: OSError) -> bool:
     """Whether ``exc`` is a Windows sharing or lock violation (:data:`_IN_USE_WINERRORS`)."""
-    return getattr(exc, "winerror", None) in _IN_USE_WINERRORS
+    winerror = getattr(exc, "winerror", None)
+    return isinstance(winerror, int) and winerror in _IN_USE_WINERRORS
 
 
 #: How often, and after how long a first pause in seconds, doubled each time, the delete tries an
@@ -640,7 +647,9 @@ def _unlink_retrying(path: Path) -> bool:
                 return False
             unreached = codec_safe_str(exc)
         except OSError as exc:
-            if attempt == _UNLINK_ATTEMPTS or not _in_use(exc):
+            if is_unreachable(exc):
+                unreached = codec_safe_str(exc)
+            elif attempt == _UNLINK_ATTEMPTS or not _in_use(exc):
                 raise
             _log.info(
                 "uploaded-file part %s is in use, trying its unlink again: %s",
@@ -648,7 +657,8 @@ def _unlink_retrying(path: Path) -> bool:
                 codec_safe_str(exc),
             )
         if unreached is not None:
-            # After the handler, so the error is on no chain.
+            # After the handler, so the error is on no chain. ENOENT, not the errno met, so no
+            # caller classes it by errno; its type says what it is.
             raise _UnreachableError(errno.ENOENT, f"{path.name} could not be reached: {unreached}")
         time.sleep(pause)
         pause *= 2
@@ -845,6 +855,11 @@ _DAMAGED = "the uploaded file's {part} is damaged or is not this upload's, so it
 
 _STORAGE_UNREACHABLE = "the uploads directory could not be reached, so nothing was read or changed"
 
+_STORAGE_UNCONFIRMED = (
+    "the uploads directory could not be reached during the delete, so whether the file's content "
+    "was removed could not be confirmed"
+)
+
 _STILL_SEALED = "the uploaded file's {part} is sealed under a store key this engine does not hold"
 
 _ACCESS_REFUSED = (
@@ -932,6 +947,23 @@ class UploadStorageUnreachableError(UploadUnavailableError):
     route answers it 503 with ``Retry-After``, with its own text."""
 
 
+class UploadDeleteUnconfirmedError(UploadStorageUnreachableError):
+    """A delete whose body unlink failed while the share could not be reached, so whether the
+    body was removed is not known: a network filesystem may apply a delete whose reply never
+    arrives (BACKLOG #5388 added item 3). The sidecar was not touched. ``meta`` is the upload's
+    metadata, so the route records the attempt with its outcome unknown, never as nothing
+    removed."""
+
+    def __init__(self, message: str, meta: UploadedFileMeta | None = None) -> None:
+        # Only the text in args, as UploadDeleteIncompleteError keeps only its id: the metadata
+        # holds the uploader's filename.
+        super().__init__(message)
+        self.meta = meta
+
+    def __reduce__(self) -> tuple[type[UploadDeleteUnconfirmedError], tuple[object, ...]]:
+        return (type(self), (self.args[0], self.meta))
+
+
 @dataclass(frozen=True)
 class UploadRemoval:
     """What one :meth:`UploadStore.delete` call removed (BACKLOG #5388 added item 3): the upload's
@@ -941,6 +973,9 @@ class UploadRemoval:
     meta: UploadedFileMeta
     body_removed: bool
     sidecar_removed: bool
+    #: Whether the sidecar was there when this call took the pair lock. One already gone, as
+    #: after another remover, is neither removed nor kept, so the row says neither.
+    sidecar_was_there: bool = True
 
     @property
     def removed_any(self) -> bool:
@@ -3187,13 +3222,22 @@ class UploadStore:
         unchecked: str | None = None
         unreached: str | None = None
         sidecar_dir = False
+        sidecar_there = True
         try:
             sidecar_dir = S_ISDIR(meta_path.lstat().st_mode)
         except FileNotFoundError as exc:
-            if not is_absent(exc):
+            if is_absent(exc):
+                # Gone since its read, as another remover's work: there is nothing of it for this
+                # call to remove or to keep, so the row records neither.
+                sidecar_there = False
+            else:
                 unreached = codec_safe_str(exc)
         except PermissionError as exc:
             unchecked = codec_safe_str(exc)
+        except OSError as exc:
+            if not is_unreachable(exc):
+                raise
+            unreached = codec_safe_str(exc)
         if unreached is not None:
             raise _unreachable(file_id, unreached)
         if unchecked is not None:
@@ -3206,6 +3250,7 @@ class UploadStore:
         try:
             body_removed = _unlink_retrying(blob_path)
         except _UnreachableError as exc:
+            # The unlink met the share going away, so whether it took is not known.
             unreached = codec_safe_str(exc)
         except OSError as exc:
             # Nothing is removed yet. A Windows sharing violation that outlasted the tries is a
@@ -3231,9 +3276,17 @@ class UploadStore:
                     )
                 else:
                     body_refusal = (codec_safe_str(exc), unlinked)
-        # After the handler, as _refusal requires, so the error is on no chain.
+        # After the handler, as _refusal requires, so the error is on no chain. A body unlink that
+        # met the share going away may have taken effect, so it is answered as unconfirmed, with
+        # the metadata, and never as nothing removed.
         if unreached is not None:
-            raise _unreachable(file_id, unreached)
+            _log.warning(
+                "uploaded file %s: its body unlink could not be confirmed, since the uploads "
+                "storage could not be reached: %s",
+                file_id,
+                unreached,
+            )
+            raise UploadDeleteUnconfirmedError(_STORAGE_UNCONFIRMED, meta)
         if in_use is not None:
             _log.warning(
                 "uploaded file %s: its body is in use, so nothing was deleted: %s", file_id, in_use
@@ -3249,7 +3302,7 @@ class UploadStore:
             unreached = codec_safe_str(exc)
         except OSError as exc:
             kept = codec_safe_str(exc)
-        removal = UploadRemoval(meta, body_removed, sidecar_removed)
+        removal = UploadRemoval(meta, body_removed, sidecar_removed, sidecar_there)
         if unreached is not None or kept is not None:
             # The sidecar is still there, or cannot be told to be gone, so this is no success: the
             # route records what this call removed, if anything, and answers that a retry finishes

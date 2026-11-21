@@ -163,6 +163,7 @@ BROWSE_THROTTLED_CODE = "browse_throttled"
 UPLOADS_UNAVAILABLE_CODE = "uploads_unavailable"
 KEY_SERVICE_BUSY_CODE = "key_service_busy"
 STORAGE_UNREACHABLE_CODE = "storage_unreachable"
+DELETE_UNCONFIRMED_CODE = "delete_unconfirmed"
 
 #: The status the engine answers when the store cipher refuses an uploaded file (BACKLOG #1169).
 _LOCKED_STATUS = status.HTTP_423_LOCKED
@@ -315,6 +316,16 @@ STORAGE_UNREACHABLE_NOTICE = (
     "happening, an administrator should check the uploads folder on the server."
 )
 
+#: 503 with ``outcome_unconfirmed`` set: a delete met the storage going away at the body's unlink,
+#: so whether the content was removed is not known (BACKLOG #5388 added item 3). It claims
+#: neither a removal nor its absence.
+DELETE_UNCONFIRMED_NOTICE = (
+    "That delete could not be confirmed. The engine lost the storage that holds uploaded files "
+    "while it was deleting, so the file's content may or may not be gone. Try the delete again "
+    "once the storage is back. If it keeps happening, an administrator should check the uploads "
+    "folder on the server."
+)
+
 #: The allow-list itself: an EXACT-match lookup from code to fixed module text. ``e`` is compared, never
 #: rendered — an unrecognized value maps to no banner at all rather than being echoed.
 _LIST_NOTICES: dict[str, str] = {
@@ -337,6 +348,7 @@ _LIST_NOTICES: dict[str, str] = {
     BROWSE_THROTTLED_CODE: BROWSE_THROTTLED_NOTICE,
     KEY_SERVICE_BUSY_CODE: KEY_SERVICE_BUSY_NOTICE,
     STORAGE_UNREACHABLE_CODE: STORAGE_UNREACHABLE_NOTICE,
+    DELETE_UNCONFIRMED_CODE: DELETE_UNCONFIRMED_NOTICE,
     # UPLOADS_UNAVAILABLE_CODE is deliberately absent. With no uploads store the list page answers
     # 503 and renders UPLOADS_UNAVAILABLE_NOTICE without reading ``e``. A listing that loads proves
     # the store is back, so a banner saying it is missing would be false there.
@@ -430,6 +442,8 @@ def _refusal_code(exc: HTTPException, codes: dict[int, str]) -> str | None:
     if exc.status_code == _UNAVAILABLE_STATUS and "Retry-After" in (exc.headers or {}):
         # BACKLOG #5388 added item 3: the engine marks a storage it could not reach, a typed
         # signal like ``upload_refusal``, so its notice does not blame the key service.
+        if getattr(exc, "outcome_unconfirmed", False) is True:
+            return DELETE_UNCONFIRMED_CODE
         if getattr(exc, "storage_unreachable", False) is True:
             return STORAGE_UNREACHABLE_CODE
         return KEY_SERVICE_BUSY_CODE

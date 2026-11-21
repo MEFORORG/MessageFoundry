@@ -6,6 +6,7 @@ other engine package can share the one answer (BACKLOG #5388 added item 3)."""
 
 from __future__ import annotations
 
+import errno
 from typing import Final
 
 #: The Windows errors that say a network path or share cannot be reached, so nothing is known about
@@ -15,12 +16,32 @@ from typing import Final
 #: even where it is mapped in another session.
 UNREACHABLE_WINERRORS: Final = frozenset({53, 67})
 
+#: Windows errors that say a share or the network went away under an open path, which CPython
+#: raises with other errnos, at least EINVAL: ERROR_REM_NOT_LIST (51), ERROR_UNEXP_NET_ERR (59),
+#: ERROR_NETNAME_DELETED (64), ERROR_NO_NETWORK (1222), ERROR_NETWORK_UNREACHABLE (1231) and
+#: ERROR_HOST_UNREACHABLE (1232), as winerror.h names them (BACKLOG #5388 added item 3).
+NETWORK_LOSS_WINERRORS: Final = frozenset({51, 59, 64, 1222, 1231, 1232})
+
+#: POSIX errnos that say the same of a network filesystem: at least a stale NFS handle (ESTALE), a
+#: host that is down (EHOSTDOWN) and a network that is down or unreachable (ENETDOWN,
+#: ENETUNREACH). EIO is not one: it is a device fault too, and stays an error.
+NETWORK_LOSS_ERRNOS: Final = frozenset(
+    code
+    for code in (
+        getattr(errno, name, None) for name in ("ESTALE", "EHOSTDOWN", "ENETDOWN", "ENETUNREACH")
+    )
+    if code is not None
+)
+
 
 def is_unreachable(exc: OSError) -> bool:
-    """Whether ``exc`` is a Windows error saying the path's share or network path could not be
-    reached (:data:`UNREACHABLE_WINERRORS`)."""
+    """Whether ``exc`` says the path's share, network path or network could not be reached
+    (:data:`UNREACHABLE_WINERRORS`, :data:`NETWORK_LOSS_WINERRORS`, :data:`NETWORK_LOSS_ERRNOS`),
+    so nothing is known about what is there."""
     winerror = getattr(exc, "winerror", None)
-    return isinstance(winerror, int) and winerror in UNREACHABLE_WINERRORS
+    if isinstance(winerror, int):
+        return winerror in UNREACHABLE_WINERRORS or winerror in NETWORK_LOSS_WINERRORS
+    return exc.errno in NETWORK_LOSS_ERRNOS
 
 
 def is_absent(exc: OSError) -> bool:
