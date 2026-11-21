@@ -2866,8 +2866,15 @@ _RELOAD_REFUSALS: tuple[type[Exception], ...] = (
     ConfigDirUnreadable,
     ConfigDirMissing,
     WiringError,
+    RunnerLeaseLostError,
 )
 
+
+#: The answer to a reload a cluster node refused because it lost its lease (BACKLOG #5906).
+_LEASE_LOST_RELOAD_DETAIL: Final = (
+    "this node no longer holds the cluster lease, so it applies no config reload; reload on the "
+    "leader instead"
+)
 
 #: The answer to a reload whose config directory the engine could not resolve or list: at the
 #: target check, or in the load after it (vault BACKLOG #5248).
@@ -2934,11 +2941,12 @@ async def _audit_refused_reload(
     an inbound connection's CA (BACKLOG #1142) or a settings anchor (BACKLOG #2034), so one audit
     filter sees both, and ``invalid_config`` otherwise. A trust-anchor check the store stopped, by
     refusing its audit read or write, writes reason ``store_unavailable`` and answers 503 (BACKLOG
-    #3091); it is neither a refused anchor nor a bad graph. A released reload whose config is not the
-    one its approval named writes ``config_reload_failed`` with ``approved_fingerprint`` and
-    ``current_fingerprint`` and reason ``digest_mismatch``, or ``no_approved_digest`` when the hold
-    carries no usable digest (:func:`held_fingerprint`), whose ``approved_fingerprint`` is then
-    null, and answers 422 (vault BACKLOG #2596); only the
+    #3091); it is neither a refused anchor nor a bad graph. A cluster node that lost its lease while
+    its graph still runs writes reason ``lease_lost`` and answers 503 (BACKLOG #5906). A released
+    reload whose config is not the one its approval named writes ``config_reload_failed`` with
+    ``approved_fingerprint`` and ``current_fingerprint`` and reason ``digest_mismatch``, or
+    ``no_approved_digest`` when the hold carries no usable digest (:func:`held_fingerprint`),
+    whose ``approved_fingerprint`` is then null, and answers 422 (vault BACKLOG #2596); only the
     executor meets it. One whose digest could not be taken now writes
     reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A gated
     request whose digest cannot be taken is refused the same way, with no hold filed. A release
@@ -3049,6 +3057,12 @@ async def _audit_refused_reload(
             else "the engine could not read the config to check it against this request's "
             "approval; see the engine log"
         )
+    elif isinstance(exc, RunnerLeaseLostError):
+        # BACKLOG #5906: this cluster node lost its lease while its graph still runs, so the
+        # runner refused the reload before it changed any lane. Nothing is wrong with the config.
+        warn("config reload refused: this node no longer holds the cluster lease")
+        action, detail["reason"] = "config_reload_failed", "lease_lost"
+        status, answer = 503, _LEASE_LOST_RELOAD_DETAIL
     elif isinstance(exc, WiringError) and explicit_cause(exc, AnchorStoreUnavailable) is not None:
         # BACKLOG #3091: the store refused a trust-anchor check's audit read or write. Nothing is
         # known to be wrong with the anchor or the config, so neither of the reasons below fits.
