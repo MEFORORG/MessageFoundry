@@ -2359,7 +2359,7 @@ def _glued_value(
         rest = _maskable_rest(text, end, stop, field_run, credential=False)
         if rest is not None:
             return rest
-    rest = _glued_end_tag_rest(text, body, token, end, field_run)
+    rest = _glued_end_tag_rest(body, token, end, field_run)
     if rest is not None:
         return rest
     if not _ends_in_credential_label(token):
@@ -2370,15 +2370,14 @@ def _glued_value(
     )
 
 
-def _glued_end_tag_rest(
-    text: str, body: str, token: str, end: int, field_run: re.Pattern[str]
-) -> str | None:
+def _glued_end_tag_rest(body: str, token: str, end: int, field_run: re.Pattern[str]) -> str | None:
     """The rest of a vocabulary end tag a field run cut through, when its ``token`` ends on
     the tag's name (``a|b|<family>Smith</family`` before `` Zqxdoe>``), masked only where both of
     these allow it: :func:`_end_tag_rest`'s rules, read on ``body``, the text with this module's
     trailing bound note set aside as the XML pass sets it aside (:func:`_without_trailing_note`);
     and, of the field-run rules, at least this one: a last word glued to what follows must not open
-    the next run's token, which would start inside the mask (BACKLOG #5925 item 1). The flat
+    the next run's token, which would start inside the mask (BACKLOG #5925 item 1). ``body`` holds
+    every position the arm reads, so it is read alone. The flat
     passes run before the XML pass, so without this the run took the tag's name and the rest it
     left was read by neither. ``None`` keeps the rest as it stood.
 
@@ -2389,8 +2388,10 @@ def _glued_end_tag_rest(
     holding the backstop's opener (:data:`_USERINFO_OPENER`) when the field-run pass reads it keeps
     every rest here (:func:`_scrub_field_runs`), where the walk can still mask one once the JSON
     pass has scrubbed the opener. The #3318 rule refusing a last word of two letters or fewer
-    glued to what follows is not applied: it guards a string prefix before a quote, and the walk
-    masks such a word before ``>`` (``a|b|</family Li>``).
+    glued to what follows is not applied by this arm itself: it guards a string prefix before a
+    quote, and the walk masks such a word before ``>`` (``a|b|</family Li>``). :func:`_end_tag_rest`
+    still applies it where only whitespace follows the rest and that whitespace opens with a line
+    break (``a|b|</family Li`` then a line break keeps ``Li``).
 
     **The rest ends inside ``body``.** A bound note joined by a space is on the tag's line, so a rest
     read on ``text`` ran into the note, and was judged as followed by it rather than as ending the
@@ -2419,7 +2420,7 @@ def _glued_end_tag_rest(
     if masked == rest or _end_tag_rest(body, end, stop, True) != masked:
         return None
     last = _GLUED_WORD.findall(rest)[-1]  # a rest the mask changed holds a word
-    if not rest.endswith(" ") and field_run.match(text, stop - len(last)) is not None:
+    if not rest.endswith(" ") and field_run.match(body, stop - len(last)) is not None:
         return None
     return rest
 

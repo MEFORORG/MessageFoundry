@@ -150,6 +150,8 @@ def test_a_rest_a_pass_could_read_differently_stays_as_main_left_it(text: str) -
         # Code review round 1: a short last word, which the walk masks too.
         ("a|b|</family Li>", "[redacted] Xx>"),
         ("<given>A^B^C</given Zqxdoe 1>", "[redacted] Xxxxxx 0>"),
+        # Code review round 2: through the pass a declared delimiter set runs.
+        ("MSH*^~\\&*X\nx*y*</family Zqxdoe>", "[redacted]\n[redacted] Xxxxxx>"),
     ],
 )
 def test_a_field_run_that_takes_the_end_tag_has_the_rest_masked(text: str, want: str) -> None:
@@ -175,6 +177,9 @@ def test_a_field_run_that_takes_the_end_tag_has_the_rest_masked(text: str, want:
         """{"name": "nonnumeric port: 'x"} a|b|</family Zqxdoe>""",
         # Code review round 1: the last word opens the next run's token, so a mask would split it.
         "a|b|</family Zqxdoe>|x|y",
+        # Code review round 2: the same, where the next run is the declared delimiter set's, so the
+        # arm must read the run it is handed, not the default one.
+        "MSH*^~\\&*X\nx*y*</family Zqxdoe>*a*b",
     ],
 )
 def test_a_field_run_rest_the_end_tag_rules_refuse_stays_as_main_left_it(text: str) -> None:
