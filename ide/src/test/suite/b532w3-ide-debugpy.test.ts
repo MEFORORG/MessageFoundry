@@ -256,17 +256,16 @@ suite("b532w3: writeDebugProgram puts the Debug program on disk (BACKLOG #5409 i
 
   test("a temporary folder that cannot be removed after a good rename is logged, not a failed launch", async () => {
     const fsp: DebugProgramFs = { ...fs.promises, rm: async () => Promise.reject(fsError("EBUSY")) };
-    const warn = console.warn;
+    // The warning goes through the injected warn: a stub on the global console installs nothing in
+    // the Extension Host (webview-receivers.test.ts records that).
     const warned: string[] = [];
-    console.warn = (m: unknown) => void warned.push(String(m));
-    try {
-      const file = await writeDebugProgram(local(), undefined, fsp);
-      assert.strictEqual(fs.readFileSync(file, "utf8"), TEST_BENCH_DEBUG_PROGRAM.source);
-    } finally {
-      console.warn = warn;
-    }
+    const file = await writeDebugProgram(local(), undefined, fsp, (m) => void warned.push(m));
+    assert.strictEqual(fs.readFileSync(file, "utf8"), TEST_BENCH_DEBUG_PROGRAM.source);
     assert.strictEqual(warned.length, 1, warned.join("\n"));
     assert.ok(warned[0].includes("EBUSY"), warned[0]);
+    // The log names the folder below the storage root, never the path under the home folder.
+    assert.ok(!warned[0].includes(base), warned[0]);
+    assert.ok(warned[0].includes(path.join(TEST_BENCH_DEBUG_PROGRAM.folder, ".tmp-")), warned[0]);
   });
 
   test("different program texts get different files, so one version never rewrites another's", async () => {

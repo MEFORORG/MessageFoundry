@@ -17,13 +17,12 @@ import * as path from "node:path";
  * texts share a file only if their checksums collide (see textChecksum). It also holds `.tmp-`
  * folders, one per write, which a failed removal or a killed extension host can leave behind and
  * no import statement can name. Nothing is ever pruned there, and nothing checks what else is
- * there. It also holds whatever another process running as the same OS user puts there, such as a
- * stdlib-named module. Under a debugpy before 1.8.22, which puts the folder on `sys.path`, such a
- * module shadows a module of that name that the debuggee has not yet imported. This code does not
- * defend against a writer running as the same OS user: that writer can already change the
- * extension, the interpreter and the workspace. Neither docs/SECURITY.md nor .github/SECURITY.md
- * states this for the extension. None of the names
- * writeDebugProgram writes is one the launch imports. The program runs the installed
+ * there. It also holds whatever another process running as the same OS user puts there. Under a
+ * debugpy before 1.8.22, which puts the folder at `sys.path[0]`, a module placed there shadows any
+ * module of that name the debuggee has not yet imported, the installed `messagefoundry` package
+ * and the standard library included. This code does not defend against a writer running as the
+ * same OS user: that writer can already change the extension, the interpreter and the workspace.
+ * None of the names writeDebugProgram writes is one the launch imports. The program runs the installed
  * package through `runpy`, so no debugpy build puts the working directory on the import path. The
  * source is written at launch rather than shipped, because the extension package holds no Python
  * (the crypto inventory's ide/ arm reads only TypeScript).
@@ -109,8 +108,9 @@ async function holds(fsp: DebugProgramFs, file: string, bytes: Buffer): Promise<
  * the source. On Windows a rename can fail with EPERM or EBUSY while another process, such as a
  * scanner, the indexer or a concurrent launch's rename, holds the target or the new temporary file,
  * so that failure is retried {@link RENAME_RETRIES} times 100 ms apart, as collectionCaseFiles.ts
- * retries an unlink. The temporary folder is removed; failing to remove it is logged, never a failed
- * launch.
+ * retries an unlink. The temporary folder is removed; failing to remove it is logged through `warn`,
+ * never a failed launch. The log names the folder below the storage root and the error code only,
+ * because the full path holds the account's home folder.
  *
  * The path is read from `storage.with({ scheme: "file" }).fsPath`, not `storage.fsPath`: VS Code
  * keeps a URI's authority in `fsPath` only for the `file` scheme, so a `vscode-userdata` URI on a
@@ -120,6 +120,7 @@ export async function writeDebugProgram(
   storage: LocalStorageUri,
   source: string = TEST_BENCH_DEBUG_PROGRAM.source,
   fsp: DebugProgramFs = fs.promises,
+  warn: (message: string) => void = (message) => console.warn(message),
 ): Promise<string> {
   if (!LOCAL_STORAGE_SCHEMES.includes(storage.scheme)) {
     throw new Error(`the extension's storage folder (scheme "${storage.scheme}") is not on this machine's file system`);
@@ -156,7 +157,12 @@ export async function writeDebugProgram(
     try {
       await fsp.rm(tempDir, { recursive: true, force: true });
     } catch (e) {
-      console.warn(`MessageFoundry: could not remove the temporary folder ${tempDir}: ${String(e)}`);
+      const code = (e as { code?: unknown })?.code;
+      const where = path.join(TEST_BENCH_DEBUG_PROGRAM.folder, path.basename(tempDir));
+      warn(
+        `MessageFoundry: could not remove the temporary folder ${where} in the extension's storage` +
+          ` (${typeof code === "string" ? code.replace(/[^A-Za-z0-9_]/g, "") : "unknown error"}).`,
+      );
     }
   }
   return file;

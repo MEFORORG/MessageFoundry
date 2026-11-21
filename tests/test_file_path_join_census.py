@@ -1212,12 +1212,13 @@ IDE_SITES: dict[str, Site] = {
     ),
     "ide/src/testBench.ts": Site(1, OPERATOR, "The fixtures setting, under the workspace."),
     "ide/src/testBenchDebugProgram.ts": Site(
-        4,
+        5,
         INTERNAL,
         "Every part is the extension's own: the global storage folder VS Code assigns the extension "
         "(never a workspace or setting value), the fixed folder `testbench-debug`, a file name made "
         "from a checksum of the extension's own program text, and a folder `mkdtemp` makes there "
-        "with the fixed name `program.py` inside it (BACKLOG #5409).",
+        "with the fixed name `program.py` inside it. The fifth only names that folder below the "
+        "storage root for a log line and opens nothing (BACKLOG #5409).",
     ),
     "ide/src/validate.ts": Site(1, OPERATOR, _IDE_WORKSPACE),
     "ide/src/workspaceContainment.ts": Site(

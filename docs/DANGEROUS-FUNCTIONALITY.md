@@ -1083,8 +1083,8 @@ a command line: the engine's `serve`, and `provision-admin`. The other two type 
 folder it passes comes from the `messagefoundry.configDir` setting. To run it, the extension writes
 a small Python program into its own global storage folder, under `testbench-debug`, and has the
 debugger run that program. debugpy 1.8.21 and older put that folder at `sys.path[0]`, so a module
-placed there is imported ahead of a standard-library module of that name that the debuggee has not
-yet imported. The folder is not pruned, and nothing
+placed there shadows any module of that name the debuggee has not yet imported, the installed
+`messagefoundry` package and the standard library included. The folder is not pruned, and nothing
 checks its contents. `ide/src/testBenchDebugProgram.ts` says what it holds (BACKLOG #5409).
 
 **Links.** `openExternal` hands a URL to the operating system, which opens it with whatever program
