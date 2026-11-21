@@ -729,7 +729,8 @@ def test_an_unelevated_run_without_whatif_is_refused_before_the_file_is_read(
     """Without ``-WhatIf`` the script writes the machine stores, so an unelevated run stops before
     it reads the file. Run only unelevated (``_run_script`` skips an elevated session), and on a
     file the script refuses anyway (a root beside a leaf), so even a regression that skipped the
-    elevation check would import nothing. The elevation check is Windows-only."""
+    elevation check would import nothing. The elevation check is Windows-only. A hosted Windows
+    runner is elevated, so this runs only on an unelevated Windows host, never in CI."""
     if sys.platform != "win32":
         pytest.skip("SKIP (nothing run): the elevation check reads a Windows identity")
     proc = _run_script(files["p7b_with_leaf"], whatif=False)

@@ -711,8 +711,8 @@ _AS = "AuthService"
 _E = "get_engine"
 
 #: Every ``/ui`` operation of ``create_app(serve_ui=True, oidc_enabled=True)``: 130 with OIDC off,
-#: which :func:`test_the_ui_route_counts_are_the_measured_ones` derives, and the 4 OIDC legs. A write's authority is its write routes, and a read
-#: only where the write's own gate names a permission that read decides and no write route does:
+#: the number :func:`test_the_ui_route_counts_are_the_measured_ones` pins, and the 4 OIDC legs.
+#: A write's authority is its write routes, and a read only where the write's own gate names a permission that read decides and no write route does:
 #: under ADR 0215 section 2 a write makes one sub-request and redirects, and the page it re-renders
 #: on an error today is read on the following GET. :func:`_write_authority_problems` checks it.
 _UI_ROUTES: dict[str, Ui] = {
@@ -784,6 +784,11 @@ _UI_ROUTES: dict[str, Ui] = {
         f"{_AS} admin.admin_revoke_user_sessions admin.federated_identity_view admin.list_roles "
         "admin.user_summary_scoped admin.checked_user",
     ),
+    # BACKLOG #5559: the delete confirmation reads the account only to see that it fails its seal,
+    # the checked read the users:manage federated-identity read of one account makes.
+    "GET /ui/users/{user_id}/delete-confirm": _J(
+        "GET /users/{user_id}/federated-identity", f"{_AS} admin.checked_user"
+    ),
     "POST /ui/users/{user_id}/delete": _J(
         "DELETE /users/{user_id}",
         f"{_AS} admin.delete_user admin.federated_identity_view admin.list_roles "
@@ -791,8 +796,6 @@ _UI_ROUTES: dict[str, Ui] = {
     ),
     "GET /ui/roles": _J("GET /roles", f"{_AS} admin.list_roles"),
     "GET /ui/roles/new": Ui("check", "ADD GET /auth/check/users:manage", ""),
-    # BACKLOG #5559: the delete confirmation for a row that fails its seal reads nothing.
-    "GET /ui/users/{user_id}/delete-confirm": Ui("check", "ADD GET /auth/check/users:manage", ""),
     "GET /ui/roles/{role_id}/edit": _J(
         "GET /roles/custom;ADD GET /auth/check/users:manage", f"{_AS} admin.list_custom_roles"
     ),
@@ -1571,7 +1574,7 @@ def test_the_ui_route_counts_are_the_measured_ones() -> None:
     assert len(default) == 130
     assert set(_UI_ROUTES) == default | _OIDC_ONLY
     counts = Counter(u.kind for u in _UI_ROUTES.values())
-    assert counts == {"json": 109, "public": 15, "confinement": 3, "ceremony": 3, "check": 4}, (
+    assert counts == {"json": 110, "public": 15, "confinement": 3, "ceremony": 3, "check": 3}, (
         counts
     )
 

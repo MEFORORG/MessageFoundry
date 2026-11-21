@@ -173,6 +173,12 @@ async def test_a_failing_account_is_listed_with_its_delete_and_the_delete_remove
         assert confirm.status_code == 200
         assert f'action="/ui/users/{victim}/delete"' in confirm.text and victim in confirm.text
         assert _PLANTED not in confirm.text and "victim" not in confirm.text
+        # Control: an intact account's confirmation claims no failed check; it goes to the
+        # account's own page. A missing one answers 404.
+        intact_confirm = await c.get(f"/ui/users/{intact}/delete-confirm")
+        assert intact_confirm.status_code == 303
+        assert intact_confirm.headers["location"] == f"/ui/users/{intact}"
+        assert (await c.get("/ui/users/no-such-account/delete-confirm")).status_code == 404
         r = await c.post(f"/ui/users/{victim}/delete", headers=SAME_ORIGIN)
     assert r.status_code == 303 and r.headers["location"] == "/ui/users"
     assert await engine.store.get_user(victim) is None
@@ -290,7 +296,8 @@ async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checke
     assert r.status_code == 200
     assert "Temporary password issued" in r.text and "<code>" in r.text
     assert f"Convey this to {victim} " in r.text and "Convey this to victim " not in r.text
-    # The fallback is logged with the account's id. A store failure keeps its traceback.
+    # The fallback is logged with the account's id, and a refusal's text, which can carry the
+    # record's values, is not.
     fallback = [
         rec
         for rec in caplog.records
@@ -299,8 +306,7 @@ async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checke
         and "names the account by id" in rec.getMessage()
     ]
     assert fallback
-    if type(failure) is RuntimeError:  # UserSealRefused is one too, and answers 423
-        assert all(rec.exc_info is not None for rec in fallback)
+    assert all(rec.exc_info is None and "stand-in" not in rec.getMessage() for rec in fallback)
 
 
 @pytest.mark.parametrize(
@@ -365,6 +371,17 @@ async def test_the_summary_takes_its_roles_from_a_checked_record_only(
     assert _console_user_summary(raw, [Role.VIEWER.value], show_scope=True).roles == [
         Role.VIEWER.value
     ]
+
+
+def test_the_delete_confirmation_offers_no_form_for_the_callers_own_account() -> None:
+    """The delete refuses the caller's own account, so its confirmation says so and offers no
+    form. The control is the same page for another account."""
+    from messagefoundry_webconsole.pages.admin import user_delete_confirm_page
+
+    own = str(user_delete_confirm_page("u1", is_self=True))
+    other = str(user_delete_confirm_page("u1", is_self=False))
+    assert "/ui/users/u1/delete" not in own and "cannot delete your own account" in own
+    assert 'action="/ui/users/u1/delete"' in other  # control
 
 
 async def test_a_users_read_only_reader_is_offered_no_delete_of_a_failing_account(

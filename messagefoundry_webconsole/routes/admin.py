@@ -278,23 +278,24 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         of a read made only to label it may replace the page that hands it over. As
         :func:`~messagefoundry.audit_write.write_audit_soft` says of its ``defects``, a raise here
         would report an operation that already ran as a failure. An ``HTTPException`` logs a
-        WARNING naming the account and the status. One of ``account_read_errors()`` outside
-        ``AUDIT_WRITE_DEFECTS`` logs a WARNING with its traceback, and anything else, a defect
-        included, logs an ERROR with its traceback. None of these lines is rate-limited."""
+        WARNING naming the account and the status, and one of ``account_read_errors()`` outside
+        ``AUDIT_WRITE_DEFECTS`` a WARNING naming its type alone, since a refusal's text can carry
+        the record's values. Anything else, a defect included, logs an ERROR with its traceback,
+        so the bug can be found. None of these lines is rate-limited."""
+        trace: BaseException | None = None
         try:
             user = await _checked(user_id, service)
         except HTTPException as exc:
             # 404 gone since the action, 423 a record that fails its seal, 503 a Vault Outage.
             level, reason = logging.WARNING, f"answered {exc.status_code}"
-            trace: BaseException | None = None
         except Exception as exc:
             # Broad on purpose: the credential was issued, and the docstring says why.
-            refusal = isinstance(exc, account_read_errors()) and not isinstance(
-                exc, AUDIT_WRITE_DEFECTS
-            )
-            level = logging.WARNING if refusal else logging.ERROR
-            # The exception itself, since the handler's exc_info is gone once this block ends.
-            reason, trace = f"failed ({type(exc).__name__})", exc
+            reason = f"failed ({type(exc).__name__})"
+            if isinstance(exc, account_read_errors()) and not isinstance(exc, AUDIT_WRITE_DEFECTS):
+                level = logging.WARNING
+            else:
+                # The exception itself, since the handler's exc_info is gone once this ends.
+                level, trace = logging.ERROR, exc
         else:
             return str(user.username)
         _log.log(
@@ -1034,12 +1035,25 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     @app.get("/ui/users/{user_id}/delete-confirm", response_class=HTMLResponse)
     async def ui_user_delete_confirm(
         user_id: str,
+        service: AuthService = Depends(_service),
         identity: Identity = Depends(require_ui_step_up(Permission.USERS_MANAGE)),
-    ) -> HTMLResponse:
+    ) -> Response:
         # BACKLOG #5559: the confirmation the users list leads to for an account whose record
-        # fails its seal. Behind the delete's own gate. It reads nothing: the page names the id
-        # alone, and the POST it carries makes every check the delete makes.
-        return HTMLResponse(pages.user_delete_confirm_page(user_id))
+        # fails its seal, behind the delete's own gate. The account is read through the checked
+        # read first, so the page says a record failed its check only when it did: an intact
+        # account goes to its own detail page, and a missing one, or any other refusal, is that
+        # read's answer. The page names the id alone, and the POST it carries makes every check
+        # the delete makes.
+        try:
+            await _checked(user_id, service)
+        except HTTPException as exc:
+            if exc.status_code != status.HTTP_423_LOCKED:
+                raise
+        else:
+            return RedirectResponse(f"/ui/users/{user_id}", status_code=303)
+        return HTMLResponse(
+            pages.user_delete_confirm_page(user_id, is_self=user_id == identity.user_id)
+        )
 
     @app.post("/ui/users/{user_id}/delete")
     async def ui_user_delete(
@@ -1059,8 +1073,8 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     user_id, service, identity, error=str(exc.detail), status_code=400
                 )
             except HTTPException as page_exc:
-                # BACKLOG #5559: the users list offers the delete for a record that fails its
-                # seal, whose detail page answers 423. The delete's own refusal is the answer, and
+                # BACKLOG #5559: the delete confirmation offers the delete for a record that fails
+                # its seal, whose detail page answers 423. The delete's own refusal is the answer, and
                 # it stays the answer when the page's read is refused on an HTTP refusal from the
                 # re-render (a 503 Vault Outage, say), which would replace it. An account gone
                 # since answers 404.

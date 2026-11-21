@@ -567,8 +567,8 @@ chain building, so the SQL Server hop still checks the chain up to the root. It 
 trust anchor by the engine's Python TLS on Windows: CPython's `ssl.create_default_context()`,
 which the PostgreSQL system-trust path calls, loads the `CA` and `ROOT` system stores, and Python
 3.13 and later set partial-chain verification, so a chain that reaches a certificate in
-`LocalMachine\CA` validates there without its root. That is why the helper refuses a file in
-which a CA does not chain to a self-signed root in the same file. With `-Confirm` you may still
+`LocalMachine\CA` validates there without its root, which is why the helper checks each CA's
+chain (its help says how). With `-Confirm` you may still
 decline the root and accept another CA, so give it the root of the CA you mean to trust, alone or
 in that CA's own `.p7b` chain, and accept every certificate it offers.
 
@@ -603,17 +603,23 @@ connection fails validation** (NIST SP 800-52r2: rotate certificates before expi
 2. **Roll the DB server certificate** to one issued by the new CA (a DB-administrator action). Because
    both CAs are trusted, connections keep validating across the swap.
 3. **Remove the old CA** once every host trusts the new one and the server cert has rolled:
-   - **SQL Server:** delete **every** certificate the old CA's file put in the machine stores: its
-     root from `LocalMachine\Root` and each of its issuing CAs from `LocalMachine\CA`. Removing the
-     root alone is not enough. An old issuing CA left in `LocalMachine\CA` stays a trust anchor for
-     the engine's Python TLS (§5.2, "Where each CA goes"), so a server certificate it issued would
-     still validate there. The helper prints each certificate's thumbprint; run it with `-WhatIf` on
-     the old file to list them again (it prints the list before it refuses a file for a CA, chain
-     or validity check, so it lists them even once the old root has expired). Then remove
-     them all at once:
+   - **SQL Server:** delete **every** certificate the old CA's file put in the machine stores that
+     the new CA's file does not also hold: its root from `LocalMachine\Root` and each of its
+     issuing CAs from `LocalMachine\CA`. Removing the root alone is not enough. An old issuing CA
+     left in `LocalMachine\CA` stays a trust anchor for the engine's Python TLS (§5.2, "Where each
+     CA goes"), so a server certificate it issued would still validate there. **Keep** any
+     certificate the new file also holds, such as the shared root when only the issuing CA
+     rotated: removing it breaks the new chain, which is the outage this order exists to avoid.
+     The helper prints each certificate's thumbprint; run it with `-WhatIf` on the old file and on
+     the new one, and take the old file's thumbprints that the new file's listing does not show.
+     For a file the helper reads, it prints the list before it refuses the file for a CA, chain or
+     validity check, so it lists them even once the old root has expired; a file it cannot read
+     at all lists nothing, so find its certificates by Subject in
+     `Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA` instead.
+     Then remove them all at once:
 
      ```powershell
-     $old = @('<old root thumbprint>', '<old issuing CA thumbprint>')  # every one the old file holds
+     $old = @('<old thumbprint>', '<old thumbprint>')  # every old one the new file does not hold
      Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA |
          Where-Object Thumbprint -in $old | Remove-Item
      ```

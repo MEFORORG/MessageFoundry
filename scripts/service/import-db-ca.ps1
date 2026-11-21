@@ -23,7 +23,9 @@
     docs/DEPLOY-SERVER-DB.md section 5.2 ("Where each CA goes"), and so is the PowerShell version
     this needs.
 
-    What this script checks. This is the one statement of it; other documents point here. A
+    What this script checks. This is the full statement of it. docs/DEPLOY-SERVER-DB.md points
+    here; at least docs/INPUT-SURFACES.md and docs/DANGEROUS-FUNCTIONALITY.md still name some of
+    its refusals, with "at least", and this text governs where they differ. A
     certificate is a self-signed root when the chain .NET's chain engine (X509Chain) builds for it
     is that certificate alone and its signature verifies under its own key. The Windows chain
     engine needs an authority key identifier to link a self-issued certificate to its signer;

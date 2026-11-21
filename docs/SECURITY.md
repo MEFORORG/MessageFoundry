@@ -1693,15 +1693,19 @@ record checked against its integrity seal: `GET /users`, `GET /users/{user_id}/p
 `PATCH /users/{user_id}`, `GET /users/{user_id}/federated-identity` and `GET /users/{user_id}/channel-scope`;
 and, in the web console (BACKLOG #5559), at least the pages the next sentences name. `GET /ui/users`
 answers 200 and lists a failing account by its id alone; to a caller holding `users:manage` it
-offers that account's delete, through a confirmation page that names the id alone.
+offers that account's delete, through a confirmation page that names the id alone and is shown
+only when the checked read refuses the record for its seal.
 `GET /ui/users/{user_id}`, `GET /ui/users/{user_id}/federated-identity`, its unlink confirmation and
 `POST /ui/users/{user_id}/channel-scope` answer 423 for a failing record. The console pages shown
 after a password reset, a factor reset or an enrolment code has already been issued read the
-account's name the same way. When that read raises anything at all, a 423 for a record that fails
-its seal, a 404, a 503, a refused store call, a record that cannot be decrypted or a defect, they name the
-account by its id and still show what was issued, and log one line naming the account: a WARNING
-for any of those but a defect, an ERROR with its traceback for a defect or anything else. That line is not rate-limited, unlike
-the seal-failure report below. A failure is reported
+account's name the same way. When that read raises any Python `Exception`, they name the account
+by its id and still show what was issued, and log one line naming the account, which is not
+rate-limited, unlike the seal-failure report below. That line is a WARNING, naming the status or
+the exception type alone, for an HTTP answer (a 423 for a record that fails its seal, a 404, a
+503) or a refusal the checked read is declared to raise (`account_read_errors()`, at least a
+refused store call and a record that cannot be decrypted), less `AUDIT_WRITE_DEFECTS`. A bug
+whose type is in that refusal set, such as a `ValueError`, is logged the same way. Any other
+exception is an ERROR with its traceback. A failure is reported
 per account and rate-limited, in each engine process: only the first refusal of an account in
 each report interval (`SEAL_FAILURE_REPORT_INTERVAL_SECONDS`, 300 seconds) logs a WARNING, writes
 the `integrity.authority_seal_failed` audit row and raises the `integrity_drift` alert. A refusal
