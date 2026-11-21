@@ -288,12 +288,7 @@ def _names_missing(host: str, pem: bytes) -> list[str]:
     lacks, matched by :func:`messagefoundry.pki.san_names`: the subject and
     :func:`_generated_sans`, except that a WILDCARD bind requires only its family's loopback, the
     address a client dials, since no client dials ``0.0.0.0`` or ``::``. Raises ``ValueError`` when
-    ``pem`` is not a parseable certificate.
-
-    OPEN EDGE: ``san_names`` ignores a trailing dot and hostname verification does not, so a pair
-    minted off loopback for ``myhost`` is reused after a move to ``myhost.``, or the reverse, and
-    likewise ``localhost`` to ``localhost.``, though a client dialling the new spelling fails
-    verification."""
+    ``pem`` is not a parseable certificate."""
     from messagefoundry import pki
 
     subject = [] if wildcard_loopback(host) is not None else [unbracketed(host)]
@@ -328,8 +323,7 @@ def _make_generated(host: str, kept: Sequence[str] = ()) -> tuple[bytes, bytes]:
 def _host_key(name: str) -> object:
     """``name`` matched loosely, to decide which binds count as loopback: an IP by address without
     an IPv6 zone, so ``0:0:0:0:0:0:0:1`` is ``::1``, and a DNS name without regard to case or a
-    trailing dot. Hostname verification (measured on OpenSSL 3.5) does not ignore a trailing dot,
-    so this is not what a client matches; :func:`_san_key` is the exact SAN entry."""
+    trailing dot. It classifies binds only; :func:`_san_key` is the exact SAN entry."""
     try:
         return ipaddress.ip_address(name.split("%", 1)[0])
     except ValueError:
@@ -346,8 +340,7 @@ def _san_key(name: str) -> object:
     """``name`` as the SAN entry ``make_self_signed`` writes for it: an IP literal by address
     without an IPv6 zone, which the entry cannot carry, so ``0:0:0:0:0:0:0:1``, ``::1`` and
     ``::1%1`` are one entry; anything else, ``127.0.0.1%x`` included, as a DNS name without regard
-    to case. Unlike :func:`_host_key` it keeps a trailing dot, because hostname verification does
-    not match ``localhost`` against an entry ``localhost.``."""
+    to case, with a trailing dot significant, as hostname verification compares it."""
     try:
         address = ipaddress.ip_address(name)
     except ValueError:

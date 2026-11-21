@@ -4340,6 +4340,27 @@ def test_a_pair_minted_for_a_127_bind_verifies_at_each_loopback_name(
     assert _handshake(server_ctx, client_ctx, client_cert=None, server_hostname=dialled)
 
 
+def test_a_move_to_a_dotted_bind_re_mints_a_pair_that_verifies_at_the_dotted_name(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5790. A pair minted for ``127.0.0.1`` names ``localhost`` but not ``localhost.``,
+    which hostname verification treats as another name, so a move to ``localhost.`` re-mints, and
+    a client dialling ``localhost.`` then verifies.
+
+    Mutation: ignore a trailing dot in ``pki.san_names``. Red: the pair is reused and the dotted
+    handshake fails."""
+    ensure_api_tls_material(ApiSettings(), state_dir=tmp_path)
+    events: list[GeneratedPairReplaced] = []
+    cert, key = ensure_api_tls_material(
+        ApiSettings(host="localhost."), state_dir=tmp_path, replacements=events
+    )
+    assert [e.reason for e in events] == ["bind_changed"]
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(cert, key)
+    client_ctx = ssl.create_default_context(cafile=cert)
+    assert _handshake(server_ctx, client_ctx, client_cert=None, server_hostname="localhost.")
+
+
 def test_a_pair_minted_for_a_127_bind_fails_verification_at_a_name_it_lacks(
     tmp_path: Path,
 ) -> None:
@@ -4370,6 +4391,14 @@ def test_a_pair_minted_for_a_127_bind_fails_verification_at_a_name_it_lacks(
         ("10.0.0.9", "0:0:0:0:0:0:0:1", ["::1", "127.0.0.1", "localhost"]),
         # A bracketed IPv6 bind is named by the address, not a DNS name spelled "[::1]".
         ("10.0.0.9", "[::1]", ["::1", "127.0.0.1", "localhost"]),
+        # A trailing dot makes a different name for hostname verification, so a move that adds
+        # or drops one re-mints (BACKLOG #5790).
+        ("myhost", "myhost.", ["myhost."]),
+        ("myhost.", "myhost", ["myhost"]),
+        ("localhost", "localhost.", ["localhost.", "127.0.0.1", "::1", "localhost"]),
+        ("127.0.0.1", "localhost.", ["localhost.", "127.0.0.1", "::1", "localhost"]),
+        ("::1", "localhost.", ["localhost.", "127.0.0.1", "::1", "localhost"]),
+        ("[::1]", "localhost.", ["localhost.", "127.0.0.1", "::1", "localhost"]),
         # Off loopback, nothing is kept: the CLI defaults cannot reach this bind anyway. A re-mint
         # carries only the fixed loopback set, as origin/main's does, so the old names are dropped.
         ("127.0.0.1", "myhost.example", ["myhost.example"]),
@@ -4437,11 +4466,6 @@ def test_a_reused_pair_is_re_minted_when_the_bind_moves_to_a_name_it_lacks(
         ("127.0.0.1", "[::1]", True),
         # Hostname matching ignores case, and a SAN cannot carry an IPv6 zone.
         ("myhost", "MYHOST", True),
-        # OPEN EDGE, pinned as current behaviour: san_names ignores a trailing dot, so these reuse
-        # though hostname verification of the new spelling fails (see _names_missing).
-        ("myhost", "myhost.", True),
-        ("myhost.", "myhost", True),
-        ("localhost", "localhost.", True),
         ("fe80::1%12", "fe80::1%12", True),
         # A bracketed host is minted and checked without its brackets, as the address.
         ("[::1]", "[::1]", True),
