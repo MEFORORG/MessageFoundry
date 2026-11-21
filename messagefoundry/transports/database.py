@@ -3640,7 +3640,7 @@ def _tracked[T](table: weakref.WeakKeyDictionary[Any, T], pool: Any) -> T | None
         return None
 
 
-async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float | None = None) -> None:
+async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float) -> None:
     """Set ``pool``'s statement timeout on a connection just borrowed from it (BACKLOG #5756).
 
     pyodbc's ``Connection.timeout`` is set on each cursor as it is made, as the ODBC query timeout.
@@ -3651,12 +3651,11 @@ async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float | Non
     The write is skipped when the connection already holds the value: a connection lent before,
     and ``0`` on a fresh one. A borrower cancelled during the write leaves at once, and the
     connection goes back only once the write has returned (:func:`_return_when_settled`), or is
-    discarded if the write then failed with a transient state. A ``timeout`` of at least
-    :data:`_TIMEOUT_WRITE_FLOOR_S` bounds the wait for the write the same way, as a transient
-    :class:`DeliveryError`; :func:`_acquire` passes what is left of its ``acquire_timeout``. Less
-    than that left counts as spent, and the write is then waited for with no bound, still off the
-    loop, as it was before it had one, so a borrow whose acquire took nearly the whole budget is
-    not failed by a sliver of it.
+    discarded if the write then failed with a transient state. ``timeout`` bounds the wait for the
+    write the same way, as a transient :class:`DeliveryError`, and the write is never waited for
+    without it. Every caller passes its borrow's whole ``acquire_timeout``, so a healthy write
+    always gets one full ``acquire_timeout`` however long the acquire before it took, and a write
+    slower than that fails the borrow.
 
     **A driver that refuses the value fails the borrow closed.** The connection goes back to
     ``pool`` first, since a refused write leaves the handle usable and no statement ran on it, and
@@ -3702,8 +3701,7 @@ async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float | Non
         await _return_to_pool(pool, conn)
         raise
     try:
-        bound = timeout if timeout is not None and timeout >= _TIMEOUT_WRITE_FLOOR_S else None
-        await asyncio.wait_for(asyncio.shield(work), bound)
+        await asyncio.wait_for(asyncio.shield(work), timeout)
     except BaseException as exc:
         if not (work.done() and isinstance(exc, Exception)):
             # The borrower left (a cancel, or the bound) while the thread may still be inside the
@@ -3740,11 +3738,6 @@ def _transient_driver_error(exc: BaseException) -> bool:
     """Whether ``exc`` carries a SQLSTATE this connector retries (:func:`_is_transient`)."""
     state = _log_sqlstate(exc)
     return state is not None and _is_transient(state)
-
-
-#: The least time left of a borrow's ``acquire_timeout`` that still bounds the ``statement_timeout``
-#: write (:func:`_apply_statement_timeout`); less counts as spent, so the write is waited for.
-_TIMEOUT_WRITE_FLOOR_S = 1.0
 
 
 def _set_driver_timeout(raw: Any, seconds: int) -> None:
@@ -3787,22 +3780,25 @@ def _retire_executor(pool: Any, closing: asyncio.Future[None]) -> None:
 # connection means pool_max is never legitimately exhausted, so an acquire that can't be satisfied
 # within the timeout means the pool is wedged or the DB is unresponsive — fail it transiently rather
 # than block the worker forever (which would let the queue back up unbounded). Override per connection
-# with the ``acquire_timeout`` setting.
+# with the ``acquire_timeout`` setting. The borrow's statement_timeout write after the acquire is
+# bounded by its own full ``acquire_timeout`` (BACKLOG #5756), so a borrow that ends in that write
+# takes at most about twice ``acquire_timeout``; at least the close of a refused ungated
+# connection (:func:`_require_gate_or_discard`) is not bounded by either.
 _DEFAULT_DB_ACQUIRE_TIMEOUT = 30.0
 
 
 async def _acquire(pool: Any, timeout: float) -> Any:
     """Acquire a connection from ``pool`` within ``timeout`` seconds, or raise a transient
     :class:`DeliveryError` with a clear, PHI-free message. Wraps the driver's own ``acquire`` so a
-    hung/exhausted pool surfaces as a retryable failure instead of an unbounded await.
+    hung/exhausted pool surfaces as a retryable failure instead of an unbounded await. The
+    statement_timeout write that follows gets its own ``timeout`` (the WP-L3-07 comment above says
+    what that bounds).
 
     The connection comes back with the call gate installed (BACKLOG #2394), so a cancelled call
     cannot free its handles under a running statement, the native crash BACKLOG #2049 recorded. A
     real aioodbc connection the gate cannot wrap is refused and discarded instead, before any call
     runs on it (:func:`_require_gate_or_discard`). It also carries the pool's statement timeout
     (:func:`_apply_statement_timeout`, BACKLOG #5756)."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
     try:
         conn = await asyncio.wait_for(pool.acquire(), timeout)
     except TimeoutError as exc:
@@ -3810,8 +3806,9 @@ async def _acquire(pool: Any, timeout: float) -> Any:
             f"DATABASE pool acquire timed out after {timeout:g}s (pool exhausted or DB unresponsive)"
         ) from exc
     await _require_gate_or_discard(pool, conn)
-    # What is left of the one bound; once it is spent the write waits unbounded, as before.
-    await _apply_statement_timeout(pool, conn, timeout=deadline - loop.time())
+    # max(what is left of the bound, the whole bound) is the whole bound: a healthy write always
+    # gets one full acquire_timeout, and the write is never unbounded.
+    await _apply_statement_timeout(pool, conn, timeout=timeout)
     return conn
 
 
@@ -4285,8 +4282,8 @@ def _cursor_refusal_discards(refused: DeliveryError) -> bool:
     """Whether a borrow whose cursor :func:`_cursor_refused` classified as ``refused`` discards its
     connection (BACKLOG #5749): every refusal but a static one, a ``config_fault`` or a
     ``credential_fault``, which a fresh connection would meet the same way, so a discard would
-    only add a login per borrow. The poll, mark, lookup, ``DatabaseRef`` sync and login role
-    probe use it; ``send()`` and :func:`_probe_db` discard on every refusal."""
+    only add a login per borrow. At least the poll, mark, lookup, ``DatabaseRef`` sync and login
+    role probe use it; at least ``send()`` and :func:`_probe_db` discard on every refusal."""
     return not (
         isinstance(refused, NegativeAckError) and (refused.config_fault or refused.credential_fault)
     )
@@ -4520,7 +4517,7 @@ class DatabaseDestination(DestinationConnector):
                 if refused is None:
                     raise  # not a DB driver error, so an internal/code error, as below
                 # BACKLOG #5749: a handle that cannot make a cursor is not lent again, whatever
-                # the refusal; the sites classified later keep it on a static one.
+                # the refusal (_cursor_refusal_discards says where a static one keeps it).
                 discard = True
                 raise refused from exc
             try:

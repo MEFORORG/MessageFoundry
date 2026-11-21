@@ -330,14 +330,21 @@ async def test_a_timeout_write_that_fails_after_its_borrower_left_discards_the_c
 async def test_acquire_timeout_bounds_a_hung_timeout_write(
     monkeypatch: pytest.MonkeyPatch, rig: _Rig
 ) -> None:
-    """The write sits inside the borrow, so the borrow's bound covers it: a hung write fails the
-    borrow transiently, and the connection goes back once the write returns."""
+    """A hung write fails the borrow transiently even when the acquire before it spent the whole
+    acquire_timeout: the write gets a full acquire_timeout of its own and is never unbounded. The
+    connection goes back once the write returns."""
     monkeypatch.setattr(_RecordsTimeoutThread, "writes", [], raising=False)
-    _aioodbc_serving(
-        monkeypatch, rig, raw_type=_RecordsTimeoutThread, blocks=never, block_autocommit=True
-    )
     dest = _destination()
-    dest._acquire_timeout = 2.0  # above _TIMEOUT_WRITE_FLOOR_S, so the write is bounded
+    dest._acquire_timeout = 0.5
+    _spend_the_budget_on_acquire(monkeypatch, dest, left=0.0)
+    _aioodbc_serving(
+        monkeypatch,
+        rig,
+        pool_type=_AcquireSpendsBudget,
+        raw_type=_RecordsTimeoutThread,
+        blocks=never,
+        block_autocommit=True,
+    )
     with pytest.raises(DeliveryError) as caught:
         await asyncio.wait_for(dest.send('{"a": 1}'), WAIT)
     assert not isinstance(caught.value, NegativeAckError)
@@ -372,7 +379,7 @@ async def test_the_cursor_close_and_autocommit_set_run_on_the_pools_executor(
     assert all(name.startswith("mefor-database") for name in threads), threads
 
 
-# --- the coordinator's repair of 976dca70 --------------------------------------------------------
+# --- the discard on send, and the write after a slow acquire -----------------------------------
 
 
 class _LoginRefusedCursor(_BusyCursorRefused):
@@ -383,7 +390,7 @@ async def test_a_send_discards_on_every_cursor_refusal_a_login_refusal_included(
     monkeypatch: pytest.MonkeyPatch, rig: _Rig
 ) -> None:
     """send() discards on every cursor refusal, as origin/main does; only the sites this branch
-    newly classifies keep a connection on a static refusal. Red at 976dca70, which kept it."""
+    newly classifies keep a connection on a static refusal."""
     _aioodbc_serving(
         monkeypatch, rig, pool_type=_WakingPool, raw_type=_LoginRefusedCursor, blocks=never
     )
@@ -405,6 +412,22 @@ class _AcquireSpendsBudget(_WakingPool):
         return conn
 
 
+def _spend_the_budget_on_acquire(
+    monkeypatch: pytest.MonkeyPatch, dest: Any, *, left: float
+) -> None:
+    """Make the loop's clock read the acquire as having taken all but ``left`` of
+    ``dest``'s acquire_timeout."""
+    loop = asyncio.get_running_loop()
+    real_time = loop.time
+    offset = [0.0]
+    monkeypatch.setattr(loop, "time", lambda: real_time() + offset[0])
+
+    def _spend() -> None:
+        offset[0] += dest._acquire_timeout - left
+
+    monkeypatch.setattr(_AcquireSpendsBudget, "bump", staticmethod(_spend))
+
+
 class _SlowTimeoutWrite(RawConn):
     """A ``timeout`` write that takes a short real time on its worker thread."""
 
@@ -424,19 +447,11 @@ class _SlowTimeoutWrite(RawConn):
 async def test_a_borrow_whose_acquire_spent_the_budget_still_waits_for_the_write(
     monkeypatch: pytest.MonkeyPatch, rig: _Rig, left: float
 ) -> None:
-    """Red at 976dca70: the write got a zero budget and the borrow failed, where origin/main,
-    whose write had no bound, succeeded."""
-    loop = asyncio.get_running_loop()
-    real_time = loop.time
-    offset = [0.0]
-    monkeypatch.setattr(loop, "time", lambda: real_time() + offset[0])
+    """A short write after an acquire that left nothing, or a sliver, of acquire_timeout still
+    succeeds: the write's bound is a full acquire_timeout, not what the acquire left."""
     dest = _destination()
     dest._acquire_timeout = 1.0  # well inside WAIT, which the moved clock also reads
-
-    def _spend() -> None:
-        offset[0] += dest._acquire_timeout - left  # a sliver left is spent too
-
-    monkeypatch.setattr(_AcquireSpendsBudget, "bump", staticmethod(_spend))
+    _spend_the_budget_on_acquire(monkeypatch, dest, left=left)
     _aioodbc_serving(
         monkeypatch, rig, pool_type=_AcquireSpendsBudget, raw_type=_SlowTimeoutWrite, blocks=never
     )

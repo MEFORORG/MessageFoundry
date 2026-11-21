@@ -4790,7 +4790,9 @@ Facts that are easy to get wrong, stated plainly first:
 - **The DATABASE connector's pool acquire is bounded.** `acquire_timeout` (default 30 s, per
   connection on `Database(...)`, `DatabasePoll(...)` and `DatabaseLookup(...)`) wraps the driver's
   `pool.acquire()`; on expiry the operation fails as a **transient** delivery error and enters the
-  `RetryPolicy` path. It never waits indefinitely.
+  `RetryPolicy` path. The acquire never waits indefinitely, and the `statement_timeout` write
+  that may follow it gets a full `acquire_timeout` of its own, so such a borrow takes at most
+  about twice `acquire_timeout`.
 - **The DATABASE connector bounds each statement with `statement_timeout`** (whole seconds, `0`
   for no limit, at most `2**31 - 1`; on `Database(...)`, `DatabasePoll(...)` and
   `DatabaseLookup(...)`, BACKLOG #5756). **Unset, the default depends on the driver family.** It is 30 s on the SQL Server
@@ -4813,10 +4815,10 @@ Facts that are easy to get wrong, stated plainly first:
   value set explicitly is never dropped silently. A send then stops its lane; a poll reports the
   failure and polls again next interval; a `db_lookup` raises into its Handler. A transient driver
   state from that write is the connection's failure instead: the borrow fails transiently and
-  the connection is discarded. A write still running when what is left of the borrow's
-  `acquire_timeout` runs out fails the borrow with a transient error too, and its connection
-  stays out of the pool until the write returns; once less than a second of it is left after the
-  acquire, the write is waited for with no bound. The transient states are every state the connector retries:
+  the connection is discarded. A write still running after a full `acquire_timeout` of its own
+  fails the borrow the same way, however long the acquire before it took, and its connection
+  stays out of the pool until the write returns; the write is never waited for without a bound.
+  The transient states are every state the connector retries:
   SQLSTATE class `08`, class `40`, `HYT00` and `HYT01`. A driver that takes it on the
   connection but refuses the ODBC query timeout on a cursor refuses every cursor; a send and the
   connection test read `HYC00` or `HY092` there as the same configuration fault, while a poll,

@@ -410,16 +410,14 @@ async def _load_database_source(
             # A probe that did not run judged nothing, so the next pass tries again.
             if probed is not None and reading.verdict is not LoginRoleVerdict.NOT_RUN:
                 probed.add(probe_key)
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + acquire_timeout
         conn = await acquire_pooled(pool, timeout=acquire_timeout, backend="reference:database")
         # Before the cursor is made, since pyodbc sets the query timeout on each cursor as it is
         # made, and before the try below: on a refusal it gives the connection back itself.
         timeout_refused = False
         try:
-            # What is left of the borrow's bound (BACKLOG #1052), never a second full one; once it
-            # is spent the write waits unbounded, as before it had a bound.
-            await _apply_statement_timeout(pool, conn, timeout=deadline - loop.time())
+            # Bounded by one full acquire_timeout of its own, as a DATABASE connector's borrow
+            # bounds it, so a hung write still cannot stall the pass (BACKLOG #1052).
+            await _apply_statement_timeout(pool, conn, timeout=acquire_timeout)
         except NegativeAckError:
             timeout_refused = True  # raised below, outside the handler, so no chain is carried
         if timeout_refused:
