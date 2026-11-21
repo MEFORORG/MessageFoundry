@@ -4371,6 +4371,17 @@ async def test_purge_metadata_respects_the_inflight_guard_pg(store) -> None:
     assert await store.message_metadata_json(mid) is not None
 
 
+@pytest.mark.parametrize("criteria", ["", None], ids=["empty", "null"])
+async def test_a_preset_write_refuses_empty_criteria_pg(store, criteria) -> None:
+    """BACKLOG #5523: the read refuses an empty or NULL criteria cell as drift, so the write
+    refuses one before sealing it, on this backend too; nothing is stored."""
+    with pytest.raises(ValueError, match="must be text and not empty"):
+        await store.upsert_search_preset(
+            preset_id="pg-blank", owner_user_id="blank-owner", name="blank", criteria=criteria
+        )
+    assert await store.list_search_presets("blank-owner") == []
+
+
 async def test_purge_search_presets_pg(store) -> None:
     """ASVS 14.2.7 Tier 2 parity on Postgres: old presets purged, new kept, second pass a no-op.
 

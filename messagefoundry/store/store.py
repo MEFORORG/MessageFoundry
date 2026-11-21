@@ -118,6 +118,7 @@ from messagefoundry.store.cell_tag import (
     open_preset_criteria,
     preset_criteria_aad,
     report_cell_tag_failures,
+    require_preset_criteria,
     row_tag_aad,
     row_tag_columns,
     withhold_message_cells,
@@ -21058,6 +21059,7 @@ class MessageStore:
         row id is reused (so the encrypted criteria's cell-AAD binding stays stable) and criteria/
         updated_at UPDATE; otherwise a fresh row with ``preset_id`` is inserted. The PHI-shaped criteria
         is encrypted at rest (cell_aad bound to the effective id). Returns ``(effective_id, replaced)``."""
+        require_preset_criteria(criteria)  # BACKLOG #5523: a read refuses a blank cell
         now = time.time() if now is None else now
         async with _writer_txn(self._db, self._lock):
             cur = await self._db.execute(

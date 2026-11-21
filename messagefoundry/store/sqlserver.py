@@ -122,6 +122,7 @@ from messagefoundry.store.cell_tag import (
     open_preset_criteria,
     preset_criteria_aad,
     report_cell_tag_failures,
+    require_preset_criteria,
     row_tag_aad,
     row_tag_columns,
     withhold_message_cells,
@@ -8529,6 +8530,7 @@ class SqlServerStore:
         criteria: str,
         now: float | None = None,
     ) -> tuple[str, bool]:
+        require_preset_criteria(criteria)  # BACKLOG #5523: a read refuses a blank cell
         now = time.time() if now is None else now
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
