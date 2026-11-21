@@ -4263,25 +4263,70 @@ def test_the_minted_certificate_names_the_bind_host(tmp_path: Path) -> None:
     assert api.host in common_names
 
 
+def _san_entries(cert: str | Path) -> list[tuple[str, str]]:
+    """The certificate's SAN as ``(kind, value)`` in certificate order: kind ``ip`` for an
+    iPAddress, ``dns`` for a DNSName, and the class name for any other type, so none passes as
+    either."""
+    loaded = x509.load_pem_x509_certificate(Path(cert).read_bytes())
+    san = loaded.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    kinds = {x509.IPAddress: "ip", x509.DNSName: "dns"}
+    return [(kinds.get(type(n), type(n).__name__), str(n.value)) for n in san]
+
+
+#: The three loopback names a generated certificate carries for a loopback bind (BACKLOG #5790):
+#: the two loopback IP literals as iPAddress entries, which is what hostname verification of an
+#: IP-literal URL matches, and ``localhost`` as a DNSName.
+_LOOPBACK_SANS = (("ip", "127.0.0.1"), ("ip", "::1"), ("dns", "localhost"))
+
+
 @pytest.mark.parametrize(
     ("host", "names"),
     [
-        ("127.0.0.1", ["127.0.0.1"]),
-        ("::1", ["::1"]),
-        ("localhost", ["localhost"]),
-        ("10.0.0.9", ["10.0.0.9"]),
-        # A wildcard is dialled on its own family's loopback, so that is named too (BACKLOG #5973).
-        ("0.0.0.0", ["0.0.0.0", "127.0.0.1"]),
-        ("::", ["::", "::1"]),
+        ("127.0.0.1", _LOOPBACK_SANS),
+        ("::1", (("ip", "::1"), ("ip", "127.0.0.1"), ("dns", "localhost"))),
+        ("localhost", (("dns", "localhost"), ("ip", "127.0.0.1"), ("ip", "::1"))),
+        # A specific off-loopback bind gets its own name alone.
+        ("10.0.0.9", (("ip", "10.0.0.9"),)),
+        ("engine.example.test", (("dns", "engine.example.test"),)),
+        # A wildcard gets its own family's loopback, the address it is dialled on (BACKLOG #5973),
+        # and nothing more: what origin/main gave it.
+        ("0.0.0.0", (("ip", "0.0.0.0"), ("ip", "127.0.0.1"))),
+        ("::", (("ip", "::"), ("ip", "::1"))),
+        # A spelling ApiSettings.is_loopback does not list is not a loopback bind here either.
+        ("0:0:0:0:0:0:0:1", (("ip", "::1"),)),
+        ("LOCALHOST", (("dns", "LOCALHOST"),)),
+        ("127.0.0.2", (("ip", "127.0.0.2"),)),
+        ("[::1]", (("dns", "[::1]"),)),
     ],
 )
-def test_the_minted_certificate_names_a_wildcard_binds_loopback(
-    host: str, names: list[str], tmp_path: Path
+def test_the_minted_certificate_names_the_loopback_names_for_a_loopback_bind_only(
+    host: str, names: tuple[tuple[str, str], ...], tmp_path: Path
 ) -> None:
+    """Exact equality, so no other name, the machine host name included, is ever added (decision
+    d20261119T191457909-25c3aa).
+
+    Mutation: mint with the SAN origin/main had before BACKLOG #5790, the bind host plus a wildcard
+    bind's own loopback. Red: the three loopback rows. Mutation: add the loopback names for every
+    bind. Red: every other row."""
     cert, _ = ensure_api_tls_material(ApiSettings(host=host), state_dir=tmp_path)
-    loaded = x509.load_pem_x509_certificate(Path(cert).read_bytes())
-    san = loaded.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
-    assert [str(n.value) for n in san] == names
+    assert tuple(_san_entries(cert)) == names
+
+
+@pytest.mark.parametrize("dialled", ["localhost", "127.0.0.1", "::1"])
+def test_a_pair_minted_for_a_127_bind_verifies_at_each_loopback_name(
+    dialled: str, tmp_path: Path
+) -> None:
+    """A real hostname-checked handshake against the minted pair, trusting only that certificate
+    (BACKLOG #5790). Mutation: the pre-#5790 SAN. Red: ``localhost`` and ``::1`` fail the
+    hostname check for a ``127.0.0.1`` bind."""
+    api = ApiSettings()
+    assert api.host == "127.0.0.1"
+    cert, key = ensure_api_tls_material(api, state_dir=tmp_path)
+    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    server_ctx.load_cert_chain(cert, key)
+    client_ctx = ssl.create_default_context(cafile=cert)
+    assert client_ctx.check_hostname
+    assert _handshake(server_ctx, client_ctx, client_cert=None, server_hostname=dialled)
 
 
 def test_a_second_start_reuses_a_fresh_pair_and_never_re_mints(tmp_path: Path) -> None:
@@ -5150,6 +5195,8 @@ def test_a_generated_pair_renews_inside_its_last_third_and_not_before(
     assert event.old_sha256 == old_sha and event.new_sha256 == _sha256(cert)
     assert event.old_sha256 != event.new_sha256
     assert event.new_not_after == new.not_valid_after_utc.isoformat()
+    # A renewal names what a mint names (BACKLOG #5790); the planted pair carried no SAN at all.
+    assert tuple(_san_entries(cert)) == _LOOPBACK_SANS
     renewed = [r for r in caplog.records if "renewed the generated" in r.getMessage()]
     assert len(renewed) == 1 and renewed[0].levelno == logging.WARNING
     assert "PRIVATE KEY" not in caplog.text
