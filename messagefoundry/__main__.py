@@ -2940,11 +2940,13 @@ class _PreLifespanAnchorAudit:
     def disarm(self) -> None:
         """End the span: uvicorn runs the lifespan next, and its preflight writes the rows."""
         self.settings = None
+        self.forward_ca_refusals = []  # holds nothing once disarmed
+        self.api_ca_refusal = None
 
     def run(self) -> None:
         """Audit what was refused, once, if the span was armed and not disarmed."""
         settings, self.settings = self.settings, None
-        if settings is None or (not self.forward_ca_refusals and self.api_ca_refusal is None):
+        if settings is None:
             return
         _audit_anchors_refused_before_the_store(
             settings,
@@ -2978,11 +2980,11 @@ def _audits_anchors_refused_before_the_lifespan(
         audit = _PreLifespanAnchorAudit()
         token = _PRE_LIFESPAN_ANCHOR_AUDIT.set(audit)
         try:
-            try:
-                rc = serve(args)
-            except Exception:
-                audit.run()
-                raise
+            rc = serve(args)
+        except Exception:
+            audit.run()
+            raise
+        else:
             audit.run()
             return rc
         finally:
