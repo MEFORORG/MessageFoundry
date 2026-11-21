@@ -7309,9 +7309,10 @@ async def test_writes_that_read_output_hold_under_nocount(store) -> None:
 
 
 async def test_concurrent_first_alert_fires_do_not_collide(store) -> None:
-    """BACKLOG #5692: the UPDATE holds its key range to the commit, so concurrent first fires on one
-    key queue rather than both INSERT and fail on ``ux_alert_instance_open``. Every fire lands on
-    one live instance."""
+    """BACKLOG #5692: a per-key applock held to the commit makes concurrent first fires on one key
+    queue rather than both INSERT and fail on ``ux_alert_instance_open``. Every fire lands on one
+    live instance. Nothing here proves the fires overlapped, so a pass without the lock is
+    possible on a fast leg; the unit test pins that the lock is taken."""
     fires = 8
     await asyncio.gather(
         *(

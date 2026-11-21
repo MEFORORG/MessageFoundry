@@ -141,14 +141,17 @@ class _Raw:
 
 
 class _OptionsCursor:
-    def __init__(self, raw: _Raw, row: tuple[int, int], timeouts: dict[str, int]) -> None:
+    def __init__(
+        self, raw: _Raw, row: tuple[int, int], timeouts: dict[str, int], alters_fail: bool
+    ) -> None:
         self._raw = raw
         self._row = row
         self._timeouts = timeouts
+        self._alters_fail = alters_fail
 
     async def execute(self, sql: str, *params: Any) -> None:
         self._timeouts[sql] = self._raw.timeout
-        if sql.startswith("ALTER DATABASE"):
+        if self._alters_fail and sql.startswith("ALTER DATABASE"):
             raise RuntimeError(_DRIVER_TEXT)
 
     async def fetchone(self) -> tuple[int, int]:
@@ -159,9 +162,9 @@ class _OptionsCursor:
 
 
 class _OptionsConn:
-    def __init__(self, row: tuple[int, int], timeouts: dict[str, int]) -> None:
+    def __init__(self, row: tuple[int, int], timeouts: dict[str, int], alters_fail: bool) -> None:
         self._conn = _Raw()
-        self._cursor = _OptionsCursor(self._conn, row, timeouts)
+        self._cursor = _OptionsCursor(self._conn, row, timeouts, alters_fail)
 
     async def cursor(self) -> _OptionsCursor:
         return self._cursor
@@ -171,7 +174,11 @@ class _OptionsConn:
 
 
 def _install(
-    monkeypatch: pytest.MonkeyPatch, *, connect_fails: bool = False, reread_fails: bool = False
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    connect_fails: bool = False,
+    reread_fails: bool = False,
+    alters_fail: bool = True,
 ) -> dict[str, int]:
     timeouts: dict[str, int] = {}
     connects = 0
@@ -181,7 +188,7 @@ def _install(
         connects += 1
         if connect_fails or (reread_fails and connects > 1):
             raise RuntimeError(_DRIVER_TEXT)
-        return _OptionsConn((0, 0), timeouts)
+        return _OptionsConn((0, 0), timeouts, alters_fail)
 
     module = types.ModuleType("aioodbc")
     module.connect = _connect  # type: ignore[attr-defined]
@@ -196,12 +203,27 @@ async def test_the_options_alters_run_under_the_command_timeout(
     """Red before #5666: the one-shot connection kept pyodbc's default of no statement limit, so an
     ALTER DATABASE waiting on a long transaction could stall the open without end. The re-read
     connections are bounded too."""
-    timeouts = _install(monkeypatch)
+    timeouts = _install(monkeypatch, alters_fail=False)
     caplog.set_level(logging.DEBUG, logger=sqlserver_module.log.name)
-    await SqlServerStore._ensure_database_options(_settings(), fail_closed=False)
+    await SqlServerStore._ensure_database_options(_settings())
     assert timeouts[_ALTER_RCSI] == 17
     assert timeouts[_ALTER_SNAPSHOT] == 17
     assert all(seconds == 17 for seconds in timeouts.values()), timeouts
+    reread = _install(monkeypatch)  # the ALTER fails, so the re-read probes run
+    with pytest.raises(RuntimeError, match="READ_COMMITTED_SNAPSHOT is OFF"):
+        await SqlServerStore._ensure_database_options(_settings())
+    assert len(reread) == 3 and all(seconds == 17 for seconds in reread.values()), reread
+
+
+async def test_provision_schema_options_alters_keep_no_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """provision-schema (``fail_closed=False``) is a DBA's one-time run, so its ALTERs keep no
+    statement limit, as the schema batch's DDL does."""
+    timeouts = _install(monkeypatch, alters_fail=False)
+    await SqlServerStore._ensure_database_options(_settings(), fail_closed=False)
+    assert timeouts[_ALTER_RCSI] == 0
+    assert timeouts[_ALTER_SNAPSHOT] == 0
 
 
 async def test_the_options_refusal_redacts_the_driver_text(
@@ -228,6 +250,7 @@ async def test_the_options_connect_failure_redacts_the_driver_text(
     with pytest.raises(RuntimeError, match="could not connect to verify") as info:
         await SqlServerStore._ensure_database_options(_settings())
     assert _SECRET not in str(info.value)
+    assert "permission denied" in str(info.value)  # the diagnosis itself survives redaction
 
 
 # --- #5672, #5675, #5692: writes that read OUTPUT, not rowcount ---------------------------------
@@ -283,6 +306,7 @@ def _store(cur: _NocountCursor) -> tuple[SqlServerStore, list[int]]:
     store._acquire = _acquire  # type: ignore[method-assign]
     store._cursor = _cursor  # type: ignore[method-assign]
     store._commit = _commit  # type: ignore[method-assign]
+    store._settings = _settings()  # _applock reads command_timeout
     return store, commits
 
 
@@ -314,23 +338,27 @@ async def test_attachment_incref_of_a_missing_ref_raises_under_nocount() -> None
 
 async def test_upsert_alert_instance_inserts_a_first_fire_under_nocount() -> None:
     """Red before #5692: the INSERT was gated on ``rowcount == 0``, which -1 never equals, so a
-    first fire was dropped. The UPDATE holds its key range to the commit, so two concurrent first
-    fires queue rather than collide on ``ux_alert_instance_open``."""
-    cur = _NocountCursor([[]])
+    first fire was dropped. A per-key applock, taken before the UPDATE and held to the commit, makes
+    two concurrent first fires queue rather than collide on ``ux_alert_instance_open``."""
+    # Rowsets: the transaction-opening SELECT, the applock's return code, then the UPDATE's OUTPUT.
+    cur = _NocountCursor([[], [(0,)], []])
     store, commits = _store(cur)
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="warning", now=1.0
     )
-    assert len(cur.executed) == 2 and cur.executed[1].startswith("INSERT INTO alert_instance")
-    update = cur.executed[0]
-    assert "WITH (UPDLOCK, HOLDLOCK)" in update and "OUTPUT inserted.id" in update
+    assert len(cur.executed) == 4, cur.executed
+    assert cur.executed[0].startswith("SELECT TOP (1) id FROM alert_instance")
+    assert cur.executed[1] == sqlserver_module._SQL_APPLOCK
+    update = cur.executed[2]
+    assert update.startswith("UPDATE alert_instance SET") and "OUTPUT inserted.id" in update
+    assert cur.executed[3].startswith("INSERT INTO alert_instance")
     assert commits == [1]
-    repeat = _NocountCursor([[(7,)]])
+    repeat = _NocountCursor([[], [(0,)], [(7,)]])
     store, _ = _store(repeat)
     await store.upsert_alert_instance(
         event_type="connection_error", connection="OB_X", severity="warning", now=2.0
     )
-    assert len(repeat.executed) == 1, "a matched UPDATE inserts nothing"
+    assert len(repeat.executed) == 3, "a matched UPDATE inserts nothing"
 
 
 async def test_the_options_reread_failure_logs_no_driver_text(

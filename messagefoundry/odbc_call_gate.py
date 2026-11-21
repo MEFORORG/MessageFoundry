@@ -374,7 +374,7 @@ def abandon_one_shot(conn: Any, cur: Any) -> bool:
     ``__del__`` cannot close it outside the gate. The running call closes both as it returns,
     cursor first; with no call running, a close is scheduled through the gate. Nothing here awaits,
     so the cancellation does not wait for a statement that may be an ``ALTER DATABASE`` with no
-    command timeout.
+    command timeout: ``provision-schema``'s, or an open's when ``[store].command_timeout`` is 0.
 
     A connection with no gate (a stand-in, or one :func:`install_call_gate` could not wrap and
     logged at ERROR) or no handle is not taken. The caller then runs :func:`close_one_shot`, which

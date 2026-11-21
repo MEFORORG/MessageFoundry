@@ -1114,9 +1114,9 @@ def _options_error(exc: BaseException) -> str:
 
 
 def _bound_one_shot(conn: Any, settings: StoreSettings) -> None:
-    """Apply ``[store].command_timeout`` to a one-shot options connection (BACKLOG #5666), as
-    :meth:`SqlServerStore._acquire` does for a pooled one, so an ``ALTER DATABASE`` waiting on a
-    long transaction ends at that limit. 0 means no limit here, as everywhere it applies. Where the
+    """Apply ``[store].command_timeout`` to a one-shot options connection at an open (BACKLOG
+    #5666), as :meth:`SqlServerStore._acquire` does for a pooled one, so an ``ALTER DATABASE``
+    waiting on a long transaction ends at that limit. 0 means no limit here, as everywhere it applies. Where the
     raw pyodbc connection is unreachable it warns, as the claim connection does (STORE-3), rather
     than run unbounded in silence."""
     raw = getattr(conn, "_conn", None)
@@ -4906,7 +4906,8 @@ class SqlServerStore:
                     abandoned = False
                     try:
                         _require_call_gate(probe)  # BACKLOG #2394, as on `conn` below
-                        _bound_one_shot(probe, settings)
+                        if fail_closed:
+                            _bound_one_shot(probe, settings)
                         pcur = await probe.cursor()
                         await pcur.execute(
                             "SELECT is_read_committed_snapshot_on FROM sys.databases"
@@ -4949,7 +4950,13 @@ class SqlServerStore:
             # `_rcsi_on_after_a_peer` exit the same way. One the gate cannot wrap is refused before
             # its first call, and the `finally` closes it while nothing runs on it.
             _require_call_gate(conn)
-            _bound_one_shot(conn, settings)
+            if fail_closed:
+                # BACKLOG #5666: an open is bounded, so an ALTER waiting on a long transaction ends
+                # the open at the limit and a restart retries. provision-schema is a DBA's one-time
+                # run, so its ALTERs keep no limit, as the schema batch's DDL does (B10/ADR 0060):
+                # cancelling the RCSI ALTER after its ROLLBACK IMMEDIATE has already disrupted the
+                # database would leave RCSI off for nothing.
+                _bound_one_shot(conn, settings)
             await _assert_autocommit(conn)
             # Standalone one-shot connection (NOT pooled), so the EF-6 pool-bleed race `_cursor`
             # guards against cannot arise; `_close_one_shot` still closes the cursor first.
@@ -8731,11 +8738,13 @@ class SqlServerStore:
     ) -> None:
         # Pure observer (ADR 0044 D2): no queue row, no finalizer. De-dup grain = ADR 0014's
         # (event_type, connection) key. UPDATE-then-conditional-INSERT in one transaction (matching the
-        # SQLite path): the filtered unique index keeps it to one LIVE instance per key. The UPDATE takes
-        # UPDLOCK, HOLDLOCK, so its key range stays locked until the commit and two concurrent first
-        # fires queue rather than both INSERT and collide on that index; it reports through OUTPUT, which
-        # a session-wide SET NOCOUNT ON cannot hide (BACKLOG #5692, as #2283). The caller wraps it
-        # fail-soft. reason rides safe_text + the cipher. escalation_tier (#81, ADR 0133) is
+        # SQLite path): the filtered unique index keeps it to one LIVE instance per key. A per-key
+        # applock, held to the commit, makes two concurrent first fires queue rather than both INSERT
+        # and collide on that index (BACKLOG #5692). A named lock, not HOLDLOCK, as put_attachment's
+        # (#5753): a key-range lock taken on the unique index before the row would invert the order a
+        # resolve or ack of the same instance takes them in, and the two could deadlock. The UPDATE
+        # reports through OUTPUT, which a session-wide SET NOCOUNT ON cannot hide (as #2283). The
+        # caller wraps it fail-soft. reason rides safe_text + the cipher. escalation_tier (#81, ADR 0133) is
         # kept monotonic within an open instance via a CASE (SQL Server has no 2-arg MAX scalar).
         now = time.time() if now is None else now
         # Bound to (event_type, connection) — the de-dup grain the upsert keys on, so the SAME AAD covers
@@ -8748,10 +8757,18 @@ class SqlServerStore:
             if reason
             else None
         )
+        key = hashlib.sha256(f"{event_type}\x00{connection}".encode()).hexdigest()
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
+                # The SELECT opens the transaction the applock needs, as in put_attachment.
                 await cur.execute(
-                    "UPDATE alert_instance WITH (UPDLOCK, HOLDLOCK)"
+                    "SELECT TOP (1) id FROM alert_instance WHERE event_type=? AND connection=?",
+                    (event_type, connection),
+                )
+                await cur.fetchall()
+                await self._applock(cur, f"mefor:alert_instance:{key}")
+                await cur.execute(
+                    "UPDATE alert_instance"
                     " SET last_seen=?, [count]=[count]+1, severity=?, reason=?,"
                     " escalation_tier=CASE WHEN escalation_tier < ? THEN ? ELSE escalation_tier END,"
                     " raised_by=?"
