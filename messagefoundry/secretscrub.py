@@ -1332,11 +1332,12 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # "@", and the match ends at the last "@" in it. With a user, every character of the first segment is
 # in the old class, but the segment stops earlier than that class does (round 9, below).
 #
-# THE USER STILL HOLDS NO "@". A user running to the first ":" was tried and regressed: in
+# A USER RUNNING TO THE FIRST ":" WAS TRIED AND REGRESSED: in
 # ``postgres://svc@db:5432;sslpassword=Tail@Secret9`` it read ``svc@db`` as the user and ``5432;...``
 # as the password, and the member's tail printed; in ``http://user@host:8080,admin@corp`` it hid a
-# port and a host that hold no secret. So a user holding an "@", as the ``user@server`` login of a
-# hosted database does, is a residual: its password prints, as it did before #5386.
+# port and a host that hold no secret. So a user holds at most one "@", then a host-shaped word,
+# and its password takes the empty user's segment, which stops at those separators
+# (:data:`_DSN_EMPTY_USER_SEGMENT`, BACKLOG #5386 wave 3).
 #
 # A FURTHER SEGMENT STOPS AT A SEPARATOR, and it has to. Running the password to the last "@" in
 # the token was tried first and swallowed the next member's label whenever that member's value held
@@ -1362,10 +1363,10 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # ``redis://:p%40Kv9x@host`` is hidden. The run after an empty user's first segment still stops at
 # every "%". An encoded separator still stops the first segment, for the reason a
 # literal "|" does, below, and an encoded "," for the reason a literal one does: taken, it read
-# ``smtp://:587%2Ccc=admin@corp`` as a password and named the wrong host (code review). It still
-# stops at "[" and "]", so it never crosses a placeholder: taking them was tried and declined,
-# since the only placeholder this reading crosses is a user's whole first segment, as
-# ``support.redact`` and ``docs/PHI.md`` state it.
+# ``smtp://:587%2Ccc=admin@corp`` as a password and named the wrong host (code review). It
+# stops at a "[" that opens a bracketed word of letters, so it never crosses a placeholder, since
+# the only placeholder this reading crosses is a user's whole first segment, as ``support.redact``
+# and ``docs/PHI.md`` state it; any other "[", and a "]", it takes (wave 3).
 # Without the user the pattern reads ``ws://:8765?accessToken=Tail@Tok`` as a password-only DSN, and
 # a review measured the token's tail print where the old pattern, matching nothing, left the query
 # label to the member pass. And a "|" it took, as in ``redis://:Tk|mrn@h``, was a separator the PHI
@@ -1378,11 +1379,11 @@ _DSN_PASSWORD = re.compile(r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]+):[^
 # rule here predicts which shapes are read.
 #
 # AN EMPTY USER'S FIRST SEGMENT MAY BE EMPTY (``*+``), so ``redis://:=Pw@db`` and ``redis://:@Pw@db``
-# are read (code review of BACKLOG #5386). WITH A USER IT MAY NOT (``++``), so
-# ``postgres://svc:@Pw@db``, a password that STARTS with "@", prints as it did before #5386, and that
-# is a residual. Read, it was rewritten to ``svc:<placeholder>@``, which the URL arm of
-# :data:`messagefoundry.redaction._CREDENTIAL_AHEAD` reads where it did not read ``svc:@Pw@``. That
-# switched the PHI pass's percent-encoded run off on a second handler, and a value later in the
+# are read (code review of BACKLOG #5386). WITH A USER IT MAY NOT (``++``); a password that STARTS
+# with "@", ``postgres://svc:@Pw@db``, is read by its leading run of "@" (group ``lead``), which the
+# rewrite keeps, as ``svc:@<placeholder>@`` (wave 3). Rewritten to ``svc:<placeholder>@``, it was
+# read by the URL arm of :data:`messagefoundry.redaction._CREDENTIAL_AHEAD` where ``svc:@Pw@``
+# was not. That switched the PHI pass's percent-encoded run off on a second handler, and a value later in the
 # token that run had hidden printed (code review, round 4). An empty user's rewrite is not read by
 # that arm, whose user may not be empty.
 #
@@ -1431,15 +1432,71 @@ _DSN_RUN_STOP = (
     + r"))"
 )
 _DSN_USER_FIRST_SEGMENT = r"(?>\[[a-z]+\]|<[a-z]+>|(?:" + _DSN_RUN_STOP + r"[^\s/@<>\[\]])++)"
+# AN EMPTY USER'S FIRST SEGMENT, AND THE SEGMENT AFTER A USER HOLDING AN "@" (BACKLOG #5386, wave
+# 3). One character is a class, a "%" the class excludes behind a fixed-width lookahead, a "[" that
+# does not open a bracketed word, or a "]". So ``redis://:p[Kv9x]@db`` is hidden whole, and the
+# segment still never crosses a placeholder: every placeholder this module's callers pass is a word
+# of letters in square or angle brackets, its "[" is refused, and "<" and ">" stay refused. The
+# alternatives start on disjoint characters and the repeat is possessive, so it stays linear.
+_DSN_EMPTY_USER_SEGMENT = (
+    r"(?:"
+    + _DSN_RUN_STOP
+    + r"(?:[^\s/@?#&=;,()|^~{}<>\[\]%\x27\x22]|%(?!7c|7e|5e|26|2c|3b|3f|23|27|22|28|29)"
+    r"|\[(?![a-z]++\])|\]))*+"
+)
+# A USER MAY HOLD ONE "@" WHEN A HOST-SHAPED WORD FOLLOWS IT, the ``user@server`` login of a hosted
+# database (``postgres://ops@srv:Kv9@srv.example``), and a user's password may START with "@"
+# (group ``lead``, written back by :func:`_dsn_password_repl`). A user holding an "@" takes the
+# empty user's segment (group 2 decides), which stops at ";", ",", "=" and the rest, so
+# ``postgres://svc@db:5432;sslpassword=Tail@Sec`` and ``http://user@host:8080,admin@corp``, where
+# the "@" ends a user and a port follows, still match nothing. The lead keeps its "@" signs before
+# the placeholder, so ``svc:@<placeholder>@`` is no ``user:password@`` the URL arm of
+# :data:`messagefoundry.redaction._CREDENTIAL_AHEAD` reads, as ``svc:@Pw@`` was not.
 _WIDE_DSN_PASSWORD = re.compile(
-    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*):"
-    r"(?:(?<=//:)(?:" + _DSN_RUN_STOP + r"(?:[^\s/@?#&=;,()|^~{}<>\[\]%\x27\x22]|%(?!7c|7e|5e|26|"
-    r"2c|3b|3f|23|27|22|28|29)))*+|(?<!//:)"
+    r"(?i)(?<![a-z0-9+.\-])([a-z0-9+.\-]+://[^\s:/@]*+(?:(@)[a-z0-9.\-]++)?):"
+    r"(?(2)"
+    + _DSN_EMPTY_USER_SEGMENT
+    + r"|(?:(?<=//:)"
+    + _DSN_EMPTY_USER_SEGMENT
+    + r"|(?<!//:)(?P<lead>@*+)"
     + _DSN_USER_FIRST_SEGMENT
-    + r")(?:"
+    + r"))(?:"
     + _DSN_RUN_STOP
     + r"[^\s/;?#&,()|^~{}<>\[\]%\x27\x22])*@"
 )
+
+
+def _dsn_password_repl(m: re.Match[str], placeholder: str) -> str:
+    """The replacement for a match of :data:`_DSN_PASSWORD` or :data:`_WIDE_DSN_PASSWORD`: group 1,
+    then ":", the widened match's leading "@" signs, the placeholder and the "@".
+
+    THE NARROW MATCH CAN HOLD A CONNECTION-STRING MEMBER (BACKLOG #5386, the JDBC no-user tail).
+    With no user before the host, ``jdbc:sqlserver://db:1433;user=svc;sslpassword=P@ss_Sec9;``
+    reads the host as the user and ``1433;...;sslpassword=P`` as the password, so the member's key
+    was hidden with it and ``ss_Sec9`` printed. Where the match holds a member key, as
+    :data:`_CONNECTION_STRING_MEMBER` opens one, whose value runs past the match's "@", the
+    placeholder stops before that key's ";" and the rest of the match is written back with its
+    value's words masked (:func:`_mask_member_value`), so the member pass, which runs later on both
+    surfaces, reads the key and masks the whole value. Nothing the match held prints: the key, its
+    "=" and the value's punctuation do, as the member pass prints them.
+
+    LINEAR in the match. Each member is read only up to the match's end, which the value reaches
+    exactly when it reaches past it in the whole text, since the match holds no line break and ends
+    in an "@" every arm takes; and the next ";" is sought after a member that ends earlier, as the
+    member pass itself would not start inside it. A key so skipped keeps the whole-match
+    placeholder."""
+    lead = (m.group("lead") or "") if "lead" in m.re.groupindex else ""
+    head = f"{m.group(1)}:{lead}{placeholder}"
+    text, end = m.string, m.end()
+    at = text.find(";", m.end(1) + 1, end)
+    while at != -1:
+        member = _CONNECTION_STRING_MEMBER.match(text, at, end)
+        if member is not None and member.end(2) == end:
+            value = member.start(2)
+            return f"{head}{text[at:value]}{_mask_member_value(text, value, end - 1)}@"
+        at = text.find(";", at + 1 if member is None else member.end(), end)
+    return f"{head}@"
+
 
 #: Words a connection-string member's KEY may end in besides :data:`_CREDENTIAL_WORDS` (BACKLOG
 #: #5030), so ``;AccessToken=`` is read as ``;sslpassword=`` is. Its own gate,
@@ -1545,7 +1602,9 @@ _MEMBER_EXTRA_WORDS = ("token",)
 # lookbehinds below read that. ``;Bypass=1`` is a member too, and its value is masked.
 #
 # THE VALUE RUNS TO THE NEXT ";", QUOTE OR LINE BREAK, OR THE END OF THE TEXT, over spaces, ",",
-# "&", "=" and "://" alike. Spaces and then one quote may open it. Stopping at a later quote costs
+# "&", "=" and "://" alike, and over a quote glued between two word characters, so
+# ``;sslpassword=P'Kv9_Sec;`` is masked whole (BACKLOG #5386 wave 3; a quote ending it there printed
+# ``Kv9_Sec``). Spaces and then one quote may open it. Stopping at a later quote costs
 # nothing the builder sends, since a plain password and every ``odbc_params`` value refuse quotes,
 # and it keeps the rest of a quoted echo (``'...;PWD=a b' refused``) readable. A braced value is
 # taken by ``_ODBC_BRACED`` with its body kept to one line, and then on to the same stops, so
@@ -1587,7 +1646,8 @@ _MEMBER_EXTRA_WORDS = ("token",)
 _CONNECTION_STRING_MEMBER = re.compile(
     r"(?i)(;[A-Za-z0-9_]++(?:(?<=password)|(?<=passwd)|(?<=passphrase)|(?<=pass)|(?<=pwd)"
     r"|(?<=secret)|(?<=credential)|(?<=token)))="
-    r"(\{(?:[^}\r\n]|\}\})*+\}(?!\})[^;'\"\r\n]*+|\{[^\r\n]*|[ \t]*+['\"]?[^;'\"\r\n]++)"
+    r"(\{(?:[^}\r\n]|\}\})*+\}(?!\})(?:[^;'\"\r\n]|(?<=\w)['\"](?=\w))*+|\{[^\r\n]*"
+    r"|[ \t]*+['\"]?(?:[^;'\"\r\n]|(?<=\w)['\"](?=\w))++)"
 )
 
 #: Words a member value keeps where a word holds one, matched as a substring ignoring case, and a
@@ -2263,9 +2323,13 @@ def _run(
     if _admits(folded, _KEY_MATERIAL_HINT):
         text = apply(_KEY_MATERIAL, lambda m: _keep_label(m, placeholder), text, _BRACED)
     if _admits(folded, _DSN_HINT):
-        text = apply(_DSN_PASSWORD, lambda m: f"{m.group(1)}:{placeholder}@", text, None)
+
+        def dsn_repl(m: re.Match[str]) -> str:
+            return _dsn_password_repl(m, placeholder)
+
+        text = apply(_DSN_PASSWORD, dsn_repl, text, None)
         if wide:
-            text = apply(_WIDE_DSN_PASSWORD, lambda m: f"{m.group(1)}:{placeholder}@", text, None)
+            text = apply(_WIDE_DSN_PASSWORD, dsn_repl, text, None)
     # LAST, over what every pass above left, masking words only (BACKLOG #5030; see the pattern).
     if ";" in text and (_admits(folded, _CREDENTIAL_HINT) or _admits(folded, _MEMBER_EXTRA_HINT)):
         text = apply(_CONNECTION_STRING_MEMBER, _mask_member, text, 2)

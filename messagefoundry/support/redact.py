@@ -55,6 +55,7 @@ from messagefoundry.redaction import redact as _redact_phi
 from messagefoundry.secretscrub import (
     _CONNECTION_STRING_MEMBER,
     _braced_tail,
+    _dsn_password_repl,
     _mask_member,
     scrub_credentials,
 )
@@ -732,5 +733,6 @@ def _keep_scheme(m: re.Match[str]) -> str:
 
 
 def _keep_dsn_user(m: re.Match[str]) -> str:
-    """Replace the password span of a URL-shaped DSN, keeping ``scheme://user`` and the ``@``."""
-    return f"{m.group(1)}:{REDACTION_PLACEHOLDER}@"
+    """Replace the password span of a URL-shaped DSN, keeping ``scheme://user`` and the ``@``, by
+    secretscrub's own replacement, so the two surfaces cannot drift apart."""
+    return _dsn_password_repl(m, REDACTION_PLACEHOLDER)

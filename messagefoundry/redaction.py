@@ -269,9 +269,10 @@ _ENCODED_SEPARATOR = re.compile(r"%(?:7[CcEe]|5[Ee]|26)")
 #: ``secretscrub``'s widened reading, ``_WIDE_DSN_PASSWORD`` (BACKLOG #5386), has no arm. With a user,
 #: its first password segment takes one character or more, each in ``_DSN_PASSWORD``'s password
 #: class, and stops no later than that class does, so every text it rewrites there, this arm
-#: already reads. With an empty user it reads a DSN this
-#: arm does not, and its rewrite, ``scheme://:<redacted>@``, this arm does not read either, since its
-#: user may not be empty. So a password-only DSN does not switch the encoded run off, and a PID run
+#: already reads. A user holding an "@", and a password starting with one, this arm reads neither
+#: before the rewrite nor after it, which keeps those "@" signs. With an empty user it reads a DSN
+#: this arm does not, and its rewrite, ``scheme://:<redacted>@``, this arm does not read either,
+#: since its user may not be empty. So a password-only DSN does not switch the encoded run off, and a PID run
 #: beside it is still hidden. The price is that run's own: where such a DSN sits in the run's token,
 #: the run takes it, as it did before #5386. The query arm is ``logging_setup._CREDENTIAL_QUERY_KEYS``.
 #:

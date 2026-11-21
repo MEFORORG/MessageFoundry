@@ -1290,8 +1290,8 @@ def test_the_dsn_scan_still_reaches_every_scheme_shape_that_matters() -> None:
             "://svc:",
         ),
         # An empty user's password that starts with "=" or "@": the first segment had to take a
-        # character, so these printed whole (code review, round 2). With a user, the residual test
-        # below pins the same shape printing.
+        # character, so these printed whole (code review, round 2). With a user, the same shape is
+        # hidden too since BACKLOG #5386's wave 3; the test after the residual test below pins it.
         ("store dsn redis://:=Lead_Eq-75@db.invalid", ("Lead_Eq-75",), "redis://:"),
         ("store dsn redis://:@Lead_At-76@db.invalid", ("Lead_At-76",), "redis://:"),
         # Both at once, two "@" signs in the password.
@@ -1347,12 +1347,12 @@ def test_a_later_member_holding_an_at_sign_keeps_its_label(
     stops before a member or query separator, so the member pass after it still sees its label.
     Through the public entry points only: masking the member is that pass's job.
 
-    NOT TRUE OF EVERY SHAPE. With no user before the host, as in
+    With no user before the host, as in
     ``jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;``, the narrow pattern reads
     the host as the user and ``1433;user=svc;sslpassword=P`` as the password, since its password
-    class holds ";", so the member's label is inside its match and ``ss_Sec9`` prints. That pattern
-    predates BACKLOG #5386, and origin/main prints the same;
-    :func:`test_a_jdbc_dsn_with_no_user_before_its_host_prints_a_member_tail` pins it."""
+    class holds ";", so the member's label is inside its match. Before BACKLOG #5386's wave 3
+    ``ss_Sec9`` printed; the narrow pass's replacement now writes the member back masked, and
+    :func:`test_a_jdbc_dsn_with_no_user_before_its_host_hides_its_member_tail` pins it."""
     for label, out in (
         ("support.redact", redact_log_line(line)),
         ("secretscrub", scrub_credentials(line)),
@@ -1362,15 +1362,19 @@ def test_a_later_member_holding_an_at_sign_keeps_its_label(
         assert kept in out, f"{label}: lost the scheme and user -- got {out!r}"
 
 
-def test_a_jdbc_dsn_with_no_user_before_its_host_prints_a_member_tail() -> None:
-    """The residual the test above states, pinned so a fix shows up as a red here."""
+def test_a_jdbc_dsn_with_no_user_before_its_host_hides_its_member_tail() -> None:
+    """The shape the test above states. This pinned ``ss_Sec9`` printing until BACKLOG #5386's
+    wave 3, which hides it, so the pin now asserts more is hidden. The narrow match still takes
+    the member's key (the control), and its replacement keeps the key so the member pass reads
+    it."""
     line = "jdbc:sqlserver://db.invalid:1433;user=svc;sslpassword=P@ss_Sec9;"
     match = scrub_mod._DSN_PASSWORD.search(line)
     assert match is not None and match.group(0) == (
         "sqlserver://db.invalid:1433;user=svc;sslpassword=P@"
     )
     for out in (redact_log_line(line), scrub_credentials(line)):
-        assert "ss_Sec9" in out and "sslpassword" not in out, out
+        assert "ss_Sec9" not in out and "P@ss" not in out and ";sslpassword=" in out, out
+        assert "1433" not in out and "user=svc" not in out, out
 
 
 @pytest.mark.parametrize(
@@ -1501,7 +1505,10 @@ def test_an_empty_user_dsn_hides_an_equals_sign_and_states_its_residual() -> Non
     assert "pw;Semi_Sec-83" in scrub_credentials("redis://:pw;Semi_Sec-83@host")
     assert "pw|Pipe_Sec-84" in scrub_credentials("redis://:pw|Pipe_Sec-84@host")
     assert "p%7CKv9x" in scrub_credentials("redis://:p%7CKv9x@host")
-    assert "Lead_At-74" in scrub_credentials("store dsn postgres://svc:@Lead_At-74@db.invalid/m")
+    # A user's password that starts with "@" printed here until BACKLOG #5386's wave 3; it is
+    # hidden now, so this pin asserts more is hidden, and the "@" stays before the placeholder.
+    lead_at = scrub_credentials("store dsn postgres://svc:@Lead_At-74@db.invalid/m")
+    assert "Lead_At-74" not in lead_at and "postgres://svc:@<redacted>@db.invalid/m" in lead_at
     # Round 4 review: a placeholder the PHI pass wrote first is a residual. BACKLOG #5386's added
     # item 3 hides the "%" line below; tests/test_b532r_redaction_segments.py holds the rest.
     chained = scrub_credentials(redact_untrusted("connect redis://:Zq7-19800505-Kv9x@host failed"))
