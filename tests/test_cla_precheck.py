@@ -410,14 +410,39 @@ def test_an_author_with_no_user_key_is_unlinked(capsys: pytest.CaptureFixture[st
     ],
     ids=["absent-author-key", "author-not-an-object", "user-not-an-object"],
 )
-def test_a_reply_in_the_wrong_shape_is_a_fault_naming_its_commit(commit: Mapping[str, Any]) -> None:
+def test_a_reply_in_the_wrong_shape_is_a_fault_naming_its_commit(
+    commit: Mapping[str, Any], request: pytest.FixtureRequest
+) -> None:
     """The query always selects author and user, so their absence or a non-object value is a reply
     in the wrong shape: a fault (warn and pass, owner ruling 2026-11-13), never a refusal, which
     would fail every pull request if GitHub's reply changed shape."""
     read = fetch_commits(_serve([_linked_page_one(), _page([commit], 2, False)]), "M", "N", 7)
     verdict = evaluate(read, _ALLOWLIST, _no_signatures)
     assert verdict.refusals == ()
-    assert verdict.fault and verdict.fault.startswith(f"commit {2:040x}: "), verdict.fault
+    reason = {
+        "absent-author-key": "a commit has no author key",
+        "author-not-an-object": "a commit's author is not an object",
+        "user-not-an-object": "a commit's user is not an object",
+    }[request.node.callspec.id]
+    assert verdict.fault == f"commit {2:040x}: {reason}"
+
+
+def test_a_linked_author_with_no_integer_id_past_page_one_is_a_fault() -> None:
+    """Rule 2 cannot look such an author up in the signature file; a silent skip would pass."""
+    author = {"name": "N", "user": {"login": "new-person", "databaseId": None}}
+    commit = {"oid": f"{2:040x}", "author": author, "committer": author}
+    read = fetch_commits(_serve([_linked_page_one(), _page([commit], 2, False)]), "M", "N", 7)
+    verdict = evaluate(read, _ALLOWLIST, _no_signatures)
+    assert verdict.refusals == ()
+    assert verdict.fault == f"commit {2:040x}: its linked author has no integer databaseId"
+
+
+def test_ten_refusals_are_all_annotated(capsys: pytest.CaptureFixture[str]) -> None:
+    unlinked = [_commit(i, f"Unlinked {i}") for i in range(1, 11)]
+    assert _run(_ENV, _serve([_page(unlinked, 10, False)])) == EXIT_REFUSED
+    lines = capsys.readouterr().out.splitlines()
+    annotated = [line for line in lines if line.startswith("::error title=CLA pre-check refused::")]
+    assert len(annotated) == 10 and not any("more refusal" in line for line in annotated)
 
 
 def test_both_rules_reach_the_first_annotations_and_the_rest_reach_the_log(

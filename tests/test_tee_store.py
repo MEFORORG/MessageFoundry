@@ -565,11 +565,26 @@ def test_a_file_it_cannot_restrict_is_logged(
     def refuse(_path: object, *_args: object) -> None:
         raise PermissionError("denied")
 
-    monkeypatch.setattr(tee_store, "_owner_only_dacl", lambda _paths: "error 5")
+    monkeypatch.setattr(
+        tee_store, "_owner_only_dacl", lambda paths: dict.fromkeys(paths, "error 5")
+    )
     monkeypatch.setattr(os, "chmod", refuse)
     with caplog.at_level(logging.WARNING, logger="tee.store"):
         tee_store._secure_file(str(target))  # noqa: SLF001 - the helper under test
     assert [r.getMessage() for r in caplog.records if str(target) in r.getMessage()], caplog.text
+
+
+def test_a_file_it_restricts_is_not_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The negative control for the test above: a restriction that succeeds logs nothing."""
+    target = tmp_path / "tee.db"
+    target.write_bytes(b"")
+    monkeypatch.setattr(tee_store, "_owner_only_dacl", lambda _paths: {})
+    monkeypatch.setattr(os, "chmod", lambda *_args: None)
+    with caplog.at_level(logging.WARNING, logger="tee.store"):
+        tee_store._secure_file(str(target))  # noqa: SLF001 - the helper under test
+    assert caplog.records == []
 
 
 def test_a_plain_purge_of_a_missing_db_creates_nothing_and_fails(

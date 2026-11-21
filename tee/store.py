@@ -258,11 +258,24 @@ def _precreate_secure(path: str) -> None:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         os.close(fd)
     except OSError:
-        # Race / permission / Windows quirks are non-fatal; _secure_file still chmods after open.
+        # Race / permission / Windows quirks are non-fatal; _secure_file still restricts the file
+        # after open (chmod on POSIX, a DACL on Windows) and logs when it cannot.
         pass
 
 
-def _owner_only_dacl(paths: list[str]) -> str | dict[str, str]:
+def _owner_only_dacl(paths: list[str]) -> dict[str, str]:
+    """Each of ``paths`` that could not be given an owner-only DACL, with the reason; empty when
+    every one was. See ``_apply_owner_only_dacl``. An unexpected ctypes error is a failure too."""
+    import ctypes
+
+    try:
+        result = _apply_owner_only_dacl(paths)
+    except (OSError, ValueError, TypeError, ctypes.ArgumentError) as exc:
+        result = f"the native call failed ({type(exc).__name__})"
+    return dict.fromkeys(paths, result) if isinstance(result, str) else result
+
+
+def _apply_owner_only_dacl(paths: list[str]) -> str | dict[str, str]:
     """Give each of ``paths`` a protected DACL holding one entry, full control for this process's
     own user.
 
@@ -397,9 +410,7 @@ def _secure_file(path: str) -> None:
     test_wal_siblings_recreated_after_open_inherit_owner_only_mode pins the inheritance."""
     present = [s for s in (path, path + "-wal", path + "-shm") if os.path.exists(s)]
     if os.name == "nt":
-        result = _owner_only_dacl(present)
-        failures = dict.fromkeys(present, result) if isinstance(result, str) else result
-        for sibling, reason in failures.items():
+        for sibling, reason in _owner_only_dacl(present).items():
             _log.warning(
                 "could not restrict %s to its owner (%s); it keeps its folder's access list, "
                 "so keep the tee DB on a protected volume",
@@ -447,8 +458,13 @@ class RelayStore:
         await db.executescript(_SCHEMA)
         await db.commit()
         if path != ":memory:":
-            # Off the loop: native ACL calls can block on a network volume.
-            await asyncio.to_thread(_secure_file, path)
+            # Off the loop: native ACL calls can block on a network volume. A cancellation there
+            # must not leave the connection's worker thread running.
+            try:
+                await asyncio.to_thread(_secure_file, path)
+            except BaseException:
+                await db.close()
+                raise
         return cls(db, path)
 
     async def record_leg(

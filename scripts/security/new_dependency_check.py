@@ -342,8 +342,7 @@ class _Scan:
                 self.refuse(
                     metadata_where,
                     "not a list",
-                    "dependency-metadata must be an array of tables "
-                    "([[tool.uv.dependency-metadata]]).",
+                    "dependency-metadata must be an array of tables, one [[...]] per entry.",
                 )
                 metadata = []
             for index, entry in enumerate(metadata):

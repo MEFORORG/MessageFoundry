@@ -436,7 +436,12 @@ def evaluate(
     for who in (slot for slot in slots if slot is not None):
         if not who.author_linked:
             continue  # rule 1 judged it above
-        if who.name in seen_by_action or who.database_id is None or who.database_id in checked:
+        if who.name in seen_by_action or who.database_id in checked:
+            continue
+        if who.database_id is None:
+            # Linked, but with no integer id: the signature file cannot be checked for it, so
+            # rule 2 cannot be judged, and skipping it in silence would read as a pass.
+            faults.append(f"commit {who.oid}: its linked author has no integer databaseId")
             continue
         # Rule 2: a linked author the action never reads, unless it would skip them anyway.
         checked.add(who.database_id)
@@ -630,9 +635,10 @@ def run(
     fault = "; ".join(f for f in (read_fault, verdict.fault) if f)
     if fault:
         print(f"::warning title=CLA pre-check fault::{_escape_command(fault)}")
-    # GitHub keeps at most 10 error annotations per step, so past 9 the rest go to the log as plain
-    # lines, with one annotation saying so; the step's log keeps every one.
-    shown = verdict.refusals[:_ANNOTATED_REFUSALS]
+    # GitHub keeps at most 10 error annotations per step. Up to 10 refusals are all annotated; past
+    # that, 9 are, one annotation counts the rest, and they go to the log as plain lines.
+    limit = len(verdict.refusals) if len(verdict.refusals) <= 10 else _ANNOTATED_REFUSALS
+    shown = verdict.refusals[:limit]
     for refusal in shown:
         print(f"::error title=CLA pre-check refused::{_escape_command(refusal)}")
     rest = verdict.refusals[len(shown) :]
