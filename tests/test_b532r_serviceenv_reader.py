@@ -81,13 +81,12 @@ def test_a_retired_keys_list_on_the_line_below_an_empty_name_refuses(key: str) -
 @pytest.mark.parametrize("key", KEY_CLASS_NAMES)
 def test_an_empty_store_key_item_above_an_ordinary_item_does_not_refuse(key: str) -> None:
     """The control: an empty key is harmless when the next item's first line sets a variable
-    Windows itself sets, spelled as Windows spells it, or the secrets directory, or is one of
-    Windows' own nameless entries such as ``=C:``. Any other item may be the key itself, so it
+    Windows itself sets, spelled as Windows spells it, or the secrets directory. Any other item,
+    Windows' own nameless entries such as ``=C:`` among them, may be the key itself, so it
     refuses: ``tests/test_b532w3_serviceenv_split_shapes.py`` pins those."""
     followers = (
         "ProgramFiles(x86)=C:\\x",
         "Path=C:\\x",
-        "=C:=C:\\x",
         "MEFOR_SECRETS_DIRECTORY=C:\\s",
     )
     for follower in followers:
@@ -387,15 +386,21 @@ def test_the_next_item_is_read_as_the_same_lines_below_the_key_in_one_string(
 
 @pytest.mark.parametrize(
     ("item", "refuses"),
-    [("=C:=C:\\x", False), ("MEFOR_SECRETS_DIRECTORY=", True), ("HTTP_PROXY=", True)],
+    [
+        ("Path=C:\\x", False),
+        ("=C:=C:\\x", True),
+        ("MEFOR_SECRETS_DIRECTORY=", True),
+        ("HTTP_PROXY=", True),
+    ],
 )
 def test_the_first_line_shapes_the_readings_once_differed_on_now_agree(
     item: str, refuses: bool
 ) -> None:
     """Below an empty key, a later line of one string and the next item are read under one rule
-    (vault BACKLOG #5394). Windows' own ``=C:`` entry ends the key's value both ways; an empty
-    directory entry or an empty ``HTTP_PROXY`` is not positively a variable of its own, so both
-    readings take it into the key's value and refuse."""
+    (vault BACKLOG #5394). ``Path=C:\\x`` ends the key's value both ways; Windows' own ``=C:``
+    entry, an empty directory entry or an empty ``HTTP_PROXY`` is not positively a variable of
+    its own, so both readings take it into the key's value and refuse, as origin/main 9421dcbf27
+    did for the later line of one string."""
     key = KEY_CLASS_NAMES[0]
     expected = (key,) if refuses else ()
     assert _read([f"MEFOR_AI_ENVIRONMENT=prod\n{key}=\n{item}"]).listed_keys == expected
@@ -493,10 +498,27 @@ def test_a_key_shaped_item_with_an_ordinary_later_line_continues_the_empty_key()
 
 
 @pytest.mark.parametrize("value", ["x", ""])
-def test_no_runs_on_step_when_the_variable_that_ran_on_is_not_refused(value: str) -> None:
-    """The path-form OIDC key runs on into a path, which is not a secret, so only the
-    ``MEFOR_VALUE_A`` above it refuses, and its value did not run on, empty or not."""
+def test_an_empty_pem_key_that_runs_on_into_a_path_refuses_with_the_run_on_step(
+    value: str,
+) -> None:
+    """An OIDC key empty on its own line takes the next item as its value. That key was once
+    exempted as a path by the text it ran on into, which let a password split below it escape
+    (round-2 finding 1); the exemption now judges only the key's own line, so the key refuses
+    and the remedy says to remove the item it ran on into. The ``MEFOR_VALUE_A`` above it did
+    not run on, empty or not."""
     entries = [f"MEFOR_VALUE_A={value}\nMEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=", "C:\\k.pem"]
+    posture = _read(entries)
+    assert posture.listed == ("MEFOR_VALUE_A", "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY")
+    assert posture.value_runs_on
+    refusal = service_env_refusal(posture)
+    assert refusal is not None
+    assert _RUNS_ON in refusal
+
+
+def test_no_runs_on_step_when_only_a_variable_that_did_not_run_on_is_refused() -> None:
+    """The control the test above once was: a path on the OIDC key's own line does not run on,
+    so only the empty ``MEFOR_VALUE_A`` refuses, and there is no run-on step."""
+    entries = ["MEFOR_VALUE_A=\nMEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY=C:\\k.pem", "Path=C:\\x"]
     posture = _read(entries)
     assert posture.listed == ("MEFOR_VALUE_A",)
     assert not posture.value_runs_on

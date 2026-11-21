@@ -5,9 +5,10 @@
 
 The join stays: the string still continues the empty value, and every input that refused before
 still refuses. What changes is the remedy, which must neither tell the operator to remove the
-directory's entry with a run-on value, nor say the lists set no secrets directory. The variable
-the directory string is joined to need not be refused or kept by ``_names``: a path-form OIDC key
-is neither, and the directory string is still an item NSSM may read. Synthetic values only.
+directory's entry with a run-on value, nor say the lists set no secrets directory. An OIDC key
+empty on its own line was once dropped by ``_names`` as a path when it ran on; it is now kept
+(round-2 finding 1), and the remedy pins that relied on the drop build the posture directly.
+Synthetic values only.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import pytest
 from messagefoundry.serviceenv import (
     KEY_CLASS_NAMES,
     ServiceEnvPosture,
+    ServiceEnvStatus,
     read_service_env_posture,
     service_env_refusal,
 )
@@ -110,10 +112,11 @@ def test_a_directory_set_elsewhere_too_is_kept_once() -> None:
     _assert_kept_once(refusal)
 
 
-def test_a_directory_joined_to_a_dropped_variable_still_counts_as_set() -> None:
-    """The Lander's input on 88a9f83: a path-form OIDC key is not kept by ``_names``, but the
-    directory string joined to it is still an item NSSM may read as the directory. So the lists
-    do set it, and the remedy must not say they set none or to add it back."""
+def test_a_directory_joined_to_an_empty_pem_key_still_counts_as_set() -> None:
+    """The Lander's input on 88a9f83: the directory string joined to an OIDC key is still an item
+    NSSM may read as the directory. So the lists do set it, and the remedy must not say they set
+    none or to add it back. The key, empty on its own line, now refuses and runs on (round-2
+    finding 1), so the run-on step carries the directory's exception."""
     posture = _read_pairs(
         [
             (_EXTRA, "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY="),
@@ -121,12 +124,32 @@ def test_a_directory_joined_to_a_dropped_variable_still_counts_as_set() -> None:
             (_PLAIN, "MEFOR_VALUE_B=1"),
         ]
     )
-    assert posture.listed == ("MEFOR_VALUE_B",)
-    assert posture.directory_joined and not posture.value_runs_on
+    assert posture.listed == ("MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY", "MEFOR_VALUE_B")
+    assert posture.directory_joined and posture.value_runs_on
     refusal = service_env_refusal(posture)
-    assert refusal is not None  # still refuses, on the MEFOR_VALUE_* name
+    assert refusal is not None
     _assert_kept_once(refusal)
-    # Nothing refused runs on here, so there is no run-on step to carry an exception.
+    assert _KEEPS_ONE in refusal
+
+
+def _joined_beside(*listed: str) -> ServiceEnvPosture:
+    """A posture with a directory string joined to a variable ``_names`` dropped and nothing
+    refused running on, built directly: the reading no longer drops an OIDC key that runs on."""
+    return ServiceEnvPosture(
+        ServiceEnvStatus.OBSERVED,
+        service_name="MessageFoundry",
+        listed=listed,
+        sources=tuple((name, _PLAIN) for name in listed),
+        directory_joined=True,
+    )
+
+
+def test_a_directory_joined_to_a_dropped_variable_still_counts_as_set() -> None:
+    """The remedy half of the pin above, for a joined directory with nothing refused running on:
+    the lists do set it, and there is no run-on step to carry an exception."""
+    refusal = service_env_refusal(_joined_beside("MEFOR_VALUE_B"))
+    assert refusal is not None
+    _assert_kept_once(refusal)
     assert "its value runs on into" not in refusal
 
 
@@ -152,13 +175,7 @@ def test_a_run_on_and_a_join_from_different_variables_do_not_claim_the_strings_h
 def test_a_join_beside_a_store_key_alone_adds_no_directory_step() -> None:
     """A refusal about a store key alone, with nothing running on, sends the operator to a key
     file. The joined directory string does not need touching for that, so no step names it."""
-    posture = _read_pairs(
-        [
-            (_EXTRA, "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY="),
-            (_EXTRA, "MEFOR_SECRETS_DIRECTORY=="),
-            (_PLAIN, f"{KEY_CLASS_NAMES[0]}=QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVphYmNkZWZnaGk="),
-        ]
-    )
+    posture = _joined_beside(KEY_CLASS_NAMES[0])
     assert posture.directory_joined and not posture.value_runs_on
     refusal = service_env_refusal(posture)
     assert refusal is not None

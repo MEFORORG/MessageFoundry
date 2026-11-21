@@ -123,9 +123,8 @@ def test_a_split_secret_on_a_later_line_below_another_variable_refuses(
 
 
 #: Items and lines that still end an empty secret-class value above them: a variable Windows
-#: itself sets, spelled exactly as Windows spells it, the secrets directory in upper case, and
-#: Windows' own nameless entries. ``=ExitCode=0`` ends it, since ``=ExitCode`` is Windows' own
-#: name, whatever the value; that is a residual hole the reader accepts.
+#: itself sets, spelled exactly as Windows spells it, and the secrets directory in upper case.
+#: Windows' own nameless entries no longer do: see ``_WINDOWS_NAMELESS`` below.
 _ORDINARY_ITEMS = (
     "ProgramFiles(x86)=C:\\x",
     "CommonProgramFiles(x86)=C:\\x",
@@ -137,6 +136,13 @@ _ORDINARY_ITEMS = (
     "PUBLIC=C:\\Users\\Public",
     "NUMBER_OF_PROCESSORS=8",
     "MEFOR_SECRETS_DIRECTORY=C:\\s",
+)
+
+#: Windows' own nameless entries, spelled as Windows spells them. Below an empty secret-class value
+#: on a later line of one string, origin/main 9421dcbf27 read each as that value, and so refused;
+#: the reader must refuse every shape origin/main refused, so they refuse as items too, and the
+#: two readings still agree.
+_WINDOWS_NAMELESS = (
     "=C:=C:\\x",
     "=::=::\\",
     "=ExitCode=00000000",
@@ -202,7 +208,22 @@ _FAIL_CLOSED = (
     "=exitcode=0",
     "=c:=c:\\x",
     "=",
+    *_WINDOWS_NAMELESS,
 )
+
+
+@pytest.mark.parametrize("line", _WINDOWS_NAMELESS)
+@pytest.mark.parametrize("prefix", ["PATH=C:\\x", "MEFOR_SECRETS_DIRECTORY=C:\\s", "HTTP_PROXY="])
+@pytest.mark.parametrize("name", [KEY_CLASS_NAMES[0], "MEFOR_STORE_PASSWORD"])
+def test_an_empty_secret_on_a_later_line_above_a_windows_nameless_entry_refuses(
+    name: str, prefix: str, line: str
+) -> None:
+    """The 172 shapes the round-2 differential found that origin/main 9421dcbf27 refused and
+    round 2 let through: an empty secret-class value on a later line of one string, above one of
+    Windows' own nameless entries. Failed on b532w3-serviceenv-r2 fc3ebdef6c9."""
+    posture = _read([f"{prefix}\n{name}=\n{line}"])
+    assert name in posture.listed, line
+    assert service_env_refusal(posture) is not None
 
 
 @pytest.mark.parametrize("line", _FAIL_CLOSED)
@@ -276,16 +297,18 @@ def test_a_name_written_alone_with_nothing_below_it_does_not_refuse() -> None:
 
 def test_a_long_name_below_an_empty_secret_reads_in_linear_time() -> None:
     """The name rule once backtracked quadratically, about 0.13 s for one name of 8,000
-    characters, so 32,000-character items took seconds each. Read linearly, the whole set takes a
-    small fraction of a second; the bound is loose, so a slow runner does not flake it."""
+    characters, so the three 32,000-character items below took about 6 s together. Read
+    linearly, they take milliseconds. The bound counts this process's CPU time, not the wall
+    clock, so other pytest-xdist workers on a busy runner do not inflate it, and at 2 s it is
+    generous for the linear reading while still under the quadratic one."""
     import time
 
     long_items = ["_" * 32_000 + "a=x", "A" * 32_000 + "a=x", "a_" * 16_000 + "!=x"]
-    started = time.perf_counter()
+    started = time.process_time()
     for item in long_items:
         posture = _read([f"{KEY_CLASS_NAMES[0]}=", item])
         assert posture.listed_keys == (KEY_CLASS_NAMES[0],)
-    assert time.perf_counter() - started < 1.0
+    assert time.process_time() - started < 2.0
 
 
 def test_an_empty_secret_kept_on_a_later_line_reads_the_line_below_it_too() -> None:
@@ -351,3 +374,90 @@ def test_a_later_empty_secret_above_an_ordinary_line_refuses() -> None:
     assert _read([f"PATH=x\n{key}=\nx=y"]).listed_keys == (key,)
     assert _read([f"PATH=x\n{key}=", "x=y"]).listed_keys == (key,)
     assert _read([f"{key}=", "x=y"]).listed_keys == (key,)
+
+
+# --- round 3: findings 1, 2, 5 and 6 of the round-2 report -------------------------------------
+
+_PEM = "MEFOR_AUTH_OIDC_CLIENT_PRIVATE_KEY"
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        [f"{_PEM}=", "MEFOR_STORE_PASSWORD", "=hunter2"],
+        [f"{_PEM}=\nMEFOR_STORE_PASSWORD\n=hunter2"],
+        [f"{_PEM}= ", "MEFOR_AUTH_AD_BIND_PASSWORD", "=", "hunter2"],
+        [f"{_PEM}=", "C:\\k.pem"],
+    ],
+)
+def test_an_empty_pem_key_does_not_hide_what_it_runs_on_into(items: list[str]) -> None:
+    """Finding 1: a key that takes either PEM or a path was exempted as a path by the text it ran
+    on into, so a password split from its name below it escaped. The exemption now judges only the
+    key's own line, which is blank here, so the key refuses. Failed on fc3ebdef6c9."""
+    posture = _read(items)
+    assert _PEM in posture.listed, items
+    assert service_env_refusal(posture) is not None
+
+
+def test_a_pem_key_set_to_a_path_on_its_own_line_is_still_a_path() -> None:
+    """The control for the pins above: a path on the key's own line is no secret."""
+    assert _read([f"{_PEM}=C:\\k.pem"]).listed == ()
+    assert _read([f"{_PEM}=C:\\k.pem\nPath=C:\\x"]).listed == ()
+    assert _read([f"{_PEM}=C:\\k.pem", "Path=C:\\x"]).listed == ()
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        ["MEFOR_VALUE_X", "=abc"],
+        ["MEFOR_VALUE_X", "Winter=2026!"],
+        ["MEFOR_VALUE_X", "=", "abc"],
+        ["Path=x\nMEFOR_VALUE_X\n=abc"],
+        ["Path=x", "MEFOR_VALUE_X", "=abc"],
+    ],
+)
+def test_a_value_name_written_alone_above_its_value_refuses(items: list[str]) -> None:
+    """Finding 2: ``nssm set ... MEFOR_VALUE_X =abc`` writes the name as an item of its own and
+    the value as the next. The name alone is read as set to nothing so far, under the fail-closed
+    rule a secret-class name alone is read under, so the value below it refuses, and the remedy
+    names the items it ran on into. Failed on fc3ebdef6c9."""
+    posture = _read(items)
+    assert posture.listed == ("MEFOR_VALUE_X",), items
+    assert service_env_refusal(posture) is not None
+    if len(items) > 1:
+        assert posture.value_runs_on, items
+
+
+def test_a_value_name_written_alone_with_nothing_below_it_does_not_refuse() -> None:
+    """The control, as ``tests/test_service_env_secrets.py`` pins it: an entry with no ``=`` and
+    no value read into it sets no variable."""
+    for items in (["MEFOR_VALUE_X"], ["MEFOR_VALUE_X", "Path=C:\\x"]):
+        posture = _read(items)
+        assert posture.listed == (), items
+        assert posture.empty_value_names == posture.unplain_value_names == (), items
+
+
+@pytest.mark.parametrize("name", ["MEFOR_STORE_PASSWORD", _PEM])
+def test_a_value_of_equals_signs_alone_refuses(name: str) -> None:
+    """Finding 5: equals signs alone are read on the side that refuses. A secret-class value of
+    ``=`` is set, so it refuses alone; for the PEM-or-path key it is no path either, so that key
+    refuses too. The PEM case failed on fc3ebdef6c9."""
+    for items in ([f"{name}=="], [f"{name}==", "Path=C:\\x"]):
+        posture = _read(items)
+        assert posture.listed == (name,), items
+        assert service_env_refusal(posture) is not None
+
+
+@pytest.mark.parametrize("item", ["abc==", "QUJD==", "MEFOR_STORE_PASSWORD"])
+def test_a_value_name_set_to_equals_signs_does_not_run_on(item: str) -> None:
+    """Finding 6: ``MEFOR_VALUE_X==`` sets the value ``=``, which refuses whatever it holds, so the
+    next item is its own, as on origin/main 9421dcbf27, and the remedy does not say to remove it.
+    Failed on fc3ebdef6c9."""
+    posture = _read(["MEFOR_VALUE_X==", item])
+    assert posture.listed == ("MEFOR_VALUE_X",), item
+    assert not posture.value_runs_on, item
+
+
+def test_an_empty_value_name_still_runs_on_into_a_key_like_item() -> None:
+    """The control: ``MEFOR_VALUE_X=`` with nothing after it runs on as on origin/main."""
+    assert _read(["MEFOR_VALUE_X=", "abc=="]).value_runs_on
