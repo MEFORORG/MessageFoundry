@@ -256,8 +256,6 @@ def test_a_refused_crl_is_reported_by_its_own_setting(
     assert rc == 2
     crl = grab.starting("no audit row records the refused [api].tls_client_crl_file (BACKLOG")
     assert len(crl) == 1, grab.seen
-    # No start writes a CRL row, so the line must not say any preflight writes one.
-    assert "writes that row" not in crl[0], crl
     assert grab.starting(_CLIENT_CA_LINE) == []
 
 

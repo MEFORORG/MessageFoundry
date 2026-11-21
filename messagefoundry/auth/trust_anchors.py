@@ -149,14 +149,13 @@ byte-identical behaviour (no preflight runs, no audit rows, no new settings effe
       and the log file but no collector. No listener binds, since uvicorn binds after the
       lifespan. A start refused for another reason before uvicorn runs the lifespan, such as at
       the API TLS context build, runs no attestation and no lifespan, though the API TLS pair may
-      already be minted or renewed. It writes **no** row for the collector CA, nor for
-      ``[api].tls_client_ca_file`` where that build refused it: a refused start opens no store,
-      since every writable open writes more than the row. On at least a return or an
-      ``Exception`` before uvicorn runs, ``serve``'s exit hook logs a WARNING with the refusal's
-      reason, for the collector CA and for the client CA where the build refused it, as an anchor
-      refusal or as an ``OSError`` reading that file (BACKLOG #5391). At least an interrupt, an
-      exit uvicorn takes before the lifespan starts, and an exit inside the lifespan before this
-      preflight runs log no such WARNING and write no row.
+      already be minted or renewed. Such a start writes **no** audit row for either anchor: it
+      opens no store (BACKLOG #5391). ``serve``'s exit hook logs a WARNING with the refusal's
+      reason for at least the collector CA and a client CA the build refused as an anchor refusal
+      or as an ``OSError`` naming that file. Other refusals may log nothing, at least a client CA
+      path that is a directory, pipe or device, a path the OS rejects, and the CRL's other build
+      refusals. So may at least these exits: an interrupt, an exit uvicorn takes before the
+      lifespan starts, and an exit inside the lifespan before this preflight runs.
     * ``supervise`` checks the same CA before it builds its own forwarder, and refuses on stderr
       before any engine shard spawns. Its process has no audited preflight, so no row is written.
     * The API lifespan checks the CA of :func:`smtp_hop_anchor_spec` before it builds an alert
