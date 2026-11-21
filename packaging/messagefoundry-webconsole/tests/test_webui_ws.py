@@ -111,6 +111,21 @@ async def test_ws_cookie_auth_rejects_cross_origin(engine: Engine) -> None:
     assert identity is None
 
 
+async def test_ws_cookie_auth_refuses_an_unparseable_origin(engine: Engine) -> None:
+    """``urlsplit`` raises on ``http://[x`` (an invalid IPv6 literal). The cookie gate refuses that
+    handshake as it refuses a foreign origin, rather than raising."""
+    from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import authorize_ui_ws
+
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    app, token = await _token(engine, service, "op")
+    ws = _FakeWS(origin="http://[x", host="t", cookie=token, app=app)
+    identity, _ = await authorize_ui_ws(ws, Permission.MONITORING_READ)  # type: ignore[arg-type]
+    assert identity is None
+    assert not ws_accept_allowed(ws.scope)
+
+
 async def test_ws_cookie_auth_rejects_a_repeated_or_blank_origin(engine: Engine) -> None:
     """BACKLOG #5789: the cookie gate judges every Origin copy, as the header path does. A second
     copy is refused even after our own origin, and a blank one is refused, not taken for absent."""

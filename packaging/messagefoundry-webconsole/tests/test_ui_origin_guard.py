@@ -127,6 +127,25 @@ async def test_login_rejects_foreign_origin_without_sec_fetch(engine: Engine) ->
         assert "set-cookie" not in {k.lower() for k in r.headers}
 
 
+async def test_login_refuses_an_unparseable_origin_as_it_refuses_a_foreign_one(
+    engine: Engine,
+) -> None:
+    """``urlsplit`` raises on an invalid IPv6 literal such as ``http://[x``. That Origin matches
+    nothing, so it gets a foreign origin's 403 and body rather than a 500, on the ``Host`` fallback
+    and with a configured public origin alike."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    for public_origin in (None, "http://t"):
+        app = create_app(engine, auth=service, serve_ui=True, public_origin=public_origin)
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            foreign = await c.post("/ui/login", data=_creds(), headers={"Origin": EVIL_ORIGIN})
+            bad = await c.post("/ui/login", data=_creds(), headers={"Origin": "http://[x"})
+        assert foreign.status_code == 403, public_origin
+        assert (bad.status_code, bad.text) == (foreign.status_code, foreign.text), public_origin
+        assert "set-cookie" not in {k.lower() for k in bad.headers}
+
+
 async def test_login_rejection_precedes_the_rate_limiter(engine: Engine) -> None:
     """The guard is the FIRST statement, so a cross-site flood burns no per-address login budget: a
     legitimate same-origin login still succeeds immediately after many rejected cross-site POSTs."""
