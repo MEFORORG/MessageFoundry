@@ -778,6 +778,12 @@ REFINED_READING_DENY = [
     pytest.param(
         'echo "$(if((x << y)); then :; fi\nfind /proc)"', id="shift-in-arithmetic-glued-to-if"
     ),
+    # A combining mark after an apostrophe still leaves it a quote to bash; a culture-sensitive
+    # search for the closing quote skipped it and moved the paren match.
+    pytest.param(
+        "echo \"$((echo 'a'\u0301; find /proc) )\"; echo ')) '",
+        id="combining-mark-after-a-quote-in-a-subshell-substitution",
+    ),
     # With no quote at all, the masker used to return the text as it was, arithmetic unblanked.
     pytest.param("(( a << b ))\nfind /proc", id="spaced-shift-in-arithmetic-with-no-quote"),
 ]
@@ -807,16 +813,51 @@ def test_both_bodies_of_two_heredocs_on_one_line_are_still_blanked() -> None:
     assert_allowed(run_guard(bash('echo "$(cat <<A <<B\nfind /proc\nA\nfind /proc\nB\n)"')))
 
 
-def test_a_long_run_of_open_parens_is_read_in_linear_time() -> None:
-    """Every arithmetic-close scan shares one budget, so 40000 `((` cost one bounded pass.
+def test_arithmetic_that_reads_like_a_walk_is_still_allowed() -> None:
+    """The control for Get-ParenMatches: `$(( find / 2 ))` divides a variable by two.
 
-    Without the budget each scan read up to 8192 characters, about 98 seconds here, which is past
-    the dispatcher's hook timeout, and a timed-out hook lets the command run. The word `find` keeps
-    the guard from returning early, so every view, the refined one included, is built.
+    It closes with `))`, so it is arithmetic and runs nothing. Read as a subshell instead, its
+    `find /` would sit in program position and be denied.
     """
+    assert_allowed(run_guard(bash('echo "$(( find / 2 ))"')))
+
+
+# EACH ROW IS ALLOWED ON origin/main AND WAS A FALSE DENY OF AN EARLIER CUT OF -Refined. The first
+# put enough nested subshells ahead of the arithmetic to spend a shared scan budget, after which
+# every `$((` read as a subshell. The second read a glued `<<` in an array subscript as a heredoc,
+# whose body blanked the opening quote and exposed the prose it holds.
+REFINED_FALSE_DENY_ALLOW = [
+    pytest.param(
+        "(" * 250 + "true" + ") " * 250 + '; echo "$(( find / 2 ))"',
+        id="arithmetic-after-many-nested-subshells",
+    ),
+    pytest.param('a[x<<y]=1\necho "\ny\nfind /proc\n"', id="glued-shift-in-an-array-subscript"),
+]
+
+
+@pytest.mark.parametrize("command", REFINED_FALSE_DENY_ALLOW)
+def test_the_refined_reading_adds_no_deny_main_did_not_have(command: str) -> None:
+    assert_allowed(run_guard(bash(command)))
+
+
+def _guard_seconds(command: str) -> float:
     started = time.monotonic()
-    run_guard(bash('echo find; echo "$(' + "(" * 40000 + '"'))
-    assert time.monotonic() - started < 30
+    run_guard(bash(command))
+    return time.monotonic() - started
+
+
+def test_a_long_run_of_open_parens_is_read_in_linear_time() -> None:
+    """Get-ParenMatches is one pass, so doubling a run of `((` does not quadruple the time.
+
+    An earlier cut scanned forward from every `((`, and 40000 of them took about 98 seconds here,
+    past the dispatcher's hook timeout; a timed-out hook lets the command run. The word `find` keeps
+    the guard from returning early, so every view, the refined one included, is built. The bound
+    allows for the fixed cost of starting pwsh, which both runs pay.
+    """
+    half = _guard_seconds('echo find; echo "$(' + "(" * 20000 + '"')
+    full = _guard_seconds('echo find; echo "$(' + "(" * 40000 + '"')
+    assert full < 30
+    assert full < 2.5 * half + 2
 
 
 # ============================================ the corpora must not quietly shrink
@@ -848,8 +889,9 @@ EXPECTED_ROW_COUNTS = {
     "POWERSHELL_QUOTE_DENY": 2,
     "TOGGLE_FLOOR_DENY": 5,
     "COMMENT_BOUNDARY_DENY": 6,
-    "REFINED_READING_DENY": 12,
+    "REFINED_READING_DENY": 13,
     "REFINED_FLOOR_DENY": 2,
+    "REFINED_FALSE_DENY_ALLOW": 2,
 }
 
 

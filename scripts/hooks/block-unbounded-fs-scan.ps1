@@ -77,40 +77,71 @@ function Hide-HeredocBodies([string]$Text, [string]$Masked) {
     return ($out -join "`n")
 }
 
-# Whether the `(` at $Open, the second of `$((` or `((`, closes with `))`, which is when bash reads
-# arithmetic; otherwise, as in `$((find /proc) )`, it is a subshell. The scan skips a backslash
-# escape and a single- or double-quoted string, so a quoted paren (`'foo('`) does not move the
-# match. It does not read at least comments, heredoc bodies, backtick substitutions, `$'...'`
-# strings or a substitution nested in a quoted string. Every call shares one budget of 65536
-# characters, so a long run of `((` cannot make the scans quadratic; once it is spent, every call
-# returns false. An unmatched or cut-off scan returns false too, which -Refined reads as a
-# subshell, the reading that leaves the text visible.
-$script:ArithmeticBudget = 65536
-function Test-ArithmeticClose([string]$Text, [int]$Open) {
-    $depth = 1
-    $limit = [Math]::Min($Text.Length, $Open + 1 + $script:ArithmeticBudget)
-    $k = $Open + 1
-    try {
-    while ($k -lt $limit) {
+# The index of the `)` that closes each unquoted `(`, or -1, from one linear pass, so -Refined can
+# tell arithmetic from a subshell at every `$((` and `((` without a forward scan per site. Bash
+# reads `$((` or `((` as arithmetic when the `)` matching its second `(` is followed by `)`;
+# otherwise, as in `$((find /proc) )`, it is a subshell. The pass reads at least these as bash
+# does: a backslash escape, a single- or double-quoted string, whose parens are not counted
+# (`'foo('`), a `$(` inside double quotes, which is unquoted again until its `)`, and a `#` comment
+# at a word start. It does not read at least heredoc bodies, backtick substitutions, `$'...'`
+# strings or a `case` pattern's `)`, so a paren in one can move a match. A paren with no match is
+# -1, and the caller then keeps the reading without -Refined there, never a third one.
+function Get-ParenMatches([string]$Text) {
+    $match = [int[]]::new($Text.Length)
+    for ($k = 0; $k -lt $Text.Length; $k++) { $match[$k] = -1 }
+    # One frame per quoting context: 'u' (unquoted), 'dq' or 'sq'. An unquoted frame opened by a
+    # `$(` inside double quotes records that paren, which closes the frame when it is matched.
+    $frames = [System.Collections.Generic.List[string]]::new(); $frames.Add('u')
+    $frameOpener = [System.Collections.Generic.List[int]]::new(); $frameOpener.Add(-1)
+    $parens = [System.Collections.Generic.Stack[int]]::new()
+    $parenFrame = [System.Collections.Generic.Stack[int]]::new()
+    $wordStart = $true
+    $k = 0
+    while ($k -lt $Text.Length) {
         $c = $Text[$k]
-        if ($c -ceq '\') { $k += 2; continue }
-        if ($c -ceq "'") {
-            $k = $Text.IndexOf("'", $k + 1)
-            if ($k -lt 0) { $k = $limit; return $false }
-        } elseif ($c -ceq '"') {
-            $k++
-            while ($k -lt $limit -and $Text[$k] -cne '"') { $k += $(if ($Text[$k] -ceq '\') { 2 } else { 1 }) }
-        } elseif ($c -ceq '(') { $depth++ }
-        elseif ($c -ceq ')') {
-            $depth--
-            if ($depth -eq 0) { return ($k + 1 -lt $Text.Length -and $Text[$k + 1] -ceq ')') }
+        $f = $frames.Count - 1
+        $kind = $frames[$f]
+        if ($kind -ceq 'sq') {
+            if ($c -ceq "'") { $frames.RemoveAt($f); $frameOpener.RemoveAt($f); $wordStart = $false }
+            $k++; continue
         }
+        if ($kind -ceq 'dq') {
+            if ($c -ceq '\') { $k += 2; continue }
+            if ($c -ceq '"') { $frames.RemoveAt($f); $frameOpener.RemoveAt($f); $wordStart = $false }
+            elseif ($c -ceq '$' -and $k + 1 -lt $Text.Length -and $Text[$k + 1] -ceq '(') {
+                $frames.Add('u'); $frameOpener.Add($k + 1)
+                $parens.Push($k + 1); $parenFrame.Push($f + 1)
+                $wordStart = $true; $k += 2; continue
+            }
+            $k++; continue
+        }
+        if ($c -ceq '\') { $k += 2; $wordStart = $false; continue }
+        if ($c -ceq '#' -and $wordStart) {
+            $end = $Text.IndexOf([char]10, $k)
+            $k = if ($end -lt 0) { $Text.Length } else { $end }
+            continue
+        }
+        if ($c -ceq "'") { $frames.Add('sq'); $frameOpener.Add(-1) }
+        elseif ($c -ceq '"') { $frames.Add('dq'); $frameOpener.Add(-1) }
+        elseif ($c -ceq '(') { $parens.Push($k); $parenFrame.Push($f) }
+        elseif ($c -ceq ')' -and $parens.Count -gt 0 -and $parenFrame.Peek() -eq $f) {
+            $open = $parens.Pop(); [void]$parenFrame.Pop()
+            $match[$open] = $k
+            if ($open -eq $frameOpener[$f]) { $frames.RemoveAt($f); $frameOpener.RemoveAt($f) }
+        }
+        $wordStart = [char]::IsWhiteSpace($c) -or ';&|('.IndexOf($c) -ge 0
         $k++
     }
-    return $false
-    } finally {
-        $script:ArithmeticBudget = [Math]::Max(0, $script:ArithmeticBudget - ([Math]::Min($k, $limit) - $Open))
-    }
+    return ,$match
+}
+
+# 1 when the `(` at $Open, the second of `$((` or `((`, is arithmetic, 0 when it is a subshell, and
+# -1 when Get-ParenMatches found no match for it.
+function Get-ArithmeticVerdict([int[]]$Table, [string]$Text, [int]$Open) {
+    $close = $Table[$Open]
+    if ($close -lt 0) { return -1 }
+    if ($close + 1 -lt $Text.Length -and $Text[$close + 1] -ceq ')') { return 1 }
+    return 0
 }
 
 # Blank the CONTENTS of quoted spans, keeping the quotes and the length, so a separator or a
@@ -141,9 +172,10 @@ function Test-ArithmeticClose([string]$Text, [int]$Open) {
 #
 # -Refined CHANGES FOUR READINGS (BACKLOG #5607), each of which the reading without it misreads
 # into blanking a walk inside a double-quoted substitution, where the plain toggle blanks it too.
-# A `$((` is arithmetic only when Test-ArithmeticClose closes it with `))`, so `"$((find /proc) )"`
-# is a subshell inside a substitution; that test's own limits are stated on it. A `<<` glued to a
-# word opens a heredoc (`"$(cat<<'EOF'"`). Every heredoc opened on one line has a body, read in
+# A `$((` is a subshell inside a substitution when Get-ParenMatches closes its second `(` with
+# something other than `))`, as in `"$((find /proc) )"`; that pass's own limits are stated on it.
+# A `<<` glued to a word opens a heredoc (`"$(cat<<'EOF'"`), except inside `${...}` or an unquoted
+# `[...]` in the same word, such as an array subscript. Every heredoc opened on one line has a body, read in
 # order to its own terminator (`cat <<A <<B`), where the reading without it keeps only the last
 # delimiter. And the arithmetic command `(( ... ))`, also glued to `if`, `elif`, `while`, `until`
 # or `for`, and `$[ ... ]` are blanked as `$((` is, so a shift in them opens no heredoc. Unlike
@@ -185,6 +217,11 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
     $pending = [System.Collections.Generic.List[string]]::new()
     $bodyTerms = [System.Collections.Generic.List[string]]::new()
     $delimiterAt = [regex]::new('\G-?[ \t]*(?:''([^''\n]+)''|"([^"\n]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))')
+    # Built on the first `$((` or `((` -Refined meets; see Get-ParenMatches.
+    $parenTable = $null
+    # The depth of an unquoted `[...]` in the current word, such as an array subscript, where a
+    # glued `<<` is a shift and never opens a heredoc (`a[x<<y]=1`).
+    $bracketDepth = 0
     $n = 0
     while ($n -lt $Text.Length) {
         if ($bodyTerms.Count -gt 0) {
@@ -228,9 +265,14 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
         }
         if ($ch -ceq '$' -and $next -ceq '(' -and $n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '(' -and
             $kind -cne 'sq' -and $kind -cne 'ansi') {
-            # With -Refined, a `$((` that Test-ArithmeticClose does not close with `))` falls
-            # through, to be read as `$(` and then `(`: `$((find /proc) )` is a subshell.
-            $isArith = -not $Refined -or (Test-ArithmeticClose $Text ($n + 2))
+            # With -Refined, a `$((` whose second `(` Get-ParenMatches closes with something other
+            # than `))` falls through, to be read as `$(` and then `(`: `$((find /proc) )` is a
+            # subshell. One it found no match for is read as arithmetic, as without -Refined.
+            $isArith = $true
+            if ($Refined) {
+                if ($null -eq $parenTable) { $parenTable = Get-ParenMatches $Text }
+                $isArith = (Get-ArithmeticVerdict $parenTable $Text ($n + 2)) -ne 0
+            }
         } else { $isArith = $false }
         if ($isArith) {
             $kinds.Add('arith'); $depths.Add(0); [void]$sb.Append('$(('); $prevDollar = $false
@@ -238,11 +280,12 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
         }
         # With -Refined, the arithmetic command `(( ... ))` at a word start or glued to a keyword
         # (`if((`, `while((`), and the old-style `$[ ... ]`, are blanked as `$((` is, so a `<<` in
-        # them opens no heredoc.
+        # them opens no heredoc. A `((` Get-ParenMatches found no match for is left as it is.
         if ($Refined -and ($kind -ceq 'top' -or $kind -ceq 'sub' -or $kind -ceq 'bt')) {
             if ($ch -ceq '(' -and $next -ceq '(' -and $braceDepth -eq 0 -and
                 ($wordStart -or $keywordBefore.IsMatch($Text.Substring([Math]::Max(0, $n - 7), [Math]::Min($n, 7)))) -and
-                (Test-ArithmeticClose $Text ($n + 1))) {
+                $(if ($null -eq $parenTable) { $parenTable = Get-ParenMatches $Text }
+                  (Get-ArithmeticVerdict $parenTable $Text ($n + 1)) -eq 1)) {
                 $kinds.Add('arith'); $depths.Add(0); [void]$sb.Append('(('); $prevDollar = $false
                 $n += 2; continue
             }
@@ -288,7 +331,8 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
             $n++; continue
         }
         if ($ch -ceq '<' -and $next -ceq '<' -and
-            ($n -eq 0 -or [char]::IsWhiteSpace($Text[$n - 1]) -or ($Refined -and $Text[$n - 1] -cne '<')) -and
+            ($n -eq 0 -or [char]::IsWhiteSpace($Text[$n - 1]) -or
+             ($Refined -and $Text[$n - 1] -cne '<' -and $braceDepth -eq 0 -and $bracketDepth -eq 0)) -and
             -not ($n + 2 -lt $Text.Length -and $Text[$n + 2] -ceq '<')) {
             # Matched in place: a Substring of the rest at every opener made a long command quadratic.
             $d = $delimiterAt.Match($Text, $n + 2)
@@ -344,6 +388,9 @@ function Hide-QuotedSpans([string]$Text, [switch]$Plain, [switch]$Refined) {
         elseif ($ch -ceq '}' -and $braceDepth -gt 0) { $braceDepth-- }
         [void]$sb.Append($ch)
         $wordStart = [char]::IsWhiteSpace($ch) -or ';&|('.IndexOf($ch) -ge 0
+        if ($wordStart) { $bracketDepth = 0 }
+        elseif ($ch -ceq '[') { $bracketDepth++ }
+        elseif ($ch -ceq ']' -and $bracketDepth -gt 0) { $bracketDepth-- }
         $prevDollar = ($ch -ceq '$') -and -not $prevDollar
         $n++
     }
