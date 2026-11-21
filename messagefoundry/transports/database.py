@@ -3023,7 +3023,8 @@ class AutocommitNotConfirmed(RuntimeError):
 
     The borrow is refused, and the connection goes back to its pool unconfirmed, so no statement runs
     on it until a later borrow has set the mode. A setter that raises a driver error raises that
-    error instead, and its connection goes back unconfirmed the same way. The text names neither
+    error instead, and its connection goes back unconfirmed the same way, unless the error is a
+    connection failure (class 08), which discards it (BACKLOG #5748). The text names neither
     the DSN nor the server."""
 
 
@@ -3045,7 +3046,9 @@ _ENGINE_FIXED_TEXT: tuple[type[BaseException], ...] = (
 _ENGINE_TEXT_LIMIT = 400
 
 
-def _thread_settled[T](fn: Callable[[], T], *, gate: CallGate | None = None) -> asyncio.Future[T]:
+def _thread_settled[T](
+    fn: Callable[[], T], *, gate: CallGate | None = None, pool: Any = None
+) -> asyncio.Future[T]:
     """Run ``fn`` on a worker thread and return a future that the THREAD resolves, once ``fn`` has
     returned or raised.
 
@@ -3059,8 +3062,15 @@ def _thread_settled[T](fn: Callable[[], T], *, gate: CallGate | None = None) -> 
     runs beside another pyodbc call on the connection. When a call is running there, as after a
     cancelled ``execute``, ``fn`` is handed to that call, which runs it on its own thread as it
     returns. So no second thread waits for a statement that may have no timeout. Otherwise ``fn``
-    goes to a worker thread through the gate, as before."""
+    goes to a worker thread through the gate, as before.
+
+    **With ``pool``, that worker thread is the pool's own executor** (:func:`_make_pool`, BACKLOG
+    #5756), so a hung close or set holds a thread of that pool, never one of the event loop's
+    default executor. A pool with no tracked executor, and no ``pool``, use the default one. A
+    pool's executor is shut down once a close of the pool has ended, and a call submitted after
+    that raises ``RuntimeError`` here, as one on a shut-down default executor does."""
     loop = asyncio.get_running_loop()
+    executor = None if pool is None else _tracked(_POOL_EXECUTORS, pool)
     settled: asyncio.Future[T] = loop.create_future()
 
     def _resolve(value: T | None, error: BaseException | None) -> None:
@@ -3090,9 +3100,9 @@ def _thread_settled[T](fn: Callable[[], T], *, gate: CallGate | None = None) -> 
             )
 
     if gate is None:
-        loop.run_in_executor(None, _work)
+        loop.run_in_executor(executor, _work)
     elif not gate.run_after_running_call(_work):
-        loop.run_in_executor(None, partial(gate.run, _work))
+        loop.run_in_executor(executor, partial(gate.run, _work))
     return settled
 
 
@@ -3155,7 +3165,9 @@ async def _return_to_pool(pool: Any, conn: Any) -> None:
     worker thread can still be using ``conn`` (the rule :func:`_return_when_settled` enforces).
     Never raises: the caller, if any, is already raising its own reason.
 
-    A connection whose autocommit was not confirmed is returned, not closed. It is not marked
+    A connection whose autocommit was not confirmed is returned, not closed; a caller whose set
+    failed with a connection failure calls :func:`_discard_to_pool` instead (BACKLOG #5748), since
+    this function never discards. It is not marked
     confirmed, so its next borrow sets autocommit again before any statement runs on it, and refuses
     again if the driver still rejects the set. Closing it would add nothing to that rule, and
     aioodbc's own release of an open connection is what wakes a borrower waiting for a free slot.
@@ -3301,7 +3313,34 @@ async def _return_held(pool: Any, conn: Any) -> None:
         _settle_held(pool)
 
 
-def _return_when_settled(pool: Any, conn: Any, work: asyncio.Future[Any], what: str) -> None:
+async def _discard_to_pool(pool: Any, conn: Any) -> None:
+    """Close ``conn``, whose handle is presumed dead, and give it back to ``pool`` closed (BACKLOG
+    #5748). Call it only once no worker thread can still be using ``conn``. Never raises an
+    ``Exception``, as :func:`_return_to_pool` never does: the caller, if any, is already raising
+    its own reason, and a failed return is logged as one."""
+    try:
+        await _close_and_release(pool, conn, None, discard=True)
+    except Exception as exc:  # noqa: BLE001 - no borrower is left to tell
+        logger.warning("DATABASE: discarding a pooled connection failed: %s", _safe_db_error(exc))
+
+
+async def _discard_held(pool: Any, conn: Any) -> None:
+    """:func:`_discard_to_pool` for a held-back ``conn``, then take it off the count as
+    :func:`_return_held` does."""
+    try:
+        await _discard_to_pool(pool, conn)
+    finally:
+        _settle_held(pool)
+
+
+def _return_when_settled(
+    pool: Any,
+    conn: Any,
+    work: asyncio.Future[Any],
+    what: str,
+    *,
+    discard_on: Callable[[BaseException], bool] | None = None,
+) -> None:
     """Once ``work`` is done, return ``conn`` to ``pool``, but only if ``work`` ending proves the
     worker thread it waited on has finished with ``conn`` (PR 2593 review).
 
@@ -3317,7 +3356,13 @@ def _return_when_settled(pool: Any, conn: Any, work: asyncio.Future[Any], what: 
     aioodbc that renamed ``_impl``) passes a task, and a CANCELLED task proves nothing: loop
     teardown cancels every task and leaves the thread running. That connection is kept out of the
     pool, and logged. Not closed either, since that is the same crash. It then holds any
-    ``wait_closed`` on its pool, so this fallback is a known cost, logged when it happens."""
+    ``wait_closed`` on its pool, so this fallback is a known cost, logged when it happens.
+
+    **A ``work`` that failed is logged, and one whose failure ``discard_on`` accepts discards the
+    connection rather than returning it** (BACKLOG #5748): by default a connection failure, class
+    08, whose handle is presumed dead (:func:`_connection_lost`). No borrower is left to raise
+    either to."""
+    discards = _connection_lost if discard_on is None else discard_on
 
     def _done(finished: asyncio.Future[Any]) -> None:
         if finished.cancelled():
@@ -3327,6 +3372,22 @@ def _return_when_settled(pool: Any, conn: Any, work: asyncio.Future[Any], what: 
                 what,
             )
             return
+        failure = finished.exception()
+        if failure is not None and discards(failure):
+            logger.warning(
+                "DATABASE: %s failed after its borrower left (%s); the connection is discarded "
+                "rather than returned to its pool",
+                what,
+                _safe_db_error(failure),
+            )
+            _detach(_discard_held(pool, conn))
+            return
+        if failure is not None:
+            logger.warning(
+                "DATABASE: %s failed after its borrower left (%s); the connection goes back",
+                what,
+                _safe_db_error(failure),
+            )
         _detach(_return_held(pool, conn))
 
     _hold_back(pool)
@@ -3407,11 +3468,13 @@ class _AutocommitPool:
             return conn
         try:
             # No driver call has run on it before this succeeds: _thread_settled raises at once
-            # if the default executor is already shut down, and neither starts a thread then.
+            # if the pool's executor is already shut down, and neither starts a thread then.
             raw = _driver_connection(conn)
             # Through the gate (BACKLOG #2394): the set uses the raw handle, which aioodbc's gated
             # _execute never sees.
-            work = _thread_settled(partial(_set_and_read_autocommit, raw), gate=call_gate(conn))
+            work = _thread_settled(
+                partial(_set_and_read_autocommit, raw), gate=call_gate(conn), pool=self._pool
+            )
         except (AutocommitNotConfirmed, RuntimeError):
             await _return_to_pool(self._pool, conn)
             raise
@@ -3422,8 +3485,13 @@ class _AutocommitPool:
                 # The thread resolved ``work`` with a driver error, so no call is running on it.
                 # Returned open, not closed: a close here is itself a worker-thread call that a
                 # cancellation could abandon, and a driver error on a set does not leave a
-                # transaction open the way a failed rollback can (BACKLOG #5010).
-                await _return_to_pool(self._pool, conn)
+                # transaction open the way a failed rollback can (BACKLOG #5010). A connection-class
+                # failure (class 08) is the exception: that handle is presumed dead, so it is
+                # closed rather than lent again, as every other borrow site does (BACKLOG #5748).
+                if _connection_lost(exc):
+                    await _discard_to_pool(self._pool, conn)
+                else:
+                    await _return_to_pool(self._pool, conn)
             else:
                 # The borrower left (a cancel, or the coroutine closed) while the thread may still
                 # be inside the setter. Settled when the thread resolves ``work``, never sooner,
@@ -3444,7 +3512,8 @@ class _AutocommitPool:
     def _settle_detached(self, conn: Any, work: asyncio.Future[bool]) -> None:
         """Settle ``conn`` once the thread has resolved a set its borrower abandoned: marked
         confirmed and returned if it passed, otherwise logged (no borrower is left to raise to,
-        CLAUDE.md section 6) and returned unconfirmed, so its next borrow sets it again. A done
+        CLAUDE.md section 6) and returned unconfirmed, so its next borrow sets it again, or
+        discarded when the set failed with a connection failure (BACKLOG #5748). A done
         callback, so it never raises. ``work`` is a :func:`_thread_settled` future, which only
         its thread completes, so this runs only once the setter has returned (PR 2593 review)."""
         if work.cancelled():  # nothing cancels a _thread_settled future; refuse to guess if one is
@@ -3457,6 +3526,14 @@ class _AutocommitPool:
         if failure is None and work.result():
             self._mark_confirmed(conn)
             _detach(_return_held(self._pool, conn))
+            return
+        if failure is not None and _connection_lost(failure):
+            logger.warning(
+                "DATABASE: an abandoned borrow's autocommit set failed with a connection failure "
+                "(%s); the connection is discarded rather than returned to its pool",
+                _safe_db_error(failure),
+            )
+            _detach(_discard_held(self._pool, conn))  # BACKLOG #5748
             return
         logger.warning(
             "DATABASE: an abandoned borrow's autocommit set did not pass (%s); the connection goes "
@@ -3563,18 +3640,22 @@ def _tracked[T](table: weakref.WeakKeyDictionary[Any, T], pool: Any) -> T | None
         return None
 
 
-async def _apply_statement_timeout(pool: Any, conn: Any) -> None:
+async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float) -> None:
     """Set ``pool``'s statement timeout on a connection just borrowed from it (BACKLOG #5756).
 
     pyodbc's ``Connection.timeout`` is set on each cursor as it is made, as the ODBC query timeout.
-    aioodbc exposes it read-only, so it is set on the pyodbc connection (``_conn``), on the loop
-    with no call running on a connection just lent, as the SQL Server store sets
-    ``[store].command_timeout``. pyodbc's setter also hands the value to the driver as a
-    connection attribute, so the write is skipped when the connection already holds the value: a
-    connection lent before, and ``0`` on a fresh one.
+    aioodbc exposes it read-only, so it is set on the pyodbc connection (``_conn``). pyodbc's
+    setter also hands the value to the driver as a connection attribute, so the write runs on the
+    pool's own executor, inside the connection's call gate (:func:`_thread_settled`), never on the
+    event loop. The read of the current value is pyodbc's own record of it and stays on the loop.
+    The write is skipped when the connection already holds the value: a connection lent before,
+    and ``0`` on a fresh one. A borrower cancelled during the write leaves at once, and the
+    connection goes back only once the write has returned (:func:`_return_when_settled`), or is
+    discarded if the write then failed with a transient state.
 
     **A driver that refuses the value fails the borrow closed.** The connection goes back to
-    ``pool`` first, since no call ran on it, and a ``config_fault`` naming the setting is raised,
+    ``pool`` first, since a refused write leaves the handle usable and no statement ran on it, and
+    a ``config_fault`` naming the setting is raised,
     so the lane stops rather than running with a bound the operator believes is set.
 
     **A transient driver state from the setter, class 08 or ``HYT00`` among them, is the
@@ -3598,7 +3679,7 @@ async def _apply_statement_timeout(pool: Any, conn: Any) -> None:
             # call ran on it, and the exception propagates unchanged, as _cursor_refused's does.
             await _return_to_pool(pool, conn)
             raise
-        await _close_and_release(pool, conn, None, discard=True)
+        await _discard_to_pool(pool, conn)
         raise DeliveryError(
             f"DATABASE connection unusable reading its statement timeout: {_safe_db_error(exc)}"
         ) from exc
@@ -3609,21 +3690,56 @@ async def _apply_statement_timeout(pool: Any, conn: Any) -> None:
     if current == seconds:
         return
     try:
-        raw.timeout = seconds
-    except Exception as exc:  # noqa: BLE001 - a driver's own error class too; re-raised classified
-        state = _log_sqlstate(exc)
-        if state is not None and _is_transient(state):
-            await _close_and_release(pool, conn, None, discard=True)
-            raise _classify_db_error(state, str(exc), connecting=True) from exc
+        work = _thread_settled(
+            partial(_set_driver_timeout, raw, seconds), gate=call_gate(conn), pool=pool
+        )
+    except RuntimeError:  # the pool's executor is shut down: no thread started, nothing ran
         await _return_to_pool(pool, conn)
-        raise NegativeAckError(
-            "database driver refused statement_timeout"
-            + (f" [{state}]" if state else f" ({type(exc).__name__})")
-            + "; set statement_timeout = 0 on this connection if it cannot take one",
-            code=state or "db",
-            permanent=True,
-            config_fault=True,
-        ) from exc
+        raise
+    try:
+        await asyncio.wait_for(asyncio.shield(work), timeout)
+    except BaseException as exc:
+        if not (work.done() and isinstance(exc, Exception)):
+            # The borrower left (a cancel, or the bound) while the thread may still be inside the
+            # setter: the connection goes back only once the thread has resolved ``work``, as a
+            # cursor close's does, and is discarded if the write failed as the arm below would.
+            _return_when_settled(
+                pool, conn, work, "a statement_timeout write", discard_on=_transient_driver_error
+            )
+            if isinstance(exc, TimeoutError):
+                raise DeliveryError(
+                    "DATABASE statement_timeout write did not finish within the borrow's "
+                    "acquire_timeout"
+                ) from exc
+            raise
+    failure = work.exception()  # done here; the thread resolved it, so it is never cancelled
+    if failure is None:
+        return
+    state = _log_sqlstate(failure)
+    if state is not None and _is_transient(state):  # _transient_driver_error's test
+        await _discard_to_pool(pool, conn)
+        raise _classify_db_error(state, str(failure), connecting=True) from failure
+    await _return_to_pool(pool, conn)
+    raise NegativeAckError(
+        "database driver refused statement_timeout"
+        + (f" [{state}]" if state else f" ({type(failure).__name__})")
+        + "; set statement_timeout = 0 on this connection if it cannot take one",
+        code=state or "db",
+        permanent=True,
+        config_fault=True,
+    ) from failure
+
+
+def _transient_driver_error(exc: BaseException) -> bool:
+    """Whether ``exc`` carries a SQLSTATE this connector retries (:func:`_is_transient`)."""
+    state = _log_sqlstate(exc)
+    return state is not None and _is_transient(state)
+
+
+def _set_driver_timeout(raw: Any, seconds: int) -> None:
+    """On a worker thread: write ``seconds`` to pyodbc's ``Connection.timeout``, whose setter hands
+    it to the driver (BACKLOG #5756), so a driver slow to take it holds no event-loop time."""
+    raw.timeout = seconds
 
 
 #: Pools already warned that their driver connection has no ``timeout`` (BACKLOG #5756), so the
@@ -3681,7 +3797,7 @@ async def _acquire(pool: Any, timeout: float) -> Any:
             f"DATABASE pool acquire timed out after {timeout:g}s (pool exhausted or DB unresponsive)"
         ) from exc
     await _require_gate_or_discard(pool, conn)
-    await _apply_statement_timeout(pool, conn)
+    await _apply_statement_timeout(pool, conn, timeout=timeout)
     return conn
 
 
@@ -3700,8 +3816,9 @@ async def _require_gate_or_discard(pool: Any, conn: Any) -> None:
     closed at once. The close of that handle runs on a worker thread, and the refusal does not wait
     for it, as the store's refusal does not: nothing runs on the connection, so the close can race
     nothing, and the borrow is not held behind a busy executor or a slow disconnect. Where the
-    executor is already shut down, at loop teardown, no thread can take the close, and the handle
-    is freed as this refusal unwinds, on the event loop thread.
+    pool's executor is already shut down, once a close of the pool has ended (or the default
+    executor at loop teardown, for a pool with none tracked), no thread can take the close, and
+    the handle is freed as this refusal unwinds, on the event loop thread.
 
     **A connection with no ``_conn``** (an aioodbc that renamed it, as it renamed ``_execute``) has
     no handle to drop, so it is closed through its own ``close()``
@@ -3716,7 +3833,9 @@ async def _require_gate_or_discard(pool: Any, conn: Any) -> None:
         raw = drop_handle(conn)  # first, and await-free: the pool never lends it again
         if raw is not None:
             try:
-                asyncio.get_running_loop().run_in_executor(None, _close_refused, raw)
+                asyncio.get_running_loop().run_in_executor(
+                    _tracked(_POOL_EXECUTORS, pool), _close_refused, raw
+                )
             except RuntimeError as exc:  # the executor is shut down; see the docstring
                 logger.debug("DATABASE: refused connection not closed, executor shut down: %s", exc)
         else:
@@ -3860,9 +3979,9 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
         else:
             close = partial(_close_raw_cursor, raw_cur)
         try:
-            work = _thread_settled(close, gate=gate)
+            work = _thread_settled(close, gate=gate, pool=pool)
         except RuntimeError as exc:
-            # The default executor is shut down: no close thread started, so none runs on it.
+            # The executor is shut down: no close thread started, so none runs on it.
             # Not raised: this runs in callers' finally blocks, and must not mask their outcome.
             # A dropped handle is left for pyodbc to close when it is collected.
             logger.debug("DATABASE: cursor close not run, executor shut down: %s", exc)
@@ -3870,7 +3989,9 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
             return
     else:
         work = asyncio.ensure_future(
-            _close_cursor(cur) if dropped is None else _close_cursor_then_drop(cur, dropped, gate)
+            _close_cursor(cur)
+            if dropped is None
+            else _close_cursor_then_drop(cur, dropped, gate, pool)
         )
         # The loop holds a task only weakly; keep this one alive until its done-callback has run.
         _DETACHED_SETTLES.add(work)
@@ -3891,12 +4012,12 @@ async def _close_and_release(pool: Any, conn: Any, cur: Any, *, discard: bool = 
     await _release(pool, conn)
 
 
-async def _close_cursor_then_drop(cur: Any, raw: Any, gate: CallGate | None) -> None:
+async def _close_cursor_then_drop(cur: Any, raw: Any, gate: CallGate | None, pool: Any) -> None:
     """The discard for a cursor with no raw pyodbc cursor: close it through its own ``close()``,
     then close the dropped handle on a worker thread, through the gate. Never raises."""
     await _close_cursor(cur)
     try:
-        closing = _thread_settled(partial(_close_dropped, raw), gate=gate)
+        closing = _thread_settled(partial(_close_dropped, raw), gate=gate, pool=pool)
     except RuntimeError as exc:  # the executor is shut down: pyodbc closes it when collected
         logger.debug("DATABASE: discarded connection not closed, executor shut down: %s", exc)
         return
@@ -4146,6 +4267,17 @@ def _cursor_refused(exc: Exception, pool: Any) -> DeliveryError | None:
     return _classify_db_error(state, str(exc), connecting=True)
 
 
+def _cursor_refusal_discards(refused: DeliveryError) -> bool:
+    """Whether a borrow whose cursor :func:`_cursor_refused` classified as ``refused`` discards its
+    connection (BACKLOG #5749): every refusal but a static one, a ``config_fault`` or a
+    ``credential_fault``, which a fresh connection would meet the same way, so a discard would
+    only add a login per borrow. At least the poll, mark, lookup, ``DatabaseRef`` sync and login
+    role probe use it; at least ``send()`` and :func:`_probe_db` discard on every refusal."""
+    return not (
+        isinstance(refused, NegativeAckError) and (refused.config_fault or refused.credential_fault)
+    )
+
+
 async def _probe_db(
     get_pool: Callable[[], Any], *, timeout: float = _DEFAULT_DB_ACQUIRE_TIMEOUT
 ) -> None:
@@ -4167,7 +4299,7 @@ async def _probe_db(
             )  # classified as send() classifies it (BACKLOG #5749)
             if refused is None:
                 raise
-            discard = True
+            discard = True  # every refusal, as send() discards (BACKLOG #5749)
             raise refused from exc
         await cur.execute("SELECT 1")
     except DeliveryError:
@@ -4373,9 +4505,9 @@ class DatabaseDestination(DestinationConnector):
                 refused = _cursor_refused(exc, pool)
                 if refused is None:
                     raise  # not a DB driver error, so an internal/code error, as below
-                discard = (
-                    True  # BACKLOG #5749: a handle that cannot make a cursor is not lent again
-                )
+                # BACKLOG #5749: a handle that cannot make a cursor is not lent again, whatever
+                # the refusal (_cursor_refusal_discards says where a static one keeps it).
+                discard = True
                 raise refused from exc
             try:
                 await cur.execute(self._sql, params)
@@ -5146,8 +5278,16 @@ class DatabaseSource(SourceConnector):
         skipped: list[str] = []
         budget_spent = False
         ceiling = self._poll_max_rows
+        discard = False
         try:
-            cur = await conn.cursor()
+            try:
+                cur = await conn.cursor()
+            except Exception as exc:
+                refused = _cursor_refused(exc, pool)  # BACKLOG #5749, as send() reads it
+                if refused is None:
+                    raise
+                discard = _cursor_refusal_discards(refused)
+                raise refused from exc
             await cur.execute(self._poll_sql)
             columns = [d[0] for d in cur.description]
             if self._body_column is not None and self._body_column not in columns:
@@ -5222,7 +5362,7 @@ class DatabaseSource(SourceConnector):
                     ceiling,
                 )
         finally:
-            await _close_and_release(pool, conn, cur)
+            await _close_and_release(pool, conn, cur, discard=discard)
         return _PolledBatch(rows, skipped, budget_spent)
 
     def _body(self, record: dict[str, Any]) -> bytes:
@@ -5287,11 +5427,19 @@ class DatabaseSource(SourceConnector):
         pool = await self._get_pool()
         conn = await _acquire(pool, self._acquire_timeout)
         cur: Any = None
+        discard = False
         try:
-            cur = await conn.cursor()
+            try:
+                cur = await conn.cursor()
+            except Exception as exc:
+                refused = _cursor_refused(exc, pool)  # BACKLOG #5749, as send() reads it
+                if refused is None:
+                    raise
+                discard = _cursor_refusal_discards(refused)
+                raise refused from exc
             await cur.execute(self._mark_sql, params)
         finally:
-            await _close_and_release(pool, conn, cur)
+            await _close_and_release(pool, conn, cur, discard=discard)
 
     async def test_connection(self) -> None:
         await _probe_db(self._get_pool, timeout=self._acquire_timeout)
@@ -5604,11 +5752,18 @@ async def _read_login_roles(pool: Any, acquire_timeout: float) -> LoginRoleReadi
     cur: Any = None
     lost = False
     try:
-        cur = await conn.cursor()
+        try:
+            cur = await conn.cursor()
+        except Exception as exc:
+            refused = _cursor_refused(exc, pool)
+            # BACKLOG #5749: a handle that cannot make a cursor is not lent to the next borrower.
+            lost = refused is not None and _cursor_refusal_discards(refused)
+            raise
         await cur.execute(_LOGIN_ROLE_PROBE_SQL, _LOGIN_ROLE_PROBE_PARAMS)
         row = await cur.fetchone()
     except Exception as exc:
-        lost = _connection_lost(exc)  # handled here, so the release below cannot see it (#5748)
+        # Handled here, so the release below cannot see it (#5748).
+        lost = lost or _connection_lost(exc)
         reading = LoginRoleReading(LoginRoleVerdict.NOT_RUN, cause=_probe_failure_cause(exc))
     except BaseException:  # a cancellation: the connection still goes back, then it propagates
         await _close_and_release(pool, conn, cur)
@@ -5793,8 +5948,17 @@ class DatabaseLookupExecutor:
         except Exception as exc:
             raise DbLookupError(_lookup_connect_failure(connection, exc)) from exc
         cur: Any = None
+        discard = False
         try:
-            cur = await conn.cursor()
+            try:
+                cur = await conn.cursor()
+            except Exception as exc:
+                refused = _cursor_refused(exc, pool)  # BACKLOG #5749, as send() reads it
+                if refused is None:
+                    raise
+                discard = _cursor_refusal_discards(refused)
+                # A failure to borrow a usable connection, mapped as the acquire's is above.
+                raise DbLookupError(f"db_lookup on {connection!r}: {refused}") from exc
             await cur.execute(sql, bound)
             columns = [d[0] for d in cur.description] if cur.description else []
             limit = self._max_rows[connection]
@@ -5820,7 +5984,7 @@ class DatabaseLookupExecutor:
                 f"db_lookup query on {connection!r} failed" + (f" [{state}]" if state else "")
             ) from exc
         finally:
-            await _close_and_release(pool, conn, cur)
+            await _close_and_release(pool, conn, cur, discard=discard)
         return [dict(zip(columns, row)) for row in rows]  # noqa: B905
 
     async def aclose(self) -> None:
