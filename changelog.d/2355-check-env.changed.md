@@ -8,8 +8,8 @@
   instead of skipping, and can fail where they skipped before. The dry run's Handlers still run
   with no active environment. ADR 0050 AC-6 is amended for `check --env` alone: with no `--env`,
   `check` still skips, where `serve` refuses, an instance that names no environment, and
-  `validate`, `graph` and `dryrun` still read `--env` only for the value-file check under
-  `--project-root`. (`BACKLOG #2355`)
+  `validate`, `graph` and `dryrun` adopt no refusal; what they read `--env` for is the
+  `BACKLOG #5554` entry. (`BACKLOG #2355`)
 - **A `--service-config` that names no file fails `messagefoundry check`.** `serve` exits 2 on it;
   `check` skipped every settings check and passed. (`BACKLOG #2355`)
 - **The offline value-file check reads `MEFOR_ENVIRONMENTS_DIR`.** Under `--project-root` with

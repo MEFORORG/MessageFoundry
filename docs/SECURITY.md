@@ -1727,13 +1727,27 @@ are still answered as a failing record and reported**, a false alarm the reads c
 tampering, because the role rows are read apart from the account's row. Where
 `[auth].require_action_step_up` is on, the default, `PATCH /users/{user_id}` reads the account
 after its gate has spent the single-use `admin_user_update` grant, so its 423 and its 404 cost that
-proof, as the console's `POST /ui/users/{user_id}/update` does after its own gate. Where it is
-off, the gate checks the step-up session window instead and spends nothing, so neither answer
-costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
+proof, as the console's `POST /ui/users/{user_id}/update` does after its own gate. So does its 422
+for a changed display name the name rule refuses (BACKLOG #5784), which the route checks against
+the stored name after that read. Where it is
+off, the gate checks the step-up session window instead and spends nothing, so none of these
+answers costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
 answered the same way, a 423 or listed as failed, but reported under
 `integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
 its own. A Vault transit Outage on any account these reads check answers 503 with `Retry-After`,
 lists nothing, pages `authority-seal-transit` and writes no audit row.
+
+A custom role save checks the role name (BACKLOG #5785) after its gate. Where
+`[auth].require_action_step_up` is on, the default, and the save would end the caller's own
+sessions, that gate has spent the single-use `save_ends_own_sessions` proof, so a refused name
+costs it: on `PUT /roles/custom/{role_id}` the answer is a 422, and on the console's
+`POST /ui/roles/custom/{role_id}/update` it is a 400 page re-rendering the form. The console's
+proof is also spent on a form the request model refuses, such as a malformed permission id. Where
+the setting is off, or the save ends none of the caller's own sessions, the gate checks the
+step-up session window and spends nothing. The save reads the stored name only for a name the
+rule refuses, to tell a re-sent stored name, which is exempt, from a new one. That read checks
+no seal, so it calls no Vault transit and reports nothing; a name written outside the store is
+exempt like any other, and the save re-seals the row as it always has.
 
 #### Audit
 
