@@ -840,3 +840,72 @@ def test_a_label_dict_holding_the_name_beside_a_followed_send_is_not_refused(
     assert plan.unresolved == ()
     apply_rename(plan)
     assert 'LABELS = {"OB_A": "OB_OLD"}' in _text(config_dir)
+
+
+# --- r3 final round: nested routing tables (round-8e41ea17 finding 2) ---------------------------
+
+
+@pytest.mark.parametrize(
+    ("prelude", "body"),
+    [
+        # The inner dict's key is the name sent: missed, and the rename reported success.
+        (
+            'ROUTES = {"adt": {"OB_OLD": 1}}\n',
+            "    return [Send(d, msg) for d in ROUTES[str(msg)]]\n",
+        ),
+        # The inner dict's value is a label: rewritten, and the key that is sent missed.
+        (
+            'ROUTES = {"adt": {"OB_A": "OB_OLD"}, "oru": {"OB_OLD": 1}}\n',
+            "    return [Send(d, msg) for d in ROUTES.get(str(msg), {})]\n",
+        ),
+        # The same, read out of a local table.
+        (
+            "",
+            '    routes = {"adt": {"OB_OLD": 1}}\n'
+            "    return [Send(d, msg) for d in routes[str(msg)]]\n",
+        ),
+    ],
+    ids=["module_subscript", "module_get", "local"],
+)
+def test_a_nested_routing_table_reports_the_referrer(
+    tmp_path: Path, prelude: str, body: str
+) -> None:
+    """A role iterating a value read out of a table takes the inner dict's keys, which the scan
+    carried as values: the plan never rewrites the keys, so it must report the handler."""
+    config_dir = _write(
+        tmp_path,
+        {"mod.py": _HEAD + prelude + _WIRE + '@handler("h_p")\ndef h_p(msg):\n' + body},
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert _H_P in plan.unresolved
+
+
+def test_a_nested_routing_table_a_router_returns_reports_the_router(tmp_path: Path) -> None:
+    """The router variant: the engine iterates ``list(TABLE[kind])``, an inner dict's keys."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "mod.py": _HEAD + 'TABLE = {"adt": {"h_p": 1}}\n\n'
+            'inbound("IB_P", MLLP(port=2937), router="r_t")\n'
+            'outbound("OB_A", MLLP(host="127.0.0.1", port=6935))\n\n\n'
+            '@router("r_t")\ndef r_t(msg):\n    return list(TABLE[str(msg)])\n\n\n'
+            '@handler("h_p")\ndef h_p(msg):\n    return Send("OB_A", msg)\n'
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "handler", "h_p", "h_new")
+    assert Reference("router", "r_t", "handler", "h_p") in plan.unresolved
+
+
+def test_a_table_of_lists_iterated_by_key_is_rewritten(tmp_path: Path) -> None:
+    """The control: a table whose values are lists yields their elements, which are rewritten."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "mod.py": _HEAD + 'ROUTES = {"adt": ["OB_OLD", "OB_A"]}\n' + _WIRE + '@handler("h_p")\n'
+            "def h_p(msg):\n    return [Send(d, msg) for d in ROUTES[str(msg)]]\n"
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert 'ROUTES = {"adt": ["OB_NEW", "OB_A"]}' in _text(config_dir)

@@ -255,6 +255,21 @@ def rename_code_set(
                     f"{dest.name} back to {src.name} by hand"
                 ) from exc
             raise WiringError(f"{exc}. The code set was moved back to {src.name}") from exc
+        except BaseException:
+            # An interrupt (Ctrl-C, SystemExit) or an unexpected error: write_rename has restored
+            # the references to the old name, so the table goes back to it too before the
+            # exception propagates, leaving the config as it was.
+            try:
+                replace_generated(dest, src)
+            except OSError as back:
+                _log.error(
+                    "code set rename interrupted: moving %s back to %s failed (%s); rename it "
+                    "back by hand",
+                    dest.name,
+                    src.name,
+                    type(back).__name__,
+                )
+            raise
         if rewritten:
             result["referents_rewritten"] = rewritten
     return result

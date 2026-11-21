@@ -426,6 +426,27 @@ def test_codeset_rename_moves_the_table_back_when_the_rewrite_fails(
     assert sorted(p.name for p in (config_dir / "codesets").iterdir()) == ["diets.csv"]
 
 
+def test_an_interrupted_codeset_rename_moves_the_table_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ctrl-C while the references are written: they are restored to the old name, so the table
+    must go back to it too, leaving the config consistent and loadable."""
+    mod = CODESET_MOD.replace("r_cs_misspelled", "r_cs")
+    config_dir = _config(tmp_path, {"mod.py": mod, "codesets/diets.csv": "code,value\nA,Apple\n"})
+    before = (config_dir / "mod.py").read_bytes()
+
+    def interrupted(*_args: Any, **_kwargs: Any) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(atomic_edit, "replace_validated", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        codeset_edit.rename_code_set(config_dir, "diets", "meals", validate=_validate)
+    monkeypatch.undo()
+    assert sorted(p.name for p in (config_dir / "codesets").iterdir()) == ["diets.csv"]
+    assert (config_dir / "mod.py").read_bytes() == before
+    load_config(config_dir)
+
+
 def test_reapplying_a_plan_with_two_edits_on_one_line_is_a_no_op(tmp_path: Path) -> None:
     """The already-renamed check maps each span through the edits before it: a second edit on the
     same line sits where the first one's change in length moved it."""

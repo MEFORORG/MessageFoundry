@@ -897,7 +897,7 @@ def _referrer_sites(
                 _Site(file, span, allowed, frozenset(role), own, scan.reads, returned, helper)
             )
         # A local that carries a rewritten literal into another read leaves the referrer unresolved.
-        complete = complete and not any(scan.unsafe for scan in scans)
+        complete = complete and not any(scan.unsafe or scan.unfollowed for scan in scans)
         # An argument for a role parameter that is also read elsewhere is never rewritten, so one
         # that may hold the old name leaves the referrer unresolved (BACKLOG #5980).
         taint_globals = {name for scan in scans for name in scan.taint_globals}
@@ -915,6 +915,24 @@ def _referrer_sites(
             )
         )
         complete = complete and not tainted
+        # A module table a role takes the elements of a value of: an inner dict holding the name
+        # would have its values rewritten and its keys, the elements, missed.
+        nested = {name for scan in scans for name in scan.nested}
+        nested_attrs = {name for scan in scans for name in scan.nested_attrs}
+        inner_held = bool(nested or nested_attrs) and any(
+            isinstance(captured.value, dict)
+            and any(
+                isinstance(inner, dict) and _holds_either(inner, old)
+                for inner in captured.value.values()
+            )
+            for func in reached
+            for captured in captured_values(func, func.__module__)
+            if captured.source != "default"
+            and captured.name in (nested_attrs if captured.source == "attribute" else nested)
+        )
+        complete = complete and not inner_held
+        if held is not None and inner_held:
+            held.append(True)
         if held is not None and tainted:
             held.append(True)
         if opaque is not None and any(scan.opaque for scan in scans):
@@ -1221,6 +1239,14 @@ class _Flow:
     iter_calls: set[str] = field(default_factory=set)
     # The keys of the name and attribute nodes the flow read.
     read: set[_Key] = field(default_factory=set)
+    # A role takes the elements of a value read out of a table (``for d in ROUTES[kind]``). The
+    # table's values are carried, which is right for a list or a name; for an inner dict its keys
+    # are the elements and its values are not, so such a table is checked by name (``nested``,
+    # ``nested_attrs``), and one the scan cannot name or see (``unfollowed``) leaves its referrer
+    # unresolved (BACKLOG #5980).
+    nested: set[str] = field(default_factory=set)
+    nested_attrs: set[str] = field(default_factory=set)
+    unfollowed: bool = False
 
     def is_empty(self) -> bool:
         """Whether the flow carried no value: no constant, name, attribute or helper return."""
@@ -1280,6 +1306,11 @@ class _Scan:
     tainted: bool = False
     taint_globals: set[str] = field(default_factory=set)
     taint_attrs: set[str] = field(default_factory=set)
+    # A role takes the elements of a value read out of a table (:attr:`_Flow.unfollowed`), and the
+    # module names and attributes read that way.
+    unfollowed: bool = False
+    nested: set[str] = field(default_factory=set)
+    nested_attrs: set[str] = field(default_factory=set)
     # A role read the scan cannot follow to any value: a name bound in a form it does not track
     # (``for _i, d in enumerate(DESTS)``), or an expression that carries nothing (``p[1]``).
     opaque: bool = False
@@ -1580,7 +1611,10 @@ def _scan_function(
         tainted=any(c.value == old for c in taint.consts) or bool(taint.calls | taint.iter_calls),
         taint_globals=(taint.unbound | taint.iterated) - params,
         taint_attrs=taint.attrs | taint.iter_attrs,
-        opaque=opaque,
+        opaque=opaque or sink.unfollowed or back.unfollowed,
+        unfollowed=sink.unfollowed or back.unfollowed,
+        nested=(sink.nested | back.nested) - params,
+        nested_attrs=sink.nested_attrs | back.nested_attrs,
     )
 
 
@@ -1915,6 +1949,38 @@ def _carried_elements(
             expr, [*flow.passes.get(helper, ()), *flow.iter_passes.get(helper, ())]
         ):
             _carried_elements(root, values, seen, flow)
+    elif isinstance(expr, ast.Subscript) or (
+        isinstance(expr, ast.Call)
+        and isinstance(expr.func, ast.Attribute)
+        and expr.func.attr == "get"
+        and expr.args
+    ):
+        # The elements of a value read out of a table: carried as the table's values, and the
+        # table checked for an inner dict, whose keys would be the elements.
+        _carried(expr, values, seen, flow)
+        base: ast.expr = expr
+        if isinstance(expr, ast.Subscript):
+            base = expr.value
+        elif isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
+            base = expr.func.value
+        # What the table is: module names and attributes are checked by their bound value; a
+        # parameter, a helper's return or a local dict holding a dict is not seen, so unfollowed.
+        probe = _Flow(params=flow.params, modules=flow.modules)
+        _carried(base, values, set(), probe)
+        flow.nested |= probe.unbound - flow.params
+        flow.nested_attrs |= probe.attrs
+        local_inner = any(
+            isinstance(node, (ast.Dict, ast.DictComp)) and node is not base
+            for node in ast.walk(base)
+        ) or any(
+            isinstance(node, (ast.Dict, ast.DictComp)) and node is not value
+            for name in probe.unbound | {n.id for n in ast.walk(base) if isinstance(n, ast.Name)}
+            for value in values.get(name, ())
+            for node in ast.walk(value)
+        )
+        flow.unfollowed = flow.unfollowed or bool(
+            probe.unbound & flow.params or probe.calls or local_inner or probe.is_empty()
+        )
     elif isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute) and not expr.args:
         if expr.func.attr in ("keys", "copy"):
             # A dict's keys, or a copy of a container, iterate as the container does.
@@ -2281,9 +2347,18 @@ def _holds(value: object, old: str, depth: int = 0, *, elements: bool = False) -
     return False
 
 
-def _holds_either(value: object, old: str) -> bool:
-    """Whether ``value`` holds ``old`` read either way: for its values or for its elements."""
-    return _holds(value, old) or _holds(value, old, elements=True)
+def _holds_either(value: object, old: str, depth: int = 0) -> bool:
+    """Whether ``value`` holds ``old`` read any way, a few levels down: as a value, an element, or
+    a dict key at any level (``ROUTES = {"adt": {"OB_X": 1}}``)."""
+    if isinstance(value, str):
+        return value == old
+    if depth >= 4:
+        return False
+    if isinstance(value, dict):
+        return any(_holds_either(v, old, depth + 1) for v in (*value.keys(), *value.values()))
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_holds_either(v, old, depth + 1) for v in value)
+    return False
 
 
 def _binding_read_only_by_referents(
