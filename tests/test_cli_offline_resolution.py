@@ -734,3 +734,35 @@ def test_offline_env_fails_loud_under_a_settings_base_dir(
     rc = main(["graph", "--config", str(cfg), "--env", "prod", "--json"])
     captured = capsys.readouterr()
     assert rc == 0 and json.loads(captured.out)["env_problems"] == [], captured
+
+
+@pytest.mark.parametrize("settings", ["typo", "bad_port"])
+def test_graph_keeps_its_missing_value_file_refusal_when_settings_do_not_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    settings: str,
+) -> None:
+    # Before --env read values, graph under --project-root exited 2 on an env()-referencing graph
+    # with no value file, whatever the settings file held. A settings load that fails must not
+    # turn that into a listed problem and exit 0.
+    root = tmp_path / "R"
+    cfg = _config_dir(root, body=_ENV_GRAPH)
+    _empty_cwd(tmp_path, monkeypatch)
+    argv = ["graph", "--project-root", str(root), "--config", str(cfg), "--env", "prod", "--json"]
+    if settings == "typo":
+        argv += ["--service-config", str(root / "typo.toml")]
+    else:
+        (root / "messagefoundry.toml").write_text('[api]\nport = "not-a-port"\n', encoding="utf-8")
+    rc = main(argv)
+    captured = capsys.readouterr()
+    assert rc == 2, captured
+    assert str(root / "environments" / "prod.toml") in captured.err, captured
+    # Control: with the value file present graph prints the graph and lists the settings failure.
+    _values_file(root, "prod", f'peer_host = "{_SECRET_HOST}"\n')
+    rc = main(argv)
+    captured = capsys.readouterr()
+    assert rc == 0, captured
+    problems = json.loads(captured.out)["env_problems"]
+    assert any("could not load the service settings" in p for p in problems), problems
+    assert _SECRET_HOST not in captured.out + captured.err

@@ -474,8 +474,10 @@ those settings, and its Handlers still run with no active environment.
   `[ai].environment` override and `--project-root` as the `[environments].base_dir` override that
   `serve` applies. That one load names the value file for both the missing-file check (AC-3) and
   the read. For `validate` and `dryrun` the check fires wherever that load names a project root,
-  a `base_dir` from the settings file or the environment included, as `serve`'s does; for `graph`
-  it fires under an explicit `--project-root` only, as before. They read the file with `serve`'s
+  a `base_dir` from the settings file or the environment included, as `serve`'s does. `graph`
+  keeps the check it ran before: under an explicit `--project-root` only, ahead of the settings
+  load and without it, so it exits 2 in the cases it did before, a settings file that does not
+  load included, and can name a different folder than its read. They read the file with `serve`'s
   own reader, so overrides such as `MEFOR_VALUE_*` apply. Settings that do not load are reported
   as `serve`'s settings load renders them, naming the settings file where one exists; a value file
   that cannot be read is reported naming that file. They resolve every `env()` reference of each
