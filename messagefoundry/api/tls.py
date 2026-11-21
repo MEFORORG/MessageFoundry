@@ -10,6 +10,7 @@ isolation. The ``tls_min_version`` floor (NIST SP 800-52r2: 1.2+) is enforced vi
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -242,8 +243,18 @@ _GENERATED_LIFETIME_DAYS = 365
 #: The loopback names every generated certificate carries, whatever the bind (BACKLOG #5790): a
 #: client on this box may dial either loopback literal or ``localhost``. Never the machine's own
 #: host name: the certificate goes to every peer in the handshake, before any sign-in, so it names
-#: nothing the bind did not already spell (decision d20261119T191457909-25c3aa).
+#: only the bind host and these fixed names, which say nothing about the machine (decision
+#: d20261119T191457909-25c3aa).
 _GENERATED_LOOPBACK_SANS = ("127.0.0.1", "::1", "localhost")
+
+
+def _same_name_key(name: str) -> str:
+    """One spelling per name, for de-duplication: an IP literal in compressed form, brackets
+    dropped, and any other name in lower case, as hostname verification compares DNS names."""
+    try:
+        return ipaddress.ip_address(name.strip("[]")).compressed
+    except ValueError:
+        return name.lower()
 
 
 def _generated_sans(host: str) -> list[str]:
@@ -252,14 +263,21 @@ def _generated_sans(host: str) -> list[str]:
     A WILDCARD bind (``0.0.0.0``, ``::``) is not an address any client can dial, so a certificate
     naming it alone verifies against no URL at all. The loopback of the same family
     (:func:`messagefoundry.api_tls_source.wildcard_loopback`), the address the tray and any other
-    client on this box reach a wildcard bind through, comes first (BACKLOG #5973). Every bind then
-    carries :data:`_GENERATED_LOOPBACK_SANS` (BACKLOG #5790); ``make_self_signed`` drops the
-    duplicates. A wildcard bind is off loopback, so ``serve`` refuses it without an operator
-    certificate unless the operator accepts the placeholder; this list does not make it reachable
-    by any name a remote client would dial.
+    client on this box reach a wildcard bind through, comes right after ``host`` (BACKLOG #5973).
+    Every bind then carries :data:`_GENERATED_LOOPBACK_SANS` (BACKLOG #5790). A name that is
+    ``host``, or an earlier name, in another spelling is left out. A wildcard bind is off loopback,
+    so ``serve`` refuses it without an operator certificate unless the operator accepts the
+    placeholder; this list adds no name a remote client would dial.
     """
     loopback = wildcard_loopback(host)
-    return [*([] if loopback is None else [loopback]), *_GENERATED_LOOPBACK_SANS]
+    seen = {_same_name_key(host)}
+    sans: list[str] = []
+    for name in (*([] if loopback is None else [loopback]), *_GENERATED_LOOPBACK_SANS):
+        key = _same_name_key(name)
+        if key not in seen:
+            seen.add(key)
+            sans.append(name)
+    return sans
 
 
 #: Renew the generated pair at startup once less than this share of its OWN validity period is
