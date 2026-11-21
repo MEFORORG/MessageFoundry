@@ -33,12 +33,15 @@ _WIRE = (
 
 
 @pytest.fixture(autouse=True)
-def _forget_helper_modules() -> object:
-    """Config helper modules are imported by name, so one test's ``_ha`` must not serve the next."""
+def _forget_helper_modules(tmp_path: Path) -> object:
+    """Config helper modules are imported by name, so one test's ``_ha`` must not serve the next.
+    Only the modules this test's config dir supplied are forgotten."""
     before = set(sys.modules)
     yield None
+    root = tmp_path.resolve()
     for name in set(sys.modules) - before:
-        if name.startswith("_h"):
+        file = getattr(sys.modules[name], "__file__", None)
+        if file and Path(file).resolve().is_relative_to(root):
             del sys.modules[name]
 
 
@@ -93,6 +96,11 @@ def test_a_router_keyword_inside_a_sibling_argument_is_left(tmp_path: Path) -> N
             "def _fan(dests, msg):\n    return [Send(d, msg) for d in dests]\n",
             '    return _fan({"OB_A": "OB_OLD"}, msg)\n',
         ),
+        ('LABELS = {"OB_A": "OB_OLD"}\n', "    return [Send(d, msg) for d in LABELS.copy()]\n"),
+        (
+            'def _fan(msg, dests={"OB_A": "OB_OLD"}):\n    return [Send(d, msg) for d in dests]\n',
+            "    return _fan(msg)\n",
+        ),
     ],
 )
 def test_iterating_a_dict_reads_its_keys_not_its_values(
@@ -104,6 +112,10 @@ def test_iterating_a_dict_reads_its_keys_not_its_values(
         {"mod.py": _HEAD + _WIRE + prelude + '\n@handler("h_p")\ndef h_p(msg):\n' + body},
     )
     plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    # Where the index has an edge from h_p but no role reads the name, the referrer is still
+    # reported (the planner cannot see the read the index saw); the claim here is only that the
+    # label is never rewritten.
+    assert plan.unresolved in ((), (_H_P,))
     apply_rename(plan)
     text = _text(config_dir)
     assert 'outbound("OB_NEW"' in text
@@ -116,6 +128,7 @@ def test_iterating_a_dict_reads_its_keys_not_its_values(
     [
         '    return [Send(dest, msg) for dest in {"OB_OLD": "primary"}]\n',
         '    for dest in {**{"OB_OLD": 1}}:\n        return Send(dest, msg)\n',
+        '    return [Send(d, msg) for d, n in {"OB_OLD": 1}.items()]\n',
     ],
 )
 def test_iterating_a_dict_rewrites_a_key_that_is_sent(tmp_path: Path, body: str) -> None:
@@ -199,11 +212,38 @@ _H_P = Reference("handler", "h_p", "outbound", "OB_OLD")
             "    return Send(dest, msg)\n",
             '    return _send("OB_OLD", msg)\n',
         ),
+        # Step 7: a string's length depends on which name it holds.
+        (
+            "",
+            '    dest = "OB_OLD"\n    if len(dest) == 6:\n        return None\n'
+            "    return Send(dest, msg)\n",
+        ),
         # Step 9: flow-insensitive values: a later value never reaches the Send, only the comparison.
         (
             "",
             '    dest = "OB_A"\n    out = Send(dest, msg)\n    dest = "OB_OLD"\n'
             "    if str(msg) == dest:\n        return None\n    return out\n",
+        ),
+        # Step 9: a local copy of a parameter, a module constant or a helper's return, compared.
+        (
+            "def _send(dest, msg):\n    label = dest\n    if str(msg) == label:\n"
+            "        return None\n    return Send(dest, msg)\n",
+            '    return _send("OB_OLD", msg)\n',
+        ),
+        (
+            'DEST = "OB_OLD"\n',
+            "    label = DEST\n    if str(msg) == label:\n        return None\n"
+            "    return Send(DEST, msg)\n",
+        ),
+        (
+            'def _pick():\n    return "OB_OLD"\n',
+            "    label = _pick()\n    if str(msg) == label:\n        return None\n"
+            "    return Send(_pick(), msg)\n",
+        ),
+        # Step 3: a helper passing its default through, compared by the caller.
+        (
+            'def _pick(d="OB_OLD"):\n    return d\n',
+            "    if str(msg) == _pick():\n        return None\n    return Send(_pick(), msg)\n",
         ),
         # Step 9: a copy taken before the Send keeps reading the old value.
         (
@@ -230,13 +270,13 @@ def test_a_name_read_outside_its_role_reports_the_referrer(
     [
         '    dests = []\n    if msg:\n        dests.append("OB_OLD")\n    if not dests:\n'
         "        return None\n    return [Send(d, msg) for d in dests if d]\n",
-        '    dest = "OB_OLD"\n    if dest is None or len(dest) == 0:\n        return None\n'
+        '    dest = "OB_OLD"\n    if dest is None or not dest:\n        return None\n'
         "    return Send(dest, msg)\n",
     ],
 )
 def test_a_value_agnostic_read_keeps_the_rename_resolved(tmp_path: Path, body: str) -> None:
-    """Steps 7 and 9: a truth test, len(), an ``is None`` check and a collector do not read the
-    string, so they do not stop the rewrite."""
+    """Steps 7 and 9: a truth test, an ``is None`` check and a collector do not read the string,
+    so they do not stop the rewrite."""
     config_dir = _write(
         tmp_path, {"mod.py": _HEAD + _WIRE + '@handler("h_p")\ndef h_p(msg):\n' + body}
     )
@@ -454,3 +494,40 @@ def test_a_container_holding_the_literal_is_rewritten(tmp_path: Path) -> None:
     apply_rename(plan)
     assert 'ALL = ["OB_NEW", "OB_A"]' in _text(config_dir)
     load_config(config_dir)
+
+
+def test_two_helpers_sharing_an_unused_bare_name_keep_the_rename_resolved(tmp_path: Path) -> None:
+    """Step 4: a bare-name collision between helpers no role reads cannot mislead the scan."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "_ha.py": "def fmt(x):\n    return x\n",
+            "_hb.py": "def fmt(x):\n    return x\n",
+            "mod.py": _HEAD + "import _ha\nimport _hb\n\n" + _WIRE + '@handler("h_p")\n'
+            "def h_p(msg):\n"
+            "    _ha.fmt(1)\n"
+            "    _hb.fmt(2)\n"
+            '    return Send("OB_OLD", msg)\n',
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert '"OB_OLD"' not in _text(config_dir)
+
+
+def test_a_helper_module_constant_a_helper_returns_is_rewritten(tmp_path: Path) -> None:
+    """Steps 3 and 11: the constant behind an imported helper's return is the sent name."""
+    config_dir = _write(
+        tmp_path,
+        {
+            "_hc.py": 'DEST = "OB_OLD"\n\n\ndef dest():\n    return DEST\n',
+            "mod.py": _HEAD + "import _hc\n\n" + _WIRE + '@handler("h_p")\n'
+            "def h_p(msg):\n"
+            "    return Send(_hc.dest(), msg)\n",
+        },
+    )
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_OLD", "OB_NEW")
+    assert plan.unresolved == ()
+    apply_rename(plan)
+    assert _text(config_dir, "_hc.py").startswith('DEST = "OB_NEW"')
