@@ -5730,14 +5730,29 @@ class SqlServerStore:
                         )
                 raise
 
+            close_failure: list[Exception] = []
+
             async def _release() -> None:
                 try:
                     await _graceful()
-                except Exception as cleanup:  # noqa: BLE001 — never mask the error
+                except Exception as cleanup:  # noqa: BLE001 — re-raised below, as main raised it
+                    close_failure.append(cleanup)
                     log.warning(
                         "closing a one-connection store after an error also failed (%s)",
                         type(cleanup).__name__,
                     )
+                    # A close that raised before its own pool step leaves the pool and the
+                    # executor open, so release both here (BACKLOG #5720).
+                    try:
+                        pool.close()
+                        await pool.wait_closed()
+                    except Exception as released:  # noqa: BLE001 — keep the close's error
+                        log.warning(
+                            "closing the pool after that also failed (%s)",
+                            type(released).__name__,
+                        )
+                    finally:
+                        executor.shutdown(wait=False)
 
             await cleanup_failed_open(
                 exc,
@@ -5746,6 +5761,10 @@ class SqlServerStore:
                 cancels_before=cancels_before,
                 what="a one-connection store's cleanup",
             )
+            if close_failure:
+                # Main's finally raised the close's error in place of the block's; this keeps
+                # that, with the block's error as its cause.
+                raise close_failure[0] from exc
             raise
         await store.close()
 
@@ -5902,7 +5921,8 @@ class SqlServerStore:
                 await self.checkpoint_cipher_invocations(settle=True)
         except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
             # By class at WARNING, the traceback at DEBUG only: a driver's message may carry a
-            # path or a value, and a failed open's cleanup runs this close too (BACKLOG #5720).
+            # path or a value, and the one-connection store's error path and open_store's keyless
+            # refusal run this close too (BACKLOG #5720).
             log.warning(
                 "could not settle the AES-GCM invocation bound at close (%s)", type(exc).__name__
             )

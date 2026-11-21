@@ -498,3 +498,27 @@ async def test_a_keyboard_interrupt_during_an_acloses_graceful_close_propagates(
     await cm.__aenter__()
     with pytest.raises(KeyboardInterrupt):
         await cm.gen.aclose()
+
+
+async def test_a_close_that_raises_on_the_error_path_still_releases_and_propagates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: on the one-connection store's error path, a ``close()`` that raises before
+    its own pool step still has the pool closed and the executor shut down, and its error is
+    raised, as main's ``finally`` raised it, with the block's error as its context."""
+    pool = _FakePool()
+    _install_fake_aioodbc(monkeypatch, pool)
+    executor = _fake_executor(monkeypatch)
+    monkeypatch.setattr(sqlserver_module, "check_pinned_certificate", lambda *a, **k: None)
+
+    def _boom(self: SqlServerStore) -> None:
+        raise RuntimeError("sync pool close boom")
+
+    monkeypatch.setattr(SqlServerStore, "close_sync_handoff_pool", _boom)
+    with pytest.raises(RuntimeError, match="sync pool close boom") as raised:
+        async with SqlServerStore._one_connection_store(_settings(), posture=None):
+            raise ValueError("probe boom")
+    assert isinstance(raised.value.__context__, ValueError)
+    assert pool.closed >= 1
+    assert pool.wait_closed_called >= 1
+    assert executor.shutdown_calls and executor.shutdown_calls[0] is False

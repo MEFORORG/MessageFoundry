@@ -3015,7 +3015,8 @@ class PostgresStore:
                 await self.checkpoint_cipher_invocations(settle=True)
         except Exception as exc:  # noqa: BLE001 — shutdown best-effort; log and continue
             # By class at WARNING, the traceback at DEBUG only: a driver's message may carry a
-            # path or a value, and a failed open's cleanup runs this close too (BACKLOG #5720).
+            # path or a value, and the one-connection store's error path and open_store's keyless
+            # refusal run this close too (BACKLOG #5720).
             log.warning(
                 "could not settle the AES-GCM invocation bound at close (%s)", type(exc).__name__
             )
