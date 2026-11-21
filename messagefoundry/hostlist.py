@@ -6,10 +6,12 @@
 One parse serves both sides of the rule. :mod:`messagefoundry.transports.egress` matches with it,
 and :mod:`messagefoundry.config.settings` refuses at load every entry it cannot read, so an entry
 that loads is one the matcher reads. The load refuses some entries the matcher does read as well,
-at least a URL or a path, a host holding a character no host name does, and a port outside 1 to
-65535: :func:`allow_entry_problem` says which. A leaf module at the package root for that reason: the settings
-module may not import the transports package, which imports every connector. It imports nothing
-outside the standard library.
+at least some URLs and paths, a host holding a character such as ``*``, ``,`` or a space, and a
+port outside 1 to 65535: :func:`allow_entry_problem` says which.
+
+A leaf module at the package root because one parse serves both: the settings module may not
+import the transports package, which imports every connector. It imports nothing outside the
+standard library.
 """
 
 from __future__ import annotations
@@ -121,6 +123,12 @@ def _is_host_name(text: str) -> bool:
     return all(unicodedata.category(char)[0] in "LMN" or char in "._-" for char in text)
 
 
+_HOST_CHARACTER_REASON = (
+    "its host holds a character no host name does, such as '*', ',' or a space; list each host by "
+    "name, since no pattern is read"
+)
+
+
 def allow_entry_problem(entry: str) -> str | None:
     """Why ``entry`` is refused when the settings load, or ``None`` when :func:`parse_allow_entry`
     reads it, its host is an IP address or holds only what :func:`_is_host_name` admits, and any
@@ -133,22 +141,25 @@ def allow_entry_problem(entry: str) -> str | None:
         return "it is a URL or a path, not a host; list the host alone, with ':port' to pin a port"
     parsed = parse_allow_entry(text)
     if parsed is None:
-        # Bracketed or not: an unbracketed zoned address would otherwise be told to write [v6],
-        # and the bracketed form is refused too.
-        if "%" in text:
-            return "it carries a '%' zone id, which no host is matched with"
-        if not text.startswith("[") and text.count(":") > 1:
-            return "it holds more than one ':' outside brackets; write an IPv6 address as [v6]"
+        bracketed = text.startswith("[")
+        if bracketed or text.count(":") > 1:
+            # An IPv6 shape, bracketed or not: a '%' in its address is a zone id. Unbracketed, it
+            # would otherwise be told to write [v6], and the bracketed form is refused too.
+            address = text[1:].partition("]")[0] if bracketed else text
+            if "%" in address:
+                return "it carries a '%' zone id, which no host is matched with"
+            if not bracketed:
+                return "it holds more than one ':' outside brackets; write an IPv6 address as [v6]"
+        elif "%" in text.partition(":")[0]:
+            # A name holding '%', such as a percent-encoded one, is no zoned address.
+            return _HOST_CHARACTER_REASON
         return (
             "it is not 'host', 'host:port', '[v6]' or '[v6]:port': brackets hold an IPv6 address "
             "alone, and a ':' needs a port after it"
         )
     host, port = parsed
     if isinstance(host, str) and not _is_host_name(host):
-        return (
-            "its host holds a character no host name does, such as '*', ',' or a space; list "
-            "each host by name, since no pattern is read"
-        )
+        return _HOST_CHARACTER_REASON
     if port and not port_or_zero(port):
         return "its port is not a number from 1 to 65535"
     return None

@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Foundation, LLC and contributors
-"""The ``host[:port]`` allowlists refuse at load an entry no host can match, and the matcher
-compares ports as numbers and reads a URL with no port at the port it dials (BACKLOG #5915).
+"""The ``host[:port]`` allowlists refuse at load an entry ``allow_entry_problem`` refuses, and
+the matcher compares ports as numbers and reads a URL with no port at the port it dials (BACKLOG
+#5915).
 
 On origin/main each of these loaded silently or matched on text: a malformed entry admitted
 nothing, ``06661`` matched ``host:06661`` but not ``host:6661`` while the connector dials 6661, and
@@ -91,6 +92,10 @@ def test_refusal_does_not_quote_the_entry() -> None:
         # bracketed form above is refused for too.
         ("fe80::1%eth0", "zone id"),
         ("[fe80::1%eth0]:443", "zone id"),
+        # A '%' outside an IPv6 address is no zone id.
+        ("h%2Eexample.org", "character no host name does"),
+        ("h%2Eexample.org:443", "character no host name does"),
+        ("[::1]x%", r"is not 'host', 'host:port'"),
         ("fe80::1:443", r"more than one ':' outside brackets"),
         ("*.example.org", "no pattern is read"),
         ("h.example.org:99999", "port is not a number"),

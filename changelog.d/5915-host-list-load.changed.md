@@ -4,7 +4,7 @@
   `allowed_remote`, `allowed_smtp`, `allowed_direct`, `allowed_proxy`, `allowed_syslog` and
   `[ai].allowed_endpoints` now refuse such an entry, at least a malformed one, a URL, a `*`
   pattern and a port outside 1 to 65535, naming the list and the entry's
-  position and never its text; in the shipped code it loaded and admitted nothing. A blank entry in
+  position and never its text; in the shipped code it loaded without error. A blank entry in
   a TOML list is refused too; the comma-separated environment form of the `[egress]` lists still
   drops blank items, as before. A JSON list given in one of those environment variables is refused:
   write it comma-separated. An `allowed_db` entry naming an IPv6 address is refused too, and a

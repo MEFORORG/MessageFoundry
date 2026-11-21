@@ -1710,7 +1710,7 @@ an address, so `[0:0:0:0:0:0:0:1]` names `::1`; a name compares without regard t
 looser matches: an IPv4-mapped IPv6 address does not name its IPv4 address, and `127.1` is a name,
 not `127.0.0.1`. The lists named here refuse an entry when the settings load, naming the list and
 the entry's position (BACKLOG #5915), at least when it is unbracketed and holds more than one colon
-(write `::1` as `[::1]`, except in `allowed_db`, which refuses an IPv6 entry in any form), when
+(write `::1` as `[::1]`, except in `allowed_db`, as the next paragraph says), when
 its brackets hold anything but an IPv6 literal, when a colon has no port after it, when its port is
 not a number from 1 to 65535 written in ASCII digits, when it carries a `%` zone id, when it is a
 URL or holds a `/` or `@`, or when its host holds anything but letters, combining marks, numbers
