@@ -341,10 +341,11 @@ def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
 
     - ``unparseable-reply``: the body is not JSON, repeats a key at any depth (``json.loads`` keeps
       the last of two, so a FailedSOPSequence could be read two ways), is nested past json's
-      recursion limit (a ``RecursionError``, which a ``ValueError`` arm does not reach), or is not
-      a dataset object or a non-empty array of them.
-    - ``failed-sop``: a FailedSOPSequence (``00081198``) with any item, or in a shape dicom+json
-      does not allow -- that direction fails closed.
+      recursion limit (a ``RecursionError``, which a ``ValueError`` arm does not reach), is not
+      a dataset object or a non-empty array of them, or carries a FailedSOPSequence in a shape
+      dicom+json does not allow -- that direction fails closed, under this code and not
+      ``failed-sop``, since such a sequence proves no rejection (BACKLOG #5914).
+    - ``failed-sop``: a FailedSOPSequence (``00081198``) with any item, a proven rejection.
     - ``unconfirmed-202``: a 202 (stored with warnings, or some instances failed) whose reply names
       no stored instance: no ReferencedSOPSequence (``00081199``) item that names one by its
       ReferencedSOPInstanceUID (``00081155``; :func:`_names_an_instance`). An empty 202 is one.
@@ -368,9 +369,10 @@ def _stowrs_refusal(body: str, status: int) -> tuple[str, str] | None:
         return "unparseable-reply", f"a reply that is not parseable dicom+json; {_NOT_SENT}"
     failed = _sequence_items(datasets, _FAILED_SOP_SEQUENCE)
     if failed is None:
-        # A malformed sequence proves no rejection, so it carries the replay advice.
+        # A malformed sequence proves no rejection, so it is not failed-sop, and it carries the
+        # replay advice.
         return (
-            "failed-sop",
+            "unparseable-reply",
             f"a FailedSOPSequence in a shape dicom+json does not allow; {_NOT_SENT}",
         )
     if failed:

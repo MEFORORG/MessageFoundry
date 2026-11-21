@@ -690,12 +690,14 @@ async def test_dicomweb_a_malformed_failed_sop_sequence_fails_closed(
     element: str, status: int
 ) -> None:
     # A FailedSOPSequence with bulk data in place of a Value is not an empty one (BACKLOG #5914).
+    # It proves no rejection, so its code is unparseable-reply, never failed-sop.
     body = json.dumps({**json.loads(STORED_OK), "00081198": json.loads(element)})
     dest = _dest()
     dest._opener = _FakeOpener(body=body.encode(), status=status)  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as exc:
         await dest.send(PAYLOAD)
-    assert exc.value.code == "failed-sop"
+    assert exc.value.code == "unparseable-reply"
+    assert exc.value.permanent
 
 
 async def test_dicomweb_an_empty_failed_sop_sequence_is_not_a_refusal() -> None:
@@ -716,7 +718,7 @@ async def test_only_the_reply_refusals_that_prove_nothing_carry_the_replay_advic
     dest._opener = _FakeOpener(body=b'{"00081198": {"vr": "SQ", "value": []}}', status=200)  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as exc:
         await dest.send(PAYLOAD)
-    assert exc.value.code == "failed-sop"
+    assert exc.value.code == "unparseable-reply"
     assert "before a replay" in str(exc.value)
     dest._opener = _FakeOpener(body=b"", status=202)  # type: ignore[assignment]
     with pytest.raises(NegativeAckError) as exc:

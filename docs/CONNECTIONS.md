@@ -3973,8 +3973,9 @@ over the byte bound cannot be checked for a FailedSOPSequence, so it is a perman
 again: see *A 2xx reply over the byte bound* under [REST](#rest--rest). Each of these 2xx replies is
 also a permanent refusal, in both capture modes (BACKLOG #5914): a non-empty 2xx body that is not
 parseable JSON, repeats a key at any depth, is nested too deep, or is not a dataset object or a
-non-empty array of them (code `unparseable-reply`); a FailedSOPSequence that is not an object, has a
-`Value` that is not an array, or carries any key but `vr` and `Value` (code `failed-sop`); and a
+non-empty array of them, or carries a FailedSOPSequence that is not an object, has a `Value` that is
+not an array, or carries any key but `vr` and `Value` (code `unparseable-reply`, since such a
+sequence proves no rejection; `failed-sop` is kept for a FailedSOPSequence with an item); and a
 202 with no **ReferencedSOPSequence** (`00081199`) item whose ReferencedSOPInstanceUID (`00081155`)
 element has `vr` `UI`, carries no key but `vr` and `Value`, and has a `Value` of exactly one string
 in the UID grammar once trailing NUL or space padding is dropped (dot-separated ASCII digits, at
