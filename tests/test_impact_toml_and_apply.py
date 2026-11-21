@@ -730,16 +730,17 @@ def test_a_file_the_snapshot_does_not_hold_is_refused(tmp_path: Path) -> None:
 
 
 def test_an_undecodable_file_is_refused_without_chaining_its_bytes(tmp_path: Path) -> None:
-    """A UnicodeDecodeError keeps the whole file in ``.object``; chained onto the refusal it would
-    ride out with it, so the refusal names the error's type and carries no cause or context."""
+    """A UnicodeDecodeError keeps the whole file in ``.object``. Chained, it would leave with the
+    refusal, so the refusal names only its type and carries no cause or context."""
     config_dir = _config(tmp_path, SPLIT)
     plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
-    (config_dir / "b.py").write_bytes(b"# SECRET-BODY \xff\n")
+    (config_dir / "b.py").write_bytes(b"# body \xff\n")
+    before = {name: (config_dir / name).read_bytes() for name in SPLIT}
     with pytest.raises(WiringError, match=r"could not be read \(UnicodeDecodeError\)") as caught:
         apply_rename(plan)
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
-    assert "SECRET-BODY" not in f"{caught.value} {caught.value.args!r} {vars(caught.value)!r}"
+    assert {name: (config_dir / name).read_bytes() for name in SPLIT} == before
 
 
 def test_a_file_that_cannot_be_opened_keeps_its_os_error_chained(tmp_path: Path) -> None:
@@ -747,24 +748,27 @@ def test_a_file_that_cannot_be_opened_keeps_its_os_error_chained(tmp_path: Path)
     config_dir = _config(tmp_path, SPLIT)
     plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
     (config_dir / "b.py").unlink()
+    a_before = (config_dir / "a.py").read_bytes()
     with pytest.raises(WiringError, match=r"could not be read \(FileNotFoundError\)") as caught:
         apply_rename(plan)
     assert isinstance(caught.value.__cause__, FileNotFoundError)
+    assert (config_dir / "a.py").read_bytes() == a_before
 
 
 def test_an_unencodable_new_literal_is_refused_without_chaining_the_text(tmp_path: Path) -> None:
     """A UnicodeEncodeError keeps the whole edited text in ``.object``, so it is not chained.
-    plan_rename refuses a lone surrogate in the new name, so the plan is edited by hand to reach
-    the encode step."""
+    plan_rename refuses a lone surrogate, so the test edits the plan by hand to reach this step."""
     import dataclasses
 
     config_dir = _config(tmp_path, SPLIT)
     plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
     edits = tuple(dataclasses.replace(e, new_literal='"OB_\ud800"') for e in plan.edits)
+    before = {name: (config_dir / name).read_bytes() for name in SPLIT}
     with pytest.raises(WiringError, match="cannot be written as UTF-8") as caught:
         apply_rename(dataclasses.replace(plan, edits=edits))
     assert caught.value.__cause__ is None
     assert caught.value.__context__ is None
+    assert {name: (config_dir / name).read_bytes() for name in SPLIT} == before
 
 
 def test_a_rename_write_error_survives_pickling() -> None:

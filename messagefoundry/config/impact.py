@@ -485,8 +485,8 @@ def prepare_rename(plan: RenamePlan) -> PreparedRename:
     applied: list[LiteralEdit] = []
     stale: list[LiteralEdit] = []
     for file, file_edits in by_file.items():
-        # A UnicodeDecodeError holds the whole file in .object, so only its type name leaves its
-        # handler, and the raise waits until the handler has ended rather than chaining the error.
+        # A UnicodeDecodeError holds the whole file in .object. Only its type name leaves the
+        # handler, and the raise comes after the handler ends, so the error is not chained.
         unreadable: str | None = None
         try:
             raw = Path(file).read_bytes()
@@ -511,8 +511,8 @@ def prepare_rename(plan: RenamePlan) -> PreparedRename:
         if unchanged and not missing:
             for edit in sorted(file_edits, key=lambda e: (e.start_line, e.start_col), reverse=True):
                 _apply_one(lines, edit)
-            # A UnicodeEncodeError holds the whole edited text in .object, so the raise waits until
-            # the handler has ended rather than chaining the error.
+            # A UnicodeEncodeError holds the whole edited text in .object. The raise comes after
+            # the handler ends, so the error is not chained.
             new_bytes: bytes | None
             try:
                 new_bytes = "".join(lines).encode("utf-8")
