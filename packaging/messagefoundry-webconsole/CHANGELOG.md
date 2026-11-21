@@ -261,9 +261,10 @@ this line.**
 
 ### Fixed
 
-- **An unparseable `Origin` is refused, not a 500.** An `Origin` that `urlsplit` cannot parse,
-  such as `http://[x`, made every same-origin-guarded /ui POST and the browser WebSocket handshake
-  raise, so a POST answered 500. `_origin_matches` now treats it as a non-match, so it gets the
+- **An unparseable `Origin` is refused, not a 500.** Where the /ui origin check compares the
+  `Origin` header, at least on a write with no `Sec-Fetch-Site` and on the browser WebSocket
+  handshake, an `Origin` that `urlsplit` cannot parse, such as `http://[x`, raised, so
+  `POST /ui/login` answered 500. `_origin_matches` now treats it as a non-match, so it gets the
   refusal a foreign origin gets.
 - **The High Availability pages degrade when the store does not answer.** The page, its live
   fragment and both step-down confirm pages read the cluster membership and lease rows with no error

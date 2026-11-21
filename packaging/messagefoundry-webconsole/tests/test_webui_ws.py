@@ -113,17 +113,22 @@ async def test_ws_cookie_auth_rejects_cross_origin(engine: Engine) -> None:
 
 async def test_ws_cookie_auth_refuses_an_unparseable_origin(engine: Engine) -> None:
     """``urlsplit`` raises on ``http://[x`` (an invalid IPv6 literal). The cookie gate refuses that
-    handshake as it refuses a foreign origin, rather than raising."""
+    handshake as it refuses a foreign origin, rather than raising, on the ``Host`` fallback and
+    with a configured public origin alike. Control: each posture admits its own origin."""
     from messagefoundry.auth import Permission
     from messagefoundry_webconsole import authorize_ui_ws
 
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
-    app, token = await _token(engine, service, "op")
-    ws = _FakeWS(origin="http://[x", host="t", cookie=token, app=app)
-    identity, _ = await authorize_ui_ws(ws, Permission.MONITORING_READ)  # type: ignore[arg-type]
-    assert identity is None
-    assert not ws_accept_allowed(ws.scope)
+    _, token = await _token(engine, service, "op")
+    for public_origin in (None, "http://t"):
+        app = create_app(engine, auth=service, serve_ui=True, public_origin=public_origin)
+        ws = _FakeWS(origin="http://[x", host="t", cookie=token, app=app)
+        identity, _ = await authorize_ui_ws(ws, Permission.MONITORING_READ)  # type: ignore[arg-type]
+        assert identity is None, public_origin
+        assert not ws_accept_allowed(ws.scope)
+        ok = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
+        assert (await authorize_ui_ws(ok, Permission.MONITORING_READ))[0] is not None  # type: ignore[arg-type]
 
 
 async def test_ws_cookie_auth_rejects_a_repeated_or_blank_origin(engine: Engine) -> None:
