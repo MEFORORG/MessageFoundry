@@ -342,6 +342,22 @@ def test_apply_writes_nothing_when_a_file_changed_after_the_plan(tmp_path: Path)
     assert {name: (config_dir / name).read_bytes() for name in SPLIT} == before
 
 
+def test_apply_refuses_a_file_that_still_holds_the_old_literal_at_the_span(tmp_path: Path) -> None:
+    """A line inserted above an edit can put an equal literal at the planned span; the span check
+    alone would rewrite that one and leave the real reference reading the old name."""
+    config_dir = _config(tmp_path, SPLIT)
+    plan = plan_rename(load_config(config_dir), config_dir, "outbound", "OB_X", "OB_Y")
+    b = config_dir / "b.py"
+    text = b.read_text(encoding="utf-8")
+    b.write_text(
+        text.replace("    return Send(", '    _ =    Send("OB_X", msg)\n    return Send('), "utf-8"
+    )
+    before = b.read_bytes()
+    with pytest.raises(WiringError, match="changed after the plan"):
+        apply_rename(plan)
+    assert b.read_bytes() == before
+
+
 def test_the_cli_does_not_report_success_when_an_edit_could_not_be_made(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:

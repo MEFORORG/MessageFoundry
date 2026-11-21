@@ -77,17 +77,21 @@ from messagefoundry.config.wiring import (
     config_py_files,
 )
 from messagefoundry.connection_names import CONNECTION_NAME_PATTERN, is_connection_name
-from messagefoundry.controlchars import has_control_char
+from messagefoundry.controlchars import has_control_char, has_lone_surrogate
 from messagefoundry.redaction import safe_exc
 
 _log = logging.getLogger(__name__)
 
 __all__ = [
     "LiteralEdit",
+    "PreparedRename",
     "RenamePlan",
+    "RenameWriteError",
     "apply_rename",
     "delete_impact",
     "plan_rename",
+    "prepare_rename",
+    "write_rename",
 ]
 
 #: The object kinds a rename/delete can target (the registry tables reachability indexes).
@@ -193,6 +197,9 @@ class RenamePlan:
     new: str
     edits: tuple[LiteralEdit, ...] = ()
     unresolved: tuple[Reference, ...] = ()
+    #: (file, its bytes) for each edited file, as read when the plan was made, so applying it to a
+    #: file that changed since is refused (BACKLOG #5980). Config modules are small.
+    sources: tuple[tuple[str, bytes], ...] = field(default=(), repr=False)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -397,79 +404,137 @@ def plan_rename(
         )
     )
     return RenamePlan(
-        target_kind=target_kind, old=old, new=new, edits=tuple(ordered), unresolved=unresolved
+        target_kind=target_kind,
+        old=old,
+        new=new,
+        edits=tuple(ordered),
+        unresolved=unresolved,
+        sources=_file_bytes({e.file for e in ordered}),
     )
 
 
+def _file_bytes(files: Iterable[str]) -> tuple[tuple[str, bytes], ...]:
+    """Each readable file's bytes; one that cannot be read gets none, and fails at apply."""
+    out: list[tuple[str, bytes]] = []
+    for file in sorted(files):
+        try:
+            out.append((file, Path(file).read_bytes()))
+        except OSError as exc:
+            _log.debug("rename could not read %s at plan time: %s", file, type(exc).__name__)
+    return tuple(out)
+
+
 def apply_rename(plan: RenamePlan) -> list[LiteralEdit]:
-    """Write ``plan``'s edits to disk and return the edits actually applied.
+    """Write ``plan``'s edits to disk and return the edits actually applied:
+    :func:`prepare_rename`, then :func:`write_rename`."""
+    return write_rename(prepare_rename(plan))
+
+
+@dataclass(frozen=True)
+class PreparedRename:
+    """A plan checked against the files on disk, with each file's original and new bytes."""
+
+    plan: RenamePlan
+    files: tuple[tuple[str, bytes, bytes], ...]
+    applied: tuple[LiteralEdit, ...]
+
+
+class RenameWriteError(WiringError):
+    """A write failed partway; ``unrestored`` names the files left holding the new name."""
+
+    def __init__(self, message: str, unrestored: list[str]) -> None:
+        super().__init__(message)
+        self.unrestored = unrestored
+
+
+def prepare_rename(plan: RenamePlan) -> PreparedRename:
+    """Check ``plan`` against the files on disk and build each file's new bytes, writing nothing.
 
     Each file is rewritten byte-for-byte outside the replaced spans (newline style preserved). Edits
     are applied bottom-to-top / right-to-left so earlier offsets stay valid. A file whose every span
-    already carries the new literal (a re-applied plan) is left alone, so re-applying is a no-op.
+    already carries the new literal where the edits would have put it (a re-applied plan) is left
+    alone, so re-applying is a no-op.
 
-    Any other state -- a span carrying neither literal, or a file only partly renamed -- means the
-    file changed after the plan was made, and writing the rest would leave a half-renamed config
-    while reporting success. That raises :class:`WiringError` before any file is written (BACKLOG
-    #5980), as does a file that cannot be read or decoded. A write that fails restores the files
-    already written from the bytes read, then raises :class:`WiringError` too, naming any file it
-    could not restore."""
+    A file whose bytes differ from the ones the plan read, and that is not wholly renamed already,
+    changed after the plan was made: writing the edits would rewrite whatever now sits at their
+    spans, or leave a half-renamed config while reporting success. That raises
+    :class:`WiringError`, as does a file that cannot be read, decoded or encoded (BACKLOG #5980)."""
     by_file: dict[str, list[LiteralEdit]] = {}
     for edit in plan.edits:
         by_file.setdefault(edit.file, []).append(edit)
+    planned = dict(plan.sources)
 
-    rewritten: dict[str, tuple[bytes, list[str]]] = {}
+    files: list[tuple[str, bytes, bytes]] = []
     applied: list[LiteralEdit] = []
     stale: list[LiteralEdit] = []
     for file, file_edits in by_file.items():
         try:
             raw = Path(file).read_bytes()
-            text = raw.decode("utf-8")
+            # Split on \n, \r\n and \r only: the plan numbered lines by tokenizing a universal-newline
+            # read, which breaks on exactly those, so an edit's line is the line it names here too.
+            lines = source_lines(raw.decode("utf-8"))
         except (OSError, UnicodeDecodeError) as exc:
             raise WiringError(
                 f"cannot apply the rename of {plan.target_kind} {plan.old!r}: {file} could not "
                 f"be read ({type(exc).__name__}). Nothing was written"
             ) from exc
-        # Split on \n, \r\n and \r only: the plan numbered lines by tokenizing a universal-newline read,
-        # which breaks on exactly those, so an edit's line is the line it names here too.
-        lines = source_lines(text)
+        unchanged = planned.get(file, raw) == raw
         missing = [e for e in file_edits if _span_text(lines, e) != e.old_literal]
-        if not missing:
-            # Bottom-to-top, right-to-left: a multi-line edit changes the line count below it, so
-            # applying in descending (start_line, start_col) keeps every later edit's indices valid.
+        if unchanged and not missing:
             for edit in sorted(file_edits, key=lambda e: (e.start_line, e.start_col), reverse=True):
                 _apply_one(lines, edit)
-            rewritten[file] = (raw, lines)
+            try:
+                new_bytes = "".join(lines).encode("utf-8")
+            except UnicodeEncodeError as exc:
+                raise WiringError(
+                    f"cannot apply the rename of {plan.target_kind} {plan.old!r}: the new name "
+                    "cannot be written as UTF-8. Nothing was written"
+                ) from exc
+            files.append((file, raw, new_bytes))
             applied.extend(file_edits)
         elif len(missing) < len(file_edits) or not _already_renamed(lines, file_edits):
-            stale.extend(missing)
+            stale.extend(missing or file_edits)
     if stale:
-        where = ", ".join(f"{e.file}:{e.start_line}" for e in stale)
+        where = ", ".join(sorted({f"{e.file}:{e.start_line}" for e in stale}))
         raise WiringError(
-            f"cannot apply the rename of {plan.target_kind} {plan.old!r}: {len(stale)} edit(s) no "
-            f"longer match the file, which changed after the plan was made ({where}). Nothing was "
-            "written; plan the rename again"
+            f"cannot apply the rename of {plan.target_kind} {plan.old!r}: the file changed after "
+            f"the plan was made ({where}). Nothing was written; plan the rename again"
         )
+    return PreparedRename(plan=plan, files=tuple(files), applied=tuple(applied))
+
+
+def write_rename(prepared: PreparedRename) -> list[LiteralEdit]:
+    """Write a :func:`prepare_rename` result and return the edits applied.
+
+    A write that fails restores every file already written, and the failing one if it changed, from
+    the bytes read, then raises :class:`RenameWriteError` naming any file it could not restore."""
+    plan = prepared.plan
     written: list[tuple[str, bytes]] = []
-    for file, (raw, lines) in rewritten.items():
+    for file, raw, new_bytes in prepared.files:
         try:
-            Path(file).write_bytes("".join(lines).encode("utf-8"))
+            Path(file).write_bytes(new_bytes)
         except OSError as exc:
-            # The failed file may be partly written, so it is restored with the ones before it.
             unrestored = _restore([*written, (file, raw)])
-            left = f"; these could not be restored: {', '.join(unrestored)}" if unrestored else ""
-            raise WiringError(
+            left = f"; these still hold the new name: {', '.join(unrestored)}" if unrestored else ""
+            raise RenameWriteError(
                 f"cannot apply the rename of {plan.target_kind} {plan.old!r}: writing {file} "
-                f"failed ({type(exc).__name__}), so the files already written were restored{left}"
+                f"failed ({type(exc).__name__}), so the files already written were restored{left}",
+                unrestored,
             ) from exc
         written.append((file, raw))
-    return applied
+    return list(prepared.applied)
 
 
 def _restore(files: list[tuple[str, bytes]]) -> list[str]:
-    """Write each file's original bytes back, returning the files that could not be."""
+    """Write each file's original bytes back where they changed, returning the files that could
+    not be. A file whose write failed before it changed anything is left alone."""
     failed: list[str] = []
     for file, raw in files:
+        try:
+            if Path(file).read_bytes() == raw:
+                continue
+        except OSError as exc:
+            _log.debug("rename could not re-read %s: %s", file, type(exc).__name__)
         try:
             Path(file).write_bytes(raw)
         except OSError as exc:
@@ -2001,7 +2066,8 @@ def _toml_edits(
         _apply_one(lines, edit)
     try:
         after = tomllib.loads("".join(lines))
-    except tomllib.TOMLDecodeError:
+    except tomllib.TOMLDecodeError as exc:
+        _log.info("rename refused its edits to %s: they do not parse (%s)", toml_path, exc)
         return None
     # By repr, so a nan, which never equals itself, still compares equal to the nan it was.
     return edits if repr(after) == repr(expected) else None
@@ -2074,6 +2140,9 @@ def _validate_new_name(config_dir: Path, target_kind: str, new: str) -> None:
     # refuse anything that could corrupt the rewrite.
     if has_control_char(new):
         raise WiringError(f"the new name {new!r} must not contain control characters")
+    if has_lone_surrogate(new):
+        # Not encodable as UTF-8, so no file could be written with it.
+        raise WiringError(f"the new name {new!r} must not contain a lone surrogate")
     if any(ch in new for ch in ("'", '"', "\\")):
         raise WiringError(f"the new name {new!r} must not contain a quote or backslash")
     # A renamed connection must still load (BACKLOG #1107): refuse here, before any file is rewritten.

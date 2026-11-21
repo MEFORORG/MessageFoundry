@@ -46,6 +46,7 @@ from messagefoundry.config.code_sets import (
 )
 from messagefoundry.config.wiring import WiringError
 from messagefoundry.controlchars import has_control_char
+from messagefoundry.secretscrub import scrub_credentials
 from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
 
 _log = logging.getLogger(__name__)
@@ -226,31 +227,34 @@ def rename_code_set(
                 f"cannot rename code set {old!r} to {new!r}: {len(plan.unresolved)} reference(s) "
                 f"cannot be rewritten and would still read the old name: {named}. Nothing was "
                 "changed; rewrite those references by hand, or run `messagefoundry-toolkit impact "
-                "--kind code_set --rename-to` to see the plan"
+                f"--config <dir> code_set {old} --rename-to {new}` to see the plan"
             )
+        from messagefoundry.config import impact
+
+        # Checked against the files before the table moves: a referent file that changed since
+        # the plan refuses here, with nothing moved (BACKLOG #5980).
+        prepared = impact.prepare_rename(plan)
         with atomic_edit.refused_as(src, WiringError, f"rename it to {dest.name}"):
             replace_generated(src, dest)
         result: dict[str, Any] = {"op": "rename", "name": old, "to": new}
         # The referent rewrite stays under the lock: a second rename planned between the move
         # and the rewrite would read literals naming a table that is already gone.
-        from messagefoundry.config import impact
-
         try:
-            rewritten = len(impact.apply_rename(plan))
-        except WiringError as exc:
-            # apply_rename left every referent file as it was (it writes none on a stale or
-            # unreadable file, and restores the ones written when a write fails), so moving the
-            # table back leaves the config as it was rather than half renamed.
+            rewritten = len(impact.write_rename(prepared))
+        except impact.RenameWriteError as exc:
+            # A write failed and the files written were restored, so the table moves back to the
+            # name they read. A file the error names could not be restored and still reads the new
+            # name; the message says so.
             try:
                 with atomic_edit.refused_as(dest, WiringError, f"rename it back to {src.name}"):
                     replace_generated(dest, src)
-            except WiringError as back:
+            except (WiringError, OSError) as back:
                 raise WiringError(
                     f"{exc} The code set was then left as {dest.name}, because moving it back "
-                    f"failed ({back}), while its references still name {old!r}: rename "
+                    f"failed ({back}), while the restored references name {old!r}: rename "
                     f"{dest.name} back to {src.name} by hand"
                 ) from exc
-            raise
+            raise WiringError(f"{exc}. The code set was moved back to {src.name}") from exc
         if rewritten:
             result["referents_rewritten"] = rewritten
     return result
@@ -673,9 +677,11 @@ def _plan_code_set_referents(config_dir: str | Path, old: str, new: str) -> Any:
     try:
         registry = _load_referent_registry_or_raise(config_dir)
     except _REGISTRY_LOAD_ERRORS as exc:
+        # Scrubbed as validate_config scrubs it: a load error can echo a setting's value.
+        reason = scrub_credentials(str(exc))
         raise WiringError(
             f"cannot rename code set {old!r} to {new!r}: its references could not be checked "
-            f"({exc}). Nothing was changed; fix the config so it loads, then rename again"
+            f"({reason}). Nothing was changed; fix the config so it loads, then rename again"
         ) from exc
     # A refusal of the planner's own carries its own reason, and nothing has moved yet.
     return impact.plan_rename(registry, config_dir, "code_set", old, new)
