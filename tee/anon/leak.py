@@ -1065,9 +1065,10 @@ RETARGET_RESIDUE = "left by a retarget"
 KEPT_COMPONENT = "in a component an identifier rule keeps"
 #: The two labels a hit of :func:`past_first_component_hits` carries.
 _MAPPED_FIELD_LABELS = (RETARGET_RESIDUE, KEPT_COMPONENT)
-#: The tail of such a hit: `` <label> in <address>``, the address one word.
+#: The tail of such a hit: `` <label> in <address>``, the address one word. The labels are
+#: written out so the ReDoS scanner can read the pattern; a test pins them to the constants.
 _MAPPED_FIELD_TAIL: re.Pattern[str] = re.compile(
-    "(?: (" + "|".join(re.escape(label) for label in _MAPPED_FIELD_LABELS) + ") in )[^ ]+$"
+    r" (left by a retarget|in a component an identifier rule keeps) in [^ ]+$"
 )
 
 
@@ -1076,7 +1077,7 @@ def mapped_field_label(hit: str) -> str | None:
     :func:`past_first_component_hits`, whose text ends `` <label> in <address>``, else ``None``.
     It is the one reading of that label, so a label's words elsewhere in a hit, such as in a
     token's description, are not taken for it (BACKLOG #5533 items 4 and 27). A token hit can
-    still end that way, so a caller with a report also asks whether the hit is structural, as
+    still end that way, so a caller with a report counts its token hits apart, as
     :func:`has_other_cause` does."""
     match = _MAPPED_FIELD_TAIL.search(hit)
     return match.group(1) if match else None
@@ -1375,8 +1376,10 @@ def has_other_cause(report: LeakReport) -> bool:
     """True if ``report`` holds a hit that is not in a mapped field, such as a token or a shape
     in a field no rule maps, so its fix is not only the advice :func:`mapped_field_advice`
     gives."""
-    structural = set(report.structural_hits)
-    return any(hit not in structural or mapped_field_label(hit) is None for hit in report.hits)
+    # ``hits`` holds the token hits, then the structural ones, so a token hit is never read as a
+    # mapped-field hit, whatever its text.
+    token_hits = len(report.hits) > len(report.structural_hits)
+    return token_hits or any(mapped_field_label(hit) is None for hit in report.structural_hits)
 
 
 #: The address a header hit after the encoding characters names.

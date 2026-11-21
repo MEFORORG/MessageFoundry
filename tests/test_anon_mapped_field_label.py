@@ -16,6 +16,7 @@ The token description here is made up.
 
 from __future__ import annotations
 
+import re
 from types import ModuleType
 
 import pytest
@@ -67,3 +68,22 @@ def test_each_label_is_read_where_the_walk_writes_it(leak: ModuleType) -> None:
     report = _report(leak, tokens=[], structural=[f"dashed SSN {leak.KEPT_COMPONENT} in GT1-2"])
     assert not leak.has_other_cause(report)
     assert "Extend the rule map" not in leak.refusal_advice(report)
+
+
+@_LEAKS
+def test_a_token_hit_with_a_structural_hits_exact_text_is_another_cause(leak: ModuleType) -> None:
+    """A token hit is told apart by where it sits in ``hits``, not by its text, so one that reads
+    exactly like a mapped-field hit still needs the general advice."""
+    same = f"dashed SSN {leak.KEPT_COMPONENT} in PID-3"
+    report = _report(leak, tokens=[same], structural=[same])
+    assert leak.has_other_cause(report)
+
+
+@_LEAKS
+def test_the_pattern_names_the_label_constants(leak: ModuleType) -> None:
+    """The pattern is written out for the ReDoS scanner; this keeps it on the constants."""
+    # Each label is plain words, so it stands in the pattern unescaped.
+    assert all(re.escape(label).replace("\\ ", " ") == label for label in leak._MAPPED_FIELD_LABELS)
+    alternation = "|".join(leak._MAPPED_FIELD_LABELS)
+    assert leak._MAPPED_FIELD_TAIL.pattern == f" ({alternation}) in [^ ]+$"
+    assert leak._MAPPED_FIELD_LABELS == (leak.RETARGET_RESIDUE, leak.KEPT_COMPONENT)

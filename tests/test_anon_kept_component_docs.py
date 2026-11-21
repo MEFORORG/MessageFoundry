@@ -4,9 +4,9 @@
 (vault BACKLOG #5533 items 11 and 23).
 
 The kept positions are stated in ``surrogates._CX_KEPT_COMPONENTS`` and restated in prose in at
-least ``docs/PHI.md`` section 9, the ADR 0030 amendment and two changelog fragments. A change to the
-constant that left the prose behind would leave a reader told that a component is blanked when it
-is kept, or kept when it is blanked. This pins each restatement found here to the constant; it
+least ``docs/PHI.md`` section 9 and the ADR 0030 amendment. A changelog fragment is not read
+here: the release fold deletes it. A change to the constant that left the prose behind would
+leave a reader told that a component is blanked when it is kept, or kept when it is blanked. This pins each restatement found here to the constant; it
 does not prove there are no others.
 """
 
@@ -27,8 +27,6 @@ _KEPT_PHRASE = re.compile(r"CX\.(\d+) to CX\.(\d+)((?:, CX\.\d+)*) and CX\.(\d+)
 _SITES = (
     "docs/PHI.md",
     "docs/adr/0030-anonymization-test-harness-tee.md",
-    "changelog.d/5533-remaining-defaults.security.md",
-    "changelog.d/5533-pid20-dln.security.md",
 )
 
 
