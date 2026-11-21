@@ -33,6 +33,7 @@ from harness.config.shardcert._shape import (
     PARTITIONED,
     PARTITIONED_FANOUT,
     destinations_for_seq,
+    fanout_refusal,
     fifo_lane_destination,
 )
 from harness.load.coord import DRIVE_START, SHARDS_READY, FileDropCoord
@@ -637,6 +638,66 @@ def test_tracker_partitioned_copy_at_the_wrong_destination_is_missing() -> None:
     assert _tracker(acked, wrong).acked_copies_missing(expected, fifo_lane_destination) == 20
 
 
+@pytest.mark.parametrize("label", ["a_²", "a_0٣", "a_１"])
+def test_fifo_lane_destination_names_no_destination_for_non_ascii_digits(label: str) -> None:
+    """BACKLOG #5640: ``str.isdigit`` accepts superscript two (``int`` then raises at report time,
+    ending the run with no report) and other scripts' digits (which ``int`` reads as a destination
+    the harness never stamped). Only ASCII digits name one.
+
+    Mutation: drop the ``isascii`` test. Red: the first label raises, the others name a destination."""
+    assert fifo_lane_destination(label) is None
+    assert fifo_lane_destination("a_03") == 3
+
+
+@pytest.mark.parametrize(
+    ("routing", "dests", "fanout", "reason"),
+    [
+        (PARTITIONED_FANOUT, 4, 5, "above the 4 destinations"),
+        (PARTITIONED, 0, 1, "above the 0 destinations"),
+        ("round-robin", 4, 1, "unknown routing"),
+        (PARTITIONED, 4, -1, "negative fan-out"),
+    ],
+)
+def test_destinations_for_seq_refuses_a_fanout_the_router_never_serves(
+    routing: str, dests: int, fanout: int, reason: str
+) -> None:
+    """BACKLOG #5640: a fan-out above the destination count divided by zero in the partial
+    Fisher-Yates, and an unknown routing was answered as partitioned. Both are refused, by name.
+
+    Mutation: drop the guard. Red: ZeroDivisionError, or a list for the unknown routing."""
+    assert reason in (fanout_refusal(routing, dests=dests, fanout=fanout) or "")
+    with pytest.raises(ValueError, match=reason):
+        destinations_for_seq(7, routing=routing, dests=dests, fanout=fanout)
+    # Broadcast needs no destination count, so a missing one refuses nothing there.
+    assert fanout_refusal(BROADCAST, dests=0, fanout=4) is None
+    assert fanout_refusal(PARTITIONED_FANOUT, dests=4, fanout=4) is None
+
+
+@pytest.mark.parametrize(
+    ("over", "reason"),
+    [
+        ({"routing": PARTITIONED_FANOUT, "dests": 4, "delivering": 6}, "above the 4 destinations"),
+        ({"routing": "round-robin"}, "unknown routing"),
+    ],
+)
+async def test_driver_refuses_a_fanout_the_router_never_serves(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, over: dict[str, Any], reason: str
+) -> None:
+    """BACKLOG #5640: such a SHARDS_READY made the copy walk divide by zero after the whole hold, so
+    the run ended with no report. Now the copy check fails, with a note naming why.
+
+    Mutation: drop the driver's refusal. Red: ZeroDivisionError, or a checked verdict."""
+    _install_fakes(monkeypatch)
+    coord = FileDropCoord(tmp_path, run_id="badfan")
+    _post_ready(coord, **over)
+    report = await sc.run_shardcert_driver(
+        engine_host="10.0.0.5", hold_seconds=0.05, drain_timeout=1.0, coord=coord
+    )
+    assert report.delivering == 0
+    assert not report.copies_ok
+    assert any(reason in n for n in report.notes), report.notes
+
+
 def test_destinations_for_seq_matches_the_served_router() -> None:
     """The driver's expected set and the served router's choice come from one function, so they
     cannot drift: the shape's own selectors agree with it at every seq."""
@@ -1063,6 +1124,7 @@ async def test_drive_ladder_launches_no_soak_after_a_climb_abort(
                 routing=BROADCAST,
                 lanes=1,
                 sink_count=1,
+                sign_in_refused=False,
             )
         raise CoordTimeout("SHARDS_READY not seen")
 
@@ -1179,6 +1241,95 @@ def test_remote_poller_refuses_insecure_with_a_cacert() -> None:
     """A certificate means nothing on a plaintext hop; asking for both is a mistake, said loud."""
     with pytest.raises(ValueError, match="--cacert"):
         sc._remote_engine_poller("10.0.0.5", [9001], allow_insecure=True, cacert="x.pem")
+
+
+def test_remote_poller_refuses_an_empty_cacert() -> None:
+    """BACKLOG #5640: an empty ``cacert`` read as unset, so the poll verified against the default
+    trust without a word. It is refused instead.
+
+    Mutation: drop the check. Red: a poller is built."""
+    with pytest.raises(ValueError, match="names no certificate"):
+        sc._remote_engine_poller("10.0.0.5", [9001], allow_insecure=False, cacert="")
+
+
+@pytest.mark.parametrize(
+    ("sub", "extra"),
+    [
+        ("shardcert-driver", []),
+        ("shardcert-drive", []),
+        ("shardcert-drive-ladder", ["--rate-ladder", "10,20"]),
+    ],
+)
+def test_two_box_cli_refuses_an_empty_cacert(
+    sub: str, extra: list[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """BACKLOG #5640: ``--cacert ""`` is a usage error, not a silent fall back to the default trust."""
+    with pytest.raises(SystemExit) as exc:
+        hmain.main(
+            [
+                sub,
+                "--engine-host",
+                "10.0.0.5",
+                *extra,
+                "--cacert",
+                "",
+                "--coord-dir",
+                str(tmp_path),
+            ]
+        )
+    assert exc.value.code == 2
+    assert "names no certificate" in capsys.readouterr().err
+
+
+async def test_drive_ladder_does_not_retry_a_refused_sign_in(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """BACKLOG #5640: once a rung's sign-in is refused, later rungs and the soak skip it, since
+    each retry of a refused credential counts toward locking the rig Administrator out.
+
+    Mutation: pass ``sign_in=True`` on every rung. Red: the later drives are asked to sign in."""
+    import harness.load.shardcert_ladder as ladder
+
+    seen: list[bool] = []
+
+    async def drive(**kwargs: Any) -> Any:
+        seen.append(kwargs["sign_in"])
+        return types.SimpleNamespace(
+            shards=("a",),
+            dests=1,
+            handlers=1,
+            delivering=1,
+            routing=BROADCAST,
+            lanes=1,
+            sink_count=1,
+            sign_in_refused=True,
+        )
+
+    async def no_report(*_a: Any, **_k: Any) -> None:
+        return None
+
+    monkeypatch.setattr(ladder, "run_shardcert_drive", drive)
+    monkeypatch.setattr(ladder, "_read_engine_report", no_report)
+    monkeypatch.setattr(
+        ladder, "build_rung_outcome", lambda *_a, **_k: types.SimpleNamespace(verdict=None)
+    )
+    monkeypatch.setattr(ladder, "stops_climb", lambda _v: False)
+    monkeypatch.setattr(ladder, "pick_soak_rate", lambda *_a, **_k: 10.0)
+    sentinel: Any = object()
+    monkeypatch.setattr(ladder, "build_consolidated_report", lambda **_k: sentinel)
+    report = await ladder.run_drive_ladder(
+        engine_host="10.0.0.5",
+        rates=[10.0, 20.0, 30.0],
+        hold_seconds=0.05,
+        drain_timeout=1.0,
+        driver_count=1,
+        sink_count=1,
+        sink_host="127.0.0.1",
+        base_coord=FileDropCoord(tmp_path, run_id="refused"),
+        soak_hold_seconds=0.05,
+    )
+    assert report is sentinel
+    assert seen == [True, False, False, False]
 
 
 def _refusing_poller(built: list[dict[str, Any]], exc: Exception) -> type:
