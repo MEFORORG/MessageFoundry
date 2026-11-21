@@ -1104,6 +1104,31 @@ def _rcsi_remedy(database: str | None) -> str:
     )
 
 
+def _options_error(exc: BaseException) -> str:
+    """How the database-options check renders an error into its refusals and logs (BACKLOG #5666).
+
+    ODBC text can echo connection parameters, and a server message can quote a stored value. So an
+    error that carries a SQLSTATE renders as its class, SQLSTATE and native error number and no
+    text, the form the CLI's ``_store_error_text`` prints; any other keeps its type and its text
+    through ``redact_log_line``, as ``probe_failure`` renders it."""
+    state = driver_sqlstate(exc)
+    if state is None:
+        return f"{type(exc).__name__}: {redact_log_line(str(exc))[:300]}"
+    native = re.findall(r"\((\d{1,6})\)\s*\(SQL[A-Za-z]+\)", str(exc))
+    return f"{type(exc).__name__} [SQLSTATE {state}]" + (
+        f" native error {native[-1]}" if native else ""
+    )
+
+
+def _bound_one_shot(conn: Any, settings: StoreSettings) -> None:
+    """Apply ``[store].command_timeout`` to a one-shot options connection (BACKLOG #5666), as
+    :meth:`SqlServerStore._acquire` does for a pooled one, so an ``ALTER DATABASE`` waiting on a
+    long transaction ends at that limit. 0 means no limit here, as everywhere it applies."""
+    raw = getattr(conn, "_conn", None)
+    if raw is not None:
+        raw.timeout = settings.command_timeout
+
+
 def _upload_quota_lock(uploader_id: str) -> str:
     """The applock the reserve and the release of one uploader's reservations both take (vault
     BACKLOG #3180). One spelling, because the release's lock order holds only while the names
@@ -4881,6 +4906,7 @@ class SqlServerStore:
                     abandoned = False
                     try:
                         _require_call_gate(probe)  # BACKLOG #2394, as on `conn` below
+                        _bound_one_shot(probe, settings)
                         pcur = await probe.cursor()
                         await pcur.execute(
                             "SELECT is_read_committed_snapshot_on FROM sys.databases"
@@ -4911,7 +4937,8 @@ class SqlServerStore:
             )
         except Exception as exc:
             raise RuntimeError(
-                f"could not connect to verify READ_COMMITTED_SNAPSHOT on database {db!r}: {exc}"
+                f"could not connect to verify READ_COMMITTED_SNAPSHOT on database {db!r}:"
+                f" {_options_error(exc)}"
             ) from exc
         cur: Any = None
         abandoned = False
@@ -4921,6 +4948,7 @@ class SqlServerStore:
             # `_rcsi_on_after_a_peer` exit the same way. One the gate cannot wrap is refused before
             # its first call, and the `finally` closes it while nothing runs on it.
             _require_call_gate(conn)
+            _bound_one_shot(conn, settings)
             await _assert_autocommit(conn)
             # Standalone one-shot connection (NOT pooled), so the EF-6 pool-bleed race `_cursor`
             # guards against cannot arise; `_close_one_shot` still closes the cursor first.
@@ -4954,7 +4982,7 @@ class SqlServerStore:
                         log.info(
                             "READ_COMMITTED_SNAPSHOT on %r was enabled by a concurrent opener (%s)",
                             db,
-                            exc,
+                            _options_error(exc),
                         )
                         # Our connection may be dead, and the peer's open runs the same snapshot
                         # step, so a warning from a doomed ALTER here would only mislead.
@@ -4962,7 +4990,8 @@ class SqlServerStore:
                     elif fail_closed:
                         raise RuntimeError(
                             f"READ_COMMITTED_SNAPSHOT is OFF on database {db!r} and this login could"
-                            f" not enable it ({exc}); {remedy} -- refusing to open the store, because"
+                            f" not enable it ({_options_error(exc)}); {remedy} -- refusing to open"
+                            " the store, because"
                             " under locking read committed concurrent finalizers deadlock (fail closed)"
                         ) from exc
                     else:
@@ -4972,7 +5001,7 @@ class SqlServerStore:
                             "READ_COMMITTED_SNAPSHOT is OFF on database %r and this login could"
                             " not enable it (%s); %s",
                             db,
-                            exc,
+                            _options_error(exc),
                             remedy,
                         )
             if "ALLOW_SNAPSHOT_ISOLATION" in off:
@@ -4983,7 +5012,7 @@ class SqlServerStore:
                     log.warning(
                         "could not enable ALLOW_SNAPSHOT_ISOLATION on %r (%s); a DBA should run once: %s",
                         db,
-                        exc,
+                        _options_error(exc),
                         _options_remedy(db, ["ALLOW_SNAPSHOT_ISOLATION"]),
                     )
         except BaseException as exc:
