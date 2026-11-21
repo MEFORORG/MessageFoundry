@@ -10092,10 +10092,10 @@ def create_app(
                 # BACKLOG #5523, as #3734 split the upload routes: the key service gave no verdict,
                 # so a later try may succeed. Its text goes to the log only, as in uploads, and as
                 # a str: the exception's traceback would reach this frame's decrypted `criterias`.
-                # Once per preset per interval, as the other arms log: an outage fails every
-                # recall (BACKLOG #5523).
+                # Once per preset and reason per interval, as the other arms log: an outage fails
+                # every recall, and a changed reason is logged again (BACKLOG #5523).
                 cause = type(exc).__name__
-                if _first_layered_refusal(preset_id, cause):
+                if _first_layered_refusal(preset_id, f"{cause}:{exc}"):
                     _log.warning(
                         "layered search answered 503 on preset %s: %s", preset_id, str(exc)
                     )

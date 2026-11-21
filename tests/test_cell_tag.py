@@ -791,7 +791,7 @@ async def test_a_planted_blob_in_a_message_cell_is_contained(
     """BACKLOG #5650 added item 2: a BLOB planted in a ``messages`` cell raised ``TypeError`` out of
     a keyed cipher, so a list read failed with a 500 and a handoff re-pended the row forever; a
     keyless cipher returned the bytes unchanged. Both now raise :class:`NonTextCellError`, so a list
-    withholds the row and a handoff dead-letters it with one tag-failed audit row."""
+    withholds the row's cells and a handoff dead-letters it with one tag-failed audit row."""
     for memo in ("_reported", "_reported_audit"):  # leave no entry for a later test
         monkeypatch.setattr(cell_tag, memo, {})
     cipher = make_cipher(generate_key() if keyed else None, write_v2=True)

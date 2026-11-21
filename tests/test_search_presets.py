@@ -250,12 +250,12 @@ async def test_a_refused_open_leaves_the_v032_preset_table_untouched(tmp_path: P
 
 
 @pytest.mark.parametrize("criteria", ["", None, b"{}"], ids=["empty", "null", "bytes"])
-async def test_a_preset_write_refuses_criteria_a_read_would_refuse(
+async def test_a_preset_write_refuses_criteria_the_read_refuses_as_drift(
     store: MessageStore, criteria: object
 ) -> None:
-    """BACKLOG #5523: a read refuses a blank or non-text criteria cell as drift, so the write path
-    refuses one too rather than sealing a preset no recall can open. Control: real criteria save."""
-    with pytest.raises(ValueError, match="non-blank text"):
+    """BACKLOG #5523: the store's read refuses an empty or non-text criteria cell as drift, so the
+    write path refuses one too rather than sealing it. Control: real criteria save."""
+    with pytest.raises(ValueError, match="must be text and not empty"):
         await store.upsert_search_preset(
             preset_id="pb",
             owner_user_id="op",
@@ -267,21 +267,32 @@ async def test_a_preset_write_refuses_criteria_a_read_would_refuse(
     assert await store.get_search_preset(preset_id="pb", owner_user_id="op") is not None
 
 
-async def test_a_marked_cell_that_opens_to_blank_is_drift(store: MessageStore) -> None:
+async def test_a_marked_cell_that_opens_to_blank_is_drift(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """BACKLOG #5523: a marked cell that verifies under its own row's tag but holds "" was sealed
-    outside the store, which never writes blank criteria. It is a ``BlankCellError``, audited as
-    drift, not criteria a route reads as malformed JSON with no integrity row."""
+    outside the store, which never writes blank criteria. It is a ``SealedBlankCellError``, a
+    ``BlankCellError`` whose text says the cell opened empty, audited as drift, not criteria a
+    route reads as malformed JSON with no integrity row."""
+    from messagefoundry.store import cell_tag
     from messagefoundry.store.cell_tag import (
         PRESET_TAG_FAILED_ACTION,
         BlankCellError,
+        SealedBlankCellError,
         preset_criteria_aad,
     )
+
+    for memo in ("_reported", "_reported_audit"):  # leave no entry for a later test or rerun
+        monkeypatch.setattr(cell_tag, memo, {})
 
     await store.upsert_search_preset(preset_id="pe", owner_user_id="op", name="n", criteria=CRIT)
     sealed = store._cipher.encrypt("", aad=preset_criteria_aad(preset_id="pe", owner_user_id="op"))
     assert sealed.startswith("mfenc:")  # control: a marked cell, which the cipher opens
     await store._db.execute("UPDATE search_presets SET criteria=? WHERE id='pe'", (sealed,))
     await store._db.commit()
-    with pytest.raises(BlankCellError):
+    with pytest.raises(SealedBlankCellError) as refused:
         await store.get_search_preset(preset_id="pe", owner_user_id="op")
+    assert isinstance(refused.value, BlankCellError) and "opens to an empty value" in str(
+        refused.value
+    )
     assert len(await store.list_audit(action=PRESET_TAG_FAILED_ACTION)) == 1

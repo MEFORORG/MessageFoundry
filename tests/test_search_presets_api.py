@@ -896,6 +896,7 @@ async def test_layered_search_feeds_the_summary_access_audit(engine: Engine) -> 
         assert await engine.store.list_audit(action="summary_access") == []  # control
         r = await c.get("/search/layered", params={"presets": hit}, headers=h)
         assert r.status_code == 200 and r.json()["matched"] == 1, r.text
+        assert len(noted) == 1  # positive control: the spy sees the route's call
         await app.state.summary_auditor.flush(engine.store)
     rows = await engine.store.list_audit(action="summary_access")
     assert [a["actor"] for a in rows] == ["op"]

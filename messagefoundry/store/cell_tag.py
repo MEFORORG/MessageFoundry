@@ -79,6 +79,7 @@ __all__ = [
     "CellTagSink",
     "CorruptCellError",
     "NonTextCellError",
+    "SealedBlankCellError",
     "UnmarkedCellError",
     "audits_cell_tag",
     "dead_letter_on_cell_tag",
@@ -307,6 +308,24 @@ class BlankCellError(CellTagError):
         )
 
 
+class SealedBlankCellError(BlankCellError):
+    """A preset's ``criteria`` cell is sealed and opens under its own row's tag, but to an empty
+    string (BACKLOG #5523). The cell on disk is ciphertext, not blank, so the text says what opened;
+    the store never seals blank criteria, so it is drift and refused as a blank cell is."""
+
+    def _describe(self) -> str:
+        return (
+            f"integrity: the {self.table}.{self.column} cell of row {self.row_ref} opens to an"
+            " empty value, which the store never seals"
+        )
+
+    def alert_reason(self) -> str:
+        return (
+            f"a {self.table}.{self.column} cell opens to an empty value, which the store never"
+            f" seals (row {self.row_ref})"
+        )
+
+
 class NonTextCellError(CellTagError):
     """A tagged cell holds a value that is not text, a planted BLOB say: a preset's ``criteria``
     (BACKLOG #5523) or a ``messages`` cell (BACKLOG #5650). The store writes these cells as text
@@ -436,14 +455,16 @@ def open_preset_criteria(
 
     The store writes every preset's criteria as non-blank text, so a NULL or empty cell raises
     :class:`BlankCellError` and a value that is not text, a planted BLOB say, raises
-    :class:`NonTextCellError`, on a keyed and a keyless store alike (BACKLOG #5523). Both are drift:
+    :class:`NonTextCellError`, on a keyed and a keyless store alike, and a sealed cell that opens to
+    an empty string raises :class:`SealedBlankCellError` (BACKLOG #5523). Each is drift:
     logged here, alerted here on a keyed store only, and audited by the store's read, before the
     caller reads the cell or stamps the preset as used. The store's whole-surface cell walks do not run this check."""
     # A blank cell is not opened: a keyed cipher passes it through. open_tagged_cell refuses a
     # non-text cell, and returns None only for a None cell, which is not opened either.
+    blank = stored is None or stored == ""
     opened = (
         ""
-        if stored is None or stored == ""
+        if blank
         else cast(
             str,
             open_tagged_cell(
@@ -457,19 +478,21 @@ def open_preset_criteria(
         )
     )
     if opened == "":
-        # Blank, or a marked cell that opens to "": either way written outside the store.
-        refused = BlankCellError("search_presets", "criteria", preset_id, None)
+        # Blank, or a sealed cell that opens to "": either way written outside the store.
+        kind = BlankCellError if blank else SealedBlankCellError
+        refused = kind("search_presets", "criteria", preset_id, None)
         _alert(cipher, refused)
         raise refused
     return opened
 
 
 def require_preset_criteria(criteria: object) -> None:
-    """Refuse, with ``ValueError``, criteria that are not non-blank text, before a preset write
-    seals them: a read refuses such a cell as drift (:func:`open_preset_criteria`), so no writer
-    stores one (BACKLOG #5523)."""
+    """Refuse, with ``ValueError``, criteria that are not text or are the empty string, before a
+    preset write seals them: :func:`open_preset_criteria` refuses either as drift, so no writer
+    stores one (BACKLOG #5523). It does not check the text is a JSON object; the layered search
+    refuses one that is not, as malformed."""
     if not isinstance(criteria, str) or criteria == "":
-        raise ValueError("a search preset's criteria must be non-blank text")
+        raise ValueError("a search preset's criteria must be text and not empty")
 
 
 def withhold_message_cells(
