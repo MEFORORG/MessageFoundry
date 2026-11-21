@@ -248,7 +248,9 @@ prints no counts; and an error while closing the store after a scrub error, whic
 To finish an unfinished scrub without deleting anything, run
 `python -m tee purge --db ./tee.db --scrub-only` once the cause is gone. A plain re-run of the
 purge works too, as above, but deletes under its own arguments. `--scrub-only` needs no `-y`,
-refuses a `--db` path that does not exist, and prints `scrubbed <db>` when the scrub finishes.
+refuses a `--db` path that does not exist, and prints `scrubbed <db>` when the scrub finishes. A
+plain purge refuses a missing `--db` path too, exiting 2 and creating nothing, so a mistyped path
+cannot report a clean purge.
 
 ```bash
 python -m tee purge --db ./tee.db --before 7d -y          # retention sweep
@@ -257,8 +259,9 @@ python -m tee purge --db ./tee.db --captures-only -y      # drop only the captur
 
 ## Limits (by design, for the test-only scope)
 
-* **Test data only** — not hardened for production PHI (no at-rest encryption; the DB is `chmod 0600`
-  best-effort only). Keep every tee DB on a protected volume, capture on or off, because a log row's
+* **Test data only** — not hardened for production PHI (no at-rest encryption; on open the DB and
+  its `-wal` and `-shm` are restricted to their owner best-effort only, `chmod 0600` on POSIX and an
+  owner-only access list on Windows, with a logged warning when that fails). Keep every tee DB on a protected volume, capture on or off, because a log row's
   detail can name a patient. Enable `--capture-bodies` only with test data.
 * **Not store-and-forward** — no durable retry queue; recovery of post-trip traffic is delegated to Epic's
   resend/queue (see *Fail-closed* above).

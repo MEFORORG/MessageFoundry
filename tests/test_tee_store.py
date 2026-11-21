@@ -506,7 +506,7 @@ async def _set_journal_mode(store: RelayStore, mode: str) -> str:
     return str(row[0])
 
 
-@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits; the Windows DACL half is open")
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits; Windows has its own DACL test")
 async def test_wal_siblings_recreated_after_open_inherit_owner_only_mode(tmp_path: Path) -> None:
     # Reviewed not-a-bug check for the POSIX half of #5637: SQLite creates -wal and -shm with the
     # main DB file's mode (unix VFS findCreateFileMode), so siblings re-created long after open's
@@ -529,6 +529,57 @@ async def test_wal_siblings_recreated_after_open_inherit_owner_only_mode(tmp_pat
             await store.close()
     finally:
         os.umask(old_umask)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="the owner-only DACL is the Windows half of #5637")
+async def test_the_db_and_its_wal_and_shm_get_an_owner_only_dacl_on_windows(
+    tmp_path: Path,
+) -> None:
+    """BACKLOG #5637: chmod restricts nothing on Windows, so each file needs its own DACL. The
+    folder grants the Administrators group too, so a file that kept the folder's list would show
+    it; after open each of the three holds exactly one entry, this account's full control."""
+    from messagefoundry.restricted_file import _windows_engine_sid
+    from tests._win_acl import assert_owner_only, folder_granting
+
+    me = _windows_engine_sid()
+    assert me
+    folder = folder_granting(tmp_path / "acl", me, "S-1-5-32-544")
+    db_path = folder / "tee.db"
+    store = await RelayStore.open(str(db_path))
+    try:
+        await store.record_capture(direction="corepoint_copy", control_id="C", raw=b"MSH|x")
+        for sibling in (db_path, Path(f"{db_path}-wal"), Path(f"{db_path}-shm")):
+            assert sibling.exists(), sibling
+            assert_owner_only(sibling, me)
+    finally:
+        await store.close()
+
+
+def test_a_file_it_cannot_restrict_is_logged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Best-effort is not silent: a file left unrestricted is named in a warning."""
+    target = tmp_path / "tee.db"
+    target.write_bytes(b"")
+
+    def refuse(_path: object, *_args: object) -> None:
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(tee_store, "_owner_only_dacl", lambda _path: "error 5")
+    monkeypatch.setattr(os, "chmod", refuse)
+    with caplog.at_level(logging.WARNING, logger="tee.store"):
+        tee_store._secure_file(str(target))  # noqa: SLF001 - the helper under test
+    assert [r.getMessage() for r in caplog.records if str(target) in r.getMessage()], caplog.text
+
+
+def test_a_plain_purge_of_a_missing_db_creates_nothing_and_fails(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A mistyped --db used to be created, purged of nothing, and reported as a clean purge."""
+    missing = tmp_path / "typo.db"
+    assert tee_main(["purge", "--db", str(missing), "-y"]) == 2
+    assert not missing.exists() and list(tmp_path.iterdir()) == []
+    assert "does not exist" in capsys.readouterr().err
 
 
 def _count_checkpoints(store: RelayStore, monkeypatch: pytest.MonkeyPatch) -> list[bool]:

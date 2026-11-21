@@ -523,6 +523,11 @@ async def _scrub_only(args: argparse.Namespace) -> int:
 async def _purge(args: argparse.Namespace) -> int:
     if args.scrub_only:
         return await _scrub_only(args)
+    if not os.path.isfile(args.db):
+        # RelayStore.open would create it, and a purge of a new empty file would read as success,
+        # so a mistyped --db would report a clean purge while the real DB kept every row.
+        print(f"error: {args.db} does not exist; nothing to purge", file=sys.stderr)
+        return 2
     scope = "captured bodies only" if args.captures_only else "all logged rows + captured bodies"
     window = "older than the cutoff" if args.before is not None else "EVERYTHING"
     target = f"{scope} ({window}) in {args.db}"
@@ -601,7 +606,8 @@ def _write_owner_only(path: str, text: str, *, in_place_on_windows: bool) -> Non
     --show-diffs`` report holds field values from both engines; an ``anonymize-captures`` dataset
     holds surrogates and every value a rule kept; an ``export`` carries control ids, message types
     and NAK details from the capture DB. ``write_text`` would create any of them at the process
-    umask, world-readable under 022, beside a capture DB that :mod:`tee.store` keeps at 0600.
+    umask, world-readable under 022, beside a capture DB that :mod:`tee.store` keeps at 0600 on
+    POSIX.
 
     ``in_place_on_windows`` is True for ``export`` and ``anonymize-captures``, and False for
     ``compare``. False keeps ``compare``'s writer on main, unchanged on every OS: newlines are the
@@ -620,10 +626,11 @@ def _write_owner_only(path: str, text: str, *, in_place_on_windows: bool) -> Non
     A ``path`` naming nothing, on any platform -- no file and no link, not even a dangling one --
     is created as a NEW file that ``mkstemp`` creates exclusively at 0600 in the same directory,
     flushed to disk, then renamed to ``path``. A failed write leaves no temp file. On Windows the
-    0600 mode means nothing and the new file takes its directory's access list, the stance
-    :mod:`tee.store` takes for the capture DB; the tee imports nothing from ``messagefoundry``, so
-    the engine's ``restricted_file`` is out of reach. There the rename refuses a name that appeared
-    since the check, and that name is then written in place as below rather than replaced.
+    0600 mode means nothing and the new file takes its directory's access list. :mod:`tee.store`
+    gives the capture DB an owner-only access list on open, but this writer does not; the tee
+    imports nothing from ``messagefoundry``, so the engine's ``restricted_file`` is out of reach.
+    There the rename refuses a name that appeared since the check, and that name is then written
+    in place as below rather than replaced.
 
     On POSIX an existing ``path`` gets the same treatment: a regular file, or a link, is replaced
     rather than written into, so neither its owner nor its mode carries over, and a reader holding

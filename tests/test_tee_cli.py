@@ -133,7 +133,9 @@ def test_purge_refuses_without_confirmation(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # Non-tty stdin (pytest default) + no -y → refuse a destructive purge (returns 1).
-    rc = main(["purge", "--db", str(tmp_path / "tee.db")])
+    db = str(tmp_path / "tee.db")
+    asyncio.run(_seed(db))
+    rc = main(["purge", "--db", db])
     assert rc == 1
     assert "refusing to purge" in capsys.readouterr().err.lower()
 
