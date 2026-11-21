@@ -372,10 +372,11 @@ def _open_plain(path: Path) -> tuple[BinaryIO, os.stat_result]:
     the name is now a link or not a regular file (BACKLOG #5388 added item 3), as at least a
     dangling link Windows followed, which answers ``FileNotFoundError``, a Windows folder, which
     answers ``PermissionError``, and a socket, which Windows answers with ``EINVAL``, are. So is an
-    ``EINVAL`` on a name that still lstats as a regular file, as at least a Windows reparse point
-    that ``_UNOPENABLE_REPARSE_TAGS`` does not list is. A refused open whose name is gone by that
-    ``lstat`` raises ``FileNotFoundError``, whatever the open met, so the race answers the same
-    on every platform. Raises :class:`_NotPlainError` for a refusal, and any other ``OSError`` the
+    ``EINVAL`` on a regular file that is a Windows reparse point of a kind
+    :func:`_readable_reparse` does not name; on a plain file, or a placeholder it names, the
+    ``EINVAL`` is re-raised. A refused open whose name is gone by that ``lstat``, while its
+    directory is still there, raises ``FileNotFoundError``, whatever the open met, so the race
+    answers the same on every platform. Raises :class:`_NotPlainError` for a refusal, and any other ``OSError`` the
     filesystem gives, ``FileNotFoundError`` and ``PermissionError`` included. An error of the open
     itself carries the re-check's verdict for :func:`_refused_read`."""
     before = path.lstat()
@@ -528,10 +529,27 @@ def _refused_read(exc: OSError) -> _ReadRefusal | None:
 #: What a fresh ``lstat`` shows of a part after an access to it was refused (:func:`_recheck`).
 _Recheck = Literal["unplain", "plain", "reparse", "gone", "unnamed", "unchecked"]
 
-#: Windows reparse tags of files that are read as the file they are, though a filter serves them:
-#: at least data deduplication (``IO_REPARSE_TAG_DEDUP``) and the compressed files of WOF
-#: (``IO_REPARSE_TAG_WOF``). Cloud-files placeholders are matched by :func:`_readable_reparse`.
-_READABLE_REPARSE_TAGS = frozenset({0x80000013, 0x80000017})
+#: Windows reparse tags of files that are read as the file they are, though a filter or an agent
+#: serves them, so an ``EINVAL`` while it is not running is no damage: at least data deduplication
+#: (``IO_REPARSE_TAG_DEDUP``), WOF compression (``_WOF``), single-instance storage (``_SIS``), the
+#: HSM stubs (``_HSM``, ``_HSM2``), Azure File Sync (``_STORAGE_SYNC``), container isolation
+#: (``_WCI``, ``_WCI_1``), ProjFS (``_PROJFS``) and OneDrive (``_ONEDRIVE``). Cloud-files
+#: placeholders are matched by :func:`_readable_reparse`. A tag missing here reads as damage, so
+#: the list is the residual risk of the EINVAL rule (BACKLOG #5388 added item 3).
+_READABLE_REPARSE_TAGS = frozenset(
+    {
+        0x80000013,
+        0x80000017,
+        0x80000007,
+        0xC0000004,
+        0x80000006,
+        0x8000001E,
+        0x80000018,
+        0x90001018,
+        0x9000001C,
+        0x80000021,
+    }
+)
 
 
 def _readable_reparse(tag: int) -> bool:
@@ -578,17 +596,19 @@ def _recheck(name: object, cause: OSError) -> _Recheck:
     return "unchecked"
 
 
-def _refused_unlink(exc: OSError, path: Path) -> _ReadRefusal | None:
+def _refused_unlink(exc: OSError, path: Path) -> _ReadRefusal | Literal["gone"] | None:
     """How the delete answers ``exc``, raised unlinking the body ``path`` (BACKLOG #5388 added
-    item 3). ``"damaged"`` only when the body is now a directory, which no unlink removes: a FIFO,
-    a socket or a device is unlinked as a file is, so its kind is not why an unlink failed.
-    ``"denied"`` for any other ``PermissionError``, and ``None`` for any other ``OSError``, which
-    the caller raises as it is. A body that cannot be checked again is a directory only by
-    ``EISDIR``; that check's failure is logged, never swallowed."""
+    item 3). ``"gone"`` when the body is not there by a fresh ``lstat``, as when another remover
+    held it delete-pending, so the delete goes on to the sidecar. ``"damaged"`` only when the body
+    is now a directory, which no unlink removes: a FIFO, a socket or a device is unlinked as a file
+    is, so its kind is not why an unlink failed. ``"denied"`` for any other ``PermissionError``, and
+    ``None`` for any other ``OSError``, which the caller raises as it is. A body that cannot be
+    checked again is a directory only by ``EISDIR``; that check's failure is logged, never
+    swallowed."""
     try:
         folder = S_ISDIR(os.lstat(path).st_mode)
     except FileNotFoundError:
-        folder = False
+        return "gone"
     except OSError as again:
         _log.warning(
             "uploaded-file body could not be checked again after a refused unlink (%s): %s",
@@ -910,8 +930,13 @@ class UploadDeleteIncompleteError(UploadError):
     own read of it does on Windows (:func:`_in_use`)."""
 
     def __init__(self, file_id: str, removed: UploadedFileMeta | None = None) -> None:
-        super().__init__(file_id, removed)
+        # Only the id in args: the metadata holds the uploader's filename, which an orphaned
+        # operation's log line would print through the error's repr.
+        super().__init__(file_id)
         self.removed = removed
+
+    def __reduce__(self) -> tuple[type[UploadDeleteIncompleteError], tuple[object, ...]]:
+        return (type(self), (self.args[0], self.removed))
 
 
 @dataclass(frozen=True)
@@ -3129,10 +3154,11 @@ class UploadStore:
                     if _in_use(exc):
                         in_use = codec_safe_str(exc)
                     else:
-                        refused = _refused_unlink(exc, blob_path)
-                        if refused is None:
+                        unlinked = _refused_unlink(exc, blob_path)
+                        if unlinked is None:
                             raise
-                        body_refusal = (codec_safe_str(exc), refused)
+                        if unlinked != "gone":
+                            body_refusal = (codec_safe_str(exc), unlinked)
                 # After the handler, as _refusal requires, so the error is on no chain.
                 if in_use is not None:
                     _log.warning(

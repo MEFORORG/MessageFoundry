@@ -221,8 +221,14 @@ async def test_an_invalid_open_of_an_unlisted_reparse_point_is_damage(
 
 @pytest.mark.parametrize(
     "info",
-    [_regular(0x20, 0), _regular(0x420, 0x9000101A), _regular(0x420, 0x80000013)],
-    ids=["plain-file", "cloud-placeholder", "dedup"],
+    [
+        _regular(0x20, 0),
+        _regular(0x420, 0x9000101A),
+        _regular(0x420, 0x80000013),
+        _regular(0x420, 0x8000001E),
+        _regular(0x420, 0x80000021),
+    ],
+    ids=["plain-file", "cloud-placeholder", "dedup", "azure-file-sync", "onedrive"],
 )
 async def test_an_invalid_open_of_a_readable_file_is_re_raised(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, info: Any
@@ -272,10 +278,35 @@ async def test_a_part_whose_directory_went_is_not_called_gone(
     assert raised.value.errno == errno.EIO
 
 
-def test_the_incomplete_error_copies() -> None:
-    exc = UploadDeleteIncompleteError("f" * 32, None)
-    assert copy.copy(exc).args == exc.args
-    assert pickle.loads(pickle.dumps(exc)).removed is None
+async def test_the_incomplete_error_copies_and_its_args_hold_no_filename(tmp_path: Path) -> None:
+    meta = await _saved(_store(tmp_path / "uploads"))
+    exc = UploadDeleteIncompleteError(meta.file_id, meta)
+    assert copy.copy(exc).removed == meta and copy.copy(exc).args == exc.args
+    assert pickle.loads(pickle.dumps(exc)).removed == meta
+    # An orphaned operation logs the error's repr, so the uploader's filename must not be in it
+    # (round-f03184d8 finding 4).
+    assert exc.args == (meta.file_id,) and meta.filename not in repr(exc)
+
+
+async def test_a_body_gone_after_its_unlink_failed_lets_the_delete_finish(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Another remover held the body delete-pending, so its unlink was refused and it is gone by
+    # the re-check. On 3ac67f76c81 that answered access refused, leaving the sidecar listed.
+    store = _store(tmp_path / "uploads")
+    meta = await _saved(store)
+    blob = _blob(store, meta.file_id)
+    real = Path.unlink
+
+    def _unlink(self: Path, missing_ok: bool = False) -> None:
+        if self == blob and blob.exists():
+            real(self)
+            raise PermissionError(errno.EACCES, "Access is denied", str(self))
+        real(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _unlink)
+    assert await store.delete(meta.file_id) == meta
+    assert not _sidecar(store, meta.file_id).exists()
 
 
 @pytest.mark.parametrize("met", [errno.ENXIO, errno.EINVAL], ids=["linux-socket", "windows-socket"])
