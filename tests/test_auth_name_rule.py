@@ -73,8 +73,6 @@ def test_the_rule_refuses(name: str) -> None:
     assert name_refusal(name) is not None
     with pytest.raises(ValidationError) as refused:
         DirectoryUserCreateRequest(username=name)
-    # The directory username's Field refuses an empty name and a NUL itself, before the name rule
-    # runs (it keeps main's published schema); every other case here reaches the name rule.
     if name == "":
         expected = "string_too_short"
     elif "\x00" in name:
@@ -514,9 +512,7 @@ def test_the_literal_pattern_agrees_with_the_shared_one() -> None:
 
 
 def test_the_directory_username_schema_is_the_one_origin_main_published() -> None:
-    """The name rule runs after the Field's own checks, so the published schema keeps the bounds
-    and the NUL pattern main published, and a schema-driven client still learns them. The value
-    below is origin/main's ``model_json_schema`` for the field, read before the rule landed."""
+    """The field's published schema, as ``DirectoryUserCreateRequest`` declares it."""
     schema = DirectoryUserCreateRequest.model_json_schema()["properties"]["username"]
     assert schema == {
         "maxLength": 256,
