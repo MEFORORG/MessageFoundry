@@ -1236,6 +1236,8 @@ async def _start_then_flip(tmp_path: Path, *, base_dir: str, dry_run: bool = Fal
         try:
             return await engine.reload_detail(cfg, dry_run=dry_run)
         except WiringError as exc:
+            live = engine.registry_runner.registry
+            assert live.outbound["OB_OFF"].deployed is False, "a refusal leaves the old graph"
             return exc
 
 
@@ -1336,3 +1338,36 @@ def test_value_file_guard_is_off_without_a_root_or_value_file(tmp_path: Path) ->
     assert explicit_root_value_file_guard(rooted, lambda: {}) is None
     assert explicit_root_value_file_guard(rooted, _NoFile()) is None
     assert explicit_root_value_file_guard(rooted, provider) is not None
+
+
+def test_value_file_guard_reads_disk_where_the_snapshot_left_the_file_out(tmp_path: Path) -> None:
+    """A start whose snapshot could not read the value file keeps the values read when the engine
+    was built, so the guard asks the disk rather than refusing a file that is there."""
+    from messagefoundry.__main__ import _environment_values_reader
+    from messagefoundry.config.anchor import explicit_root_value_file_guard
+    from messagefoundry.config.settings import EnvironmentsSettings, ServiceSettings
+    from messagefoundry.config.snapshot import ConfigSnapshot
+    from messagefoundry.config.wiring import WiringError
+
+    cfg = _config_dir(tmp_path, _ENV_GRAPH, name="cfg")
+    (cfg / "environments").mkdir()
+    value_file = cfg / "environments" / "dev.toml"
+    value_file.write_text('peer_host = "h"\n', encoding="utf-8")
+    reg = load_config(cfg)
+    snap = reg.config_snapshot
+    assert snap is not None
+    reg.config_snapshot = ConfigSnapshot(
+        directory=snap.directory,
+        files={k: v for k, v in snap.files.items() if k != "environments/dev.toml"},
+        unreadable=(*snap.unreadable, "environments/dev.toml"),
+    )
+    provider = _environment_values_reader(base_dir=cfg, dir_name="environments", environment="dev")
+    guard = explicit_root_value_file_guard(
+        ServiceSettings(environments=EnvironmentsSettings(base_dir=str(cfg))), provider
+    )
+    assert guard is not None
+    assert reg.config_snapshot.left_out_environment_file(value_file), "control: left out"
+    guard(reg)  # the file is there: no refusal
+    value_file.unlink()
+    with pytest.raises(WiringError, match="no value file was found"):
+        guard(reg)

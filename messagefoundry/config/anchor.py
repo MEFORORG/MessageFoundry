@@ -182,8 +182,9 @@ def _iter_settings_values(registry: Registry) -> Iterable[Any]:
     from (BACKLOG #5775). It is never built (ADR 0111 AC-1), so counting all of it failed the AC-3
     check under an explicit root for a connection that is switched off. The ``.processed`` archive
     sweep's guard still resolves those directory settings on every connection, deployed or not
-    (``RegistryRunner.archive_guard_dirs``), and with a value missing there it deletes nothing, so
-    they still count. Turning the connection on is a config change that takes a reload, and a
+    (``RegistryRunner.archive_guard_dirs``), so they still count: with no value file, a missing
+    value there makes the sweep delete nothing, and an ``env(default=...)`` there makes the guard
+    protect the default directory rather than the one the value file would name. Turning the connection on is a config change that takes a reload, and a
     reload runs the same check again (:func:`explicit_root_value_file_guard`).
     """
     from messagefoundry.transports.base import guard_dir_settings
@@ -254,9 +255,10 @@ def explicit_root_value_file_guard(
 
     The engine runs its guard at the first load and on every reload, a dry run included, over the
     whole graph before an engine shard's filter, so every engine shard reaches one verdict. Where
-    the load's config snapshot covers the value file, presence is the snapshot's, the read the
-    reload's values were parsed from; else it is a stat of the file. The refusal names paths only,
-    never a value."""
+    the load's config snapshot covers and read the value file, presence is the snapshot's, the
+    read a reload's values are parsed from; else it is a stat of the file now
+    (:func:`_value_file_present`), which a reload that read its values from disk took earlier. The
+    refusal names paths only, never a value."""
     if settings is None or not settings.environments.base_dir:
         return None
     if not isinstance(provider, SnapshotEnvValuesProvider):
@@ -268,12 +270,13 @@ def explicit_root_value_file_guard(
     def _refuse_missing_value_file(registry: Registry) -> None:
         if not graph_references_env(registry):
             return  # zero-env() graph: the silent-empty contract is preserved (AC-3).
-        fault = ""
+        present: bool | None = None
+        fault = "unknown fault"
         try:
             present = _value_file_present(registry, value_file)
         except OSError as exc:
             fault = safe_exc(exc)
-        if fault:
+        if present is None:
             # Raised outside the handler, so it carries no exception chain.
             raise WiringError(
                 f"the graph references env() and the value file {value_file} could not be "
@@ -282,8 +285,8 @@ def explicit_root_value_file_guard(
         if not present:
             raise WiringError(
                 f"the graph references env() but no value file was found at {value_file}, and "
-                "[environments].base_dir names an explicit project root. Create the file, or "
-                "correct [environments].base_dir and restart."
+                "[environments].base_dir names an explicit project root. Create the file and "
+                "reload, or correct [environments].base_dir and restart."
             )
 
     return _refuse_missing_value_file
@@ -291,11 +294,17 @@ def explicit_root_value_file_guard(
 
 def _value_file_present(registry: Registry, value_file: Path) -> bool:
     """Whether ``value_file`` is there for this load: as its config snapshot read it where the
-    snapshot covers it, else as a stat finds it now. Raises ``OSError`` for a fault, never reading
-    one as no file (:func:`~messagefoundry.config.snapshot.is_regular_file`)."""
+    snapshot covers it and could read it, else as a stat finds it now, as for a start whose
+    snapshot left the file out and which keeps the values read when the engine was built. Raises
+    ``OSError`` for a fault, never reading one as no file
+    (:func:`~messagefoundry.config.snapshot.is_regular_file`)."""
     from messagefoundry.config.snapshot import is_regular_file
 
     snapshot = registry.config_snapshot
-    if snapshot is not None and snapshot.covers_environment_file(value_file):
+    if (
+        snapshot is not None
+        and snapshot.covers_environment_file(value_file)
+        and not snapshot.left_out_environment_file(value_file)
+    ):
         return snapshot.environment_file(value_file) is not None
     return is_regular_file(value_file)
