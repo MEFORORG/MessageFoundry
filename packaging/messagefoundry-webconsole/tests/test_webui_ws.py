@@ -124,11 +124,13 @@ async def test_ws_cookie_auth_refuses_an_unparseable_origin(engine: Engine) -> N
     for public_origin in (None, "http://t"):
         app = create_app(engine, auth=service, serve_ui=True, public_origin=public_origin)
         ws = _FakeWS(origin="http://[x", host="t", cookie=token, app=app)
+        record_ws_gate(ws, admitted=True)  # type: ignore[arg-type]  # the refusal must clear it
         identity, _ = await authorize_ui_ws(ws, Permission.MONITORING_READ)  # type: ignore[arg-type]
         assert identity is None, public_origin
         assert not ws_accept_allowed(ws.scope)
         ok = _FakeWS(origin="http://t", host="t", cookie=token, app=app)
         assert (await authorize_ui_ws(ok, Permission.MONITORING_READ))[0] is not None  # type: ignore[arg-type]
+        assert ws_accept_allowed(ok.scope)
 
 
 async def test_ws_cookie_auth_rejects_a_repeated_or_blank_origin(engine: Engine) -> None:
@@ -1123,3 +1125,22 @@ def test_public_origin_matching_is_case_insensitive() -> None:
 
     assert _origin_matches(_NoPO(), "http://T", "t")  # Host fallback is case-insensitive too
     assert not _origin_matches(_NoPO(), "http://evil", "t")
+
+
+def test_an_unparseable_origin_matches_nothing_on_any_posture() -> None:
+    """Each of these makes ``urlsplit`` raise ValueError, with more than one message. On every
+    posture ``_origin_matches`` answers False for them rather than raising, and the control shows
+    each posture still matches its own origin where it matches any."""
+    from messagefoundry_webconsole._auth import _origin_matches
+
+    postures = {
+        "public origin": SimpleNamespace(public_origin="http://t"),
+        "host fallback": SimpleNamespace(public_origin=None),
+        "proxied loopback": SimpleNamespace(
+            public_origin=None, loopback=True, webauthn_rp_from_request=False
+        ),
+    }
+    for name, state in postures.items():
+        for origin in ("http://[x", "http://x]", "http://[x]", "http://[::1]x"):
+            assert not _origin_matches(state, origin, "t"), (name, origin)
+        assert _origin_matches(state, "http://t", "t") is (name != "proxied loopback"), name
