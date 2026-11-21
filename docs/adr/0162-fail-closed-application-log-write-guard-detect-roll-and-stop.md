@@ -486,11 +486,11 @@ bullet, "On `GET /status` the latch changes only the `state` field": the latch n
 `latch_only`.**
 
 Each sink on `GET /status` (`LogSinkInfo`, from `LogSinkStatus`) carries `latch_only`. It is true
-when the sink reads `unwritable` only through the flap latch, while its own state is `rolled`.
-It is false whenever the sink's own state is `unwritable`, whatever made it so, at least a failed
-replacement, a roll past the bound and a formatter fault. It is also false in the interval where
-the roll that trips the bound has written `rolled` and not yet reached
-`LogWriteGuard.record_unwritable`. This is the field's one definition; the other documents point
+when the sink reads `unwritable` only through the flap latch, while its own state is `rolled`,
+except in the interval where the roll that trips the bound has written `rolled` and not yet
+reached `LogWriteGuard.record_unwritable`, where it is false. It is false whenever the sink's own
+state is `unwritable`, whatever made it so, at least a failed replacement, a roll past the bound
+and a formatter fault. This is the field's one definition; the other documents point
 here. Only `status()` and `GET /status` carry the field. The stop decision, the pages and
 `revalidate()` do not read it, though the latch itself is read by more than `/status`, as
 Amendments B and C say.

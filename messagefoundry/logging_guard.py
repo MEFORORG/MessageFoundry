@@ -270,8 +270,10 @@ class LogWriteGuard:
 
     def status(self) -> list[LogSinkStatus]:
         """Each sink as ``GET /status`` shows it. A sink the flap latch holds reads ``unwritable``,
-        and ``latch_only`` says when the latch alone makes it so; every other field, the cause and
-        the rolled-aside path included, is what the guard records with or without the latch."""
+        and ``latch_only`` says when the latch alone makes it so, except in the interval where the
+        roll that trips the bound has not yet reached :meth:`record_unwritable` (ADR 0162
+        amendment D); every other field, the cause and the rolled-aside path included, is what the
+        guard records with or without the latch."""
         with self._lock:
             return sorted((self._reported(s) for s in self._sinks.values()), key=lambda s: s.sink)
 
