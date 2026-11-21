@@ -526,16 +526,22 @@ def test_every_mutated_payload_keeps_the_sentinel() -> None:
     marker = sentinel.encode()
     _, x12 = mutation_seeds(sentinel)
     isa, iea = x12[:_ISA_LEN], x12[x12.rindex(b"IEA") :]
-    for s in (seed, seed + 1, seed + 2):
-        cases = mutation_cases(s, max(48, int(policy["mutations"])), _CAP, sentinel)
-        assert {c.plane for c in cases} == {"mllp", "x12"}
-        lost = [c.name for c in cases if marker not in c.payload]
-        assert not lost, f"mutations at seed {s} that lost the sentinel: {lost}"
-        for c in cases:
-            if c.plane == "x12":
-                assert c.payload.startswith(isa) and c.payload.endswith(iea), c.name
-            # An MLLP payload is the body plus three framing bytes.
-            assert len(c.payload) <= _CAP // 2 + 3, (c.name, len(c.payload))
+    per_seed = max(48, int(policy["mutations"]))
+    cases = [
+        (s, c)
+        for s in (seed, seed + 1, seed + 2)
+        for c in mutation_cases(s, per_seed, _CAP, sentinel)
+    ]
+    # The positive control: three seeds' worth of cases, so an empty walk cannot pass the check below.
+    assert len(cases) >= 3 * per_seed, len(cases)
+    assert {c.plane for _, c in cases} == {"mllp", "x12"}
+    lost = [(s, c.name) for s, c in cases if marker not in c.payload]
+    assert not lost, f"mutations (seed, name) that lost the sentinel: {lost}"
+    for _, c in cases:
+        if c.plane == "x12":
+            assert c.payload.startswith(isa) and c.payload.endswith(iea), c.name
+        # An MLLP payload is the body plus three framing bytes.
+        assert len(c.payload) <= _CAP // 2 + 3, (c.name, len(c.payload))
 
 
 def test_keep_sentinel_appends_after_a_cut_and_respects_the_limit() -> None:
@@ -749,9 +755,12 @@ def test_the_ingress_job_is_not_required_and_its_name_is_unique() -> None:
     name = _ingress_job()["name"]
     assert "${{" not in name
     assert name not in required_contexts()
+    workflows = sorted(WORKFLOWS.glob("*.yml"))
+    # The positive control: the walk reaches the workflow files, so it cannot pass on nothing.
+    assert len(workflows) >= 1, WORKFLOWS
     elsewhere = [
         (path.name, key)
-        for path in sorted(WORKFLOWS.glob("*.yml"))
+        for path in workflows
         for key, job in jobs_of(path.name).items()
         if context_of(key, job) == name and key != "dast-ingress"
     ]
