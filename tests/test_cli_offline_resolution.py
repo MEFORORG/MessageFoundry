@@ -421,8 +421,9 @@ def _offline_argv(command: str, tmp_path: Path, *extra: str) -> list[str]:
 
 
 def _assert_reports_unresolved(command: str, rc: int, captured: Any, key: str) -> None:
-    """validate and dryrun fail on a reference that does not resolve; graph is a viewer and lists
-    it under env_problems beside the graph, exiting 0 (vault BACKLOG #5554, a Manager decision)."""
+    """validate and dryrun fail on a reference that does not resolve, or on settings or a value
+    file that cannot be read; graph is a viewer and lists each under env_problems beside the graph,
+    exiting 0 (vault BACKLOG #5554, a Manager decision)."""
     if command == "graph":
         assert rc == 0, captured
         problems = json.loads(captured.out)["env_problems"]
@@ -541,8 +542,7 @@ def test_offline_env_reports_a_malformed_value_file_without_its_content(
     monkeypatch.chdir(cwd)
     rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), "--env", "dev"))
     captured = capsys.readouterr()
-    assert rc != 0, captured
-    assert "dev.toml" in captured.out + captured.err, captured
+    _assert_reports_unresolved(command, rc, captured, "dev.toml")
     assert _SECRET_HOST not in captured.out + captured.err, captured
 
 
@@ -585,8 +585,7 @@ def test_offline_env_refuses_a_service_config_that_is_no_file(
     monkeypatch.chdir(cwd)
     typo = ["--service-config", str(tmp_path / "typo.toml")]
     rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), *typo, "--env", "prod"))
-    captured = capsys.readouterr()
-    assert rc != 0 and "service config not found" in captured.out + captured.err, captured
+    _assert_reports_unresolved(command, rc, capsys.readouterr(), "service config not found")
     # Control: without --env no values are read, so the flag is not judged here, as before.
     rc = main(_offline_argv(command, tmp_path, "--config", str(cfg), *typo))
     assert rc == 0, capsys.readouterr()
@@ -730,3 +729,8 @@ def test_offline_env_fails_loud_under_a_settings_base_dir(
     err = capsys.readouterr().err
     assert rc == 2 and str(deploy / "environments" / "prod.toml") in err, err
     assert "[environments].base_dir" in err and _SECRET_HOST not in err
+    # graph keeps the refusal to an explicit --project-root, as before --env read values, and
+    # still prints the graph here.
+    rc = main(["graph", "--config", str(cfg), "--env", "prod", "--json"])
+    captured = capsys.readouterr()
+    assert rc == 0 and json.loads(captured.out)["env_problems"] == [], captured

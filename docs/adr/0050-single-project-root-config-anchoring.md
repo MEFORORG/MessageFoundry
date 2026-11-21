@@ -462,15 +462,17 @@ those settings, and its Handlers still run with no active environment.
   and `dryrun` now run the service settings load `serve` runs, with `--env` as the
   `[ai].environment` override and `--project-root` as the `[environments].base_dir` override that
   `serve` applies. That one load names the value file for both the missing-file check (AC-3) and
-  the read, and the check fires wherever it names a project root, a `base_dir` from the settings
-  file or the environment included, as `serve`'s does. They read the file with `serve`'s own
-  reader, so overrides such as `MEFOR_VALUE_*` apply. Settings that do not load fail the command,
-  naming the settings file; a value file that cannot be read fails it, naming the value file.
-  Neither failure names a value. They resolve every `env()` reference of each deployed connection
-  and lookup, and report one that does not resolve by its key, never its value. `validate` lists
-  it with its other problems and `dryrun` stops on it. `graph` lists it under `env_problems`
-  beside the graph and exits as it would without it, because it reports a graph and does not gate
-  one (BACKLOG #1648); that is a Manager decision. A reference set is left out, as `serve` and
+  the read. For `validate` and `dryrun` the check fires wherever that load names a project root,
+  a `base_dir` from the settings file or the environment included, as `serve`'s does; for `graph`
+  it fires under an explicit `--project-root` only, as before. They read the file with `serve`'s
+  own reader, so overrides such as `MEFOR_VALUE_*` apply. Settings that do not load are reported
+  as `serve`'s settings load renders them, naming the settings file where one exists; a value file
+  that cannot be read is reported naming that file. They resolve every `env()` reference of each
+  deployed connection and lookup, and report one that does not resolve by its key, never its
+  value. `validate` lists each of these failures with its other problems and `dryrun` stops on
+  it. `graph` lists it under `env_problems` beside the graph and exits as it would without it,
+  because it reports a graph and does not gate one (BACKLOG #1648); that is a Manager decision.
+  A reference set is left out, as `serve` and
   `check` leave an unresolved one to its sync. Without `--env` nothing changes. Where they still
   differ from `serve`, at least:
 
@@ -486,5 +488,5 @@ reads `MEFOR_ENVIRONMENTS_DIR` above the file's `[environments].dir`, as `serve`
 does. The file it reads that `dir` from can still differ from the one `serve` reads. For `check`
 it does not cover a `[environments].base_dir` set in the file or the environment without
 `--project-root`: `serve` fails loud on a missing value file under that root, and `check`'s value-file
-check fires only under an explicit `--project-root`. `validate`, `graph` and `dryrun` cover it
-since the 2026-11-20 note above.
+check fires only under an explicit `--project-root`, and so does `graph`'s. `validate` and `dryrun`
+cover it since the 2026-11-20 note above.

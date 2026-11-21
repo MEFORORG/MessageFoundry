@@ -406,7 +406,9 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         graph,
         env_help=_offline_env_help(
             "A reference that does not resolve is listed under env_problems beside the graph, "
-            "naming its key; graph reports it and does not fail on it."
+            "naming its key, as are settings or a value file that cannot be read; graph reports "
+            "them and does not fail on them.",
+            root_scope="Under an explicit --project-root",
         ),
     )
     graph.add_argument("--json", action="store_true", help="emit JSON")
@@ -1423,17 +1425,18 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     return parser, _DISPATCH
 
 
-def _offline_env_help(outcome: str) -> str:
+def _offline_env_help(outcome: str, *, root_scope: str = "Where a project root is set") -> str:
     """The ``--env`` help of ``validate``/``graph``/``dryrun``; ``outcome`` says what the command
-    does with a reference that does not resolve (vault BACKLOG #5554)."""
+    does with a reference that does not resolve, and ``root_scope`` where its missing-value-file
+    refusal applies (vault BACKLOG #5554)."""
     return (
         "active environment NAME. The command resolves every env() reference of each deployed "
         "connection and lookup against that environment's values. It finds them through the "
         "settings load serve runs, with --env as [ai].environment and --project-root as "
         "[environments].base_dir (default: the working directory). It reads them with serve's "
         f"value reader, so overrides such as MEFOR_VALUE_* apply. {outcome} A resolved value is "
-        "never printed. Where a project root is set, a graph that references env() fails when its "
-        "value file is missing. No connector is built: at least the build and posture checks are "
+        f"never printed. {root_scope}, a graph that references env() fails when its value file is "
+        "missing. No connector is built: at least the build and posture checks are "
         "left to check --env. ADR 0050 lists where this still differs from serve."
     )
 
@@ -1538,7 +1541,11 @@ def _resolve_offline_anchor(
 
 
 def _offline_env_values(
-    args: argparse.Namespace, config_dir: str, service_config: str | None
+    args: argparse.Namespace,
+    config_dir: str,
+    service_config: str | None,
+    *,
+    settings_root_check: bool = True,
 ) -> dict[str, Any] | int | None:
     """The ``env()`` values ``validate``/``graph``/``dryrun`` resolve against: ``None`` with no
     ``--env``, or an exit code, already reported, for the AC-3 missing-value-file refusal (vault
@@ -1548,13 +1555,15 @@ def _offline_env_values(
     serve runs, with ``--env`` as the ``[ai].environment`` override and ``--project-root`` as the
     ``[environments].base_dir`` override serve applies. ``service_config`` is the file
     :func:`_resolve_offline_anchor` chose. The AC-3 check fires wherever that load names a project
-    root, as serve's does, including a ``base_dir`` from the file or the environment. The values
+    root, as serve's does, including a ``base_dir`` from the file or the environment;
+    ``settings_root_check=False`` (``graph``) keeps it to an explicit ``--project-root``. The values
     are read by :func:`_read_environment_values`, serve's own reader, so overrides such as
     ``MEFOR_VALUE_*`` apply. A value file that is absent reads as no values, as serve's read does,
     so each reference it would have supplied is reported missing; a note on stderr names the file
     looked for. Raises :class:`~messagefoundry.config.wiring.WiringError` for settings that do not
-    load, naming the settings file, and for a value file that cannot be read, naming that file.
-    Neither names a value, and the callers never print a resolved value."""
+    load, rendered as :func:`_load_service_settings` renders them and naming the settings file when
+    one exists, and for a value file that cannot be read, naming that file. The callers never print
+    a resolved ``env()`` value."""
     from messagefoundry.config.anchor import resolve_project_root
     from messagefoundry.config.environments import resolve_values_base_dir, values_file_path
     from messagefoundry.config.settings import settings_file_path
@@ -1568,16 +1577,17 @@ def _offline_env_values(
     # Rendered, never stringified: see _load_service_settings.
     settings, detail = _load_service_settings(service_config, cli=cli)
     if settings is None:
-        raise WiringError(
-            f"could not load the service settings ({settings_file_path(service_config)}): "
-            f"{detail or 'no detail'}"
-        )
+        settings_file = settings_file_path(service_config)
+        # Name the file only where there is one: with none, the failure is the environment's or
+        # the command line's, and a named file would send the operator to the wrong place.
+        source = f" ({settings_file})" if settings_file.exists() else ""
+        raise WiringError(f"could not load the service settings{source}: {detail or 'no detail'}")
     cwd = Path.cwd()
     base_dir = resolve_values_base_dir(settings.environments.base_dir, cwd=cwd)
     dir_name = settings.environments.dir
     # serve's AC-3 root is the merged base_dir, so a file- or environment-set one counts too.
     root = resolve_project_root(settings.environments.base_dir or None, cwd=cwd)
-    if root is not None:
+    if root is not None and (settings_root_check or args.project_root is not None):
         rc = _check_env_file_present(
             config_dir,
             root,
@@ -6130,9 +6140,19 @@ def _graph(args: argparse.Namespace) -> int:
     if isinstance(resolved, int):
         return resolved
     config_dir, service_config = resolved
-    env_values = _offline_env_or_exit(args, config_dir, service_config)
-    if isinstance(env_values, int):
-        return env_values
+    # graph reports a graph and does not gate one (BACKLOG #1648, and a Manager decision for vault
+    # BACKLOG #5554): a settings or value-file failure under --env is listed beside the graph, and
+    # the missing-value-file refusal stays where it was before --env read values, under an explicit
+    # --project-root only.
+    env_read_problems: list[str] = []
+    try:
+        env = _offline_env_values(args, config_dir, service_config, settings_root_check=False)
+    except WiringError as exc:
+        env_read_problems.append(str(exc))
+        env = None
+    if isinstance(env, int):
+        return env
+    env_values = env
     try:
         # allow_empty: `graph` REPORTS a graph, it does not gate one (BACKLOG #1648), and its edges
         # come from Routers and Handlers, which a connection-less config still has. Refusing here
@@ -6141,8 +6161,13 @@ def _graph(args: argparse.Namespace) -> int:
     except WiringError as exc:
         return _emit_error(str(exc), as_json=args.json)
     # For the same reason an env() reference that does not resolve is reported beside the graph,
-    # never instead of it (vault BACKLOG #5554, a Manager decision). Keys only, never values.
-    env_problems = None if env_values is None else reg.env_resolution_problems(env_values)
+    # never instead of it. Keys only, never values.
+    env_problems: list[str] | None = None
+    if args.env is not None:
+        env_problems = [
+            *env_read_problems,
+            *([] if env_values is None else reg.env_resolution_problems(env_values)),
+        ]
     # Edges come from the one authoritative static extractor (ADR 0091 D1): AST-first with the
     # legacy string-constant scan as a fallback tier, provenance-tagged, plus reverse adjacency.
     # v1 fields ("handlers"/"sends" name lists, per-element file/line) are preserved unchanged;
