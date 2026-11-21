@@ -958,10 +958,8 @@ from typing import Any
 #: factories hand it their new-address question, so a refused request spends no budget. The
 #: snapshot hashes those gates' bodies and closures, so the digest moved. No engine surface
 #: changed. Re-derived with ``--write``, from ``0cb66e183386b7c8`` to ``3ada6b29fc47e480``, and
-#: again when those factories' own refusals took their continuation from
-#: ``_step_up_continuation``, working it out only on a refusal, to ``7c3240bbbaf0605a``.
-#: ``spend_ui_action_step_up`` still takes the route's ``reauth_next`` on the ``spend=False``
-#: routes.
+#: again when those factories took every continuation from ``_step_up_continuation``, working it
+#: out only on a refusal, to ``7c3240bbbaf0605a``.
 #:
 #: The digest below covers the surface DISCOVERED from the console's own imports and uses, which is
 #: strictly larger than the five hand-maintained tuples it replaced -- those had drifted, and the
