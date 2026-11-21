@@ -347,6 +347,7 @@ from messagefoundry.config.ai_policy import (
     AiMode,
     resolve_effective_policy,
 )
+from messagefoundry.config.anchor import explicit_root_value_file_preflight
 from messagefoundry.config.fingerprint import (
     ConfigDirMissing,
     DigestCoverage,
@@ -13162,8 +13163,14 @@ def create_managed_app(
                 # Dormant when no connection names a CA: no store call, no audit row.
                 # BACKLOG #3402: the caller's own preflight runs first, beside it and never in its
                 # place, so a graph it refuses writes no anchor audit row.
+                # BACKLOG #5775: then the ADR 0050 AC-3 value-file check, so a reload that turns
+                # on a connection whose env() a start did not count is refused as that start
+                # would have been. None, no check, without an explicit project root.
                 registry_preflight=_chain_registry_preflights(
                     registry_preflight,
+                    explicit_root_value_file_preflight(
+                        static_credential_settings, env_values_provider
+                    ),
                     make_registry_anchor_preflight(store, enforcing=trust_anchors_enforcing),
                 ),
                 # vault BACKLOG #2371: the same check, per lane, as the runner builds an outbound or
