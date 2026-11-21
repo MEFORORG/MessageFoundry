@@ -1265,6 +1265,7 @@ class StageDispatcher:
                 # serializer does (PROCESSING, one slot) and readies it again once it lands.
                 st.phase = _LanePhase.PROCESSING
                 st.dirty = False
+                st.episode_start_ns = now_ns  # occupancy, booked as a drop at its release
                 self._reserve_lane_slot(st)
                 repending += 1
                 self._track_lane_task(lane, self._repend_stranded(lane, st.stranded))
@@ -1596,7 +1597,8 @@ class StageDispatcher:
             kept_head = None
             if head_reschedule is not None and head in _RECORDED_ENDS:
                 kept_head = (head_reschedule[0], dated)
-            kept_tail = tuple(tail_ids) if tail in _RECORDED_ENDS else ()
+            # A tail the fence skipped is kept too: _repend_stranded reads the fence again.
+            kept_tail = tuple(tail_ids) if tail is not HoldResult.LANDED else ()
             stranded = _Stranded(kept_head, kept_tail, fence)
         if unlanded:
             log.warning(
@@ -1706,10 +1708,12 @@ class StageDispatcher:
         fence = stranded.fence
         left = stranded
         ended = HoldResult.LANDED
+        due: float | None = None  # the date a landed head was re-pended with
         # Not the leader, nothing is sent (the lane parks below); leading, the fence decides.
-        if fence.is_leader() and fence.superseded():
+        leading = fence.is_leader()
+        if leading and fence.superseded():
             ended = HoldResult.SUPERSEDED
-        elif fence.is_leader():
+        elif leading:
             if left.head is not None:
                 head_id, dated = left.head
                 ended = await self._land_while_holding(
@@ -1719,7 +1723,11 @@ class StageDispatcher:
                     fence,
                 )
                 if ended is HoldResult.LANDED:
-                    left = replace(left, head=None)
+                    left, due = replace(left, head=None), dated
+                    if left.tail and fence.moved():
+                        # As in _run_lane: a lease another node took while the head's write ran
+                        # may cover the tail now, so its release is not sent.
+                        ended = HoldResult.SUPERSEDED
             if ended is HoldResult.LANDED and left.tail:
                 ended = await self._land_while_holding(
                     lane,
@@ -1737,6 +1745,7 @@ class StageDispatcher:
         if st is None:
             return
         self._release_lane_slot(st)
+        self._drop_lane_episode(st, time.perf_counter_ns() if self._lane_episode_timing else 0)
         if ended is HoldResult.SUPERSEDED:
             log.warning(
                 "StageDispatcher %s lane %s: another node may have led since %d stranded row(s) "
@@ -1766,6 +1775,8 @@ class StageDispatcher:
             )
         elif st.stranded is not None:  # not the leader, or a hold that ended unlanded: ask again
             self._park(lane, st, self._clock() + _LANE_ERROR_BACKOFF_SECONDS)
+        elif due is not None and due > self._clock():
+            self._park(lane, st, due)  # the head is not due yet, as _run_lane parks a T17 head
         else:
             self._to_ready(lane, woken=st.ready_woken)
 

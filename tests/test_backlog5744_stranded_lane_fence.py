@@ -123,9 +123,14 @@ async def _next_claim(store: MessageStore, d: stage_dispatcher.StageDispatcher) 
             items = result.by_lane.get(LANE) or []
             return items[0].message_id if items else None
         task = d._lane_tasks.get(LANE)
-        if task is None:
+        until = d.park_until(LANE)
+        if task is not None:
+            await asyncio.wait_for(task, timeout=5.0)
+        elif d.phase(LANE) is stage_dispatcher._LanePhase.PARKED and until is not None:
+            # Parked until the re-pended head is due; its own timer readies it.
+            await asyncio.sleep(max(0.0, until - time.time()) + 0.05)
+        else:
             return None
-        await asyncio.wait_for(task, timeout=5.0)
     raise AssertionError("the lane never reached a claim")
 
 
@@ -247,7 +252,8 @@ async def test_a_record_whose_lease_moved_is_dropped_unwritten(
     monkeypatch.setattr(store, "reschedule_claimed", recording)
     lease.epoch = 8
     assert d.resume_lane(LANE) is True
-    await _next_claim(store, d)
+    claimed = await _next_claim(store, d)
+    assert claimed is not None and claimed != head.message_id  # it claims past, as before
     assert writes == []
     assert await _status(store, head.message_id) == "inflight"
     assert d._states[LANE].stranded is None
@@ -279,3 +285,90 @@ async def test_a_record_waits_while_this_node_is_not_the_leader(
     lease.held = True
     d._unpark(LANE, woken=True)
     assert await _next_claim(store, d) == head.message_id
+
+
+async def _stranded_by_the_bound(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> tuple[stage_dispatcher.StageDispatcher, Any, asyncio.Event, list[str]]:
+    """A head the stop policy's bound left in flight, with the lane STOPPED and the store down."""
+    await _enqueue(store, RAW, RAW_B)
+    head = await store.claim_next_fifo(LANE, stage=Stage.INGRESS.value, now=2.0)
+    assert head is not None
+    down = _outage(monkeypatch, store, "reschedule_claimed")
+    stops: list[str] = []
+    d = _dispatcher(store, _Lease(), _Sink(), stops)
+    _drain_to(monkeypatch, d, stage_dispatcher.LaneResultKind.RETRY, [], (head.id, time.time()))
+    await asyncio.wait_for(d._run_lane(LANE, [head]), timeout=5.0)
+    assert d._states[LANE].phase is stage_dispatcher._LanePhase.STOPPED
+    return d, head, down, stops
+
+
+@pytest.mark.parametrize("end", ["pause", "bound"])
+async def test_a_re_pend_episode_that_does_not_land_keeps_the_record(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch, end: str
+) -> None:
+    """The store is still down when the re-armed lane's episode runs. The bound STOPs the lane
+    again and reports it as its own stop; a pause during the episode PAUSES it. Either way the
+    record stays, so the next re-arm re-pends the head before it claims."""
+    d, head, down, stops = await _stranded_by_the_bound(store, monkeypatch)
+    stops.clear()
+    assert d.resume_lane(LANE) is True
+    real = d._land_while_holding
+    if end == "pause":
+
+        async def paused_mid_hold(*a: Any, **k: Any) -> Any:
+            d.pause_lane(LANE)
+            return await real(*a, **k)
+
+        monkeypatch.setattr(d, "_land_while_holding", paused_mid_hold)
+    assert d._assemble_chunk(d._claimers[0]) == []
+    await asyncio.wait_for(d._lane_tasks[LANE], timeout=5.0)
+    st = d._states[LANE]
+    if end == "pause":
+        assert st.phase is stage_dispatcher._LanePhase.PAUSED
+        monkeypatch.setattr(d, "_land_while_holding", real)
+    else:
+        assert st.phase is stage_dispatcher._LanePhase.STOPPED and stops == [LANE]
+    assert st.stranded is not None and st.slot_held is False
+    assert await _status(store, head.message_id) == "inflight"
+    down.clear()
+    assert d.resume_lane(LANE) is True
+    assert await _next_claim(store, d) == head.message_id
+
+
+async def test_a_tail_release_after_a_moved_lease_is_not_sent(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The episode's head write lands while another node takes the lease. The tail release that
+    would follow may re-pend the successor's claim, so it is not sent and the record is dropped,
+    as _run_lane fences the same window."""
+    await _enqueue(store, RAW, RAW_B)
+    head, tail = await store.claim_next_fifo_batch(
+        LANE, stage=Stage.INGRESS.value, limit=2, now=2.0
+    )
+    lease = _Lease()
+    d = _dispatcher(store, lease, _Sink(), [])
+    fence = stage_dispatcher.RependFence.capture(lease.is_leader, lease.current_epoch)
+    real_reschedule = store.reschedule_claimed
+
+    async def slow_write(ids: list[str], when: float) -> Any:
+        lease.epoch = 8  # another node took the lease while this write ran
+        return await real_reschedule(ids, when)
+
+    released: list[list[str]] = []
+
+    async def recording_release(ids: list[str]) -> None:
+        released.append(list(ids))
+
+    monkeypatch.setattr(store, "reschedule_claimed", slow_write)
+    monkeypatch.setattr(store, "release_claimed", recording_release)
+    d._states[LANE] = stage_dispatcher._LaneState(
+        phase=stage_dispatcher._LanePhase.READY,
+        stranded=stage_dispatcher._Stranded((head.id, time.time()), (tail.id,), fence),
+    )
+    d._enqueue(LANE)
+    assert d._assemble_chunk(d._claimers[0]) == []
+    await asyncio.wait_for(d._lane_tasks[LANE], timeout=5.0)
+    assert released == []
+    assert d._states[LANE].stranded is None
+    assert await _status(store, tail.message_id) == "inflight"
