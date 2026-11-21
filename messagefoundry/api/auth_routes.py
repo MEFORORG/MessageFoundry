@@ -77,6 +77,7 @@ from messagefoundry.api.auth_models import (
     UserPermissions,
     UserSummary,
     UserUpdateRequest,
+    changed_name_refusal,
 )
 from messagefoundry.api.paging import ts_pinned_page
 from messagefoundry.api.security import (
@@ -1650,6 +1651,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         # display_name/email keep their current value (the store sets them unconditionally, so a
         # partial PATCH would otherwise NULL them); an explicit null still clears (review M-20).
         supplied = body.model_fields_set
+        # BACKLOG #5784: a changed display name takes the name rule; the stored one, re-sent while
+        # another field is edited, is exempt (``changed_name_refusal``).
+        if "display_name" in supplied:
+            refusal = changed_name_refusal(body.display_name, current.display_name)
+            if refusal is not None:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_CONTENT, f"display_name {refusal}"
+                )
         # BACKLOG #1139, ADR 0182 Amendment A (the rule is on AuthService.update_user): notify_email
         # is NOT filled from the stored row when omitted, and an explicit null is refused, because a
         # client sending it asked for a clear the address does not allow.

@@ -11,6 +11,7 @@ the two bases.
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Literal
 
 from pydantic import AfterValidator, BaseModel, Field
@@ -18,7 +19,7 @@ from pydantic import AfterValidator, BaseModel, Field
 from messagefoundry.api.request_model import RequestModel
 from messagefoundry.api.validation import (
     MAX_MAP_ENTRIES,
-    SIGN_IN_NAME_PATTERN,
+    PRINTABLE_TEXT_PATTERN,
     ChannelScopeEntry,
     PermissionId,
     RoleId,
@@ -275,6 +276,43 @@ class ChannelScope(RequestModel):
     expected_source: Literal["ad", "manual"] | None = Field(default=None, exclude=True)
 
 
+def name_refusal(name: str) -> str | None:
+    """Why ``name`` may not be stored as an account or role name an administrator sends, or
+    ``None`` when it may (BACKLOG #5784, #5785). Refused: a blank name or one of white space
+    alone, and a name holding a C0 control (NUL included), DEL or a C1 control, the characters
+    :data:`~messagefoundry.api.validation.PRINTABLE_TEXT_PATTERN` excludes. Nothing else is
+    refused here: a format character such as a zero-width joiner, which some scripts need inside
+    a word, passes, and so does white space at an edge. The reason is fixed text that never echoes
+    the value."""
+    if not name.strip():
+        return "must not be blank"
+    if re.fullmatch(PRINTABLE_TEXT_PATTERN, name) is None:
+        return "must not contain a control character"
+    return None
+
+
+def changed_name_refusal(name: str | None, stored: str | None) -> str | None:
+    """:func:`name_refusal` for a name an edit sends, with one exemption: a value equal to the one
+    already stored passes, so a client re-sending a stored name another writer put there, such as
+    a directory sync or a save made before this rule, is not refused while it edits another field.
+    A different value takes the rule, so a repair to a clean name is accepted. ``None`` (a clear,
+    where the field allows one) passes too."""
+    if name is None or name == stored:
+        return None
+    return name_refusal(name)
+
+
+def _printable_name(name: str) -> str:
+    refusal = name_refusal(name)
+    if refusal is not None:
+        raise ValueError(refusal)
+    return name
+
+
+#: A name a create request sends, with no stored value to compare: :func:`name_refusal`'s rule.
+PrintableName = Annotated[str, Field(max_length=_NAME_MAX), AfterValidator(_printable_name)]
+
+
 def _valid_new_username(username: str) -> str:
     """BACKLOG #5521: the rule ``AuthService.create_local_user`` applies, checked here as well so a
     refused name never reaches the route."""
@@ -306,7 +344,8 @@ class UserCreateRequest(RequestModel):
 
     #: Refused, 422, by the new-username rule ``auth/usernames.py`` states (BACKLOG #5521).
     username: NewUsername
-    display_name: str | None = Field(default=None, max_length=_NAME_MAX)
+    #: Refused, 422, by :func:`name_refusal` (BACKLOG #5784).
+    display_name: PrintableName | None = None
     #: REQUIRED (BACKLOG #2018, ASVS 6.3.7). It seeds both the profile address and ``notify_email``,
     #: where every security notice goes. An account born without one is told nothing about a change
     #: made to it before its holder's first sign-in, an administrator's password reset included. The
@@ -329,13 +368,17 @@ class DirectoryUserCreateRequest(RequestModel):
     cannot point the holder's notices away from the directory's (ASVS 6.3.7).
     """
 
-    # vault BACKLOG #5342. Pinned by tests/test_auth_federated_identity_routes.py::
+    # vault BACKLOG #5342, BACKLOG #5784: refused, 422, by :func:`name_refusal` before the
+    # directory is asked. The NUL case is pinned by tests/test_auth_federated_identity_routes.py::
     # test_the_directory_create_refuses_a_nul_in_the_name_before_the_directory.
-    username: str = Field(min_length=1, max_length=_NAME_MAX, pattern=SIGN_IN_NAME_PATTERN)
+    username: PrintableName
     notify_email: str | None = Field(default=None, max_length=_NAME_MAX)
 
 
 class UserUpdateRequest(RequestModel):
+    #: An explicit null clears it. A value is checked by the route, not here, against the stored
+    #: name: :func:`changed_name_refusal` refuses a changed value :func:`name_refusal` refuses,
+    #: with a 422, and lets the stored value through unchanged (BACKLOG #5784).
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
     #: The PROFILE address. It does not move ``notify_email`` (BACKLOG #1139, ADR 0182 Amendment A).
     #: Its shape rule is in ``AuthService.update_user`` (BACKLOG #3278).
