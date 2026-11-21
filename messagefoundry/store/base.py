@@ -5564,11 +5564,16 @@ async def warm_pool_connections(pool: Any, *, target: int, timeout: float, backe
     task with no timeout). On the bound lapsing we accept a *bounded* partial strand rather than hang. See
     :func:`_release_held`.
 
-    **Relied-upon invariant** (leak-freedom of the acquire side rests on it): ``pool.acquire()`` must
-    mark the connection in-use atomically with returning it — true for ``asyncpg>=0.29`` and
-    ``aioodbc>=0.5``. Combined with CPython's cancellation semantics (a ``CancelledError`` delivered while
-    suspended at the ``await`` *raises* rather than yielding the already-resolved connection, so the
-    post-``await`` append never runs), no half-acquired connection can escape ``held`` and leak.
+    **Acquire-side leak-freedom** (BACKLOG #5686): each borrow runs as its own task behind a shield,
+    and the acquiring task only appends what that task returned. A cancel can still land in the same
+    loop turn the borrow resolves, and then the append never runs; awaiting the hand-off directly would
+    discard the connection there, because a pending cancel is thrown in instead of the resolved value.
+    So the cancel path attaches :func:`_salvage_late_borrow` to the borrow, which returns a connection
+    the borrow did hand over, and defers the borrow's cancel with ``call_soon``, so any step the borrow
+    already has scheduled runs first and finishes the hand-over. A cancel that does reach a still-pending borrow lands at one of the
+    driver's own suspension points, and what that does is the driver's: this rests on ``pool.acquire()``
+    marking the connection in-use atomically with returning it, as ``asyncpg>=0.29`` and
+    ``aioodbc>=0.5`` do.
 
     **Acquire-and-release ONLY** — this deliberately opens NO cursor and runs NO statement, so it neither
     needs nor uses the EF-6 ``_cursor`` close-before-release discipline. If a liveness probe (``SELECT 1``)
@@ -5579,9 +5584,17 @@ async def warm_pool_connections(pool: Any, *, target: int, timeout: float, backe
     held: list[Any] = []
 
     async def _acquire_one() -> None:
-        # Append the instant it is acquired (a list append between awaits is atomic on the loop) so the
-        # cleanup below releases it even if the gather is cancelled or times out mid-flight.
-        held.append(await pool.acquire())
+        borrow: asyncio.Future[Any] = asyncio.ensure_future(_as_awaitable(pool.acquire()))
+        try:
+            conn = await asyncio.shield(borrow)
+        except asyncio.CancelledError:
+            # See "Acquire-side leak-freedom" above for why the cancel is deferred one turn.
+            borrow.add_done_callback(partial(_salvage_late_borrow, pool, backend))
+            asyncio.get_running_loop().call_soon(borrow.cancel)
+            raise
+        # No await between the hand-over and the append, so the cleanup below releases it even if the
+        # gather is cancelled or times out mid-flight.
+        held.append(conn)
 
     tasks = [asyncio.create_task(_acquire_one()) for _ in range(target)]
     try:

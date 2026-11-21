@@ -236,6 +236,50 @@ async def test_warm_absorbs_a_release_error_and_releases_the_rest() -> None:
     )  # the loop attempted release for all 3 (did not stop at the raise)
 
 
+class _HandOffPool:
+    """A pool whose ``acquire()`` hands its connection over through a plain future, marking it in-use
+    at the instant it resolves (``checked_out`` is the ground truth for a stranded connection). The
+    test resolves the hand-off and cancels the warm-up in the SAME loop turn, which is the race
+    BACKLOG #5686 names: a task awaiting the future directly has the pending cancel thrown in instead
+    of the resolved connection, so nobody holds it and nobody returns it."""
+
+    def __init__(self) -> None:
+        self.handoffs: list[asyncio.Future[str]] = []
+        self.checked_out: list[str] = []
+
+    def acquire(self) -> asyncio.Future[str]:
+        fut: asyncio.Future[str] = asyncio.get_running_loop().create_future()
+        self.handoffs.append(fut)
+        return fut
+
+    def hand_over(self) -> None:
+        conn = f"conn-{len(self.checked_out) + 1}"
+        self.checked_out.append(conn)  # in-use atomically with the hand-off
+        self.handoffs[0].set_result(conn)
+
+    async def release(self, conn: str) -> None:
+        self.checked_out.remove(conn)
+
+
+async def _settle() -> None:
+    for _ in range(50):
+        await asyncio.sleep(0)
+
+
+async def test_warm_cancelled_in_the_turn_the_acquire_resolves_strands_nothing() -> None:
+    pool = _HandOffPool()
+    task = asyncio.create_task(warm_pool_connections(pool, target=1, timeout=5.0, backend="stub"))
+    await _settle()
+    assert len(pool.handoffs) == 1  # the borrow is parked on the hand-off
+
+    pool.hand_over()  # the pool resolves the borrow ...
+    task.cancel()  # ... and the cancel lands in the same loop turn
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await _settle()  # let a salvage release run
+    assert pool.checked_out == [], "a connection the pool handed over was stranded"
+
+
 # --- warm_pool_target: headroom sizing --------------------------------------
 
 
