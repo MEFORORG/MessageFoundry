@@ -24,8 +24,9 @@ from messagefoundry.serviceenv import (
 )
 
 _KEY_B64 = base64.b64encode(b"synthetic-store-key-0123456789ab").decode()
-#: A base64url stand-in of a 32-byte secret's length, with one ``=`` and a "-" and a "_" in it.
-_URL_ONE_PAD = "synthetic-store_key-0123456789abcdefghijklm="
+#: A base64url stand-in of a 32-byte secret's length, with one ``=``, a "-" and a "_" in it, and
+#: letters of both cases, as a random secret has.
+_URL_ONE_PAD = "Synthetic-Store_Key-0123456789AbCdEfGhIjKlm="
 _EXTRA = "Parameters\\AppEnvironmentExtra"
 _KEY = "MEFOR_STORE_ENCRYPTION_KEY"
 
@@ -82,6 +83,11 @@ def test_key_material_in_the_next_item_makes_the_empty_key_read_as_set(shape: st
     [
         "PATH=C:\\Windows\\system32;C:\\Windows",
         "MEFOR_SECURITY_REQUIRE_MEMORY_ENCRYPTION_DECLARATION=1",
+        # Review round 1: each of these was read as key material by a looser rule.
+        "mefor_security_require_memory_encryption_declaration=1",
+        "PYTHONPYCACHEPREFIX=C:/ProgramData/MessageFoundry/pycache/cachedir",
+        "OTEL_SERVICE_NAME=messagefoundry-integration-engine-production-east",
+        "MEFOR_SECRETS_DIRECTORY=D:/MessageFoundrySecrets/ProductionEngineSecretsDirectory",
     ],
 )
 def test_an_ordinary_line_still_ends_the_empty_key(line: str) -> None:
