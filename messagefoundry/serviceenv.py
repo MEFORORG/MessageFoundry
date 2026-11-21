@@ -456,12 +456,17 @@ def _refused_name(name: str) -> bool:
 def _starts_refused(written: str, *, below_empty_class: bool) -> bool:
     """Whether the text before a line's first equals sign, ``written``, names a variable the
     refusal is about (:func:`_refused_name`), so the line starts a variable of its own. Below an
-    empty secret-class value it must be in upper case, as the engine's names are: mixed-case text
+    empty secret-class value a name that takes either a key or its path
+    (:data:`_INLINE_PEM_NAMES`) must be in upper case, as the engine spells it: mixed-case text
     such as ``Mefor_Auth_Oidc_Client_Private_Key=Summer!`` may be the secret split from its name,
-    and read as that path-form key it would be dropped and the empty value above it with it, so
-    it is read as the value instead, which refuses."""
+    and read as that key it would be dropped as a path, and the empty value above it with it, so
+    it is read as the value instead, which refuses. Any other refused name is kept in any case,
+    as Windows compares names, since it refuses on its own."""
     name = written.strip()
-    return _refused_name(name.upper()) and not (below_empty_class and name != name.upper())
+    upper = name.upper()
+    if below_empty_class and upper in _INLINE_PEM_NAMES and name != upper:
+        return False
+    return _refused_name(upper)
 
 
 def _line_start(line: str, *, below_empty_class: bool = False) -> Literal["kept", "ends"] | None:
@@ -503,11 +508,11 @@ def _still_blank(text: str) -> bool:
     leaves between a name and its value, so a secret-class value is still empty after it.
 
     A value of equals signs alone is read on the side that refuses, wherever it is read: still
-    empty where that reads more text into a secret-class value (:func:`_value_still_open`) or
-    takes a path-form key as no path (:func:`_path_form`), and set where an empty value would not
-    be kept (:func:`_names`), so ``MEFOR_STORE_PASSWORD==`` refuses alone. Below a
-    ``MEFOR_VALUE_*`` name, which refuses whatever it holds, it is set, so the value does not run
-    on into the next item."""
+    empty where it takes a path-form key as no path (:func:`_path_form`), and set where an empty
+    value would not be kept (:func:`_names`), so ``MEFOR_STORE_PASSWORD==`` refuses alone. On a
+    later line, as ``NAME<LF>=`` writes it, it keeps a secret-class value open to the strings
+    after it (:func:`_value_still_open`); on the name's own line it is set, so the value does not
+    run on into the next item."""
     return not text.replace("=", "").strip()
 
 
@@ -521,9 +526,12 @@ def _name_alone(line: str) -> bool:
 def _value_still_open(variable: _Variable) -> bool:
     """Whether ``variable``, the one a string ends on, may take the strings after it as its
     value (:func:`_variables`): a secret-class value or a refused name written alone that is
-    still blank (:func:`_still_blank`), or a ``MEFOR_VALUE_*`` value that is empty or blank."""
+    blank on its own line and still blank after it (:func:`_still_blank`), as ``NAME<LF>=``
+    leaves it, or a ``MEFOR_VALUE_*`` value that is empty or blank. ``NAME==`` sets ``=`` in its
+    own string, so it does not run on, and it refuses as set (:func:`_names`)."""
     if _below_open_class(variable):
-        return _still_blank(variable.value)
+        own_line = _LINE_BREAK.split(variable.value, 1)[0]
+        return not own_line.strip() and _still_blank(variable.value)
     return variable.written.upper().startswith(_VALUE_PREFIX) and not variable.value.strip()
 
 
@@ -867,10 +875,10 @@ def _names(variables: Sequence[_Variable]) -> tuple[tuple[str, str, int | None],
     empty value the engine still overlays on the value file, unless it is written alone with
     nothing read into it (:func:`_kept_empty`). A path in a name that takes either a key or its
     path is not a secret, so that name is not kept either (:func:`_path_form`). Only a
-    secret-class name, a ``MEFOR_VALUE_*`` name and ``MEFOR_SECRETS_DIRECTORY`` are kept: the text before any other
-    line's equals sign may be key material (vault BACKLOG #5394). Windows compares environment
-    names without case, so this does too. Each name is returned with the first registry value,
-    and the line, that sets it."""
+    secret-class name, a ``MEFOR_VALUE_*`` name and ``MEFOR_SECRETS_DIRECTORY`` are kept: the
+    text before any other line's equals sign may be key material (vault BACKLOG #5394). Windows
+    compares environment names without case, so this does too. Each name is returned with the
+    first registry value, and the line, that sets it."""
     names: dict[str, tuple[str, int | None]] = {}
     for variable in variables:
         name = variable.written.upper()

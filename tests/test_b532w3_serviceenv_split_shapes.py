@@ -504,3 +504,21 @@ def test_a_secret_name_alone_in_a_later_item_below_a_value_name_alone_is_kept() 
     assert posture.listed_keys == (KEY_CLASS_NAMES[0],)
     refusal = service_env_refusal(posture)
     assert refusal is not None and "DPAPI-protected key file" in refusal
+
+
+def test_a_secret_set_to_equals_signs_on_its_own_line_does_not_run_on() -> None:
+    """Round-3 review round 2, finding 2: ``NAME==`` sets ``=`` in its own string, so it refuses
+    as set, and the remedy does not say its value runs on into the next item. ``NAME<LF>=`` is the
+    gap ``nssm set ... NAME = value`` leaves, and still runs on: the control."""
+    posture = _read(["MEFOR_STORE_PASSWORD==", "TZ=UTC"])
+    assert posture.listed == ("MEFOR_STORE_PASSWORD",)
+    assert not posture.value_runs_on
+    assert _read(["MEFOR_STORE_PASSWORD\n=", "Winter2026"]).value_runs_on
+
+
+def test_a_lower_case_secret_name_below_an_empty_key_is_still_named() -> None:
+    """Round-3 review round 2, finding 3: the upper-case rule below an empty secret value covers
+    only the path-form key's name. Any other refused name in any case is its own variable, as
+    Windows compares names, so the refusal names it and gives its own remedy."""
+    posture = _read([f"{KEY_CLASS_NAMES[0]}=", "mefor_store_password=hunter2"])
+    assert posture.listed == ("MEFOR_STORE_PASSWORD",)
