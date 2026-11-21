@@ -3303,7 +3303,9 @@ chains directly to a supplied anchor, or is a self-signed correspondent cert pin
 multi-level path building is deferred. On top of issuance, construction refuses at least:
 
 - a `recipient_cert` whose every issuing `trust_anchor` is **not a CA** (no `basicConstraints` asserting
-  `CA=true`, or a `keyUsage` that does not assert `keyCertSign`) or has extensions that cannot be read. An
+  `CA=true`, or a `keyUsage` that does not assert `keyCertSign`) or has extensions that cannot be read.
+  An X.509 **version 1** root that carries no extensions, as such roots usually do, therefore has no
+  `basicConstraints` and is refused as not a CA. An
   issuing anchor that fails this is skipped, and the recipient is accepted when another issuing anchor in
   the file passes. A **pinned** correspondent is exempt: an anchor with the same subject and the same public
   key as the `recipient_cert` (the same cert, or an older copy of a renewed one), because it issues nothing
@@ -3326,13 +3328,19 @@ addresses `recipients` holds, counting each comma-joined address apart), never t
 a `subjectAltName` value, any of which can identify a patient's provider.
 
 **The validity window is checked at every send, not refused at construction.** The send refuses, before
-anything is built or dialled, when the `recipient_cert` is outside its window, or when every issuing
-`trust_anchor` is. A bundle may hold an older copy of a CA beside its renewal under the same name and key, and
-any one of them inside its window will do. No clock skew is allowed.
+anything is built or dialled, when the `recipient_cert` or the `signing_cert` is outside its window, or when
+every issuing `trust_anchor` is. A partner's verifier refuses a signature made under an out-of-window
+`signing_cert`, after the relay has accepted the message. A bundle may hold an older copy of a CA beside its
+renewal under the same name and key, and any one of them inside its window will do. For the `recipient_cert`
+and the anchors, a `notBefore` up to five minutes ahead of this host's clock still counts as valid, so a
+certificate a CA issued moments ago is not refused for a small clock difference. The `signing_cert` gets no
+such allowance, because its partner verifies it on the partner's own clock: a freshly renewed signing cert on
+a host a little behind the CA stops the lane until `notBefore` passes and the lane is started again. No
+allowance is given past `notAfter`.
 
 Either bound is a permanent `NegativeAckError` marked as a configuration fault, with code
 `direct-cert-validity:<setting>:expired` or `direct-cert-validity:<setting>:not-yet-valid`, `<setting>` being
-`recipient_cert` or `trust_anchor`. Under the default `credential_fault_policy = "stop"` the delivery worker
+`recipient_cert`, `trust_anchor` or `signing_cert`. Under the default `credential_fault_policy = "stop"` the delivery worker
 stops the lane and keeps the queue, spending none of a row's attempts, and its ERROR log line and
 `connection_stopped` alert carry that code, so they say which certificate failed and how. Under
 `credential_fault_policy = "dead_letter"` the message dead-letters, as other configuration faults do.
@@ -3340,11 +3348,13 @@ stops the lane and keeps the queue, spending none of a row's attempts, and its E
 - **Expired:** renew the certificate, point the setting at the new file, and reload, or restart.
 - **Not yet valid:** once `notBefore` has passed, an operator starts the lane again; the same connector then
   delivers, with no change to its settings.
-- Where the recipient cert and every issuing anchor both fail, an expiry is the one reported, because it is
-  the one that needs a renewal: a not-yet-valid recipient whose only anchor has expired reports the anchor.
+- Where more than one certificate fails, an expiry is the one reported, because it is the one that needs a
+  renewal: a not-yet-valid recipient whose only anchor has expired reports the anchor.
 
 Construction only **logs a WARNING** naming the setting and the bound, once every construction refusal has
-passed, so `messagefoundry check`, a reload and
+passed. It is logged once per process for the same connection and the same certificates, so a rebuild of
+an unchanged config does not repeat it, and a renewed certificate that is still out of its window warns
+again. So `messagefoundry check`, a reload and
 an engine start or restart still build the connection with an out-of-window certificate. That is deliberate:
 a build refusal would record the lane failed at start (ADR 0031) rather than stopped with its queue kept,
 which is what the send-time refusal does. `test_connection` does not read
@@ -5105,7 +5115,7 @@ reading this page already applies to a file the scan never opened.
 | DICOM C-STORE SCP (inbound) | `max_associations` default 10; `max_pdu_size` 16384; `max_object_bytes` 128 MiB, capped at the engine's 16 MiB binary ingress ceiling | over the association cap pynetdicom rejects the association; `max_pdu_size` is the fragment size the SCP offers, not a limit on an object, so `max_object_bytes` is charged against the raw received Data Set **before** it is decoded — and so before the durable commit. A PDU longer than `max_pdu_size`, or an object past twice the effective `max_object_bytes`, aborts the association | the modality re-sends; nothing is half-committed |
 | DICOM C-STORE SCU / C-ECHO | one association per delivery, bounded by the lane budget | the association request fails on `connect_timeout` | out-of-resources status → retry; a hard refusal → dead-letter; an object over 32 MiB whose store ends with no response three times in a row → dead-letter, whatever `RetryPolicy` says (vault BACKLOG #4908) |
 | EMAIL (SMTP) destination | one SMTP connection per send, bounded by the lane budget | the relay's own limit surfaces as an SMTP error | transient → retry; permanent → dead-letter |
-| DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL, plus the send-time certificate check: a `recipient_cert` or issuing `trust_anchor` outside its validity window is a configuration fault (`direct-cert-validity:<setting>:expired` or `:not-yet-valid`) that stops the lane and keeps the queue under the default `credential_fault_policy` |
+| DIRECT (S/MIME over SMTP) | one SMTP connection per send, bounded by the lane budget | as EMAIL | as EMAIL, plus the send-time certificate check: a `recipient_cert`, issuing `trust_anchor` or `signing_cert` outside its validity window is a configuration fault (`direct-cert-validity:<setting>:expired` or `:not-yet-valid`) that stops the lane and keeps the queue under the default `credential_fault_policy` |
 | DATABASE destination / poll source / `db_lookup` | `pool_max` default 5 connections per connection definition; the poll source additionally fetches at most `poll_max_rows` (500) rows per poll, [deferring the rest](#per-tick-poll-ceilings); a `db_lookup` call fetches at most `max_rows` (500) plus one, and [refuses a larger result](#a-lookup-that-selects-too-many-rows-fails-the-message) | a borrow that cannot be satisfied within `acquire_timeout` (default 30 s) fails **transiently** with a PHI-free "pool exhausted or DB unresponsive" error | the row re-queues into the `RetryPolicy` path; the pool self-heals as borrows return |
 | Reference-set sync (`DatabaseRef`) | `pool_max` default 5, in a **throwaway pool built per sync** | a borrow that cannot be satisfied within `DatabaseRef(acquire_timeout=…)` (default 30 s) raises `StoreAcquireTimeout`, failing that set's sync | the sync task is isolated per reference set; the previous snapshot keeps serving reads and the AlertSink fires. The bound also keeps one wedged source from stalling the sequential pass over the other sets |
 | Internal sources — Timer / Loopback / PassThrough | n/a — they open no socket and reach no external system | n/a | n/a |

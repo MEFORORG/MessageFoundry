@@ -664,11 +664,13 @@ def test_every_client_read_in_the_console_gates_goes_through_client_ip() -> None
 
     ``require_ui`` read the address two ways, and four step-up factories fed the new-IP signal an
     inline read while their JSON twins pass ``client_ip``. The site count is the control: a walk that
-    found no calls would report no offences for the wrong reason.
+    found no calls would report no offences for the wrong reason. Its floor moved from 11 to 9, the
+    live count, when five step-up factories stopped asking the new-IP signal themselves and
+    ``require_ui`` asked it once for them (BACKLOG #5646): five calls gone, one added.
     """
     offences, checked = _client_read_offences(ast.parse(_AUTH_SOURCE.read_text(encoding="utf-8")))
     assert offences == [], offences
-    assert checked >= 11, f"only {checked} client-taking calls found in {_AUTH_SOURCE}"
+    assert checked >= 9, f"only {checked} client-taking calls found in {_AUTH_SOURCE}"
 
 
 @pytest.mark.parametrize(
