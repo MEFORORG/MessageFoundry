@@ -8,6 +8,7 @@ import {
   EditLoopGuard,
   QueuedEditRebaser,
   drainEdits,
+  errorText,
   physicalLines,
   rowAfterRewrite,
   type AppliedRewrite,
@@ -330,6 +331,31 @@ suite("Steps edit -- rowAfterRewrite and QueuedEditRebaser (BACKLOG #5943)", () 
     await drainEdits(new EditLoopGuard(), edit("B"), async () => undefined, undefined, undefined, rebase);
     assert.strictEqual(logged.length, 1);
     assert.ok(logged[0].includes("document closed"));
+  });
+
+  test("errorText never throws, and a throwing onError does not strand a queued edit", async () => {
+    const noProto = Object.create(null) as unknown;
+    assert.throws(() => String(noProto), "the control: String() of a null-prototype object throws");
+    assert.strictEqual(errorText(noProto), "an unexpected error");
+    assert.strictEqual(errorText(new Error("boom")), "boom");
+    const guard = new EditLoopGuard();
+    const sent: unknown[] = [];
+    const apply = async (m: EditMessage): Promise<void> => {
+      sent.push(m.value);
+      if (m.value === "B") {
+        guard.queue(edit("C", "other"));
+        throw noProto;
+      }
+    };
+    // The provider's handler as it was: it formats with String(), which throws for this rejection.
+    const onError = (err: unknown): void => {
+      void `${err instanceof Error ? err.message : String(err)}`;
+    };
+    await drainEdits(guard, edit("B"), apply, onError);
+    assert.deepStrictEqual(sent, ["B", "C"], "the queued edit is still sent");
+    assert.strictEqual(guard.isEditing, false);
+    const view = fs.readFileSync(path.join(__dirname, "..", "..", "..", "src", "stepsView.ts"), "utf8");
+    assert.ok(view.includes("could not apply the edit — ${errorText(err)}"), "the provider formats with errorText");
   });
 
   test("a throwing logger, or an error String() cannot convert, does not escape drainEdits", async () => {

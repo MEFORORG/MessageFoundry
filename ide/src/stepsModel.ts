@@ -3019,7 +3019,11 @@ export async function drainEdits(
         wrote = await apply(current);
       } catch (err) {
         rebase?.rebaser.latch(); // the buffer's state is unknown after an unexpected rejection
-        onError?.(err, current);
+        try {
+          onError?.(err, current);
+        } catch {
+          // A throwing handler must not strand the queued edits; the rejection was already caught here.
+        }
       }
       record(current, wrote);
       const next = guard.takePending();
@@ -3027,6 +3031,18 @@ export async function drainEdits(
     }
   } finally {
     releaseEdit(guard, onRefreshOwed);
+  }
+}
+
+/**
+ * A thrown value as text for a toast or a log line. Never throws: `String()` of an object with no
+ * prototype throws, so that case, and any other conversion failure, gets a fixed fallback.
+ */
+export function errorText(err: unknown): string {
+  try {
+    return err instanceof Error ? err.message : String(err);
+  } catch {
+    return "an unexpected error";
   }
 }
 
