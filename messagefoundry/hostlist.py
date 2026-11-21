@@ -117,28 +117,31 @@ def parse_allow_entry(entry: str) -> tuple[HostKey, str] | None:
 
 
 def _is_host_name(text: str) -> bool:
-    """True if ``text`` holds only what a host name holds: letters, combining marks, digits,
-    ``.``, ``-`` and ``_``. Any script passes, its marks included, so an internationalized name a
+    """True if ``text`` holds only characters in the Unicode categories L (letters), M (marks)
+    and N (numbers, not only ASCII digits: a superscript or a Roman numeral passes), and ``.``,
+    ``-`` and ``_``. Any script passes, its marks included, so an internationalized name a
     connection writes unencoded is still listed as written."""
     return all(unicodedata.category(char)[0] in "LMN" or char in "._-" for char in text)
 
 
-def _is_zoned_v6_entry(text: str) -> bool:
-    """True if ``text`` is ``v6%zone``, ``[v6%zone]`` or ``[v6%zone]:port``: an entry that would
-    read as an IPv6 entry but for its zone id. Anything else holding a ``%`` is not, so it keeps
-    the reason its shape earns."""
-    if text.startswith("["):
-        close = text.find("]")
-        if close == -1 or (text[close + 1 :] and not text[close + 1 :].startswith(":")):
-            return False
-        text = text[1:close]
-    address, pct, zone = text.partition("%")
-    if not pct or not zone or ":" in zone:
-        return False
-    try:
-        return isinstance(ipaddress.ip_address(address), ipaddress.IPv6Address)
-    except ValueError:
-        return False
+def _without_zone(text: str) -> str | None:
+    """``text`` with its one ``%zone`` cut out, or ``None`` when it holds no ``%``, more than one,
+    or a zone that is empty or holds a blank. The zone runs from the ``%`` to the next ``]`` or
+    ``:``. An unbracketed address that holds a ``:`` comes back bracketed, so ``fe80::1%eth0:443``
+    is ``[fe80::1]:443``; :func:`parse_allow_entry` then judges the rest. Nothing here reads the
+    address itself."""
+    if text.count("%") != 1:
+        return None
+    head, _, tail = text.partition("%")
+    ends = [index for index in (tail.find("]"), tail.find(":")) if index != -1]
+    end = min(ends, default=len(tail))
+    zone, rest = tail[:end].strip(), tail[end:]
+    if not zone or any(char.isspace() for char in zone):
+        return None
+    if head.startswith("["):
+        return head + rest
+    address = head.strip()
+    return (f"[{address}]" if ":" in address else address) + rest
 
 
 _HOST_CHARACTER_REASON = (
@@ -159,15 +162,19 @@ def allow_entry_problem(entry: str) -> str | None:
         return "it is a URL or a path, not a host; list the host alone, with ':port' to pin a port"
     parsed = parse_allow_entry(text)
     if parsed is None:
+        # A zone id only where cutting it out leaves an entry whose host is an IP address. Any
+        # other fault that entry has is named first, so fixing the zone is the last edit;
+        # unbracketed, a zoned address would otherwise be told to write [v6], refused too.
+        unzoned = _without_zone(text)
+        reread = parse_allow_entry(unzoned) if unzoned is not None else None
+        if unzoned is not None and reread is not None and not isinstance(reread[0], str):
+            return allow_entry_problem(unzoned) or (
+                "its address carries a '%' zone id, which no host is matched with"
+            )
         bracketed = text.startswith("[")
-        if bracketed or text.count(":") > 1:
-            # A zone id only where the rest is a well-formed IPv6 address with a zone: unbracketed,
-            # it would otherwise be told to write [v6], and the bracketed form is refused too.
-            if _is_zoned_v6_entry(text):
-                return "it carries a '%' zone id, which no host is matched with"
-            if not bracketed:
-                return "it holds more than one ':' outside brackets; write an IPv6 address as [v6]"
-        elif "%" in text.partition(":")[0]:
+        if not bracketed and text.count(":") > 1:
+            return "it holds more than one ':' outside brackets; write an IPv6 address as [v6]"
+        if not bracketed and "%" in text.partition(":")[0]:
             # A name holding '%', such as a percent-encoded one, is no zoned address.
             return _HOST_CHARACTER_REASON
         return (

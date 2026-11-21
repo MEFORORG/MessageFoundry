@@ -1717,8 +1717,13 @@ URL or holds a `/` or `@`, or when its host holds anything but letters, combinin
 (the Unicode categories L, M and N), `.`, `-` and `_`, such as a `*` pattern. A blank entry in a
 TOML list is refused the same way. The comma-separated environment form of the `[egress]` lists
 drops blank items instead, as it always has, and counts an entry's position after dropping them.
-So a variable holding only commas or spaces sets its list empty, in place of any list the file
-sets, and an empty list is read as an unset one. A host being checked
+**So a variable that is an empty string, or holds only commas or spaces, empties its list,
+replacing any list the file sets,** and an empty list is read as an unset one. Under
+`[security].block_unlisted_outbound = false` an empty destination list, such as `allowed_mllp` or
+`allowed_http`, admits any host of its type, so such a variable opens that transport to every
+host; under the deny default it refuses every one. At least `allowed_proxy` and
+`allowed_ech_sidecar` refuse what they gate while they are empty, under either setting, as their
+rows say. A host being checked
 that carries a `%` zone id matches no entry, so while its list is set a zoned IPv6 destination is
 refused whatever the entries say. The host being checked must name an IPv6 literal
 bare, as `::1`, at least in a connection's `host` setting and in `[logging].forward_host`: a

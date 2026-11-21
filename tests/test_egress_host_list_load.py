@@ -100,6 +100,20 @@ def test_refusal_does_not_quote_the_entry() -> None:
         ("[fe80::1%eth0", r"is not 'host', 'host:port'"),
         ("[fe80::1%eth0]x", r"is not 'host', 'host:port'"),
         ("db.example.org:5432:%", r"more than one ':' outside brackets"),
+        # An unbracketed zoned address with a port is told about its zone, never to write [v6].
+        ("fe80::1%eth0:443", "zone id"),
+        # Blanks inside the brackets are read as the matcher reads them.
+        ("[ fe80::1%eth0 ]", "zone id"),
+        ("[fe80::1%eth0 ]:443", "zone id"),
+        # An IPv4 address with a '%' suffix is an address, not a name or a pattern.
+        ("192.0.2.4%eth0", "zone id"),
+        ("192.0.2.4%eth0:443", "zone id"),
+        # Cutting the zone out must leave a readable entry; any other fault is named first.
+        ("[fe80::1%eth0]:", r"is not 'host', 'host:port'"),
+        ("[fe80::1%eth0]:abc", "port is not a number"),
+        ("[fe80::1%eth0]:443:1", "port is not a number"),
+        ("fe80::1%eth0]", r"more than one ':' outside brackets"),
+        ("fe80::1%%", r"more than one ':' outside brackets"),
         ("fe80::1:443", r"more than one ':' outside brackets"),
         ("*.example.org", "no pattern is read"),
         ("h.example.org:99999", "port is not a number"),

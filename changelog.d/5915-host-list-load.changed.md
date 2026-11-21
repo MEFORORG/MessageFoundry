@@ -1,5 +1,5 @@
-- **A `host[:port]` allowlist entry that is not a host in one of the four entry forms is refused at
-  config load, ports compare as numbers, and an `http(s)://` URL with no port is matched at the
+- **A `host[:port]` allowlist entry with a bad shape, host or port is refused at config load,
+  ports compare as numbers, and an `http(s)://` URL with no port is matched at the
   port it dials.** At least `[egress]` `allowed_mllp`, `allowed_tcp`, `allowed_http`, `allowed_db`,
   `allowed_remote`, `allowed_smtp`, `allowed_direct`, `allowed_proxy`, `allowed_syslog` and
   `[ai].allowed_endpoints` now refuse such an entry, at least a malformed one, a URL, a `*`
