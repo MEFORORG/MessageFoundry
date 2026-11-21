@@ -8729,9 +8729,12 @@ class SqlServerStore:
         raised_by: str | None = None,
     ) -> None:
         # Pure observer (ADR 0044 D2): no queue row, no finalizer. De-dup grain = ADR 0014's
-        # (event_type, connection) key. UPDATE-then-conditional-INSERT in one serializable transaction
-        # (matching the SQLite path): the filtered unique index keeps it to one LIVE instance per key. The
-        # caller wraps it fail-soft. reason rides safe_text + the cipher. escalation_tier (#81, ADR 0133) is
+        # (event_type, connection) key. UPDATE-then-conditional-INSERT in one transaction (matching the
+        # SQLite path): the filtered unique index keeps it to one LIVE instance per key. The UPDATE takes
+        # UPDLOCK, HOLDLOCK, so its key range stays locked until the commit and two concurrent first
+        # fires queue rather than both INSERT and collide on that index; it reports through OUTPUT, which
+        # a session-wide SET NOCOUNT ON cannot hide (BACKLOG #5692, as #2283). The caller wraps it
+        # fail-soft. reason rides safe_text + the cipher. escalation_tier (#81, ADR 0133) is
         # kept monotonic within an open instance via a CASE (SQL Server has no 2-arg MAX scalar).
         now = time.time() if now is None else now
         # Bound to (event_type, connection) — the de-dup grain the upsert keys on, so the SAME AAD covers
@@ -8747,9 +8750,11 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await cur.execute(
-                    "UPDATE alert_instance SET last_seen=?, [count]=[count]+1, severity=?, reason=?,"
+                    "UPDATE alert_instance WITH (UPDLOCK, HOLDLOCK)"
+                    " SET last_seen=?, [count]=[count]+1, severity=?, reason=?,"
                     " escalation_tier=CASE WHEN escalation_tier < ? THEN ? ELSE escalation_tier END,"
                     " raised_by=?"
+                    " OUTPUT inserted.id"
                     " WHERE event_type=? AND connection=? AND status<>'resolved'",
                     (
                         now,
@@ -8762,7 +8767,7 @@ class SqlServerStore:
                         connection,
                     ),
                 )
-                if cur.rowcount == 0:
+                if not await cur.fetchall():
                     await cur.execute(
                         "INSERT INTO alert_instance"
                         " (event_type, connection, severity, status, first_seen, last_seen,"
