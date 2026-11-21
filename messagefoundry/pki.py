@@ -1855,10 +1855,11 @@ def san_names(pem: bytes, name: str) -> bool:
 
     ``name`` is classified as :func:`make_self_signed` classifies it (:func:`_general_names`), so a
     certificate that function minted for ``name`` always answers ``True``. An IP is compared by
-    address without an IPv6 zone, which a SAN cannot carry; a DNS name without regard to case,
-    with a trailing dot significant, as hostname verification compares it (BACKLOG #5790).
-    ``False`` when the certificate has no readable SAN; ``True`` when ``name`` cannot be
-    classified at all, so a caller deciding whether
+    address without an IPv6 zone, which a SAN cannot carry; a DNS name without regard to case or a
+    trailing dot. Hostname verification ignores case but, measured on OpenSSL 3.5, not a trailing
+    dot, so this answers ``True`` for a name a client would fail to verify by its trailing dot
+    alone. ``False`` when the certificate has no
+    readable SAN; ``True`` when ``name`` cannot be classified at all, so a caller deciding whether
     to replace the certificate never replaces it over a name the mint would refuse too. Raises
     ``ValueError`` when ``pem`` is not a parseable certificate. Reads only the public certificate.
     """
@@ -1879,8 +1880,8 @@ def san_names(pem: bytes, name: str) -> bool:
     if isinstance(wanted, x509.IPAddress):
         address = ipaddress.ip_address(str(wanted.value).split("%", 1)[0])
         return any(isinstance(g, x509.IPAddress) and g.value == address for g in held)
-    dns = str(wanted.value).lower()
-    return any(isinstance(g, x509.DNSName) and g.value.lower() == dns for g in held)
+    dns = str(wanted.value).rstrip(".").lower()
+    return any(isinstance(g, x509.DNSName) and g.value.rstrip(".").lower() == dns for g in held)
 
 
 def make_self_signed(cn: str, sans: list[str], days: int) -> tuple[bytes, bytes]:
