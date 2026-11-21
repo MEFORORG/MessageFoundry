@@ -2798,9 +2798,11 @@ reason is written only for an anchor that passed them. An anchor they refuse is 
 `trust_anchor` when its audit row then fails, and so is an anchor file that cannot be read.
 Such a refusal may then have no `auth.trust_anchor` row behind it, so the engine log is the record
 of it. An inline reload answers **503** for `store_unavailable`; a released one answers 422, as
-every refused release does. The engine log carries the store's error. A reload on a cluster node
-that has lost its lease, while its graph still runs, is refused as `lease_lost` (BACKLOG #5906).
-An inline reload answers **503**; a released one answers 422. The lease is read twice, on entry
+every refused release does. The engine log carries the store's error. An applied reload on a
+cluster node that has lost its lease, while its graph still runs, is refused as `lease_lost`
+(BACKLOG #5906). An inline reload that dual control does not gate answers **503**. A gated one
+files its hold as usual, since the hold reads no lease, and its release is refused with 422. A
+dry run is not refused: it swaps nothing and never asks for the lease. The lease is read twice, on entry
 and before the reload stops any listener. Each read is point in time: a lease lost after the
 second read is not refused. That reload then binds listeners and resumes lanes on the node, and
 `Engine._stop_graph` takes them down only once the reload ends, since it waits on the same lock.

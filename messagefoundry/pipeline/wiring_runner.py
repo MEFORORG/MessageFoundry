@@ -4662,10 +4662,11 @@ class RegistryRunner:
         ``leader_gate`` a poll source reads at each tick (its contract is
         :meth:`~messagefoundry.transports.base.SourceConnector.start`), the L1 pre-send leadership
         re-check (in :meth:`_process_delivery_item`, and :meth:`_may_send` right before both the
-        single-row and the coalesced-batch send), and ``Engine._stop_graph`` itself. The store's H1 leader-epoch fence (ADR 0157; its
-        scope is :meth:`~messagefoundry.pipeline.cluster.ClusterCoordinator.current_epoch`) does
-        not fire on this node's claims before at least a successor's acquire bumps the epoch, and
-        it does not cover intake, the ingress commit a listener makes. A listen source does not read
+        single-row and the coalesced-batch send), and ``Engine._stop_graph`` itself. The store's H1
+        leader-epoch fence (ADR 0157; its scope is
+        :meth:`~messagefoundry.pipeline.cluster.ClusterCoordinator.current_epoch`) does not fire
+        on this node's claims before at least a successor's acquire bumps the epoch, and it does
+        not cover intake, the ingress commit a listener makes. A listen source does not read
         ``leader_gate``, so a listener a start brings up after the lease drops keeps taking messages
         until ``Engine._stop_graph`` stops it, whether or not a successor has acquired."""
         if not self._running and not (stop and self.has_residual_state):
@@ -9697,9 +9698,9 @@ class RegistryRunner:
                 # BACKLOG #5906: a node that lost its lease while its graph still runs takes no
                 # reload, as the start doors take no start (_require_running): steps 2 and 3 would
                 # bind listeners and resume lanes on a node whose graph is about to stop. Asked
-                # again here, after the last await before the quiesce, so the handler below undoes what
-                # any refusal here undoes and no lane has changed. A point in time read, as at the
-                # doors: a lease lost during the steps below is ``Engine._stop_graph``'s to take
+                # again here, after the last await before the quiesce, so the handler below undoes
+                # what any refusal here undoes and no lane has changed. A point in time read, as at
+                # the doors: a lease lost during the steps below is ``Engine._stop_graph``'s to take
                 # down.
                 if not self._coordinator.is_leader():
                     raise RunnerLeaseLostError.for_reload()

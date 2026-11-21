@@ -2942,10 +2942,10 @@ async def _audit_refused_reload(
     refusing its audit read or write, writes reason ``store_unavailable`` and answers 503 (BACKLOG
     #3091); it is neither a refused anchor nor a bad graph. A cluster node that lost its lease while
     its graph still runs writes reason ``lease_lost`` and answers 503 (BACKLOG #5906). A released
-    reload whose config is not the one its approval named writes ``config_reload_failed`` with ``approved_fingerprint`` and
-    ``current_fingerprint`` and reason ``digest_mismatch``, or ``no_approved_digest`` when the hold
-    carries no usable digest (:func:`held_fingerprint`), whose ``approved_fingerprint`` is then
-    null, and answers 422 (vault BACKLOG #2596); only the
+    reload whose config is not the one its approval named writes ``config_reload_failed`` with
+    ``approved_fingerprint`` and ``current_fingerprint`` and reason ``digest_mismatch``, or
+    ``no_approved_digest`` when the hold carries no usable digest (:func:`held_fingerprint`),
+    whose ``approved_fingerprint`` is then null, and answers 422 (vault BACKLOG #2596); only the
     executor meets it. One whose digest could not be taken now writes
     reason ``digest_unavailable`` and answers 422; the engine logged why at WARNING. A gated
     request whose digest cannot be taken is refused the same way, with no hold filed. A release
