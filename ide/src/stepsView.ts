@@ -313,6 +313,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // is sent with the row's current source rather than refused as stale (BACKLOG #5943). render()
     // tells it which buffer each new webview was projected from.
     const rebaser = new QueuedEditRebaser();
+    let projectionId = 0;
 
     // The ONE debounced re-projection channel (ADR 0076 §5 "sync on save"). Both a save and a refresh
     // the guard deferred (BACKLOG #1759) go through it, so an owed refresh coalesces with a real save
@@ -439,6 +440,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       const scriptUri = panel.webview.asWebviewUri(
         vscode.Uri.joinPath(this.extensionUri, "media", "stepsWebview.js"),
       );
+      // Each projection gets a new id, which the page echoes in every edit it posts (#5943).
+      const projection = ++projectionId;
       panel.webview.html = pageHtml(
         panel.webview,
         handlers,
@@ -446,9 +449,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         this.version,
         scriptUri,
         this.opSchema,
+        projection,
       );
       // The new rows carry `source`, which decides whether the recorded rewrites still apply (#5943).
-      rebaser.project(source);
+      rebaser.project(projection, source);
       // Arm the handshake: if the freshly-loaded script doesn't ping within 3s, it failed to initialize.
       sawAlive = false;
       setTimeout(() => {
@@ -526,7 +530,7 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         },
         scheduleRerender, // a save the guard suppressed mid-drain is deferred, not dropped (#1759)
         // Lets an edit on a row rewritten since the last projection carry its expectSrc over (#5943).
-        { rebaser, readSource: () => document.getText() },
+        { rebaser, readSource: () => document.getText(), log: (text) => console.warn(text) },
       );
 
     // Apply a STRUCTURAL op (insert/delete/move). Unlike a param edit these change the file's line count,
@@ -1091,6 +1095,7 @@ function pageHtml(
   version: string,
   scriptUri: vscode.Uri,
   schema: OpSchema | undefined,
+  projection: number,
 ): string {
   const n = nonce();
   const body = renderHandlersHtml(handlers, schema);
@@ -1125,6 +1130,7 @@ function pageHtml(
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy"
         content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src ${webview.cspSource} 'nonce-${n}';" />
+  <meta name="mf-projection" content="${projection}" />
   <style>
     body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 0 12px 16px; }
     .bar { padding: 10px 0; position: sticky; top: 0; z-index: 1; background: var(--vscode-editor-background);
