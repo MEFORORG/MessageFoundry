@@ -786,6 +786,7 @@ The scan leaves some parsing out on purpose, and it has limits:
 | It parses no input. It builds messages or reads `hl7apy`'s own schema tables. | `messagefoundry_toolkit/generators/_core.py`, `messagefoundry_toolkit/generators/siu.py`, `messagefoundry_toolkit/hl7schema.py`, `messagefoundry_toolkit/hl7structures.py` |
 | It reads a URL an operator configures, never a received body: an outbound's or a `FhirLookup`'s `url` setting, the value its `env()` reference resolves to, and, for the settings views, any URL-named setting such as `proxy_url` and an `env()` default. It splits the query string with `urllib.parse` to name the parameters that look like credentials. At least the ASVS 14.2.1 warning and loosening entry, the `verify_tls = false` credential refusal (vault BACKLOG #3230) and the off-box cleartext credential refusal (vault BACKLOG #3533) use those names. For the settings views it also splits the whole URL by hand, with one regular expression, at every `?`, `&`, `#` and `;`, and percent-decodes each segment's name; a URL it finds a credential name in is withheld whole. It runs at least when a `Rest`, `Soap`, `FHIR`, `DICOMweb` or `FhirLookup` connection is built, in `messagefoundry check`, on `GET /security/posture` on a running engine and on each settings view (`GET /metadata`, `graph --json`). The warning, the reports and the views put no bound on the URL's length, because the operator wrote it. Some refusals read it only after `enforce_outbound_length_limits` has refused one over `MAX_OUTBOUND_URL_LEN`, and some before, at least a `FhirLookup`'s off-box cleartext refusal. It returns parameter names, never values, and returns nothing rather than raising on a URL it cannot parse. | `secretscrub.py` |
 | It reads a URL an operator configures, never a received body: the value an `env()` URL setting resolves to. `_url_credential_part` takes the userinfo with `urllib.parse.urlsplit` and splits the query with `urllib.parse.parse_qsl`, to find the credential values the secret-rotation watcher fingerprints (vault BACKLOG #5513). The `connector_secret_env_values` docstring says which settings it reads and what is done with the values. | `config/wiring.py` |
+| It reads an app-log file the engine's own logging wrote, never a received body: the newest plain regular file with one name and a log suffix directly under `[logging].log_dir`, for the `app-log.txt` member of the zip `messagefoundry support-bundle` writes. `_read_log_file` reads at most the last `_LOG_TAIL_MAX_BYTES` bytes, and one byte more. When that bound cuts into the file, it finds the first line break in those bytes, to drop the line the bound cuts into, and refuses a tail left with nothing but line breaks (`_LogLineTooLong`, BACKLOG #5385). The log can hold outside text the engine logged, so `_log_tail` passes every string it returns through `redact_log_text`. | `support/bundle.py` |
 
 **Hand-written parsers the patterns cannot see.**
 
@@ -843,6 +844,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 |---|---|---|
 | Replies from an engine address | Whatever answers at the engine URL setting. The file's own comment says that is not necessarily the engine, and a plain `http` URL gets no TLS. The Python clients' replies sit in the first table above for that reason too. Unlike `apiclient/client.py`, this client puts no size cap on a reply before it parses it, and a POST has no timeout. | `engineClient.ts` |
 | An HL7 sample, and what a dry run made of it | The sample file you pick, which [`CONNECTIONS.md`](CONNECTIONS.md) lists as an upload feature, and the output a dry run built from it. The Test Bench diff splits them into segments and fields by hand, and the Steps view pulls the segment names out of the sample. A saved test case's recorded output is diffed the same way. `hl7diff.ts` does the same job as `messagefoundry_toolkit/anon/surrogates.py` in the hand-read table above. | `hl7diff.ts`, `hl7scope.ts` |
+| A path setting's folder and file names | The path settings, which a workspace's own `.vscode/settings.json` can set. The Windows name checks split the path into names and read each name's characters by hand, to find a trailing dot or space, a colon, or a device name. The device-name check strips trailing spaces in linear time, because the value is the workspace's (BACKLOG #5404). | `workspaceContainment.ts` |
 
 **Extension parse sites left out, and why.**
 
@@ -857,6 +859,7 @@ the patterns cannot see, found by reading the code. The scan's limits include at
 | It reads back the saved Test Bench collections it stored itself, as JSON, in VS Code SecretStorage. It checks each collection's shape and drops a malformed one. The case bodies inside go on to `hl7diff.ts`, in the table above, when a collection is rerun | `collectionStore.ts` |
 | It takes the first line of hover text it built, for a menu title. That text can carry words from the engine's reply, which `engineClient.ts` already parsed. | `statusBar.ts` |
 | It splits what the MessageFoundry command line and git printed into lines, to put a time stamp on each for the "MessageFoundry Checks" output. It reads nothing out of them. | `checksLog.ts` |
+| It reads the characters of the Test Bench Debug program's text, which the extension holds itself, to name the program's file by a checksum (BACKLOG #5409) | `testBenchDebugProgram.ts` |
 
 **Extension files that parse text the patterns cannot see.**
 
@@ -1078,7 +1081,12 @@ a command line: the engine's `serve`, and `provision-admin`. The other two type 
 
 **Debug sessions.** The test bench's debug action starts a Python debug session. It runs
 `messagefoundry dryrun` with `--show-phi` on one sample message, in a VS Code terminal. The config
-folder it passes comes from the `messagefoundry.configDir` setting.
+folder it passes comes from the `messagefoundry.configDir` setting. To run it, the extension writes
+a small Python program into its own global storage folder, under `testbench-debug`, and has the
+debugger run that program. debugpy 1.8.21 and older put that folder at `sys.path[0]`, so a module
+placed there shadows any module of that name the debuggee has not yet imported, the installed
+`messagefoundry` package and the standard library included. The folder is not pruned, and nothing
+checks its contents. `ide/src/testBenchDebugProgram.ts` says what it holds (BACKLOG #5409).
 
 **Links.** `openExternal` hands a URL to the operating system, which opens it with whatever program
 is registered for its scheme. The extension opens web console pages and the Git download page this

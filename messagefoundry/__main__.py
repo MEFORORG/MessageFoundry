@@ -47,6 +47,7 @@ __lazy_modules__ = ["sqlite3", "tomllib", "messagefoundry.exception_origin"]
 
 # E402 on each import below: they follow the install call above on purpose.
 import argparse  # noqa: E402
+import contextvars  # noqa: E402  # a builtin module; serve's exit hook (#5391)
 import functools  # noqa: E402
 import json  # noqa: E402
 import logging  # noqa: E402
@@ -96,6 +97,7 @@ if TYPE_CHECKING:
     # call must not pay for it (see the module docstring on deferred heavy imports).
     import asyncio
 
+    from messagefoundry.api.tls import GeneratedPairReplaced
     from messagefoundry.auth.service import AuthService
     from messagefoundry.auth.trust_anchors import TrustAnchorError
     from messagefoundry.config.environments import EnvironmentValuesReader
@@ -569,20 +571,25 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     )
     security.add_argument("--json", action="store_true", help="emit JSON")
 
-    # The old wording read "a SECRET-FREE / PHI-free support zip". That is true of the config
-    # summary and the status snapshot and NOT of the log tail, whose redaction is best-effort: a
-    # single-token identifier survives it (messagefoundry/redaction.py states that residual), and an
-    # operator username is exactly that shape while this engine's own settings classifier calls a
-    # username a credential. A blanket claim resting on a member that does not meet it is the
+    # The old wording read "a SECRET-FREE / PHI-free support zip". The config summary holds no
+    # secret and the status snapshot is metadata-only, the phi_contract's own terms, but the log
+    # tail meets neither, because its redaction is best-effort: a single-token identifier
+    # survives it (messagefoundry/redaction.py states that residual), and an operator username
+    # is exactly that shape while this engine's own settings classifier calls a username a
+    # credential. A blanket claim resting on a member that does not meet it is the
     # false-premise shape CLAUDE.md section 11 forbids, so the claim was repaired rather than the
     # control -- see BACKLOG #1475 and the exclusion table in
     # tests/test_log_redaction_secret_domain.py for why the username class stays out. The help
     # repeats the manifest phi_contract's log-tail residual because an operator reads it before the
-    # zip exists; tests/test_support_bundle.py holds the two to the same terms (BACKLOG #5385).
+    # zip exists; tests/test_support_bundle.py and tests/test_b532w3_redaction_bundle_members.py
+    # hold the two to the same terms (BACKLOG #5385).
     # Both the command list and `support-bundle --help` print it.
     support_bundle_help = (
-        "write a support zip to hand to support (#49): a secret-free config summary "
-        "(counts/names only) + a PHI-free /status snapshot + a REDACTED app-log tail. The tail's "
+        "write a support zip to hand to support (#49). Its members: version.txt (the engine "
+        "version); manifest.json (at least a list of the other members, the engine version, a generation "
+        "time and the phi_contract); config-summary.json (counts/names only, holding no "
+        "secret); status.json (from the metadata-only status models); and, when written, app-log.txt, "
+        "a REDACTED app-log tail or an MF-BUNDLE-LOG-* code in its place. The tail's "
         "redaction is BEST-EFFORT, and values survive it: at least a single-token identifier such "
         "as an operator username and, on a non-production instance logging at DEBUG, a message "
         "body the log recorded in a shape the redaction does not read. Handle the zip as a copy of "
@@ -597,7 +604,7 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
     support_bundle.add_argument(
         "--config",
         default=None,
-        help="config modules directory — drives the secret-free graph summary (counts/names only)",
+        help="config modules directory — drives the graph summary (counts/names only, no secret)",
     )
     support_bundle.add_argument(
         "--service-config",
@@ -609,8 +616,8 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "--log-tail-lines",
         type=_non_negative_int,
         default=None,
-        help="number of trailing app-log lines to include (redacted); default 500; 0 omits the "
-        "app log",
+        help="at most this many trailing app-log lines are included (redacted), from at most the "
+        "last 4 MiB of the file; default 500; 0 omits the app log",
     )
 
     sub.add_parser(
@@ -2326,8 +2333,10 @@ def _start_logging(
     ``spool_dir`` is this process's own spool directory (:func:`_forward_spool_dir`); the spool
     locks it. The last gate checks the collector's CA as a trust anchor (BACKLOG #3470). A caller
     that passes ``deferred_ca_refusals`` takes that refusal itself: it is appended there, and
-    logging is configured without the forwarder. ``serve`` does, so its audited preflight refuses
-    the start, with a row when it can read the file.
+    logging is configured without the forwarder. ``serve`` does: its API lifespan's audited
+    preflight refuses the start. On a way out before uvicorn runs the lifespan, a start already
+    refused for another reason, its exit hook logs that no row records the refusal (BACKLOG
+    #5391). trust_anchors module item 10 says when a row is written.
 
     ``configure`` is the caller's own ``configure_logging`` call, given the forwarder the gates
     passed (``None`` with no collector). It stays at the call site because level, format and the
@@ -2613,9 +2622,8 @@ def _start_logging_gates(
             logging.getLogger(__name__).warning("%s", _ca_note)
     if _ca_refusal is not None:
         logging.getLogger(__name__).warning(
-            "off-box log forwarding is off: the collector's CA was refused (%s). The start check "
-            "refuses the start once the store is open. trust_anchors module item 10 says when "
-            "that refusal has an audit row.",
+            "off-box log forwarding is off: the collector's CA was refused (%s), and this start "
+            "is refused. trust_anchors module item 10 says when that refusal has an audit row.",
             _ca_refusal,
         )
     if forwarder_live and log_forward is not None:
@@ -2904,6 +2912,91 @@ def _remote_debug_refused(
 _UVICORN_DRAIN_SECONDS = 3.0
 
 
+class _PreLifespanAnchorAudit:
+    """The trust anchors ``serve`` refused before uvicorn ran its lifespan, for its exit hook
+    (BACKLOG #5391 added item 2).
+
+    The lifespan's audited preflight writes a refused anchor's ``auth.trust_anchor`` row. At least
+    two anchors are refused before it runs: ``[logging].forward_tls_ca_file``, which
+    ``_start_logging`` refuses and defers, and ``[api].tls_client_ca_file``, which the API TLS
+    context build refuses. ``serve`` arms this just before ``_start_logging`` and disarms it just
+    before ``uvicorn.run``. Any way out in between, a return or an ``Exception``, is an exit the
+    lifespan never ran for, so :func:`_audits_anchors_refused_before_the_lifespan` reports then
+    that no row records each such anchor (:func:`_report_anchors_refused_before_the_lifespan`
+    says why none is written). An interrupt, or any other ``BaseException`` that is not an
+    ``Exception``, reports nothing. Nor does an exit uvicorn takes before the lifespan starts, or
+    one inside the lifespan before its preflight runs."""
+
+    def __init__(self) -> None:
+        self.armed = False
+        self.forward_ca_refusals: list[TrustAnchorError] = []
+        self.api_ca_refusal: Exception | None = None  # a TrustAnchorError, or the CA's OSError
+
+    def arm(self, forward_ca_refusals: list[TrustAnchorError]) -> None:
+        """Start the span. ``forward_ca_refusals`` is the list ``_start_logging`` appends to, read
+        at the exit, so a refusal it adds after this call is still reported."""
+        self.armed = True
+        self.forward_ca_refusals = forward_ca_refusals
+
+    def disarm(self) -> None:
+        """End the span: uvicorn runs the lifespan next, and its preflight writes the rows."""
+        self.armed = False
+        self.forward_ca_refusals = []  # holds nothing once disarmed
+        self.api_ca_refusal = None
+
+    def run(self) -> None:
+        """Report what was refused, once, if the span was armed and not disarmed."""
+        armed, self.armed = self.armed, False
+        if armed and (self.forward_ca_refusals or self.api_ca_refusal is not None):
+            _report_anchors_refused_before_the_lifespan(
+                forward_ca_refusals=self.forward_ca_refusals,
+                api_ca_refusal=self.api_ca_refusal,
+            )
+
+
+_PRE_LIFESPAN_ANCHOR_AUDIT: contextvars.ContextVar[_PreLifespanAnchorAudit | None] = (
+    contextvars.ContextVar("_PRE_LIFESPAN_ANCHOR_AUDIT", default=None)
+)
+
+
+def _pre_lifespan_anchor_audit() -> _PreLifespanAnchorAudit:
+    """The exit hook's record for this ``serve`` call. Raises when the body runs without the
+    hook, so a refactor that drops the decorator fails loudly rather than auditing nothing."""
+    audit = _PRE_LIFESPAN_ANCHOR_AUDIT.get()
+    if audit is None:
+        raise RuntimeError("serve ran without its pre-lifespan anchor audit hook (BACKLOG #5391)")
+    return audit
+
+
+def _audits_anchors_refused_before_the_lifespan(
+    serve: Callable[[argparse.Namespace], int],
+) -> Callable[[argparse.Namespace], int]:
+    """``serve``'s one exit hook over the span :class:`_PreLifespanAnchorAudit` names. The report
+    runs once the body has returned, after every refusal is printed, and before an ``Exception``
+    propagates. It only logs, and opens no store."""
+
+    @functools.wraps(serve)
+    def hooked(args: argparse.Namespace) -> int:
+        audit = _PreLifespanAnchorAudit()
+        token = _PRE_LIFESPAN_ANCHOR_AUDIT.set(audit)
+        failure: Exception | None = None
+        try:
+            try:
+                rc = serve(args)
+            except Exception as exc:
+                failure = exc
+            # Outside the except block, so what the report logs is not chained to the failure.
+            audit.run()
+        finally:
+            _PRE_LIFESPAN_ANCHOR_AUDIT.reset(token)
+        if failure is not None:
+            raise failure
+        return rc
+
+    return hooked
+
+
+@_audits_anchors_refused_before_the_lifespan
 def _serve(args: argparse.Namespace) -> int:
     # Vault BACKLOG #2700: first in this function, ahead of the imports below and of config. The
     # module-level call (vault BACKLOG #2742) has normally put the hook in place already, before
@@ -3326,9 +3419,13 @@ def _serve(args: argparse.Namespace) -> int:
         _write_start_audit(_start_audit)
         raise
     # BACKLOG #3470: a refused collector CA does not stop the start here. The forwarder is not
-    # built, and the API lifespan's audited preflight refuses the start. It writes its audit row
-    # when it can read the file.
+    # built, and the API lifespan's audited preflight refuses the start. A way out before uvicorn
+    # runs the lifespan is a start already refused for another reason, and this function's exit
+    # hook, armed here, logs then that no row records the CA's refusal (BACKLOG #5391).
+    # trust_anchors module item 10 says when the CA's audit row is written.
     _forward_ca_refusals: list[TrustAnchorError] = []
+    _anchor_audit = _pre_lifespan_anchor_audit()
+    _anchor_audit.arm(_forward_ca_refusals)
     _logging_refused = _start_logging(
         settings,
         env_name=env_name,
@@ -4822,7 +4919,7 @@ def _serve(args: argparse.Namespace) -> int:
     # security notifications — must surface first. An operator who is missing three declarations
     # should be told about the concrete misconfiguration before the platform-property one, and a
     # gate that jumped the queue would silently change which error every existing exposed-PHI test
-    # (and every existing exposed-PHI deployment) reports.
+    # reports, and which one a deploying site would meet first.
     # ASVS 3.7.3: the "you are leaving this site" interstitial. Two knobs can weaken it, and BOTH are
     # announced at start rather than discovered in a later assessment. Warn-only by design: neither is
     # a PHI-safety property and refusing on an operator's deliberate UX decision would be a
@@ -5127,7 +5224,6 @@ def _serve(args: argparse.Namespace) -> int:
     # Unconditional on purpose: a CONDITIONAL scheme is what let the tray, the harness and the
     # DAST target each decide it their own way, which is the defect this item exists to remove.
     from messagefoundry.api.tls import (
-        GeneratedPairReplaced,
         ensure_api_tls_material,
         generated_state_dir,
     )
@@ -5373,6 +5469,13 @@ def _serve(args: argparse.Namespace) -> int:
                 _tls_refusal,
                 exc_info=exc,
             )
+            # BACKLOG #5391 added item 2: the exit hook reports a refused client CA after this
+            # return. verified_anchor_cadata passes the CA file's own read failure through as a
+            # bare OSError, so that one is told apart by the file it names.
+            if isinstance(exc, TrustAnchorError) or _names_the_file(
+                exc, settings.api.tls_client_ca_file
+            ):
+                _anchor_audit.api_ca_refusal = exc
             return 2
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx
         # Vault BACKLOG #3302: the loop runs every API handshake, so a failed one left no record.
@@ -5399,6 +5502,7 @@ def _serve(args: argparse.Namespace) -> int:
     logging.getLogger(__name__).info(
         "HTTP request parser in force on the API: %s", http_parser_in_force(run_kwargs["http"])
     )
+    _anchor_audit.disarm()  # the lifespan's preflight audits the anchors from here (#5391)
     try:
         uvicorn.run(app, host=settings.api.host, port=settings.api.port, **run_kwargs)
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
@@ -5408,6 +5512,60 @@ def _serve(args: argparse.Namespace) -> int:
         if api_handshakes is not None:
             api_handshakes.close()
     return 0
+
+
+def _names_the_file(exc: BaseException, path: str | None) -> bool:
+    """Whether ``exc`` is an ``OSError`` raised for the file at ``path``, as a failed open or read
+    of it reports in its ``filename``."""
+    if path is None or not isinstance(exc, OSError) or not isinstance(exc.filename, str):
+        return False
+    try:
+        return Path(exc.filename).resolve() == Path(path).resolve()
+    except (OSError, ValueError):
+        return False
+
+
+def _report_anchors_refused_before_the_lifespan(
+    *,
+    forward_ca_refusals: Sequence[TrustAnchorError],
+    api_ca_refusal: Exception | None,
+) -> None:
+    """Log, for each trust anchor a ``serve`` start refused before uvicorn ran its lifespan, that no
+    ``auth.trust_anchor`` row records this refusal, and why it was refused (BACKLOG #5391 added
+    item 2). ``serve``'s exit hook calls this on a way out between ``_start_logging`` and
+    ``uvicorn.run``: a return or an ``Exception``, and not an interrupt or other
+    ``BaseException`` (:class:`_PreLifespanAnchorAudit` names the exits it does not cover).
+
+    **No row is written, and no store is opened** (Manager decision, BACKLOG #5391: a refused
+    start writes nothing to the store). Writing a row here would take a writable store open, which
+    writes more than the row: :func:`~messagefoundry.store.open_store` says what an open does. At
+    least the AES-GCM invocation reserve is written by every keyed writable open.
+
+    The anchors it names: ``[logging].forward_tls_ca_file`` for each refusal in
+    ``forward_ca_refusals``, and for ``api_ca_refusal`` the setting a ``TrustAnchorError`` names,
+    or ``[api].tls_client_ca_file`` for one that names none and for the CA file's own
+    ``OSError``. Each line says first that no row records the refusal, then carries the
+    refusal's own reason, cut to :func:`~messagefoundry.redaction.safe_exc`'s length, because
+    ``serve`` prints none for a collector CA when ``_start_logging`` then refuses at
+    ``configure_logging``. The lines go through :func:`_write_start_audit`, so ``[logging].level``
+    does not filter them out."""
+    from messagefoundry.auth.trust_anchors import TrustAnchorError
+    from messagefoundry.controlchars import scrub_log_argument
+    from messagefoundry.redaction import safe_exc
+
+    refused: list[tuple[str, Exception]] = [
+        ("[logging].forward_tls_ca_file", refusal) for refusal in forward_ca_refusals
+    ]
+    if api_ca_refusal is not None:
+        named = api_ca_refusal.setting if isinstance(api_ca_refusal, TrustAnchorError) else None
+        refused.append((named or "[api].tls_client_ca_file", api_ca_refusal))
+    _write_start_audit(
+        [
+            f"no audit row records the refused {setting} (BACKLOG #5391); the refusal was: "
+            f"{scrub_log_argument(safe_exc(refusal))}"
+            for setting, refusal in refused
+        ]
+    )
 
 
 def _floor_or_refusal[T](refusing_to: str, build: Callable[[], T]) -> T | None:
@@ -5489,7 +5647,6 @@ def _renew_api_tls_before_spawning(settings: ServiceSettings, db_base: str) -> P
     would in serve: the WARNING the renewal logged, with both fingerprints, is then its record.
     """
     from messagefoundry.api.tls import (
-        GeneratedPairReplaced,
         ensure_api_tls_material,
         generated_state_dir,
         record_generated_pair_replacements,
@@ -13895,16 +14052,10 @@ def _verify(args: argparse.Namespace) -> int:
 
 
 def _support_bundle(args: argparse.Namespace) -> int:
-    """Write a support zip (#49): engine version + a config summary (registry COUNTS/names only — never
-    settings values or secrets) + a ``/status`` snapshot built from the real status models + a REDACTED
-    app-log tail. **The blanket "secret-free / PHI-free" this docstring used to open with covered the
-    first two members and not the tail**, whose redaction is best-effort with a single-token residual
-    that includes an operator username (BACKLOG #1475; the argparse help above carries the reasoning,
-    and ``docs/PHI.md`` stream 14 is the record). Offline: touches no network, starts no server. The
-    status
-    snapshot + log tail come from the service settings (the configured store + ``[logging].log_dir``);
-    the config summary comes from ``--config``. A missing service config or store is tolerated — the
-    bundle is still produced (support is most wanted when something is already broken)."""
+    """Write a support zip (#49) with :func:`messagefoundry.support.build_bundle`. The argparse
+    help above names the members, the manifest's ``phi_contract`` states the log-tail residual, and
+    ``docs/PHI.md`` stream 14 is the record (BACKLOG #1475, #5385). The status
+    snapshot + log tail come from the service settings, the config summary from ``--config``."""
     from pydantic import ValidationError
 
     from messagefoundry.config.anchor import anchor_settings_store_path

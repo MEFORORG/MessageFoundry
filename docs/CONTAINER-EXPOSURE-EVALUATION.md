@@ -106,7 +106,12 @@ the gate. The right topology depends on the orchestrator.
     `[security].serve_web_console = true`, and under `enforce` `serve` requires
     `web_console_public_address`. It also probes that origin's TLS floor at startup and exits 2 if
     the probe fails. In a pod the sidecar must answer on that origin before the engine starts, or
-    the engine restarts until it does.
+    the engine restarts until it does. Adapting `docker/k8s/statefulset.yaml` or `ha-postgres.yaml`,
+    delete their `revocation-attestation-check` initContainer: it reads no bind, so it refuses an
+    honest `0` here, where the gate never trips. Keep the Secret's `tls-revocation-attested` key,
+    set to `0`, and `api.crt` / `api.key` while the `tls-secret` volume stays: the kubelet refuses
+    the pod without them. In `docker/compose.yaml` the `revocation-attestation-check` service does
+    the same, so drop it and each engine's `depends_on` entry for it.
   - **Separate container, different netns:** the engine binds the internal interface (off-loopback),
     so you **must** set `tls_terminated_upstream=true` + `trusted_proxies`, plus an operator
     `tls_cert_file` the proxy trusts and connects to over https, and `MEFOR_TLS_REVOCATION_ATTESTED=1`.

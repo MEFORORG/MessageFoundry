@@ -9,6 +9,7 @@ import * as path from "node:path";
 import type { Field, FieldType } from "./securityEditorWebview";
 import {
   hasColonInName,
+  hasReservedDeviceName,
   hasTrailingDotOrSpaceName,
   type ContainedPathSetting,
   type PathSettingScopes,
@@ -104,7 +105,9 @@ function noLinkBelow(root: string, rel: string, fsx: LinkFs): boolean {
  *    trailing space. The check refuses every such name, the ones kept as written included. A
  *    folder or file name below the workspace folder that holds a colon is refused there too, before
  *    any file-system call, since a Win32 open reads it as a stream on another entry, which may be a
- *    link out of the folder ({@link hasColonInName} says why the link walk cannot be relied on). Then
+ *    link out of the folder ({@link hasColonInName} says why the link walk cannot be relied on). So
+ *    is a folder or file name that is a reserved device name, such as `nul` or `com1.toml`
+ *    ({@link hasReservedDeviceName}), which a Win32 open can read as the device. Then
  *    every existing path below the workspace folder, down to the target, must lstat as not a link,
  *    a dangling one included; the walk stops at the first that does not exist. The deepest
  *    existing one must then realpath to the folder's own realpath joined with the same parts,
@@ -168,6 +171,14 @@ export function securityConfigTarget(
       problem:
         "messagefoundry.serviceConfig names a path in the workspace folder with a folder or file name that holds " +
         "a colon, which Windows opens as a stream on another entry. Remove the colon",
+    };
+  }
+  if (hasReservedDeviceName(rel)) {
+    return {
+      ok: false,
+      problem:
+        "messagefoundry.serviceConfig names a path in the workspace folder with a folder or file name that is " +
+        "a Windows device name such as nul or com1, which Windows can open as the device. Rename the folder or file",
     };
   }
   if (!noLinkBelow(root, rel, fsx)) {

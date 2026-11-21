@@ -324,7 +324,9 @@ def test_copy_tls_runs_as_the_engine_with_the_engine_s_hardening(
     no container may override the pod's. And each initContainer is held to the engine's own
     restrictions."""
     engine = _container(pod, "engine")
-    inits = [_container(pod, "tls-dir"), _container(pod, "copy-tls")]
+    # Every initContainer, so one added later (the attestation check, BACKLOG #5400) is held too.
+    inits = [_container(pod, c["name"]) for c in pod["initContainers"]]
+    assert {"tls-dir", "copy-tls"} <= {c["name"] for c in inits}, name
     pod_ctx = pod["securityContext"]
     assert pod_ctx["runAsNonRoot"] is True and pod_ctx["runAsUser"] == 10001, name
     assert pod_ctx["seccompProfile"] == {"type": "RuntimeDefault"}, name
