@@ -4815,8 +4815,8 @@ Facts that are easy to get wrong, stated plainly first:
   state from that write is the connection's failure instead: the borrow fails transiently and
   the connection is discarded. A write still running when what is left of the borrow's
   `acquire_timeout` runs out fails the borrow with a transient error too, and its connection
-  stays out of the pool until the write returns; once the acquire itself has spent the whole
-  `acquire_timeout`, the write is waited for with no bound. The transient states are every state the connector retries:
+  stays out of the pool until the write returns; once less than a second of it is left after the
+  acquire, the write is waited for with no bound. The transient states are every state the connector retries:
   SQLSTATE class `08`, class `40`, `HYT00` and `HYT01`. A driver that takes it on the
   connection but refuses the ODBC query timeout on a cursor refuses every cursor; a send and the
   connection test read `HYC00` or `HY092` there as the same configuration fault, while a poll,

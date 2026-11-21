@@ -337,7 +337,7 @@ async def test_acquire_timeout_bounds_a_hung_timeout_write(
         monkeypatch, rig, raw_type=_RecordsTimeoutThread, blocks=never, block_autocommit=True
     )
     dest = _destination()
-    dest._acquire_timeout = 0.2
+    dest._acquire_timeout = 2.0  # above _TIMEOUT_WRITE_FLOOR_S, so the write is bounded
     with pytest.raises(DeliveryError) as caught:
         await asyncio.wait_for(dest.send('{"a": 1}'), WAIT)
     assert not isinstance(caught.value, NegativeAckError)
@@ -420,8 +420,9 @@ class _SlowTimeoutWrite(RawConn):
         self._timeout = value
 
 
+@pytest.mark.parametrize("left", [0.0, 0.01])
 async def test_a_borrow_whose_acquire_spent_the_budget_still_waits_for_the_write(
-    monkeypatch: pytest.MonkeyPatch, rig: _Rig
+    monkeypatch: pytest.MonkeyPatch, rig: _Rig, left: float
 ) -> None:
     """Red at 976dca70: the write got a zero budget and the borrow failed, where origin/main,
     whose write had no bound, succeeded."""
@@ -433,7 +434,7 @@ async def test_a_borrow_whose_acquire_spent_the_budget_still_waits_for_the_write
     dest._acquire_timeout = 1.0  # well inside WAIT, which the moved clock also reads
 
     def _spend() -> None:
-        offset[0] += dest._acquire_timeout
+        offset[0] += dest._acquire_timeout - left  # a sliver left is spent too
 
     monkeypatch.setattr(_AcquireSpendsBudget, "bump", staticmethod(_spend))
     _aioodbc_serving(

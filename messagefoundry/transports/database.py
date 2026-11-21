@@ -3651,11 +3651,12 @@ async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float | Non
     The write is skipped when the connection already holds the value: a connection lent before,
     and ``0`` on a fresh one. A borrower cancelled during the write leaves at once, and the
     connection goes back only once the write has returned (:func:`_return_when_settled`), or is
-    discarded if the write then failed with a transient state. A positive ``timeout`` bounds the
-    wait for the write the same way, as a transient :class:`DeliveryError`; :func:`_acquire`
-    passes what is left of its ``acquire_timeout``. Once that is spent (``timeout`` of ``0`` or
-    less) the write is waited for with no bound, still off the loop, as it was before it had one,
-    so a borrow whose acquire took the whole budget still succeeds.
+    discarded if the write then failed with a transient state. A ``timeout`` of at least
+    :data:`_TIMEOUT_WRITE_FLOOR_S` bounds the wait for the write the same way, as a transient
+    :class:`DeliveryError`; :func:`_acquire` passes what is left of its ``acquire_timeout``. Less
+    than that left counts as spent, and the write is then waited for with no bound, still off the
+    loop, as it was before it had one, so a borrow whose acquire took nearly the whole budget is
+    not failed by a sliver of it.
 
     **A driver that refuses the value fails the borrow closed.** The connection goes back to
     ``pool`` first, since a refused write leaves the handle usable and no statement ran on it, and
@@ -3701,7 +3702,7 @@ async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float | Non
         await _return_to_pool(pool, conn)
         raise
     try:
-        bound = timeout if timeout is not None and timeout > 0 else None
+        bound = timeout if timeout is not None and timeout >= _TIMEOUT_WRITE_FLOOR_S else None
         await asyncio.wait_for(asyncio.shield(work), bound)
     except BaseException as exc:
         if not (work.done() and isinstance(exc, Exception)):
@@ -3739,6 +3740,11 @@ def _transient_driver_error(exc: BaseException) -> bool:
     """Whether ``exc`` carries a SQLSTATE this connector retries (:func:`_is_transient`)."""
     state = _log_sqlstate(exc)
     return state is not None and _is_transient(state)
+
+
+#: The least time left of a borrow's ``acquire_timeout`` that still bounds the ``statement_timeout``
+#: write (:func:`_apply_statement_timeout`); less counts as spent, so the write is waited for.
+_TIMEOUT_WRITE_FLOOR_S = 1.0
 
 
 def _set_driver_timeout(raw: Any, seconds: int) -> None:
