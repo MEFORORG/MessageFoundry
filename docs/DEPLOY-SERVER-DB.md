@@ -610,6 +610,9 @@ connection fails validation** (NIST SP 800-52r2: rotate certificates before expi
      CA goes"), so a server certificate it issued would still validate there. **Keep** any
      certificate the new file also holds, such as the shared root when only the issuing CA
      rotated: removing it breaks the new chain, which is the outage this order exists to avoid.
+     Keep too any certificate something else on the host still relies on, such as a root another
+     DB's CA file shares or one a Group Policy deploys: the helper does not record what it added,
+     so an old file's root may have been in the store before it.
      The helper prints each certificate's thumbprint; run it with `-WhatIf` on the old file and on
      the new one, and take the old file's thumbprints that the new file's listing does not show.
      For a file the helper reads, it prints the list before it refuses the file for a CA, chain or
@@ -623,7 +626,9 @@ connection fails validation** (NIST SP 800-52r2: rotate certificates before expi
      Get-ChildItem Cert:\LocalMachine\Root, Cert:\LocalMachine\CA |
          Where-Object Thumbprint -in $old | Remove-Item
      ```
-   - **PostgreSQL:** drop the old CA from the PEM bundle and reload.
+   - **PostgreSQL:** drop the old CA from the PEM bundle and reload. Where the PostgreSQL hop uses
+     the machine stores instead of a file pin, remove the old CA from them as the SQL Server step
+     above says.
 
 **Rotating only the server leaf cert** (same CA): no trust-store change is needed — the new leaf still
 chains to the already-trusted CA. Just roll it before expiry. **Caveat — leaf pinning:** if you pinned

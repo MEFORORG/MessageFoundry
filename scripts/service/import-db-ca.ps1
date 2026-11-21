@@ -23,9 +23,11 @@
     docs/DEPLOY-SERVER-DB.md section 5.2 ("Where each CA goes"), and so is the PowerShell version
     this needs.
 
-    What this script checks. This is the full statement of it. docs/DEPLOY-SERVER-DB.md points
-    here; at least docs/INPUT-SURFACES.md and docs/DANGEROUS-FUNCTIONALITY.md still name some of
-    its refusals, with "at least", and this text governs where they differ. A
+    What this script checks. This paragraph states the chain and root checks, and the paragraph
+    that starts "The file is read once" states the rest; together they are the full statement.
+    docs/DEPLOY-SERVER-DB.md points here; at least docs/INPUT-SURFACES.md and
+    docs/DANGEROUS-FUNCTIONALITY.md still name some of its refusals, with "at least", and this text
+    governs where they differ. A
     certificate is a self-signed root when the chain .NET's chain engine (X509Chain) builds for it
     is that certificate alone and its signature verifies under its own key. The Windows chain
     engine needs an authority key identifier to link a self-issued certificate to its signer;
@@ -469,7 +471,8 @@ try {
 Write-Host "The file holds $($bundle.Count) certificate(s):"
 $checks = Get-CaChainCheck -Bundle $bundle -Now ([datetime]::UtcNow)
 $refusals = [System.Collections.Generic.List[object]]::new()
-# The store each certificate is shown with is the one it is offered for and written to.
+# The store each certificate is shown with is the one it is offered for and written to when the
+# file passes; a file with any refusal offers nothing, and its refused certificates show none.
 $entries = @(foreach ($cert in $bundle) {
     $check = $checks[$cert.Thumbprint]
     $target = $stores[$check.Store]

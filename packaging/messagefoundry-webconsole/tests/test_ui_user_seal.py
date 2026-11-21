@@ -9,8 +9,9 @@ of what was planted shown, and the failure is handed to the seal-failure report,
 ``integrity.authority_seal_failed`` row and raises the alert. Before #5559 these read the store row
 directly: the page showed the planted values with a 200 and nothing was recorded.
 
-The users list keeps such an account by id alone (BACKLOG #5520) and now offers its delete, the
-one action the console takes on it, since its detail page answers 423.
+The users list keeps such an account by id alone (BACKLOG #5520) and, to a users:manage holder,
+links to its delete confirmation, the one action the console takes on it, since its detail page
+answers 423.
 
 Every test has a control: the same read of an intact account, or of the same account before the
 tampering.
@@ -189,7 +190,7 @@ async def test_a_refused_delete_of_a_failing_account_answers_its_own_refusal(
     keyed: tuple[Engine, Path], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A refused delete re-renders the detail page, which answers 423 for a record that fails its
-    seal. For the delete the list offers on such a row, the delete's own refusal is the answer.
+    seal. For the delete the confirmation offers on such a row, the delete's own refusal is the answer.
     The refusal is stood in for at the service's delete; the control is the same refusal on an
     intact account, shown on its detail page."""
     engine, path = keyed
@@ -306,7 +307,7 @@ async def test_a_page_after_a_landed_action_names_the_account_only_from_a_checke
         and "names the account by id" in rec.getMessage()
     ]
     assert fallback
-    assert all(rec.exc_info is None and "stand-in" not in rec.getMessage() for rec in fallback)
+    assert all(not rec.exc_info and "stand-in" not in rec.getMessage() for rec in fallback)
 
 
 @pytest.mark.parametrize(

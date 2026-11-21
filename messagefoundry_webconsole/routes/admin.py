@@ -282,31 +282,31 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ``AUDIT_WRITE_DEFECTS`` a WARNING naming its type alone, since a refusal's text can carry
         the record's values. Anything else, a defect included, logs an ERROR with its traceback,
         so the bug can be found. None of these lines is rate-limited."""
-        trace: BaseException | None = None
+
+        def fallback(level: int, reason: str, *, trace: bool = False) -> str:
+            # Called inside each handler, so exc_info=True reads the exception being handled.
+            _log.log(
+                level,
+                "the name of account %s for a page after a landed action was not shown: its "
+                "checked read %s; the page names the account by id",
+                scrub_log_argument(user_id),
+                reason,
+                exc_info=trace,
+            )
+            return user_id
+
         try:
             user = await _checked(user_id, service)
         except HTTPException as exc:
             # 404 gone since the action, 423 a record that fails its seal, 503 a Vault Outage.
-            level, reason = logging.WARNING, f"answered {exc.status_code}"
+            return fallback(logging.WARNING, f"answered {exc.status_code}")
         except Exception as exc:
             # Broad on purpose: the credential was issued, and the docstring says why.
             reason = f"failed ({type(exc).__name__})"
             if isinstance(exc, account_read_errors()) and not isinstance(exc, AUDIT_WRITE_DEFECTS):
-                level = logging.WARNING
-            else:
-                # The exception itself, since the handler's exc_info is gone once this ends.
-                level, trace = logging.ERROR, exc
-        else:
-            return str(user.username)
-        _log.log(
-            level,
-            "the name of account %s for a page after a landed action was not shown: its checked "
-            "read %s; the page names the account by id",
-            scrub_log_argument(user_id),
-            reason,
-            exc_info=trace,
-        )
-        return user_id
+                return fallback(logging.WARNING, reason)
+            return fallback(logging.ERROR, reason, trace=True)
+        return str(user.username)
 
     async def _user_detail(
         user_id: str,

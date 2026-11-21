@@ -14,11 +14,12 @@ period. A root goes into the machine Root store and any other CA into the interm
 NOTHING HERE WRITES A CERTIFICATE STORE. The fixtures are generated in a pytest temporary
 directory. The function-level tests lift ``Read-CaBundle``, ``Get-CaRefusal`` and
 ``Get-CaChainCheck`` (and the console helpers they call) out of the script's AST and call them, as
-``tests/test_import_db_ca_console_text.py`` does. The whole-script tests run it with ``-WhatIf``
-only, where ``ShouldProcess`` declines every import, so the store is never opened; they are also
-skipped in an elevated session, so even a regression that ignored ``-WhatIf`` would meet the
-script's own elevation refusal rather than the machine Root store. Both halves need ``pwsh`` and
-skip where there is none.
+``tests/test_import_db_ca_console_text.py`` does. The whole-script tests but one run it with
+``-WhatIf``, where ``ShouldProcess`` declines every import, so the store is never opened. The one
+run without it is the elevation refusal test, which gives it a file the script refuses anyway.
+All of them are skipped in an elevated session, so even a regression that ignored ``-WhatIf``
+would meet the script's own elevation refusal rather than the machine Root store. Both halves need
+``pwsh`` and skip where there is none.
 """
 
 from __future__ import annotations
