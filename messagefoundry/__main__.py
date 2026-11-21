@@ -2329,9 +2329,9 @@ def _start_logging(
     locks it. The last gate checks the collector's CA as a trust anchor (BACKLOG #3470). A caller
     that passes ``deferred_ca_refusals`` takes that refusal itself: it is appended there, and
     logging is configured without the forwarder. ``serve`` does: its API lifespan's audited
-    preflight refuses the start, and on a way out before uvicorn runs the lifespan, a start already
-    refused for another reason, its exit hook audits the refusal (BACKLOG #5391). trust_anchors
-    module item 10 says when either writes a row.
+    preflight refuses the start. On a way out before uvicorn runs the lifespan, a start already
+    refused for another reason, its exit hook logs that no row records the refusal (BACKLOG
+    #5391). trust_anchors module item 10 says when a row is written.
 
     ``configure`` is the caller's own ``configure_logging`` call, given the forwarder the gates
     passed (``None`` with no collector). It stays at the call site because level, format and the
@@ -2916,69 +2916,37 @@ class _PreLifespanAnchorAudit:
     ``_start_logging`` refuses and defers, and ``[api].tls_client_ca_file``, which the API TLS
     context build refuses. ``serve`` arms this just before ``_start_logging`` and disarms it just
     before ``uvicorn.run``. Any way out in between, a return or an ``Exception``, is an exit the
-    lifespan never ran for, so :func:`_audits_anchors_refused_before_the_lifespan` writes those
-    rows then.
-
-    At least these write no row for an anchor refused before the store: an interrupt, any other
-    ``BaseException`` that is not an ``Exception`` (a ``SystemExit`` included), an exit a gate
-    marks with :meth:`forgo`, an exit uvicorn takes before the lifespan starts, and an exit inside
-    the lifespan before its preflight runs, such as a refused secret provider, a store that does
-    not open, or an attestation that fails closed."""
+    lifespan never ran for, so :func:`_audits_anchors_refused_before_the_lifespan` reports then
+    that no row records each such anchor (:func:`_report_anchors_refused_before_the_lifespan`
+    says why none is written). An interrupt, or any other ``BaseException`` that is not an
+    ``Exception``, reports nothing. Nor does an exit uvicorn takes before the lifespan starts, or
+    one inside the lifespan before its preflight runs."""
 
     def __init__(self) -> None:
-        self.settings: ServiceSettings | None = None
-        self.enforcing = True
+        self.armed = False
         self.forward_ca_refusals: list[TrustAnchorError] = []
         self.api_ca_refusal: TrustAnchorError | None = None
-        self.replaced: list[GeneratedPairReplaced] = []
-        self.forgone: str | None = None
 
-    def arm(
-        self,
-        settings: ServiceSettings,
-        *,
-        enforcing: bool,
-        forward_ca_refusals: list[TrustAnchorError],
-    ) -> None:
+    def arm(self, forward_ca_refusals: list[TrustAnchorError]) -> None:
         """Start the span. ``forward_ca_refusals`` is the list ``_start_logging`` appends to, read
-        at the exit, so a refusal it adds after this call is still audited."""
-        self.settings = settings
-        self.enforcing = enforcing
+        at the exit, so a refusal it adds after this call is still reported."""
+        self.armed = True
         self.forward_ca_refusals = forward_ca_refusals
 
     def disarm(self) -> None:
         """End the span: uvicorn runs the lifespan next, and its preflight writes the rows."""
-        self.settings = None
+        self.armed = False
         self.forward_ca_refusals = []  # holds nothing once disarmed
         self.api_ca_refusal = None
-        self.replaced = []
-
-    def forgo(self, why: str) -> None:
-        """Mark this exit as one that must not write to the store, such as the low-disk floor's
-        or a fail-closed clock check's. ``run`` then opens no store, and logs one WARNING that no
-        row records the refused anchors, naming the reason and not each anchor. Only the gates
-        that call this are marked."""
-        self.forgone = why
 
     def run(self) -> None:
-        """Audit what was refused, once, if the span was armed and not disarmed."""
-        settings, self.settings = self.settings, None
-        if settings is None or (not self.forward_ca_refusals and self.api_ca_refusal is None):
-            return
-        if self.forgone is not None:
-            logging.getLogger(__name__).warning(
-                "no audit row records the refused trust anchors: the start was refused because %s, "
-                "so the audit does not write to the store",
-                self.forgone,
+        """Report what was refused, once, if the span was armed and not disarmed."""
+        armed, self.armed = self.armed, False
+        if armed and (self.forward_ca_refusals or self.api_ca_refusal is not None):
+            _report_anchors_refused_before_the_lifespan(
+                forward_ca_refused=bool(self.forward_ca_refusals),
+                api_ca_refusal=self.api_ca_refusal,
             )
-            return
-        _audit_anchors_refused_before_the_store(
-            settings,
-            enforcing=self.enforcing,
-            forward_ca_refused=bool(self.forward_ca_refusals),
-            api_ca_refusal=self.api_ca_refusal,
-            replaced=self.replaced,
-        )
 
 
 _PRE_LIFESPAN_ANCHOR_AUDIT: contextvars.ContextVar[_PreLifespanAnchorAudit | None] = (
@@ -2998,11 +2966,9 @@ def _pre_lifespan_anchor_audit() -> _PreLifespanAnchorAudit:
 def _audits_anchors_refused_before_the_lifespan(
     serve: Callable[[argparse.Namespace], int],
 ) -> Callable[[argparse.Namespace], int]:
-    """``serve``'s one exit hook over the span :class:`_PreLifespanAnchorAudit` names. The audit
-    runs once the body has returned, so every refusal is printed before the store opens, and
-    before an ``Exception`` propagates. The audit logs its own ``Exception``s rather than raise
-    them, so it does not replace the body's. A ``MemoryError`` or an interrupt during the audit
-    does replace it. On a server store the exit waits on the store's connect."""
+    """``serve``'s one exit hook over the span :class:`_PreLifespanAnchorAudit` names. The report
+    runs once the body has returned, after every refusal is printed, and before an ``Exception``
+    propagates. It only logs, and opens no store."""
 
     @functools.wraps(serve)
     def hooked(args: argparse.Namespace) -> int:
@@ -3014,7 +2980,7 @@ def _audits_anchors_refused_before_the_lifespan(
                 rc = serve(args)
             except Exception as exc:
                 failure = exc
-            # Outside the except block, so what the audit logs is not chained to the failure.
+            # Outside the except block, so what the report logs is not chained to the failure.
             audit.run()
         finally:
             _PRE_LIFESPAN_ANCHOR_AUDIT.reset(token)
@@ -3450,11 +3416,11 @@ def _serve(args: argparse.Namespace) -> int:
     # BACKLOG #3470: a refused collector CA does not stop the start here. The forwarder is not
     # built, and the API lifespan's audited preflight refuses the start. A way out before uvicorn
     # runs the lifespan is a start already refused for another reason, and this function's exit
-    # hook, armed here, audits the CA then (BACKLOG #5391). trust_anchors module item 10 says when
-    # either writes the CA's audit row.
+    # hook, armed here, logs then that no row records the CA's refusal (BACKLOG #5391).
+    # trust_anchors module item 10 says when the CA's audit row is written.
     _forward_ca_refusals: list[TrustAnchorError] = []
     _anchor_audit = _pre_lifespan_anchor_audit()
-    _anchor_audit.arm(settings, enforcing=enforcing, forward_ca_refusals=_forward_ca_refusals)
+    _anchor_audit.arm(_forward_ca_refusals)
     _logging_refused = _start_logging(
         settings,
         env_name=env_name,
@@ -3639,7 +3605,6 @@ def _serve(args: argparse.Namespace) -> int:
                     "time_sync_fail_closed to downgrade this to a warning.",
                     file=sys.stderr,
                 )
-                _anchor_audit.forgo("the clock could not be confirmed")  # rows carry the time
                 return 2
             sync_log.warning(
                 "clock-sync check: could not query time reference %r (%s); continuing — cross-host "
@@ -3658,7 +3623,6 @@ def _serve(args: argparse.Namespace) -> int:
                         "clock (w32tm/NTP), or unset time_sync_fail_closed to warn instead.",
                         file=sys.stderr,
                     )
-                    _anchor_audit.forgo("the clock is skewed")  # rows carry the time
                     return 2
                 sync_log.warning(
                     "clock-sync check: local clock is %.3fs off time reference %r (threshold %.3fs) "
@@ -4713,7 +4677,6 @@ def _serve(args: argparse.Namespace) -> int:
                 "to turn the floor off.",
                 file=sys.stderr,
             )
-            _anchor_audit.forgo("the store's volume is below its free-space floor")
             return 2
 
     # --- #290 slice 3: the first [inbound]-keyed rung -- INFO ONLY, NEVER REFUSE (ASVS 15.2.2) -----
@@ -5264,7 +5227,6 @@ def _serve(args: argparse.Namespace) -> int:
     # A renewal or recovery of the generated pair is reported here and audited by the lifespan once
     # the store is open, which is after this point (ADR 0172 decision 6: never silent).
     _replaced: list[GeneratedPairReplaced] = []
-    _anchor_audit.replaced = _replaced  # written if the exit hook opens the store (#5391)
     _state_dir = generated_state_dir(settings.store.path)
     try:
         _material = ensure_api_tls_material(
@@ -5503,7 +5465,7 @@ def _serve(args: argparse.Namespace) -> int:
                 exc_info=exc,
             )
             if isinstance(exc, TrustAnchorError):
-                # BACKLOG #5391 added item 2: the exit hook writes its row, after this return.
+                # BACKLOG #5391 added item 2: the exit hook reports it, after this return.
                 _anchor_audit.api_ca_refusal = exc
             return 2
         run_kwargs["ssl_context_factory"] = lambda config, default_factory: ctx
@@ -5531,7 +5493,7 @@ def _serve(args: argparse.Namespace) -> int:
     logging.getLogger(__name__).info(
         "HTTP request parser in force on the API: %s", http_parser_in_force(run_kwargs["http"])
     )
-    _anchor_audit.disarm()  # the lifespan's preflight writes the rows from here (#5391)
+    _anchor_audit.disarm()  # the lifespan's preflight audits the anchors from here (#5391)
     try:
         uvicorn.run(app, host=settings.api.host, port=settings.api.port, **run_kwargs)
     except Exception as exc:  # last-resort: log an abnormal server exit PHI-redacted, then re-raise
@@ -5543,174 +5505,38 @@ def _serve(args: argparse.Namespace) -> int:
     return 0
 
 
-def _audit_anchors_refused_before_the_store(
-    settings: ServiceSettings,
-    *,
-    enforcing: bool,
-    forward_ca_refused: bool,
-    api_ca_refusal: TrustAnchorError | None,
-    replaced: Sequence[GeneratedPairReplaced] = (),
+def _report_anchors_refused_before_the_lifespan(
+    *, forward_ca_refused: bool, api_ca_refusal: TrustAnchorError | None
 ) -> None:
-    """Write the audit rows of trust anchors a ``serve`` start refused before uvicorn ran its
-    lifespan, whose audited preflight would have written them (BACKLOG #5391 added item 2).
+    """Log, for each trust anchor a ``serve`` start refused before uvicorn ran its lifespan, that no
+    ``auth.trust_anchor`` row records its refusal (BACKLOG #5391 added item 2). ``serve``'s exit
+    hook calls this on every way out between ``_start_logging`` and ``uvicorn.run``.
 
-    ``serve``'s exit hook (:func:`_audits_anchors_refused_before_the_lifespan`) calls this on every
-    way out between ``_start_logging`` and ``uvicorn.run``. It opens the store directly, at the hop
-    posture the lifespan's own open passes, so its hop checks are never stricter or looser than
-    ``serve``'s: at ``enforce`` it refuses what the lifespan's open refuses. Unlike that open it
-    passes no ``refusal_hook`` and no ``message_events``, so a store-cipher refusal found at open
-    is logged and raises no alert. **It never creates or migrates the store** (Manager decision
-    on round-d89a2d24's finding 1): it opens without ``create``, and only a store that exists and
-    whose schema is current. A SQLite store's schema is compared read-only first. A server store
-    under ``[store].schema_management = auto``, whose open could upgrade it, is not opened at all;
-    under ``external`` its open runs no DDL and refuses a marker that is not current. In each of
-    those cases no row is written, and a WARNING says why. It runs the audited preflight
-    (:func:`run_anchor_preflight`) on each anchor refused before the store, and closes the store.
-    It runs no lifespan, so none of the lifespan's other startup work (at least the secret
-    provider, the notifier, the attestation and the engine) runs for a start already refused.
+    **No row is written, and no store is opened** (Manager decision on round-32e2013d's finding 1:
+    a refused start writes nothing but the anchor rows themselves). The row is the lifespan's
+    audited preflight's to write, and writing it here would take a writable store open. Every such
+    open writes more than the row, and no read-only check can rule that out. At least these at-open
+    writes are why: the schema ensure, which creates a SQLite file and migrates an older schema;
+    the WAL journal mode; the open-store hook; the salt bind; the AES-GCM invocation reserve, which
+    a keyed open writes every time; the sealing of legacy plaintext on unsealed surfaces; the
+    keyed-surface markers; the audit chain's genesis row; the store file's ACL rewrite; and a
+    ``key_provider = "host"`` custody handoff's conversion and deletion.
 
-    The anchors it checks, each on its own so a refusal of one does not hide the next:
-
-    * ``[logging].forward_tls_ca_file`` when ``forward_ca_refused``: ``_start_logging`` refused the
-      collector's CA and left its row to the lifespan (BACKLOG #3470).
-    * ``[api].tls_client_ca_file`` when the API TLS context build refused with
-      ``api_ca_refusal``, unless that refusal names ``[api].tls_client_crl_file``
-      (``build_api_ssl_context`` tags that one). That CRL is kept out of the audited preflight by
-      design, so no row could come of its refusal.
-
-    ``replaced`` is the generated API pairs this start minted in place of old ones. The lifespan
-    would have written their ``api.tls_generated_pair_replaced`` rows (ADR 0172 decision 6), so
-    they are written here once the store is open. A refused client CA has none, since it needs an
-    operator ``[api].tls_cert_file``, which is never minted, but a refused collector CA may.
-
-    Every outcome is logged at WARNING. A refusal the store refused, a check that passed after the
-    start refused it, a store that did not open, and an anchor whose audit raised each say that no
-    row records it. Any other refusal says only that the check refused it: a file that cannot be
-    read, or a pin that does not parse, is refused before any row is written, and the refusal does
-    not say which. An ``Exception`` is logged and not raised, because a raise would turn the clean
-    exit 2 into the uncaught floor's exit 1. A ``MemoryError`` is raised once every anchor has been
-    checked, and an interrupt propagates."""
-    from messagefoundry.api.tls import record_generated_pair_replacements
-    from messagefoundry.auth.trust_anchors import (
-        AnchorSpec,
-        AnchorStoreUnavailable,
-        TrustAnchorError,
-        api_client_anchor_spec,
-        api_client_crl_spec,
-        log_forward_anchor_spec,
-        run_anchor_preflight,
-    )
-    from messagefoundry.config.settings import (
-        SchemaManagement,
-        StoreBackend,
-        hop_posture_from_ai,
-        keyless_opt_out_refusal,
-    )
-    from messagefoundry.controlchars import scrub_log_argument
-    from messagefoundry.last_resort import run_guarded
-    from messagefoundry.redaction import safe_exc
-    from messagefoundry.store import open_store
-
+    The anchors it names: ``[logging].forward_tls_ca_file`` when ``forward_ca_refused``, and the
+    setting ``api_ca_refusal`` names, ``[api].tls_client_ca_file`` where it names none. Each
+    refusal's own reason was printed and logged when it was made."""
     log = logging.getLogger(__name__)
-    specs: list[AnchorSpec] = []
-    forward_ca = log_forward_anchor_spec(settings.logging) if forward_ca_refused else None
-    if forward_ca is not None:
-        specs.append(forward_ca)
-    if api_ca_refusal is not None and (ca := api_client_anchor_spec(settings.api)) is not None:
-        crl = api_client_crl_spec(settings.api)
-        if crl is None or api_ca_refusal.setting != crl.setting:
-            specs.append(ca)
-    if not specs:
-        return
-    # The lifespan's own posture (BACKLOG #5391, Manager decision Q1), not _command_hop_posture's,
-    # which is None at warn and so refuses hops serve accepts.
-    posture = hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement)
-
-    def _unaudited(why: str) -> None:
-        log.warning("no audit row records the refused trust anchors: %s", why)
-
-    async def _audit() -> None:
-        if settings.store.backend == StoreBackend.SQLITE:
-            from messagefoundry.store.store import MessageStore
-
-            if not Path(settings.store.path).is_file():
-                _unaudited("the store does not exist, and a refused start does not create it")
-                return
-            if await MessageStore.schema_differences_at(settings.store.path):
-                _unaudited(
-                    "the store's schema is not current, and a refused start does not migrate it"
-                )
-                return
-        elif settings.store.resolved_schema_management() is SchemaManagement.AUTO:
-            _unaudited(
-                "the store's [store].schema_management is auto, so opening it could migrate it, "
-                "and a refused start does not"
-            )
-            return
-        store = await open_store(
-            settings.store,
-            create=False,  # never create or migrate a store for a refused start
-            posture=posture,
-            keyless_chain_refusal=keyless_opt_out_refusal(settings.store, settings.security),
-        )
-        memory_fault: MemoryError | None = None
-        try:
-            await record_generated_pair_replacements(store, replaced)  # logs its own failure
-            for spec in specs:
-                try:
-                    await run_anchor_preflight([spec], store, enforcing=enforcing)
-                except TrustAnchorError as refused:
-                    reason = scrub_log_argument(safe_exc(refused))
-                    # _preflight_one names it: the pin's setting for a pin that did not parse.
-                    if refused.unaudited:
-                        log.warning(
-                            "no audit row records the refused %s: %s", refused.setting, reason
-                        )
-                    else:
-                        log.warning(
-                            "the audited check refused %s: %s. Its audit row is written unless "
-                            "the check refused before writing one, as it does for a file it "
-                            "cannot read or a pin that does not parse",
-                            refused.setting,
-                            reason,
-                        )
-                except AnchorStoreUnavailable as unavailable:
-                    # Not a TrustAnchorError: the check passed and the store refused its row.
-                    log.warning(
-                        "no audit row records the refused %s: the audited check passed it after "
-                        "the start refused it, and the store refused its row (%s)",
-                        spec.setting,
-                        scrub_log_argument(safe_exc(unavailable)),
-                    )
-                except MemoryError as exc:
-                    memory_fault = memory_fault or exc  # raised once the others are checked
-                    log.warning("no audit row records the refused %s: out of memory", spec.setting)
-                except Exception as exc:  # a defect in one anchor's audit does not stop the next
-                    log.warning(
-                        "no audit row records the refused %s: its audit stopped (%s)",
-                        spec.setting,
-                        scrub_log_argument(_store_error_text(exc)),
-                    )
-                else:
-                    log.warning(
-                        "no audit row records the refused %s: the audited check passed it after "
-                        "the start refused it",
-                        spec.setting,
-                    )
-        finally:
-            await _close_store_quietly(store)  # a failed close is not a missing row
-        if memory_fault is not None:
-            raise memory_fault
-
-    try:
-        run_guarded(_audit())
-    except MemoryError:
-        raise
-    except Exception as exc:  # the start is refused already; log it, never mask the exit 2
-        # _store_error_text, not safe_exc: a store error can quote stored values, and no traceback.
+    refused: list[str] = []
+    if forward_ca_refused:
+        refused.append("[logging].forward_tls_ca_file")
+    if api_ca_refusal is not None:
+        refused.append(api_ca_refusal.setting or "[api].tls_client_ca_file")
+    for setting in refused:
         log.warning(
-            "no audit row records the refused trust anchors: the audit stopped first (%s)",
-            scrub_log_argument(_store_error_text(exc)),
+            "no audit row records the refused %s: the start was refused before the API lifespan, "
+            "whose audited preflight writes that row, and a refused start opens no store to write "
+            "it (BACKLOG #5391)",
+            setting,
         )
 
 
@@ -14839,10 +14665,9 @@ async def _open_store_or_refuse(opening: Awaitable[Store]) -> Store:
 
 
 async def _close_store_quietly(store: Store) -> None:
-    """Close ``store`` once its caller has its result: at least ``audit-verify``,
-    ``audit-anchor``, ``admin-unlock``, ``cipher-audit``, ``store attest-transit-bound``,
-    ``store withdraw-transit-bound`` and ``serve``'s audit of an anchor refused before the store
-    opened. A close that fails prints a warning naming its
+    """Close ``store`` after ``audit-verify``, ``audit-anchor``, ``admin-unlock``,
+    ``cipher-audit``, ``store attest-transit-bound`` or ``store withdraw-transit-bound`` has its
+    result. A close that fails prints a warning naming its
     class, and never replaces that result (vault BACKLOG #3054; BACKLOG #2337)."""
     try:
         await store.close()

@@ -276,8 +276,6 @@ _CENSUS: list[Row] = sorted(
         ("__main__.py", "_admin_unlock.run", "open_store", "posture"),
         ("__main__.py", "_admin_revoke_sessions.run", "open_store", "posture"),  # BACKLOG #2614
         ("__main__.py", "_audit_anchor.run", "open_store", "posture"),
-        # BACKLOG #5391: serve's audit of a trust anchor it refused before the store opened.
-        ("__main__.py", "_audit_anchors_refused_before_the_store._audit", "open_store", "posture"),
         ("__main__.py", "_audit_verify.run", "open_store", "posture"),
         ("__main__.py", "_backup.run", "_BackupRunner", "posture"),
         ("__main__.py", "_backup.run", "open_store", "posture"),
@@ -520,8 +518,6 @@ _SERVE_DIAL = "(security_settings or SecuritySettings()).enforcement"
 #: reads the dial off the instance's own ``[security]`` settings, never a constant.
 _DERIVATIONS = sorted(
     [
-        # BACKLOG #5391: serve's pre-lifespan anchor audit opens at the lifespan's own posture.
-        ("__main__.py", "_audit_anchors_refused_before_the_store", "settings.security.enforcement"),
         ("__main__.py", "_check_privileges", "settings.security.enforcement"),
         ("__main__.py", "_cipher_audit", "settings.security.enforcement"),
         ("__main__.py", "_connection.validate", "settings.security.enforcement"),
