@@ -4293,6 +4293,9 @@ def test_the_minted_certificate_names_a_wildcard_binds_loopback(
         ("10.0.0.9", "0.0.0.0", ["0.0.0.0", "127.0.0.1"]),
         ("127.0.0.1", "localhost", ["localhost", "127.0.0.1"]),
         ("::1", "localhost", ["localhost", "127.0.0.1", "::1"]),
+        # A loopback is recognised as hostname verification compares it.
+        ("127.0.0.1", "LOCALHOST", ["LOCALHOST", "127.0.0.1"]),
+        ("127.0.0.1", "0:0:0:0:0:0:0:1", ["::1", "127.0.0.1"]),
         # A bracketed IPv6 bind is named by the address, not a DNS name spelled "[::1]".
         ("127.0.0.1", "[::1]", ["::1", "127.0.0.1"]),
         # Off loopback, nothing is kept: the CLI defaults cannot reach this bind anyway.
@@ -4373,6 +4376,29 @@ def test_a_bind_move_that_needs_no_new_name_or_is_a_shard_reuses_the_pair(
         ApiSettings(host=then), state_dir=tmp_path, replacements=events, renew=renew
     )
     assert events == [] and _snapshot(cert, key) == before
+
+
+def test_a_renewal_keeps_the_loopback_names_a_bind_re_mint_kept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BACKLOG #5973. A re-mint for a move from 127.0.0.1 to localhost keeps 127.0.0.1, which the
+    CLI, IDE and harness dial by default. The renewal months later must keep it too, or those
+    clients fail hostname verification then.
+
+    Mutation: keep the names on a bind re-mint only. Red: the renewal names only localhost."""
+    import messagefoundry.api.tls as tls
+
+    ensure_api_tls_material(ApiSettings(host="127.0.0.1"), state_dir=tmp_path)
+    ensure_api_tls_material(ApiSettings(host="localhost"), state_dir=tmp_path)
+    monkeypatch.setattr(tls, "_RENEW_REMAINING_FRACTION", 1.01)  # every pair is due now
+    events: list[GeneratedPairReplaced] = []
+    cert, _ = ensure_api_tls_material(
+        ApiSettings(host="localhost"), state_dir=tmp_path, replacements=events
+    )
+    assert [e.reason for e in events] == ["renewal"]
+    loaded = x509.load_pem_x509_certificate(Path(cert).read_bytes())
+    san = loaded.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
+    assert [str(n.value) for n in san] == ["localhost", "127.0.0.1"]
 
 
 def test_an_engine_shaped_pair_with_no_san_is_re_minted(tmp_path: Path) -> None:

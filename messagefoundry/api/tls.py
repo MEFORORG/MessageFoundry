@@ -10,6 +10,7 @@ isolation. The ``tls_min_version`` floor (NIST SP 800-52r2: 1.2+) is enforced vi
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
@@ -271,19 +272,32 @@ def _make_generated(host: str, kept: Sequence[str] = ()) -> tuple[bytes, bytes]:
     )
 
 
-def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
-    """The loopback names a re-mint for a changed bind keeps (BACKLOG #5973).
+def _dials_loopback(host: str) -> bool:
+    """Whether a client on this box dials a bind on ``host`` through one of ``localhost``,
+    ``127.0.0.1`` and ``::1``, compared as hostname verification compares: an IP by address, so
+    ``0:0:0:0:0:0:0:1`` counts, and a name without regard to case or a trailing dot."""
+    dialled = dialled_host(host)
+    try:
+        address = ipaddress.ip_address(dialled.split("%", 1)[0])
+    except ValueError:
+        return dialled.rstrip(".").lower() in _LOOPBACK_HOSTS
+    return any(address == ipaddress.ip_address(name) for name in ("127.0.0.1", "::1"))
 
-    Only for a bind a client on this box dials through a loopback: of ``localhost``, ``127.0.0.1``
-    and ``::1``, every one the old certificate names, and the default ``[api].host``, which the
-    CLI, the IDE and the harness dial by default. A move from ``127.0.0.1`` to ``localhost`` would
-    otherwise drop the ``127.0.0.1`` those clients verify. The set is fixed, so repeated moves do
-    not grow it. A bind off loopback keeps nothing, as a first-run mint for it would name nothing
-    else.
+
+def _kept_loopback_names(host: str, old_pem: bytes) -> list[str]:
+    """The loopback names a replacement of a loadable pair keeps (BACKLOG #5973).
+
+    Only for a bind a client on this box dials through a loopback (:func:`_dials_loopback`): of
+    ``localhost``, ``127.0.0.1`` and ``::1``, every one the old certificate names, and the default
+    ``[api].host``, which the CLI, the IDE and the harness dial by default. A move from
+    ``127.0.0.1`` to ``localhost`` would otherwise drop the ``127.0.0.1`` those clients verify. A
+    renewal keeps them as a bind re-mint does, or the next renewal would drop what the re-mint
+    kept. The set is fixed, so repeated moves do not grow it. A bind off loopback keeps nothing.
+    A first-run mint has no old certificate, so it names only the bind.
     """
     from messagefoundry import pki
 
-    if dialled_host(host) not in _LOOPBACK_HOSTS:
+    if not _dials_loopback(host):
         return []
     default = ApiSettings.model_fields["host"].default
     return [
@@ -892,7 +906,8 @@ def _replacement_due(host: str, cert_path: Path) -> _Due | None:
     dials for ``host`` (:func:`messagefoundry.api_tls_source.dialled_host`, matched by
     :func:`messagefoundry.pki.san_names`), so a bind moved after the mint, for example to ``::``
     from ``127.0.0.1``, gets a fresh certificate for the new bind at this start rather than at the
-    next renewal (BACKLOG #5973). It names only the new bind, as a first-run mint for it would.
+    next renewal (BACKLOG #5973). It names the new bind, as a first-run mint for it would, plus
+    the loopback names :func:`_kept_loopback_names` keeps.
 
     **Only the engine's own shape is ever due**: a certificate at the generated path that is not
     self-signed with ``CA=false`` was put there by someone else, so it is served as found. That
@@ -987,16 +1002,16 @@ def _renew_generated_pair(
     if the rollback fails too is a new certificate left beside the old key; that start fails, and
     the next one discards and re-mints it as an unusable pair, and reports that.
 
-    A re-mint for a changed bind keeps the loopback names :func:`_kept_loopback_names` gives.
+    A renewal and a re-mint for a changed bind both keep the loopback names
+    :func:`_kept_loopback_names` gives.
     """
     from messagefoundry import pki
     from messagefoundry.__main__ import _write_private_key
 
     reason, old, old_pem = due
     staged_cert, staged_key, prior_cert = _staged_files(cert_path, key_path)
-    kept = _kept_loopback_names(api.host, old_pem) if reason == "bind_changed" else []
     try:
-        cert_pem, key_pem = _make_generated(api.host, kept)
+        cert_pem, key_pem = _make_generated(api.host, _kept_loopback_names(api.host, old_pem))
     except ValueError as exc:
         # A RE-MINT FOR A CHANGED BIND IS NEVER WORTH A START (BACKLOG #5973). The old pair still
         # loads and is fresh, so a host the certificate builder refuses (a CN over 64 characters,
@@ -1077,7 +1092,8 @@ def _roll_back_certificate(prior_cert: Path, cert_path: Path, key_path: Path, ex
         return
     log.error(
         "could not replace the generated TLS key at %s (%s); put the previous certificate back at "
-        "%s, so the previous pair still serves and the next start tries again.",
+        "%s, beside the previous key, so the pair on disk matches again; the next start tries the "
+        "replacement again.",
         key_path,
         exc,
         cert_path,

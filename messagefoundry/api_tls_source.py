@@ -48,7 +48,7 @@ def wildcard_loopback(host: str) -> str | None:
     (:mod:`messagefoundry.tray.config`), so the address dialled and the name verified are one rule.
     """
     try:
-        ip = ipaddress.ip_address(unbracketed(host))
+        ip = ipaddress.ip_address(host.strip("[]"))
     except ValueError:
         return None
     if not ip.is_unspecified:

@@ -1141,11 +1141,14 @@ any copy of it you pass to `--cacert`.** A sharded service (`supervise`) renews 
 starts its shards, and a shard it restarts never renews, so every shard serves the same certificate.
 The same replacement runs at startup, whatever the expiry, when the certificate does not name the
 address a client on this box dials for the current bind: the family's loopback for a wildcard
-`--host` (`127.0.0.1` for `0.0.0.0`, `::1` for `::`), else the host as written, matched without
-regard to case or an IPv6 zone. A move from `127.0.0.1` to `::` replaces it; a move from
-`127.0.0.1` to `0.0.0.0` does not. The new certificate names the current bind only, as a first-run
-mint would. Its audit row's reason is `bind_changed`, a shard never makes it, and the new
-certificate must be imported the same way (BACKLOG #5973).
+`--host` (`127.0.0.1` for `0.0.0.0`, `::1` for `::`), else the host without IPv6 brackets
+(`[::1]` is the address `::1`), matched without regard to case or an IPv6 zone. A move from
+`127.0.0.1` to `::` replaces it; a move from `127.0.0.1` to `0.0.0.0` does not. The new
+certificate names what a first-run mint for the current bind would. When a client on this box
+dials that bind through `localhost`, `127.0.0.1` or `::1`, a replacement, a renewal included,
+also keeps each of those three the old certificate named, and always `127.0.0.1`, which the CLI,
+the IDE and the harness dial by default. Its audit row's reason is `bind_changed`, a shard never
+makes it, and the new certificate must be imported the same way (BACKLOG #5973).
 See
 [INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console". (The former PySide6 desktop
 console was retired — BACKLOG #103.)
