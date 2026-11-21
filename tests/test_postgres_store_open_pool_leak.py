@@ -460,3 +460,34 @@ async def test_an_aclose_whose_graceful_close_fails_forces_the_release(
     await cm.gen.aclose()
     assert pool.closed == 1
     assert terminated == ["terminated"]
+
+
+async def test_a_cancel_during_an_acloses_graceful_close_is_raised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """BACKLOG #5720: a cancel landing in the graceful close under ``aclose()`` is raised, as main's
+    unshielded close raised it, after the forced release drops what the close left. Red when the
+    fallback swallows it: ``aclose()`` returns normally."""
+    closing = asyncio.Event()
+    pool = _FakePool()
+    terminated: list[str] = []
+
+    async def slow_close() -> None:
+        closing.set()
+        await asyncio.sleep(5)
+
+    pool.close = slow_close  # type: ignore[method-assign]
+    pool.terminate = lambda: terminated.append("terminated")  # type: ignore[method-assign]
+    _install_fake_asyncpg(monkeypatch, pool)
+
+    async def body() -> None:
+        cm = PostgresStore._one_connection_store(_settings(), posture=None)
+        await cm.__aenter__()
+        await cm.gen.aclose()
+
+    task = asyncio.create_task(body())
+    await asyncio.wait_for(closing.wait(), 5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert terminated == ["terminated"]

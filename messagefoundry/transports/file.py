@@ -1390,9 +1390,10 @@ class FileSource(SourceConnector):
 
     async def _examine(self, path: Path, *, retry: bool = False) -> _Step:
         """Take one candidate as far as it goes this scan, and say what that cost (:class:`_Step`).
-        ``retry`` is a remembered stuck reject due a retry (BACKLOG #5717), which :meth:`_scan_once`
-        examines after every other candidate. It takes the settle gate, and once past it is read
-        and judged afresh, so a retry that now passes is ingested. A retry is counted against
+        ``retry`` is a remembered stuck file due a retry (BACKLOG #5717), which :meth:`_scan_once`
+        examines after every other candidate. It takes the settle gate, and once past it is read.
+        A reject is judged afresh, so a retry that now passes is ingested; a handed-off file whose
+        bytes still match has only its move or delete retried (:meth:`_dispose`). A retry is counted against
         :meth:`_retry_allowance`, not the per-tick ceiling. A retry is stat'd again rather than
         trusting the fresh pass's stat, because the fresh pass's hand-offs sit between the two."""
         # One stat serves the leave-mode key, the settle gate and the before-read side of the #116
@@ -2206,8 +2207,8 @@ class FileSource(SourceConnector):
         )
 
     def _try_pin(self, path: Path, read_id: _FileId | None) -> tuple[_Pin | None, bool]:
-        """:func:`_pin_confined` for a move or delete, or None when it refuses or cannot check, logged
-        (BACKLOG #2507), and whether a refusal is LASTING (BACKLOG #5717): a link is, a file replaced
+        """The :func:`_pin_confined` pin for a move or delete, or None when it refuses or cannot
+        check, logged (BACKLOG #2507), and whether a refusal is LASTING (BACKLOG #5717): a link is, a file replaced
         since the read is not (the next scan reads the new one), and an ``OSError`` is as
         :func:`_lasting` says. The read's check does not carry over: the hand-off, the scan hook and
         a thread hop sit between it and the move. The caller closes the pin.
@@ -2433,7 +2434,7 @@ class FileSource(SourceConnector):
                     _remove_pinned(pin)
                 except OSError as exc:
                     logger.warning(
-                        "archived %s to %s but could not remove the original (it will be re-read): "
+                        "archived %s to %s but could not remove the original (it is left where it is): "
                         "%s",
                         safe_name(path.name),
                         dest_dir.name,

@@ -5703,6 +5703,17 @@ class SqlServerStore:
             if isinstance(exc, GeneratorExit):
                 try:
                     await _graceful()
+                except asyncio.CancelledError:
+                    # A cancel during the close is raised, as main's unshielded close raised it,
+                    # once what the close left is released.
+                    try:
+                        _force_release()
+                    except Exception as forced:  # noqa: BLE001 — keep the cancel
+                        log.warning(
+                            "releasing a one-connection store without waiting also failed (%s)",
+                            type(forced).__name__,
+                        )
+                    raise
                 except BaseException as cleanup:  # noqa: BLE001 — fall back, keep the exit
                     log.warning(
                         "closing a one-connection store at its close failed (%s); it is released "
