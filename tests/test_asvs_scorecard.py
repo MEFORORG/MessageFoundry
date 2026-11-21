@@ -2559,6 +2559,185 @@ def test_signature_tells_which_keyword_only_parameter_has_the_default() -> None:
     assert _sig("def f(*, a, b=1): ...") == _sig("def f(*, a, b=2): ...")
 
 
+def test_signature_tells_a_generator_from_a_function() -> None:
+    """A function that now yields keeps every parameter and hands each caller a generator object in
+    place of its value. A ``yield`` inside a NESTED function or lambda does not make the outer one a
+    generator, so it must not count.
+
+    Falsified on origin/main: `_signature` had no generator flag, so the first pair compared EQUAL.
+    BACKLOG #5590.
+    """
+    assert _sig("def f(a):\n    return a") != _sig("def f(a):\n    yield a")
+    assert _sig("def f(a):\n    return a") != _sig("def f(a):\n    yield from a")
+    assert _sig("async def f(a):\n    return a") != _sig("async def f(a):\n    yield a")
+    assert _sig("def f(a):\n    return a") == _sig(
+        "def f(a):\n    def g():\n        yield a\n    return g"
+    )
+
+
+def test_signature_tells_a_decorator_swap() -> None:
+    """Adding, dropping or replacing a decorator that changes what the name is bound to (a property,
+    a context manager, a cached wrapper) breaks every call site with every parameter intact. Its
+    ARGUMENTS are not compared, for the reason default values are not, nor its module prefix. A
+    decorator outside that set may come or go: dropping a permission-check decorator can BE the
+    reintroduction.
+
+    Falsified on origin/main: decorators were not in `_signature`, so the first two pairs compared
+    EQUAL. BACKLOG #5590.
+    """
+    assert _sig("def f(a): ...") != _sig("@contextmanager\ndef f(a): ...")
+    assert _sig("@staticmethod\ndef f(a): ...") != _sig("@classmethod\ndef f(a): ...")
+    assert _sig("@lru_cache(maxsize=1)\ndef f(a): ...") == _sig(
+        "@lru_cache(maxsize=9)\ndef f(a): ..."
+    )
+    assert _sig("@functools.cache\ndef f(a): ...") == _sig("@cache\ndef f(a): ...")
+    assert _sig("@require_permission('admin')\ndef f(a): ...") == _sig("def f(a): ...")
+
+
+def test_screen_does_not_match_a_mutation_against_an_overload_stub(tmp_path: Path) -> None:
+    """``@overload`` stubs are never the live binding. A mutation copied from a stub's narrower
+    signature breaks every call the implementation takes, so it must not pass by matching the stub.
+    origin/main compared only the last definition, the implementation, and refused it; this holds
+    that while every definition is a candidate shape."""
+    target = (
+        "@overload\ndef get(key: str): ...\n@overload\ndef get(key: str, default: int): ...\n"
+        "def get(key, default=None):\n    return default\n"
+    )
+    assert any("different signature" in p for p in _screen("def get(key): ...", target, tmp_path))
+    assert _screen("def get(key, default=None):\n    return 1\n", target, tmp_path) == []
+    # An @overload stub appended over a live function raises on every call, so is refused too.
+    live = "def get(key, default=None): ...\n"
+    assert _screen("@overload\n" + live, live, tmp_path)
+
+
+def test_screen_compares_only_the_definition_a_name_is_left_bound_to(tmp_path: Path) -> None:
+    """In sequence a later ``def`` replaces an earlier one, so a mutation copied from the shadowed
+    one breaks every call the live one takes; an ``if TYPE_CHECKING:`` body never runs, so its stub
+    is not live either. Alternatives under ``if``/``else`` or ``try``/``except`` each stay live.
+
+    The shadowed case passed at the first cut of this fix (every definition was a candidate) where
+    origin/main, comparing only the last definition, refused it."""
+    shadowed = "def f(a): ...\ndef f(a, b): ...\n"
+    assert any("different signature" in p for p in _screen("def f(a): ...", shadowed, tmp_path))
+    assert _screen("def f(a, b): ...", shadowed, tmp_path) == []
+    typing_only = "if TYPE_CHECKING:\n    def f(x): ...\nelse:\n    def f(x, y=None): ...\n"
+    assert any("different signature" in p for p in _screen("def f(x): ...", typing_only, tmp_path))
+    assert _screen("def f(x, y=None): ...", typing_only, tmp_path) == []
+    alternatives = "try:\n    def f(x): ...\nexcept ImportError:\n    def f(x, y): ...\n"
+    assert _screen("def f(x): ...", alternatives, tmp_path) == []
+    assert _screen("def f(x, y): ...", alternatives, tmp_path) == []
+    guarded = "def f(a): ...\nif FAST:\n    def f(a, b): ...\n"
+    assert _screen("def f(a): ...", guarded, tmp_path) == []  # an if with no else may not run
+
+
+def test_screen_accepts_a_concrete_override_of_an_abstract_method(tmp_path: Path) -> None:
+    """Dropping ``@abstractmethod`` in a concrete override changes no call site, so it is not a
+    shape change; origin/main accepted it, and so must this."""
+    target = "class Base(ABC):\n    @abstractmethod\n    def run(self, x): ...\n"
+    assert (
+        _screen("class Base(Base):\n    def run(self, x):\n        return 1\n", target, tmp_path)
+        == []
+    )
+
+
+def test_signature_fields_name_every_signature_value() -> None:
+    """The refusal labels each value by `_SIGNATURE_FIELDS`, so the two must stay the same length."""
+    assert len(scorecard_module._SIGNATURE_FIELDS) == len(_sig("def f(a): ..."))
+
+
+def test_is_generator_counts_a_yield_in_a_nested_defs_default() -> None:
+    """A nested function's body is its own scope, but its defaults and decorators run in the
+    enclosing function, so a ``yield`` there makes the enclosing one a generator."""
+    assert _sig("def f():\n    def g(x=(yield)):\n        pass\n    return g") != _sig(
+        "def f():\n    def g(x=None):\n        pass\n    return g"
+    )
+
+
+def _screen(mutation: str, target_source: str, tmp_path: Path) -> list[str]:
+    target = tmp_path / "target.py"
+    target.write_text(target_source, encoding="utf-8")
+    claim = _live_claim(mutation, "target.py", "test_target.py::test_x").absence[0]
+    findings = Findings()
+    passed = scorecard_module._screen_mutation(claim, "1.1.1", target, findings)
+    assert passed is (not findings.problems)
+    return findings.problems
+
+
+def test_screen_compares_a_definition_nested_under_a_compound_statement(tmp_path: Path) -> None:
+    """A ``def`` under ``try:``/``if``/``with`` at module level binds a module-level name all the
+    same, so wrapping a wrong-arity mutation in ``try:`` must not slip it past the screen, and a
+    target whose live definition sits under ``if`` must still be compared.
+
+    Falsified on origin/main: `_toplevel` read `tree.body` only, so both screens passed with no
+    problem. BACKLOG #5590.
+    """
+    target = "def scan(p):\n    return 'clean'\n"
+    wrapped = "try:\n    def scan():\n        return 'infected'\nexcept Exception:\n    pass\n"
+    assert any("different signature" in p for p in _screen(wrapped, target, tmp_path))
+    guarded = "if True:\n    def scan(p):\n        return 'clean'\n"
+    assert any("different signature" in p for p in _screen("def scan(): ...", guarded, tmp_path))
+    # Negative control: the same nesting with the live signature screens clean.
+    assert (
+        _screen("try:\n    def scan(p): ...\nexcept Exception:\n    pass\n", target, tmp_path) == []
+    )
+
+
+_CLASS_TARGET = (
+    "@dataclass\nclass Scanner(Base):\n    p: int\n    q: int = 0\n\n"
+    "    def scan(self, p):\n        return 'clean'\n\n"
+    "    class Inner:\n        def go(self, x): ...\n\n"
+    "    def other(self): ...\n"
+)
+
+
+def test_screen_compares_the_methods_of_a_redefined_class(tmp_path: Path) -> None:
+    """A mutation that redefines a CLASS reaches its methods: a method whose signature moved, or
+    that became a generator, breaks every caller of it exactly as a module-level function would. A
+    class swapped for a function, or a function for a class, is refused too. A subclass of the
+    original (``class Scanner(Scanner):``) inherits what it leaves out, so only what it redefines
+    is compared.
+
+    Falsified on origin/main: only module-level functions were compared, so every refusal below
+    passed with no problem. BACKLOG #5590.
+    """
+    sub = "class Scanner(Scanner):\n"
+    method = sub + "    def scan(self):\n        return 'infected'\n"
+    assert any("Scanner.scan()" in p for p in _screen(method, _CLASS_TARGET, tmp_path))
+    gen = sub + "    def scan(self, p):\n        yield 'infected'\n"
+    assert any("Scanner.scan()" in p for p in _screen(gen, _CLASS_TARGET, tmp_path))
+    inner = sub + "    class Inner:\n        def go(self): ...\n"
+    assert any("Scanner.Inner.go()" in p for p in _screen(inner, _CLASS_TARGET, tmp_path))
+    assert any("as a function" in p for p in _screen("def Scanner(): ...", _CLASS_TARGET, tmp_path))
+    func_target = "def scan(p): ...\n"
+    assert any("as a class" in p for p in _screen("class scan: ...", func_target, tmp_path))
+    # Negative control: the surgical override, one method in a subclass, screens clean.
+    honest = sub + "    def scan(self, p):\n        return 'infected'\n"
+    assert _screen(honest, _CLASS_TARGET, tmp_path) == []
+
+
+def test_screen_refuses_a_class_replacement_that_drops_a_shape_changing_decorator(
+    tmp_path: Path,
+) -> None:
+    """A class redefined without subclassing the original replaces it whole, so dropping its
+    ``@dataclass`` takes away the generated constructor every caller uses, and is refused. A
+    subclass of the original inherits the decorator, so leaving it off is not a drop.
+
+    Falsified on origin/main: classes were not compared, so the replacement passed. BACKLOG #5590.
+    """
+    replacement = "class Scanner(Base):\n    def scan(self, p):\n        return 'infected'\n"
+    problems = _screen(replacement, _CLASS_TARGET, tmp_path)
+    assert any("decorators" in p for p in problems), problems
+    # Negative control: the same body as a whole copy with the decorator kept screens clean.
+    assert _screen("@dataclass\n" + replacement, _CLASS_TARGET, tmp_path) == []
+    # A subclass may leave the decorator off, under a dotted base too, but may not ADD one: a
+    # generated constructor would replace the inherited one.
+    dotted = "class Scanner(target.Scanner):\n    def scan(self, p): ...\n"
+    assert _screen(dotted, _CLASS_TARGET, tmp_path) == []
+    plain = "class Scanner:\n    def __init__(self, a): ...\n"
+    added = "@dataclass\nclass Scanner(Scanner):\n    x: int\n"
+    assert any("decorators" in p for p in _screen(added, plain, tmp_path))
+
+
 def test_prove_absences_refuses_an_async_swap(tmp_path: Path) -> None:
     """End to end: a mutation that redefines the symbol as ``async def`` with the same parameters makes
     the observable red because `scan` now returns a coroutine, and was counted as a proof.

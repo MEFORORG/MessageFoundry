@@ -2498,37 +2498,174 @@ def _landing_swallows(source: str) -> bool:
 
 
 _FunctionNode = ast.FunctionDef | ast.AsyncFunctionDef
+_DefNode = ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+_Scope = dict[str, list[_DefNode]]
 
 
-def _toplevel(source: str) -> tuple[dict[str, _FunctionNode], set[str]] | None:
-    """Top-level function signatures by name, plus every top-level name bound. ``None`` if `source`
-    does not parse.
+def _is_type_checking(test: ast.expr) -> bool:
+    """``if TYPE_CHECKING:`` or ``if typing.TYPE_CHECKING:``, whose body never runs."""
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+    )
 
-    TOP LEVEL ONLY, and that is the point rather than a simplification: the mutation is APPENDED to
-    the module, so it can only shadow a module-level binding. A method inside a class body is not
-    reachable by this mechanism and must not be compared against.
+
+def _branches(node: ast.stmt) -> list[list[ast.stmt]] | None:
+    """The alternative blocks a compound statement runs exactly one of, or ``None`` when it is not
+    one. A block that may not run at all (a loop body, an ``if`` without ``else``, an unmatched
+    ``match``) has the empty block as its alternative."""
+    if isinstance(node, ast.If):
+        return [node.body, node.orelse]
+    if isinstance(node, (ast.For, ast.AsyncFor, ast.While)):
+        return [node.body + node.orelse, node.orelse]
+    if isinstance(node, (ast.Try, ast.TryStar)):
+        return [node.body + node.orelse, *(h.body for h in node.handlers)]
+    if isinstance(node, ast.Match):
+        return [*(c.body for c in node.cases), []]
+    return None
+
+
+def _run_block(body: list[ast.stmt], scope: _Scope) -> _Scope:
+    """`scope` after `body` runs: each name's possible live definitions.
+
+    In sequence a later ``def`` or ``class`` replaces an earlier one, as at runtime, so only the
+    last is a shape the name can have.
+    A compound statement's alternatives (``if``/``else``, ``try``/``except``, ``match`` cases, a
+    loop that may not run) each give one, and an alternative that does not bind the name leaves the
+    earlier definition possible. An ``if TYPE_CHECKING:`` body never runs, so only its ``else``
+    counts. A ``with`` body always runs. A ``try``'s ``finally`` runs after its alternatives.
+    """
+    out = dict(scope)
+    for node in body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            out[node.name] = [node]
+        elif isinstance(node, ast.If) and _is_type_checking(node.test):
+            out = _run_block(node.orelse, out)
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            out = _run_block(node.body, out)
+        elif (branches := _branches(node)) is not None:
+            results = [_run_block(b, out) for b in branches]
+            merged: _Scope = {}
+            for result in results:
+                for name, defs in result.items():
+                    alts = merged.setdefault(name, [])
+                    alts.extend(d for d in defs if not any(d is a for a in alts))
+            out = merged
+            if isinstance(node, (ast.Try, ast.TryStar)):
+                out = _run_block(node.finalbody, out)
+    return out
+
+
+def _scope_defs(body: list[ast.stmt]) -> _Scope:
+    """Every ``def`` and ``class`` the scope `body` opens can leave bound, by name, as
+    :func:`_run_block` reads them. A ``def`` under a compound statement at module level binds a
+    MODULE-level name all the same, so a mutation wrapped in ``try:`` shadows exactly what a bare
+    one does and is compared the same way (BACKLOG #5590). Function and class bodies open a new
+    scope and are not entered here.
+    """
+    return _run_block(body, {})
+
+
+def _toplevel(source: str) -> _Scope | None:
+    """Module-scope function and class definitions by name. ``None`` if `source` does not parse.
+
+    MODULE SCOPE ONLY, and that is the point rather than a simplification: the mutation is APPENDED
+    to the module, so it can only shadow a module-level binding. A method is compared only when the
+    mutation redefines its whole CLASS at module scope (:func:`_scope_mismatch`).
     """
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return None
-    sigs: dict[str, _FunctionNode] = {}
-    bound: set[str] = set()
-    for node in tree.body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            sigs[node.name] = node
-            bound.add(node.name)
-        elif isinstance(node, ast.ClassDef):
-            bound.add(node.name)
-        elif isinstance(node, ast.Assign):
-            bound.update(t.id for t in node.targets if isinstance(t, ast.Name))
-        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
-            bound.add(node.target.id)
-    return sigs, bound
+    return _scope_defs(tree.body)
+
+
+def _is_generator(fn: _FunctionNode) -> bool:
+    """Whether `fn`'s OWN body yields. A nested function, lambda or class body is its own scope, so
+    a ``yield`` there does not make `fn` a generator; its decorators, defaults and bases run in
+    `fn`'s scope, so a ``yield`` in one of those does.
+    """
+    stack: list[ast.AST] = list(fn.body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.Yield, ast.YieldFrom)):
+            return True
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            stack.extend(node.args.defaults)
+            stack.extend(d for d in node.args.kw_defaults if d is not None)
+            if not isinstance(node, ast.Lambda):
+                stack.extend(node.decorator_list)
+            continue
+        if isinstance(node, ast.ClassDef):
+            stack.extend([*node.decorator_list, *node.bases, *node.keywords])
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+    return False
+
+
+#: Decorators that change what a call site gets back, by the last part of their dotted name: a
+#: property for a method, a context manager for a value, a wrapper that hashes its arguments, a
+#: generated constructor. At least these; a decorator not named here is free to come or go, because
+#: dropping one can BE the reintroduction (a permission check written as a decorator).
+_SHAPE_DECORATORS: Final = frozenset(
+    {
+        "property",
+        "cached_property",
+        "setter",
+        "getter",
+        "deleter",
+        "staticmethod",
+        "classmethod",
+        "contextmanager",
+        "asynccontextmanager",
+        "cache",
+        "lru_cache",
+        "singledispatch",
+        "singledispatchmethod",
+        "dataclass",
+        "fixture",
+        # A stub the live binding never is. Not abstractmethod: a concrete override drops it with no
+        # change at any call site.
+        "overload",
+        # attrs' generated constructors.
+        "define",
+        "frozen",
+        "mutable",
+        "attrs",
+    }
+)
+
+
+def _decorators(node: _DefNode) -> tuple[str, ...]:
+    """The decorators in :data:`_SHAPE_DECORATORS`, by the last part of their name, in order.
+    Arguments are left out for the reason default VALUES are, and so is the module prefix, so
+    ``@functools.cache`` and ``@cache`` are one decorator.
+    """
+    out = []
+    for d in node.decorator_list:
+        name = ast.unparse(d.func if isinstance(d, ast.Call) else d).rsplit(".", 1)[-1]
+        if name in _SHAPE_DECORATORS:
+            out.append(name)
+    return tuple(out)
+
+
+#: The name of each field :func:`_signature` returns, in its order, for the refusal message.
+_SIGNATURE_FIELDS: Final = (
+    "async",
+    "generator",
+    "decorators",
+    "positional-only",
+    "positional",
+    "keyword-only",
+    "*args",
+    "**kwargs",
+    "positional defaults",
+    "keyword-only defaults",
+)
 
 
 def _signature(fn: _FunctionNode) -> tuple[object, ...]:
-    """The call-compatible shape of a signature: what a CALL SITE can observe.
+    """The call-compatible shape of a signature: what a CALL SITE can observe, one value per
+    :data:`_SIGNATURE_FIELDS` entry.
 
     Parameter NAMES are included, not just counts -- a rename breaks every keyword call, which is the
     same wrecking-ball failure as a wrong count and is invisible to an arity-only comparison. Default
@@ -2540,11 +2677,15 @@ def _signature(fn: _FunctionNode) -> tuple[object, ...]:
 
     ``async`` is part of the shape too: a plain caller of an ``async def`` gets a coroutine it never
     runs, and an awaiting caller of a ``def`` gets a non-awaitable, so a swap breaks every call site
-    with every parameter intact (BACKLOG #5590).
+    with every parameter intact (BACKLOG #5590). Being a GENERATOR is part of it for the same
+    reason: a caller of a function that now yields gets a generator object in place of its value.
+    So are the decorators that change what the name is bound to (:func:`_decorators`).
     """
     args = fn.args
     return (
         isinstance(fn, ast.AsyncFunctionDef),
+        _is_generator(fn),
+        _decorators(fn),
         tuple(p.arg for p in args.posonlyargs),
         tuple(p.arg for p in args.args),
         tuple(p.arg for p in args.kwonlyargs),
@@ -2553,6 +2694,73 @@ def _signature(fn: _FunctionNode) -> tuple[object, ...]:
         len(args.defaults),
         tuple(d is not None for d in args.kw_defaults),
     )
+
+
+def _describe(shape: tuple[object, ...]) -> str:
+    return ", ".join(
+        f"{name}={value!r}" for name, value in zip(_SIGNATURE_FIELDS, shape, strict=True)
+    )
+
+
+def _scope_mismatch(mut: _Scope, src: _Scope, prefix: str = "") -> str | None:
+    """The first definition in `mut` that shadows one in `src` with a different call shape, as a
+    clause for the refusal; ``None`` if every shadowing definition matches.
+
+    A name `src` does not define shadows nothing and is skipped. A FUNCTION must match the shape of
+    at least one of `src`'s definitions of that name. A class swapped for a function, or a function
+    for a class, changes what every call site gets back, and is refused. A CLASS redefined over a
+    class is compared by :func:`_class_mismatch` (BACKLOG #5590).
+    """
+    for name, mdefs in mut.items():
+        sdefs = src.get(name)
+        if not sdefs:
+            continue
+        qual = f"{prefix}{name}"
+        sfuncs = [d for d in sdefs if not isinstance(d, ast.ClassDef)]
+        sclasses = [d for d in sdefs if isinstance(d, ast.ClassDef)]
+        for m in mdefs:
+            if isinstance(m, ast.ClassDef):
+                if not sclasses:
+                    return f"redefines {qual} as a class where the target defines a function"
+                problems = [_class_mismatch(m, s, qual) for s in sclasses]
+                if all(problems):
+                    return problems[0]
+            elif not sfuncs:
+                return f"redefines {qual}() as a function where the target defines a class"
+            elif _signature(m) not in (shapes := [_signature(s) for s in sfuncs]):
+                return (
+                    f"redefines {qual}() with a different signature than the target declares "
+                    f"({_describe(_signature(m))} vs {_describe(shapes[0])})"
+                )
+    return None
+
+
+def _class_mismatch(m: ast.ClassDef, s: ast.ClassDef, qual: str) -> str | None:
+    """:func:`_scope_mismatch` for class `m` redefined over class `s`.
+
+    Each method and nested class `m` redefines is compared recursively: a member reshaped breaks
+    every caller of it. A redefinition that does not subclass the original must also keep its
+    shape-changing decorators. One that does (``class C(C):`` or ``class C(mod.C):``) inherits
+    them, so it may leave them off, but may not add one the original lacks: ``@dataclass`` on it
+    would generate a new constructor over the inherited one.
+
+    NOT COMPARED, at least: the members, annotated fields (a dataclass's constructor arguments) and
+    bases a redefinition leaves out or changes, though a whole replacement that drops one breaks its
+    callers. Refusing those would refuse live claims whose mutation redefines a model class with
+    other fields or bases, so whether they are wrecking balls is a call on those claims, not one
+    this screen makes.
+    """
+    subclass = any(
+        isinstance(b, (ast.Name, ast.Attribute)) and ast.unparse(b).rsplit(".", 1)[-1] == s.name
+        for b in m.bases
+    )
+    allowed = ((), _decorators(s)) if subclass else (_decorators(s),)
+    if _decorators(m) not in allowed:
+        return (
+            f"redefines class {qual} with different decorators than the target declares "
+            f"({_decorators(m)} vs {_decorators(s)})"
+        )
+    return _scope_mismatch(_scope_defs(m.body), _scope_defs(s.body), f"{qual}.")
 
 
 def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings) -> bool:
@@ -2586,25 +2794,18 @@ def _screen_mutation(a: Absence, cell_id: str, target: Path, findings: Findings)
         # The TARGET does not parse. Not this claim's defect, and not something to refuse it over --
         # leave it to execution, where the baseline will already be red and fail closed.
         return True
-    mut_sigs, _ = mutation
-    src_sigs, _ = source
-    for name, margs in mut_sigs.items():
-        real = src_sigs.get(name)
-        if real is None:
-            continue  # shadows no module-level function of that name; nothing to compare
-        if _signature(margs) != _signature(real):
-            findings.problems.append(
-                f"{cell_id}: absence claim PROVE-ERROR — the mutation redefines {name}() with a "
-                f"different signature than {a.mutation_path} declares "
-                f"((async, positional-only, positional, keyword-only, *args, **kwargs, positional "
-                f"defaults, keyword-only defaults) = {_signature(margs)} vs {_signature(real)}). "
-                "Applied, that breaks every call site -- a TypeError, or a coroutine where a value "
-                "was expected -- so the observable would go red for the call shape and not for the "
-                "reintroduction — a wrecking ball wearing the shape of a surgical proof. Copy the "
-                "live signature; the mutation lives in a different repository from the symbol it "
-                "shadows, so nothing else keeps the two in step"
-            )
-            return False
+    mismatch = _scope_mismatch(mutation, source)
+    if mismatch is not None:
+        findings.problems.append(
+            f"{cell_id}: absence claim PROVE-ERROR — the mutation {mismatch}, in "
+            f"{a.mutation_path}. Applied, that breaks every call site -- a TypeError, or a "
+            "coroutine, generator or other object where a value was expected -- so the observable "
+            "would go red for the call shape and not for the reintroduction — a wrecking ball "
+            "wearing the shape of a surgical proof. Copy the live signature; the mutation lives in "
+            "a different repository from the symbol it shadows, so nothing else keeps the two in "
+            "step"
+        )
+        return False
     return True
 
 
