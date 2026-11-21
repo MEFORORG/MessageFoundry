@@ -84,6 +84,7 @@ import {
   traceRowValues,
   withPickedPath,
   type AddMenuItem,
+  QueuedEditRebaser,
   type AppliedRewrite,
   type EditMessage,
   type HandlerViewModel,
@@ -308,6 +309,10 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     let sawAlive = false;
     // One edit at a time + the webview↔document update-loop guard (ADR 0076 §5).
     const guard = new EditLoopGuard();
+    // The typed rewrites applied since the webview was last projected, so an edit on one of their rows
+    // is sent with the row's current source rather than refused as stale (BACKLOG #5943). Reset when
+    // render() replaces the webview, whose new rows carry the current source.
+    const rebaser = new QueuedEditRebaser();
 
     // The ONE debounced re-projection channel (ADR 0076 §5 "sync on save"). Both a save and a refresh
     // the guard deferred (BACKLOG #1759) go through it, so an owed refresh coalesces with a real save
@@ -442,6 +447,11 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         scriptUri,
         this.opSchema,
       );
+      // The new rows carry `source`. Keep the recorded rewrites when a typed one landed after that
+      // snapshot, since the new rows still carry the row text it replaced (BACKLOG #5943).
+      if (document.getText() === source) {
+        rebaser.reset();
+      }
       // Arm the handshake: if the freshly-loaded script doesn't ping within 3s, it failed to initialize.
       sawAlive = false;
       setTimeout(() => {
@@ -518,7 +528,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           void render(); // revert the optimistic webview change to the true projection
         },
         scheduleRerender, // a save the guard suppressed mid-drain is deferred, not dropped (#1759)
-        () => document.getText(), // lets a queued edit on a rewritten row carry its expectSrc over (#5943)
+        // Lets an edit on a row rewritten since the last projection carry its expectSrc over (#5943).
+        { rebaser, readSource: () => document.getText() },
       );
 
     // Apply a STRUCTURAL op (insert/delete/move). Unlike a param edit these change the file's line count,

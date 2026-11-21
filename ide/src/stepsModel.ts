@@ -2967,26 +2967,38 @@ export async function drainEdits(
   apply: (msg: EditMessage) => Promise<AppliedRewrite | void>,
   onError?: (err: unknown, msg: EditMessage) => void,
   onRefreshOwed?: () => void,
-  readSource?: () => string,
+  rebase?: { rebaser: QueuedEditRebaser; readSource: () => string },
 ): Promise<void> {
   if (!guard.beginEdit()) {
     guard.queue(first);
     return;
   }
+  // An edit's expectSrc is carried over the rewrites already applied to its row only when `rebase` is
+  // given, since the rebase must compare the live buffer (BACKLOG #5943). A throw while reading the
+  // buffer latches the rebase off and sends the edit as posted, so the drain still never throws.
+  const carry = (msg: EditMessage): EditMessage => {
+    if (rebase === undefined) {
+      return msg;
+    }
+    try {
+      return rebase.rebaser.rebase(msg, rebase.readSource());
+    } catch {
+      rebase.rebaser.latch();
+      return msg;
+    }
+  };
   try {
-    // A queued edit's expectSrc is carried over the rewrites this drain applied to its row only when
-    // `readSource` is given, since the rebase must compare the live buffer (BACKLOG #5943).
-    const rebaser = new QueuedEditRebaser();
-    let current: EditMessage | undefined = first;
+    let current: EditMessage | undefined = carry(first);
     while (current) {
       try {
-        rebaser.record(current, await apply(current));
+        const wrote = await apply(current);
+        rebase?.rebaser.record(current, wrote);
       } catch (err) {
-        rebaser.latch(); // the buffer's state is unknown after an unexpected rejection
+        rebase?.rebaser.latch(); // the buffer's state is unknown after an unexpected rejection
         onError?.(err, current);
       }
       const next = guard.takePending();
-      current = next && readSource ? rebaser.rebase(next, readSource()) : next;
+      current = next === undefined ? undefined : carry(next);
     }
   } finally {
     releaseEdit(guard, onRefreshOwed);
@@ -3032,28 +3044,34 @@ export function rowAfterRewrite(msg: EditMessage, write: AppliedRewrite): string
 }
 
 /**
- * Carries a queued edit's `expectSrc` forward over the rewrites a drain already applied to its row
- * (BACKLOG #5943). An edit typed on a row while an earlier rewrite of that row was in flight was
- * projected from the source before that rewrite, so sent unchanged the engine's stale guard (F7)
- * refuses it and the user's edit is reverted. The queued edit's `expectSrc` is replaced with the row's
- * current text only when all of these hold, so the stale guard still refuses every row text this drain
- * did not itself write:
+ * Carries an edit's `expectSrc` forward over the typed rewrites already applied to its row since the
+ * webview was last projected (BACKLOG #5943). The webview's rows keep their projection-time source until
+ * the next re-projection, so an edit on a row whose earlier rewrite landed after that projection, queued
+ * behind the rewrite or posted before the re-projection arrives, is sent with the row's old text, and the
+ * engine's stale guard (F7) refuses it and the user's edit is reverted. The edit's `expectSrc` is
+ * replaced with the row's current text only when all of these hold, so the stale guard still refuses
+ * every row text these rewrites did not themselves write:
  *
- *  - every write in this drain so far rewrote its own row in place ({@link rowAfterRewrite}); the first
- *    write that did not, or an unexpected rejection, latches rebasing off for the rest of the drain;
- *  - the queued edit names the same handler and line range as a row this drain rewrote, and its
- *    `expectSrc` is one of that row's earlier texts in this drain;
- *  - the live buffer, read just before the queued edit is sent, is exactly the last write's output, so a
- *    split-view change, or a write that did not land, leaves that edit unrebased.
+ *  - every recorded write since the last {@link reset} rewrote its own row in place
+ *    ({@link rowAfterRewrite}); the first that did not, or an unexpected rejection, latches rebasing off
+ *    until the next reset. A recorded write whose input buffer is not the previous one's output starts
+ *    a new chain, since a change between them may have moved lines;
+ *  - the edit names the same handler and line range as a recorded row, and its `expectSrc` is one of
+ *    that row's earlier texts since the reset;
+ *  - the live buffer, read just before the edit is sent, is exactly the last recorded write's output.
+ *    Any change these writes did not make (a split view, an undo, a structural op, a pick, another panel)
+ *    leaves the edit unrebased.
  *
- * Only the typed-edit drain uses it. The field picker's drain (`applyPickedEdit`) does not: a typed
- * template edit queued behind a pick carries the parts as shown before the pick, and rebasing it would
- * write the old path back over the picked one.
+ * The provider owns one for the panel and resets it whenever it replaces the webview, whose new rows
+ * carry the current source. Only the typed-edit drain records writes. The field picker's drain
+ * (`applyPickedEdit`) does not, so a pick's write breaks the live-buffer condition: a typed template
+ * edit posted behind a pick carries the parts as shown before the pick, and rebasing it would write the
+ * old path back over the picked one.
  */
 export class QueuedEditRebaser {
   private latched = false;
   private lastAfter: string | undefined;
-  // Per row: the texts this drain replaced, and the row's current text.
+  // Per row: the texts recorded writes replaced, and the row's current text.
   private readonly rows = new Map<string, { superseded: Set<string>; current: string }>();
 
   private static key(msg: EditMessage): string {
@@ -3065,23 +3083,37 @@ export class QueuedEditRebaser {
     if (this.latched || write === undefined) {
       return;
     }
+    const expectSrc = msg.expectSrc;
     const row = rowAfterRewrite(msg, write);
-    // A write sent with no expectSrc is unverified, so it latches like a write that moved other rows.
-    if (row === undefined || msg.expectSrc === undefined) {
+    // rowAfterRewrite returns undefined for a write sent with no expectSrc, which is unverified; the
+    // expectSrc test here only narrows its type.
+    if (row === undefined || expectSrc === undefined) {
       this.latch();
       return;
     }
+    if (this.lastAfter !== undefined && write.before !== this.lastAfter) {
+      // A change these writes did not make came between them and may have moved lines, so the rows
+      // recorded before it no longer name the same lines. Start a new chain from this write.
+      this.rows.clear();
+    }
     const key = QueuedEditRebaser.key(msg);
     const entry = this.rows.get(key) ?? { superseded: new Set<string>(), current: row };
-    entry.superseded.add(msg.expectSrc);
+    entry.superseded.add(expectSrc);
     entry.current = row;
     this.rows.set(key, entry);
     this.lastAfter = write.after;
   }
 
-  /** Turn rebasing off for the rest of the drain. */
+  /** Turn rebasing off until the next {@link reset}. */
   latch(): void {
     this.latched = true;
+    this.rows.clear();
+    this.lastAfter = undefined;
+  }
+
+  /** Forget every recorded write and lift a latch: the webview now carries the current source. */
+  reset(): void {
+    this.latched = false;
     this.rows.clear();
     this.lastAfter = undefined;
   }
@@ -3093,6 +3125,11 @@ export class QueuedEditRebaser {
     }
     const entry = this.rows.get(QueuedEditRebaser.key(msg));
     if (entry === undefined || entry.current === msg.expectSrc || !entry.superseded.has(msg.expectSrc)) {
+      return msg;
+    }
+    // Implied by the chain rule in record(); checked so a gap in that rule cannot move an edit to another row.
+    const live = physicalLines(liveSource).slice(msg.lineStart - 1, msg.lineEnd).join("\n");
+    if (live !== entry.current) {
       return msg;
     }
     return { ...msg, expectSrc: entry.current };
