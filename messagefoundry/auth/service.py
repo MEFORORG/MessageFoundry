@@ -20805,6 +20805,16 @@ class AuthService:
             )
         return out
 
+    async def custom_role_stored_name(self, role_id: str) -> tuple[bool, str | None]:
+        """Whether a custom role row holds ``role_id``, and its display name when its integrity
+        seal holds (``None`` when it fails). The API's name rule exempts a save that re-sends this
+        name (BACKLOG #5785), so a name written outside the store, which fails the seal, is never
+        exempt."""
+        if not await self._custom_role_held(role_id):
+            return False, None
+        row = await self._load_role(role_id)
+        return True, (row.display_name if row is not None else None)
+
     async def create_custom_role(
         self,
         *,

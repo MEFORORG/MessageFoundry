@@ -361,6 +361,15 @@ def _refuse_custom_role_name(display_name: str, *, stored: str | None) -> None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"display_name {refusal}")
 
 
+async def _check_custom_role_name(service: AuthService, role_id: str, display_name: str) -> None:
+    """:func:`_refuse_custom_role_name` for a save of the custom role ``role_id``, exempting its
+    stored name when the row's seal holds (BACKLOG #5785). An unknown id is not checked here, so
+    it stays the service's 404."""
+    held, stored = await service.custom_role_stored_name(role_id)
+    if held:
+        _refuse_custom_role_name(display_name, stored=stored)
+
+
 def _seal_outage_503() -> HTTPException:
     """The 503 an admin user read answers when Vault transit could not check a record's seal (ADR
     0217, the Outage row): nothing was read, so retry once Vault answers."""
@@ -1397,11 +1406,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         proof in its own gate, so the seam hands it this. ``ended`` is the set the gate read, which
         the revoke ends (BACKLOG #5505)."""
         # BACKLOG #5785: the stored name is exempt, so a role stored under a name the rule refuses
-        # can still have its permissions edited. An unknown id finds none, is not checked here, and
-        # is the service's 404.
-        stored = [r.display_name for r in await service.list_custom_roles() if r.id == role_id]
-        if stored:
-            _refuse_custom_role_name(body.display_name, stored=stored[0])
+        # can still have its permissions edited.
+        await _check_custom_role_name(service, role_id, body.display_name)
         try:
             role = await service.update_custom_role(
                 role_id,

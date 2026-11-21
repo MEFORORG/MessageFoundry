@@ -60,6 +60,7 @@ _REFUSED = [
     "x" + chr(0x2029),  # a paragraph separator
     chr(0x202E) + "rotartsinimdA",  # a right-to-left override
     "a" + chr(0x2066) + "b",  # an isolate
+    "Bob" + chr(0x200F),  # a right-to-left mark
 ]
 _ACCEPTED = ["Bob", "Jane Doe", " edge ", "Zo\u00eb", "\u0645\u06cc\u200c\u0631\u0627"]
 
@@ -137,6 +138,19 @@ def test_the_exemption_cannot_add_a_control_character_to_a_clean_name() -> None:
 )
 def test_a_custom_role_may_not_take_a_built_in_role_name(name: str) -> None:
     assert custom_role_name_refusal(name) is not None
+
+
+def test_a_visible_format_character_is_not_blank() -> None:
+    """A prepended concatenation mark is a format character that draws a glyph."""
+    assert name_refusal(chr(0x06DD)) is None
+    assert custom_role_name_refusal("Administrator" + chr(0x06DD)) is None
+
+
+def test_a_console_variant_of_a_stored_name_cannot_become_a_built_in_name() -> None:
+    """A role stored as ``Admin`` + LF + ``istrator`` folds to no built-in name; the variant a
+    console posts for it does, so it is not exempt from the built-in check."""
+    assert custom_role_name_refusal("Administrator", "Admin\nistrator") is not None
+    assert custom_role_name_refusal("Administrator", "Administrator ") is None  # same fold
 
 
 def test_a_cross_script_lookalike_is_not_caught() -> None:
@@ -237,7 +251,7 @@ async def test_patch_refuses_a_changed_display_name_the_rule_refuses(engine: Eng
     assert blank.status_code == 422, blank.text
     assert "display_name" in blank.json()["detail"]
     assert nul.status_code == 422, nul.text
-    assert "\x00" not in nul.text
+    assert "a\x00b" not in nul.json()["detail"]
     assert ok.status_code == 200, ok.text
     user = await service.store.get_user(target)
     assert user is not None and user.display_name == "Renamed"
@@ -349,3 +363,24 @@ async def test_a_stored_custom_role_name_the_rule_refuses_does_not_block_a_permi
     assert names[stored[0]][0] == "Administrator"
     assert names[stored[1]][0] == "Tab Role"
     assert Permission.MESSAGES_READ in names[stored[0]][1]
+
+
+async def test_a_role_whose_seal_fails_has_no_exempt_name(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A name written outside the store fails the row's seal, so it is never the exemption's
+    stored name: a re-save under it takes the rule."""
+    service, _ = await _setup(engine)
+    role = await service.create_custom_role(
+        display_name="Administrator", description=None, permissions=["monitoring:read"], actor="t"
+    )
+    assert await service.custom_role_stored_name(role.id) == (True, "Administrator")
+    assert await service.custom_role_stored_name("custom:" + "0" * 32) == (False, None)
+
+    async def _seal_fails(role_id: str) -> None:
+        return None
+
+    monkeypatch.setattr(service, "_load_role", _seal_fails)
+    held, stored = await service.custom_role_stored_name(role.id)
+    assert (held, stored) == (True, None)
+    assert custom_role_name_refusal("Administrator", stored) is not None

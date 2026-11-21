@@ -278,9 +278,18 @@ class ChannelScope(RequestModel):
     expected_source: Literal["ad", "manual"] | None = Field(default=None, exclude=True)
 
 
-#: The explicit bidirectional embeddings, overrides and isolates, which reorder how a name and the
-#: text beside it display, so ``U+202E`` followed by a reversed spelling renders as another name.
-_BIDI_REORDERING = frozenset(range(0x202A, 0x202F)) | frozenset(range(0x2066, 0x206A))
+#: Unicode's Bidi_Control characters: the explicit embeddings, overrides and isolates, which
+#: reorder how a name and the text beside it display, so ``U+202E`` followed by a reversed spelling
+#: renders as another name, and the invisible marks U+061C, U+200E and U+200F, which move
+#: neutral characters and digits beside the name.
+_BIDI_CONTROLS = (
+    frozenset(range(0x202A, 0x202F))
+    | frozenset(range(0x2066, 0x206A))
+    | frozenset({0x061C, 0x200E, 0x200F})
+)
+
+#: What a browser reads a NUL in an HTML attribute as.
+_REPLACEMENT_CHARACTER = chr(0xFFFD)
 
 
 def name_refusal(name: str) -> str | None:
@@ -292,7 +301,7 @@ def name_refusal(name: str) -> str | None:
       set aside;
     * a C0 control (NUL included), DEL or a C1 control, the characters
       :data:`~messagefoundry.api.validation.PRINTABLE_TEXT_PATTERN` excludes, a line or paragraph
-      separator (U+2028, U+2029), or a bidirectional embedding, override or isolate.
+      separator (U+2028, U+2029), or a bidirectional control (:data:`_BIDI_CONTROLS`).
 
     A format character inside a visible name, such as the zero-width non-joiner some scripts need
     inside a word, passes, and so does white space at an edge. The reason is fixed text that never
@@ -300,16 +309,17 @@ def name_refusal(name: str) -> str | None:
     if not "".join(c for c in name if not renders_as_nothing(c)).strip():
         return "must not be blank"
     if re.fullmatch(PRINTABLE_TEXT_PATTERN, name) is None or any(
-        unicodedata.category(c) in ("Zl", "Zp") or ord(c) in _BIDI_REORDERING for c in name
+        unicodedata.category(c) in ("Zl", "Zp") or ord(c) in _BIDI_CONTROLS for c in name
     ):
-        return "must not contain a control, line separator or bidirectional override character"
+        return "must not contain a control, line separator or bidirectional control character"
     return None
 
 
 def _as_a_form_posts_it(stored: str) -> str:
     """``stored`` as a console form posts it back: a browser drops CR and LF from a text input's
     value and reads a NUL in an attribute as U+FFFD, and the console's route strips the edges."""
-    return stored.replace("\r", "").replace("\n", "").replace("\x00", "�").strip()
+    posted = stored.replace("\r", "").replace("\n", "")
+    return posted.replace("\x00", _REPLACEMENT_CHARACTER).strip()
 
 
 def _resends_stored(name: str, stored: str | None) -> bool:
@@ -406,7 +416,8 @@ class DirectoryUserCreateRequest(RequestModel):
 class UserUpdateRequest(RequestModel):
     #: An explicit null clears it. A value is checked by the route, not here, against the stored
     #: name: :func:`changed_name_refusal` refuses a changed value :func:`name_refusal` refuses,
-    #: with a 422, and lets the stored value through unchanged (BACKLOG #5784).
+    #: with a 422, and lets the stored name re-sent through. The value sent is what is written, so
+    #: a console form's variant of the stored name replaces it (BACKLOG #5784).
     display_name: str | None = Field(default=None, max_length=_NAME_MAX)
     #: The PROFILE address. It does not move ``notify_email`` (BACKLOG #1139, ADR 0182 Amendment A).
     #: Its shape rule is in ``AuthService.update_user`` (BACKLOG #3278).
@@ -656,15 +667,19 @@ def custom_role_name_refusal(name: str, stored: str | None = None) -> str | None
     ``ADMINISTRATOR`` or ``Administrator`` with a zero-width space inside, is refused, so a custom
     role cannot be listed under a built-in role's name. It does not fold letters across scripts: a
     name that only looks alike, such as one spelled with a Cyrillic or small-capital letter,
-    passes. A save that re-sends the stored name (:func:`_resends_stored`) is exempt from both
-    checks, so a role stored under a name the rule now refuses can still have its permissions
-    edited."""
-    if _resends_stored(name, stored):
-        return None
-    refusal = name_refusal(name)
-    if refusal is not None:
-        return refusal
-    if _fold_role_name(name) in _BUILTIN_ROLE_NAMES:
+    passes. A save that re-sends the stored name (:func:`_resends_stored`) is exempt from the name
+    rule, so a role stored under a name the rule now refuses can still have its permissions
+    edited. It is exempt from the built-in check only when it folds as the stored name does, so a
+    console's variant of a stored ``Admin`` + LF + ``istrator`` cannot become ``Administrator``."""
+    resent = _resends_stored(name, stored)
+    if not resent:
+        refusal = name_refusal(name)
+        if refusal is not None:
+            return refusal
+    folded = _fold_role_name(name)
+    if folded in _BUILTIN_ROLE_NAMES and not (
+        resent and stored is not None and folded == _fold_role_name(stored)
+    ):
         return "must not be a built-in role's name"
     return None
 

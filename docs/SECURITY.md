@@ -1730,8 +1730,8 @@ after its gate has spent the single-use `admin_user_update` grant, so its 423 an
 proof, as the console's `POST /ui/users/{user_id}/update` does after its own gate. So does its 422
 for a changed display name the name rule refuses (BACKLOG #5784), which the route checks against
 the stored name after that read. Where it is
-off, the gate checks the step-up session window instead and spends nothing, so neither answer
-costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
+off, the gate checks the step-up session window instead and spends nothing, so none of these
+answers costs a proof. On a `vault_transit` store (ADR 0217), a record Vault transit cannot verify is
 answered the same way, a 423 or listed as failed, but reported under
 `integrity.authority_seal_unverifiable` and paged under its own capped subject, on an interval of
 its own. A Vault transit Outage on any account these reads check answers 503 with `Retry-After`,
