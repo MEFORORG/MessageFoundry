@@ -62,10 +62,9 @@ _MAX_LAYERS = 8
 #: One preset id, as ``LAYERED_PRESET_IDS_PATTERN`` spells each comma-separated item. That pattern
 #: sits in the JSON route's ``Query`` declaration, which the console's direct call skips.
 _PRESET_ID = r"[0-9a-f]{32}"
-#: The layered unlock pattern. The repeat bound ``{0,7}`` is ``_MAX_LAYERS - 1`` written out, because
-#: the ReDoS scanner in ``tests/test_security_static.py`` resolves an f-string only when every
-#: interpolation is a string constant; ``test_the_route_bound_matches_the_json_routes_cap`` holds the
-#: two equal.
+#: The layered unlock pattern. The repeat bound ``{0,7}`` is ``_MAX_LAYERS - 1`` written out so the
+#: static ReDoS scan in ``tests/test_security_static.py`` can read the pattern;
+#: ``test_the_route_bound_matches_the_json_routes_cap`` holds the two equal.
 _LAYERED_UNLOCK = (
     rf"^/ui/messages/search/layered(\?presets={_PRESET_ID}(&presets={_PRESET_ID}){{0,7}})?$"
 )

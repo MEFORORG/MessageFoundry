@@ -1636,12 +1636,12 @@ def _step_up_continuation(
 
 
 def _reauth_refusal(
-    reauth_next: Callable[[Request], str] | None,
+    continuation: Callable[[Request], str | None],
 ) -> Callable[[Request], HTTPException]:
     """The ``mfa_refusal`` a step-up factory hands :func:`require_ui`: the same 303 to ``/ui/reauth``
-    its own freshness check sends, carrying the same continuation. The gate that raises it is still
-    ``require_ui``'s, so the refusal is audited and runs above the permission loop."""
-    continuation = _step_up_continuation(reauth_next)
+    its own freshness check sends, carrying the factory's :func:`_step_up_continuation`. The gate
+    that raises it is still ``require_ui``'s, so the refusal is audited and runs above the
+    permission loop."""
 
     def refuse(request: Request) -> HTTPException:
         return _reauth_redirect(request, continuation(request))
@@ -1720,7 +1720,7 @@ def require_ui_step_up(
     base = require_ui(
         *permissions,
         phi=phi,
-        mfa_refusal=_reauth_refusal(reauth_next),
+        mfa_refusal=_reauth_refusal(continuation),
         new_address_check=False,
         # The new-client-IP refusal, asked in the base so it comes before both budgets (#5646).
         step_up_new_address=continuation,
@@ -1846,7 +1846,7 @@ def require_ui_step_up_action(
     base = require_ui(
         *permissions,
         phi=phi,
-        mfa_refusal=_reauth_refusal(reauth_next),
+        mfa_refusal=_reauth_refusal(continuation),
         new_address_check=False,
         # new_ip first, in the base: before both budgets (#5646) and before the proof is spent.
         step_up_new_address=continuation,
@@ -1908,7 +1908,7 @@ def require_ui_step_up_when_own_sessions_end(
     continuation = _step_up_continuation(reauth_next)
     base = require_ui(
         *permissions,
-        mfa_refusal=_reauth_refusal(reauth_next),
+        mfa_refusal=_reauth_refusal(continuation),
         new_address_check=False,
         # new_ip first, in the base: before both budgets (#5646) and before the proof is spent.
         step_up_new_address=continuation,
