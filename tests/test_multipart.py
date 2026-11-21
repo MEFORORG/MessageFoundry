@@ -411,18 +411,20 @@ def test_the_walk_stops_at_the_first_part_over_the_cap() -> None:
     assert 0 < body.finds <= 3 * (multipart._MAX_PARTS + 2), body.finds
 
 
-def test_a_part_with_no_header_block_is_bounded_too() -> None:
-    """A part with no blank line after its headers is skipped, and is bounded like a nameless field
-    rather than by the body cap alone."""
-    junk = b"x" * (multipart._MAX_FIELD_BYTES + 1)
-    with pytest.raises(MultipartError, match="no header block") as caught:
-        parse_single_file_upload(
-            f"multipart/form-data; boundary={_B}", _body([_FILE_PART, junk]), max_file_bytes=1024
-        )
-    assert type(caught.value) is MultipartError  # 400: the size is not the cause to fix
-    small = b"x" * multipart._MAX_FIELD_BYTES
+def test_a_part_with_no_header_block_is_refused_at_any_size() -> None:
+    """A part with no blank line after its headers is refused with a 400 at any size (#5787). It was
+    skipped up to ``_MAX_FIELD_BYTES``, which let a file cut by a whole delimiter line be stored
+    short."""
+    for size in (0, 1, multipart._MAX_FIELD_BYTES, multipart._MAX_FIELD_BYTES + 1):
+        with pytest.raises(MultipartError, match="no header block") as caught:
+            parse_single_file_upload(
+                f"multipart/form-data; boundary={_B}",
+                _body([_FILE_PART, b"x" * size]),
+                max_file_bytes=1024,
+            )
+        assert type(caught.value) is MultipartError  # 400: the size is not the cause to fix
     file = parse_single_file_upload(
-        f"multipart/form-data; boundary={_B}", _body([_FILE_PART, small]), max_file_bytes=1024
+        f"multipart/form-data; boundary={_B}", _body([_FILE_PART]), max_file_bytes=1024
     )
     assert file.data == b"MSH|body"
 
@@ -480,21 +482,15 @@ def test_a_trailing_delimiter_line_without_a_close_marker_is_refused() -> None:
     assert len(form.fields) == multipart._MAX_PARTS - 1
 
 
-def test_a_part_with_neither_name_nor_filename_is_bounded_too() -> None:
-    """#5520 item 23: the field cap applies to every non-file part. A part with neither ``name=``
-    nor ``filename=`` used to be copied whole and then skipped, bounded only by the body cap."""
-    nameless = b"Content-Disposition: form-data\r\n\r\n" + b"x" * (multipart._MAX_FIELD_BYTES + 1)
-    with pytest.raises(MultipartTooLargeError, match="text field"):
-        parse_single_file_upload(
-            f"multipart/form-data; boundary={_B}",
-            _body([_FILE_PART, nameless]),
-            max_file_bytes=1024,
-        )
-    under = b"Content-Disposition: form-data\r\n\r\n" + b"x" * multipart._MAX_FIELD_BYTES
-    file = parse_single_file_upload(
-        f"multipart/form-data; boundary={_B}", _body([_FILE_PART, under]), max_file_bytes=1024
-    )
-    assert file.data == b"MSH|body"
+def test_a_part_with_neither_name_nor_filename_is_refused_at_any_size() -> None:
+    """#5520 item 23 bounded a part with neither ``name=`` nor ``filename=`` at the field cap; #5787
+    refuses it with a 400 at any size (RFC 7578 requires a name), by both entry points."""
+    for size in (0, 1, multipart._MAX_FIELD_BYTES, multipart._MAX_FIELD_BYTES + 1):
+        nameless = b"Content-Disposition: form-data\r\n\r\n" + b"x" * size
+        for parse in (parse_multipart_form, parse_single_file_upload):
+            with pytest.raises(MultipartError, match="neither a name nor a filename") as caught:
+                parse(_CT_WK, _body([_FILE_PART, nameless]), max_file_bytes=1024)
+            assert type(caught.value) is MultipartError
 
 
 def test_a_file_sent_as_a_plain_field_names_the_cause_at_any_size() -> None:
@@ -618,13 +614,15 @@ def test_an_unterminated_body_over_the_part_cap_is_refused() -> None:
         parse_multipart_form(f"multipart/form-data; boundary={_B}", body, max_file_bytes=1024)
 
 
-def test_an_epilogue_after_the_terminator_does_not_count_as_parts() -> None:
-    """RFC 2046 makes everything after the closing delimiter an ignorable epilogue, so delimiter
-    text there is not a part. A well-formed one-file body with such an epilogue still parses."""
-    epilogue = (f"--{_B}\r\n".encode()) * (multipart._MAX_PARTS * 2)
-    file = parse_single_file_upload(
-        f"multipart/form-data; boundary={_B}", _body([_FILE_PART]) + epilogue, max_file_bytes=1024
-    )
+def test_an_epilogue_line_starting_with_the_boundary_is_refused() -> None:
+    """#5787: a line after the close marker that starts with the boundary is refused, because a file
+    line that is a close-marker line, ahead of the real close, leaves exactly that. Main ignored it.
+    Epilogue text with no such line, mid-line boundary text included, still parses."""
+    for epilogue in (f"--{_B}\r\n".encode() * 2, f"x\r\n--{_B}junk".encode()):
+        with pytest.raises(MultipartError, match="after its close marker"):
+            parse_single_file_upload(_CT_WK, _body([_FILE_PART]) + epilogue, max_file_bytes=1024)
+    epilogue = f"plain text --{_B}-- mid-line\r\n".encode()
+    file = parse_single_file_upload(_CT_WK, _body([_FILE_PART]) + epilogue, max_file_bytes=1024)
     assert file.data == b"MSH|body"
 
 
@@ -661,15 +659,14 @@ def test_a_text_field_at_the_cap_still_parses() -> None:
     assert form.fields["note"] == value.decode()
 
 
-# --- BACKLOG #5787: a body with no closing delimiter is refused -----------------------------------
+# --- BACKLOG #5787: a body with no closing delimiter line is refused ------------------------------
 #
-# The fix is deliberately narrow: it refuses a body in which ``--<boundary>--`` appears nowhere, and
-# changes nothing about how delimiters are found. The differential arm below pins that: every body
-# in the corpus that carries a close marker must parse exactly as origin/main parsed it, outcome for
-# outcome. The outcomes were recorded by running origin/main's parser (at ec75a5f61bf) over this same
-# corpus, so a change that moves any of them, accept or refuse, shows here. The record says what
-# main did, not that each outcome is right: the mid-line rows are delimiters not anchored to a line
-# start, the other half of #5787, which is not built here and would move those rows when it is.
+# Two halves. A body the walk does not close is refused, and a delimiter counts only on its own line
+# (the module docstring defines one). The differential arm below pins what moved: every body in the
+# corpus carries close-marker text, and each parses exactly as origin/main parsed it (at
+# ec75a5f61bf, before either half) except the rows in ``_MOVED_OUTCOMES``, which are the bodies
+# whose boundary text is not on a delimiter line of its own. A change that moves any other row,
+# accept or refuse, shows here.
 
 _CT_B = "multipart/form-data; boundary=B"
 _CT_WK = f"multipart/form-data; boundary={_B}"
@@ -741,8 +738,9 @@ def _digest(value: bytes) -> bytes | tuple[int, str]:
     return value if len(value) <= 64 else (len(value), hashlib.sha256(value).hexdigest())
 
 
-#: origin/main's outcome for each corpus body, recorded at ec75a5f61bf. Every body here carries a close
-#: marker, so the #5787 fix must leave each one exactly as it was.
+#: origin/main's outcome for each corpus body, as main printed it at ec75a5f61bf. Every body here
+#: carries close-marker text. A cap change moves the rows that print it, which is the price of a
+#: record that says exactly what main did.
 _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "plain": ("parsed", [("file", "a.hl7", b"MSH|x")], []),
     "delim-cr-run": ("parsed", [("file", "a.hl7", b"MSH|x")], []),
@@ -779,23 +777,7 @@ _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "wk-at-part-cap": (
         "parsed",
         [("file", "a.hl7", b"MSH|body")],
-        [
-            ("f0", b"v"),
-            ("f1", b"v"),
-            ("f10", b"v"),
-            ("f11", b"v"),
-            ("f12", b"v"),
-            ("f13", b"v"),
-            ("f14", b"v"),
-            ("f2", b"v"),
-            ("f3", b"v"),
-            ("f4", b"v"),
-            ("f5", b"v"),
-            ("f6", b"v"),
-            ("f7", b"v"),
-            ("f8", b"v"),
-            ("f9", b"v"),
-        ],
+        sorted((f"f{i}", b"v") for i in range(15)),
     ),
     "wk-over-part-cap": (
         "refused",
@@ -805,18 +787,20 @@ _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     "wk-field-at-cap": (
         "parsed",
         [("file", "a.hl7", b"MSH|body")],
-        [("note", (16384, "1536c422c31cc98834759d7085cda394a3510a03d78188248986a6b1a7207d03"))],
+        [("note", _digest(b"x" * multipart._MAX_FIELD_BYTES))],
     ),
     "wk-field-over-cap": (
         "refused",
         "MultipartTooLargeError",
-        'multipart text field is 16385 bytes; the limit is 16384. Send a file as a file part with a plain filename parameter (filename="...")',
+        "multipart text field is 16385 bytes; the limit is 16384. Send a file as a file part with "
+        'a plain filename parameter (filename="...")',
     ),
     "wk-noheader-at-cap": ("parsed", [("file", "a.hl7", b"MSH|body")], []),
     "wk-noheader-over-cap": (
         "refused",
         "MultipartError",
-        "multipart part of 16385 bytes has no header block ended by a blank CRLF line; a part without one is skipped only up to 16384 bytes",
+        "multipart part of 16385 bytes has no header block ended by a blank CRLF line; a part "
+        "without one is skipped only up to 16384 bytes",
     ),
     "wk-header-over-cap": (
         "refused",
@@ -825,6 +809,74 @@ _MAIN_OUTCOMES: dict[str, tuple[Any, ...]] = {
     ),
     "wk-epilogue-delims": ("parsed", [("file", "a.hl7", b"MSH|body")], []),
 }
+
+
+def _HEADERLESS(size: int) -> tuple[Any, ...]:  # noqa: N802 - reads as a record constant
+    return (
+        "refused",
+        "MultipartError",
+        f"multipart part of {size} bytes has no header block ended by a blank CRLF line; "
+        "a file line that is a whole boundary delimiter line leaves one",
+    )
+
+
+_NOT_CLOSED = (
+    "refused",
+    "MultipartError",
+    "multipart body has no closing boundary delimiter; the upload may be truncated",
+)
+
+#: The rows #5787 moves, and what each is now. A part with no header block is refused at any size
+#: (``_HEADERLESS``), and so is a part with neither a name nor a filename (``delim-crlf-run``, whose
+#: CRLF run leaves an empty header block) and a boundary line after the close marker
+#: (``wk-epilogue-delims``). The rest are the line anchor's. A delimiter in the middle of a line is part
+#: content, so the second "part" of ``mid-line-delim`` is now inside the first, and close-marker text
+#: that is not on a line of its own closes nothing. ``close-then-epilogue`` has its close marker at a
+#: line start but text after it on the same line, which RFC 2046 does not allow, so it is refused
+#: rather than taken as a close: the same line inside a file would otherwise end the file there.
+_MOVED_OUTCOMES: dict[str, tuple[Any, ...]] = {
+    "empty-part-then-close": _HEADERLESS(0),
+    "delim-crlf-run": (
+        "refused",
+        "MultipartError",
+        "multipart part has neither a name nor a filename in its Content-Disposition; "
+        "a file line that is a whole boundary delimiter line can leave one",
+    ),
+    "wk-epilogue-delims": (
+        "refused",
+        "MultipartError",
+        "multipart body has a line starting with the boundary after its close marker; "
+        "a file line may hold the close marker",
+    ),
+    "no-header-part": _HEADERLESS(8),
+    "wk-noheader-at-cap": _HEADERLESS(16384),
+    "wk-noheader-over-cap": _HEADERLESS(16385),
+    "mid-line-delim": ("parsed", [("file", "a.hl7", _digest(b"MSH|x--B\r\n" + _FP + b"y"))], []),
+    "mid-line-close": _NOT_CLOSED,
+    "close-in-preamble": (
+        "refused",
+        "MultipartError",
+        "multipart body holds no delimiter for the boundary its Content-Type names",
+    ),
+    "close-then-epilogue": (
+        "refused",
+        "MultipartError",
+        "multipart body has a line that starts with the boundary delimiter but is not a delimiter line; the body may use another boundary than its Content-Type names",
+    ),
+}
+
+
+#: The moved rows whose refusal is raised only for a closed body.
+_WAITS_FOR_CLOSE = {
+    "empty-part-then-close",
+    "no-header-part",
+    "wk-noheader-at-cap",
+    "delim-crlf-run",
+}
+
+
+def _expected(case: str) -> tuple[Any, ...]:
+    return _MOVED_OUTCOMES.get(case, _MAIN_OUTCOMES[case])
 
 
 _CORPUS = _corpus()
@@ -837,20 +889,24 @@ def _close_marker(content_type: str) -> bytes:
 
 
 @pytest.mark.parametrize(("case", "content_type", "body"), _CORPUS, ids=[c[0] for c in _CORPUS])
-def test_a_body_with_a_close_marker_parses_exactly_as_main_did(
+def test_a_body_with_a_close_marker_parses_as_recorded(
     case: str, content_type: str, body: bytes
 ) -> None:
-    """#5787 differential arm: the refusal of an unterminated body moves no body that carries a
-    close marker, whatever its shape (a CR run after a delimiter, a close marker after a bare CR,
-    anything after the close marker, a delimiter not at a line start). It pins
-    ``parse_multipart_form``; ``parse_single_file_upload`` shares the same walk and terminator check."""
-    assert _close_marker(content_type) in body, "the corpus holds terminated bodies only"
-    assert _outcome(content_type, body) == _MAIN_OUTCOMES[case]
+    """#5787 differential arm: each corpus body parses as origin/main parsed it, whatever its shape
+    (a CR run after a delimiter, a close marker after a bare CR, padding after either), except the
+    rows the line anchor moves, which parse as ``_MOVED_OUTCOMES`` records. It pins
+    ``parse_multipart_form``; ``parse_single_file_upload`` shares the same walk and close check."""
+    assert _close_marker(content_type) in body, "the corpus holds close-marker text in every body"
+    assert _outcome(content_type, body) == _expected(case)
 
 
 def test_the_recorded_outcomes_cover_the_whole_corpus() -> None:
-    """The record and the corpus must name the same bodies, or a body could go uncompared."""
+    """The record and the corpus must name the same bodies, or a body could go uncompared, and each
+    anchored row must really differ from main's, or the record would claim a move that is not one."""
     assert [case for case, _, _ in _CORPUS] == list(_MAIN_OUTCOMES)
+    assert set(_MOVED_OUTCOMES) <= set(_MAIN_OUTCOMES)
+    for case, outcome in _MOVED_OUTCOMES.items():
+        assert outcome != _MAIN_OUTCOMES[case], case
 
 
 @pytest.mark.parametrize(
@@ -862,24 +918,48 @@ def test_the_same_body_without_its_close_marker_is_refused(
     case: str, content_type: str, body: bytes
 ) -> None:
     """#5787: each corpus body with its close marker turned into a plain delimiter is refused. A body
-    origin/main parsed is refused for the missing terminator (or, for the epilogue body, for the part
-    cap, since the walk now runs on into the delimiter text that sat after the close marker). A body
-    main refused keeps main's refusal from ``parse_multipart_form``, class and all, because the
-    terminator check runs last. (``parse_single_file_upload`` refuses a no-file or two-file body
-    after the walk, so an unterminated one of those now gets the terminator refusal there.)"""
+    that parses is refused for the missing close marker. A body that is refused keeps that refusal
+    from ``parse_multipart_form``, class and all: the close check runs last, and the misdelimited-line
+    refusal is raised by the walk on the same line. The exceptions are the rows whose refusal waits
+    for a closed body (a small part with no header block, a part that mentions no name): unclosed,
+    they get the missing close marker refusal, as main gave them. And the epilogue body, unclosed,
+    walks on into the delimiter lines of its old epilogue and is refused for the part cap."""
     marker = _close_marker(content_type)
     unterminated = body.replace(marker, marker[:-2])
     assert marker not in unterminated
     with pytest.raises(MultipartError) as caught:
         parse_multipart_form(content_type, unterminated, max_file_bytes=1024)
-    main = _MAIN_OUTCOMES[case]
-    if main[0] == "refused":
-        assert (type(caught.value).__name__, str(caught.value)) == main[1:]
+    expected = _expected(case)
+    got = (type(caught.value).__name__, str(caught.value))
+    if case in _WAITS_FOR_CLOSE:
+        assert got == _NOT_CLOSED[1:]
     elif case == "wk-epilogue-delims":
-        assert "more parts than the limit" in str(caught.value)
+        assert "more parts than the limit" in got[1]
+    elif expected[0] == "refused":
+        assert got == expected[1:]
     else:
-        assert "no closing boundary delimiter" in str(caught.value)
-        assert type(caught.value) is MultipartError  # 400: the body is malformed, not too large
+        assert got == _NOT_CLOSED[1:]  # a 400: the body is malformed, not too large
+
+
+@pytest.mark.parametrize(
+    "parts",
+    [[_field("note", b"v")], [_FILE_PART, _FILE_PART]],
+    ids=["no-file", "two-files"],
+)
+def test_an_unterminated_body_names_the_missing_close_before_the_file_count(
+    parts: list[bytes],
+) -> None:
+    """``parse_single_file_upload`` counts file parts only after the walk, so an unterminated body
+    with no file part, or with two, is refused for the missing close marker, the cause a client can
+    act on, rather than for the count. With the close marker each gets its count refusal."""
+    body = _body(parts)
+    with pytest.raises(MultipartError, match="file part") as counted:
+        parse_single_file_upload(_CT_WK, body, max_file_bytes=1024)
+    assert "no closing boundary delimiter" not in str(counted.value)
+    unterminated = body[: -len(b"--\r\n")] + b"\r\n"
+    with pytest.raises(MultipartError) as caught:
+        parse_single_file_upload(_CT_WK, unterminated, max_file_bytes=1024)
+    assert str(caught.value) == _NOT_CLOSED[2]
 
 
 @pytest.mark.parametrize(
@@ -888,19 +968,21 @@ def test_the_same_body_without_its_close_marker_is_refused(
         (_CT_B, b""),
         (_CT_B, b"no delimiter here"),
         ("multipart/form-data; boundary=Y", b"--B\r\n" + _FP + b"MSH|x\r\n--B--\r\n"),
+        (_CT_B, b"text--B\r\n" + _FP + b"MSH|x--B--\r\n"),
     ],
-    ids=["empty", "no-delimiter", "other-boundary"],
+    ids=["empty", "no-delimiter", "other-boundary", "mid-line-only"],
 )
 def test_a_body_with_no_delimiter_at_all_is_not_called_truncated(
     content_type: str, body: bytes
 ) -> None:
-    """#5787: a body holding no delimiter for the declared boundary (an empty one, or one built with
-    another boundary) is refused, and the refusal does not send the client looking for a truncation."""
-    with pytest.raises(MultipartError, match="no delimiter for the boundary") as caught:
-        parse_multipart_form(content_type, body, max_file_bytes=1024)
-    assert type(caught.value) is MultipartError
-    with pytest.raises(MultipartError, match="no delimiter for the boundary"):
-        parse_single_file_upload(content_type, body, max_file_bytes=1024)
+    """#5787: a body holding no delimiter line for the declared boundary (an empty one, one built
+    with another boundary, or one whose boundary text is all mid-line) is refused, and the refusal
+    does not send the client looking for a truncation."""
+    for parse in (parse_multipart_form, parse_single_file_upload):
+        with pytest.raises(MultipartError, match="no delimiter for the boundary") as caught:
+            parse(content_type, body, max_file_bytes=1024)
+        assert type(caught.value) is MultipartError
+        assert "truncated" not in str(caught.value)
 
 
 _TAIL = len(f"\r\n--{_B}--\r\n")
@@ -910,7 +992,8 @@ _TAIL = len(f"\r\n--{_B}--\r\n")
 def test_a_truncated_upload_is_refused_not_ingested(cut: int) -> None:
     """#5787: an upload cut short before its close marker is complete was taken as a whole file of
     whatever bytes arrived. It is refused now, by both entry points, whether the cut falls in the
-    close marker or in the file's own bytes (the last cuts lose ``MRN`` and more)."""
+    close marker (the first cut leaves ``--<boundary>-``) or in the file's own bytes (the last cuts
+    lose ``MRN`` and more)."""
     body = _body([_FILE_PART + b"\r\nPID|1||MRN"])
     truncated = body[:-cut]
     assert f"--{_B}--".encode() not in truncated
@@ -928,3 +1011,177 @@ def test_a_cut_that_leaves_the_close_marker_whole_still_parses(cut: int) -> None
     body = _body([_FILE_PART + b"\r\nPID|1||MRN"])
     file = parse_single_file_upload(_CT_WK, body[:-cut], max_file_bytes=1024)
     assert file.data == b"MSH|body\r\nPID|1||MRN"
+
+
+# --- BACKLOG #5787: a delimiter counts only on a line of its own ----------------------------------
+
+_CUT_FILE = b"MSH|a--B--b\r\nPID|1||MRN"
+
+
+def test_a_cut_short_body_with_close_marker_text_mid_line_is_refused() -> None:
+    """The defect the line anchor closes: a body cut short before its close marker, whose file holds
+    the close-marker text in the middle of a line, was taken as complete and ended there (main
+    returned ``MSH|a``). That text is file content now, so the body is refused as unterminated."""
+    body = b"--B\r\n" + _FP + _CUT_FILE + b"\r\n--B--\r\n"
+    cut = body[: -len(b"\r\n--B--\r\n")]
+    for parse in (parse_multipart_form, parse_single_file_upload):
+        with pytest.raises(MultipartError, match="no closing boundary delimiter"):
+            parse(_CT_B, cut, max_file_bytes=1024)
+    # Positive control: whole, the body keeps the mid-line text as file content.
+    assert parse_single_file_upload(_CT_B, body, max_file_bytes=1024).data == _CUT_FILE
+
+
+def test_mid_line_boundary_text_is_file_content() -> None:
+    """Delimiter and close-marker text in the middle of a line split and close nothing."""
+    content = b"MSH|a--B|b--B--|c--B--\r\nPID|1--B\r\nOBX|--B"
+    body = b"--B\r\n" + _FP + content + b"\r\n--B--\r\n"
+    assert parse_single_file_upload(_CT_B, body, max_file_bytes=1024).data == content
+    form = parse_multipart_form(_CT_B, body, max_file_bytes=1024)
+    assert [f.data for f in form.files] == [content]
+
+
+@pytest.mark.parametrize(
+    "line",
+    [b"--B--note", b"--Bnote", b"--B-x", b"--B---", b"--B  x", b"--B--  x"],
+)
+def test_a_file_line_that_starts_with_the_boundary_is_refused(line: bytes) -> None:
+    """A file line that starts with the boundary but is not a delimiter line is refused, by both
+    entry points. Main took each line starting ``--B--`` as the close, ending the file there, and
+    split the file at the others."""
+    body = b"--B\r\n" + _FP + b"MSH|x\r\n" + line + b"\r\nPID|1\r\n--B--\r\n"
+    for parse in (parse_multipart_form, parse_single_file_upload):
+        with pytest.raises(MultipartError, match="not a delimiter line") as caught:
+            parse(_CT_B, body, max_file_bytes=1024)
+        assert type(caught.value) is MultipartError
+
+
+def test_a_body_built_with_a_longer_boundary_is_refused() -> None:
+    """Declared ``B``, built with ``BX``: each delimiter line starts with ``--B`` and goes on, so the
+    refusal names a boundary mismatch."""
+    body = b"--BX\r\n" + _FP + b"MSH|x\r\n--BX--\r\n"
+    with pytest.raises(MultipartError, match="another boundary than its Content-Type names"):
+        parse_single_file_upload(_CT_B, body, max_file_bytes=1024)
+
+
+@pytest.mark.parametrize(
+    ("ending", "data"),
+    [
+        (b"\r\n--B--", b"MSH|x"),
+        (b"\r--B--", b"MSH|x\r"),
+        (b"\n--B--", b"MSH|x\n"),
+        (b"\r\n--B-- \t", b"MSH|x"),
+        (b"\r\n--B--\t \r\nepilogue --B and --B-- mid-line", b"MSH|x"),
+    ],
+    ids=["crlf", "bare-cr", "bare-lf", "padding-then-end", "epilogue-after-crlf"],
+)
+def test_a_close_marker_on_its_own_line_still_closes(ending: bytes, data: bytes) -> None:
+    """Positive controls for the anchor: a close marker after any line break, with padding and the
+    end of the body or an epilogue after it, closes the body. Boundary text in the middle of an
+    epilogue line is ignored."""
+    body = b"--B\r\n" + _FP + b"MSH|x" + ending
+    assert parse_single_file_upload(_CT_B, body, max_file_bytes=1024).data == data
+
+
+def test_mid_line_boundary_text_costs_no_more_finds() -> None:
+    """Each line-break stream scans the body about once, so ten thousand mid-line delimiter texts
+    in a file cost no ``find`` calls of their own."""
+    content = b"x--B" * 10_000
+    body = _FindCounter(b"--B\r\n" + _FP + content + b"\r\n--B--\r\n")
+    assert parse_single_file_upload(_CT_B, body, max_file_bytes=1 << 20).data == content
+    assert 0 < body.finds <= 8, body.finds
+
+
+def test_delimiters_alternating_between_cr_and_lf_lines_are_each_found() -> None:
+    """The two line-break streams take turns: each part here starts after the other stream's kind
+    of line break than the part before it, so a cached hit is reused after the other stream won."""
+    body = (
+        b"--B\n" + _FP + b"1\r--B\r\n" + _FP + b"2\n--B\r" + _FP + b"3\r\n--B\n" + _FP + b"4\r--B--"
+    )
+    form = parse_multipart_form(_CT_B, body, max_file_bytes=1024)
+    assert [f.data for f in form.files] == [b"1\r", b"2\n", b"3", b"4\r"]
+
+
+def test_a_preamble_line_that_starts_with_the_boundary_is_refused() -> None:
+    """A preamble line is read like any other line: one that starts with the boundary but is not a
+    delimiter line is refused, though main ignored it as preamble. No real client writes one."""
+    body = b"--Bjunk preamble\r\n--B\r\n" + _FP + b"MSH|x\r\n--B--\r\n"
+    with pytest.raises(MultipartError, match="not a delimiter line"):
+        parse_single_file_upload(_CT_B, body, max_file_bytes=1024)
+
+
+def test_a_whole_close_marker_segment_still_ends_a_cut_short_file() -> None:
+    """The limit the module docstring states: a bare CR is a line break, so an HL7 segment that is
+    exactly the close marker ends the file there. With the real close marker later the body is
+    refused (a boundary line after the close), but cut short before it, the body is taken as
+    complete. This pins the limit so a change to it is seen."""
+    body = b"--B\r\n" + _FP + b"MSH|x\r--B--\rPID|1\r\n--B--\r\n"
+    with pytest.raises(MultipartError, match="after its close marker"):
+        parse_single_file_upload(_CT_B, body, max_file_bytes=1024)
+    cut = body[: -len(b"\r\n--B--\r\n")]
+    assert parse_single_file_upload(_CT_B, cut, max_file_bytes=1024).data == b"MSH|x\r"
+
+
+@pytest.mark.parametrize(
+    "lead",
+    [b"\xef\xbb\xbf", b"x", b"pre\r\nx"],
+    ids=["bom", "stray-text", "preamble-then-stray"],
+)
+def test_bytes_before_the_first_delimiter_on_its_line_are_refused(lead: bytes) -> None:
+    """#5787: the first delimiter, with bytes before it on its line, is not a delimiter line, so the
+    first part became preamble and was dropped unseen; main parsed or refused it. Refused now."""
+    body = lead + b"--B\r\n" + _FP + b"1\r\n--B\r\n" + _FP + b"2\r\n--B--\r\n"
+    for parse in (parse_multipart_form, parse_single_file_upload):
+        with pytest.raises(MultipartError, match="before its first delimiter line"):
+            parse(_CT_B, body, max_file_bytes=1024)
+
+
+def test_a_split_whose_rest_reads_as_a_nameless_part_is_refused() -> None:
+    """#5787: an HL7 segment that is a whole delimiter line splits the file, and a blank CRLF line in
+    the rest makes it a part with a header block but no name. It was dropped and the file stored
+    short (``MSH|x\\r``); it is refused now."""
+    body = b"--B\r\n" + _FP + b"MSH|x\r--B\rPID|1\r\n\r\nOBX|1\r\n--B--\r\n"
+    for parse in (parse_multipart_form, parse_single_file_upload):
+        with pytest.raises(MultipartError, match="neither a name nor a filename"):
+            parse(_CT_B, body, max_file_bytes=1024)
+
+
+def test_an_hl7_segment_that_is_a_whole_delimiter_line_is_refused_not_stored_short() -> None:
+    """#5787: an HL7 file whose segment, after a bare CR, is exactly ``--B`` split there, and the
+    headerless rest was skipped, so main stored ``MSH|x\r`` and dropped PID and OBX. Refused now."""
+    body = b"--B\r\n" + _FP + b"MSH|x\r--B\rPID|1||MRN\rOBX|1\r\n--B--\r\n"
+    for parse in (parse_multipart_form, parse_single_file_upload):
+        with pytest.raises(MultipartError, match="no header block") as caught:
+            parse(_CT_B, body, max_file_bytes=1024)
+        assert type(caught.value) is MultipartError
+
+
+def test_an_unquoted_name_is_not_called_nameless() -> None:
+    """A field whose name the parser cannot read (``name=submit``, unquoted) is skipped as main
+    skipped it, not refused as a part with no name."""
+    unquoted = b"Content-Disposition: form-data; name=submit\r\n\r\ngo"
+    file = parse_single_file_upload(_CT_WK, _body([_FILE_PART, unquoted]), max_file_bytes=1024)
+    assert file.data == b"MSH|body"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    [b'Content-Disposition: form-data; name="file"; filen', b"\r\n\r\n"],
+    ids=["cut-in-header", "cut-after-empty-header"],
+)
+def test_a_body_cut_in_a_header_block_is_called_truncated(tail: bytes) -> None:
+    """An unclosed body whose last part has no header block, or no name, is refused for the missing
+    close marker, the refusal that names the cause, as main refused it."""
+    body = b"--B\r\n" + _FP + b"MSH|x\r\n--B\r\n" + tail
+    for parse in (parse_multipart_form, parse_single_file_upload):
+        with pytest.raises(MultipartError, match="no closing boundary delimiter"):
+            parse(_CT_B, body, max_file_bytes=1024)
+
+
+def test_a_body_cut_right_after_a_close_marker_prefix_line_is_taken_as_complete() -> None:
+    """A limit the module docstring states: ``--B--note`` in a file is refused in a whole body, but
+    a body cut right after its ``--B--`` leaves a valid close and is taken as complete."""
+    body = b"--B\r\n" + _FP + b"MSH|x\r\n--B--note\r\nPID|1\r\n--B--\r\n"
+    with pytest.raises(MultipartError, match="not a delimiter line"):
+        parse_single_file_upload(_CT_B, body, max_file_bytes=1024)
+    cut = body[: body.index(b"note")]
+    assert parse_single_file_upload(_CT_B, cut, max_file_bytes=1024).data == b"MSH|x"
