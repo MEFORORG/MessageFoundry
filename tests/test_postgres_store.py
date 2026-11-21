@@ -6149,8 +6149,12 @@ async def test_ingress_handoff_dead_letters_a_token_it_can_never_hand_off(
             await s.close()
 
 
+_ISOLATION_LEVELS = ("read uncommitted", "read committed", "repeatable read", "serializable")
+
+
 async def _role_isolation_default(conn: Any) -> str | None:
-    """This role's own default_transaction_isolation in this database, or ``None``."""
+    """This role's own default_transaction_isolation in this database, lower-cased, or ``None``.
+    The catalog keeps the text as it was written, so ``READ COMMITTED`` reads back as itself."""
     configs = await conn.fetchval(
         "SELECT setconfig FROM pg_db_role_setting"
         " WHERE setrole = (SELECT oid FROM pg_roles WHERE rolname = current_user)"
@@ -6158,8 +6162,8 @@ async def _role_isolation_default(conn: Any) -> str | None:
     )
     for entry in configs or []:
         name, _, value = entry.partition("=")
-        if name == "default_transaction_isolation":
-            return str(value)
+        if name.strip().lower() == "default_transaction_isolation":
+            return " ".join(value.strip().strip("'\"").lower().split())
     return None
 
 
@@ -6173,19 +6177,21 @@ async def _set_role_isolation_default(conn: Any, value: str | None) -> None:
         )
         stmt += " current_database())"
     else:
-        assert value in ("read uncommitted", "read committed", "repeatable read", "serializable")
+        assert value in _ISOLATION_LEVELS, value
         stmt = "format('ALTER ROLE CURRENT_USER IN DATABASE %I SET default_transaction_isolation"
         stmt += f" = %L', current_database(), '{value}')"
     await conn.execute(f"DO $do$ BEGIN EXECUTE {stmt}; END $do$")
 
 
-async def test_pool_isolation_pin_outranks_a_role_default(store) -> None:
+async def test_finalizer_isolation_outranks_a_role_default(store) -> None:
     """BACKLOG #5674: the finalizer's read after its advisory lock sees a sibling's commit only under
-    READ COMMITTED. With the role's default in this database set to REPEATABLE READ, a freshly
-    opened pool still runs a transaction that names no isolation under READ COMMITTED, and the
-    pool's reset on release restores the pin on the very connection a session changed. CONTROL: the
-    role setting is in place, and the session's value comes from the client, so the pin is what
-    won. The role's prior setting is restored afterwards."""
+    READ COMMITTED. With the role's default in this database set to REPEATABLE READ, the
+    transaction a final delivery finalizes in still runs READ COMMITTED. CONTROL: on the same handle
+    a transaction that names no isolation runs REPEATABLE READ, so the role default is in force and
+    the finalizer's own pin is what held.
+
+    The role's prior setting is restored in a ``finally``. A hard kill, such as pytest-timeout's
+    thread method ending the process, skips that restore and leaves the default changed."""
     from messagefoundry.config.settings import load_settings
     from messagefoundry.store.postgres import PostgresStore
 
@@ -6193,35 +6199,33 @@ async def test_pool_isolation_pin_outranks_a_role_default(store) -> None:
         prior = await _role_isolation_default(conn)
         await _set_role_isolation_default(conn, "repeatable read")
     try:
-        async with store._pool.acquire() as conn:
-            assert await _role_isolation_default(conn) == "repeatable read"
-
-        pinned = await PostgresStore.open(load_settings(environ=os.environ).store)
+        # Opened after the change, so every connection it holds takes the role default.
+        s = await PostgresStore.open(load_settings(environ=os.environ).store)
         try:
-            async with pinned._pool.acquire() as conn:
-                source = await conn.fetchval(
-                    "SELECT source FROM pg_settings WHERE name = 'default_transaction_isolation'"
-                )
-                assert source == "client"
-                async with conn.transaction():
-                    assert await conn.fetchval("SHOW transaction_isolation") == "read committed"
-                await conn.execute("SET SESSION default_transaction_isolation = 'repeatable read'")
-                changed = await conn.fetchval("SELECT pg_backend_pid()")
-            # Cycle the pool until the changed connection comes back; each must read the pin.
-            seen = False
-            for _ in range(pinned._pool.get_max_size() + 1):
-                async with pinned._pool.acquire() as conn:
-                    async with conn.transaction():
-                        assert await conn.fetchval("SHOW transaction_isolation") == "read committed"
-                    if await conn.fetchval("SELECT pg_backend_pid()") == changed:
-                        seen = True
-                        break
-            assert seen, "the connection the session changed never came back from the pool"
+            async with s._pool.acquire() as conn, conn.transaction():
+                assert await conn.fetchval("SHOW transaction_isolation") == "repeatable read"
+
+            seen: list[str] = []
+            finalize = s._maybe_finalize_message
+
+            async def spy(conn: Any, message_id: str, now: float) -> None:
+                seen.append(await conn.fetchval("SHOW transaction_isolation"))
+                await finalize(conn, message_id, now)
+
+            s._maybe_finalize_message = spy  # type: ignore[method-assign]
+            mid = await s.enqueue_message(
+                channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+            )
+            [item] = await s.claim_ready(now=200.0)
+            await s.mark_done(item.id, now=300.0)
+            assert seen and set(seen) == {"read committed"}, seen
+            [row] = await s._pool.fetch("SELECT status FROM messages WHERE id=$1", mid)
+            assert row["status"] == MessageStatus.PROCESSED.value
         finally:
-            await pinned.close()
+            await s.close()
     finally:
         async with store._pool.acquire() as conn:
-            await _set_role_isolation_default(conn, prior)
+            await _set_role_isolation_default(conn, prior if prior in _ISOLATION_LEVELS else None)
 
 
 @pytest.mark.parametrize("case", KEYLESS_BLANK_CASES, ids=lambda c: c.__name__)

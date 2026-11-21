@@ -537,6 +537,12 @@ def _audit_write_probe(table: str, privilege: str) -> str:
 
 _SCHEMA_LOCK = "mefor_schema_init"
 _FINALIZE_LOCK_PREFIX = "mefor_finalize:"
+#: The isolation every transaction that runs :meth:`PostgresStore._maybe_finalize_message` opens
+#: with (BACKLOG #5674). The finalizer reads its message's queue rows after taking the finalize
+#: advisory lock, and only under READ COMMITTED does that read see a sibling's commit, so a server,
+#: database or role default of REPEATABLE READ must not decide it. Pinned per transaction rather
+#: than as a pool startup parameter, which a stock PgBouncer refuses.
+_FINALIZE_ISOLATION = "read_committed"
 _OUTBOUND_LANE_LOCK_PREFIX = "mefor_outlane:"
 
 #: SQLSTATE lock_not_available: a statement waited out lock_timeout (BACKLOG #1726).
@@ -2320,17 +2326,7 @@ class PostgresStore:
                 "Postgres backend requires the 'postgres' extra: "
                 "pip install 'messagefoundry[postgres]'"
             ) from exc
-        server_settings = {
-            "application_name": settings.application_name,
-            # BACKLOG #5674: pinned, so a server, database or role default of REPEATABLE READ cannot
-            # change what a transaction that names no isolation sees. `_maybe_finalize_message`
-            # reads its message's queue rows after taking the finalize advisory lock, and only
-            # under READ COMMITTED does that read see a sibling's commit. A startup parameter
-            # outranks those defaults, and the pool's RESET ALL on release restores it. A pooler in
-            # front of the server may refuse the parameter, or drop it, which leaves the server's
-            # own default in force (docs/DEPLOY-SERVER-DB.md).
-            "default_transaction_isolation": "read committed",
-        }
+        server_settings = {"application_name": settings.application_name}
         if settings.db_schema:
             # Resolve unqualified table names against the configured schema (it must already exist).
             server_settings["search_path"] = settings.db_schema
@@ -5014,7 +5010,7 @@ class PostgresStore:
         now = time.time() if now is None else now
         applied: list[tuple[tuple[str, str], Any]] = []
         async with self._timed_acquire() as conn:  # noqa: SIM117
-            async with conn.transaction():
+            async with conn.transaction(isolation=_FINALIZE_ISOLATION):
                 # ADR 0090 writer-funnel: lock the outbound lanes this txn writes (sorted, before seq
                 # assignment, before the later finalize lock) so commit-order == seq-order per lane.
                 await self._lock_outbound_lanes(conn, (d for d, _ in deliveries))
@@ -5336,7 +5332,7 @@ class PostgresStore:
             f" FROM head WHERE q.id=head.id AND head.next_attempt_at<=$5{epoch_guard} RETURNING q.*"
         )
         async with self._timed_acquire() as conn:  # noqa: SIM117
-            async with conn.transaction():
+            async with conn.transaction(isolation=_FINALIZE_ISOLATION):
                 # FIRST recover this lane's stranded head: a crashed/fenced predecessor's claimed rows
                 # are still inflight under an expired ROW lease, and the PENDING-only head SELECT below
                 # would skip them and reorder past N. Return them to pending IN THIS TXN before the head
@@ -5622,7 +5618,7 @@ class PostgresStore:
         )
         rearm: set[str] = set()
         kept_rows: list[Any] = []
-        async with self._timed_acquire() as conn, conn.transaction():
+        async with self._timed_acquire() as conn, conn.transaction(isolation=_FINALIZE_ISOLATION):
             # (i) multi-lane stranded-head lease reclaim, same txn, FIRST (the multi-lane twin
             # of the single claim's): bounded to the requested lanes and to already-expired
             # leases, so it never steals a live node's own actively-leased rows.
@@ -5951,7 +5947,10 @@ class PostgresStore:
         now = time.time() if now is None else now
         guard, guard_args = self._resolve_guard(6)  # ADR 0157 C1 — TERMINAL
         try:
-            async with self._timed_acquire() as conn, conn.transaction():
+            async with (
+                self._timed_acquire() as conn,
+                conn.transaction(isolation=_FINALIZE_ISOLATION),
+            ):
                 row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
                 if row is None:
                     return
@@ -5991,7 +5990,10 @@ class PostgresStore:
         now = time.time() if now is None else now
         guard, guard_args = self._resolve_guard(6)  # ADR 0157 C1 — TERMINAL
         try:
-            async with self._timed_acquire() as conn, conn.transaction():
+            async with (
+                self._timed_acquire() as conn,
+                conn.transaction(isolation=_FINALIZE_ISOLATION),
+            ):
                 # Not updated_at: the in-flight watch measures a held row's age from its claim.
                 hit = await conn.fetchrow(
                     "UPDATE queue SET worker_deaths = worker_deaths + 1"
@@ -6035,7 +6037,10 @@ class PostgresStore:
         now = time.time() if now is None else now
         guard, guard_args = self._resolve_guard(4)  # ADR 0157 C1 — TERMINAL
         try:
-            async with self._timed_acquire() as conn, conn.transaction():
+            async with (
+                self._timed_acquire() as conn,
+                conn.transaction(isolation=_FINALIZE_ISOLATION),
+            ):
                 row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
                 if row is None:
                     return False
@@ -6093,7 +6098,10 @@ class PostgresStore:
         # rolls all N back, which is exactly the all-or-nothing contract the docstring already promises.
         guard, guard_args = self._resolve_guard(4)
         try:
-            async with self._timed_acquire() as conn, conn.transaction():
+            async with (
+                self._timed_acquire() as conn,
+                conn.transaction(isolation=_FINALIZE_ISOLATION),
+            ):
                 finalize: dict[str, None] = {}
                 for outbox_id in outbox_ids:
                     row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
@@ -6165,7 +6173,7 @@ class PostgresStore:
             async with self._timed_acquire() as conn:  # noqa: SIM117
                 # READ COMMITTED pinned: the MAX(response_seq) read after the lock must see the
                 # completion it waited on, which a repeatable-read server default would hide.
-                async with conn.transaction(isolation="read_committed"):
+                async with conn.transaction(isolation=_FINALIZE_ISOLATION):
                     # FOR UPDATE (BACKLOG #5752): a second completion of the same row waits here and
                     # then reads the first one's committed DONE, so only one reply is ever captured.
                     row = await conn.fetchrow(
@@ -6315,11 +6323,12 @@ class PostgresStore:
         single-transaction guarded-DELETE handoff under one ``conn.transaction()``. A no-op (work-row
         already consumed) rolls the transaction back via the internal sentinel and returns ``False``.
 
-        A token that can never be handed off is dead-lettered and consumed, returning ``True``: a
-        corrupt reference, a missing or erased reply, an origin metadata cell that fails its tag, a
-        depth past the cap, and (BACKLOG #5689) a reply or origin metadata cell that does not
-        decrypt, or origin metadata that does not parse. A decrypt failure from a key service that
-        gave no verdict propagates instead, as any other error does."""
+        A token that can never be handed off is dead-lettered and consumed, returning ``True``. The
+        cases include at least: a work-row that fails its tag, a corrupt reference, a missing or
+        erased reply, an origin metadata cell that fails its tag, a depth past the cap, and (BACKLOG
+        #5689) a reply or origin metadata cell that does not decrypt, or origin metadata that does
+        not parse. A decrypt failure from a key service that gave no verdict, or one that is also a
+        fault in the engine's own code, propagates instead."""
 
         class _Noop(Exception):
             pass
@@ -6335,7 +6344,7 @@ class PostgresStore:
         queue_tag_rows: list[tuple[Any, QueueTagError]] = []
         try:
             async with self._timed_acquire() as conn:  # noqa: SIM117
-                async with conn.transaction():
+                async with conn.transaction(isolation=_FINALIZE_ISOLATION):
                     wr = await conn.fetchrow(
                         f"SELECT {QUEUE_TAG_SELECT}, payload FROM queue"
                         " WHERE id=$1 AND stage=$2 AND status=$3",
@@ -7470,7 +7479,10 @@ class PostgresStore:
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         try:
-            async with self._timed_acquire() as conn, conn.transaction():
+            async with (
+                self._timed_acquire() as conn,
+                conn.transaction(isolation=_FINALIZE_ISOLATION),
+            ):
                 # FOR UPDATE: the DEAD branch's decline below reads the row this transaction then
                 # writes, so no writer moves it in between (ADR 0157 Amendment C).
                 row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1 FOR UPDATE", outbox_id)
@@ -7570,7 +7582,10 @@ class PostgresStore:
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
         try:
-            async with self._timed_acquire() as conn, conn.transaction():
+            async with (
+                self._timed_acquire() as conn,
+                conn.transaction(isolation=_FINALIZE_ISOLATION),
+            ):
                 present = []
                 for outbox_id in outbox_ids:
                     row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
@@ -7662,7 +7677,10 @@ class PostgresStore:
             6
         )  # ADR 0157 C1 — TERMINAL, once for the whole loop
         try:
-            async with self._timed_acquire() as conn, conn.transaction():
+            async with (
+                self._timed_acquire() as conn,
+                conn.transaction(isolation=_FINALIZE_ISOLATION),
+            ):
                 finalize: dict[str, None] = {}
                 for outbox_id in outbox_ids:
                     row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
@@ -8213,7 +8231,7 @@ class PostgresStore:
         """Dead-letter every non-terminal **outbound** row whose ``destination_name`` left the
         registry. Scoped to ``stage='outbound'``. Returns the rows killed."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn, conn.transaction():
+        async with self._timed_acquire() as conn, conn.transaction(isolation=_FINALIZE_ISOLATION):
             rows = await conn.fetch(
                 "SELECT id, message_id, destination_name FROM queue"
                 " WHERE stage=$1 AND status = ANY($2::text[])",
@@ -8259,7 +8277,7 @@ class PostgresStore:
         """Dead-letter every non-terminal **routed** row whose ``handler_name`` left the registry
         (no transform worker can run it). Scoped to ``stage='routed'``. Returns the rows killed."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn, conn.transaction():
+        async with self._timed_acquire() as conn, conn.transaction(isolation=_FINALIZE_ISOLATION):
             rows = await conn.fetch(
                 "SELECT id, message_id, handler_name FROM queue"
                 " WHERE stage=$1 AND status = ANY($2::text[])",
@@ -8301,7 +8319,7 @@ class PostgresStore:
         ``destination_name`` and drain regardless of origin. ``valid_names`` is the WHOLE
         deployment's inbound names, never one engine shard's slice. Returns the rows killed."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn, conn.transaction():
+        async with self._timed_acquire() as conn, conn.transaction(isolation=_FINALIZE_ISOLATION):
             rows = await conn.fetch(
                 "SELECT id, message_id, channel_id FROM queue"
                 " WHERE stage = ANY($1::text[]) AND status = ANY($2::text[])",
@@ -8892,7 +8910,11 @@ class PostgresStore:
         if top_only:
             query += " LIMIT 1"
         # BACKLOG #2624: ``audit``'s row commits with the cancel, zero included.
-        async with AuditedWrite(now) as written, self._timed_acquire() as conn, conn.transaction():
+        async with (
+            AuditedWrite(now) as written,
+            self._timed_acquire() as conn,
+            conn.transaction(isolation=_FINALIZE_ISOLATION),
+        ):
             rows = await conn.fetch(
                 query,
                 destination_name,
