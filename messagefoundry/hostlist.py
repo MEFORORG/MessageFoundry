@@ -126,8 +126,9 @@ def _is_host_name(text: str) -> bool:
 
 def _without_zone(text: str) -> str | None:
     """``text`` with its one ``%zone`` cut out, or ``None`` when it holds no ``%``, more than one,
-    or a zone that is empty or holds a blank. The zone runs from the ``%`` to the next ``]`` or
-    ``:``. An unbracketed address that holds a ``:`` comes back bracketed, so ``fe80::1%eth0:443``
+    or a zone that, once stripped of blanks at either end, is empty or still holds a blank. The
+    zone runs from the ``%`` to the next ``]`` or ``:``, even inside brackets. A ``%`` after the
+    ``]`` is cut out too. An unbracketed address that holds a ``:`` comes back bracketed, so ``fe80::1%eth0:443``
     is ``[fe80::1]:443``; :func:`parse_allow_entry` then judges the rest. Nothing here reads the
     address itself."""
     if text.count("%") != 1:
@@ -162,14 +163,16 @@ def allow_entry_problem(entry: str) -> str | None:
         return "it is a URL or a path, not a host; list the host alone, with ':port' to pin a port"
     parsed = parse_allow_entry(text)
     if parsed is None:
-        # A zone id only where cutting it out leaves an entry whose host is an IP address. Any
-        # other fault that entry has is named first, so fixing the zone is the last edit;
-        # unbracketed, a zoned address would otherwise be told to write [v6], refused too.
+        # A '%' suffix is named only where cutting it out leaves an entry whose host is an IP
+        # address, and a fault that bracketed entry has is named first. An unbracketed IPv6
+        # address is bracketed before that check, so its missing brackets are named only on the
+        # next load; told to write [v6] first, the operator would be refused for the zone then.
         unzoned = _without_zone(text)
         reread = parse_allow_entry(unzoned) if unzoned is not None else None
         if unzoned is not None and reread is not None and not isinstance(reread[0], str):
             return allow_entry_problem(unzoned) or (
-                "its address carries a '%' zone id, which no host is matched with"
+                "its address carries a '%' suffix, such as an IPv6 zone id, which no host is "
+                "matched with"
             )
         bracketed = text.startswith("[")
         if not bracketed and text.count(":") > 1:

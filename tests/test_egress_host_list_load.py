@@ -92,7 +92,7 @@ def test_refusal_does_not_quote_the_entry() -> None:
         # bracketed form above is refused for too.
         ("fe80::1%eth0", "zone id"),
         ("[fe80::1%eth0]:443", "zone id"),
-        # A '%' outside an IPv6 address is no zone id.
+        # A '%' in a host name, or one that leaves no readable entry once cut, is no zone id.
         ("h%2Eexample.org", "character no host name does"),
         ("h%2Eexample.org:443", "character no host name does"),
         ("[::1]x%", r"is not 'host', 'host:port'"),
@@ -106,9 +106,10 @@ def test_refusal_does_not_quote_the_entry() -> None:
         ("[ fe80::1%eth0 ]", "zone id"),
         ("[fe80::1%eth0 ]:443", "zone id"),
         # An IPv4 address with a '%' suffix is an address, not a name or a pattern.
-        ("192.0.2.4%eth0", "zone id"),
-        ("192.0.2.4%eth0:443", "zone id"),
-        # Cutting the zone out must leave a readable entry; any other fault is named first.
+        ("192.0.2.4%eth0", "'%' suffix"),
+        ("192.0.2.4%eth0:443", "'%' suffix"),
+        # Cutting the zone out must leave a readable entry; a fault the bracketed entry then has
+        # is named first.
         ("[fe80::1%eth0]:", r"is not 'host', 'host:port'"),
         ("[fe80::1%eth0]:abc", "port is not a number"),
         ("[fe80::1%eth0]:443:1", "port is not a number"),

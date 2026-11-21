@@ -1722,8 +1722,7 @@ replacing any list the file sets,** and an empty list is read as an unset one. U
 `[security].block_unlisted_outbound = false` an empty destination list, such as `allowed_mllp` or
 `allowed_http`, admits any host of its type, so such a variable opens that transport to every
 host; under the deny default it refuses every one. At least `allowed_proxy` and
-`allowed_ech_sidecar` refuse what they gate while they are empty, under either setting, as their
-rows say. A host being checked
+`allowed_ech_sidecar` keep their own empty-list rules, which their rows state. A host being checked
 that carries a `%` zone id matches no entry, so while its list is set a zoned IPv6 destination is
 refused whatever the entries say. The host being checked must name an IPv6 literal
 bare, as `::1`, at least in a connection's `host` setting and in `[logging].forward_host`: a
