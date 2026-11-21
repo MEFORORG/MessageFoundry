@@ -270,8 +270,8 @@ async def test_a_preset_write_refuses_criteria_the_read_refuses_as_drift(
 async def test_a_marked_cell_that_opens_to_blank_is_drift(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """BACKLOG #5523: a marked cell that verifies under its own row's tag but holds "" was sealed
-    outside the store, which never writes blank criteria. It is a ``SealedBlankCellError``, a
+    """BACKLOG #5523: a marked cell sealed under this row's tag that opens to "" was sealed outside
+    the store, which never writes blank criteria. It is a ``SealedBlankCellError``, a
     ``BlankCellError`` whose text says the cell opened empty, audited as drift, not criteria a
     route reads as malformed JSON with no integrity row."""
     from messagefoundry.store import cell_tag

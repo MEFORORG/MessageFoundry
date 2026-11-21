@@ -309,9 +309,10 @@ class BlankCellError(CellTagError):
 
 
 class SealedBlankCellError(BlankCellError):
-    """A preset's ``criteria`` cell is sealed and opens under its own row's tag, but to an empty
-    string (BACKLOG #5523). The cell on disk is ciphertext, not blank, so the text says what opened;
-    the store never seals blank criteria, so it is drift and refused as a blank cell is."""
+    """A preset's ``criteria`` cell is sealed and the cipher opens it, but to an empty string
+    (BACKLOG #5523). The cell on disk is ciphertext, not blank, so the text says what opened. The
+    store never seals blank criteria, so it is drift and refused as a blank cell is. Under a marker
+    whose tag binds no row (v1), opening says nothing about which row it was sealed for."""
 
     def _describe(self) -> str:
         return (
@@ -459,28 +460,25 @@ def open_preset_criteria(
     an empty string raises :class:`SealedBlankCellError` (BACKLOG #5523). Each is drift:
     logged here, alerted here on a keyed store only, and audited by the store's read, before the
     caller reads the cell or stamps the preset as used. The store's whole-surface cell walks do not run this check."""
-    # A blank cell is not opened: a keyed cipher passes it through. open_tagged_cell refuses a
-    # non-text cell, and returns None only for a None cell, which is not opened either.
-    blank = stored is None or stored == ""
-    opened = (
-        ""
-        if blank
-        else cast(
-            str,
-            open_tagged_cell(
-                cipher,
-                stored,
-                preset_criteria_aad(preset_id=preset_id, owner_user_id=owner_user_id),
-                table="search_presets",
-                column="criteria",
-                row_id=preset_id,
-            ),
-        )
+    if stored is None or stored == "":
+        # Not opened: a keyed cipher passes a blank value through.
+        refused: CellTagError = BlankCellError("search_presets", "criteria", preset_id, None)
+        _alert(cipher, refused)
+        raise refused
+    # open_tagged_cell refuses a non-text cell, and returns None only for a None cell, refused above.
+    opened = cast(
+        str,
+        open_tagged_cell(
+            cipher,
+            stored,
+            preset_criteria_aad(preset_id=preset_id, owner_user_id=owner_user_id),
+            table="search_presets",
+            column="criteria",
+            row_id=preset_id,
+        ),
     )
     if opened == "":
-        # Blank, or a sealed cell that opens to "": either way written outside the store.
-        kind = BlankCellError if blank else SealedBlankCellError
-        refused = kind("search_presets", "criteria", preset_id, None)
+        refused = SealedBlankCellError("search_presets", "criteria", preset_id, None)
         _alert(cipher, refused)
         raise refused
     return opened

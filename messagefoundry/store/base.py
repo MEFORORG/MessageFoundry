@@ -3041,8 +3041,9 @@ class AuthStore(Protocol):
         now: float | None = None,
     ) -> tuple[str, bool]:
         """Create-or-replace a per-user preset by ``(owner, name)`` (id reused on a name collision so the
-        cell-AAD stays stable). ``criteria`` is a JSON blob encrypted at rest. Returns
-        ``(effective_id, replaced)``."""
+        cell-AAD stays stable). ``criteria`` is a JSON blob encrypted at rest. Raises ``ValueError``
+        for criteria that are not text or are empty, which every read refuses as drift
+        (``cell_tag.require_preset_criteria``, BACKLOG #5523). Returns ``(effective_id, replaced)``."""
         ...
 
     async def list_search_presets(self, owner_user_id: str) -> list[dict[str, Any]]:

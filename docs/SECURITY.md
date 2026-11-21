@@ -4779,11 +4779,11 @@ unconditional dedicated rows (`message_view`, `message_search`) regardless, and 
 `GET /messages/{id}/responses` (`response.read`) and `GET /search/layered` (`preset.layered_search`).
 `GET /search/layered` also tries to write its `preset.layered_search` row when it refuses a
 stored preset while loading it, naming at least the number of presets layered, the preset id, the
-status and the refusal cause, an error class name or `malformed` (BACKLOG #5523). The write is best effort: a failed write does not change
-the answer, and it is logged at ERROR. A refusal of the composed layers writes no such row. A
-refusal row has `refused` in its detail, which tells it from a search that ran. A NULL, empty or
-non-text criteria cell, and a sealed one that opens to an empty string, are refused by the store
-itself, which logs a WARNING and writes the
+status and the refusal cause, an error class name or `malformed` (BACKLOG #5523). The write is
+best effort: a failed write does not change the answer, and it is logged at ERROR. A refusal of
+the composed layers writes no such row. A refusal row has `refused` in its detail, which tells it
+from a search that ran. A NULL, empty or non-text criteria cell, and a sealed one that opens to an
+empty string, are refused by the store itself, which logs a WARNING and writes the
 `integrity.preset_tag_failed` row on every store, and on a keyed store raises the
 `integrity_drift` alert, as for a moved preset. The store rate-limits its WARNING, alert and
 `integrity.preset_tag_failed` row for a repeated refusal, and the route rate-limits some of its

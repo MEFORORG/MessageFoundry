@@ -792,6 +792,27 @@ async def test_a_store_returning_non_text_criteria_answers_400_not_500(
     ]
 
 
+async def test_a_sealed_blank_criteria_cell_answers_423_naming_what_opened(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """BACKLOG #5523: a sealed cell that opens to an empty value takes the blank arm, and its 423
+    says what opened, not that the cell is blank: on disk it is ciphertext."""
+    from messagefoundry.store.cell_tag import SealedBlankCellError
+
+    async def _read(**kw: Any) -> dict[str, Any]:
+        raise SealedBlankCellError("search_presets", "criteria", kw["preset_id"], None)
+
+    r, pid = await _layered_with_preset_read(engine, monkeypatch, caplog, _read)
+    assert r.status_code == 423, r.text
+    assert r.json()["detail"] == (
+        f"preset {pid} has criteria that open to an empty value, written outside the store, and"
+        " cannot be used"
+    )
+    assert await _refusal_audits(engine) == [
+        {"presets": 1, "refused": pid, "status": 423, "cause": "SealedBlankCellError"}
+    ]
+
+
 @pytest.mark.parametrize("kind", ["CorruptCellError", "CellTagError"])
 async def test_a_corrupt_or_tag_failed_criteria_cell_answers_423(
     engine: Engine, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, kind: str

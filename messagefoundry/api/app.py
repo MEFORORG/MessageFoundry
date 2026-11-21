@@ -537,7 +537,12 @@ from messagefoundry.store.base import (
     audit_write_errors,
     build_store_cipher,
 )
-from messagefoundry.store.cell_tag import BlankCellError, CellTagError, NonTextCellError
+from messagefoundry.store.cell_tag import (
+    BlankCellError,
+    CellTagError,
+    NonTextCellError,
+    SealedBlankCellError,
+)
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
 )
@@ -10030,12 +10035,12 @@ def create_app(
                 )
             except AUDIT_WRITE_DEFECTS as exc:
                 # Inside the refusal set below, so caught first: they still mean a defect, and
-                # the record says so (BACKLOG #5523). Not re-raised, as the next arm says.
+                # the record says so (BACKLOG #5523). Not re-raised: a raise would replace the
+                # refusal owed with a 500, the case write_audit_soft's docstring says to pass
+                # defects=() for.
                 failed = f"defect {type(exc).__name__}"
             except audit_write_errors() as exc:
-                # The store-refusal set the other fail-soft audit writes catch. Defects
-                # (AUDIT_WRITE_DEFECTS) are not re-raised: a raise would replace the refusal owed
-                # with a 500, the case write_audit_soft's docstring says to pass defects=() for.
+                # The store-refusal set the other fail-soft audit writes catch.
                 # write_audit_soft itself is not used: it logs the traceback, whose frames reach
                 # the route frame's decrypted `criterias`. Names the refusal's own status and
                 # cause, which the row would have held, at most once per preset, cause and failure
@@ -10068,16 +10073,21 @@ def create_app(
                     preset_id=preset_id, owner_user_id=identity.user_id
                 )
             except (BlankCellError, NonTextCellError) as exc:
-                # BACKLOG #5523: the store refused a NULL, empty or non-text criteria cell, which
-                # it never writes (audited and logged there, and alerted on a keyed store), so it
-                # never reads as an empty filter that would widen the search. Its own text: a
-                # keyless store has no integrity tag for such a cell to fail.
+                # BACKLOG #5523: the store refused a NULL, empty or non-text criteria cell, or a
+                # sealed one that opens to an empty value, which it never writes (audited and
+                # logged there, and alerted on a keyed store), so it never reads as an empty filter
+                # that would widen the search. Its own text: a keyless store has no integrity tag
+                # for such a cell to fail.
                 cause = type(exc).__name__
-                shape = "blank" if isinstance(exc, BlankCellError) else "non-text"
+                if isinstance(exc, SealedBlankCellError):
+                    shape = "criteria that open to an empty value"
+                elif isinstance(exc, BlankCellError):
+                    shape = "blank criteria"
+                else:
+                    shape = "non-text criteria"
                 refusal = HTTPException(
                     423,
-                    f"preset {preset_id} has {shape} criteria, written outside the store, and"
-                    " cannot be used",
+                    f"preset {preset_id} has {shape}, written outside the store, and cannot be used",
                 )
             except CellTagError as exc:
                 # BACKLOG #2593: the criteria fail their owner tag (alerted and audited), hold an
