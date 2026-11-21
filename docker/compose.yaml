@@ -375,7 +375,8 @@ services:
     environment:
       <<: *ha-engine-env
     # The anchor's volumes plus this engine's own log-spool volume (x-ha-engine-env says why). A
-    # service's volumes replace the anchor's, so the first two alias its entries.
+    # service's volumes replace the anchor's, so the first two alias its entries. Do not --scale
+    # it; engine-standby's note says why.
     volumes:
       - *ha-config-mount
       - *ha-tls-mount
@@ -393,9 +394,9 @@ services:
     # The anchor's volumes plus this engine's own log-spool volume (x-ha-engine-env says why). A
     # service's volumes replace the anchor's, so the first two alias its entries.
     # `--scale` above 1 is UNSUPPORTED here and on engine-ha: the fixed host ports refuse a second
-    # replica, and without them every replica would mount the service's one named spool volume, so all but
-    # one would run without a spool. Add another engine as its own service, with its own spool
-    # volume and host ports, instead.
+    # replica, and without them every replica would mount the service's one named spool volume, so
+    # all but one would run without a spool. Add another engine as its own service, with its own
+    # spool volume and host ports, instead.
     volumes:
       - *ha-config-mount
       - *ha-tls-mount

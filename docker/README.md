@@ -215,7 +215,7 @@ certificate (A) and its revocation attestation, or it **refuses to start** — b
   `mefor-spool-standby` volumes, the `log-spool` emptyDir in `k8s/ha-postgres.yaml`, and the
   `log-spool` directory the other engines keep on the store volume hold the off-box forwarder's
   unsent log records. `MEFOR_STORE_ENCRYPTION_KEY` does not cover them, so put them on an
-  encrypted volume or node disk with the store's access control;
+  encrypted volume or node disk that only the engine's account can read;
   [PHI.md §2](../docs/PHI.md#2-where-phi-lives--data-at-rest-inventory), *Off-box forwarder
   spool*, is the inventory row.
 - **Secrets** (`MEFOR_STORE_ENCRYPTION_KEY`, `MEFOR_API_TLS_KEY_PASSWORD`, `MEFOR_STORE_PASSWORD`, …):

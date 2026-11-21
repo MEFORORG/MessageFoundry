@@ -26,7 +26,6 @@ import posixpath
 import re
 import tempfile
 from collections.abc import Iterator
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -39,6 +38,7 @@ from messagefoundry.pipeline.alert_sinks import (
 )
 from messagefoundry.transports.egress import syslog_forward_refusal
 from tests.test_compose_revocation_attestation import (
+    _COMPOSE,
     _all_services,
     _compose_doc,
     _serving_engines,
@@ -54,8 +54,6 @@ from tests.test_k8s_enforce_start_inputs import (
     _site_entries as _k8s_site_entries,
 )
 
-_ROOT = Path(__file__).resolve().parents[1]
-_COMPOSE = _ROOT / "docker" / "compose.yaml"
 _HA_POSTGRES = "ha-postgres.yaml"
 #: Each serving engine -> (the text that opens its environment block, its k8s parity manifest).
 #: The ha engines share x-ha-engine-env; only they, like ha-postgres.yaml, run the Postgres store.
@@ -198,46 +196,60 @@ def _writable_sources(service: str) -> set[str]:
     return out
 
 
-#: The ha engines: every serving engine on the Postgres store, so a new one is checked too.
-_HA_ENGINES = tuple(n for n in sorted(_ENGINES) if _postgres(n))
-_ANCHOR_MOUNTS = len(_compose_doc()["x-ha-engine"].get("volumes") or [])
+_ANCHOR = _compose_doc().get("x-ha-engine") or {}
+
+
+def _anchored(doc: dict[str, Any]) -> list[str]:
+    """The services built on x-ha-engine: the ha profile's services that run the anchor's image."""
+    anchor = doc.get("x-ha-engine") or {}
+    return sorted(
+        name
+        for name, svc in doc["services"].items()
+        if "ha" in (svc.get("profiles") or []) and svc.get("image") == anchor.get("image")
+    )
 
 
 def _dropped_anchor_mounts(doc: dict[str, Any]) -> dict[str, list[Any]]:
-    """Per ha engine, the x-ha-engine mounts its own ``volumes`` no longer carries."""
-    anchor = doc["x-ha-engine"].get("volumes") or []
+    """Per service built on x-ha-engine, the anchor mounts its own ``volumes`` no longer carries."""
+    anchor = (doc.get("x-ha-engine") or {}).get("volumes") or []
     assert anchor, "positive control: x-ha-engine declares mounts"
     out: dict[str, list[Any]] = {}
-    for name in _HA_ENGINES:
+    for name in _anchored(doc):
         mounts = doc["services"][name].get("volumes") or []
         out[name] = [m for m in anchor if m not in mounts]
     return out
 
 
-def test_the_ha_engines_keep_every_anchor_mount() -> None:
-    # Each serving ha engine replaces x-ha-engine's volumes to add its spool, so it must still
-    # carry every mount the anchor declares.
-    dropped = _dropped_anchor_mounts(_compose_doc())
-    assert not any(dropped.values()), f"an ha engine dropped an anchor mount: {dropped}"
+def test_every_anchored_service_keeps_every_anchor_mount() -> None:
+    # The ha engines replace x-ha-engine's volumes to add their spools, so each must still carry
+    # every mount the anchor declares; schema-provision inherits them.
+    doc = _compose_doc()
+    assert {"schema-provision", "engine-ha", "engine-standby"} <= set(_anchored(doc)), (
+        "positive control: the anchored services are found"
+    )
+    dropped = _dropped_anchor_mounts(doc)
+    assert not any(dropped.values()), f"a service dropped an anchor mount: {dropped}"
 
 
-@pytest.mark.parametrize("index", range(_ANCHOR_MOUNTS))
-@pytest.mark.parametrize("name", _HA_ENGINES)
+@pytest.mark.parametrize("index", range(len(_ANCHOR.get("volumes") or [])))
+@pytest.mark.parametrize("name", ("schema-provision", "engine-ha", "engine-standby"))
 def test_the_anchor_mount_check_sees_a_dropped_mount(name: str, index: int) -> None:
-    """Negative control: the check above fails once an engine's copy of any anchor mount is gone."""
+    """Negative control: the check above fails once a service's copy of any anchor mount is gone."""
     doc = copy.deepcopy(_compose_doc())
     removed = doc["x-ha-engine"]["volumes"][index]
-    doc["services"][name]["volumes"].remove(removed)
+    # A new list: schema-provision's inherited list is the anchor's own object, even deep-copied.
+    svc = doc["services"][name]
+    svc["volumes"] = [m for m in svc["volumes"] if m != removed]
     assert _dropped_anchor_mounts(doc)[name] == [removed]
 
 
-def test_the_ha_engines_share_no_writable_volume() -> None:
+def test_no_two_serving_engines_share_a_writable_volume() -> None:
     # The spool locks its directory, so two engines writing one volume, at the spool path or
-    # anywhere above it, would leave the second without a spool.
-    assert len(_HA_ENGINES) >= 2, "positive control: the ha profile runs a pair"
-    sources = {n: _writable_sources(n) for n in _HA_ENGINES}
-    assert all(sources.values()), "positive control: each ha engine mounts a writable volume"
-    for a, b in itertools.combinations(_HA_ENGINES, 2):
+    # anywhere above it, would leave the second without a spool. The default engine has no
+    # profile, so it runs beside the ha pair under --profile ha and is compared too.
+    sources = {n: _writable_sources(n) for n in sorted(_ENGINES)}
+    assert all(sources.values()), "positive control: each engine mounts a writable volume"
+    for a, b in itertools.combinations(sources, 2):
         shared = sources[a] & sources[b]
         assert not shared, f"{a} and {b} share a writable volume: {sorted(shared)}"
 
