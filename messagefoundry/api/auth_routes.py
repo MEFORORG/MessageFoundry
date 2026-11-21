@@ -363,10 +363,13 @@ def _refuse_custom_role_name(display_name: str, *, stored: str | None) -> None:
 
 async def _check_custom_role_name(service: AuthService, role_id: str, display_name: str) -> None:
     """:func:`_refuse_custom_role_name` for a save of the custom role ``role_id``, exempting its
-    stored name when the row's seal holds (BACKLOG #5785). An unknown id is not checked here, so
+    stored name (BACKLOG #5785). A name the rule takes on its own needs no stored name, so it reads
+    nothing and the save goes on exactly as before the rule. An unknown id is not checked here, so
     it stays the service's 404."""
-    held, stored = await service.custom_role_stored_name(role_id)
-    if held:
+    if custom_role_name_refusal(display_name) is None:
+        return
+    stored = await service.custom_role_stored_name(role_id)
+    if stored is not None:
         _refuse_custom_role_name(display_name, stored=stored)
 
 

@@ -1744,9 +1744,10 @@ costs it: on `PUT /roles/custom/{role_id}` the answer is a 422, and on the conso
 `POST /ui/roles/custom/{role_id}/update` it is a 400 page re-rendering the form. The console's
 proof is also spent on a form the request model refuses, such as an unknown permission. Where
 the setting is off, or the save ends none of the caller's own sessions, the gate checks the
-step-up session window and spends nothing. The read of the stored name for the name rule's
-exemption is quiet: a seal it cannot verify, a Vault transit Outage included, gives no exempt
-name and reports nothing.
+step-up session window and spends nothing. The save reads the stored name only for a name the
+rule refuses, to tell a re-sent stored name, which is exempt, from a new one. That read checks
+no seal, so it calls no Vault transit and reports nothing; a name written outside the store is
+exempt like any other, and the save re-seals the row as it always has.
 
 #### Audit
 

@@ -339,15 +339,13 @@ _ROLE_READERS = frozenset(
 _LOADERS: dict[str, frozenset[str]] = {
     "_load_role": frozenset({"get_role"}),
     "_load_custom_roles": frozenset({"list_roles"}),
-    # An existence question: only a bool leaves it, never the unchecked row.
-    "_custom_role_held": frozenset({"get_role"}),
+    # Unchecked, for two callers: _custom_role_held lets only a bool out, and
+    # custom_role_stored_name only the name, which the name rule's exemption compares (BACKLOG
+    # #5785); neither acts on the row's authority.
+    "_held_custom_role_row": frozenset({"get_role"}),
     # Also an existence question (BACKLOG #5968): only the role ids leave it, to tell which
     # requested custom ids a failed role write no longer finds; no row's content is acted on.
     "_role_write_refusal": frozenset({"list_roles"}),
-    # Checks the seal itself and returns the name only when it holds (BACKLOG #5785). It is a
-    # quiet pre-save read for the name rule's exemption, so it reports nothing on a failure;
-    # tests/test_auth_name_rule.py pins that.
-    "custom_role_stored_name": frozenset({"get_role"}),
     # _ad_map reads through it, so a caller can tell a failing map from an empty one (#3082).
     "_sealed_ad_map": frozenset({"get_ad_map"}),
 }

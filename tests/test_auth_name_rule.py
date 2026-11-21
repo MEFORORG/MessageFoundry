@@ -33,17 +33,13 @@ from messagefoundry.api.auth_models import (
     name_refusal,
 )
 from messagefoundry.auth import Permission, Role
-from messagefoundry.auth import service as service_module
 from messagefoundry.auth.identity import ALL_CHANNELS
 from messagefoundry.auth.permissions import validate_custom_role_permissions
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings, EgressSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry.store.row_seal import (
-    RowSealError,
-    TransitSealUnavailableError,
-    TransitSealUnverifiableError,
-)
+from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.row_seal import RowSealer
 from messagefoundry.store.store import MessageStore
 from tests._admin_account import create_local_user_chosen
 
@@ -372,86 +368,104 @@ async def test_a_stored_custom_role_name_the_rule_refuses_does_not_block_a_permi
     assert Permission.MESSAGES_READ in names[stored[0]][1]
 
 
-async def test_a_role_whose_seal_fails_has_no_exempt_name(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """On a store with an integrity key, a name written outside the store fails the row's seal, so
-    it is never the exemption's stored name: a re-save under it takes the rule. The read is quiet:
-    it reports no seal failure. The seal failure is stood in for by patching the seal check; the
-    keyless case is the next test."""
+async def test_the_stored_name_read(engine: Engine) -> None:
+    """The name a custom role row stores, and ``None`` for an id no custom role row holds: an
+    unknown id, and a built-in role's, so the route leaves both to the service's answer."""
     service, _ = await _setup(engine)
     role = await service.create_custom_role(
         display_name="Administrator", description=None, permissions=["monitoring:read"], actor="t"
     )
-    assert await service.custom_role_stored_name(role.id) == (True, "Administrator")
-    assert await service.custom_role_stored_name("custom:" + "0" * 32) == (False, None)
-
-    async def _seal_fails(_sealer: object, _row: object) -> bool:
-        return False
-
-    reports = _count_seal_reports(service, monkeypatch)
-    monkeypatch.setattr(service_module, "role_seal_ok_async", _seal_fails)
-    held, stored = await service.custom_role_stored_name(role.id)
-    assert (held, stored) == (True, None)
-    assert custom_role_name_refusal("Administrator", stored) is not None
-    assert reports == []
+    assert await service.custom_role_stored_name(role.id) == "Administrator"
+    assert await service.custom_role_stored_name("custom:" + "0" * 32) is None
+    assert await service.custom_role_stored_name(Role.ADMINISTRATOR.value) is None
 
 
-def _count_seal_reports(service: AuthService, monkeypatch: pytest.MonkeyPatch) -> list[str]:
-    """Every seal-failure report the service makes from here on, by subject."""
-    reports: list[str] = []
-    original = service._report_seal_failure
-
-    async def _record(subject: str, *args: Any, **kwargs: Any) -> Any:
-        reports.append(subject)
-        return await original(subject, *args, **kwargs)
-
-    monkeypatch.setattr(service, "_report_seal_failure", _record)
-    return reports
-
-
-@pytest.mark.parametrize(
-    "error",
-    [
-        TransitSealUnavailableError(),
-        TransitSealUnverifiableError("role", 1, 2),
-        RowSealError("role", "r"),
-    ],
-)
-async def test_a_seal_check_that_raises_gives_no_exempt_name_and_no_report(
-    engine: Engine, monkeypatch: pytest.MonkeyPatch, error: Exception
+async def test_a_save_under_a_name_the_rule_takes_reads_no_stored_name(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A Vault transit Outage or Unverifiable answer, or a forged seal, on the pre-save read
-    neither escapes nor reports: the save goes on as it did before the read existed, so a
-    re-save under a clean name lands."""
+    """A name the rule takes on its own needs no stored name, so the save reads nothing more than
+    it did before the rule; only a refused name is compared with the stored one."""
     service, _ = await _setup(engine)
     perms = ["monitoring:read"]
     role = await service.create_custom_role(
         display_name="Readers", description=None, permissions=perms, actor="t"
     )
+    reads: list[str] = []
+    original = service.custom_role_stored_name
 
-    async def _seal_raises(_sealer: object, _row: object) -> bool:
-        raise error
+    async def _counted(role_id: str) -> str | None:
+        reads.append(role_id)
+        return await original(role_id)
 
-    reports = _count_seal_reports(service, monkeypatch)
-    monkeypatch.setattr(service_module, "role_seal_ok_async", _seal_raises)
-    assert await service.custom_role_stored_name(role.id) == (True, None)
-    [saved] = await _calls(
+    monkeypatch.setattr(service, "custom_role_stored_name", _counted)
+    url = f"/roles/custom/{role.id}"
+    clean, refused = await _calls(
         engine,
         service,
-        [("PUT", f"/roles/custom/{role.id}", {"display_name": "Readers", "permissions": perms})],
+        [
+            ("PUT", url, {"display_name": "Readers", "permissions": perms}),
+            ("PUT", url, {"display_name": "Auditor", "permissions": perms}),
+        ],
     )
-    assert saved.status_code == 200, saved.text
-    assert reports == []
-    audit = await engine.store.list_audit(limit=200)
-    assert not any("seal" in str(r["action"]) for r in audit)
+    assert clean.status_code == 200, clean.text
+    assert refused.status_code == 422, refused.text
+    assert reads == [role.id]  # the refused name alone
+
+
+async def test_a_name_whose_row_fails_its_seal_is_exempt_and_the_save_repairs_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """On a store with an integrity key, a name written outside the store fails the row's seal.
+    The save never checked that seal before the rule, and does not now: re-sending the name is
+    exempt, the save re-seals the row, and nothing reports a seal failure on the way."""
+    store = await MessageStore.open(
+        tmp_path / "keyed.db", cipher=make_cipher(generate_key(), write_v2=True)
+    )
+    store._row_sealer = RowSealer(bytes(32))
+    keyed = Engine(store, poll_interval=0.02, egress_settings=EgressSettings(deny_by_default=False))
+    try:
+        service, _ = await _setup(keyed)
+        perms = ["monitoring:read"]
+        role = await service.create_custom_role(
+            display_name="Readers", description=None, permissions=perms, actor="t"
+        )
+        await store._db.execute(
+            "UPDATE roles SET display_name=? WHERE id=?", ("Administrator", role.id)
+        )
+        await store._db.commit()
+        assert await service._load_role(role.id) is None  # control: the row fails its seal
+        reports: list[str] = []
+        original = service._report_seal_failure
+
+        async def _record(subject: str, *args: Any, **kwargs: Any) -> Any:
+            reports.append(subject)
+            return await original(subject, *args, **kwargs)
+
+        monkeypatch.setattr(service, "_report_seal_failure", _record)
+        [saved] = await _calls(
+            keyed,
+            service,
+            [
+                (
+                    "PUT",
+                    f"/roles/custom/{role.id}",
+                    {"display_name": "Administrator", "permissions": perms},
+                )
+            ],
+        )
+        assert saved.status_code == 200, saved.text
+        assert reports == []
+        repaired = await service._load_role(role.id)
+        assert repaired is not None and repaired.display_name == "Administrator"
+    finally:
+        await keyed.stop()
 
 
 async def test_on_a_keyless_store_a_name_written_outside_the_store_is_exempt(
     engine: Engine,
 ) -> None:
-    """Pins the keyless case as it behaves: no seal is checked, so a name written straight into
-    the ``roles`` table is returned as the stored name, and a save re-sending it is exempt."""
+    """The keyless case: a name written straight into the ``roles`` table is the stored name, and
+    a save re-sending it is exempt."""
     service, _ = await _setup(engine)
     assert engine.store.row_sealer() is None  # control: this store has no integrity key
     role = await service.create_custom_role(
@@ -463,8 +477,8 @@ async def test_on_a_keyless_store_a_name_written_outside_the_store_is_exempt(
         "UPDATE roles SET display_name=? WHERE id=?", ("Administrator", role.id)
     )
     await store._db.commit()
-    held, stored = await service.custom_role_stored_name(role.id)
-    assert (held, stored) == (True, "Administrator")
+    stored = await service.custom_role_stored_name(role.id)
+    assert stored == "Administrator"
     assert custom_role_name_refusal("Administrator", stored) is None
 
 
