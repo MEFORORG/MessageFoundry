@@ -748,6 +748,17 @@ def test_no_msh_message_is_refused_fail_closed() -> None:
         anonymize("PID|1||9^^^H^MR||DOE^JOHN||19800101|M", salt=_SALT)
 
 
+def test_a_batch_header_of_other_delimiters_than_its_msh_is_refused() -> None:
+    """``Message`` reads every line under the first line's delimiters (BACKLOG #5972), the
+    surrogates under the MSH's, so a BHS of other delimiters would have the two disagree. The
+    engine adapter refuses it rather than emit; the same BHS with the MSH's delimiters is
+    anonymized."""
+    tail = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|M1|P|2.5\rPID|1||9^^^H^MR||DOE^JOHN||19800101|M\r"
+    with pytest.raises(AnonError, match="other delimiters than its MSH"):
+        anonymize("BHS|#~\\&|A\r" + tail, salt=_SALT)
+    assert "DOE" not in anonymize("BHS|^~\\&|A\r" + tail, salt=_SALT)
+
+
 def test_mllp_framed_message_is_anonymized() -> None:
     framed = "\x0b" + _SAMPLE + "\x1c\r"  # VT … FS CR framing
     out = anonymize(framed, salt=_SALT)
