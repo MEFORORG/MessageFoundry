@@ -3301,6 +3301,18 @@ async def _return_held(pool: Any, conn: Any) -> None:
         _settle_held(pool)
 
 
+async def _discard_held(pool: Any, conn: Any) -> None:
+    """Close a held-back ``conn`` whose handle is presumed dead and give it back to ``pool``
+    closed (BACKLOG #5748), then take it off the count as :func:`_return_held` does. Never raises
+    an ``Exception``: no borrower is left to tell."""
+    try:
+        await _close_and_release(pool, conn, None, discard=True)
+    except Exception as exc:  # noqa: BLE001 - no borrower is left to tell
+        logger.warning("DATABASE: discarding a pooled connection failed: %s", _safe_db_error(exc))
+    finally:
+        _settle_held(pool)
+
+
 def _return_when_settled(pool: Any, conn: Any, work: asyncio.Future[Any], what: str) -> None:
     """Once ``work`` is done, return ``conn`` to ``pool``, but only if ``work`` ending proves the
     worker thread it waited on has finished with ``conn`` (PR 2593 review).
@@ -3422,8 +3434,13 @@ class _AutocommitPool:
                 # The thread resolved ``work`` with a driver error, so no call is running on it.
                 # Returned open, not closed: a close here is itself a worker-thread call that a
                 # cancellation could abandon, and a driver error on a set does not leave a
-                # transaction open the way a failed rollback can (BACKLOG #5010).
-                await _return_to_pool(self._pool, conn)
+                # transaction open the way a failed rollback can (BACKLOG #5010). A connection-class
+                # failure (class 08) is the exception: that handle is presumed dead, so it is
+                # closed rather than lent again, as every other borrow site does (BACKLOG #5748).
+                if _connection_lost(exc):
+                    await _close_and_release(self._pool, conn, None, discard=True)
+                else:
+                    await _return_to_pool(self._pool, conn)
             else:
                 # The borrower left (a cancel, or the coroutine closed) while the thread may still
                 # be inside the setter. Settled when the thread resolves ``work``, never sooner,
@@ -3457,6 +3474,14 @@ class _AutocommitPool:
         if failure is None and work.result():
             self._mark_confirmed(conn)
             _detach(_return_held(self._pool, conn))
+            return
+        if failure is not None and _connection_lost(failure):
+            logger.warning(
+                "DATABASE: an abandoned borrow's autocommit set failed with a connection failure "
+                "(%s); the connection is discarded rather than returned to its pool",
+                _safe_db_error(failure),
+            )
+            _detach(_discard_held(self._pool, conn))  # BACKLOG #5748
             return
         logger.warning(
             "DATABASE: an abandoned borrow's autocommit set did not pass (%s); the connection goes "
