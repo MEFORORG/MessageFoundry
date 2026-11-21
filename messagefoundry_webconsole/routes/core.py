@@ -55,6 +55,7 @@ from messagefoundry.auth.webauthn import CHALLENGE_TTL_SECONDS
 from messagefoundry.connection_names import is_connection_name
 from messagefoundry.parsing import HL7PeekError, parse_tree
 from messagefoundry.parsing.tree import ParseTreeTooLargeError
+from messagefoundry.redaction import json_loads_or_refusal
 
 from .. import pages
 from .._auth import (
@@ -630,7 +631,10 @@ def _is_expected_csp_probe_report(report: dict[str, object], origin: str | None)
         blocked = report.get("blockedURL")
     if not isinstance(blocked, str):
         return False
-    parts = urlsplit(blocked)
+    try:
+        parts = urlsplit(blocked)
+    except ValueError:  # an unparseable host, such as an unclosed IPv6 bracket: not ours, so warn
+        return False
     # Compare paths: browsers report the absolute URL, but tolerate a bare path too. Query/fragment are
     # stripped so a cache-buster can never smuggle a non-probe URL past the match.
     if parts.path != CSP_PROBE_SRC:
@@ -2466,9 +2470,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if not raw:
             _log.warning("CSP violation report from %s: %s", client, "empty")
             return Response(status_code=204)
-        try:
-            doc = json.loads(raw.decode("utf-8", "replace"))
-        except ValueError:
+        # The helper also refuses a body nested too deep to decode (vault BACKLOG #5341).
+        doc, refused = json_loads_or_refusal(raw.decode("utf-8", "replace"))
+        if refused:
             _log.warning("CSP violation report from %s: %s", client, "malformed-json")
             return Response(status_code=204)
         bodies = _csp_report_bodies(doc)
