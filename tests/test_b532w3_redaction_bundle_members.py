@@ -29,9 +29,9 @@ _REPO = Path(__file__).resolve().parents[1]
 
 
 def _members_written_by_build_bundle() -> set[str]:
-    """Every ``members["<literal>"] = ...`` in ``build_bundle``. A store under any other key, or
-    any method call on ``members`` such as ``update`` or ``setdefault``, fails here, because this
-    reading would not see the member it adds."""
+    """Every ``members["<literal>"] = ...`` in ``build_bundle``. It fails on a subscript store
+    under a non-literal key and on any attribute of ``members``, such as ``update``. Other
+    forms, such as rebinding ``members`` or passing it to a helper, are not seen."""
     source = textwrap.dedent(inspect.getsource(bundle_mod.build_bundle))
     names: set[str] = set()
     for node in ast.walk(ast.parse(source)):

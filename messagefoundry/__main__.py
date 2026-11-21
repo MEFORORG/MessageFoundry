@@ -586,10 +586,10 @@ def _build_parser() -> tuple[argparse.ArgumentParser, Dispatch]:
         "version); manifest.json (at least the member list, the engine version, a generation "
         "time and the phi_contract); config-summary.json (counts/names only, holding no "
         "secret); status.json (the metadata-only status models); and app-log.txt, a REDACTED "
-        "tail of the newest app log, or an MF-BUNDLE-LOG-* code in its place when the log "
-        "directory or that log cannot be read. app-log.txt is left out in at least these "
-        "cases: no [logging].log_dir is set, no log file is found there, or --log-tail-lines "
-        "is 0. The tail's "
+        "tail of the newest .log or .txt file under [logging].log_dir. An MF-BUNDLE-LOG-* code "
+        "replaces the tail, or app-log.txt is left out, at least when no log_dir is set, a file "
+        "there cannot be read or is refused, or --log-tail-lines is 0; a log set only through "
+        "[logging].file is not bundled. The tail's "
         "redaction is BEST-EFFORT, and values survive it: at least a single-token identifier such "
         "as an operator username and, on a non-production instance logging at DEBUG, a message "
         "body the log recorded in a shape the redaction does not read. Handle the zip as a copy of "
@@ -13904,12 +13904,10 @@ def _verify(args: argparse.Namespace) -> int:
 def _support_bundle(args: argparse.Namespace) -> int:
     """Write a support zip (#49): ``version.txt``, ``manifest.json`` (with the ``phi_contract``), a
     config summary (registry COUNTS/names only, holding no secret), a metadata-only ``/status``
-    snapshot built from the real status models, and a REDACTED app-log tail. **The blanket
-    "secret-free / PHI-free" this docstring used to open with was not the phi_contract's claim
-    about any member**: the contract calls the config summary one that holds no secret and the
-    status snapshot metadata-only, and the tail meets neither, since its redaction is best-effort
-    with a single-token residual that includes an operator username (BACKLOG #1475; the argparse
-    help above carries the reasoning, and ``docs/PHI.md`` stream 14 is the record). Offline:
+    snapshot built from the real status models, and a REDACTED app-log tail. The tail is neither
+    secret-free nor PHI-free, since its redaction is best-effort with a single-token residual
+    that includes an operator username (BACKLOG #1475; the argparse help above carries the
+    reasoning, and ``docs/PHI.md`` stream 14 is the record). Offline:
     touches no network, starts no server. The status snapshot + log tail come from the service
     settings (the configured store + ``[logging].log_dir``); the config summary comes from
     ``--config``. A missing service config or store is tolerated — the bundle is still produced

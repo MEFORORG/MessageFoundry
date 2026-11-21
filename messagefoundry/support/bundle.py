@@ -12,15 +12,11 @@ starts no server. Contents (each a small text/JSON member):
   value, host, path, credential, or any ``env()``-resolved data.
 * ``status.json`` — a ``/status`` snapshot built from the REAL status models
   (:class:`~messagefoundry.api.models.SystemStatus` / ``EngineInfo`` / ``DbInfo``), populated offline
-  from the store. Metadata-only, the term the manifest's ``phi_contract`` uses. It holds at
-  least counts, sizes, the engine version, the pid of the support-bundle CLI process itself,
-  the store's journal_mode and synchronous settings, and a store descriptor: the SQLite
-  file's basename, or the ``<sqlserver>`` or ``<postgres>`` placeholder for a server store,
-  never its host or database name.
-* ``app-log.txt`` — a **redacted** tail of the newest app log (see
-  :mod:`messagefoundry.support.redact`), or an ``MF-BUNDLE-LOG-*`` code in its place when the log
-  directory or that log cannot be read; omitted in at least these cases: no ``[logging].log_dir``
-  is configured, no log file is found there, or the tail is set to 0 lines.
+  from the store. Metadata-only, the term the manifest's ``phi_contract`` uses;
+  :func:`status_snapshot` says what it holds.
+* ``app-log.txt`` — a **redacted** tail of the newest ``.log`` or ``.txt`` file under
+  ``[logging].log_dir`` (see :mod:`messagefoundry.support.redact`); :func:`_log_tail` says when
+  a code replaces it or it is omitted. A log set only through ``[logging].file`` is not bundled.
 
 HARD RULE (do not break): no member this module builds reads a message body from the store, and only
 the app-log tail can carry a secret or a body into the archive. The config summary loads the config but
@@ -146,12 +142,11 @@ def status_snapshot(settings: ServiceSettings | None) -> dict[str, Any]:
 
     The engine isn't running under the CLI, so ``EngineInfo`` carries the version with a zero uptime /
     no live channel counts; ``DbInfo`` is read from the store the settings point at (when reachable).
-    Metadata-only, the manifest ``phi_contract``'s term. The status models hold at least counts,
-    sizes, the engine version, the pid of the support-bundle CLI process itself, the store's
-    journal_mode and synchronous settings, and a store descriptor: the SQLite file's basename,
-    or the ``<sqlserver>`` or ``<postgres>`` placeholder for a server store, never its host or
-    database name. Returns a ``db_error`` member instead of raising if the store can't be
-    opened (e.g. the DB is missing or in use), so the bundle still builds."""
+    Metadata-only, the manifest ``phi_contract``'s term: at least the engine version and, when the
+    store is read, store metadata, never the store's host or database name. ``db`` is null when
+    ``settings`` is None or the store cannot be opened; in the second case a ``db_error`` member
+    holds a code instead of raising (e.g. the DB is missing or in use), so the bundle still
+    builds."""
     import os
 
     from messagefoundry.api.models import EngineInfo, SystemStatus
