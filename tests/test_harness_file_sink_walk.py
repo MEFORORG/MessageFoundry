@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+import harness.bounded_file as bounded_file
 import harness.sinks.file as file_sink
 from harness.bounded_file import NOT_REGULAR
 from harness.scenarios import SCENARIOS
@@ -303,10 +304,10 @@ def test_a_file_replaced_right_after_its_read_is_recorded_and_so_is_its_replacem
     replacement = tmp_path.parent / f"{tmp_path.name}-next.hl7"
     real = FileSink._inside
 
-    def replace_after_read(self: FileSink, path: Path, link: bool, root: Path) -> bool:
+    def replace_after_read(self: FileSink, path: Path, link: bool, *rest: Any) -> bool:
         if replacement.exists():
             os.replace(replacement, target)
-        return real(self, path, link, root)
+        return real(self, path, link, *rest)
 
     with FileSink(tmp_path) as sink:
         target.write_bytes(_BODY)
@@ -609,3 +610,157 @@ def test_verify_sink_stops_waiting_on_a_sink_fault() -> None:
     started = time.monotonic()
     result = _verify_sink(scenario, fake, ["X1"], 30.0, "p")
     assert not result.ok and time.monotonic() - started < 5.0
+
+
+# --- the walk's own faults (PR 3076's known defects 5, 6, 8 and 9) ------------------------------
+
+
+def test_a_directory_gone_before_its_first_listing_fails_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The by-path walk took the directory itself vanishing before its listing for an empty
+    folder, so start() took an empty first scan for a whole one."""
+    monkeypatch.setattr(file_sink, "_DIR_FD", False)
+    out = tmp_path / "out"
+    real_scandir = os.scandir
+
+    def scandir(target: Any = ".") -> Any:
+        if _named(target, "out"):
+            raise FileNotFoundError(2, "gone")
+        return real_scandir(target)
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    with pytest.raises(NotADirectoryError):
+        FileSink(out).start()
+
+
+def test_a_root_read_fault_at_start_is_raised_with_its_error_not_logged_as_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def scandir(target: Any = ".") -> Any:
+        raise PermissionError(13, "denied")
+
+    monkeypatch.setattr(os, "scandir", scandir)
+    with (
+        caplog.at_level(logging.WARNING, logger="harness.sinks.file"),
+        pytest.raises(NotADirectoryError) as raised,
+    ):
+        FileSink(tmp_path).start()
+    assert "retried next scan" not in caplog.text
+    assert "errno 13" in str(raised.value)
+    assert isinstance(raised.value.__cause__, PermissionError)
+
+
+@pytest.mark.parametrize("by_path", [False, True], ids=["native-walk", "by-path-walk"])
+def test_a_fault_that_clears_and_comes_back_is_logged_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    by_path: bool,
+) -> None:
+    """A fault found on every scan is logged once; one that clears and recurs is logged again,
+    rather than once for the sink's life."""
+    if by_path:
+        monkeypatch.setattr(file_sink, "_DIR_FD", False)
+    (tmp_path / "locked").mkdir()
+    locked = os.stat(tmp_path / "locked")
+    real_scandir = os.scandir
+    denied = [True]
+
+    def scandir(target: Any = ".") -> Any:
+        listed = os.fstat(target) if isinstance(target, int) else os.stat(target)
+        if denied[0] and os.path.samestat(listed, locked):
+            raise PermissionError(13, "denied")
+        return real_scandir(target)
+
+    with FileSink(tmp_path) as sink:
+        monkeypatch.setattr(os, "scandir", scandir)
+        with caplog.at_level(logging.WARNING, logger="harness.sinks.file"):
+            for state in (True, True, False, True):
+                denied[0] = state
+                sink.records()
+    said = [r.getMessage() for r in caplog.records if "cannot list a folder" in r.getMessage()]
+    assert len(said) == 2, said
+
+
+def test_a_root_with_a_file_id_where_start_found_none_is_reported_changed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Started on a volume that reported no file id, a later scan that reads one is not of the
+    directory start() found: it is not adopted as that directory."""
+    real_identity = file_sink._identity
+    no_ids = [True]
+
+    def identity(st: os.stat_result) -> tuple[int, int] | None:
+        return None if no_ids[0] else real_identity(st)
+
+    monkeypatch.setattr(file_sink, "_identity", identity)
+    with FileSink(tmp_path) as sink:
+        no_ids[0] = False
+        (tmp_path / "a.hl7").write_bytes(_BODY)
+        records = sink.records()
+    assert [(r.payload, r.meta["refused"]) for r in records] == [(b"", ROOT_CHANGED)]
+
+
+def test_the_handle_check_refuses_a_followed_link_on_every_os(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With ``O_NOFOLLOW`` off the file open, as on Windows, a file swapped for a link at its open
+    is followed, so only the handle check stands between the walk and the file outside. Where the
+    OS has ``O_NOFOLLOW`` the swap tests above are refused at the open before that check runs."""
+    monkeypatch.setattr(file_sink, "_DIR_FD", False)
+    monkeypatch.setattr(file_sink, "_FILE_FLAGS", file_sink._FILE_FLAGS & ~file_sink._NOFOLLOW)
+    test_a_file_swapped_for_a_link_between_lstat_and_open_is_not_read(tmp_path, monkeypatch, False)
+
+
+@pytest.mark.skipif(not file_sink._DIR_FD, reason="no dir_fd here (Windows): the walk is by path")
+def test_a_swap_is_read_again_through_the_held_folder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``a.hl7`` is replaced by another file between its ``lstat`` and its open. The entry is
+    ``lstat``-ed again relative to the held folder, never by its full path."""
+    target, other = tmp_path / "a.hl7", tmp_path / "b.tmp"
+    real_open, real_lstat = os.open, os.lstat
+    fired: list[bool] = []
+
+    def open_(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if _named(path, "a.hl7") and not fired:
+            fired.append(True)
+            other.write_bytes(_LATER)
+            other.replace(target)
+        return real_open(path, flags, *args, **kwargs)
+
+    def lstat_(path: Any, *args: Any, **kwargs: Any) -> Any:
+        assert not _named(path, "a.hl7"), "the entry was lstat-ed again by its full path"
+        return real_lstat(path, *args, **kwargs)
+
+    with FileSink(tmp_path) as sink:
+        target.write_bytes(_BODY)
+        monkeypatch.setattr(os, "open", open_)
+        monkeypatch.setattr(os, "lstat", lstat_)
+        assert sink.records() == []  # not the file its lstat saw: retried
+        monkeypatch.undo()
+        records = sink.records()
+    assert fired, "the hook never fired: the swap was not staged"
+    assert [r.payload for r in records] == [_LATER]
+
+
+@pytest.mark.skipif(not file_sink._DIR_FD, reason="no dir_fd here (Windows): the walk is by path")
+def test_a_file_read_through_held_folders_is_inside_whatever_happens_to_its_path_after(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its folder moved away right after the read: the file was read through handles held from
+    the sink directory down, so it was inside, not an escape."""
+    (tmp_path / "sub").mkdir()
+    real_read = bounded_file.read_fd_capped
+
+    def read_then_move(fd: int, cap: int) -> tuple[bytes, str]:
+        got = real_read(fd, cap)
+        (tmp_path / "sub").rename(tmp_path.parent / f"{tmp_path.name}-moved")
+        return got
+
+    with FileSink(tmp_path) as sink:
+        (tmp_path / "sub" / "a.hl7").write_bytes(_BODY)
+        monkeypatch.setattr(file_sink, "read_fd_capped", read_then_move)
+        records = sink.records()
+    assert [(r.payload, r.meta["inside"]) for r in records] == [(_BODY, "true")]

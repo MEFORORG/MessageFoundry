@@ -16,6 +16,7 @@ import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -288,9 +289,9 @@ def test_the_file_sink_records_a_file_removed_right_after_its_read(
         target.write_bytes(_BODY)
         real = FileSink._inside
 
-        def remove_after_read(self: FileSink, path: Path, link: bool, root: Path) -> bool:
+        def remove_after_read(self: FileSink, path: Path, link: bool, *rest: Any) -> bool:
             path.unlink()  # the handle is closed by now, as it is when the engine moves a file on
-            return real(self, path, link, root)
+            return real(self, path, link, *rest)
 
         monkeypatch.setattr(FileSink, "_inside", remove_after_read)
         records = sink.records()
