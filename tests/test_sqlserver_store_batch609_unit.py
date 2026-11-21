@@ -290,9 +290,13 @@ class _NocountCursor:
 class _FakeConn:
     def __init__(self) -> None:
         self.rolled_back = 0
+        self.committed = 0  # every physical commit; the counted ones go through `_commit`
 
     async def rollback(self) -> None:
         self.rolled_back += 1
+
+    async def commit(self) -> None:
+        self.committed += 1
 
 
 def _store(cur: _NocountCursor) -> tuple[SqlServerStore, list[int]]:
@@ -332,11 +336,12 @@ async def test_delete_search_preset_reads_output() -> None:
 
 async def test_attachment_incref_of_a_missing_ref_raises_under_nocount() -> None:
     """Red before #5675: ``rowcount`` of -1 is truthy, so a missing ref returned as if counted.
-    Through ``_execute_output`` the zero-match UPDATE still commits, and commits no change."""
+    The zero-match UPDATE commits as a read, so ``committed_txns`` does not count it, as on main."""
     cur = _NocountCursor([[]])
-    store, _ = _store(cur)
+    store, commits = _store(cur)
     with pytest.raises(KeyError):
         await store.attachment_incref("f" * 64)
+    assert commits == [], "a missing ref is not a counted write"
     hit = _NocountCursor([[("a" * 64,)]])
     store, commits = _store(hit)
     await store.attachment_incref("a" * 64)

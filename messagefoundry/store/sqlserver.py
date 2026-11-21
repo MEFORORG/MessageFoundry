@@ -6498,7 +6498,9 @@ class SqlServerStore:
             return committed
         return rows
 
-    async def _execute_output(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+    async def _execute_output(
+        self, sql: str, params: tuple[Any, ...] = (), *, empty_is_read: bool = False
+    ) -> list[dict[str, Any]]:
         """Run one write that carries an ``OUTPUT`` clause, commit it as a durable write, and return
         the rows it output (BACKLOG #2283).
 
@@ -6506,14 +6508,19 @@ class SqlServerStore:
         ``cursor.rowcount`` would, and a session-wide ``SET NOCOUNT ON`` cannot hide it, while the
         count can come back ``-1`` for a zero-match UPDATE. ``_fetchall`` would not do: it commits
         as a READ. The rows are drained before the commit, and ``_cursor`` frees the statement
-        handle the ``OUTPUT`` clause leaves open."""
+        handle the ``OUTPUT`` clause leaves open. ``empty_is_read`` commits a write that output no
+        row through :meth:`_commit_read`, so ``committed_txns`` does not count a change that never
+        happened (BACKLOG #5675)."""
         async with self._acquire() as conn:
             try:
                 async with self._cursor(conn) as cur:
                     await cur.execute(sql, params)
                     columns = [c[0] for c in cur.description]
                     rows = await cur.fetchall()
-                    await self._commit(conn)
+                    if rows or not empty_is_read:
+                        await self._commit(conn)
+                    else:
+                        await self._commit_read(conn)
             except Exception:
                 # As in _execute: a failed rollback discards rather than recycles the connection,
                 # and it runs after the cursor block.
@@ -12618,9 +12625,9 @@ class SqlServerStore:
         """Add one live reference to an attachment (store-once refcount). Raises :class:`KeyError` if the
         attachment does not exist — an incref must name a real stored document."""
         # Read from OUTPUT, which a session-wide SET NOCOUNT ON cannot hide: there cur.rowcount is
-        # -1, which is truthy (BACKLOG #5675, as #2283). A missing ref matches nothing, so the
-        # commit _execute_output runs commits no change.
-        if not await self._execute_output(_SQL_INCREF_ATTACHMENT, (1, ref)):
+        # -1, which is truthy (BACKLOG #5675, as #2283). A missing ref matches nothing, so its
+        # commit is a read and is not counted in committed_txns, as on main.
+        if not await self._execute_output(_SQL_INCREF_ATTACHMENT, (1, ref), empty_is_read=True):
             raise KeyError(f"attachment {ref!r} not found")
 
     async def _decref_attachment(self, cur: Any, ref: str, count: int = 1) -> None:
