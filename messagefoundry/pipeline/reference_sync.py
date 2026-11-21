@@ -415,8 +415,6 @@ async def _load_database_source(
         # made, and before the try below: on a refusal it gives the connection back itself.
         timeout_refused = False
         try:
-            # Bounded by one full acquire_timeout of its own, as a DATABASE connector's borrow
-            # bounds it, so a hung write still cannot stall the pass (BACKLOG #1052).
             await _apply_statement_timeout(pool, conn, timeout=acquire_timeout)
         except NegativeAckError:
             timeout_refused = True  # raised below, outside the handler, so no chain is carried

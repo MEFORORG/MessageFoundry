@@ -3433,7 +3433,7 @@ class _AutocommitPool:
     or the task is cancelled. Releasing or closing the connection then would let another call reach
     it, or free handles the running call is using, the crash shape BACKLOG #2049 recorded. So the call
     runs on :func:`_thread_settled`, whose future only the thread resolves, and is shielded: the
-    borrower leaves at once, and the connection goes
+    borrower leaves at once, so ``acquire_timeout`` still bounds the borrow, and the connection goes
     back to the pool only once the call has returned. No task cancel can decide that early, loop
     teardown's included (PR 2593 review). The call also runs through the connection's call gate,
     installed at the borrow (BACKLOG #2394), so no other pyodbc call on that connection, a close
@@ -3651,11 +3651,7 @@ async def _apply_statement_timeout(pool: Any, conn: Any, *, timeout: float) -> N
     The write is skipped when the connection already holds the value: a connection lent before,
     and ``0`` on a fresh one. A borrower cancelled during the write leaves at once, and the
     connection goes back only once the write has returned (:func:`_return_when_settled`), or is
-    discarded if the write then failed with a transient state. ``timeout`` bounds the wait for the
-    write the same way, as a transient :class:`DeliveryError`, and the write is never waited for
-    without it. At least :func:`_acquire` and the ``DatabaseRef`` sync pass their borrow's whole
-    ``acquire_timeout``, so there a healthy write gets one full ``acquire_timeout`` however long
-    the acquire before it took, and a write slower than that fails the borrow.
+    discarded if the write then failed with a transient state.
 
     **A driver that refuses the value fails the borrow closed.** The connection goes back to
     ``pool`` first, since a refused write leaves the handle usable and no statement ran on it, and
@@ -3780,17 +3776,14 @@ def _retire_executor(pool: Any, closing: asyncio.Future[None]) -> None:
 # connection means pool_max is never legitimately exhausted, so an acquire that can't be satisfied
 # within the timeout means the pool is wedged or the DB is unresponsive — fail it transiently rather
 # than block the worker forever (which would let the queue back up unbounded). Override per connection
-# with the ``acquire_timeout`` setting. The statement_timeout write after the acquire is bounded
-# by its own ``acquire_timeout`` (BACKLOG #5756). Neither bounds the borrow as a whole.
+# with the ``acquire_timeout`` setting.
 _DEFAULT_DB_ACQUIRE_TIMEOUT = 30.0
 
 
 async def _acquire(pool: Any, timeout: float) -> Any:
     """Acquire a connection from ``pool`` within ``timeout`` seconds, or raise a transient
     :class:`DeliveryError` with a clear, PHI-free message. Wraps the driver's own ``acquire`` so a
-    hung/exhausted pool surfaces as a retryable failure instead of an unbounded await. The
-    statement_timeout write that follows gets its own ``timeout`` (the WP-L3-07 comment above says
-    what that bounds).
+    hung/exhausted pool surfaces as a retryable failure instead of an unbounded await.
 
     The connection comes back with the call gate installed (BACKLOG #2394), so a cancelled call
     cannot free its handles under a running statement, the native crash BACKLOG #2049 recorded. A
@@ -3804,8 +3797,6 @@ async def _acquire(pool: Any, timeout: float) -> Any:
             f"DATABASE pool acquire timed out after {timeout:g}s (pool exhausted or DB unresponsive)"
         ) from exc
     await _require_gate_or_discard(pool, conn)
-    # max(what is left of the bound, the whole bound) is the whole bound: a healthy write always
-    # gets one full acquire_timeout, and the write is never unbounded.
     await _apply_statement_timeout(pool, conn, timeout=timeout)
     return conn
 
@@ -5745,8 +5736,7 @@ async def probe_login_roles(pool: Any, *, label: str, acquire_timeout: float) ->
     the statement failed or no row came back, warns and returns :attr:`LoginRoleVerdict.NOT_RUN`. A
     cancellation is let through.
 
-    The acquire, and the ``statement_timeout`` write after it, are each bounded by
-    ``acquire_timeout``, as a lookup's are. The statement is bounded by the
+    The borrow is bounded by ``acquire_timeout``, as a lookup's is. The statement is bounded by the
     pool's ``statement_timeout`` where it set one, as a lookup's pool does (BACKLOG #5756)."""
     reading = await _read_login_roles(pool, acquire_timeout)
     _log_login_role_reading(reading, label)

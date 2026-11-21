@@ -1198,7 +1198,7 @@ def DatabaseRef(
     app_name: str = "messagefoundry",
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     pool_max: int = 5,
-    acquire_timeout: float = 30.0,  # cap the pool acquire, and the timeout write after it (s) — #1052
+    acquire_timeout: float = 30.0,  # cap this source's pooled-connection borrow (s) — BACKLOG #1052
     max_rows: int | EnvRef = DEFAULT_REFERENCE_MAX_ROWS,  # refuse a larger result; 0 = off (#2617)
     statement_timeout: int | EnvRef | None = None,  # whole s, 0 = no limit, unset = 30 (#5891)
     tls_hop_attested: bool = False,
@@ -1226,9 +1226,10 @@ def DatabaseRef(
     ``[security].enforcement = warn``. The dial-out is gated by the **fail-closed**
     ``[egress].allowed_db`` allowlist, exactly like a DATABASE poll source — point the engine only at allowed hosts.
 
-    ``acquire_timeout`` bounds the acquire from this source's throwaway pool, and separately the
-    ``statement_timeout`` write that follows it (default 30 s, matching the DATABASE connector and
-    ``[store].acquire_timeout``).
+    ``acquire_timeout`` bounds the borrow from this source's throwaway pool (default 30 s, matching
+    the DATABASE connector and ``[store].acquire_timeout``). On expiry the set's sync fails, the
+    last-good snapshot stays active and the AlertSink fires — the runner syncs sets sequentially, so
+    the bound is what stops one unresponsive server from stalling every other set's refresh.
 
     ``max_rows`` (default :data:`DEFAULT_REFERENCE_MAX_ROWS`) bounds one sync's result. The engine
     reads at most one row past it from the driver, then refuses the sync: the last-good snapshot
@@ -1422,7 +1423,7 @@ def DatabaseLookup(
     odbc_driver: str = "ODBC Driver 18 for SQL Server",
     max_rows: int = 500,  # refuse a result larger than this; 0 = no ceiling (BACKLOG #1730)
     pool_max: int = 5,
-    acquire_timeout: float = 30.0,  # cap the pool acquire, and the timeout write after it (s)
+    acquire_timeout: float = 30.0,  # cap a pooled-connection borrow (s) — fail transiently, not forever
     statement_timeout: int | None = None,  # cap each statement (s); 0 none, None per dialect
     tls_hop_attested: bool = False,
     tls_hop_attested_reason: str | None = None,
@@ -5065,7 +5066,7 @@ def Database(
     odbc_user_key: str = "UID",  # generic dialect: ODBC keyword the username is emitted under
     odbc_password_key: str = "PWD",  # generic dialect: ODBC keyword the password is emitted under
     pool_max: int = 5,
-    acquire_timeout: float = 30.0,  # cap the pool acquire, and the timeout write after it (s)
+    acquire_timeout: float = 30.0,  # cap a pooled-connection borrow (s) — fail transiently, not forever
     statement_timeout: int | None = None,  # cap each statement (s); 0 none, None per dialect
     capture_response: bool = False,  # capture the statement's RETURNING/OUTPUT result-set (ADR 0013)
     capture_out_params: bool = False,  # #67: capture a stored-proc CALL's OUT params + scalar RETURN value
@@ -5164,7 +5165,7 @@ def DatabasePoll(
     odbc_user_key: str = "UID",  # generic dialect: ODBC keyword the username is emitted under
     odbc_password_key: str = "PWD",  # generic dialect: ODBC keyword the password is emitted under
     pool_max: int = 5,
-    acquire_timeout: float = 30.0,  # cap the pool acquire, and the timeout write after it (s)
+    acquire_timeout: float = 30.0,  # cap a pooled-connection borrow (s) — fail transiently, not forever
     statement_timeout: int | None = None,  # cap each statement (s); 0 none, None per dialect
     encoding: str = "utf-8",
 ) -> ConnectionSpec:
